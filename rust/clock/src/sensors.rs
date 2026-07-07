@@ -192,7 +192,8 @@ impl core::fmt::Write for LineBuf {
 pub fn format_sensor_line(r: &Reading) -> LineBuf {
     use core::fmt::Write;
     let mut line = LineBuf::new();
-    // e.g. "23C 3.9V"  (temp rounded to int °C, volts to 1 decimal)
-    let _ = write!(line, "{}C {:.1}V", r.chip_c as i32, r.batt_v);
+    // e.g. "73F 3.9V"  (chip temp in Fahrenheit, rounded to int; volts to 1 decimal)
+    let f = r.chip_c * 9.0 / 5.0 + 32.0;
+    let _ = write!(line, "{}F {:.1}V", f as i32, r.batt_v);
     line
 }

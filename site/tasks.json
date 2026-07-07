@@ -41,7 +41,8 @@
     { "id": 38, "title": "app-pixels-style modes/apps gallery on the site", "status": "done", "owner": "you + Claude" },
     { "id": 39, "title": "Resin + watch-case enclosure guide (docs/enclosure-resin.md)", "status": "done", "owner": "RESIN" },
     { "id": 40, "title": "Unified Rust firmware: Clock + Snake + Bench + OLED 180° (compiles)", "status": "done", "owner": "KERNEL" },
-    { "id": 42, "title": "Flash unified Rust firmware to a board + verify menu/modes", "status": "pending", "owner": "you + Claude" },
-    { "id": 41, "title": "Case v4: crown = USB-C cover + classic orientation (bail→USB-C)", "status": "in_progress", "owner": "PORTAL" }
+    { "id": 41, "title": "Case v4: crown + classic orientation — DONE (body+lid+crown, watertight)", "status": "done", "owner": "PORTAL" },
+    { "id": 42, "title": "Flash unified firmware to board #2 (12h/AM-PM + °F) — flashed, verifying on OLED", "status": "in_progress", "owner": "you + Claude" },
+    { "id": 43, "title": "Re-render final case (bail-up) + crown on site", "status": "done", "owner": "you + Claude" }
   ]
 }

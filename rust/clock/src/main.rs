@@ -439,22 +439,45 @@ fn draw_clock<D>(
         label
     };
 
-    // "HH:MM" with a colon that blinks once per second.
-    let mut buf = [0u8; 8];
-    format_hms(sod, &mut buf);
-    if sod % 2 == 1 {
-        buf[2] = b' ';
+    // 12-hour clock with AM/PM and a colon that blinks once per second.
+    let h24 = (sod / 3600) % 24;
+    let mm = (sod / 60) % 60;
+    let pm = h24 >= 12;
+    let h12 = {
+        let h = h24 % 12;
+        if h == 0 { 12 } else { h }
+    };
+    let colon = if sod % 2 == 1 { b' ' } else { b':' };
+    // Build "H:MM" or "HH:MM" (no leading zero on the hour) — 4 or 5 chars.
+    let mut tb = [0u8; 5];
+    let mut ti = 0usize;
+    if h12 >= 10 {
+        tb[ti] = b'1';
+        ti += 1;
     }
-    let hm = core::str::from_utf8(&buf[0..5]).unwrap_or("--:--");
+    tb[ti] = b'0' + (h12 % 10) as u8;
+    ti += 1;
+    tb[ti] = colon;
+    ti += 1;
+    tb[ti] = b'0' + (mm / 10) as u8;
+    ti += 1;
+    tb[ti] = b'0' + (mm % 10) as u8;
+    ti += 1;
+    let hm = core::str::from_utf8(&tb[..ti]).unwrap_or("--:--");
+    // Center: "12:34" (5ch/50px) -> x=11; "1:34" (4ch/40px) -> x=16.
+    let tx = if h12 >= 10 { 11 } else { 16 };
 
-    // Center "HH:MM": (72-50)/2 = 11px left margin; 20px tall from y=2. The
-    // caller clears the buffer before calling and flushes after, so this helper
-    // stays generic over any DrawTarget (flush lives on the concrete display).
-    Text::with_baseline(hm, Point::new(11, 2), time_style, Baseline::Top)
+    // AM/PM small in the top-right (its own row above the big digits — no overlap).
+    let ampm = if pm { "PM" } else { "AM" };
+    Text::with_baseline(ampm, Point::new(59, 0), label_style, Baseline::Top)
+        .draw(display)
+        .ok();
+    // Big 12-hour time, 20px tall from y=8 (AM/PM row sits above it).
+    Text::with_baseline(hm, Point::new(tx, 8), time_style, Baseline::Top)
         .draw(display)
         .ok();
     // Bottom line at x=2 so longer peer messages fit.
-    Text::with_baseline(bottom, Point::new(2, 30), label_style, Baseline::Top)
+    Text::with_baseline(bottom, Point::new(2, 31), label_style, Baseline::Top)
         .draw(display)
         .ok();
 }
@@ -496,17 +519,4 @@ fn draw_snake_death<D>(
         .ok();
 }
 
-/// Format seconds-of-day into an 8-byte `HH:MM:SS` ASCII buffer (no heap).
-fn format_hms(sod: u32, out: &mut [u8; 8]) {
-    let h = (sod / 3600) % 24;
-    let m = (sod / 60) % 60;
-    let s = sod % 60;
-    out[0] = b'0' + (h / 10) as u8;
-    out[1] = b'0' + (h % 10) as u8;
-    out[2] = b':';
-    out[3] = b'0' + (m / 10) as u8;
-    out[4] = b'0' + (m % 10) as u8;
-    out[5] = b':';
-    out[6] = b'0' + (s / 10) as u8;
-    out[7] = b'0' + (s % 10) as u8;
-}
+// (12-hour time is formatted inline in draw_clock; no shared HH:MM:SS helper needed.)
