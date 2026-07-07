@@ -42,6 +42,16 @@ use ssd1306::{
 // this file can reference it unconditionally without cfg noise.
 mod net;
 
+// Blue status LED on GPIO8 (Phase 3 drives it; the module itself only needs
+// esp-hal GPIO, so it is always available for reuse).
+#[cfg(feature = "espnow")]
+mod led;
+
+// LOCAL git-ignored WiFi credentials, used by the `wifi`/`espnow` radio bring-up.
+// Fresh clones copy `src/secrets.rs.example` -> `src/secrets.rs` (see README).
+#[cfg(feature = "wifi")]
+mod secrets;
+
 /// Compile-time clock start, encoded as seconds-since-midnight.
 /// Phase 1 has no real-time source, so the clock free-runs from here.
 /// (12:34:56 -> 12*3600 + 34*60 + 56 = 45296.) Phase 2 overwrites this at
@@ -105,6 +115,18 @@ fn main() -> ! {
         wifi: peripherals.WIFI,
     });
 
+    // Phase 3: blue status LED on GPIO8. Create it FIRST (initialised to the
+    // logical-OFF physical level so we never hold this strapping pin low through
+    // a reset), then pass it into `mode::start` so it can fast-blink (~10 Hz)
+    // during the WiFi/NTP burst. After start() returns, the render loop drives
+    // it from the ESP-NOW peer state.
+    #[cfg(feature = "espnow")]
+    let mut led = led::Led::new(esp_hal::gpio::Output::new(
+        peripherals.GPIO8,
+        led::Led::off_level(),
+        esp_hal::gpio::OutputConfig::default(),
+    ));
+
     #[cfg(feature = "espnow")]
     let (mut radio, synced) = net::mode::start(
         net::WifiPeripherals {
@@ -112,8 +134,9 @@ fn main() -> ! {
             rng: peripherals.RNG,
             wifi: peripherals.WIFI,
         },
-        // This unit's short id, embedded in the broadcast "hello from smol NNN".
+        // This unit's short id, embedded in HELLO beacons ("SMOLv1 HELLO NNN").
         7,
+        &mut led,
     );
 
     let mut seconds_of_day: u32 = match synced {
@@ -127,53 +150,80 @@ fn main() -> ! {
     let mut bottom_line = alloc::string::String::from("smol");
 
     // --- Render loop ---------------------------------------------------------
-    // One tick per second: service the radio (Phase 3), then clear the
-    // framebuffer, draw HH:MM:SS + the bottom line, and flush.
-    let mut buf = [0u8; 8]; // "HH:MM:SS"
+    // The loop runs at a fast SUB-TICK (50 ms) so the blue LED can blink smoothly
+    // (a ~10 Hz blink needs a 50 ms toggle; ~2 Hz needs 250 ms). The clock digits
+    // and the OLED are only advanced/redrawn once per accumulated 1000 ms, so the
+    // display still ticks exactly once per second and we don't hammer the I2C bus.
+    //
+    // Each 50 ms sub-tick (Phase 3): service ESP-NOW (drain RX, run the HELLO/ACK
+    // handshake), periodically broadcast our HELLO beacon, then recompute the
+    // peer state and push it to the LED at the current time so blinking is smooth
+    // and non-blocking. Phase 1/2 have no LED and simply redraw the clock.
+    const SUBTICK_MS: u32 = 50;
     #[cfg(feature = "espnow")]
-    let mut tick: u32 = 0;
+    const SUBTICKS_PER_SEC: u32 = 1000 / SUBTICK_MS; // 20
+    #[cfg(feature = "espnow")]
+    const HELLO_EVERY_SUBTICKS: u32 = SUBTICKS_PER_SEC * 2; // broadcast HELLO ~every 2 s
+
+    let mut buf = [0u8; 8]; // "HH:MM:SS"
+    let mut ms_accum: u32 = 0; // time since last 1 s clock advance
+    let mut first_frame = true; // draw once immediately at startup
+    #[cfg(feature = "espnow")]
+    let mut subtick: u32 = 0;
     loop {
-        // Phase 3: broadcast a hello once per 5 s and display any inbound msg.
+        // --- Phase 3: ESP-NOW servicing + LED, every sub-tick ---------------
         #[cfg(feature = "espnow")]
         if let Some(r) = radio.as_mut() {
-            if let Some((_src, text)) = r.poll_message() {
+            // Drain inbound frames + advance the handshake; surface last activity.
+            if let Some(text) = r.service() {
                 bottom_line = text;
             }
-            if tick % 5 == 0 {
+            // Periodically advertise ourselves so peers can detect + ACK us.
+            if subtick % HELLO_EVERY_SUBTICKS == 0 {
                 r.broadcast_hello();
             }
+            // Reflect the current peer link state on the blue LED (off / slow
+            // blink / solid), phased off the monotonic clock for smooth blink.
+            let now = net::mode::now_ms();
+            led.apply(r.peer_led_state(now), now);
+            subtick = subtick.wrapping_add(1);
         }
 
-        // Resolve the bottom-line &str for this frame (String view or static).
-        #[cfg(feature = "espnow")]
-        let bottom: &str = bottom_line.as_str();
-        #[cfg(not(feature = "espnow"))]
-        let bottom: &str = "smol";
+        // --- Advance + redraw the clock once per second ---------------------
+        if first_frame || ms_accum >= 1000 {
+            if !first_frame {
+                seconds_of_day = (seconds_of_day + 1) % 86_400;
+                ms_accum -= 1000;
+            }
+            first_frame = false;
 
-        format_hms(seconds_of_day, &mut buf);
-        let hms = core::str::from_utf8(&buf).unwrap_or("--:--:--");
+            // Resolve the bottom-line &str for this frame (String view or static).
+            #[cfg(feature = "espnow")]
+            let bottom: &str = bottom_line.as_str();
+            #[cfg(not(feature = "espnow"))]
+            let bottom: &str = "smol";
 
-        display.clear(BinaryColor::Off).ok();
+            format_hms(seconds_of_day, &mut buf);
+            let hms = core::str::from_utf8(&buf).unwrap_or("--:--:--");
 
-        // Center "HH:MM:SS": 8 chars * 6px = 48px wide on a 72px panel ->
-        // left margin (72-48)/2 = 12. Vertically place the big line ~row 14.
-        Text::with_baseline(hms, Point::new(12, 14), time_style, Baseline::Top)
-            .draw(&mut display)
-            .ok();
+            display.clear(BinaryColor::Off).ok();
 
-        // Bottom line (5x8 font). Draw at x=2 so longer peer messages fit.
-        Text::with_baseline(bottom, Point::new(2, 30), label_style, Baseline::Top)
-            .draw(&mut display)
-            .ok();
+            // Center "HH:MM:SS": 8 chars * 6px = 48px wide on a 72px panel ->
+            // left margin (72-48)/2 = 12. Vertically place the big line ~row 14.
+            Text::with_baseline(hms, Point::new(12, 14), time_style, Baseline::Top)
+                .draw(&mut display)
+                .ok();
 
-        display.flush().ok();
+            // Bottom line (5x8 font). Draw at x=2 so longer peer messages fit.
+            Text::with_baseline(bottom, Point::new(2, 30), label_style, Baseline::Top)
+                .draw(&mut display)
+                .ok();
 
-        delay.delay_millis(1000);
-        seconds_of_day = (seconds_of_day + 1) % 86_400;
-        #[cfg(feature = "espnow")]
-        {
-            tick = tick.wrapping_add(1);
+            display.flush().ok();
         }
+
+        delay.delay_millis(SUBTICK_MS);
+        ms_accum += SUBTICK_MS;
     }
 }
 

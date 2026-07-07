@@ -7,6 +7,12 @@ the battery so the cell can actually be recharged — the SuperMini has **no onb
 charging** (see [`docs/power.md`](../../docs/power.md)). Generated procedurally by
 [`pocketwatch.py`](./pocketwatch.py) with `trimesh` + the `manifold` boolean engine.
 
+The front face also carries **both board buttons routed to the top** (BOOT +
+RESET, via vertical plunger bores) and **two LED light-pipe holes** for the blue
+GPIO8 and power LEDs — see **[Buttons & LEDs](#buttons--leds-read-this)** for the
+researched board layout, the *RESET-is-not-a-firmware-input* caveat, and the
+clear-PLA note.
+
 Prior research (see [`docs/cases.md`](../../docs/cases.md)) confirmed no existing
 STL fits this board **plus** an internal 502030 cell, so this one is built from
 primitives (cylinders, boxes, a torus) combined with boolean unions/differences.
@@ -15,7 +21,7 @@ primitives (cylinders, boxes, a torus) combined with boolean unions/differences.
 
 | File | Print? | What it is |
 |---|---|---|
-| `pocketwatch_body.stl` | **yes** | Round case body: front face + OLED window, **two** USB-C slots (SuperMini @ 6 o'clock, TP4056 charge @ 9 o'clock), BOOT hole, chain bail. |
+| `pocketwatch_body.stl` | **yes** | Round case body: front face + OLED window, **two** USB-C slots (SuperMini @ 6 o'clock, TP4056 charge @ 9 o'clock), **two top-face button plunger bores (BOOT + RESET)**, **two LED light-pipe holes (clear-PLA)**, chain bail. |
 | `pocketwatch_lid.stl`  | **yes** | Press-fit back lid with a pry-notch **and a 3-sided retention fence** that cradles the TP4056. |
 | `pocketwatch_assembly.stl` | no | Preview only — body + lid nested. Do **not** slice this. |
 
@@ -36,7 +42,8 @@ Measured from the exported STLs (both verified **watertight**, single-body):
 | OLED window | 12.0 x 12.0 mm (through the face) |
 | SuperMini USB-C slot | 11.0 (w) x 5.0 (h) mm, at **6 o'clock** |
 | **TP4056 charge USB-C slot** | **11.0 (w) x 5.0 (h) mm, at 9 o'clock** |
-| BOOT poke-hole | 4.4 mm dia, at 3 o'clock |
+| **BOOT + RESET plunger bores** | **2 x 3.6 mm dia, vertical through the front face**, at the **+Y (OLED/12 o'clock) end, flanking the window** (BOOT +X, RESET -X) |
+| **LED light-pipe holes** | **2 x 2.5 mm dia, through the front face**, **above the window toward the bail** (blue GPIO8 + power LED) — **clear PLA** *(position assumed)* |
 | Bail chain hole | ~4.8 mm (fits most chains/split-rings) |
 | Lid lip engagement | 4.0 mm, 0.20 mm/side press-fit gap |
 
@@ -67,8 +74,11 @@ top of the script and re-run to resize for a different board/cell/charger.
 
 Looking at the **front face**:
 
-- **12 o'clock (+Y):** OLED window and the chain **bail**. Orient the board so
-  the OLED end points up.
+- **12 o'clock (+Y):** OLED window, the chain **bail**, and — on the **front
+  face** at this same OLED end — the **two button plunger bores** (BOOT + RESET,
+  flanking the window left/right) and the **two LED light-pipe holes** (just
+  above the window, toward the bail). Orient the board so the OLED/button end
+  points up. See **[Buttons & LEDs](#buttons--leds-read-this)** below.
 - **6 o'clock (-Y):** the **SuperMini's** USB-C slot (for flashing / occasional
   powered use). The board's USB-C edge faces down. This is *up* near the board's
   Z level (z ~ 14 mm).
@@ -76,11 +86,86 @@ Looking at the **front face**:
   TP4056's Z layer (z ~ 3 mm), behind the battery. Two **different** USB-C ports,
   two **different** clock positions, at two **different** heights — they never
   collide (see [charging](#charging-read-this)).
-- **3 o'clock (+X):** **BOOT** button poke-hole (GPIO9).
+- **3 o'clock (+X):** *(optional)* a legacy side-wall **BOOT** poke-hole, **off by
+  default** (`BOOT_SIDE_HOLE = False`) — both buttons now go through the top face.
+
+## Buttons & LEDs (read this)
+
+### Where the buttons and LEDs actually are
+
+The two tactile buttons are **BOOT** (GPIO9, via RST2/R6) and **RESET** (tied to
+`EN`/`CHIP_PU`). Two onboard LEDs: a **blue user LED on GPIO8** (active-LOW) and a
+**power LED** (red/orange/green depending on the batch) that lights on USB/VBUS.
+
+> **Which end are the buttons on?** Generic ESP32-C3 SuperMini pinout docs
+> ([lastminuteengineers](https://lastminuteengineers.com/esp32-c3-super-mini-pinout-reference/),
+> [espboards.dev](https://www.espboards.dev/esp32/esp32-c3-super-mini/)) put both
+> buttons *"next to the USB port."* **But on the owner's actual 0.42" OLED board
+> the buttons are at the OPPOSITE end — the OLED / antenna end** (owner-confirmed,
+> authoritative). This case follows the **actual board**: in the case frame (OLED
+> at **+Y / 12 o'clock**, USB-C at **−Y / 6 o'clock**) **both buttons are up at the
+> +Y (OLED / "top of screen") end**, which also matches the original
+> "buttons at the top" intent.
+
+**LED positions are an ASSUMPTION.** The owner corrected only the *buttons*. The
+two LED light-pipe holes are placed at the **+Y (OLED) end too** by default (just
+above the window, toward the bail). **Verify the LEDs against your physical
+board** — on some layouts they sit back near the USB-C end; if so, move them (see
+`LED_*` below).
+
+> **Board-revision caveat:** manufacturers move these parts around. Exact X/Y of
+> each button and LED **varies by revision**, so every position is a **parameter**
+> (`BTN_Y`, `BTN_X_FROM_WIN_EDGE`, `BOOT_BTN_X`, `RESET_BTN_X`, `LED_Y_ABOVE_WIN`,
+> `LED_X`, `BLUE_LED_X`, `PWR_LED_X`). Eyeball your own board, nudge the numbers,
+> and re-run.
+
+### Both buttons routed to the top (plunger bores)
+
+The spec is *both buttons actuatable from the top* (the front face / OLED end,
+face-up). The buttons are at the **+Y (OLED) end**, so the case cuts **two
+straight vertical through-holes in the front face, one directly above each
+button, flanking the OLED window** (BOOT on the +X side, RESET on the −X side).
+Drop in a **pin, a spudger, or a short loose-fit printed plunger** and press
+**straight down** onto the switch. This is the **most printable,
+genuinely-actuatable** approach.
+
+- Bores are **3.6 mm dia** (`BTN_BORE_R = 1.8`) and stop **0.4 mm above the switch
+  cap** (`BTN_BORE_CLEAR_Z`) so a plunger bottoms on the button, not on plastic.
+- They **flank the window** with a ~0.8 mm bezel gap to the window edge
+  (`BTN_X_FROM_WIN_EDGE`) and ~6.9 mm to the side wall — verified clear.
+- Why a straight vertical bore (not an angled/bent channel)? A bent channel can't
+  be printed as a single clean bore and would need supports; a **vertical face
+  bore prints face-down with no supports** and presses the switch for real.
+- An optional set of **printed plungers** can be previewed/exported into the
+  assembly (`BTN_PLUNGER_PREVIEW = True`) — but a toothpick works fine.
+
+> **⚠️ Honesty caveat — RESET vs BOOT.** **RESET reboots the chip** (it pulls
+> `EN`/`CHIP_PU`), so in **firmware only BOOT (GPIO9) is a usable input button.**
+> The case still **physically exposes and actuates BOTH** buttons as requested —
+> RESET remains useful as a **manual reboot / recovery** press (and for entering
+> the bootloader together with BOOT). Don't expect to read RESET as a GPIO.
+
+### Two LED light-pipe holes — **print in / plug with CLEAR PLA**
+
+Two small **2.5 mm** through-holes (`LED_PIPE_R = 1.25`) are cut in the front face
+over the **blue GPIO8 LED** and the **power LED** so their glow reaches the front.
+By default they sit **at the OLED end, just above the window** (toward the bail),
+clearing both the window (~0.85 mm) and the two flanking buttons — **their exact
+position is an assumption; verify against the board.** They are meant to be
+**filled with a clear-PLA light pipe** — either:
+
+- **print the body in clear PLA** so the whole face passes light (then the holes
+  just thin the wall over each LED for a brighter dot), **or**
+- print the body opaque and **plug each hole with a short clear-PLA pin / a drop
+  of clear resin / a snippet of clear filament**, sanded flush, to pipe the light.
+
+Set `LED_PIPE = False` to omit them.
 
 ## Printing
 
-- **Material:** PLA or PETG. PETG if it'll ride in a warm pocket.
+- **Material:** PLA or PETG. PETG if it'll ride in a warm pocket. For the LED
+  light-pipes, either print the **body in clear PLA** or **plug the two LED holes
+  with clear PLA** (see [Buttons & LEDs](#buttons--leds-read-this)).
 - **Layer height:** 0.2 mm. **Walls:** 3 perimeters. **Infill:** 15-20% is plenty
   (walls carry the load). Rough solid volume is ~9 cm3 total (~11 g PLA solid;
   much less at low infill).
@@ -216,6 +301,25 @@ The **TP4056 charger** is fully parametric too:
 | `TP_X_OFFSET` | how far the board is nudged toward -X so its USB-C reaches the slot |
 | `TP_USB_W/H`, `TP_USB_ANGLE_DEG` | charge slot size and clock position (180 = 9 o'clock) |
 | `TP_RIB`, `TP_RIB_H`, `TP_RIB_W` | the lid retention fence (set `TP_RIB = False` to omit) |
+
+The **buttons** (both routed to the top face) and **LED light-pipes** are
+parametric too — nudge these to match your board revision:
+
+Both buttons and both LEDs are at the **+Y (OLED) end**; positions are keyed off
+the OLED-window geometry so they auto-adjust if you resize the window.
+
+| Variable | Meaning |
+|---|---|
+| `BTN_Y` | button-bore Y (default = window centre; buttons flank the window sides) |
+| `BTN_X_FROM_WIN_EDGE` | bezel gap from the window edge out to each bore centre (sets `BTN_X`) |
+| `BOOT_BTN_X`, `RESET_BTN_X` | the ±X of each button (BOOT +X, RESET −X); swap signs to mirror |
+| `BTN_ACTUATE` | cut the two top-face plunger bores (default `True`) |
+| `BTN_BORE_R`, `BTN_BORE_CLEAR_Z` | plunger-bore radius / air gap left above the switch cap |
+| `BTN_PLUNGER_PREVIEW` | also export short printed plungers into the assembly (default `False`) |
+| `LED_PIPE`, `LED_PIPE_R` | cut the two LED light-pipe holes / their radius (default 1.25 → 2.5 mm) |
+| `LED_Y_ABOVE_WIN` | gap from the window top edge up to the LED holes (they sit above the window) |
+| `LED_X`, `BLUE_LED_X`, `PWR_LED_X` | LED X spacing either side of centre (**position is an assumption — verify**) |
+| `BOOT_SIDE_HOLE` | re-enable the old 3 o'clock **side-wall** BOOT poke (default `False`) |
 
 The script prints the computed diameters/heights (and the TP4056 layer's Z range
 and USB-slot positions), then verifies both parts are **watertight** before

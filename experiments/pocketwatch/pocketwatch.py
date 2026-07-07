@@ -7,9 +7,26 @@ docs/power.md).
 
 Two printable parts are exported to this directory:
     pocketwatch_body.stl   - round case body: front face, OLED window, two USB
-                             slots (SuperMini @ 6 o'clock, TP4056 @ 9 o'clock), bail
+                             slots (SuperMini @ 6 o'clock, TP4056 @ 9 o'clock),
+                             TWO top-face button plunger bores (BOOT + RESET) and
+                             TWO LED light-pipe holes (clear-PLA), bail
     pocketwatch_lid.stl    - press-fit back lid
     pocketwatch_assembly.stl - (preview only) body + lid nested together
+
+Buttons + LEDs (layout)
+-----------------------
+    On THIS user's actual ESP32-C3 SuperMini 0.42" OLED board the two tactile
+    buttons (BOOT + RESET) are at the OLED / antenna end -- NOT the USB-C end
+    that generic pinout docs show. So in our case (OLED at +Y / 12 o'clock) both
+    buttons are up at the +Y ("top of screen") end. The case cuts two straight
+    VERTICAL plunger bores through the front face, one directly over each button,
+    FLANKING the OLED window left/right in X -- press with a pin / spudger /
+    short printed plunger. HONESTY: RESET reboots the chip, so in firmware only
+    BOOT is a usable input; the case exposes/actuates both anyway (RESET = manual
+    reboot). Two small LED light-pipe holes over the blue (GPIO8) and power LEDs
+    are also cut through the face at the +Y end (their exact position is an
+    ASSUMPTION -- verify against the board) -- meant to be printed in / plugged
+    with CLEAR PLA. All button/LED positions are parametric (revision-dependent).
 
 Geometry is built procedurally from primitives (cylinders, boxes, a torus) combined
 with boolean unions/differences using the `manifold` engine, which is robust for
@@ -115,11 +132,87 @@ TP_USB_W = 11.0        # width of the charge slot
 TP_USB_H = 5.0         # height (USB-C shell ~3.2 mm + relief; shell is taller than the bare PCB)
 TP_USB_ANGLE_DEG = 180 # 180 = 9 o'clock (-X). 6 o'clock (270) is the SuperMini port.
 
-# --- BOOT button access hole (GPIO9). Small hole on the side wall. ---
-# Angle is measured CCW from +X: 0 = 3 o'clock, 90 = 12 o'clock (bail),
-# 180 = 9 o'clock, 270 = 6 o'clock (USB). Keep it clear of the bail (+Y) and
-# USB slot (-Y); 3 o'clock (0 deg) is a clean spot on the side wall.
-BOOT_HOLE_R = 2.2   # radius of the poke hole
+# ----------------------------------------------------------------------------
+# BOARD BUTTONS + LEDs  -- physical layout (see README + comments)
+# ----------------------------------------------------------------------------
+# The two tactile buttons are BOOT (GPIO9, via RST2/R6) and RESET (tied to
+# EN/CHIP_PU).
+#
+# BUTTON END -- CORRECTED BY THE OWNER OF THE ACTUAL BOARD:
+#   Generic ESP32-C3 SuperMini docs (lastminuteengineers, espboards.dev, etc.)
+#   put both buttons at the USB-C end. BUT on THIS user's actual 0.42" OLED
+#   board the two buttons are at the OPPOSITE end -- the OLED / antenna end. So
+#   in our case frame (OLED at +Y / 12 o'clock, USB-C at -Y / 6 o'clock) BOTH
+#   buttons are up at the +Y (12 o'clock / OLED / "top of screen") end. The
+#   plunger bores are placed there and FLANK the OLED window left/right in X.
+#   This also matches the original "buttons at the top of the screen" intent.
+#
+# LEDs (blue user LED on GPIO8, active-LOW; power LED that lights on USB/VBUS):
+#   The user only corrected the BUTTONS. The two LED light-pipe holes are, by
+#   default, also placed at the OLED (+Y) end (flanking the window, inboard of
+#   the buttons). LED PLACEMENT IS AN ASSUMPTION -- verify against the physical
+#   board and nudge LED_* if they sit elsewhere (e.g. back near the USB-C end).
+#
+# Exact X/Y of every part VARIES BY BOARD REVISION, so all positions below are
+# parameters. HONESTY CAVEAT (also in README): RESET reboots the chip, so in
+# FIRMWARE only BOOT is a usable input; the case actuates BOTH as requested
+# (RESET stays useful as a manual reboot / recovery / bootloader-combo press).
+#
+# Board coordinate convention (matches the OLED window math below):
+#   board centred at XY origin; long axis (BOARD_L) along Y; short axis
+#   (BOARD_W) along X; +Y = OLED / button end, -Y = USB-C end.
+
+# The OLED window centre (+Y) and its half-extents, reused to place things that
+# must FLANK or SIT ABOVE the window without overlapping it.
+_WIN_Y = (BOARD_L / 2.0) - OLED_CENTER_FROM_END   # window centre Y (== win_y below)
+_WIN_HALF_X = OLED_GLASS_H / 2.0                  # window half-width in X (face)
+
+# --- Button physical positions on the PCB (board-frame, mm) ---
+# Buttons are at the +Y (OLED) end and FLANK the window left/right. Their Y sits
+# at the window centre; their X is pushed just outside the window edge with a
+# comfortable bezel gap.
+BTN_Y = _WIN_Y                       # button centres level with the window centre
+BTN_X_FROM_WIN_EDGE = 2.6            # gap from the window edge out to the bore CENTRE
+BTN_X = _WIN_HALF_X + BTN_X_FROM_WIN_EDGE   # each button this far off centre in X
+# BOOT (GPIO9) and RESET (EN). Swap the signs if your board mirrors them.
+BOOT_BTN_X = +BTN_X                  # BOOT to +X side of the window (3 o'clock-ish)
+RESET_BTN_X = -BTN_X                 # RESET to -X side of the window (9 o'clock-ish)
+
+# --- BOTH buttons routed to the TOP via vertical plunger bores in the FACE ---
+# The buttons are at the +Y (OLED / top) end; the spec wants both actuatable
+# from the TOP (the front face). The most printable, genuinely-actuatable
+# approach is a straight VERTICAL through-hole in the front face directly ABOVE
+# each button: drop in a pin, a spudger, or a short loose-fit printed plunger
+# and press straight down onto the switch. (A bent channel would not print as a
+# single clean bore; a vertical face bore prints cleanly face-down, no supports.)
+BTN_ACTUATE = True          # cut the two vertical button bores in the face
+BTN_BORE_R = 1.8            # bore radius (fits a ~3 mm pin / printed plunger)
+BTN_BORE_CLEAR_Z = 0.4      # stop the bore this far ABOVE the button top so a
+                            # plunger bottoms on the switch, not on the plastic
+# Optional loose-fit printed plungers (a short peg per bore). Off by default --
+# a toothpick/spudger works; enable to also export peg solids into the assembly.
+BTN_PLUNGER_PREVIEW = False
+
+# --- LED light-pipe holes (print in / plug with CLEAR PLA) ---
+# Two small through-holes in the front face over the two onboard LEDs (blue
+# GPIO8 + power LED), sized to take a clear-PLA light pipe or to be bridged with
+# a clear-PLA plug so the LEDs are visible from the front. By default placed at
+# the OLED (+Y) end, ABOVE the window (toward the bail) so they clear both the
+# window and the two flanking buttons. LED POSITION IS AN ASSUMPTION -- verify
+# against your physical board (they may sit elsewhere, e.g. by the USB-C end).
+LED_PIPE = True             # cut the two LED light-pipe holes in the face
+LED_PIPE_R = 1.25           # radius -> 2.5 mm holes (light-pipe / clear-PLA plug)
+# Y sits just ABOVE the window's +Y (top) edge, with a bezel gap.
+LED_Y_ABOVE_WIN = 2.1       # gap from the window top edge up to the LED-hole CENTRE
+LED_Y = (_WIN_Y + OLED_GLASS_W / 2.0) + LED_Y_ABOVE_WIN
+LED_X = 3.0                 # the two LEDs sit this far either side of centre in X
+BLUE_LED_X = +LED_X                 # GPIO8 blue LED (+X side)
+PWR_LED_X = -LED_X                  # power LED (-X side)
+
+# --- (Legacy) side-wall BOOT poke hole. Kept OFF: both buttons now go via the
+#     top face bores above. Set True to ALSO get the old 3 o'clock side poke. ---
+BOOT_SIDE_HOLE = False   # old radial side-wall poke at 3 o'clock (superseded)
+BOOT_HOLE_R = 2.2   # radius of the (optional) side poke hole
 BOOT_ANGLE_DEG = 0  # position around the rim (0 = +X / 3 o'clock side)
 
 # --- Bail / chain loop at 12 o'clock ---
@@ -192,6 +285,25 @@ def difference(a, bs):
     return trimesh.boolean.difference([a] + list(bs), engine='manifold')
 
 
+def _board_y(y_from_usb_edge):
+    """Convert a distance measured from the board's USB-C (-Y) short edge toward
+    the OLED into a case-frame Y. Board is centred at the XY origin with its long
+    axis (BOARD_L) on Y and the USB-C edge at -BOARD_L/2."""
+    return -BOARD_L / 2.0 + y_from_usb_edge
+
+
+def _face_bore(x, y, r, z_bottom):
+    """A vertical cylinder cutter (axis = Z) that pierces the front face from
+    just above the outer face down to ``z_bottom``. Used for the button plunger
+    bores and the LED light-pipe holes. Overshoots the top by 1 mm for a clean
+    cut and is centred at (x, y)."""
+    top = Z_FACE_OUT + 1.0
+    h = top - z_bottom
+    c = cylinder(radius=r, height=h, sections=48)
+    c.apply_translation([x, y, z_bottom + h / 2.0])
+    return c
+
+
 def _rim_slot(width, height, z, angle_deg):
     """A rectangular cutter that punches a USB-C-sized notch straight through the
     side wall at the given clock ``angle_deg`` (0=+X/3 o'clock, 90=+Y/12,
@@ -262,20 +374,40 @@ def make_body():
     tp_usb_z = (Z_TP_TOP + Z_TP_BOT) / 2.0
     parts_neg.append(_rim_slot(TP_USB_W, TP_USB_H, tp_usb_z, TP_USB_ANGLE_DEG))
 
-    # --- BOOT button poke hole on the side wall ---
-    ang = math.radians(BOOT_ANGLE_DEG)
-    boot_z = (Z_BOARD_TOP + Z_BOARD_BOT) / 2.0
-    hole_len = (OUTER_R - INNER_R) + 6.0
-    boot = cylinder(radius=BOOT_HOLE_R, height=hole_len, sections=48)
-    # orient along radial (X by default is along its own Z after rotation);
-    # cylinder axis is Z; rotate to point radially outward in XY plane.
-    boot.apply_transform(trimesh.transformations.rotation_matrix(math.pi / 2, [0, 1, 0]))
-    # now axis is along X. rotate around Z to the desired angle.
-    boot.apply_transform(trimesh.transformations.rotation_matrix(ang, [0, 0, 1]))
-    bx = math.cos(ang) * (INNER_R + (OUTER_R - INNER_R) / 2.0)
-    by = math.sin(ang) * (INNER_R + (OUTER_R - INNER_R) / 2.0)
-    boot.apply_translation([bx, by, boot_z])
-    parts_neg.append(boot)
+    # --- BOTH buttons routed to the TOP: vertical plunger bores in the face ---
+    # Two straight Z-bores through the front face, one directly above each
+    # button (BOOT and RESET), stopping BTN_BORE_CLEAR_Z above the button top so
+    # a pin / short printed plunger presses the switch itself, not the plastic.
+    # The buttons are at the +Y (OLED) end, flanking the window in X; they sit at
+    # the board top plane (same tall features as the OLED).
+    if BTN_ACTUATE:
+        btn_top_z = Z_BOARD_TOP                       # switch cap ~ board-top plane
+        bore_stop = btn_top_z + BTN_BORE_CLEAR_Z      # leave a thin air gap
+        for bx in (BOOT_BTN_X, RESET_BTN_X):
+            parts_neg.append(_face_bore(bx, BTN_Y, BTN_BORE_R, bore_stop))
+
+    # --- Two LED light-pipe holes in the face (clear-PLA) ---
+    # Small through-holes over the blue GPIO8 LED and the power LED, punched all
+    # the way through the face (down to the board-top plane) so a clear-PLA light
+    # pipe / plug carries the glow to the front. See README: print/plug in CLEAR.
+    if LED_PIPE:
+        led_stop = Z_BOARD_TOP                        # pierce fully through the face
+        for lx in (BLUE_LED_X, PWR_LED_X):
+            parts_neg.append(_face_bore(lx, LED_Y, LED_PIPE_R, led_stop))
+
+    # --- (Optional, legacy) BOOT button poke hole on the side wall @ 3 o'clock ---
+    if BOOT_SIDE_HOLE:
+        ang = math.radians(BOOT_ANGLE_DEG)
+        boot_z = (Z_BOARD_TOP + Z_BOARD_BOT) / 2.0
+        hole_len = (OUTER_R - INNER_R) + 6.0
+        boot = cylinder(radius=BOOT_HOLE_R, height=hole_len, sections=48)
+        # cylinder axis is Z; rotate to point radially outward in XY plane.
+        boot.apply_transform(trimesh.transformations.rotation_matrix(math.pi / 2, [0, 1, 0]))
+        boot.apply_transform(trimesh.transformations.rotation_matrix(ang, [0, 0, 1]))
+        bx = math.cos(ang) * (INNER_R + (OUTER_R - INNER_R) / 2.0)
+        by = math.sin(ang) * (INNER_R + (OUTER_R - INNER_R) / 2.0)
+        boot.apply_translation([bx, by, boot_z])
+        parts_neg.append(boot)
 
     # Apply all cuts.
     body = difference(body, parts_neg)
@@ -358,13 +490,31 @@ def make_lid():
     return lid
 
 
+def make_plungers():
+    """Optional loose-fit printed button plungers: a short peg per button bore,
+    sitting in the bore with its tip near the switch. Preview / print-separately
+    aid; a toothpick or spudger works just as well. Returns a list of meshes."""
+    pegs = []
+    if not (BTN_ACTUATE and BTN_PLUNGER_PREVIEW):
+        return pegs
+    peg_r = BTN_BORE_R - 0.25              # loose slip fit in the bore
+    tip_z = Z_BOARD_TOP + BTN_BORE_CLEAR_Z # rests just above the switch cap
+    peg_h = (Z_FACE_OUT + 1.5) - tip_z     # protrudes ~1.5 mm proud of the face
+    for x in (BOOT_BTN_X, RESET_BTN_X):
+        p = cylinder(radius=peg_r, height=peg_h, sections=32)
+        p.apply_translation([x, BTN_Y, tip_z + peg_h / 2.0])
+        pegs.append(p)
+    return pegs
+
+
 def make_assembly(body, lid):
     """Preview: nest the lid into the body at its seated position (no boolean)."""
     b = body.copy()
     l = lid.copy()
     # Lid floor bottom is at z=0 which is already the assembled position
     # (body open rim at Z_BODY_OPEN = BACK_LIP_T sits on lid floor top).
-    scene = trimesh.util.concatenate([b, l])
+    parts = [b, l] + make_plungers()
+    scene = trimesh.util.concatenate(parts)
     return scene
 
 
@@ -396,6 +546,18 @@ def main():
           f"tp4056[{Z_TP_BOT:.2f},{Z_TP_TOP:.2f}] open={Z_BODY_OPEN:.2f}")
     print(f"USB slots: SuperMini @ 6 o'clock z={ (Z_BOARD_TOP+Z_BOARD_BOT)/2.0:.2f}; "
           f"TP4056 @ {TP_USB_ANGLE_DEG} deg (9 o'clock) z={(Z_TP_TOP+Z_TP_BOT)/2.0:.2f}")
+    if BTN_ACTUATE:
+        print(f"Button top-face bores (r={BTN_BORE_R}): "
+              f"BOOT @ (x={BOOT_BTN_X:+.1f}, y={BTN_Y:+.1f}), "
+              f"RESET @ (x={RESET_BTN_X:+.1f}, y={BTN_Y:+.1f})  "
+              f"[both at +Y/OLED end, flanking window (half-width {_WIN_HALF_X:.1f}); "
+              f"bore stops z={Z_BOARD_TOP+BTN_BORE_CLEAR_Z:.2f}]")
+        print("  NOTE: RESET reboots the chip -> only BOOT is a firmware input; "
+              "case actuates BOTH as requested.")
+    if LED_PIPE:
+        print(f"LED light-pipe holes (r={LED_PIPE_R}, CLEAR-PLA, position ASSUMED): "
+              f"blue/GPIO8 @ (x={BLUE_LED_X:+.1f}, y={LED_Y:+.1f}), "
+              f"power @ (x={PWR_LED_X:+.1f}, y={LED_Y:+.1f})")
     print("-" * 74)
 
     print("Building BODY ...")

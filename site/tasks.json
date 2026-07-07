@@ -28,6 +28,7 @@
     { "id": 25, "title": "Full LE Audio research (docs/le-audio.md)", "status": "done", "owner": "AURA" },
     { "id": 26, "title": "Showcase pocket-watch case + renders on site", "status": "done", "owner": "you + Claude" },
     { "id": 27, "title": "Surface all research + code on the site", "status": "done", "owner": "you + Claude" },
-    { "id": 28, "title": "Case v2: both buttons at top + clear-PLA LED holes", "status": "active", "owner": "PORTAL" }
+    { "id": 28, "title": "Case v2: buttons + LED holes at OLED/top end", "status": "done", "owner": "PORTAL" },
+    { "id": 29, "title": "Flash Rust clock + blue-LED peer states (detect/connect)", "status": "active", "owner": "PULSE" }
   ]
 }

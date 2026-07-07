@@ -42,18 +42,109 @@
 
 extern crate alloc;
 
-use esp_hal::{rng::Rng, timer::timg::TimerGroup};
+use esp_hal::{
+    rng::Rng,
+    time::Instant,
+    timer::timg::TimerGroup,
+};
 use esp_wifi::{
     esp_now::{EspNow, EspNowWifiInterface, PeerInfo, BROADCAST_ADDRESS},
-    wifi::{ClientConfiguration, Configuration, WifiController, WifiMode},
+    wifi::{WifiController, WifiMode},
     EspWifiController,
 };
 
+use crate::led::{Led, LedState};
 use crate::net::WifiPeripherals;
 
 /// Fixed ESP-NOW channel used in TIME-SHARE mode. All smol units must agree on
 /// this value (1..=13). 6 is a common, low-congestion default.
 const ESP_NOW_FIXED_CHANNEL: u8 = 6;
+
+// =========================================================================
+// Peer handshake protocol (drives the blue status LED).
+// =========================================================================
+//
+// ESP-NOW is connectionless: sending a broadcast tells you NOTHING about who
+// (if anyone) received it. To honestly distinguish "I can hear a peer" from
+// "a peer and I have a working two-way link", we run a tiny explicit handshake
+// on top of ESP-NOW broadcasts:
+//
+//   * Every unit periodically BROADCASTS a HELLO beacon carrying its own id.
+//   * When unit B hears unit A's HELLO, B learns A exists (A is "detected") and
+//     replies with a *unicast* ACK echoing A's id ("I, B, heard you, A").
+//   * When A receives an ACK carrying A's own id, A now has proof the frame it
+//     sent was received by someone AND that someone is talking back — i.e. the
+//     link is bidirectional. A is "connected".
+//
+// Mapping to LED states (see crate::led):
+//   * heard a HELLO within PEER_STALE_MS, but no fresh ACK-for-us  -> Detected
+//   * received an ACK addressed to our id within PEER_STALE_MS      -> Connected
+//   * neither within PEER_STALE_MS                                  -> Idle (off)
+//
+// Everything is edge-free and timestamp-based: we just remember the monotonic
+// time of the last relevant event and compare against `now` each tick, so a
+// peer going away naturally decays Connected -> Detected -> Idle as its frames
+// stop arriving. No allocation, no fixed peer table — one remote peer is enough
+// to light the LED, which matches the "is anyone out there / are we linked"
+// question the LED answers.
+
+/// A frame is considered "recent" for this long. Beyond it the corresponding
+/// LED state decays (Connected/Detected -> lower). ~3 s per the spec: long
+/// enough to ride over a couple of missed beacons, short enough that unplugging
+/// the peer visibly drops the LED within a few seconds.
+const PEER_STALE_MS: u64 = 3_000;
+
+/// Wire tags. Kept as short ASCII prefixes so payloads stay tiny and are
+/// human-readable in a serial sniffer. `SMOLv1` namespaces us off other
+/// ESP-NOW traffic on the channel.
+const HELLO_PREFIX: &[u8] = b"SMOLv1 HELLO "; // + 3-digit id
+const ACK_PREFIX: &[u8] = b"SMOLv1 ACK "; // + 3-digit id (the id being acked)
+
+/// Parsed inbound handshake frame.
+enum Frame {
+    /// A peer beacon; carries the sender's id.
+    Hello(u8),
+    /// An acknowledgement; carries the id of the unit being acked.
+    Ack(u8),
+}
+
+/// Tracks the two timestamps that define the peer link state. Monotonic ms
+/// (`Instant::now().duration_since_epoch().as_millis()`); 0 = "never seen".
+struct PeerTracker {
+    /// Last time we heard ANY peer HELLO (proves we can hear a peer).
+    last_hello_ms: u64,
+    /// Last time we received an ACK addressed to OUR id (proves a peer heard
+    /// us -> the link is bidirectional).
+    last_ack_for_us_ms: u64,
+}
+
+impl PeerTracker {
+    const fn new() -> Self {
+        Self {
+            last_hello_ms: 0,
+            last_ack_for_us_ms: 0,
+        }
+    }
+
+    /// Fresh iff seen and within the staleness window at `now_ms`.
+    #[inline]
+    fn fresh(stamp_ms: u64, now_ms: u64) -> bool {
+        stamp_ms != 0 && now_ms.saturating_sub(stamp_ms) <= PEER_STALE_MS
+    }
+
+    /// Collapse the two timestamps into the current [`LedState`] peer state.
+    /// Connected takes priority (bidirectional proof implies we also heard the
+    /// peer), then Detected, else Idle.
+    fn state(&self, now_ms: u64) -> LedState {
+        if Self::fresh(self.last_ack_for_us_ms, now_ms) {
+            LedState::Connected
+        } else if Self::fresh(self.last_hello_ms, now_ms) {
+            LedState::PeerDetected
+        } else {
+            LedState::Idle
+        }
+    }
+}
 
 /// Which stack the single radio is currently servicing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,9 +166,25 @@ pub enum Mode {
 pub struct RadioManager {
     controller: WifiController<'static>,
     esp_now: EspNow<'static>,
+    /// The WiFi STA device, handed out once by esp-wifi's `Interfaces`. Held as
+    /// an `Option` so the NTP burst can drive it, then `take()` + drop it to
+    /// free the smoltcp stack before we time-share the radio to ESP-NOW.
+    sta: Option<esp_wifi::wifi::WifiDevice<'static>>,
+    /// Kept for the SNTP ephemeral-port seed during the burst.
+    rng: Rng,
     mode: Mode,
-    /// Our short device id, embedded in the broadcast message.
+    /// Our short device id, embedded in HELLO beacons and matched against the
+    /// id carried by inbound ACKs to detect a bidirectional link.
     id: u8,
+    /// Handshake state driving the blue LED (see the protocol comment above).
+    peers: PeerTracker,
+}
+
+/// Monotonic milliseconds since boot — the single time base for both the
+/// handshake staleness checks and the LED blink phase.
+#[inline]
+pub fn now_ms() -> u64 {
+    Instant::now().duration_since_epoch().as_millis()
 }
 
 impl RadioManager {
@@ -89,7 +196,9 @@ impl RadioManager {
 
         let timg0 = TimerGroup::new(p.timg0);
         let rng = Rng::new(p.rng);
-        let ctrl: EspWifiController<'static> = esp_wifi::init(timg0.timer0, rng).ok()?;
+        // esp-wifi's `init` wants the RNG by value; keep a clone for our own
+        // SNTP ephemeral-port seed (Rng is a cheap handle, not the entropy).
+        let ctrl: EspWifiController<'static> = esp_wifi::init(timg0.timer0, rng.clone()).ok()?;
         let ctrl: &'static EspWifiController<'static> =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(ctrl));
 
@@ -100,9 +209,31 @@ impl RadioManager {
         Some(Self {
             controller,
             esp_now: interfaces.esp_now,
+            // Keep the STA device alive for the NTP burst; dropped afterward.
+            sta: Some(interfaces.sta),
+            rng,
             mode: Mode::WifiSta,
             id,
+            peers: PeerTracker::new(),
         })
+    }
+
+    /// Run the real WiFi -> DHCP -> SNTP burst using the STA device, driving the
+    /// caller's `tick` closure throughout (the `espnow` build fast-blinks the
+    /// blue LED so "WiFi/NTP in progress" is visible). Returns the synced Unix
+    /// time, or `None` on any timeout. Consumes the STA device (drops it after)
+    /// so the radio is free to time-share to ESP-NOW next.
+    pub fn burst_ntp(&mut self, tick: &mut dyn FnMut()) -> Option<u32> {
+        let mut sta = self.sta.take()?;
+        let synced = crate::net::wifi::run_ntp_burst(
+            &mut self.controller,
+            &mut sta,
+            self.rng.clone(),
+            tick,
+        );
+        // Drop the STA device + smoltcp stack; the ESP-NOW handle stays live.
+        drop(sta);
+        synced
     }
 
     /// Current radio mode. Part of the public API (a caller may inspect which
@@ -110,28 +241,6 @@ impl RadioManager {
     #[allow(dead_code)]
     pub fn mode(&self) -> Mode {
         self.mode
-    }
-
-    /// Access the WiFi controller (Phase 2 uses this to associate + run NTP).
-    pub fn controller(&mut self) -> &mut WifiController<'static> {
-        &mut self.controller
-    }
-
-    /// Configure + associate to the AP (used before an NTP burst). Blocking
-    /// only up to the caller's own deadline check via `is_connected`.
-    pub fn wifi_connect(&mut self, ssid: &str, password: &str) -> Result<(), ()> {
-        self.controller
-            .set_configuration(&Configuration::Client(ClientConfiguration {
-                ssid: ssid.into(),
-                password: password.into(),
-                ..Default::default()
-            }))
-            .map_err(|_| ())?;
-        // set_configuration flips the mode; ensure the radio is (re)started.
-        if !matches!(self.controller.is_started(), Ok(true)) {
-            self.controller.start().map_err(|_| ())?;
-        }
-        self.controller.connect().map_err(|_| ())
     }
 
     /// Switch which stack the single radio services.
@@ -171,20 +280,21 @@ impl RadioManager {
         Ok(())
     }
 
-    /// Send one broadcast "hello from smol <id>" frame. Safe to call in either
-    /// mode; in `WifiSta` it rides the AP channel, in `EspNow` the fixed one.
+    /// Broadcast one HELLO beacon carrying our id: `"SMOLv1 HELLO NNN"`.
+    ///
+    /// This is the periodic "I'm here" advertisement other units listen for.
+    /// Safe in either radio mode; in `WifiSta` it rides the AP channel, in
+    /// `EspNow` the fixed one. Called by `main` a few times per second.
     pub fn broadcast_hello(&mut self) {
-        // Build the message on the stack: "hello from smol NNN".
-        let mut msg = [0u8; 20];
-        let prefix = b"hello from smol ";
-        msg[..prefix.len()].copy_from_slice(prefix);
-        // 3-digit zero-padded id.
-        msg[prefix.len()] = b'0' + (self.id / 100) % 10;
-        msg[prefix.len() + 1] = b'0' + (self.id / 10) % 10;
-        msg[prefix.len() + 2] = b'0' + self.id % 10;
-        let len = prefix.len() + 3;
+        let mut msg = [0u8; 16];
+        let len = encode_id_frame(HELLO_PREFIX, self.id, &mut msg);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
+    }
 
-        match self.esp_now.send(&BROADCAST_ADDRESS, &msg[..len]) {
+    /// Low-level send helper: fire one frame and wait for the TX callback so we
+    /// don't overrun the single in-flight ESP-NOW send slot.
+    fn send_to(&mut self, dst: &[u8; 6], data: &[u8]) {
+        match self.esp_now.send(dst, data) {
             Ok(waiter) => {
                 let _ = waiter.wait();
             }
@@ -192,81 +302,142 @@ impl RadioManager {
         }
     }
 
-    /// Poll for one inbound ESP-NOW frame. Returns the sender MAC + a short
-    /// display string (payload as UTF-8, truncated) if something arrived.
+    /// Service inbound ESP-NOW traffic and advance the handshake.
     ///
-    /// Also auto-registers unknown broadcasters as peers so a subsequent
-    /// unicast reply would succeed (mirrors the esp-wifi example).
-    pub fn poll_message(&mut self) -> Option<([u8; 6], alloc::string::String)> {
-        let recv = self.esp_now.receive()?;
-        let src = recv.info.src_address;
+    /// Drains up to a few queued frames (bounded so we never block the render
+    /// loop), and for each recognised HELLO/ACK updates the [`PeerTracker`]
+    /// timestamps. On hearing a peer HELLO it also (a) registers that peer so we
+    /// can unicast back, and (b) replies with an ACK echoing the peer's id —
+    /// this is the reply that lets the *other* unit reach the Connected state.
+    ///
+    /// Returns an optional short display string for the OLED bottom line (the
+    /// most recent recognised frame), so the clock UI can show peer activity.
+    pub fn service(&mut self) -> Option<alloc::string::String> {
+        // Bound the drain: ESP-NOW's RX queue can hold several frames; process a
+        // handful per call so a burst can't stall the 1 Hz clock tick.
+        let mut label: Option<alloc::string::String> = None;
+        for _ in 0..8 {
+            let Some(recv) = self.esp_now.receive() else {
+                break;
+            };
+            let src = recv.info.src_address;
+            let now = now_ms();
 
-        if recv.info.dst_address == BROADCAST_ADDRESS && !self.esp_now.peer_exists(&src) {
-            let _ = self.esp_now.add_peer(PeerInfo {
-                interface: EspNowWifiInterface::Sta,
-                peer_address: src,
-                lmk: None,
-                channel: None,
-                encrypt: false,
-            });
+            match parse_frame(recv.data()) {
+                Some(Frame::Hello(peer_id)) => {
+                    // We can hear a peer -> at least "detected".
+                    self.peers.last_hello_ms = now;
+
+                    // Register the broadcaster so the ACK below can be unicast.
+                    if !self.esp_now.peer_exists(&src) {
+                        let _ = self.esp_now.add_peer(PeerInfo {
+                            interface: EspNowWifiInterface::Sta,
+                            peer_address: src,
+                            lmk: None,
+                            channel: None,
+                            encrypt: false,
+                        });
+                    }
+
+                    // Reply "I heard you, <peer_id>" so the peer can confirm the
+                    // link is two-way from its side.
+                    let mut ack = [0u8; 16];
+                    let len = encode_id_frame(ACK_PREFIX, peer_id, &mut ack);
+                    self.send_to(&src, &ack[..len]);
+
+                    label = Some(alloc::format!("peer {:03}", peer_id));
+                }
+                Some(Frame::Ack(acked_id)) => {
+                    // An ACK addressed to US proves a peer received our HELLO ->
+                    // the link is bidirectional -> "connected".
+                    if acked_id == self.id {
+                        self.peers.last_ack_for_us_ms = now;
+                        label = Some(alloc::string::String::from("linked"));
+                    }
+                    // ACKs for other ids are peer-to-peer chatter; ignore.
+                }
+                None => {
+                    // Unrecognised payload (other ESP-NOW traffic on-channel);
+                    // surface it on the OLED but don't touch the handshake.
+                    label = Some(alloc::string::String::from_utf8_lossy(recv.data()).into_owned());
+                }
+            }
         }
-
-        let text = alloc::string::String::from_utf8_lossy(recv.data()).into_owned();
-        Some((src, text))
+        label
     }
+
+    /// Current peer-link state as an [`LedState`], evaluated at `now_ms`.
+    /// One of `Idle` / `PeerDetected` / `Connected` (never `WifiSync` — that is
+    /// owned by the boot-time WiFi burst, not the steady-state loop).
+    pub fn peer_led_state(&self, now_ms: u64) -> LedState {
+        self.peers.state(now_ms)
+    }
+}
+
+/// Encode `"<prefix>NNN"` (3-digit zero-padded id) into `out`; returns length.
+fn encode_id_frame(prefix: &[u8], id: u8, out: &mut [u8]) -> usize {
+    out[..prefix.len()].copy_from_slice(prefix);
+    out[prefix.len()] = b'0' + (id / 100) % 10;
+    out[prefix.len() + 1] = b'0' + (id / 10) % 10;
+    out[prefix.len() + 2] = b'0' + id % 10;
+    prefix.len() + 3
+}
+
+/// Parse an inbound payload into a [`Frame`], or `None` if it isn't ours.
+fn parse_frame(data: &[u8]) -> Option<Frame> {
+    if let Some(rest) = data.strip_prefix(HELLO_PREFIX) {
+        return parse_id(rest).map(Frame::Hello);
+    }
+    if let Some(rest) = data.strip_prefix(ACK_PREFIX) {
+        return parse_id(rest).map(Frame::Ack);
+    }
+    None
+}
+
+/// Parse a 3-digit ASCII id (`b"007"` -> 7). Rejects non-digits / short input.
+fn parse_id(rest: &[u8]) -> Option<u8> {
+    if rest.len() < 3 {
+        return None;
+    }
+    let mut val: u16 = 0;
+    for &b in &rest[..3] {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val * 10 + (b - b'0') as u16;
+    }
+    (val <= 255).then_some(val as u8)
 }
 
 // -------------------------------------------------------------------------
 // Public flow used by `main` under `--features espnow`.
 // -------------------------------------------------------------------------
 
-/// WiFi credentials for the NTP burst (compile-time placeholders).
-const WIFI_SSID: &str = "YOUR_WIFI_SSID";
-const WIFI_PASSWORD: &str = "YOUR_WIFI_PASSWORD";
-
-/// Bring the radio up, do a WiFi/NTP burst, then TIME-SHARE-switch to ESP-NOW.
+/// Bring the radio up, run a REAL WiFi -> DHCP -> SNTP burst (fast-blinking the
+/// blue LED throughout), then TIME-SHARE-switch the single radio to ESP-NOW.
+///
 /// Returns the live `RadioManager` (now in ESP-NOW mode) and the synced Unix
-/// time (or None if the NTP burst failed — clock then free-runs).
-pub fn start(p: WifiPeripherals, id: u8) -> (Option<RadioManager>, Option<u32>) {
+/// time (or `None` if the burst failed — the clock then free-runs). The LED is
+/// left in whatever physical state the last fast-blink tick set; `main`'s loop
+/// immediately takes over and drives it from the peer state.
+///
+/// Credentials come from `crate::secrets` (git-ignored; repo is public). The
+/// burst genuinely runs DHCP + SNTP against the STA device, which esp-wifi hands
+/// out once alongside the ESP-NOW handle — we drive it here, then drop it before
+/// pinning the ESP-NOW channel, so the single radio is never double-driven.
+pub fn start(p: WifiPeripherals, id: u8, led: &mut Led) -> (Option<RadioManager>, Option<u32>) {
     let Some(mut radio) = RadioManager::new(p, id) else {
         return (None, None);
     };
 
-    // --- WiFi burst for NTP (Phase 2 logic, reused honestly) -------------
-    let synced = burst_ntp(&mut radio);
+    // --- WiFi burst for NTP, blue LED fast-blinking (~10 Hz) while it runs ---
+    // The closure is called inside every busy-wait loop of the burst; it just
+    // re-derives the fast-blink phase from the monotonic clock and pushes it to
+    // the pin (non-blocking, no per-blink state).
+    let synced = radio.burst_ntp(&mut || led.apply(LedState::WifiSync, now_ms()));
 
     // --- Hand the radio to ESP-NOW on a fixed channel (TIME-SHARE) -------
     let _ = radio.switch(Mode::EspNow);
 
     (Some(radio), synced)
-}
-
-/// Associate to the AP and run one SNTP exchange, reusing the smoltcp/SNTP
-/// machinery from the Phase 2 `wifi` module. Kept here (rather than calling the
-/// Phase 2 entry point) because Phase 3 already owns the controller + radio.
-fn burst_ntp(radio: &mut RadioManager) -> Option<u32> {
-    use esp_hal::time::{Duration, Instant};
-
-    if radio.wifi_connect(WIFI_SSID, WIFI_PASSWORD).is_err() {
-        log::warn!("smol: wifi_connect failed; skipping NTP");
-        return None;
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !matches!(radio.controller().is_connected(), Ok(true)) {
-        if Instant::now() > deadline {
-            log::warn!("smol: WiFi connect timed out; skipping NTP");
-            return None;
-        }
-    }
-    // NOTE: A full DHCP+SNTP run needs the STA `WifiDevice`, which esp-wifi
-    // hands out once from `Interfaces`. Under `--features espnow` we keep the
-    // ESP-NOW handle live for the clock loop and DO NOT drive the smoltcp stack
-    // here, to avoid holding two mutable radio stacks at once. The compile-safe
-    // behaviour is: associate (proving the WiFi side works), then time-share to
-    // ESP-NOW. Real NTP over this path is available in the `wifi`-only build
-    // (`crate::net::wifi::try_time_sync`); wiring the shared device into this
-    // Phase-3 flow is documented in README as the remaining integration step.
-    log::info!("smol: WiFi associated (Phase 3 burst); NTP handled in wifi-only build");
-    None
 }

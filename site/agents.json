@@ -21,6 +21,7 @@
     { "name": "SQUELCH", "role": "Walkie-talkie IS feasible on C3 (PTT) — PCMFlowG722", "status": "done", "glyph": "≋" },
     { "name": "AURA", "role": "LE Audio: C3 can't; only the new ESP32-H4 can", "status": "done", "glyph": "⟡" },
     { "name": "OXIDE", "role": "Rust firmware compiles — clock + WiFi/SNTP + ESP-NOW", "status": "done", "glyph": "❖" },
-    { "name": "PORTAL", "role": "Case v2: both buttons at top + clear-PLA LED holes", "status": "active", "glyph": "◫" }
+    { "name": "PORTAL", "role": "Case v2 done — buttons + LED pipes at the OLED/top end", "status": "done", "glyph": "◫" },
+    { "name": "PULSE", "role": "Flashing Rust clock + blue-LED peer states to board #1", "status": "active", "glyph": "⏻" }
   ]
 }

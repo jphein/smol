@@ -47,8 +47,8 @@ use smoltcp::{
 // Configuration (compile-time placeholders — set before flashing).
 // -------------------------------------------------------------------------
 
-const WIFI_SSID: &str = "YOUR_WIFI_SSID";
-const WIFI_PASSWORD: &str = "YOUR_WIFI_PASSWORD";
+// Real values live in the git-ignored `crate::secrets` (repo is public).
+use crate::secrets::{WIFI_PASS as WIFI_PASSWORD, WIFI_SSID};
 
 /// NTP server IPv4. We hardcode an anycast IP so we need no DNS resolver in
 /// the smoltcp build. time.cloudflare.com's NTP anycast address:
@@ -99,7 +99,7 @@ pub fn try_time_sync(p: WifiPeripherals) -> Option<u32> {
 
     // --- Radio init ------------------------------------------------------
     let timg0 = TimerGroup::new(p.timg0);
-    let mut rng = Rng::new(p.rng);
+    let rng = Rng::new(p.rng);
     let esp_wifi_ctrl: EspWifiController<'static> =
         esp_wifi::init(timg0.timer0, rng.clone()).ok()?;
     // Leak the controller so its borrow lives 'static for the rest of the
@@ -110,8 +110,29 @@ pub fn try_time_sync(p: WifiPeripherals) -> Option<u32> {
     let (mut controller, interfaces) = esp_wifi::wifi::new(esp_wifi_ctrl, p.wifi).ok()?;
     let mut device = interfaces.sta;
 
+    // Phase-2 (wifi-only) build has no status LED, so the tick is a no-op.
+    run_ntp_burst(&mut controller, &mut device, rng, &mut || {})
+}
+
+/// Shared WiFi -> DHCP -> SNTP burst, reused by both the Phase-2 `wifi`-only
+/// build and the Phase-3 `espnow` build. Associates using the `crate::secrets`
+/// credentials, drives a `smoltcp` DHCP+UDP stack over `device`, runs one SNTP
+/// exchange, and returns the Unix time (seconds) or `None` on any timeout.
+///
+/// `tick` is invoked frequently inside every busy-wait loop; the `espnow` build
+/// passes a closure that fast-blinks the blue LED so "WiFi/NTP in progress" is
+/// visible on hardware. The `wifi`-only build passes a no-op.
+///
+/// Blocking, no async executor — we poll the stack directly, matching the rest
+/// of the firmware's style and keeping the dependency set on crates.io.
+pub fn run_ntp_burst(
+    controller: &mut esp_wifi::wifi::WifiController<'static>,
+    device: &mut esp_wifi::wifi::WifiDevice<'static>,
+    mut rng: Rng,
+    tick: &mut dyn FnMut(),
+) -> Option<u32> {
     // --- smoltcp stack: DHCP + UDP sockets -------------------------------
-    let mut iface = create_interface(&mut device);
+    let mut iface = create_interface(device);
 
     let mut sockets_storage: [SocketStorage; 3] = Default::default();
     let mut sockets = SocketSet::new(&mut sockets_storage[..]);
@@ -142,26 +163,30 @@ pub fn try_time_sync(p: WifiPeripherals) -> Option<u32> {
             ..Default::default()
         }))
         .ok()?;
-    controller.start().ok()?;
+    if !matches!(controller.is_started(), Ok(true)) {
+        controller.start().ok()?;
+    }
     controller.connect().ok()?;
 
     let deadline = Instant::now() + SYNC_BUDGET;
 
     // Wait for association.
     while !matches!(controller.is_connected(), Ok(true)) {
+        tick();
         if Instant::now() > deadline {
             log::warn!("smol: WiFi connect timed out");
             return None;
         }
     }
-    log::info!("smol: WiFi associated");
+    log::info!("smol: WiFi associated to '{}'", WIFI_SSID);
 
     // Poll the stack until DHCP yields an address. The DHCP `Event` borrows
     // the socket, so we extract the plain (Ipv4Cidr, router) data inside a
     // short scope, then apply it to the interface once the borrow is released.
     loop {
+        tick();
         let ts = smoltcp_now();
-        iface.poll(ts, &mut device, &mut sockets);
+        iface.poll(ts, device, &mut sockets);
 
         let configured = {
             let socket = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
@@ -183,7 +208,15 @@ pub fn try_time_sync(p: WifiPeripherals) -> Option<u32> {
     }
 
     // --- SNTP exchange ---------------------------------------------------
-    sntp_query(&mut iface, &mut device, &mut sockets, udp_handle, rng.random(), deadline)
+    sntp_query(
+        &mut iface,
+        device,
+        &mut sockets,
+        udp_handle,
+        rng.random(),
+        deadline,
+        tick,
+    )
 }
 
 /// Install the DHCP-provided address + default route on the interface.
@@ -205,6 +238,7 @@ fn sntp_query(
     udp_handle: smoltcp::iface::SocketHandle,
     ephemeral_port_seed: u32,
     deadline: Instant,
+    tick: &mut dyn FnMut(),
 ) -> Option<u32> {
     // Bind a pseudo-random ephemeral source port (49152..=65535).
     let src_port = 49152 + (ephemeral_port_seed % 16384) as u16;
@@ -227,6 +261,7 @@ fn sntp_query(
 
     let mut sent = false;
     loop {
+        tick();
         let ts = smoltcp_now();
         iface.poll(ts, device, sockets);
 

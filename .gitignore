@@ -21,3 +21,9 @@ node_modules/
 target/
 **/target/
 *.rs.bk
+
+# WiFi credentials / secrets — never commit (repo is public)
+secrets.rs
+**/secrets.rs
+*secrets.h
+wifi_secrets.*
