@@ -9,8 +9,12 @@
     { "name": "ARCADE", "role": "Delivered NES-on-C3 build plan (needs ST7735 + IDF)", "status": "done", "glyph": "▩" },
     { "name": "CARTRIDGE", "role": "Flashed atomic14 — 5 games + menu (BOOT button)", "status": "done", "glyph": "▤" },
     { "name": "SHELL", "role": "Found 3D-printable cases — no handheld shell yet", "status": "done", "glyph": "⬢" },
-    { "name": "PROSPECTOR", "role": "Deep GitHub sweep for more board repos", "status": "active", "glyph": "⌖" },
-    { "name": "BEACON", "role": "Community-source sweep for more board repos", "status": "active", "glyph": "◎" },
-    { "name": "TIMEPIECE", "role": "Hunting smartwatch + pocket-watch cases", "status": "active", "glyph": "◷" }
+    { "name": "PROSPECTOR", "role": "Found 9 new board repos (incl. a Rust one!)", "status": "done", "glyph": "⌖" },
+    { "name": "BEACON", "role": "Found 6 more repos/libs; search now saturated", "status": "done", "glyph": "◎" },
+    { "name": "TIMEPIECE", "role": "No exact watch case exists — found adaptable bases", "status": "done", "glyph": "◷" },
+    { "name": "VOLT", "role": "Designing the LiPo charging + power circuit", "status": "active", "glyph": "⌁" },
+    { "name": "CHIPTUNE", "role": "Adding piezo-buzzer sound to the game", "status": "active", "glyph": "♪" },
+    { "name": "PIXELPORT", "role": "Writing a Snake game (2nd cartridge)", "status": "active", "glyph": "⊞" },
+    { "name": "CHRONOS", "role": "Designing the smartwatch firmware + starter", "status": "active", "glyph": "⌚" }
   ]
 }
