@@ -16,13 +16,13 @@
     { "name": "CHIPTUNE", "role": "Wrote sound guide — LEDC beeps on GPIO10", "status": "done", "glyph": "♪" },
     { "name": "PIXELPORT", "role": "Wrote Snake — 2nd game, self/wall collision", "status": "done", "glyph": "⊞" },
     { "name": "CHRONOS", "role": "Scaffolded watch/ starter — fork HDRobotica, Arduino core", "status": "done", "glyph": "⌚" },
-    { "name": "DUEL", "role": "2-player ESP-NOW Snake — flashed to boards #1 + #2", "status": "done", "glyph": "⇄" },
+    { "name": "DUEL", "role": "2-player ESP-NOW Snake (Arduino) — benchmark folded into Rust", "status": "done", "glyph": "⇄" },
     { "name": "LOCKET", "role": "Pocket-watch case (slim + charger variants), watertight", "status": "done", "glyph": "⊙" },
     { "name": "SQUELCH", "role": "Walkie-talkie IS feasible on C3 (PTT) — PCMFlowG722", "status": "done", "glyph": "≋" },
     { "name": "AURA", "role": "LE Audio: C3 can't; only the new ESP32-H4 can", "status": "done", "glyph": "⟡" },
     { "name": "OXIDE", "role": "Rust firmware compiles — clock + WiFi/SNTP + ESP-NOW", "status": "done", "glyph": "❖" },
-    { "name": "PORTAL", "role": "Case v2 done — buttons + LED pipes at the OLED/top end", "status": "done", "glyph": "◫" },
-    { "name": "PULSE", "role": "Rust clock on 2 boards — ESP-NOW CONNECT verified (solid blue) ✓", "status": "done", "glyph": "⏻" },
-    { "name": "GAUGE", "role": "Adding chip-temp + battery-voltage readout to Rust clock", "status": "active", "glyph": "◧" }
+    { "name": "GAUGE", "role": "Added chip-temp + battery(ADC/GPIO4) to Rust clock — clean", "status": "done", "glyph": "◧" },
+    { "name": "PORTAL", "role": "Case v3: USB-C ✓, buttons top ✓, moving LEDs to USB-C end", "status": "active", "glyph": "◫" },
+    { "name": "KERNEL", "role": "Unifying ONE Rust firmware: Clock + Snake + Bench (BOOT menu)", "status": "active", "glyph": "▦" }
   ]
 }

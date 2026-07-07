@@ -102,6 +102,7 @@ dependencies = [
  "esp-println",
  "esp-wifi",
  "log",
+ "nb 1.1.0",
  "smoltcp",
  "ssd1306",
 ]

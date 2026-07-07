@@ -23,10 +23,11 @@ Buttons + LEDs (layout)
     FLANKING the OLED window left/right in X -- press with a pin / spudger /
     short printed plunger. HONESTY: RESET reboots the chip, so in firmware only
     BOOT is a usable input; the case exposes/actuates both anyway (RESET = manual
-    reboot). Two small LED light-pipe holes over the blue (GPIO8) and power LEDs
-    are also cut through the face at the +Y end (their exact position is an
-    ASSUMPTION -- verify against the board) -- meant to be printed in / plugged
-    with CLEAR PLA. All button/LED positions are parametric (revision-dependent).
+    reboot). Two small LED light-pipe holes over the blue (GPIO8, "IO8") and
+    power ("PWR") LEDs are cut through the face at the -Y (USB-C / 6 o'clock)
+    end, one on EACH SIDE of the USB-C slot -- CONFIRMED from a board photo
+    (PWR bottom-left, IO8 bottom-right) -- meant to be printed in / plugged with
+    CLEAR PLA. All button/LED positions are parametric (revision-dependent).
 
 Geometry is built procedurally from primitives (cylinders, boxes, a torus) combined
 with boolean unions/differences using the `manifold` engine, which is robust for
@@ -148,10 +149,11 @@ TP_USB_ANGLE_DEG = 180 # 180 = 9 o'clock (-X). 6 o'clock (270) is the SuperMini 
 #   This also matches the original "buttons at the top of the screen" intent.
 #
 # LEDs (blue user LED on GPIO8, active-LOW; power LED that lights on USB/VBUS):
-#   The user only corrected the BUTTONS. The two LED light-pipe holes are, by
-#   default, also placed at the OLED (+Y) end (flanking the window, inboard of
-#   the buttons). LED PLACEMENT IS AN ASSUMPTION -- verify against the physical
-#   board and nudge LED_* if they sit elsewhere (e.g. back near the USB-C end).
+#   CONFIRMED FROM A PHOTO OF THE ACTUAL BOARD -- the two LEDs are at the USB-C
+#   (BOTTOM / -Y / 6 o'clock) end, FLANKING the USB-C connector. Silkscreen reads
+#   "PWR" on the bottom-LEFT (-X) and "IO8" (the GPIO8 blue LED) on the bottom-
+#   RIGHT (+X). So the two LED light-pipe holes go at the -Y end, one on each
+#   side of the USB-C rim slot -- NOT at the OLED end. (Confirmed, not assumed.)
 #
 # Exact X/Y of every part VARIES BY BOARD REVISION, so all positions below are
 # parameters. HONESTY CAVEAT (also in README): RESET reboots the chip, so in
@@ -196,18 +198,21 @@ BTN_PLUNGER_PREVIEW = False
 # --- LED light-pipe holes (print in / plug with CLEAR PLA) ---
 # Two small through-holes in the front face over the two onboard LEDs (blue
 # GPIO8 + power LED), sized to take a clear-PLA light pipe or to be bridged with
-# a clear-PLA plug so the LEDs are visible from the front. By default placed at
-# the OLED (+Y) end, ABOVE the window (toward the bail) so they clear both the
-# window and the two flanking buttons. LED POSITION IS AN ASSUMPTION -- verify
-# against your physical board (they may sit elsewhere, e.g. by the USB-C end).
+# a clear-PLA plug so the LEDs are visible from the front. CONFIRMED from a board
+# photo: the LEDs are at the USB-C (-Y / 6 o'clock) end, one on EACH SIDE of the
+# USB-C connector -- "PWR" bottom-left (-X), "IO8"/GPIO8 blue bottom-right (+X).
 LED_PIPE = True             # cut the two LED light-pipe holes in the face
 LED_PIPE_R = 1.25           # radius -> 2.5 mm holes (light-pipe / clear-PLA plug)
-# Y sits just ABOVE the window's +Y (top) edge, with a bezel gap.
-LED_Y_ABOVE_WIN = 2.1       # gap from the window top edge up to the LED-hole CENTRE
-LED_Y = (_WIN_Y + OLED_GLASS_W / 2.0) + LED_Y_ABOVE_WIN
-LED_X = 3.0                 # the two LEDs sit this far either side of centre in X
-BLUE_LED_X = +LED_X                 # GPIO8 blue LED (+X side)
-PWR_LED_X = -LED_X                  # power LED (-X side)
+# Y sits a little IN from the board's -Y (USB-C) short edge (LEDs are near, but
+# inboard of, the connector so they stay clear of the rim USB-C slot).
+LED_Y_FROM_USB_EDGE = 4.0   # gap from the -Y board edge inward to the LED CENTRE
+LED_Y = -BOARD_L / 2.0 + LED_Y_FROM_USB_EDGE
+# X flanks the USB-C connector: pushed just outside the rim slot's half-width so
+# the light-pipe holes straddle the connector without touching the slot.
+LED_X_FROM_USB_EDGE = 1.5   # gap from the USB-C slot edge out to each LED CENTRE
+LED_X = USB_SLOT_W / 2.0 + LED_X_FROM_USB_EDGE   # each LED this far off centre in X
+BLUE_LED_X = +LED_X                 # "IO8" GPIO8 blue LED -- bottom-RIGHT (+X)
+PWR_LED_X = -LED_X                  # "PWR" power LED       -- bottom-LEFT  (-X)
 
 # --- (Legacy) side-wall BOOT poke hole. Kept OFF: both buttons now go via the
 #     top face bores above. Set True to ALSO get the old 3 o'clock side poke. ---
@@ -555,9 +560,10 @@ def main():
         print("  NOTE: RESET reboots the chip -> only BOOT is a firmware input; "
               "case actuates BOTH as requested.")
     if LED_PIPE:
-        print(f"LED light-pipe holes (r={LED_PIPE_R}, CLEAR-PLA, position ASSUMED): "
-              f"blue/GPIO8 @ (x={BLUE_LED_X:+.1f}, y={LED_Y:+.1f}), "
-              f"power @ (x={PWR_LED_X:+.1f}, y={LED_Y:+.1f})")
+        print(f"LED light-pipe holes (r={LED_PIPE_R}, CLEAR-PLA, at -Y/USB-C end, "
+              f"flanking the USB-C slot; CONFIRMED from board photo): "
+              f"IO8/GPIO8 blue @ (x={BLUE_LED_X:+.1f}, y={LED_Y:+.1f}), "
+              f"PWR @ (x={PWR_LED_X:+.1f}, y={LED_Y:+.1f})")
     print("-" * 74)
 
     print("Building BODY ...")

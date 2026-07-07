@@ -43,7 +43,7 @@ Measured from the exported STLs (both verified **watertight**, single-body):
 | SuperMini USB-C slot | 11.0 (w) x 5.0 (h) mm, at **6 o'clock** |
 | **TP4056 charge USB-C slot** | **11.0 (w) x 5.0 (h) mm, at 9 o'clock** |
 | **BOOT + RESET plunger bores** | **2 x 3.6 mm dia, vertical through the front face**, at the **+Y (OLED/12 o'clock) end, flanking the window** (BOOT +X, RESET -X) |
-| **LED light-pipe holes** | **2 x 2.5 mm dia, through the front face**, **above the window toward the bail** (blue GPIO8 + power LED) — **clear PLA** *(position assumed)* |
+| **LED light-pipe holes** | **2 x 2.5 mm dia, through the front face**, at the **−Y (USB-C/6 o'clock) end, flanking the USB-C slot** ("PWR" −X, "IO8"/GPIO8 blue +X) — **clear PLA** *(confirmed from board photo)* |
 | Bail chain hole | ~4.8 mm (fits most chains/split-rings) |
 | Lid lip engagement | 4.0 mm, 0.20 mm/side press-fit gap |
 
@@ -76,12 +76,13 @@ Looking at the **front face**:
 
 - **12 o'clock (+Y):** OLED window, the chain **bail**, and — on the **front
   face** at this same OLED end — the **two button plunger bores** (BOOT + RESET,
-  flanking the window left/right) and the **two LED light-pipe holes** (just
-  above the window, toward the bail). Orient the board so the OLED/button end
+  flanking the window left/right). Orient the board so the OLED/button end
   points up. See **[Buttons & LEDs](#buttons--leds-read-this)** below.
 - **6 o'clock (-Y):** the **SuperMini's** USB-C slot (for flashing / occasional
   powered use). The board's USB-C edge faces down. This is *up* near the board's
-  Z level (z ~ 14 mm).
+  Z level (z ~ 14 mm). On the **front face** at this same end sit the **two LED
+  light-pipe holes**, one on each side of the USB-C slot ("PWR" on the −X side,
+  "IO8"/GPIO8 blue on the +X side) — **confirmed from a board photo**.
 - **9 o'clock (-X):** the **TP4056's** USB-C charge slot. This is *down* at the
   TP4056's Z layer (z ~ 3 mm), behind the battery. Two **different** USB-C ports,
   two **different** clock positions, at two **different** heights — they never
@@ -97,27 +98,25 @@ The two tactile buttons are **BOOT** (GPIO9, via RST2/R6) and **RESET** (tied to
 `EN`/`CHIP_PU`). Two onboard LEDs: a **blue user LED on GPIO8** (active-LOW) and a
 **power LED** (red/orange/green depending on the batch) that lights on USB/VBUS.
 
-> **Which end are the buttons on?** Generic ESP32-C3 SuperMini pinout docs
-> ([lastminuteengineers](https://lastminuteengineers.com/esp32-c3-super-mini-pinout-reference/),
-> [espboards.dev](https://www.espboards.dev/esp32/esp32-c3-super-mini/)) put both
-> buttons *"next to the USB port."* **But on the owner's actual 0.42" OLED board
-> the buttons are at the OPPOSITE end — the OLED / antenna end** (owner-confirmed,
-> authoritative). This case follows the **actual board**: in the case frame (OLED
-> at **+Y / 12 o'clock**, USB-C at **−Y / 6 o'clock**) **both buttons are up at the
-> +Y (OLED / "top of screen") end**, which also matches the original
-> "buttons at the top" intent.
+Both the button and LED positions here are **confirmed from a photo of the
+owner's actual board** (authoritative), not from generic docs:
 
-**LED positions are an ASSUMPTION.** The owner corrected only the *buttons*. The
-two LED light-pipe holes are placed at the **+Y (OLED) end too** by default (just
-above the window, toward the bail). **Verify the LEDs against your physical
-board** — on some layouts they sit back near the USB-C end; if so, move them (see
-`LED_*` below).
+- **Buttons (RST + BOOT) are at the +Y (OLED / antenna / "top of screen") end.**
+  Generic ESP32-C3 SuperMini pinout docs
+  ([lastminuteengineers](https://lastminuteengineers.com/esp32-c3-super-mini-pinout-reference/),
+  [espboards.dev](https://www.espboards.dev/esp32/esp32-c3-super-mini/)) put both
+  buttons *"next to the USB port"* (the opposite end) — **this board is different.**
+  In the case frame (OLED at **+Y / 12 o'clock**, USB-C at **−Y / 6 o'clock**),
+  both buttons are up at the **+Y** end, matching the "buttons at the top" intent.
+- **LEDs are at the −Y (USB-C / 6 o'clock / bottom) end, flanking the USB-C
+  connector.** The silkscreen reads **"PWR"** on the bottom-**left** (−X) and
+  **"IO8"** (the GPIO8 blue LED) on the bottom-**right** (+X). The two LED
+  light-pipe holes sit **one on each side of the USB-C slot.**
 
-> **Board-revision caveat:** manufacturers move these parts around. Exact X/Y of
-> each button and LED **varies by revision**, so every position is a **parameter**
-> (`BTN_Y`, `BTN_X_FROM_WIN_EDGE`, `BOOT_BTN_X`, `RESET_BTN_X`, `LED_Y_ABOVE_WIN`,
-> `LED_X`, `BLUE_LED_X`, `PWR_LED_X`). Eyeball your own board, nudge the numbers,
-> and re-run.
+> **Board-revision caveat:** manufacturers still move these parts around. Every
+> position is a **parameter** (`BTN_Y`, `BTN_X_FROM_WIN_EDGE`, `BOOT_BTN_X`,
+> `RESET_BTN_X`, `LED_Y_FROM_USB_EDGE`, `LED_X_FROM_USB_EDGE`, `BLUE_LED_X`,
+> `PWR_LED_X`). If yours differs, eyeball it, nudge the numbers, and re-run.
 
 ### Both buttons routed to the top (plunger bores)
 

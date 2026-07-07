@@ -56,6 +56,10 @@ esp-println = { version = "=0.15.0", default-features = false, features = [
     "critical-section",
 ] }
 log = "0.4"
+# `nb::block!` turns esp-hal's non-blocking `Adc::read_oneshot` (nb::Result) into
+# a short busy-wait for the battery-voltage read in `src/sensors.rs`. Resolves to
+# the 1.1.0 already in the tree (embedded-hal etc. depend on it) — no lock churn.
+nb = "1"
 
 # --- Display stack (Phase 1, always on) ----------------------------------
 ssd1306 = "=0.10.0"

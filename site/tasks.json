@@ -23,7 +23,7 @@
     { "id": 20, "title": "Pocket-watch case: slim + charger variants", "status": "done", "owner": "LOCKET" },
     { "id": 21, "title": "Rust firmware: clock + WiFi/SNTP + ESP-NOW (compiles!)", "status": "done", "owner": "OXIDE" },
     { "id": 22, "title": "Walkie-talkie over ESP-NOW: feasibility + parts", "status": "done", "owner": "SQUELCH" },
-    { "id": 23, "title": "2-player Snake over ESP-NOW (compiles!)", "status": "done", "owner": "DUEL" },
+    { "id": 23, "title": "2-player Snake over ESP-NOW (Arduino, compiles)", "status": "done", "owner": "DUEL" },
     { "id": 24, "title": "Add TP4056 charger pocket to pocket-watch case", "status": "done", "owner": "LOCKET" },
     { "id": 25, "title": "Full LE Audio research (docs/le-audio.md)", "status": "done", "owner": "AURA" },
     { "id": 26, "title": "Showcase pocket-watch case + renders on site", "status": "done", "owner": "you + Claude" },
@@ -32,9 +32,12 @@
     { "id": 29, "title": "Rust clock: blue-LED peer states — VERIFIED (2 boards go solid)", "status": "done", "owner": "PULSE + you" },
     { "id": 30, "title": "Bigger PST clock — verified on hardware (board #2)", "status": "done", "owner": "you + Claude" },
     { "id": 31, "title": "Flash 2-player Snake to boards #1 + #2 (head-to-head)", "status": "done", "owner": "you + Claude" },
-    { "id": 32, "title": "Commit Rust clock improvements (PST + big font) with default id", "status": "done", "owner": "Claude" },
-    { "id": 33, "title": "Publish site to GitHub Pages (auto-deploy on push) — jphein.github.io/smol", "status": "done", "owner": "Claude" },
-    { "id": 34, "title": "Add chip-temp + battery-voltage readout to Rust clock", "status": "in_progress", "owner": "GAUGE" },
-    { "id": 35, "title": "Add shop/board (AliExpress) URL to the site", "status": "done", "owner": "you + Claude" }
+    { "id": 32, "title": "Commit Rust clock improvements (PST + big font)", "status": "done", "owner": "Claude" },
+    { "id": 33, "title": "Publish site to GitHub Pages (auto-deploy)", "status": "done", "owner": "Claude" },
+    { "id": 34, "title": "Add chip-temp + battery-voltage readout to Rust clock", "status": "done", "owner": "GAUGE" },
+    { "id": 35, "title": "Add shop/board (AliExpress) URL to the site", "status": "done", "owner": "you + Claude" },
+    { "id": 36, "title": "Mesh benchmark HUD → folded into unified Rust firmware", "status": "done", "owner": "DUEL → KERNEL" },
+    { "id": 37, "title": "Unified Rust firmware: Clock + Snake + Bench modes (BOOT menu)", "status": "in_progress", "owner": "KERNEL" },
+    { "id": 38, "title": "Case v3: move LED holes to USB-C end (board photo confirmed)", "status": "in_progress", "owner": "PORTAL" }
   ]
 }

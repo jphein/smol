@@ -42,6 +42,10 @@ use ssd1306::{
 // this file can reference it unconditionally without cfg noise.
 mod net;
 
+// On-board sensor readouts: C3 internal die-temperature + battery voltage via
+// ADC1 on GPIO4. Always compiled (Phase 1+); see `src/sensors.rs`.
+mod sensors;
+
 // Blue status LED on GPIO8 (Phase 3 drives it; the module itself only needs
 // esp-hal GPIO, so it is always available for reuse).
 #[cfg(feature = "espnow")]
@@ -99,6 +103,23 @@ fn main() -> ! {
         .build();
 
     let delay = Delay::new();
+
+    // --- On-board sensors ----------------------------------------------------
+    // C3 internal die-temperature sensor + battery voltage on ADC1/GPIO4. These
+    // peripherals (TSENS, ADC1, GPIO4) are untouched by the radio path, so we
+    // claim them here up front. The tsens datasheet asks for a short settle
+    // after power-up before the first read; `new()` powers it up and the radio
+    // bring-up / first render below is far more than the few hundred µs needed.
+    let mut sensors = sensors::Sensors::new(
+        peripherals.TSENS,
+        peripherals.ADC1,
+        peripherals.GPIO4,
+    );
+    log::info!(
+        "smol: sensors up — chip temp (internal) + battery ADC on GPIO{} (needs a {}:1 divider)",
+        sensors::BATT_ADC_GPIO,
+        sensors::BATT_DIVIDER as u32,
+    );
 
     // Radio bring-up varies by build phase. Each branch produces `synced`
     // (Option<u32> Unix time) and, for Phase 3, a live ESP-NOW `radio`.
@@ -218,11 +239,37 @@ fn main() -> ! {
             }
             first_frame = false;
 
-            // Resolve the bottom-line &str for this frame (String view or static).
+            // Refresh the sensor sample once per second (chip °C + battery V).
+            let reading = sensors.read();
+            let sensor_line = sensors::format_sensor_line(&reading);
+            // Full detail (incl. rough battery %) on serial; the OLED shows the
+            // compact "NNC N.NV" form. Battery values are meaningless without a
+            // divider wired to the ADC pin (see README "Sensors").
+            log::debug!(
+                "smol: chip {}C, batt {:.2}V (~{}%)",
+                reading.chip_c as i32,
+                reading.batt_v,
+                reading.batt_pct,
+            );
+
+            // Bottom line ALTERNATES every SENSOR_LINE_EVERY_S seconds between the
+            // normal label (peer message in Phase 3, "smol" otherwise) and the
+            // sensor readout ("23C 3.9V"), so the big HH:MM is never disturbed and
+            // both fit the 72 px width comfortably.
+            const SENSOR_LINE_EVERY_S: u32 = 4;
+            let show_sensors = (seconds_of_day / SENSOR_LINE_EVERY_S) % 2 == 1;
+
+            // Resolve the label &str for this frame (String view or static).
             #[cfg(feature = "espnow")]
-            let bottom: &str = bottom_line.as_str();
+            let label: &str = bottom_line.as_str();
             #[cfg(not(feature = "espnow"))]
-            let bottom: &str = "smol";
+            let label: &str = "smol";
+
+            let bottom: &str = if show_sensors {
+                sensor_line.as_str()
+            } else {
+                label
+            };
 
             format_hms(seconds_of_day, &mut buf);
             // Blink the colon once per second so the big clock reads as "live".

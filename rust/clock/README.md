@@ -2,7 +2,9 @@
 
 A `no_std` bare-metal Rust firmware for **"smol"**: an ESP32-C3 SuperMini with a
 0.42" SSD1306 OLED (72×40, I²C). It shows a clock, syncs real time over WiFi via
-SNTP, and does ESP-NOW peer messaging with an honest WiFi↔ESP-NOW radio switch.
+SNTP, does ESP-NOW peer messaging with an honest WiFi↔ESP-NOW radio switch, and
+reads two on-board sensors (chip die-temperature + battery voltage via ADC) onto
+the display.
 
 Built on `esp-hal` 1.0 (RISC-V bare metal — **not** ESP-IDF/std).
 
@@ -123,6 +125,11 @@ Two more non-obvious flags that were required to link:
 
 I²C address `0x3C`, 400 kHz. Panel: 0.42" SSD1306, 72×40 visible window.
 
+The blue status LED is on **GPIO8** and the battery-voltage ADC read is on
+**GPIO4** (via an external divider — see [Sensors](#sensors)). Free-pin map:
+GPIO5/6 = OLED I²C, GPIO8 = LED, GPIO9 = BOOT, GPIO2 = a strapping pin — leaving
+GPIO0/1/3/4 as the safe ADC1 inputs (GPIO4 is used here).
+
 ### 72×40 offset
 
 The SSD1306 controller has 128×64 RAM; this glass only exposes a 72×40 window at
@@ -135,6 +142,80 @@ coordinates `(0,0)..(72,40)` map onto the visible area — no manual offset need
 > rows look clipped on your specific panel, that's the knob to nudge. This build
 > trusts the crate's built-in `OFFSETY = 0`, which is correct for the common
 > variant.
+
+---
+
+## Sensors
+
+Two on-board readouts are sampled once per second and shown on the OLED's bottom
+line (all three phases). They live in [`src/sensors.rs`](src/sensors.rs) and are
+compiled into **every** build (Phase 1+) — no feature flag needed.
+
+The bottom line **alternates every ~4 s** between its normal label (in Phase 3,
+the last ESP-NOW peer message; otherwise `"smol"`) and a compact sensor readout
+like `23C 3.9V`. The big `HH:MM` clock at the top is never touched, and the
+sensor string (~8–10 chars in `FONT_5X8`) stays well inside the 72 px width. The
+full detail, including the rough battery **percentage**, is also logged once per
+second at `debug` level (`smol: chip 23C, batt 3.94V (~71%)`) — build with
+`ESP_LOG=debug` to see it on the serial console.
+
+### Chip temperature (internal — NOT ambient)
+
+Uses the C3's on-chip temperature sensor via esp-hal's **`esp_hal::tsens`**
+module (`TemperatureSensor::new(peripherals.TSENS, Config::default())`, read with
+`get_temperature().to_celsius()`). Its measuring range is −40..125 °C.
+
+> **This is the die temperature, not the room.** The silicon self-heats from the
+> CPU clock and I/O load, so it typically reads **several degrees above ambient**.
+> Treat it as a rough "how hot is the chip" gauge — the OLED labels it plainly as
+> the chip temp (e.g. `23C`), not as an ambient thermometer. It is uncalibrated
+> (esp-hal 1.0.0-rc.0 does not yet apply the per-range calibration offset).
+
+### Battery voltage via ADC (needs an external divider)
+
+One **ADC1 oneshot** read on **`GPIO4`** (ADC1 channel 4), at 11 dB attenuation
+for the widest input range. The pin, divider ratio and curve are documented
+consts in [`src/sensors.rs`](src/sensors.rs):
+
+| Const              | Value  | Meaning                                                        |
+|--------------------|--------|----------------------------------------------------------------|
+| `BATT_ADC_GPIO`    | `4`    | GPIO / ADC1 channel used for the battery read.                 |
+| `BATT_DIVIDER`     | `2.0`  | External divider ratio `Vbatt / Vpin` (e.g. 100 kΩ / 100 kΩ).  |
+| `ADC_FULL_SCALE_V` | `3.3`  | Uncalibrated nominal: code 4095 ≈ 3.3 V at the pin.            |
+| `BATT_EMPTY_V`     | `3.3`  | 1S-LiPo empty → 0 %.                                            |
+| `BATT_FULL_V`      | `4.2`  | 1S-LiPo full → 100 %.                                          |
+
+**Conversion.** The 12-bit code (0..4095) → pin volts →  battery volts → %:
+
+```text
+v_pin  = (raw / 4095) * ADC_FULL_SCALE_V      # ~0..3.3 V at the pin
+v_batt = v_pin * BATT_DIVIDER                 # undo the external divider
+```
+
+**Percentage (rough).** Linear between the two 1S-LiPo endpoints, clamped:
+
+```text
+pct = clamp( (v_batt - 3.3) / (4.2 - 3.3) * 100 , 0 , 100 )
+       3.30 V → 0 %      3.75 V → 50 %      4.20 V → 100 %
+```
+
+This is a deliberately crude linear map — a real LiPo discharge curve is flatter
+in the middle — but it is fine for a "roughly how full" readout.
+
+> ⚠️ **You must wire a resistor divider from the battery + to `GPIO4`.**
+> A 1S LiPo reaches 4.2 V, which is above the C3's ~3.3 V ADC ceiling, so the
+> battery **must** be divided down (the `2.0` default halves it to ≤2.1 V at the
+> pin). **With no divider wired, `GPIO4` floats and the voltage/percentage are
+> meaningless** (whatever charge is on the floating pin). The absolute voltage is
+> also only a ballpark: the ADC is uncalibrated (esp-hal 1.0.0-rc.0 does not apply
+> the eFuse calibration), so expect the reading to be a few percent off even with
+> a good divider.
+
+> **Not hardware-verified.** These sensors are **build-verified only** — the code
+> compiles and links into all three phases, but it was **not flashed** (the boards
+> are currently running the game). In particular the battery path has never been
+> exercised against a real divider + cell, and the chip-temperature absolute value
+> was not checked against a reference.
 
 ---
 
@@ -176,6 +257,8 @@ The Phase-1 (default) build needs no WiFi and does not compile the secrets modul
 * Blue-LED polarity — `LED_ACTIVE_LOW` in `src/led.rs` (default `true`).
 * NTP server — `NTP_SERVER_IP` in `src/net/wifi.rs` (default: Cloudflare NTP
   anycast `162.159.200.123`; hardcoded IP so no DNS resolver is needed).
+* Battery ADC pin / divider / LiPo curve — `BATT_ADC_GPIO`, `BATT_DIVIDER`,
+  `BATT_EMPTY_V`, `BATT_FULL_V` in `src/sensors.rs` (see [Sensors](#sensors)).
 
 ---
 
@@ -399,6 +482,7 @@ rust/clock/
 ├── .cargo/config.toml    # target, build-std, linker scripts, host-cc workaround
 └── src/
     ├── main.rs           # entry, display, clock+LED render loop, phase wiring
+    ├── sensors.rs        # chip die-temp (tsens) + battery ADC (GPIO4) readouts
     ├── led.rs            # Phase 3: blue-LED (GPIO8) 4-state machine + polarity
     ├── secrets.rs        # LOCAL, git-ignored WiFi credentials (copy from .example)
     ├── secrets.rs.example# tracked template for secrets.rs
