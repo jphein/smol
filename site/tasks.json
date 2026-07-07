@@ -37,7 +37,10 @@
     { "id": 34, "title": "Add chip-temp + battery-voltage readout to Rust clock", "status": "done", "owner": "GAUGE" },
     { "id": 35, "title": "Add shop/board (AliExpress) URL to the site", "status": "done", "owner": "you + Claude" },
     { "id": 36, "title": "Mesh benchmark HUD → folded into unified Rust firmware", "status": "done", "owner": "DUEL → KERNEL" },
-    { "id": 37, "title": "Unified Rust firmware: Clock + Snake + Bench modes (BOOT menu)", "status": "in_progress", "owner": "KERNEL" },
-    { "id": 38, "title": "Case v3: move LED holes to USB-C end (board photo confirmed)", "status": "in_progress", "owner": "PORTAL" }
+    { "id": 37, "title": "Case v3: LED holes → USB-C end (board photo confirmed)", "status": "done", "owner": "PORTAL" },
+    { "id": 38, "title": "app-pixels-style modes/apps gallery on the site", "status": "done", "owner": "you + Claude" },
+    { "id": 39, "title": "Resin + watch-case enclosure guide (docs/enclosure-resin.md)", "status": "done", "owner": "RESIN" },
+    { "id": 40, "title": "Unified Rust firmware: Clock + Snake + Bench + OLED 180°", "status": "in_progress", "owner": "KERNEL" },
+    { "id": 41, "title": "Case v4: crown = USB-C cover + classic orientation (bail→USB-C)", "status": "in_progress", "owner": "PORTAL" }
   ]
 }

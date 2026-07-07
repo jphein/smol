@@ -40,8 +40,12 @@ Coordinate convention
 ----------------------
     +Z = case axis, pointing OUT of the front face (toward the viewer / the OLED).
     Front face is the high-Z end; the back lid closes the low-Z end.
-    The board's OLED end points toward +Y (12 o'clock); USB-C is at -Y (6 o'clock).
-    The bail ring sits at 12 o'clock (+Y).
+    The board's OLED end points toward +Y; USB-C is at -Y.
+    CLASSIC POCKET-WATCH ORIENTATION: the bail sits at -Y (6 o'clock), the SAME
+    end as the USB-C slot + crown, so crown+bail hang together at the TOP like a
+    real pocket watch. Hung that way: TOP = bail + USB-C/crown + the two LEDs;
+    BOTTOM = OLED + the two buttons. The OLED is rotated 180 deg in FIRMWARE so it
+    reads upright. (BAIL_ANGLE_DEG = 90 moves the bail back to the +Y/OLED end.)
 
 TP4056 charger placement (see docs/power.md, section 3)
 -------------------------------------------------------
@@ -220,9 +224,47 @@ BOOT_SIDE_HOLE = False   # old radial side-wall poke at 3 o'clock (superseded)
 BOOT_HOLE_R = 2.2   # radius of the (optional) side poke hole
 BOOT_ANGLE_DEG = 0  # position around the rim (0 = +X / 3 o'clock side)
 
-# --- Bail / chain loop at 12 o'clock ---
+# --- Bail / chain loop ---
+# CLASSIC POCKET-WATCH ORIENTATION (owner-confirmed): the bail sits at the SAME
+# end as the USB-C slot + crown, so crown+bail are TOGETHER at the TOP when hung
+# (like a real pocket watch). That end is -Y / 6 o'clock (270 deg). When hung
+# this way, TOP = bail + USB-C/crown + the two LEDs; BOTTOM = OLED + the two
+# buttons. The OLED is rotated 180 deg in FIRMWARE so it reads upright.
+# (Set BAIL_ANGLE_DEG = 90 to put the bail back at the OLED end / 12 o'clock.)
+BAIL_ANGLE_DEG = 270  # 270 = -Y / 6 o'clock (with the crown); 90 = +Y (OLED end)
 BAIL_TUBE_R = 1.6   # tube (minor) radius of the torus ring
 BAIL_RING_R = 4.0   # ring (major) radius -> chain hole ~ 2*(RING_R-TUBE_R)
+# The bail is lifted in Z so its neck clears the USB-C rim slot below it (the
+# slot top is at usb_z + USB_SLOT_H/2). Extra margin above the slot top:
+BAIL_Z_CLEAR = 0.8  # gap between the USB-C slot top and the bail neck bottom
+
+# ----------------------------------------------------------------------------
+# CROWN -- removable USB-C port cover (3rd printable part, pocketwatch_crown.stl)
+# ----------------------------------------------------------------------------
+# A little watch-"crown" cap on a short friction-fit plug. Pull it off to charge
+# or flash through the SuperMini's USB-C rim slot (-Y / 6 o'clock); pop it on to
+# hide the port and read as a watch crown. It seats into the SAME rim slot the
+# body already cuts (USB_SLOT_W x USB_SLOT_H at 270 deg), NOT over the two LED
+# light-pipe holes beside it -- the plug fills only the slot opening; the flange
+# and knurled cap flare OUTWARD (radially, in -Y) and downward, staying clear of
+# the top-face LED holes at (+/-7.0, -8.4).
+CROWN = True                 # export pocketwatch_crown.stl
+CROWN_FIT_GAP = 0.20         # per-side clearance of the plug in the slot (press fit)
+CROWN_PLUG_DEPTH = 3.2       # how far the plug reaches in (>= wall 2.4 to fill the
+                             # slot channel and grip; a touch proud is fine)
+CROWN_FLANGE_T = 1.2         # thickness of the stop-flange behind the plug
+CROWN_FLANGE_MARGIN = 1.4    # how far the flange oversizes the slot on each side
+                             # (gives a lip to grip AND a positive stop on the wall)
+CROWN_CAP_R = 4.0            # radius of the round knurled crown cap
+CROWN_CAP_H = 3.4            # how far the cap stands proud (radially outward, -Y)
+CROWN_KNURLS = 12            # number of vertical flutes around the cap (crown look)
+CROWN_KNURL_R = 0.9          # radius of each flute-cutter cylinder
+CROWN_KNURL_DEPTH = 0.5      # how deep each flute bites into the cap rim
+# flute-cutter centre offset from the cap axis so it removes CROWN_KNURL_DEPTH:
+CROWN_KNURL_R_OFFSET = CROWN_KNURL_R - CROWN_KNURL_DEPTH
+CROWN_STEM_R = 2.2           # short stem joining flange to cap (< CAP_R for a waist)
+CROWN_TETHER = False         # optional tiny retention nub (loose ring stub); off by
+                             # default -- prints cleaner and the friction fit holds
 
 # --- Mesh resolution ---
 CYL_SECTIONS = 160  # facets around cylinders (smooth round body)
@@ -417,25 +459,50 @@ def make_body():
     # Apply all cuts.
     body = difference(body, parts_neg)
 
-    # --- Bail / chain loop at 12 o'clock (+Y), a torus ring standing up in the
-    #     plane of the case axis so a chain can pass through. ---
+    # --- Bail / chain loop, a torus ring standing up in the plane of the case
+    #     axis so a chain can pass through. Built at +Y, then rotated to
+    #     BAIL_ANGLE_DEG (default 270 = -Y, together with the crown). ---
     ring = torus(major_radius=BAIL_RING_R, minor_radius=BAIL_TUBE_R,
                  major_sections=64, minor_sections=24)
     # torus default lies in XY plane (hole faces Z). Rotate so hole faces X
-    # (chain passes side-to-side, ring stands proud above +Y edge).
+    # (chain passes side-to-side, ring stands proud beyond the +Y edge).
     ring.apply_transform(trimesh.transformations.rotation_matrix(math.pi / 2, [1, 0, 0]))
-    # position: just outside the rim at +Y, centred on the front-face-ish Z.
-    ring_y = OUTER_R + BAIL_RING_R - BAIL_TUBE_R - 0.5   # overlap into wall a touch
-    ring_z = Z_FACE_OUT - (BAIL_RING_R + BAIL_TUBE_R)    # keep within body height
-    if ring_z < BAIL_RING_R:
-        ring_z = TOTAL_H / 2.0
+
+    # Z: lift the bail so its neck bottom clears whatever sits at the -Y end below
+    # it -- both the USB-C rim slot AND the crown cap (which stands proud at -Y
+    # and reaches z = usb_z + CROWN_CAP_R). Clear the taller of the two so the
+    # bail never fouls the seated crown. Neck half-height = BAIL_TUBE_R + 0.75.
+    usb_z = (Z_BOARD_TOP + Z_BOARD_BOT) / 2.0
+    usb_slot_top = usb_z + USB_SLOT_H / 2.0
+    crown_cap_top = (usb_z + CROWN_CAP_R) if CROWN else usb_slot_top
+    obstruction_top = max(usb_slot_top, crown_cap_top)
+    neck_half_h = BAIL_TUBE_R + 0.75
+    over_obstruction = (BAIL_ANGLE_DEG == TP_USB_ANGLE_DEG) or (BAIL_ANGLE_DEG == 270)
+    if over_obstruction:
+        # Bail shares the -Y end with the USB-C slot / crown: lift it to clear them
+        # (it may stand a little proud of the face -- fine for a hang loop).
+        ring_z = obstruction_top + BAIL_Z_CLEAR + neck_half_h
+    else:
+        # Bail is on a clear part of the rim (e.g. the OLED end): keep it tucked
+        # just under the front face as before.
+        ring_z = Z_FACE_OUT - (BAIL_RING_R + BAIL_TUBE_R)
+        if ring_z < BAIL_RING_R:
+            ring_z = TOTAL_H / 2.0
+    # position just outside the rim at +Y (pre-rotation), overlapping the wall.
+    ring_y = OUTER_R + BAIL_RING_R - BAIL_TUBE_R - 0.5
     ring.apply_translation([0, ring_y, ring_z])
 
     # A small neck connecting ring to body so it prints as one solid piece.
     neck = box(extents=[2 * BAIL_TUBE_R + 1.0, BAIL_RING_R + 2.0, 2 * BAIL_TUBE_R + 1.5])
     neck.apply_translation([0, OUTER_R + (BAIL_RING_R) / 2.0 - 1.0, ring_z])
 
-    body = union([body, neck, ring])
+    # Rotate the whole bail (ring + neck) from +Y to the requested clock angle.
+    bail = union([ring, neck])
+    if BAIL_ANGLE_DEG != 90:
+        bail.apply_transform(trimesh.transformations.rotation_matrix(
+            math.radians(BAIL_ANGLE_DEG - 90.0), [0, 0, 1]))
+
+    body = union([body, bail])
 
     return body
 
@@ -512,13 +579,94 @@ def make_plungers():
     return pegs
 
 
-def make_assembly(body, lid):
-    """Preview: nest the lid into the body at its seated position (no boolean)."""
+def make_crown():
+    """Removable USB-C port cover shaped like a watch crown.
+
+    A friction-fit rectangular PLUG (sized to the USB-C rim slot minus
+    CROWN_FIT_GAP per side) carries a stop-FLANGE, a short STEM, and a round
+    knurled CAP that stands proud at -Y (6 o'clock). Pull it off to charge/flash;
+    press it on to hide the port. Covers ONLY the slot -- it flares outward in
+    -Y, well clear of the top-face LED holes at (+/-7.0, -8.4).
+
+    Built in world coordinates at the -Y wall (no rotation needed: the slot is at
+    270 deg). +Y is 'inward' (into the case); -Y is 'outward'. The whole part is
+    exported so that, to PRINT, you stand it on the flat outer cap face (cap
+    down, plug up) -- the flutes run along the print Z and need no supports.
+    """
+    usb_z = (Z_BOARD_TOP + Z_BOARD_BOT) / 2.0     # slot vertical centre (matches body)
+
+    # --- Plug: fills the slot channel with a press-fit clearance. ---
+    plug_w = USB_SLOT_W - 2 * CROWN_FIT_GAP       # tangential (X)
+    plug_h = USB_SLOT_H - 2 * CROWN_FIT_GAP       # vertical (Z)
+    # Outer face flush with the outer wall; reaches CROWN_PLUG_DEPTH inward so it
+    # grips past the inner wall edge (PLUG_DEPTH >= wall thickness).
+    y_plug_out = -OUTER_R                          # flush with outer wall surface
+    y_plug_in = y_plug_out + CROWN_PLUG_DEPTH      # inner end (into the cavity a bit)
+    plug = box(extents=[plug_w, CROWN_PLUG_DEPTH, plug_h])
+    plug.apply_translation([0.0, (y_plug_out + y_plug_in) / 2.0, usb_z])
+
+    # --- Flange: a stop just OUTSIDE the wall, oversizing the slot so it can't
+    #     push through and gives a lip to grip. Sits from the outer wall outward.
+    fl_w = plug_w + 2 * CROWN_FLANGE_MARGIN
+    fl_h = plug_h + 2 * CROWN_FLANGE_MARGIN
+    flange = box(extents=[fl_w, CROWN_FLANGE_T, fl_h])
+    y_fl_mid = y_plug_out - CROWN_FLANGE_T / 2.0
+    flange.apply_translation([0.0, y_fl_mid, usb_z])
+
+    # Outer face of the flange -> everything beyond is stem + cap.
+    y_fl_outer = y_fl_mid - CROWN_FLANGE_T / 2.0
+
+    # --- Stem: a short waist between flange and cap (axis along Y). ---
+    stem_len = 0.8
+    stem = cylinder(radius=CROWN_STEM_R, height=stem_len, sections=48)
+    stem.apply_transform(trimesh.transformations.rotation_matrix(math.pi / 2, [1, 0, 0]))
+    stem.apply_translation([0.0, y_fl_outer - stem_len / 2.0, usb_z])
+
+    # --- Cap: the round knurled crown head (axis along Y). ---
+    cap = cylinder(radius=CROWN_CAP_R, height=CROWN_CAP_H, sections=max(48, CROWN_KNURLS * 4))
+    cap.apply_transform(trimesh.transformations.rotation_matrix(math.pi / 2, [1, 0, 0]))
+    y_cap_mid = y_fl_outer - stem_len - CROWN_CAP_H / 2.0
+    cap.apply_translation([0.0, y_cap_mid, usb_z])
+
+    # Knurl flutes: subtract a ring of small vertical cylinders around the cap
+    # rim (classic crown look). Their axes run along Z (the print Z when the cap
+    # sits face-down), so they print as clean vertical grooves without supports.
+    knurl_cutters = []
+    for i in range(CROWN_KNURLS):
+        a = 2 * math.pi * i / CROWN_KNURLS
+        # place flute centre slightly outside the cap radius so it bites a groove
+        fr = CROWN_CAP_R + CROWN_KNURL_R_OFFSET
+        cx = math.cos(a) * fr
+        cyy = y_cap_mid + math.sin(a) * fr
+        flute = cylinder(radius=CROWN_KNURL_R, height=CROWN_CAP_H + 2.0, sections=16)
+        flute.apply_translation([cx, cyy, usb_z])
+        knurl_cutters.append(flute)
+    cap = difference(cap, knurl_cutters)
+
+    crown = union([plug, flange, stem, cap])
+
+    # --- Optional tether nub: a tiny stub off the flange (a place to loop a
+    #     thread so the crown can't get lost). Printable (a short peg). ---
+    if CROWN_TETHER:
+        nub = cylinder(radius=1.0, height=2.0, sections=24)
+        # point it +Z (up), off the top of the flange; prints as a small post
+        nub.apply_translation([0.0, y_fl_mid, usb_z + fl_h / 2.0 + 1.0])
+        crown = union([crown, nub])
+
+    return crown
+
+
+def make_assembly(body, lid, crown=None):
+    """Preview: nest the lid into the body at its seated position (no boolean).
+    The crown is shown SEATED in the USB-C slot (it is already built at that
+    world position, so no move is needed)."""
     b = body.copy()
     l = lid.copy()
     # Lid floor bottom is at z=0 which is already the assembled position
     # (body open rim at Z_BODY_OPEN = BACK_LIP_T sits on lid floor top).
     parts = [b, l] + make_plungers()
+    if crown is not None:
+        parts.append(crown.copy())
     scene = trimesh.util.concatenate(parts)
     return scene
 
@@ -564,6 +712,16 @@ def main():
               f"flanking the USB-C slot; CONFIRMED from board photo): "
               f"IO8/GPIO8 blue @ (x={BLUE_LED_X:+.1f}, y={LED_Y:+.1f}), "
               f"PWR @ (x={PWR_LED_X:+.1f}, y={LED_Y:+.1f})")
+    if CROWN:
+        print(f"CROWN port cover: plug {USB_SLOT_W-2*CROWN_FIT_GAP:.1f} x "
+              f"{USB_SLOT_H-2*CROWN_FIT_GAP:.1f} mm (slot {USB_SLOT_W:.1f} x {USB_SLOT_H:.1f} "
+              f"minus {CROWN_FIT_GAP} /side), depth {CROWN_PLUG_DEPTH:.1f}; "
+              f"cap dia {2*CROWN_CAP_R:.1f} x {CROWN_CAP_H:.1f} proud, {CROWN_KNURLS} flutes; "
+              f"seats in USB-C slot @ 6 o'clock, z={(Z_BOARD_TOP+Z_BOARD_BOT)/2.0:.2f}")
+    _bail_end = ("-Y / 6 o'clock (WITH crown -- classic orientation)" if BAIL_ANGLE_DEG == 270
+                 else f"{BAIL_ANGLE_DEG} deg")
+    print(f"BAIL @ {_bail_end}; ring dia ~{2*(BAIL_RING_R-BAIL_TUBE_R):.1f} mm chain hole. "
+          f"(OLED rotated 180 deg in firmware to read upright when hung.)")
     print("-" * 74)
 
     print("Building BODY ...")
@@ -584,6 +742,17 @@ def main():
         lid.fix_normals()
         _report("lid (repaired)", lid)
 
+    crown = None
+    if CROWN:
+        print("Building CROWN (USB-C port cover) ...")
+        crown = make_crown()
+        _report("crown (raw)", crown)
+        if not crown.is_watertight:
+            crown.merge_vertices()
+            crown.fill_holes()
+            crown.fix_normals()
+            _report("crown (repaired)", crown)
+
     # Export
     body_path = os.path.join(OUTDIR, "pocketwatch_body.stl")
     lid_path = os.path.join(OUTDIR, "pocketwatch_lid.stl")
@@ -592,10 +761,14 @@ def main():
     print("-" * 74)
     print(f"WROTE {body_path}")
     print(f"WROTE {lid_path}")
+    if crown is not None:
+        crown_path = os.path.join(OUTDIR, "pocketwatch_crown.stl")
+        crown.export(crown_path)
+        print(f"WROTE {crown_path}")
 
     # Assembly preview
     try:
-        asm = make_assembly(body, lid)
+        asm = make_assembly(body, lid, crown)
         asm_path = os.path.join(OUTDIR, "pocketwatch_assembly.stl")
         asm.export(asm_path)
         print(f"WROTE {asm_path}  (preview, not for printing)")
@@ -604,11 +777,15 @@ def main():
 
     print("=" * 74)
     print("FINAL")
-    print(f"  BODY: extents {np.round(body.extents,2).tolist()} mm  "
+    print(f"  BODY : extents {np.round(body.extents,2).tolist()} mm  "
           f"watertight={body.is_watertight}")
-    print(f"  LID : extents {np.round(lid.extents,2).tolist()} mm  "
+    print(f"  LID  : extents {np.round(lid.extents,2).tolist()} mm  "
           f"watertight={lid.is_watertight}")
     ok = body.is_watertight and lid.is_watertight
+    if crown is not None:
+        print(f"  CROWN: extents {np.round(crown.extents,2).tolist()} mm  "
+              f"watertight={crown.is_watertight}")
+        ok = ok and crown.is_watertight
     print(f"  ALL WATERTIGHT: {ok}")
     print("=" * 74)
     return 0 if ok else 1

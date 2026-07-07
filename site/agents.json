@@ -22,7 +22,9 @@
     { "name": "AURA", "role": "LE Audio: C3 can't; only the new ESP32-H4 can", "status": "done", "glyph": "⟡" },
     { "name": "OXIDE", "role": "Rust firmware compiles — clock + WiFi/SNTP + ESP-NOW", "status": "done", "glyph": "❖" },
     { "name": "GAUGE", "role": "Added chip-temp + battery(ADC/GPIO4) to Rust clock — clean", "status": "done", "glyph": "◧" },
-    { "name": "PORTAL", "role": "Case v3: USB-C ✓, buttons top ✓, moving LEDs to USB-C end", "status": "active", "glyph": "◫" },
-    { "name": "KERNEL", "role": "Unifying ONE Rust firmware: Clock + Snake + Bench (BOOT menu)", "status": "active", "glyph": "▦" }
+    { "name": "PULSE", "role": "Rust clock on 2 boards — ESP-NOW CONNECT verified (solid blue) ✓", "status": "done", "glyph": "⏻" },
+    { "name": "RESIN", "role": "Wrote enclosure-resin.md — metal kills RF, don't pot a LiPo", "status": "done", "glyph": "⬗" },
+    { "name": "PORTAL", "role": "Case: crown = USB-C cover + classic orientation (bail→USB-C)", "status": "active", "glyph": "◫" },
+    { "name": "KERNEL", "role": "Unified Rust firmware: Clock + Snake + Bench (+ OLED 180°)", "status": "active", "glyph": "▦" }
   ]
 }

@@ -189,6 +189,21 @@ ul.feat li::before{content:"▚";position:absolute;left:0;color:var(--glow)}
 .pw-spec .lbl{font-family:var(--mono);font-size:.62rem;letter-spacing:.18em;text-transform:uppercase;color:var(--faint)}
 .pw-spec .val{font-family:var(--mono);font-size:.92rem;color:var(--ink)}
 .pw-dl{text-decoration:none}.pw-dl:hover{border-color:var(--glow);box-shadow:0 0 22px -8px var(--glow-soft)}.pw-dl .val{color:var(--glow)}
+/* apps / modes gallery */
+.apps-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:16px}
+.app-card{border:1px solid var(--line);border-radius:16px;background:linear-gradient(180deg,var(--panel),var(--bg2));overflow:hidden;transition:.22s;display:flex;flex-direction:column;text-decoration:none}
+.app-card:hover{border-color:var(--glow);box-shadow:0 0 40px -18px var(--glow-soft);transform:translateY(-3px)}
+.app-screen{aspect-ratio:72/40;background:#02100f;position:relative;border-bottom:1px solid var(--line2);box-shadow:inset 0 0 30px rgba(0,0,0,.55)}
+.app-screen svg{position:absolute;inset:0;width:100%;height:100%;display:block}
+.app-screen::after{content:"";position:absolute;inset:0;background:repeating-linear-gradient(0deg,rgba(0,0,0,.22) 0 1px,transparent 1px 3px);mix-blend-mode:multiply;opacity:.5;pointer-events:none}
+.app-body{padding:13px 15px 15px;display:flex;flex-direction:column;gap:6px;flex:1}
+.app-name{font-family:var(--mono);font-weight:700;font-size:.9rem;color:var(--ink);display:flex;justify-content:space-between;align-items:center;gap:8px}
+.app-badge{font-family:var(--mono);font-size:.56rem;letter-spacing:.1em;text-transform:uppercase;padding:2px 7px;border-radius:999px;white-space:nowrap;flex:none}
+.app-badge.on{color:var(--lime);border:1px solid rgba(182,255,91,.35)}
+.app-badge.wip{color:var(--amber);border:1px solid rgba(255,180,84,.35)}
+.app-badge.plan{color:var(--faint);border:1px solid var(--line2)}
+.app-desc{font-size:.82rem;color:var(--dim);flex:1;line-height:1.45}
+.app-tags{font-family:var(--mono);font-size:.66rem;color:var(--glow);opacity:.85}
 /* footer */
 footer{padding:50px 0 80px;border-top:1px solid var(--line2);color:var(--faint);font-family:var(--mono);font-size:.78rem;display:flex;justify-content:space-between;flex-wrap:wrap;gap:16px}
 footer a{color:var(--dim)}footer a:hover{color:var(--glow)}
@@ -230,7 +245,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
   <div class="wrap bar">
     <div class="brand">smol<span class="dot">▚</span><span class="cursor"></span></div>
     <nav>
-      <a href="#vitals">vitals</a><a href="#game">the game</a><a href="#controls">controls</a><a href="#builds">builds</a>
+      <a href="#vitals">vitals</a><a href="#game">the game</a><a href="#controls">controls</a><a href="#builds">apps</a>
       <a href="#mission">mission control</a><a href="#roadmap">roadmap</a><a href="#research">research</a><a href="#board">board</a><a href="#pocketwatch">watch</a><a href="#case">case</a>
     </nav>
     <div class="live" id="live"><span class="led"></span><span id="liveTxt">connecting…</span></div>
@@ -342,22 +357,46 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
   </div>
 </div></section>
 
-<!-- BUILDS -->
+<!-- APPS / MODES GALLERY -->
 <section id="builds"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">04 — Builds</span>
-    <h2>Everything we flashed & wrote.</h2>
-    <p data-edit="builds.intro">The actual code living in the repo — games, firmware starters, and experiments. Block Digger and the atomic14 pack are flashed and confirmed on real hardware; the rest compile and are ready to flash.</p>
+    <span class="kicker">04 — Apps</span>
+    <h2>What runs on smol.</h2>
+    <p data-edit="apps.intro">Every "app" smol can run, picked from a BOOT-button menu — the unified Rust firmware folds Clock, Snake and the Benchmark into one binary. Some are flashed and confirmed on real hardware; others are in progress or planned. Each card links to its source.</p>
   </div>
-  <div class="specs reveal">
-    <a class="spec" href="https://github.com/jphein/smol/tree/main/blockdigger" target="_blank"><span class="n">▚</span><div class="lbl">Block Digger · flashed ✓</div><div class="val">The Minecraft-ish game</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Arduino + Bluepad32 + U8g2. Stadia controller. Runs now.</div></a>
-    <a class="spec" href="https://github.com/jphein/smol/tree/main/games/snake" target="_blank"><span class="n">⊞</span><div class="lbl">Snake</div><div class="val">2nd game</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Classic Snake, BLE controller, same stack. Compiles.</div></a>
-    <a class="spec" href="https://github.com/jphein/smol/tree/main/games/snake-2p" target="_blank"><span class="n">⇄</span><div class="lbl">2-Player Snake</div><div class="val">Two boards over ESP-NOW</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Wireless head-to-head, BOOT-button input. Compiles clean.</div></a>
-    <a class="spec" href="https://github.com/jphein/smol/tree/main/watch" target="_blank"><span class="n">⌚</span><div class="lbl">Watch starter</div><div class="val">NTP clock + weather</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Arduino + Open-Meteo; BLE-notification path stubbed.</div></a>
-    <a class="spec" href="https://github.com/jphein/smol/tree/main/rust/clock" target="_blank"><span class="n">❖</span><div class="lbl">Rust clock</div><div class="val">no_std esp-hal</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">OLED → WiFi/NTP → ESP-NOW switching. Bare-metal Rust.</div></a>
-    <a class="spec" href="https://github.com/jphein/smol/tree/main/experiments/atomic14-games" target="_blank"><span class="n">▤</span><div class="lbl">atomic14 pack · flashed ✓</div><div class="val">5 single-button games</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Breakout, racer, Defender, jumper, Heli Cave + menu.</div></a>
-    <a class="spec" href="https://github.com/jphein/smol/tree/main/experiments/nes-c3" target="_blank"><span class="n">▩</span><div class="lbl">NES experiment</div><div class="val">Emulator base</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Trimmed Anemoia core for a future ST7735 + ESP-IDF port.</div></a>
-    <a class="spec" href="https://github.com/jphein/smol/tree/main/docs/walkie-talkie.md" target="_blank"><span class="n">≋</span><div class="lbl">Walkie-talkie</div><div class="val">Voice over ESP-NOW</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Feasible on the bare C3 (PTT) — parts + wiring in docs.</div></a>
+  <div class="apps-grid reveal">
+    <a class="app-card" href="https://github.com/jphein/smol/tree/main/rust/clock" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><text x="36" y="23" text-anchor="middle" font-family="monospace" font-weight="bold" font-size="16" fill="#7df9ff">12:34</text><text x="36" y="34" text-anchor="middle" font-family="monospace" font-size="6" fill="#7df9ff">PDT 21C 3.9V</text></svg></div>
+      <div class="app-body"><div class="app-name">Clock <span class="app-badge on">flashed</span></div><div class="app-desc">NTP + Pacific time, big digits, chip-temp & battery readout. Bare-metal Rust.</div><div class="app-tags">#rust #wifi #sensors</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/tree/main/blockdigger" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><g fill="#7df9ff"><rect x="6" y="27" width="60" height="6"/><rect x="6" y="33" width="60" height="5" opacity=".55"/><rect x="31" y="19" width="7" height="7"/></g><g fill="none" stroke="#7df9ff" stroke-width="1"><rect x="14" y="27" width="6" height="6"/></g><text x="5" y="12" font-family="monospace" font-size="8" fill="#7df9ff">&#9670; 3</text></svg></div>
+      <div class="app-body"><div class="app-name">Block Digger <span class="app-badge on">flashed</span></div><div class="app-desc">Minecraft-ish dig/build on a grid. Bluetooth Stadia pad. The one that started it all.</div><div class="app-tags">#game #ble</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/tree/main/games/snake" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><g fill="#7df9ff"><rect x="18" y="18" width="4" height="4"/><rect x="22" y="18" width="4" height="4"/><rect x="26" y="18" width="4" height="4"/><rect x="30" y="18" width="4" height="4"/><rect x="34" y="18" width="4" height="4"/><rect x="34" y="22" width="4" height="4"/><rect x="34" y="26" width="4" height="4"/></g><rect x="52" y="26" width="4" height="4" fill="#7df9ff"/><text x="4" y="9" font-family="monospace" font-size="7" fill="#7df9ff">7</text></svg></div>
+      <div class="app-body"><div class="app-name">Snake <span class="app-badge on">flashed</span></div><div class="app-desc">Classic Snake on the 72×40 grid. One-button steering. Ported to the Rust menu.</div><div class="app-tags">#game</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/tree/main/games/snake-2p" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><g fill="#7df9ff"><rect x="12" y="13" width="4" height="4"/><rect x="16" y="13" width="4" height="4"/><rect x="20" y="13" width="4" height="4"/><rect x="24" y="13" width="4" height="4"/></g><g fill="none" stroke="#7df9ff" stroke-width="1"><rect x="42" y="25" width="4" height="4"/><rect x="46" y="25" width="4" height="4"/><rect x="50" y="25" width="4" height="4"/><rect x="54" y="25" width="4" height="4"/></g><text x="36" y="37" text-anchor="middle" font-family="monospace" font-size="6" fill="#7df9ff">P1  vs  P2</text></svg></div>
+      <div class="app-body"><div class="app-name">Mesh Snake <span class="app-badge on">flashed</span></div><div class="app-desc">Two smols, head-to-head over ESP-NOW. Verified 2-board play. Yours filled, foe outlined.</div><div class="app-tags">#game #espnow</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/tree/main/rust/clock" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><g font-family="monospace" font-size="8" fill="#7df9ff"><text x="6" y="13">FPS 58</text><text x="6" y="25">RTT 7ms</text><text x="6" y="37">-54dBm</text></g></svg></div>
+      <div class="app-body"><div class="app-name">Benchmark <span class="app-badge wip">wip</span></div><div class="app-desc">Live ESP-NOW link test: FPS, TX/RX rate, round-trip latency, loss %, RSSI. A mode in the Rust firmware.</div><div class="app-tags">#espnow #diag</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/tree/main/experiments/atomic14-games" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><g fill="#7df9ff"><rect x="8" y="7" width="10" height="4"/><rect x="20" y="7" width="10" height="4"/><rect x="32" y="7" width="10" height="4"/><rect x="44" y="7" width="10" height="4"/><rect x="56" y="7" width="9" height="4"/><rect x="40" y="24" width="3" height="3"/><rect x="28" y="34" width="16" height="3"/></g></svg></div>
+      <div class="app-body"><div class="app-name">atomic14 pack <span class="app-badge on">flashed</span></div><div class="app-desc">5 single-button games (Breakout, racer, Defender, jumper, Heli Cave) + menu. Built for this exact board.</div><div class="app-tags">#games</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/blob/main/docs/nes-on-c3.md" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><text x="36" y="19" text-anchor="middle" font-family="monospace" font-weight="bold" font-size="12" fill="#7df9ff">NES</text><text x="36" y="31" text-anchor="middle" font-family="monospace" font-size="6" fill="#ffb454">needs color TFT</text></svg></div>
+      <div class="app-body"><div class="app-name">NES <span class="app-badge plan">planned</span></div><div class="app-desc">Emulation is possible — but needs an added ST7735 color TFT + an ESP-IDF port. Build plan in docs.</div><div class="app-tags">#emu #future</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/blob/main/docs/walkie-talkie.md" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><polyline points="4,20 12,20 16,10 20,30 24,14 28,26 32,20 68,20" fill="none" stroke="#7df9ff" stroke-width="1.5"/><text x="36" y="35" text-anchor="middle" font-family="monospace" font-size="6" fill="#7df9ff">PTT · ESP-NOW</text></svg></div>
+      <div class="app-body"><div class="app-name">Walkie-talkie <span class="app-badge plan">planned</span></div><div class="app-desc">Push-to-talk voice over ESP-NOW — feasible on the bare C3 with an I²S mic + amp. Parts in docs.</div><div class="app-tags">#voice #espnow</div></div>
+    </a>
   </div>
 </div></section>
 
@@ -415,6 +454,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
     <a class="spec" href="https://github.com/jphein/smol/blob/main/docs/walkie-talkie.md" target="_blank"><span class="n">≋</span><div class="lbl">SQUELCH</div><div class="val">Walkie-talkie over ESP-NOW</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Feasible on the bare C3 for push-to-talk. Parts + wiring.</div></a>
     <a class="spec" href="https://github.com/jphein/smol/blob/main/docs/wearables.md" target="_blank"><span class="n">◷</span><div class="lbl">TIMEPIECE</div><div class="val">Watch-case research</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Adaptable smartwatch/pocket-watch bases + battery reality.</div></a>
     <a class="spec" href="https://github.com/jphein/smol/blob/main/docs/le-audio.md" target="_blank"><span class="n">⟡</span><div class="lbl">AURA</div><div class="val">Bluetooth LE Audio</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">The C3 can't — and why. The only ESP path is the new H4.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/blob/main/docs/enclosure-resin.md" target="_blank"><span class="n">⬗</span><div class="lbl">RESIN</div><div class="val">Epoxy + watch-case build</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Casting a lens & mounting in a real watch — RF, heat & access gotchas.</div></a>
     <a class="spec" href="https://github.com/jphein/smol/tree/main/docs" target="_blank"><span class="n">◇</span><div class="lbl">All docs</div><div class="val">The full index</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Every report in one place → docs/ ↗</div></a>
   </div>
 </div></section>

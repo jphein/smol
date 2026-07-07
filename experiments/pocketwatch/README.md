@@ -23,11 +23,12 @@ primitives (cylinders, boxes, a torus) combined with boolean unions/differences.
 |---|---|---|
 | `pocketwatch_body.stl` | **yes** | Round case body: front face + OLED window, **two** USB-C slots (SuperMini @ 6 o'clock, TP4056 charge @ 9 o'clock), **two top-face button plunger bores (BOOT + RESET)**, **two LED light-pipe holes (clear-PLA)**, chain bail. |
 | `pocketwatch_lid.stl`  | **yes** | Press-fit back lid with a pry-notch **and a 3-sided retention fence** that cradles the TP4056. |
-| `pocketwatch_assembly.stl` | no | Preview only — body + lid nested. Do **not** slice this. |
+| `pocketwatch_crown.stl` | **yes** | **Removable "crown" USB-C port cover** — a knurled cap on a friction-fit plug that seats into the SuperMini's 6 o'clock USB-C slot. Pull it off to charge/flash; pop it on to hide the port. See [Crown](#crown-removable-usb-c-port-cover). |
+| `pocketwatch_assembly.stl` | no | Preview only — body + lid + **crown (seated)**. Do **not** slice this. |
 
 ## Final dimensions
 
-Measured from the exported STLs (both verified **watertight**, single-body):
+Measured from the exported STLs (all three verified **watertight**, single-body):
 
 | Property | Value |
 |---|---|
@@ -36,6 +37,7 @@ Measured from the exported STLs (both verified **watertight**, single-body):
 | **Total height (assembled, excl. bail)** | **21.2 mm** *(was 18.6 — grew +2.6 mm for the charger)* |
 | Body bounding box (incl. bail) | 43.1 x 47.1 x 19.6 mm |
 | Lid bounding box | 42.9 x 43.1 x 5.6 mm |
+| **Crown bounding box** | **13.4 x 8.6 x 8.0 mm** (flange 13.4 wide, cap 8.0 dia) |
 | Side wall thickness | 2.4 mm |
 | Front face (bezel) thickness | 2.0 mm |
 | Interior depth (usable) | 17.6 mm *(was 15.0)* |
@@ -46,6 +48,7 @@ Measured from the exported STLs (both verified **watertight**, single-body):
 | **LED light-pipe holes** | **2 x 2.5 mm dia, through the front face**, at the **−Y (USB-C/6 o'clock) end, flanking the USB-C slot** ("PWR" −X, "IO8"/GPIO8 blue +X) — **clear PLA** *(confirmed from board photo)* |
 | Bail chain hole | ~4.8 mm (fits most chains/split-rings) |
 | Lid lip engagement | 4.0 mm, 0.20 mm/side press-fit gap |
+| **Crown plug** | **10.6 (w) x 4.6 (h) mm** (slot minus 0.20 mm/side), 3.2 mm deep; cap 8.0 dia x 3.4 proud, 12 flutes |
 
 Interior stack (front to back): 0.8 mm air gap -> board (8 mm reserved) ->
 0.6 mm shelf -> 5 mm battery -> **0.6 mm shelf -> 2 mm TP4056 -> 0.6 mm gap** ->
@@ -147,18 +150,71 @@ genuinely-actuatable** approach.
 ### Two LED light-pipe holes — **print in / plug with CLEAR PLA**
 
 Two small **2.5 mm** through-holes (`LED_PIPE_R = 1.25`) are cut in the front face
-over the **blue GPIO8 LED** and the **power LED** so their glow reaches the front.
-By default they sit **at the OLED end, just above the window** (toward the bail),
-clearing both the window (~0.85 mm) and the two flanking buttons — **their exact
-position is an assumption; verify against the board.** They are meant to be
-**filled with a clear-PLA light pipe** — either:
+over the **"PWR" power LED** and the **"IO8" blue GPIO8 LED** so their glow reaches
+the front. **Confirmed from a board photo:** they sit at the **−Y (USB-C / bottom)
+end, one on each side of the USB-C slot** — PWR on the −X side, IO8 (blue) on the
++X side. Verified clear of the USB-C rim slot (both in the vertical Z range and
+with a ~0.25 mm bezel rib in X) and clear of the battery pocket (the bores stop at
+the board-top plane, well above the battery layer). They are meant to be **filled
+with a clear-PLA light pipe** — either:
 
 - **print the body in clear PLA** so the whole face passes light (then the holes
   just thin the wall over each LED for a brighter dot), **or**
 - print the body opaque and **plug each hole with a short clear-PLA pin / a drop
   of clear resin / a snippet of clear filament**, sanded flush, to pipe the light.
 
-Set `LED_PIPE = False` to omit them.
+> The bezel rib between each LED hole and the USB-C slot is only ~0.25 mm at the
+> default spacing. If your slicer struggles with such a thin rib, bump
+> `LED_X_FROM_USB_EDGE` (default 1.5) a little to push the LED holes further out —
+> it's parametric. Set `LED_PIPE = False` to omit the holes entirely.
+
+## Crown (removable USB-C port cover)
+
+`pocketwatch_crown.stl` is a little watch-**crown**-shaped cap that plugs into the
+SuperMini's **6 o'clock USB-C slot**. **Pull it off to charge or flash; press it
+back on to hide the port** and read as a proper pocket-watch crown.
+
+**Anatomy** (all parametric — `CROWN_*` at the top of the script):
+
+- **Plug** — a rectangular peg sized to the USB-C slot **minus `CROWN_FIT_GAP`
+  (0.20 mm) per side** (so 10.6 x 4.6 mm into the 11.0 x 5.0 slot), **3.2 mm deep**
+  (`CROWN_PLUG_DEPTH`, ≥ the 2.4 mm wall so it grips past the inner edge). This is
+  the **friction/press fit** — snug but removable by hand.
+- **Flange** — a thin lip (`CROWN_FLANGE_T`) that oversizes the slot by
+  `CROWN_FLANGE_MARGIN` (1.4 mm) per side, so it **stops flush on the outer wall**
+  and hides the clearance gap; also gives a fingernail edge to pull on.
+- **Stem + knurled cap** — a short waist into a round cap (`CROWN_CAP_R` = 4 mm,
+  standing `CROWN_CAP_H` = 3.4 mm proud) with **12 vertical flutes**
+  (`CROWN_KNURLS`) cut around the rim for the classic crown look and grip.
+
+**It covers ONLY the USB-C slot.** The plug fills just the slot opening and the
+cap/flange flare **outward** (radially, at −Y) and downward — verified to **clear
+the two LED light-pipe holes** beside it (nearest crown geometry is ~10 mm from
+each LED hole) and to **not collide with the board or battery pockets** (the whole
+crown sits outside the wall, at y ≈ −18 to −27 mm; the internal pockets are near
+y = 0). A model intersection with the body is **0.00 cm³** — the plug enters the
+open slot cleanly.
+
+- **Removable:** just a friction fit; no tools. If it's too tight, raise
+  `CROWN_FIT_GAP` to 0.25–0.30 and re-run; too loose, drop it to 0.15.
+- **Optional tether:** set `CROWN_TETHER = True` for a tiny post on the flange to
+  loop a retaining thread through (off by default — the fit holds and it prints
+  cleaner without it).
+
+### Printing the crown
+- **Stand it cap-down** (the flat round cap face on the bed, **plug pointing up**).
+  The knurl flutes then run **along the print Z** and print as clean vertical
+  grooves with **no supports**; the plug and flange are simple upward extrusions.
+- PLA or PETG, 0.2 mm layers. It's tiny (~0.45 cm³) — print a few spares.
+
+> **Classic-look alternative (not implemented — future option).** Traditionally a
+> pocket-watch crown sits at **12 o'clock, right next to the bail**. Here the crown
+> is at **6 o'clock** because that's where the USB-C port is. A future "classic
+> look" variant could **move the bail to the USB-C (−Y) end** so the crown and bail
+> sit together at the top, and **rotate the OLED 180° in firmware** so the display
+> still reads upright. That's purely an orientation change (bail angle + firmware
+> display flip); the port/crown geometry would stay as-is. Documented here as an
+> idea; the current build keeps bail @ 12 o'clock and crown @ 6 o'clock.
 
 ## Printing
 
@@ -304,8 +360,9 @@ The **TP4056 charger** is fully parametric too:
 The **buttons** (both routed to the top face) and **LED light-pipes** are
 parametric too — nudge these to match your board revision:
 
-Both buttons and both LEDs are at the **+Y (OLED) end**; positions are keyed off
-the OLED-window geometry so they auto-adjust if you resize the window.
+The **buttons** are at the **+Y (OLED) end** (keyed off the OLED-window geometry,
+so they auto-adjust if you resize the window); the **LEDs** are at the **−Y
+(USB-C) end** (keyed off the −Y board edge and the USB-C slot width).
 
 | Variable | Meaning |
 |---|---|
@@ -316,8 +373,9 @@ the OLED-window geometry so they auto-adjust if you resize the window.
 | `BTN_BORE_R`, `BTN_BORE_CLEAR_Z` | plunger-bore radius / air gap left above the switch cap |
 | `BTN_PLUNGER_PREVIEW` | also export short printed plungers into the assembly (default `False`) |
 | `LED_PIPE`, `LED_PIPE_R` | cut the two LED light-pipe holes / their radius (default 1.25 → 2.5 mm) |
-| `LED_Y_ABOVE_WIN` | gap from the window top edge up to the LED holes (they sit above the window) |
-| `LED_X`, `BLUE_LED_X`, `PWR_LED_X` | LED X spacing either side of centre (**position is an assumption — verify**) |
+| `LED_Y_FROM_USB_EDGE` | how far in from the −Y (USB-C) board edge the LED holes sit |
+| `LED_X_FROM_USB_EDGE` | gap from the USB-C slot edge out to each LED hole (they flank the slot) |
+| `BLUE_LED_X`, `PWR_LED_X` | the ±X of each LED (IO8/blue +X, PWR −X); swap signs to mirror |
 | `BOOT_SIDE_HOLE` | re-enable the old 3 o'clock **side-wall** BOOT poke (default `False`) |
 
 The script prints the computed diameters/heights (and the TP4056 layer's Z range
