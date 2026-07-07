@@ -33,6 +33,8 @@
     { "id": 30, "title": "Bigger PST clock — verified on hardware (board #2)", "status": "done", "owner": "you + Claude" },
     { "id": 31, "title": "Flash 2-player Snake to boards #1 + #2 (head-to-head)", "status": "done", "owner": "you + Claude" },
     { "id": 32, "title": "Commit Rust clock improvements (PST + big font) with default id", "status": "done", "owner": "Claude" },
-    { "id": 33, "title": "Publish site to GitHub Pages (auto-deploy on push) — jphein.github.io/smol", "status": "done", "owner": "Claude" }
+    { "id": 33, "title": "Publish site to GitHub Pages (auto-deploy on push) — jphein.github.io/smol", "status": "done", "owner": "Claude" },
+    { "id": 34, "title": "Add chip-temp + battery-voltage readout to Rust clock", "status": "in_progress", "owner": "GAUGE" },
+    { "id": 35, "title": "Add shop/board (AliExpress) URL to the site", "status": "done", "owner": "you + Claude" }
   ]
 }
