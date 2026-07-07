@@ -239,6 +239,13 @@
   }
 
   /* ================================ boot ================================ */
+  // On the published (GitHub Pages) copy or a file:// open there is no server
+  // to POST edits to, so hide the editor dock and run read-only. Editing works
+  // when served locally by server.py.
+  const READ_ONLY = location.hostname.endsWith('github.io') || location.protocol === 'file:';
+  if (READ_ONLY) {
+    const dock = $('.dock'); if (dock) dock.style.display = 'none';
+  }
   loadContent();
   poll(); setInterval(poll, 4000);
   clock(); setInterval(clock, 15000);
