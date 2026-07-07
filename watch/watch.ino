@@ -141,10 +141,12 @@ void fetchWeather() {
   }
 
   // Response is small (~250 bytes). Filter to just current_weather to save RAM.
-  StaticJsonDocument<256> filter;
+  // ArduinoJson v7 API (Library Manager default). On v6, use
+  // StaticJsonDocument<256> filter; / StaticJsonDocument<512> doc; instead.
+  JsonDocument filter;
   filter["current_weather"] = true;
 
-  StaticJsonDocument<512> doc;
+  JsonDocument doc;
   DeserializationError err =
       deserializeJson(doc, https.getStream(), DeserializationOption::Filter(filter));
   https.end();

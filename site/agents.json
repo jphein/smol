@@ -12,10 +12,10 @@
     { "name": "PROSPECTOR", "role": "Found 9 new board repos (incl. a Rust one!)", "status": "done", "glyph": "⌖" },
     { "name": "BEACON", "role": "Found 6 more repos/libs; search now saturated", "status": "done", "glyph": "◎" },
     { "name": "TIMEPIECE", "role": "No exact watch case exists — found adaptable bases", "status": "done", "glyph": "◷" },
-    { "name": "VOLT", "role": "Designing the LiPo charging + power circuit", "status": "active", "glyph": "⌁" },
+    { "name": "VOLT", "role": "Wrote power.md — TP4056 → 5V pin, cut charge current", "status": "done", "glyph": "⌁" },
     { "name": "CHIPTUNE", "role": "Wrote sound guide — LEDC beeps on GPIO10", "status": "done", "glyph": "♪" },
     { "name": "PIXELPORT", "role": "Wrote Snake — 2nd game, self/wall collision", "status": "done", "glyph": "⊞" },
-    { "name": "CHRONOS", "role": "Designing the smartwatch firmware + starter", "status": "active", "glyph": "⌚" },
-    { "name": "LOCKET", "role": "Generating a pocket-watch case (with battery room)", "status": "active", "glyph": "⊙" }
+    { "name": "CHRONOS", "role": "Scaffolded watch/ starter — fork HDRobotica, Arduino core", "status": "done", "glyph": "⌚" },
+    { "name": "LOCKET", "role": "Generated a 43mm pocket-watch case — body+lid, watertight", "status": "done", "glyph": "⊙" }
   ]
 }
