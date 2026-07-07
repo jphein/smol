@@ -1,0 +1,7 @@
+# Pin the toolchain so the RISC-V bare-metal target is always available.
+# The ESP32-C3 core is a RISC-V RV32IMC, so we use the stock rustc target
+# `riscv32imc-unknown-none-elf` (no Xtensa fork of the compiler required).
+[toolchain]
+channel = "1.96.1"
+targets = ["riscv32imc-unknown-none-elf"]
+components = ["rust-src", "rustfmt", "clippy"]

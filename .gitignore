@@ -16,3 +16,8 @@ node_modules/
 
 # ---- OS ----
 .DS_Store
+
+# Rust build artifacts
+target/
+**/target/
+*.rs.bk

@@ -1,0 +1,36 @@
+# Build configuration for the ESP32-C3 (RISC-V RV32IMC) "smol" firmware.
+#
+# We build for the bare-metal RISC-V target. esp-hal supplies the linker
+# script fragments (memory.x, esp32c3.x, linkall.x) via its build script and
+# the `link-arg` flags below wire them into the final link step.
+
+[build]
+target = "riscv32imc-unknown-none-elf"
+
+# Host target (build scripts + proc-macros compile for x86_64-linux). This
+# machine has a non-compiler `cc` shim earlier on PATH, so pin the real GCC as
+# the host linker driver; otherwise host build scripts fail to link with
+# "Unknown: -m64".
+[target.x86_64-unknown-linux-gnu]
+linker = "gcc"
+
+[target.riscv32imc-unknown-none-elf]
+runner = "espflash flash --monitor"
+# Link the firmware with the bundled rust-lld directly (LLD flavor) instead of
+# going through a C compiler driver. This machine's `cc` is a non-compiler
+# shim, so we must not route the target link through it.
+linker = "rust-lld"
+rustflags = [
+    "-C", "linker-flavor=ld.lld",
+    # Pull in the linker scripts exported by esp-hal's build script.
+    "-C", "link-arg=-Tlinkall.x",
+    # Force frame pointers so esp-backtrace can unwind panics.
+    "-C", "force-frame-pointers",
+]
+
+[unstable]
+# esp-hal / esp-wifi build core+alloc from source for the exact target.
+build-std = ["core", "alloc"]
+
+[registries.crates-io]
+protocol = "sparse"

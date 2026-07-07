@@ -1,0 +1,100 @@
+[package]
+name = "clock"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+description = "smol: ESP32-C3 SuperMini + 0.42\" SSD1306 OLED clock with WiFi/NTP + ESP-NOW"
+license = "MIT OR Apache-2.0"
+
+# -----------------------------------------------------------------------------
+# Pinned, mutually-compatible crate versions.
+#
+# The esp-hal / esp-wifi / esp-hal-embassy / esp-alloc quartet is extremely
+# version-sensitive because esp-wifi links against esp-hal INTERNAL APIs, and
+# its Cargo `^1.0.0-rc.0` requirement is looser than what actually compiles.
+#
+# THE KEY GOTCHA: esp-wifi 0.15.x calls `esp_hal::rng::Rng::new(peripherals.RNG)`
+# internally. In esp-hal 1.0.0-rc.1 and the 1.0.0 release, `Rng::new()` was
+# changed to take NO argument, which makes esp-wifi 0.15.x fail to compile
+# ("this function takes 0 arguments but 1 was supplied") even though Cargo's
+# semver check passes. We therefore pin esp-hal to the EXACT release esp-wifi
+# 0.15.x was built against: the 2025-07-16 cluster.
+#
+#   esp-hal          1.0.0-rc.0  (2025-07-16; Rng::new(RNG) still takes the peripheral)
+#   esp-wifi         0.15.0      (2025-07-16; requires esp-alloc ^0.8.0)
+#   esp-hal-embassy  0.9.0       (2025-07-16)
+#   esp-alloc        0.8.0
+#   esp-backtrace    0.17.0      (2025-07-16)
+#   esp-println      0.15.0      (2025-07-16)
+#
+# ssd1306 0.10.0 + embedded-graphics 0.8 target embedded-hal 1.0, which esp-hal
+# 1.x implements, so the display stack composes cleanly with the HAL.
+# -----------------------------------------------------------------------------
+
+[dependencies]
+# --- Core HAL (Phase 1, always on) ---------------------------------------
+# `unstable` is required for I2C/SPI/RNG and is also a hard requirement of
+# esp-wifi. `esp32c3` selects the chip. `rt` + `exception-handler` come from
+# the default features (runtime + fault handler).
+esp-hal = { version = "=1.0.0-rc.0", features = ["esp32c3", "unstable"] }
+# NOTE: esp-hal's default features already install the exception handler, so
+# esp-backtrace only provides the panic handler + backtrace printing here.
+# Enabling esp-backtrace's `exception-handler` too causes a duplicate
+# `ExceptionHandler` symbol and an LTO bitcode-load failure at link time.
+esp-backtrace = { version = "=0.17.0", features = ["esp32c3", "panic-handler", "println"] }
+esp-println = { version = "=0.15.0", features = ["esp32c3", "log-04"] }
+log = "0.4"
+
+# --- Display stack (Phase 1, always on) ----------------------------------
+ssd1306 = "=0.10.0"
+embedded-graphics = "=0.8.1"
+
+# --- WiFi / NTP (Phase 2, feature = "wifi") ------------------------------
+# esp-alloc pinned to 0.8.x to satisfy esp-wifi 0.15.1's `^0.8.0` requirement.
+esp-alloc = { version = "=0.8.0", optional = true }
+esp-wifi = { version = "=0.15.0", optional = true, default-features = false, features = [
+    "esp32c3",
+    "wifi",
+    "esp-alloc",
+    "smoltcp",
+    # esp-wifi needs a preemption scheduler backing its `esp_wifi_preempt_*`
+    # os-adapter hooks. `builtin-scheduler` is normally in esp-wifi's default
+    # feature set, but we set `default-features = false`, so we must re-add it
+    # explicitly (otherwise: `undefined symbol: esp_wifi_preempt_*` at link).
+    "builtin-scheduler",
+] }
+smoltcp = { version = "=0.12.0", optional = true, default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-dhcpv4",
+    "socket-udp",
+    "socket-dhcpv4",
+    "socket-tcp",
+] }
+
+# --- ESP-NOW (Phase 3, feature = "espnow") -------------------------------
+# ESP-NOW support lives inside esp-wifi behind its `esp-now` feature.
+# (No extra top-level crate; the feature is toggled on esp-wifi below.)
+
+[features]
+# Phase 1 only: clock on the OLED. This is the default so `cargo build
+# --release` with no flags exercises the guaranteed-green baseline.
+default = []
+
+# Phase 2: WiFi STA + SNTP time sync (+ optional weather).
+wifi = ["dep:esp-alloc", "dep:esp-wifi", "dep:smoltcp"]
+
+# Phase 3: ESP-NOW peer messaging + WiFi<->ESP-NOW switching.
+# Builds on `wifi` (shares the radio init path) and turns on esp-wifi/esp-now.
+espnow = ["wifi", "esp-wifi/esp-now"]
+
+[profile.release]
+# esp-wifi strongly recommends opt-level "s"/2/3 and LTO; the radio blobs are
+# timing-sensitive and misbehave when built at opt-level 0.
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+overflow-checks = false
+
+[profile.dev]
+opt-level = "s"

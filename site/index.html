@@ -174,6 +174,21 @@ ul.feat li::before{content:"▚";position:absolute;left:0;color:var(--glow)}
 .road li{font-family:var(--sans);color:var(--dim);border:1px solid var(--line2);border-radius:12px;padding:14px 16px;background:rgba(125,249,255,.02)}
 .road li b{color:var(--glow);font-weight:600;display:block;font-size:.78rem;font-family:var(--mono);letter-spacing:.05em;margin-bottom:4px}
 
+/* pocket watch renders */
+.pw{display:grid;grid-template-columns:1.4fr 1fr;gap:16px;margin-bottom:16px}
+@media(max-width:760px){.pw{grid-template-columns:1fr}}
+.pw figure{margin:0;border:1px solid var(--line);border-radius:16px;overflow:hidden;background:radial-gradient(120% 120% at 50% 0%,rgba(125,249,255,.06),var(--bg2));position:relative}
+.pw img{display:block;width:100%;height:auto}
+.pw figcaption{font-family:var(--mono);font-size:.7rem;color:var(--dim);padding:9px 12px;border-top:1px solid var(--line2);background:rgba(7,11,12,.5)}
+.pw-hero{display:flex;flex-direction:column}
+.pw-hero img{flex:1;object-fit:cover}
+.pw-side{display:grid;grid-template-rows:1fr 1fr;gap:16px}
+.pw-side figure{display:flex;flex-direction:column}.pw-side img{flex:1;object-fit:cover}
+.pw-strip{display:flex;flex-wrap:wrap;gap:10px}
+.pw-spec{flex:1;min-width:120px;border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:linear-gradient(180deg,var(--panel),var(--bg2));display:flex;flex-direction:column;gap:3px;transition:.2s}
+.pw-spec .lbl{font-family:var(--mono);font-size:.62rem;letter-spacing:.18em;text-transform:uppercase;color:var(--faint)}
+.pw-spec .val{font-family:var(--mono);font-size:.92rem;color:var(--ink)}
+.pw-dl{text-decoration:none}.pw-dl:hover{border-color:var(--glow);box-shadow:0 0 22px -8px var(--glow-soft)}.pw-dl .val{color:var(--glow)}
 /* footer */
 footer{padding:50px 0 80px;border-top:1px solid var(--line2);color:var(--faint);font-family:var(--mono);font-size:.78rem;display:flex;justify-content:space-between;flex-wrap:wrap;gap:16px}
 footer a{color:var(--dim)}footer a:hover{color:var(--glow)}
@@ -216,7 +231,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
     <div class="brand">smol<span class="dot">▚</span><span class="cursor"></span></div>
     <nav>
       <a href="#vitals">vitals</a><a href="#game">the game</a><a href="#controls">controls</a>
-      <a href="#mission">mission control</a><a href="#roadmap">roadmap</a><a href="#research">research</a><a href="#board">board</a><a href="#case">case</a>
+      <a href="#mission">mission control</a><a href="#roadmap">roadmap</a><a href="#research">research</a><a href="#board">board</a><a href="#pocketwatch">watch</a><a href="#case">case</a>
     </nav>
     <div class="live" id="live"><span class="led"></span><span id="liveTxt">connecting…</span></div>
   </div>
@@ -404,6 +419,33 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
     <li><b>SIGMDEL · I²C+SPI</b><a href="https://github.com/sigmdel/mini_esp32c3_oled_sketches" target="_blank">Runs the OLED (I²C) + an SPI device together; ships board defs. ↗</a></li>
     <li><b>◇ FULL LIST</b><a href="https://github.com/jphein/smol/blob/main/docs/board-repos.md" target="_blank">All discovered repos, updated as the search agents report → docs/board-repos.md ↗</a></li>
   </ul>
+</div></section>
+
+<!-- POCKET WATCH -->
+<section id="pocketwatch"><div class="wrap">
+  <div class="sec-head reveal">
+    <span class="kicker">09 — Pocket Watch</span>
+    <h2>We designed smol a pocket watch.</h2>
+    <p data-edit="pw.intro">No printable pocket-watch case existed for this board, so an agent generated one from scratch — a parametric round shell with a chain bail, a window sized to the OLED glass, pockets for the board + a 502030 LiPo, a USB-C charging slot, and a press-fit back lid. These are live renders of the actual STL.</p>
+  </div>
+  <div class="pw reveal">
+    <figure class="pw-hero">
+      <img src="renders/pw_body_front.png" alt="Pocket watch case, front view" loading="lazy">
+      <figcaption>Front — chain bail at 12 o'clock, OLED window centered</figcaption>
+    </figure>
+    <div class="pw-side">
+      <figure><img src="renders/pw_body_threequarter.png" alt="Pocket watch case, three-quarter view" loading="lazy"><figcaption>¾ view — USB-C slot + BOOT hole on the rim</figcaption></figure>
+      <figure><img src="renders/pw_assembly_threequarter.png" alt="Pocket watch case with lid" loading="lazy"><figcaption>Body + press-fit back lid</figcaption></figure>
+    </div>
+  </div>
+  <div class="pw-strip reveal">
+    <div class="pw-spec"><span class="lbl">Diameter</span><span class="val">43.1 mm</span></div>
+    <div class="pw-spec"><span class="lbl">Height</span><span class="val">19.6 mm</span></div>
+    <div class="pw-spec"><span class="lbl">Battery</span><span class="val">502030 LiPo</span></div>
+    <div class="pw-spec"><span class="lbl">Parts</span><span class="val">body + lid</span></div>
+    <div class="pw-spec"><span class="lbl">Watertight</span><span class="val">✓ printable</span></div>
+    <a class="pw-spec pw-dl" href="https://github.com/jphein/smol/tree/main/experiments/pocketwatch" target="_blank"><span class="lbl">Files</span><span class="val">STL + generator ↗</span></a>
+  </div>
 </div></section>
 
 <!-- PRINT A CASE -->

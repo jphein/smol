@@ -6,7 +6,7 @@
     { "id": 3, "title": "Install Bluepad32 core (BLE controller)", "status": "done", "owner": "FLASHER" },
     { "id": 4, "title": "Compile + flash Block Digger", "status": "done", "owner": "FLASHER" },
     { "id": 5, "title": "Pair Stadia controller · verify gameplay", "status": "done", "owner": "you" },
-    { "id": 6, "title": "Create GitHub repo + keep synced", "status": "done", "owner": "FORGE" },
+    { "id": 6, "title": "Create GitHub repo (public) + keep synced", "status": "done", "owner": "FORGE" },
     { "id": 7, "title": "Build editable project website", "status": "done", "owner": "you + Claude" },
     { "id": 8, "title": "Research interesting ESP32-C3 firmware", "status": "done", "owner": "SCOUT" },
     { "id": 9, "title": "NES-on-C3 feasibility + build plan", "status": "done", "owner": "ARCADE" },
@@ -21,6 +21,10 @@
     { "id": 18, "title": "Second game: Snake (games/snake)", "status": "done", "owner": "PIXELPORT" },
     { "id": 19, "title": "Smartwatch firmware: base + toolchain + starter", "status": "done", "owner": "CHRONOS" },
     { "id": 20, "title": "Generate a pocket-watch case w/ battery", "status": "done", "owner": "LOCKET" },
-    { "id": 21, "title": "Simple clock in Rust (no_std esp-hal)", "status": "active", "owner": "you + Claude" }
+    { "id": 21, "title": "Rust firmware: clock → WiFi/NTP → ESP-NOW switching", "status": "active", "owner": "OXIDE" },
+    { "id": 22, "title": "Walkie-talkie over ESP-NOW: feasibility + parts", "status": "done", "owner": "SQUELCH" },
+    { "id": 23, "title": "2-player Snake over ESP-NOW", "status": "active", "owner": "DUEL" },
+    { "id": 24, "title": "Add TP4056 charger pocket to pocket-watch case", "status": "active", "owner": "LOCKET" },
+    { "id": 25, "title": "Full LE Audio research (docs/le-audio.md)", "status": "active", "owner": "AURA" }
   ]
 }
