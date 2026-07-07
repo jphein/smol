@@ -20,11 +20,14 @@
     { "id": 17, "title": "Add piezo sound to the game (docs/sound.md)", "status": "done", "owner": "CHIPTUNE" },
     { "id": 18, "title": "Second game: Snake (games/snake)", "status": "done", "owner": "PIXELPORT" },
     { "id": 19, "title": "Smartwatch firmware: base + toolchain + starter", "status": "done", "owner": "CHRONOS" },
-    { "id": 20, "title": "Generate a pocket-watch case w/ battery", "status": "done", "owner": "LOCKET" },
+    { "id": 20, "title": "Pocket-watch case: slim + charger variants", "status": "done", "owner": "LOCKET" },
     { "id": 21, "title": "Rust firmware: clock → WiFi/NTP → ESP-NOW switching", "status": "active", "owner": "OXIDE" },
     { "id": 22, "title": "Walkie-talkie over ESP-NOW: feasibility + parts", "status": "done", "owner": "SQUELCH" },
-    { "id": 23, "title": "2-player Snake over ESP-NOW", "status": "active", "owner": "DUEL" },
-    { "id": 24, "title": "Add TP4056 charger pocket to pocket-watch case", "status": "active", "owner": "LOCKET" },
-    { "id": 25, "title": "Full LE Audio research (docs/le-audio.md)", "status": "active", "owner": "AURA" }
+    { "id": 23, "title": "2-player Snake over ESP-NOW (compiles!)", "status": "done", "owner": "DUEL" },
+    { "id": 24, "title": "Add TP4056 charger pocket to pocket-watch case", "status": "done", "owner": "LOCKET" },
+    { "id": 25, "title": "Full LE Audio research (docs/le-audio.md)", "status": "done", "owner": "AURA" },
+    { "id": 26, "title": "Showcase pocket-watch case + renders on site", "status": "done", "owner": "you + Claude" },
+    { "id": 27, "title": "Surface all research + code on the site", "status": "done", "owner": "you + Claude" },
+    { "id": 28, "title": "Case v2: both buttons at top + clear-PLA LED holes", "status": "active", "owner": "PORTAL" }
   ]
 }

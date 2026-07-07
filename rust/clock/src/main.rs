@@ -15,6 +15,10 @@
 #![no_std]
 #![no_main]
 
+// Phase 3 stores inbound ESP-NOW messages as owned Strings for display.
+#[cfg(feature = "espnow")]
+extern crate alloc;
+
 use embedded_graphics::{
     mono_font::{ascii::FONT_6X10, ascii::FONT_5X8, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
@@ -83,28 +87,69 @@ fn main() -> ! {
 
     let delay = Delay::new();
 
-    // Give WiFi/SNTP (Phase 2+) a chance to correct the clock. Under the
-    // default (Phase 1) build this is a no-op returning `None`; under
-    // `--features wifi` it brings the radio up for a burst SNTP query.
+    // Radio bring-up varies by build phase. Each branch produces `synced`
+    // (Option<u32> Unix time) and, for Phase 3, a live ESP-NOW `radio`.
+    //
+    //  * Phase 1 (default):        no radio; `synced = None`.
+    //  * Phase 2 (`wifi`):         WiFi burst -> SNTP -> Unix time.
+    //  * Phase 3 (`espnow`):       WiFi burst for NTP, then TIME-SHARE the
+    //                              single radio over to ESP-NOW for messaging.
+
     #[cfg(not(feature = "wifi"))]
     let synced = net::try_time_sync();
 
-    #[cfg(feature = "wifi")]
+    #[cfg(all(feature = "wifi", not(feature = "espnow")))]
     let synced = net::try_time_sync(net::WifiPeripherals {
         timg0: peripherals.TIMG0,
         rng: peripherals.RNG,
         wifi: peripherals.WIFI,
     });
 
+    #[cfg(feature = "espnow")]
+    let (mut radio, synced) = net::mode::start(
+        net::WifiPeripherals {
+            timg0: peripherals.TIMG0,
+            rng: peripherals.RNG,
+            wifi: peripherals.WIFI,
+        },
+        // This unit's short id, embedded in the broadcast "hello from smol NNN".
+        7,
+    );
+
     let mut seconds_of_day: u32 = match synced {
         Some(unix) => unix % 86_400,
         None => START_SECONDS_OF_DAY,
     };
 
+    // Bottom-line label. In Phase 3 it is replaced by the last ESP-NOW peer
+    // message (an owned String); in Phase 1/2 it stays the static "smol".
+    #[cfg(feature = "espnow")]
+    let mut bottom_line = alloc::string::String::from("smol");
+
     // --- Render loop ---------------------------------------------------------
-    // One tick per second: clear the framebuffer, draw HH:MM:SS + label, flush.
+    // One tick per second: service the radio (Phase 3), then clear the
+    // framebuffer, draw HH:MM:SS + the bottom line, and flush.
     let mut buf = [0u8; 8]; // "HH:MM:SS"
+    #[cfg(feature = "espnow")]
+    let mut tick: u32 = 0;
     loop {
+        // Phase 3: broadcast a hello once per 5 s and display any inbound msg.
+        #[cfg(feature = "espnow")]
+        if let Some(r) = radio.as_mut() {
+            if let Some((_src, text)) = r.poll_message() {
+                bottom_line = text;
+            }
+            if tick % 5 == 0 {
+                r.broadcast_hello();
+            }
+        }
+
+        // Resolve the bottom-line &str for this frame (String view or static).
+        #[cfg(feature = "espnow")]
+        let bottom: &str = bottom_line.as_str();
+        #[cfg(not(feature = "espnow"))]
+        let bottom: &str = "smol";
+
         format_hms(seconds_of_day, &mut buf);
         let hms = core::str::from_utf8(&buf).unwrap_or("--:--:--");
 
@@ -116,9 +161,8 @@ fn main() -> ! {
             .draw(&mut display)
             .ok();
 
-        // Small "smol" label centered on the bottom: 4 chars * 5px = 20px ->
-        // left margin (72-20)/2 = 26.
-        Text::with_baseline("smol", Point::new(26, 30), label_style, Baseline::Top)
+        // Bottom line (5x8 font). Draw at x=2 so longer peer messages fit.
+        Text::with_baseline(bottom, Point::new(2, 30), label_style, Baseline::Top)
             .draw(&mut display)
             .ok();
 
@@ -126,6 +170,10 @@ fn main() -> ! {
 
         delay.delay_millis(1000);
         seconds_of_day = (seconds_of_day + 1) % 86_400;
+        #[cfg(feature = "espnow")]
+        {
+            tick = tick.wrapping_add(1);
+        }
     }
 }
 

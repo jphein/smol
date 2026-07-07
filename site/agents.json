@@ -10,16 +10,17 @@
     { "name": "CARTRIDGE", "role": "Flashed atomic14 — 5 games + menu (BOOT button)", "status": "done", "glyph": "▤" },
     { "name": "SHELL", "role": "Found 3D-printable cases — no handheld shell yet", "status": "done", "glyph": "⬢" },
     { "name": "PROSPECTOR", "role": "Found 9 new board repos (incl. a Rust one!)", "status": "done", "glyph": "⌖" },
-    { "name": "BEACON", "role": "Found 6 more repos/libs; search now saturated", "status": "done", "glyph": "◎" },
+    { "name": "BEACON", "role": "Found more repos/libs; search now saturated", "status": "done", "glyph": "◎" },
     { "name": "TIMEPIECE", "role": "No exact watch case exists — found adaptable bases", "status": "done", "glyph": "◷" },
     { "name": "VOLT", "role": "Wrote power.md — TP4056 → 5V pin, cut charge current", "status": "done", "glyph": "⌁" },
     { "name": "CHIPTUNE", "role": "Wrote sound guide — LEDC beeps on GPIO10", "status": "done", "glyph": "♪" },
     { "name": "PIXELPORT", "role": "Wrote Snake — 2nd game, self/wall collision", "status": "done", "glyph": "⊞" },
     { "name": "CHRONOS", "role": "Scaffolded watch/ starter — fork HDRobotica, Arduino core", "status": "done", "glyph": "⌚" },
-    { "name": "LOCKET", "role": "Adding a TP4056 charger pocket to the pocket-watch case", "status": "active", "glyph": "⊙" },
-    { "name": "OXIDE", "role": "Building the Rust clock: OLED → WiFi/NTP → ESP-NOW", "status": "active", "glyph": "❖" },
+    { "name": "DUEL", "role": "2-player ESP-NOW Snake — compiles, BOOT-button input", "status": "done", "glyph": "⇄" },
+    { "name": "LOCKET", "role": "Pocket-watch case (slim + charger variants), watertight", "status": "done", "glyph": "⊙" },
     { "name": "SQUELCH", "role": "Walkie-talkie IS feasible on C3 (PTT) — PCMFlowG722", "status": "done", "glyph": "≋" },
-    { "name": "DUEL", "role": "Building 2-player Snake synced over ESP-NOW", "status": "active", "glyph": "⇄" },
-    { "name": "AURA", "role": "Fully researching Bluetooth LE Audio + ESP chip support", "status": "active", "glyph": "⟡" }
+    { "name": "AURA", "role": "LE Audio: C3 can't; only the new ESP32-H4 can", "status": "done", "glyph": "⟡" },
+    { "name": "OXIDE", "role": "Building the Rust clock: OLED → WiFi/NTP → ESP-NOW", "status": "active", "glyph": "❖" },
+    { "name": "PORTAL", "role": "Case v2: both buttons at top + clear-PLA LED holes", "status": "active", "glyph": "◫" }
   ]
 }

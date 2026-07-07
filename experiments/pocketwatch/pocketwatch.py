@@ -384,8 +384,11 @@ def main():
     print(f"INNER diameter : {INNER_DIA:.2f} mm  (radius {INNER_R:.2f})  "
           f"[battery-driven; TP4056 diag {tp_diag:.2f} fits inside]")
     print(f"OUTER diameter : {OUTER_DIA:.2f} mm  (radius {OUTER_R:.2f})")
+    # Net growth vs. the pre-charger design (which ended at ...+BAT_T+BACK_CLEAR,
+    # BACK_CLEAR being 0.6, now re-used as TP_GAP): +TP_T + TP_BACK_CLEAR.
+    depth_growth = TP_T + TP_BACK_CLEAR
     print(f"Interior depth : {INNER_DEPTH:.2f} mm  "
-          f"(+{TP_GAP+TP_T+TP_BACK_CLEAR:.1f} for the TP4056 layer)")
+          f"(+{depth_growth:.1f} vs. no-charger design, for the TP4056 layer)")
     print(f"TOTAL height   : {TOTAL_H:.2f} mm  (excl. bail)")
     print(f"Z: face_out={Z_FACE_OUT:.2f} face_in={Z_FACE_IN:.2f} "
           f"board[{Z_BOARD_BOT:.2f},{Z_BOARD_TOP:.2f}] "

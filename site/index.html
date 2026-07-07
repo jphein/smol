@@ -230,7 +230,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
   <div class="wrap bar">
     <div class="brand">smol<span class="dot">▚</span><span class="cursor"></span></div>
     <nav>
-      <a href="#vitals">vitals</a><a href="#game">the game</a><a href="#controls">controls</a>
+      <a href="#vitals">vitals</a><a href="#game">the game</a><a href="#controls">controls</a><a href="#builds">builds</a>
       <a href="#mission">mission control</a><a href="#roadmap">roadmap</a><a href="#research">research</a><a href="#board">board</a><a href="#pocketwatch">watch</a><a href="#case">case</a>
     </nav>
     <div class="live" id="live"><span class="led"></span><span id="liveTxt">connecting…</span></div>
@@ -341,10 +341,29 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
   </div>
 </div></section>
 
+<!-- BUILDS -->
+<section id="builds"><div class="wrap">
+  <div class="sec-head reveal">
+    <span class="kicker">04 — Builds</span>
+    <h2>Everything we flashed & wrote.</h2>
+    <p data-edit="builds.intro">The actual code living in the repo — games, firmware starters, and experiments. Block Digger and the atomic14 pack are flashed and confirmed on real hardware; the rest compile and are ready to flash.</p>
+  </div>
+  <div class="specs reveal">
+    <a class="spec" href="https://github.com/jphein/smol/tree/main/blockdigger" target="_blank"><span class="n">▚</span><div class="lbl">Block Digger · flashed ✓</div><div class="val">The Minecraft-ish game</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Arduino + Bluepad32 + U8g2. Stadia controller. Runs now.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/tree/main/games/snake" target="_blank"><span class="n">⊞</span><div class="lbl">Snake</div><div class="val">2nd game</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Classic Snake, BLE controller, same stack. Compiles.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/tree/main/games/snake-2p" target="_blank"><span class="n">⇄</span><div class="lbl">2-Player Snake</div><div class="val">Two boards over ESP-NOW</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Wireless head-to-head, BOOT-button input. Compiles clean.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/tree/main/watch" target="_blank"><span class="n">⌚</span><div class="lbl">Watch starter</div><div class="val">NTP clock + weather</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Arduino + Open-Meteo; BLE-notification path stubbed.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/tree/main/rust/clock" target="_blank"><span class="n">❖</span><div class="lbl">Rust clock</div><div class="val">no_std esp-hal</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">OLED → WiFi/NTP → ESP-NOW switching. Bare-metal Rust.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/tree/main/experiments/atomic14-games" target="_blank"><span class="n">▤</span><div class="lbl">atomic14 pack · flashed ✓</div><div class="val">5 single-button games</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Breakout, racer, Defender, jumper, Heli Cave + menu.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/tree/main/experiments/nes-c3" target="_blank"><span class="n">▩</span><div class="lbl">NES experiment</div><div class="val">Emulator base</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Trimmed Anemoia core for a future ST7735 + ESP-IDF port.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/tree/main/docs/walkie-talkie.md" target="_blank"><span class="n">≋</span><div class="lbl">Walkie-talkie</div><div class="val">Voice over ESP-NOW</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Feasible on the bare C3 (PTT) — parts + wiring in docs.</div></a>
+  </div>
+</div></section>
+
 <!-- MISSION CONTROL -->
 <section id="mission"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">04 — Mission Control</span>
+    <span class="kicker">05 — Mission Control</span>
     <h2>Live build status.</h2>
     <p data-edit="mission.intro">This board updates itself. Tasks and the agents working them are tracked in real time as smol comes together — flashing firmware, wrangling git, freeing disk, and more.</p>
   </div>
@@ -365,7 +384,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- ROADMAP -->
 <section id="roadmap" class="road"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">05 — Roadmap</span>
+    <span class="kicker">06 — Roadmap</span>
     <h2>Where smol goes next.</h2>
     <p class="body" data-edit="roadmap.intro">Ideas we're kicking around. Edit this list as the project grows — it's your design doc.</p>
   </div>
@@ -382,7 +401,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- RESEARCH -->
 <section id="research"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">06 — Research</span>
+    <span class="kicker">07 — Research</span>
     <h2>What the agents found.</h2>
     <p data-edit="research.intro">Six agents scouted the ESP32-C3 landscape while smol came together. The full reports live in the repo — here's the map.</p>
   </div>
@@ -390,13 +409,19 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
     <a class="spec" href="https://github.com/jphein/smol/blob/main/docs/gaming-firmware.md" target="_blank"><span class="n">◉</span><div class="lbl">RECON</div><div class="val">Gaming firmware & emulators</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Why retro emulators hit a display wall on the C3.</div></a>
     <a class="spec" href="https://github.com/jphein/smol/blob/main/docs/firmware-ideas.md" target="_blank"><span class="n">✦</span><div class="lbl">SCOUT</div><div class="val">Everything else you can flash</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">ESPHome, MQTT, Rust, BLE HID — and why USB BadUSB is out.</div></a>
     <a class="spec" href="https://github.com/jphein/smol/blob/main/docs/nes-on-c3.md" target="_blank"><span class="n">▩</span><div class="lbl">ARCADE</div><div class="val">NES-on-C3 build plan</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">The real path: add an ST7735 TFT + ESP-IDF port.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/blob/main/docs/power.md" target="_blank"><span class="n">⌁</span><div class="lbl">VOLT</div><div class="val">Battery & charging</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">No onboard charger — TP4056 to 5V, cut the charge current.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/blob/main/docs/sound.md" target="_blank"><span class="n">♪</span><div class="lbl">CHIPTUNE</div><div class="val">Piezo sound</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">LEDC tone on GPIO10 — blips on dig & place.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/blob/main/docs/walkie-talkie.md" target="_blank"><span class="n">≋</span><div class="lbl">SQUELCH</div><div class="val">Walkie-talkie over ESP-NOW</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Feasible on the bare C3 for push-to-talk. Parts + wiring.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/blob/main/docs/wearables.md" target="_blank"><span class="n">◷</span><div class="lbl">TIMEPIECE</div><div class="val">Watch-case research</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Adaptable smartwatch/pocket-watch bases + battery reality.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/blob/main/docs/le-audio.md" target="_blank"><span class="n">⟡</span><div class="lbl">AURA</div><div class="val">Bluetooth LE Audio</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">The C3 can't — and why. The only ESP path is the new H4.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/tree/main/docs" target="_blank"><span class="n">◇</span><div class="lbl">All docs</div><div class="val">The full index</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Every report in one place → docs/ ↗</div></a>
   </div>
 </div></section>
 
 <!-- BUILT FOR THIS BOARD -->
 <section id="board" class="road"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">07 — Built for this board</span>
+    <span class="kicker">08 — Built for this board</span>
     <h2>You're not alone.</h2>
     <p class="body" data-edit="board.intro">Projects that run on this exact ESP32-C3 + 0.42″ OLED (72×40). A couple need their art re-drawn for the tiny screen — noted inline.</p>
   </div>
@@ -440,8 +465,9 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
   </div>
   <div class="pw-strip reveal">
     <div class="pw-spec"><span class="lbl">Diameter</span><span class="val">43.1 mm</span></div>
-    <div class="pw-spec"><span class="lbl">Height</span><span class="val">19.6 mm</span></div>
+    <div class="pw-spec"><span class="lbl">Height</span><span class="val">21.2 mm</span></div>
     <div class="pw-spec"><span class="lbl">Battery</span><span class="val">502030 LiPo</span></div>
+    <div class="pw-spec"><span class="lbl">Charging</span><span class="val">TP4056 pocket</span></div>
     <div class="pw-spec"><span class="lbl">Parts</span><span class="val">body + lid</span></div>
     <div class="pw-spec"><span class="lbl">Watertight</span><span class="val">✓ printable</span></div>
     <a class="pw-spec pw-dl" href="https://github.com/jphein/smol/tree/main/experiments/pocketwatch" target="_blank"><span class="lbl">Files</span><span class="val">STL + generator ↗</span></a>
@@ -451,7 +477,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- PRINT A CASE -->
 <section id="case" class="road"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">08 — Print a case</span>
+    <span class="kicker">10 — Print a case</span>
     <h2>Give smol a shell.</h2>
     <p class="body" data-edit="case.intro">Exact-fit 3D-printable cases for the 0.42″ OLED SuperMini. No dedicated handheld shell exists yet — so for a pocket player, start from an editable one and add a button perch at GPIO9. Board is ~24.8×20.45 mm, USB-C on the short edge opposite the OLED. Full ranked list in <a href="https://github.com/jphein/smol/blob/main/docs/cases.md" target="_blank" style="color:var(--glow)">docs/cases.md</a>.</p>
   </div>
