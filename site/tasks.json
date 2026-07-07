@@ -21,7 +21,7 @@
     { "id": 18, "title": "Second game: Snake (games/snake)", "status": "done", "owner": "PIXELPORT" },
     { "id": 19, "title": "Smartwatch firmware: base + toolchain + starter", "status": "done", "owner": "CHRONOS" },
     { "id": 20, "title": "Pocket-watch case: slim + charger variants", "status": "done", "owner": "LOCKET" },
-    { "id": 21, "title": "Rust firmware: clock → WiFi/NTP → ESP-NOW switching", "status": "active", "owner": "OXIDE" },
+    { "id": 21, "title": "Rust firmware: clock + WiFi/SNTP + ESP-NOW (compiles!)", "status": "done", "owner": "OXIDE" },
     { "id": 22, "title": "Walkie-talkie over ESP-NOW: feasibility + parts", "status": "done", "owner": "SQUELCH" },
     { "id": 23, "title": "2-player Snake over ESP-NOW (compiles!)", "status": "done", "owner": "DUEL" },
     { "id": 24, "title": "Add TP4056 charger pocket to pocket-watch case", "status": "done", "owner": "LOCKET" },

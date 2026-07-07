@@ -20,7 +20,7 @@
     { "name": "LOCKET", "role": "Pocket-watch case (slim + charger variants), watertight", "status": "done", "glyph": "⊙" },
     { "name": "SQUELCH", "role": "Walkie-talkie IS feasible on C3 (PTT) — PCMFlowG722", "status": "done", "glyph": "≋" },
     { "name": "AURA", "role": "LE Audio: C3 can't; only the new ESP32-H4 can", "status": "done", "glyph": "⟡" },
-    { "name": "OXIDE", "role": "Building the Rust clock: OLED → WiFi/NTP → ESP-NOW", "status": "active", "glyph": "❖" },
+    { "name": "OXIDE", "role": "Rust firmware compiles — clock + WiFi/SNTP + ESP-NOW", "status": "done", "glyph": "❖" },
     { "name": "PORTAL", "role": "Case v2: both buttons at top + clear-PLA LED holes", "status": "active", "glyph": "◫" }
   ]
 }
