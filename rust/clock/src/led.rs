@@ -89,7 +89,7 @@ impl LedState {
 #[inline]
 fn blink_phase(now_ms: u64, half_ms: u64) -> bool {
     // (now / half) parity: even half = on, odd half = off.
-    (now_ms / half_ms) % 2 == 0
+    (now_ms / half_ms).is_multiple_of(2)
 }
 
 /// Thin wrapper over the GPIO8 `Output` that applies [`LED_ACTIVE_LOW`] so the

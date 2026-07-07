@@ -22,6 +22,6 @@
     { "name": "AURA", "role": "LE Audio: C3 can't; only the new ESP32-H4 can", "status": "done", "glyph": "⟡" },
     { "name": "OXIDE", "role": "Rust firmware compiles — clock + WiFi/SNTP + ESP-NOW", "status": "done", "glyph": "❖" },
     { "name": "PORTAL", "role": "Case v2 done — buttons + LED pipes at the OLED/top end", "status": "done", "glyph": "◫" },
-    { "name": "PULSE", "role": "Flashing Rust clock + blue-LED peer states to board #1", "status": "active", "glyph": "⏻" }
+    { "name": "PULSE", "role": "Board #1 flashed — Rust clock, WiFi+NTP verified, LED idle", "status": "done", "glyph": "⏻" }
   ]
 }

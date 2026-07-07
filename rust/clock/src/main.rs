@@ -140,8 +140,14 @@ fn main() -> ! {
     );
 
     let mut seconds_of_day: u32 = match synced {
-        Some(unix) => unix % 86_400,
-        None => START_SECONDS_OF_DAY,
+        Some(unix) => {
+            log::info!("smol: time synced via NTP -> {} s-of-day (UTC)", unix % 86_400);
+            unix % 86_400
+        }
+        None => {
+            log::info!("smol: no NTP; clock free-runs from compile-time start");
+            START_SECONDS_OF_DAY
+        }
     };
 
     // Bottom-line label. In Phase 3 it is replaced by the last ESP-NOW peer
@@ -170,6 +176,10 @@ fn main() -> ! {
     let mut first_frame = true; // draw once immediately at startup
     #[cfg(feature = "espnow")]
     let mut subtick: u32 = 0;
+    // Last LED peer-state we logged, so we print only on transitions (gives a
+    // serial-observable trace of the state machine without spamming every tick).
+    #[cfg(feature = "espnow")]
+    let mut last_led_state: Option<led::LedState> = None;
     loop {
         // --- Phase 3: ESP-NOW servicing + LED, every sub-tick ---------------
         #[cfg(feature = "espnow")]
@@ -179,13 +189,18 @@ fn main() -> ! {
                 bottom_line = text;
             }
             // Periodically advertise ourselves so peers can detect + ACK us.
-            if subtick % HELLO_EVERY_SUBTICKS == 0 {
+            if subtick.is_multiple_of(HELLO_EVERY_SUBTICKS) {
                 r.broadcast_hello();
             }
             // Reflect the current peer link state on the blue LED (off / slow
             // blink / solid), phased off the monotonic clock for smooth blink.
             let now = net::mode::now_ms();
-            led.apply(r.peer_led_state(now), now);
+            let state = r.peer_led_state(now);
+            if last_led_state != Some(state) {
+                log::info!("smol: LED -> {:?}", state);
+                last_led_state = Some(state);
+            }
+            led.apply(state, now);
             subtick = subtick.wrapping_add(1);
         }
 

@@ -11,6 +11,7 @@
 //!     only on that same channel (all peers must match it).
 //!   * Want ESP-NOW on a fixed known channel -> drop the WiFi association and
 //!     pin the channel yourself (time-sharing).
+//!
 //! `crate::net::mode::RadioManager` (Phase 3) makes this trade-off explicit.
 //! Phase 2 uses only the WiFi-burst path: connect, DHCP, SNTP, done.
 //!
@@ -99,9 +100,10 @@ pub fn try_time_sync(p: WifiPeripherals) -> Option<u32> {
 
     // --- Radio init ------------------------------------------------------
     let timg0 = TimerGroup::new(p.timg0);
+    // `Rng` is a `Copy` handle; keep our own copy for the SNTP port seed.
     let rng = Rng::new(p.rng);
     let esp_wifi_ctrl: EspWifiController<'static> =
-        esp_wifi::init(timg0.timer0, rng.clone()).ok()?;
+        esp_wifi::init(timg0.timer0, rng).ok()?;
     // Leak the controller so its borrow lives 'static for the rest of the
     // burst; the device is dropped when we return, which stops WiFi cleanly.
     let esp_wifi_ctrl: &'static EspWifiController<'static> =
@@ -267,10 +269,8 @@ fn sntp_query(
 
         let socket = sockets.get_mut::<udp::Socket>(udp_handle);
 
-        if !sent && socket.can_send() {
-            if socket.send_slice(&request, server).is_ok() {
-                sent = true;
-            }
+        if !sent && socket.can_send() && socket.send_slice(&request, server).is_ok() {
+            sent = true;
         }
 
         if socket.can_recv() {

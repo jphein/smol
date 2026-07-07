@@ -196,9 +196,10 @@ impl RadioManager {
 
         let timg0 = TimerGroup::new(p.timg0);
         let rng = Rng::new(p.rng);
-        // esp-wifi's `init` wants the RNG by value; keep a clone for our own
-        // SNTP ephemeral-port seed (Rng is a cheap handle, not the entropy).
-        let ctrl: EspWifiController<'static> = esp_wifi::init(timg0.timer0, rng.clone()).ok()?;
+        // esp-wifi's `init` takes the RNG by value; `Rng` is a `Copy` handle
+        // (not the entropy itself), so we keep our own copy for the SNTP
+        // ephemeral-port seed while also handing one to `init`.
+        let ctrl: EspWifiController<'static> = esp_wifi::init(timg0.timer0, rng).ok()?;
         let ctrl: &'static EspWifiController<'static> =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(ctrl));
 
@@ -225,14 +226,11 @@ impl RadioManager {
     /// so the radio is free to time-share to ESP-NOW next.
     pub fn burst_ntp(&mut self, tick: &mut dyn FnMut()) -> Option<u32> {
         let mut sta = self.sta.take()?;
-        let synced = crate::net::wifi::run_ntp_burst(
-            &mut self.controller,
-            &mut sta,
-            self.rng.clone(),
-            tick,
-        );
-        // Drop the STA device + smoltcp stack; the ESP-NOW handle stays live.
-        drop(sta);
+        let synced =
+            crate::net::wifi::run_ntp_burst(&mut self.controller, &mut sta, self.rng, tick);
+        // `sta` (the STA device + its smoltcp stack) falls out of scope here,
+        // releasing the WiFi datapath; the ESP-NOW handle stays live for the
+        // clock loop. We took it out of `self.sta` so it can't be reused.
         synced
     }
 

@@ -42,7 +42,19 @@ esp-hal = { version = "=1.0.0-rc.0", features = ["esp32c3", "unstable"] }
 # Enabling esp-backtrace's `exception-handler` too causes a duplicate
 # `ExceptionHandler` symbol and an LTO bitcode-load failure at link time.
 esp-backtrace = { version = "=0.17.0", features = ["esp32c3", "panic-handler", "println"] }
-esp-println = { version = "=0.15.0", features = ["esp32c3", "log-04"] }
+# Force the USB Serial/JTAG backend explicitly. This board's console is the
+# native USB Serial/JTAG link (/dev/ttyACM0); esp-println's default `auto`
+# backend only routes to USB-JTAG when it detects host SOF packets at the
+# instant it writes, which proved unreliable during the busy WiFi burst and
+# left app logs going to the (unwired) UART0. `jtag-serial` pins the output to
+# USB-JTAG so boot/WiFi/NTP/ESP-NOW logs always appear on /dev/ttyACM0.
+esp-println = { version = "=0.15.0", default-features = false, features = [
+    "esp32c3",
+    "log-04",
+    "jtag-serial",
+    "colors",
+    "critical-section",
+] }
 log = "0.4"
 
 # --- Display stack (Phase 1, always on) ----------------------------------

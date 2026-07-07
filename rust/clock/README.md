@@ -12,11 +12,11 @@ Built on `esp-hal` 1.0 (RISC-V bare metal — **not** ESP-IDF/std).
 
 All three phases build cleanly with `cargo build --release` (zero warnings):
 
-| Phase | Feature flag        | What it does                                                        | Status            |
-|-------|---------------------|---------------------------------------------------------------------|-------------------|
-| 1     | *(default)*         | Clock on the OLED, free-running from a compile-time start constant   | ✅ compiles + links |
-| 2     | `--features wifi`   | + WiFi STA, DHCP, SNTP real-time sync (raw `smoltcp`, blocking)      | ✅ compiles + links |
-| 3     | `--features espnow` | + ESP-NOW broadcast/receive + WiFi↔ESP-NOW time-share switching      | ✅ compiles + links |
+| Phase | Feature flag        | What it does                                                        | Status                    |
+|-------|---------------------|---------------------------------------------------------------------|---------------------------|
+| 1     | *(default)*         | Clock on the OLED, free-running from a compile-time start constant   | ✅ compiles + links         |
+| 2     | `--features wifi`   | + WiFi STA, DHCP, SNTP real-time sync (raw `smoltcp`, blocking)      | ✅ compiles + links         |
+| 3     | `--features espnow` | + WiFi/NTP burst, ESP-NOW HELLO/ACK peer handshake, blue-LED state machine, WiFi↔ESP-NOW time-share | ✅ **flashed + verified on HW** |
 
 `espnow` implies `wifi`. Every phase produces a valid RISC-V
 (`riscv32imc-unknown-none-elf`) ELF.
@@ -38,19 +38,21 @@ cargo build --release --features espnow     # Phase 3
   `DisplaySize72x40`, `embedded-graphics` text, `HH:MM:SS` counting once per
   second off a blocking `Delay`.
 * **Phase 2** is a full blocking WiFi→DHCP→SNTP path written directly against
-  `smoltcp` (no async executor, no git-only crates). It compiles and links. It
-  is *untested on hardware* (build-only task) and needs real WiFi credentials
-  before it can associate — see [Configuration](#configuration).
-* **Phase 3** implements the ESP-NOW send/receive loop and an explicit
+  `smoltcp` (no async executor, no git-only crates). The **`wifi`-only** binary
+  hasn't itself been flashed, but its `run_ntp_burst` is the *same* code the
+  hardware-verified `espnow` build runs, and there it associates, gets a DHCP
+  lease, and returns correct UTC time (see
+  [Hardware-verified behaviour](#hardware-verified-behaviour)). Needs real WiFi
+  credentials — see [Configuration](#configuration).
+* **Phase 3** implements the ESP-NOW HELLO/ACK peer handshake, an explicit
   `RadioManager` with a `Mode` enum + `switch()` covering **both** single-radio
-  strategies (coexist / time-share). It compiles and links.
-  **One integration honesty note:** esp-wifi hands out the WiFi STA `WifiDevice`
-  exactly once from `Interfaces`. In the `espnow` build the ESP-NOW handle is
-  kept live for the clock loop, so the Phase-3 NTP burst currently associates to
-  the AP (proving the WiFi side) but does **not** re-drive the full DHCP/SNTP
-  smoltcp stack — that full run lives in the `wifi`-only build
-  (`net::wifi::try_time_sync`). Wiring the single shared `WifiDevice` through the
-  Phase-3 flow is the one remaining integration step; it is *not* faked green.
+  strategies (coexist / time-share), and the blue-LED peer-state machine. It is
+  **flashed and verified on hardware** (see [Hardware-verified behaviour](#hardware-verified-behaviour)):
+  at boot it runs a **real** WiFi → DHCP → SNTP burst (the STA `WifiDevice` and
+  the ESP-NOW handle both come from the same `Interfaces`; the burst drives the
+  STA device, then drops it before pinning the ESP-NOW channel, so the single
+  radio is never double-driven), syncs real UTC time, then time-shares the radio
+  to ESP-NOW on a fixed channel and runs the clock + handshake loop.
 
 ---
 
@@ -138,14 +140,40 @@ coordinates `(0,0)..(72,40)` map onto the visible area — no manual offset need
 
 ## Configuration
 
-Set these `const` placeholders before flashing (currently dummy values):
+### WiFi credentials (git-ignored — the repo is PUBLIC)
 
-* WiFi credentials — `WIFI_SSID` / `WIFI_PASSWORD` in **`src/net/wifi.rs`**
-  (Phase 2) and **`src/net/mode.rs`** (Phase 3).
+WiFi credentials live in **`src/secrets.rs`**, which is **git-ignored**
+(`.gitignore`: `**/secrets.rs`) so real credentials never land in this public
+repo. A tracked template `src/secrets.rs.example` holds placeholders. On a fresh
+clone:
+
+```bash
+cd rust/clock
+cp src/secrets.rs.example src/secrets.rs      # then edit with your SSID/password
+```
+
+`src/secrets.rs` exposes two consts consumed by the `wifi`/`espnow` builds:
+
+```rust
+pub const WIFI_SSID: &str = "your-ssid";
+pub const WIFI_PASS: &str = "your-password";
+```
+
+The Phase-1 (default) build needs no WiFi and does not compile the secrets module.
+
+> ⚠️ Never `git add` `src/secrets.rs`. Confirm with
+> `git check-ignore rust/clock/src/secrets.rs` (should echo the path) and check
+> `git status` does not list it before committing.
+
+### Other compile-time settings
+
 * Clock start (Phase-1 fallback) — `START_SECONDS_OF_DAY` in `src/main.rs`.
-* This unit's ESP-NOW id — passed to `net::mode::start(..., 7)` in `src/main.rs`.
+* This unit's ESP-NOW id — passed to `net::mode::start(..., 7, ..)` in `src/main.rs`
+  (each board on the mesh should get a **distinct** id, 0–255).
 * Fixed ESP-NOW channel (time-share mode) — `ESP_NOW_FIXED_CHANNEL` in
   `src/net/mode.rs` (default 6; all peers must agree).
+* Peer staleness window — `PEER_STALE_MS` in `src/net/mode.rs` (default 3000 ms).
+* Blue-LED polarity — `LED_ACTIVE_LOW` in `src/led.rs` (default `true`).
 * NTP server — `NTP_SERVER_IP` in `src/net/wifi.rs` (default: Cloudflare NTP
   anycast `162.159.200.123`; hardcoded IP so no DNS resolver is needed).
 
@@ -180,36 +208,185 @@ implements **both** honest options:
   ESP-NOW mode; re-syncing time means another WiFi burst.
 
 The default `main` flow (Phase 3) uses **TIME-SHARE**: `net::mode::start()` brings
-the radio up in STA mode, does a WiFi burst, then `switch(Mode::EspNow)` pins the
-fixed channel and the clock loop broadcasts `"hello from smol NNN"` every ~5 s
-while displaying the most recent inbound peer message on the OLED's bottom line.
-Because esp-wifi's `init` must run exactly once, `RadioManager` initialises the
-radio a single time and keeps both the `WifiController` and the `EspNow` handle
-alive for the program's lifetime — "switching" chooses which stack is serviced
-and retunes the channel; it never re-inits the radio.
+the radio up in STA mode, runs a real WiFi→DHCP→SNTP burst, then `switch(Mode::EspNow)`
+pins the fixed channel and the clock loop runs the peer handshake (below) while
+displaying the most recent peer activity on the OLED's bottom line. Because
+esp-wifi's `init` must run exactly once, `RadioManager` initialises the radio a
+single time and keeps both the `WifiController` and the `EspNow` handle alive for
+the program's lifetime — "switching" chooses which stack is serviced and retunes
+the channel; it never re-inits the radio.
 
 ---
 
-## Flashing later (with espflash)
+## Blue status LED (GPIO8) + peer handshake
 
-This task was **build-only** — nothing was flashed. To flash on a machine with
-the board on USB (default `/dev/ttyACM0`):
+The onboard **blue LED on GPIO8** is a four-state indicator of WiFi/NTP progress
+and ESP-NOW peer link status. GPIO8 on the C3 SuperMini is **active-low** (driving
+it LOW lights it); this polarity is a single documented const,
+[`LED_ACTIVE_LOW`](src/led.rs) (`true`), and everything else in `src/led.rs` works
+in logical on/off. GPIO8 is also a boot **strapping pin** — the firmware creates
+the `Output` initialised to the logical-OFF level and only drives it *after* boot,
+so it is never held low through a reset.
 
-```bash
-cargo install espflash            # one-time
+### The four states (distinct blink rates, tellable apart by eye)
 
-# Flash + open serial monitor (the runner in .cargo/config.toml already does this):
-cargo run --release                     # Phase 1
-cargo run --release --features espnow   # Phase 3
+| State          | LED behaviour       | Meaning                                                                 |
+|----------------|---------------------|-------------------------------------------------------------------------|
+| **WiFi/NTP sync** | **FAST blink ~10 Hz** (50 ms on/off) | WiFi associating / DHCP / SNTP in progress (the boot-time burst) |
+| **Idle**          | **OFF**            | No ESP-NOW peer heard (last peer beacon older than `PEER_STALE_MS` ≈ 3 s) |
+| **Peer detected** | **SLOW blink ~2 Hz** (250 ms on/off) | Heard a peer `HELLO` beacon, but the two-way link is **not** yet confirmed |
+| **Connected**     | **SOLID on**       | Bidirectional handshake confirmed (we heard the peer **and** hold an `ACK` proving the peer heard us) |
 
-# …or explicitly:
-espflash flash --monitor \
-  target/riscv32imc-unknown-none-elf/release/clock
+The 10 Hz vs 2 Hz split is a 5× separation, so "still connecting" and "found a
+peer" are obvious without counting flashes. WiFi/NTP normally runs first at boot,
+so the fast blink appears immediately; once NTP finishes, the loop falls through
+to the peer states (off → slow → solid). Blinking is derived from a monotonic
+millisecond clock (a square wave), not a blocking sleep, so the OLED clock keeps
+rendering and the LED never stalls it.
+
+### The handshake (why "detected" ≠ "connected")
+
+ESP-NOW is connectionless: a broadcast tells you nothing about who received it. To
+*honestly* distinguish "I can hear a peer" from "a peer and I have a working link",
+each unit runs a tiny explicit handshake on top of ESP-NOW broadcasts (see the
+long comment in `src/net/mode.rs`):
+
+* Every unit periodically **broadcasts** a `HELLO` beacon carrying its own id
+  (`"SMOLv1 HELLO NNN"`, ~every 2 s).
+* On hearing unit A's `HELLO`, unit B registers A as a peer and replies with a
+  **unicast** `ACK` echoing A's id (`"SMOLv1 ACK NNN"` — "I, B, heard you, A").
+* When A receives an `ACK` carrying **A's own id**, A now has proof its frame was
+  received and the peer is talking back → the link is **bidirectional** →
+  *connected*. Hearing only a `HELLO` (no `ACK` for us yet) → *detected*.
+
+State decays purely on timestamps: if a peer goes away, its frames stop arriving
+and the LED drops Connected → Detected → Idle within `PEER_STALE_MS`.
+
+---
+
+## Hardware-verified behaviour
+
+Flashed to the ESP32-C3 SuperMini on `/dev/ttyACM0` and observed over the USB
+Serial/JTAG console (`espflash flash` + serial capture). **Observed** boot log of
+the `espnow` build (Info level; times are real UTC and matched wall-clock):
+
+```
+INFO - smol booting: Phase 1 clock
+INFO - smol: WiFi associated to '<ssid>'
+INFO - smol: DHCP address 10.0.11.123/24
+INFO - smol: radio -> ESP-NOW (time-share) on ch 6
+INFO - smol: time synced via NTP -> 72657 s-of-day (UTC)      # = 20:10:57 UTC
+INFO - smol: LED -> Idle
 ```
 
-`esp-println` output (boot logs, WiFi/DHCP/SNTP status, ESP-NOW traffic) appears
-in the serial monitor. If your OLED shows nothing, re-check the I²C wiring and
-the 72×40 vertical-offset calibration note above.
+Confirmed on the single available board:
+
+* **Boots cleanly** — one boot, no panic, no reset loop (verified quiet for >10 s
+  of steady-state after boot).
+* **WiFi + real NTP work** — associates to the AP, gets a DHCP lease, and the SNTP
+  reply decodes to the correct current UTC time.
+* **Radio time-shares to ESP-NOW** on the fixed channel, then the clock loop runs.
+* **LED defaults to the no-peer OFF state** — the firmware logs `LED -> Idle` and
+  never spuriously transitions with no peer present.
+
+> **Single-board honesty note.** Only **one** board was available, so the
+> **fast-blink (WiFi/NTP)**, **slow-blink (detected)**, **solid (connected)** and
+> the OLED contents were **not** visually/camera-confirmed. What *is* confirmed is
+> that the firmware **drives** the correct state: the serial `LED -> <state>`
+> trace (logged on every state change) shows it selecting `Idle` at rest, and the
+> `esp-println` log proves the WiFi/NTP/ESP-NOW path (during which the code drives
+> the fast-blink) executes to completion. Verifying the blink/solid transitions
+> and the OLED visually requires a **second unit** — see below.
+
+### esp-println console note
+
+esp-println is pinned to its **`jtag-serial`** backend (not the default `auto`) so
+logs always reach `/dev/ttyACM0`; `auto` only routes to USB-JTAG when it detects
+host SOF packets at write time, which dropped app logs to the (unwired) UART0 on
+this board. Log level is baked in at compile time from `ESP_LOG`, so build with
+`ESP_LOG=info cargo build ...` to see the `INFO` lines above (an unset `ESP_LOG`
+compiles the level to `Off` and the app runs **silently**).
+
+---
+
+## Testing the LED states with two boards
+
+The blink/solid states need two units on the **same `ESP_NOW_FIXED_CHANNEL`**.
+
+1. **Give each board a distinct id.** In `src/main.rs`, board A keeps
+   `net::mode::start(..., 7, ..)`; change board B to a different id, e.g. `8`.
+   (Both must share the same `ESP_NOW_FIXED_CHANNEL`, default 6.)
+2. **Flash both** with `--features espnow` (see [Flashing](#flashing-with-espflash)).
+   Each can use the same or different WiFi in `secrets.rs`; NTP is independent.
+3. **Power-on sequence + expected LED:**
+   * At boot each board **fast-blinks (~10 Hz)** during its WiFi/NTP burst, then
+     goes **OFF** (Idle) because it hasn't heard a peer yet.
+   * Bring the **second** board up (or reset it) within a few seconds of the first.
+     As soon as board A hears board B's `HELLO`, A **slow-blinks (~2 Hz)**
+     (*detected*). The instant A also receives B's `ACK` for A's own id, A goes
+     **SOLID** (*connected*) — and symmetrically for B. In practice both settle to
+     **SOLID** within one or two `HELLO` periods (≈2–4 s).
+   * **Power off / move one board out of range:** the other drops SOLID → SLOW →
+     OFF within `PEER_STALE_MS` (~3 s) as beacons/ACKs stop arriving.
+4. **Watch it on serial too:** each board logs `smol: LED -> PeerDetected` then
+   `-> Connected` (and back to `-> Idle` when the peer leaves), and the OLED bottom
+   line shows `peer NNN` / `linked`. Capture with:
+
+   ```bash
+   sudo chmod a+rw /dev/ttyACM0
+   espflash monitor --port /dev/ttyACM0          # Ctrl+R resets, Ctrl+C exits
+   ```
+
+To sanity-check the blink *rates* with a single board, temporarily hard-code
+`peer_led_state` to return `LedState::PeerDetected` (or `Connected`) — but the real
+two-way transitions require the second unit.
+
+---
+
+## Flashing with espflash
+
+The `espnow` build is flashed with **espflash v3** (see the install note below).
+With the board on USB (default `/dev/ttyACM0`):
+
+```bash
+# The board's port is root:dialout and the user may not be in `dialout`:
+sudo chmod a+rw /dev/ttyACM0
+
+# Build (ESP_LOG=info so boot/WiFi/NTP/ESP-NOW logs are visible on serial):
+ESP_LOG=info cargo build --release --features espnow
+
+# Flash the built ELF (espflash v3 auto-generates bootloader + partition table):
+espflash flash --port /dev/ttyACM0 \
+  target/riscv32imc-unknown-none-elf/release/clock
+
+# Then watch the serial console:
+espflash monitor --port /dev/ttyACM0        # Ctrl+R = reset, Ctrl+C = exit
+```
+
+> **Use espflash v3, not v4.** espflash **v4+** requires an ESP-IDF *app
+> descriptor* (`esp_bootloader_esp_idf::esp_app_desc!()`) that this esp-hal
+> `1.0.0-rc.0` project does not emit, and refuses to flash without it. Install
+> the v3 line instead:
+> ```bash
+> cargo install espflash --version "^3"
+> ```
+
+### Installing espflash on a box with a broken `cc` shim
+
+If `cargo install espflash` fails with `Unknown: -m64` (host build-script link
+errors) or a `ring`/cc-rs C-compile error, the machine has a non-compiler `cc`
+earlier on `PATH` (this box does — see `.cargo/config.toml`). Force the real GCC
+for both linking **and** cc-rs C compilation:
+
+```bash
+CC=gcc \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc \
+cargo install espflash --version "^3"
+```
+
+`esp-println` output (boot logs, WiFi/DHCP/SNTP status, LED state transitions,
+ESP-NOW traffic) appears in the serial monitor. If your OLED shows nothing,
+re-check the I²C wiring and the 72×40 vertical-offset calibration note above.
 
 ---
 
@@ -221,9 +398,12 @@ rust/clock/
 ├── rust-toolchain.toml   # rustc 1.96.1 + riscv32imc target
 ├── .cargo/config.toml    # target, build-std, linker scripts, host-cc workaround
 └── src/
-    ├── main.rs           # entry, display, clock render loop, phase wiring
+    ├── main.rs           # entry, display, clock+LED render loop, phase wiring
+    ├── led.rs            # Phase 3: blue-LED (GPIO8) 4-state machine + polarity
+    ├── secrets.rs        # LOCAL, git-ignored WiFi credentials (copy from .example)
+    ├── secrets.rs.example# tracked template for secrets.rs
     └── net/
         ├── mod.rs (net.rs)  # feature gating + shared heap init
         ├── wifi.rs          # Phase 2: WiFi STA + DHCP + SNTP (smoltcp, blocking)
-        └── mode.rs          # Phase 3: ESP-NOW + RadioManager (WiFi↔ESP-NOW switch)
+        └── mode.rs          # Phase 3: ESP-NOW HELLO/ACK handshake + RadioManager
 ```
