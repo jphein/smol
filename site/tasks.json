@@ -32,6 +32,7 @@
     { "id": 29, "title": "Rust clock: blue-LED peer states — VERIFIED (2 boards go solid)", "status": "done", "owner": "PULSE + you" },
     { "id": 30, "title": "Bigger PST clock — verified on hardware (board #2)", "status": "done", "owner": "you + Claude" },
     { "id": 31, "title": "Flash 2-player Snake to boards #1 + #2 (head-to-head)", "status": "done", "owner": "you + Claude" },
-    { "id": 32, "title": "Commit Rust clock improvements (PST + big font) with default id", "status": "done", "owner": "Claude" }
+    { "id": 32, "title": "Commit Rust clock improvements (PST + big font) with default id", "status": "done", "owner": "Claude" },
+    { "id": 33, "title": "Publish site to GitHub Pages (auto-deploy on push) — jphein.github.io/smol", "status": "done", "owner": "Claude" }
   ]
 }
