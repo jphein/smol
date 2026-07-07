@@ -9,6 +9,11 @@
     { "id": 6, "title": "Create GitHub repo + keep synced", "status": "done", "owner": "FORGE" },
     { "id": 7, "title": "Build editable project website", "status": "done", "owner": "you + Claude" },
     { "id": 8, "title": "Research interesting ESP32-C3 firmware", "status": "done", "owner": "SCOUT" },
-    { "id": 9, "title": "NES-on-C3 feasibility + build plan", "status": "done", "owner": "ARCADE" }
+    { "id": 9, "title": "NES-on-C3 feasibility + build plan", "status": "done", "owner": "ARCADE" },
+    { "id": 10, "title": "Install atomic14 single-button games", "status": "done", "owner": "CARTRIDGE" },
+    { "id": 11, "title": "Link board projects on the site", "status": "done", "owner": "you + Claude" },
+    { "id": 12, "title": "Find 3D-printable cases (STL) for this board", "status": "done", "owner": "SHELL" },
+    { "id": 13, "title": "Keep discovering board-specific repos", "status": "active", "owner": "PROSPECTOR + BEACON" },
+    { "id": 14, "title": "Find smartwatch + pocket-watch cases", "status": "active", "owner": "TIMEPIECE" }
   ]
 }

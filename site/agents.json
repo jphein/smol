@@ -6,6 +6,11 @@
     { "name": "FORGE", "role": "Created private GitHub repo + sync", "status": "done", "glyph": "⬡", "link": "https://github.com/jphein/smol" },
     { "name": "FLASHER", "role": "Flashed OLED test + game · OLED live at 0x3C", "status": "done", "glyph": "⚡" },
     { "name": "SCOUT", "role": "Surveyed all interesting ESP32-C3 firmware", "status": "done", "glyph": "✦" },
-    { "name": "ARCADE", "role": "Delivered NES-on-C3 build plan (needs ST7735 + IDF)", "status": "done", "glyph": "▩" }
+    { "name": "ARCADE", "role": "Delivered NES-on-C3 build plan (needs ST7735 + IDF)", "status": "done", "glyph": "▩" },
+    { "name": "CARTRIDGE", "role": "Flashed atomic14 — 5 games + menu (BOOT button)", "status": "done", "glyph": "▤" },
+    { "name": "SHELL", "role": "Found 3D-printable cases — no handheld shell yet", "status": "done", "glyph": "⬢" },
+    { "name": "PROSPECTOR", "role": "Deep GitHub sweep for more board repos", "status": "active", "glyph": "⌖" },
+    { "name": "BEACON", "role": "Community-source sweep for more board repos", "status": "active", "glyph": "◎" },
+    { "name": "TIMEPIECE", "role": "Hunting smartwatch + pocket-watch cases", "status": "active", "glyph": "◷" }
   ]
 }
