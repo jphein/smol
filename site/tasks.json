@@ -43,6 +43,9 @@
     { "id": 40, "title": "Unified Rust firmware: Clock + Snake + Bench + OLED 180° (compiles)", "status": "done", "owner": "KERNEL" },
     { "id": 41, "title": "Case v4: crown + classic orientation — DONE (body+lid+crown, watertight)", "status": "done", "owner": "PORTAL" },
     { "id": 42, "title": "Flash unified firmware (12h/AM-PM + °F) to boards #1 (id8) + #2 (id7)", "status": "done", "owner": "you + Claude" },
-    { "id": 43, "title": "Re-render final case (bail-up) + crown on site", "status": "done", "owner": "you + Claude" }
+    { "id": 43, "title": "Re-render final case (bail-up) + crown on site", "status": "done", "owner": "you + Claude" },
+    { "id": 44, "title": "Wrap-up: root README, docs/BUILDING.md, render tool, refreshed memory", "status": "done", "owner": "Claude" },
+    { "id": 45, "title": "Flash board #3 (id 9) for a 3-way ESP-NOW mesh", "status": "pending", "owner": "you + Claude" },
+    { "id": 46, "title": "Wire battery + TP4056 and print/assemble the pocket-watch case", "status": "pending", "owner": "you" }
   ]
 }
