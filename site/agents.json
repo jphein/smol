@@ -13,8 +13,9 @@
     { "name": "BEACON", "role": "Found 6 more repos/libs; search now saturated", "status": "done", "glyph": "◎" },
     { "name": "TIMEPIECE", "role": "No exact watch case exists — found adaptable bases", "status": "done", "glyph": "◷" },
     { "name": "VOLT", "role": "Designing the LiPo charging + power circuit", "status": "active", "glyph": "⌁" },
-    { "name": "CHIPTUNE", "role": "Adding piezo-buzzer sound to the game", "status": "active", "glyph": "♪" },
-    { "name": "PIXELPORT", "role": "Writing a Snake game (2nd cartridge)", "status": "active", "glyph": "⊞" },
-    { "name": "CHRONOS", "role": "Designing the smartwatch firmware + starter", "status": "active", "glyph": "⌚" }
+    { "name": "CHIPTUNE", "role": "Wrote sound guide — LEDC beeps on GPIO10", "status": "done", "glyph": "♪" },
+    { "name": "PIXELPORT", "role": "Wrote Snake — 2nd game, self/wall collision", "status": "done", "glyph": "⊞" },
+    { "name": "CHRONOS", "role": "Designing the smartwatch firmware + starter", "status": "active", "glyph": "⌚" },
+    { "name": "LOCKET", "role": "Generating a pocket-watch case (with battery room)", "status": "active", "glyph": "⊙" }
   ]
 }

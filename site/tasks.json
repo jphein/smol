@@ -17,8 +17,9 @@
     { "id": 14, "title": "Find smartwatch + pocket-watch cases", "status": "done", "owner": "TIMEPIECE" },
     { "id": 15, "title": "Modify case: deepen back for a battery", "status": "done", "owner": "you + Claude" },
     { "id": 16, "title": "Battery + charging solution (docs/power.md)", "status": "active", "owner": "VOLT" },
-    { "id": 17, "title": "Add piezo sound to the game (docs/sound.md)", "status": "active", "owner": "CHIPTUNE" },
-    { "id": 18, "title": "Second game: Snake (games/snake)", "status": "active", "owner": "PIXELPORT" },
-    { "id": 19, "title": "Smartwatch firmware: base + toolchain + starter", "status": "active", "owner": "CHRONOS" }
+    { "id": 17, "title": "Add piezo sound to the game (docs/sound.md)", "status": "done", "owner": "CHIPTUNE" },
+    { "id": 18, "title": "Second game: Snake (games/snake)", "status": "done", "owner": "PIXELPORT" },
+    { "id": 19, "title": "Smartwatch firmware: base + toolchain + starter", "status": "active", "owner": "CHRONOS" },
+    { "id": 20, "title": "Design a pocket-watch case w/ battery (generate STL)", "status": "active", "owner": "LOCKET" }
   ]
 }
