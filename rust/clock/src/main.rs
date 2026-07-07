@@ -319,6 +319,7 @@ fn main() -> ! {
                     if let Some(g) = game.as_mut() {
                         if g.is_dead() {
                             *g = snake::Snake::new(now);
+                            redraw = true; // repaint the fresh board immediately
                         } else {
                             g.on_tap();
                         }
@@ -342,11 +343,12 @@ fn main() -> ! {
 
             AppMode::Snake => {
                 if let Some(g) = game.as_mut() {
-                    let was_dead = g.is_dead();
-                    g.update(now);
-                    // Redraw every tick while alive (the snake moves), and once
-                    // more on the transition into death to show the final frame.
-                    if !g.is_dead() || !was_dead || redraw {
+                    // `update` returns true only when the board actually moved (a
+                    // step, incl. the fatal one). Repaint on a step or a forced
+                    // redraw (mode entry / restart) — not every 20 ms tick — so we
+                    // don't hammer the I²C bus or flicker between the ~220 ms steps.
+                    let stepped = g.update(now);
+                    if stepped || redraw {
                         display.clear(BinaryColor::Off).ok();
                         g.draw(&mut display);
                         if g.is_dead() {

@@ -204,12 +204,16 @@ impl Snake {
 
     /// Advance the simulation if a step is due at `now_ms`. Safe to call every
     /// render tick; it self-limits to one move per [`STEP_MS`]. No-op once dead.
-    pub fn update(&mut self, now_ms: u64) {
+    ///
+    /// Returns `true` if the game state changed this call (a movement step
+    /// happened — including the step that ends the game), so the caller only has
+    /// to repaint the OLED when something actually moved rather than every tick.
+    pub fn update(&mut self, now_ms: u64) -> bool {
         if self.dead {
-            return;
+            return false;
         }
         if now_ms.saturating_sub(self.last_step_ms) < STEP_MS {
-            return;
+            return false;
         }
         self.last_step_ms = now_ms;
 
@@ -225,10 +229,10 @@ impl Snake {
         let nx = head.x as i32 + dx as i32;
         let ny = head.y as i32 + dy as i32;
 
-        // Wall collision -> death.
+        // Wall collision -> death. (A step still occurred, so report `true`.)
         if nx < 0 || ny < 0 || nx >= COLS as i32 || ny >= PLAY_ROWS as i32 {
             self.dead = true;
-            return;
+            return true;
         }
         let new_head = Cell {
             x: nx as u8,
@@ -244,7 +248,7 @@ impl Snake {
         for seg in &self.body[..occupied_len] {
             if *seg == new_head {
                 self.dead = true;
-                return;
+                return true;
             }
         }
 
@@ -274,6 +278,7 @@ impl Snake {
             self.food = random_free_cell(&self.body, self.len, &mut rng);
             self.rng = rng;
         }
+        true
     }
 
     /// Draw the current frame: score line, food (hollow), snake (filled).

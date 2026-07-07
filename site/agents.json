@@ -25,6 +25,6 @@
     { "name": "PULSE", "role": "Rust clock on 2 boards — ESP-NOW CONNECT verified (solid blue) ✓", "status": "done", "glyph": "⏻" },
     { "name": "RESIN", "role": "Wrote enclosure-resin.md — metal kills RF, don't pot a LiPo", "status": "done", "glyph": "⬗" },
     { "name": "PORTAL", "role": "Case: crown = USB-C cover + classic orientation (bail→USB-C)", "status": "active", "glyph": "◫" },
-    { "name": "KERNEL", "role": "Unified Rust firmware: Clock + Snake + Bench (+ OLED 180°)", "status": "active", "glyph": "▦" }
+    { "name": "KERNEL", "role": "Unified Rust firmware DONE — Clock+Snake+Bench, all builds clean", "status": "done", "glyph": "▦" }
   ]
 }

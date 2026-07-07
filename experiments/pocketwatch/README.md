@@ -7,11 +7,18 @@ the battery so the cell can actually be recharged — the SuperMini has **no onb
 charging** (see [`docs/power.md`](../../docs/power.md)). Generated procedurally by
 [`pocketwatch.py`](./pocketwatch.py) with `trimesh` + the `manifold` boolean engine.
 
-The front face also carries **both board buttons routed to the top** (BOOT +
-RESET, via vertical plunger bores) and **two LED light-pipe holes** for the blue
-GPIO8 and power LEDs — see **[Buttons & LEDs](#buttons--leds-read-this)** for the
-researched board layout, the *RESET-is-not-a-firmware-input* caveat, and the
-clear-PLA note.
+The front face also carries **both board buttons** (BOOT + RESET, via vertical
+plunger bores) and **two LED light-pipe holes** for the blue GPIO8 and power LEDs
+— see **[Buttons & LEDs](#buttons--leds-read-this)** for the confirmed board
+layout, the *RESET-is-not-a-firmware-input* caveat, and the clear-PLA note. A
+removable **[crown](#crown-removable-usb-c-port-cover)** hides the USB-C port.
+
+**Classic pocket-watch orientation.** The chain **bail** sits at the **same end as
+the USB-C port + crown** (−Y / 6 o'clock), so — like a real pocket watch —
+**crown + bail hang together at the top**. Hung that way: **TOP** = bail, USB-C /
+crown, and the two LEDs; **BOTTOM** = the OLED window and the two buttons. The
+OLED is **rotated 180° in firmware** so it reads upright when the piece hangs.
+(Set `BAIL_ANGLE_DEG = 90` to put the bail back at the OLED end instead.)
 
 Prior research (see [`docs/cases.md`](../../docs/cases.md)) confirmed no existing
 STL fits this board **plus** an internal 502030 cell, so this one is built from
@@ -35,7 +42,7 @@ Measured from the exported STLs (all three verified **watertight**, single-body)
 | **Outer diameter** | **43.1 mm** *(unchanged — see note)* |
 | Inner (cavity) diameter | 38.3 mm |
 | **Total height (assembled, excl. bail)** | **21.2 mm** *(was 18.6 — grew +2.6 mm for the charger)* |
-| Body bounding box (incl. bail) | 43.1 x 47.1 x 19.6 mm |
+| Body bounding box (incl. bail) | 43.1 x 48.1 x 28.8 mm *(bail now at −Y, standing proud above the crown)* |
 | Lid bounding box | 42.9 x 43.1 x 5.6 mm |
 | **Crown bounding box** | **13.4 x 8.6 x 8.0 mm** (flange 13.4 wide, cap 8.0 dia) |
 | Side wall thickness | 2.4 mm |
@@ -75,23 +82,31 @@ top of the script and re-run to resize for a different board/cell/charger.
 
 ## Orientation on the board (as designed)
 
+**Classic pocket-watch layout:** the piece hangs from the bail with the **USB-C
+end up**. The clock positions below are in the model's **board frame** (OLED at
++Y, USB-C at −Y); when hung, −Y is the **top**.
+
 Looking at the **front face**:
 
-- **12 o'clock (+Y):** OLED window, the chain **bail**, and — on the **front
-  face** at this same OLED end — the **two button plunger bores** (BOOT + RESET,
-  flanking the window left/right). Orient the board so the OLED/button end
-  points up. See **[Buttons & LEDs](#buttons--leds-read-this)** below.
-- **6 o'clock (-Y):** the **SuperMini's** USB-C slot (for flashing / occasional
-  powered use). The board's USB-C edge faces down. This is *up* near the board's
-  Z level (z ~ 14 mm). On the **front face** at this same end sit the **two LED
-  light-pipe holes**, one on each side of the USB-C slot ("PWR" on the −X side,
-  "IO8"/GPIO8 blue on the +X side) — **confirmed from a board photo**.
-- **9 o'clock (-X):** the **TP4056's** USB-C charge slot. This is *down* at the
+- **−Y / 6 o'clock — the TOP when hung:** the chain **bail** (relocated here),
+  the **SuperMini's USB-C slot** + removable **[crown](#crown-removable-usb-c-port-cover)**,
+  and — on the front face — the **two LED light-pipe holes**, one each side of the
+  USB-C slot ("PWR" on the −X side, "IO8"/GPIO8 blue on the +X side, **confirmed
+  from a board photo**). The bail stands proud *above* the crown, so crown + bail
+  read together like a real pocket-watch crown-and-loop.
+- **+Y / 12 o'clock — the BOTTOM when hung:** the **OLED window** and the **two
+  button plunger bores** (BOOT + RESET, flanking the window left/right). The OLED
+  is **rotated 180° in firmware** so it reads upright. See
+  **[Buttons & LEDs](#buttons--leds-read-this)** below.
+- **9 o'clock (−X):** the **TP4056's** USB-C charge slot. This is *down* at the
   TP4056's Z layer (z ~ 3 mm), behind the battery. Two **different** USB-C ports,
   two **different** clock positions, at two **different** heights — they never
   collide (see [charging](#charging-read-this)).
 - **3 o'clock (+X):** *(optional)* a legacy side-wall **BOOT** poke-hole, **off by
   default** (`BOOT_SIDE_HOLE = False`) — both buttons now go through the top face.
+
+> To go back to the older layout (bail at the OLED end, no 180° firmware flip),
+> set `BAIL_ANGLE_DEG = 90` and re-run.
 
 ## Buttons & LEDs (read this)
 
@@ -207,14 +222,14 @@ open slot cleanly.
   grooves with **no supports**; the plug and flange are simple upward extrusions.
 - PLA or PETG, 0.2 mm layers. It's tiny (~0.45 cm³) — print a few spares.
 
-> **Classic-look alternative (not implemented — future option).** Traditionally a
-> pocket-watch crown sits at **12 o'clock, right next to the bail**. Here the crown
-> is at **6 o'clock** because that's where the USB-C port is. A future "classic
-> look" variant could **move the bail to the USB-C (−Y) end** so the crown and bail
-> sit together at the top, and **rotate the OLED 180° in firmware** so the display
-> still reads upright. That's purely an orientation change (bail angle + firmware
-> display flip); the port/crown geometry would stay as-is. Documented here as an
-> idea; the current build keeps bail @ 12 o'clock and crown @ 6 o'clock.
+> **Classic orientation (now the default).** Traditionally a pocket-watch crown
+> sits at the top next to the bail. This build does exactly that: the **bail is
+> at the USB-C (−Y) end together with the crown** (`BAIL_ANGLE_DEG = 270`), and
+> the bail stands proud *above* the crown cap (verified clear, ~1.3 mm gap). Hang
+> it and the **crown + bail are at the top**; the **OLED + buttons are at the
+> bottom**, so **rotate the OLED 180° in firmware** to read upright. To revert to
+> the older bail-at-OLED-end layout, set `BAIL_ANGLE_DEG = 90` and re-run (no
+> firmware flip needed then).
 
 ## Printing
 
@@ -229,11 +244,15 @@ open slot cleanly.
 - **Print face-down** (front face on the bed, open end up). The flat circular
   face gives the best window edges and needs **no supports** — every internal
   overhang (pockets, lid recess) faces upward and prints cleanly.
-- The **bail** is the only real overhang. Face-down it prints as a small
-  horizontal loop off the rim; enable **supports "touching buildplate" only**,
-  or just let a short bridge span the ring hole (it's only ~5 mm). If your
-  slicer struggles, print the body **face-up** instead and support the window +
-  bail — but face-down gives the nicer display bezel.
+- The **bail** now sits at the **−Y (USB-C/crown) end and stands ~9 mm proud of
+  the face** (it loops up above the crown). Face-down (face on the bed), the bail
+  points **downward past the bed plane**, which won't work directly — so either
+  **print the body face-UP** (open end on the bed) with the bail rising cleanly
+  upward off the rim, **or** keep it face-down and let the slicer add **supports
+  "touching buildplate" only** under the bail loop. Face-up needs light support
+  in the OLED window and lid recess; face-down gives the nicer bezel but supports
+  the bail. Either works — pick based on whether you care more about the bezel or
+  avoiding window supports. The ring-hole bridge is only ~5 mm and spans easily.
 
 ### Lid
 - **Print floor-down** (the flat disc on the bed, lip pointing up). **No supports.**
@@ -378,6 +397,22 @@ so they auto-adjust if you resize the window); the **LEDs** are at the **−Y
 | `BLUE_LED_X`, `PWR_LED_X` | the ±X of each LED (IO8/blue +X, PWR −X); swap signs to mirror |
 | `BOOT_SIDE_HOLE` | re-enable the old 3 o'clock **side-wall** BOOT poke (default `False`) |
 
-The script prints the computed diameters/heights (and the TP4056 layer's Z range
-and USB-slot positions), then verifies both parts are **watertight** before
-exporting.
+The **crown** (removable USB-C cover) and the **bail** are parametric too:
+
+| Variable | Meaning |
+|---|---|
+| `CROWN` | export `pocketwatch_crown.stl` (default `True`) |
+| `CROWN_FIT_GAP` | plug clearance per side in the slot — the press fit (default 0.20 mm) |
+| `CROWN_PLUG_DEPTH` | how far the plug reaches into the slot (default 3.2 mm, ≥ wall) |
+| `CROWN_FLANGE_T`, `CROWN_FLANGE_MARGIN` | stop-flange thickness / how far it oversizes the slot |
+| `CROWN_CAP_R`, `CROWN_CAP_H` | crown-cap radius / how far it stands proud |
+| `CROWN_KNURLS`, `CROWN_KNURL_R`, `CROWN_KNURL_DEPTH` | number / size / depth of the knurl flutes |
+| `CROWN_STEM_R` | radius of the waist between flange and cap |
+| `CROWN_TETHER` | add a tiny retention post on the flange (default `False`) |
+| `BAIL_ANGLE_DEG` | bail clock position: **270 = −Y (with the crown, classic — default)**; 90 = +Y (OLED end) |
+| `BAIL_Z_CLEAR` | gap the bail leaves above the USB-C slot / crown cap it sits over |
+| `BAIL_TUBE_R`, `BAIL_RING_R` | chain-loop tube / ring radius |
+
+The script prints the computed diameters/heights (and the TP4056 layer's Z range,
+USB-slot / button / LED / crown / bail positions), then verifies **all three
+parts** (body, lid, crown) are **watertight** before exporting.

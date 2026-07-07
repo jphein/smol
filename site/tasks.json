@@ -40,7 +40,8 @@
     { "id": 37, "title": "Case v3: LED holes → USB-C end (board photo confirmed)", "status": "done", "owner": "PORTAL" },
     { "id": 38, "title": "app-pixels-style modes/apps gallery on the site", "status": "done", "owner": "you + Claude" },
     { "id": 39, "title": "Resin + watch-case enclosure guide (docs/enclosure-resin.md)", "status": "done", "owner": "RESIN" },
-    { "id": 40, "title": "Unified Rust firmware: Clock + Snake + Bench + OLED 180°", "status": "in_progress", "owner": "KERNEL" },
+    { "id": 40, "title": "Unified Rust firmware: Clock + Snake + Bench + OLED 180° (compiles)", "status": "done", "owner": "KERNEL" },
+    { "id": 42, "title": "Flash unified Rust firmware to a board + verify menu/modes", "status": "pending", "owner": "you + Claude" },
     { "id": 41, "title": "Case v4: crown = USB-C cover + classic orientation (bail→USB-C)", "status": "in_progress", "owner": "PORTAL" }
   ]
 }

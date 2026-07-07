@@ -476,12 +476,17 @@ def make_body():
     usb_slot_top = usb_z + USB_SLOT_H / 2.0
     crown_cap_top = (usb_z + CROWN_CAP_R) if CROWN else usb_slot_top
     obstruction_top = max(usb_slot_top, crown_cap_top)
-    neck_half_h = BAIL_TUBE_R + 0.75
+    # The bail's lowest point is the bottom of the RING arc (major+minor radius
+    # below the ring centre), so clear the obstruction by that full reach -- not
+    # just the neck -- so neither the neck nor the ring's lower arc fouls the
+    # seated crown cap standing proud below.
+    bail_reach_down = BAIL_RING_R + BAIL_TUBE_R
     over_obstruction = (BAIL_ANGLE_DEG == TP_USB_ANGLE_DEG) or (BAIL_ANGLE_DEG == 270)
     if over_obstruction:
-        # Bail shares the -Y end with the USB-C slot / crown: lift it to clear them
-        # (it may stand a little proud of the face -- fine for a hang loop).
-        ring_z = obstruction_top + BAIL_Z_CLEAR + neck_half_h
+        # Bail shares the -Y end with the USB-C slot / crown: lift it so its whole
+        # loop clears them (it stands proud of the face -- fine for a hang loop,
+        # and gives the classic "crown below, bail above" pocket-watch look).
+        ring_z = obstruction_top + BAIL_Z_CLEAR + bail_reach_down
     else:
         # Bail is on a clear part of the rim (e.g. the OLED end): keep it tucked
         # just under the front face as before.
@@ -492,9 +497,26 @@ def make_body():
     ring_y = OUTER_R + BAIL_RING_R - BAIL_TUBE_R - 0.5
     ring.apply_translation([0, ring_y, ring_z])
 
-    # A small neck connecting ring to body so it prints as one solid piece.
-    neck = box(extents=[2 * BAIL_TUBE_R + 1.0, BAIL_RING_R + 2.0, 2 * BAIL_TUBE_R + 1.5])
-    neck.apply_translation([0, OUTER_R + (BAIL_RING_R) / 2.0 - 1.0, ring_z])
+    # Neck connecting the ring to the body so it prints as one solid piece. When
+    # the bail is lifted (over the crown), the neck must BRIDGE vertically from
+    # the body wall (which tops out at the front face, Z_FACE_OUT) up to the ring
+    # centre -- otherwise the ring floats. Build a tall post spanning that Z range
+    # and reaching into the wall radially.
+    # Neck bottom: dip into the wall for a solid join, but if the bail is over the
+    # crown, keep the bottom ABOVE the crown cap so the neck doesn't foul it. The
+    # wall top (Z_FACE_OUT) is above the crown cap, so there's room for both.
+    neck_bottom = min(ring_z, Z_FACE_OUT - 3.0)   # default: a few mm into the wall
+    if over_obstruction:
+        neck_bottom = max(neck_bottom, obstruction_top + BAIL_Z_CLEAR)
+    neck_top = ring_z + BAIL_TUBE_R               # up to the ring tube centre-ish
+    neck_h = neck_top - neck_bottom
+    neck_w = 2 * BAIL_TUBE_R + 1.0                # tangential width (X)
+    neck_depth = BAIL_RING_R + 2.5                # radial depth (Y), reaches wall->ring
+    neck = box(extents=[neck_w, neck_depth, neck_h])
+    # centre it radially so it spans from inside the wall out toward the ring, and
+    # vertically over [neck_bottom, neck_top].
+    neck.apply_translation([0, OUTER_R + neck_depth / 2.0 - 1.5,
+                            (neck_bottom + neck_top) / 2.0])
 
     # Rotate the whole bail (ring + neck) from +Y to the requested clock angle.
     bail = union([ring, neck])

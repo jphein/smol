@@ -1,27 +1,82 @@
-# smol — ESP32-C3 clock (Rust, `no_std`)
+# smol — ESP32-C3 unified firmware (Rust, `no_std`)
 
 A `no_std` bare-metal Rust firmware for **"smol"**: an ESP32-C3 SuperMini with a
-0.42" SSD1306 OLED (72×40, I²C). It shows a clock, syncs real time over WiFi via
-SNTP, does ESP-NOW peer messaging with an honest WiFi↔ESP-NOW radio switch, and
-reads two on-board sensors (chip die-temperature + battery voltage via ADC) onto
-the display.
+0.42" SSD1306 OLED (72×40, I²C). It is a **single binary with a BOOT-button menu**
+that dispatches between three modes — **Clock**, **Snake**, and **Bench** — all
+sharing the OLED, the on-board sensors, and (under `espnow`) the ESP-NOW radio +
+blue status LED. It syncs real time over WiFi via SNTP at boot, does ESP-NOW peer
+messaging with an honest WiFi↔ESP-NOW radio switch, and reads two on-board sensors
+(chip die-temperature + battery voltage via ADC).
 
 Built on `esp-hal` 1.0 (RISC-V bare metal — **not** ESP-IDF/std).
 
 ---
 
+## The mode menu
+
+One physical control — the **BOOT button on GPIO9** (active-low, internal
+pull-up) — drives the whole UI, debounced into a **short tap** vs. a **long
+press** (~700 ms). At boot the firmware NTP-syncs (WiFi/`espnow` builds) then
+shows a **Home menu**. Selecting an entry enters that mode; a long press anywhere
+inside a mode returns to Home.
+
+| Context            | Short tap                              | Long press (~700 ms)         |
+|--------------------|----------------------------------------|------------------------------|
+| **Home menu**      | move selection (highlight, wraps)      | **enter** the highlighted mode |
+| **Clock**          | *(nothing)*                            | **back** to Home             |
+| **Snake** (alive)  | **turn** clockwise                     | **back** to Home             |
+| **Snake** (dead)   | **restart**                            | **back** to Home             |
+| **Bench** (`espnow`)| *(nothing)*                           | **back** to Home             |
+
+The rule is uniform: **hold to change level** (enter / back), **tap to act within
+a level**. The menu highlights the selection in inverse video on the 72×40 OLED.
+
+### The three modes
+
+* **Clock** — big `HH:MM` (`FONT_10X20`) with a colon that blinks once per
+  second, plus a bottom line that alternates every ~4 s between a label (the last
+  ESP-NOW peer message under `espnow`, else `smol`) and a compact sensor readout
+  (`23C 3.9V`). Time is anchored to the monotonic clock from the boot NTP sync, so
+  it stays correct no matter how long another mode was on screen.
+* **Snake** — single-player Snake on a 4 px-cell **18×8** grid (below an `S:NN`
+  score band), with random food, growth, wall + self collision, and a millis-based
+  movement tick. A short tap turns the snake **clockwise** (the single-button
+  control reaches any heading and can never reverse into itself). On death the
+  screen freezes with `DEAD S:NN`; a short tap restarts. Compiled into **every**
+  build (it needs only the display).
+* **Bench** (`--features espnow` only) — live **ESP-NOW link statistics**: render
+  **FPS**, **TX/s** and **RX/s** beacon rates, **RTT** (from a seq echoed on the
+  beacon), packet **loss %** (from peer seq gaps), **RSSI** (dBm, from the ESP-NOW
+  RX path), and the peer **link** state — a compact 5-line `FONT_5X8` readout. This
+  is the mode that exercises the ESP-NOW mesh (Snake is single-player).
+
+Across **all** modes in the `espnow` build, the ESP-NOW peer handshake + the
+**blue-LED peer-state machine** run in the **background** (the LED reflects the
+ESP-NOW link regardless of which mode is on screen), as does the boot WiFi/NTP
+fast-blink.
+
+---
+
 ## What compiles today
 
-All three phases build cleanly with `cargo build --release` (zero warnings):
+All three feature builds compile **clean (zero warnings, `cargo build` *and*
+`cargo clippy`)** and link to a valid RISC-V (`riscv32imc-unknown-none-elf`) ELF:
 
-| Phase | Feature flag        | What it does                                                        | Status                    |
-|-------|---------------------|---------------------------------------------------------------------|---------------------------|
-| 1     | *(default)*         | Clock on the OLED, free-running from a compile-time start constant   | ✅ compiles + links         |
-| 2     | `--features wifi`   | + WiFi STA, DHCP, SNTP real-time sync (raw `smoltcp`, blocking)      | ✅ compiles + links         |
-| 3     | `--features espnow` | + WiFi/NTP burst, ESP-NOW HELLO/ACK peer handshake, blue-LED state machine, WiFi↔ESP-NOW time-share | ✅ **flashed + verified on HW** |
+| Build                       | Feature flag        | Menu items          | What it adds                                                        |
+|-----------------------------|---------------------|---------------------|---------------------------------------------------------------------|
+| default                     | *(none)*            | Clock, Snake        | Clock (free-running from a compile-time start) + Snake              |
+| Phase 2                     | `--features wifi`   | Clock, Snake        | + WiFi STA, DHCP, SNTP real-time sync (raw `smoltcp`, blocking)     |
+| Phase 3 (**FULL unified**)  | `--features espnow` | Clock, Snake, Bench | + WiFi/NTP burst, ESP-NOW HELLO/ACK handshake + BEACON stats, blue-LED state machine, WiFi↔ESP-NOW time-share, **Bench** mode |
 
-`espnow` implies `wifi`. Every phase produces a valid RISC-V
-(`riscv32imc-unknown-none-elf`) ELF.
+`espnow` implies `wifi`. **Bench and everything ESP-NOW-specific is `cfg`-gated
+behind the `espnow` feature**, so the default and `wifi` builds still compile and
+run Clock + Snake (their menu simply has two items, not three).
+
+> **Build-verify status.** The unified refactor is **compile-verified only** (all
+> three builds clean + valid ELF). The underlying Phase-3 radio/LED/NTP path was
+> hardware-verified in the pre-menu clock firmware (see
+> [Hardware-verified behaviour](#hardware-verified-behaviour)); the menu, Snake,
+> and Bench modes themselves have **not** yet been flashed/observed.
 
 ### Build commands
 
@@ -29,32 +84,40 @@ All three phases build cleanly with `cargo build --release` (zero warnings):
 . "$HOME/.cargo/env"          # put cargo on PATH
 cd rust/clock
 
-cargo build --release                       # Phase 1
-cargo build --release --features wifi       # Phase 2
-cargo build --release --features espnow     # Phase 3
+cargo build --release                       # default: Clock + Snake
+cargo build --release --features wifi       # + NTP (Clock + Snake)
+cargo build --release --features espnow     # FULL unified: Clock + Snake + Bench
 ```
 
-### Honest status of each phase
+### Honest status of each layer
 
-* **Phase 1** is complete and self-contained: I²C on GPIO5/6, `ssd1306`
-  `DisplaySize72x40`, `embedded-graphics` text, `HH:MM:SS` counting once per
-  second off a blocking `Delay`.
-* **Phase 2** is a full blocking WiFi→DHCP→SNTP path written directly against
-  `smoltcp` (no async executor, no git-only crates). The **`wifi`-only** binary
-  hasn't itself been flashed, but its `run_ntp_burst` is the *same* code the
-  hardware-verified `espnow` build runs, and there it associates, gets a DHCP
-  lease, and returns correct UTC time (see
+* **Mode dispatcher + UI** (`src/main.rs`, `src/menu.rs`, `src/input.rs`,
+  `src/snake.rs`, `src/bench.rs`) — the BOOT-button menu and the Clock / Snake /
+  Bench modes. **Compile-verified only** (all three builds clean + valid ELF); the
+  menu, Snake, and Bench have not yet been flashed/observed on hardware.
+* **Clock + display** is self-contained: I²C on GPIO5/6, `ssd1306`
+  `DisplaySize72x40`, `embedded-graphics` text, `HH:MM` anchored to the monotonic
+  clock (so time survives excursions into other modes). Present in every build.
+* **WiFi/NTP** (`--features wifi`) is a full blocking WiFi→DHCP→SNTP path written
+  directly against `smoltcp` (no async executor, no git-only crates). The
+  **`wifi`-only** binary hasn't itself been flashed, but its `run_ntp_burst` is the
+  *same* code the hardware-verified radio path runs, where it associates, gets a
+  DHCP lease, and returns correct UTC time (see
   [Hardware-verified behaviour](#hardware-verified-behaviour)). Needs real WiFi
   credentials — see [Configuration](#configuration).
-* **Phase 3** implements the ESP-NOW HELLO/ACK peer handshake, an explicit
-  `RadioManager` with a `Mode` enum + `switch()` covering **both** single-radio
-  strategies (coexist / time-share), and the blue-LED peer-state machine. It is
-  **flashed and verified on hardware** (see [Hardware-verified behaviour](#hardware-verified-behaviour)):
-  at boot it runs a **real** WiFi → DHCP → SNTP burst (the STA `WifiDevice` and
-  the ESP-NOW handle both come from the same `Interfaces`; the burst drives the
-  STA device, then drops it before pinning the ESP-NOW channel, so the single
-  radio is never double-driven), syncs real UTC time, then time-shares the radio
-  to ESP-NOW on a fixed channel and runs the clock + handshake loop.
+* **ESP-NOW + LED** (`--features espnow`) implements the HELLO/ACK peer handshake,
+  an explicit `RadioManager` with a `Mode` enum + `switch()` covering **both**
+  single-radio strategies (coexist / time-share), the blue-LED peer-state machine,
+  and (for Bench) a BEACON carrying a seq + echo for RTT/loss/RSSI stats. The
+  **radio/LED/NTP path** was **flashed and verified on hardware** in the pre-menu
+  clock firmware (see [Hardware-verified behaviour](#hardware-verified-behaviour)):
+  at boot it runs a **real** WiFi → DHCP → SNTP burst (the STA `WifiDevice` and the
+  ESP-NOW handle both come from the same `Interfaces`; the burst drives the STA
+  device, then drops it before pinning the ESP-NOW channel, so the single radio is
+  never double-driven), syncs real UTC time, then time-shares the radio to ESP-NOW
+  on a fixed channel. In the unified firmware this handshake + LED update now runs
+  in the **background of every mode**; the BEACON stats path is new and
+  compile-verified only.
 
 ---
 
@@ -477,17 +540,32 @@ re-check the I²C wiring and the 72×40 vertical-offset calibration note above.
 
 ```
 rust/clock/
-├── Cargo.toml            # pinned deps + phase feature flags
+├── Cargo.toml            # pinned deps + feature flags (default / wifi / espnow)
 ├── rust-toolchain.toml   # rustc 1.96.1 + riscv32imc target
 ├── .cargo/config.toml    # target, build-std, linker scripts, host-cc workaround
 └── src/
-    ├── main.rs           # entry, display, clock+LED render loop, phase wiring
+    ├── main.rs           # entry, display, mode dispatcher + unified render loop
+    ├── menu.rs           # Home menu + AppMode { Menu, Clock, Snake, Bench } enum
+    ├── input.rs          # BOOT button (GPIO9) debounce + short/long gestures
+    ├── snake.rs          # single-player Snake on the 72×40 grid (all builds)
+    ├── bench.rs          # espnow: ESP-NOW link-stats readout (FPS/TX/RX/RTT/loss/RSSI)
     ├── sensors.rs        # chip die-temp (tsens) + battery ADC (GPIO4) readouts
-    ├── led.rs            # Phase 3: blue-LED (GPIO8) 4-state machine + polarity
+    ├── led.rs            # espnow: blue-LED (GPIO8) 4-state machine + polarity
     ├── secrets.rs        # LOCAL, git-ignored WiFi credentials (copy from .example)
     ├── secrets.rs.example# tracked template for secrets.rs
     └── net/
         ├── mod.rs (net.rs)  # feature gating + shared heap init
-        ├── wifi.rs          # Phase 2: WiFi STA + DHCP + SNTP (smoltcp, blocking)
-        └── mode.rs          # Phase 3: ESP-NOW HELLO/ACK handshake + RadioManager
+        ├── wifi.rs          # wifi: WiFi STA + DHCP + SNTP (smoltcp, blocking)
+        └── mode.rs          # espnow: ESP-NOW HELLO/ACK + BEACON stats + RadioManager
 ```
+
+### Module structure (dispatcher)
+
+`main.rs` owns `esp_hal::init()`, brings up the display / sensors / button /
+(espnow) LED + radio, then runs one loop that every ~20 ms: (1) services ESP-NOW
++ drives the LED in the background (espnow), (2) polls the button and applies the
+menu/mode state transition, and (3) renders the **current** `AppMode`. `AppMode`
+(in `menu.rs`) always declares all four variants so the dispatch `match` is
+identical across builds; the non-`espnow` builds just never construct/enter
+`Bench`. Snake state is created on entry and dropped on exit. See the module-level
+doc comments in each file for the details.
