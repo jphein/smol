@@ -1,0 +1,66 @@
+#ifndef UI_H
+#define UI_H
+
+#include <SD.h>
+#include <TFT_eSPI.h>
+
+#include "controller.h"
+#include "core/bus.h"
+#include "core/rom_backends.h"
+#include "runtime_config.h"
+
+#define BL_CHANNEL          0
+#define BL_FREQ             5000
+#define BL_RESOLUTION       8
+
+#define BG_COLOR            0x0015
+#define BAR_COLOR           0xAD55
+#define TEXT_COLOR          0xFFFF
+#define TEXT2_COLOR         0xA800
+#define SELECTED_TEXT_COLOR 0x57CA
+#define SELECTED_BG_COLOR   0x0560
+
+extern RuntimeConfig runtime_config;
+class UI
+{
+public:
+    UI(TFT_eSPI* screen);
+    ~UI();
+    Cartridge* selectGame();
+    void pauseMenu(Bus* nes);
+    void settingsMenu(Bus* nes);
+
+    void initializeSettings();
+    void loadEmulatorSettings(Bus* nes);
+    void restoreBrightness();
+    bool paused = false;
+
+private:
+    void getNesFiles();
+    void drawFileList();
+    void drawWindowBox(int x, int y, int w, int h);
+    void drawBars();
+    void setBrightness(int value);
+    void drawText(const char* text, const int16_t x, const int16_t y);
+    void drawRomMode();
+    TFT_eSPI* screen = nullptr;
+    int selected = 0;
+    int prev_selected = 0;
+    int scroll_offset = 0;
+    int max_items = 0;
+    static constexpr int ITEM_HEIGHT = 12;
+    std::vector<std::string> files;
+
+    struct Settings
+    {
+        uint8_t volume = 100;
+        uint8_t brightness = 100;
+        uint8_t palette = 0;
+        uint8_t rom_backend = 0;
+    };
+    Settings settings;
+    void saveSettings(const Settings* s);
+    void loadSettings(Settings* s);
+};
+
+#endif

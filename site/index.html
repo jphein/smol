@@ -216,7 +216,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
     <div class="brand">smol<span class="dot">▚</span><span class="cursor"></span></div>
     <nav>
       <a href="#vitals">vitals</a><a href="#game">the game</a><a href="#controls">controls</a>
-      <a href="#mission">mission control</a><a href="#roadmap">roadmap</a>
+      <a href="#mission">mission control</a><a href="#roadmap">roadmap</a><a href="#research">research</a>
     </nav>
     <div class="live" id="live"><span class="led"></span><span id="liveTxt">connecting…</span></div>
   </div>
@@ -362,6 +362,20 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
     <li><b>STEP COUNTER</b>Bolt on an accelerometer for a pocket pedometer.</li>
     <li><b>SOUND</b>A piezo buzzer for chiptune blips on dig + place.</li>
   </ul>
+</div></section>
+
+<!-- RESEARCH -->
+<section id="research"><div class="wrap">
+  <div class="sec-head reveal">
+    <span class="kicker">06 — Research</span>
+    <h2>What the agents found.</h2>
+    <p data-edit="research.intro">Six agents scouted the ESP32-C3 landscape while smol came together. The full reports live in the repo — here's the map.</p>
+  </div>
+  <div class="specs reveal">
+    <a class="spec" href="https://github.com/jphein/smol/blob/main/docs/gaming-firmware.md" target="_blank"><span class="n">◉</span><div class="lbl">RECON</div><div class="val">Gaming firmware & emulators</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">Why retro emulators hit a display wall on the C3.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/blob/main/docs/firmware-ideas.md" target="_blank"><span class="n">✦</span><div class="lbl">SCOUT</div><div class="val">Everything else you can flash</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">ESPHome, MQTT, Rust, BLE HID — and why USB BadUSB is out.</div></a>
+    <a class="spec" href="https://github.com/jphein/smol/blob/main/docs/nes-on-c3.md" target="_blank"><span class="n">▩</span><div class="lbl">ARCADE</div><div class="val">NES-on-C3 build plan</div><div style="color:var(--dim);font-size:.82rem;margin-top:6px">The real path: add an ST7735 TFT + ESP-IDF port.</div></a>
+  </div>
 </div></section>
 
 <footer class="wrap">

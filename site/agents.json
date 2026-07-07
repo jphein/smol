@@ -4,8 +4,8 @@
     { "name": "RECON", "role": "Surveyed C3 gaming firmware & emulators", "status": "done", "glyph": "◉" },
     { "name": "CUSTODIAN", "role": "Reclaimed ~23 GB of disk space", "status": "done", "glyph": "◈" },
     { "name": "FORGE", "role": "Created private GitHub repo + sync", "status": "done", "glyph": "⬡", "link": "https://github.com/jphein/smol" },
-    { "name": "FLASHER", "role": "Compiling & flashing the board over USB", "status": "active", "glyph": "⚡" },
-    { "name": "SCOUT", "role": "Surveying all interesting ESP32-C3 firmware", "status": "active", "glyph": "✦" },
-    { "name": "ARCADE", "role": "Scoping NES emulation on the C3", "status": "active", "glyph": "▩" }
+    { "name": "FLASHER", "role": "Flashed OLED test + game · OLED live at 0x3C", "status": "done", "glyph": "⚡" },
+    { "name": "SCOUT", "role": "Surveyed all interesting ESP32-C3 firmware", "status": "done", "glyph": "✦" },
+    { "name": "ARCADE", "role": "Delivered NES-on-C3 build plan (needs ST7735 + IDF)", "status": "done", "glyph": "▩" }
   ]
 }

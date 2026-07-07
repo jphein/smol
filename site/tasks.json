@@ -2,13 +2,13 @@
   "updated": "2026-07-07",
   "tasks": [
     { "id": 1, "title": "Install arduino-cli + ESP32 core + U8g2", "status": "done", "owner": "system" },
-    { "id": 2, "title": "Flash OLED test · confirm display + I²C addr", "status": "active", "owner": "FLASHER" },
-    { "id": 3, "title": "Install Bluepad32 core (BLE controller)", "status": "pending", "owner": "FLASHER" },
-    { "id": 4, "title": "Compile + flash Block Digger", "status": "pending", "owner": "FLASHER" },
-    { "id": 5, "title": "Pair Stadia controller · verify gameplay", "status": "pending", "owner": "FLASHER" },
+    { "id": 2, "title": "Flash OLED test · confirm display + I²C addr", "status": "done", "owner": "FLASHER" },
+    { "id": 3, "title": "Install Bluepad32 core (BLE controller)", "status": "done", "owner": "FLASHER" },
+    { "id": 4, "title": "Compile + flash Block Digger", "status": "done", "owner": "FLASHER" },
+    { "id": 5, "title": "Pair Stadia controller · verify gameplay", "status": "done", "owner": "you" },
     { "id": 6, "title": "Create GitHub repo + keep synced", "status": "done", "owner": "FORGE" },
     { "id": 7, "title": "Build editable project website", "status": "done", "owner": "you + Claude" },
-    { "id": 8, "title": "Research interesting ESP32-C3 firmware", "status": "active", "owner": "SCOUT" },
-    { "id": 9, "title": "NES-on-C3 feasibility + build plan", "status": "active", "owner": "ARCADE" }
+    { "id": 8, "title": "Research interesting ESP32-C3 firmware", "status": "done", "owner": "SCOUT" },
+    { "id": 9, "title": "NES-on-C3 feasibility + build plan", "status": "done", "owner": "ARCADE" }
   ]
 }
