@@ -29,6 +29,9 @@
     { "id": 26, "title": "Showcase pocket-watch case + renders on site", "status": "done", "owner": "you + Claude" },
     { "id": 27, "title": "Surface all research + code on the site", "status": "done", "owner": "you + Claude" },
     { "id": 28, "title": "Case v2: buttons + LED holes at OLED/top end", "status": "done", "owner": "PORTAL" },
-    { "id": 29, "title": "Flash Rust clock + blue-LED peer states (detect/connect)", "status": "active", "owner": "PULSE" }
+    { "id": 29, "title": "Rust clock: blue-LED peer states — VERIFIED (2 boards go solid)", "status": "done", "owner": "PULSE + you" },
+    { "id": 30, "title": "Bigger PST clock — verified on hardware (board #2)", "status": "done", "owner": "you + Claude" },
+    { "id": 31, "title": "Flash 2-player Snake to boards #1 + #2 (head-to-head)", "status": "done", "owner": "you + Claude" },
+    { "id": 32, "title": "Commit Rust clock improvements (PST + big font) with default id", "status": "pending", "owner": "Claude" }
   ]
 }

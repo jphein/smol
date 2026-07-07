@@ -20,7 +20,7 @@
 extern crate alloc;
 
 use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, ascii::FONT_5X8, MonoTextStyleBuilder},
+    mono_font::{ascii::FONT_10X20, ascii::FONT_5X8, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
     prelude::*,
     text::{Baseline, Text},
@@ -57,6 +57,9 @@ mod secrets;
 /// (12:34:56 -> 12*3600 + 34*60 + 56 = 45296.) Phase 2 overwrites this at
 /// runtime once SNTP returns a real Unix time.
 const START_SECONDS_OF_DAY: u32 = 12 * 3600 + 34 * 60 + 56;
+/// Local timezone offset from UTC, in seconds. Pacific is -7h (PDT, summer /
+/// daylight time — correct for July); switch to `-8 * 3600` for PST in winter.
+const TZ_OFFSET_SECONDS: i64 = -7 * 3600;
 
 #[main]
 fn main() -> ! {
@@ -87,7 +90,7 @@ fn main() -> ! {
 
     // Text styles: 6x10 for the big HH:MM:SS line, 5x8 for the little label.
     let time_style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(&FONT_10X20)
         .text_color(BinaryColor::On)
         .build();
     let label_style = MonoTextStyleBuilder::new()
@@ -135,14 +138,17 @@ fn main() -> ! {
             wifi: peripherals.WIFI,
         },
         // This unit's short id, embedded in HELLO beacons ("SMOLv1 HELLO NNN").
+        // Give each physical board a distinct value (we flashed 7 / 8 / 9).
         7,
         &mut led,
     );
 
     let mut seconds_of_day: u32 = match synced {
         Some(unix) => {
-            log::info!("smol: time synced via NTP -> {} s-of-day (UTC)", unix % 86_400);
-            unix % 86_400
+            // NTP gives UTC; shift to local (Pacific) for display.
+            let local = ((unix as i64 + TZ_OFFSET_SECONDS).rem_euclid(86_400)) as u32;
+            log::info!("smol: NTP {} UTC s-of-day -> local {} (Pacific)", unix % 86_400, local);
+            local
         }
         None => {
             log::info!("smol: no NTP; clock free-runs from compile-time start");
@@ -219,13 +225,17 @@ fn main() -> ! {
             let bottom: &str = "smol";
 
             format_hms(seconds_of_day, &mut buf);
-            let hms = core::str::from_utf8(&buf).unwrap_or("--:--:--");
+            // Blink the colon once per second so the big clock reads as "live".
+            if seconds_of_day % 2 == 1 {
+                buf[2] = b' ';
+            }
+            // BIG time line: "HH:MM" (5 chars * 10px = 50px) in the 10x20 font.
+            let hm = core::str::from_utf8(&buf[0..5]).unwrap_or("--:--");
 
             display.clear(BinaryColor::Off).ok();
 
-            // Center "HH:MM:SS": 8 chars * 6px = 48px wide on a 72px panel ->
-            // left margin (72-48)/2 = 12. Vertically place the big line ~row 14.
-            Text::with_baseline(hms, Point::new(12, 14), time_style, Baseline::Top)
+            // Center "HH:MM": (72-50)/2 = 11px left margin; 20px tall from y=2.
+            Text::with_baseline(hm, Point::new(11, 2), time_style, Baseline::Top)
                 .draw(&mut display)
                 .ok();
 
