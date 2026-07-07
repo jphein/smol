@@ -42,7 +42,7 @@
     { "id": 39, "title": "Resin + watch-case enclosure guide (docs/enclosure-resin.md)", "status": "done", "owner": "RESIN" },
     { "id": 40, "title": "Unified Rust firmware: Clock + Snake + Bench + OLED 180° (compiles)", "status": "done", "owner": "KERNEL" },
     { "id": 41, "title": "Case v4: crown + classic orientation — DONE (body+lid+crown, watertight)", "status": "done", "owner": "PORTAL" },
-    { "id": 42, "title": "Flash unified firmware to board #2 (12h/AM-PM + °F) — flashed, verifying on OLED", "status": "in_progress", "owner": "you + Claude" },
+    { "id": 42, "title": "Flash unified firmware (12h/AM-PM + °F) to boards #1 (id8) + #2 (id7)", "status": "done", "owner": "you + Claude" },
     { "id": 43, "title": "Re-render final case (bail-up) + crown on site", "status": "done", "owner": "you + Claude" }
   ]
 }
