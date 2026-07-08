@@ -1,0 +1,22 @@
+[Unit]
+Description=smol relay collector (ESP-NOW -> internet telemetry receiver)
+Documentation=https://github.com/jphein/smol/tree/main/collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jp
+# Adjust to where you deploy the collector on the homelab host (see README).
+WorkingDirectory=/home/jp/smol-collector
+ExecStart=/usr/bin/python3 /home/jp/smol-collector/collector.py --port 9999 --status-port 9998
+# JSONL is written into WorkingDirectory as collector.jsonl.
+Restart=on-failure
+RestartSec=3
+# Hardening (safe defaults; loosen if the deploy path differs).
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
