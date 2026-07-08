@@ -468,6 +468,15 @@ const RELAY_EMIT_INTERVAL_MS: u64 = 15_000;
 const RELAY_RETX_MS: u64 = 2_000;
 /// Gateway flushes its queue this often (if non-empty), or at once when full.
 const RELAY_FLUSH_INTERVAL_MS: u64 = 30_000;
+/// After this many CONSECUTIVE failed flushes, shed the OLDEST queued message on
+/// every further failure. Bounds queue staleness AND lets a gateway stuck against
+/// a dead AP drain to empty → `relay_ready_to_flush` goes false → the blocking
+/// bursts STOP (finding 1c). A couple of transient failures are tolerated first.
+const FLUSH_FAILS_BEFORE_DROP: u8 = 2;
+/// Recently-completed `(src_mac, msgid)` memory. A lost RELAYACK makes a leaf
+/// retransmit an ALREADY-complete message; we must re-ACK it but NOT re-enqueue
+/// (else duplicate UDP delivery — finding 3). Ring of the last few completions.
+const DONE_RING: usize = 4;
 
 /// Low `count` bits set — the "all fragments received" mask. `count` is validated
 /// 1..=RELAY_MAX_FRAGS (<= 8) before this is used, so the shift never overflows.
@@ -523,6 +532,7 @@ struct GwMsg {
     used: bool,
     src_id: u8,
     len: usize,
+    enq_ms: u64, // enqueue time, so the queue can shed its OLDEST (finding 1c)
     buf: [u8; RELAY_MAX_MSG],
 }
 
@@ -532,6 +542,7 @@ impl GwMsg {
             used: false,
             src_id: 0,
             len: 0,
+            enq_ms: 0,
             buf: [0; RELAY_MAX_MSG],
         }
     }
@@ -580,6 +591,13 @@ struct Relay {
     reasm: [ReasmSlot; REASSEMBLY_SLOTS],
     queue: [GwMsg; GATEWAY_QUEUE],
     last_flush_ms: u64,
+    /// Consecutive failed flushes; past `FLUSH_FAILS_BEFORE_DROP` we shed the
+    /// queue's oldest each failure so a dead-AP gateway drains + stops re-bursting.
+    flush_fails: u8,
+    /// Recently-completed `(src_mac, msgid)` ring — dedup post-completion
+    /// retransmits so a message is never enqueued (UDP-delivered) twice (finding 3).
+    done: [Option<([u8; 6], u16)>; DONE_RING],
+    done_cursor: usize,
 }
 
 impl Relay {
@@ -592,6 +610,9 @@ impl Relay {
             reasm: [ReasmSlot::new(); REASSEMBLY_SLOTS],
             queue: [GwMsg::new(); GATEWAY_QUEUE],
             last_flush_ms: 0,
+            flush_fails: 0,
+            done: [None; DONE_RING],
+            done_cursor: 0,
         }
     }
 
@@ -616,6 +637,13 @@ impl Relay {
         {
             return (0, false);
         }
+        // Finding 3: if we ALREADY completed this (src_mac, msgid), the leaf is
+        // retransmitting because its RELAYACK was lost. Re-ACK it as complete (so
+        // it stops) but do NOT re-reassemble/enqueue — that would UDP-deliver the
+        // same telemetry twice and burn a queue slot.
+        if self.recently_done(&src_mac, msgid) {
+            return (frag_mask(count), true);
+        }
         let Some(idx) = self.slot_for(&src_mac, msgid, now) else {
             // Table full of fresh (non-stale) other messages: drop (bounded).
             return (0, false);
@@ -638,8 +666,9 @@ impl Relay {
             (s.got, all_received(s.got, s.count), s.total_len)
         };
         if complete {
-            self.enqueue(idx, total_len);
+            self.enqueue(idx, total_len, now);
             self.reasm[idx].used = false; // free the slot
+            self.mark_done(src_mac, msgid); // remember it → dedup late retransmits
         }
         (got, complete)
     }
@@ -676,7 +705,7 @@ impl Relay {
     /// Move a completed reassembly into a free flush-queue slot (drop if full —
     /// bounded, loss-tolerant). Copies the buffer out first to avoid aliasing the
     /// reasm and queue arrays at once.
-    fn enqueue(&mut self, reasm_idx: usize, total_len: usize) {
+    fn enqueue(&mut self, reasm_idx: usize, total_len: usize, now: u64) {
         let len = total_len.min(RELAY_MAX_MSG);
         let src_id = self.reasm[reasm_idx].src_id;
         let src_buf = self.reasm[reasm_idx].buf; // [u8; RELAY_MAX_MSG] is Copy
@@ -688,7 +717,36 @@ impl Relay {
         q.used = true;
         q.src_id = src_id;
         q.len = len;
+        q.enq_ms = now;
         q.buf[..len].copy_from_slice(&src_buf[..len]);
+    }
+
+    /// Finding 3: is `(src_mac, msgid)` in the recently-completed ring?
+    fn recently_done(&self, src_mac: &[u8; 6], msgid: u16) -> bool {
+        self.done.contains(&Some((*src_mac, msgid)))
+    }
+
+    /// Record a completed `(src_mac, msgid)` in the ring (evicting the oldest entry).
+    fn mark_done(&mut self, src_mac: [u8; 6], msgid: u16) {
+        self.done[self.done_cursor] = Some((src_mac, msgid));
+        self.done_cursor = (self.done_cursor + 1) % DONE_RING;
+    }
+
+    /// Finding 1c: shed the OLDEST buffered message so a gateway stuck against a
+    /// dead AP bounds queue staleness and eventually drains to empty. No-op if
+    /// the queue is already empty.
+    fn drop_oldest(&mut self) {
+        let mut victim: Option<usize> = None;
+        let mut oldest = u64::MAX;
+        for (i, q) in self.queue.iter().enumerate() {
+            if q.used && q.enq_ms <= oldest {
+                oldest = q.enq_ms;
+                victim = Some(i);
+            }
+        }
+        if let Some(i) = victim {
+            self.queue[i].used = false;
+        }
     }
 
     /// Leaf: stage a fresh telemetry message for (fragmented) broadcast; returns
@@ -1023,16 +1081,31 @@ impl RadioManager {
         if pending == 0 {
             return false;
         }
-        pending >= GATEWAY_QUEUE
+        // "Queue full → flush now" applies only when NOT in a failing streak
+        // (finding 1a): once flushes are failing, the interval backoff must govern
+        // even a full queue, or a dead AP causes back-to-back bursts again.
+        // `last_flush_ms == 0` is the "never flushed yet" fast path.
+        (self.relay.flush_fails == 0 && pending >= GATEWAY_QUEUE)
             || self.relay.last_flush_ms == 0
             || now.saturating_sub(self.relay.last_flush_ms) >= RELAY_FLUSH_INTERVAL_MS
     }
 
     /// Gateway only: run a WiFi burst and UDP each buffered message to the fixed
     /// collector as `"<src_id> <telemetry>"`, then return to ESP-NOW ch6. This
-    /// EXERCISES the (formerly dead) `switch(Mode::WifiSta)` arm. The mesh is deaf
-    /// on ch6 for the burst's duration (single radio); `tick` fast-blinks the LED
-    /// like the boot NTP burst. Clears the queue only on success. Returns success.
+    /// EXERCISES the (formerly dead) `switch(Mode::WifiSta)` arm.
+    ///
+    /// SINGLE-RADIO / SINGLE-THREAD COST (honest): this BLOCKS the main loop for
+    /// the whole burst — so the **display and button are frozen and the mesh is
+    /// deaf on ch6**, not merely "mesh deaf". `tick` fast-blinks the LED throughout.
+    /// The burst is now hard-bounded by `RELAY_FLUSH_BUDGET` (~6 s), so a FAILED
+    /// flush (AP down) can no longer block for the 30 s NTP budget. A future
+    /// non-blocking (cooperative/async) flush would remove the stall entirely;
+    /// that redesign is deliberately deferred.
+    ///
+    /// On success the queue is cleared. On FAILURE it backs off a full flush
+    /// interval (see the unconditional `last_flush_ms` below) and, past
+    /// `FLUSH_FAILS_BEFORE_DROP`, sheds its oldest message so a dead-AP gateway
+    /// drains and stops re-bursting. Returns whether the flush succeeded.
     pub fn flush_telemetry(&mut self, tick: &mut dyn FnMut()) -> bool {
         if !self.relay.is_gateway {
             return false;
@@ -1067,12 +1140,32 @@ impl RadioManager {
         };
         // Back to deterministic ESP-NOW ch6 regardless of flush outcome.
         let _ = self.switch(Mode::EspNow);
+        // FINDING 1a: stamp the backoff UNCONDITIONALLY. Previously `last_flush_ms`
+        // was set only on success, so a FAILED flush left it stale →
+        // `relay_ready_to_flush` re-fired instantly → back-to-back multi-second
+        // blocking bursts FOREVER (display + input + mesh all frozen). Now every
+        // attempt resets the clock, so a failure backs off a full
+        // RELAY_FLUSH_INTERVAL_MS instead of spinning.
+        self.relay.last_flush_ms = now_ms();
         if ok {
             for q in self.relay.queue.iter_mut() {
                 q.used = false;
             }
-            self.relay.last_flush_ms = now_ms();
+            self.relay.flush_fails = 0;
             log::info!("smol: relay flush done");
+        } else {
+            self.relay.flush_fails = self.relay.flush_fails.saturating_add(1);
+            // FINDING 1c: once failures pile up, shed the OLDEST message each time
+            // so the queue drains to empty (→ relay_ready_to_flush false → the
+            // bursts stop) and never holds arbitrarily-stale telemetry.
+            if self.relay.flush_fails >= FLUSH_FAILS_BEFORE_DROP {
+                self.relay.drop_oldest();
+            }
+            log::warn!(
+                "smol: relay flush FAILED ({} consecutive) — backing off {} ms",
+                self.relay.flush_fails,
+                RELAY_FLUSH_INTERVAL_MS
+            );
         }
         ok
     }

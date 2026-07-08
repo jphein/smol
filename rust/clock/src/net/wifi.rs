@@ -76,6 +76,14 @@ const NTP_TO_UNIX_OFFSET: u32 = 2_208_988_800;
 /// give up and let the clock free-run from its compile-time constant.
 const SYNC_BUDGET: Duration = Duration::from_secs(30);
 
+/// Overall budget for a RELAY flush burst (associate + DHCP + UDP sends + drain),
+/// MUCH shorter than the NTP burst's 30 s so a gateway can't block the whole
+/// firmware loop for 30 s when the AP is down (finding 1b). ~6 s covers a healthy
+/// associate + DHCP + a few small datagrams on the AP's channel; raise it if a
+/// real AP is slower — the tradeoff is a longer display/input freeze on outage.
+#[cfg(feature = "espnow")]
+const RELAY_FLUSH_BUDGET: Duration = Duration::from_secs(6);
+
 // -------------------------------------------------------------------------
 // Peripheral bundle handed over from `main` (single esp_hal::init()).
 // -------------------------------------------------------------------------
@@ -353,7 +361,10 @@ pub fn run_udp_flush(
     );
     let udp_handle = sockets.add(udp_socket);
 
-    let deadline = Instant::now() + SYNC_BUDGET;
+    // FINDING 1b: bound the ENTIRE flush (connect + DHCP + sends + drain) by the
+    // short RELAY_FLUSH_BUDGET, not the 30 s NTP budget — a dead AP fails fast so
+    // the caller's blocking loop isn't frozen for 30 s.
+    let deadline = Instant::now() + RELAY_FLUSH_BUDGET;
 
     // The caller's switch(WifiSta) already issued connect(); just wait for it.
     while !matches!(controller.is_connected(), Ok(true)) {
@@ -398,6 +409,11 @@ pub fn run_udp_flush(
 
     let mut all_sent = true;
     for &(src_id, payload) in messages {
+        // Out of the overall budget (finding 1b) — leave the rest for next flush.
+        if Instant::now() > deadline {
+            all_sent = false;
+            break;
+        }
         // Datagram = "<3-digit id> <telemetry>".
         let mut dg = [0u8; FLUSH_DG_MAX];
         dg[0] = b'0' + (src_id / 100) % 10;
@@ -408,7 +424,6 @@ pub fn run_udp_flush(
         dg[4..4 + plen].copy_from_slice(&payload[..plen]);
         let dglen = 4 + plen;
 
-        let send_deadline = Instant::now() + Duration::from_secs(3);
         let mut sent = false;
         while !sent {
             tick();
@@ -416,16 +431,17 @@ pub fn run_udp_flush(
             let socket = sockets.get_mut::<udp::Socket>(udp_handle);
             if socket.can_send() && socket.send_slice(&dg[..dglen], server).is_ok() {
                 sent = true;
-            } else if Instant::now() > send_deadline {
-                all_sent = false;
+            } else if Instant::now() > deadline {
+                all_sent = false; // shared overall budget; rest waits for next flush
                 break;
             }
         }
     }
 
     // Poll briefly so the last datagram actually egresses (smoltcp is
-    // poll-driven; `send_slice` only enqueues into the TX buffer).
-    let drain_deadline = Instant::now() + Duration::from_secs(1);
+    // poll-driven; `send_slice` only enqueues into the TX buffer). Short + fixed
+    // so it can't meaningfully extend the RELAY_FLUSH_BUDGET-bounded burst (1b).
+    let drain_deadline = Instant::now() + Duration::from_millis(300);
     while Instant::now() < drain_deadline {
         tick();
         iface.poll(smoltcp_now(), device, &mut sockets);

@@ -83,8 +83,8 @@ stays well under 250 B.
 | [ACK](#ack--led-handshake) | `SMOLv1 ACK ` | 14 | unicast | reactive | espnow | 🟢 |
 | [BEACON](#beacon--bench-link-stats) | `SMOLv1 BEACON ` | 29 | broadcast | ~2 s (Bench) | espnow | 🟡 |
 | [TIME](#time--mesh-time-sync) | `SMOLv1 TIME ` | 37 | broadcast | ~2 s | espnow | 🟢 |
-| [RELAY](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAY ` | ≤91 | broadcast | ~15 s (leaf) | espnow | 🔵 |
-| [RELAYACK](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAYACK ` | 25 | unicast | reactive | espnow | 🔵 |
+| [RELAY](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAY ` | ≤91 | broadcast | ~15 s (leaf) | espnow | 🟡 |
+| [RELAYACK](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAYACK ` | 25 | unicast | reactive | espnow | 🟡 |
 | [SNK](#snk--mmo-mesh-snake-design) | `SMOLv1 SNK ` | 18 | broadcast | 5 Hz jittered | espnow | ⚪ |
 
 ---
@@ -180,7 +180,7 @@ A TIME frame also counts as `Detected`.
 2026-07-07.** Built clean (`cargo` + `clippy -D warnings`, all 3 builds) and flashed;
 id 8 *Eldritch Nexus* (started at `synced_at = 0`) **adopted** id 7's exact
 `synced_at = 1783467581` over ESP-NOW, then **re-converged** when id 7's stamp
-advanced on reboot (…8465). Zero panics. (Code still in tree / uncommitted.)
+advanced on reboot (…8465). Zero panics. (Committed in `76b19e4`.)
 **Security.** Unauthenticated → a forged far-future `synced_at` hijacks every clock
 (see Shared conventions).
 **Source.** `mode.rs` `TIME_PREFIX`, `encode_time`, `write_u10`/`parse_u10`,
@@ -235,11 +235,12 @@ compile-time placeholder, mirroring `NTP_SERVER_IP`), then switches back to ESP-
 ch 6. **The mesh is deaf during the flush burst** (single radio).
 **Out of scope (documented stubs):** downlink (collector → leaf) and multi-hop
 routing (needs a next-hop/TTL header, +200–400 LOC).
-**Flag.** espnow. **Status.** 🔵 **in progress** — frame consts, `Frame::Relay`/
-`Frame::RelayAck`, and the reassembly tables are **in tree but uncommitted** and
-still being implemented; **not hardware-tested** and not independently
-compile-confirmed in this doc pass (verify against the current build before
-relying on the exact layout).
+**Flag.** espnow. **Status.** 🟡 **compile-verified** — `Frame::Relay`/`Frame::RelayAck`,
+the reassembly tables, and the gateway flush are **committed** (`76b19e4`) and build
+clean across all 3 builds (`cargo build` + `clippy -D warnings`). **Not yet exercised
+on hardware** (needs a gateway + leaf + a UDP collector). The flush's failure-backoff
+and post-completion dedup were hardened after an adversarial review — see
+`scratch/smol/morpheus-oracle-fixes.md`.
 **Security.** Unauthenticated → a forged RELAYACK can stall a leaf's retransmit.
 **Source.** `mode.rs` relay-bridge section (`RELAY_PREFIX`, `RELAYACK_PREFIX`,
 `Relay`/`RelayTx`/reassembly); spec `relay-bridge-spec.md`.
@@ -289,8 +290,8 @@ field**, 0..31) and **not yet frozen** — bit positions may shift at implementa
 
 - **Verification is per-frame and current as of 2026-07-07.** HELLO/ACK and **TIME
   (2-board adoption)** are hardware-verified. BEACON is compile-verified (runs in
-  Bench mode, not accuracy-checked). RELAY is **mid-implementation and uncommitted**.
-  SNK is **design-only**.
+  Bench mode, not accuracy-checked). RELAY/RELAYACK are **committed + compile-verified**
+  (not yet hardware-exercised). SNK is **committed** (see its own section).
 - **ESP-NOW airtime/throughput/RX-reliability under COEXIST** are unmeasured on
   hardware — reasoned from the `esp-wifi 0.15.0` API (see `nebula-espnow-gateway.md`),
   not a bench run.
