@@ -56,13 +56,16 @@ use crate::secrets::{WIFI_PASS as WIFI_PASSWORD, WIFI_SSID};
 const NTP_SERVER_IP: Ipv4Addr = Ipv4Addr::new(162, 159, 200, 123);
 const NTP_PORT: u16 = 123;
 
-/// Relay uplink collector — a compile-time placeholder (set to your homelab
-/// collector before flashing a gateway), mirroring `NTP_SERVER_IP`'s hardcoded-IP
-/// style so no DNS resolver is needed. UDP. An unreachable placeholder is
-/// harmless: the flush just times out and retries next cadence. Only the `espnow`
-/// relay flush references these (see `run_udp_flush`).
+/// Relay uplink collector — the homelab receiver on **disks** (`10.0.11.117:9999`,
+/// a linger-enabled user systemd unit logging telemetry as JSONL). Hardcoded IPv4
+/// (mirrors `NTP_SERVER_IP`) so no DNS resolver is needed. It sits on the SAME
+/// VLAN-11 /24 the boards DHCP onto, so the relay path is same-subnet L2 — no
+/// gatekeeper hop. UDP is fire-and-forget: `send` "succeeds" locally regardless of
+/// the listener, so a genuine outage is an ASSOCIATION failure — which
+/// `run_udp_flush` now bounds via `RELAY_FLUSH_BUDGET` (finding-1 fix). Only the
+/// `espnow` relay flush references these (see `run_udp_flush`).
 #[cfg(feature = "espnow")]
-const RELAY_COLLECTOR_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 11, 1);
+const RELAY_COLLECTOR_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 11, 117);
 #[cfg(feature = "espnow")]
 const RELAY_COLLECTOR_PORT: u16 = 9999;
 /// Max relay-flush datagram = "NNN " (4) + up to `RELAY_MAX_MSG` telemetry bytes.
