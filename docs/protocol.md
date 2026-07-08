@@ -230,9 +230,12 @@ this is short-telemetry relay, not bulk transfer).
 gateway flushes buffered messages to the collector every `RELAY_FLUSH_INTERVAL_MS
 = 30 s`.
 **Gateway flush.** Switches to `WifiSta` (COEXIST arm — resurrected here), UDP-sends
-`"<src_id> <telemetry>"` to `RELAY_COLLECTOR_IP:RELAY_COLLECTOR_PORT` (a documented
-compile-time placeholder, mirroring `NTP_SERVER_IP`), then switches back to ESP-NOW
-ch 6. **The mesh is deaf during the flush burst** (single radio).
+`"<src_id> <telemetry>"` to `RELAY_COLLECTOR_IP:RELAY_COLLECTOR_PORT` — the **disks**
+host `10.0.11.117:9999` on VLAN 11 (same-subnet L2, no gatekeeper hop), mirroring
+`NTP_SERVER_IP`'s hardcoded-IP style — then switches back to ESP-NOW ch 6. The burst
+**stalls display + input + mesh** for its duration (single radio); it is hard-bounded
+by `RELAY_FLUSH_BUDGET ≈ 6 s`, and a failed flush backs off a full interval and sheds
+the oldest queued message so a dead AP can't freeze the node (finding-1 fix).
 **Out of scope (documented stubs):** downlink (collector → leaf) and multi-hop
 routing (needs a next-hop/TTL header, +200–400 LOC).
 **Flag.** espnow. **Status.** 🟡 **compile-verified** — `Frame::Relay`/`Frame::RelayAck`,

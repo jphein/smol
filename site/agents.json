@@ -28,7 +28,12 @@
     { "name": "KERNEL", "role": "Unified Rust firmware DONE — Clock+Snake+Bench, all builds clean", "status": "done", "glyph": "▦" },
     { "name": "CHIME", "role": "Mesh time sync — SMOLv1 TIME frame, newest-NTP-wins (loop-free); compile + clippy clean, board #1 flashed", "status": "active", "glyph": "⧗" },
     { "name": "SIGIL", "role": "Ported realm-sigil for magical node names — display-only realm words (id8 = 'Eldritch Nexus')", "status": "active", "glyph": "✶" },
-    { "name": "CONDUIT", "role": "ESP-NOW → internet relay bridge — single-hop telemetry to a WiFi gateway; browsing-grade ruled out (250 B MTU)", "status": "active", "glyph": "⇅" },
-    { "name": "OUROBOROS", "role": "MMO mesh snake — shared toroidal world, 18 B self-broadcast frames, dead-reckoned peers (netcode + design)", "status": "active", "glyph": "∞" }
+    { "name": "CONDUIT", "role": "ESP-NOW → internet relay — LAN UDP collector + status page committed (19 tests); gateway hardening after a review caught a freeze bug", "status": "active", "glyph": "⇅" },
+    { "name": "OUROBOROS", "role": "MMO mesh snake — shared toroidal world + six treasure-powers, ALL in code + committed (52/52 tests); scrolling viewport, dead-reckoned peers, mesh leaderboard (score≡length); compile-verified, hardware flash pending", "status": "active", "glyph": "∞" },
+    { "name": "RELIQUARY", "role": "OTA + version identity — pin-compatible OTA path (research); UX designed; each build wears a sigil VERSION name ('Dominion v42', forge realm)", "status": "active", "glyph": "⬖" },
+    { "name": "LATTICE", "role": "Plugin/mode framework — enum-delegation registry; a shared About screen absorbs OTA (designed)", "status": "active", "glyph": "⌗" },
+    { "name": "WARDEN", "role": "Adversarial review — an Oracle's eye that caught a pre-ship relay-gateway freeze-on-failed-flush bug before it shipped", "status": "done", "glyph": "⚔" },
+    { "name": "CRUCIBLE", "role": "Hardware verifier — flashed all three boards and proved the 3-way ESP-NOW mesh (Dominion + Nexus + Jade Herald; logged on issue #4)", "status": "done", "glyph": "⚒" },
+    { "name": "CISTERN", "role": "Collector-keeper — the LAN UDP telemetry receiver + status page for the relay; committed with 19 tests", "status": "done", "glyph": "⊛" }
   ]
 }
