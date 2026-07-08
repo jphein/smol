@@ -1,4 +1,4 @@
-// VENDORED VERBATIM from scratch/smol/mmo-snake-proto/src/lib.rs (the 49-test oracle).
+// VENDORED VERBATIM from scratch/smol/mmo-snake-proto/src/lib.rs (the 52-test oracle).
 // Firmware copy: crate attr + #[cfg(test)] module stripped; logic byte-identical.
 // Re-vendor on any proto change and diff to prove no drift. Do NOT hand-edit logic here.
 #![allow(dead_code)] // not every core API is used by the firmware yet (powers/leaderboard)
@@ -424,9 +424,38 @@ impl Snake {
     /// the tail is vacating is allowed (classic snake rule) — unless the snake
     /// is growing this tick, in which case the tail stays and the cell is
     /// occupied.
+    #[inline]
     pub fn step<const W: u16, const H: u16>(
         &mut self,
         blocked: impl Fn(Cell) -> bool,
+    ) -> StepOutcome {
+        self.step_impl::<W, H>(blocked, false)
+    }
+
+    /// Advance while **phasing through the snake's own body** — the Wraith Veil
+    /// power (design §11.1 Phantom): self-collision is NOT lethal, so the head
+    /// may pass over its own segments. The external `blocked` closure still
+    /// applies (the game gates peer bodies there — passing `|_| false` also
+    /// phases through peers, which is the phantom contract).
+    ///
+    /// **Phasing-expiry rule** (power ends while the head overlaps the body):
+    /// nothing special is needed — only the cell you are ABOUT TO ENTER is ever
+    /// tested (never the current head's overlap). So a plain [`Snake::step`]
+    /// after the power lapses lets you survive on top of your own body until you
+    /// would step INTO an occupied cell. See `phasing_expiry_only_entered_cell_kills`.
+    #[inline]
+    pub fn step_phasing<const W: u16, const H: u16>(
+        &mut self,
+        blocked: impl Fn(Cell) -> bool,
+    ) -> StepOutcome {
+        self.step_impl::<W, H>(blocked, true)
+    }
+
+    /// Shared step core. `phase_self` skips the self-collision check (Phantom).
+    fn step_impl<const W: u16, const H: u16>(
+        &mut self,
+        blocked: impl Fn(Cell) -> bool,
+        phase_self: bool,
     ) -> StepOutcome {
         let (dx, dy) = self.heading.delta();
         let new_head = World::<W, H>::add(self.head(), dx, dy);
@@ -436,7 +465,7 @@ impl Snake {
         // else all but the vacating tail.
         let remaining = if growing { self.len } else { self.len - 1 };
 
-        let hit_self = self.first_segments(remaining).any(|c| c == new_head);
+        let hit_self = !phase_self && self.first_segments(remaining).any(|c| c == new_head);
         if hit_self || blocked(new_head) {
             return StepOutcome::Blocked;
         }
@@ -1014,3 +1043,4 @@ pub fn treasure_at<const W: u16, const H: u16>(seed: u32, treasure_bucket: u32) 
     let power = 1 + (h % POWER_COUNT as u64) as u8; // 1..=6
     (cell, power)
 }
+

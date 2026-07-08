@@ -191,9 +191,11 @@ impl MeshSnake {
 
         let phantom = self.active_power(unix_now) == POWER_PHANTOM;
         // Peer bodies block us — EXCEPT peers who are themselves phantom (they're
-        // non-lethal). While WE are phantom we pass through everything.
+        // non-lethal). While WE are phantom we PHASE through everything: the
+        // dedicated `step_phasing` skips the self-collision check too, so a
+        // Wraith Veil snake passes through its OWN body, not just peers.
         let outcome = if phantom {
-            self.snake.step::<W, H>(|_| false)
+            self.snake.step_phasing::<W, H>(|_| false)
         } else {
             // Snapshot peers for the closure (borrow split).
             let peers = &self.peers;
@@ -211,8 +213,10 @@ impl MeshSnake {
                 true
             }
             StepOutcome::Blocked => {
+                // With `step_phasing`, a phantom never returns Blocked on its own
+                // body; a block here means an EXTERNAL wall (closure) — treat it
+                // as a stall, not death, while phasing.
                 if phantom {
-                    // Phantom stalls at a self-crossing but never dies.
                     return false;
                 }
                 // Aegis absorbs one lethal hit.
