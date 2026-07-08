@@ -10,29 +10,36 @@
 # node caches it too.
 #
 # Payload format (LOCKED — the exact lines the firmware renders on the 72×40 OLED):
-#   BATT|48V 52.8V|HV 391.9V|d 43mV|A 69%|B 99%|C 4.1A
+#   BATT|48V 52.8V|HV 391.9V|d 43mV|48V 69%|HV 99%|Chg 4.1A
 #   - pipe-separated, ≤6 segments, each ≤12 chars, whole payload ≤96 bytes, ASCII
-#     (verified worst case ≈56 B). Segments 1-3 = the VOLTAGE page (title `Batt`);
-#     segments 4-6 = the SOC page (title `SOC`), added for issue #17. A short tap
-#     on the board flips pages; boards flashed before #17 `split('|').take(3)` so
-#     they ignore 4-6 and keep showing the voltage page — FULLY backward-compatible.
-#   VOLTAGE page (segments 1-3):
+#     (verified worst case ≈62 B). Segments 1-3 = the VOLTAGE overview page (title
+#     `Batt`); segments 4-6 = the SOC/charge DETAIL segments (issue #17). A short tap
+#     on the board pages through them; boards flashed before #17 `split('|').take(3)`
+#     so they ignore 4-6 and keep showing the voltage page — FULLY backward-compatible.
+#   ⚠️ BIG-RENDER CONTRACT (co-designed with the firmware, 2026-07-08): the firmware
+#     renders each DETAIL segment (4-6) as its own full-window page = a small LABEL
+#     (text before the FIRST space) + a BIG value (everything after). So each detail
+#     segment MUST be `<shortlabel> <value>` with NO interior space before the value
+#     (`48V 69%` -> label "48V", value "69%"). Keep labels single-token.
+#   VOLTAGE overview page (segments 1-3, unchanged):
 #   - seg 1: 48V bank    %.1f V   sensor.48v_battery1_voltage  (BMS-direct; see below)
 #            fallback           → sensor.48v_battery2_voltage, else `--`
 #   - seg 2: BMW i3 HV pack %.1f V   sensor.be_battery_voltage
 #   - seg 3: i3 cell spread %.0f mV  sensor.be_cell_voltage_delta
-#   SOC page (segments 4-6, issue #17):
-#   - seg 4 `A`: 48V bank SOC  %.0f %  sensor.48v_battery1_battery  (BMS, coulomb-
+#   DETAIL segments (4-6, issue #17 — each a big full-window page on the board):
+#   - seg 4 `48V`: 48V bank SOC  %.0f %  sensor.48v_battery1_battery  (BMS, coulomb-
 #            counted — the same source we trust for the voltage line), fallback
 #            sensor.48v_battery2_battery. (Team ruling 2026-07-08: moved OFF EPEver —
 #            EPEver's SOC is a crude voltage estimate and its bus flaps `unavailable`;
 #            the BMS is authoritative and keeps the SOC page off the flaky EPEver path.)
-#   - seg 5 `B`: HV pack SOC   %.0f %  sensor.be_soc, fallback sensor.battery_state_of_charge
-#   - seg 6 `C`: charge current %.1f A sensor.epever_charging_current (solar into the
-#            48V bank), else `--`.
+#   - seg 5 `HV`: HV pack SOC   %.0f %  sensor.be_soc, fallback sensor.battery_state_of_charge
+#   - seg 6 `Chg`: charge current %.1f A sensor.epever_charging_current (TOTAL solar
+#            charge into the 48V bank), else `--`. (Kept on EPEver, not a BMS current:
+#            the per-battery BMS currents are half-the-bank each and can't be summed in
+#            the macro; EPEver gives the true total bank charge current.)
 #   - any source that is unavailable / unknown / STALE renders `--` for that segment
-#     (e.g. `BATT|48V --|HV 391.9V|d 43mV|A 69%|B 99%|C --`). See STALENESS below —
-#     the SOC (seg 5) window is wider than the voltage window on purpose.
+#     (e.g. `BATT|48V --|HV 391.9V|d 43mV|48V 69%|HV 99%|Chg --`). See STALENESS below
+#     — the HV SOC (seg 5) window is wider than the others on purpose.
 #
 # OVERRIDE MODE: when input_boolean.smol_display_override is ON, the automation
 # publishes `BATT|<line1>|<line2>|<line3>|A ..|B ..|C ..` — the three line SOURCES
@@ -213,9 +220,9 @@ automation:
             {%- endfor -%}
             {{- ns.out -}}
             {%- endmacro -%}
-            {%- set s1 = cell('A', ['sensor.48v_battery1_battery', 'sensor.48v_battery2_battery'], '%.0f%%') | trim -%}
-            {%- set s2 = cell('B', ['sensor.be_soc', 'sensor.battery_state_of_charge'], '%.0f%%', 21600) | trim -%}
-            {%- set s3 = cell('C', ['sensor.epever_charging_current'], '%.1fA') | trim -%}
+            {%- set s1 = cell('48V', ['sensor.48v_battery1_battery', 'sensor.48v_battery2_battery'], '%.0f%%') | trim -%}
+            {%- set s2 = cell('HV', ['sensor.be_soc', 'sensor.battery_state_of_charge'], '%.0f%%', 21600) | trim -%}
+            {%- set s3 = cell('Chg', ['sensor.epever_charging_current'], '%.1fA') | trim -%}
             {%- if is_state('input_boolean.smol_display_override', 'on') -%}
             {%- set bad = ['unknown', 'unavailable', 'none', ''] -%}
             {%- set o1 = states('input_text.smol_display_line1') -%}

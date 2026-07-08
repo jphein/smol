@@ -27,3 +27,9 @@ secrets.rs
 **/secrets.rs
 *secrets.h
 wifi_secrets.*
+
+# Per-board config (issue #19) — identity/config (NODE_ID, DEFAULT_APP), NOT
+# credentials. Git-ignored so a per-board build dirties no tracked file (clean
+# version stamp). The tracked template is board.rs.example (cp it on a fresh clone).
+board.rs
+**/board.rs

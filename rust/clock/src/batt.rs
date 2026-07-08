@@ -34,11 +34,11 @@
 //!     cfg'd `Ctx` fields (`label`, `mesh`, `radio`) `main` already hands plugins.
 //!   * [`BattState`] — the [`Plugin`]: renders `Batt` + own fetch age on the title
 //!     row and the three battery lines below it. Long press → Menu (uniform
-//!     grammar). Short tap → flip the VOLTAGE ↔ SOC page when the payload carries
-//!     the optional SOC trio, else a no-op (see [`BattState::on_button`], #17).
+//!     grammar). Short tap → CYCLE the pages: 0 = the three-line voltage overview,
+//!     1..N = one BIG full-window page per non-empty detail segment (Task 3).
 
 use embedded_graphics::{
-    mono_font::{ascii::FONT_5X8, ascii::FONT_6X10, MonoTextStyleBuilder},
+    mono_font::{ascii::FONT_10X20, ascii::FONT_5X8, ascii::FONT_6X10, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
     prelude::*,
     text::{Baseline, Text},
@@ -123,66 +123,67 @@ impl BattCache {
         core::str::from_utf8(&self.lines[..self.len]).unwrap_or("")
     }
 
-    /// Number of pipe-separated segments in the cached payload, AFTER the `BATT|`
-    /// marker (issue #17). `3` = a VOLTAGE-only payload (backward-compatible, no
-    /// SOC page); `> 3` = the optional SOC trio (segments 4-6) is present, so the
-    /// Batt screen offers a second page. `0` when never fetched / no marker.
-    fn segment_count(&self) -> usize {
+    /// The count of NON-EMPTY detail segments — payload segments 4+ (after the three
+    /// voltage lines) that carry real data (non-empty, not the `--` sentinel). Each
+    /// drives one BIG full-window SOC/charge page (Task 3). `0` for a 3-segment
+    /// (voltage-only) payload → no detail pages (backward-compatible no-op tap).
+    fn detail_count(&self) -> usize {
         match self.payload().strip_prefix("BATT|") {
-            Some(body) => body.split('|').count(),
+            Some(body) => body
+                .split('|')
+                .skip(3)
+                .filter(|s| !s.is_empty() && *s != "--")
+                .count(),
             None => 0,
         }
     }
-}
 
-/// Which page the Batt screen shows (issue #17). The retained payload optionally
-/// carries a second trio of segments: 1-3 are battery VOLTAGES, 4-6 are state-of-
-/// charge. A short tap flips between them when the SOC trio is present.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Page {
-    /// Segments 1-3 — title row reads `Batt`.
-    Voltage,
-    /// Segments 4-6 — title row reads `SOC`.
-    Soc,
-}
-
-impl Page {
-    /// The other page. Short-tap toggles voltage ↔ SOC.
-    fn toggle(self) -> Self {
-        match self {
-            Page::Voltage => Page::Soc,
-            Page::Soc => Page::Voltage,
-        }
+    /// The `k`-th (0-based) non-empty detail segment (e.g. `48V 69%` / `Chg 16.5A`),
+    /// or `None`. `--`/empty segments are skipped so a big page never goes blank.
+    fn detail_segment(&self, k: usize) -> Option<&str> {
+        self.payload()
+            .strip_prefix("BATT|")?
+            .split('|')
+            .skip(3)
+            .filter(|s| !s.is_empty() && *s != "--")
+            .nth(k)
     }
 }
 
-/// BATT screen state. Render-dedup bookkeeping (the data lives in the cache) plus
-/// the selected page: repaint once/second so the fetch age ticks live, on a forced
-/// redraw (menu entry), the instant a fresh fetch lands, AND the instant a tap
-/// flips the page — mirroring the CLOCK/ABOUT dedup.
+/// BATT screen state. Render-dedup bookkeeping (data lives in the cache) + the
+/// current page INDEX. Page 0 = the VOLTAGE overview (three-line); pages 1..N = one
+/// BIG full-window page per non-empty detail segment (Task 3 — SOC% per bank, charge
+/// A). Repaint once/second (live age), on a forced redraw, on a fresh fetch, and on
+/// a page flip — mirroring the CLOCK/ABOUT dedup.
 pub struct BattState {
     /// Last uptime-second painted (drives the once/second age tick).
     last_s: Option<u32>,
-    /// Last `fetched_at_ms` painted — so a new reply repaints immediately rather
-    /// than waiting up to a second for the age tick.
+    /// Last `fetched_at_ms` painted — a new reply repaints at once.
     last_fetch: Option<u64>,
-    /// The page short-tap has selected (issue #17). Clamped at render to what the
-    /// payload actually carries — a 3-segment payload always shows `Voltage`.
-    page: Page,
-    /// Last page painted — so a tap-driven page flip repaints immediately.
-    last_page: Option<Page>,
+    /// Selected page INDEX (0 = voltage overview; 1.. = big detail pages). Stored
+    /// raw; the renderer/cycler take it `% page_count`, so an out-of-range boot page
+    /// (from `DEFAULT_PAGE`) or a shrunk payload safely resolves to a valid page.
+    page: u8,
+    /// Last page painted — so a tap-driven flip repaints immediately.
+    last_page: Option<u8>,
 }
 
 impl BattState {
-    /// Fresh state (nothing painted yet). No args: the age is derived from the
-    /// cache + `ctx.now_ms`, so unlike Snake/About there is no entry stamp to take.
+    /// Fresh state (page 0 = the voltage overview). The age derives from the cache,
+    /// so unlike Snake/About there is no entry stamp to take.
     pub fn new() -> Self {
         Self {
             last_s: None,
             last_fetch: None,
-            page: Page::Voltage,
+            page: 0,
             last_page: None,
         }
+    }
+
+    /// Seed the boot page (`board::DEFAULT_PAGE`) — stored raw, clamped at render.
+    /// Only the boot one-shot calls this; Menu entry keeps page 0.
+    pub fn set_page(&mut self, page: u8) {
+        self.page = page;
     }
 }
 
@@ -191,22 +192,16 @@ impl Plugin for BattState {
         match press {
             // Uniform grammar: long press leaves to the menu.
             Press::Long => Transition::Switch(AppKind::Menu),
-            // Short tap: flip the VOLTAGE ↔ SOC page (issue #17) — but ONLY when
-            // the retained payload carries the optional SOC trio (> 3 segments).
-            // A voltage-only (3-segment) payload has no second page, so the tap
-            // stays a no-op there — backward-compatible with pre-#17 payloads and
-            // boards (this SUPERSEDES the earlier "short tap is always a no-op"
-            // ruling). The flip is the WHOLE action: it mutates only this plugin's
-            // `page` field, opens no WiFi burst and touches no `Ctx` transport, so
-            // a tap still can NEVER open the mesh-deaf `run_mqtt_burst` path nor
-            // extend the spec's hard 1.5 s button bound. (An on-demand refresh is
-            // still deliberately absent: the downlink already piggybacks every
-            // burst the node opens — a gateway flush ~30 s, every build at boot —
-            // so a "refresh now" flag would be redundant on a gateway and never
-            // fire on a leaf, which opens no post-boot bursts.)
+            // Short tap: CYCLE the pages 0→1→…→N→0 (Task 3). Page 0 = voltage
+            // overview; pages 1..N = one big page per non-empty detail segment. A
+            // voltage-only (3-segment) payload has exactly ONE page, so the tap is a
+            // no-op there — backward-compatible. Pure `page` mutation (no WiFi burst,
+            // no `Ctx` transport touch), so a tap can NEVER open `run_mqtt_burst` nor
+            // extend the spec's hard 1.5 s button bound.
             Press::Short => {
-                if ctx.batt.segment_count() > 3 {
-                    self.page = self.page.toggle();
+                let n = 1 + ctx.batt.detail_count() as u8;
+                if n > 1 {
+                    self.page = self.page.wrapping_add(1) % n;
                 }
                 Transition::Stay
             }
@@ -236,10 +231,16 @@ impl Plugin for BattState {
     }
 }
 
-/// Paint the screen: the page title (`Batt`/`SOC`) + fetch age on the title row,
-/// then the three lines of the CURRENT page. Free fn (all inputs are the cache +
-/// age + page), reading disjoint `Ctx` fields (`display` mut, `batt` shared).
-fn render(ctx: &mut Ctx, age_s: Option<u64>, page: Page) {
+/// Paint the screen. Page 0 = VOLTAGE overview (`Batt` + age title row, then the
+/// three voltage lines). Pages 1..N = one BIG full-window detail page (Task 3): the
+/// segment's short label (before the first space) small on top + its value (after)
+/// LARGE (FONT_10X20). `page` is taken `% page_count`, so an out-of-range boot page
+/// or a shrunk payload resolves to a valid page. Reads disjoint `Ctx` fields.
+fn render(ctx: &mut Ctx, age_s: Option<u64>, page: u8) {
+    let big = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
     let title_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
         .text_color(BinaryColor::On)
@@ -251,21 +252,8 @@ fn render(ctx: &mut Ctx, age_s: Option<u64>, page: Page) {
 
     ctx.display.clear(BinaryColor::Off).ok();
 
-    // Which page can actually be shown: the SOC page exists only when the payload
-    // carries segments 4-6 (> 3 total; issue #17). Otherwise clamp to Voltage, so
-    // a 3-segment payload (or an empty cache) always renders as `Batt` — even if
-    // `page` still remembers a SOC selection from a richer earlier payload.
-    let show_soc = page == Page::Soc && ctx.batt.segment_count() > 3;
-
-    // Title: the current page name (matches the menu row + FONT_6X10 title style).
-    let title = if show_soc { "SOC" } else { "Batt" };
-    Text::with_baseline(title, Point::new(2, 0), title_style, Baseline::Top)
-        .draw(ctx.display)
-        .ok();
-
-    // Own fetch age, right of the title (`12s` / `5m` / `2h`, or `--` if never
-    // fetched). This is OUR freshness (when the cache last changed) — distinct
-    // from any `--` HA renders inside a line for a stale/unavailable source entity.
+    // Own fetch age (`12s`/`5m`/`2h`, or `--` if never fetched) — OUR freshness,
+    // distinct from any `--` HA renders inside a line for a stale source entity.
     let mut age = AgeBuf::new();
     match age_s {
         Some(s) => write_age(&mut age, s),
@@ -273,20 +261,40 @@ fn render(ctx: &mut Ctx, age_s: Option<u64>, page: Page) {
             let _ = age.write_str("--");
         }
     }
-    Text::with_baseline(age.as_str(), Point::new(48, 1), small, Baseline::Top)
-        .draw(ctx.display)
-        .ok();
 
-    // Rows 2-4: the three lines of the current page. The cache holds the payload
-    // verbatim (`BATT|v1|v2|v3[|s1|s2|s3]`), so strip the marker, split on `|`,
-    // then skip to this page's window (Voltage = segments 1-3; SOC = 4-6) and clip
-    // to the panel width. Missing/short segments leave that row blank — the `--`
-    // age already signals "no data".
-    let body = ctx.batt.payload().strip_prefix("BATT|").unwrap_or("");
-    let skip = if show_soc { 3 } else { 0 };
-    for (i, seg) in body.split('|').skip(skip).take(3).enumerate() {
-        let y = 12 + i as i32 * 9;
-        Text::with_baseline(clip(seg, LINE_CHARS), Point::new(2, y), small, Baseline::Top)
+    // Pages: 0 = voltage overview, 1..N = one big page per non-empty detail segment.
+    let n = 1 + ctx.batt.detail_count() as u8;
+    let p = page % n.max(1);
+
+    if p == 0 {
+        // Voltage overview: title + age + the three voltage lines (segments 1-3).
+        Text::with_baseline("Batt", Point::new(2, 0), title_style, Baseline::Top)
+            .draw(ctx.display)
+            .ok();
+        Text::with_baseline(age.as_str(), Point::new(48, 1), small, Baseline::Top)
+            .draw(ctx.display)
+            .ok();
+        let body = ctx.batt.payload().strip_prefix("BATT|").unwrap_or("");
+        for (i, seg) in body.split('|').take(3).enumerate() {
+            let y = 12 + i as i32 * 9;
+            Text::with_baseline(clip(seg, LINE_CHARS), Point::new(2, y), small, Baseline::Top)
+                .draw(ctx.display)
+                .ok();
+        }
+    } else if let Some(seg) = ctx.batt.detail_segment((p - 1) as usize) {
+        // Big detail page: `<label> <value>` → small label on top, BIG value below.
+        let (label, value) = seg.split_once(' ').unwrap_or(("", seg));
+        Text::with_baseline(clip(label, LINE_CHARS), Point::new(2, 1), small, Baseline::Top)
+            .draw(ctx.display)
+            .ok();
+        // Tiny age top-right so freshness stays visible on the big page too.
+        Text::with_baseline(age.as_str(), Point::new(56, 1), small, Baseline::Top)
+            .draw(ctx.display)
+            .ok();
+        let v = clip(value, 7); // ≤ 7 glyphs @ 10 px advance fits 72 px
+        let w = v.chars().count() as i32 * 10;
+        let x = ((72 - w) / 2).max(1);
+        Text::with_baseline(v, Point::new(x, 14), big, Baseline::Top)
             .draw(ctx.display)
             .ok();
     }

@@ -23,26 +23,34 @@ configs and needs no HA config (see *MQTT discovery* below).
 ### `smol/display/batt` payload (LOCKED — the exact lines the firmware renders on the 72×40 OLED)
 
 ```
-BATT|48V 52.8V|HV 391.9V|d 43mV|A 69%|B 99%|C 4.1A
+BATT|48V 52.8V|HV 391.9V|d 43mV|48V 69%|HV 99%|Chg 4.1A
 ```
 
-- pipe-separated, **≤6 segments**, each ≤12 chars, ≤96 bytes total, ASCII (worst case ≈56 B).
-- **Segments 1-3 = VOLTAGE page** (title `Batt`); **segments 4-6 = SOC page** (title
-  `SOC`), added for issue #17. The board short-taps to flip pages; boards flashed
-  before #17 do `split('|').take(3)` so they ignore 4-6 — **fully backward-compatible**.
+- pipe-separated, **≤6 segments**, each ≤12 chars, ≤96 bytes total, ASCII (worst case ≈62 B).
+- **Segments 1-3 = VOLTAGE overview page** (title `Batt`); **segments 4-6 = SOC/charge
+  DETAIL segments** (issue #17). The board pages through them; boards flashed before
+  #17 do `split('|').take(3)` so they ignore 4-6 — **fully backward-compatible**.
+- **⚠️ Big-render contract (co-designed with the firmware 2026-07-08):** the firmware
+  renders each DETAIL segment (4-6) as its own full-window page — a small **label**
+  (text before the FIRST space) + a **big value** (everything after). So each detail
+  segment is `<shortlabel> <value>` with **no interior space before the value**
+  (`48V 69%` → label `48V`, value `69%`). Labels are single tokens.
 - seg 1 `48V` = **`sensor.48v_battery1_voltage`** (48 V LFP bank, BMS-direct), `%.1f`V —
   fallback **`sensor.48v_battery2_voltage`**, else `--`
 - seg 2 `HV`  = `sensor.be_battery_voltage` (BMW i3 HV pack), `%.1f`V
 - seg 3 `d`   = `sensor.be_cell_voltage_delta` (i3 cell spread), `%.0f`mV
-- seg 4 `A`   = **48V bank SOC** `sensor.48v_battery1_battery` (**BMS, coulomb-counted**),
+- seg 4 `48V` = **48V bank SOC** `sensor.48v_battery1_battery` (**BMS, coulomb-counted**),
   `%.0f`% — fallback `sensor.48v_battery2_battery`. **Deliberately the BMS, NOT EPEver**
   (team ruling 2026-07-08 — see below).
-- seg 5 `B`   = **HV pack SOC** `sensor.be_soc`, `%.0f`% — fallback `sensor.battery_state_of_charge`
-- seg 6 `C`   = **charge current** `sensor.epever_charging_current` (solar into the 48V bank), `%.1f`A
+- seg 5 `HV`  = **HV pack SOC** `sensor.be_soc`, `%.0f`% — fallback `sensor.battery_state_of_charge`
+- seg 6 `Chg` = **charge current** `sensor.epever_charging_current` (TOTAL solar charge
+  into the 48V bank), `%.1f`A. Kept on EPEver, not a BMS current: the per-battery BMS
+  currents (`48v_battery{1,2}_current`, ~12 A + ~10 A) are half-the-bank each and can't
+  be summed in the macro; EPEver reads the true total bank charge current (~16 A).
 - an `unavailable`/`unknown`/**stale** source renders that value as `--`
-  (e.g. `BATT|48V --|HV 391.9V|d 43mV|A 69%|B 99%|C --`)
-- **Override mode** (see below) owns segments 1-3 when active; the SOC trio (4-6) is
-  still appended, so the board can page to live SOC even mid-override.
+  (e.g. `BATT|48V --|HV 391.9V|d 43mV|48V 69%|HV 99%|Chg --`)
+- **Override mode** (see below) owns segments 1-3 when active; the detail trio (4-6) is
+  still appended, so the board can page to live SOC/charge even mid-override.
 
 ### `smol/display/grid` payload (issue #16, v2.2 EXTENSION)
 

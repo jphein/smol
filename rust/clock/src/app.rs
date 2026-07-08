@@ -251,6 +251,19 @@ impl App {
             App::MeshSnake(s) => Plugin::update(s, ctx),
         }
     }
+
+    /// Seed the boot default's initial PAGE (`board::DEFAULT_PAGE`) — boot-into-a-page.
+    /// Only the page-capable screens (Batt/Grid) honour it; the rest ignore it. Called
+    /// ONCE from the boot one-shot (Menu-entered screens keep page 0). The value is
+    /// stored raw and clamped to the live page count at render.
+    pub fn set_page(&mut self, _page: u8) {
+        #[cfg(feature = "wifi")]
+        match self {
+            App::Batt(s) => s.set_page(_page),
+            App::Grid(s) => s.set_page(_page),
+            _ => {}
+        }
+    }
 }
 
 /// A Home-menu entry: title + the kind entering it launches. NO fn pointers —

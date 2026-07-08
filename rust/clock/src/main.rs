@@ -104,6 +104,13 @@ mod grid;
 #[cfg(feature = "wifi")]
 mod secrets;
 
+// Per-board config (issue #19): git-ignored identity/config knobs (NODE_ID +
+// DEFAULT_APP), moved OUT of this tracked file so a per-board build dirties NOTHING
+// tracked → clean version stamp on every board. UNCONDITIONAL (NODE_ID feeds the
+// node name in all builds). Fresh clone: `cp src/board.rs.example src/board.rs`.
+mod board;
+pub(crate) use board::{DEFAULT_APP, DEFAULT_PAGE, NODE_ID};
+
 use app::{App, Ctx, Transition};
 use input::Button;
 
@@ -115,26 +122,9 @@ const START_SECONDS_OF_DAY: u32 = 12 * 3600 + 34 * 60 + 56;
 /// (`clock.rs`) can render seconds-of-day from `ctx.unix_now`.
 pub(crate) const TZ_OFFSET_SECONDS: i64 = -7 * 3600;
 
-/// This unit's logical short id — the SINGLE source of truth for both the id
-/// embedded in HELLO/ACK/BEACON/TIME frames (passed to `net::mode::start`) and
-/// this node's magical name (`net::names::name_for_id`). Give each physical board
-/// a distinct value; we flashed 7 / 8 / 9 (now id7 / id8). Changing it changes
-/// BOTH the on-wire id and the displayed name — the name is *derived* from the
-/// id and is never itself transmitted. `pub(crate)` so the CLOCK/ABOUT/MENU
-/// plugins can derive this node's name/identity from it.
-pub(crate) const NODE_ID: u8 = 7;
-
-/// The screen this board enters at BOOT, instead of the Home menu (issue #18 v1).
-/// A per-board boot knob — sibling to [`NODE_ID`] — and it lives HERE, a committed
-/// config const, rather than in the git-ignored `secrets.rs`: it is boot BEHAVIOUR,
-/// not a credential, so every clone should see the same version-controlled default
-/// (secrets.rs is per-clone + untracked — the wrong home for shared config). Set it
-/// to any `AppKind` the built firmware defines — e.g. `AppKind::Clock` for a bedside
-/// clock, or `AppKind::Batt` on a `wifi`/`espnow` build for a wall battery display.
-/// The default `AppKind::Menu` preserves the historical behaviour (boot straight to
-/// the Home menu). A long press still returns to the Menu from ANY screen (the
-/// uniform gesture grammar), so a non-menu default never traps the UI.
-pub(crate) const DEFAULT_APP: app::AppKind = app::AppKind::Menu;
+// NODE_ID and DEFAULT_APP moved to the git-ignored `board.rs` (issue #19) — see the
+// `mod board;` + `pub(crate) use` above. Referenced crate-wide as `crate::NODE_ID` /
+// `crate::DEFAULT_APP` exactly as before (the re-export preserves every call site).
 
 /// Render/poll sub-tick period (ms). Fast enough for a smooth ~10 Hz LED blink,
 /// responsive button polling, and a snappy Snake; the clock and OLED still only
@@ -672,6 +662,10 @@ fn main() -> ! {
         if boot_default_pending {
             boot_default_pending = false;
             app = App::enter(DEFAULT_APP, &ctx);
+            // Boot into a PAGE too (not just a screen): seed the entered plugin's page
+            // from DEFAULT_PAGE. Page-capable screens (Batt/Grid) honour it; others
+            // ignore it. Only this boot one-shot applies it — Menu entry keeps page 0.
+            app.set_page(DEFAULT_PAGE);
             ctx.redraw = true;
         }
 

@@ -34,12 +34,13 @@
 //!     an inbound GRID frame while this screen may be inactive, and the plugin only
 //!     ever READS it, borrowed through [`crate::app::Ctx::grid`] — mirroring
 //!     `Ctx::batt`.
-//!   * [`GridState`] — the [`Plugin`]: renders `Grid` + own fetch age on the title
-//!     row and the three grid lines below it. Long press → Menu (uniform grammar).
-//!     Short tap → a documented NO-OP (single page — see [`GridState::on_button`]).
+//!   * [`GridState`] — the [`Plugin`]: page 0 (entry) = the BREAKDOWN (total / L1 /
+//!     L2, three lines); a SHORT TAP reveals page 1 = the big TOTAL power filling the
+//!     window (FONT_10X20, mirrors the CLOCK — JP's "just the power, whole window,
+//!     when you click the button"). Long press → Menu (uniform grammar).
 
 use embedded_graphics::{
-    mono_font::{ascii::FONT_5X8, ascii::FONT_6X10, MonoTextStyleBuilder},
+    mono_font::{ascii::FONT_10X20, ascii::FONT_5X8, ascii::FONT_6X10, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
     prelude::*,
     text::{Baseline, Text},
@@ -123,27 +124,57 @@ impl GridCache {
     fn payload(&self) -> &str {
         core::str::from_utf8(&self.lines[..self.len]).unwrap_or("")
     }
+
+    /// The TOTAL segment (segment 1 after the `GRID|` marker, e.g. `878W` / `1.2kW`)
+    /// for the big-number view, or `"--"` when never fetched / empty. The `<L1>`/`<L2>`
+    /// breakdown lives in the later segments (shown on the breakdown page).
+    fn total(&self) -> &str {
+        match self.payload().strip_prefix("GRID|") {
+            Some(body) => {
+                let t = body.split('|').next().unwrap_or("");
+                if t.is_empty() { "--" } else { t }
+            }
+            None => "--",
+        }
+    }
 }
 
-/// GRID screen state. Only render-dedup bookkeeping (the data lives in the cache):
-/// repaint once/second so the fetch age ticks live, on a forced redraw (menu
-/// entry), and the instant a fresh fetch lands — mirroring the CLOCK/ABOUT dedup.
+/// Grid has two pages: 0 = breakdown (entry), 1 = big total power.
+const PAGE_COUNT: u8 = 2;
+
+/// GRID screen state: render-dedup bookkeeping (data lives in the cache) + the
+/// current page INDEX. Page 0 = the BREAKDOWN (total / L1 / L2, three-line) — the
+/// entry view; page 1 = the big TOTAL power filling the window (JP's "just the power
+/// … when you click the button"). Repaint once/second (live age), on a forced
+/// redraw, on a fresh fetch, and on a page flip.
 pub struct GridState {
     /// Last uptime-second painted (drives the once/second age tick).
     last_s: Option<u32>,
-    /// Last `fetched_at_ms` painted — so a new reply repaints immediately rather
-    /// than waiting up to a second for the age tick.
+    /// Last `fetched_at_ms` painted — a new reply repaints at once.
     last_fetch: Option<u64>,
+    /// Selected page INDEX (0 = breakdown, 1 = big total). Stored raw; the
+    /// renderer/cycler take it `% PAGE_COUNT`, so an out-of-range boot page (from
+    /// `DEFAULT_PAGE`) safely resolves to a valid page.
+    page: u8,
+    /// Last page painted — so a tap-driven flip repaints immediately.
+    last_page: Option<u8>,
 }
 
 impl GridState {
-    /// Fresh state (nothing painted yet). No args: the age is derived from the
-    /// cache + `ctx.now_ms`, so there is no entry stamp to take.
+    /// Fresh state — page 0, the breakdown overview (the entry view).
     pub fn new() -> Self {
         Self {
             last_s: None,
             last_fetch: None,
+            page: 0,
+            last_page: None,
         }
+    }
+
+    /// Seed the boot page (`board::DEFAULT_PAGE`) — stored raw, clamped at render.
+    /// Only the boot one-shot calls this; Menu entry keeps page 0.
+    pub fn set_page(&mut self, page: u8) {
+        self.page = page;
     }
 }
 
@@ -152,39 +183,49 @@ impl Plugin for GridState {
         match press {
             // Uniform grammar: long press leaves to the menu.
             Press::Long => Transition::Switch(AppKind::Menu),
-            // Short tap: intentional NO-OP. Grid is a SINGLE page (unlike Batt's
-            // voltage↔SOC toggle — the grid payload has no optional second trio), so
-            // there is nothing to page to. As with Batt, the fetch already
-            // PIGGYBACKS every burst the node opens (a gateway on each ~30 s flush,
-            // every build at boot; leaves get the gateway's GRID frame), so an
-            // on-demand refresh would be redundant on a gateway and never fire on a
-            // leaf — and a no-op guarantees a tap can never extend the mesh-deaf
-            // window past the spec's 1.5 s button bound.
-            Press::Short => Transition::Stay,
+            // Short tap: flip BREAKDOWN (0) ↔ big TOTAL power (1) — JP's "show just
+            // the power, whole window, when you click the button". Pure `page`
+            // mutation (no WiFi burst, no `Ctx` touch), so a tap can never extend the
+            // mesh-deaf window past the spec's 1.5 s button bound.
+            Press::Short => {
+                self.page = self.page.wrapping_add(1) % PAGE_COUNT;
+                Transition::Stay
+            }
         }
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
-        // Repaint iff forced (menu entry), the second rolled over (live age), or a
-        // fresh fetch landed since we last painted — else leave the panel be.
+        // Repaint iff forced (menu entry), the second rolled over (live age), a
+        // fresh fetch landed, or a tap flipped the page — else leave the panel be.
         let sec = (ctx.now_ms / 1000) as u32;
         let fetched = ctx.grid.fetched_at_ms;
-        if !(ctx.redraw || self.last_s != Some(sec) || self.last_fetch != fetched) {
+        if !(ctx.redraw
+            || self.last_s != Some(sec)
+            || self.last_fetch != fetched
+            || self.last_page != Some(self.page))
+        {
             return;
         }
         self.last_s = Some(sec);
         self.last_fetch = fetched;
+        self.last_page = Some(self.page);
 
         // Age in whole seconds since the last fetch, or `None` if never fetched.
         let age_s = fetched.map(|f| ctx.now_ms.saturating_sub(f) / 1000);
-        render(ctx, age_s);
+        render(ctx, age_s, self.page);
     }
 }
 
-/// Paint the screen: `Grid` + fetch age on the title row, then the three grid
-/// lines. Free fn (all inputs are the cache + age), reading disjoint `Ctx` fields
-/// (`display` mut, `grid` shared).
-fn render(ctx: &mut Ctx, age_s: Option<u64>) {
+/// Paint the screen. Page 0 = BREAKDOWN (`Grid` + age title row, then total/L1/L2,
+/// three-line) — the entry view. Page 1 = the big TOTAL power (FONT_10X20, mirroring
+/// the CLOCK's big digits) filling the window + a small age. `page` is taken
+/// `% PAGE_COUNT`, so an out-of-range boot page resolves to a valid one. Reads
+/// disjoint `Ctx` fields (`display` mut, `grid` shared).
+fn render(ctx: &mut Ctx, age_s: Option<u64>, page: u8) {
+    let big = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(BinaryColor::On)
+        .build();
     let title_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
         .text_color(BinaryColor::On)
@@ -196,14 +237,7 @@ fn render(ctx: &mut Ctx, age_s: Option<u64>) {
 
     ctx.display.clear(BinaryColor::Off).ok();
 
-    // Title: the screen name (matches the menu row + FONT_6X10 title elsewhere).
-    Text::with_baseline("Grid", Point::new(2, 0), title_style, Baseline::Top)
-        .draw(ctx.display)
-        .ok();
-
-    // Own fetch age, right of the title (`12s` / `5m` / `2h`, or `--` if never
-    // fetched). This is OUR freshness (when the cache last changed) — distinct
-    // from any `--` HA renders inside a line for a stale/unavailable source entity.
+    // Own fetch age (`12s`/`5m`/`2h`, or `--` if never fetched) — OUR freshness.
     let mut age = AgeBuf::new();
     match age_s {
         Some(s) => write_age(&mut age, s),
@@ -211,18 +245,32 @@ fn render(ctx: &mut Ctx, age_s: Option<u64>) {
             let _ = age.write_str("--");
         }
     }
-    Text::with_baseline(age.as_str(), Point::new(48, 1), small, Baseline::Top)
-        .draw(ctx.display)
-        .ok();
 
-    // Rows 2-4: the three grid lines. The cache holds the payload verbatim
-    // (`GRID|l1|l2|l3`), so strip the marker, then split on `|` and clip to the
-    // panel width. Missing segments (never fetched, or a short/malformed payload)
-    // leave that row blank — the `--` age already signals "no data".
-    let lines = ctx.grid.payload().strip_prefix("GRID|").unwrap_or("");
-    for (i, seg) in lines.split('|').take(3).enumerate() {
-        let y = 12 + i as i32 * 9;
-        Text::with_baseline(clip(seg, LINE_CHARS), Point::new(2, y), small, Baseline::Top)
+    if page.is_multiple_of(PAGE_COUNT) {
+        // BREAKDOWN (entry view): title + age + the three payload lines.
+        Text::with_baseline("Grid", Point::new(2, 0), title_style, Baseline::Top)
+            .draw(ctx.display)
+            .ok();
+        Text::with_baseline(age.as_str(), Point::new(48, 1), small, Baseline::Top)
+            .draw(ctx.display)
+            .ok();
+        let lines = ctx.grid.payload().strip_prefix("GRID|").unwrap_or("");
+        for (i, seg) in lines.split('|').take(3).enumerate() {
+            let y = 12 + i as i32 * 9;
+            Text::with_baseline(clip(seg, LINE_CHARS), Point::new(2, y), small, Baseline::Top)
+                .draw(ctx.display)
+                .ok();
+        }
+    } else {
+        // JP's "just the power, whole window": the TOTAL as a big centred number.
+        let total = clip(ctx.grid.total(), 7); // ≤ 7 glyphs @ 10 px advance fits 72 px
+        let w = total.chars().count() as i32 * 10;
+        let x = ((72 - w) / 2).max(1); // centre like the CLOCK (10 px/char)
+        Text::with_baseline(total, Point::new(x, 11), big, Baseline::Top)
+            .draw(ctx.display)
+            .ok();
+        // Tiny age, top-right (like the CLOCK's AM/PM) — unobtrusive freshness.
+        Text::with_baseline(age.as_str(), Point::new(56, 0), small, Baseline::Top)
             .draw(ctx.display)
             .ok();
     }

@@ -1,0 +1,44 @@
+//! Per-board configuration TEMPLATE (issue #19) — copy to `board.rs` on a fresh
+//! clone, BEFORE the first build:
+//!
+//! ```bash
+//! cp src/board.rs.example src/board.rs   # then set NODE_ID (+ DEFAULT_APP if desired)
+//! ```
+//!
+//! `board.rs` is git-ignored (`.gitignore`: `**/board.rs`) — NOT because it is
+//! secret (it is IDENTITY/CONFIG, deliberately distinct from `secrets.rs`, which
+//! holds WiFi/MQTT credentials) but so a per-board build dirties NO tracked file:
+//! every board's embedded git version stamp then stays clean (that was #19's wart —
+//! editing `NODE_ID` in the tracked `main.rs` made each board's stamp read "dirty").
+//! EVERY build (even the default, no-feature build) needs this file — `NODE_ID`
+//! feeds the node's name in all builds — so the `cp` is the first fresh-clone step.
+
+use crate::app::AppKind;
+
+/// This unit's logical short id — the SINGLE source of truth for the id embedded in
+/// HELLO/ACK/BEACON/TIME frames and this node's magical name
+/// (`net::names::name_for_id`). Give each physical board a DISTINCT value (we flashed
+/// 7 / 8 / 9). Changing it changes BOTH the on-wire id and the displayed name (the
+/// name is *derived* from the id and is never itself transmitted).
+pub const NODE_ID: u8 = 7;
+
+/// The screen this board enters at BOOT instead of the Home menu (issue #18).
+/// Valid values, by the feature tier the firmware is built with:
+///   * always:              `AppKind::Menu` · `AppKind::Clock` · `AppKind::Snake` · `AppKind::About`
+///   * `--features wifi`:   + `AppKind::Batt` · `AppKind::Grid`
+///   * `--features espnow`: + `AppKind::Bench` · `AppKind::MeshSnake`
+///
+/// `AppKind::Menu` (the default) boots straight to the Home menu — the historical
+/// behaviour. A long press always returns to the Menu from any screen, so a
+/// non-menu default never traps the UI. Setting a variant the build does NOT define
+/// is a compile error (e.g. `Grid` exists only in wifi/espnow builds).
+pub const DEFAULT_APP: AppKind = AppKind::Menu;
+
+/// The PAGE within [`DEFAULT_APP`] to show at boot — so a board can boot straight
+/// into a screen's secondary page. `0` = the screen's normal first page. Applies
+/// ONLY to the boot default; screens entered via the Menu always start at page 0.
+/// Out-of-range clamps to page 0 (a screen with fewer pages ignores it). Page map:
+///   * Batt: 0 = voltage overview; 1..N = one BIG page per detail segment (48V SOC%, HV SOC%, charge A), skips blanks.
+///   * Grid: 0 = breakdown (total / L1 / L2); 1 = BIG total power (full window).
+///   * Clock / Snake / Bench / MeshSnake / About / Menu: no pages → ignored.
+pub const DEFAULT_PAGE: u8 = 0;
