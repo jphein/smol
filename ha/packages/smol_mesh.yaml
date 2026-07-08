@@ -1,0 +1,182 @@
+# smol mesh ↔ Home Assistant — MQTT-native downlink (team spec v2, 2026-07-08)
+# ---------------------------------------------------------------------------
+# This package is the HA end of the smol battery-display bridge. It publishes a
+# RETAINED, display-ready payload to the MQTT topic `smol/display/batt` every
+# time a source battery sensor changes, on a 5-minute heartbeat, and when HA
+# starts. Because the message is retained, the broker itself is the cache: a smol
+# gateway connects for only ~2 s during its WiFi burst, SUBSCRIBEs, and the
+# broker delivers the last value immediately — no HA-side request/response. The
+# gateway then rebroadcasts it over ESP-NOW (a SMOLv1 BATT frame) so every leaf
+# node caches it too.
+#
+# Payload format (LOCKED — the exact lines the firmware renders on the 72×40 OLED):
+#   BATT|48V 52.8V|HV 391.9V|d 43mV
+#   - pipe-separated, ≤3 lines, each line ≤12 chars, whole payload ≤96 bytes, ASCII
+#   - line 1: 48V bank    %.1f V   sensor.48v_battery1_voltage  (BMS-direct; see below)
+#             fallback           → sensor.48v_battery2_voltage, else `--`
+#   - line 2: BMW i3 HV pack %.1f V   sensor.be_battery_voltage
+#   - line 3: i3 cell spread %.0f mV  sensor.be_cell_voltage_delta
+#   - any source that is unavailable / unknown / STALE (>30 min) renders `--`
+#     for that value (e.g. `BATT|48V --|HV 391.9V|d 43mV`).
+#
+# OVERRIDE MODE: when input_boolean.smol_display_override is ON, the automation
+# publishes `BATT|<line1>|<line2>|<line3>` built from the three line SOURCES in
+# input_text.smol_display_line1/2/3 instead of the battery reading — SAME topic +
+# envelope, so the boards need ZERO changes.
+#   - A source is literal text with `{entity_id}` placeholders, e.g.
+#     `48V {sensor.48v_battery1_voltage}V` -> `48V 52.8V`, `PV {sensor.epever_pv_power}W`.
+#   - Placeholders are resolved by SAFE regex substitution (regex_findall on
+#     `\{([a-z0-9_.]+)\}`, each `{id}` -> `states('<id>')`). We do NOT eval
+#     user-typed Jinja (HA's sandbox forbids it and it would be an injection risk).
+#     A placeholder whose entity is unknown/unavailable renders `--`.
+#   - AFTER substitution each line is SANITIZED: `|` chars stripped (they'd corrupt
+#     the pipe framing) and the line clipped to 12 chars (payload stays ≤96 B).
+#     Blank lines render empty (fine on-glass). Toggle OFF -> live battery reading.
+#   - REFRESH: placeholder values re-render on the 5-min time_pattern (referenced
+#     entities are NOT dynamic triggers), plus on any override-helper edit and HA
+#     start. So a value inside a placeholder can be up to ~5 min stale.
+#
+# DASHBOARD: `mqtt.sensor.smol_display_batt` mirrors the retained topic so a
+# Lovelace card shows exactly what the boards will fetch. Ready-made card:
+# ha/dashboard/smol_display_card.yaml (install via the WS lovelace/config/save
+# API at deploy time — NOT by editing .storage; see ha/README.md).
+#
+# WHY NOT sensor.epever_battery_voltage for the 48V line? JP's HA history
+# (2026-07-08) shows that entity is chronically corrupted — it bounces 0↔55 V with
+# >100 V spikes all day (suspected Modbus/PE11 bus contention; under separate
+# investigation). The BMS-direct `sensor.48v_battery1_voltage` (~52.8, stable) is
+# the truth source; `sensor.48v_battery2_voltage` is the fallback. The epever
+# entity is deliberately AVOIDED here.
+#
+# STALENESS: the automation also fires every 5 min (time_pattern) and the template
+# renders `--` for any source whose `last_reported` is older than 30 min (1800 s),
+# so a wedged integration cannot freeze a stale-but-live-looking value into the
+# retained payload. `last_reported` (not `last_updated`) is used deliberately: it
+# advances on EVERY state write, so a live integration that keeps re-reporting an
+# unchanged value stays "fresh", while a truly wedged one goes stale. The 30-min
+# window (team ruling 2026-07-08) covers the measured worst case: the BE HV/delta
+# sensors publish on-change and a steady pack legitimately goes quiet up to
+# ~22.6 min, so a tighter window would blank HEALTHY data and train the reader to
+# ignore `--`. 30 min still catches the real failure (dead MQTT / wedged
+# integration). Single constant in the macro below (1800) if it ever needs tuning.
+# KNOWN LIMITATION (see ha/README.md): if HA ITSELF dies, the retained payload
+# persists on the broker and the boards cannot tell it is stale (they show it with
+# their own fetch-age only). A payload-embedded timestamp is a filed follow-up.
+#
+# Deploy: copy to /homeassistant/packages/smol_mesh.yaml and restart HA. See
+# ha/README.md. This file only PUBLISHES; the uplink entities (sensor.smol_<id>_*)
+# are created automatically by the firmware's retained MQTT-discovery configs.
+
+# --- Manual display-override helpers ---------------------------------------
+# Three free-text lines + a master toggle. When the toggle is ON the automation
+# publishes these (sanitized) instead of the battery reading.
+input_text:
+  # Line SOURCES (not the final text): literal chars + {entity_id} placeholders,
+  # e.g. "48V {sensor.48v_battery1_voltage}V" or "PV {sensor.epever_pv_power}W".
+  # max 100 to fit source + placeholders; the RENDERED line is clipped to 12.
+  smol_display_line1:
+    name: "smol display line 1 (source)"
+    max: 100
+    initial: ""
+  smol_display_line2:
+    name: "smol display line 2 (source)"
+    max: 100
+    initial: ""
+  smol_display_line3:
+    name: "smol display line 3 (source)"
+    max: 100
+    initial: ""
+
+input_boolean:
+  smol_display_override:
+    name: "smol display override"
+    icon: "mdi:pencil"
+
+# --- Dashboard mirror: subscribe the retained topic so a card shows exactly ---
+# what the boards fetch (the payload is <=96 chars, well under the 255 state cap).
+mqtt:
+  sensor:
+    - name: "smol display batt"
+      unique_id: smol_display_batt_mirror
+      state_topic: "smol/display/batt"
+      icon: "mdi:monitor-dashboard"
+
+automation:
+  - id: smol_publish_batt_display
+    alias: "smol: publish battery display payload (retained)"
+    description: >-
+      Publishes the display-ready payload to smol/display/batt (retained, QoS0):
+      the manual override text when input_boolean.smol_display_override is ON,
+      otherwise the live battery reading. Fires on any source-sensor change, any
+      override-helper change, every 5 minutes, and at HA start. Stale (>30 min) or
+      unavailable battery sources render as `--`.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        id: sensor_change
+        entity_id:
+          - sensor.48v_battery1_voltage
+          - sensor.48v_battery2_voltage
+          - sensor.be_battery_voltage
+          - sensor.be_cell_voltage_delta
+      - platform: state
+        id: override_change
+        entity_id:
+          - input_boolean.smol_display_override
+          - input_text.smol_display_line1
+          - input_text.smol_display_line2
+          - input_text.smol_display_line3
+      - platform: time_pattern
+        id: heartbeat
+        minutes: "/5"
+      - platform: homeassistant
+        event: start
+        id: ha_start
+    action:
+      - service: mqtt.publish
+        data:
+          topic: smol/display/batt
+          retain: true
+          qos: 0
+          # `>-` folds the block to one line; the {%- -%} trims + per-cell |trim
+          # make the rendered output EXACTLY the `BATT|...` line, no stray space.
+          # Override ON -> `subst()` resolves {entity_id} placeholders in each line
+          # source (unknown -> `--`), then `|` is stripped and the line clipped to
+          # 12; OFF -> the live battery reading, where the `cell` macro picks the
+          # first fresh (≤30 min), available source from its fallback list.
+          payload: >-
+            {%- macro cell(label, entities, fmt) -%}
+            {%- set ns = namespace(out=label ~ ' --', found=false) -%}
+            {%- for ent in entities -%}
+            {%- if not ns.found -%}
+            {%- set s = states[ent] -%}
+            {%- if s is not none and (s.state | lower) not in ['unknown', 'unavailable', 'none', ''] and (now() - s.last_reported).total_seconds() <= 1800 -%}
+            {%- set ns.out = label ~ ' ' ~ (fmt | format(s.state | float)) -%}
+            {%- set ns.found = true -%}
+            {%- endif -%}
+            {%- endif -%}
+            {%- endfor -%}
+            {{- ns.out -}}
+            {%- endmacro -%}
+            {%- macro subst(src) -%}
+            {%- set ns = namespace(out=src) -%}
+            {%- for id in src | regex_findall('\{([a-z0-9_.]+)\}') -%}
+            {%- set v = states(id) -%}
+            {%- set v = '--' if (v | lower) in ['unknown', 'unavailable', 'none', ''] else v -%}
+            {%- set ns.out = ns.out | replace('{' ~ id ~ '}', v) -%}
+            {%- endfor -%}
+            {{- ns.out -}}
+            {%- endmacro -%}
+            {%- if is_state('input_boolean.smol_display_override', 'on') -%}
+            {%- set bad = ['unknown', 'unavailable', 'none', ''] -%}
+            {%- set o1 = states('input_text.smol_display_line1') -%}
+            {%- set o2 = states('input_text.smol_display_line2') -%}
+            {%- set o3 = states('input_text.smol_display_line3') -%}
+            {%- set l1 = '' if (o1 | lower) in bad else (subst(o1) | replace('|', ''))[:12] -%}
+            {%- set l2 = '' if (o2 | lower) in bad else (subst(o2) | replace('|', ''))[:12] -%}
+            {%- set l3 = '' if (o3 | lower) in bad else (subst(o3) | replace('|', ''))[:12] -%}
+            BATT|{{ l1 }}|{{ l2 }}|{{ l3 }}
+            {%- else -%}
+            BATT|{{ cell('48V', ['sensor.48v_battery1_voltage', 'sensor.48v_battery2_voltage'], '%.1fV') | trim }}|{{ cell('HV', ['sensor.be_battery_voltage'], '%.1fV') | trim }}|{{ cell('d', ['sensor.be_cell_voltage_delta'], '%.0fmV') | trim }}
+            {%- endif -%}

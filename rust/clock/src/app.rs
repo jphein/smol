@@ -77,6 +77,13 @@ pub struct Ctx<'a> {
     /// Set by `main` after a mode switch; a plugin repaints when true OR when its
     /// own cadence (once/second, on-step, on-page-change, …) fires.
     pub redraw: bool,
+    /// HA battery-voltage cache (the Batt screen), borrowed read-only. Owned by
+    /// `main` and filled by the WiFi burst's MQTT downlink (`net/wifi.rs`'s
+    /// `mqtt_session`) or an inbound SMOLv1 BATT frame — either can happen while
+    /// this screen is inactive, so the plugin only reads it. cfg(wifi): the whole
+    /// Batt feature is wifi-only (espnow ⊃ wifi), like the espnow-only fields below.
+    #[cfg(feature = "wifi")]
+    pub batt: &'a crate::batt::BattCache,
     // --- espnow-only ---
     /// The Clock bottom-line label under espnow: the radio service's most-recent
     /// peer/mesh message (`bottom_line`, owned by `main`). Non-espnow builds derive
@@ -130,6 +137,11 @@ pub enum AppKind {
     #[allow(dead_code)]
     Snake,
     About,
+    // Batt is LIVE whenever compiled (constructed by its REGISTRY row + `enter`),
+    // so no `dead_code` allow is needed — unlike `Snake` under espnow. cfg(wifi):
+    // the fetch path is wifi-only (espnow ⊃ wifi).
+    #[cfg(feature = "wifi")]
+    Batt,
     #[cfg(feature = "espnow")]
     Bench,
     #[cfg(feature = "espnow")]
@@ -154,6 +166,8 @@ pub enum App {
     #[allow(dead_code)]
     Snake(crate::snake::Snake),
     About(crate::about::About),
+    #[cfg(feature = "wifi")]
+    Batt(crate::batt::BattState),
     #[cfg(feature = "espnow")]
     Bench(crate::bench::BenchState),
     #[cfg(feature = "espnow")]
@@ -169,6 +183,8 @@ impl App {
             AppKind::Clock => App::Clock(crate::clock::ClockState::new()),
             AppKind::Snake => App::Snake(crate::snake::Snake::new(ctx.now_ms)),
             AppKind::About => App::About(crate::about::About::new(ctx.now_ms)),
+            #[cfg(feature = "wifi")]
+            AppKind::Batt => App::Batt(crate::batt::BattState::new()),
             #[cfg(feature = "espnow")]
             AppKind::Bench => App::Bench(crate::bench::BenchState::new()),
             #[cfg(feature = "espnow")]
@@ -192,6 +208,8 @@ impl App {
             App::Clock(s) => Plugin::on_button(s, press, ctx),
             App::Snake(s) => Plugin::on_button(s, press, ctx),
             App::About(s) => Plugin::on_button(s, press, ctx),
+            #[cfg(feature = "wifi")]
+            App::Batt(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "espnow")]
             App::Bench(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "espnow")]
@@ -206,6 +224,8 @@ impl App {
             App::Clock(s) => Plugin::update(s, ctx),
             App::Snake(s) => Plugin::update(s, ctx),
             App::About(s) => Plugin::update(s, ctx),
+            #[cfg(feature = "wifi")]
+            App::Batt(s) => Plugin::update(s, ctx),
             #[cfg(feature = "espnow")]
             App::Bench(s) => Plugin::update(s, ctx),
             #[cfg(feature = "espnow")]
@@ -228,12 +248,18 @@ pub const SNAKE_KIND: AppKind = AppKind::MeshSnake;
 #[cfg(not(feature = "espnow"))]
 pub const SNAKE_KIND: AppKind = AppKind::Snake;
 
-/// The Home list, in order. Clock / Snake / (Bench, espnow) / About. About makes
-/// the espnow menu 4 rows → exercises the scrolling window in `menu.rs`.
+/// The Home list, in order. Batt (cfg wifi) grows the `wifi` menu to 4 rows and
+/// the `espnow` menu to 5, so both now exercise the ≤3-row scrolling window in
+/// `menu.rs`; only the default build stays at 3 and never scrolls:
+///   - default: Clock / Snake / About                (3 rows — no scroll)
+///   - wifi:    Clock / Snake / Batt / About          (4 rows — scrolls)
+///   - espnow:  Clock / Snake / Bench / Batt / About  (5 rows — scrolls)
 pub const REGISTRY: &[AppDesc] = &[
     AppDesc { title: "Clock", kind: AppKind::Clock },
     AppDesc { title: "Snake", kind: SNAKE_KIND },
     #[cfg(feature = "espnow")]
     AppDesc { title: "Bench", kind: AppKind::Bench },
+    #[cfg(feature = "wifi")]
+    AppDesc { title: "Batt", kind: AppKind::Batt },
     AppDesc { title: "About", kind: AppKind::About },
 ];

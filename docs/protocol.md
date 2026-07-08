@@ -83,9 +83,17 @@ stays well under 250 B.
 | [ACK](#ack--led-handshake) | `SMOLv1 ACK ` | 14 | unicast | reactive | espnow | 🟢 |
 | [BEACON](#beacon--bench-link-stats) | `SMOLv1 BEACON ` | 29 | broadcast | ~2 s (Bench) | espnow | 🟡 |
 | [TIME](#time--mesh-time-sync) | `SMOLv1 TIME ` | 37 | broadcast | ~2 s | espnow | 🟢 |
+| [BATT](#batt--ha-battery-snapshot) | `SMOLv1 BATT ` | ≤108 | broadcast | on-recv + periodic | espnow | 🟡 |
 | [RELAY](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAY ` | ≤91 | broadcast | ~15 s (leaf) | espnow | 🟢 |
 | [RELAYACK](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAYACK ` | 25 | unicast | reactive | espnow | 🟢 |
 | [SNK](#snk--mmo-mesh-snake) | `SMOLv1 SNK ` | 18 | broadcast | 5 Hz jittered | espnow | 🟢 |
+
+> **The battery downlink is two hops.** The [`SMOLv1 BATT`](#batt--ha-battery-snapshot)
+> frame above is the *mesh* hop (gateway → leaves). It's **fed** by an
+> [MQTT burst](#mqtt-burst--the-lan-transport-that-retires-the-udp-collector) on the
+> LAN (gateway ↔ Home Assistant's Mosquitto broker) — plain TCP, not a mesh frame,
+> so that transport is documented in its own section below, where the old UDP
+> collector egress used to live. (v2 pivot: MQTT-native, retiring the collector.)
 
 ---
 
@@ -186,6 +194,82 @@ advanced on reboot (…8465). Zero panics. (Committed in `76b19e4`.)
 **Source.** `mode.rs` `TIME_PREFIX`, `encode_time`, `write_u10`/`parse_u10`,
 `TimeTracker`; `main::should_adopt`; spec `mesh-time-sync-spec.md`.
 
+## BATT — HA battery snapshot
+
+**Purpose.** Carry Home Assistant battery voltages to **every** display over the
+mesh. A **gateway** fetches a display-ready line set from HA (via the [MQTT
+burst](#mqtt-burst--the-lan-transport-that-retires-the-udp-collector) below) and
+broadcasts it as a BATT frame so **leaves** — which never touch WiFi — render it
+from cache too. The **gateway is the sole broadcaster** (it's the single source from
+HA): it emits **on receipt** of a fresh downlink, then **periodically re-emits**
+(borrowing the TIME frame's tick) so a leaf that missed a burst still converges.
+**Unlike TIME, leaves do *not* re-broadcast** — so BATT is **single-hop**: gateway →
+its direct ESP-NOW neighbours only (see Cadence for why). (This is the *HA* battery
+— distinct from a board's own on-board LiPo readout, `sensors::batt_v`, shown by the
+Clock app.)
+
+**Layout (≤ 108 B).**
+
+| Field | Bytes | Encoding | Meaning |
+|---|---|---|---|
+| tag | 12 | `b"SMOLv1 BATT "` | namespace (mirrors `b"SMOLv1 TIME "`) |
+| `payload` | ≤ 96 | ASCII, display-ready | the `BATT\|`-marked display lines, **verbatim** from `smol/display/batt` |
+
+> **Payload framing (LOCKED — spec v2 "Pinned byte-layouts", team-lead ruling
+> 2026-07-08).** After the tag, the frame carries the **verbatim** retained
+> `smol/display/batt` payload **including its `BATT\|` marker** — e.g.
+> `SMOLv1 BATT BATT|48V 52.8V|HV 391.9V|d 43mV`. **No length byte:** payload length
+> = `frame_len − 12`. Frame payload and `BattCache` are therefore **byte-identical**
+> — one `memcpy`, no reformatting on either the broadcast or the receive side.
+
+**Payload format (pinned).** The display lines are `BATT|<line1>|<line2>|<line3>`
+— pipe-separated, **≤ 3 lines, ≤ 12 chars each, ≤ 96 B total**, no trailing pipe.
+Numbers render `%.1f` (voltage) / `%.0f` (delta mV); unavailable source entities
+render `--` with the label kept, e.g. `BATT|48V --|HV --|d --`. Default fresh
+content: `BATT|48V 52.8V|HV 391.9V|d 43mV` (System A 48 V LFP bank · System B
+BMW-i3 HV pack · System B cell-spread). Worst case on the wire: `12 + 96 = 108 B`,
+well under the 250 B ESP-NOW limit.
+
+**Cadence.** Broadcast **only by the gateway**, ~every **10 s**, gated on
+`is_gateway && !cache.is_empty()` (the `main.rs` background block) — plus a fresh
+emit whenever the MQTT burst pulls a new retained downlink. **Leaves are
+receive-only: they cache what they hear and never originate _or_ re-broadcast a BATT
+frame** — so reach is **single-hop** (gateway → its direct ESP-NOW neighbours only;
+a leaf two hops out won't see it). This is the deliberate difference from TIME, which
+every node re-floods: BATT carries **no freshness field**, so a leaf re-broadcast
+could overwrite a fresher cache or loop. (Design call — morpheus-batt-firmware,
+Stage 3.)
+
+**Rule.** On RX: validate the `SMOLv1 BATT ` tag (and the `BATT|` marker in the
+payload), copy the payload into the local `BattCache`, stamp `fetched_at_ms = now`.
+The Batt plugin renders the cached lines + that age. The age is a **fetch-age** (when
+*this node* last received a downlink), **not** the HA data's age — see the
+[downlink staleness contract](#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)
+for why that distinction matters. A stale cache just shows old numbers with a growing
+age, never a crash.
+
+**Flag.** espnow (the frame itself) — but the cache is populated only when a
+`wifi`/`espnow` **gateway** is present to run the MQTT burst. A `default` build
+neither fetches nor broadcasts.
+
+**Security.** Unauthenticated, unencrypted — like every SMOLv1 frame: anything on
+ch 6 can broadcast a forged `SMOLv1 BATT ` frame and paint bogus voltages on every
+display. The data is non-secret, and crucially the HA **broker password never
+rides the mesh** — it lives only in the gateway's git-ignored `secrets.rs`, used
+solely for the LAN TCP CONNECT. Documented, not defended.
+
+**Status.** 🟡 **compile-verified — pending hardware verify.** Frame layout + payload
+format are **locked** to spec v2 (byte-layout box above); Stage 3 landed in tree and
+passed all six build/clippy gates (per morpheus-batt-firmware). **No board has
+broadcast or rendered a real BATT frame yet** — no flash.
+
+**Source.** Firmware `rust/clock/src/net/mode.rs`: `BATT_PREFIX` (`:139`,
+`b"SMOLv1 BATT "`), `broadcast_batt` (`:1259`, `memcpy(tag)` ++ `memcpy(cache.bytes())`),
+RX `Frame::Batt(&[u8])` (`:227`, payload = `data[12..]`); render in `batt.rs`
+(`BattCache`); broadcast gated in `main.rs`. Fed by the [MQTT
+burst](#mqtt-burst--the-lan-transport-that-retires-the-udp-collector) in
+`net/wifi.rs`; team spec `scratch/smol-ha-batt/spec.md` v2 (§ Architecture — Downlink).
+
 ## RELAY / RELAYACK — ESP-NOW → internet telemetry
 
 **Purpose.** Single-hop message-relay bridge. A **leaf** (in ESP-NOW range of a
@@ -234,9 +318,13 @@ gateway flushes buffered messages to the collector every `RELAY_FLUSH_INTERVAL_M
 host `10.0.11.117:9999` on VLAN 11 (same-subnet L2, no gatekeeper hop), mirroring
 `NTP_SERVER_IP`'s hardcoded-IP style — then switches back to ESP-NOW ch 6. The burst
 **stalls display + input + mesh** for its duration (single radio); it is hard-bounded
-by `RELAY_FLUSH_BUDGET ≈ 6 s`, and a failed flush backs off a full interval and sheds
+by `RELAY_FLUSH_BUDGET ≈ 15 s` (tuned up from 6 s for real-AP DHCP, `652155b`), and a failed flush backs off a full interval and sheds
 the oldest queued message so a dead AP can't freeze the node (finding-1 fix).
-**Out of scope (documented stubs):** downlink (collector → leaf) and multi-hop
+*v2 (compile-verified — pending hardware verify):* this UDP egress is being replaced by an
+[MQTT burst](#mqtt-burst--the-lan-transport-that-retires-the-udp-collector) straight
+to Home Assistant — the ESP-NOW RELAY frame here is **unchanged**, only the gateway's
+internet hop moves.
+**Out of scope (documented stubs):** downlink (server → leaf) and multi-hop
 routing (needs a next-hop/TTL header, +200–400 LOC).
 **Flag.** espnow. **Status.** 🟢 **hardware-proven end-to-end** — on the wave-6 fleet
 (build 36 "Oxidized Spark", `bcafa7e`) leaf id8's telemetry reaches
@@ -290,12 +378,139 @@ defined in `mesh_snake/snake_core.rs`.
 
 ---
 
+## MQTT burst — the LAN transport that retires the UDP collector
+
+**What changed (v2 pivot).** v1 shipped a Python **collector** on disks that took
+relay telemetry over UDP `:9999` and answered a `BATT?` query. **v2 retires it.**
+The board now speaks **MQTT 3.1.1** (hand-rolled, QoS 0, no TLS) directly to Home
+Assistant's **Mosquitto** broker — so telemetry lands as native HA entities and the
+battery downlink is a retained broker message. No Python middleman in the end
+state. *(The UDP collector path — [relay.md](relay.md) — is still what's flashed
+today; it's being replaced, not yet removed. Rollback = git.)*
+
+**Not a mesh frame.** This is plain **TCP** on the MQTT port (1883) to **the HA VM's
+leg on the boards' own VLAN** — the exact address is a compile-time const in the
+gateway's git-ignored `secrets.rs` (see [BUILDING.md](BUILDING.md) → *Secrets*), kept
+out of this doc on purpose. Mosquitto binds `0.0.0.0`, so the **multi-homed** HA VM
+answers on every VLAN leg; the gateway deliberately targets the leg on the **boards'
+own subnet** so board → broker is one L2 hop — no inter-VLAN routing, no gatekeeper,
+and the CONNACK asymmetry (below) simply doesn't arise. *(Aim it at the wrong leg — a
+**cross-VLAN** leg of the same VM, or the **unrelated** broker that happens to run on
+the `disks` host — and you get either the silent-CONNACK hang or the wrong broker
+entirely; the const in `secrets.rs` is the source of truth.)* Spoken only by a
+**gateway** during its WiFi burst — no `SMOLv1 ` namespace, no channel 6. The
+mesh-side result is the [`SMOLv1 BATT`](#batt--ha-battery-snapshot) frame the gateway
+broadcasts after it fetches the downlink.
+
+**The burst (per flush, ~30 s when the queue is non-empty).**
+1. Associate WiFi (the COEXIST arm — as the old flush) → open a TCP socket to the
+   broker.
+2. **CONNECT** — MQTT 3.1.1, client id `smol-<gwid>` (the **gateway's own** id —
+   never a relayed leaf's), clean session, keepalive 0 (the burst is short-lived;
+   no PINGREQ). Auth: username `jp` + password from the gateway's git-ignored
+   `secrets.rs` (anonymous auth is **off** on the broker). Wait for **CONNACK**.
+3. **SUBSCRIBE** `smol/display/batt` (QoS 0) — the broker immediately delivers its
+   **retained** message (the battery downlink). *The broker is the cache:* even
+   though the gateway was away for ~30 s, the latest payload is waiting.
+4. **PUBLISH** telemetry — one message per queued leaf telemetry **and** the
+   gateway's own — to `smol/<id>/telemetry` (QoS 0, **not** retained).
+5. **PUBLISH** retained, idempotent **discovery** configs (below) so HA
+   auto-creates entities — cheap to repeat every burst.
+6. Store the downlink in `BattCache`, broadcast the [`SMOLv1 BATT`](#batt--ha-battery-snapshot)
+   frame to the mesh, **DISCONNECT**, return to ESP-NOW ch 6.
+
+**Topics & payloads (byte contracts).**
+
+| Topic | Retained | QoS | Payload |
+|---|---|---|---|
+| `smol/<id>/telemetry` | no | 0 | the **bare** telemetry line (sensor line + last peer/label) — the same string the RELAY carried, **no** legacy `NNN ` id prefix (the topic already carries the id). *(LOCKED — spec v2 "Pinned byte-layouts".)* |
+| `smol/display/batt` | **yes** | 0 | `BATT\|<l1>\|<l2>\|<l3>` — the display payload (≤ 3 lines, ≤ 12 ch each, ≤ 96 B, `--` on unavailable). Published by an **HA automation** (see [`ha/README.md`](../ha/README.md)), not by a node. |
+| `homeassistant/sensor/smol<id>/telemetry/config` | **yes** | 0 | HA MQTT-discovery JSON (below) — published by the **gateway** on each connect. |
+
+*Wire detail (`mqtt.rs::encode_publish`):* each PUBLISH's fixed-header byte 0 is
+`0x30 | retain` — QoS 0, RETAIN bit (bit 0) set only on the gateway's **retained**
+publishes (the discovery configs); telemetry PUBLISHes are `0x30` (not retained). The
+`smol/display/batt` downlink is set retained by **HA**, not the gateway.
+
+**Discovery config (PINNED scheme — spec v2).** Retained JSON on
+`homeassistant/sensor/smol<id>/telemetry/config`, republished on every connect:
+
+```json
+{
+  "unique_id": "smol<id>_telemetry",
+  "state_topic": "smol/<id>/telemetry",
+  "name": "smol <id>",
+  "device": { "identifiers": ["smol<id>"], "name": "smol <id> <noun>" }
+}
+```
+
+The entity `name` is `smol <id>`; the **`device.name` appends the node's magical
+realm noun** (e.g. `smol 7 Draconic`). Retained + idempotent → HA creates one
+registry-managed text sensor per known node, grouped under a `smol<id>` **device**,
+with **no HA config edits**.
+**Node removal:** publish an **empty** retained payload to the same config topic
+(ops-checklist item — see [`ha/README.md`](../ha/README.md)).
+
+**Downlink staleness (HA-side contract).** The HA automation re-renders the retained
+`smol/display/batt` payload on every source-entity change **and** on a 5-minute
+`time_pattern`, and renders `--` for any source entity whose **`last_reported`** is
+older than **30 minutes (1800 s)** — so a wedged integration can't freeze a
+stale-but-live-looking voltage into the retained message. (`last_reported`, not
+`last_updated`, is deliberate: it advances on **every** publish even when the value is
+unchanged, so a steady-but-healthy sensor stays fresh while only a truly wedged one
+goes stale; 30 min is the team ruling — tight enough to catch a dead MQTT / wedged
+integration, loose enough not to blank the infrequently-publishing BE sensors.)
+**Known limitation (accepted for v1):** if **HA
+itself** dies, the last retained payload persists on the broker, and a board that
+fetches it shows it with a *fresh* fetch-age — because the age on the glass is a
+**fetch-age** (when the node last *received* a downlink), **not** the HA data's age.
+A payload-embedded timestamp is a filed follow-up.
+
+**Cross-VLAN CONNACK gotcha (understood, and side-stepped).** A connect to the
+*wrong* leg can complete the TCP handshake yet have its **CONNACK silently never
+return** (asymmetric return path: the VM replies out its default-gateway leg). That
+is exactly why the target is the HA VM's leg on the **boards' own VLAN** — a
+same-subnet path with no such asymmetry. `nebula-ha-pipe` verified a real CONNACK
+from that VLAN (3/3, 2026-07-08). Residual risk is one flash-day smoke test: the
+tested host was *wired* on that VLAN; a *wireless* board's L3 is identical, so
+confidence is high but unproven on glass.
+
+**Security.** Plain TCP, no TLS, LAN-only, QoS 0. The broker password lives **only**
+in the gateway's git-ignored `secrets.rs` (+ `.example` placeholder) — never in
+this doc, logs, JSONL, or commits. Telemetry + voltages are non-secret. Same
+"documented, not defended" posture as the rest of the mesh.
+
+**Status.** 🟡 **compile-verified — pending hardware verify.** Topic / payload / byte
+contracts are **locked** to spec v2 (including the two pinned byte-layouts); Stage 3
+landed and passed all six build/clippy gates (per morpheus-batt-firmware). The broker
+path is CONNACK-verified from the boards' VLAN, but **no board has run an MQTT burst**
+— the wireless flash-day smoke test is the last check.
+
+**Source.** Firmware `rust/clock/src/net/mqtt.rs` (hand-rolled MQTT 3.1.1 / QoS 0):
+`encode_connect` (`:85`), `encode_publish` (`:105`, RETAIN = bit 0 of byte 0),
+`encode_subscribe` (`:117`); driven by `mqtt_session` (`net/wifi.rs:502`), entered
+from `run_mqtt_burst` (`net/wifi.rs:674`); broker addr/creds in `secrets.rs`. HA side
+`ha/packages/smol_mesh.yaml` + [`ha/README.md`](../ha/README.md); team spec
+`scratch/smol-ha-batt/spec.md` v2.
+
+---
+
 ## Honesty caveats
 
 - **Verification is per-frame and current as of 2026-07-07.** HELLO/ACK and **TIME
   (2-board adoption)** are hardware-verified. BEACON is compile-verified (runs in
   Bench mode, not accuracy-checked). RELAY/RELAYACK are **hardware-proven e2e** (sustained
   `node_id 8` telemetry to the collector, wave 6). SNK is **flashed on the fleet** (build 36).
+- **BATT frame + MQTT burst are compile-verified, not flashed (v2 pivot).** The
+  [`SMOLv1 BATT` frame](#batt--ha-battery-snapshot) and the
+  [MQTT burst](#mqtt-burst--the-lan-transport-that-retires-the-udp-collector) that
+  feeds it (MQTT-native, retiring the UDP collector) are **fully byte-locked** to
+  spec v2 (tag + verbatim-payload framing, bare telemetry line, discovery scheme) and
+  **landed in Stage 3, all six build/clippy gates green** (per morpheus-batt-firmware).
+  The broker path is CONNACK-verified from the boards' VLAN — but **no board has run
+  a burst or broadcast a BATT frame**; the wireless flash-day smoke test is the last
+  check. Honest caveat: an HA outage leaves a live-looking retained payload (boards
+  show fetch-age, not data-age).
 - **ESP-NOW airtime/throughput/RX-reliability under COEXIST** are unmeasured on
   hardware — reasoned from the `esp-wifi 0.15.0` API (see `nebula-espnow-gateway.md`),
   not a bench run.
@@ -304,6 +519,10 @@ defined in `mesh_snake/snake_core.rs`.
 
 ## Sources
 - `rust/clock/src/net/mode.rs` — frame consts, `Frame` enum, encode/parse helpers, relay bridge section (read-only).
+- `rust/clock/src/net/wifi.rs` — the MQTT burst (hand-rolled MQTT 3.1.1 client) + broker consts (v2); replaces the UDP collector egress.
+- `ha/packages/smol_mesh.yaml` + `ha/README.md` — the HA automation that publishes the retained `smol/display/batt` downlink + install/discovery notes.
+- `collector/collector.py` — the v1 UDP relay collector, **being retired** (see [relay.md](relay.md)); superseded by the MQTT burst above.
+- `scratch/smol-ha-batt/spec.md` (v2) — the MQTT-native architecture (uplink/downlink, discovery, retained) + role boundaries.
 - `mesh-time-sync-spec.md`, `relay-bridge-spec.md`, `mmo-snake-netcode.md`, `mmo-snake-design.md` — design specs (scratch).
 - `nebula-espnow-gateway.md` — verified ESP-NOW limits (esp-wifi 0.15.0) + the gateway feasibility verdict.
 - `lucid-hw-verify.md` / `board1-boot-ANNOTATED.md` — today's hardware boot capture.

@@ -89,6 +89,11 @@ mod snake;
 mod mesh_snake;
 // On-board sensors: chip die-temp (tsens) + battery ADC on GPIO4. Always on.
 mod sensors;
+// HA battery-voltage screen (Batt): the display-only Plugin + its `BattCache`,
+// filled by the WiFi burst's MQTT downlink (SUBSCRIBE `smol/display/batt`; see
+// net/wifi.rs) — the fetch needs the radio (espnow ⊃ wifi); default build omits it.
+#[cfg(feature = "wifi")]
+mod batt;
 
 // LOCAL git-ignored WiFi credentials, used by the `wifi`/`espnow` radio bring-up.
 #[cfg(feature = "wifi")]
@@ -211,6 +216,16 @@ fn main() -> ! {
         sensors::BATT_DIVIDER as u32,
     );
 
+    // --- HA battery-voltage cache (Batt screen) ------------------------------
+    // Owned by `main`, borrowed read-only to the Batt plugin via `Ctx::batt`. Filled
+    // with the HA `BATT|…` payload from MQTT — the boot burst's downlink in every
+    // wifi/espnow build that reaches DHCP, plus each gateway flush under espnow (see
+    // net/wifi.rs `mqtt_session`) — and, on a leaf, from the gateway's SMOLv1 BATT
+    // frame (see the background block's `take_batt_offer`). Seeded empty; the title
+    // shows a `--` age until the first payload lands. cfg(wifi): feature is wifi-only.
+    #[cfg(feature = "wifi")]
+    let mut batt_cache = batt::BattCache::new();
+
     // --- Radio bring-up (feature-dependent) ----------------------------------
     // Each branch yields `synced` (Option<u32> Unix time at boot). Phase 3 also
     // brings up the blue LED + the live ESP-NOW `radio`.
@@ -218,11 +233,14 @@ fn main() -> ! {
     let synced = net::try_time_sync();
 
     #[cfg(all(feature = "wifi", not(feature = "espnow")))]
-    let synced = net::try_time_sync(net::WifiPeripherals {
-        timg0: peripherals.TIMG0,
-        rng: peripherals.RNG,
-        wifi: peripherals.WIFI,
-    });
+    let synced = net::try_time_sync(
+        net::WifiPeripherals {
+            timg0: peripherals.TIMG0,
+            rng: peripherals.RNG,
+            wifi: peripherals.WIFI,
+        },
+        &mut batt_cache,
+    );
 
     // Phase 3: blue status LED on GPIO8, created at logical-OFF (GPIO8 is a
     // strapping pin) then fast-blinked during the WiFi/NTP burst inside start().
@@ -244,6 +262,7 @@ fn main() -> ! {
         // frames and the single source of truth shared with the node's name.
         NODE_ID,
         &mut led,
+        &mut batt_cache,
     );
 
     // --- Clock time base -----------------------------------------------------
@@ -355,6 +374,15 @@ fn main() -> ! {
             if let Some(text) = r.service() {
                 bottom_line = text;
             }
+            // A gateway's SMOLv1 BATT downlink (buffered in `service`) → store it in
+            // our cache so LEAVES render HA battery voltages too. `store` validates
+            // the `BATT|` marker; a repaint shows fresh data at once. (A gateway
+            // never hears its own broadcast — ESP-NOW has no loopback — and a second
+            // gateway just re-stores identical bytes.)
+            if let Some(o) = r.take_batt_offer() {
+                batt_cache.store(&o.buf[..o.len], now);
+                redraw = true;
+            }
             // Mesh time adoption: if a peer's clock descends from a STRICTLY
             // newer authoritative sync than ours, re-anchor onto its estimate
             // NOW and INHERIT its `synced_at` (not `now`). Because freshness
@@ -399,6 +427,18 @@ fn main() -> ! {
                 }
             }
 
+            // ~every 10 s a GATEWAY re-broadcasts its cached HA battery payload as a
+            // SMOLv1 BATT frame so neighbour LEAVES keep a fresh copy. The gateway is
+            // the single source (fresh from HA over MQTT); leaves never re-broadcast
+            // (BATT carries no freshness field — see BATT_PREFIX). Slower than the
+            // 2 s HELLO/TIME tick since battery voltages move slowly.
+            if is_gateway
+                && !batt_cache.is_empty()
+                && (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000)
+            {
+                r.broadcast_batt(batt_cache.bytes());
+            }
+
             // NOTE: the MMO-snake SNK drain+broadcast used to live here. It MOVED
             // into `MeshSnake::update` (it needs the game state, now owned by the
             // `App` enum) via `ctx.radio` (take_snk / broadcast_snk). The radio's
@@ -426,7 +466,20 @@ fn main() -> ! {
             }
             r.relay_retransmit(now);
             if r.relay_ready_to_flush(now) {
-                r.flush_telemetry(&mut || led.apply(led::LedState::WifiSync, millis()));
+                // The flush is now an MQTT burst: it publishes the gateway's OWN
+                // telemetry + each queued leaf message + retained discovery, and
+                // receives the retained battery downlink into `batt_cache` (disjoint
+                // from `r`/`led`). Compute our own telemetry here — same shape as a
+                // leaf's relay_emit payload (sensor line + current label).
+                let reading = sensors.read();
+                let own = alloc::format!(
+                    "{} {}",
+                    sensors::format_sensor_line(&reading).as_str(),
+                    bottom_line.as_str()
+                );
+                r.flush_telemetry(own.as_bytes(), &mut batt_cache, &mut || {
+                    led.apply(led::LedState::WifiSync, millis())
+                });
             }
 
             let state = r.peer_led_state(now);
@@ -460,6 +513,8 @@ fn main() -> ! {
             unix_now,
             node_id: NODE_ID,
             redraw,
+            #[cfg(feature = "wifi")]
+            batt: &batt_cache,
             #[cfg(feature = "espnow")]
             label: bottom_line.as_str(),
             #[cfg(feature = "espnow")]

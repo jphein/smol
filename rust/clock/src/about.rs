@@ -14,8 +14,10 @@
 //! this pass — a tap logs intent; the WiFi burst / streamed image / rollback are
 //! deferred to the OTA implementation slot (see ota-ux-design.md §2–§4).
 //!
-//! About is the reason the `espnow` menu has FOUR entries (Clock / Snake / Bench
-//! / About), which is what exercises the scrolling menu window in `menu.rs`.
+//! About sits at the tail of every menu; with the Batt screen (cfg wifi) added
+//! ahead of it the `wifi` menu is FOUR entries (Clock / Snake / Batt / About) and
+//! the `espnow` menu FIVE (… / Bench / Batt / About) — both exercise the scrolling
+//! menu window in `menu.rs` (default stays at 3 and never scrolls).
 
 use embedded_graphics::{
     mono_font::{ascii::FONT_5X8, ascii::FONT_6X10, MonoTextStyleBuilder},

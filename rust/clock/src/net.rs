@@ -9,6 +9,11 @@
 #[cfg(feature = "wifi")]
 mod wifi;
 
+// Hand-rolled MQTT 3.1.1 (QoS0) codec for the HA batt/telemetry bridge (v2). Pure
+// encode/decode; the socket poll-loop that drives it lives in `wifi.rs`.
+#[cfg(feature = "wifi")]
+mod mqtt;
+
 #[cfg(feature = "espnow")]
 pub mod mode;
 

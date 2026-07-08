@@ -40,7 +40,7 @@ use esp_wifi::{
 };
 use smoltcp::{
     iface::{Interface, SocketSet, SocketStorage},
-    socket::{dhcpv4, udp},
+    socket::{dhcpv4, tcp, udp},
     wire::{DhcpOption, EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Cidr},
 };
 
@@ -56,21 +56,32 @@ use crate::secrets::{WIFI_PASS as WIFI_PASSWORD, WIFI_SSID};
 const NTP_SERVER_IP: Ipv4Addr = Ipv4Addr::new(162, 159, 200, 123);
 const NTP_PORT: u16 = 123;
 
-/// Relay uplink collector — the homelab receiver on **disks** (`10.0.11.117:9999`,
-/// a linger-enabled user systemd unit logging telemetry as JSONL). Hardcoded IPv4
-/// (mirrors `NTP_SERVER_IP`) so no DNS resolver is needed. It sits on the SAME
-/// VLAN-11 /24 the boards DHCP onto, so the relay path is same-subnet L2 — no
-/// gatekeeper hop. UDP is fire-and-forget: `send` "succeeds" locally regardless of
-/// the listener, so a genuine outage is an ASSOCIATION failure — which
-/// `run_udp_flush` now bounds via `RELAY_FLUSH_BUDGET` (finding-1 fix). Only the
-/// `espnow` relay flush references these (see `run_udp_flush`).
-#[cfg(feature = "espnow")]
-const RELAY_COLLECTOR_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 11, 117);
-#[cfg(feature = "espnow")]
-const RELAY_COLLECTOR_PORT: u16 = 9999;
-/// Max relay-flush datagram = "NNN " (4) + up to `RELAY_MAX_MSG` telemetry bytes.
-#[cfg(feature = "espnow")]
-const FLUSH_DG_MAX: usize = 320;
+/// HA Mosquitto broker (v2 MQTT-native bridge — the disks UDP collector is retired).
+/// Address/creds live in the git-ignored `crate::secrets` (retargetable one-liners —
+/// see the secrets comment for the VLAN11-leg rationale + the VLAN6 fallback). Built
+/// from the `[u8;4]` there so `secrets.rs` stays a plain imports-free consts file.
+#[cfg(feature = "wifi")]
+const MQTT_BROKER_IP: Ipv4Addr = Ipv4Addr::new(
+    crate::secrets::MQTT_BROKER_IP[0],
+    crate::secrets::MQTT_BROKER_IP[1],
+    crate::secrets::MQTT_BROKER_IP[2],
+    crate::secrets::MQTT_BROKER_IP[3],
+);
+#[cfg(feature = "wifi")]
+const MQTT_BROKER_PORT: u16 = crate::secrets::MQTT_BROKER_PORT;
+
+/// The retained downlink topic every node subscribes to for battery voltages, and
+/// the uplink topic template `smol/<id>/telemetry` — see `mqtt_session`.
+#[cfg(feature = "wifi")]
+const BATT_TOPIC: &[u8] = b"smol/display/batt";
+
+/// Budget for one full MQTT session (TCP connect → CONNECT/CONNACK → publishes →
+/// SUBSCRIBE → retained downlink → DISCONNECT). Sub-bound of the enclosing burst
+/// so MQTT can't eat the whole flush/NTP window; a miss just leaves the cache be.
+/// On a gateway flush the session runs INSIDE the association the flush already
+/// holds, so it does not extend the mesh-deaf window beyond `RELAY_FLUSH_BUDGET`.
+#[cfg(feature = "wifi")]
+const MQTT_SESSION_BUDGET: Duration = Duration::from_millis(3000);
 
 /// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
 const NTP_TO_UNIX_OFFSET: u32 = 2_208_988_800;
@@ -125,7 +136,7 @@ fn create_interface(device: &mut esp_wifi::wifi::WifiDevice) -> Interface {
 /// Phase 2 entry point: bring WiFi up, DHCP, run one SNTP exchange, return the
 /// current Unix time in seconds. Returns `None` on any failure/timeout so the
 /// caller falls back to the free-running clock.
-pub fn try_time_sync(p: WifiPeripherals) -> Option<u32> {
+pub fn try_time_sync(p: WifiPeripherals, batt: &mut crate::batt::BattCache) -> Option<u32> {
     super::init_heap();
 
     // --- Radio init ------------------------------------------------------
@@ -145,7 +156,15 @@ pub fn try_time_sync(p: WifiPeripherals) -> Option<u32> {
     // Phase-2 (wifi-only) build has no status LED, so the tick is a no-op.
     // wifi-only build has no relay/gateway role, so the reached-DHCP flag is unused.
     let mut _reached_dhcp = false;
-    run_ntp_burst(&mut controller, &mut device, rng, &mut || {}, &mut _reached_dhcp)
+    run_ntp_burst(
+        &mut controller,
+        &mut device,
+        rng,
+        &mut || {},
+        &mut _reached_dhcp,
+        crate::NODE_ID,
+        batt,
+    )
 }
 
 /// Shared WiFi -> DHCP -> SNTP burst, reused by both the Phase-2 `wifi`-only
@@ -168,11 +187,18 @@ pub fn run_ntp_burst(
     // The caller uses this — NOT the returned NTP Option — to decide gateway role,
     // so an SNTP outage can't demote a node with a working LAN uplink.
     reached_dhcp: &mut bool,
+    // This node's logical id — the MQTT client-id at the tail of the burst is
+    // `smol-<node_id>`.
+    node_id: u8,
+    // HA battery cache filled by the MQTT downlink at the tail of this burst (the
+    // spec's boot fetch — every wifi/espnow build that reaches DHCP receives the
+    // retained `smol/display/batt` payload here).
+    batt: &mut crate::batt::BattCache,
 ) -> Option<u32> {
-    // --- smoltcp stack: DHCP + UDP sockets -------------------------------
+    // --- smoltcp stack: DHCP + UDP (SNTP) + TCP (MQTT) sockets -----------
     let mut iface = create_interface(device);
 
-    let mut sockets_storage: [SocketStorage; 3] = Default::default();
+    let mut sockets_storage: [SocketStorage; 4] = Default::default();
     let mut sockets = SocketSet::new(&mut sockets_storage[..]);
 
     let mut dhcp_socket = dhcpv4::Socket::new();
@@ -192,6 +218,15 @@ pub fn run_ntp_burst(
         udp::PacketBuffer::new(&mut udp_tx_meta[..], &mut udp_tx_data[..]),
     );
     let udp_handle = sockets.add(udp_socket);
+
+    // TCP socket for the MQTT downlink (the retained battery payload).
+    let mut tcp_rx = [0u8; 512];
+    let mut tcp_tx = [0u8; 512];
+    let tcp_socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(&mut tcp_rx[..]),
+        tcp::SocketBuffer::new(&mut tcp_tx[..]),
+    );
+    let tcp_handle = sockets.add(tcp_socket);
 
     // --- WiFi connect ----------------------------------------------------
     controller
@@ -249,7 +284,7 @@ pub fn run_ntp_burst(
     }
 
     // --- SNTP exchange ---------------------------------------------------
-    sntp_query(
+    let synced = sntp_query(
         &mut iface,
         device,
         &mut sockets,
@@ -257,7 +292,43 @@ pub fn run_ntp_burst(
         rng.random(),
         deadline,
         tick,
-    )
+    );
+
+    // --- HA battery downlink (MQTT, on this same open burst) -------------
+    // We reached DHCP (the loop above only breaks on a lease), so the LAN + broker
+    // are reachable — open a short MQTT session and SUBSCRIBE to the retained
+    // `smol/display/batt`, receiving it into the cache. DOWNLINK-ONLY here: at boot
+    // there is no telemetry to publish yet (the empty publish list). Runs in every
+    // wifi/espnow build that reaches DHCP, independent of the SNTP result. Bounded
+    // by MQTT_SESSION_BUDGET; a miss leaves the cache untouched.
+    let mqtt_deadline = mqtt_deadline(deadline);
+    let mqtt_port = 49152 + (rng.random() % 16384) as u16;
+    let _ = mqtt_session(
+        &mut iface,
+        device,
+        &mut sockets,
+        tcp_handle,
+        node_id,
+        &[],
+        mqtt_port,
+        batt,
+        mqtt_deadline,
+        tick,
+    );
+
+    synced
+}
+
+/// The MQTT session deadline: the sooner of `MQTT_SESSION_BUDGET` from now and the
+/// enclosing burst's `outer` deadline, so MQTT never overruns the burst it rides.
+#[cfg(feature = "wifi")]
+fn mqtt_deadline(outer: Instant) -> Instant {
+    let own = Instant::now() + MQTT_SESSION_BUDGET;
+    if own < outer {
+        own
+    } else {
+        outer
+    }
 }
 
 /// Install the DHCP-provided address + default route on the interface.
@@ -333,33 +404,291 @@ fn sntp_query(
     }
 }
 
-/// Relay uplink flush (`espnow` gateway only). The caller has ALREADY triggered
-/// re-association via `RadioManager::switch(Mode::WifiSta)` (which issued
-/// `connect()` with the config persisted from the boot NTP burst); here we build
-/// a fresh smoltcp stack on the RETAINED STA device, wait for the association +
-/// DHCP, then UDP each queued message to the collector as `"<src_id> <telemetry>"`.
+use core::fmt::Write as _;
+
+/// Heap-free scratch buffer for building an MQTT topic / client-id / discovery JSON
+/// via `write!`. 224 bytes holds the largest discovery config (~150 B) with margin.
+#[cfg(feature = "wifi")]
+struct MqttScratch {
+    buf: [u8; 224],
+    len: usize,
+}
+
+#[cfg(feature = "wifi")]
+impl MqttScratch {
+    fn new() -> Self {
+        Self { buf: [0; 224], len: 0 }
+    }
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+#[cfg(feature = "wifi")]
+impl core::fmt::Write for MqttScratch {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len < self.buf.len() {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Push `data` out a connected TCP socket, polling the stack until it is all queued
+/// or `deadline` passes. Our MQTT packets are tiny (< tx buffer), so this normally
+/// completes in one `send_slice`; returns false on a socket error or timeout.
+#[cfg(feature = "wifi")]
+fn tcp_send(
+    iface: &mut Interface,
+    device: &mut esp_wifi::wifi::WifiDevice,
+    sockets: &mut SocketSet,
+    handle: smoltcp::iface::SocketHandle,
+    data: &[u8],
+    deadline: Instant,
+    tick: &mut dyn FnMut(),
+) -> bool {
+    let mut off = 0;
+    while off < data.len() {
+        tick();
+        iface.poll(smoltcp_now(), device, sockets);
+        let socket = sockets.get_mut::<tcp::Socket>(handle);
+        if socket.can_send() {
+            match socket.send_slice(&data[off..]) {
+                Ok(n) => off += n,
+                Err(_) => return false,
+            }
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+    }
+    iface.poll(smoltcp_now(), device, sockets); // nudge the queued bytes onto the wire
+    true
+}
+
+/// Append whatever bytes are readable on the TCP socket into the stream accumulator
+/// `acc[..*acc_len]` (bounded by its capacity). MQTT is a byte stream, so packets
+/// can split/coalesce across reads — [`mqtt_session`] parses whole packets out of
+/// this accumulator with `mqtt::parse_packet`.
+#[cfg(feature = "wifi")]
+fn recv_into(
+    sockets: &mut SocketSet,
+    handle: smoltcp::iface::SocketHandle,
+    acc: &mut [u8],
+    acc_len: &mut usize,
+) {
+    let socket = sockets.get_mut::<tcp::Socket>(handle);
+    if socket.can_recv() && *acc_len < acc.len() {
+        if let Ok(n) = socket.recv_slice(&mut acc[*acc_len..]) {
+            *acc_len += n;
+        }
+    }
+}
+
+/// One short MQTT 3.1.1 QoS0 session over a fresh TCP socket to the HA broker:
+/// TCP connect → CONNECT (client-id `smol-<node_id>`, username+password) → CONNACK
+/// → SUBSCRIBE `smol/display/batt` (downlink FIRST — the retained payload every node
+/// needs is prioritized over loss-tolerant telemetry) → for each `(id, line)` in
+/// `telemetry` PUBLISH `smol/<id>/telemetry` (bare line, transient) + a RETAINED
+/// discovery config → drain the RETAINED battery payload into `batt` → DISCONNECT.
+/// Everything is hard-bounded by `deadline` (a sub-bound of the enclosing burst).
+/// `telemetry` empty ⇒ downlink-only (the boot path). Returns whether we CONNECTED
+/// (CONNACK rc=0): that is the "flush delivered" signal for the caller's backoff —
+/// a downlink miss is NOT a failure (the cache simply keeps its prior value).
+#[cfg(feature = "wifi")]
+#[allow(clippy::too_many_arguments)]
+fn mqtt_session(
+    iface: &mut Interface,
+    device: &mut esp_wifi::wifi::WifiDevice,
+    sockets: &mut SocketSet,
+    tcp_handle: smoltcp::iface::SocketHandle,
+    node_id: u8,
+    telemetry: &[(u8, &[u8])],
+    src_port: u16,
+    batt: &mut crate::batt::BattCache,
+    deadline: Instant,
+    tick: &mut dyn FnMut(),
+) -> bool {
+    let broker = (IpAddress::Ipv4(MQTT_BROKER_IP), MQTT_BROKER_PORT);
+
+    // --- TCP connect ---
+    {
+        let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
+        if socket.connect(iface.context(), broker, src_port).is_err() {
+            return false;
+        }
+    }
+    loop {
+        tick();
+        iface.poll(smoltcp_now(), device, sockets);
+        let state = sockets.get_mut::<tcp::Socket>(tcp_handle).state();
+        if state == tcp::State::Established {
+            break;
+        }
+        if state == tcp::State::Closed || Instant::now() > deadline {
+            log::warn!("smol: MQTT TCP connect failed/timeout");
+            return false;
+        }
+    }
+
+    let mut pkt = [0u8; 320];
+    let mut acc = [0u8; 256];
+    let mut acc_len = 0usize;
+
+    // --- CONNECT ---
+    {
+        let mut cid = MqttScratch::new();
+        let _ = write!(cid, "smol-{}", node_id);
+        let Some(n) = crate::net::mqtt::encode_connect(
+            &mut pkt,
+            cid.as_bytes(),
+            crate::secrets::MQTT_USER.as_bytes(),
+            crate::secrets::MQTT_PASS.as_bytes(),
+        ) else {
+            return false;
+        };
+        if !tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick) {
+            return false;
+        }
+    }
+
+    // --- CONNACK (require rc=0) ---
+    let mut connected = false;
+    while !connected {
+        tick();
+        iface.poll(smoltcp_now(), device, sockets);
+        recv_into(sockets, tcp_handle, &mut acc, &mut acc_len);
+        loop {
+            // Extract Copy scalars inside the match so the borrow of `acc` (via the
+            // parsed packet) is released before the `copy_within` compaction below.
+            let (consumed, ok, fail) = match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
+                None => break,
+                Some((crate::net::mqtt::Incoming::ConnAck { return_code }, consumed)) => {
+                    (consumed, return_code == 0, return_code != 0)
+                }
+                Some((_, consumed)) => (consumed, false, false),
+            };
+            acc.copy_within(consumed..acc_len, 0);
+            acc_len -= consumed;
+            if fail {
+                log::warn!("smol: MQTT CONNACK rejected");
+                return false;
+            }
+            if ok {
+                connected = true;
+                break;
+            }
+        }
+        if Instant::now() > deadline {
+            log::warn!("smol: MQTT CONNACK timeout");
+            return false;
+        }
+    }
+
+    // --- SUBSCRIBE smol/display/batt FIRST ---
+    // Subscribe before publishing so the broker queues the RETAINED battery payload
+    // to us immediately — the downlink (which every node needs) is prioritized over
+    // the loss-tolerant telemetry uplink, and the retained reply streams in while we
+    // publish. It is drained into the cache after the publishes, below.
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 1, BATT_TOPIC) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
+
+    // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
+    for &(id, line) in telemetry {
+        if Instant::now() > deadline {
+            break;
+        }
+        // Telemetry: bare line to smol/<id>/telemetry (topic carries the id).
+        let mut topic = MqttScratch::new();
+        let _ = write!(topic, "smol/{}/telemetry", id);
+        if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, topic.as_bytes(), line, false) {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        // Discovery: retained config so HA auto-creates a registry-managed sensor.
+        let mut dtopic = MqttScratch::new();
+        let _ = write!(dtopic, "homeassistant/sensor/smol{}/telemetry/config", id);
+        let mut json = MqttScratch::new();
+        let noun = crate::net::names::name_for_id(id).1;
+        let _ = write!(
+            json,
+            "{{\"unique_id\":\"smol{}_telemetry\",\"state_topic\":\"smol/{}/telemetry\",\"name\":\"smol {}\",\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {}\"}}}}",
+            id, id, id, id, id, noun
+        );
+        if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), json.as_bytes(), true) {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+    }
+
+    // --- Receive the retained battery payload (SUBSCRIBE was sent above) ---
+    let mut got = false;
+    while !got {
+        tick();
+        iface.poll(smoltcp_now(), device, sockets);
+        recv_into(sockets, tcp_handle, &mut acc, &mut acc_len);
+        loop {
+            let consumed = match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
+                None => break,
+                Some((crate::net::mqtt::Incoming::Publish { topic, payload }, consumed)) => {
+                    if topic == BATT_TOPIC {
+                        let now = Instant::now().duration_since_epoch().as_millis();
+                        batt.store(payload, now); // memcpy out before we compact `acc`
+                        got = true;
+                        log::info!("smol: MQTT batt downlink cached ({} B)", payload.len());
+                    }
+                    consumed
+                }
+                Some((_, consumed)) => consumed,
+            };
+            acc.copy_within(consumed..acc_len, 0);
+            acc_len -= consumed;
+        }
+        if Instant::now() > deadline {
+            log::info!("smol: MQTT downlink not received in budget (keeping cache)");
+            break;
+        }
+    }
+
+    // --- DISCONNECT (clean goodbye) + close the socket ---
+    if let Some(n) = crate::net::mqtt::encode_disconnect(&mut pkt) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
+    sockets.get_mut::<tcp::Socket>(tcp_handle).close();
+    iface.poll(smoltcp_now(), device, sockets);
+    connected
+}
+
+/// Gateway flush → **MQTT burst** (`espnow` gateway only; v2 — this REPLACES the
+/// retired UDP-to-collector egress). The caller has ALREADY triggered re-association
+/// via `RadioManager::switch(Mode::WifiSta)`; here we build a fresh smoltcp stack on
+/// the RETAINED STA device, wait for association + DHCP, then run ONE
+/// [`mqtt_session`]: PUBLISH each queued telemetry to `smol/<id>/telemetry` + a
+/// RETAINED discovery config, and SUBSCRIBE `smol/display/batt` to receive the
+/// retained battery payload into `batt` (which `main` then re-broadcasts to leaves).
 ///
-/// Best-effort + loss-tolerant (it's telemetry): returns `true` iff we associated,
-/// got an IP, and sent every message. Connect-wait + DHCP mirror `run_ntp_burst`;
-/// the send loop mirrors `sntp_query`. Kept SEPARATE from `run_ntp_burst` (a
-/// little duplication) so the hardware-verified NTP path is not disturbed.
+/// Returns whether we CONNECTED to the broker (CONNACK ok) — the "flush delivered"
+/// signal for the caller's backoff. QoS0 publishes are fire-and-forget once
+/// connected (like the old UDP sends), and a downlink miss is NOT a failure.
 ///
 /// Single-radio airtime: this runs while the PHY is on the AP's channel, so the
-/// mesh is deaf on the ESP-NOW channel for its duration — the documented cost.
+/// mesh is deaf on the ESP-NOW channel for its duration — the documented cost,
+/// bounded by `RELAY_FLUSH_BUDGET` (the MQTT session is a sub-bound within it, so
+/// it does not extend the deaf window beyond the flush the mesh already pays for).
 #[cfg(feature = "espnow")]
-pub fn run_udp_flush(
+pub fn run_mqtt_burst(
     controller: &mut esp_wifi::wifi::WifiController<'static>,
     device: &mut esp_wifi::wifi::WifiDevice<'static>,
     mut rng: Rng,
+    node_id: u8,
     messages: &[(u8, &[u8])],
+    batt: &mut crate::batt::BattCache,
     tick: &mut dyn FnMut(),
 ) -> bool {
-    if messages.is_empty() {
-        return true;
-    }
-
     let mut iface = create_interface(device);
-    let mut sockets_storage: [SocketStorage; 3] = Default::default();
+    let mut sockets_storage: [SocketStorage; 2] = Default::default();
     let mut sockets = SocketSet::new(&mut sockets_storage[..]);
 
     let mut dhcp_socket = dhcpv4::Socket::new();
@@ -369,41 +698,33 @@ pub fn run_udp_flush(
     }]);
     let dhcp_handle = sockets.add(dhcp_socket);
 
-    let mut udp_rx_meta = [udp::PacketMetadata::EMPTY; 4];
-    let mut udp_rx_data = [0u8; 256];
-    let mut udp_tx_meta = [udp::PacketMetadata::EMPTY; 4];
-    let mut udp_tx_data = [0u8; 512];
-    let udp_socket = udp::Socket::new(
-        udp::PacketBuffer::new(&mut udp_rx_meta[..], &mut udp_rx_data[..]),
-        udp::PacketBuffer::new(&mut udp_tx_meta[..], &mut udp_tx_data[..]),
+    // TCP socket for the MQTT session (the UDP collector datagram is retired).
+    let mut tcp_rx = [0u8; 512];
+    let mut tcp_tx = [0u8; 512];
+    let tcp_socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(&mut tcp_rx[..]),
+        tcp::SocketBuffer::new(&mut tcp_tx[..]),
     );
-    let udp_handle = sockets.add(udp_socket);
+    let tcp_handle = sockets.add(tcp_socket);
 
-    // FINDING 1b: bound the ENTIRE flush (connect + DHCP + sends + drain) by the
-    // short RELAY_FLUSH_BUDGET, not the 30 s NTP budget — a dead AP fails fast so
-    // the caller's blocking loop isn't frozen for 30 s.
+    // FINDING 1b (retained): bound the ENTIRE flush by the short RELAY_FLUSH_BUDGET,
+    // not the 30 s NTP budget — a dead AP fails fast so the loop isn't frozen 30 s.
     let deadline = Instant::now() + RELAY_FLUSH_BUDGET;
 
     // The caller's switch(WifiSta) already issued connect(); just wait for it.
     while !matches!(controller.is_connected(), Ok(true)) {
         tick();
         if Instant::now() > deadline {
-            log::warn!("smol: relay flush — WiFi connect timed out");
+            log::warn!("smol: MQTT flush — WiFi connect timed out");
             return false;
         }
     }
 
-    // FINDING N3b: re-assert WiFi power-save OFF now that we've RE-associated.
-    // esp-wifi applies WIFI_PS_NONE once at init (`wifi::new` → set_power_saving(
-    // default = None)), but the flush's disconnect()→connect() re-association resets
-    // the IDF ps state → the AP believes the STA is dozing and BUFFERS unicast: the
-    // ARP reply for the collector never reaches the board (HW wire-capture: the
-    // request arrives at disks and is answered, the board never sees it), while
-    // broadcast DHCP still delivers at DTIM (why DHCP succeeds yet the send drained
-    // empty — N3). PS-None keeps the STA awake so unicast (the ARP reply, and any
-    // future downlink) is delivered immediately. So this MUST be after the reconnect,
-    // not once at init. Tradeoff: higher idle draw on the 502030 LiPo — accepted for
-    // correctness now; a future tunable could use selective/min PS when not flushing.
+    // FINDING N3b (retained): re-assert WiFi power-save OFF after re-association so
+    // the AP delivers unicast immediately — the flush's disconnect()→connect()
+    // resets the IDF ps state, and here the unicast that matters is the whole TCP /
+    // MQTT stream (the old UDP path only needed the ARP reply). Same reasoning,
+    // same placement (must be AFTER the reconnect). Tradeoff: higher idle draw.
     let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
 
     // Fresh DHCP lease each burst (the interface was just rebuilt).
@@ -419,89 +740,29 @@ pub fn run_udp_flush(
         };
         if let Some((addr, router)) = configured {
             apply_dhcp(&mut iface, addr, router);
-            log::info!("smol: relay flush DHCP {}", addr);
+            log::info!("smol: MQTT flush DHCP {}", addr);
             break;
         }
         if Instant::now() > deadline {
-            log::warn!("smol: relay flush — DHCP timed out");
+            log::warn!("smol: MQTT flush — DHCP timed out");
             return false;
         }
     }
 
-    // Bind a pseudo-random ephemeral source port (mirrors sntp_query).
+    // One MQTT session: publish queued telemetry + discovery, receive the retained
+    // battery downlink into the cache. Local TCP port from the same rng seed the
+    // UDP path used. Bounded within the overall flush `deadline`.
     let src_port = 49152 + (rng.random() % 16384) as u16;
-    {
-        let socket = sockets.get_mut::<udp::Socket>(udp_handle);
-        if socket.bind(src_port).is_err() {
-            return false;
-        }
-    }
-    let server = (IpAddress::Ipv4(RELAY_COLLECTOR_IP), RELAY_COLLECTOR_PORT);
-
-    let mut all_sent = true;
-    for &(src_id, payload) in messages {
-        // Out of the overall budget (finding 1b) — leave the rest for next flush.
-        if Instant::now() > deadline {
-            all_sent = false;
-            break;
-        }
-        // Datagram = "<3-digit id> <telemetry>".
-        let mut dg = [0u8; FLUSH_DG_MAX];
-        dg[0] = b'0' + (src_id / 100) % 10;
-        dg[1] = b'0' + (src_id / 10) % 10;
-        dg[2] = b'0' + src_id % 10;
-        dg[3] = b' ';
-        let plen = payload.len().min(FLUSH_DG_MAX - 4);
-        dg[4..4 + plen].copy_from_slice(&payload[..plen]);
-        let dglen = 4 + plen;
-
-        let mut sent = false;
-        while !sent {
-            tick();
-            iface.poll(smoltcp_now(), device, &mut sockets);
-            let socket = sockets.get_mut::<udp::Socket>(udp_handle);
-            if socket.can_send() && socket.send_slice(&dg[..dglen], server).is_ok() {
-                sent = true;
-            } else if Instant::now() > deadline {
-                all_sent = false; // shared overall budget; rest waits for next flush
-                break;
-            }
-        }
-        // Interleave ARP warm-up + egress with the remaining sends: one poll after
-        // each enqueue kicks dispatch (an ARP request on a fresh association), so the
-        // collector's MAC is likely resolved by the time the drain below runs (N3).
-        tick();
-        iface.poll(smoltcp_now(), device, &mut sockets);
-    }
-
-    // Drain UNTIL the UDP TX buffer is verifiably empty, then return. FINDING N3
-    // (HW, 652155b fleet): `send_slice` only ENQUEUES; `iface.poll` dispatches — but
-    // on a FRESH association the first dispatch must resolve the collector's MAC via
-    // ARP (empty neighbour cache; the AP may power-save-buffer the reply). The old
-    // fixed 300 ms drain lost that race → datagrams died in the TX buffer at teardown
-    // and `all_sent = true` LIED (the collector saw zero packets). smoltcp RETAINS a
-    // packet in the tx buffer until it truly dispatches — verified in smoltcp 0.12
-    // `udp::Socket::dispatch`/`PacketBuffer::dequeue_with`: an emit `Err`
-    // (neighbour-unknown) consumes 0 bytes, so the packet stays queued — hence
-    // `send_queue() == 0` is a true "handed to the radio" signal. Poll until then,
-    // bounded by ~2 s AND a small grace past the overall `deadline`; if it never
-    // empties, report `all_sent = false` — an HONEST failure the caller's
-    // backoff/retry (finding 1) then handles correctly. (So the drain MUST be allowed
-    // to finish the job or report failure — the old "can't extend the burst" inverts.)
-    let drain_hard = Instant::now() + Duration::from_secs(2);
-    let drain_grace = deadline + Duration::from_millis(500);
-    loop {
-        tick();
-        iface.poll(smoltcp_now(), device, &mut sockets);
-        if sockets.get_mut::<udp::Socket>(udp_handle).send_queue() == 0 {
-            break; // every datagram dispatched from smoltcp toward the radio
-        }
-        let now = Instant::now();
-        if now > drain_hard || now > drain_grace {
-            all_sent = false;
-            log::warn!("smol: relay flush — TX drain timed out; datagrams undelivered");
-            break;
-        }
-    }
-    all_sent
+    mqtt_session(
+        &mut iface,
+        device,
+        &mut sockets,
+        tcp_handle,
+        node_id,
+        messages,
+        src_port,
+        batt,
+        deadline,
+        tick,
+    )
 }

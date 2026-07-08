@@ -1,0 +1,34 @@
+# smol OLED display — override card (Lovelace)
+# ---------------------------------------------------------------------------
+# Drop this card onto a dashboard to control what the smol boards show. Toggle
+# "Override battery display" ON, then set up to 3 line SOURCES. A source is literal
+# text plus {entity_id} placeholders, e.g.  48V {sensor.48v_battery1_voltage}V  or
+# PV {sensor.epever_pv_power}W . The HA automation resolves the placeholders to live
+# values (unknown -> --), strips "|", clips each rendered line to 12 chars, and
+# publishes to the retained `smol/display/batt` topic — boards render it verbatim.
+# Placeholder values refresh every ~5 min (and on any edit / HA start), so a value
+# can be up to ~5 min old. Toggle OFF to return to the live battery reading. The
+# "Live payload" sensor mirrors the retained topic — exactly what the boards fetch.
+#
+# Install at deploy time via the WS `lovelace/config/save` API — do NOT hand-edit
+# HA's `.storage/lovelace*` files (HA caches them in memory and overwrites your
+# edit on the next WS save). See ha/README.md "Dashboard card".
+type: entities
+title: smol OLED display
+show_header_toggle: false
+entities:
+  - entity: input_boolean.smol_display_override
+    name: Override battery display
+    icon: mdi:pencil
+  - type: section
+    label: 'Line sources — text + {entity_id}, e.g. 48V {sensor.48v_battery1_voltage}V (rendered ≤12 chars, refresh ~5 min)'
+  - entity: input_text.smol_display_line1
+    name: Line 1
+  - entity: input_text.smol_display_line2
+    name: Line 2
+  - entity: input_text.smol_display_line3
+    name: Line 3
+  - type: divider
+  - entity: sensor.smol_display_batt
+    name: Live payload (what boards fetch)
+    icon: mdi:monitor-dashboard

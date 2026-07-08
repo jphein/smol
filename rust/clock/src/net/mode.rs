@@ -125,6 +125,20 @@ const TIME_PREFIX: &[u8] = b"SMOLv1 TIME "; // + "NNN UUUUUUUUUU SSSSSSSSSS"
 /// (`"SMOLv1 RELAY "[12]` is ' ' where RELAYACK has 'A'), so match order is moot.
 const RELAY_PREFIX: &[u8] = b"SMOLv1 RELAY "; // + "NNN MMMMM F C " + chunk
 const RELAYACK_PREFIX: &[u8] = b"SMOLv1 RELAYACK "; // + "MMMMM BBB"
+/// Battery-downlink tag: the 12-B `"SMOLv1 BATT "` (trailing space, mirroring TIME)
+/// then the VERBATIM `smol/display/batt` payload INCLUDING its `BATT|` marker
+/// (e.g. `SMOLv1 BATT BATT|48V 52.8V|HV 391.9V|d 43mV`). NO length byte — the
+/// payload is the rest of the frame (len − 12), so frame payload and `BattCache`
+/// contents are byte-identical (one memcpy each way; see the pinned byte-layout).
+///
+/// Only a GATEWAY broadcasts this (the single source, fresh from HA via MQTT);
+/// leaves are receive-only and never re-broadcast — unlike TIME, which every node
+/// re-broadcasts. BATT carries no freshness field, so leaf re-broadcast could
+/// propagate a stale payload or loop; single-hop gateway → neighbour leaves is
+/// the safe, intended shape. Same threat model as every SMOLv1 frame (unauthed).
+const BATT_PREFIX: &[u8] = b"SMOLv1 BATT "; // + verbatim "BATT|l1|l2|l3"
+/// Max BATT payload retained/echoed — matches `BattCache` (LOCKED ≤ 96 B).
+const BATT_PAYLOAD_MAX: usize = 96;
 
 use crate::mesh_snake::snake_core::{self, SnkFrame};
 
@@ -208,6 +222,9 @@ enum Frame<'a> {
     /// A gateway's acknowledgement of a relay message: the `msgid` and the u8
     /// bitmap of fragments received so far, so the leaf resends only the gaps.
     RelayAck { msgid: u16, bitmap: u8 },
+    /// A battery-downlink payload from a gateway: the verbatim `BATT|…` bytes
+    /// (`payload` borrows the RX buffer; copied into `BattTracker` in `service`).
+    Batt(&'a [u8]),
 }
 
 /// Tracks the two timestamps that define the peer link state. Monotonic ms
@@ -294,6 +311,39 @@ impl TimeTracker {
             have: false,
         }
     }
+}
+
+/// Buffers the most-recent inbound SMOLv1 BATT payload (verbatim `BATT|…` bytes)
+/// until `main` takes it via [`RadioManager::take_batt_offer`] and stores it into
+/// its `BattCache`. Mirrors [`TimeTracker`]: `service()` only BUFFERS what arrives;
+/// `main` owns the cache write (this module never touches `BattCache`, keeping the
+/// clean radio/plugin split). Fixed `.bss` buffer, no heap.
+struct BattTracker {
+    buf: [u8; BATT_PAYLOAD_MAX],
+    len: usize,
+    have: bool,
+}
+
+impl BattTracker {
+    const fn new() -> Self {
+        Self { buf: [0; BATT_PAYLOAD_MAX], len: 0, have: false }
+    }
+
+    /// Buffer a freshly-received payload (truncated to capacity; ≤ 96 B by spec).
+    fn set(&mut self, payload: &[u8]) {
+        let n = payload.len().min(BATT_PAYLOAD_MAX);
+        self.buf[..n].copy_from_slice(&payload[..n]);
+        self.len = n;
+        self.have = true;
+    }
+}
+
+/// A `Copy` snapshot of a buffered BATT payload handed to `main` by
+/// [`RadioManager::take_batt_offer`]. `buf[..len]` is the verbatim `BATT|…` bytes.
+#[derive(Clone, Copy)]
+pub struct BattOffer {
+    pub buf: [u8; BATT_PAYLOAD_MAX],
+    pub len: usize,
 }
 
 // =========================================================================
@@ -1024,6 +1074,9 @@ pub struct RadioManager {
     /// Per-peer link/identity table for the Bench mesh-view (issue #8). Fed
     /// additively from `service()` beside `peers`; never feeds the LED.
     roster: Roster,
+    /// Most-recent inbound SMOLv1 BATT payload, buffered for `main` to store into
+    /// its `BattCache` (leaves receive the gateway's HA battery downlink here).
+    batt: BattTracker,
 }
 
 /// Monotonic milliseconds since boot — the single time base for both the
@@ -1067,6 +1120,7 @@ impl RadioManager {
             relay: Relay::new(),
             snk: SnkInbox::new(),
             roster: Roster::new(),
+            batt: BattTracker::new(),
         })
     }
 
@@ -1083,8 +1137,15 @@ impl RadioManager {
     /// for periodic relay flushes (`flush_telemetry`); the smoltcp interface is
     /// built + dropped INSIDE `run_ntp_burst`, so no live stack contends with
     /// ESP-NOW between bursts.
-    pub fn burst_ntp(&mut self, tick: &mut dyn FnMut()) -> (bool, Option<u32>) {
-        // Disjoint field borrows: &mut self.controller, &mut *sta, Copy of rng.
+    pub fn burst_ntp(
+        &mut self,
+        batt: &mut crate::batt::BattCache,
+        tick: &mut dyn FnMut(),
+    ) -> (bool, Option<u32>) {
+        // Disjoint field borrows: &mut self.controller, &mut *sta, Copy of rng/id.
+        // `batt` is a caller-owned &mut (main's cache), disjoint from every self
+        // field — the boot burst's MQTT downlink fills it (see wifi::run_ntp_burst).
+        let id = self.id;
         let Some(sta) = self.sta.as_mut() else {
             return (false, None);
         };
@@ -1095,6 +1156,8 @@ impl RadioManager {
             self.rng,
             tick,
             &mut reached_dhcp,
+            id,
+            batt,
         );
         (reached_dhcp, synced)
     }
@@ -1184,6 +1247,35 @@ impl RadioManager {
         let mut msg = [0u8; 40];
         let len = encode_time(self.id, unix, synced_at, &mut msg);
         self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
+    }
+
+    // --- Battery downlink relay (see the BATT_PREFIX + BattTracker sections) ---
+
+    /// Broadcast one SMOLv1 BATT frame: the 12-B tag + the verbatim `BATT|…`
+    /// `payload` (byte-for-byte the gateway's `BattCache`). GATEWAY-ONLY by
+    /// convention — `main` calls this on a slow cadence while `is_gateway` and the
+    /// cache is non-empty, so neighbour leaves fill their own cache. No length byte
+    /// (payload is the rest of the frame); safe in either radio mode.
+    pub fn broadcast_batt(&mut self, payload: &[u8]) {
+        // 12-B tag + ≤ 96-B payload = ≤ 108 B, well under the 250-B ESP-NOW limit.
+        let mut msg = [0u8; BATT_PREFIX.len() + BATT_PAYLOAD_MAX];
+        msg[..BATT_PREFIX.len()].copy_from_slice(BATT_PREFIX);
+        let n = payload.len().min(BATT_PAYLOAD_MAX);
+        msg[BATT_PREFIX.len()..BATT_PREFIX.len() + n].copy_from_slice(&payload[..n]);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..BATT_PREFIX.len() + n]);
+    }
+
+    /// Take the buffered inbound BATT payload (if any), clearing it. `main` stores
+    /// the bytes into its `BattCache`; mirrors [`take_time_offer`]'s pull pattern.
+    ///
+    /// [`take_time_offer`]: RadioManager::take_time_offer
+    pub fn take_batt_offer(&mut self) -> Option<BattOffer> {
+        if self.batt.have {
+            self.batt.have = false;
+            Some(BattOffer { buf: self.batt.buf, len: self.batt.len })
+        } else {
+            None
+        }
     }
 
     /// Broadcast one MMO-snake state frame (issue #5). 18 B; `main` calls this
@@ -1320,50 +1412,68 @@ impl RadioManager {
             || now.saturating_sub(self.relay.last_flush_ms) >= RELAY_FLUSH_INTERVAL_MS
     }
 
-    /// Gateway only: run a WiFi burst and UDP each buffered message to the fixed
-    /// collector as `"<src_id> <telemetry>"`, then return to ESP-NOW ch6. This
-    /// EXERCISES the (formerly dead) `switch(Mode::WifiSta)` arm.
+    /// Gateway only: run an **MQTT burst** — PUBLISH each buffered leaf message +
+    /// the gateway's own telemetry to `smol/<id>/telemetry` (+ retained discovery),
+    /// and receive the retained `smol/display/batt` downlink into `batt` — then
+    /// return to ESP-NOW ch6. This EXERCISES the `switch(Mode::WifiSta)` arm. (v2:
+    /// replaces the retired UDP-to-collector egress; see `wifi::run_mqtt_burst`.)
     ///
     /// SINGLE-RADIO / SINGLE-THREAD COST (honest): this BLOCKS the main loop for
     /// the whole burst — so the **display and button are frozen and the mesh is
     /// deaf on ch6**, not merely "mesh deaf". `tick` fast-blinks the LED throughout.
-    /// The burst is now hard-bounded by `RELAY_FLUSH_BUDGET` (~6 s), so a FAILED
-    /// flush (AP down) can no longer block for the 30 s NTP budget. A future
-    /// non-blocking (cooperative/async) flush would remove the stall entirely;
-    /// that redesign is deliberately deferred.
+    /// The burst is hard-bounded by `RELAY_FLUSH_BUDGET` (~15 s — hardware-tuned in
+    /// 652155b), so a FAILED flush (AP down) can no longer block for the 30 s NTP
+    /// budget. A future non-blocking (cooperative/async) flush would remove the
+    /// stall entirely; that redesign is deliberately deferred.
     ///
     /// On success the queue is cleared. On FAILURE it backs off a full flush
     /// interval (see the unconditional `last_flush_ms` below) and, past
     /// `FLUSH_FAILS_BEFORE_DROP`, sheds its oldest message so a dead-AP gateway
     /// drains and stops re-bursting. Returns whether the flush succeeded.
-    pub fn flush_telemetry(&mut self, tick: &mut dyn FnMut()) -> bool {
+    pub fn flush_telemetry(
+        &mut self,
+        own_telemetry: &[u8],
+        batt: &mut crate::batt::BattCache,
+        tick: &mut dyn FnMut(),
+    ) -> bool {
         if !self.relay.is_gateway {
             return false;
         }
-        log::info!("smol: relay flush -> WiFi burst (mesh deaf on ch6 during it)");
+        log::info!("smol: relay flush -> MQTT burst (mesh deaf on ch6 during it)");
         // Resurrected COEXIST arm: re-associate to the AP (retunes the PHY off
-        // ch6). run_udp_flush waits for the association, so we only trigger it.
+        // ch6). run_mqtt_burst waits for the association, so we only trigger it.
         let _ = self.switch(Mode::WifiSta);
+        let id = self.id;
         let sta = self.sta.as_mut();
         let ok = match sta {
             None => false,
             Some(sta) => {
-                // Gather queued messages as (src_id, &payload). Disjoint borrows:
-                // &self.relay (via items), &mut self.controller, &mut *sta.
+                // (src_id, &payload) list to PUBLISH: the gateway's OWN telemetry
+                // first (spec: "also PUBLISH its own telemetry"), then each queued
+                // leaf message. Disjoint borrows: `own_telemetry` is the caller's;
+                // the queue slices are `&self.relay`; `&mut self.controller`/`*sta`
+                // are other fields. `+ 1` slot holds the gateway's own line.
                 let empty: &[u8] = &[];
-                let mut items: [(u8, &[u8]); GATEWAY_QUEUE] = [(0u8, empty); GATEWAY_QUEUE];
+                let mut items: [(u8, &[u8]); GATEWAY_QUEUE + 1] =
+                    [(0u8, empty); GATEWAY_QUEUE + 1];
                 let mut n = 0;
+                if !own_telemetry.is_empty() {
+                    items[n] = (id, own_telemetry);
+                    n += 1;
+                }
                 for q in self.relay.queue.iter() {
                     if q.used {
                         items[n] = (q.src_id, &q.buf[..q.len]);
                         n += 1;
                     }
                 }
-                crate::net::wifi::run_udp_flush(
+                crate::net::wifi::run_mqtt_burst(
                     &mut self.controller,
                     sta,
                     self.rng,
+                    id,
                     &items[..n],
+                    batt,
                     tick,
                 )
             }
@@ -1634,6 +1744,19 @@ impl RadioManager {
                     self.relay.apply_ack(msgid, bitmap);
                     label = Some(alloc::format!("ack {:05}", msgid));
                 }
+                Some(Frame::Batt(payload)) => {
+                    // A gateway's battery downlink. Buffer the verbatim payload for
+                    // `main` to store into its `BattCache` (this module never touches
+                    // the cache — mirror of the TIME/`take_time_offer` split). Only a
+                    // well-formed `BATT|…` payload is kept, so a stray frame can't wipe
+                    // a good reading. Also proves the peer is audible (LED detected).
+                    if payload.starts_with(b"BATT|") {
+                        self.batt.set(payload);
+                    }
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, None, rssi, now);
+                    label = Some(alloc::string::String::from("batt"));
+                }
                 None => {
                     // Unrecognised payload (other ESP-NOW traffic on-channel);
                     // surface it on the OLED but don't touch the handshake.
@@ -1768,6 +1891,10 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
     }
     if let Some((msgid, bitmap)) = parse_relayack(data) {
         return Some(Frame::RelayAck { msgid, bitmap });
+    }
+    if let Some(rest) = data.strip_prefix(BATT_PREFIX) {
+        // The rest is the verbatim `BATT|…` payload (no length byte).
+        return Some(Frame::Batt(rest));
     }
     None
 }
@@ -1917,7 +2044,12 @@ fn parse_relayack(data: &[u8]) -> Option<(u16, u8)> {
 /// burst genuinely runs DHCP + SNTP against the STA device, which esp-wifi hands
 /// out once alongside the ESP-NOW handle — we drive it here, then drop it before
 /// pinning the ESP-NOW channel, so the single radio is never double-driven.
-pub fn start(p: WifiPeripherals, id: u8, led: &mut Led) -> (Option<RadioManager>, Option<u32>) {
+pub fn start(
+    p: WifiPeripherals,
+    id: u8,
+    led: &mut Led,
+    batt: &mut crate::batt::BattCache,
+) -> (Option<RadioManager>, Option<u32>) {
     let Some(mut radio) = RadioManager::new(p, id) else {
         return (None, None);
     };
@@ -1925,8 +2057,10 @@ pub fn start(p: WifiPeripherals, id: u8, led: &mut Led) -> (Option<RadioManager>
     // --- WiFi burst for NTP, blue LED fast-blinking (~10 Hz) while it runs ---
     // The closure is called inside every busy-wait loop of the burst; it just
     // re-derives the fast-blink phase from the monotonic clock and pushes it to
-    // the pin (non-blocking, no per-blink state).
-    let (reached_dhcp, synced) = radio.burst_ntp(&mut || led.apply(LedState::WifiSync, now_ms()));
+    // the pin (non-blocking, no per-blink state). `batt` rides along: the same
+    // burst runs an MQTT downlink at its tail to seed the Batt screen at boot.
+    let (reached_dhcp, synced) =
+        radio.burst_ntp(batt, &mut || led.apply(LedState::WifiSync, now_ms()));
 
     // Relay role (N3c): a node is the internet GATEWAY iff its boot burst reached
     // ASSOCIATION + DHCP — i.e. it has a usable LAN uplink — NOT iff SNTP succeeded.
