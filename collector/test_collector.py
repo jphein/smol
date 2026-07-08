@@ -117,6 +117,70 @@ class TestHandleDatagram(unittest.TestCase):
         self.assertEqual(len(self._rows()), 3)
 
 
+class TestJsonlRotation(unittest.TestCase):
+    """C1: --max-bytes rotates path -> path.1 (single backup)."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False)
+        self.tmp.close()
+        self.path = self.tmp.name
+
+    def tearDown(self):
+        for p in (self.path, self.path + ".1"):
+            if os.path.exists(p):
+                os.unlink(p)
+
+    def _rec(self, i):
+        # ~60-byte line each; small max_bytes forces rotation quickly.
+        return {"recv_iso": "t", "src_ip": "1.2.3.4", "src_port": i,
+                "raw": f"007 payload {i:03d}", "parsed": None}
+
+    def test_rotates_at_max_bytes(self):
+        # tiny cap: after a few appends, a .1 backup must appear and the live
+        # file must be smaller than the cap (fresh after rotation).
+        cap = 200
+        for i in range(20):
+            collector._append_jsonl(self.path, self._rec(i), max_bytes=cap)
+        self.assertTrue(os.path.exists(self.path + ".1"),
+                        "expected a rotated .1 backup")
+        self.assertLessEqual(os.path.getsize(self.path), cap,
+                             "live file should be fresh (<= cap) after rotation")
+
+    def test_disabled_when_zero(self):
+        for i in range(20):
+            collector._append_jsonl(self.path, self._rec(i), max_bytes=0)
+        self.assertFalse(os.path.exists(self.path + ".1"),
+                         "max_bytes=0 must never rotate")
+
+    def test_no_rotation_under_limit(self):
+        # one small line, huge cap -> no rotation.
+        collector._append_jsonl(self.path, self._rec(0), max_bytes=10 * 1024 * 1024)
+        self.assertFalse(os.path.exists(self.path + ".1"))
+        with open(self.path, encoding="utf-8") as fh:
+            self.assertEqual(len([l for l in fh if l.strip()]), 1)
+
+
+class TestArgDefaults(unittest.TestCase):
+    """C2: status-host defaults to localhost, decoupled from the UDP host."""
+
+    def test_status_host_defaults_localhost(self):
+        args = collector.build_parser().parse_args([])
+        self.assertEqual(args.status_host, "127.0.0.1")
+
+    def test_udp_host_stays_public(self):
+        # UDP bind is unchanged (public) — only the status page went private.
+        self.assertEqual(collector.build_parser().parse_args([]).host, "0.0.0.0")
+
+    def test_status_host_override(self):
+        args = collector.build_parser().parse_args(["--status-host", "0.0.0.0"])
+        self.assertEqual(args.status_host, "0.0.0.0")
+
+    def test_max_bytes_default_10mb(self):
+        self.assertEqual(collector.build_parser().parse_args([]).max_bytes,
+                         10 * 1024 * 1024)
+
+
 class TestUdpLoopback(unittest.TestCase):
     """Real loopback: send a datagram to a bound socket, assert the JSONL row."""
 

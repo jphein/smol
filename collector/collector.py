@@ -13,8 +13,10 @@ builds `dg[0..3]` from the src id then a space then the payload). Max datagram i
 therefore 4 + 256 = 260 bytes.
 
 This program listens on UDP (default 0.0.0.0:9999 — the firmware's
-`RELAY_COLLECTOR_PORT` placeholder), appends every datagram to a JSONL file, logs
-to stdout, and optionally serves a tiny read-only status HTTP endpoint.
+`RELAY_COLLECTOR_PORT` placeholder), appends every datagram to a JSONL file
+(rotated to `.1` at `--max-bytes`, default 10 MB), logs to stdout, and optionally
+serves a tiny read-only status HTTP endpoint (bound to 127.0.0.1 by default —
+`--status-host 0.0.0.0` for a LAN-visible page; the UDP listener is independent).
 
 STDLIB ONLY — deploys on any homelab host with a bare python3, no pip.
 
@@ -116,7 +118,7 @@ def _magical_name(hash_str):
 
 def version_dict(started_iso, uptime_s):
     """Minimal realm-sigil-shaped version response for /api/version."""
-    hash_str = _git_short_hash()
+    hash_str = git_short_hash()
     repo = "https://github.com/jphein/smol"
     commit_url = f"{repo}/commit/{hash_str}" if hash_str != "dev" else ""
     return {
@@ -137,7 +139,20 @@ def version_dict(started_iso, uptime_s):
     }
 
 
-def _git_short_hash():
+# C4: resolve the git hash ONCE and cache it — the /api/version handler must never
+# fork `git` per request. `git_short_hash()` memoizes; main() primes it at startup.
+_GIT_HASH = None
+
+
+def git_short_hash():
+    """Short git hash of this repo, computed once then cached ('dev' if n/a)."""
+    global _GIT_HASH
+    if _GIT_HASH is None:
+        _GIT_HASH = _compute_git_short_hash()
+    return _GIT_HASH
+
+
+def _compute_git_short_hash():
     """Best-effort short git hash of this repo; 'dev' if unavailable."""
     try:
         out = subprocess.run(
@@ -178,7 +193,7 @@ class RecentBuffer:
 # ---------------------------------------------------------------------------
 
 
-def handle_datagram(data, addr, jsonl_path, recent, log=True):
+def handle_datagram(data, addr, jsonl_path, recent, log=True, max_bytes=0):
     """Decode + record one datagram. Never raises for datagram content.
 
     Returns the record dict (or None only on a truly unexpected internal error,
@@ -189,7 +204,7 @@ def handle_datagram(data, addr, jsonl_path, recent, log=True):
         # Lossy-decode: a malformed/binary datagram is still captured as `raw`.
         raw = data.decode("utf-8", errors="replace")
         record = build_record(raw, src_ip, src_port, now_iso())
-        _append_jsonl(jsonl_path, record)
+        _append_jsonl(jsonl_path, record, max_bytes)
         recent.add(record)
         if log:
             if record["parsed"]:
@@ -206,14 +221,28 @@ def handle_datagram(data, addr, jsonl_path, recent, log=True):
         return None
 
 
-def _append_jsonl(path, record):
-    """Append one JSON object as a line, flushed so tail/tests see it at once."""
+def _append_jsonl(path, record, max_bytes=0):
+    """Append one JSON object as a line, flushed so tail/tests see it at once.
+
+    C1: if `max_bytes` > 0 and this line would push the file over it, rotate
+    `path` -> `path.1` (single backup, atomically overwriting any previous `.1`)
+    and start a fresh file. Bounds disk to ~2x `max_bytes` instead of unbounded
+    growth. Rotation is best-effort — a rotate error never drops the datagram.
+    """
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    if max_bytes and max_bytes > 0:
+        try:
+            existing = os.path.getsize(path) if os.path.exists(path) else 0
+            if existing and existing + len(line.encode("utf-8")) > max_bytes:
+                os.replace(path, path + ".1")  # atomic; overwrites the old .1
+        except OSError:
+            pass  # rotation is best-effort; fall through and still write the line
     with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        fh.write(line)
         fh.flush()
 
 
-def recv_loop(sock, jsonl_path, recent):
+def recv_loop(sock, jsonl_path, recent, max_bytes=0):
     """Receive datagrams on an already-bound socket until it closes or Ctrl-C.
 
     Split out from `serve_udp` so tests can bind their own socket (ephemeral port)
@@ -222,7 +251,7 @@ def recv_loop(sock, jsonl_path, recent):
     try:
         while True:
             data, addr = sock.recvfrom(RECV_BUFSIZE)
-            handle_datagram(data, addr, jsonl_path, recent)
+            handle_datagram(data, addr, jsonl_path, recent, max_bytes=max_bytes)
     except KeyboardInterrupt:
         print(f"\n[{now_iso()}] shutting down", flush=True)
     except OSError:
@@ -231,14 +260,14 @@ def recv_loop(sock, jsonl_path, recent):
         sock.close()
 
 
-def serve_udp(host, port, jsonl_path, recent):
+def serve_udp(host, port, jsonl_path, recent, max_bytes=0):
     """Bind a UDP socket and run the receive loop (blocking)."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, port))
     print(f"[{now_iso()}] smol-collector listening on udp://{host}:{port} "
           f"-> {jsonl_path}", flush=True)
-    recv_loop(sock, jsonl_path, recent)
+    recv_loop(sock, jsonl_path, recent, max_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -296,29 +325,43 @@ def start_status_server(host, status_port, recent, start_monotonic, started_iso)
 # ---------------------------------------------------------------------------
 
 
-def main(argv=None):
+def build_parser():
+    """CLI parser (split out so tests can assert flag defaults — C2)."""
     parser = argparse.ArgumentParser(
         description="smol relay collector — UDP receiver for the ESP-NOW bridge.")
     parser.add_argument("--host", default="0.0.0.0",
-                        help="UDP bind address (default 0.0.0.0)")
+                        help="UDP bind address (default 0.0.0.0 — all interfaces)")
     parser.add_argument("--port", type=int, default=9999,
                         help="UDP port (default 9999 = firmware RELAY_COLLECTOR_PORT)")
     parser.add_argument("--jsonl", default=None,
                         help="JSONL output path (default ./collector.jsonl)")
+    parser.add_argument("--max-bytes", type=int, default=10 * 1024 * 1024,
+                        help="rotate JSONL to .1 when a line would push it over this "
+                             "many bytes (default 10485760 = 10 MB; 0 disables)")
     parser.add_argument("--status-port", type=int, default=None,
                         help="if set, serve read-only status HTTP on this port")
-    args = parser.parse_args(argv)
+    parser.add_argument("--status-host", default="127.0.0.1",
+                        help="status HTTP bind address (default 127.0.0.1 — localhost "
+                             "only; pass 0.0.0.0 for a LAN-visible status page). "
+                             "Decoupled from --host (C2): the UDP listener stays "
+                             "public while the status page is private by default.")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
 
     jsonl_path = args.jsonl or os.path.join(os.getcwd(), "collector.jsonl")
     recent = RecentBuffer(maxlen=50)
     started_iso = now_iso()
     start_monotonic = time.monotonic()
+    git_short_hash()  # C4: resolve + cache the git hash once, at startup
 
     if args.status_port is not None:
-        start_status_server(args.host, args.status_port, recent,
+        start_status_server(args.status_host, args.status_port, recent,
                             start_monotonic, started_iso)
 
-    serve_udp(args.host, args.port, jsonl_path, recent)
+    serve_udp(args.host, args.port, jsonl_path, recent, args.max_bytes)
     return 0
 
 

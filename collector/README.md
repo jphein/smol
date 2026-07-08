@@ -33,12 +33,22 @@ python3 collector.py --port 9999 --status-port 9998
 python3 collector.py --jsonl /var/log/smol/collector.jsonl
 ```
 
-Flags: `--host` (default `0.0.0.0`), `--port` (default `9999`), `--jsonl`
-(default `./collector.jsonl`), `--status-port` (default off).
+Flags:
+- `--host` (default `0.0.0.0`) — UDP bind address (all interfaces).
+- `--port` (default `9999`) — UDP port = the firmware's `RELAY_COLLECTOR_PORT`.
+- `--jsonl` (default `./collector.jsonl`) — output path.
+- `--max-bytes` (default `10485760` = 10 MB) — **rotate** the JSONL to `.1` when a
+  line would push it past this size (single backup, atomically overwriting the old
+  `.1`; bounds disk to ~2× the cap). `0` disables rotation.
+- `--status-port` (default off) — serve the read-only status HTTP on this port.
+- `--status-host` (default `127.0.0.1`) — status-page bind address. **Localhost by
+  default** — decoupled from `--host` so the UDP listener stays public while the
+  status page stays private. Pass `--status-host 0.0.0.0` for a LAN-visible page.
 
 Every datagram is appended to the JSONL file (one JSON object per line) and logged
 to stdout. Malformed / non-UTF-8 datagrams are captured raw with `parsed: null` —
-the listener never crashes on bad input.
+the listener never crashes on bad input. The JSONL rotates at `--max-bytes`, so
+long-running deploys stay bounded (current + one `.1` backup).
 
 ```json
 {"recv_iso":"2026-07-07T17:20:01.123+00:00","src_ip":"10.0.11.124","src_port":50123,"raw":"007 chip 21C batt 3.9V","parsed":{"node_id":7,"telemetry":"chip 21C batt 3.9V"}}
@@ -50,6 +60,13 @@ A tiny read-only HTTP server (stdlib) on a separate thread:
 
 - `GET /` → `{service, uptime, started, count, messages:[…last 50…]}`
 - `GET /api/version` → the realm-sigil `/api/version` contract shape.
+
+**Binds to `127.0.0.1` by default** (decoupled from the UDP `--host`). So on a
+deployed host you view it locally — `ssh disks 'curl -s localhost:9998/ | python3
+-m json.tool'` — and it is *not* exposed on the LAN unless you pass
+`--status-host 0.0.0.0` (or a specific interface IP). The UDP relay listener is
+unaffected and stays public. (`/api/version`'s git hash is resolved once at startup
+and cached — no per-request subprocess.)
 
 > **realm-sigil note:** CLAUDE.md mandates the realm-sigil version contract for
 > HTTP surfaces. The canonical helper
@@ -102,7 +119,13 @@ journalctl -u smol-collector -f            # watch datagrams arrive
 ```
 
 Open the UDP port if a firewall is in the way (e.g. `9999/udp`). The status port
-(if used) is HTTP — keep it LAN-only.
+binds localhost by default (view via `ssh <host> curl localhost:<status-port>`);
+only pass `--status-host 0.0.0.0` if you truly want it LAN-visible.
+
+**Live deploy:** running on **disks** as a *user* service (`~/.config/systemd/user/
+smol-collector.service`, linger enabled → survives reboot, no sudo) at
+`10.0.11.117:9999`. Redeploy = `scp collector/collector.py disks:~/smol-collector/`
+then `ssh disks 'systemctl --user restart smol-collector'`.
 
 ## Honesty / security
 
@@ -111,8 +134,8 @@ Open the UDP port if a firewall is in the way (e.g. `9999/udp`). The status port
   can reach the UDP port can inject a datagram with any node id. Run it **only on
   a trusted LAN**; do not expose the port to the internet.
 - **The firmware's collector IP is a compile-time constant** (`RELAY_COLLECTOR_IP`
-  / `RELAY_COLLECTOR_PORT` in `rust/clock/src/net/wifi.rs`, default
-  `10.0.11.1:9999`). The operator must set it to **this host's** address and
-  reflash the gateway before end-to-end relay works.
+  / `RELAY_COLLECTOR_PORT` in `rust/clock/src/net/wifi.rs`, now `10.0.11.117:9999`
+  = disks, live as of `7b57216`). Change it + reflash the gateway if you move the
+  collector.
 - This is **short-telemetry** relay, not bulk transfer or browsing (250 B ESP-NOW
   MTU; see `docs/protocol.md` and `scratch/smol/nebula-espnow-gateway.md`).
