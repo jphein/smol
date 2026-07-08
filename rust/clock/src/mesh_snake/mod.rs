@@ -27,6 +27,9 @@ use snake_core::{
     StepOutcome, POWER_HASTE, POWER_MIDAS, POWER_PHANTOM, POWER_PHOENIX, POWER_REVEAL, POWER_SHIELD,
 };
 
+use crate::app::{AppKind, Ctx, Plugin, Transition};
+use crate::input::Press;
+
 // World is the ratified 256×256 (design §10.1). Hardcoded as the const-generic
 // args; `snake_core::WORLD_W/H` document the same values and stay the lever.
 const W: u16 = 256;
@@ -64,6 +67,10 @@ const POWER_ZEPHYR: u8 = POWER_HASTE;
 /// The mesh-snake game state. ~600 B, entirely on the stack via `Option` in main.
 pub struct MeshSnake {
     id: u8,
+    /// Per-id broadcast phase offset (ms) within the 200 ms window, so synced
+    /// boards don't fire their SNK frames into one RX window (netcode §2).
+    /// Computed once from `id` (was a `main` local before the plugin refactor).
+    snk_phase: u64,
     snake: snake_core::Snake,
     peers: PeerTable,
     /// Wrapping broadcast tick (wire ordering).
@@ -93,6 +100,11 @@ impl MeshSnake {
         let head = Cell::new(W / 2, H / 2);
         Self {
             id,
+            snk_phase: snake_core::phase_offset_ms(
+                id,
+                snake_core::PHASE_NMAX,
+                snake_core::BROADCAST_PERIOD_MS,
+            ) as u64,
             snake: snake_core::Snake::new(head, Dir::East, START_LEN),
             peers: PeerTable::new(),
             tick: 0,
@@ -177,6 +189,12 @@ impl MeshSnake {
     /// crash — at worst one broadcast window of stale/frozen dead-reckoning
     /// (purely cosmetic, self-heals on the next absolute frame). Not worth a
     /// wider clock for a hobby game session.
+    ///
+    /// INHERENT `update` (kept — this glue mirrors the vendored `snake_core`
+    /// naming; renaming would drift the zero-drift re-vendor discipline). It
+    /// shadows [`crate::app::Plugin::update`] by name, so `App` dispatch uses UFCS
+    /// (`Plugin::update(s, ctx)`); INSIDE `Plugin::update`, `self.update(now,unix)`
+    /// binds THIS method (arg types disambiguate) — intended, not recursion.
     pub fn update(&mut self, now_ms: u32, unix_now: u32) -> bool {
         self.frame = self.frame.wrapping_add(1);
         // Despawn stale peers (single-tier, §10.6).
@@ -504,6 +522,67 @@ impl MeshSnake {
         Text::with_baseline(s.as_str(), Point::new(2, 1), style, Baseline::Top)
             .draw(display)
             .ok();
+    }
+}
+
+/// MeshSnake as a [`Plugin`]. Beyond the uniform button grammar + repaint
+/// cadence (same as the old `main` MeshSnake arm), its `update` ABSORBS the SNK
+/// frame service that used to live in `main`'s background block (design §3.8):
+/// it drains inbound snapshots into its own `PeerTable` and broadcasts our state
+/// on the per-id phase-jittered 200 ms edge. The order — ingest → broadcast →
+/// step → draw — is exactly the prior background-then-dispatch order, so this is
+/// a relocation, not a behaviour change. The always-on infra frames
+/// (HELLO/ACK/TIME/relay/LED) remain serviced by `main` before dispatch, so this
+/// plugin never double-drives them; when MeshSnake is NOT active, `main` drains
+/// the bounded SNK inbox so it cannot back up.
+impl Plugin for MeshSnake {
+    fn on_button(&mut self, press: Press, ctx: &mut Ctx) -> Transition {
+        match press {
+            Press::Long => Transition::Switch(AppKind::Menu),
+            Press::Short => {
+                if self.is_dead() {
+                    // Death screen: a tap respawns (length 3), repaint at once.
+                    self.respawn(ctx.now_ms as u32, START_LEN);
+                    ctx.redraw = true;
+                } else {
+                    self.turn();
+                }
+                Transition::Stay
+            }
+        }
+    }
+
+    fn update(&mut self, ctx: &mut Ctx) {
+        // --- SNK radio service (moved verbatim from main's background block) ---
+        if let Some(r) = ctx.radio.as_deref_mut() {
+            // Drain inbound SNK snapshots into the peer table (service() already
+            // routed them into the radio's bounded inbox this tick).
+            while let Some(f) = r.take_snk() {
+                self.ingest(&f, ctx.now_ms as u32);
+            }
+            // Broadcast OUR state on the per-id phase-jittered 200 ms boundary —
+            // the identical cur/prev edge detector main used (SUBTICK spacing).
+            let period = snake_core::BROADCAST_PERIOD_MS as u64;
+            let cur = ctx.now_ms.saturating_sub(self.snk_phase) / period;
+            let prev = ctx
+                .now_ms
+                .saturating_sub(self.snk_phase)
+                .saturating_sub(crate::SUBTICK_MS as u64)
+                / period;
+            if cur != prev {
+                let frame = self.make_frame(ctx.unix_now);
+                r.broadcast_snk(&frame);
+            }
+        }
+
+        // --- Step + render (repaint on a game step or a forced redraw) ---------
+        // Inherent `update` (the game step); UFCS not needed — arg types bind it.
+        let stepped = self.update(ctx.now_ms as u32, ctx.unix_now);
+        if stepped || ctx.redraw {
+            ctx.display.clear(BinaryColor::Off).ok();
+            self.draw(ctx.display, ctx.now_ms as u32, ctx.unix_now);
+            ctx.display.flush().ok();
+        }
     }
 }
 

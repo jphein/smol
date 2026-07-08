@@ -188,11 +188,13 @@ enum Frame<'a> {
     /// of OUR seqs the sender had heard when it sent this — an echo_seq that
     /// matches a seq we recently sent lets us compute round-trip time.
     Beacon { seq: u32, echo: u32 },
-    /// A mesh time offer: the peer's current Unix-time estimate plus the
-    /// `synced_at` that time descends from (the Unix instant of the peer's last
-    /// authoritative NTP sync; 0 = never synced). `main` adopts it iff
-    /// `synced_at` is strictly newer than ours — see `main::should_adopt`.
-    Time { unix: u32, synced_at: u32 },
+    /// A mesh time offer: the sender's logical `id` (for adoption provenance +
+    /// the roster; already on the wire, now retained), its current Unix-time
+    /// estimate, plus the `synced_at` that time descends from (the Unix instant
+    /// of the peer's last authoritative NTP sync; 0 = never synced). `main`
+    /// adopts it iff `synced_at` is strictly newer than ours — see
+    /// `main::should_adopt`.
+    Time { id: u8, unix: u32, synced_at: u32 },
     /// One fragment of a leaf's relay-uplink telemetry: sender id, per-source
     /// rolling `msgid`, fragment index/count, and up to `RELAY_CHUNK` payload
     /// bytes. `chunk` borrows the RX buffer. See the "Relay bridge" section.
@@ -274,6 +276,11 @@ struct TimeTracker {
     best_unix: u32,
     /// That offer's `synced_at` — the freshness key the adopt decision compares.
     best_synced_at: u32,
+    /// The logical id of the peer that sent the best offer (for adoption
+    /// provenance: the `Adopted(source_id)` shown on Bench's own-status line).
+    /// The id is already on the TIME wire; the parser now retains it (no format
+    /// change). 0 until an offer is buffered.
+    best_id: u8,
     /// Whether an un-taken offer is currently buffered.
     have: bool,
 }
@@ -283,9 +290,200 @@ impl TimeTracker {
         Self {
             best_unix: 0,
             best_synced_at: 0,
+            best_id: 0,
             have: false,
         }
     }
+}
+
+// =========================================================================
+// Per-peer Roster (Bench mesh-view — scratch/smol/bench-mesh-view-spec.md).
+// =========================================================================
+//
+// A MAC-keyed link/identity table populated ADDITIVELY beside the aggregate
+// `PeerTracker`, from the SAME `service()` arms. It RETAINS per-peer what already
+// flows through `service()` (id, MAC, rssi, synced_at, last-heard/ack) so Bench
+// can show "who is on the mesh." It NEVER feeds the blue LED — `peer_led_state`
+// still reads only `PeerTracker`, so the hardware-verified handshake→LED path is
+// byte-identical. Zero new wire frames: pure retention of data already arriving.
+//
+// Keyed on the MAC because it is the ONLY id on EVERY frame — an ACK carries the
+// *acked* id (ours), not the sender's, so only `src_address` attributes "this
+// peer acked us." The logical id is learned from id-bearing frames (HELLO / SNK /
+// TIME) and drives the displayed noun.
+
+/// Per-peer table capacity. Matches the snake `PEER_CAP` and the realistic mesh N.
+const ROSTER_CAP: usize = 16;
+/// Bench "recently seen" window — deliberately longer than the LED's
+/// `PEER_STALE_MS` (3 s) so a node lingers on the list ~30 s after going quiet.
+const ROSTER_STALE_MS: u64 = 30_000;
+
+/// One tracked peer, keyed by MAC. `Copy` so the table lives in `.bss` (no heap).
+#[derive(Clone, Copy)]
+struct Node {
+    used: bool,
+    mac: [u8; 6],
+    id: u8,
+    id_known: bool,
+    last_heard_ms: u64,
+    last_ack_ms: u64,
+    rssi: i32,
+    synced_at: u32,
+}
+
+impl Node {
+    const EMPTY: Self = Self {
+        used: false,
+        mac: [0; 6],
+        id: 0,
+        id_known: false,
+        last_heard_ms: 0,
+        last_ack_ms: 0,
+        rssi: 0,
+        synced_at: 0,
+    };
+}
+
+/// Fixed-cap MAC-keyed peer table (~34 B × 16 ≈ 0.5 KB, fixed, no heap). Fed
+/// additively from `service()`; read by Bench via [`RadioManager::roster`].
+struct Roster {
+    nodes: [Node; ROSTER_CAP],
+}
+
+impl Roster {
+    const fn new() -> Self {
+        Self { nodes: [Node::EMPTY; ROSTER_CAP] }
+    }
+
+    /// Find the slot for `mac`: existing match, else a free slot, else evict the
+    /// oldest-heard (bounded — a new MAC past capacity drops the stalest).
+    fn slot(&mut self, mac: [u8; 6]) -> usize {
+        for i in 0..ROSTER_CAP {
+            if self.nodes[i].used && self.nodes[i].mac == mac {
+                return i;
+            }
+        }
+        for i in 0..ROSTER_CAP {
+            if !self.nodes[i].used {
+                self.nodes[i] = Node::EMPTY;
+                self.nodes[i].used = true;
+                self.nodes[i].mac = mac;
+                return i;
+            }
+        }
+        let mut victim = 0;
+        let mut oldest = u64::MAX;
+        for i in 0..ROSTER_CAP {
+            if self.nodes[i].last_heard_ms < oldest {
+                oldest = self.nodes[i].last_heard_ms;
+                victim = i;
+            }
+        }
+        log::warn!("smol: roster full ({}); evicting oldest peer", ROSTER_CAP);
+        self.nodes[victim] = Node::EMPTY;
+        self.nodes[victim].used = true;
+        self.nodes[victim].mac = mac;
+        victim
+    }
+
+    /// Record any frame heard from `mac` (freshens last-heard + rssi; learns the
+    /// logical id when the frame carried one).
+    fn heard(&mut self, mac: [u8; 6], id: Option<u8>, rssi: i32, now: u64) {
+        let i = self.slot(mac);
+        let n = &mut self.nodes[i];
+        n.last_heard_ms = now;
+        n.rssi = rssi;
+        if let Some(id) = id {
+            n.id = id;
+            n.id_known = true;
+        }
+    }
+
+    /// Record an ACK addressed to US from `mac` (per-peer "connected").
+    fn acked(&mut self, mac: [u8; 6], now: u64) {
+        let i = self.slot(mac);
+        self.nodes[i].last_ack_ms = now;
+    }
+
+    /// Record a TIME frame from `mac`: its `synced_at` + freshen heard/rssi/id.
+    fn synced(&mut self, mac: [u8; 6], id: Option<u8>, synced_at: u32, rssi: i32, now: u64) {
+        let i = self.slot(mac);
+        let n = &mut self.nodes[i];
+        n.last_heard_ms = now;
+        n.rssi = rssi;
+        n.synced_at = synced_at;
+        if let Some(id) = id {
+            n.id = id;
+            n.id_known = true;
+        }
+    }
+
+    /// Snapshot the fresh peers (heard within `ROSTER_STALE_MS`), strongest-RSSI
+    /// first, into a `Copy` [`RosterView`] Bench renders with no live radio borrow.
+    fn view(&self, now: u64) -> RosterView {
+        let mut out = [NodeView::EMPTY; ROSTER_CAP];
+        let mut count = 0;
+        for n in self.nodes.iter() {
+            if !n.used || now.saturating_sub(n.last_heard_ms) > ROSTER_STALE_MS {
+                continue;
+            }
+            out[count] = NodeView {
+                id: n.id,
+                id_known: n.id_known,
+                rssi: n.rssi,
+                age_s: (now.saturating_sub(n.last_heard_ms) / 1000) as u32,
+                has_mesh_time: n.synced_at != 0,
+                connected: PeerTracker::fresh(n.last_ack_ms, now),
+            };
+            count += 1;
+        }
+        // Insertion sort the populated prefix by RSSI descending (nearest first).
+        // ≤16 elements, no_std-safe, no alloc.
+        for i in 1..count {
+            let mut j = i;
+            while j > 0 && out[j].rssi > out[j - 1].rssi {
+                out.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+        RosterView { nodes: out, count }
+    }
+}
+
+/// A `Copy` per-peer snapshot for the Bench UI (no live borrow of the radio).
+#[derive(Clone, Copy)]
+pub struct NodeView {
+    /// Logical id (drives the noun); meaningful only when `id_known`.
+    pub id: u8,
+    /// Whether an id-bearing frame has been heard from this peer yet.
+    pub id_known: bool,
+    /// Most-recent frame RSSI (dBm).
+    pub rssi: i32,
+    /// Seconds since we last heard this peer.
+    pub age_s: u32,
+    /// True once a TIME frame with a real `synced_at` has been heard (the `*`).
+    pub has_mesh_time: bool,
+    /// True if a fresh ACK addressed to us has been heard from this peer (the
+    /// same `PEER_STALE_MS` freshness the LED uses, but per-peer).
+    pub connected: bool,
+}
+
+impl NodeView {
+    const EMPTY: Self = Self {
+        id: 0,
+        id_known: false,
+        rssi: 0,
+        age_s: 0,
+        has_mesh_time: false,
+        connected: false,
+    };
+}
+
+/// A `Copy` roster snapshot: `nodes[..count]` are the fresh peers, RSSI desc.
+#[derive(Clone, Copy)]
+pub struct RosterView {
+    pub nodes: [NodeView; ROSTER_CAP],
+    pub count: usize,
 }
 
 // =========================================================================
@@ -823,6 +1021,9 @@ pub struct RadioManager {
     relay: Relay,
     /// Decoded MMO-snake frames buffered for `main` to drain (issue #5).
     snk: SnkInbox,
+    /// Per-peer link/identity table for the Bench mesh-view (issue #8). Fed
+    /// additively from `service()` beside `peers`; never feeds the LED.
+    roster: Roster,
 }
 
 /// Monotonic milliseconds since boot — the single time base for both the
@@ -865,23 +1066,37 @@ impl RadioManager {
             time: TimeTracker::new(),
             relay: Relay::new(),
             snk: SnkInbox::new(),
+            roster: Roster::new(),
         })
     }
 
     /// Run the real WiFi -> DHCP -> SNTP burst using the STA device, driving the
-    /// caller's `tick` closure throughout (the `espnow` build fast-blinks the
-    /// blue LED so "WiFi/NTP in progress" is visible). Returns the synced Unix
-    /// time, or `None` on any timeout.
+    /// caller's `tick` closure throughout (the `espnow` build fast-blinks the blue
+    /// LED so "WiFi/NTP in progress" is visible).
     ///
-    /// We now BORROW the STA device instead of `take()`+drop: keeping it alive
-    /// lets a gateway re-associate for periodic relay flushes (`flush_telemetry`,
-    /// which resurrects the `switch(Mode::WifiSta)` arm). The smoltcp interface is
-    /// built and dropped INSIDE `run_ntp_burst`, so no live stack lingers to
-    /// contend with ESP-NOW between bursts.
-    pub fn burst_ntp(&mut self, tick: &mut dyn FnMut()) -> Option<u32> {
+    /// Returns `(reached_dhcp, synced)`: `reached_dhcp` is true once the burst
+    /// ASSOCIATED + got a DHCP lease (proven before SNTP runs) — this decides the
+    /// relay GATEWAY role (N3c: decoupled from NTP, so an SNTP outage can't demote
+    /// a node with a working LAN uplink); `synced` is the SNTP Unix time or `None`.
+    ///
+    /// We BORROW the STA device (not `take()`+drop) so a gateway can re-associate
+    /// for periodic relay flushes (`flush_telemetry`); the smoltcp interface is
+    /// built + dropped INSIDE `run_ntp_burst`, so no live stack contends with
+    /// ESP-NOW between bursts.
+    pub fn burst_ntp(&mut self, tick: &mut dyn FnMut()) -> (bool, Option<u32>) {
         // Disjoint field borrows: &mut self.controller, &mut *sta, Copy of rng.
-        let sta = self.sta.as_mut()?;
-        crate::net::wifi::run_ntp_burst(&mut self.controller, sta, self.rng, tick)
+        let Some(sta) = self.sta.as_mut() else {
+            return (false, None);
+        };
+        let mut reached_dhcp = false;
+        let synced = crate::net::wifi::run_ntp_burst(
+            &mut self.controller,
+            sta,
+            self.rng,
+            tick,
+            &mut reached_dhcp,
+        );
+        (reached_dhcp, synced)
     }
 
     /// Current radio mode. Part of the public API (a caller may inspect which
@@ -988,14 +1203,29 @@ impl RadioManager {
 
     /// Take the freshest buffered peer TIME offer, clearing it so a later call
     /// only sees offers that arrive afterward. Returns `(peer_unix,
-    /// peer_synced_at)`; `main` decides via `should_adopt` whether to re-anchor.
-    pub fn take_time_offer(&mut self) -> Option<(u32, u32)> {
+    /// peer_synced_at, peer_id)`; `main` decides via `should_adopt` whether to
+    /// re-anchor, and records `peer_id` as the adoption source (Bench own-status).
+    pub fn take_time_offer(&mut self) -> Option<(u32, u32, u8)> {
         if self.time.have {
             self.time.have = false;
-            Some((self.time.best_unix, self.time.best_synced_at))
+            Some((self.time.best_unix, self.time.best_synced_at, self.time.best_id))
         } else {
             None
         }
+    }
+
+    /// Snapshot the per-peer roster for the Bench mesh-view (issue #8): fresh
+    /// peers, strongest-RSSI first, as a `Copy` view (no live borrow). Read-only
+    /// w.r.t. the LED (which still reads only `PeerTracker`).
+    pub fn roster(&self, now: u64) -> RosterView {
+        self.roster.view(now)
+    }
+
+    /// Our own relay role, decided at boot (associated to an AP → gateway, else
+    /// leaf). Bench shows this as `GATE`/`LEAF` on its own-status line — own role
+    /// only, since a peer's role is never on the wire (bench-mesh-view-spec §3).
+    pub fn is_gateway(&self) -> bool {
+        self.relay.is_gateway
     }
 
     // --- Relay bridge (see the "Relay bridge" section) -----------------------
@@ -1232,6 +1462,9 @@ impl RadioManager {
                     // An MMO-snake frame proves the peer is audible → counts
                     // toward the LED "detected" state exactly like HELLO/BEACON.
                     self.peers.last_hello_ms = now;
+                    // Roster (additive; never touches the LED): learn this peer's
+                    // id (SNK frames carry it) + freshen heard/rssi.
+                    self.roster.heard(src, Some(f.id), rssi, now);
                     // Register the peer so any future unicast can reach it.
                     if !self.esp_now.peer_exists(&src) {
                         let _ = self.esp_now.add_peer(PeerInfo {
@@ -1249,6 +1482,9 @@ impl RadioManager {
                 Some(Frame::Hello(peer_id)) => {
                     // We can hear a peer -> at least "detected".
                     self.peers.last_hello_ms = now;
+                    // Roster (additive): HELLO carries the sender's id — the
+                    // primary place peer ids are learned (every node HELLOs 2 Hz).
+                    self.roster.heard(src, Some(peer_id), rssi, now);
 
                     // Register the broadcaster so the ACK below can be unicast.
                     if !self.esp_now.peer_exists(&src) {
@@ -1279,9 +1515,16 @@ impl RadioManager {
                     // the link is bidirectional -> "connected".
                     if acked_id == self.id {
                         self.peers.last_ack_for_us_ms = now;
+                        // Roster (additive): attribute per-peer "connected" to the
+                        // MAC that acked US (an ACK's payload id is OURS, so only
+                        // `src` identifies the acker — the whole reason for MAC keying).
+                        self.roster.acked(src, now);
                         label = Some(alloc::string::String::from("linked"));
                     }
-                    // ACKs for other ids are peer-to-peer chatter; ignore.
+                    // We heard *a* frame from this MAC regardless of whom it acked;
+                    // record it as audible (id unknown from an ACK → learned via HELLO).
+                    self.roster.heard(src, None, rssi, now);
+                    // ACKs for other ids are peer-to-peer chatter; ignore (LED-wise).
                 }
                 Some(Frame::Beacon { seq, echo }) => {
                     // A peer BENCH beacon. Update RX count, RSSI, loss (seq
@@ -1289,6 +1532,10 @@ impl RadioManager {
                     // sent). A BEACON also proves we can hear the peer, so it
                     // counts toward the LED "detected" state like a HELLO.
                     self.peers.last_hello_ms = now;
+                    // Roster (additive): a BEACON's sender id is not parsed (the
+                    // frame drops it), so pass None — the id is learned from this
+                    // MAC's HELLO, always present at 2 Hz alongside the BEACON.
+                    self.roster.heard(src, None, rssi, now);
                     self.bench.rx_count = self.bench.rx_count.wrapping_add(1);
                     self.bench.last_rssi = Some(rssi);
 
@@ -1329,7 +1576,7 @@ impl RadioManager {
                     }
                     label = Some(alloc::format!("bench seq {}", seq));
                 }
-                Some(Frame::Time { unix, synced_at }) => {
+                Some(Frame::Time { id, unix, synced_at }) => {
                     // Buffer the FRESHEST offer (highest synced_at) seen since
                     // `main` last took one, so a burst of frames collapses to the
                     // single best candidate. `main` owns the adopt decision + the
@@ -1338,17 +1585,23 @@ impl RadioManager {
                     if !self.time.have || synced_at > self.time.best_synced_at {
                         self.time.best_unix = unix;
                         self.time.best_synced_at = synced_at;
+                        self.time.best_id = id;
                         self.time.have = true;
                     }
                     // Hearing a TIME frame also proves the peer is audible, so it
                     // counts toward the LED "detected" state exactly like a HELLO
                     // or a BEACON does.
                     self.peers.last_hello_ms = now;
+                    // Roster (additive): record this peer's synced_at (drives the
+                    // `*` mesh-time marker) + learn its id (TIME carries it now).
+                    self.roster.synced(src, Some(id), synced_at, rssi, now);
                     label = Some(alloc::format!("time {}", synced_at));
                 }
                 Some(Frame::Relay { src_id, msgid, frag, count, chunk }) => {
                     // A RELAY fragment proves we can hear the peer (LED detected).
                     self.peers.last_hello_ms = now;
+                    // Roster (additive): RELAY carries the leaf's src_id — learn it.
+                    self.roster.heard(src, Some(src_id), rssi, now);
                     // Only a GATEWAY reassembles + acks; a leaf ignores RELAY so
                     // work + memory stay with the role that needs them.
                     if self.relay.is_gateway {
@@ -1498,12 +1751,15 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
     }
     if let Some(rest) = data.strip_prefix(TIME_PREFIX) {
         // "NNN UUUUUUUUUU SSSSSSSSSS": id (3) space unix (10) space
-        // synced_at (10) = 25 bytes. The sender id isn't needed (freshness, not
-        // identity, drives adoption), so we skip it just as the BEACON arm does.
+        // synced_at (10) = 25 bytes. Freshness (not identity) drives adoption, but
+        // the sender id IS retained now — for adoption provenance (Bench's
+        // `adopt<Noun>` own-status) and to learn ids into the roster. This reads a
+        // field already on the wire; the TIME frame format is unchanged.
         if rest.len() >= 25 {
+            let id = parse_id(&rest[0..3])?;
             let unix = parse_u10(&rest[4..14])?;
             let synced_at = parse_u10(&rest[15..25])?;
-            return Some(Frame::Time { unix, synced_at });
+            return Some(Frame::Time { id, unix, synced_at });
         }
         return None;
     }
@@ -1670,15 +1926,20 @@ pub fn start(p: WifiPeripherals, id: u8, led: &mut Led) -> (Option<RadioManager>
     // The closure is called inside every busy-wait loop of the burst; it just
     // re-derives the fast-blink phase from the monotonic clock and pushes it to
     // the pin (non-blocking, no per-blink state).
-    let synced = radio.burst_ntp(&mut || led.apply(LedState::WifiSync, now_ms()));
+    let (reached_dhcp, synced) = radio.burst_ntp(&mut || led.apply(LedState::WifiSync, now_ms()));
 
-    // Relay role: a node that reached NTP is in WiFi range, so it can be the
-    // internet GATEWAY that flushes out-of-range leaves' telemetry; a node that
-    // did not is a LEAF (it only emits RELAY). See the relay-bridge section.
-    radio.relay.is_gateway = synced.is_some();
+    // Relay role (N3c): a node is the internet GATEWAY iff its boot burst reached
+    // ASSOCIATION + DHCP — i.e. it has a usable LAN uplink — NOT iff SNTP succeeded.
+    // Decoupling from NTP means a Cloudflare-anycast SNTP outage (rate-limiting our
+    // WAN IP) can't demote both real-creds boards to leaf and leave the mesh with no
+    // gateway. SNTP stays best-effort for TIME: `synced` = NTP root, else the clock
+    // free-runs and adopts mesh time later (mesh-time handles an unsynced gateway).
+    radio.relay.is_gateway = reached_dhcp;
     log::info!(
-        "smol: relay role = {}",
-        if synced.is_some() { "GATEWAY" } else { "leaf" }
+        "smol: relay role = {} (assoc+dhcp {}, ntp {})",
+        if reached_dhcp { "GATEWAY" } else { "leaf" },
+        reached_dhcp,
+        if synced.is_some() { "ok" } else { "miss" }
     );
 
     // --- Hand the radio to ESP-NOW on a fixed channel (TIME-SHARE) -------

@@ -143,7 +143,9 @@ pub fn try_time_sync(p: WifiPeripherals) -> Option<u32> {
     let mut device = interfaces.sta;
 
     // Phase-2 (wifi-only) build has no status LED, so the tick is a no-op.
-    run_ntp_burst(&mut controller, &mut device, rng, &mut || {})
+    // wifi-only build has no relay/gateway role, so the reached-DHCP flag is unused.
+    let mut _reached_dhcp = false;
+    run_ntp_burst(&mut controller, &mut device, rng, &mut || {}, &mut _reached_dhcp)
 }
 
 /// Shared WiFi -> DHCP -> SNTP burst, reused by both the Phase-2 `wifi`-only
@@ -162,6 +164,10 @@ pub fn run_ntp_burst(
     device: &mut esp_wifi::wifi::WifiDevice<'static>,
     mut rng: Rng,
     tick: &mut dyn FnMut(),
+    // N3c: set true once we've ASSOCIATED + got a DHCP lease (before SNTP runs).
+    // The caller uses this — NOT the returned NTP Option — to decide gateway role,
+    // so an SNTP outage can't demote a node with a working LAN uplink.
+    reached_dhcp: &mut bool,
 ) -> Option<u32> {
     // --- smoltcp stack: DHCP + UDP sockets -------------------------------
     let mut iface = create_interface(device);
@@ -231,6 +237,9 @@ pub fn run_ntp_burst(
         if let Some((addr, router)) = configured {
             apply_dhcp(&mut iface, addr, router);
             log::info!("smol: DHCP address {}", addr);
+            // N3c: association + DHCP reached — this alone qualifies the node as a
+            // relay GATEWAY (see start()); the SNTP below is best-effort for TIME.
+            *reached_dhcp = true;
             break;
         }
         if Instant::now() > deadline {
@@ -383,6 +392,19 @@ pub fn run_udp_flush(
             return false;
         }
     }
+
+    // FINDING N3b: re-assert WiFi power-save OFF now that we've RE-associated.
+    // esp-wifi applies WIFI_PS_NONE once at init (`wifi::new` → set_power_saving(
+    // default = None)), but the flush's disconnect()→connect() re-association resets
+    // the IDF ps state → the AP believes the STA is dozing and BUFFERS unicast: the
+    // ARP reply for the collector never reaches the board (HW wire-capture: the
+    // request arrives at disks and is answered, the board never sees it), while
+    // broadcast DHCP still delivers at DTIM (why DHCP succeeds yet the send drained
+    // empty — N3). PS-None keeps the STA awake so unicast (the ARP reply, and any
+    // future downlink) is delivered immediately. So this MUST be after the reconnect,
+    // not once at init. Tradeoff: higher idle draw on the 502030 LiPo — accepted for
+    // correctness now; a future tunable could use selective/min PS when not flushing.
+    let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
 
     // Fresh DHCP lease each burst (the interface was just rebuilt).
     loop {

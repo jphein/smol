@@ -46,6 +46,9 @@ use embedded_graphics::{
     text::{Baseline, Text},
 };
 
+use crate::app::{AppKind, Ctx, Plugin, Transition};
+use crate::input::Press;
+
 /// Cell size in pixels (square). 4 px divides 72 evenly (18 columns).
 const CELL: i32 = 4;
 /// Grid width in cells: 72 px / 4 = 18.
@@ -208,6 +211,11 @@ impl Snake {
     /// Returns `true` if the game state changed this call (a movement step
     /// happened — including the step that ends the game), so the caller only has
     /// to repaint the OLED when something actually moved rather than every tick.
+    ///
+    /// INHERENT `update` (kept — mirrors the vendored snake naming). It shadows
+    /// [`crate::app::Plugin::update`] by name, so `App`'s dispatch uses UFCS
+    /// (`Plugin::update(s, ctx)`); INSIDE `Plugin::update` below, `self.update(now)`
+    /// still binds THIS method (the `u64` arg disambiguates) — that is intended.
     pub fn update(&mut self, now_ms: u64) -> bool {
         if self.dead {
             return false;
@@ -386,4 +394,83 @@ fn fmt_score(score: u16, buf: &mut [u8; 8]) -> &str {
         w += 1;
     }
     core::str::from_utf8(&buf[..w]).unwrap_or("S:?")
+}
+
+/// Overlay the death screen: the final score on the top band, over the frozen
+/// board (which the caller left in place). Heap-free; builds its own `FONT_5X8`
+/// style (the render loop no longer threads styles in). Moved VERBATIM from the
+/// old `main::draw_snake_death` — same glyphs, same position.
+fn draw_death<D>(display: &mut D, score: u16)
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let label_style = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
+    // "DEAD S:NN" on the top band (the score band area) so it's readable over
+    // the body. Heap-free formatting.
+    let mut buf = [0u8; 16];
+    let mut n = 0;
+    for &b in b"DEAD " {
+        buf[n] = b;
+        n += 1;
+    }
+    buf[n] = b'S';
+    buf[n + 1] = b':';
+    n += 2;
+    let s = score.min(999);
+    if s >= 100 {
+        buf[n] = b'0' + (s / 100) as u8;
+        n += 1;
+    }
+    if s >= 10 {
+        buf[n] = b'0' + ((s / 10) % 10) as u8;
+        n += 1;
+    }
+    buf[n] = b'0' + (s % 10) as u8;
+    n += 1;
+    let text = core::str::from_utf8(&buf[..n]).unwrap_or("DEAD");
+    Text::with_baseline(text, Point::new(1, 0), label_style, Baseline::Top)
+        .draw(display)
+        .ok();
+}
+
+/// Snake as a [`Plugin`]: the single-button UX contract (long = back to Menu,
+/// short = turn / restart-on-death) and the same repaint cadence the old `main`
+/// Snake arm used (repaint on a movement step OR a forced redraw). Every read,
+/// draw and cadence is the prior arm relocated — behaviour-preserving.
+impl Plugin for Snake {
+    fn on_button(&mut self, press: Press, ctx: &mut Ctx) -> Transition {
+        match press {
+            // Uniform grammar: a long press leaves any mode back to the menu.
+            Press::Long => Transition::Switch(AppKind::Menu),
+            Press::Short => {
+                if self.is_dead() {
+                    // Death screen: a tap restarts a fresh game (repaint at once).
+                    *self = Snake::new(ctx.now_ms);
+                    ctx.redraw = true;
+                } else {
+                    // Alive: queue a clockwise turn (takes effect on the next step).
+                    self.on_tap();
+                }
+                Transition::Stay
+            }
+        }
+    }
+
+    fn update(&mut self, ctx: &mut Ctx) {
+        // Inherent `update` returns true only on a real movement step (incl. the
+        // fatal one); repaint on a step or a forced redraw — not every tick. UFCS
+        // is NOT needed here: the `u64` arg binds the inherent method, not this trait one.
+        let stepped = self.update(ctx.now_ms);
+        if stepped || ctx.redraw {
+            ctx.display.clear(BinaryColor::Off).ok();
+            self.draw(ctx.display);
+            if self.is_dead() {
+                draw_death(ctx.display, self.score());
+            }
+            ctx.display.flush().ok();
+        }
+    }
 }

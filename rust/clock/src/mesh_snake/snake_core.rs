@@ -41,51 +41,82 @@
 
 
 // ===========================================================================
-// Shipped constants (change these two to reshape the world; math is generic)
+// ==== GAME TUNABLES (playtest knobs) ====
+//
+// ONE place JP tweaks the FEEL after actually playing. Everything here is a
+// gameplay/feel knob — bump a value, rebuild, reflash. These are the SINGLE
+// SOURCE OF TRUTH: `mesh_snake/mod.rs` reads them via `snake_core::*` (no local
+// copies). NOT here: wire/protocol constants (SNK frame, flags bit-layout,
+// power IDs, PHASE_NMAX) — those live in their own sections below and changing
+// them breaks cross-board compatibility, so they are deliberately kept apart.
 // ===========================================================================
 
-/// Shipped world width (cells).
-///
-/// **256×256, RATIFIED** by design doc §10.1 (which completed its ratify pass
-/// and kept the proto's original 256 — every `u8` coord valid, no masking,
-/// matches netcode). The earlier 128 flip-flop is resolved → 256 stands. Still
-/// const-generic over `World<W,H>`, so shrinking to 128/64 remains a one-line
-/// lever (§10.1) — tests exercise both sizes so correctness is size-agnostic.
+// --- World -----------------------------------------------------------------
+/// World width (cells), toroidal. **256×256 RATIFIED** (§10.1). Const-generic
+/// over `World<W,H>`, so shrinking to 128/64 for denser encounters is a
+/// one-line lever (tests exercise both sizes). Smaller world = snakes meet sooner.
 pub const WORLD_W: u16 = 256;
-/// Shipped world height (cells). See [`WORLD_W`].
+/// World height (cells). See [`WORLD_W`].
 pub const WORLD_H: u16 = 256;
 
-/// OLED usable width in pixels (0.42" SSD1306 visible area on this board).
+// --- Movement feel ----------------------------------------------------------
+/// Base movement step (ms). Bigger = calmer/slower snake; §10.7 FINAL = 200.
+pub const STEP_MS: u32 = 200;
+/// Zephyr Rune (Haste) step (ms) ≈ 1.75× faster than [`STEP_MS`]. Smaller = zippier.
+pub const HASTE_STEP_MS: u32 = 114;
+/// Fresh-spawn body length. Bigger = easier to self-trap early.
+pub const START_LEN: usize = 3;
+/// Hard max body length (ring-buffer capacity) — the ceiling on growth.
+pub const SNAKE_CAP: usize = 64;
+
+// --- Mesh cadence & peers ---------------------------------------------------
+/// Own-state broadcast period (ms) at 5 Hz — one broadcast per step (== STEP_MS).
+pub const BROADCAST_PERIOD_MS: u32 = 200;
+/// Max simultaneously-tracked peers (also the phase-jitter slot count).
+pub const PEER_CAP: usize = 16;
+/// No frame within this (ms) ⇒ peer **despawns** ([`PeerTable::prune`]). Bigger
+/// = lost/ghosting peers linger longer. Single-tier per §10.6.
+pub const PEER_STALE_MS: u32 = 5_000;
+/// OPTIONAL render-only dim threshold (ms) — cosmetic ghosting, NOT a protocol
+/// tier (§10.6). Feed to [`PeerSnake::state`] if you want the dim tell.
+pub const PEER_DIM_MS: u32 = 2_500;
+
+// --- Food & treasure --------------------------------------------------------
+/// Simultaneous food beacons per bucket (design §10.4 K). More = easier to eat.
+pub const FOOD_COUNT: usize = 12;
+/// Food re-roll period (s). Shorter = food relocates more often (more chase).
+pub const FOOD_PERIOD_S: u32 = 20;
+/// Treasure (power) re-roll period (s) — rarer than food. Bigger = powers scarcer.
+pub const TREASURE_PERIOD_S: u32 = 45;
+/// Shared, compile-time food/treasure seed (NOT per-node) — only the mesh-clock
+/// bucket must converge across boards for spawns to agree.
+pub const GAME_SEED: u32 = 0x5340_4B45;
+
+// --- Power durations (s) — design §11.1 first-pass; tweak to taste ----------
+/// Wraith Veil (Phantom) — phase-through window.
+pub const DUR_PHANTOM_S: u32 = 6;
+/// Zephyr Rune (Haste) — speed-boost window.
+pub const DUR_HASTE_S: u32 = 5;
+/// Aegis Ward (Shield) — 1-charge shield lifetime.
+pub const DUR_SHIELD_S: u32 = 10;
+/// Midas Sigil — +3-growth-per-food window.
+pub const DUR_MIDAS_S: u32 = 8;
+/// Mothlight Lantern (Reveal) — compass-shows-all window.
+pub const DUR_REVEAL_S: u32 = 10;
+/// Phoenix Ember — respawn-armed window.
+pub const DUR_PHOENIX_S: u32 = 10;
+
+// --- Display geometry (STRUCTURAL — the 72×40 OLED, not a feel knob) --------
+/// OLED usable width in pixels (0.42" SSD1306 visible area).
 pub const SCREEN_W_PX: u16 = 72;
 /// OLED usable height in pixels.
 pub const SCREEN_H_PX: u16 = 40;
 /// Pixels per world cell when rendered.
 pub const CELL_PX: u16 = 4;
-
 /// Visible columns of cells (72 / 4 = 18).
 pub const VIEW_COLS: u16 = SCREEN_W_PX / CELL_PX;
 /// Visible rows of cells (40 / 4 = 10).
 pub const VIEW_ROWS: u16 = SCREEN_H_PX / CELL_PX;
-
-/// Max segments a snake body can hold (ring-buffer capacity).
-pub const SNAKE_CAP: usize = 64;
-/// Max simultaneously-tracked remote peers.
-pub const PEER_CAP: usize = 16;
-
-/// Local snake movement step period (ms). Dead-reckoning converts elapsed
-/// `millis()` into whole steps with this. **Design §10.7 FINAL = 200** (aligns
-/// one broadcast per step at 5 Hz; proto had 150, netcode 220 — 200 is final).
-pub const STEP_MS: u32 = 200;
-/// Broadcast period (ms) at R = 5 Hz — one state broadcast per step (== STEP_MS).
-pub const BROADCAST_PERIOD_MS: u32 = 200;
-/// No frame within this window (ms) ⇒ peer is **despawned** by
-/// [`PeerTable::prune`]. Design §10.6 RATIFIES the proto's **single-tier 5000**
-/// (netcode suggested a two-tier 3000/6000; design keeps one proven tunable).
-pub const PEER_STALE_MS: u32 = 5_000;
-/// OPTIONAL render-only dim threshold (ms) — cosmetic, NOT a protocol tier
-/// (§10.6). A peer un-heard this long may be drawn dimmed/ghosted but stays
-/// live until [`PEER_STALE_MS`]. Feed to [`PeerSnake::state`] if you want it.
-pub const PEER_DIM_MS: u32 = 2_500;
 
 // --- SMOLv1 SNK wire frame (netcode spec §1) -------------------------------
 /// ASCII, sniffer-greppable frame prefix. Exactly 11 bytes.
@@ -1000,10 +1031,7 @@ pub fn food_at<const W: u16, const H: u16>(seed: u32, time_bucket: u32) -> Cell 
     }
 }
 
-/// Default beacon count for [`food_cells`] (design §10.4 wants K≈8–16 so a 2–16
-/// snake game in a 256² world actually meets food; the raw [`food_at`] returns
-/// just 1). 12 sits mid-range.
-pub const FOOD_COUNT: usize = 12;
+// `FOOD_COUNT` (beacon count, K) is defined in the GAME TUNABLES block at the top.
 
 /// Fill `out` with up to `min(out.len(), FOOD_COUNT)` deterministic food cells
 /// for a bucket — the design §10.4 "several beacons" wrapper over [`food_at`].
@@ -1094,4 +1122,3 @@ impl EatenSet {
         true
     }
 }
-
