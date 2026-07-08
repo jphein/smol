@@ -127,6 +127,94 @@ input_boolean:
     name: "smol display override"
     icon: "mdi:pencil"
 
+# =====================================================================
+# NODE MANAGER (issue #21) — remotely set each node's DEFAULT SCREEN + page
+# via retained  smol/<id>/config/default_screen = <AppKind>:<page>.
+# Protocol LOCKED per nodemgr-design.md §2. This is the HA PUBLISH/GUI half;
+# the firmware CONSUME side (subscribe + panic-free parse) is a later wave.
+#   - AppKind tokens = EXACT app.rs spellings (case-sensitive), full espnow set.
+#     Firmware ignores/clamps any token it can't build in its tier (never crashes).
+#   - page: flat "0"/"1" (only Batt has 2 pages today; firmware clamps invalid -> 0).
+#   - "Apply"  -> publishes the retained value (broker = persistence).
+#   - "Reset"  -> publishes an EMPTY retained payload = clear -> node falls back to
+#                 its board.rs DEFAULT_APP/DEFAULT_PAGE (design §2.5, R-P1 lifecycle).
+#   - "Set all" -> fans out to EVERY per-node topic (NO broadcast topic — ruling #3).
+#   - Closed-set input_select => HA can never emit a malformed payload (security §7);
+#     the firmware still parses panic-free because the broker is LAN-writable.
+# NOTE (honest, per design): credential-less leaves never open MQTT, so they use
+# their board.rs default until given creds (reach = JP decision F2). The OTA panel,
+# mesh-topology view, and LIVE current-screen preview are DEFERRED (JP-decisions
+# F5/F6/F7 + firmware smol/<id>/status F4); v1 reflects COMMANDED config only.
+# =====================================================================
+input_select:
+  # --- set-all (writes every per-node topic) ---
+  smol_all_screen:
+    name: "smol all · default screen"
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About]
+    initial: Menu
+    icon: mdi:monitor-multiple
+  smol_all_page:
+    name: "smol all · default page"
+    options: ["0", "1"]
+    initial: "0"
+    icon: mdi:book-open-page-variant
+  # --- id7 (one copy-paste block per node; new node = duplicate + renumber) ---
+  smol_7_screen:
+    name: "smol id7 · default screen"
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About]
+    initial: Menu
+    icon: mdi:monitor
+  smol_7_page:
+    name: "smol id7 · default page"
+    options: ["0", "1"]
+    initial: "0"
+    icon: mdi:book-open-page-variant
+  # --- id8 ---
+  smol_8_screen:
+    name: "smol id8 · default screen"
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About]
+    initial: Menu
+    icon: mdi:monitor
+  smol_8_page:
+    name: "smol id8 · default page"
+    options: ["0", "1"]
+    initial: "0"
+    icon: mdi:book-open-page-variant
+  # --- id9 ---
+  smol_9_screen:
+    name: "smol id9 · default screen"
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About]
+    initial: Menu
+    icon: mdi:monitor
+  smol_9_page:
+    name: "smol id9 · default page"
+    options: ["0", "1"]
+    initial: "0"
+    icon: mdi:book-open-page-variant
+
+input_button:
+  smol_all_apply:
+    name: "smol all · apply"
+    icon: mdi:send-check
+  smol_7_apply:
+    name: "smol id7 · apply"
+    icon: mdi:send
+  smol_7_reset:
+    name: "smol id7 · reset to board default"
+    icon: mdi:backup-restore
+  smol_8_apply:
+    name: "smol id8 · apply"
+    icon: mdi:send
+  smol_8_reset:
+    name: "smol id8 · reset to board default"
+    icon: mdi:backup-restore
+  smol_9_apply:
+    name: "smol id9 · apply"
+    icon: mdi:send
+  smol_9_reset:
+    name: "smol id9 · reset to board default"
+    icon: mdi:backup-restore
+
 # --- Dashboard mirror: subscribe the retained topic so a card shows exactly ---
 # what the boards fetch (the payload is <=96 chars, well under the 255 state cap).
 mqtt:
@@ -139,6 +227,22 @@ mqtt:
       unique_id: smol_display_grid_mirror
       state_topic: "smol/display/grid"
       icon: "mdi:transmission-tower"
+    # --- node-manager: COMMANDED config mirrors (issue #21) ---
+    # Reflect the commanded config (the retained value HA published) so the card
+    # shows what was set. LIVE actual screen + running build needs the firmware
+    # smol/<id>/status publish (design F4) — deferred; v1 = commanded config only.
+    - name: "smol 7 config"
+      unique_id: smol_7_config_mirror
+      state_topic: "smol/7/config/default_screen"
+      icon: "mdi:cog"
+    - name: "smol 8 config"
+      unique_id: smol_8_config_mirror
+      state_topic: "smol/8/config/default_screen"
+      icon: "mdi:cog"
+    - name: "smol 9 config"
+      unique_id: smol_9_config_mirror
+      state_topic: "smol/9/config/default_screen"
+      icon: "mdi:cog"
 
 automation:
   - id: smol_publish_batt_display
@@ -302,3 +406,131 @@ automation:
             {%- endif -%}
             {%- endmacro -%}
             GRID|{{ pcell('', 'sensor.yurt_consumption', 1000) | trim }}|{{ pcell('L1', 'sensor.l1_power_clamp', 1) | trim }}|{{ pcell('L2', 'sensor.l2_power_clamp', 1) | trim }}
+
+  # =====================================================================
+  # NODE MANAGER automations (issue #21) — publish the retained per-node config.
+  # Trigger = the Apply/Reset input_buttons; payload = <AppKind>:<page> from the
+  # closed-set input_selects (so it is always a valid token). "Set all" fans out
+  # to every per-node topic (no broadcast). Reset publishes empty = clear.
+  # =====================================================================
+  - id: smol_nodemgr_7_apply
+    alias: "smol nodemgr: id7 apply default screen"
+    description: >-
+      On the id7 Apply button, publish retained smol/7/config/default_screen =
+      <AppKind>:<page> from the id7 helpers (broker retention = persistence).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_7_apply
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/7/config/default_screen"
+          retain: true
+          qos: 0
+          payload: "{{ states('input_select.smol_7_screen') }}:{{ states('input_select.smol_7_page') }}"
+  - id: smol_nodemgr_7_reset
+    alias: "smol nodemgr: id7 reset to board default"
+    description: >-
+      On the id7 Reset button, publish an EMPTY retained payload (retain-delete) so
+      id7 falls back to its board.rs DEFAULT_APP/DEFAULT_PAGE (design §2.5, R-P1).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_7_reset
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/7/config/default_screen"
+          retain: true
+          qos: 0
+          payload: ""
+  - id: smol_nodemgr_8_apply
+    alias: "smol nodemgr: id8 apply default screen"
+    description: >-
+      On the id8 Apply button, publish retained smol/8/config/default_screen.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_8_apply
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/8/config/default_screen"
+          retain: true
+          qos: 0
+          payload: "{{ states('input_select.smol_8_screen') }}:{{ states('input_select.smol_8_page') }}"
+  - id: smol_nodemgr_8_reset
+    alias: "smol nodemgr: id8 reset to board default"
+    description: >-
+      On the id8 Reset button, publish an EMPTY retained payload (clear).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_8_reset
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/8/config/default_screen"
+          retain: true
+          qos: 0
+          payload: ""
+  - id: smol_nodemgr_9_apply
+    alias: "smol nodemgr: id9 apply default screen"
+    description: >-
+      On the id9 Apply button, publish retained smol/9/config/default_screen.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_9_apply
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/9/config/default_screen"
+          retain: true
+          qos: 0
+          payload: "{{ states('input_select.smol_9_screen') }}:{{ states('input_select.smol_9_page') }}"
+  - id: smol_nodemgr_9_reset
+    alias: "smol nodemgr: id9 reset to board default"
+    description: >-
+      On the id9 Reset button, publish an EMPTY retained payload (clear).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_9_reset
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/9/config/default_screen"
+          retain: true
+          qos: 0
+          payload: ""
+  - id: smol_nodemgr_set_all
+    alias: "smol nodemgr: SET ALL default screen"
+    description: >-
+      On the Apply-to-all button, fan the set-all screen+page out to EVERY per-node
+      topic (id7/id8/id9) — no broadcast topic (ruling #3 / design §2.1). Each
+      per-node retained value is overwritten.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_all_apply
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/7/config/default_screen"
+          retain: true
+          qos: 0
+          payload: "{{ states('input_select.smol_all_screen') }}:{{ states('input_select.smol_all_page') }}"
+      - service: mqtt.publish
+        data:
+          topic: "smol/8/config/default_screen"
+          retain: true
+          qos: 0
+          payload: "{{ states('input_select.smol_all_screen') }}:{{ states('input_select.smol_all_page') }}"
+      - service: mqtt.publish
+        data:
+          topic: "smol/9/config/default_screen"
+          retain: true
+          qos: 0
+          payload: "{{ states('input_select.smol_all_screen') }}:{{ states('input_select.smol_all_page') }}"

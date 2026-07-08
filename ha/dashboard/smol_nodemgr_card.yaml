@@ -1,0 +1,114 @@
+# smol node manager — set each node's DEFAULT screen + page remotely (issue #21)
+# ---------------------------------------------------------------------------
+# HA PUBLISH/GUI half of the node manager (nodemgr-design.md §3/§6). Pick a
+# default screen + page per node, press Apply → HA publishes the retained
+# `smol/<id>/config/default_screen = <AppKind>:<page>`; the board applies it on
+# its next MQTT burst (no reflash). "Reset" clears the retained value → the node
+# falls back to its board.rs compile-time default. "Set all" writes every
+# per-node topic (there is no broadcast topic — design ruling #3).
+#
+# Install at DEPLOY time via the WS `lovelace/config/save` API — do NOT hand-edit
+# `.storage/lovelace*` (HA caches it and overwrites your edit). See ha/README.md.
+# (Deployment is HELD for JP review — this file is the artifact, not yet installed.)
+#
+# DEFERRED (not in this card — need firmware / JP decisions, flagged in the design):
+#   • live "current screen" preview + running build  → needs firmware smol/<id>/status (F4)
+#   • mesh-topology (hub/spoke) panel                → needs firmware smol/<id>/mesh roster (§4)
+#   • OTA push panel                                 → JP-decisions F5/F6/F7 + firmware status
+# v1 reflects the COMMANDED config (the retained value HA published), not the live
+# actual screen. Credential-less leaves use their board.rs default until given creds
+# (reach = JP decision F2); the mirror line shows "unknown" until a value is applied.
+type: vertical-stack
+cards:
+  - type: markdown
+    content: >
+      ## smol · node manager
+
+      Set each node's **default screen + page** remotely — published as retained
+      MQTT, applied on the node's next burst, no reflash. **Reset** returns a node
+      to its `board.rs` default. *v1 shows the commanded config; live current-screen,
+      mesh topology, and OTA are later waves.*
+
+  - type: entities
+    title: Set all nodes
+    show_header_toggle: false
+    entities:
+      - entity: input_select.smol_all_screen
+        name: Screen (all)
+      - entity: input_select.smol_all_page
+        name: Page (all)
+      - entity: input_button.smol_all_apply
+        name: Apply to all nodes
+        icon: mdi:send-check
+
+  - type: entities
+    title: id7 · Dominion (gateway)
+    show_header_toggle: false
+    entities:
+      - entity: sensor.smol_7_dominion_smol_7
+        name: Status (telemetry)
+        icon: mdi:access-point
+      - type: section
+        label: Default screen
+      - entity: input_select.smol_7_screen
+        name: Screen
+      - entity: input_select.smol_7_page
+        name: Page (Batt only)
+      - entity: input_button.smol_7_apply
+        name: Apply to id7
+        icon: mdi:send
+      - entity: input_button.smol_7_reset
+        name: Reset to board default
+        icon: mdi:backup-restore
+      - type: divider
+      - entity: sensor.smol_7_config
+        name: Commanded config (retained)
+        icon: mdi:cog
+
+  - type: entities
+    title: id8 · Nexus
+    show_header_toggle: false
+    entities:
+      - entity: sensor.smol_8_nexus_smol_8
+        name: Status (telemetry)
+        icon: mdi:access-point
+      - type: section
+        label: Default screen
+      - entity: input_select.smol_8_screen
+        name: Screen
+      - entity: input_select.smol_8_page
+        name: Page (Batt only)
+      - entity: input_button.smol_8_apply
+        name: Apply to id8
+        icon: mdi:send
+      - entity: input_button.smol_8_reset
+        name: Reset to board default
+        icon: mdi:backup-restore
+      - type: divider
+      - entity: sensor.smol_8_config
+        name: Commanded config (retained)
+        icon: mdi:cog
+
+  - type: entities
+    title: id9 · Herald
+    show_header_toggle: false
+    entities:
+      - entity: sensor.smol_9_herald_smol_9
+        name: Status (telemetry)
+        icon: mdi:access-point
+      - type: section
+        label: Default screen
+      - entity: input_select.smol_9_screen
+        name: Screen
+      - entity: input_select.smol_9_page
+        name: Page (Batt only)
+      - entity: input_button.smol_9_apply
+        name: Apply to id9
+        icon: mdi:send
+      - entity: input_button.smol_9_reset
+        name: Reset to board default
+        icon: mdi:backup-restore
+      - type: divider
+      - entity: sensor.smol_9_config
+        name: Commanded config (retained)
+        icon: mdi:cog

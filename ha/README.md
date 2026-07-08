@@ -166,6 +166,79 @@ typed (a line of pure `|` collapses to empty). Blank/unknown sources render empt
 The ready-made Lovelace card is `dashboard/smol_display_card.yaml` (toggle + 3
 source fields with the syntax hint + the mirror sensor).
 
+## Node manager (issue #21) — set each node's default screen remotely
+
+The HA **publish/GUI half** of the node manager. Set a node's boot **default screen +
+page** from HA; it is published as **retained** MQTT and the board applies it on its
+next burst — no reflash, no per-board `board.rs` edit. Protocol is LOCKED in
+`nodemgr-design.md §2`; this package builds it verbatim. **The firmware CONSUME side
+(subscribe + panic-free parse) is a later wave** — until it lands, publishing to a real
+node's topic has no effect (harmless; the retained value simply waits).
+
+**Command topic (one per node — the single source of truth):**
+
+```
+smol/<id>/config/default_screen   (retain: true, qos: 0)   payload: <AppKind>:<page>
+```
+
+- **AppKind tokens** = the EXACT `app.rs` enum spellings (case-sensitive), full espnow
+  set: `Menu Clock Batt Grid Snake Bench MeshSnake About`. The firmware ignores/clamps
+  any token it can't build in its tier (never crashes). `Snake` maps to `MeshSnake` on
+  espnow via `SNAKE_KIND`; both are accepted.
+- **page** = one digit; flat `0`/`1` (only `Batt` has 2 pages today). Firmware clamps
+  an invalid/out-of-range page to `0`.
+- **Apply** publishes the retained value (broker retention = persistence). **Reset**
+  publishes an **empty** retained payload (retain-delete) = clear → the node falls back
+  to its `board.rs` compile-time `DEFAULT_APP`/`DEFAULT_PAGE` (design §2.5).
+- **Set all** fans out to **every** per-node topic (id7/id8/id9) — there is **no
+  broadcast topic** (design ruling #3; a broadcast couldn't reach cred-less leaves over
+  the unauthenticated mesh anyway — security R-P3).
+- **Why the GUI can't emit a bad payload:** the `input_select` options are a closed set
+  of valid tokens, so HA always publishes a well-formed `<AppKind>:<page>`. The firmware
+  still parses **panic-free** because the broker is LAN-writable by anything (a retained
+  payload that panicked would boot-loop-brick the board — security §2, the umbrella MUST).
+
+**Helpers / entities this package adds:**
+
+- `input_select.smol_all_screen` / `_all_page` + `input_button.smol_all_apply` (set-all).
+- Per node (7/8/9): `input_select.smol_<id>_screen` / `_<id>_page` +
+  `input_button.smol_<id>_apply` / `_<id>_reset`.
+- `sensor.smol_<id>_config` — mirrors the retained command topic (the **commanded**
+  value shown on the card).
+
+**Deferred (NOT built here — need firmware follow-ups / JP decisions, per the design):**
+
+- **Live** current-screen preview + running build → needs firmware `smol/<id>/status`
+  (design F4). v1 reflects the **commanded** config only, not the live actual screen.
+- **Mesh-topology** (hub/spoke) panel → needs firmware `smol/<id>/mesh` roster (design §4).
+- **OTA push panel** → JP-decisions F5 (signing vs accepted-risk) / F6 (physical
+  long-press accept) / F7 (per-node announce topic) + the firmware status publish.
+- Node **reach**: credential-less leaves never open MQTT, so they use their `board.rs`
+  default until given creds (JP decision F2). The card notes this.
+
+**The node-status rows** on the card use the EXISTING discovery entities
+(`sensor.smol_<id>_<noun>_smol_<id>`) — that part is live data today.
+⚠️ Those entity_ids are **doubled/ugly** (`sensor.smol_7_dominion_smol_7`) — a
+discovery-naming quirk worth cleaning up under the #12 device-grouping work (see the
+WLED research memo: one device `smol <id>` with structured child entities).
+
+### Deploy (HELD for JP review — do NOT run yet)
+
+Same proven pass; because this adds **new `input_*` + `mqtt:` sensors**, use
+**`reload_all`** (not `automation.reload`):
+
+```bash
+cat ha/packages/smol_mesh.yaml | ssh jp@10.0.6.108 "sudo tee /homeassistant/packages/smol_mesh.yaml > /dev/null"
+TOKEN=$(bw get password ha-llat)
+curl -sX POST https://ha.jphe.in:8123/api/config/core/check_config -H "Authorization: Bearer $TOKEN"
+curl -sX POST https://ha.jphe.in:8123/api/services/homeassistant/reload_all -H "Authorization: Bearer $TOKEN"
+# then install ha/dashboard/smol_nodemgr_card.yaml via WS lovelace/config/save (see below)
+```
+
+**Do NOT publish to the real `smol/<id>/config/*` topics until the firmware consume side
+ships** — a retained config a board can't yet parse just sits there (harmless), but keep
+the surface clean. (Validated instead against a throwaway `smol/test/config/...` topic.)
+
 ## Broker (verified 2026-07-08)
 
 Mosquitto runs on the HA VM, which is **quad-homed** (VLAN6 `10.0.6.108` / VLAN8
