@@ -96,7 +96,7 @@ detected → solid = connected). Once linked, your snakes share one world.
 The wire protocol (the 18-byte `SMOLv1 SNK` frame, 5 Hz phase-jittered, head-only
 with dead-reckoned bodies, and the `flags` byte that carries the active power in 5
 bits at **zero** extra size) is documented in
-[protocol.md](protocol.md#snk--mmo-mesh-snake-design). Why head-only: a full
+[protocol.md](protocol.md#snk--mmo-mesh-snake). Why head-only: a full
 144-segment body would be 288 bytes — over the 250 B ESP-NOW frame limit — so the
 body *can't* be sent; broadcasting head+heading+length and reconstructing the rest
 is both necessary and naturally loss-tolerant.

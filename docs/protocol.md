@@ -85,7 +85,7 @@ stays well under 250 B.
 | [TIME](#time--mesh-time-sync) | `SMOLv1 TIME ` | 37 | broadcast | ~2 s | espnow | 🟢 |
 | [RELAY](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAY ` | ≤91 | broadcast | ~15 s (leaf) | espnow | 🟡 |
 | [RELAYACK](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAYACK ` | 25 | unicast | reactive | espnow | 🟡 |
-| [SNK](#snk--mmo-mesh-snake-design) | `SMOLv1 SNK ` | 18 | broadcast | 5 Hz jittered | espnow | ⚪ |
+| [SNK](#snk--mmo-mesh-snake) | `SMOLv1 SNK ` | 18 | broadcast | 5 Hz jittered | espnow | 🟡 |
 
 ---
 
@@ -248,7 +248,7 @@ and post-completion dedup were hardened after an adversarial review — see
 **Source.** `mode.rs` relay-bridge section (`RELAY_PREFIX`, `RELAYACK_PREFIX`,
 `Relay`/`RelayTx`/reassembly); spec `relay-bridge-spec.md`.
 
-## SNK — MMO mesh snake (design)
+## SNK — MMO mesh snake
 
 **Purpose.** Every board's snake shares **one world**; a scrolling viewport
 follows your own head (no walls). Each node is the **sole authority over its own
@@ -282,9 +282,10 @@ by `min(elapsed/STEP_MS, 3)` cells (clamped). `tick` wrap-order drops stale
 frames. Despawn via the `PEER_STALE_MS` idiom. Dead snakes still announce
 (`alive=0`) so peers clear them fast.
 **Playable N.** smooth ≤ 8, good 12–16 (jittered), graceful degradation beyond.
-**Flag.** espnow (would gate here). **Status.** ⚪ **design — not in code.** The
-`flags` byte is **design v2** (heading 2 b + alive 1 b + a **5-bit active-power
-field**, 0..31) and **not yet frozen** — bit positions may shift at implementation.
+**Flag.** espnow. **Status.** 🟡 **committed + compile-verified** (`6baea36`; builds clean
+across all 3 builds, not yet hardware-exercised). The `flags` byte is **design v2** (heading 2 b +
+alive 1 b + a **5-bit active-power field**, 0..31); the active-power bits may still shift as
+treasures/powers land — confirm against the current build before relying on the exact bit layout.
 **Source.** `mmo-snake-netcode.md` (§1/§5) + `mmo-snake-design.md` (§7).
 
 ---

@@ -50,29 +50,36 @@ a missed window), but **don't run a high-rate game and a busy relay gateway on t
 same board** expecting both to stay smooth.
 
 ## Freeze-on-failed-flush: the fix + backoff semantics
-*(fix wave landing — const names may shift one commit; I'll true this up next pass)*
+*(committed — `2ea7c4d` gateway liveness/dedup fix + `7b57216` live collector)*
 
-**The bug (found in adversarial review):** a gateway with queued messages but a
-**dead/unreachable AP** would re-enter the *blocking* flush burst on a tight
-cadence — each attempt stalls for the association timeout — so the whole device
-(clock, game, LED) **freezes** in repeated multi-second hangs.
+**The bug (found in adversarial review — "Oracle findings"):** a gateway with queued
+messages but a **dead/unreachable AP** would re-enter the *blocking* flush burst on a
+tight cadence — each attempt stalled for the association timeout — so the whole device
+(clock, game, LED) **froze** in repeated multi-second hangs.
 
-**The fix (known design):**
-- **Unconditional backoff stamp** — the gateway records the flush-attempt time
-  **before** trying and **whether or not it succeeds**, so `relay_ready_to_flush`
-  honors `RELAY_FLUSH_INTERVAL_MS` even after a failure instead of spin-retrying.
-- **`RELAY_FLUSH_BUDGET` (~6 s)** — a flush burst is capped well under the 30 s NTP
-  budget, so a single failed burst can't hang the loop for long.
-- **Queue aging** — building on the committed `FLUSH_FAILS_BEFORE_DROP` (**2**):
-  after 2 consecutive failed flushes the gateway sheds the **oldest** queued
-  message on each further failure, so a gateway stuck against a dead AP **drains to
-  empty** → `relay_ready_to_flush` goes false → the blocking bursts **stop**.
+**The fix (as committed):**
+- **Bounded burst — `RELAY_FLUSH_BUDGET = 6 s`** (`net/wifi.rs`), *separate from* the
+  30 s NTP `SYNC_BUDGET`: a flush's associate → DHCP → UDP is deadlined at 6 s, so a
+  dead AP **fails fast** instead of hanging the loop.
+- **Unconditional backoff stamp** (`net/mode.rs`, "finding 1a"): `last_flush_ms` is
+  stamped **before** the attempt and **regardless of success/failure**, so after a
+  failed flush the next attempt is held off a full `RELAY_FLUSH_INTERVAL_MS`
+  (**30 s** backoff) instead of spin-retrying every loop.
+- **Full-queue fast-path gated on health**: the "flush immediately when the queue is
+  full" shortcut fires **only while `flush_fails == 0`** — a failing gateway won't
+  hammer a full queue against a dead AP.
+- **Queue aging — `FLUSH_FAILS_BEFORE_DROP = 2`**: after 2 consecutive failed flushes
+  the gateway sheds the **oldest** queued message (`drop_oldest`) on each further
+  failure, so a gateway stuck against a dead AP **drains to empty** →
+  `relay_ready_to_flush` goes false → the blocking bursts **stop**.
+- **Dedup ring — `DONE_RING = 4`**: a lost RELAYACK makes a leaf retransmit an
+  *already-complete* message; the gateway remembers the last 4 completed
+  `(src_mac, msgid)` pairs and **re-ACKs without re-enqueuing**, so telemetry is never
+  delivered to the collector twice.
 
-Net: a gateway that can't reach its AP degrades to occasional short, bounded
-attempts and then goes quiet, instead of freezing. *(Committed consts today:
-`RELAY_FLUSH_INTERVAL_MS`, `FLUSH_FAILS_BEFORE_DROP`, `RELAY_STALE_MS` in
-`rust/clock/src/net/mode.rs`; the backoff stamp + `RELAY_FLUSH_BUDGET` land with
-the fix wave.)*
+Net: a gateway that can't reach its AP degrades to short (≤6 s), 30-s-spaced attempts
+then goes quiet — no freeze, no duplicate delivery. All consts live in
+`rust/clock/src/net/{wifi,mode}.rs`.
 
 ## Configure the collector target
 
@@ -89,8 +96,8 @@ const RELAY_COLLECTOR_PORT: u16      = 9999;
 - The deployed collector is on **disks `10.0.11.117:9999`**, which sits on the
   **same VLAN 11 /24 the boards DHCP onto**, so board → collector stays on one
   subnet (no inter-VLAN routing, no gatekeeper in the path — the ideal placement).
-  *(The in-tree default is still the `10.0.11.1` placeholder; the fix wave sets it
-  to `10.0.11.117`.)*
+  *(This is now the in-tree default — set live in `7b57216`; change it only if you
+  deploy the collector elsewhere.)*
 
 ## Run the collector (LAN side)
 
@@ -116,9 +123,9 @@ unaffected.)
 - **Browsing / general IP** — physically impractical (see the gateway analysis).
 
 ## Status
-🟡→ **firmware in progress**: the relay path (leaf emit, reassembly, RELAYACK,
-gateway flush) is committed and compile-verified; the freeze-fix + backoff is
-**landing now** (fix wave). **Not yet hardware-verified end-to-end** — that's the
-final-flash test against the live collector on disks. The LAN collector side **is**
-committed (19 tests) and deployed. Wire frames: see
+🟡 **compile-verified**: the relay path (leaf emit, reassembly, RELAYACK, gateway
+flush) **and** the liveness/dedup fix are committed (`2ea7c4d`, `7b57216`) and build
+clean across all 3 builds. **Not yet hardware-verified end-to-end** — that's the
+final-flash test against the live collector on disks (`10.0.11.117:9999`). The LAN
+collector side **is** committed (19 tests) and deployed. Wire frames: see
 [protocol.md](protocol.md#relay--relayack--espnow--internet-telemetry).
