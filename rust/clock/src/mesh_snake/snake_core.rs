@@ -1,5 +1,5 @@
-// VENDORED VERBATIM from scratch/smol/mmo-snake-proto/src/lib.rs (the 52-test oracle).
-// Firmware copy: crate attr + #[cfg(test)] module stripped; logic byte-identical.
+// VENDORED VERBATIM from scratch/smol/mmo-snake-proto/src/lib.rs (the 53-test oracle).
+// Firmware copy: crate attr + test module stripped; logic byte-identical.
 // Re-vendor on any proto change and diff to prove no drift. Do NOT hand-edit logic here.
 #![allow(dead_code)] // not every core API is used by the firmware yet (powers/leaderboard)
 
@@ -1042,5 +1042,56 @@ pub fn treasure_at<const W: u16, const H: u16>(seed: u32, treasure_bucket: u32) 
     };
     let power = 1 + (h % POWER_COUNT as u64) as u8; // 1..=6
     (cell, power)
+}
+
+/// Per-bucket "already eaten" set — the anti-farm guard for food scoring.
+///
+/// A bucket exposes up to [`FOOD_COUNT`] beacons at once. Remembering only the
+/// LAST eaten cell lets a snake alternate between two beacons and farm growth
+/// on every revisit within one bucket. This set remembers **all** cells eaten
+/// in the current bucket (cap [`FOOD_COUNT`], the max simultaneous beacons) and
+/// auto-clears when the bucket rolls, so each beacon feeds you exactly once per
+/// bucket. Fixed-size, no heap.
+#[derive(Clone, Copy, Debug)]
+pub struct EatenSet {
+    bucket: u32,
+    cells: [Cell; FOOD_COUNT],
+    len: usize,
+}
+
+impl Default for EatenSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EatenSet {
+    pub const fn new() -> Self {
+        Self {
+            bucket: u32::MAX,
+            cells: [Cell::new(0, 0); FOOD_COUNT],
+            len: 0,
+        }
+    }
+
+    /// Record eating `cell` in `bucket`. Returns `true` if this is the FIRST
+    /// time that cell has been eaten this bucket (i.e. the caller should grow),
+    /// `false` on a revisit. Rolling to a new bucket clears the set first.
+    pub fn eat(&mut self, bucket: u32, cell: Cell) -> bool {
+        if bucket != self.bucket {
+            self.bucket = bucket;
+            self.len = 0;
+        }
+        if self.cells[..self.len].contains(&cell) {
+            return false; // already eaten this bucket → no growth
+        }
+        if self.len < FOOD_COUNT {
+            self.cells[self.len] = cell;
+            self.len += 1;
+        }
+        // At the (impossible) overflow past FOOD_COUNT distinct beacons we still
+        // report `true` — bounded, and there are never more than FOOD_COUNT.
+        true
+    }
 }
 

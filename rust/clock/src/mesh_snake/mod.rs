@@ -23,8 +23,8 @@ use embedded_graphics::{
 };
 
 use snake_core::{
-    food_cells, power_name, treasure_at, Camera, Cell, Dir, IngestOutcome, PeerTable, SnkFrame,
-    StepOutcome, POWER_HASTE, POWER_MIDAS, POWER_PHANTOM, POWER_PHOENIX, POWER_SHIELD,
+    food_cells, treasure_at, Camera, Cell, Dir, EatenSet, IngestOutcome, PeerTable, SnkFrame,
+    StepOutcome, POWER_HASTE, POWER_MIDAS, POWER_PHANTOM, POWER_PHOENIX, POWER_REVEAL, POWER_SHIELD,
 };
 
 // World is the ratified 256×256 (design §10.1). Hardcoded as the const-generic
@@ -78,9 +78,9 @@ pub struct MeshSnake {
     aegis_charged: bool,
     /// Phoenix Ember: one respawn-keeping-length remaining while active.
     phoenix_ready: bool,
-    /// Local "already ate this food cell this bucket" guard (design §… race).
-    ate_bucket: u32,
-    ate_cell: Option<Cell>,
+    /// Per-bucket eaten-food set — prevents farming growth by alternating
+    /// between two beacons within one bucket (F5). Auto-rolls on bucket change.
+    eaten: EatenSet,
     /// Local "already took this treasure bucket" guard.
     took_treasure_bucket: Option<u32>,
     /// Flicker phase for the phantom render tell.
@@ -102,8 +102,7 @@ impl MeshSnake {
             power_until_unix: 0,
             aegis_charged: false,
             phoenix_ready: false,
-            ate_bucket: u32::MAX,
-            ate_cell: None,
+            eaten: EatenSet::new(),
             took_treasure_bucket: None,
             frame: 0,
         }
@@ -171,6 +170,13 @@ impl MeshSnake {
 
     /// Advance the game. Returns `true` if the board changed (repaint hint).
     /// `now_ms` = local monotonic ms; `unix_now` = mesh Unix clock (buckets).
+    ///
+    /// NOTE (F6): `now_ms` is the firmware's `millis()` (u64) truncated to u32 by
+    /// the caller, so it WRAPS every ~49.7 days. All step-timing and peer
+    /// dead-reckoning use `saturating_sub`, so at the wrap boundary there is no
+    /// crash — at worst one broadcast window of stale/frozen dead-reckoning
+    /// (purely cosmetic, self-heals on the next absolute frame). Not worth a
+    /// wider clock for a hobby game session.
     pub fn update(&mut self, now_ms: u32, unix_now: u32) -> bool {
         self.frame = self.frame.wrapping_add(1);
         // Despawn stale peers (single-tier, §10.6).
@@ -238,6 +244,12 @@ impl MeshSnake {
     }
 
     /// Food / treasure pickup at the new head (both-get-it; §11.4 / §… food).
+    ///
+    /// Buckets derive from the mesh-synced Unix clock (`unix_now`). Free-run
+    /// boards that have not yet adopted mesh time compute DIFFERENT buckets, so
+    /// their food/treasure cells differ from peers' until the clock converges —
+    /// transient and by design (§6/§10.4 eventually-consistent); `GAME_SEED` is
+    /// a shared compile-time constant, so only the bucket needs to converge.
     fn handle_pickups(&mut self, unix_now: u32) {
         let head = self.snake.head();
 
@@ -250,14 +262,12 @@ impl MeshSnake {
         }
 
         // Food (K beacons). +1 length, or +3 under Midas (§11.1 Midas Sigil).
+        // The EatenSet remembers ALL beacons eaten this bucket, so alternating
+        // between two beacons can't farm growth (F5) — each feeds once/bucket.
         let fbucket = unix_now / FOOD_PERIOD_S;
         let mut beacons = [Cell::default(); snake_core::FOOD_COUNT];
         let n = food_cells::<W, H>(GAME_SEED, fbucket, &mut beacons);
-        let on_food = beacons[..n].contains(&head);
-        let already = self.ate_bucket == fbucket && self.ate_cell == Some(head);
-        if on_food && !already {
-            self.ate_bucket = fbucket;
-            self.ate_cell = Some(head);
+        if beacons[..n].contains(&head) && self.eaten.eat(fbucket, head) {
             let grow = if self.active_power(unix_now) == POWER_MIDAS {
                 3
             } else {
@@ -512,15 +522,18 @@ fn peer_body_hits(peers: &PeerTable, c: Cell, now_ms: u32) -> bool {
     false
 }
 
-/// One-letter power tell for the HUD.
+/// One-letter power tell for the HUD. Keyed off the power ID (not the name's
+/// first byte) so Midas Sigil and Mothlight Lantern — which both start "M" —
+/// get DISTINCT glyphs (F4): Midas = 'G' (Golden Growth), Mothlight = 'L'
+/// (Lantern). The rest use their treasure initial.
 fn power_initial(power: u8) -> &'static str {
-    // First letter of the design §11.1 name.
-    match power_name(power).as_bytes().first() {
-        Some(b'W') => "W", // Wraith Veil (Phantom)
-        Some(b'Z') => "Z", // Zephyr Rune (Haste)
-        Some(b'A') => "A", // Aegis Ward (Shield)
-        Some(b'M') => "M", // Midas / Mothlight — disambiguated below
-        Some(b'P') => "P", // Phoenix Ember
+    match power {
+        POWER_PHANTOM => "W", // Wraith Veil
+        POWER_HASTE => "Z",   // Zephyr Rune
+        POWER_SHIELD => "A",  // Aegis Ward
+        POWER_MIDAS => "G",   // Midas Sigil — Golden Growth (≠ Mothlight's 'L')
+        POWER_REVEAL => "L",  // Mothlight Lantern
+        POWER_PHOENIX => "P", // Phoenix Ember
         _ => "?",
     }
 }
