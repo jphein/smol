@@ -33,11 +33,12 @@ leaves.
 
 ## The flush cycle
 
-> **⚠️ v2 pivot in flight (compile-verified — pending hardware verify).** Steps 1–3 below are
-> the **currently flashed** ESP-NOW relay + UDP-collector flush. In v2 the LAN egress
-> changes: the flush burst becomes an **MQTT burst** to Home Assistant's Mosquitto
-> broker and the **UDP collector is being retired** (step 4 + the deaf-time note).
-> The ESP-NOW relay/reassembly itself (steps 1–2) is unchanged.
+> **⚠️ v2 shipped — MQTT-native (hardware-verified, build 40 "Pressed Oven",
+> 2026-07-08).** The gateway's LAN egress is now an **MQTT burst** straight to Home
+> Assistant (step 4), and the **UDP collector is retired** (stopped/disabled, JSONL
+> archived). Steps 1–2 (the ESP-NOW relay/reassembly) are unchanged and current;
+> step 3 describes the **superseded** UDP flush, kept for context. One honest hold-out:
+> leaf-side `SMOLv1 BATT`-frame *receipt* is still inferred (finding #15).
 
 1. **Leaf emits** fresh telemetry every `RELAY_EMIT_INTERVAL_MS` (**15 s**) as up to
    `RELAY_MAX_FRAGS` (**4**) `SMOLv1 RELAY` fragments of `RELAY_CHUNK` (**64 B**)
@@ -54,8 +55,8 @@ leaves.
    actually egress** the interface — bounded ~2 s (`ca5d985`, "finding N3") — **not
    a fixed post-send delay**: a warm interface flushes fast, a slow one still
    completes within the bound.
-4. **v2 — the flush burst becomes an MQTT burst** *(compile-verified — pending
-   hardware verify)*. Instead of `run_udp_flush` → the UDP collector, the same WiFi window
+4. **v2 — the flush burst is now an MQTT burst** *(hardware-verified, build 40 —
+   leaf-BATT receipt inferred, #15)*. Instead of `run_udp_flush` → the UDP collector, the same WiFi window
    **connects to Home Assistant's Mosquitto broker** (the HA VM's leg on the boards'
    own VLAN — const in the gateway's git-ignored `secrets.rs`, see
    [BUILDING.md](BUILDING.md); plain TCP, hand-rolled MQTT 3.1.1 / QoS 0),
@@ -66,8 +67,8 @@ leaves.
    then **broadcasts a [`SMOLv1 BATT`](protocol.md#batt--ha-battery-snapshot) frame**
    (gateway-only — its neighbour leaves cache it but never re-broadcast, so BATT is
    single-hop) and DISCONNECTs back to ch 6. The **UDP
-   collector egress is being retired** (rollback = git; the disks service is stopped
-   only *after* hardware verify). Full byte contracts:
+   collector egress is retired** (as of build 40; the disks service is
+   stopped/disabled and its JSONL archived — rollback = git). Full byte contracts:
    [protocol.md → MQTT burst](protocol.md#mqtt-burst--the-lan-transport-that-retires-the-udp-collector).
 
 > **Known follow-up (not a blocker):** each flush rebuilds the interface, so its
@@ -97,10 +98,10 @@ MQTT downlink into the existing 30 s NTP window. It's still the same single-radi
 trade-off (the mesh is deaf for the burst), still tens of seconds apart, still
 loss-tolerant (a missed downlink just leaves the previous cached voltages on screen) —
 but **don't pair a high-rate game with a busy MQTT gateway** and expect both smooth.
-*(Compile-verified Stage 3, 6/6 gates; on-hardware burst duration unmeasured. The
-[broker path](protocol.md#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)
-is CONNACK-verified from the boards' VLAN — `nebula-ha-pipe`, 3/3 — leaving a wireless
-flash-day smoke test as the last check.)*
+*(Hardware-verified on build 40: a wireless gateway CONNACKs and completes the
+[MQTT burst](protocol.md#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)
+at both boot and flush, no panic; exact burst duration wasn't instrumented but it fits
+inside the 15 s budget. Leaf-side `SMOLv1 BATT`-frame receipt remains inferred — #15.)*
 
 ## Freeze-on-failed-flush: the fix + backoff semantics
 *(committed — `2ea7c4d` gateway liveness/dedup fix + `7b57216` live collector)*
@@ -137,10 +138,11 @@ then goes quiet — no freeze, no duplicate delivery. All consts live in
 
 ## Configure the collector target
 
-> **Being retired (v2).** This UDP-collector target is the *currently flashed* path.
-> v2 replaces it with the [MQTT burst](protocol.md#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)
-> to Home Assistant's broker; it's kept here (and still the in-tree default) until
-> the MQTT path is hardware-verified — rollback is git.
+> **Retired (v2, 2026-07-08).** This UDP-collector target has been **replaced** by the
+> [MQTT burst](protocol.md#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)
+> to Home Assistant (hardware-verified on build 40); the disks collector is
+> stopped/disabled and its JSONL archived. This section is kept for historical /
+> rollback context (rollback = git).
 
 Set where the gateway sends telemetry — compile-time consts in
 `rust/clock/src/net/wifi.rs` (hardcoded IP, no DNS, mirroring `NTP_SERVER_IP`):
@@ -178,7 +180,8 @@ curl localhost:9998`; it is not exposed on the LAN unless the collector is run w
   publishes a *retained* battery payload the gateway picks up in its
   [MQTT burst](protocol.md#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)
   and re-broadcasts as a [`SMOLv1 BATT`](protocol.md#batt--ha-battery-snapshot) frame
-  (compile-verified, pending hardware verify). A *general* command/data downlink (per-leaf
+  (HA→gateway→cache leg hardware-verified on build 40; the gateway→leaf `SMOLv1 BATT`
+  frame *receipt* is inferred, not observed — finding #15). A *general* command/data downlink (per-leaf
   unicast fragmentation back to the leaf MAC) is still deferred.
 - **Multi-hop** (leaf → relay → … → gateway) — needs a next-hop/TTL header + a
   loop-prevention seen-set + a shared-channel invariant (+200–400 LOC); this is
@@ -195,12 +198,13 @@ in. One non-blocking cold-ARP first-round nit remains (see the flush follow-up).
 LAN collector is committed (19→26 tests, hardened) + deployed. Wire frames:
 [protocol.md](protocol.md#relay--relayack--espnow--internet-telemetry).
 
-**v2 (compile-verified — pending hardware verify):** the LAN egress is pivoting from the UDP
-collector to an [MQTT burst](protocol.md#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)
-straight to Home Assistant (telemetry as native HA entities; a retained battery
-downlink re-broadcast as a [`SMOLv1 BATT`](protocol.md#batt--ha-battery-snapshot)
-frame). The ESP-NOW relay/reassembly above is unchanged; only the gateway's
-internet hop changes. Stage 3 is in tree (6/6 build/clippy gates green) and the
-broker path CONNACK-verified from the boards' VLAN — but **no board has run an MQTT
-burst yet** (wireless flash-day smoke test outstanding), so the UDP collector stays
-the flashed default until then.
+**v2 (hardware-verified — build 40 "Pressed Oven", 2026-07-08):** the LAN egress is now
+an [MQTT burst](protocol.md#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)
+straight to Home Assistant (telemetry as native HA entities via discovery; a retained
+battery downlink cached + re-broadcast as a [`SMOLv1 BATT`](protocol.md#batt--ha-battery-snapshot)
+frame). The ESP-NOW relay/reassembly above is unchanged; only the gateway's internet
+hop moved. Proven on real boards: wireless CONNACK (boot + flush), 31 B byte-exact
+downlink, `sensor.smol_7…`/`sensor.smol_8…` live in HA (incl. a leaf's telemetry
+relayed leaf→gateway→cloud). The **UDP collector is retired** (stopped/disabled, JSONL
+archived). Still open: leaf-side BATT-frame *receipt* is inferred (finding #15), plus
+one SNTP-starved-boot-MQTT edge (#15).
