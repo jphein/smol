@@ -81,11 +81,17 @@ const SYNC_BUDGET: Duration = Duration::from_secs(30);
 
 /// Overall budget for a RELAY flush burst (associate + DHCP + UDP sends + drain),
 /// MUCH shorter than the NTP burst's 30 s so a gateway can't block the whole
-/// firmware loop for 30 s when the AP is down (finding 1b). ~6 s covers a healthy
-/// associate + DHCP + a few small datagrams on the AP's channel; raise it if a
-/// real AP is slower — the tradeoff is a longer display/input freeze on outage.
+/// firmware loop for 30 s when the AP is down (finding 1b).
+///
+/// HARDWARE-TUNED 2026-07-07: 6 s was NOT enough on the real AP — wave-3 flashes
+/// showed both gateways failing with "relay flush — DHCP timed out" (associate
+/// succeeded; the FRESH DHCP exchange overran the remaining budget), 0/N flushes,
+/// exactly as the pass-3 review's N2 note predicted. 15 s gives the observed
+/// associate+DHCP ~2.5× headroom while keeping the outage freeze bounded and far
+/// below the old 30 s spin. Tradeoff unchanged: longer budget = longer worst-case
+/// display/input freeze per attempt during an outage.
 #[cfg(feature = "espnow")]
-const RELAY_FLUSH_BUDGET: Duration = Duration::from_secs(6);
+const RELAY_FLUSH_BUDGET: Duration = Duration::from_secs(15);
 
 // -------------------------------------------------------------------------
 // Peripheral bundle handed over from `main` (single esp_hal::init()).
