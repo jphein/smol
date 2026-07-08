@@ -95,6 +95,11 @@ mod sensors;
 #[cfg(feature = "wifi")]
 mod batt;
 
+// HA grid-power screen (Grid, issue #16): the display-only Plugin + its `GridCache`,
+// twin of Batt — filled by the same WiFi burst (SUBSCRIBE `smol/display/grid`).
+#[cfg(feature = "wifi")]
+mod grid;
+
 // LOCAL git-ignored WiFi credentials, used by the `wifi`/`espnow` radio bring-up.
 #[cfg(feature = "wifi")]
 mod secrets;
@@ -118,6 +123,18 @@ pub(crate) const TZ_OFFSET_SECONDS: i64 = -7 * 3600;
 /// id and is never itself transmitted. `pub(crate)` so the CLOCK/ABOUT/MENU
 /// plugins can derive this node's name/identity from it.
 pub(crate) const NODE_ID: u8 = 7;
+
+/// The screen this board enters at BOOT, instead of the Home menu (issue #18 v1).
+/// A per-board boot knob — sibling to [`NODE_ID`] — and it lives HERE, a committed
+/// config const, rather than in the git-ignored `secrets.rs`: it is boot BEHAVIOUR,
+/// not a credential, so every clone should see the same version-controlled default
+/// (secrets.rs is per-clone + untracked — the wrong home for shared config). Set it
+/// to any `AppKind` the built firmware defines — e.g. `AppKind::Clock` for a bedside
+/// clock, or `AppKind::Batt` on a `wifi`/`espnow` build for a wall battery display.
+/// The default `AppKind::Menu` preserves the historical behaviour (boot straight to
+/// the Home menu). A long press still returns to the Menu from ANY screen (the
+/// uniform gesture grammar), so a non-menu default never traps the UI.
+pub(crate) const DEFAULT_APP: app::AppKind = app::AppKind::Menu;
 
 /// Render/poll sub-tick period (ms). Fast enough for a smooth ~10 Hz LED blink,
 /// responsive button polling, and a snappy Snake; the clock and OLED still only
@@ -226,6 +243,13 @@ fn main() -> ! {
     #[cfg(feature = "wifi")]
     let mut batt_cache = batt::BattCache::new();
 
+    // --- HA grid-power cache (Grid screen, issue #16) ------------------------
+    // Twin of `batt_cache`: owned by `main`, borrowed read-only via `Ctx::grid`,
+    // filled from the SAME MQTT burst (`smol/display/grid` downlink) and, on a leaf,
+    // from the gateway's SMOLv1 GRID frame (`take_grid_offer`). cfg(wifi).
+    #[cfg(feature = "wifi")]
+    let mut grid_cache = grid::GridCache::new();
+
     // --- Radio bring-up (feature-dependent) ----------------------------------
     // Each branch yields `synced` (Option<u32> Unix time at boot). Phase 3 also
     // brings up the blue LED + the live ESP-NOW `radio`.
@@ -240,6 +264,7 @@ fn main() -> ! {
             wifi: peripherals.WIFI,
         },
         &mut batt_cache,
+        &mut grid_cache,
     );
 
     // Phase 3: blue status LED on GPIO8, created at logical-OFF (GPIO8 is a
@@ -263,6 +288,7 @@ fn main() -> ! {
         NODE_ID,
         &mut led,
         &mut batt_cache,
+        &mut grid_cache,
     );
 
     // --- Clock time base -----------------------------------------------------
@@ -315,6 +341,13 @@ fn main() -> ! {
     // moved into its plugin (the SNK phase offset now lives in `MeshSnake::new`,
     // the clock second-dedup in `ClockState`). Start on the Home menu.
     let mut app = App::Menu(menu::Menu::new());
+    // Issue #18: a board may boot straight into a configured screen (DEFAULT_APP)
+    // instead of the Home menu. `App::enter` needs the borrowed `Ctx` that some
+    // screens seed from (`now_ms`/`node_id`), and that only exists inside the loop
+    // — so seed Menu here and perform the ONE-SHOT switch to DEFAULT_APP on the
+    // first tick below, where the real `Ctx` is in hand. `DEFAULT_APP == Menu`
+    // (the default) makes that switch a no-op.
+    let mut boot_default_pending = !matches!(DEFAULT_APP, app::AppKind::Menu);
 
     // Phase 3: last ESP-NOW peer message, shown as the CLOCK bottom-line label
     // (handed to plugins via `Ctx::label`). Idle default = our OWN noun ("I am …"
@@ -383,6 +416,13 @@ fn main() -> ! {
                 batt_cache.store(&o.buf[..o.len], now);
                 redraw = true;
             }
+            // Twin of the BATT offer (issue #16): a gateway's SMOLv1 GRID downlink,
+            // buffered in `service`, stored into our cache so leaves render grid
+            // power too. `store` validates the `GRID|` marker (mirror of BATT).
+            if let Some(o) = r.take_grid_offer() {
+                grid_cache.store(&o.buf[..o.len], now);
+                redraw = true;
+            }
             // Mesh time adoption: if a peer's clock descends from a STRICTLY
             // newer authoritative sync than ours, re-anchor onto its estimate
             // NOW and INHERIT its `synced_at` (not `now`). Because freshness
@@ -438,6 +478,14 @@ fn main() -> ! {
             {
                 r.broadcast_batt(batt_cache.bytes());
             }
+            // Twin GRID re-broadcast (issue #16): same ~10 s gateway-only cadence
+            // and single-hop rationale as BATT (grid power also moves slowly).
+            if is_gateway
+                && !grid_cache.is_empty()
+                && (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000)
+            {
+                r.broadcast_grid(grid_cache.bytes());
+            }
 
             // NOTE: the MMO-snake SNK drain+broadcast used to live here. It MOVED
             // into `MeshSnake::update` (it needs the game state, now owned by the
@@ -477,7 +525,7 @@ fn main() -> ! {
                     sensors::format_sensor_line(&reading).as_str(),
                     bottom_line.as_str()
                 );
-                r.flush_telemetry(own.as_bytes(), &mut batt_cache, &mut || {
+                r.flush_telemetry(own.as_bytes(), &mut batt_cache, &mut grid_cache, &mut || {
                     led.apply(led::LedState::WifiSync, millis())
                 });
             }
@@ -515,6 +563,8 @@ fn main() -> ! {
             redraw,
             #[cfg(feature = "wifi")]
             batt: &batt_cache,
+            #[cfg(feature = "wifi")]
+            grid: &grid_cache,
             #[cfg(feature = "espnow")]
             label: bottom_line.as_str(),
             #[cfg(feature = "espnow")]
@@ -528,6 +578,15 @@ fn main() -> ! {
             #[cfg(feature = "espnow")]
             radio: radio.as_mut(),
         };
+
+        // Issue #18: one-shot entry into the configured boot screen, now that a
+        // real `Ctx` exists to construct it via `App::enter` (see DEFAULT_APP). A
+        // long press still reaches the Menu from there (uniform grammar).
+        if boot_default_pending {
+            boot_default_pending = false;
+            app = App::enter(DEFAULT_APP, &ctx);
+            ctx.redraw = true;
+        }
 
         // One debounced BOOT-button gesture → the active plugin. ANY press forces
         // a repaint (Menu cursor move, Snake/MeshSnake restart, Bench page cycle);

@@ -140,6 +140,16 @@ const BATT_PREFIX: &[u8] = b"SMOLv1 BATT "; // + verbatim "BATT|l1|l2|l3"
 /// Max BATT payload retained/echoed — matches `BattCache` (LOCKED ≤ 96 B).
 const BATT_PAYLOAD_MAX: usize = 96;
 
+/// Grid-downlink tag (issue #16): the exact TWIN of [`BATT_PREFIX`] — the 12-B
+/// `"SMOLv1 GRID "` (trailing space) then the VERBATIM `smol/display/grid` payload
+/// INCLUDING its `GRID|` marker (e.g. `SMOLv1 GRID GRID|963W|L1 177W|L2 786W`). NO
+/// length byte; same gateway-only single-hop rule as BATT (no freshness field, so
+/// leaves never re-broadcast). `"SMOLv1 GRID "` diverges from `"SMOLv1 BATT "` at
+/// byte 7 (0-indexed), so `strip_prefix` never confuses the two.
+const GRID_PREFIX: &[u8] = b"SMOLv1 GRID "; // + verbatim "GRID|l1|l2|l3"
+/// Max GRID payload retained/echoed — matches `GridCache` (LOCKED ≤ 96 B).
+const GRID_PAYLOAD_MAX: usize = 96;
+
 use crate::mesh_snake::snake_core::{self, SnkFrame};
 
 /// Depth of the decoded MMO-snake RX ring. A full 16-peer broadcast burst plus
@@ -225,6 +235,9 @@ enum Frame<'a> {
     /// A battery-downlink payload from a gateway: the verbatim `BATT|…` bytes
     /// (`payload` borrows the RX buffer; copied into `BattTracker` in `service`).
     Batt(&'a [u8]),
+    /// A grid-downlink payload from a gateway (issue #16): the verbatim `GRID|…`
+    /// bytes (twin of `Batt`; copied into `GridTracker` in `service`).
+    Grid(&'a [u8]),
 }
 
 /// Tracks the two timestamps that define the peer link state. Monotonic ms
@@ -343,6 +356,38 @@ impl BattTracker {
 #[derive(Clone, Copy)]
 pub struct BattOffer {
     pub buf: [u8; BATT_PAYLOAD_MAX],
+    pub len: usize,
+}
+
+/// Buffers the most-recent inbound SMOLv1 GRID payload — the exact TWIN of
+/// [`BattTracker`] (issue #16). `service()` only BUFFERS; `main` takes it via
+/// [`RadioManager::take_grid_offer`] and writes its `GridCache`. Fixed `.bss`
+/// buffer, no heap.
+struct GridTracker {
+    buf: [u8; GRID_PAYLOAD_MAX],
+    len: usize,
+    have: bool,
+}
+
+impl GridTracker {
+    const fn new() -> Self {
+        Self { buf: [0; GRID_PAYLOAD_MAX], len: 0, have: false }
+    }
+
+    /// Buffer a freshly-received payload (truncated to capacity; ≤ 96 B by spec).
+    fn set(&mut self, payload: &[u8]) {
+        let n = payload.len().min(GRID_PAYLOAD_MAX);
+        self.buf[..n].copy_from_slice(&payload[..n]);
+        self.len = n;
+        self.have = true;
+    }
+}
+
+/// A `Copy` snapshot of a buffered GRID payload handed to `main` by
+/// [`RadioManager::take_grid_offer`]. `buf[..len]` is the verbatim `GRID|…` bytes.
+#[derive(Clone, Copy)]
+pub struct GridOffer {
+    pub buf: [u8; GRID_PAYLOAD_MAX],
     pub len: usize,
 }
 
@@ -1080,6 +1125,9 @@ pub struct RadioManager {
     /// Most-recent inbound SMOLv1 BATT payload, buffered for `main` to store into
     /// its `BattCache` (leaves receive the gateway's HA battery downlink here).
     batt: BattTracker,
+    /// Twin of `batt` (issue #16): most-recent inbound SMOLv1 GRID payload, buffered
+    /// for `main` to store into its `GridCache`.
+    grid: GridTracker,
 }
 
 /// Monotonic milliseconds since boot — the single time base for both the
@@ -1124,6 +1172,7 @@ impl RadioManager {
             snk: SnkInbox::new(),
             roster: Roster::new(),
             batt: BattTracker::new(),
+            grid: GridTracker::new(),
         })
     }
 
@@ -1143,6 +1192,7 @@ impl RadioManager {
     pub fn burst_ntp(
         &mut self,
         batt: &mut crate::batt::BattCache,
+        grid: &mut crate::grid::GridCache,
         tick: &mut dyn FnMut(),
     ) -> (bool, Option<u32>) {
         // Disjoint field borrows: &mut self.controller, &mut *sta, Copy of rng/id.
@@ -1161,6 +1211,7 @@ impl RadioManager {
             &mut reached_dhcp,
             id,
             batt,
+            grid,
         );
         (reached_dhcp, synced)
     }
@@ -1276,6 +1327,32 @@ impl RadioManager {
         if self.batt.have {
             self.batt.have = false;
             Some(BattOffer { buf: self.batt.buf, len: self.batt.len })
+        } else {
+            None
+        }
+    }
+
+    /// Broadcast one SMOLv1 GRID frame — the exact TWIN of [`broadcast_batt`]
+    /// (issue #16). GATEWAY-ONLY by convention (`main` gates on `is_gateway` + a
+    /// non-empty cache); 12-B tag + verbatim `GRID|…` payload, no length byte.
+    ///
+    /// [`broadcast_batt`]: RadioManager::broadcast_batt
+    pub fn broadcast_grid(&mut self, payload: &[u8]) {
+        let mut msg = [0u8; GRID_PREFIX.len() + GRID_PAYLOAD_MAX];
+        msg[..GRID_PREFIX.len()].copy_from_slice(GRID_PREFIX);
+        let n = payload.len().min(GRID_PAYLOAD_MAX);
+        msg[GRID_PREFIX.len()..GRID_PREFIX.len() + n].copy_from_slice(&payload[..n]);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..GRID_PREFIX.len() + n]);
+    }
+
+    /// Take the buffered inbound GRID payload (if any), clearing it. Twin of
+    /// [`take_batt_offer`]; `main` stores the bytes into its `GridCache`.
+    ///
+    /// [`take_batt_offer`]: RadioManager::take_batt_offer
+    pub fn take_grid_offer(&mut self) -> Option<GridOffer> {
+        if self.grid.have {
+            self.grid.have = false;
+            Some(GridOffer { buf: self.grid.buf, len: self.grid.len })
         } else {
             None
         }
@@ -1437,6 +1514,7 @@ impl RadioManager {
         &mut self,
         own_telemetry: &[u8],
         batt: &mut crate::batt::BattCache,
+        grid: &mut crate::grid::GridCache,
         tick: &mut dyn FnMut(),
     ) -> bool {
         if !self.relay.is_gateway {
@@ -1477,6 +1555,7 @@ impl RadioManager {
                     id,
                     &items[..n],
                     batt,
+                    grid,
                     tick,
                 )
             }
@@ -1755,10 +1834,26 @@ impl RadioManager {
                     // a good reading. Also proves the peer is audible (LED detected).
                     if payload.starts_with(b"BATT|") {
                         self.batt.set(payload);
+                        // Issue #15b: log receipt so leaf-side downlink adoption is
+                        // observable in serial (mirrors the "adopted mesh time" line
+                        // for TIME frames — a BATT frame is the display's downlink).
+                        log::info!("smol: BATT frame received ({} B) — cached", payload.len());
                     }
                     self.peers.last_hello_ms = now;
                     self.roster.heard(src, None, rssi, now);
                     label = Some(alloc::string::String::from("batt"));
+                }
+                Some(Frame::Grid(payload)) => {
+                    // Twin of the BATT arm (issue #16): a gateway's grid downlink.
+                    // Buffer the verbatim `GRID|…` payload for `main` to store into
+                    // its `GridCache`; a stray/foreign frame can't wipe a good reading.
+                    if payload.starts_with(b"GRID|") {
+                        self.grid.set(payload);
+                        log::info!("smol: GRID frame received ({} B) — cached", payload.len());
+                    }
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, None, rssi, now);
+                    label = Some(alloc::string::String::from("grid"));
                 }
                 None => {
                     // Unrecognised payload (other ESP-NOW traffic on-channel);
@@ -1898,6 +1993,10 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
     if let Some(rest) = data.strip_prefix(BATT_PREFIX) {
         // The rest is the verbatim `BATT|…` payload (no length byte).
         return Some(Frame::Batt(rest));
+    }
+    if let Some(rest) = data.strip_prefix(GRID_PREFIX) {
+        // Twin of BATT (issue #16): the rest is the verbatim `GRID|…` payload.
+        return Some(Frame::Grid(rest));
     }
     None
 }
@@ -2052,6 +2151,7 @@ pub fn start(
     id: u8,
     led: &mut Led,
     batt: &mut crate::batt::BattCache,
+    grid: &mut crate::grid::GridCache,
 ) -> (Option<RadioManager>, Option<u32>) {
     let Some(mut radio) = RadioManager::new(p, id) else {
         return (None, None);
@@ -2063,7 +2163,7 @@ pub fn start(
     // the pin (non-blocking, no per-blink state). `batt` rides along: the same
     // burst runs an MQTT downlink at its tail to seed the Batt screen at boot.
     let (reached_dhcp, synced) =
-        radio.burst_ntp(batt, &mut || led.apply(LedState::WifiSync, now_ms()));
+        radio.burst_ntp(batt, grid, &mut || led.apply(LedState::WifiSync, now_ms()));
 
     // Relay role (N3c): a node is the internet GATEWAY iff its boot burst reached
     // ASSOCIATION + DHCP — i.e. it has a usable LAN uplink — NOT iff SNTP succeeded.

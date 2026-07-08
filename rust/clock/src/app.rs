@@ -84,6 +84,12 @@ pub struct Ctx<'a> {
     /// Batt feature is wifi-only (espnow ⊃ wifi), like the espnow-only fields below.
     #[cfg(feature = "wifi")]
     pub batt: &'a crate::batt::BattCache,
+    /// HA grid-power cache (the Grid screen), borrowed read-only. Twin of `batt`
+    /// (issue #16): owned by `main`, filled by the WiFi burst's MQTT downlink
+    /// (`smol/display/grid`) or an inbound SMOLv1 GRID frame — either can happen
+    /// while this screen is inactive, so the plugin only reads it. cfg(wifi).
+    #[cfg(feature = "wifi")]
+    pub grid: &'a crate::grid::GridCache,
     // --- espnow-only ---
     /// The Clock bottom-line label under espnow: the radio service's most-recent
     /// peer/mesh message (`bottom_line`, owned by `main`). Non-espnow builds derive
@@ -142,6 +148,11 @@ pub enum AppKind {
     // the fetch path is wifi-only (espnow ⊃ wifi).
     #[cfg(feature = "wifi")]
     Batt,
+    // Grid (issue #16) is LIVE whenever compiled (constructed by its REGISTRY row +
+    // `enter`), like Batt — no `dead_code` allow needed. cfg(wifi): the fetch path
+    // is wifi-only (espnow ⊃ wifi).
+    #[cfg(feature = "wifi")]
+    Grid,
     #[cfg(feature = "espnow")]
     Bench,
     #[cfg(feature = "espnow")]
@@ -168,6 +179,8 @@ pub enum App {
     About(crate::about::About),
     #[cfg(feature = "wifi")]
     Batt(crate::batt::BattState),
+    #[cfg(feature = "wifi")]
+    Grid(crate::grid::GridState),
     #[cfg(feature = "espnow")]
     Bench(crate::bench::BenchState),
     #[cfg(feature = "espnow")]
@@ -185,6 +198,8 @@ impl App {
             AppKind::About => App::About(crate::about::About::new(ctx.now_ms)),
             #[cfg(feature = "wifi")]
             AppKind::Batt => App::Batt(crate::batt::BattState::new()),
+            #[cfg(feature = "wifi")]
+            AppKind::Grid => App::Grid(crate::grid::GridState::new()),
             #[cfg(feature = "espnow")]
             AppKind::Bench => App::Bench(crate::bench::BenchState::new()),
             #[cfg(feature = "espnow")]
@@ -210,6 +225,8 @@ impl App {
             App::About(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "wifi")]
             App::Batt(s) => Plugin::on_button(s, press, ctx),
+            #[cfg(feature = "wifi")]
+            App::Grid(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "espnow")]
             App::Bench(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "espnow")]
@@ -226,6 +243,8 @@ impl App {
             App::About(s) => Plugin::update(s, ctx),
             #[cfg(feature = "wifi")]
             App::Batt(s) => Plugin::update(s, ctx),
+            #[cfg(feature = "wifi")]
+            App::Grid(s) => Plugin::update(s, ctx),
             #[cfg(feature = "espnow")]
             App::Bench(s) => Plugin::update(s, ctx),
             #[cfg(feature = "espnow")]
@@ -248,12 +267,13 @@ pub const SNAKE_KIND: AppKind = AppKind::MeshSnake;
 #[cfg(not(feature = "espnow"))]
 pub const SNAKE_KIND: AppKind = AppKind::Snake;
 
-/// The Home list, in order. Batt (cfg wifi) grows the `wifi` menu to 4 rows and
-/// the `espnow` menu to 5, so both now exercise the ≤3-row scrolling window in
-/// `menu.rs`; only the default build stays at 3 and never scrolls:
-///   - default: Clock / Snake / About                (3 rows — no scroll)
-///   - wifi:    Clock / Snake / Batt / About          (4 rows — scrolls)
-///   - espnow:  Clock / Snake / Bench / Batt / About  (5 rows — scrolls)
+/// The Home list, in order. Batt + Grid (both cfg wifi; issue #16 added Grid) grow
+/// the `wifi` menu to 5 rows and the `espnow` menu to 6, so both exercise the
+/// ≤3-row scrolling window in `menu.rs` (the window math is `VISIBLE`-relative, so
+/// it holds for any length); only the default build stays at 3 and never scrolls:
+///   - default: Clock / Snake / About                       (3 rows — no scroll)
+///   - wifi:    Clock / Snake / Batt / Grid / About          (5 rows — scrolls)
+///   - espnow:  Clock / Snake / Bench / Batt / Grid / About  (6 rows — scrolls)
 pub const REGISTRY: &[AppDesc] = &[
     AppDesc { title: "Clock", kind: AppKind::Clock },
     AppDesc { title: "Snake", kind: SNAKE_KIND },
@@ -261,5 +281,7 @@ pub const REGISTRY: &[AppDesc] = &[
     AppDesc { title: "Bench", kind: AppKind::Bench },
     #[cfg(feature = "wifi")]
     AppDesc { title: "Batt", kind: AppKind::Batt },
+    #[cfg(feature = "wifi")]
+    AppDesc { title: "Grid", kind: AppKind::Grid },
     AppDesc { title: "About", kind: AppKind::About },
 ];

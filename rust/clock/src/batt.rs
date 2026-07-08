@@ -12,10 +12,13 @@
 //! ## Payload format (LOCKED — HA automation + firmware agree byte-for-byte)
 //!
 //! The `smol/display/batt` payload is ASCII, ≤ 96 bytes:
-//! `BATT|<line1>|<line2>|<line3>` — a `BATT|` marker then pipe-separated,
-//! display-ready lines, each ≤ 12 chars, no trailing pipe. Default content:
-//! `BATT|48V 52.8V|HV 391.9V|d 43mV`. Any source entity that is unavailable or
-//! stale (> 30 min by `last_reported`) renders as `--` (HA's job, not ours).
+//! `BATT|<line1>|<line2>|<line3>[|<soc1>|<soc2>|<soc3>]` — a `BATT|` marker then
+//! pipe-separated, display-ready lines, each ≤ 12 chars, no trailing pipe.
+//! Segments 1-3 are the VOLTAGE page (default content
+//! `BATT|48V 52.8V|HV 391.9V|d 43mV`); the OPTIONAL segments 4-6 are the
+//! state-of-charge (SOC) page (issue #17) — present iff HA appends them, still
+//! ≤ 96 B total. Any source entity that is unavailable or stale (> 30 min by
+//! `last_reported`) renders as `--` (HA's job, not ours).
 //!
 //! The cache stores this payload **verbatim, marker included** — so the SMOLv1
 //! BATT frame is a byte-for-byte memcpy of the cache (frame = 12-B tag +
@@ -31,7 +34,8 @@
 //!     cfg'd `Ctx` fields (`label`, `mesh`, `radio`) `main` already hands plugins.
 //!   * [`BattState`] — the [`Plugin`]: renders `Batt` + own fetch age on the title
 //!     row and the three battery lines below it. Long press → Menu (uniform
-//!     grammar). Short tap → a documented NO-OP (see [`BattState::on_button`]).
+//!     grammar). Short tap → flip the VOLTAGE ↔ SOC page when the payload carries
+//!     the optional SOC trio, else a no-op (see [`BattState::on_button`], #17).
 
 use embedded_graphics::{
     mono_font::{ascii::FONT_5X8, ascii::FONT_6X10, MonoTextStyleBuilder},
@@ -118,17 +122,55 @@ impl BattCache {
     fn payload(&self) -> &str {
         core::str::from_utf8(&self.lines[..self.len]).unwrap_or("")
     }
+
+    /// Number of pipe-separated segments in the cached payload, AFTER the `BATT|`
+    /// marker (issue #17). `3` = a VOLTAGE-only payload (backward-compatible, no
+    /// SOC page); `> 3` = the optional SOC trio (segments 4-6) is present, so the
+    /// Batt screen offers a second page. `0` when never fetched / no marker.
+    fn segment_count(&self) -> usize {
+        match self.payload().strip_prefix("BATT|") {
+            Some(body) => body.split('|').count(),
+            None => 0,
+        }
+    }
 }
 
-/// BATT screen state. Only render-dedup bookkeeping (the data lives in the cache):
-/// repaint once/second so the fetch age ticks live, on a forced redraw (menu
-/// entry), and the instant a fresh fetch lands — mirroring the CLOCK/ABOUT dedup.
+/// Which page the Batt screen shows (issue #17). The retained payload optionally
+/// carries a second trio of segments: 1-3 are battery VOLTAGES, 4-6 are state-of-
+/// charge. A short tap flips between them when the SOC trio is present.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    /// Segments 1-3 — title row reads `Batt`.
+    Voltage,
+    /// Segments 4-6 — title row reads `SOC`.
+    Soc,
+}
+
+impl Page {
+    /// The other page. Short-tap toggles voltage ↔ SOC.
+    fn toggle(self) -> Self {
+        match self {
+            Page::Voltage => Page::Soc,
+            Page::Soc => Page::Voltage,
+        }
+    }
+}
+
+/// BATT screen state. Render-dedup bookkeeping (the data lives in the cache) plus
+/// the selected page: repaint once/second so the fetch age ticks live, on a forced
+/// redraw (menu entry), the instant a fresh fetch lands, AND the instant a tap
+/// flips the page — mirroring the CLOCK/ABOUT dedup.
 pub struct BattState {
     /// Last uptime-second painted (drives the once/second age tick).
     last_s: Option<u32>,
     /// Last `fetched_at_ms` painted — so a new reply repaints immediately rather
     /// than waiting up to a second for the age tick.
     last_fetch: Option<u64>,
+    /// The page short-tap has selected (issue #17). Clamped at render to what the
+    /// payload actually carries — a 3-segment payload always shows `Voltage`.
+    page: Page,
+    /// Last page painted — so a tap-driven page flip repaints immediately.
+    last_page: Option<Page>,
 }
 
 impl BattState {
@@ -138,55 +180,67 @@ impl BattState {
         Self {
             last_s: None,
             last_fetch: None,
+            page: Page::Voltage,
+            last_page: None,
         }
     }
 }
 
 impl Plugin for BattState {
-    fn on_button(&mut self, press: Press, _ctx: &mut Ctx) -> Transition {
+    fn on_button(&mut self, press: Press, ctx: &mut Ctx) -> Transition {
         match press {
             // Uniform grammar: long press leaves to the menu.
             Press::Long => Transition::Switch(AppKind::Menu),
-            // Short tap: intentional NO-OP (the spec's "or no-op if simpler").
-            //
-            // A "force refresh" would have to make THIS button press open a fresh
-            // WiFi burst (disconnect ESP-NOW → associate → DHCP → MQTT → re-pin
-            // ch6) — the heavyweight, mesh-deaf `run_mqtt_burst` path — on demand,
-            // and thread a mutable request flag from here through `Ctx` into the
-            // radio stack. But the fetch already PIGGYBACKS every burst the node
-            // opens: a gateway refreshes on each ~30 s flush, and every build that
-            // reaches DHCP refreshes at boot (leaves get the gateway's BATT frame).
-            // A flag "picked up at next burst" would therefore be redundant on a
-            // gateway (it fetches every flush regardless) and never fire on a leaf
-            // (which opens no post-boot bursts). So the honest, simplest choice is
-            // no-op — it also guarantees a tap can NEVER extend
-            // the mesh-deaf window, matching the spec's hard 1.5 s bound.
-            Press::Short => Transition::Stay,
+            // Short tap: flip the VOLTAGE ↔ SOC page (issue #17) — but ONLY when
+            // the retained payload carries the optional SOC trio (> 3 segments).
+            // A voltage-only (3-segment) payload has no second page, so the tap
+            // stays a no-op there — backward-compatible with pre-#17 payloads and
+            // boards (this SUPERSEDES the earlier "short tap is always a no-op"
+            // ruling). The flip is the WHOLE action: it mutates only this plugin's
+            // `page` field, opens no WiFi burst and touches no `Ctx` transport, so
+            // a tap still can NEVER open the mesh-deaf `run_mqtt_burst` path nor
+            // extend the spec's hard 1.5 s button bound. (An on-demand refresh is
+            // still deliberately absent: the downlink already piggybacks every
+            // burst the node opens — a gateway flush ~30 s, every build at boot —
+            // so a "refresh now" flag would be redundant on a gateway and never
+            // fire on a leaf, which opens no post-boot bursts.)
+            Press::Short => {
+                if ctx.batt.segment_count() > 3 {
+                    self.page = self.page.toggle();
+                }
+                Transition::Stay
+            }
         }
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
-        // Repaint iff forced (menu entry), the second rolled over (live age), or a
-        // fresh fetch landed since we last painted — else leave the panel be.
+        // Repaint iff forced (menu entry), the second rolled over (live age), a
+        // fresh fetch landed, or a tap flipped the page since we last painted —
+        // else leave the panel be.
         let sec = (ctx.now_ms / 1000) as u32;
         let fetched = ctx.batt.fetched_at_ms;
-        if !(ctx.redraw || self.last_s != Some(sec) || self.last_fetch != fetched) {
+        if !(ctx.redraw
+            || self.last_s != Some(sec)
+            || self.last_fetch != fetched
+            || self.last_page != Some(self.page))
+        {
             return;
         }
         self.last_s = Some(sec);
         self.last_fetch = fetched;
+        self.last_page = Some(self.page);
 
         // Age in whole seconds since the last fetch, or `None` if never fetched.
         let age_s = fetched.map(|f| ctx.now_ms.saturating_sub(f) / 1000);
-        render(ctx, age_s);
+        render(ctx, age_s, self.page);
     }
 }
 
-/// Paint the screen: `Batt` + fetch age on the title row, then the collector's
-/// three lines. Free fn (needs no `BattState` field — all inputs are the cache +
-/// age), reading disjoint `Ctx` fields (`display` mut, `batt` shared).
-fn render(ctx: &mut Ctx, age_s: Option<u64>) {
-    let title = MonoTextStyleBuilder::new()
+/// Paint the screen: the page title (`Batt`/`SOC`) + fetch age on the title row,
+/// then the three lines of the CURRENT page. Free fn (all inputs are the cache +
+/// age + page), reading disjoint `Ctx` fields (`display` mut, `batt` shared).
+fn render(ctx: &mut Ctx, age_s: Option<u64>, page: Page) {
+    let title_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
         .text_color(BinaryColor::On)
         .build();
@@ -197,8 +251,15 @@ fn render(ctx: &mut Ctx, age_s: Option<u64>) {
 
     ctx.display.clear(BinaryColor::Off).ok();
 
-    // Title: the screen name (matches the menu row + FONT_6X10 title elsewhere).
-    Text::with_baseline("Batt", Point::new(2, 0), title, Baseline::Top)
+    // Which page can actually be shown: the SOC page exists only when the payload
+    // carries segments 4-6 (> 3 total; issue #17). Otherwise clamp to Voltage, so
+    // a 3-segment payload (or an empty cache) always renders as `Batt` — even if
+    // `page` still remembers a SOC selection from a richer earlier payload.
+    let show_soc = page == Page::Soc && ctx.batt.segment_count() > 3;
+
+    // Title: the current page name (matches the menu row + FONT_6X10 title style).
+    let title = if show_soc { "SOC" } else { "Batt" };
+    Text::with_baseline(title, Point::new(2, 0), title_style, Baseline::Top)
         .draw(ctx.display)
         .ok();
 
@@ -216,12 +277,14 @@ fn render(ctx: &mut Ctx, age_s: Option<u64>) {
         .draw(ctx.display)
         .ok();
 
-    // Rows 2-4: the three battery lines. The cache holds the payload verbatim
-    // (`BATT|l1|l2|l3`), so strip the marker, then split on `|` and clip to the
-    // panel width. Missing segments (never fetched, or a short/malformed payload)
-    // leave that row blank — the `--` age already signals "no data".
-    let lines = ctx.batt.payload().strip_prefix("BATT|").unwrap_or("");
-    for (i, seg) in lines.split('|').take(3).enumerate() {
+    // Rows 2-4: the three lines of the current page. The cache holds the payload
+    // verbatim (`BATT|v1|v2|v3[|s1|s2|s3]`), so strip the marker, split on `|`,
+    // then skip to this page's window (Voltage = segments 1-3; SOC = 4-6) and clip
+    // to the panel width. Missing/short segments leave that row blank — the `--`
+    // age already signals "no data".
+    let body = ctx.batt.payload().strip_prefix("BATT|").unwrap_or("");
+    let skip = if show_soc { 3 } else { 0 };
+    for (i, seg) in body.split('|').skip(skip).take(3).enumerate() {
         let y = 12 + i as i32 * 9;
         Text::with_baseline(clip(seg, LINE_CHARS), Point::new(2, y), small, Baseline::Top)
             .draw(ctx.display)

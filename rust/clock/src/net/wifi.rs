@@ -75,6 +75,11 @@ const MQTT_BROKER_PORT: u16 = crate::secrets::MQTT_BROKER_PORT;
 #[cfg(feature = "wifi")]
 const BATT_TOPIC: &[u8] = b"smol/display/batt";
 
+/// Twin of [`BATT_TOPIC`] (issue #16): the retained grid-power downlink. Subscribed
+/// on the SAME MQTT session — one extra SUBSCRIBE on the already-open connection.
+#[cfg(feature = "wifi")]
+const GRID_TOPIC: &[u8] = b"smol/display/grid";
+
 /// Budget for one full MQTT session (TCP connect → CONNECT/CONNACK → publishes →
 /// SUBSCRIBE → retained downlink → DISCONNECT). Sub-bound of the enclosing burst
 /// so MQTT can't eat the whole flush/NTP window; a miss just leaves the cache be.
@@ -136,7 +141,11 @@ fn create_interface(device: &mut esp_wifi::wifi::WifiDevice) -> Interface {
 /// Phase 2 entry point: bring WiFi up, DHCP, run one SNTP exchange, return the
 /// current Unix time in seconds. Returns `None` on any failure/timeout so the
 /// caller falls back to the free-running clock.
-pub fn try_time_sync(p: WifiPeripherals, batt: &mut crate::batt::BattCache) -> Option<u32> {
+pub fn try_time_sync(
+    p: WifiPeripherals,
+    batt: &mut crate::batt::BattCache,
+    grid: &mut crate::grid::GridCache,
+) -> Option<u32> {
     super::init_heap();
 
     // --- Radio init ------------------------------------------------------
@@ -164,6 +173,7 @@ pub fn try_time_sync(p: WifiPeripherals, batt: &mut crate::batt::BattCache) -> O
         &mut _reached_dhcp,
         crate::NODE_ID,
         batt,
+        grid,
     )
 }
 
@@ -178,6 +188,7 @@ pub fn try_time_sync(p: WifiPeripherals, batt: &mut crate::batt::BattCache) -> O
 ///
 /// Blocking, no async executor — we poll the stack directly, matching the rest
 /// of the firmware's style and keeping the dependency set on crates.io.
+#[allow(clippy::too_many_arguments)] // +grid (issue #16) tips this to 8 params
 pub fn run_ntp_burst(
     controller: &mut esp_wifi::wifi::WifiController<'static>,
     device: &mut esp_wifi::wifi::WifiDevice<'static>,
@@ -194,6 +205,9 @@ pub fn run_ntp_burst(
     // spec's boot fetch — every wifi/espnow build that reaches DHCP receives the
     // retained `smol/display/batt` payload here).
     batt: &mut crate::batt::BattCache,
+    // Twin grid cache (issue #16): filled from `smol/display/grid` on the same
+    // downlink session as `batt`.
+    grid: &mut crate::grid::GridCache,
 ) -> Option<u32> {
     // --- smoltcp stack: DHCP + UDP (SNTP) + TCP (MQTT) sockets -----------
     let mut iface = create_interface(device);
@@ -299,9 +313,16 @@ pub fn run_ntp_burst(
     // are reachable — open a short MQTT session and SUBSCRIBE to the retained
     // `smol/display/batt`, receiving it into the cache. DOWNLINK-ONLY here: at boot
     // there is no telemetry to publish yet (the empty publish list). Runs in every
-    // wifi/espnow build that reaches DHCP, independent of the SNTP result. Bounded
-    // by MQTT_SESSION_BUDGET; a miss leaves the cache untouched.
-    let mqtt_deadline = mqtt_deadline(deadline);
+    // wifi/espnow build that reaches DHCP, independent of the SNTP result.
+    //
+    // FRESH deadline (issue #15a): give MQTT its OWN `MQTT_SESSION_BUDGET` window,
+    // NOT the enclosing NTP `deadline`. A slow/rate-limited SNTP can consume the
+    // whole 30 s `SYNC_BUDGET` (Cloudflare anycast throttling several boards booting
+    // together — HW-observed on id8, 2026-07-08), which would leave the clamped
+    // deadline already expired and starve the batt fetch to an instant timeout. The
+    // boot burst runs BEFORE the main loop, so the ≤ 3 s tail (worst case ~33 s total)
+    // costs nothing the mesh cares about; a miss still leaves the cache untouched.
+    let mqtt_deadline = Instant::now() + MQTT_SESSION_BUDGET;
     let mqtt_port = 49152 + (rng.random() % 16384) as u16;
     let _ = mqtt_session(
         &mut iface,
@@ -312,6 +333,7 @@ pub fn run_ntp_burst(
         &[],
         mqtt_port,
         batt,
+        grid,
         mqtt_deadline,
         tick,
     );
@@ -319,17 +341,6 @@ pub fn run_ntp_burst(
     synced
 }
 
-/// The MQTT session deadline: the sooner of `MQTT_SESSION_BUDGET` from now and the
-/// enclosing burst's `outer` deadline, so MQTT never overruns the burst it rides.
-#[cfg(feature = "wifi")]
-fn mqtt_deadline(outer: Instant) -> Instant {
-    let own = Instant::now() + MQTT_SESSION_BUDGET;
-    if own < outer {
-        own
-    } else {
-        outer
-    }
-}
 
 /// Install the DHCP-provided address + default route on the interface.
 fn apply_dhcp(iface: &mut Interface, addr: Ipv4Cidr, router: Option<Ipv4Addr>) {
@@ -509,6 +520,7 @@ fn mqtt_session(
     telemetry: &[(u8, &[u8])],
     src_port: u16,
     batt: &mut crate::batt::BattCache,
+    grid: &mut crate::grid::GridCache,
     deadline: Instant,
     tick: &mut dyn FnMut(),
 ) -> bool {
@@ -588,12 +600,16 @@ fn mqtt_session(
         }
     }
 
-    // --- SUBSCRIBE smol/display/batt FIRST ---
-    // Subscribe before publishing so the broker queues the RETAINED battery payload
-    // to us immediately — the downlink (which every node needs) is prioritized over
-    // the loss-tolerant telemetry uplink, and the retained reply streams in while we
-    // publish. It is drained into the cache after the publishes, below.
+    // --- SUBSCRIBE smol/display/batt + smol/display/grid FIRST ---
+    // Subscribe before publishing so the broker queues the RETAINED downlink payloads
+    // to us immediately — the downlinks (which every node needs) are prioritized over
+    // the loss-tolerant telemetry uplink, and the retained replies stream in while we
+    // publish. Both are drained into their caches after the publishes, below. GRID
+    // (issue #16) is one extra SUBSCRIBE on the already-open connection (packet-id 2).
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 1, BATT_TOPIC) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 2, GRID_TOPIC) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
     }
 
@@ -609,13 +625,16 @@ fn mqtt_session(
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
         // Discovery: retained config so HA auto-creates a registry-managed sensor.
+        // `expire_after: 300` (issue #12): leaves emit telemetry ~15 s and gateways
+        // flush ~30 s, so 300 s is a ~10× margin — HA auto-marks a node `unavailable`
+        // if nothing arrives for 5 min (silent/dead node) without any firmware ping.
         let mut dtopic = MqttScratch::new();
         let _ = write!(dtopic, "homeassistant/sensor/smol{}/telemetry/config", id);
         let mut json = MqttScratch::new();
         let noun = crate::net::names::name_for_id(id).1;
         let _ = write!(
             json,
-            "{{\"unique_id\":\"smol{}_telemetry\",\"state_topic\":\"smol/{}/telemetry\",\"name\":\"smol {}\",\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {}\"}}}}",
+            "{{\"unique_id\":\"smol{}_telemetry\",\"state_topic\":\"smol/{}/telemetry\",\"name\":\"smol {}\",\"expire_after\":300,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {}\"}}}}",
             id, id, id, id, id, noun
         );
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), json.as_bytes(), true) {
@@ -623,9 +642,14 @@ fn mqtt_session(
         }
     }
 
-    // --- Receive the retained battery payload (SUBSCRIBE was sent above) ---
-    let mut got = false;
-    while !got {
+    // --- Receive the retained battery + grid payloads (both SUBSCRIBEs above) ---
+    // Wait until BOTH retained downlinks land (they arrive back-to-back after the
+    // subscribes) or the deadline — whichever first. A topic with no retained message
+    // on the broker (e.g. GRID before HA first publishes it) simply never sets its
+    // flag, and we time out keeping that cache's prior value — not a failure, a miss.
+    let mut got_batt = false;
+    let mut got_grid = false;
+    while !(got_batt && got_grid) {
         tick();
         iface.poll(smoltcp_now(), device, sockets);
         recv_into(sockets, tcp_handle, &mut acc, &mut acc_len);
@@ -636,8 +660,13 @@ fn mqtt_session(
                     if topic == BATT_TOPIC {
                         let now = Instant::now().duration_since_epoch().as_millis();
                         batt.store(payload, now); // memcpy out before we compact `acc`
-                        got = true;
+                        got_batt = true;
                         log::info!("smol: MQTT batt downlink cached ({} B)", payload.len());
+                    } else if topic == GRID_TOPIC {
+                        let now = Instant::now().duration_since_epoch().as_millis();
+                        grid.store(payload, now); // twin of batt (issue #16)
+                        got_grid = true;
+                        log::info!("smol: MQTT grid downlink cached ({} B)", payload.len());
                     }
                     consumed
                 }
@@ -647,7 +676,7 @@ fn mqtt_session(
             acc_len -= consumed;
         }
         if Instant::now() > deadline {
-            log::info!("smol: MQTT downlink not received in budget (keeping cache)");
+            log::info!("smol: MQTT downlink(s) not all received in budget (keeping cache)");
             break;
         }
     }
@@ -678,6 +707,7 @@ fn mqtt_session(
 /// bounded by `RELAY_FLUSH_BUDGET` (the MQTT session is a sub-bound within it, so
 /// it does not extend the deaf window beyond the flush the mesh already pays for).
 #[cfg(feature = "espnow")]
+#[allow(clippy::too_many_arguments)] // +grid (issue #16) tips this to 8 params
 pub fn run_mqtt_burst(
     controller: &mut esp_wifi::wifi::WifiController<'static>,
     device: &mut esp_wifi::wifi::WifiDevice<'static>,
@@ -685,6 +715,7 @@ pub fn run_mqtt_burst(
     node_id: u8,
     messages: &[(u8, &[u8])],
     batt: &mut crate::batt::BattCache,
+    grid: &mut crate::grid::GridCache,
     tick: &mut dyn FnMut(),
 ) -> bool {
     let mut iface = create_interface(device);
@@ -762,6 +793,7 @@ pub fn run_mqtt_burst(
         messages,
         src_port,
         batt,
+        grid,
         deadline,
         tick,
     )

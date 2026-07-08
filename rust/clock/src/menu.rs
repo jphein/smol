@@ -17,13 +17,14 @@
 //! ## Scrolling window (REQUIRED under wifi and espnow)
 //!
 //! The 40 px panel fits a title row + [`VISIBLE`] = 3 item rows
-//! (`FIRST_Y=11 + 3·ROW_H=9 = 38 ≤ 40`). Adding the Batt screen (cfg wifi) grows
-//! the `wifi` menu to FOUR entries (Clock / Snake / Batt / About) and the `espnow`
-//! menu to FIVE (Clock / Snake / Bench / Batt / About), so BOTH render a WINDOW of
-//! ≤3 rows that follows the selection, with edge chevrons (`^`/`v`) marking
-//! off-window items. Only the default build stays at 3 entries (Clock / Snake /
-//! About) → the window is the whole list and never scrolls (no chevrons). The
-//! window math is `VISIBLE`-relative, so it holds unchanged for 4 and 5 entries.
+//! (`FIRST_Y=11 + 3·ROW_H=9 = 38 ≤ 40`). The Batt + Grid screens (both cfg wifi;
+//! issue #16 added Grid) grow the `wifi` menu to FIVE entries (Clock / Snake / Batt
+//! / Grid / About) and the `espnow` menu to SIX (Clock / Snake / Bench / Batt /
+//! Grid / About), so BOTH render a WINDOW of ≤3 rows that follows the selection,
+//! with edge chevrons (`^`/`v`) marking off-window items. Only the default build
+//! stays at 3 entries (Clock / Snake / About) → the window is the whole list and
+//! never scrolls (no chevrons). The window math is `VISIBLE`-relative, so it holds
+//! unchanged for 5 and 6 entries.
 
 use embedded_graphics::{
     mono_font::{ascii::FONT_5X8, ascii::FONT_6X10, MonoTextStyle, MonoTextStyleBuilder},
