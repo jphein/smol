@@ -13,13 +13,18 @@ full analysis is in `scratch/smol/nebula-espnow-gateway.md`; the wire frames are
 
 ## Roles: leaf vs gateway (creds decide, automatically)
 
-A board picks its role **at boot**, from whether it associated to WiFi:
+A board picks its role **at boot**, from whether it reached **DHCP** — **decoupled
+from NTP** (N3c): a board that associates + gets a lease is a gateway *even if the
+NTP sync misses*.
 
-- **Gateway** — has valid WiFi creds *and* an AP in range (it associated during the
-  boot NTP burst). It **receives** RELAY fragments from leaves, reassembles them,
-  and periodically bridges them to the collector over a WiFi burst.
-- **Leaf** — no AP (out of range, or no creds). It **emits** its telemetry as
-  RELAY fragments over ESP-NOW and never flushes.
+- **Gateway** — associated to an AP **and got a DHCP lease** at boot (`is_gateway`,
+  `main.rs`). It **receives** RELAY fragments from leaves, reassembles them, and
+  periodically bridges them to the collector over a WiFi burst.
+- **Leaf** — no AP / no lease (out of range or no creds). It **emits** its telemetry
+  as RELAY fragments over ESP-NOW and never flushes.
+
+The role is logged at boot with its criteria, so it's auditable — e.g.
+`GATEWAY (assoc+dhcp true, ntp ok)` or `leaf (assoc+dhcp false, ntp miss)`.
 
 No configuration flag — the role follows the boot association. Put creds on the
 board you want to be the gateway (see [BUILDING.md](BUILDING.md) → *Secrets*), keep
@@ -39,7 +44,17 @@ leaves.
    every `RELAY_FLUSH_INTERVAL_MS` (**30 s**) if the queue is non-empty (or at once
    when full), runs a **flush burst**: switch to WiFi-STA (the COEXIST arm),
    `run_udp_flush` UDP-sends each `"NNN <telemetry>"` datagram to the collector,
-   then switches back to ESP-NOW ch 6.
+   then switches back to ESP-NOW ch 6. The flush **drains until the datagrams
+   actually egress** the interface — bounded ~2 s (`ca5d985`, "finding N3") — **not
+   a fixed post-send delay**: a warm interface flushes fast, a slow one still
+   completes within the bound.
+
+> **Known follow-up (not a blocker):** each flush rebuilds the interface, so its
+> *first* round-trip hits a **cold ARP cache**. The ~2 s egress bound occasionally
+> loses that first cold-ARP edge → one `TX drain timed out`, after which backoff +
+> retry lands the message (seen once on board 3 at wave 6; board 1 won the same
+> race and flushed clean). Filed: a cold-ARP first-round retry / **pre-warming** the
+> ARP entry so every flush delivers on the first attempt.
 
 ### The single-radio cost (honest)
 A flush burst tunes the one PHY to the AP's channel, so **the mesh is deaf during
@@ -108,11 +123,11 @@ It's already running on disks as a user systemd service:
 ```
 ssh disks 'systemctl --user status smol-collector'      # health
 ssh disks 'tail -f ~/smol-collector/collector.jsonl'    # watch telemetry land
-ssh disks 'curl -s localhost:9998/ | python3 -m json.tool'   # status page (VLAN-11 only)
+ssh disks 'curl -s localhost:9998/ | python3 -m json.tool'   # status page (localhost-only)
 ```
-(The status page on :9998 is reachable within VLAN 11; it's firewalled from VLAN 6
-— a gatekeeper policy, flagged not changed. The relay's UDP :9999 path is
-unaffected.)
+(Post-hardening the status page binds **`127.0.0.1` only** — view it via `ssh disks
+curl localhost:9998`; it is not exposed on the LAN unless the collector is run with
+`--status-host 0.0.0.0`. The relay's UDP `:9999` path is public and unaffected.)
 
 ## Out of scope (documented stubs)
 - **Downlink** (collector → leaf) — needs a gateway-side poll/queue + unicast
@@ -123,9 +138,11 @@ unaffected.)
 - **Browsing / general IP** — physically impractical (see the gateway analysis).
 
 ## Status
-🟡 **compile-verified**: the relay path (leaf emit, reassembly, RELAYACK, gateway
-flush) **and** the liveness/dedup fix are committed (`2ea7c4d`, `7b57216`) and build
-clean across all 3 builds. **Not yet hardware-verified end-to-end** — that's the
-final-flash test against the live collector on disks (`10.0.11.117:9999`). The LAN
-collector side **is** committed (19 tests) and deployed. Wire frames: see
+🟢 **hardware-proven end-to-end + sustained.** On the wave-6 fleet (build 36
+"Oxidized Spark", `bcafa7e`) the full chain runs: leaf id8 emits → gateway
+reassembles → WiFi flush → **`node_id 8` telemetry accumulates in
+`disks:~/smol-collector/collector.jsonl`, sustained ~02:06Z → 02:44Z** across a
+firmware upgrade. Freeze/dup/liveness fixes (`2ea7c4d`, `652155b`, `ca5d985`) all
+in. One non-blocking cold-ARP first-round nit remains (see the flush follow-up). The
+LAN collector is committed (19→26 tests, hardened) + deployed. Wire frames:
 [protocol.md](protocol.md#relay--relayack--espnow--internet-telemetry).

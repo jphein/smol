@@ -26,14 +26,15 @@
     { "name": "RESIN", "role": "Wrote enclosure-resin.md — metal kills RF, don't pot a LiPo", "status": "done", "glyph": "⬗" },
     { "name": "PORTAL", "role": "Case FINAL — body+lid+crown, bail+crown at top (classic), watertight", "status": "done", "glyph": "◫" },
     { "name": "KERNEL", "role": "Unified Rust firmware DONE — Clock+Snake+Bench, all builds clean", "status": "done", "glyph": "▦" },
-    { "name": "CHIME", "role": "Mesh time sync — SMOLv1 TIME frame, newest-NTP-wins (loop-free); compile + clippy clean, board #1 flashed", "status": "active", "glyph": "⧗" },
-    { "name": "SIGIL", "role": "Ported realm-sigil for magical node names — display-only realm words (id8 = 'Eldritch Nexus')", "status": "active", "glyph": "✶" },
-    { "name": "CONDUIT", "role": "ESP-NOW → internet relay — collector committed (19 tests); gateway on the final leg: DHCP budget fixed 6s→15s (review prediction vindicated on HW), a wave-4 drain race now in fix; E2E leaf-rows not yet proven", "status": "active", "glyph": "⇅" },
+    { "name": "CHIME", "role": "Mesh time sync — SMOLv1 TIME frame, newest-NTP-wins (loop-free); 3-way mesh verified across all three boards, shipped in build 36", "status": "done", "glyph": "⧗" },
+    { "name": "SIGIL", "role": "Ported realm-sigil for magical node names (id7 Draconic Dominion / id8 Eldritch Nexus / id9 Jade Herald) — flashed on all three boards, now paired with forge-realm VERSION names on the splash", "status": "done", "glyph": "✶" },
+    { "name": "CONDUIT", "role": "ESP-NOW → internet relay — E2E HARDWARE-PROVEN + SUSTAINED (leaf→gateway→WiFi→collector; 18+ rows flowing across a firmware upgrade). DHCP budget + drain race fixed; one follow-up filed: cold-ARP first-round retry", "status": "done", "glyph": "⇅" },
     { "name": "OUROBOROS", "role": "MMO mesh snake — shared toroidal world + six treasure-powers, ALL in code + committed (52/52 tests); scrolling viewport, dead-reckoned peers, mesh leaderboard (score≡length); compile-verified, hardware flash pending", "status": "active", "glyph": "∞" },
-    { "name": "RELIQUARY", "role": "OTA + version identity — OTA spike de-risked (#6, bundled bootloader slot-selects); the sigil VERSION-name splash is LIVE on glass — boot shows 'Pressed Jig' build 34 (forge realm)", "status": "active", "glyph": "⬖" },
-    { "name": "LATTICE", "role": "Plugin/mode framework — enum-delegation registry, atomic mode-switch in progress (keystone + completion spec); Bench mesh-view (#8) rides it", "status": "active", "glyph": "⌗" },
-    { "name": "WARDEN", "role": "Adversarial review — an Oracle's eye: caught the pre-ship relay freeze bug, and its 6s-DHCP-budget warning was hardware-vindicated in wave-3", "status": "done", "glyph": "⚔" },
-    { "name": "CRUCIBLE", "role": "Hardware verifier — waves 3+4 flashed the full stack on all three boards; 3-way mesh proven and the sigil VERSION splash live on glass ('Pressed Jig' build 34); logged on #4", "status": "done", "glyph": "⚒" },
-    { "name": "CISTERN", "role": "Collector-keeper — the LAN UDP telemetry receiver + status page for the relay; committed with 19 tests", "status": "done", "glyph": "⊛" }
+    { "name": "RELIQUARY", "role": "OTA + version identity — spike de-risked (#6); the sigil VERSION-name splash is LIVE on glass, evolving with the code in a single day: Pressed Jig → Riveted Jig → 'Oxidized Spark' build 36 (forge realm). Update mechanism next", "status": "active", "glyph": "⬖" },
+    { "name": "LATTICE", "role": "Plugin/mode framework — LANDED on build 36: atomic mode-switch, a shared About screen, a 4-entry scrolling menu, Bench mesh-view. Oracle-gated clean (byte-exact ELF, six screens verbatim)", "status": "done", "glyph": "⌗" },
+    { "name": "WARDEN", "role": "Adversarial review — caught the pre-ship relay freeze bug and predicted the 6s-DHCP budget (hardware-vindicated wave-3); docket closed, every finding across five review passes resolved", "status": "done", "glyph": "⚔" },
+    { "name": "CRUCIBLE", "role": "Hardware verifier — through wave 6, all three boards on build 36 'Oxidized Spark' running the full stack; 3-way mesh + the N3b marginal-gateway flush proven; splash live on glass. Logged on #4", "status": "done", "glyph": "⚒" },
+    { "name": "CISTERN", "role": "Collector-keeper — the LAN UDP telemetry receiver + status page for the relay (committed, 19 tests); now taking live leaf rows end-to-end (18+ and counting)", "status": "done", "glyph": "⊛" },
+    { "name": "ORACLE", "role": "Final behavior-preserving gate — independently rebuilt a byte-exact default ELF and verified all six firmware screens verbatim; the closing CLEAN certification of the session's five review passes", "status": "done", "glyph": "✴" }
   ]
 }

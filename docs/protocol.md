@@ -83,9 +83,9 @@ stays well under 250 B.
 | [ACK](#ack--led-handshake) | `SMOLv1 ACK ` | 14 | unicast | reactive | espnow | 🟢 |
 | [BEACON](#beacon--bench-link-stats) | `SMOLv1 BEACON ` | 29 | broadcast | ~2 s (Bench) | espnow | 🟡 |
 | [TIME](#time--mesh-time-sync) | `SMOLv1 TIME ` | 37 | broadcast | ~2 s | espnow | 🟢 |
-| [RELAY](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAY ` | ≤91 | broadcast | ~15 s (leaf) | espnow | 🟡 |
-| [RELAYACK](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAYACK ` | 25 | unicast | reactive | espnow | 🟡 |
-| [SNK](#snk--mmo-mesh-snake) | `SMOLv1 SNK ` | 18 | broadcast | 5 Hz jittered | espnow | 🟡 |
+| [RELAY](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAY ` | ≤91 | broadcast | ~15 s (leaf) | espnow | 🟢 |
+| [RELAYACK](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAYACK ` | 25 | unicast | reactive | espnow | 🟢 |
+| [SNK](#snk--mmo-mesh-snake) | `SMOLv1 SNK ` | 18 | broadcast | 5 Hz jittered | espnow | 🟢 |
 
 ---
 
@@ -238,12 +238,12 @@ by `RELAY_FLUSH_BUDGET ≈ 6 s`, and a failed flush backs off a full interval an
 the oldest queued message so a dead AP can't freeze the node (finding-1 fix).
 **Out of scope (documented stubs):** downlink (collector → leaf) and multi-hop
 routing (needs a next-hop/TTL header, +200–400 LOC).
-**Flag.** espnow. **Status.** 🟡 **compile-verified** — `Frame::Relay`/`Frame::RelayAck`,
-the reassembly tables, and the gateway flush are **committed** (`76b19e4`) and build
-clean across all 3 builds (`cargo build` + `clippy -D warnings`). **Not yet exercised
-on hardware** (needs a gateway + leaf + a UDP collector). The flush's failure-backoff
-and post-completion dedup were hardened after an adversarial review — see
-`scratch/smol/morpheus-oracle-fixes.md`.
+**Flag.** espnow. **Status.** 🟢 **hardware-proven end-to-end** — on the wave-6 fleet
+(build 36 "Oxidized Spark", `bcafa7e`) leaf id8's telemetry reaches
+`disks:~/smol-collector/collector.jsonl` as `node_id 8`, sustained ~02:06Z→02:44Z. The
+flush's budget/backoff/dedup and the drain-until-egress path were hardened over five
+Oracle passes (`2ea7c4d`, `652155b`, `ca5d985`; see `morpheus-oracle-fixes.md`). One
+non-blocking cold-ARP first-round nit remains — see [relay.md](relay.md#the-flush-cycle).
 **Security.** Unauthenticated → a forged RELAYACK can stall a leaf's retransmit.
 **Source.** `mode.rs` relay-bridge section (`RELAY_PREFIX`, `RELAYACK_PREFIX`,
 `Relay`/`RelayTx`/reassembly); spec `relay-bridge-spec.md`.
@@ -265,7 +265,7 @@ snake** and broadcasts an **absolute, stateless** head snapshot; peers
 | `ver` | 1 | u8 | frame format version (=1) |
 | `id` | 1 | u8 | sender snake id |
 | `tick` | 1 | u8 (wrapping) | step counter — ordering + dead-reckon base |
-| `flags` | 1 | u8 | **heading (2 bits) + alive (1 bit) + 5-bit active-power field** (0..31, 0 = none; design v2, in flight) |
+| `flags` | 1 | u8 | **bit 0** alive · **bits 1–2** heading (0=U 1=R 2=D 3=L) · **bits 3–7** active-power (0=none, 1–6 = Phantom/Haste/Shield/Midas/Reveal/Phoenix, 7–31 reserved) — layout **final** |
 | `head_x` | 1 | u8 | world cell X (toroidal) |
 | `head_y` | 1 | u8 | world cell Y (toroidal) |
 | `length` | 1 | u8 | segment count; **body dead-reckoned, not sent** |
@@ -282,10 +282,10 @@ by `min(elapsed/STEP_MS, 3)` cells (clamped). `tick` wrap-order drops stale
 frames. Despawn via the `PEER_STALE_MS` idiom. Dead snakes still announce
 (`alive=0`) so peers clear them fast.
 **Playable N.** smooth ≤ 8, good 12–16 (jittered), graceful degradation beyond.
-**Flag.** espnow. **Status.** 🟡 **committed + compile-verified** (`6baea36`; builds clean
-across all 3 builds, not yet hardware-exercised). The `flags` byte is **design v2** (heading 2 b +
-alive 1 b + a **5-bit active-power field**, 0..31); the active-power bits may still shift as
-treasures/powers land — confirm against the current build before relying on the exact bit layout.
+**Flag.** espnow. **Status.** 🟢 **flashed on the fleet** — build 36 "Oxidized Spark" (`bcafa7e`),
+all three boards; powers + leaderboard live (compile-clean across all 3 builds). The `flags`
+bit-layout is **final** (bit 0 alive · bits 1–2 heading · bits 3–7 active-power, `POWER_COUNT = 6`),
+defined in `mesh_snake/snake_core.rs`.
 **Source.** `mmo-snake-netcode.md` (§1/§5) + `mmo-snake-design.md` (§7).
 
 ---
@@ -294,8 +294,8 @@ treasures/powers land — confirm against the current build before relying on th
 
 - **Verification is per-frame and current as of 2026-07-07.** HELLO/ACK and **TIME
   (2-board adoption)** are hardware-verified. BEACON is compile-verified (runs in
-  Bench mode, not accuracy-checked). RELAY/RELAYACK are **committed + compile-verified**
-  (not yet hardware-exercised). SNK is **committed** (see its own section).
+  Bench mode, not accuracy-checked). RELAY/RELAYACK are **hardware-proven e2e** (sustained
+  `node_id 8` telemetry to the collector, wave 6). SNK is **flashed on the fleet** (build 36).
 - **ESP-NOW airtime/throughput/RX-reliability under COEXIST** are unmeasured on
   hardware — reasoned from the `esp-wifi 0.15.0` API (see `nebula-espnow-gateway.md`),
   not a bench run.
