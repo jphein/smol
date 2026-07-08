@@ -42,7 +42,7 @@
 extern crate alloc;
 
 use embedded_graphics::{
-    mono_font::{ascii::FONT_10X20, ascii::FONT_5X8, MonoTextStyleBuilder},
+    mono_font::{ascii::FONT_10X20, ascii::FONT_5X8, ascii::FONT_6X10, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
     prelude::*,
     text::{Baseline, Text},
@@ -109,6 +109,11 @@ const NODE_ID: u8 = 7;
 /// advance/redraw on their own schedules so the I²C bus isn't hammered.
 const SUBTICK_MS: u32 = 20;
 
+/// Minimum time the boot splash (node name + firmware version) stays on screen,
+/// even when radio bring-up was instant (default build). The espnow/wifi NTP burst
+/// usually already exceeds this, so the splash naturally rides the burst window.
+const SPLASH_MIN_MS: u64 = 2_000;
+
 /// OLED panel rotation. The pocket-watch case hangs from the USB-C end, so the
 /// display is physically upside-down and must be rotated 180° to read upright.
 ///
@@ -137,11 +142,23 @@ fn main() -> ! {
     esp_println::logger::init_logger_from_env();
     log::info!("smol booting: unified firmware (menu: Clock / Snake / Bench)");
 
-    // Our magical identity, derived from NODE_ID (see src/net/names.rs). The full
-    // "Adjective Noun" appears ONLY here in the log; the OLED shows just `my_noun`
-    // (the handle), and NOTHING name-related ever goes on the wire.
+    // Identity + provenance, both DERIVED (never on the wire): the node's FANTASY
+    // name from NODE_ID, and the firmware's FORGE version name seeded from the git
+    // short hash baked in by build.rs. The full "Adjective Noun" of each appears
+    // ONLY in this log; the OLED (splash + menu) shows the noun handles. `env!`
+    // reads the build.rs-emitted vars (archive builds pass SMOL_GIT_HASH/_NUMBER).
     let (my_adj, my_noun) = net::names::name_for_id(NODE_ID);
-    log::info!("smol: I am {} {} (id {})", my_adj, my_noun, NODE_ID);
+    let (v_adj, v_noun) = net::names::version_name();
+    log::info!(
+        "smol id{} \"{} {}\" · build {} \"{} {}\" ({})",
+        NODE_ID,
+        my_adj,
+        my_noun,
+        env!("BUILD_NUMBER"),
+        v_adj,
+        v_noun,
+        env!("BUILD_HASH"),
+    );
 
     // --- I2C bus to the OLED -------------------------------------------------
     let i2c = I2c::new(
@@ -168,6 +185,15 @@ fn main() -> ! {
         .font(&FONT_5X8)
         .text_color(BinaryColor::On)
         .build();
+
+    // --- Boot splash (all builds) --------------------------------------------
+    // Fill the otherwise-blank display during the (blocking) radio bring-up — and
+    // for >= SPLASH_MIN_MS even in the default build — with WHO this is (node noun,
+    // FONT_6X10) over WHICH build ("v<N> <forge-noun>", FONT_5X8). Nothing repaints
+    // the panel until the first menu draw, so it rides the whole NTP burst window.
+    let splash_start = millis();
+    draw_splash(&mut display, my_noun, env!("BUILD_NUMBER"), v_noun);
+    display.flush().ok();
 
     let delay = Delay::new();
 
@@ -300,6 +326,13 @@ fn main() -> ! {
     let mut last_clock_sec: Option<u32> = None;
     // Force a redraw immediately after any mode switch (clears stale pixels).
     let mut redraw = true;
+
+    // Hold the boot splash for at least SPLASH_MIN_MS total. The espnow/wifi NTP
+    // burst above usually already blew past this (the splash was up throughout);
+    // this only adds real wait in the default build, where bring-up is instant.
+    while millis().saturating_sub(splash_start) < SPLASH_MIN_MS {
+        delay.delay_millis(SUBTICK_MS);
+    }
 
     log::info!("smol: entering menu");
 
@@ -709,6 +742,66 @@ fn draw_snake_death<D>(
 #[cfg(feature = "espnow")]
 fn should_adopt(mine: u32, peer: u32) -> bool {
     peer > mine
+}
+
+/// Boot splash: WHO (node noun, FONT_6X10) over WHICH build ("v<N> <forge-noun>",
+/// FONT_5X8). FONT_6X10 is the largest font that fits EVERY fantasy noun at 72 px
+/// (FONT_10X20 would clip an 8-char noun); it matches the menu title. Heap-free so
+/// it runs in the alloc-free default build. The full "Adjective Noun" version name
+/// is in the boot log; the screen shows the noun handle, like the rest of the UI.
+fn draw_splash<D>(display: &mut D, node_noun: &str, build_num: &str, ver_noun: &str)
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let big = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
+    display.clear(BinaryColor::Off).ok();
+    // WHO — the node's noun, near the top.
+    Text::with_baseline(node_noun, Point::new(2, 5), big, Baseline::Top)
+        .draw(display)
+        .ok();
+    // WHICH — "v<N> <forge-noun>", built heap-free into a fixed buffer.
+    let mut line = [0u8; 20];
+    let n = fmt_version_line(&mut line, build_num, ver_noun);
+    let ver = core::str::from_utf8(&line[..n]).unwrap_or("v?");
+    Text::with_baseline(ver, Point::new(2, 22), small, Baseline::Top)
+        .draw(display)
+        .ok();
+    // The caller flushes — `flush` lives on the concrete `Ssd1306`, not the
+    // generic `DrawTarget` (same split as `draw_clock`/`draw_snake_death`).
+}
+
+/// Write `"v<build_num> <ver_noun>"` into `out` (heap-free — the splash runs in the
+/// alloc-free default build); returns the byte length, truncated to `out.len()`.
+fn fmt_version_line(out: &mut [u8], build_num: &str, ver_noun: &str) -> usize {
+    let mut n = 0;
+    if n < out.len() {
+        out[n] = b'v';
+        n += 1;
+    }
+    for &b in build_num.as_bytes() {
+        if n < out.len() {
+            out[n] = b;
+            n += 1;
+        }
+    }
+    if n < out.len() {
+        out[n] = b' ';
+        n += 1;
+    }
+    for &b in ver_noun.as_bytes() {
+        if n < out.len() {
+            out[n] = b;
+            n += 1;
+        }
+    }
+    n
 }
 
 // (12-hour time is formatted inline in draw_clock; no shared HH:MM:SS helper needed.)

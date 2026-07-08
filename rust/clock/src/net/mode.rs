@@ -1210,9 +1210,12 @@ impl RadioManager {
     pub fn service(&mut self) -> Option<alloc::string::String> {
         // Bound the drain: ESP-NOW's RX queue is 10 deep. The MMO-snake game
         // (netcode §2) bursts up to ~16 peers/round + background; raise the
-        // per-call drain to 24 so a full burst is absorbed without dropping,
-        // while staying BOUNDED so a pathological flood can't stall the 1 Hz
-        // clock tick or the LED. Each parse is a cheap prefix match.
+        // per-call drain to 24 so it absorbs TYPICAL bursts, while staying BOUNDED
+        // so a pathological flood can't stall the 1 Hz clock tick or the LED.
+        // (Note: the decoded-SNK inbox is SNK_RX_RING=8 vs the 10-deep HW queue, so
+        // a worst-case all-SNK window can drop ≤2 SNK frames/subtick — tolerated by
+        // design: per-id upsert + absolute state + 200 ms resend recover it.)
+        // Each parse is a cheap prefix match.
         let mut label: Option<alloc::string::String> = None;
         for _ in 0..24 {
             let Some(recv) = self.esp_now.receive() else {

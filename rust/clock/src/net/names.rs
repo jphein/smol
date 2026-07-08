@@ -88,3 +88,49 @@ pub fn seed_from_id(id: u8) -> u32 {
 pub fn name_for_id(id: u8) -> (&'static str, &'static str) {
     name_for_seed(seed_from_id(id), REALM)
 }
+
+/// The `forge` realm — verbatim from sigil's generated corpus (20 adj / 20 noun),
+/// same source as FANTASY (research `nebula-magical-names.md` §7). Used for the
+/// FIRMWARE VERSION name so a build's identity (e.g. "Molten Crucible") reads in a
+/// DELIBERATELY different vocabulary from a node's fantasy name — provenance is
+/// never confused with identity at a glance (ota-ux-design.md §1).
+pub static FORGE: Realm = Realm {
+    adjectives: &[
+        "Annealed", "Bolted", "Carbonized", "Dense", "Electric", "Flux", "Galvanized",
+        "Hardened", "Ignited", "Joined", "Keen", "Laminated", "Molten", "Nitrided", "Oxidized",
+        "Pressed", "Quenched", "Riveted", "Sintered", "Tempered",
+    ],
+    nouns: &[
+        "Anvil", "Bellows", "Crucible", "Die", "Engine", "Furnace", "Gear", "Hammer", "Ingot",
+        "Jig", "Kiln", "Lathe", "Mandrel", "Nozzle", "Oven", "Piston", "Quench", "Rivet", "Spark",
+        "Tongs",
+    ],
+};
+
+/// Parse leading hex digits of `s` into a `u32` seed (sigil's native version path:
+/// the git short hash IS the seed). Non-hex terminates parsing, so a non-hex build
+/// tag like `"dev"` seeds deterministically off its leading hex (`"dev"` → `0xDE`)
+/// — every dev build then shares one forge name, which is the honest signal.
+fn parse_hex_seed(s: &str) -> u32 {
+    let mut seed: u32 = 0;
+    for &b in s.as_bytes() {
+        let d = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => break, // non-hex char ends the seed (e.g. the 'v' in "dev")
+        };
+        seed = seed.wrapping_mul(16).wrapping_add(d as u32);
+    }
+    seed
+}
+
+/// The firmware's magical VERSION name — sigil's native path: seed from the git
+/// short hash (`BUILD_HASH`, from `build.rs`), rendered in the FORGE realm. Both
+/// the seed and the corpus are compile-time, so this const-folds to two
+/// `&'static str` exactly like `name_for_id(NODE_ID)` (the seed here is an `env!`
+/// literal). `.0` = adjective, `.1` = noun. Full name in the boot log; the OLED
+/// shows the noun handle, matching the rest of the UI.
+pub fn version_name() -> (&'static str, &'static str) {
+    name_for_seed(parse_hex_seed(env!("BUILD_HASH")), &FORGE)
+}
