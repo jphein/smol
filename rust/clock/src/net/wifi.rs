@@ -169,7 +169,7 @@ pub fn try_time_sync(
         &mut controller,
         &mut device,
         rng,
-        &mut || {},
+        &mut || false,
         &mut _reached_dhcp,
         crate::NODE_ID,
         batt,
@@ -193,7 +193,7 @@ pub fn run_ntp_burst(
     controller: &mut esp_wifi::wifi::WifiController<'static>,
     device: &mut esp_wifi::wifi::WifiDevice<'static>,
     mut rng: Rng,
-    tick: &mut dyn FnMut(),
+    tick: &mut dyn FnMut() -> bool,
     // N3c: set true once we've ASSOCIATED + got a DHCP lease (before SNTP runs).
     // The caller uses this — NOT the returned NTP Option — to decide gateway role,
     // so an SNTP outage can't demote a node with a working LAN uplink.
@@ -259,7 +259,10 @@ pub fn run_ntp_burst(
 
     // Wait for association.
     while !matches!(controller.is_connected(), Ok(true)) {
-        tick();
+        // #20 abort: a long-press mid-sync bails the burst (tick latches true).
+        if tick() {
+            return None;
+        }
         if Instant::now() > deadline {
             log::warn!("smol: WiFi connect timed out");
             return None;
@@ -271,7 +274,9 @@ pub fn run_ntp_burst(
     // the socket, so we extract the plain (Ipv4Cidr, router) data inside a
     // short scope, then apply it to the interface once the borrow is released.
     loop {
-        tick();
+        if tick() {
+            return None; // #20 abort during DHCP wait
+        }
         let ts = smoltcp_now();
         iface.poll(ts, device, &mut sockets);
 
@@ -361,7 +366,7 @@ fn sntp_query(
     udp_handle: smoltcp::iface::SocketHandle,
     ephemeral_port_seed: u32,
     deadline: Instant,
-    tick: &mut dyn FnMut(),
+    tick: &mut dyn FnMut() -> bool,
 ) -> Option<u32> {
     // Bind a pseudo-random ephemeral source port (49152..=65535).
     let src_port = 49152 + (ephemeral_port_seed % 16384) as u16;
@@ -384,7 +389,9 @@ fn sntp_query(
 
     let mut sent = false;
     loop {
-        tick();
+        if tick() {
+            return None; // #20 abort during SNTP exchange
+        }
         let ts = smoltcp_now();
         iface.poll(ts, device, sockets);
 
@@ -459,11 +466,13 @@ fn tcp_send(
     handle: smoltcp::iface::SocketHandle,
     data: &[u8],
     deadline: Instant,
-    tick: &mut dyn FnMut(),
+    tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut off = 0;
     while off < data.len() {
-        tick();
+        if tick() {
+            return false; // #20 abort mid-send (QoS0 — partial send tolerable)
+        }
         iface.poll(smoltcp_now(), device, sockets);
         let socket = sockets.get_mut::<tcp::Socket>(handle);
         if socket.can_send() {
@@ -522,7 +531,7 @@ fn mqtt_session(
     batt: &mut crate::batt::BattCache,
     grid: &mut crate::grid::GridCache,
     deadline: Instant,
-    tick: &mut dyn FnMut(),
+    tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let broker = (IpAddress::Ipv4(MQTT_BROKER_IP), MQTT_BROKER_PORT);
 
@@ -534,7 +543,9 @@ fn mqtt_session(
         }
     }
     loop {
-        tick();
+        if tick() {
+            return false; // #20 abort during TCP connect wait
+        }
         iface.poll(smoltcp_now(), device, sockets);
         let state = sockets.get_mut::<tcp::Socket>(tcp_handle).state();
         if state == tcp::State::Established {
@@ -570,7 +581,9 @@ fn mqtt_session(
     // --- CONNACK (require rc=0) ---
     let mut connected = false;
     while !connected {
-        tick();
+        if tick() {
+            return false; // #20 abort during CONNACK wait (not yet connected)
+        }
         iface.poll(smoltcp_now(), device, sockets);
         recv_into(sockets, tcp_handle, &mut acc, &mut acc_len);
         loop {
@@ -650,7 +663,9 @@ fn mqtt_session(
     let mut got_batt = false;
     let mut got_grid = false;
     while !(got_batt && got_grid) {
-        tick();
+        if tick() {
+            break; // #20 abort during downlink wait → fall through to clean DISCONNECT
+        }
         iface.poll(smoltcp_now(), device, sockets);
         recv_into(sockets, tcp_handle, &mut acc, &mut acc_len);
         loop {
@@ -716,7 +731,7 @@ pub fn run_mqtt_burst(
     messages: &[(u8, &[u8])],
     batt: &mut crate::batt::BattCache,
     grid: &mut crate::grid::GridCache,
-    tick: &mut dyn FnMut(),
+    tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
     let mut sockets_storage: [SocketStorage; 2] = Default::default();
@@ -744,7 +759,9 @@ pub fn run_mqtt_burst(
 
     // The caller's switch(WifiSta) already issued connect(); just wait for it.
     while !matches!(controller.is_connected(), Ok(true)) {
-        tick();
+        if tick() {
+            return false; // #20 abort during flush re-association
+        }
         if Instant::now() > deadline {
             log::warn!("smol: MQTT flush — WiFi connect timed out");
             return false;
@@ -760,7 +777,9 @@ pub fn run_mqtt_burst(
 
     // Fresh DHCP lease each burst (the interface was just rebuilt).
     loop {
-        tick();
+        if tick() {
+            return false; // #20 abort during flush DHCP wait
+        }
         iface.poll(smoltcp_now(), device, &mut sockets);
         let configured = {
             let socket = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);

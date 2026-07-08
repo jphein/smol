@@ -53,7 +53,7 @@ use esp_wifi::{
     EspWifiController,
 };
 
-use crate::led::{Led, LedState};
+use crate::led::LedState;
 use crate::net::WifiPeripherals;
 
 /// Fixed ESP-NOW channel used in TIME-SHARE mode. All smol units must agree on
@@ -1193,7 +1193,7 @@ impl RadioManager {
         &mut self,
         batt: &mut crate::batt::BattCache,
         grid: &mut crate::grid::GridCache,
-        tick: &mut dyn FnMut(),
+        tick: &mut dyn FnMut() -> bool,
     ) -> (bool, Option<u32>) {
         // Disjoint field borrows: &mut self.controller, &mut *sta, Copy of rng/id.
         // `batt` is a caller-owned &mut (main's cache), disjoint from every self
@@ -1515,7 +1515,7 @@ impl RadioManager {
         own_telemetry: &[u8],
         batt: &mut crate::batt::BattCache,
         grid: &mut crate::grid::GridCache,
-        tick: &mut dyn FnMut(),
+        tick: &mut dyn FnMut() -> bool,
     ) -> bool {
         if !self.relay.is_gateway {
             return false;
@@ -2149,7 +2149,12 @@ fn parse_relayack(data: &[u8]) -> Option<(u16, u8)> {
 pub fn start(
     p: WifiPeripherals,
     id: u8,
-    led: &mut Led,
+    // #20: `main` passes the responsive tick (poll button + "Syncing…" redraw +
+    // LED fast-blink); returns true to ABORT the boot burst (a long-press → boot
+    // ends early and proceeds straight to the Menu). Replaces the old internal
+    // LED-only closure, keeping this radio module UI-agnostic — it just calls
+    // `tick() -> bool`.
+    tick: &mut dyn FnMut() -> bool,
     batt: &mut crate::batt::BattCache,
     grid: &mut crate::grid::GridCache,
 ) -> (Option<RadioManager>, Option<u32>) {
@@ -2157,13 +2162,12 @@ pub fn start(
         return (None, None);
     };
 
-    // --- WiFi burst for NTP, blue LED fast-blinking (~10 Hz) while it runs ---
-    // The closure is called inside every busy-wait loop of the burst; it just
-    // re-derives the fast-blink phase from the monotonic clock and pushes it to
-    // the pin (non-blocking, no per-blink state). `batt` rides along: the same
-    // burst runs an MQTT downlink at its tail to seed the Batt screen at boot.
-    let (reached_dhcp, synced) =
-        radio.burst_ntp(batt, grid, &mut || led.apply(LedState::WifiSync, now_ms()));
+    // --- WiFi burst for NTP; `main`'s responsive `tick` runs inside every busy-
+    // wait loop (LED fast-blink + "Syncing…" redraw + long-press abort). `batt`/
+    // `grid` ride along: the same burst runs the MQTT downlink at its tail to seed
+    // the Batt/Grid screens at boot. If `tick` returns true (abort), the burst
+    // returns early (no sync) and boot proceeds straight to the Menu.
+    let (reached_dhcp, synced) = radio.burst_ntp(batt, grid, tick);
 
     // Relay role (N3c): a node is the internet GATEWAY iff its boot burst reached
     // ASSOCIATION + DHCP — i.e. it has a usable LAN uplink — NOT iff SNTP succeeded.

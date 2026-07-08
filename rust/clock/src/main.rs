@@ -146,6 +146,25 @@ pub(crate) const SUBTICK_MS: u32 = 20;
 /// usually already exceeds this, so the splash naturally rides the burst window.
 const SPLASH_MIN_MS: u64 = 2_000;
 
+/// #20 (UI-during-WiFi-sync) tunables — all `cfg(espnow)` so the default/wifi
+/// builds stay byte-identical. Redraw cadence for the in-burst "Syncing…" spinner
+/// (~2 Hz) and its frame period. Kept deliberately SLOW (JP's conservative call
+/// on #20 Q3): each redraw is an I2C flush (~10 ms) driven from INSIDE the smoltcp
+/// poll loop, so this is a ⚠️ HARDWARE-WATCH item — 500 ms should be negligible vs
+/// the second-scale DHCP/CONNACK/MQTT timeouts, but it is UNVERIFIED on glass. If a
+/// 2 Hz OLED flush ever correlates with a flush/DHCP/MQTT miss on the bench, raise
+/// this value (throttle further); do not lower it without a hardware re-check.
+#[cfg(feature = "espnow")]
+const SYNC_REDRAW_MS: u64 = 500;
+/// (1a defer) A recurring flush is postponed while the user pressed a button within
+/// this window — so the ~15 s mesh-deaf burst never freezes an active session.
+#[cfg(feature = "espnow")]
+const FLUSH_IDLE_MS: u64 = 3_000;
+/// (1a cap) …but never defer longer than this: past the cap the flush runs anyway,
+/// so telemetry can't starve under continuous interaction.
+#[cfg(feature = "espnow")]
+const FLUSH_DEFER_CAP_MS: u64 = 120_000;
+
 /// OLED panel rotation. The pocket-watch case hangs from the USB-C end, so the
 /// display is physically upside-down and must be rotated 180° to read upright.
 ///
@@ -277,19 +296,43 @@ fn main() -> ! {
     ));
 
     #[cfg(feature = "espnow")]
-    let (mut radio, synced) = net::mode::start(
-        net::WifiPeripherals {
-            timg0: peripherals.TIMG0,
-            rng: peripherals.RNG,
-            wifi: peripherals.WIFI,
-        },
-        // This unit's short id (see NODE_ID) — embedded in HELLO/ACK/BEACON/TIME
-        // frames and the single source of truth shared with the node's name.
-        NODE_ID,
-        &mut led,
-        &mut batt_cache,
-        &mut grid_cache,
-    );
+    let (mut radio, synced) = {
+        // #20 (1b): responsive BOOT tick — runs inside every busy-wait loop of the
+        // NTP/MQTT burst. LED fast-blink (as before) + a throttled "Syncing…"
+        // spinner (only AFTER the splash minimum, so the identity splash still
+        // shows) + a LONG-PRESS abort that LATCHES (once `boot_abort` is set the
+        // closure returns true forever, so the burst unwinds fast and boot proceeds
+        // straight to the Menu). Built here so the radio module stays UI-agnostic.
+        let mut boot_draw_ms = 0u64;
+        let mut boot_abort = false;
+        let mut boot_tick = || {
+            let now = millis();
+            led.apply(led::LedState::WifiSync, now);
+            if matches!(button.poll(now), Some(input::Press::Long)) {
+                boot_abort = true;
+            }
+            if now.saturating_sub(splash_start) >= SPLASH_MIN_MS
+                && now.saturating_sub(boot_draw_ms) >= SYNC_REDRAW_MS
+            {
+                boot_draw_ms = now;
+                draw_syncing(&mut display, (now / SYNC_REDRAW_MS) as u8);
+            }
+            boot_abort
+        };
+        net::mode::start(
+            net::WifiPeripherals {
+                timg0: peripherals.TIMG0,
+                rng: peripherals.RNG,
+                wifi: peripherals.WIFI,
+            },
+            // This unit's short id (see NODE_ID) — embedded in HELLO/ACK/BEACON/TIME
+            // frames and the single source of truth shared with the node's name.
+            NODE_ID,
+            &mut boot_tick,
+            &mut batt_cache,
+            &mut grid_cache,
+        )
+    };
 
     // --- Clock time base -----------------------------------------------------
     // Anchor the clock to the monotonic ms clock instead of accumulating ticks
@@ -372,6 +415,13 @@ fn main() -> ! {
     // Phase 3: LED-state trace bookkeeping (LED stays a `main` concern).
     #[cfg(feature = "espnow")]
     let mut last_led_state: Option<led::LedState> = None;
+
+    // #20 (1a): last BOOT-button activity + the current flush-deferral start, to
+    // postpone a recurring flush while the user is interacting (capped).
+    #[cfg(feature = "espnow")]
+    let mut last_input_ms: u64 = 0;
+    #[cfg(feature = "espnow")]
+    let mut flush_defer_since_ms: u64 = 0;
 
     // FPS measurement for BENCH: count frames, recompute once per second.
     #[cfg(feature = "espnow")]
@@ -513,21 +563,58 @@ fn main() -> ! {
                 r.relay_emit(tele.as_bytes(), now);
             }
             r.relay_retransmit(now);
+            // #20 (1a DEFER): don't START a flush while the user is actively
+            // interacting — postpone the ~15 s mesh-deaf burst to an idle gap so it
+            // never freezes an active session. CAP the defer at FLUSH_DEFER_CAP_MS
+            // so telemetry can't starve under continuous interaction.
             if r.relay_ready_to_flush(now) {
-                // The flush is now an MQTT burst: it publishes the gateway's OWN
-                // telemetry + each queued leaf message + retained discovery, and
-                // receives the retained battery downlink into `batt_cache` (disjoint
-                // from `r`/`led`). Compute our own telemetry here — same shape as a
-                // leaf's relay_emit payload (sensor line + current label).
-                let reading = sensors.read();
-                let own = alloc::format!(
-                    "{} {}",
-                    sensors::format_sensor_line(&reading).as_str(),
-                    bottom_line.as_str()
-                );
-                r.flush_telemetry(own.as_bytes(), &mut batt_cache, &mut grid_cache, &mut || {
-                    led.apply(led::LedState::WifiSync, millis())
-                });
+                let idle = now.saturating_sub(last_input_ms) >= FLUSH_IDLE_MS;
+                if flush_defer_since_ms == 0 {
+                    flush_defer_since_ms = now;
+                }
+                let capped = now.saturating_sub(flush_defer_since_ms) >= FLUSH_DEFER_CAP_MS;
+                if idle || capped {
+                    // The flush is an MQTT burst: publishes the gateway's OWN
+                    // telemetry + each queued leaf message + retained discovery, and
+                    // receives the retained batt/grid downlinks into the caches.
+                    // Compute our own telemetry here (sensor line + current label).
+                    let reading = sensors.read();
+                    let own = alloc::format!(
+                        "{} {}",
+                        sensors::format_sensor_line(&reading).as_str(),
+                        bottom_line.as_str()
+                    );
+                    // #20 (1b RESPONSIVE): the tick keeps the UI alive during the
+                    // burst — LED blink + throttled "Syncing…" spinner + a LATCHING
+                    // long-press ABORT. Abort returns the burst's fail value (queue
+                    // kept, mode switched back to ESP-NOW — existing paths), only
+                    // ever SHORTENING the deaf window.
+                    let mut flush_abort = false;
+                    let mut flush_draw_ms = 0u64;
+                    r.flush_telemetry(own.as_bytes(), &mut batt_cache, &mut grid_cache, &mut || {
+                        let t = millis();
+                        led.apply(led::LedState::WifiSync, t);
+                        if matches!(button.poll(t), Some(input::Press::Long)) {
+                            flush_abort = true;
+                        }
+                        if t.saturating_sub(flush_draw_ms) >= SYNC_REDRAW_MS {
+                            flush_draw_ms = t;
+                            draw_syncing(&mut display, (t / SYNC_REDRAW_MS) as u8);
+                        }
+                        flush_abort
+                    });
+                    flush_defer_since_ms = 0;
+                    if flush_abort {
+                        // Long-press during the burst == the global "back to Menu"
+                        // gesture; land there and count it as fresh activity so the
+                        // next flush defers too.
+                        app = App::Menu(menu::Menu::new());
+                        redraw = true;
+                        last_input_ms = millis();
+                    }
+                }
+            } else {
+                flush_defer_since_ms = 0;
             }
 
             let state = r.peer_led_state(now);
@@ -595,6 +682,11 @@ fn main() -> ! {
         // is enforced centrally: `main` acts only on the returned `Transition`).
         if let Some(press) = button.poll(now) {
             ctx.redraw = true;
+            // #20 (1a): any press marks activity so the next recurring flush defers.
+            #[cfg(feature = "espnow")]
+            {
+                last_input_ms = now;
+            }
             if let Transition::Switch(kind) = app.on_button(press, &mut ctx) {
                 app = App::enter(kind, &ctx); // lazy-construct the entered screen
                 ctx.redraw = true; // it paints THIS tick
@@ -660,6 +752,44 @@ where
         .ok();
     // The caller flushes — `flush` lives on the concrete `Ssd1306`, not the
     // generic `DrawTarget` (same split as `draw_clock`/`draw_snake_death`).
+}
+
+/// #20: the "Syncing WiFi" indicator shown while a WiFi burst blocks the loop
+/// (boot NTP burst + gateway flush). An animated spinner (`|/-\`) so the freeze
+/// reads as intentional progress, plus a `hold=menu` hint for the long-press
+/// abort. Takes the concrete [`app::Oled`] and flushes itself (unlike
+/// `draw_splash`). espnow-only — the only builds with the blocking flush + abort
+/// path, so default/wifi stay untouched.
+#[cfg(feature = "espnow")]
+fn draw_syncing(display: &mut app::Oled, frame: u8) {
+    let big = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+    let small = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
+    display.clear(BinaryColor::Off).ok();
+    // "Sync <spinner>" — motion is visible even while the single radio is busy and
+    // the rest of the UI can't advance.
+    let spin = [b'|', b'/', b'-', b'\\'][(frame & 3) as usize];
+    let head = [b'S', b'y', b'n', b'c', b' ', spin];
+    Text::with_baseline(
+        core::str::from_utf8(&head).unwrap_or("Sync"),
+        Point::new(2, 3),
+        big,
+        Baseline::Top,
+    )
+    .draw(display)
+    .ok();
+    Text::with_baseline("WiFi...", Point::new(2, 16), big, Baseline::Top)
+        .draw(display)
+        .ok();
+    Text::with_baseline("hold=menu", Point::new(2, 31), small, Baseline::Top)
+        .draw(display)
+        .ok();
+    display.flush().ok();
 }
 
 /// Write `"v<build_num> <ver_noun>"` into `out` (heap-free — the splash runs in the
