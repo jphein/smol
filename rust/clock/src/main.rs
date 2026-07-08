@@ -92,6 +92,14 @@ const START_SECONDS_OF_DAY: u32 = 12 * 3600 + 34 * 60 + 56;
 /// switch to `-8 * 3600` for PST in winter.
 const TZ_OFFSET_SECONDS: i64 = -7 * 3600;
 
+/// This unit's logical short id — the SINGLE source of truth for both the id
+/// embedded in HELLO/ACK/BEACON/TIME frames (passed to `net::mode::start`) and
+/// this node's magical name (`net::names::name_for_id`). Give each physical board
+/// a distinct value; we flashed 7 / 8 / 9 (now id7 / id8). Changing it changes
+/// BOTH the on-wire id and the displayed name — the name is *derived* from the
+/// id and is never itself transmitted.
+const NODE_ID: u8 = 7;
+
 /// Render/poll sub-tick period (ms). Fast enough for a smooth ~10 Hz LED blink,
 /// responsive button polling, and a snappy Snake; the clock and OLED still only
 /// advance/redraw on their own schedules so the I²C bus isn't hammered.
@@ -124,6 +132,12 @@ fn main() -> ! {
 
     esp_println::logger::init_logger_from_env();
     log::info!("smol booting: unified firmware (menu: Clock / Snake / Bench)");
+
+    // Our magical identity, derived from NODE_ID (see src/net/names.rs). The full
+    // "Adjective Noun" appears ONLY here in the log; the OLED shows just `my_noun`
+    // (the handle), and NOTHING name-related ever goes on the wire.
+    let (my_adj, my_noun) = net::names::name_for_id(NODE_ID);
+    log::info!("smol: I am {} {} (id {})", my_adj, my_noun, NODE_ID);
 
     // --- I2C bus to the OLED -------------------------------------------------
     let i2c = I2c::new(
@@ -193,29 +207,54 @@ fn main() -> ! {
             rng: peripherals.RNG,
             wifi: peripherals.WIFI,
         },
-        // This unit's short id, embedded in HELLO/BEACON frames. Give each
-        // physical board a distinct value (we flashed 7 / 8 / 9).
-        7,
+        // This unit's short id (see NODE_ID) — embedded in HELLO/ACK/BEACON/TIME
+        // frames and the single source of truth shared with the node's name.
+        NODE_ID,
         &mut led,
     );
 
     // --- Clock time base -----------------------------------------------------
-    // Instead of accumulating ticks in the loop (which would drift while we're
-    // in another mode), we anchor the clock to the monotonic ms clock: the
-    // seconds-of-day at boot plus elapsed real time. This way CLOCK shows the
-    // right time whenever we return to it, regardless of how long Snake/Bench ran.
+    // Anchor the clock to the monotonic ms clock instead of accumulating ticks
+    // in the loop (which would drift while another mode is on screen): the time
+    // is `base_unix` + elapsed-since-`anchor_ms`, so CLOCK shows the right time
+    // whenever we return to it no matter how long Snake/Bench ran.
+    //
+    // The base is kept in ABSOLUTE Unix seconds (not seconds-of-day) so the very
+    // same value can be broadcast to — and adopted from — the ESP-NOW mesh (see
+    // the espnow background block). For the default/wifi builds this is a PURE
+    // representation change: the rendered seconds-of-day stays identical mod
+    // 86_400 to the old `(base_sod + elapsed) % 86_400` (proof in the Clock
+    // arm's comment). `base_unix`/`anchor_ms` are `mut` only so the espnow build
+    // can re-anchor them on adoption; nothing mutates them in the smaller builds
+    // (hence the cfg'd `allow(unused_mut)`).
     let boot_ms = millis();
-    let base_sod: u32 = match synced {
+    #[cfg_attr(not(feature = "espnow"), allow(unused_mut))]
+    let mut base_unix: u32 = match synced {
         Some(unix) => {
-            let local = ((unix as i64 + TZ_OFFSET_SECONDS).rem_euclid(86_400)) as u32;
-            log::info!("smol: NTP synced -> local s-of-day {} (Pacific)", local);
-            local
+            log::info!(
+                "smol: NTP synced -> Unix {} (local s-of-day {})",
+                unix,
+                ((unix as i64 + TZ_OFFSET_SECONDS).rem_euclid(86_400)) as u32,
+            );
+            unix
         }
         None => {
+            // Pick the Unix base whose LOCAL seconds-of-day equals the
+            // compile-time START_SECONDS_OF_DAY. Render does
+            // `sod = (base_unix + TZ) mod 86_400`, so invert: base_unix =
+            // (START - TZ) mod 86_400.
             log::info!("smol: no NTP; clock free-runs from compile-time start");
-            START_SECONDS_OF_DAY
+            ((START_SECONDS_OF_DAY as i64 - TZ_OFFSET_SECONDS).rem_euclid(86_400)) as u32
         }
     };
+    #[cfg_attr(not(feature = "espnow"), allow(unused_mut))]
+    let mut anchor_ms: u64 = boot_ms;
+
+    // Our authoritative sync stamp: the Unix instant our clock was last set for
+    // real. NTP at boot -> the synced time itself; never-synced -> 0. Mesh
+    // adoption is the only thing that changes it at runtime (espnow only).
+    #[cfg(feature = "espnow")]
+    let mut my_synced_at: u32 = synced.unwrap_or(0);
 
     // --- Mode dispatcher state ----------------------------------------------
     let mut app = AppMode::Menu;
@@ -225,8 +264,10 @@ fn main() -> ! {
     let mut game: Option<snake::Snake> = None;
 
     // Phase 3: last ESP-NOW peer message, shown as the CLOCK bottom-line label.
+    // The idle default is our OWN noun (the "I am …" identity at rest); a heard
+    // peer replaces it with THAT peer's noun (see net::mode::service).
     #[cfg(feature = "espnow")]
-    let mut bottom_line = alloc::string::String::from("smol");
+    let mut bottom_line = alloc::string::String::from(my_noun);
 
     // Phase 3: HELLO/BEACON cadence + LED-state trace bookkeeping.
     #[cfg(feature = "espnow")]
@@ -259,10 +300,36 @@ fn main() -> ! {
             if let Some(text) = r.service() {
                 bottom_line = text;
             }
+            // Mesh time adoption: if a peer's clock descends from a STRICTLY
+            // newer authoritative sync than ours, re-anchor onto its estimate
+            // NOW and INHERIT its `synced_at` (not `now`). Because freshness
+            // travels with the time, no adoption chain can inflate `synced_at`
+            // past the origin NTP node's, so the mesh converges and stops
+            // swapping (loop-free — see net::mode's TimeTracker + should_adopt).
+            // Checked every subtick so a never-synced board picks up time fast.
+            if let Some((punix, psynced)) = r.take_time_offer() {
+                if should_adopt(my_synced_at, psynced) {
+                    let old = my_synced_at;
+                    base_unix = punix;
+                    anchor_ms = now;
+                    my_synced_at = psynced;
+                    // Show the adopted time immediately rather than waiting for
+                    // the next 1 Hz redraw (force the Clock arm to repaint).
+                    last_clock_sec = None;
+                    bottom_line = alloc::string::String::from("mesh");
+                    log::info!("smol: adopted mesh time (synced_at {} -> {})", old, psynced);
+                }
+            }
             // ~every 2 s advertise ourselves (HELLO drives the LED handshake).
             // 2000 ms / SUBTICK_MS aligned via the monotonic clock.
             if (now / 2000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 2000) {
                 r.broadcast_hello();
+                // Advertise our current Unix time + the sync it descends from on
+                // the SAME tick, so a peer with an older sync can adopt ours.
+                // (A separate frame from HELLO — the LED handshake wire format is
+                // hardware-verified and must not change.)
+                let unix_now = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
+                r.broadcast_time(unix_now, my_synced_at);
                 // In BENCH mode also emit the stats BEACON (seq + echo) so the
                 // peer can measure RTT/loss. Only bother when Bench is on screen
                 // to keep other modes' airtime minimal.
@@ -270,6 +337,29 @@ fn main() -> ! {
                     r.broadcast_beacon();
                 }
             }
+
+            // --- Relay bridge (see net::mode's "Relay bridge" section) --------
+            // LEAF: emit short telemetry (sensor line + current label) as RELAY
+            // fragments on a cadence, then retransmit the gaps a gateway's
+            // RELAYACK reports. GATEWAY: on a cadence, WiFi-burst the buffered
+            // leaf messages to the collector (this BLOCKS ~seconds — the mesh is
+            // deaf on ch6 for the burst; the LED fast-blinks meanwhile). The role
+            // checks inside each call make it a no-op for the wrong role, so only
+            // one path is ever live on a given board.
+            if r.relay_emit_due(now) {
+                let reading = sensors.read();
+                let tele = alloc::format!(
+                    "{} {}",
+                    sensors::format_sensor_line(&reading).as_str(),
+                    bottom_line.as_str()
+                );
+                r.relay_emit(tele.as_bytes(), now);
+            }
+            r.relay_retransmit(now);
+            if r.relay_ready_to_flush(now) {
+                r.flush_telemetry(&mut || led.apply(led::LedState::WifiSync, millis()));
+            }
+
             let state = r.peer_led_state(now);
             if last_led_state != Some(state) {
                 log::info!("smol: LED -> {:?}", state);
@@ -361,10 +451,21 @@ fn main() -> ! {
             }
 
             AppMode::Clock => {
-                // Derive the current seconds-of-day from the monotonic clock so
-                // time is correct no matter how long another mode was active.
-                let elapsed_s = (now.saturating_sub(boot_ms) / 1000) as u32;
-                let sod = (base_sod + elapsed_s) % 86_400;
+                // Derive the current seconds-of-day from the Unix anchor so time
+                // is correct no matter how long another mode was active.
+                //
+                // Equivalence to the old `(base_sod + elapsed) % 86_400` (where
+                // `base_sod = (unix + TZ).rem_euclid(86_400)`): since
+                //   (base_unix + TZ + e) mod 86_400
+                //     == ((base_unix + TZ) mod 86_400 + e) mod 86_400
+                //     == (base_sod + e) mod 86_400,
+                // the rendered value is identical for BOTH the synced and the
+                // free-run base — the anchor refactor changes representation, not
+                // behavior. i64 + rem_euclid keeps it correct even though TZ is
+                // negative and however large `elapsed` grows.
+                let elapsed_s = (now.saturating_sub(anchor_ms) / 1000) as i64;
+                let unix_secs = base_unix as i64 + TZ_OFFSET_SECONDS + elapsed_s;
+                let sod = unix_secs.rem_euclid(86_400) as u32;
 
                 // Redraw once per second (or right after a mode switch).
                 if redraw || last_clock_sec != Some(sod) {
@@ -430,8 +531,10 @@ fn draw_clock<D>(
     const SENSOR_LINE_EVERY_S: u32 = 4;
     let show_sensors = (sod / SENSOR_LINE_EVERY_S) % 2 == 1;
 
+    // No radio -> no peer chatter, so the bottom line is simply our own name (the
+    // node's noun, derived from its id). Matches the espnow build's idle label.
     #[cfg(not(feature = "espnow"))]
-    let label: &str = "smol";
+    let label: &str = crate::net::names::name_for_id(NODE_ID).1;
 
     let bottom: &str = if show_sensors {
         sensor_line.as_str()
@@ -517,6 +620,18 @@ fn draw_snake_death<D>(
     Text::with_baseline(text, Point::new(1, 0), label_style, Baseline::Top)
         .draw(display)
         .ok();
+}
+
+/// Mesh time-sync adopt predicate: adopt a peer's time IFF the peer's
+/// authoritative sync is STRICTLY newer than ours. Strict `>` (not `>=`) is what
+/// makes the scheme loop-free and ping-pong-free — equal freshness is ignored,
+/// and since an adopting node INHERITS the peer's `synced_at` (see the espnow
+/// background block), no adoption chain can ever manufacture a `synced_at`
+/// greater than the origin NTP node's. A never-synced node (`mine == 0`) adopts
+/// from any real peer. Pure + total, so it is trivially host-unit-testable.
+#[cfg(feature = "espnow")]
+fn should_adopt(mine: u32, peer: u32) -> bool {
+    peer > mine
 }
 
 // (12-hour time is formatted inline in draw_clock; no shared HH:MM:SS helper needed.)

@@ -12,6 +12,12 @@ mod wifi;
 #[cfg(feature = "espnow")]
 pub mod mode;
 
+// Deterministic magical node names (realm-sigil port). Needs no radio — a node
+// derives its OWN name and any peer's name from the logical id alone — so it is
+// compiled in ALL builds (peer names are only *displayed* under espnow, but our
+// own name is the idle bottom-line label everywhere).
+pub mod names;
+
 #[cfg(feature = "wifi")]
 pub use wifi::WifiPeripherals;
 

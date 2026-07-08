@@ -56,6 +56,19 @@ use crate::secrets::{WIFI_PASS as WIFI_PASSWORD, WIFI_SSID};
 const NTP_SERVER_IP: Ipv4Addr = Ipv4Addr::new(162, 159, 200, 123);
 const NTP_PORT: u16 = 123;
 
+/// Relay uplink collector — a compile-time placeholder (set to your homelab
+/// collector before flashing a gateway), mirroring `NTP_SERVER_IP`'s hardcoded-IP
+/// style so no DNS resolver is needed. UDP. An unreachable placeholder is
+/// harmless: the flush just times out and retries next cadence. Only the `espnow`
+/// relay flush references these (see `run_udp_flush`).
+#[cfg(feature = "espnow")]
+const RELAY_COLLECTOR_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 11, 1);
+#[cfg(feature = "espnow")]
+const RELAY_COLLECTOR_PORT: u16 = 9999;
+/// Max relay-flush datagram = "NNN " (4) + up to `RELAY_MAX_MSG` telemetry bytes.
+#[cfg(feature = "espnow")]
+const FLUSH_DG_MAX: usize = 320;
+
 /// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
 const NTP_TO_UNIX_OFFSET: u32 = 2_208_988_800;
 
@@ -292,4 +305,130 @@ fn sntp_query(
             return None;
         }
     }
+}
+
+/// Relay uplink flush (`espnow` gateway only). The caller has ALREADY triggered
+/// re-association via `RadioManager::switch(Mode::WifiSta)` (which issued
+/// `connect()` with the config persisted from the boot NTP burst); here we build
+/// a fresh smoltcp stack on the RETAINED STA device, wait for the association +
+/// DHCP, then UDP each queued message to the collector as `"<src_id> <telemetry>"`.
+///
+/// Best-effort + loss-tolerant (it's telemetry): returns `true` iff we associated,
+/// got an IP, and sent every message. Connect-wait + DHCP mirror `run_ntp_burst`;
+/// the send loop mirrors `sntp_query`. Kept SEPARATE from `run_ntp_burst` (a
+/// little duplication) so the hardware-verified NTP path is not disturbed.
+///
+/// Single-radio airtime: this runs while the PHY is on the AP's channel, so the
+/// mesh is deaf on the ESP-NOW channel for its duration — the documented cost.
+#[cfg(feature = "espnow")]
+pub fn run_udp_flush(
+    controller: &mut esp_wifi::wifi::WifiController<'static>,
+    device: &mut esp_wifi::wifi::WifiDevice<'static>,
+    mut rng: Rng,
+    messages: &[(u8, &[u8])],
+    tick: &mut dyn FnMut(),
+) -> bool {
+    if messages.is_empty() {
+        return true;
+    }
+
+    let mut iface = create_interface(device);
+    let mut sockets_storage: [SocketStorage; 3] = Default::default();
+    let mut sockets = SocketSet::new(&mut sockets_storage[..]);
+
+    let mut dhcp_socket = dhcpv4::Socket::new();
+    dhcp_socket.set_outgoing_options(&[DhcpOption {
+        kind: 12,
+        data: b"smol",
+    }]);
+    let dhcp_handle = sockets.add(dhcp_socket);
+
+    let mut udp_rx_meta = [udp::PacketMetadata::EMPTY; 4];
+    let mut udp_rx_data = [0u8; 256];
+    let mut udp_tx_meta = [udp::PacketMetadata::EMPTY; 4];
+    let mut udp_tx_data = [0u8; 512];
+    let udp_socket = udp::Socket::new(
+        udp::PacketBuffer::new(&mut udp_rx_meta[..], &mut udp_rx_data[..]),
+        udp::PacketBuffer::new(&mut udp_tx_meta[..], &mut udp_tx_data[..]),
+    );
+    let udp_handle = sockets.add(udp_socket);
+
+    let deadline = Instant::now() + SYNC_BUDGET;
+
+    // The caller's switch(WifiSta) already issued connect(); just wait for it.
+    while !matches!(controller.is_connected(), Ok(true)) {
+        tick();
+        if Instant::now() > deadline {
+            log::warn!("smol: relay flush — WiFi connect timed out");
+            return false;
+        }
+    }
+
+    // Fresh DHCP lease each burst (the interface was just rebuilt).
+    loop {
+        tick();
+        iface.poll(smoltcp_now(), device, &mut sockets);
+        let configured = {
+            let socket = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
+            match socket.poll() {
+                Some(dhcpv4::Event::Configured(cfg)) => Some((cfg.address, cfg.router)),
+                _ => None,
+            }
+        };
+        if let Some((addr, router)) = configured {
+            apply_dhcp(&mut iface, addr, router);
+            log::info!("smol: relay flush DHCP {}", addr);
+            break;
+        }
+        if Instant::now() > deadline {
+            log::warn!("smol: relay flush — DHCP timed out");
+            return false;
+        }
+    }
+
+    // Bind a pseudo-random ephemeral source port (mirrors sntp_query).
+    let src_port = 49152 + (rng.random() % 16384) as u16;
+    {
+        let socket = sockets.get_mut::<udp::Socket>(udp_handle);
+        if socket.bind(src_port).is_err() {
+            return false;
+        }
+    }
+    let server = (IpAddress::Ipv4(RELAY_COLLECTOR_IP), RELAY_COLLECTOR_PORT);
+
+    let mut all_sent = true;
+    for &(src_id, payload) in messages {
+        // Datagram = "<3-digit id> <telemetry>".
+        let mut dg = [0u8; FLUSH_DG_MAX];
+        dg[0] = b'0' + (src_id / 100) % 10;
+        dg[1] = b'0' + (src_id / 10) % 10;
+        dg[2] = b'0' + src_id % 10;
+        dg[3] = b' ';
+        let plen = payload.len().min(FLUSH_DG_MAX - 4);
+        dg[4..4 + plen].copy_from_slice(&payload[..plen]);
+        let dglen = 4 + plen;
+
+        let send_deadline = Instant::now() + Duration::from_secs(3);
+        let mut sent = false;
+        while !sent {
+            tick();
+            iface.poll(smoltcp_now(), device, &mut sockets);
+            let socket = sockets.get_mut::<udp::Socket>(udp_handle);
+            if socket.can_send() && socket.send_slice(&dg[..dglen], server).is_ok() {
+                sent = true;
+            } else if Instant::now() > send_deadline {
+                all_sent = false;
+                break;
+            }
+        }
+    }
+
+    // Poll briefly so the last datagram actually egresses (smoltcp is
+    // poll-driven; `send_slice` only enqueues into the TX buffer).
+    let drain_deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < drain_deadline {
+        tick();
+        iface.poll(smoltcp_now(), device, &mut sockets);
+    }
+    all_sent
 }

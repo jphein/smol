@@ -122,7 +122,15 @@ impl Menu {
             .text_color(BinaryColor::Off)
             .build();
 
-        Text::with_baseline("smol", Point::new(1, 0), title, Baseline::Top)
+        // Title row = this node's magical NOUN (its handle), derived from
+        // NODE_ID — the same identity the Clock bottom line and peer labels use,
+        // now on Home too. The noun (<= 8 chars for fantasy) fits the 6x10 title
+        // within 72 px; the full "Adjective Noun" (up to 17 chars) would not fit
+        // one line in any font here, so we show the noun consistently across the
+        // whole UI. It is static per boot, so it rides the normal `redraw` with no
+        // extra invalidation, and it needs no radio — works in EVERY build.
+        let noun = crate::net::names::name_for_id(crate::NODE_ID).1;
+        Text::with_baseline(noun, Point::new(1, 0), title, Baseline::Top)
             .draw(display)
             .ok();
 

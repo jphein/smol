@@ -104,9 +104,32 @@ const ACK_PREFIX: &[u8] = b"SMOLv1 ACK "; // + 3-digit id (the id being acked)
 /// BENCH mode, on top of the normal HELLO/ACK handshake, so the LED path is
 /// untouched. See [`RadioManager::broadcast_beacon`].
 const BEACON_PREFIX: &[u8] = b"SMOLv1 BEACON "; // + "NNN SSSSS EEEEE"
+/// Mesh time-sync tag: `"SMOLv1 TIME "` + 3-digit id + `" "` + 10-digit Unix
+/// time + `" "` + 10-digit `synced_at`. 10 digits spans the full u32 range
+/// (max 4_294_967_295), fixed-width and sniffer-readable — the same discipline
+/// as BEACON. A *separate* frame from HELLO on purpose: the LED handshake wire
+/// format is hardware-verified and must not change. Broadcast on the same ~2 s
+/// tick as HELLO (see `main`). See [`RadioManager::broadcast_time`].
+///
+/// SECURITY: ESP-NOW here is unauthenticated and unencrypted, so ANY device on
+/// the channel can inject a TIME frame with an arbitrary, far-future
+/// `synced_at` and thereby hijack every mesh clock. Acceptable for a hobby mesh
+/// on a private fixed channel; harden with a signed payload or an ESP-NOW LMK
+/// if it ever matters. Documented, not defended.
+const TIME_PREFIX: &[u8] = b"SMOLv1 TIME "; // + "NNN UUUUUUUUUU SSSSSSSSSS"
+/// Relay-bridge tags (see the "Relay bridge" section below). RELAY carries a
+/// fragment of a leaf's telemetry uplink; RELAYACK is the gateway's per-message
+/// received-fragment bitmap so the leaf can retransmit gaps. Distinct tags to
+/// keep the SMOLv1 namespace clean for the in-flight MMO-snake frames (issue #5).
+/// The trailing space on RELAY disambiguates it from RELAYACK at parse time
+/// (`"SMOLv1 RELAY "[12]` is ' ' where RELAYACK has 'A'), so match order is moot.
+const RELAY_PREFIX: &[u8] = b"SMOLv1 RELAY "; // + "NNN MMMMM F C " + chunk
+const RELAYACK_PREFIX: &[u8] = b"SMOLv1 RELAYACK "; // + "MMMMM BBB"
 
-/// Parsed inbound frame.
-enum Frame {
+/// Parsed inbound frame. The `'a` borrows the RX buffer for `Relay`'s payload
+/// chunk (copied out immediately in `service`); every other variant carries only
+/// copied scalars, so `'a` is used by exactly one variant — which is allowed.
+enum Frame<'a> {
     /// A peer HELLO beacon (LED handshake); carries the sender's id.
     Hello(u8),
     /// An acknowledgement (LED handshake); carries the id of the unit acked.
@@ -115,6 +138,24 @@ enum Frame {
     /// of OUR seqs the sender had heard when it sent this — an echo_seq that
     /// matches a seq we recently sent lets us compute round-trip time.
     Beacon { seq: u32, echo: u32 },
+    /// A mesh time offer: the peer's current Unix-time estimate plus the
+    /// `synced_at` that time descends from (the Unix instant of the peer's last
+    /// authoritative NTP sync; 0 = never synced). `main` adopts it iff
+    /// `synced_at` is strictly newer than ours — see `main::should_adopt`.
+    Time { unix: u32, synced_at: u32 },
+    /// One fragment of a leaf's relay-uplink telemetry: sender id, per-source
+    /// rolling `msgid`, fragment index/count, and up to `RELAY_CHUNK` payload
+    /// bytes. `chunk` borrows the RX buffer. See the "Relay bridge" section.
+    Relay {
+        src_id: u8,
+        msgid: u16,
+        frag: u8,
+        count: u8,
+        chunk: &'a [u8],
+    },
+    /// A gateway's acknowledgement of a relay message: the `msgid` and the u8
+    /// bitmap of fragments received so far, so the leaf resends only the gaps.
+    RelayAck { msgid: u16, bitmap: u8 },
 }
 
 /// Tracks the two timestamps that define the peer link state. Monotonic ms
@@ -151,6 +192,48 @@ impl PeerTracker {
             LedState::PeerDetected
         } else {
             LedState::Idle
+        }
+    }
+}
+
+// =========================================================================
+// Mesh time sync (inherited absolute sync-timestamp — see main::should_adopt).
+// =========================================================================
+//
+// Each node tracks `synced_at` = the Unix time at which its own clock was last
+// set AUTHORITATIVELY (NTP at boot, or inherited on adoption). It advertises
+// `(current_unix_estimate, synced_at)` in a TIME frame and adopts a peer's
+// offer IFF `peer.synced_at > my.synced_at` (strict), inheriting the peer's
+// `synced_at` rather than "now". Freshness therefore travels WITH the time, so
+// no chain of adoptions can inflate a `synced_at` beyond the origin NTP node's
+// — the mesh converges and stops swapping (loop-free). A never-synced node
+// (`synced_at == 0`) adopts from anyone real; two never-synced nodes ignore
+// each other (0 is not strictly > 0), so free-runners never fight.
+//
+// This tracker only BUFFERS the best (freshest) offer heard since `main` last
+// took it; the adopt DECISION and the clock re-anchor live in `main`, keeping
+// this module free of clock-representation knowledge (the single-radio realities
+// documented at the top of the file are already enough for one module to own).
+
+/// Buffers the freshest peer TIME offer seen since the last
+/// [`RadioManager::take_time_offer`]. Mirrors the small-tracker pattern of
+/// [`PeerTracker`]/[`BenchTracker`].
+struct TimeTracker {
+    /// The peer's advertised current-time estimate (Unix seconds) from the best
+    /// offer buffered so far.
+    best_unix: u32,
+    /// That offer's `synced_at` — the freshness key the adopt decision compares.
+    best_synced_at: u32,
+    /// Whether an un-taken offer is currently buffered.
+    have: bool,
+}
+
+impl TimeTracker {
+    const fn new() -> Self {
+        Self {
+            best_unix: 0,
+            best_synced_at: 0,
+            have: false,
         }
     }
 }
@@ -271,6 +354,325 @@ pub struct BenchStats {
     pub link: LedState,
 }
 
+// =========================================================================
+// Relay bridge (ESP-NOW -> internet telemetry, single hop).
+// =========================================================================
+//
+// Spec: scratch/smol/relay-bridge-spec.md; feasibility: nebula-espnow-gateway.md.
+//
+// A LEAF (no WiFi at boot) periodically fragments its short telemetry into
+// `SMOLv1 RELAY` frames and BROADCASTS them. A GATEWAY (associated at boot)
+// reassembles keyed by (src MAC, msgid), unicasts a `SMOLv1 RELAYACK` bitmap so
+// the leaf retransmits only missing fragments (bounded to RELAY_MAX_TRIES),
+// buffers completed messages, and every RELAY_FLUSH_INTERVAL_MS runs a WiFi burst
+// to UDP them to a fixed collector, then returns to ESP-NOW ch6.
+//
+// SINGLE-RADIO AIRTIME COST: a flush burst tunes the one PHY to the AP's channel,
+// so the mesh is DEAF on ch6 for the ~seconds it lasts (the documented one-radio
+// trade-off — see the module header). Flushes are tens of seconds apart and
+// telemetry is loss-tolerant, so this is acceptable; retransmit rides over it.
+//
+// HONESTY (compile-verified only): the flush uses the PROVEN TIME-SHARE burst
+// (disconnect -> associate -> UDP -> re-pin ch6), the same pattern boot NTP uses,
+// NOT true concurrent COEXIST. Per Nebula, STA-associated + ESP-NOW RX
+// reliability / DTIM latency under real COEXIST is UNVERIFIED on this board, so we
+// deliberately pause RX during the burst rather than depend on it.
+//
+// SECURITY: like every SMOLv1 frame, RELAY is unauthenticated + unencrypted — any
+// on-channel device can inject telemetry attributed to any src id, or spoof a
+// RELAYACK. Fine for a hobby mesh; sign or LMK-encrypt if it ever matters.
+//
+// OUT OF SCOPE this run (documented stubs, NOT implemented):
+//   * DOWNLINK (collector -> leaf): needs a poll/queue on the gateway + unicast
+//     fragmentation back to the leaf MAC. `service` already has the leaf MAC on
+//     every RX, and `send_to` already unicasts, so the hook exists — but the
+//     collector-side queue/protocol is unspecified, so it is deferred.
+//   * MULTI-HOP (leaf -> relay -> ... -> gateway): needs a next-hop/TTL routing
+//     header + a loop-prevention seen-set + a shared-channel invariant across
+//     every node (+200-400 LOC). This is single-hop uplink only.
+
+/// Max telemetry payload per RELAY fragment (bytes). On the wire a frame is the
+/// fixed 27-byte ASCII header + this, comfortably under the 250 B ESP-NOW limit.
+const RELAY_CHUNK: usize = 64;
+/// Max fragments per message. Kept <= 8 so the received-fragment bitmap is a
+/// single `u8`; => max reassembled telemetry = CHUNK * FRAGS bytes.
+const RELAY_MAX_FRAGS: usize = 4;
+/// Max reassembled message length (bytes) = 256. A leaf truncates telemetry to
+/// this (documented) — this is SHORT-telemetry relay, not bulk transfer.
+const RELAY_MAX_MSG: usize = RELAY_CHUNK * RELAY_MAX_FRAGS;
+/// Max RELAY frame length on the wire (header + full chunk); sizes stack buffers.
+const RELAY_FRAME_MAX: usize = 27 + RELAY_CHUNK;
+/// Max RELAYACK frame length ("SMOLv1 RELAYACK " + "MMMMM BBB" = 25); rounded up.
+const RELAYACK_FRAME_MAX: usize = 32;
+/// Concurrent (src_mac, msgid) reassemblies a gateway tracks. Bounded table.
+const REASSEMBLY_SLOTS: usize = 3;
+/// Completed messages a gateway buffers between flushes. Bounded queue.
+const GATEWAY_QUEUE: usize = 4;
+/// Leaf retransmit ceiling per message (telemetry is loss-tolerant).
+const RELAY_MAX_TRIES: u8 = 3;
+/// Drop a partial reassembly whose newest fragment is older than this.
+const RELAY_STALE_MS: u64 = 10_000;
+/// Leaf re-emits fresh telemetry this often.
+const RELAY_EMIT_INTERVAL_MS: u64 = 15_000;
+/// Leaf waits this long for a fuller RELAYACK before retransmitting the gaps.
+const RELAY_RETX_MS: u64 = 2_000;
+/// Gateway flushes its queue this often (if non-empty), or at once when full.
+const RELAY_FLUSH_INTERVAL_MS: u64 = 30_000;
+
+/// Low `count` bits set — the "all fragments received" mask. `count` is validated
+/// 1..=RELAY_MAX_FRAGS (<= 8) before this is used, so the shift never overflows.
+#[inline]
+fn frag_mask(count: u8) -> u8 {
+    if count >= 8 {
+        0xFF
+    } else {
+        (1u8 << count) - 1
+    }
+}
+
+/// True once every fragment `0..count` of a message has been received.
+#[inline]
+fn all_received(got: u8, count: u8) -> bool {
+    got & frag_mask(count) == frag_mask(count)
+}
+
+/// One in-progress gateway reassembly, keyed by (src_mac, msgid). `Copy` only so
+/// the fixed-size table can be array-initialised in a `const fn`.
+#[derive(Clone, Copy)]
+struct ReasmSlot {
+    used: bool,
+    src_mac: [u8; 6],
+    src_id: u8,
+    msgid: u16,
+    count: u8,
+    got: u8,          // received-fragment bitmap
+    total_len: usize, // set once the FINAL fragment arrives; 0 until then
+    last_ms: u64,     // newest-fragment time, for staleness eviction
+    buf: [u8; RELAY_MAX_MSG],
+}
+
+impl ReasmSlot {
+    const fn new() -> Self {
+        Self {
+            used: false,
+            src_mac: [0; 6],
+            src_id: 0,
+            msgid: 0,
+            count: 0,
+            got: 0,
+            total_len: 0,
+            last_ms: 0,
+            buf: [0; RELAY_MAX_MSG],
+        }
+    }
+}
+
+/// One completed message buffered for the next uplink flush.
+#[derive(Clone, Copy)]
+struct GwMsg {
+    used: bool,
+    src_id: u8,
+    len: usize,
+    buf: [u8; RELAY_MAX_MSG],
+}
+
+impl GwMsg {
+    const fn new() -> Self {
+        Self {
+            used: false,
+            src_id: 0,
+            len: 0,
+            buf: [0; RELAY_MAX_MSG],
+        }
+    }
+}
+
+/// A leaf's single outstanding outbound message (its own telemetry), retained so
+/// it can retransmit whichever fragments the gateway's RELAYACK still shows as
+/// missing. One at a time — a fresh emit supersedes the previous.
+#[derive(Clone, Copy)]
+struct RelayTx {
+    active: bool,
+    msgid: u16,
+    count: u8,
+    acked: u8, // fragments the gateway has confirmed (from RELAYACK)
+    tries: u8,
+    total_len: usize,
+    last_ms: u64,
+    buf: [u8; RELAY_MAX_MSG],
+}
+
+impl RelayTx {
+    const fn new() -> Self {
+        Self {
+            active: false,
+            msgid: 0,
+            count: 0,
+            acked: 0,
+            tries: 0,
+            total_len: 0,
+            last_ms: 0,
+            buf: [0; RELAY_MAX_MSG],
+        }
+    }
+}
+
+/// All relay-bridge state. A node is a leaf OR a gateway (decided at boot from
+/// whether the NTP burst associated); it carries both roles' fixed-capacity state
+/// but only exercises one. Nothing here grows on the heap.
+struct Relay {
+    is_gateway: bool,
+    // --- leaf (uplink source) ---
+    next_msgid: u16,
+    tx: RelayTx,
+    last_emit_ms: u64,
+    // --- gateway (reassemble + buffer + flush) ---
+    reasm: [ReasmSlot; REASSEMBLY_SLOTS],
+    queue: [GwMsg; GATEWAY_QUEUE],
+    last_flush_ms: u64,
+}
+
+impl Relay {
+    const fn new() -> Self {
+        Self {
+            is_gateway: false,
+            next_msgid: 0,
+            tx: RelayTx::new(),
+            last_emit_ms: 0,
+            reasm: [ReasmSlot::new(); REASSEMBLY_SLOTS],
+            queue: [GwMsg::new(); GATEWAY_QUEUE],
+            last_flush_ms: 0,
+        }
+    }
+
+    /// Gateway: accept one inbound fragment; returns (current bitmap, complete).
+    /// `chunk` is copied in immediately (no borrow kept). On completion the
+    /// assembled message is moved into the flush queue and the slot is freed.
+    fn accept(
+        &mut self,
+        src_mac: [u8; 6],
+        hdr: (u8, u16, u8, u8),
+        chunk: &[u8],
+        now: u64,
+    ) -> (u8, bool) {
+        // `hdr` = (src_id, msgid, frag, count) straight off the RELAY frame —
+        // bundled into a tuple to keep the argument count reasonable.
+        let (src_id, msgid, frag, count) = hdr;
+        // Reject anything outside our caps; a bad frame just reads as "nothing".
+        if count == 0
+            || count as usize > RELAY_MAX_FRAGS
+            || frag >= count
+            || chunk.len() > RELAY_CHUNK
+        {
+            return (0, false);
+        }
+        let Some(idx) = self.slot_for(&src_mac, msgid, now) else {
+            // Table full of fresh (non-stale) other messages: drop (bounded).
+            return (0, false);
+        };
+        {
+            let s = &mut self.reasm[idx];
+            s.src_id = src_id;
+            s.count = count;
+            let off = frag as usize * RELAY_CHUNK;
+            let end = off + chunk.len();
+            s.buf[off..end].copy_from_slice(chunk);
+            s.got |= 1u8 << frag;
+            if frag == count - 1 {
+                s.total_len = end; // the final fragment fixes the message length
+            }
+            s.last_ms = now;
+        }
+        let (got, complete, total_len) = {
+            let s = &self.reasm[idx];
+            (s.got, all_received(s.got, s.count), s.total_len)
+        };
+        if complete {
+            self.enqueue(idx, total_len);
+            self.reasm[idx].used = false; // free the slot
+        }
+        (got, complete)
+    }
+
+    /// Find the slot for (src_mac, msgid): an existing match, else a free slot,
+    /// else the stalest slot to evict. `None` only if every slot holds a fresh
+    /// (non-stale) different message — then the fragment is dropped.
+    fn slot_for(&mut self, src_mac: &[u8; 6], msgid: u16, now: u64) -> Option<usize> {
+        for (i, s) in self.reasm.iter().enumerate() {
+            if s.used && s.msgid == msgid && &s.src_mac == src_mac {
+                return Some(i);
+            }
+        }
+        let mut victim: Option<usize> = None;
+        let mut oldest = u64::MAX;
+        for (i, s) in self.reasm.iter().enumerate() {
+            if !s.used {
+                victim = Some(i);
+                break;
+            }
+            if now.saturating_sub(s.last_ms) >= RELAY_STALE_MS && s.last_ms < oldest {
+                oldest = s.last_ms;
+                victim = Some(i);
+            }
+        }
+        let i = victim?;
+        self.reasm[i] = ReasmSlot::new();
+        self.reasm[i].used = true;
+        self.reasm[i].src_mac = *src_mac;
+        self.reasm[i].msgid = msgid;
+        Some(i)
+    }
+
+    /// Move a completed reassembly into a free flush-queue slot (drop if full —
+    /// bounded, loss-tolerant). Copies the buffer out first to avoid aliasing the
+    /// reasm and queue arrays at once.
+    fn enqueue(&mut self, reasm_idx: usize, total_len: usize) {
+        let len = total_len.min(RELAY_MAX_MSG);
+        let src_id = self.reasm[reasm_idx].src_id;
+        let src_buf = self.reasm[reasm_idx].buf; // [u8; RELAY_MAX_MSG] is Copy
+        let Some(qi) = self.queue.iter().position(|q| !q.used) else {
+            log::warn!("smol: relay queue full; dropping a reassembled telemetry msg");
+            return;
+        };
+        let q = &mut self.queue[qi];
+        q.used = true;
+        q.src_id = src_id;
+        q.len = len;
+        q.buf[..len].copy_from_slice(&src_buf[..len]);
+    }
+
+    /// Leaf: stage a fresh telemetry message for (fragmented) broadcast; returns
+    /// the fragment count to send (0 if empty). Truncates to RELAY_MAX_MSG.
+    fn stage_tx(&mut self, telemetry: &[u8], now: u64) -> u8 {
+        let len = telemetry.len().min(RELAY_MAX_MSG);
+        if len == 0 {
+            return 0;
+        }
+        let count = len.div_ceil(RELAY_CHUNK) as u8; // 1..=RELAY_MAX_FRAGS
+        self.tx = RelayTx::new();
+        self.tx.active = true;
+        self.tx.msgid = self.next_msgid;
+        self.next_msgid = self.next_msgid.wrapping_add(1);
+        self.tx.count = count;
+        self.tx.total_len = len;
+        self.tx.tries = 1;
+        self.tx.last_ms = now;
+        self.tx.buf[..len].copy_from_slice(&telemetry[..len]);
+        count
+    }
+
+    /// Leaf: fold in a gateway's cumulative RELAYACK bitmap; deactivate once every
+    /// fragment is confirmed. No-op unless it matches our outstanding message.
+    fn apply_ack(&mut self, msgid: u16, bitmap: u8) {
+        if self.tx.active && self.tx.msgid == msgid {
+            self.tx.acked |= bitmap;
+            if all_received(self.tx.acked, self.tx.count) {
+                self.tx.active = false;
+            }
+        }
+    }
+}
+
 /// Which stack the single radio is currently servicing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -292,8 +694,10 @@ pub struct RadioManager {
     controller: WifiController<'static>,
     esp_now: EspNow<'static>,
     /// The WiFi STA device, handed out once by esp-wifi's `Interfaces`. Held as
-    /// an `Option` so the NTP burst can drive it, then `take()` + drop it to
-    /// free the smoltcp stack before we time-share the radio to ESP-NOW.
+    /// an `Option` and BORROWED (never dropped) so it survives the boot NTP burst
+    /// and is available again for periodic relay flushes (`flush_telemetry`). The
+    /// smoltcp stack is built/dropped inside each burst, so between bursts this is
+    /// just an idle handle that doesn't contend with ESP-NOW on ch6.
     sta: Option<esp_wifi::wifi::WifiDevice<'static>>,
     /// Kept for the SNTP ephemeral-port seed during the burst.
     rng: Rng,
@@ -305,6 +709,10 @@ pub struct RadioManager {
     peers: PeerTracker,
     /// BENCH link statistics (only exercised while in BENCH mode).
     bench: BenchTracker,
+    /// Freshest pending mesh time offer (see the mesh-time section above).
+    time: TimeTracker,
+    /// Relay-bridge state (leaf uplink + gateway reassembly/flush; bounded).
+    relay: Relay,
 }
 
 /// Monotonic milliseconds since boot — the single time base for both the
@@ -344,22 +752,25 @@ impl RadioManager {
             id,
             peers: PeerTracker::new(),
             bench: BenchTracker::new(),
+            time: TimeTracker::new(),
+            relay: Relay::new(),
         })
     }
 
     /// Run the real WiFi -> DHCP -> SNTP burst using the STA device, driving the
     /// caller's `tick` closure throughout (the `espnow` build fast-blinks the
     /// blue LED so "WiFi/NTP in progress" is visible). Returns the synced Unix
-    /// time, or `None` on any timeout. Consumes the STA device (drops it after)
-    /// so the radio is free to time-share to ESP-NOW next.
+    /// time, or `None` on any timeout.
+    ///
+    /// We now BORROW the STA device instead of `take()`+drop: keeping it alive
+    /// lets a gateway re-associate for periodic relay flushes (`flush_telemetry`,
+    /// which resurrects the `switch(Mode::WifiSta)` arm). The smoltcp interface is
+    /// built and dropped INSIDE `run_ntp_burst`, so no live stack lingers to
+    /// contend with ESP-NOW between bursts.
     pub fn burst_ntp(&mut self, tick: &mut dyn FnMut()) -> Option<u32> {
-        let mut sta = self.sta.take()?;
-        let synced =
-            crate::net::wifi::run_ntp_burst(&mut self.controller, &mut sta, self.rng, tick);
-        // `sta` (the STA device + its smoltcp stack) falls out of scope here,
-        // releasing the WiFi datapath; the ESP-NOW handle stays live for the
-        // clock loop. We took it out of `self.sta` so it can't be reused.
-        synced
+        // Disjoint field borrows: &mut self.controller, &mut *sta, Copy of rng.
+        let sta = self.sta.as_mut()?;
+        crate::net::wifi::run_ntp_burst(&mut self.controller, sta, self.rng, tick)
     }
 
     /// Current radio mode. Part of the public API (a caller may inspect which
@@ -436,6 +847,168 @@ impl RadioManager {
         self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
     }
 
+    // --- Mesh time sync (see the TimeTracker section + main::should_adopt) ---
+
+    /// Broadcast one TIME frame: our current Unix-time estimate + the `synced_at`
+    /// it descends from. `main` calls this on the SAME ~2 s tick as HELLO so a
+    /// peer whose sync is older can adopt ours. Fixed-width ASCII like BEACON;
+    /// safe in either radio mode (rides whichever channel is currently tuned).
+    pub fn broadcast_time(&mut self, unix: u32, synced_at: u32) {
+        // 37 bytes on the wire; 40 leaves the same small headroom BEACON uses.
+        let mut msg = [0u8; 40];
+        let len = encode_time(self.id, unix, synced_at, &mut msg);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
+    }
+
+    /// Take the freshest buffered peer TIME offer, clearing it so a later call
+    /// only sees offers that arrive afterward. Returns `(peer_unix,
+    /// peer_synced_at)`; `main` decides via `should_adopt` whether to re-anchor.
+    pub fn take_time_offer(&mut self) -> Option<(u32, u32)> {
+        if self.time.have {
+            self.time.have = false;
+            Some((self.time.best_unix, self.time.best_synced_at))
+        } else {
+            None
+        }
+    }
+
+    // --- Relay bridge (see the "Relay bridge" section) -----------------------
+
+    /// Leaf only: is it time to emit a fresh telemetry message? Always false on a
+    /// gateway (gateways relay leaves' telemetry, they don't originate RELAY).
+    pub fn relay_emit_due(&self, now: u64) -> bool {
+        !self.relay.is_gateway
+            && (self.relay.last_emit_ms == 0
+                || now.saturating_sub(self.relay.last_emit_ms) >= RELAY_EMIT_INTERVAL_MS)
+    }
+
+    /// Leaf only: fragment `telemetry` into RELAY frames and BROADCAST them all,
+    /// staging the message for bounded retransmit. No-op on a gateway.
+    pub fn relay_emit(&mut self, telemetry: &[u8], now: u64) {
+        if self.relay.is_gateway {
+            return;
+        }
+        let count = self.relay.stage_tx(telemetry, now);
+        if count == 0 {
+            return;
+        }
+        self.relay.last_emit_ms = now;
+        let (msgid, total_len) = (self.relay.tx.msgid, self.relay.tx.total_len);
+        for frag in 0..count {
+            let off = frag as usize * RELAY_CHUNK;
+            let end = (off + RELAY_CHUNK).min(total_len);
+            // Encode into a LOCAL frame buffer (copying the chunk out of tx.buf)
+            // BEFORE send_to, so no borrow of self.relay is held across the
+            // &mut-self send call.
+            let mut fb = [0u8; RELAY_FRAME_MAX];
+            let len = encode_relay(self.id, msgid, frag, count, &self.relay.tx.buf[off..end], &mut fb);
+            self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+        }
+        log::info!("smol: relay emit msgid {} ({} frag)", msgid, count);
+    }
+
+    /// Leaf only: retransmit the fragments still unacked, bounded to
+    /// RELAY_MAX_TRIES. No-op once fully acked, out of tries, too soon since the
+    /// last send, or on a gateway.
+    pub fn relay_retransmit(&mut self, now: u64) {
+        if self.relay.is_gateway || !self.relay.tx.active {
+            return;
+        }
+        if all_received(self.relay.tx.acked, self.relay.tx.count) {
+            self.relay.tx.active = false;
+            return;
+        }
+        if self.relay.tx.tries >= RELAY_MAX_TRIES {
+            self.relay.tx.active = false; // give up — telemetry is loss-tolerant
+            return;
+        }
+        if now.saturating_sub(self.relay.tx.last_ms) < RELAY_RETX_MS {
+            return; // give the gateway time to ACK before resending
+        }
+        let (msgid, count, acked, total_len) = (
+            self.relay.tx.msgid,
+            self.relay.tx.count,
+            self.relay.tx.acked,
+            self.relay.tx.total_len,
+        );
+        for frag in 0..count {
+            if acked & (1u8 << frag) != 0 {
+                continue; // already confirmed
+            }
+            let off = frag as usize * RELAY_CHUNK;
+            let end = (off + RELAY_CHUNK).min(total_len);
+            let mut fb = [0u8; RELAY_FRAME_MAX];
+            let len = encode_relay(self.id, msgid, frag, count, &self.relay.tx.buf[off..end], &mut fb);
+            self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+        }
+        self.relay.tx.tries += 1;
+        self.relay.tx.last_ms = now;
+    }
+
+    /// Gateway only: are there buffered messages due for a flush burst (queue full,
+    /// or the flush interval has elapsed with a non-empty queue)?
+    pub fn relay_ready_to_flush(&self, now: u64) -> bool {
+        if !self.relay.is_gateway {
+            return false;
+        }
+        let pending = self.relay.queue.iter().filter(|q| q.used).count();
+        if pending == 0 {
+            return false;
+        }
+        pending >= GATEWAY_QUEUE
+            || self.relay.last_flush_ms == 0
+            || now.saturating_sub(self.relay.last_flush_ms) >= RELAY_FLUSH_INTERVAL_MS
+    }
+
+    /// Gateway only: run a WiFi burst and UDP each buffered message to the fixed
+    /// collector as `"<src_id> <telemetry>"`, then return to ESP-NOW ch6. This
+    /// EXERCISES the (formerly dead) `switch(Mode::WifiSta)` arm. The mesh is deaf
+    /// on ch6 for the burst's duration (single radio); `tick` fast-blinks the LED
+    /// like the boot NTP burst. Clears the queue only on success. Returns success.
+    pub fn flush_telemetry(&mut self, tick: &mut dyn FnMut()) -> bool {
+        if !self.relay.is_gateway {
+            return false;
+        }
+        log::info!("smol: relay flush -> WiFi burst (mesh deaf on ch6 during it)");
+        // Resurrected COEXIST arm: re-associate to the AP (retunes the PHY off
+        // ch6). run_udp_flush waits for the association, so we only trigger it.
+        let _ = self.switch(Mode::WifiSta);
+        let sta = self.sta.as_mut();
+        let ok = match sta {
+            None => false,
+            Some(sta) => {
+                // Gather queued messages as (src_id, &payload). Disjoint borrows:
+                // &self.relay (via items), &mut self.controller, &mut *sta.
+                let empty: &[u8] = &[];
+                let mut items: [(u8, &[u8]); GATEWAY_QUEUE] = [(0u8, empty); GATEWAY_QUEUE];
+                let mut n = 0;
+                for q in self.relay.queue.iter() {
+                    if q.used {
+                        items[n] = (q.src_id, &q.buf[..q.len]);
+                        n += 1;
+                    }
+                }
+                crate::net::wifi::run_udp_flush(
+                    &mut self.controller,
+                    sta,
+                    self.rng,
+                    &items[..n],
+                    tick,
+                )
+            }
+        };
+        // Back to deterministic ESP-NOW ch6 regardless of flush outcome.
+        let _ = self.switch(Mode::EspNow);
+        if ok {
+            for q in self.relay.queue.iter_mut() {
+                q.used = false;
+            }
+            self.relay.last_flush_ms = now_ms();
+            log::info!("smol: relay flush done");
+        }
+        ok
+    }
+
     /// Snapshot the current BENCH link stats for the UI. `fps` is measured by the
     /// render loop (this module can't see frame timing), so the caller passes it
     /// in and it is not part of this snapshot. Also refreshes the per-second
@@ -509,7 +1082,12 @@ impl RadioManager {
                     let len = encode_id_frame(ACK_PREFIX, peer_id, &mut ack);
                     self.send_to(&src, &ack[..len]);
 
-                    label = Some(alloc::format!("peer {:03}", peer_id));
+                    // Show the PEER's magical noun, derived LOCALLY from the id in
+                    // the frame (names never travel on the wire). Bare noun (no
+                    // "peer " prefix) — ≤ 8 chars for fantasy, always fits the
+                    // 72 px OLED line, and the blue LED already signals "a peer".
+                    let noun = crate::net::names::name_for_id(peer_id).1;
+                    label = Some(alloc::string::String::from(noun));
                 }
                 Some(Frame::Ack(acked_id)) => {
                     // An ACK addressed to US proves a peer received our HELLO ->
@@ -565,6 +1143,58 @@ impl RadioManager {
                         });
                     }
                     label = Some(alloc::format!("bench seq {}", seq));
+                }
+                Some(Frame::Time { unix, synced_at }) => {
+                    // Buffer the FRESHEST offer (highest synced_at) seen since
+                    // `main` last took one, so a burst of frames collapses to the
+                    // single best candidate. `main` owns the adopt decision + the
+                    // clock re-anchor (see main::should_adopt); we only surface
+                    // the offer here — this module never touches the clock.
+                    if !self.time.have || synced_at > self.time.best_synced_at {
+                        self.time.best_unix = unix;
+                        self.time.best_synced_at = synced_at;
+                        self.time.have = true;
+                    }
+                    // Hearing a TIME frame also proves the peer is audible, so it
+                    // counts toward the LED "detected" state exactly like a HELLO
+                    // or a BEACON does.
+                    self.peers.last_hello_ms = now;
+                    label = Some(alloc::format!("time {}", synced_at));
+                }
+                Some(Frame::Relay { src_id, msgid, frag, count, chunk }) => {
+                    // A RELAY fragment proves we can hear the peer (LED detected).
+                    self.peers.last_hello_ms = now;
+                    // Only a GATEWAY reassembles + acks; a leaf ignores RELAY so
+                    // work + memory stay with the role that needs them.
+                    if self.relay.is_gateway {
+                        let (bitmap, complete) =
+                            self.relay.accept(src, (src_id, msgid, frag, count), chunk, now);
+                        // Register the source so the RELAYACK can be unicast back
+                        // (same pattern as the HELLO -> ACK reply).
+                        if !self.esp_now.peer_exists(&src) {
+                            let _ = self.esp_now.add_peer(PeerInfo {
+                                interface: EspNowWifiInterface::Sta,
+                                peer_address: src,
+                                lmk: None,
+                                channel: None,
+                                encrypt: false,
+                            });
+                        }
+                        let mut ack = [0u8; RELAYACK_FRAME_MAX];
+                        let len = encode_relayack(msgid, bitmap, &mut ack);
+                        self.send_to(&src, &ack[..len]);
+                        label = Some(if complete {
+                            alloc::format!("relay {:03} ok", src_id)
+                        } else {
+                            alloc::format!("relay {:03} {}/{}", src_id, bitmap.count_ones(), count)
+                        });
+                    }
+                }
+                Some(Frame::RelayAck { msgid, bitmap }) => {
+                    // Leaf: the gateway confirmed these fragments — stop resending
+                    // them. On a gateway (no outstanding tx) this is a no-op.
+                    self.relay.apply_ack(msgid, bitmap);
+                    label = Some(alloc::format!("ack {:05}", msgid));
                 }
                 None => {
                     // Unrecognised payload (other ESP-NOW traffic on-channel);
@@ -625,8 +1255,42 @@ fn write_u5(v: u32, out: &mut [u8]) {
     out[4] = b'0' + (v % 10) as u8;
 }
 
+/// Encode a TIME frame `"SMOLv1 TIME NNN UUUUUUUUUU SSSSSSSSSS"` into `out`;
+/// returns length (37). `unix`/`synced_at` are 10-digit zero-padded decimals —
+/// 10 digits spans the whole u32 range, so (unlike [`write_u5`]) no modulo clamp
+/// is needed. Pure + fixed-width so a serial sniffer and a host unit test can
+/// both read it. Mirrors [`encode_beacon`].
+fn encode_time(id: u8, unix: u32, synced_at: u32, out: &mut [u8]) -> usize {
+    let mut n = 0;
+    out[..TIME_PREFIX.len()].copy_from_slice(TIME_PREFIX);
+    n += TIME_PREFIX.len();
+    out[n] = b'0' + (id / 100) % 10;
+    out[n + 1] = b'0' + (id / 10) % 10;
+    out[n + 2] = b'0' + id % 10;
+    n += 3;
+    out[n] = b' ';
+    n += 1;
+    write_u10(unix, &mut out[n..]);
+    n += 10;
+    out[n] = b' ';
+    n += 1;
+    write_u10(synced_at, &mut out[n..]);
+    n += 10;
+    n
+}
+
+/// Write a 10-digit zero-padded decimal into `out[..10]`. 10 digits holds every
+/// u32 (max 4_294_967_295), so no clamp is needed — the full value round-trips
+/// through [`parse_u10`]. Filled least-significant-digit first.
+fn write_u10(mut v: u32, out: &mut [u8]) {
+    for i in (0..10).rev() {
+        out[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+}
+
 /// Parse an inbound payload into a [`Frame`], or `None` if it isn't ours.
-fn parse_frame(data: &[u8]) -> Option<Frame> {
+fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
     if let Some(rest) = data.strip_prefix(HELLO_PREFIX) {
         return parse_id(rest).map(Frame::Hello);
     }
@@ -641,6 +1305,23 @@ fn parse_frame(data: &[u8]) -> Option<Frame> {
             return Some(Frame::Beacon { seq, echo });
         }
         return None;
+    }
+    if let Some(rest) = data.strip_prefix(TIME_PREFIX) {
+        // "NNN UUUUUUUUUU SSSSSSSSSS": id (3) space unix (10) space
+        // synced_at (10) = 25 bytes. The sender id isn't needed (freshness, not
+        // identity, drives adoption), so we skip it just as the BEACON arm does.
+        if rest.len() >= 25 {
+            let unix = parse_u10(&rest[4..14])?;
+            let synced_at = parse_u10(&rest[15..25])?;
+            return Some(Frame::Time { unix, synced_at });
+        }
+        return None;
+    }
+    if let Some((src_id, msgid, frag, count, chunk)) = parse_relay(data) {
+        return Some(Frame::Relay { src_id, msgid, frag, count, chunk });
+    }
+    if let Some((msgid, bitmap)) = parse_relayack(data) {
+        return Some(Frame::RelayAck { msgid, bitmap });
     }
     None
 }
@@ -675,6 +1356,105 @@ fn parse_u5(rest: &[u8]) -> Option<u32> {
     Some(val)
 }
 
+/// Parse exactly 10 ASCII digits into a u32. Accumulates in u64 and range-checks
+/// on the way out, so a garbled/hostile 10-digit field that exceeds u32::MAX
+/// (e.g. "9999999999") is rejected as `None` rather than silently wrapping —
+/// stricter than [`parse_u5`], where 5 digits always fit in u32.
+fn parse_u10(rest: &[u8]) -> Option<u32> {
+    if rest.len() < 10 {
+        return None;
+    }
+    let mut val: u64 = 0;
+    for &b in &rest[..10] {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val * 10 + (b - b'0') as u64;
+    }
+    u32::try_from(val).ok()
+}
+
+// --- Relay wire codec (pure + fixed-width; host-unit-testable) --------------
+
+/// Encode a RELAY fragment `"SMOLv1 RELAY NNN MMMMM F C " + <chunk>` into `out`;
+/// returns total length (27-byte header + chunk). `NNN` = src id, `MMMMM` = msgid
+/// (5-digit u16), `F`/`C` = single-digit frag index / count (count <=
+/// RELAY_MAX_FRAGS <= 9). `chunk` is truncated to `RELAY_CHUNK`. Mirrors
+/// [`encode_beacon`]'s discipline.
+fn encode_relay(src_id: u8, msgid: u16, frag: u8, count: u8, chunk: &[u8], out: &mut [u8]) -> usize {
+    let mut n = 0;
+    out[..RELAY_PREFIX.len()].copy_from_slice(RELAY_PREFIX);
+    n += RELAY_PREFIX.len();
+    out[n] = b'0' + (src_id / 100) % 10;
+    out[n + 1] = b'0' + (src_id / 10) % 10;
+    out[n + 2] = b'0' + src_id % 10;
+    n += 3;
+    out[n] = b' ';
+    n += 1;
+    write_u5(msgid as u32, &mut out[n..]);
+    n += 5;
+    out[n] = b' ';
+    n += 1;
+    out[n] = b'0' + frag;
+    n += 1;
+    out[n] = b' ';
+    n += 1;
+    out[n] = b'0' + count;
+    n += 1;
+    out[n] = b' ';
+    n += 1;
+    let len = chunk.len().min(RELAY_CHUNK);
+    out[n..n + len].copy_from_slice(&chunk[..len]);
+    n + len
+}
+
+/// Parse a RELAY frame into `(src_id, msgid, frag, count, chunk)`, or `None` if it
+/// isn't a well-formed RELAY. `chunk` borrows `data`. The caller
+/// ([`Relay::accept`]) re-validates `count`/`frag`/`chunk.len()` against its caps.
+fn parse_relay(data: &[u8]) -> Option<(u8, u16, u8, u8, &[u8])> {
+    let rest = data.strip_prefix(RELAY_PREFIX)?;
+    if rest.len() < 14 {
+        return None;
+    }
+    let src_id = parse_id(&rest[0..3])?;
+    let msgid = u16::try_from(parse_u5(&rest[4..9])?).ok()?;
+    if !rest[10].is_ascii_digit() || !rest[12].is_ascii_digit() {
+        return None;
+    }
+    let frag = rest[10] - b'0';
+    let count = rest[12] - b'0';
+    Some((src_id, msgid, frag, count, &rest[14..]))
+}
+
+/// Encode a `"SMOLv1 RELAYACK MMMMM BBB"` frame into `out`; returns length (25).
+/// `MMMMM` = msgid (5-digit), `BBB` = the 3-digit received-fragment bitmap (0..255).
+fn encode_relayack(msgid: u16, bitmap: u8, out: &mut [u8]) -> usize {
+    let mut n = 0;
+    out[..RELAYACK_PREFIX.len()].copy_from_slice(RELAYACK_PREFIX);
+    n += RELAYACK_PREFIX.len();
+    write_u5(msgid as u32, &mut out[n..]);
+    n += 5;
+    out[n] = b' ';
+    n += 1;
+    out[n] = b'0' + (bitmap / 100) % 10;
+    out[n + 1] = b'0' + (bitmap / 10) % 10;
+    out[n + 2] = b'0' + bitmap % 10;
+    n += 3;
+    n
+}
+
+/// Parse a RELAYACK frame into `(msgid, bitmap)`, or `None`. The 3-digit bitmap
+/// reuses [`parse_id`] (both are a 3-ASCII-digit `u8` in 0..=255).
+fn parse_relayack(data: &[u8]) -> Option<(u16, u8)> {
+    let rest = data.strip_prefix(RELAYACK_PREFIX)?;
+    if rest.len() < 9 {
+        return None;
+    }
+    let msgid = u16::try_from(parse_u5(&rest[0..5])?).ok()?;
+    let bitmap = parse_id(&rest[6..9])?;
+    Some((msgid, bitmap))
+}
+
 // -------------------------------------------------------------------------
 // Public flow used by `main` under `--features espnow`.
 // -------------------------------------------------------------------------
@@ -701,6 +1481,15 @@ pub fn start(p: WifiPeripherals, id: u8, led: &mut Led) -> (Option<RadioManager>
     // re-derives the fast-blink phase from the monotonic clock and pushes it to
     // the pin (non-blocking, no per-blink state).
     let synced = radio.burst_ntp(&mut || led.apply(LedState::WifiSync, now_ms()));
+
+    // Relay role: a node that reached NTP is in WiFi range, so it can be the
+    // internet GATEWAY that flushes out-of-range leaves' telemetry; a node that
+    // did not is a LEAF (it only emits RELAY). See the relay-bridge section.
+    radio.relay.is_gateway = synced.is_some();
+    log::info!(
+        "smol: relay role = {}",
+        if synced.is_some() { "GATEWAY" } else { "leaf" }
+    );
 
     // --- Hand the radio to ESP-NOW on a fixed channel (TIME-SHARE) -------
     let _ = radio.switch(Mode::EspNow);
