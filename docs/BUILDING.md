@@ -64,7 +64,7 @@ Block Digger needs the Bluepad32 core: `esp32-bluepad32:esp32:esp32c3:CDCOnBoot=
 ### Rust unified firmware (`rust/clock/`)
 ```bash
 cd rust/clock
-cp src/board.rs.example   src/board.rs        # then set NODE_ID (per board) — git-ignored, ALL builds (#19)
+cp src/board.rs.example   src/board.rs        # then set NODE_ID + DEFAULT_APP/DEFAULT_PAGE (per board) — git-ignored, ALL builds (#18/#19)
 cp src/secrets.rs.example src/secrets.rs      # then edit WIFI_SSID / WIFI_PASS — git-ignored, wifi/espnow only
 ESP_LOG=info cargo build --release --features espnow   # full build: Clock + Snake + Bench
 espflash flash --port /dev/ttyACM0 target/riscv32imc-unknown-none-elf/release/clock

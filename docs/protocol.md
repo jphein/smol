@@ -84,6 +84,7 @@ stays well under 250 B.
 | [BEACON](#beacon--bench-link-stats) | `SMOLv1 BEACON ` | 29 | broadcast | ~2 s (Bench) | espnow | 🟡 |
 | [TIME](#time--mesh-time-sync) | `SMOLv1 TIME ` | 37 | broadcast | ~2 s | espnow | 🟢 |
 | [BATT](#batt--ha-battery-snapshot) | `SMOLv1 BATT ` | ≤108 | broadcast | on-recv + periodic | espnow | 🟡 |
+| [GRID](#grid--ha-grid-power-snapshot-16) | `SMOLv1 GRID ` | ≤108 | broadcast | on-recv + periodic | espnow | 🟡 |
 | [RELAY](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAY ` | ≤91 | broadcast | ~15 s (leaf) | espnow | 🟢 |
 | [RELAYACK](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAYACK ` | 25 | unicast | reactive | espnow | 🟢 |
 | [SNK](#snk--mmo-mesh-snake) | `SMOLv1 SNK ` | 18 | broadcast | 5 Hz jittered | espnow | 🟢 |
@@ -218,17 +219,30 @@ Clock app.)
 > **Payload framing (LOCKED — spec v2 "Pinned byte-layouts", team-lead ruling
 > 2026-07-08).** After the tag, the frame carries the **verbatim** retained
 > `smol/display/batt` payload **including its `BATT\|` marker** — e.g.
-> `SMOLv1 BATT BATT|48V 52.8V|HV 391.9V|d 43mV`. **No length byte:** payload length
-> = `frame_len − 12`. Frame payload and `BattCache` are therefore **byte-identical**
-> — one `memcpy`, no reformatting on either the broadcast or the receive side.
+> `SMOLv1 BATT BATT|48V 52.8V|HV 391.9V|d 43mV|48V 69%|HV 99%|Chg 4.1A`. **No length
+> byte:** payload length = `frame_len − 12`. Frame payload and `BattCache` are
+> therefore **byte-identical** — one `memcpy`, no reformatting on either the broadcast
+> or the receive side.
 
-**Payload format (pinned).** The display lines are `BATT|<line1>|<line2>|<line3>`
-— pipe-separated, **≤ 3 lines, ≤ 12 chars each, ≤ 96 B total**, no trailing pipe.
-Numbers render `%.1f` (voltage) / `%.0f` (delta mV); unavailable source entities
-render `--` with the label kept, e.g. `BATT|48V --|HV --|d --`. Default fresh
-content: `BATT|48V 52.8V|HV 391.9V|d 43mV` (System A 48 V LFP bank · System B
-BMW-i3 HV pack · System B cell-spread). Worst case on the wire: `12 + 96 = 108 B`,
-well under the 250 B ESP-NOW limit.
+**Payload format (pinned; extended to 6 segments — #16/#17).** The payload is
+`BATT|<v1>|<v2>|<v3>[|<s1>|<s2>|<s3>]` — pipe-separated, **≤ 6 segments, ≤ 12 chars
+each, ≤ 96 B total** (verified worst case ≈ 62 B), no trailing pipe. **Segments 1-3 =
+the VOLTAGE overview page** (title `Batt`); **segments 4-6 = the SOC/charge DETAIL
+segments** (#17), which the firmware renders as **big per-battery full-window pages**
+(short-tap to page; boards flashed before #17 do `split('|').take(3)` and ignore 4-6 →
+**fully backward-compatible**). An unavailable/stale source renders `--` with the label
+kept (e.g. `BATT|48V --|HV 391.9V|d 43mV|48V 69%|HV 99%|Chg --`).
+- **Voltage page:** `48V %.1fV` (System A 48 V LFP bank) · `HV %.1fV` (System B BMW-i3
+  HV pack) · `d %.0fmV` (cell spread).
+- **Detail segments** — **⚠️ big-render contract (co-designed with the firmware):** the
+  small **label** is the text before the FIRST space, the **big value** everything
+  after, so each label is a single token: `48V %.0f%%` (48 V bank SOC — **BMS,
+  coulomb-counted**, not EPEver) · `HV %.0f%%` (HV pack SOC) · `Chg %.1fA` (total solar
+  charge current into the 48 V bank).
+
+Default fresh content: `BATT|48V 52.8V|HV 391.9V|d 43mV|48V 69%|HV 99%|Chg 4.1A`. Worst
+case on the wire: `12 + 96 = 108 B`, well under the 250 B ESP-NOW limit. The exact HA
+source entities + per-segment staleness windows live in [ha/README.md](../ha/README.md).
 
 **Cadence.** Broadcast **only by the gateway**, ~every **10 s**, gated on
 `is_gateway && !cache.is_empty()` (the `main.rs` background block) — plus a fresh
@@ -258,10 +272,11 @@ display. The data is non-secret, and crucially the HA **broker password never
 rides the mesh** — it lives only in the gateway's git-ignored `secrets.rs`, used
 solely for the LAN TCP CONNECT. Documented, not defended.
 
-**Status.** 🟡 **partly hardware-verified — build 40 "Pressed Oven", 2026-07-08.** The
-gateway *acquires* the HA payload and renders it on its own Batt screen on real
+**Status.** 🟡 **partly hardware-verified — build 45 "Oxidized Die", 2026-07-08.** The
+gateway *acquires* the (now 6-segment, #16/#17) HA payload and renders **both** the
+voltage overview and the big SOC/charge detail pages on its own screen on real
 hardware (via the 🟢 [MQTT burst](#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)
-— 31 B cached byte-exact). But the **ESP-NOW BATT frame's over-the-air delivery to a
+— cached byte-exact). But the **ESP-NOW BATT frame's over-the-air delivery to a
 leaf is *inferred*, not observed**: the mechanism is identical to the
 hardware-verified [TIME](#time--mesh-time-sync) broadcast/adoption, yet frame *receipt*
 isn't logged (finding #15) and the fleet currently runs **all-gateway**, so no leaf has
@@ -274,6 +289,66 @@ RX `Frame::Batt(&[u8])` (`:227`, payload = `data[12..]`); render in `batt.rs`
 (`BattCache`); broadcast gated in `main.rs`. Fed by the [MQTT
 burst](#mqtt-burst--the-lan-transport-that-retires-the-udp-collector) in
 `net/wifi.rs`; team spec `scratch/smol-ha-batt/spec.md` v2 (§ Architecture — Downlink).
+
+## GRID — HA grid-power snapshot (#16)
+
+**Purpose.** The **exact twin of [BATT](#batt--ha-battery-snapshot)** for grid/
+consumption power. A gateway fetches a display-ready line set from HA's retained
+`smol/display/grid` on its [MQTT burst](#mqtt-burst--the-lan-transport-that-retires-the-udp-collector),
+renders it on its **Grid** screen, and re-broadcasts it single-hop as a GRID frame so
+its neighbour leaves cache it too. All the shared mechanics — verbatim framing, no
+length byte, gateway-only single-hop broadcast, receive-only leaves, fetch-age
+staleness, security posture — are identical to BATT.
+
+**Layout (≤ 108 B).**
+
+| Field | Bytes | Encoding | Meaning |
+|---|---|---|---|
+| tag | 12 | `b"SMOLv1 GRID "` | namespace (diverges from `b"SMOLv1 BATT "` at byte 8) |
+| `payload` | ≤ 96 | ASCII, display-ready | the `GRID\|`-marked lines, **verbatim** from `smol/display/grid` |
+
+**Payload format (pinned).** `GRID|<total>|<L1>|<L2>` — pipe-separated, **≤ 3 lines,
+≤ 12 chars each, ≤ 96 B total**, no trailing pipe. All three lines are in **watts**
+(a value that would exceed 5 digits of watts renders `X.XXkW` for that line). Default
+content: `GRID|963W|L1 177W|L2 786W` — line 1 (no label) = **total consumption** (the
+"yurt consumption" HA sensor, sourced in kW and scaled ×1000 to W); lines 2-3 = the two
+PJ2101A phase clamps `L1`/`L2`. Unavailable/stale (> 30 min `last_reported`) → `--`.
+**Single page** — unlike Batt there is no optional second trio, so a short-tap is a
+plain no-op. Exact HA sources in [ha/README.md](../ha/README.md).
+
+**Status.** 🟡 **build 45 "Oxidized Die", 2026-07-08.** The gateway acquires
+`smol/display/grid` and renders it on real hardware (🟢 via the MQTT burst; live HA
+mirror `sensor.smol_display_grid`). Leaf-side GRID frame receipt is **inferred** (same
+all-gateway-fleet caveat as BATT — no leaf has cached one yet).
+
+**Source.** `rust/clock/src/net/mode.rs`: `GRID_PREFIX` (`:155`, `b"SMOLv1 GRID "`),
+`broadcast_grid` (`:1374`); RX `Frame::Grid`; render + `GridCache` in `grid.rs`; fed by
+`GRID_TOPIC` (`net/wifi.rs:81`, `smol/display/grid`) in the same burst as BATT.
+
+## CONFIG — retained per-node default screen (#21, spec'd — firmware pending)
+
+**Purpose.** Set a node's boot **default screen + page** remotely, no reflash. This is
+**MQTT-only, not an ESP-NOW frame** (deliberately — the unauthenticated mesh must never
+become a command channel; security ruling R-P3). Documented here so the wire contract
+is one place; the **HA publish side is deployed**, the **firmware consume side is a
+pending wave**.
+
+```
+smol/<id>/config/default_screen   (retain: true, qos: 0)   payload: <AppKind>:<page>
+```
+
+- **AppKind** = the exact `app.rs` enum spelling (case-sensitive), full espnow set:
+  `Menu Clock Batt Grid Snake Bench MeshSnake About` (wire `Snake` maps to `SNAKE_KIND`
+  = MeshSnake on espnow). **page** = one digit; flat, firmware clamps out-of-range → 0.
+- **Empty retained payload = clear** → the node falls back to its compile-time
+  `board.rs` `DEFAULT_APP`/`DEFAULT_PAGE` (#18/#19). There is **no broadcast topic** —
+  "set all" writes every per-node topic.
+- **Firmware parse MUST be panic-free** (strict allowlist, heap-free, bounded, unknown/
+  wrong-tier/bad-page → ignore + keep current): the broker is LAN-writable, and a
+  retained payload that panicked would be re-delivered every boot → **boot-loop brick**.
+- **Status.** 🟡 **spec'd + HA-side deployed; firmware consume side not yet built.**
+  Protocol LOCKED in `scratch/smol-ha-batt/nodemgr-design.md §2`; HA helpers/automations/
+  Lovelace live (see [ha/README.md](../ha/README.md) → "Node manager").
 
 ## RELAY / RELAYACK — ESP-NOW → internet telemetry
 

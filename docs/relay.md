@@ -55,20 +55,25 @@ leaves.
    actually egress** the interface — bounded ~2 s (`ca5d985`, "finding N3") — **not
    a fixed post-send delay**: a warm interface flushes fast, a slow one still
    completes within the bound.
-4. **v2 — the flush burst is now an MQTT burst** *(hardware-verified, build 40 —
-   leaf-BATT receipt inferred, #15)*. Instead of `run_udp_flush` → the UDP collector, the same WiFi window
+4. **v2 — the flush burst is now an MQTT burst** *(hardware-verified since build 40;
+   current fleet build 45 "Oxidized Die" — leaf-BATT receipt inferred, #15)*. Instead of
+   `run_udp_flush` → the UDP collector, the same WiFi window
    **connects to Home Assistant's Mosquitto broker** (the HA VM's leg on the boards'
    own VLAN — const in the gateway's git-ignored `secrets.rs`, see
    [BUILDING.md](BUILDING.md); plain TCP, hand-rolled MQTT 3.1.1 / QoS 0),
    **PUBLISHes** each queued telemetry to
    `smol/<id>/telemetry` (which become native HA entities via MQTT discovery),
-   **SUBSCRIBEs** `smol/display/batt` to pick up HA's **retained** battery payload
-   (the broker is the downlink cache — the latest is waiting even after 30 s away),
-   then **broadcasts a [`SMOLv1 BATT`](protocol.md#batt--ha-battery-snapshot) frame**
-   (gateway-only — its neighbour leaves cache it but never re-broadcast, so BATT is
-   single-hop) and DISCONNECTs back to ch 6. The **UDP
-   collector egress is retired** (as of build 40; the disks service is
-   stopped/disabled and its JSONL archived — rollback = git). Full byte contracts:
+   **SUBSCRIBEs** `smol/display/batt` **and** `smol/display/grid` to pick up HA's
+   **retained** battery (6-segment: voltage + big SOC/charge pages, #16/#17) and
+   grid-power payloads (the broker is the downlink cache — the latest is waiting even
+   after 30 s away), then **broadcasts [`SMOLv1 BATT`](protocol.md#batt--ha-battery-snapshot)
+   + [`SMOLv1 GRID`](protocol.md#grid--ha-grid-power-snapshot-16) frames** (gateway-only
+   — its neighbour leaves cache them but never re-broadcast, so both are single-hop) and
+   DISCONNECTs back to ch 6. The **UDP collector egress is retired** (as of build 40; the
+   disks service is stopped/disabled and its JSONL archived — rollback = git). *(A pending
+   firmware wave adds a third SUBSCRIBE — `smol/<id>/config/default_screen` for the
+   [node manager](protocol.md#config--retained-per-node-default-screen-21-specd--firmware-pending),
+   #21.)* Full byte contracts:
    [protocol.md → MQTT burst](protocol.md#mqtt-burst--the-lan-transport-that-retires-the-udp-collector).
 
 > **Known follow-up (not a blocker):** each flush rebuilds the interface, so its

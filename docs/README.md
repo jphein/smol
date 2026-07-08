@@ -1,10 +1,13 @@
 # smol — docs
 
-Docs for the **smol** ESP32-C3 handheld, gathered/written by agents during the build (2026-07-07).
+Docs for the **smol** ESP32-C3 handheld, gathered/written during the build.
+
+- **[ROADMAP.md](ROADMAP.md)** — the steering doc: what's **shipped / in-flight / spec'd / researched** + the open-decision docket (companion to GitHub issue [#24](https://github.com/jphein/smol/issues/24)). **Start here for status.**
 
 ## Firmware, protocol & play
 - **[BUILDING.md](BUILDING.md)** — toolchain, flashing, pin map, the "which board am I holding?" name/MAC guide, and the gotchas that cost us time.
-- **[protocol.md](protocol.md)** — the canonical **SMOLv1** wire-protocol reference: every ESP-NOW frame (HELLO/ACK, BEACON, TIME, RELAY/RELAYACK, SNK) with exact byte layout, cadence, and honest per-frame verification status.
+- **[protocol.md](protocol.md)** — the canonical **SMOLv1** wire-protocol reference: every ESP-NOW frame (HELLO/ACK, BEACON, TIME, BATT, GRID, RELAY/RELAYACK, SNK) + the retained MQTT config topic, with exact byte layout, cadence, and honest per-frame verification status.
+- **[home-assistant.md](home-assistant.md)** — the **Home Assistant integration** (MQTT-native): the Batt (voltage + SOC) and Grid displays, the node manager, collector retirement, and why not ESPHome/native-API.
 - **[mesh-snake.md](mesh-snake.md)** — how to play **World Snake**, the shared-world MMO: one-button controls, the six treasure-powers, the leaderboard, joining a mesh.
 - **[relay.md](relay.md)** — operator guide for the **ESP-NOW → internet relay**: leaf vs gateway roles, the flush cycle + its single-radio cost, configuring the collector, and the freeze-fix backoff semantics.
 
