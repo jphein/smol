@@ -126,10 +126,60 @@ const TIME_PREFIX: &[u8] = b"SMOLv1 TIME "; // + "NNN UUUUUUUUUU SSSSSSSSSS"
 const RELAY_PREFIX: &[u8] = b"SMOLv1 RELAY "; // + "NNN MMMMM F C " + chunk
 const RELAYACK_PREFIX: &[u8] = b"SMOLv1 RELAYACK "; // + "MMMMM BBB"
 
+use crate::mesh_snake::snake_core::{self, SnkFrame};
+
+/// Depth of the decoded MMO-snake RX ring. A full 16-peer broadcast burst plus
+/// background traffic can land between two 20 ms `service()` calls; 8 covers a
+/// realistic burst and, like the ESP-NOW hardware queue, DROPS OLDEST on
+/// overflow — which the game's absolute-state + staleness tolerates by design.
+const SNK_RX_RING: usize = 8;
+
+/// A tiny FIFO of decoded [`SnkFrame`]s buffered by `service()` for `main` to
+/// drain into the game's `PeerTable` each subtick. Keeps `mode.rs` free of game
+/// state (mirrors the `TimeTracker`/`take_time_offer` split). All `Copy`, fixed
+/// size → `.bss`, no heap.
+struct SnkInbox {
+    buf: [Option<SnkFrame>; SNK_RX_RING],
+    head: usize,
+    tail: usize,
+    len: usize,
+}
+
+impl SnkInbox {
+    const fn new() -> Self {
+        Self { buf: [None; SNK_RX_RING], head: 0, tail: 0, len: 0 }
+    }
+
+    /// Push a frame; drop the OLDEST if full (matches the RX-queue policy).
+    fn push(&mut self, f: SnkFrame) {
+        self.buf[self.head] = Some(f);
+        self.head = (self.head + 1) % SNK_RX_RING;
+        if self.len < SNK_RX_RING {
+            self.len += 1;
+        } else {
+            self.tail = (self.tail + 1) % SNK_RX_RING; // overwrote the tail
+        }
+    }
+
+    /// Pop the oldest buffered frame, or `None` if empty.
+    fn pop(&mut self) -> Option<SnkFrame> {
+        if self.len == 0 {
+            return None;
+        }
+        let f = self.buf[self.tail].take();
+        self.tail = (self.tail + 1) % SNK_RX_RING;
+        self.len -= 1;
+        f
+    }
+}
+
 /// Parsed inbound frame. The `'a` borrows the RX buffer for `Relay`'s payload
 /// chunk (copied out immediately in `service`); every other variant carries only
 /// copied scalars, so `'a` is used by exactly one variant — which is allowed.
 enum Frame<'a> {
+    /// An MMO Mesh Snake state snapshot (issue #5): the decoded 18 B SMOLv1 SNK
+    /// frame. Scalar-only (no borrow).
+    Snk(SnkFrame),
     /// A peer HELLO beacon (LED handshake); carries the sender's id.
     Hello(u8),
     /// An acknowledgement (LED handshake); carries the id of the unit acked.
@@ -713,6 +763,8 @@ pub struct RadioManager {
     time: TimeTracker,
     /// Relay-bridge state (leaf uplink + gateway reassembly/flush; bounded).
     relay: Relay,
+    /// Decoded MMO-snake frames buffered for `main` to drain (issue #5).
+    snk: SnkInbox,
 }
 
 /// Monotonic milliseconds since boot — the single time base for both the
@@ -754,6 +806,7 @@ impl RadioManager {
             bench: BenchTracker::new(),
             time: TimeTracker::new(),
             relay: Relay::new(),
+            snk: SnkInbox::new(),
         })
     }
 
@@ -858,6 +911,21 @@ impl RadioManager {
         let mut msg = [0u8; 40];
         let len = encode_time(self.id, unix, synced_at, &mut msg);
         self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
+    }
+
+    /// Broadcast one MMO-snake state frame (issue #5). 18 B; `main` calls this
+    /// on the per-id phase-jittered 200 ms schedule while MeshSnake is active.
+    pub fn broadcast_snk(&mut self, f: &SnkFrame) {
+        let mut msg = [0u8; 24];
+        if let Some(len) = snake_core::encode_snk(f, &mut msg) {
+            self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
+        }
+    }
+
+    /// Drain one buffered MMO-snake frame (oldest first), or `None` if empty.
+    /// `main` loops this each subtick into `MeshSnake::ingest`.
+    pub fn take_snk(&mut self) -> Option<SnkFrame> {
+        self.snk.pop()
     }
 
     /// Take the freshest buffered peer TIME offer, clearing it so a later call
@@ -1047,10 +1115,13 @@ impl RadioManager {
     /// Returns an optional short display string for the OLED bottom line (the
     /// most recent recognised frame), so the clock UI can show peer activity.
     pub fn service(&mut self) -> Option<alloc::string::String> {
-        // Bound the drain: ESP-NOW's RX queue can hold several frames; process a
-        // handful per call so a burst can't stall the 1 Hz clock tick.
+        // Bound the drain: ESP-NOW's RX queue is 10 deep. The MMO-snake game
+        // (netcode §2) bursts up to ~16 peers/round + background; raise the
+        // per-call drain to 24 so a full burst is absorbed without dropping,
+        // while staying BOUNDED so a pathological flood can't stall the 1 Hz
+        // clock tick or the LED. Each parse is a cheap prefix match.
         let mut label: Option<alloc::string::String> = None;
-        for _ in 0..8 {
+        for _ in 0..24 {
             let Some(recv) = self.esp_now.receive() else {
                 break;
             };
@@ -1061,6 +1132,24 @@ impl RadioManager {
             let now = now_ms();
 
             match parse_frame(recv.data()) {
+                Some(Frame::Snk(f)) => {
+                    // An MMO-snake frame proves the peer is audible → counts
+                    // toward the LED "detected" state exactly like HELLO/BEACON.
+                    self.peers.last_hello_ms = now;
+                    // Register the peer so any future unicast can reach it.
+                    if !self.esp_now.peer_exists(&src) {
+                        let _ = self.esp_now.add_peer(PeerInfo {
+                            interface: EspNowWifiInterface::Sta,
+                            peer_address: src,
+                            lmk: None,
+                            channel: None,
+                            encrypt: false,
+                        });
+                    }
+                    // Buffer for `main` to drain into the game PeerTable; do NOT
+                    // set `label` — the MeshSnake screen owns its own render.
+                    self.snk.push(f);
+                }
                 Some(Frame::Hello(peer_id)) => {
                     // We can hear a peer -> at least "detected".
                     self.peers.last_hello_ms = now;
@@ -1291,6 +1380,11 @@ fn write_u10(mut v: u32, out: &mut [u8]) {
 
 /// Parse an inbound payload into a [`Frame`], or `None` if it isn't ours.
 fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
+    // MMO-snake frames are the hot path in the game; try them first. `parse_snk`
+    // validates prefix/length/ver itself and degrades on unknown ver.
+    if data.starts_with(snake_core::SNK_PREFIX) {
+        return snake_core::parse_snk(data).map(Frame::Snk);
+    }
     if let Some(rest) = data.strip_prefix(HELLO_PREFIX) {
         return parse_id(rest).map(Frame::Hello);
     }

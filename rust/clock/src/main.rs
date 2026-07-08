@@ -75,6 +75,10 @@ mod menu;
 mod net;
 // Single-player Snake. Always compiled (needs only the display).
 mod snake;
+// MMO Mesh Snake over ESP-NOW (issue #5): vendored pure core + radio/render glue.
+// espnow-only (needs the mesh) → zero code in default/wifi builds.
+#[cfg(feature = "espnow")]
+mod mesh_snake;
 // On-board sensors: chip die-temp (tsens) + battery ADC on GPIO4. Always on.
 mod sensors;
 
@@ -262,6 +266,17 @@ fn main() -> ! {
     // Snake is created lazily on entry (so a fresh game starts each time) and
     // dropped on exit; `None` while not playing.
     let mut game: Option<snake::Snake> = None;
+    // MMO Mesh Snake (espnow): same lazy-create-on-entry / drop-on-exit pattern.
+    #[cfg(feature = "espnow")]
+    let mut game_mesh: Option<mesh_snake::MeshSnake> = None;
+    // Per-id broadcast phase offset (ms) within the 200 ms window, so synced
+    // boards don't fire their SNK frames into one 20 ms RX window (netcode §2).
+    #[cfg(feature = "espnow")]
+    let snk_phase = mesh_snake::snake_core::phase_offset_ms(
+        NODE_ID,
+        mesh_snake::snake_core::PHASE_NMAX,
+        mesh_snake::snake_core::BROADCAST_PERIOD_MS,
+    ) as u64;
 
     // Phase 3: last ESP-NOW peer message, shown as the CLOCK bottom-line label.
     // The idle default is our OWN noun (the "I am …" identity at rest); a heard
@@ -338,6 +353,31 @@ fn main() -> ! {
                 }
             }
 
+            // --- MMO Mesh Snake radio service (issue #5) ----------------------
+            // Drain inbound SNK frames into the game every subtick; broadcast our
+            // own state on the per-id phase-jittered 200 ms edge while playing.
+            {
+                let unix_now = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
+                if let Some(gm) = game_mesh.as_mut() {
+                    while let Some(f) = r.take_snk() {
+                        gm.ingest(&f, now as u32);
+                    }
+                    let period = mesh_snake::snake_core::BROADCAST_PERIOD_MS as u64;
+                    let cur = now.saturating_sub(snk_phase) / period;
+                    let prev = now
+                        .saturating_sub(snk_phase)
+                        .saturating_sub(SUBTICK_MS as u64)
+                        / period;
+                    if cur != prev {
+                        let frame = gm.make_frame(unix_now);
+                        r.broadcast_snk(&frame);
+                    }
+                } else {
+                    // Not in the game: drain so the inbox can't back up.
+                    while r.take_snk().is_some() {}
+                }
+            }
+
             // --- Relay bridge (see net::mode's "Relay bridge" section) --------
             // LEAF: emit short telemetry (sensor line + current label) as RELAY
             // fragments on a cadence, then retransmit the gaps a gateway's
@@ -393,6 +433,11 @@ fn main() -> ! {
                     if app == AppMode::Snake {
                         game = Some(snake::Snake::new(now));
                     }
+                    // Entering MeshSnake spins up a fresh mesh game (espnow).
+                    #[cfg(feature = "espnow")]
+                    if app == AppMode::MeshSnake {
+                        game_mesh = Some(mesh_snake::MeshSnake::new(NODE_ID, now as u32));
+                    }
                     log::info!("smol: enter {:?}", app);
                     redraw = true;
                     last_clock_sec = None;
@@ -402,6 +447,10 @@ fn main() -> ! {
                     log::info!("smol: {:?} -> menu", app);
                     app = AppMode::Menu;
                     game = None;
+                    #[cfg(feature = "espnow")]
+                    {
+                        game_mesh = None;
+                    }
                     redraw = true;
                 }
                 // --- Snake: short tap turns, or restarts on the death screen ---
@@ -412,6 +461,18 @@ fn main() -> ! {
                             redraw = true; // repaint the fresh board immediately
                         } else {
                             g.on_tap();
+                        }
+                    }
+                }
+                // --- MeshSnake: short tap turns, or respawns on the death screen ---
+                #[cfg(feature = "espnow")]
+                (AppMode::MeshSnake, Press::Short) => {
+                    if let Some(gm) = game_mesh.as_mut() {
+                        if gm.is_dead() {
+                            gm.respawn(now as u32, 3);
+                            redraw = true;
+                        } else {
+                            gm.turn();
                         }
                     }
                 }
@@ -495,6 +556,22 @@ fn main() -> ! {
                     bench::draw(&mut display, &stats, fps);
                     display.flush().ok();
                     redraw = false;
+                }
+            }
+
+            AppMode::MeshSnake => {
+                // Only reachable under espnow (menu-gated), like Bench. Repaint
+                // on a game step or a forced redraw — not every 20 ms subtick.
+                #[cfg(feature = "espnow")]
+                if let Some(gm) = game_mesh.as_mut() {
+                    let unix_now = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
+                    let stepped = gm.update(now as u32, unix_now);
+                    if stepped || redraw {
+                        display.clear(BinaryColor::Off).ok();
+                        gm.draw(&mut display, now as u32, unix_now);
+                        display.flush().ok();
+                        redraw = false;
+                    }
                 }
             }
         }

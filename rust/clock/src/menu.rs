@@ -47,8 +47,14 @@ pub enum AppMode {
     Menu,
     /// Live clock (big HH:MM + alternating sensor line); NTP-synced at boot.
     Clock,
-    /// Single-player Snake (see `src/snake.rs`).
+    /// Single-player Snake (see `src/snake.rs`). Under `espnow`, MeshSnake
+    /// replaces it in the menu, so it is not entered there.
+    #[allow(dead_code)] // not selected in espnow builds (MeshSnake takes its slot)
     Snake,
+    /// MMO Mesh Snake over ESP-NOW (issue #5; see `src/mesh_snake`). Only
+    /// entered under `espnow`.
+    #[allow(dead_code)] // never constructed in non-espnow builds
+    MeshSnake,
     /// ESP-NOW link statistics (see `src/bench.rs`). Only entered under `espnow`.
     #[allow(dead_code)] // never constructed in non-espnow builds
     Bench,
@@ -67,9 +73,18 @@ const MENU_ITEMS: &[MenuItem] = &[
         label: "Clock",
         mode: AppMode::Clock,
     },
+    // Non-espnow builds get the single-player Snake; espnow builds replace it
+    // with MMO Mesh Snake (design §6) so the menu stays ≤ 3 items (4 would
+    // overflow the 40 px panel).
+    #[cfg(not(feature = "espnow"))]
     MenuItem {
         label: "Snake",
         mode: AppMode::Snake,
+    },
+    #[cfg(feature = "espnow")]
+    MenuItem {
+        label: "MeshSnake",
+        mode: AppMode::MeshSnake,
     },
     #[cfg(feature = "espnow")]
     MenuItem {
