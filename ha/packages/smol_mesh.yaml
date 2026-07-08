@@ -10,18 +10,35 @@
 # node caches it too.
 #
 # Payload format (LOCKED — the exact lines the firmware renders on the 72×40 OLED):
-#   BATT|48V 52.8V|HV 391.9V|d 43mV
-#   - pipe-separated, ≤3 lines, each line ≤12 chars, whole payload ≤96 bytes, ASCII
-#   - line 1: 48V bank    %.1f V   sensor.48v_battery1_voltage  (BMS-direct; see below)
-#             fallback           → sensor.48v_battery2_voltage, else `--`
-#   - line 2: BMW i3 HV pack %.1f V   sensor.be_battery_voltage
-#   - line 3: i3 cell spread %.0f mV  sensor.be_cell_voltage_delta
-#   - any source that is unavailable / unknown / STALE (>30 min) renders `--`
-#     for that value (e.g. `BATT|48V --|HV 391.9V|d 43mV`).
+#   BATT|48V 52.8V|HV 391.9V|d 43mV|A 69%|B 99%|C 4.1A
+#   - pipe-separated, ≤6 segments, each ≤12 chars, whole payload ≤96 bytes, ASCII
+#     (verified worst case ≈56 B). Segments 1-3 = the VOLTAGE page (title `Batt`);
+#     segments 4-6 = the SOC page (title `SOC`), added for issue #17. A short tap
+#     on the board flips pages; boards flashed before #17 `split('|').take(3)` so
+#     they ignore 4-6 and keep showing the voltage page — FULLY backward-compatible.
+#   VOLTAGE page (segments 1-3):
+#   - seg 1: 48V bank    %.1f V   sensor.48v_battery1_voltage  (BMS-direct; see below)
+#            fallback           → sensor.48v_battery2_voltage, else `--`
+#   - seg 2: BMW i3 HV pack %.1f V   sensor.be_battery_voltage
+#   - seg 3: i3 cell spread %.0f mV  sensor.be_cell_voltage_delta
+#   SOC page (segments 4-6, issue #17):
+#   - seg 4 `A`: 48V bank SOC  %.0f %  sensor.48v_battery1_battery  (BMS, coulomb-
+#            counted — the same source we trust for the voltage line), fallback
+#            sensor.48v_battery2_battery. (Team ruling 2026-07-08: moved OFF EPEver —
+#            EPEver's SOC is a crude voltage estimate and its bus flaps `unavailable`;
+#            the BMS is authoritative and keeps the SOC page off the flaky EPEver path.)
+#   - seg 5 `B`: HV pack SOC   %.0f %  sensor.be_soc, fallback sensor.battery_state_of_charge
+#   - seg 6 `C`: charge current %.1f A sensor.epever_charging_current (solar into the
+#            48V bank), else `--`.
+#   - any source that is unavailable / unknown / STALE renders `--` for that segment
+#     (e.g. `BATT|48V --|HV 391.9V|d 43mV|A 69%|B 99%|C --`). See STALENESS below —
+#     the SOC (seg 5) window is wider than the voltage window on purpose.
 #
 # OVERRIDE MODE: when input_boolean.smol_display_override is ON, the automation
-# publishes `BATT|<line1>|<line2>|<line3>` built from the three line SOURCES in
-# input_text.smol_display_line1/2/3 instead of the battery reading — SAME topic +
+# publishes `BATT|<line1>|<line2>|<line3>|A ..|B ..|C ..` — the three line SOURCES
+# (input_text.smol_display_line1/2/3) own segments 1-3 instead of the battery
+# voltages, but the SOC trio (segments 4-6) is STILL appended (issue #17 spec), so
+# a board can short-tap to the live SOC page even mid-override. SAME topic +
 # envelope, so the boards need ZERO changes.
 #   - A source is literal text with `{entity_id}` placeholders, e.g.
 #     `48V {sensor.48v_battery1_voltage}V` -> `48V 52.8V`, `PV {sensor.epever_pv_power}W`.
@@ -49,16 +66,27 @@
 # entity is deliberately AVOIDED here.
 #
 # STALENESS: the automation also fires every 5 min (time_pattern) and the template
-# renders `--` for any source whose `last_reported` is older than 30 min (1800 s),
-# so a wedged integration cannot freeze a stale-but-live-looking value into the
-# retained payload. `last_reported` (not `last_updated`) is used deliberately: it
-# advances on EVERY state write, so a live integration that keeps re-reporting an
-# unchanged value stays "fresh", while a truly wedged one goes stale. The 30-min
-# window (team ruling 2026-07-08) covers the measured worst case: the BE HV/delta
-# sensors publish on-change and a steady pack legitimately goes quiet up to
-# ~22.6 min, so a tighter window would blank HEALTHY data and train the reader to
-# ignore `--`. 30 min still catches the real failure (dead MQTT / wedged
-# integration). Single constant in the macro below (1800) if it ever needs tuning.
+# renders `--` for any source whose `last_reported` is older than its per-segment
+# window, so a wedged integration cannot freeze a stale-but-live-looking value into
+# the retained payload. `last_reported` (not `last_updated`) is used deliberately:
+# it advances on EVERY state write, so a live integration that keeps re-reporting an
+# unchanged value stays "fresh", while a truly wedged one goes stale. (Confirmed
+# live 2026-07-08: sensor.48v_battery1_battery re-reports every ~25 s at a steady
+# 69% — last_reported 25 s, last_updated 46 min — so `last_reported` correctly
+# treats it as fresh.)
+#   - VOLTAGE segments + 48V BMS SOC + EPEver charge current: 30 min (1800 s), the
+#     `cell()` default. The 30-min window (team ruling 2026-07-08) covers the measured
+#     worst case: the BE HV/delta sensors publish on-change and a steady pack
+#     legitimately goes quiet up to ~22.6 min, so a tighter window would blank HEALTHY
+#     data and train the reader to ignore `--`. Keeping the EPEver charge current (s3)
+#     at 30 min ALSO makes it a health signal for the PE11 bus — it blanks fast if the
+#     bus wedges again.
+#   - HV pack SOC (segment 5, sensor.be_soc): 6 h (21600 s). SOC at rest changes
+#     glacially, so this on-change MQTT source legitimately goes silent for tens of
+#     minutes to hours (measured 50 min silent at a steady 99% on 2026-07-08). A
+#     30-min window would blank a perfectly valid SOC almost the whole time the pack
+#     is at rest, gutting the SOC page. 6 h shows the real value yet still catches a
+#     truly dead Battery-Emulator. Each window is a per-call `maxage` arg on `cell()`.
 # KNOWN LIMITATION (see ha/README.md): if HA ITSELF dies, the retained payload
 # persists on the broker and the boards cannot tell it is stale (they show it with
 # their own fetch-age only). A payload-embedded timestamp is a filed follow-up.
@@ -100,16 +128,22 @@ mqtt:
       unique_id: smol_display_batt_mirror
       state_topic: "smol/display/batt"
       icon: "mdi:monitor-dashboard"
+    - name: "smol display grid"
+      unique_id: smol_display_grid_mirror
+      state_topic: "smol/display/grid"
+      icon: "mdi:transmission-tower"
 
 automation:
   - id: smol_publish_batt_display
     alias: "smol: publish battery display payload (retained)"
     description: >-
       Publishes the display-ready payload to smol/display/batt (retained, QoS0):
-      the manual override text when input_boolean.smol_display_override is ON,
-      otherwise the live battery reading. Fires on any source-sensor change, any
-      override-helper change, every 5 minutes, and at HA start. Stale (>30 min) or
-      unavailable battery sources render as `--`.
+      6 segments `BATT|v1|v2|v3|s1|s2|s3` — the voltage trio (1-3) is the manual
+      override text when input_boolean.smol_display_override is ON, otherwise the
+      live battery voltages; the SOC trio (4-6, issue #17) is always appended.
+      Fires on any source-sensor change, any override-helper change, every 5
+      minutes, and at HA start. Stale (voltage/EPEver >30 min, HV SOC >6 h) or
+      unavailable sources render as `--` per segment.
     mode: single
     max_exceeded: silent
     trigger:
@@ -120,6 +154,14 @@ automation:
           - sensor.48v_battery2_voltage
           - sensor.be_battery_voltage
           - sensor.be_cell_voltage_delta
+          # SOC page (issue #17, segments 4-6). 48V SOC = the BMS (coulomb-counted,
+          # same source we trust for the voltage line) — decoupled from the flaky
+          # EPEver bus per team ruling 2026-07-08. Charge current (s3, still EPEver)
+          # rides the 5-min heartbeat instead of triggering, to avoid churn.
+          - sensor.48v_battery1_battery
+          - sensor.48v_battery2_battery
+          - sensor.be_soc
+          - sensor.battery_state_of_charge
       - platform: state
         id: override_change
         entity_id:
@@ -141,17 +183,20 @@ automation:
           qos: 0
           # `>-` folds the block to one line; the {%- -%} trims + per-cell |trim
           # make the rendered output EXACTLY the `BATT|...` line, no stray space.
+          # The SOC trio (s1/s2/s3) is computed ONCE and appended in both branches
+          # so the SOC page is available even mid-override (issue #17).
           # Override ON -> `subst()` resolves {entity_id} placeholders in each line
           # source (unknown -> `--`), then `|` is stripped and the line clipped to
-          # 12; OFF -> the live battery reading, where the `cell` macro picks the
-          # first fresh (≤30 min), available source from its fallback list.
+          # 12; OFF -> the live battery voltages. The `cell(label, entities, fmt,
+          # maxage)` macro picks the first available source from its fallback list
+          # whose `last_reported` is within `maxage` (default 1800 s; HV SOC 21600 s).
           payload: >-
-            {%- macro cell(label, entities, fmt) -%}
+            {%- macro cell(label, entities, fmt, maxage=1800) -%}
             {%- set ns = namespace(out=label ~ ' --', found=false) -%}
             {%- for ent in entities -%}
             {%- if not ns.found -%}
             {%- set s = states[ent] -%}
-            {%- if s is not none and (s.state | lower) not in ['unknown', 'unavailable', 'none', ''] and (now() - s.last_reported).total_seconds() <= 1800 -%}
+            {%- if s is not none and (s.state | lower) not in ['unknown', 'unavailable', 'none', ''] and (now() - s.last_reported).total_seconds() <= maxage -%}
             {%- set ns.out = label ~ ' ' ~ (fmt | format(s.state | float)) -%}
             {%- set ns.found = true -%}
             {%- endif -%}
@@ -168,6 +213,9 @@ automation:
             {%- endfor -%}
             {{- ns.out -}}
             {%- endmacro -%}
+            {%- set s1 = cell('A', ['sensor.48v_battery1_battery', 'sensor.48v_battery2_battery'], '%.0f%%') | trim -%}
+            {%- set s2 = cell('B', ['sensor.be_soc', 'sensor.battery_state_of_charge'], '%.0f%%', 21600) | trim -%}
+            {%- set s3 = cell('C', ['sensor.epever_charging_current'], '%.1fA') | trim -%}
             {%- if is_state('input_boolean.smol_display_override', 'on') -%}
             {%- set bad = ['unknown', 'unavailable', 'none', ''] -%}
             {%- set o1 = states('input_text.smol_display_line1') -%}
@@ -176,7 +224,74 @@ automation:
             {%- set l1 = '' if (o1 | lower) in bad else (subst(o1) | replace('|', ''))[:12] -%}
             {%- set l2 = '' if (o2 | lower) in bad else (subst(o2) | replace('|', ''))[:12] -%}
             {%- set l3 = '' if (o3 | lower) in bad else (subst(o3) | replace('|', ''))[:12] -%}
-            BATT|{{ l1 }}|{{ l2 }}|{{ l3 }}
+            BATT|{{ l1 }}|{{ l2 }}|{{ l3 }}|{{ s1 }}|{{ s2 }}|{{ s3 }}
             {%- else -%}
-            BATT|{{ cell('48V', ['sensor.48v_battery1_voltage', 'sensor.48v_battery2_voltage'], '%.1fV') | trim }}|{{ cell('HV', ['sensor.be_battery_voltage'], '%.1fV') | trim }}|{{ cell('d', ['sensor.be_cell_voltage_delta'], '%.0fmV') | trim }}
+            BATT|{{ cell('48V', ['sensor.48v_battery1_voltage', 'sensor.48v_battery2_voltage'], '%.1fV') | trim }}|{{ cell('HV', ['sensor.be_battery_voltage'], '%.1fV') | trim }}|{{ cell('d', ['sensor.be_cell_voltage_delta'], '%.0fmV') | trim }}|{{ s1 }}|{{ s2 }}|{{ s3 }}
             {%- endif -%}
+
+  # --- GRID display (issue #16, v2.2 EXTENSION) -----------------------------
+  # A SECOND retained payload for the grid/consumption page the boards page to,
+  # separate from the batt payload (own topic, own automation, own triggers):
+  #   GRID|1118W|L1 150W|L2 970W
+  #   - line 1 (no label): TOTAL = sensor.yurt_consumption — the "yurt consumption"
+  #     sensor JP watches on his dashboard (a calculated sum over the two PJ2101A
+  #     clamps). It reports in kW, so it is scaled ×1000 to WATTS for unit
+  #     consistency with the legs. (sensor.total_grid_power is the same value already
+  #     in W, but JP watches "yurt consumption", so that is the source of truth.)
+  #   - line 2 `L1`: sensor.l1_power_clamp (W) · line 3 `L2`: sensor.l2_power_clamp (W)
+  #   - same envelope as batt: ≤96 B, ≤12 ch/line, ASCII; per-line `--` on
+  #     unavailable/unknown/STALE (>30 min last_reported). A value that would exceed
+  #     5 digits of watts switches THAT line to `X.XXkW` (safety valve; a yurt won't).
+  # Kept as its own automation (not a shared macro with batt) because power lines
+  # need kW/W scaling + an empty-label total that the batt `cell()` macro doesn't —
+  # two focused automations read cleaner than one merged one, and this leaves the
+  # already-live batt publish untouched.
+  - id: smol_publish_grid_display
+    alias: "smol: publish grid display payload (retained)"
+    description: >-
+      Publishes the grid/consumption payload to smol/display/grid (retained, QoS0):
+      GRID|<total>|L1 <l1>W|L2 <l2>W. Total = the "yurt consumption" sensor (kW,
+      scaled to W); legs = the two PJ2101A power clamps (W). Fires on any of the
+      three source changes, every 5 minutes, and at HA start. Stale (>30 min) or
+      unavailable sources render `--` per line.
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        id: grid_change
+        entity_id:
+          - sensor.yurt_consumption
+          - sensor.l1_power_clamp
+          - sensor.l2_power_clamp
+      - platform: time_pattern
+        id: heartbeat
+        minutes: "/5"
+      - platform: homeassistant
+        event: start
+        id: ha_start
+    action:
+      - service: mqtt.publish
+        data:
+          topic: smol/display/grid
+          retain: true
+          qos: 0
+          # `pcell(label, entity, scale, maxage)` renders one power segment: an empty
+          # label -> bare value (the total line); `scale` converts kW->W (total=1000,
+          # legs=1); a magnitude >=100000 W renders `X.XXkW`; unavailable/unknown or
+          # last_reported older than `maxage` (30 min) -> `--`.
+          payload: >-
+            {%- macro pcell(label, entity, scale, maxage=1800) -%}
+            {%- set pre = (label ~ ' ') if label else '' -%}
+            {%- set s = states[entity] -%}
+            {%- if s is not none and (s.state | lower) not in ['unknown', 'unavailable', 'none', ''] and (now() - s.last_reported).total_seconds() <= maxage -%}
+            {%- set w = (s.state | float) * scale -%}
+            {%- if (w | abs) >= 100000 -%}
+            {{- pre ~ ('%.2fkW' | format(w / 1000)) -}}
+            {%- else -%}
+            {{- pre ~ ('%.0fW' | format(w)) -}}
+            {%- endif -%}
+            {%- else -%}
+            {{- pre ~ '--' -}}
+            {%- endif -%}
+            {%- endmacro -%}
+            GRID|{{ pcell('', 'sensor.yurt_consumption', 1000) | trim }}|{{ pcell('L1', 'sensor.l1_power_clamp', 1) | trim }}|{{ pcell('L2', 'sensor.l2_power_clamp', 1) | trim }}

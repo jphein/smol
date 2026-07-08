@@ -12,23 +12,54 @@ configs and needs no HA config (see *MQTT discovery* below).
 
 ## What's here
 
-- `packages/smol_mesh.yaml` — an HA **package** with one automation that publishes
-  a **retained**, display-ready payload to `smol/display/batt` on any source-sensor
-  change, every 5 minutes (heartbeat), and at HA start.
+- `packages/smol_mesh.yaml` — an HA **package** with **two** automations, each
+  publishing a **retained**, display-ready payload on any source-sensor change,
+  every 5 minutes (heartbeat), and at HA start:
+  - `smol/display/batt` — the battery screen (voltages + SOC page).
+  - `smol/display/grid` — the grid/consumption screen (issue #16).
+  Plus two MQTT **mirror** sensors (`sensor.smol_display_batt` / `sensor.smol_display_grid`)
+  so a dashboard card shows exactly what the boards fetch.
 
-Payload (LOCKED — the exact lines the firmware renders on the 72×40 OLED):
+### `smol/display/batt` payload (LOCKED — the exact lines the firmware renders on the 72×40 OLED)
 
 ```
-BATT|48V 52.8V|HV 391.9V|d 43mV
+BATT|48V 52.8V|HV 391.9V|d 43mV|A 69%|B 99%|C 4.1A
 ```
 
-- pipe-separated, ≤3 lines, each ≤12 chars, ≤96 bytes total, ASCII
-- `48V` = **`sensor.48v_battery1_voltage`** (48 V LFP bank, BMS-direct), `%.1f`V —
+- pipe-separated, **≤6 segments**, each ≤12 chars, ≤96 bytes total, ASCII (worst case ≈56 B).
+- **Segments 1-3 = VOLTAGE page** (title `Batt`); **segments 4-6 = SOC page** (title
+  `SOC`), added for issue #17. The board short-taps to flip pages; boards flashed
+  before #17 do `split('|').take(3)` so they ignore 4-6 — **fully backward-compatible**.
+- seg 1 `48V` = **`sensor.48v_battery1_voltage`** (48 V LFP bank, BMS-direct), `%.1f`V —
   fallback **`sensor.48v_battery2_voltage`**, else `--`
-- `HV`  = `sensor.be_battery_voltage` (BMW i3 HV pack), `%.1f`V
-- `d`   = `sensor.be_cell_voltage_delta` (i3 cell spread), `%.0f`mV
+- seg 2 `HV`  = `sensor.be_battery_voltage` (BMW i3 HV pack), `%.1f`V
+- seg 3 `d`   = `sensor.be_cell_voltage_delta` (i3 cell spread), `%.0f`mV
+- seg 4 `A`   = **48V bank SOC** `sensor.48v_battery1_battery` (**BMS, coulomb-counted**),
+  `%.0f`% — fallback `sensor.48v_battery2_battery`. **Deliberately the BMS, NOT EPEver**
+  (team ruling 2026-07-08 — see below).
+- seg 5 `B`   = **HV pack SOC** `sensor.be_soc`, `%.0f`% — fallback `sensor.battery_state_of_charge`
+- seg 6 `C`   = **charge current** `sensor.epever_charging_current` (solar into the 48V bank), `%.1f`A
 - an `unavailable`/`unknown`/**stale** source renders that value as `--`
-  (e.g. `BATT|48V --|HV 391.9V|d 43mV`)
+  (e.g. `BATT|48V --|HV 391.9V|d 43mV|A 69%|B 99%|C --`)
+- **Override mode** (see below) owns segments 1-3 when active; the SOC trio (4-6) is
+  still appended, so the board can page to live SOC even mid-override.
+
+### `smol/display/grid` payload (issue #16, v2.2 EXTENSION)
+
+```
+GRID|1118W|L1 150W|L2 970W
+```
+
+- same envelope: pipe-separated, ≤96 B, each line ≤12 chars, ASCII.
+- line 1 (no label) = **TOTAL** `sensor.yurt_consumption` — the "yurt consumption"
+  sensor JP watches (a calculated sum over the two PJ2101A clamps). It reports in
+  **kW**, so it is scaled **×1000 → watts** for unit consistency with the legs.
+  (`sensor.total_grid_power` is the same value already in W, but JP watches "yurt
+  consumption", so that is the source of truth.)
+- line 2 `L1` = `sensor.l1_power_clamp` (W) · line 3 `L2` = `sensor.l2_power_clamp` (W)
+- all three lines in **watts**; a value that would exceed 5 digits of watts renders
+  as `X.XXkW` for that line (safety valve — a yurt won't reach 100 kW).
+- per-line `--` on unavailable/unknown/stale (30-min gate, same as the voltage lines).
 
 ### ⚠️ Why NOT `sensor.epever_battery_voltage` for the 48V line
 
@@ -38,25 +69,56 @@ for 2026-07-08 (1672 points) shows it bouncing **0.00 – 111.40 V** all day:
 garbage (suspected Modbus/PE11 bus contention — under separate investigation). The
 BMS-direct `sensor.48v_battery1_voltage` (~52.8 V, stable; cross-checks against the
 DessMonitor inverter's 52.5–52.8 V) is the truth source, with
-`sensor.48v_battery2_voltage` as fallback. **Do not** reintroduce the epever entity
-here until its root cause is fixed.
+`sensor.48v_battery2_voltage` as fallback. (The underlying EPEver corruption was
+root-caused & fixed 2026-07-08 — a hidden PE11 vendor-cloud agent acting as a second
+Modbus master, blocked at the firewall — but the BMS-direct entity remains the
+authoritative voltage source and the EPEver bus still occasionally flaps
+`unavailable` on a device reboot.)
+
+### ⚠️ Why the 48V **SOC** (segment `A`) is the BMS, not EPEver
+
+Team ruling 2026-07-08: segment `A` sources the **BMS** SOC
+(`sensor.48v_battery1_battery`, fallback `sensor.48v_battery2_battery`), **not**
+`sensor.epever_battery_soc`. Two reasons: (1) the BMS **coulomb-counts**, while
+EPEver's SOC is a crude voltage estimate; (2) the EPEver bus flaps `unavailable`, so
+sourcing SOC from it would blank the SOC page on every EPEver reboot. Using the BMS
+— the same source we already trust for the voltage line — keeps the SOC page off the
+flaky EPEver path entirely. (The observed SOC estimates disagreed: EPEver ~80 % /
+BMS ~69 % / DessMonitor ~60 %; the coulomb-counted BMS wins.) The charge-current
+line (segment `C`) still reads EPEver `sensor.epever_charging_current`, so it blanks
+`C --` when the EPEver bus is down — acceptable, since it is current, not SOC.
 
 ### Staleness (freshness gate)
 
 The automation also fires every 5 min, and the template renders `--` for any
-source whose **`last_reported`** is older than **30 min (1800 s)** — so a wedged
-integration can't freeze a stale-but-live-looking value into the retained payload.
+source whose **`last_reported`** is older than its **per-segment window** — so a
+wedged integration can't freeze a stale-but-live-looking value into the payload.
 
 - `last_reported` (not `last_updated`) is used on purpose: it advances on **every**
   state write, so a live integration re-reporting an unchanged value stays "fresh",
-  while a truly wedged one goes stale.
-- **Why 30 min (team ruling 2026-07-08):** the BE HV/delta sensors publish
-  on-change with a steady pack, so they legitimately go quiet up to **~22.6 min**
-  (median ~17 s; measured from `/api/history`). A tighter window (e.g. 10 min)
-  blanks *healthy* data and trains the reader to ignore `--`; 30 min covers the
-  observed worst case with margin and still catches the real failure (dead MQTT /
-  wedged integration). Per-entity windows were rejected as over-engineering for v1.
-  It's a single `1800` constant in the macro if it ever needs tuning.
+  while a truly wedged one goes stale. (Verified live 2026-07-08:
+  `sensor.48v_battery1_battery` re-reports every ~25 s at a steady value —
+  `last_reported` age 25 s vs `last_updated` 46 min — so it correctly reads as fresh.
+  ⚠️ The REST `/api/states` `last_reported` field can disagree with the template
+  engine's — **validate freshness via `/api/template`**, which is what the automation
+  actually runs.)
+- **Per-segment windows (team ruling 2026-07-08 — approved):**
+  - **Voltage segments + 48V BMS SOC + EPEver charge current + all GRID lines:
+    30 min (1800 s)** — the `cell()`/`pcell()` default. The BE HV/delta sensors
+    publish on-change with a steady pack, so they legitimately go quiet up to
+    **~22.6 min** (median ~17 s; measured from `/api/history`). A tighter window
+    (e.g. 10 min) blanks *healthy* data and trains the reader to ignore `--`; 30 min
+    covers the observed worst case with margin and still catches the real failure.
+  - **HV pack SOC (segment `B`, `sensor.be_soc`): 6 h (21600 s).** SOC at rest changes
+    glacially, so this on-change MQTT source legitimately goes silent for tens of
+    minutes to hours (**measured 50 min silent at a steady 99 %** on 2026-07-08). A
+    30-min window would blank a perfectly valid SOC almost the whole time the pack is
+    at rest, gutting the SOC page; 6 h shows the real value yet still catches a truly
+    dead Battery-Emulator. (48V BMS SOC stays at 30 min because the BMS *polls* and
+    re-reports every ~25 s — it doesn't need the wide window, and the tight window
+    keeps it honest.)
+  - Each window is a per-call `maxage` argument on the `cell()`/`pcell()` macro — one
+    constant per segment if it ever needs tuning.
 - **KNOWN LIMITATION:** the freshness gate only protects against a wedged
   *integration*. If **HA itself dies**, the retained payload persists on the broker
   and boards will keep showing it (with their own fetch-age, which stays small). A
@@ -135,7 +197,7 @@ python3 ~/Projects/ha/tools/ha_supervisor.py GET /addons/e4069849_juicepassproxy
 **Never paste the password into committed files, findings, logs, or issue comments.**
 Addon ACL: authed users have readwrite on `#`, so `smol/#` needs no ACL changes.
 
-## Install (deployment is HELD for review — do NOT run yet)
+## Install / redeploy (DEPLOYED & LIVE 2026-07-08 — this is the update procedure)
 
 `scp` doesn't work on the HAOS SSH add-on (no subsystem), so use the tee pattern:
 
@@ -148,18 +210,31 @@ cat ha/packages/smol_mesh.yaml \
 #   homeassistant:
 #     packages: !include_dir_named packages
 
-# validate config, then restart HA to load the automation
+# validate config, then apply the MINIMAL reload (see below)
 TOKEN=$(bw get password ha-llat)
 curl -sX POST https://ha.jphe.in:8123/api/config/core/check_config \
   -H "Authorization: Bearer $TOKEN"
-curl -sX POST https://ha.jphe.in:8123/api/services/homeassistant/restart \
-  -H "Authorization: Bearer $TOKEN"
 ```
 
-After restart the automation fires on HA start and publishes the retained payload
-immediately, so `smol/display/batt` is warm before any gateway connects. (A real
-rendered payload is already retained on the broker from verification — HA overwrites
-it on start.)
+**Which reload? (verified 2026-07-08 — avoid a full restart when you can):**
+
+| Change | Minimal reload |
+| --- | --- |
+| Automation template / trigger edits only | `POST /api/services/automation/reload` — re-reads all YAML incl. package-merged automations |
+| **Added/removed a `mqtt:` sensor or an `input_*` helper** | `POST /api/services/homeassistant/reload_all` — automation.reload does **not** register new manually-configured MQTT entities |
+| New top-level integration/domain | full `POST /api/services/homeassistant/restart` |
+
+```bash
+# e.g. after a template edit:
+curl -sX POST https://ha.jphe.in:8123/api/services/automation/reload -H "Authorization: Bearer $TOKEN"
+# after adding a mqtt mirror sensor (as the grid one was):
+curl -sX POST https://ha.jphe.in:8123/api/services/homeassistant/reload_all -H "Authorization: Bearer $TOKEN"
+```
+
+Both automations fire on HA start (and after a reload, trigger them once to warm the
+topics), so `smol/display/batt` and `smol/display/grid` are retained on the broker
+before any gateway connects. Confirm the mirror sensors reflect the new payloads:
+`sensor.smol_display_batt` (6 segments) and `sensor.smol_display_grid`.
 
 Sanity-check the retained topic any time (no HA restart needed):
 
