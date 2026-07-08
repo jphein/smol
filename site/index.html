@@ -605,6 +605,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
     <ul>
     <li><b>GRBL</b><a href="https://github.com/gnea/grbl" target="_blank">Real-time CNC motion-control firmware in tightly optimized C for an Arduino-class AVR — a G-code planner that looks 16 moves ahead, emits up to 30 kHz of jitter-free step pulses, and honors real-time override commands mid-stream. smol borrows the lean-real-time-firmware craft — deterministic behavior squeezed from a tiny MCU — and a loose design echo: GRBL interleaves out-of-band real-time commands with a streamed buffer, roughly the shape of smol draining ESP-NOW RX between MQTT poll cycles. Differs — GRBL is single-purpose motion with no radio or mesh; the echo is lineage, not a code steal. ↗</a></li>
     </ul>
+    <p class="mono" style="font-size:.78rem;color:var(--faint);margin-top:26px;max-width:74ch">◇ BLE presence (the #22 basis) — smol's beacon-tracking idea would build on <a href="https://github.com/agittins/bermuda" target="_blank" style="color:var(--dim)">Bermuda</a> (HACS trilateration that reuses existing bluetooth_proxy anchors) and <a href="https://espresense.com" target="_blank" style="color:var(--dim)">ESPresense</a> (dedicated MQTT anchors). Prior art and reference, not code smol borrows.</p>
   </div>
 </div></section>
 
