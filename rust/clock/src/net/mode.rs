@@ -663,7 +663,8 @@ pub struct BenchStats {
 // reassembles keyed by (src MAC, msgid), unicasts a `SMOLv1 RELAYACK` bitmap so
 // the leaf retransmits only missing fragments (bounded to RELAY_MAX_TRIES),
 // buffers completed messages, and every RELAY_FLUSH_INTERVAL_MS runs a WiFi burst
-// to UDP them to a fixed collector, then returns to ESP-NOW ch6.
+// — an MQTT session to the HA broker (`run_mqtt_burst`: publish telemetry +
+// retained discovery, receive the retained downlink) — then returns to ESP-NOW ch6.
 //
 // SINGLE-RADIO AIRTIME COST: a flush burst tunes the one PHY to the AP's channel,
 // so the mesh is DEAF on ch6 for the ~seconds it lasts (the documented one-radio
@@ -671,7 +672,7 @@ pub struct BenchStats {
 // telemetry is loss-tolerant, so this is acceptable; retransmit rides over it.
 //
 // HONESTY (compile-verified only): the flush uses the PROVEN TIME-SHARE burst
-// (disconnect -> associate -> UDP -> re-pin ch6), the same pattern boot NTP uses,
+// (disconnect -> associate -> MQTT -> re-pin ch6), the same pattern boot NTP uses,
 // NOT true concurrent COEXIST. Per Nebula, STA-associated + ESP-NOW RX
 // reliability / DTIM latency under real COEXIST is UNVERIFIED on this board, so we
 // deliberately pause RX during the burst rather than depend on it.
@@ -681,10 +682,12 @@ pub struct BenchStats {
 // RELAYACK. Fine for a hobby mesh; sign or LMK-encrypt if it ever matters.
 //
 // OUT OF SCOPE this run (documented stubs, NOT implemented):
-//   * DOWNLINK (collector -> leaf): needs a poll/queue on the gateway + unicast
-//     fragmentation back to the leaf MAC. `service` already has the leaf MAC on
-//     every RX, and `send_to` already unicasts, so the hook exists — but the
-//     collector-side queue/protocol is unspecified, so it is deferred.
+//   * PER-LEAF DOWNLINK (broker -> one leaf): the v2 BATT downlink covers the
+//     broadcast display case (retained `smol/display/batt` -> gateway-only
+//     `SMOLv1 BATT` broadcast, single-hop). Addressed unicast payloads back to a
+//     specific leaf would still need a poll/queue + unicast fragmentation; the
+//     hooks exist (`service` has the leaf MAC, `send_to` unicasts) but the
+//     queue/protocol is unspecified, so it stays deferred.
 //   * MULTI-HOP (leaf -> relay -> ... -> gateway): needs a next-hop/TTL routing
 //     header + a loop-prevention seen-set + a shared-channel invariant across
 //     every node (+200-400 LOC). This is single-hop uplink only.
