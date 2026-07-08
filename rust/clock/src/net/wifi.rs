@@ -445,15 +445,41 @@ pub fn run_udp_flush(
                 break;
             }
         }
-    }
-
-    // Poll briefly so the last datagram actually egresses (smoltcp is
-    // poll-driven; `send_slice` only enqueues into the TX buffer). Short + fixed
-    // so it can't meaningfully extend the RELAY_FLUSH_BUDGET-bounded burst (1b).
-    let drain_deadline = Instant::now() + Duration::from_millis(300);
-    while Instant::now() < drain_deadline {
+        // Interleave ARP warm-up + egress with the remaining sends: one poll after
+        // each enqueue kicks dispatch (an ARP request on a fresh association), so the
+        // collector's MAC is likely resolved by the time the drain below runs (N3).
         tick();
         iface.poll(smoltcp_now(), device, &mut sockets);
+    }
+
+    // Drain UNTIL the UDP TX buffer is verifiably empty, then return. FINDING N3
+    // (HW, 652155b fleet): `send_slice` only ENQUEUES; `iface.poll` dispatches — but
+    // on a FRESH association the first dispatch must resolve the collector's MAC via
+    // ARP (empty neighbour cache; the AP may power-save-buffer the reply). The old
+    // fixed 300 ms drain lost that race → datagrams died in the TX buffer at teardown
+    // and `all_sent = true` LIED (the collector saw zero packets). smoltcp RETAINS a
+    // packet in the tx buffer until it truly dispatches — verified in smoltcp 0.12
+    // `udp::Socket::dispatch`/`PacketBuffer::dequeue_with`: an emit `Err`
+    // (neighbour-unknown) consumes 0 bytes, so the packet stays queued — hence
+    // `send_queue() == 0` is a true "handed to the radio" signal. Poll until then,
+    // bounded by ~2 s AND a small grace past the overall `deadline`; if it never
+    // empties, report `all_sent = false` — an HONEST failure the caller's
+    // backoff/retry (finding 1) then handles correctly. (So the drain MUST be allowed
+    // to finish the job or report failure — the old "can't extend the burst" inverts.)
+    let drain_hard = Instant::now() + Duration::from_secs(2);
+    let drain_grace = deadline + Duration::from_millis(500);
+    loop {
+        tick();
+        iface.poll(smoltcp_now(), device, &mut sockets);
+        if sockets.get_mut::<udp::Socket>(udp_handle).send_queue() == 0 {
+            break; // every datagram dispatched from smoltcp toward the radio
+        }
+        let now = Instant::now();
+        if now > drain_hard || now > drain_grace {
+            all_sent = false;
+            log::warn!("smol: relay flush — TX drain timed out; datagrams undelivered");
+            break;
+        }
     }
     all_sent
 }
