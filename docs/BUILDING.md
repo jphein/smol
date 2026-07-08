@@ -75,6 +75,9 @@ Feature tiers: default = Clock + Snake · `--features wifi` = + NTP · `--featur
 - **espflash v4 won't flash** esp-hal `1.0.0-rc.0` images (wants an ESP-IDF app descriptor). Use **espflash v3**.
 - **`esp-wifi` pins to esp-hal internals:** it needs **`esp-hal = "=1.0.0-rc.0"`** exactly (newer rc.1/1.0 changed `Rng::new()` and break the build despite passing semver). Full working pin-set is in `rust/clock/Cargo.toml` + comments.
 - **Rust serial logs go over USB-JTAG:** build with `ESP_LOG=info` (level is compile-time) and view with `espflash monitor` — plain `cat /dev/ttyACM0` won't show them, and the monitor needs a real TTY (fails under a pipe).
+- **`espflash monitor` reset mode matters on this native-USB C3:** `--before default-reset` (the UART-bridge DTR/RTS reset) **fails silently** — it drops the chip into download/stub mode, so you get the monitor banner and then nothing. Use **`--before usb-reset`** (the USB-JTAG-Serial peripheral reset) to actually reboot the app and catch its boot log. The firmware only logs at **boot + state changes**, so a silent idle board looks identical to a broken capture — you must catch the boot.
+- **Capture logs through a PTY, not a pipe:** espflash block-buffers when stdout isn't a terminal, so `espflash monitor | tee` stalls. Wrap it in a pseudo-terminal: `timeout <N> script -qec "espflash monitor --port <port> --before usb-reset" <capfile>`. Kill it by **exact** name only (`pgrep -x espflash` / `pkill -x espflash`) so you don't nuke unrelated processes.
+- **Identify boards by USB vendor / MAC, never by `ttyACMx`:** the number isn't stable — a board re-enumerates on replug (we saw `ttyACM2 → ttyACM0`, same MAC) and other USB-serial devices can squat a lower number. Espressif boards are **`303a:…`** (`lsusb`; `303a:1001` = the USB-JTAG/serial peripheral); pin the exact unit by **MAC** (`udevadm info /dev/ttyACM* | grep -i serial`, or read it from the boot log). On this box `ttyACM1 = 1209:2201` is a **Dygma keyboard** — opening it as if it were the board is a real mistake, so match `303a:` first.
 - **Broken `cc` shim on PATH** on this box → prefix cargo installs with `CC=gcc`.
 - **`CDCOnBoot=cdc`** is required in the Arduino FQBN for Serial over USB-Serial/JTAG.
 - **Bluepad32 package is `esp32-bluepad32`** (hyphen), not `esp32_bluepad32`.
@@ -83,3 +86,5 @@ Feature tiers: default = Clock + Snake · `--features wifi` = + NTP · `--featur
 
 ## Multi-board / ESP-NOW mesh
 Give each board a **distinct peer id** (`rust/clock/src/main.rs`, the `mode::start(..., N, ...)` arg — we flashed 7 / 8 / 9). Distinct ids let the blue-LED handshake and the Bench link stats work between boards (same id can be filtered as self-echo). Boards auto-pair over ESP-NOW on the AP's channel; watch the blue LED go slow-blink (detected) → solid (connected).
+
+The mesh wire protocol (HELLO/ACK, BEACON, TIME, RELAY, and the design-stage SNK) — exact byte layouts, cadence, and per-frame verification status — is documented in **[docs/protocol.md](protocol.md)**.

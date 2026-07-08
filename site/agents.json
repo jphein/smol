@@ -25,6 +25,10 @@
     { "name": "PULSE", "role": "Rust clock on 2 boards — ESP-NOW CONNECT verified (solid blue) ✓", "status": "done", "glyph": "⏻" },
     { "name": "RESIN", "role": "Wrote enclosure-resin.md — metal kills RF, don't pot a LiPo", "status": "done", "glyph": "⬗" },
     { "name": "PORTAL", "role": "Case FINAL — body+lid+crown, bail+crown at top (classic), watertight", "status": "done", "glyph": "◫" },
-    { "name": "KERNEL", "role": "Unified Rust firmware DONE — Clock+Snake+Bench, all builds clean", "status": "done", "glyph": "▦" }
+    { "name": "KERNEL", "role": "Unified Rust firmware DONE — Clock+Snake+Bench, all builds clean", "status": "done", "glyph": "▦" },
+    { "name": "CHIME", "role": "Mesh time sync — SMOLv1 TIME frame, newest-NTP-wins (loop-free); compile + clippy clean, board #1 flashed", "status": "active", "glyph": "⧗" },
+    { "name": "SIGIL", "role": "Ported realm-sigil for magical node names — display-only realm words (id8 = 'Eldritch Nexus')", "status": "active", "glyph": "✶" },
+    { "name": "CONDUIT", "role": "ESP-NOW → internet relay bridge — single-hop telemetry to a WiFi gateway; browsing-grade ruled out (250 B MTU)", "status": "active", "glyph": "⇅" },
+    { "name": "OUROBOROS", "role": "MMO mesh snake — shared toroidal world, 18 B self-broadcast frames, dead-reckoned peers (netcode + design)", "status": "active", "glyph": "∞" }
   ]
 }

@@ -45,6 +45,11 @@
     { "id": 42, "title": "Flash unified firmware (12h/AM-PM + °F) to boards #1 (id8) + #2 (id7)", "status": "done", "owner": "you + Claude" },
     { "id": 43, "title": "Re-render final case (bail-up) + crown on site", "status": "done", "owner": "you + Claude" },
     { "id": 44, "title": "Wrap-up: root README, docs/BUILDING.md, render tool, refreshed memory", "status": "done", "owner": "Claude" },
+    { "id": 47, "title": "Mesh time sync (#1): SMOLv1 TIME frame, newest-NTP-wins (loop-free) — in tree (uncommitted), compile + clippy clean; 2-board adoption VERIFIED 2026-07-07 (id8 ac:a7:04:ba:1f:24 adopted id7 ac:a7:04:b9:77:14's synced_at over ESP-NOW)", "status": "active", "owner": "CHIME" },
+    { "id": 48, "title": "Magical node names (#2): realm-sigil port, display-only fantasy realm — in tree (uncommitted), compile-verified; live: id7 (ac:a7:04:b9:77:14) = 'Draconic Dominion', id8 (ac:a7:04:ba:1f:24) = 'Eldritch Nexus'", "status": "active", "owner": "SIGIL" },
+    { "id": 49, "title": "ESP-NOW → internet relay bridge (#3): single-hop telemetry, leaf → RELAY fragments → gateway → UDP over WiFi burst — in progress; browsing-grade gateway ruled out (250 B MTU)", "status": "active", "owner": "CONDUIT" },
+    { "id": 50, "title": "MMO mesh snake (#5): shared 256×256 toroidal world, scrolling viewport, 18 B SNK self-broadcast @5 Hz, dead-reckoned peers, N≈16 — design", "status": "pending", "owner": "OUROBOROS" },
+    { "id": 51, "title": "Flash root board id7 'Draconic Dominion' (MAC ac:a7:04:b9:77:14) with unified firmware + time sync + names — done today; id8 'Eldritch Nexus' (ac:a7:04:ba:1f:24) online + adopted mesh time; 3rd board pending (needs data cable)", "status": "done", "owner": "you + Claude" },
     { "id": 45, "title": "Flash board #3 (id 9) for a 3-way ESP-NOW mesh", "status": "pending", "owner": "you + Claude" },
     { "id": 46, "title": "Wire battery + TP4056 and print/assemble the pocket-watch case", "status": "pending", "owner": "you" }
   ]
