@@ -19,6 +19,16 @@ configs and needs no HA config (see *MQTT discovery* below).
   - `smol/display/grid` — the grid/consumption screen (issue #16).
   Plus two MQTT **mirror** sensors (`sensor.smol_display_batt` / `sensor.smol_display_grid`)
   so a dashboard card shows exactly what the boards fetch.
+- `dashboard/smol_control_room.yaml` — the **assembled Control Room view** (phosphor-CRT):
+  live mesh-topology graph, per-node status tiles, retained OTA install (canary-first),
+  the shared OLED glass, and power/solar — folds the modular cards below into one themed
+  view. Install steps are in the file header (theme + fonts + paste-the-view).
+- `themes/smol.yaml` — the phosphor-green Lovelace **theme** (dark + light; zero HACS for
+  color, card-mod optional for the VT323 pixel-font). Scopes to any view with `theme: smol`.
+- `www/luna-fonts/` — VT323 + IBM Plex Mono (SIL OFL, see `ATTRIBUTION.md`), loaded locally
+  (no CDN) via `@font-face` in the theme so the dashboard is self-contained.
+- `dashboard/smol_{display,nodemgr,ota,topology}_card.yaml` — the modular source cards the
+  Control Room assembles; usable standalone if you'd rather compose your own view.
 
 ### `smol/display/batt` payload (LOCKED — the exact lines the firmware renders on the 72×40 OLED)
 

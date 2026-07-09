@@ -1,0 +1,107 @@
+# smol · Home Assistant theme — PHOSPHOR-CRT (matches JP's Control Room mockup)
+# =====================================================================
+# Luna, 2026-07-09 (v2 — re-colored cyan→phosphor-green per JP's node-manager mockup).
+# Green-phosphor terminal on near-black (dark) / green-on-paper (light). Skins every
+# vanilla Lovelace card; set a view's `theme: smol`. Zero HACS.
+# DEPLOY: sudo tee → /homeassistant/themes/smol.yaml ; reload_themes.
+# FONTS: color theming is full; VT323/IBM Plex Mono are referenced but only render if
+# loaded as a frontend resource (vanilla falls back to the mono stack — that's the
+# no-HACS approximation; card-mod @font-face gives true VT323 if JP opts into it).
+# =====================================================================
+smol:
+  # ---- brand accents (phosphor green) ----
+  primary-color: "#5bff9a"
+  accent-color: "#ffc24b"
+  dark-primary-color: "#5bff9a"
+  light-primary-color: "#5bff9a"
+  # ---- card-mod: load LOCAL retro fonts (no CDN). Applied via this theme's font vars,
+  #      so VT323/IBM Plex Mono only affect the theme:smol view — not JP's other views. ----
+  card-mod-theme: smol
+  card-mod-root: |
+    @font-face { font-family: 'VT323'; src: url('/local/luna-fonts/vt323.woff2') format('woff2'); font-display: swap; }
+    @font-face { font-family: 'IBM Plex Mono'; src: url('/local/luna-fonts/ibmplexmono.woff2') format('woff2'); font-display: swap; }
+  # ---- state / icon ----
+  state-icon-color: "#5bff9a"
+  state-icon-active-color: "#5bff9a"
+  paper-item-icon-color: "#6f8f78"
+  paper-item-icon-active-color: "#5bff9a"
+  label-badge-red: "#ff6b6b"
+  label-badge-green: "#5bff9a"
+  label-badge-yellow: "#ffc24b"
+  label-badge-blue: "#5bff9a"
+  # ---- text ----
+  primary-text-color: "#c9e8d2"
+  secondary-text-color: "#6f8f78"
+  text-primary-color: "#04140a"          # dark ink on phosphor fills
+  disabled-text-color: "#3f5a49"
+  # ---- surfaces ----
+  ha-card-border-radius: "10px"
+  ha-card-border-width: "1px"
+  card-background-color: "#0e150e"
+  ha-card-background: "linear-gradient(180deg,#121b12,#0e150e)"
+  ha-card-border-color: "rgba(91,255,154,.16)"
+  ha-card-box-shadow: "0 0 18px -6px rgba(91,255,154,.18)"
+  divider-color: "rgba(91,255,154,.12)"
+  # ---- header / sidebar ----
+  app-header-background-color: "#060906"
+  app-header-text-color: "#c9e8d2"
+  sidebar-background-color: "#0b100b"
+  sidebar-icon-color: "#6f8f78"
+  sidebar-selected-icon-color: "#5bff9a"
+  sidebar-selected-text-color: "#5bff9a"
+  # ---- controls ----
+  switch-checked-color: "#5bff9a"
+  switch-checked-track-color: "#5bff9a"
+  paper-toggle-button-checked-button-color: "#5bff9a"
+  input-fill-color: "#0b100b"
+  input-ink-color: "#c9e8d2"
+  mdc-theme-primary: "#5bff9a"
+  # ---- typography (VT323/IBM Plex Mono if loaded; mono fallback) ----
+  paper-font-common-base_-_font-family: "'IBM Plex Mono',ui-monospace,monospace"
+  paper-font-body1_-_font-family: "'IBM Plex Mono',ui-monospace,monospace"
+  paper-font-subhead_-_font-family: "'IBM Plex Mono',ui-monospace,monospace"
+  paper-font-headline_-_font-family: "'VT323','IBM Plex Mono',monospace"
+  paper-font-title_-_font-family: "'VT323','IBM Plex Mono',monospace"
+  ha-heading-card-title-font-family: "'VT323','IBM Plex Mono',monospace"
+  ha-heading-card-title-font-size: "1.2rem"
+  # ---- backgrounds ----
+  primary-background-color: "#060906"
+  secondary-background-color: "#0b100b"
+  # =====================================================================
+  modes:
+    dark:
+      primary-background-color: "#060906"
+      secondary-background-color: "#0b100b"
+      card-background-color: "#0e150e"
+      ha-card-background: "linear-gradient(180deg,#121b12,#0e150e)"
+      ha-card-border-color: "rgba(91,255,154,.16)"
+      primary-text-color: "#c9e8d2"
+      secondary-text-color: "#6f8f78"
+      divider-color: "rgba(91,255,154,.12)"
+      app-header-background-color: "#060906"
+      sidebar-background-color: "#0b100b"
+    light:                                  # mockup's green-on-paper
+      primary-color: "#0f7a44"
+      accent-color: "#a5650a"
+      state-icon-active-color: "#0f7a44"
+      paper-item-icon-active-color: "#0f7a44"
+      switch-checked-color: "#0f7a44"
+      switch-checked-track-color: "#0f7a44"
+      mdc-theme-primary: "#0f7a44"
+      primary-background-color: "#e7ece4"
+      secondary-background-color: "#dde4d8"
+      card-background-color: "#f4f7f0"
+      ha-card-background: "linear-gradient(180deg,#f4f7f0,#eaf0e6)"
+      ha-card-border-color: "rgba(15,122,68,.22)"
+      divider-color: "rgba(15,122,68,.14)"
+      primary-text-color: "#1a271d"
+      secondary-text-color: "#5c7263"
+      text-primary-color: "#f4f7f0"
+      disabled-text-color: "#8aa093"
+      app-header-background-color: "#e7ece4"
+      app-header-text-color: "#1a271d"
+      sidebar-selected-icon-color: "#0f7a44"
+      sidebar-selected-text-color: "#0f7a44"
+      label-badge-red: "#c0392b"
+      label-badge-green: "#0f7a44"
+      label-badge-yellow: "#a5650a"
