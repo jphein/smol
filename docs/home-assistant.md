@@ -52,8 +52,8 @@ See [protocol.md](protocol.md#batt--ha-battery-snapshot) for the frames and
 ## Node manager (#21) — remote screen config
 
 Set each node's **default screen + page** from HA, no reflash. HA publishes a **retained**
-`smol/<id>/config/default_screen` = `<AppKind>:<page>`; the board reads it on its next
-burst and applies it (empty payload = clear → the board.rs compile-time default). The
+`smol/<id>/config/default_screen` = `<AppKind>:<page>`; once the firmware consume side lands, the board will read it on its next
+burst and apply it (empty payload = clear → the board.rs compile-time default). The
 control surface is HA **Lovelace** (not an on-device web UI — a burst radio can't host
 one; the node manager IS smol's WLED-web-UI analog, relocated to where a burst device is
 reachable). "Set all" writes every per-node topic — there is **no broadcast topic**, and
@@ -65,17 +65,22 @@ GUI/entities: [`ha/README.md`](../ha/README.md).
 ## OTA (#6) — retained announce (spec'd)
 Firmware updates ride the same MQTT-native pattern: a retained
 `smol/ota/announce` = `OTA|build|size|sha256|url`; the board fetches the image over
-HTTP to its inactive A/B slot, verifies, and reboots with bootloader rollback. 🟡 spec'd
-+ hardware-de-risked (`scratch/smol-ha-batt/ota-plan.md`); not yet built.
+HTTP to its inactive A/B slot, verifies (sha256), and activates it. Recovery is
+**app-side self-rollback + canary-one-board-at-a-time** — the bundled bootloader
+slot-selects, but **revert-on-boot-fail is OFF** (unproven/likely disabled), so a bad
+image is contained by pushing to one board at a time (never fleet-unison), not by an
+automatic bootloader revert. 🟡 engine landed (integrity SHA gate + app-side rollback +
+monotonicity); the fetch trigger + hardware run are next
+(`scratch/smol-ha-batt/ota-plan.md`).
 
 ## Collector retirement
 The MQTT link **retires the old Python UDP collector** (`collector/`, which ran on
-`disks`). Telemetry now goes straight to HA; the collector is kept in git history only as
+`<host>`). Telemetry now goes straight to HA; the collector is kept in git history only as
 a rollback path. The retirement checklist (stop/disable the service, archive the JSONL) is
 in [`ha/README.md`](../ha/README.md#collector-retirement-checklist-post-hardware-verify-only--not-now).
 
 ## Broker (one line; detail in ha/README)
-Mosquitto runs on the quad-homed HA VM and binds `0.0.0.0`; boards target the **VLAN11
-leg `10.0.11.110:1883`** (same subnet as the boards — no cross-VLAN routing). Creds are
+Mosquitto runs on the HA VM and binds `0.0.0.0`; boards target its **`<broker-ip>:1883`**
+leg on the boards' own subnet (no cross-VLAN routing). Creds are
 the Mosquitto addon option, never on the mesh. Full broker-leg table + gotchas:
 [`ha/README.md`](../ha/README.md#broker-verified-2026-07-08).

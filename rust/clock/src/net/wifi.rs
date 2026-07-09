@@ -56,7 +56,7 @@ use crate::secrets::{WIFI_PASS as WIFI_PASSWORD, WIFI_SSID};
 const NTP_SERVER_IP: Ipv4Addr = Ipv4Addr::new(162, 159, 200, 123);
 const NTP_PORT: u16 = 123;
 
-/// HA Mosquitto broker (v2 MQTT-native bridge — the disks UDP collector is retired).
+/// HA Mosquitto broker (v2 MQTT-native bridge — the old LAN UDP collector is retired).
 /// Address/creds live in the git-ignored `crate::secrets` (retargetable one-liners —
 /// see the secrets comment for the VLAN11-leg rationale + the VLAN6 fallback). Built
 /// from the `[u8;4]` there so `secrets.rs` stays a plain imports-free consts file.
@@ -79,6 +79,81 @@ const BATT_TOPIC: &[u8] = b"smol/display/batt";
 /// on the SAME MQTT session — one extra SUBSCRIBE on the already-open connection.
 #[cfg(feature = "wifi")]
 const GRID_TOPIC: &[u8] = b"smol/display/grid";
+
+/// #23 stage 4: the retained single-gateway ELECTION topic — `MC|<owner_id>|<ch>|<seq>`.
+/// Broker-mediated so it can't fragment (all gateways reach the one broker regardless
+/// of channel); lowest owner_id wins; `seq` is the load-bearing liveness counter.
+#[cfg(feature = "wifi")]
+const MESH_CHANNEL_TOPIC: &[u8] = b"smol/mesh/channel";
+
+/// #23 stage 3-4 boot ELECTION result, filled by [`mqtt_session`] from the retained
+/// `smol/mesh/channel`. A board that reached DHCP is a candidate; the lowest-id
+/// candidate is the OWNER (coexist gateway). Non-owners demote to leaf + scan for the
+/// owner's HELLO. `channel` is advisory (0 = unknown → leaves discover by scanning).
+#[cfg(feature = "wifi")]
+#[derive(Clone, Copy)]
+pub struct MeshElect {
+    // --- inputs (seeded by the caller from the live RadioManager) ---
+    /// Monotonic "now" in ms (same clock the caller uses for scan/liveness), so the
+    /// stale-owner timeout is measured on ONE clock across bursts. (The node's own id
+    /// is the `node_id` param `mqtt_session` already carries — not duplicated here.)
+    pub now_ms: u64,
+    // --- persistent staleness observation (in AND out) ---
+    /// The owner id of the last retained `MC` record this node observed.
+    pub seen_owner: u8,
+    /// That record's `seq`.
+    pub seen_seq: u32,
+    /// When the current `(seen_owner, seen_seq)` pair was FIRST seen (ms). An owner
+    /// whose seq stays frozen past `MC_STALE_MS` from here is presumed dead.
+    pub seen_ms: u64,
+    // --- outputs (applied to the live role by the caller) ---
+    /// True iff I claimed / hold ownership (I am the coexist gateway).
+    pub i_am_owner: bool,
+    /// The elected owner's id (== my_id when I own it).
+    pub owner_id: u8,
+}
+
+#[cfg(feature = "wifi")]
+impl MeshElect {
+    pub fn new(my_id: u8) -> Self {
+        Self {
+            now_ms: 0,
+            seen_owner: 0,
+            seen_seq: 0,
+            seen_ms: 0,
+            i_am_owner: false,
+            owner_id: my_id,
+        }
+    }
+}
+
+/// OTA (issue #6): retained per-fleet announce topic (`OTA|build|size|sha|url`). The
+/// per-BOARD topic `smol/ota/announce/<id>` is built at runtime from `node_id` — the
+/// CANARY path (spec §4b-4 Option 1): JP publishes to one id, watches it reach the new
+/// build, then publishes the next / the `all` topic. A board subscribes to BOTH.
+#[cfg(feature = "wifi")]
+const OTA_ANNOUNCE_ALL_TOPIC: &[u8] = b"smol/ota/announce/all";
+
+/// A retained owner whose `seq` has not advanced for this long is presumed DEAD and
+/// may be taken over. The owner re-publishes `MC` (seq++) every gateway flush (~30 s),
+/// so 3 missed refreshes with a frozen seq is a safe "owner gone" threshold. Consumed
+/// by the [`mqtt_session`] adopt decision (a leaf re-election is what re-reads `MC`
+/// after a prolonged HELLO silence, giving the stale check a second sample to fire on).
+#[cfg(feature = "wifi")]
+const MC_STALE_MS: u64 = 90_000;
+
+/// Parse a retained `MC|<owner_id>|<channel>|<seq>` election payload → (owner, ch, seq).
+/// ASCII, decimal fields. Returns `None` on any malformed field (panic-free).
+#[cfg(feature = "wifi")]
+fn parse_mesh_channel(payload: &[u8]) -> Option<(u8, u8, u32)> {
+    let s = core::str::from_utf8(payload).ok()?;
+    let rest = s.strip_prefix("MC|")?;
+    let mut it = rest.split('|');
+    let owner: u8 = it.next()?.parse().ok()?;
+    let ch: u8 = it.next()?.parse().ok()?;
+    let seq: u32 = it.next()?.parse().ok()?;
+    Some((owner, ch, seq))
+}
 
 /// Budget for one full MQTT session (TCP connect → CONNECT/CONNACK → publishes →
 /// SUBSCRIBE → retained downlink → DISCONNECT). Sub-bound of the enclosing burst
@@ -164,17 +239,29 @@ pub fn try_time_sync(
 
     // Phase-2 (wifi-only) build has no status LED, so the tick is a no-op.
     // wifi-only build has no relay/gateway role, so the reached-DHCP flag is unused.
-    let mut _reached_dhcp = false;
-    run_ntp_burst(
+    let mut reached_dhcp = false;
+    // wifi-only build has no mesh election; pass a throwaway result.
+    let mut elect = MeshElect::new(crate::NODE_ID);
+    // wifi-only build has no main-loop OTA fetch trigger; capture (unused) offer.
+    let mut _ota_offer: Option<crate::ota::Announce> = None;
+    let synced = run_ntp_burst(
         &mut controller,
         &mut device,
         rng,
         &mut || false,
-        &mut _reached_dhcp,
+        &mut reached_dhcp,
         crate::NODE_ID,
         batt,
         grid,
-    )
+        &mut elect,
+        &mut _ota_offer,
+    );
+    // OTA MF-1 (wifi-only build): confirm/rollback the running image on its first boot.
+    // self-test = reached DHCP (a broken-WiFi image can't reach it; the just-run OTA
+    // download proved the network is up, so a healthy image won't false-rollback). May
+    // reset (rollback) → never returns in that case.
+    crate::ota::boot_confirm(reached_dhcp);
+    synced
 }
 
 /// Shared WiFi -> DHCP -> SNTP burst, reused by both the Phase-2 `wifi`-only
@@ -208,6 +295,10 @@ pub fn run_ntp_burst(
     // Twin grid cache (issue #16): filled from `smol/display/grid` on the same
     // downlink session as `batt`.
     grid: &mut crate::grid::GridCache,
+    // #23 boot election result (filled from the retained `smol/mesh/channel`).
+    elect: &mut MeshElect,
+    // #6 OTA: filled with a gated retained announce, if one is present for this board.
+    ota_offer: &mut Option<crate::ota::Announce>,
 ) -> Option<u32> {
     // --- smoltcp stack: DHCP + UDP (SNTP) + TCP (MQTT) sockets -----------
     let mut iface = create_interface(device);
@@ -247,6 +338,11 @@ pub fn run_ntp_burst(
         .set_configuration(&Configuration::Client(ClientConfiguration {
             ssid: WIFI_SSID.into(),
             password: WIFI_PASSWORD.into(),
+            // COEXIST SOAK (#23 PART 1): pin association to ch1 so the gateway lands
+            // on the same channel the leaf pins to (mesh ch == AP ch). The `roam`
+            // SSID spans 1/6/11; this restricts the STA to the ch1 AP (north-bedroom).
+            #[cfg(feature = "coexist-soak")]
+            channel: Some(1),
             ..Default::default()
         }))
         .ok()?;
@@ -339,6 +435,8 @@ pub fn run_ntp_burst(
         mqtt_port,
         batt,
         grid,
+        elect,
+        ota_offer,
         mqtt_deadline,
         tick,
     );
@@ -530,10 +628,17 @@ fn mqtt_session(
     src_port: u16,
     batt: &mut crate::batt::BattCache,
     grid: &mut crate::grid::GridCache,
+    elect: &mut MeshElect,
+    // #6 OTA: filled with a GATED (build>running, host-allowed, size-ok) retained
+    // announce if one is present for this board; the caller then triggers the fetch.
+    ota_offer: &mut Option<crate::ota::Announce>,
     deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let broker = (IpAddress::Ipv4(MQTT_BROKER_IP), MQTT_BROKER_PORT);
+    // Per-board OTA announce topic (the canary path), built from node_id.
+    let mut ota_topic = MqttScratch::new();
+    let _ = write!(ota_topic, "smol/ota/announce/{}", node_id);
 
     // --- TCP connect ---
     {
@@ -625,6 +730,18 @@ fn mqtt_session(
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 2, GRID_TOPIC) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
     }
+    // #23 election: subscribe the retained single-gateway topic (packet-id 3).
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 3, MESH_CHANNEL_TOPIC) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
+    // #6 OTA: subscribe this board's canary topic (packet-id 4) + the fleet topic
+    // (packet-id 5). Retained announces stream in with the batt/grid/mc downlinks.
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 4, ota_topic.as_bytes()) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 5, OTA_ANNOUNCE_ALL_TOPIC) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
 
     // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
     for &(id, line) in telemetry {
@@ -662,7 +779,10 @@ fn mqtt_session(
     // flag, and we time out keeping that cache's prior value — not a failure, a miss.
     let mut got_batt = false;
     let mut got_grid = false;
-    while !(got_batt && got_grid) {
+    // #23 election: capture the retained MC|owner|ch|seq (None = topic empty/absent).
+    let mut got_mc = false;
+    let mut mc: Option<(u8, u8, u32)> = None;
+    while !(got_batt && got_grid && got_mc) {
         if tick() {
             break; // #20 abort during downlink wait → fall through to clean DISCONNECT
         }
@@ -682,6 +802,32 @@ fn mqtt_session(
                         grid.store(payload, now); // twin of batt (issue #16)
                         got_grid = true;
                         log::info!("smol: MQTT grid downlink cached ({} B)", payload.len());
+                    } else if topic == MESH_CHANNEL_TOPIC {
+                        mc = parse_mesh_channel(payload); // #23 election record
+                        got_mc = true; // present (unparseable → treated as claimable below)
+                    } else if topic == ota_topic.as_bytes() || topic == OTA_ANNOUNCE_ALL_TOPIC {
+                        // #6 OTA: parse + GATE the retained announce (monotonicity +
+                        // host allowlist + size). Only an actionable one becomes an
+                        // offer; a stale/foreign/oversize one is logged + ignored (so a
+                        // retained announce for the running build is a no-op every burst).
+                        match crate::ota::parse_announce(payload) {
+                            Some(a) => match crate::ota::gate(&a) {
+                                Ok(()) => {
+                                    log::info!(
+                                        "smol OTA: announce build {} accepted (running {})",
+                                        a.build,
+                                        crate::ota::BUILD_NUMBER
+                                    );
+                                    *ota_offer = Some(a);
+                                }
+                                Err(why) => log::info!(
+                                    "smol OTA: announce build {} ignored ({:?})",
+                                    a.build,
+                                    why
+                                ),
+                            },
+                            None => log::warn!("smol OTA: malformed announce ignored"),
+                        }
                     }
                     consumed
                 }
@@ -695,6 +841,62 @@ fn mqtt_session(
             break;
         }
     }
+
+    // --- #23 single-gateway ELECTION with RUNTIME re-decision + stale-owner takeover ---
+    // (Fixes oracle #1 dead-owner wedge + #2 split-brain: the decision here flows BACK to
+    // the live role via `elect`, and a frozen `seq` lets a dead owner be taken over.)
+    //
+    // 1. Refresh the persistent staleness observation: a *changed* (owner,seq) resets the
+    //    "first seen" clock (fresh liveness); an unchanged pair keeps it (staleness accrues).
+    // 2. Adopt a lower-id owner ONLY while it is ALIVE (seq advanced within MC_STALE_MS).
+    //    A stale (frozen-seq) lower-id owner is DEAD → fall through to CLAIM (take over).
+    //    id >= mine, or empty/absent/unparseable, also CLAIM. `channel` stays 0 (advisory;
+    //    leaves discover the real channel by scanning the owner's HELLO).
+    let claim_seq: Option<u32> = match mc {
+        Some((owner, _ch, seq)) => {
+            if owner != elect.seen_owner || seq != elect.seen_seq {
+                elect.seen_owner = owner;
+                elect.seen_seq = seq;
+                elect.seen_ms = elect.now_ms;
+            }
+            let stale = elect.now_ms.saturating_sub(elect.seen_ms) >= MC_STALE_MS;
+            if owner < node_id && !stale {
+                elect.i_am_owner = false;
+                elect.owner_id = owner;
+                None
+            } else {
+                // id >= mine, or a STALE (dead) lower-id owner → claim / take over.
+                elect.i_am_owner = true;
+                elect.owner_id = node_id;
+                Some(seq.wrapping_add(1))
+            }
+        }
+        None => {
+            elect.i_am_owner = true;
+            elect.owner_id = node_id;
+            Some(1)
+        }
+    };
+    if let Some(newseq) = claim_seq {
+        // Record my own ownership locally so my seq counts as "fresh" next read, then
+        // publish the retained record (the liveness heartbeat other boards watch).
+        elect.seen_owner = node_id;
+        elect.seen_seq = newseq;
+        elect.seen_ms = elect.now_ms;
+        let mut mcp = MqttScratch::new();
+        let _ = write!(mcp, "MC|{}|0|{}", node_id, newseq);
+        if let Some(n) =
+            crate::net::mqtt::encode_publish(&mut pkt, MESH_CHANNEL_TOPIC, mcp.as_bytes(), true)
+        {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+    }
+    log::info!(
+        "smol: mesh election -> {} (owner id{}, seen seq {})",
+        if elect.i_am_owner { "OWNER/gateway" } else { "leaf" },
+        elect.owner_id,
+        elect.seen_seq
+    );
 
     // --- DISCONNECT (clean goodbye) + close the socket ---
     if let Some(n) = crate::net::mqtt::encode_disconnect(&mut pkt) {
@@ -731,6 +933,12 @@ pub fn run_mqtt_burst(
     messages: &[(u8, &[u8])],
     batt: &mut crate::batt::BattCache,
     grid: &mut crate::grid::GridCache,
+    // #23 fix: caller-OWNED election state (seeded from the live RadioManager role +
+    // its persistent staleness observation), filled by `mqtt_session` and read BACK
+    // by the caller so the role re-decides at runtime — not just at boot.
+    elect: &mut MeshElect,
+    // #6 OTA: filled with a gated retained announce, if one is present for this board.
+    ota_offer: &mut Option<crate::ota::Announce>,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
@@ -757,10 +965,23 @@ pub fn run_mqtt_burst(
     // not the 30 s NTP budget — a dead AP fails fast so the loop isn't frozen 30 s.
     let deadline = Instant::now() + RELAY_FLUSH_BUDGET;
 
-    // The caller's switch(WifiSta) already issued connect(); just wait for it.
+    // The caller's switch(WifiSta) already issued connect(); wait for it — but a
+    // gateway that ROAMED (lost its AP, e.g. JP's 1/6/11 hard-roam) while staying
+    // POWERED would otherwise zombie here every flush until the deadline, wedging HA
+    // telemetry. R-CONNECT (oracle audit-#1): re-issue connect() on a throttled cadence
+    // so a dropped association self-recovers in seconds — this is what makes the roam
+    // actually follow. Throttled to avoid connect() re-entrancy thrash (esp-wifi
+    // dislikes back-to-back connect() calls); the initial switch()-issued attempt gets
+    // one full RECONNECT_EVERY window before the first retry.
+    const RECONNECT_EVERY: Duration = Duration::from_millis(2000);
+    let mut next_reconnect = Instant::now() + RECONNECT_EVERY;
     while !matches!(controller.is_connected(), Ok(true)) {
         if tick() {
             return false; // #20 abort during flush re-association
+        }
+        if Instant::now() > next_reconnect {
+            let _ = controller.connect();
+            next_reconnect = Instant::now() + RECONNECT_EVERY;
         }
         if Instant::now() > deadline {
             log::warn!("smol: MQTT flush — WiFi connect timed out");
@@ -803,6 +1024,8 @@ pub fn run_mqtt_burst(
     // battery downlink into the cache. Local TCP port from the same rng seed the
     // UDP path used. Bounded within the overall flush `deadline`.
     let src_port = 49152 + (rng.random() % 16384) as u16;
+    // #23: refresh election/liveness each flush — the caller's `elect` carries the
+    // persistent (owner,seq,seen_ms) observation IN and the re-decided role OUT.
     mqtt_session(
         &mut iface,
         device,
@@ -813,7 +1036,240 @@ pub fn run_mqtt_burst(
         src_port,
         batt,
         grid,
+        elect,
+        ota_offer,
         deadline,
         tick,
     )
+}
+
+/// OTA download budget. Unlike a ~1 s telemetry flush, the OTA burst is mesh-DEAF for
+/// the whole ~0.6 MB HTTP download (spec §6-R4), so the window is minutes-scale. It is
+/// user/announce-initiated + abortable (`tick` long-press), never auto-fleet-wide.
+#[cfg(feature = "espnow")]
+const OTA_FETCH_BUDGET: Duration = Duration::from_secs(180);
+
+/// Parse a dotted-quad IPv4 literal (the allowlist is IP-only → no DNS on-device).
+#[cfg(feature = "espnow")]
+fn parse_ipv4(host: &str) -> Option<smoltcp::wire::Ipv4Address> {
+    let mut it = host.split('.');
+    let a: u8 = it.next()?.parse().ok()?;
+    let b: u8 = it.next()?.parse().ok()?;
+    let c: u8 = it.next()?.parse().ok()?;
+    let d: u8 = it.next()?.parse().ok()?;
+    if it.next().is_some() {
+        return None; // >4 octets
+    }
+    Some(smoltcp::wire::Ipv4Address::new(a, b, c, d))
+}
+
+/// #6 OTA FETCH burst (`espnow` gateway, triggered by a gated announce): stream the
+/// announced image over plain HTTP/1.0 into the INACTIVE slot, hashing on the fly,
+/// verify SHA-256 + size, then activate + reboot. The caller has ALREADY
+/// `switch(Mode::WifiSta)`'d. `tick` keeps the UI alive + latches a long-press ABORT
+/// (the whole download is mesh-deaf, §6-R4). Returns only on a NON-activating outcome
+/// (failure/abort, good slot untouched); on SUCCESS it reboots inside `ota::activate`
+/// and never returns.
+#[cfg(feature = "espnow")]
+pub fn run_ota_fetch(
+    controller: &mut esp_wifi::wifi::WifiController<'static>,
+    device: &mut esp_wifi::wifi::WifiDevice<'static>,
+    mut rng: Rng,
+    announce: &crate::ota::Announce,
+    tick: &mut dyn FnMut() -> bool,
+) -> bool {
+    let Some((host, port, path)) = crate::ota::split_url(announce.url()) else {
+        log::error!("smol OTA: malformed announce URL — aborting fetch");
+        return false;
+    };
+    let Some(ip) = parse_ipv4(host) else {
+        log::error!("smol OTA: host is not an IPv4 literal (allowlist is IP-only)");
+        return false;
+    };
+    log::info!(
+        "smol OTA: fetching build {} ({} B) from {}:{}{}",
+        announce.build,
+        announce.size,
+        host,
+        port,
+        path
+    );
+
+    let mut iface = create_interface(device);
+    let mut sockets_storage: [SocketStorage; 2] = Default::default();
+    let mut sockets = SocketSet::new(&mut sockets_storage[..]);
+    let mut dhcp_socket = dhcpv4::Socket::new();
+    dhcp_socket.set_outgoing_options(&[DhcpOption {
+        kind: 12,
+        data: b"smol",
+    }]);
+    let dhcp_handle = sockets.add(dhcp_socket);
+    let mut tcp_rx = [0u8; 1536];
+    let mut tcp_tx = [0u8; 512];
+    let tcp_socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(&mut tcp_rx[..]),
+        tcp::SocketBuffer::new(&mut tcp_tx[..]),
+    );
+    let tcp_handle = sockets.add(tcp_socket);
+    let deadline = Instant::now() + OTA_FETCH_BUDGET;
+
+    // The caller's switch(WifiSta) already issued connect(); wait for association.
+    while !matches!(controller.is_connected(), Ok(true)) {
+        if tick() {
+            return false;
+        }
+        if Instant::now() > deadline {
+            log::warn!("smol OTA: WiFi association timed out");
+            return false;
+        }
+    }
+    let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
+
+    // Fresh DHCP lease (interface just rebuilt).
+    loop {
+        if tick() {
+            return false;
+        }
+        iface.poll(smoltcp_now(), device, &mut sockets);
+        let configured = {
+            let s = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
+            match s.poll() {
+                Some(dhcpv4::Event::Configured(cfg)) => Some((cfg.address, cfg.router)),
+                _ => None,
+            }
+        };
+        if let Some((addr, router)) = configured {
+            apply_dhcp(&mut iface, addr, router);
+            break;
+        }
+        if Instant::now() > deadline {
+            log::warn!("smol OTA: DHCP timed out");
+            return false;
+        }
+    }
+
+    // TCP connect to the (allowlisted) image host.
+    let src_port = 49152 + (rng.random() % 16384) as u16;
+    {
+        let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
+        if s.connect(iface.context(), (IpAddress::Ipv4(ip), port), src_port)
+            .is_err()
+        {
+            log::error!("smol OTA: TCP connect failed");
+            return false;
+        }
+    }
+    loop {
+        iface.poll(smoltcp_now(), device, &mut sockets);
+        if sockets.get_mut::<tcp::Socket>(tcp_handle).may_send() {
+            break;
+        }
+        if tick() {
+            return false;
+        }
+        if Instant::now() > deadline {
+            log::warn!("smol OTA: TCP connect timed out");
+            return false;
+        }
+    }
+
+    // Send the request in pieces (no format buffer; total « the 512 B tx ring).
+    {
+        let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
+        let ok = s.send_slice(b"GET ").is_ok()
+            && s.send_slice(path.as_bytes()).is_ok()
+            && s.send_slice(b" HTTP/1.0\r\nHost: ").is_ok()
+            && s.send_slice(host.as_bytes()).is_ok()
+            && s.send_slice(b"\r\nConnection: close\r\n\r\n").is_ok();
+        if !ok {
+            log::error!("smol OTA: failed to send HTTP request");
+            return false;
+        }
+    }
+
+    // Open the inactive-slot writer (image is streamed here, never buffered whole).
+    let Some(mut writer) = crate::ota::ImageWriter::begin() else {
+        log::error!("smol OTA: cannot open inactive slot (no OTA partition table?)");
+        return false;
+    };
+    let target = writer.target();
+
+    // Receive: accumulate the HTTP headers (validate 200 + Content-Length == size),
+    // then STREAM every body byte straight into the flash writer.
+    let mut header_buf = [0u8; 512];
+    let mut header_len = 0usize;
+    let mut headers_done = false;
+    loop {
+        if tick() {
+            log::warn!("smol OTA: aborted by long-press (slot untouched)");
+            return false;
+        }
+        iface.poll(smoltcp_now(), device, &mut sockets);
+        let mut closed = false;
+        {
+            let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
+            if s.can_recv() {
+                let outcome = s.recv(|data| {
+                    if !headers_done {
+                        let take = core::cmp::min(header_buf.len() - header_len, data.len());
+                        if take == 0 {
+                            return (0, false); // headers exceed the buffer → give up
+                        }
+                        header_buf[header_len..header_len + take]
+                            .copy_from_slice(&data[..take]);
+                        header_len += take;
+                        if let Some(bstart) = crate::ota::header_end(&header_buf[..header_len]) {
+                            if crate::ota::status_code(&header_buf[..header_len]) != Some(200) {
+                                return (take, false); // non-200 → abort
+                            }
+                            if let Some(cl) = crate::ota::content_length(&header_buf[..header_len])
+                            {
+                                if cl != announce.size {
+                                    return (take, false); // length mismatch → abort
+                                }
+                            }
+                            headers_done = true;
+                            // feed body bytes already captured past the header terminator
+                            let fed = writer.feed(&header_buf[bstart..header_len]);
+                            return (take, fed);
+                        }
+                        (take, true) // headers still arriving
+                    } else {
+                        let fed = writer.feed(data);
+                        (data.len(), fed)
+                    }
+                });
+                match outcome {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        log::error!("smol OTA: bad HTTP response or flash write error");
+                        return false;
+                    }
+                    Err(_) => closed = true,
+                }
+            } else if !s.may_recv() {
+                closed = true; // peer closed (Connection: close) + rx drained
+            }
+        }
+        if headers_done && writer.written() >= announce.size {
+            break;
+        }
+        if closed {
+            break;
+        }
+        if Instant::now() > deadline {
+            log::warn!("smol OTA: download timed out (slot untouched)");
+            return false;
+        }
+    }
+
+    // Integrity gate: exact size + SHA-256. Pass ⇒ activate (reboots). Fail ⇒ discard.
+    if writer.finalize(announce.size, &announce.sha256) {
+        log::info!("smol OTA: image VERIFIED — activating the new slot");
+        crate::ota::activate(target); // reboots on success
+        false // reached only if the otadata write failed
+    } else {
+        log::error!("smol OTA: size/SHA-256 verify FAILED — discarded (good slot intact)");
+        false
+    }
 }

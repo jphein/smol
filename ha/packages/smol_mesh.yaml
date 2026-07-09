@@ -214,6 +214,26 @@ input_button:
   smol_9_reset:
     name: "smol id9 · reset to board default"
     icon: mdi:backup-restore
+  # --- OTA panel (issue #6) — CANARY-first, per-id. The "target" is whatever
+  #     tools/ota_publish.sh last STAGED (smol/ota/staged); these buttons push that
+  #     staged line to a single node's acted topic smol/ota/announce/<id>. Push ONE,
+  #     verify its running build advances (needs firmware smol/<id>/status), then the
+  #     next. NEVER fleet-unison while bootloader revert is unproven (ROADMAP D2).
+  smol_ota_push_7:
+    name: "smol OTA · push staged → id7 (canary)"
+    icon: mdi:rocket-launch
+  smol_ota_push_8:
+    name: "smol OTA · push staged → id8"
+    icon: mdi:rocket-launch
+  smol_ota_push_9:
+    name: "smol OTA · push staged → id9"
+    icon: mdi:rocket-launch
+  smol_ota_rollout:
+    name: "smol OTA · roll out to rest (id8+id9, after id7 canary healthy)"
+    icon: mdi:rocket-launch-outline
+  smol_ota_clear:
+    name: "smol OTA · clear all announces (abort)"
+    icon: mdi:cancel
 
 # --- Dashboard mirror: subscribe the retained topic so a card shows exactly ---
 # what the boards fetch (the payload is <=96 chars, well under the 255 state cap).
@@ -243,6 +263,134 @@ mqtt:
       unique_id: smol_9_config_mirror
       state_topic: "smol/9/config/default_screen"
       icon: "mdi:cog"
+    # --- OTA panel (issue #6) ---
+    # The STAGED target — set by tools/ota_publish.sh (OTA|build|size|sha256|url).
+    # State = the build number; the full fields are attributes the push automations
+    # reconstruct the announce line from.
+    - name: "smol ota staged"
+      unique_id: smol_ota_staged_mirror
+      state_topic: "smol/ota/staged"
+      value_template: "{{ value.split('|')[1] if value.startswith('OTA|') else 'none' }}"
+      json_attributes_topic: "smol/ota/staged"
+      json_attributes_template: >-
+        {% set p = value.split('|') %}
+        {{ {'build': p[1], 'size': p[2], 'sha256': p[3], 'url': p[4]} if (p | length >= 5 and p[0] == 'OTA') else {} }}
+      icon: "mdi:package-up"
+    # Per-node LIVE status — NEEDS firmware smol/<id>/status = STAT|<screen>:<page>|<build>
+    # (design F4; unknown until the firmware wave ships it). Feeds the OTA no-downgrade
+    # gate (running build) AND the node-manager live current-screen reflection.
+    - name: "smol 7 status"
+      unique_id: smol_7_status_mirror
+      state_topic: "smol/7/status"
+      value_template: "{{ value.split('|')[1] if '|' in value else value }}"
+      json_attributes_topic: "smol/7/status"
+      json_attributes_template: "{% set p = value.split('|') %}{{ {'build': p[2]} if p | length >= 3 else {} }}"
+      icon: "mdi:chip"
+    - name: "smol 8 status"
+      unique_id: smol_8_status_mirror
+      state_topic: "smol/8/status"
+      value_template: "{{ value.split('|')[1] if '|' in value else value }}"
+      json_attributes_topic: "smol/8/status"
+      json_attributes_template: "{% set p = value.split('|') %}{{ {'build': p[2]} if p | length >= 3 else {} }}"
+      icon: "mdi:chip"
+    - name: "smol 9 status"
+      unique_id: smol_9_status_mirror
+      state_topic: "smol/9/status"
+      value_template: "{{ value.split('|')[1] if '|' in value else value }}"
+      json_attributes_topic: "smol/9/status"
+      json_attributes_template: "{% set p = value.split('|') %}{{ {'build': p[2]} if p | length >= 3 else {} }}"
+      icon: "mdi:chip"
+    # --- MESH TOPOLOGY (issue #27) — HELD; needs the firmware peers/channel publish ---
+    # NOT YET PUBLISHED BY FIRMWARE. These + the template block below back the topology
+    # card (ha/dashboard/smol_topology_card.yaml). Contract (#27, fw morpheus-fw Task 3):
+    #   smol/mesh/channel = MC|owner|channel|seq         (the elected gateway + mesh ch)
+    #   smol/<id>/peers   = PEERS|role|ch|id,rssi,age,flags|…   (each connected board's roster)
+    # Parsing mirrors the batt/grid/config discipline (guarded split, panic-free). Until
+    # firmware publishes these, every entity below reads unknown/unavailable (harmless).
+    - name: "smol mesh channel"
+      unique_id: smol_mesh_channel_mirror
+      state_topic: "smol/mesh/channel"
+      value_template: "{% set p = value.split('|') %}{{ p[3] if p | length >= 4 else 'unknown' }}"
+      json_attributes_topic: "smol/mesh/channel"
+      json_attributes_template: "{% set p = value.split('|') %}{{ {'owner': p[1], 'channel': p[2], 'seq': p[3]} if p | length >= 4 else {} }}"
+      expire_after: 90
+      icon: "mdi:lan"
+    - name: "smol 7 peers"
+      unique_id: smol_7_peers_mirror
+      state_topic: "smol/7/peers"
+      value_template: "{% set p = value.split('|') %}{{ 'gateway' if (p | length > 1 and p[1] == 'G') else 'leaf' }}"
+      json_attributes_topic: "smol/7/peers"
+      json_attributes_template: "{% set p = value.split('|') %}{{ {'ch': p[2], 'peers': p[3:]} if p | length >= 3 else {'peers': []} }}"
+      expire_after: 90
+      icon: "mdi:lan-connect"
+    - name: "smol 8 peers"
+      unique_id: smol_8_peers_mirror
+      state_topic: "smol/8/peers"
+      value_template: "{% set p = value.split('|') %}{{ 'gateway' if (p | length > 1 and p[1] == 'G') else 'leaf' }}"
+      json_attributes_topic: "smol/8/peers"
+      json_attributes_template: "{% set p = value.split('|') %}{{ {'ch': p[2], 'peers': p[3:]} if p | length >= 3 else {'peers': []} }}"
+      expire_after: 90
+      icon: "mdi:lan-connect"
+    - name: "smol 9 peers"
+      unique_id: smol_9_peers_mirror
+      state_topic: "smol/9/peers"
+      value_template: "{% set p = value.split('|') %}{{ 'gateway' if (p | length > 1 and p[1] == 'G') else 'leaf' }}"
+      json_attributes_topic: "smol/9/peers"
+      json_attributes_template: "{% set p = value.split('|') %}{{ {'ch': p[2], 'peers': p[3:]} if p | length >= 3 else {'peers': []} }}"
+      expire_after: 90
+      icon: "mdi:lan-connect"
+
+# =====================================================================
+# MESH TOPOLOGY derived sensors (issue #27) — HELD; back the topology card.
+# rssi = each spoke's signal as heard by the ELECTED owner (dynamic — reads the
+# owner's peers list, defaults id7). online = the telemetry entity is present
+# (⚠️ those discovery entities currently lack expire_after — a silently-dead node
+# won't auto-flip offline until #12 sets it; the doubled entity names are also
+# #12-cleanup-fragile). resync = a leaf's self-reported ch != the elected channel.
+# reelecting = the elected owner is offline or the MC record went stale.
+# =====================================================================
+template:
+  - sensor:
+      - name: "smol 8 rssi"
+        unique_id: smol_8_rssi
+        state: >-
+          {% set owner = state_attr('sensor.smol_mesh_channel', 'owner') or '7' %}
+          {% set ps = state_attr('sensor.smol_' ~ owner ~ '_peers', 'peers') or [] %}
+          {% set m = ps | select('match', '^8,') | list %}
+          {{ m[0].split(',')[1] if m else 'unknown' }}
+      - name: "smol 9 rssi"
+        unique_id: smol_9_rssi
+        state: >-
+          {% set owner = state_attr('sensor.smol_mesh_channel', 'owner') or '7' %}
+          {% set ps = state_attr('sensor.smol_' ~ owner ~ '_peers', 'peers') or [] %}
+          {% set m = ps | select('match', '^9,') | list %}
+          {{ m[0].split(',')[1] if m else 'unknown' }}
+  - binary_sensor:
+      - name: "smol 7 online"
+        unique_id: smol_7_online
+        state: "{{ states('sensor.smol_7_dominion_smol_7') not in ['unavailable', 'unknown', 'none', ''] }}"
+      - name: "smol 8 online"
+        unique_id: smol_8_online
+        state: "{{ states('sensor.smol_8_nexus_smol_8') not in ['unavailable', 'unknown', 'none', ''] }}"
+      - name: "smol 9 online"
+        unique_id: smol_9_online
+        state: "{{ states('sensor.smol_9_herald_smol_9') not in ['unavailable', 'unknown', 'none', ''] }}"
+      - name: "smol 8 resync"
+        unique_id: smol_8_resync
+        state: >-
+          {% set ch = state_attr('sensor.smol_8_peers', 'ch') %}
+          {{ ch is not none and ch != state_attr('sensor.smol_mesh_channel', 'channel') }}
+      - name: "smol 9 resync"
+        unique_id: smol_9_resync
+        state: >-
+          {% set ch = state_attr('sensor.smol_9_peers', 'ch') %}
+          {{ ch is not none and ch != state_attr('sensor.smol_mesh_channel', 'channel') }}
+      - name: "smol mesh reelecting"
+        unique_id: smol_mesh_reelecting
+        state: >-
+          {% set owner = state_attr('sensor.smol_mesh_channel', 'owner') or '7' %}
+          {{ is_state('binary_sensor.smol_' ~ owner ~ '_online', 'off')
+             or states('sensor.smol_mesh_channel') in ['unavailable', 'unknown'] }}
 
 automation:
   - id: smol_publish_batt_display
@@ -534,3 +682,107 @@ automation:
           retain: true
           qos: 0
           payload: "{{ states('input_select.smol_all_screen') }}:{{ states('input_select.smol_all_page') }}"
+
+  # =====================================================================
+  # OTA panel automations (issue #6) — publish the STAGED announce line
+  # (smol/ota/staged, set by tools/ota_publish.sh) to a single node's acted
+  # topic smol/ota/announce/<id>. CANARY-first: push one, verify its running
+  # build advances (needs firmware smol/<id>/status), then the next. The line is
+  # rebuilt from the staged mirror's attributes (build|size|sha256|url).
+  # =====================================================================
+  - id: smol_ota_push_id7
+    alias: "smol OTA: push staged to id7 (canary)"
+    description: >-
+      On the id7 push button, republish the staged OTA announce to
+      smol/ota/announce/7 (only id7 acts). No-op if nothing is staged.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_ota_push_7
+    condition:
+      - condition: template
+        value_template: "{{ state_attr('sensor.smol_ota_staged', 'build') not in [none, 'none'] }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/ota/announce/7"
+          retain: true
+          qos: 0
+          payload: "OTA|{{ state_attr('sensor.smol_ota_staged','build') }}|{{ state_attr('sensor.smol_ota_staged','size') }}|{{ state_attr('sensor.smol_ota_staged','sha256') }}|{{ state_attr('sensor.smol_ota_staged','url') }}"
+  - id: smol_ota_push_id8
+    alias: "smol OTA: push staged to id8"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_ota_push_8
+    condition:
+      - condition: template
+        value_template: "{{ state_attr('sensor.smol_ota_staged', 'build') not in [none, 'none'] }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/ota/announce/8"
+          retain: true
+          qos: 0
+          payload: "OTA|{{ state_attr('sensor.smol_ota_staged','build') }}|{{ state_attr('sensor.smol_ota_staged','size') }}|{{ state_attr('sensor.smol_ota_staged','sha256') }}|{{ state_attr('sensor.smol_ota_staged','url') }}"
+  - id: smol_ota_push_id9
+    alias: "smol OTA: push staged to id9"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_ota_push_9
+    condition:
+      - condition: template
+        value_template: "{{ state_attr('sensor.smol_ota_staged', 'build') not in [none, 'none'] }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/ota/announce/9"
+          retain: true
+          qos: 0
+          payload: "OTA|{{ state_attr('sensor.smol_ota_staged','build') }}|{{ state_attr('sensor.smol_ota_staged','size') }}|{{ state_attr('sensor.smol_ota_staged','sha256') }}|{{ state_attr('sensor.smol_ota_staged','url') }}"
+  - id: smol_ota_rollout_rest
+    alias: "smol OTA: roll out to rest (id8+id9) after id7 canary healthy"
+    description: >-
+      Publishes the staged announce to id8 + id9 — GATED: fires only once id7's
+      running build (smol/7/status) equals the staged build, i.e. the canary came
+      back healthy. Inert until the firmware publishes smol/<id>/status (F4) — so it
+      cannot fleet-flash before a canary is proven. id7 is the canary by convention.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_ota_rollout
+    condition:
+      - condition: template
+        value_template: "{{ state_attr('sensor.smol_ota_staged', 'build') not in [none, 'none'] }}"
+      - condition: template
+        value_template: "{{ state_attr('sensor.smol_7_status', 'build') == state_attr('sensor.smol_ota_staged', 'build') }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/ota/announce/8"
+          retain: true
+          qos: 0
+          payload: "OTA|{{ state_attr('sensor.smol_ota_staged','build') }}|{{ state_attr('sensor.smol_ota_staged','size') }}|{{ state_attr('sensor.smol_ota_staged','sha256') }}|{{ state_attr('sensor.smol_ota_staged','url') }}"
+      - service: mqtt.publish
+        data:
+          topic: "smol/ota/announce/9"
+          retain: true
+          qos: 0
+          payload: "OTA|{{ state_attr('sensor.smol_ota_staged','build') }}|{{ state_attr('sensor.smol_ota_staged','size') }}|{{ state_attr('sensor.smol_ota_staged','sha256') }}|{{ state_attr('sensor.smol_ota_staged','url') }}"
+  - id: smol_ota_clear_all
+    alias: "smol OTA: clear all announces (abort)"
+    description: >-
+      Retain-deletes smol/ota/announce/{7,8,9} (empty payload) — the R-P1 lifecycle
+      abort. Does NOT touch smol/ota/staged (the staged target stays for re-push).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_ota_clear
+    action:
+      - service: mqtt.publish
+        data: { topic: "smol/ota/announce/7", retain: true, payload: "" }
+      - service: mqtt.publish
+        data: { topic: "smol/ota/announce/8", retain: true, payload: "" }
+      - service: mqtt.publish
+        data: { topic: "smol/ota/announce/9", retain: true, payload: "" }

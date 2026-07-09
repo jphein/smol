@@ -48,6 +48,25 @@ use embedded_graphics::{
     text::{Baseline, Text},
 };
 use esp_backtrace as _;
+
+// --- OTA (issue #6, `wifi` builds only) ----------------------------------
+// The ESP-IDF app descriptor the OTA-aware bootloader reads to validate an image
+// (spec ledger V4); also re-enables espflash v4's save-image path. Crate-root scope.
+#[cfg(feature = "wifi")]
+esp_bootloader_esp_idf::esp_app_desc!();
+
+// MF-2 (OTA safety net, spec §4.3): esp-backtrace's `custom-halt` (turned on via
+// the `wifi` feature) calls this at the HALT step, AFTER it prints the panic +
+// backtrace. We RESET instead of the stock `loop {}` so a panicking OTA image
+// re-enters the bootloader → the next boot runs app-side self-rollback (and the
+// bootloader auto-reverts too, if it was built with rollback enabled). rc.0 puts
+// `software_reset` in `esp_hal::system`, NOT `esp_hal::reset` (spike-verified).
+#[cfg(feature = "wifi")]
+#[no_mangle]
+extern "Rust" fn custom_halt() -> ! {
+    esp_hal::system::software_reset()
+}
+
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
@@ -99,6 +118,12 @@ mod batt;
 // twin of Batt — filled by the same WiFi burst (SUBSCRIBE `smol/display/grid`).
 #[cfg(feature = "wifi")]
 mod grid;
+
+// OTA self-update engine (issue #6): announce parse/gate, streaming image writer
+// (HTTP body → flash + HW-SHA), otadata slot activate, and the first-boot
+// self-test/rollback (MF-1). Needs radio + flash-from-running-fw → wifi-only.
+#[cfg(feature = "wifi")]
+mod ota;
 
 // LOCAL git-ignored WiFi credentials, used by the `wifi`/`espnow` radio bring-up.
 #[cfg(feature = "wifi")]
@@ -397,10 +422,10 @@ fn main() -> ! {
     } else {
         app::TimeSource::None
     };
-    // Our relay ROLE — gateway iff we reached DHCP at boot (decided in
-    // `mode::start`). Fixed after boot, so read once here for `Ctx::mesh`.
-    #[cfg(feature = "espnow")]
-    let is_gateway = radio.as_ref().is_some_and(|r| r.is_gateway());
+    // Our relay ROLE is no longer fixed after boot (roaming R-DEMOTE + the broker
+    // election can flip it at runtime), so it is read LIVE at each use — the boot
+    // snapshot binding was removed (audit-#2). See the BATT/GRID re-broadcast gate and
+    // `Ctx::mesh.is_gateway`, both of which now call `r.is_gateway()` per iteration.
 
     // Phase 3: LED-state trace bookkeeping (LED stays a `main` concern).
     #[cfg(feature = "espnow")]
@@ -446,6 +471,55 @@ fn main() -> ! {
         if let Some(r) = radio.as_mut() {
             if let Some(text) = r.service() {
                 bottom_line = text;
+            }
+            // #23 stage 2: a LEAF scans 1/6/11 for the elected gateway's HELLO and
+            // locks onto its channel (a no-op on the gateway, which rides its AP ch).
+            r.leaf_scan_tick(now);
+            // #23 fix (oracle #1): a LEAF whose owner has gone silent for a PROLONGED
+            // period re-opens the broker election — the ONLY runtime path that takes
+            // over a DEAD lowest-id owner (leaves never flush). Cheap: early-returns
+            // unless owner-silent past its threshold + throttled. When it does fire it
+            // blocks for the association, so it drives the SAME responsive tick as a
+            // flush (LED + throttled spinner + latching long-press abort).
+            {
+                let mut reelect_draw_ms = 0u64;
+                let mut reelect_abort = false;
+                if r.maybe_leaf_reelect(&mut batt_cache, &mut grid_cache, now, &mut || {
+                    let t = millis();
+                    led.apply(led::LedState::WifiSync, t);
+                    if matches!(button.poll(t), Some(input::Press::Long)) {
+                        reelect_abort = true;
+                    }
+                    if t.saturating_sub(reelect_draw_ms) >= SYNC_REDRAW_MS {
+                        reelect_draw_ms = t;
+                        draw_syncing(&mut display, (t / SYNC_REDRAW_MS) as u8);
+                    }
+                    reelect_abort
+                }) {
+                    redraw = true; // a recovery burst ran → role may have changed; repaint
+                }
+            }
+            // #6 OTA: if a burst (boot or gateway flush) surfaced a gated announce for
+            // this board, run the update — download → SHA verify → activate → reboot.
+            // Heavy + mesh-deaf + abortable, so it uses the SAME responsive tick as a
+            // flush (LED + throttled spinner + latching long-press abort). A success
+            // reboots inside the burst; a failure/abort leaves the good image running.
+            if let Some(announce) = r.take_ota_offer() {
+                let mut ota_draw_ms = 0u64;
+                let mut ota_abort = false;
+                r.run_ota_update(&announce, &mut || {
+                    let t = millis();
+                    led.apply(led::LedState::WifiSync, t);
+                    if matches!(button.poll(t), Some(input::Press::Long)) {
+                        ota_abort = true;
+                    }
+                    if t.saturating_sub(ota_draw_ms) >= SYNC_REDRAW_MS {
+                        ota_draw_ms = t;
+                        draw_syncing(&mut display, (t / SYNC_REDRAW_MS) as u8);
+                    }
+                    ota_abort
+                });
+                redraw = true;
             }
             // A gateway's SMOLv1 BATT downlink (buffered in `service`) → store it in
             // our cache so LEAVES render HA battery voltages too. `store` validates
@@ -507,12 +581,26 @@ fn main() -> ! {
                 }
             }
 
+            // COEXIST SOAK (#23 PART 1): beacon 1/s (independent of the 2 s HELLO) so
+            // the seq-gap loss instrument has fine resolution across flush windows;
+            // log a cumulative loss report every 10 s (read off the measurer's serial).
+            #[cfg(feature = "coexist-soak")]
+            if (now / 1000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 1000) {
+                r.broadcast_beacon();
+                if (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000) {
+                    r.soak_report();
+                }
+            }
+
             // ~every 10 s a GATEWAY re-broadcasts its cached HA battery payload as a
             // SMOLv1 BATT frame so neighbour LEAVES keep a fresh copy. The gateway is
             // the single source (fresh from HA over MQTT); leaves never re-broadcast
             // (BATT carries no freshness field — see BATT_PREFIX). Slower than the
             // 2 s HELLO/TIME tick since battery voltages move slowly.
-            if is_gateway
+            // Display-gate (oracle audit-#2): gate on the LIVE role, not the boot
+            // snapshot — a board DEMOTED at runtime (R-DEMOTE / election) must stop
+            // spraying stale BATT/GRID, and a newly-PROMOTED one must start.
+            if r.is_gateway()
                 && !batt_cache.is_empty()
                 && (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000)
             {
@@ -520,7 +608,7 @@ fn main() -> ! {
             }
             // Twin GRID re-broadcast (issue #16): same ~10 s gateway-only cadence
             // and single-hop rationale as BATT (grid power also moves slowly).
-            if is_gateway
+            if r.is_gateway()
                 && !grid_cache.is_empty()
                 && (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000)
             {
@@ -579,6 +667,10 @@ fn main() -> ! {
                     // long-press ABORT. Abort returns the burst's fail value (queue
                     // kept, mode switched back to ESP-NOW — existing paths), only
                     // ever SHORTENING the deaf window.
+                    // Coexist soak (#23 PART 1): snapshot RX/loss BEFORE the flush so
+                    // the during-flush-window RX loss (the crux) can be bucketed below.
+                    #[cfg(feature = "coexist-soak")]
+                    let (_, soak_rx0, soak_lost0, _) = r.soak_counts();
                     let mut flush_abort = false;
                     let mut flush_draw_ms = 0u64;
                     r.flush_telemetry(own.as_bytes(), &mut batt_cache, &mut grid_cache, &mut || {
@@ -594,6 +686,19 @@ fn main() -> ! {
                         flush_abort
                     });
                     flush_defer_since_ms = 0;
+                    // Coexist soak (#23 PART 1): the during-window RX loss — how many
+                    // leaf BEACONs the gateway's 10-deep ESP-NOW RX queue dropped while
+                    // the CPU-blocking flush starved `service()`. THIS is the number.
+                    #[cfg(feature = "coexist-soak")]
+                    {
+                        let (_, soak_rx1, soak_lost1, soak_loss) = r.soak_counts();
+                        log::info!(
+                            "smol: SOAK flush done — during-window rx+{} lost+{} (cumulative loss {}%)",
+                            soak_rx1.wrapping_sub(soak_rx0),
+                            soak_lost1.wrapping_sub(soak_lost0),
+                            soak_loss
+                        );
+                    }
                     if flush_abort {
                         // Long-press during the burst == the global "back to Menu"
                         // gesture; land there and count it as fresh activity so the
@@ -650,7 +755,9 @@ fn main() -> ! {
             mesh: app::MeshStatus {
                 synced_at: my_synced_at,
                 source: time_source,
-                is_gateway,
+                // LIVE role (audit-#2): reflects a runtime demote/promote, not the boot
+                // snapshot, so Bench's GW indicator tracks the actual role after a flip.
+                is_gateway: radio.as_ref().is_some_and(|r| r.is_gateway()),
             },
             #[cfg(feature = "espnow")]
             radio: radio.as_mut(),

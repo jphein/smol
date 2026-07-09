@@ -58,7 +58,13 @@ use crate::net::WifiPeripherals;
 
 /// Fixed ESP-NOW channel used in TIME-SHARE mode. All smol units must agree on
 /// this value (1..=13). 6 is a common, low-congestion default.
+#[cfg(not(feature = "coexist-soak"))]
 const ESP_NOW_FIXED_CHANNEL: u8 = 6;
+/// COEXIST SOAK (#23 PART 1): pin the mesh to the test gateway's AP channel
+/// (north-bedroom = ch1) so the leaf (`set_channel`) and the gateway (rides the AP
+/// channel via association) agree — the coexist precondition (mesh ch == AP ch).
+#[cfg(feature = "coexist-soak")]
+const ESP_NOW_FIXED_CHANNEL: u8 = 1;
 
 // =========================================================================
 // Peer handshake protocol (drives the blue status LED).
@@ -769,6 +775,14 @@ const RELAY_FLUSH_INTERVAL_MS: u64 = 30_000;
 /// a dead AP drain to empty → `relay_ready_to_flush` goes false → the blocking
 /// bursts STOP (finding 1c). A couple of transient failures are tolerated first.
 const FLUSH_FAILS_BEFORE_DROP: u8 = 2;
+/// R-DEMOTE (oracle audit-#1): after this many CONSECUTIVE failed flushes the AP is
+/// GENUINELY gone (R-CONNECT would have recovered a mere roam within seconds), so the
+/// gateway relinquishes ownership — `is_gateway=false` + drop to leaf-scan — and its
+/// HELLO stops pinning leaves to a HA-unreachable owner, letting a reachable board
+/// take over. Set well above `FLUSH_FAILS_BEFORE_DROP` (≈`FLUSH_FAILS_BEFORE_DEMOTE` ×
+/// RELAY_FLUSH_INTERVAL_MS ≈ 2.5 min of no AP) so a transient broker blip never
+/// flap-demotes; the election re-promotes once an AP is reachable again.
+const FLUSH_FAILS_BEFORE_DEMOTE: u8 = 5;
 /// Recently-completed `(src_mac, msgid)` memory. A lost RELAYACK makes a leaf
 /// retransmit an ALREADY-complete message; we must re-ACK it but NOT re-enqueue
 /// (else duplicate UDP delivery — finding 3). Ring of the last few completions.
@@ -1128,6 +1142,28 @@ pub struct RadioManager {
     /// Twin of `batt` (issue #16): most-recent inbound SMOLv1 GRID payload, buffered
     /// for `main` to store into its `GridCache`.
     grid: GridTracker,
+    /// #23: the elected mesh owner's id (the single coexist gateway). Set at boot from
+    /// the broker election; a leaf scans for THIS id's HELLO to find the mesh channel.
+    elected_owner: u8,
+    /// #23 leaf scan-discovery state (stage 2): locked onto the owner's channel, the
+    /// current 1/6/11 scan index, last channel-hop time, last time the owner was heard.
+    scan_locked: bool,
+    scan_idx: usize,
+    last_scan_hop_ms: u64,
+    last_owner_heard_ms: u64,
+    /// #23 fix (oracle #1/#2): persistent staleness observation of the retained `MC`
+    /// record — the last owner id + seq seen and when that pair was FIRST seen. A seq
+    /// frozen past `MC_STALE_MS` marks the owner DEAD (takeover-able). Seeded into the
+    /// per-burst `MeshElect` and read back so staleness accrues ACROSS bursts.
+    mc_seen_owner: u8,
+    mc_seen_seq: u32,
+    mc_seen_ms: u64,
+    /// #23 fix (oracle #1): last time a LEAF opened a recovery re-election burst — the
+    /// retry throttle so a partitioned leaf can't thrash the radio re-associating.
+    last_reelect_ms: u64,
+    /// #6 OTA: a gated retained announce surfaced by a burst (boot or gateway flush),
+    /// pending `main`'s `take_ota_offer` → fetch. `None` when nothing is pending.
+    ota_offer: Option<crate::ota::Announce>,
 }
 
 /// Monotonic milliseconds since boot — the single time base for both the
@@ -1173,7 +1209,145 @@ impl RadioManager {
             roster: Roster::new(),
             batt: BattTracker::new(),
             grid: GridTracker::new(),
+            elected_owner: id,
+            scan_locked: false,
+            scan_idx: 0,
+            last_scan_hop_ms: 0,
+            last_owner_heard_ms: 0,
+            mc_seen_owner: 0,
+            mc_seen_seq: 0,
+            mc_seen_ms: 0,
+            last_reelect_ms: 0,
+            ota_offer: None,
         })
+    }
+
+    /// #23 stage 2 leaf channel-discovery. Call every subtick from `main`. A LEAF (not
+    /// the elected gateway) that hasn't LOCKED onto the owner's HELLO hops the ESP-NOW
+    /// channel across 1/6/11 on a dwell; once the owner is heard (see the HELLO arm in
+    /// `service`) it locks. If the owner then goes silent past `SCAN_SILENCE_MS` (a
+    /// roam), it unlocks + resumes scanning. Gateways never scan (they ride their AP
+    /// channel via the live association).
+    pub fn leaf_scan_tick(&mut self, now: u64) {
+        const CANDIDATES: [u8; 3] = [1, 6, 11]; // JP's roam plan
+        const DWELL_MS: u64 = 1500; // listen this long per candidate before hopping
+        const SCAN_SILENCE_MS: u64 = 6000; // owner silence → assume roam → re-scan
+        if self.relay.is_gateway {
+            return; // gateway owns its channel via association; never scans
+        }
+        if self.scan_locked && now.saturating_sub(self.last_owner_heard_ms) > SCAN_SILENCE_MS {
+            self.scan_locked = false;
+            log::info!("smol: leaf lost gateway id{} — re-scanning", self.elected_owner);
+        }
+        if self.scan_locked {
+            return;
+        }
+        if now.saturating_sub(self.last_scan_hop_ms) >= DWELL_MS {
+            self.scan_idx = (self.scan_idx + 1) % CANDIDATES.len();
+            let ch = CANDIDATES[self.scan_idx];
+            let _ = self.esp_now.set_channel(ch);
+            self.last_scan_hop_ms = now;
+        }
+    }
+
+    /// #23 fix (oracle #1 dead-owner wedge): a LEAF that has lost its owner's HELLO for
+    /// a PROLONGED period re-opens the broker election. This is the ONLY runtime path
+    /// that lets a dead lowest-id owner be taken over — leaves never flush, so without
+    /// it a fleet whose lowest-id owner dies can never self-heal (it just ghost-scans
+    /// the dead id forever). Call every subtick from `main` (cheap: it early-returns
+    /// unless a leaf has been owner-silent past `REELECT_SILENCE_MS`, throttled by
+    /// `REELECT_RETRY_MS`). Re-associates, runs an election-only MQTT burst (no
+    /// telemetry), applies the result to the LIVE role:
+    ///   * WON (a stale/dead owner taken over, or the topic empty) → become GATEWAY,
+    ///     stay WiFi-associated (mesh rides the AP channel);
+    ///   * adopted a LIVE owner (possibly a NEW lower id) → stay leaf, drop back to
+    ///     ESP-NOW, re-scan for it. A live owner the leaf simply can't hear is NEVER
+    ///     taken over — the takeover fires only on a FROZEN `MC` seq (owner truly dead).
+    ///
+    /// Returns true iff a re-election burst actually ran.
+    pub fn maybe_leaf_reelect(
+        &mut self,
+        batt: &mut crate::batt::BattCache,
+        grid: &mut crate::grid::GridCache,
+        now: u64,
+        tick: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        const REELECT_SILENCE_MS: u64 = 30_000; // owner HELLO gone this long → recover
+        const REELECT_RETRY_MS: u64 = 30_000; // min gap between recovery bursts
+        if self.relay.is_gateway {
+            return false; // a gateway re-decides on its own flush; only leaves recover here
+        }
+        let silent = now.saturating_sub(self.last_owner_heard_ms) >= REELECT_SILENCE_MS;
+        let retry_ok = now.saturating_sub(self.last_reelect_ms) >= REELECT_RETRY_MS;
+        if !(silent && retry_ok) {
+            return false;
+        }
+        self.last_reelect_ms = now;
+        log::info!(
+            "smol: leaf owner id{} silent {}ms — re-opening broker election",
+            self.elected_owner,
+            now.saturating_sub(self.last_owner_heard_ms)
+        );
+        // Re-associate + run an election-ONLY burst (empty telemetry list).
+        let _ = self.switch(Mode::WifiSta);
+        let id = self.id;
+        let mut elect = crate::net::wifi::MeshElect::new(id);
+        elect.now_ms = now;
+        elect.seen_owner = self.mc_seen_owner;
+        elect.seen_seq = self.mc_seen_seq;
+        elect.seen_ms = self.mc_seen_ms;
+        // #6 OTA: a leaf's recovery burst can also surface a gated announce.
+        let mut ota_offer: Option<crate::ota::Announce> = None;
+        let reached = match self.sta.as_mut() {
+            None => false,
+            Some(sta) => {
+                let empty: [(u8, &[u8]); 0] = [];
+                crate::net::wifi::run_mqtt_burst(
+                    &mut self.controller,
+                    sta,
+                    self.rng,
+                    id,
+                    &empty,
+                    batt,
+                    grid,
+                    &mut elect,
+                    &mut ota_offer,
+                    tick,
+                )
+            }
+        };
+        if ota_offer.is_some() {
+            self.ota_offer = ota_offer;
+        }
+        if !reached {
+            // Broker unreachable (AP down / off our scan channel): do NOT claim on a
+            // failed read — fall back to ESP-NOW + keep scanning; retry after the gap.
+            let _ = self.switch(Mode::EspNow);
+            log::info!("smol: leaf re-election — broker unreachable, still scanning");
+            return true;
+        }
+        // Persist the refreshed staleness observation (so takeover accrues across bursts).
+        self.mc_seen_owner = elect.seen_owner;
+        self.mc_seen_seq = elect.seen_seq;
+        self.mc_seen_ms = elect.seen_ms;
+        self.elected_owner = elect.owner_id;
+        self.scan_locked = false;
+        if elect.i_am_owner {
+            // Took over a dead/stale owner (or empty topic): become the coexist GATEWAY.
+            self.relay.is_gateway = true;
+            log::info!("smol: leaf re-election WON — now GATEWAY (owner id{})", id);
+            // switch() already left us in WifiSta — stay associated (coexist gateway).
+        } else {
+            // A LIVE owner holds the mesh (possibly a new lower id): stay leaf, re-scan.
+            self.relay.is_gateway = false;
+            self.last_owner_heard_ms = now; // grace: give the scan time to re-lock it
+            let _ = self.switch(Mode::EspNow);
+            log::info!(
+                "smol: leaf re-election → live owner id{} (re-scanning)",
+                self.elected_owner
+            );
+        }
+        true
     }
 
     /// Run the real WiFi -> DHCP -> SNTP burst using the STA device, driving the
@@ -1193,6 +1367,8 @@ impl RadioManager {
         &mut self,
         batt: &mut crate::batt::BattCache,
         grid: &mut crate::grid::GridCache,
+        elect: &mut crate::net::wifi::MeshElect,
+        ota_offer: &mut Option<crate::ota::Announce>,
         tick: &mut dyn FnMut() -> bool,
     ) -> (bool, Option<u32>) {
         // Disjoint field borrows: &mut self.controller, &mut *sta, Copy of rng/id.
@@ -1212,6 +1388,8 @@ impl RadioManager {
             id,
             batt,
             grid,
+            elect,
+            ota_offer,
         );
         (reached_dhcp, synced)
     }
@@ -1288,6 +1466,34 @@ impl RadioManager {
         let mut msg = [0u8; 32];
         let len = encode_beacon(self.id, seq, echo, &mut msg);
         self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
+    }
+
+    /// Coexist-soak (#23 PART 1) loss snapshot `(tx, rx, lost, loss_pct)` — `main`
+    /// reads it around each flush to bucket during-flush vs idle ESP-NOW RX loss.
+    #[cfg(feature = "coexist-soak")]
+    pub fn soak_counts(&self) -> (u32, u32, u32, u8) {
+        (
+            self.bench.tx_count,
+            self.bench.rx_count,
+            self.bench.lost_count,
+            self.bench.loss_pct(),
+        )
+    }
+
+    /// Coexist-soak periodic report to serial (the measurer reads this off the log):
+    /// cumulative BEACON tx/rx, inferred seq-gap losses, loss %, last RTT + RSSI.
+    #[cfg(feature = "coexist-soak")]
+    pub fn soak_report(&self) {
+        log::info!(
+            "smol: SOAK role={} tx={} rx={} lost={} loss={}% rtt={:?}ms rssi={:?}",
+            if self.relay.is_gateway { "GW" } else { "leaf" },
+            self.bench.tx_count,
+            self.bench.rx_count,
+            self.bench.lost_count,
+            self.bench.loss_pct(),
+            self.bench.last_rtt_ms,
+            self.bench.last_rssi,
+        );
     }
 
     // --- Mesh time sync (see the TimeTracker section + main::should_adopt) ---
@@ -1480,8 +1686,18 @@ impl RadioManager {
             return false;
         }
         let pending = self.relay.queue.iter().filter(|q| q.used).count();
+        // M-1 (oracle MEDIUM): an EMPTY queue STILL flushes on the interval so the
+        // gateway's retained MC record keeps refreshing (seq++). Without this a
+        // quiet-but-alive lower-id gateway (no leaf traffic) stops bumping seq → looks
+        // STALE to a re-electing leaf → gets falsely taken over (reintroduced
+        // split-brain). HELLO (~2 s) stays the primary liveness beacon; this only stops
+        // the MC record from FALSELY freezing. In coexist the gateway is already
+        // associated, so an idle flush is a sub-second MQTT session (soak-proven, no
+        // mesh loss) and also heartbeats the gateway's own telemetry to HA. Interval
+        // 30 s vs MC_STALE_MS 90 s = a 3x liveness margin.
         if pending == 0 {
-            return false;
+            return self.relay.last_flush_ms == 0
+                || now.saturating_sub(self.relay.last_flush_ms) >= RELAY_FLUSH_INTERVAL_MS;
         }
         // "Queue full → flush now" applies only when NOT in a failing streak
         // (finding 1a): once flushes are failing, the interval backoff must govern
@@ -1510,6 +1726,32 @@ impl RadioManager {
     /// interval (see the unconditional `last_flush_ms` below) and, past
     /// `FLUSH_FAILS_BEFORE_DROP`, sheds its oldest message so a dead-AP gateway
     /// drains and stops re-bursting. Returns whether the flush succeeded.
+    /// #6 OTA: take a pending gated announce (surfaced by a boot/flush burst) for
+    /// `main` to act on — the pull pattern mirroring `take_time_offer`.
+    pub fn take_ota_offer(&mut self) -> Option<crate::ota::Announce> {
+        self.ota_offer.take()
+    }
+
+    /// #6 OTA: run the update burst for a gated announce — re-associate, stream the
+    /// image to the inactive slot, verify, activate + reboot. Returns only on a
+    /// non-activating outcome (a SUCCESS reboots inside the fetch). Mesh-deaf for the
+    /// whole download (spec §6-R4) — driven by the caller's responsive/abortable tick.
+    pub fn run_ota_update(
+        &mut self,
+        announce: &crate::ota::Announce,
+        tick: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        log::info!("smol OTA: opening update burst (mesh deaf for the whole download)");
+        let _ = self.switch(Mode::WifiSta);
+        let rng = self.rng;
+        match self.sta.as_mut() {
+            None => false,
+            Some(sta) => {
+                crate::net::wifi::run_ota_fetch(&mut self.controller, sta, rng, announce, tick)
+            }
+        }
+    }
+
     pub fn flush_telemetry(
         &mut self,
         own_telemetry: &[u8],
@@ -1525,6 +1767,17 @@ impl RadioManager {
         // ch6). run_mqtt_burst waits for the association, so we only trigger it.
         let _ = self.switch(Mode::WifiSta);
         let id = self.id;
+        let now = now_ms();
+        // #23 fix: seed the election from the live role + persistent staleness so THIS
+        // flush RE-DECIDES ownership (demote a duplicate gateway that now sees a LIVE
+        // lower-id owner — oracle #2). Read back below and applied to the live role.
+        let mut elect = crate::net::wifi::MeshElect::new(id);
+        elect.now_ms = now;
+        elect.seen_owner = self.mc_seen_owner;
+        elect.seen_seq = self.mc_seen_seq;
+        elect.seen_ms = self.mc_seen_ms;
+        // #6 OTA: capture any gated retained announce this flush surfaces.
+        let mut ota_offer: Option<crate::ota::Announce> = None;
         let sta = self.sta.as_mut();
         let ok = match sta {
             None => false,
@@ -1556,12 +1809,41 @@ impl RadioManager {
                     &items[..n],
                     batt,
                     grid,
+                    &mut elect,
+                    &mut ota_offer,
                     tick,
                 )
             }
         };
-        // Back to deterministic ESP-NOW ch6 regardless of flush outcome.
-        let _ = self.switch(Mode::EspNow);
+        // #6 OTA: stash any announce this flush surfaced for `main` to act on.
+        if ota_offer.is_some() {
+            self.ota_offer = ota_offer;
+        }
+        // #23 fix (oracle #2): APPLY the re-election result to the LIVE role. On a
+        // connected flush, persist the refreshed staleness observation; if a LIVE
+        // lower-id owner now holds the mesh, DEMOTE to a scanning leaf (drop to ESP-NOW)
+        // — the runtime convergence the boot-only election never had. A NON-connected
+        // flush (transient broker outage) is NOT trusted → keep the current role.
+        if ok {
+            self.mc_seen_owner = elect.seen_owner;
+            self.mc_seen_seq = elect.seen_seq;
+            self.mc_seen_ms = elect.seen_ms;
+            self.elected_owner = elect.owner_id;
+            if !elect.i_am_owner {
+                self.relay.is_gateway = false;
+                self.scan_locked = false;
+                self.last_owner_heard_ms = now;
+                let _ = self.switch(Mode::EspNow);
+                log::info!(
+                    "smol: gateway DEMOTED — live owner id{} holds the mesh; leaf-scanning",
+                    self.elected_owner
+                );
+            }
+        }
+        // #23 stage 1 — PRODUCTION COEXIST: STAY WiFi-associated after the flush (NO
+        // ESP-NOW teardown). The gateway keeps riding its AP channel, so the flush is
+        // a sub-second DHCP+MQTT on the live link with no channel-deaf window — only
+        // the CPU-blocking poll loop remains (soak-proven: 0/60 flush-window RX loss).
         // FINDING 1a: stamp the backoff UNCONDITIONALLY. Previously `last_flush_ms`
         // was set only on success, so a FAILED flush left it stale →
         // `relay_ready_to_flush` re-fired instantly → back-to-back multi-second
@@ -1582,6 +1864,22 @@ impl RadioManager {
             // bursts stop) and never holds arbitrarily-stale telemetry.
             if self.relay.flush_fails >= FLUSH_FAILS_BEFORE_DROP {
                 self.relay.drop_oldest();
+            }
+            // R-DEMOTE (oracle audit-#1): sustained failures mean the AP is truly gone
+            // (a mere roam would have self-recovered via R-CONNECT within seconds).
+            // Relinquish ownership so this board's HELLO stops pinning leaves to a
+            // HA-unreachable owner — drop to leaf-scan; the broker election re-promotes
+            // a reachable board (or this one, once an AP returns). Guarded on the demote
+            // threshold (≈2.5 min) so a transient broker blip can't flap the role.
+            if self.relay.is_gateway && self.relay.flush_fails >= FLUSH_FAILS_BEFORE_DEMOTE {
+                self.relay.is_gateway = false;
+                self.scan_locked = false;
+                self.last_owner_heard_ms = now;
+                let _ = self.switch(Mode::EspNow);
+                log::warn!(
+                    "smol: gateway DEMOTED after {} failed flushes — AP unreachable, leaf-scanning",
+                    self.relay.flush_fails
+                );
             }
             log::warn!(
                 "smol: relay flush FAILED ({} consecutive) — backing off {} ms",
@@ -1677,6 +1975,14 @@ impl RadioManager {
                     // Roster (additive): HELLO carries the sender's id — the
                     // primary place peer ids are learned (every node HELLOs 2 Hz).
                     self.roster.heard(src, Some(peer_id), rssi, now);
+
+                    // #23 leaf channel-lock: a leaf that hears the ELECTED OWNER's
+                    // HELLO has found the mesh channel — lock (stop scanning) + stamp
+                    // the time (silence re-scan is driven by `leaf_scan_tick`).
+                    if !self.relay.is_gateway && peer_id == self.elected_owner {
+                        self.scan_locked = true;
+                        self.last_owner_heard_ms = now;
+                    }
 
                     // Register the broadcaster so the ACK below can be unicast.
                     if !self.esp_now.peer_exists(&src) {
@@ -2167,24 +2473,56 @@ pub fn start(
     // `grid` ride along: the same burst runs the MQTT downlink at its tail to seed
     // the Batt/Grid screens at boot. If `tick` returns true (abort), the burst
     // returns early (no sync) and boot proceeds straight to the Menu.
-    let (reached_dhcp, synced) = radio.burst_ntp(batt, grid, tick);
+    // #23 stage 3-4: the boot MQTT session (inside the burst) runs the single-gateway
+    // election over the retained `smol/mesh/channel`; `elect` returns whether I own the
+    // mesh (coexist gateway) or must demote to a scanning leaf.
+    let mut elect = crate::net::wifi::MeshElect::new(id);
+    elect.now_ms = now_ms(); // seed the ONE clock the stale-owner timeout runs on
+    let mut ota_offer: Option<crate::ota::Announce> = None;
+    let (reached_dhcp, synced) = radio.burst_ntp(batt, grid, &mut elect, &mut ota_offer, tick);
+    // #6 OTA: stash any gated boot-time announce for `main` to fetch after boot.
+    radio.ota_offer = ota_offer;
 
-    // Relay role (N3c): a node is the internet GATEWAY iff its boot burst reached
-    // ASSOCIATION + DHCP — i.e. it has a usable LAN uplink — NOT iff SNTP succeeded.
-    // Decoupling from NTP means a Cloudflare-anycast SNTP outage (rate-limiting our
-    // WAN IP) can't demote both real-creds boards to leaf and leave the mesh with no
-    // gateway. SNTP stays best-effort for TIME: `synced` = NTP root, else the clock
-    // free-runs and adopts mesh time later (mesh-time handles an unsynced gateway).
-    radio.relay.is_gateway = reached_dhcp;
+    // OTA MF-1: confirm/rollback the running image on its first boot, NOW that the
+    // WiFi/DHCP result is known. self-test = reached DHCP (a broken-WiFi image can't;
+    // the just-run download proved the net is up, so a healthy image won't
+    // false-rollback). May `software_reset` (rollback) → never returns in that case.
+    crate::ota::boot_confirm(reached_dhcp);
+
+    // #23: GATEWAY iff we reached DHCP AND won the election (lowest-id owner). A board
+    // that reached DHCP but LOST (a lower-id owner already holds it) demotes to leaf.
+    // `synced` stays best-effort for TIME (mesh-time adoption handles an unsynced GW).
+    radio.relay.is_gateway = reached_dhcp && elect.i_am_owner;
+    radio.elected_owner = elect.owner_id;
+    // #23 fix: persist the boot election's staleness observation → a leaf's later
+    // recovery re-election measures the owner's seq freshness FROM this first sample.
+    radio.mc_seen_owner = elect.seen_owner;
+    radio.mc_seen_seq = elect.seen_seq;
+    radio.mc_seen_ms = elect.seen_ms;
     log::info!(
-        "smol: relay role = {} (assoc+dhcp {}, ntp {})",
-        if reached_dhcp { "GATEWAY" } else { "leaf" },
+        "smol: relay role = {} (assoc+dhcp {}, elected-owner id{}, ntp {})",
+        if radio.relay.is_gateway { "GATEWAY" } else { "leaf" },
         reached_dhcp,
+        elect.owner_id,
         if synced.is_some() { "ok" } else { "miss" }
     );
 
-    // --- Hand the radio to ESP-NOW on a fixed channel (TIME-SHARE) -------
-    let _ = radio.switch(Mode::EspNow);
+    // --- #23 stage 1: PRODUCTION COEXIST (soak-proven, retire the burst) ---------
+    // A GATEWAY (reached DHCP) STAYS WiFi-associated — the mesh rides its AP channel,
+    // no ESP-NOW time-share teardown, so the flush is sub-second on the live link
+    // (0/60 flush-window RX loss in the 30-min soak). A LEAF (didn't reach DHCP)
+    // switches to ESP-NOW and discovers the mesh channel (stages 2-4). Under the
+    // `coexist-soak` measurement feature the gateway additionally rides the pinned
+    // ch1 (ESP_NOW_FIXED_CHANNEL) via the ClientConfiguration channel pin.
+    if radio.relay.is_gateway {
+        // Coexist gateway (elected owner): stay WiFi-STA, mesh rides my AP channel.
+        log::info!("smol: coexist gateway — staying WiFi STA on AP channel (no teardown)");
+    } else {
+        // Leaf (no DHCP, or lost the election): drop to ESP-NOW and scan 1/6/11 for the
+        // elected owner's HELLO — channel-agnostic discovery (stage 2).
+        let _ = radio.switch(Mode::EspNow);
+        log::info!("smol: leaf — scanning for gateway id{}", radio.elected_owner);
+    }
 
     (Some(radio), synced)
 }

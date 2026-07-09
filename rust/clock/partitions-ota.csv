@@ -1,0 +1,17 @@
+# smol dual-OTA A/B partition table (issue #6) — 4 MB flash, zero waste.
+# Hardware-validated on Board 2 (lucid-ota-spike.md): this table flashes + boots,
+# and the bundled espflash ESP-IDF v5.1.2 bootloader honors otadata slot-select.
+# DO NOT "tidy" the offsets — they are exact. Budget proof (every byte accounted):
+#   bootloader 32K + parttable 4K (implicit, < 0x8000)
+#   + nvs 24K + otadata 8K + phy 4K + align-gap 56K
+#   + ota_0 1,984K + ota_1 1,984K = 4,194,304 B = 4.000 MB.
+# otadata MUST be exactly 0x2000 or esp_bootloader_esp_idf::ota::Ota::new →
+# InvalidPartition. Each app slot = 0x1F0000 (1.938 MB); the real ~590 KB image
+# is ~30% of a slot → 3.3x headroom. ota_publish.sh hard-gates size <= 0x1F0000.
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+otadata,    data, ota,     0xf000,   0x2000,
+phy_init,   data, phy,     0x11000,  0x1000,
+ota_0,      app,  ota_0,   0x20000,  0x1F0000,
+ota_1,      app,  ota_1,   0x210000, 0x1F0000,

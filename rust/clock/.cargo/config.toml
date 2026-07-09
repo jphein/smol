@@ -15,7 +15,12 @@ target = "riscv32imc-unknown-none-elf"
 linker = "gcc"
 
 [target.riscv32imc-unknown-none-elf]
-runner = "espflash flash --monitor"
+# OTA (issue #6): flash the dual-OTA A/B partition table alongside the app. This
+# is a DESTRUCTIVE, one-way migration off the single-app layout (spec §6-R2) —
+# the first OTA-capable image MUST be USB-flashed WITH this table (§6-R1); after
+# that, updates ride OTA. With 3 boards present espflash prompts for the port, so
+# pass an explicit --port when flashing a specific board (MAC-guard per §6-R2).
+runner = "espflash flash --monitor --partition-table partitions-ota.csv"
 # Link the firmware with the bundled rust-lld directly (LLD flavor) instead of
 # going through a C compiler driver. This machine's `cc` is a non-compiler
 # shim, so we must not route the target link through it.

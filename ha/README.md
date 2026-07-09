@@ -239,6 +239,66 @@ curl -sX POST https://ha.jphe.in:8123/api/services/homeassistant/reload_all -H "
 ships** — a retained config a board can't yet parse just sits there (harmless), but keep
 the surface clean. (Validated instead against a throwaway `smol/test/config/...` topic.)
 
+## OTA push (issue #6) — server side
+
+The HA/host side of OTA: the boards fetch a firmware image from a LAN server, and HA
+publishes the retained announce that triggers a fetch. **The firmware fetch/parse/rollback
+side is a separate wave (fw-wave2);** this side is publish + host + GUI. Matches the
+firmware parse contract (`ota-firmware-spec.md`):
+
+```
+smol/ota/announce/<id>   (retain, qos0)   OTA|<build>|<size>|<sha256hex>|<url>     # per-id canary
+smol/ota/announce/all    (retain, qos0)   OTA|...                                  # deliberate fleet push
+```
+
+### Image host — `<host>` on the boards' VLAN, live
+A `systemd --user` static HTTP server (`~/.config/systemd/user/smol-ota.service`,
+`python3 -m http.server 8087 --directory ~/smol-ota`) on your image host **`<host>`** at
+**`<image-host-ip>`** — put it **on the boards' own VLAN** (same subnet as the boards) so
+there is no cross-VLAN routing (like the broker). Images live at
+`~/smol-ota/ota/smol-<build>.bin` → URL `http://<image-host-ip>:8087/ota/smol-<build>.bin`.
+Linger is enabled (survives reboot). Pick a free port (default 8087). ⚠️ The firmware's
+compiled **URL host allowlist must include `<image-host-ip>`** (coordinate with fw-wave2).
+Set `<host>`/`<image-host-ip>` in `tools/ota_publish.sh` (or override via its env vars).
+
+### Publish — `tools/ota_publish.sh`
+Builds the espnow release → `espflash save-image` → sha256 + size → **hard-gate
+`size ≤ 0x1F0000`** → scp to the image host → publishes the announce. Broker creds are
+sourced from the Mosquitto addon option (**never printed**). Modes:
+
+```bash
+tools/ota_publish.sh stage            # build + host + publish smol/ota/staged (no board acts) — DEFAULT
+tools/ota_publish.sh push <id|all>    # stage, then publish smol/ota/announce/<id|all>
+tools/ota_publish.sh clear <id|all>   # retain-delete the announce (R-P1 lifecycle / abort)
+tools/ota_publish.sh stage --bin F    # host a prebuilt .bin (skip the cargo build)
+```
+
+`stage` publishes to a **non-acted** topic `smol/ota/staged` that the HA panel mirrors,
+so the GUI can do per-id canary targeting **without** rebuilding/re-hashing.
+
+### HA panel — `dashboard/smol_ota_card.yaml` (+ package helpers)
+Mirrors the staged target (`sensor.smol_ota_staged`), shows each node's **running build**
+(`sensor.smol_<id>_status` — needs firmware `smol/<id>/status`, F4), and offers **per-node
+canary push** buttons (republish the staged line to `smol/ota/announce/<id>`), a **gated
+"roll out to rest"** (fires only once id7's running build == the staged build), and a
+**clear** (abort). Deployed the same way as the other cards (WS `lovelace/config/save`).
+
+### ⚠️ Safety caveats (READ before enabling fleet OTA)
+- **CANARY ONE AT A TIME — never fleet-unison.** The panel has **no "push all" button**
+  by design; `push all` on the CLI warns. Push one board, confirm its running build
+  advanced, then the next.
+- **Bootloader revert-on-boot-fail is confirmed OFF** (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`
+  is off; the spike proved otadata *slot-selection*, NOT revert-on-fail — ROADMAP D2 /
+  lucid-revert-gate). Recovery is **app-side self-rollback on a graceful self-test fail; a
+  hard crash before self-test bricks → USB recovery**, not auto-reverted. So a bad image on
+  all boards at once = **mass-brick**. Canary one board at a time is the only defense.
+- **sha256 is integrity, not authenticity** — it rides the same broker as the image, so
+  it does nothing against a malicious publisher. On the trusted home LAN this is the
+  accepted posture (ROADMAP D3); ed25519 signing is the upgrade path.
+- **Credential-less leaves are USB-only** — the ~0.6 MB image never crosses ESP-NOW.
+- **The deaf window is minutes** during a download (vs ~1 s for a telemetry flush) —
+  keep OTA user-initiated.
+
 ## Broker (verified 2026-07-08)
 
 Mosquitto runs on the HA VM, which is **quad-homed** (VLAN6 `10.0.6.108` / VLAN8

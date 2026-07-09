@@ -2,8 +2,9 @@
 
 smol's relay lets a board that's **out of WiFi range** still get its short
 telemetry to the internet, by hopping through a nearby board that **is** on WiFi.
-This is the firmware-side operator guide; for the LAN receiver see
-[`collector/README.md`](../collector/README.md).
+This is the firmware-side operator guide; the gateway's LAN egress is now an **MQTT burst
+to Home Assistant** (see [home-assistant.md](home-assistant.md)). The old UDP receiver in
+[`collector/README.md`](../collector/README.md) is **retired** (v1, git-history only).
 
 **What it is — and isn't.** Single-hop, **short telemetry only** (the sensor line
 + last peer/label). It is **not** browsing or a general gateway: ESP-NOW's 250 B
@@ -19,7 +20,8 @@ NTP sync misses*.
 
 - **Gateway** — associated to an AP **and got a DHCP lease** at boot (`is_gateway`,
   `main.rs`). It **receives** RELAY fragments from leaves, reassembles them, and
-  periodically bridges them to the collector over a WiFi burst.
+  periodically bridges them to **Home Assistant over an MQTT burst** (v1 bridged to a UDP
+  collector — now retired; see the flush cycle below).
 - **Leaf** — no AP / no lease (out of range or no creds). It **emits** its telemetry
   as RELAY fragments over ESP-NOW and never flushes.
 
@@ -70,7 +72,7 @@ leaves.
    + [`SMOLv1 GRID`](protocol.md#grid--ha-grid-power-snapshot-16) frames** (gateway-only
    — its neighbour leaves cache them but never re-broadcast, so both are single-hop) and
    DISCONNECTs back to ch 6. The **UDP collector egress is retired** (as of build 40; the
-   disks service is stopped/disabled and its JSONL archived — rollback = git). *(A pending
+   <host> service is stopped/disabled and its JSONL archived — rollback = git). *(A pending
    firmware wave adds a third SUBSCRIBE — `smol/<id>/config/default_screen` for the
    [node manager](protocol.md#config--retained-per-node-default-screen-21-specd--firmware-pending),
    #21.)* Full byte contracts:
@@ -145,40 +147,38 @@ then goes quiet — no freeze, no duplicate delivery. All consts live in
 
 > **Retired (v2, 2026-07-08).** This UDP-collector target has been **replaced** by the
 > [MQTT burst](protocol.md#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)
-> to Home Assistant (hardware-verified on build 40); the disks collector is
+> to Home Assistant (hardware-verified on build 40); the <host> collector is
 > stopped/disabled and its JSONL archived. This section is kept for historical /
 > rollback context (rollback = git).
 
-Set where the gateway sends telemetry — compile-time consts in
+*(v1, historical.)* The gateway's telemetry target was a compile-time const in
 `rust/clock/src/net/wifi.rs` (hardcoded IP, no DNS, mirroring `NTP_SERVER_IP`):
 
 ```rust
-const RELAY_COLLECTOR_IP:   Ipv4Addr = Ipv4Addr::new(10, 0, 11, 117); // your collector host
+const RELAY_COLLECTOR_IP:   Ipv4Addr = Ipv4Addr::new(0, 0, 0, 0); // <collector-host> (v1, legacy)
 const RELAY_COLLECTOR_PORT: u16      = 9999;
 ```
 
-- **Point it at your collector host and reflash the gateway** — the relay does
-  nothing until this matches a running collector.
-- The deployed collector is on **disks `10.0.11.117:9999`**, which sits on the
-  **same VLAN 11 /24 the boards DHCP onto**, so board → collector stays on one
-  subnet (no inter-VLAN routing, no gatekeeper in the path — the ideal placement).
-  *(This is now the in-tree default — set live in `7b57216`; change it only if you
-  deploy the collector elsewhere.)*
+- You **pointed it at your collector host and reflashed the gateway** — the relay did
+  nothing until it matched a running collector.
+- The v1 collector ran on a **LAN host (`<collector-host>`)** on the **boards' own subnet**
+  (board → collector on one subnet, no inter-VLAN routing) — it was the
+  in-tree default (`7b57216`). **v2 replaced this const-target with the MQTT broker leg**
+  (in the gateway's git-ignored `secrets.rs`); `RELAY_COLLECTOR_*` is now legacy.
 
 ## Run the collector (LAN side)
 
-The receiver is a stdlib-only Python 3 service — see
-[`collector/README.md`](../collector/README.md) for the code, tests, and deploy.
-It's already running on disks as a user systemd service:
+*(v1, retired.)* The receiver was a stdlib-only Python 3 service (code/tests in
+[`collector/README.md`](../collector/README.md)). It **ran on <host> as a user systemd
+service** and has been **stopped/disabled + its JSONL archived** (retirement checklist in
+[ha/README.md](../ha/README.md)); rollback = git. For historical reference the ops were:
 
 ```
-ssh disks 'systemctl --user status smol-collector'      # health
-ssh disks 'tail -f ~/smol-collector/collector.jsonl'    # watch telemetry land
-ssh disks 'curl -s localhost:9998/ | python3 -m json.tool'   # status page (localhost-only)
+ssh <host> 'systemctl --user status smol-collector'      # health (service now disabled)
+ssh <host> 'tail -f ~/smol-collector/collector.jsonl'    # telemetry (archived)
 ```
-(Post-hardening the status page binds **`127.0.0.1` only** — view it via `ssh disks
-curl localhost:9998`; it is not exposed on the LAN unless the collector is run with
-`--status-host 0.0.0.0`. The relay's UDP `:9999` path is public and unaffected.)
+v2 telemetry now lands in Home Assistant as native MQTT entities — see
+[home-assistant.md](home-assistant.md).
 
 ## Out of scope (documented stubs)
 - **Downlink** (server → leaf) — v2 introduces a **display-only** downlink: HA
@@ -194,14 +194,14 @@ curl localhost:9998`; it is not exposed on the LAN unless the collector is run w
 - **Browsing / general IP** — physically impractical (see the gateway analysis).
 
 ## Status
-🟢 **hardware-proven end-to-end + sustained.** On the wave-6 fleet (build 36
-"Oxidized Spark", `bcafa7e`) the full chain runs: leaf id8 emits → gateway
-reassembles → WiFi flush → **`node_id 8` telemetry accumulates in
-`disks:~/smol-collector/collector.jsonl`, sustained ~02:06Z → 02:44Z** across a
-firmware upgrade. Freeze/dup/liveness fixes (`2ea7c4d`, `652155b`, `ca5d985`) all
-in. One non-blocking cold-ARP first-round nit remains (see the flush follow-up). The
-LAN collector is committed (19→26 tests, hardened) + deployed. Wire frames:
-[protocol.md](protocol.md#relay--relayack--espnow--internet-telemetry).
+**v1 (retired, historical) — was hardware-proven end-to-end + sustained.** On the wave-6
+fleet (build 36 "Oxidized Spark", `bcafa7e`) the full v1 chain ran: leaf id8 emits →
+gateway reassembles → WiFi flush → **`node_id 8` telemetry accumulated in
+`<host>:~/smol-collector/collector.jsonl`, sustained ~02:06Z → 02:44Z** across a firmware
+upgrade. Freeze/dup/liveness fixes (`2ea7c4d`, `652155b`, `ca5d985`) all in. The LAN
+collector was committed (19→26 tests, hardened) + deployed — **now retired** (superseded by
+v2 below). One non-blocking cold-ARP first-round nit carried over (see the flush follow-up).
+Wire frames: [protocol.md](protocol.md#relay--relayack--espnow--internet-telemetry).
 
 **v2 (hardware-verified — build 40 "Pressed Oven", 2026-07-08):** the LAN egress is now
 an [MQTT burst](protocol.md#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)

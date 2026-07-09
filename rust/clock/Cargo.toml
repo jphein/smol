@@ -88,6 +88,26 @@ smoltcp = { version = "=0.12.0", optional = true, default-features = false, feat
     "socket-tcp",
 ] }
 
+# --- OTA (Phase B, issue #6) — HAL-decoupled, folded into `wifi` ----------
+# Spike-proven co-compile with the pinned quartet (WAVE 10). Both are optional
+# and pulled ONLY by `wifi`, so the `default` (no-radio) build compiles NO OTA
+# code. `esp32c3` on esp-bootloader-esp-idf is REQUIRED — without it the crate's
+# rom.rs references an unresolved `esp_rom_sys` (md5/crc pulled by the chip
+# feature). esp-storage gives XIP-safe flash writes (FlashStorage auto-detects
+# 4 MB); esp-bootloader-esp-idf gives the otadata slot/state API + esp_app_desc!.
+esp-storage = { version = "=0.7.0", optional = true, features = ["esp32c3"] }
+esp-bootloader-esp-idf = { version = "=0.2.0", optional = true, features = ["esp32c3"] }
+# Software SHA-256 for the OTA image integrity gate. Chosen over the HW `esp_hal::sha`
+# peripheral deliberately: the HW path needs the SHA peripheral threaded through boot
+# into the OTA burst + a self-referential `ShaDigest` (borrows the `Sha` beside it),
+# whereas `sha2` is peripheral-free + move-friendly. Cost is ~4 KB flash — negligible
+# at ~30% slot usage (3.3x headroom). Hashing is bound by the ~600 KB HTTP download,
+# not the digest, so there's no throughput reason to prefer HW here. (spec §Stage C-4.)
+sha2 = { version = "0.10", default-features = false, optional = true }
+# The `NorFlash` trait (erase/write) whose impl on esp-storage's FlashStorage the OTA
+# ImageWriter drives. Trait-only crate; pin to the 0.3.x esp-storage already links.
+embedded-storage = { version = "0.3", optional = true }
+
 # --- ESP-NOW (Phase 3, feature = "espnow") -------------------------------
 # ESP-NOW support lives inside esp-wifi behind its `esp-now` feature.
 # (No extra top-level crate; the feature is toggled on esp-wifi below.)
@@ -98,11 +118,31 @@ smoltcp = { version = "=0.12.0", optional = true, default-features = false, feat
 default = []
 
 # Phase 2: WiFi STA + SNTP time sync (+ optional weather).
-wifi = ["dep:esp-alloc", "dep:esp-wifi", "dep:smoltcp"]
+# Also carries OTA (issue #6): the flash/otadata crates + esp-backtrace's
+# `custom-halt` (panic→software_reset, MF-2) are pulled in HERE, not on the base
+# esp-backtrace dep, so the `default` build's panic behavior stays the stock
+# loop{} (OTA rollback semantics only matter once there's a radio to fetch over).
+wifi = [
+    "dep:esp-alloc",
+    "dep:esp-wifi",
+    "dep:smoltcp",
+    "dep:esp-storage",
+    "dep:esp-bootloader-esp-idf",
+    "dep:sha2",
+    "dep:embedded-storage",
+    "esp-backtrace/custom-halt",
+]
 
 # Phase 3: ESP-NOW peer messaging + WiFi<->ESP-NOW switching.
 # Builds on `wifi` (shares the radio init path) and turns on esp-wifi/esp-now.
 espnow = ["wifi", "esp-wifi/esp-now"]
+
+# COEXIST SOAK (issue #23 PART 1 — the gating experiment, NOT for production).
+# The gateway stays WiFi-associated after boot (no switch to ESP-NOW time-share),
+# the mesh rides the AP channel (pinned to ch1 = north-bedroom), and mesh + MQTT
+# flushes run CONCURRENTLY while the Bench beacon seq-gap loss/RTT is logged to
+# serial. Builds on espnow. Everything it changes is `cfg(feature = "coexist-soak")`.
+coexist-soak = ["espnow"]
 
 [profile.release]
 # esp-wifi strongly recommends opt-level "s"/2/3 and LTO; the radio blobs are
