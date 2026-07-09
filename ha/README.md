@@ -216,11 +216,12 @@ smol/<id>/config/default_screen   (retain: true, qos: 0)   payload: <AppKind>:<p
 - Node **reach**: credential-less leaves never open MQTT, so they use their `board.rs`
   default until given creds (JP decision F2). The card notes this.
 
-**The node-status rows** on the card use the EXISTING discovery entities
-(`sensor.smol_<id>_<noun>_smol_<id>`) — that part is live data today.
-⚠️ Those entity_ids are **doubled/ugly** (`sensor.smol_7_dominion_smol_7`) — a
-discovery-naming quirk worth cleaning up under the #12 device-grouping work (see the
-WLED research memo: one device `smol <id>` with structured child entities).
+**The node-status rows** on the card use the typed discovery entities
+(`sensor.smol_<id>_temp` / `_voltage` / `_status`) — one device `smol <id>` with
+structured child entities (#12, done). The earlier doubled
+`sensor.smol_<id>_<noun>_smol_<id>` entities were retired in the #12 HA cleanup: the
+firmware emits `object_id`, and the stale pre-`object_id` HA registry ids were renamed
+to the clean typed ids.
 
 ### Deploy (HELD for JP review — do NOT run yet)
 

@@ -1,0 +1,91 @@
+# smol · mesh topology view (issue #27) — HELD; DEPLOY IFF the peers topic is live.
+# ---------------------------------------------------------------------------
+# Card by nebula (#27 design); supporting entities pre-built (HELD) into
+# ha/packages/smol_mesh.yaml by ha-wave2. This card + those entities go live ONLY
+# once the firmware publishes the #27 topics (morpheus-fw Task 3, optional/do-last):
+#   smol/mesh/channel = MC|owner|channel|seq
+#   smol/<id>/peers   = PEERS|role|ch|id,rssi,age,flags|…
+# Until then every entity reads unknown/unavailable → an all-"unknown" panel, so
+# HOLD this card from the ship deploy (see ha/README.md + the deploy runbook §8).
+#
+# picture-elements v1: vanilla Lovelace, NO HACS. Fixed 3-board hub-and-spoke
+# (hub = the MC-elected owner, id7 today; spokes = id8/id9). Owner+channel from the
+# MC election record; per-spoke RSSI from the OWNER's peers payload. Install via WS
+# lovelace/config/save (NOT .storage).
+type: picture-elements
+title: Mesh topology
+# Inline SVG background (data URI) — hub + two spokes; no external asset needed.
+image: >-
+  data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg'
+  viewBox='0 0 400 260'%3E%3Crect width='400' height='260' fill='%230b0f0b'/%3E
+  %3Cline x1='200' y1='130' x2='90' y2='210' stroke='%232f7a4e' stroke-width='2'/%3E
+  %3Cline x1='200' y1='130' x2='310' y2='210' stroke='%232f7a4e' stroke-width='2'/%3E
+  %3Ccircle cx='200' cy='130' r='6' fill='%235bff9a'/%3E
+  %3Ccircle cx='90' cy='210' r='5' fill='%235bff9a'/%3E
+  %3Ccircle cx='310' cy='210' r='5' fill='%235bff9a'/%3E%3C/svg%3E
+
+elements:
+  # ---- elected-channel badge (from the MC record) ------------------------
+  - type: state-label
+    entity: sensor.smol_mesh_channel
+    attribute: channel
+    prefix: "mesh ch "
+    style: {top: 6%, left: 50%, color: "#ffc24b", font-weight: "600"}
+  - type: state-label
+    entity: sensor.smol_mesh_channel
+    attribute: owner
+    prefix: "owner id"
+    style: {top: 14%, left: 50%, color: "#6f8f78", font-size: 11px}
+
+  # ---- HUB: the elected owner (id7 today) --------------------------------
+  - type: state-label
+    entity: sensor.smol_7_screen          # STAT mirror (build/screen), renamed at #12/F2; name = who
+    attribute: build
+    prefix: "id7 · GATE · b"
+    style: {top: 50%, left: 50%, color: "#5bff9a", font-weight: "600"}
+  - type: state-badge                      # online/offline
+    entity: binary_sensor.smol_7_online
+    style: {top: 42%, left: 50%}
+
+  # ---- SPOKE id8 (bottom-left) -------------------------------------------
+  - type: state-label
+    entity: sensor.smol_8_rssi             # id8 RSSI from the owner's peers
+    prefix: "id8 "
+    suffix: " dBm"
+    style: {top: 82%, left: 22%, color: "#c9e8d2"}
+  - type: state-badge
+    entity: binary_sensor.smol_8_online
+    style: {top: 74%, left: 22%}
+  - type: conditional                      # amber "resync" if ch != MC.channel
+    conditions: [{entity: binary_sensor.smol_8_resync, state: "on"}]
+    elements:
+      - type: state-label
+        entity: binary_sensor.smol_8_resync
+        prefix: "⟳ resync"
+        style: {top: 90%, left: 22%, color: "#ffc24b", font-size: 10px}
+
+  # ---- SPOKE id9 (bottom-right) ------------------------------------------
+  - type: state-label
+    entity: sensor.smol_9_rssi
+    prefix: "id9 "
+    suffix: " dBm"
+    style: {top: 82%, left: 78%, color: "#c9e8d2"}
+  - type: state-badge
+    entity: binary_sensor.smol_9_online
+    style: {top: 74%, left: 78%}
+  - type: conditional
+    conditions: [{entity: binary_sensor.smol_9_resync, state: "on"}]
+    elements:
+      - type: state-label
+        entity: binary_sensor.smol_9_resync
+        prefix: "⟳ resync"
+        style: {top: 90%, left: 78%, color: "#ffc24b", font-size: 10px}
+
+  # ---- re-electing banner (MC owner offline / seq stale) -----------------
+  - type: conditional
+    conditions: [{entity: binary_sensor.smol_mesh_reelecting, state: "on"}]
+    elements:
+      - type: state-label
+        entity: binary_sensor.smol_mesh_reelecting
+        prefix: "⚠ mesh re-electing…"
+        style: {top: 30%, left: 50%, color: "#ff6b6b", font-weight: "600"}

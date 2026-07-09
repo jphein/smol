@@ -45,8 +45,8 @@ cards:
     title: id7 · Dominion (gateway)
     show_header_toggle: false
     entities:
-      - entity: sensor.smol_7_dominion_smol_7
-        name: Status (telemetry)
+      - entity: sensor.smol_7_status
+        name: Status
         icon: mdi:access-point
       - type: section
         label: Default screen
@@ -69,8 +69,8 @@ cards:
     title: id8 · Nexus
     show_header_toggle: false
     entities:
-      - entity: sensor.smol_8_nexus_smol_8
-        name: Status (telemetry)
+      - entity: sensor.smol_8_status
+        name: Status
         icon: mdi:access-point
       - type: section
         label: Default screen
@@ -93,8 +93,8 @@ cards:
     title: id9 · Herald
     show_header_toggle: false
     entities:
-      - entity: sensor.smol_9_herald_smol_9
-        name: Status (telemetry)
+      - entity: sensor.smol_9_status
+        name: Status
         icon: mdi:access-point
       - type: section
         label: Default screen
