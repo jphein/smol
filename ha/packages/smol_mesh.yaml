@@ -214,6 +214,15 @@ input_button:
   smol_9_reset:
     name: "smol id9 · reset to board default"
     icon: mdi:backup-restore
+  smol_ota_install_7:
+    name: "smol OTA · install staged → id7"
+    icon: mdi:download
+  smol_ota_install_8:
+    name: "smol OTA · install staged → id8"
+    icon: mdi:download
+  smol_ota_install_9:
+    name: "smol OTA · install staged → id9"
+    icon: mdi:download
 
 # --- Dashboard mirror: subscribe the retained topic so a card shows exactly ---
 # what the boards fetch (the payload is <=96 chars, well under the 255 state cap).
@@ -290,7 +299,7 @@ mqtt:
     - name: "smol mesh channel"
       unique_id: smol_mesh_channel_mirror
       state_topic: "smol/mesh/channel"
-      value_template: "{% set p = value.split('|') %}{{ p[3] if p | length >= 4 else 'unknown' }}"
+      value_template: "{% set p = value.split('|') %}{{ p[2] if p | length >= 4 else 'unknown' }}"
       json_attributes_topic: "smol/mesh/channel"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'owner': p[1], 'channel': p[2], 'seq': p[3]} if p | length >= 4 else {}) | tojson }}"
       expire_after: 90
@@ -569,7 +578,7 @@ automation:
         entity_id: input_button.smol_7_apply
     condition:
       - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
     action:
       - service: mqtt.publish
         data:
@@ -588,7 +597,7 @@ automation:
         entity_id: input_button.smol_7_reset
     condition:
       - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
     action:
       - service: mqtt.publish
         data:
@@ -606,7 +615,7 @@ automation:
         entity_id: input_button.smol_8_apply
     condition:
       - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
     action:
       - service: mqtt.publish
         data:
@@ -624,7 +633,7 @@ automation:
         entity_id: input_button.smol_8_reset
     condition:
       - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
     action:
       - service: mqtt.publish
         data:
@@ -642,7 +651,7 @@ automation:
         entity_id: input_button.smol_9_apply
     condition:
       - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
     action:
       - service: mqtt.publish
         data:
@@ -660,7 +669,7 @@ automation:
         entity_id: input_button.smol_9_reset
     condition:
       - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
     action:
       - service: mqtt.publish
         data:
@@ -680,7 +689,7 @@ automation:
         entity_id: input_button.smol_all_apply
     condition:
       - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
     action:
       - service: mqtt.publish
         data:
@@ -700,3 +709,69 @@ automation:
           retain: true
           qos: 0
           payload: "{{ states('input_select.smol_all_screen') }}:{{ states('input_select.smol_all_page') }}"
+  - id: smol_ota_install_id7
+    alias: "smol OTA: install staged to id7 (retained)"
+    description: >-
+      On the id7 OTA-Install button, publish RETAINED smol/7/ota/install = INSTALL.
+      RETAINED because the fw does a retained-read on connect (wifi.rs:336/:822) — a bursty
+      node (~2s/burst) misses a non-retained publish. The fw self-clears the retained install
+      after acting (no re-trigger). The native Update entity stays the "update available"
+      indicator; this is the working install trigger until fw discovery adds retain:true (#33 follow-up).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_ota_install_7
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/7/ota/install"
+          retain: true
+          qos: 0
+          payload: "INSTALL"
+  - id: smol_ota_install_id8
+    alias: "smol OTA: install staged to id8 (retained)"
+    description: >-
+      On the id8 OTA-Install button, publish RETAINED smol/8/ota/install = INSTALL.
+      RETAINED because the fw does a retained-read on connect (wifi.rs:336/:822) — a bursty
+      node (~2s/burst) misses a non-retained publish. The fw self-clears the retained install
+      after acting (no re-trigger). The native Update entity stays the "update available"
+      indicator; this is the working install trigger until fw discovery adds retain:true (#33 follow-up).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_ota_install_8
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/8/ota/install"
+          retain: true
+          qos: 0
+          payload: "INSTALL"
+  - id: smol_ota_install_id9
+    alias: "smol OTA: install staged to id9 (retained)"
+    description: >-
+      On the id9 OTA-Install button, publish RETAINED smol/9/ota/install = INSTALL.
+      RETAINED because the fw does a retained-read on connect (wifi.rs:336/:822) — a bursty
+      node (~2s/burst) misses a non-retained publish. The fw self-clears the retained install
+      after acting (no re-trigger). The native Update entity stays the "update available"
+      indicator; this is the working install trigger until fw discovery adds retain:true (#33 follow-up).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_ota_install_9
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/9/ota/install"
+          retain: true
+          qos: 0
+          payload: "INSTALL"
