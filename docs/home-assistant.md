@@ -62,15 +62,16 @@ channel). **Status:** 🟡 HA publish/GUI side **deployed**; the firmware consum
 (strict, panic-free parse) is the next wave. Protocol: [protocol.md → CONFIG](protocol.md#config--retained-per-node-default-screen-21-specd--firmware-pending);
 GUI/entities: [`ha/README.md`](../ha/README.md).
 
-## OTA (#6) — retained announce (spec'd)
+## OTA (#6) — retained announce (built + deployed; HW-verify-pending)
 Firmware updates ride the same MQTT-native pattern: a retained
 `smol/ota/announce` = `OTA|build|size|sha256|url`; the board fetches the image over
 HTTP to its inactive A/B slot, verifies (sha256), and activates it. Recovery is
 **app-side self-rollback + canary-one-board-at-a-time** — the bundled bootloader
 slot-selects, but **revert-on-boot-fail is OFF** (unproven/likely disabled), so a bad
 image is contained by pushing to one board at a time (never fleet-unison), not by an
-automatic bootloader revert. 🟡 engine landed (integrity SHA gate + app-side rollback +
-monotonicity); the fetch trigger + hardware run are next
+automatic bootloader revert. 🟡 engine + publish tooling + HA panel are **built and deployed**;
+end-to-end canary is **hardware-verify-pending** — an offer-surfacing bug meant the engine never
+ran on hardware; the fix has since landed, canary next
 (`scratch/smol-ha-batt/ota-plan.md`).
 
 ## Collector retirement
