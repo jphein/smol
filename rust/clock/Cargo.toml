@@ -137,6 +137,13 @@ wifi = [
 # Builds on `wifi` (shares the radio init path) and turns on esp-wifi/esp-now.
 espnow = ["wifi", "esp-wifi/esp-now"]
 
+# #25 WLED WiZmote-emit: smol impersonates a WLED "linked remote" (13-B WiZmote
+# ESP-NOW broadcast). Needs the ESP-NOW broadcast path + RadioManager, so it builds
+# on `espnow`. Nothing new links — pure encode + the existing `esp_now.send`. The
+# default build is BYTE-FREE of it (symbol-absence provable; net/wled.rs is
+# `#![cfg(feature = "wled")]` and every hook is `#[cfg(feature = "wled")]`).
+wled = ["espnow"]
+
 # COEXIST SOAK (issue #23 PART 1 — the gating experiment, NOT for production).
 # The gateway stays WiFi-associated after boot (no switch to ESP-NOW time-share),
 # the mesh rides the AP channel (pinned to ch1 = north-bedroom), and mesh + MQTT

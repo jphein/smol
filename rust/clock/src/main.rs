@@ -626,6 +626,17 @@ fn main() -> ! {
             {
                 r.broadcast_grid(grid_cache.bytes());
             }
+            // #21 leaf-relay: a GATEWAY re-broadcasts each cached leaf's dashboard-set
+            // default screen as a SMOLv1 CFG frame on the SAME ~10 s cadence as
+            // BATT/GRID. Single-hop (leaves never re-broadcast → no flood/loop);
+            // edge-trigger on the leaf makes the periodic resend idempotent (never
+            // yanks a user off their current screen). No-op on a leaf / empty cache
+            // (broadcast_cached_configs self-gates on is_gateway).
+            if r.is_gateway()
+                && (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000)
+            {
+                r.broadcast_cached_configs();
+            }
 
             // NOTE: the MMO-snake SNK drain+broadcast used to live here. It MOVED
             // into `MeshSnake::update` (it needs the game state, now owned by the
@@ -750,8 +761,23 @@ fn main() -> ! {
         let unix_now = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
         // #21: pull any pending default-screen command BEFORE `ctx` borrows `radio`
         // (ctx holds `radio.as_mut()`), so the apply below can use `ctx` freely.
+        // Two sources feed the ONE apply path (edge-triggered below):
+        //   * GATEWAY — its own MQTT `default_screen` config (`take_config_offer`,
+        //     already parsed to a `DefaultScreen` in `mqtt_session`);
+        //   * LEAF (#21 leaf-relay) — the gateway-relayed `SMOLv1 CFG` value bytes
+        //     (`take_cfg_offer`), run through the SAME strict/panic-free
+        //     `parse_default_screen` (unknown/wrong-tier → None → keep current; empty
+        //     → Clear → board default). A board is gateway XOR leaf, so at most one
+        //     yields; the gateway's own config wins if both ever do.
         #[cfg(feature = "espnow")]
-        let config_cmd = radio.as_mut().and_then(|r| r.take_config_offer());
+        let config_cmd = radio.as_mut().and_then(|r| {
+            if let Some(c) = r.take_config_offer() {
+                Some(c)
+            } else {
+                r.take_cfg_offer()
+                    .and_then(|o| app::parse_default_screen(&o.buf[..o.len]))
+            }
+        });
         let mut ctx = Ctx {
             display: &mut display,
             sensors: &mut sensors,

@@ -156,6 +156,18 @@ const GRID_PREFIX: &[u8] = b"SMOLv1 GRID "; // + verbatim "GRID|l1|l2|l3"
 /// Max GRID payload retained/echoed — matches `GridCache` (LOCKED ≤ 96 B).
 const GRID_PAYLOAD_MAX: usize = 96;
 
+/// #21 leaf-relay config-downlink tag: `"SMOLv1 CFG "` (11 B, trailing space) then
+/// `"NNN"` (3-ASCII zero-padded TARGET leaf id) then the VERBATIM default-screen
+/// value (`<AppKind>:<page>`, empty = clear). Diverges from HELLO/BATT/GRID/TIME/OTA
+/// at byte 7 (`'C'`), so `strip_prefix` never confuses them. Single-hop gateway →
+/// leaf (leaves never re-broadcast). **HARD BOUNDARY (oracle R-P3, §0 of the #21
+/// design):** this frame carries SCREEN CONFIG ONLY — never OTA/url/install. It's a
+/// low-blast, reversible, escapable command (long-press → Menu is universal), so a
+/// forged frame's worst case is a valid screen or an ignore — never code exec, never
+/// a brick. The value length is bounded by `CFG_VALUE_MAX`; the leaf validates it
+/// with the strict/panic-free `parse_default_screen`.
+const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + verbatim "<AppKind>:<page>"
+
 use crate::mesh_snake::snake_core::{self, SnkFrame};
 
 /// Depth of the decoded MMO-snake RX ring. A full 16-peer broadcast burst plus
@@ -244,6 +256,10 @@ enum Frame<'a> {
     /// A grid-downlink payload from a gateway (issue #16): the verbatim `GRID|…`
     /// bytes (twin of `Batt`; copied into `GridTracker` in `service`).
     Grid(&'a [u8]),
+    /// #21 leaf-relay: a gateway's CONFIG downlink — `target` leaf id + the verbatim
+    /// default-screen `value` bytes (`value` borrows the RX buffer; the leaf buffers
+    /// it in `CfgTracker` in `service` IFF `target == self.id`). Screen config ONLY.
+    Cfg { target: u8, value: &'a [u8] },
 }
 
 /// Tracks the two timestamps that define the peer link state. Monotonic ms
@@ -394,6 +410,40 @@ impl GridTracker {
 #[derive(Clone, Copy)]
 pub struct GridOffer {
     pub buf: [u8; GRID_PAYLOAD_MAX],
+    pub len: usize,
+}
+
+/// #21 leaf-relay: buffers the most-recent inbound `SMOLv1 CFG` VALUE that targeted
+/// THIS leaf (the `service()` arm target-filters on `self.id` before buffering, so a
+/// config for another leaf never lands here). `main` takes it via
+/// [`RadioManager::take_cfg_offer`] and runs the bytes through the strict
+/// `parse_default_screen`. Fixed `.bss` buffer, no heap. Twin of [`BattTracker`].
+struct CfgTracker {
+    buf: [u8; crate::net::wifi::CFG_VALUE_MAX],
+    len: usize,
+    have: bool,
+}
+
+impl CfgTracker {
+    const fn new() -> Self {
+        Self { buf: [0; crate::net::wifi::CFG_VALUE_MAX], len: 0, have: false }
+    }
+
+    /// Buffer a freshly-received value (truncated to capacity).
+    fn set(&mut self, value: &[u8]) {
+        let n = value.len().min(crate::net::wifi::CFG_VALUE_MAX);
+        self.buf[..n].copy_from_slice(&value[..n]);
+        self.len = n;
+        self.have = true;
+    }
+}
+
+/// A `Copy` snapshot of a buffered CFG value handed to `main` by
+/// [`RadioManager::take_cfg_offer`]. `buf[..len]` is the verbatim `<AppKind>:<page>`
+/// value (empty = clear → board default); `main` parses it via `parse_default_screen`.
+#[derive(Clone, Copy)]
+pub struct CfgOffer {
+    pub buf: [u8; crate::net::wifi::CFG_VALUE_MAX],
     pub len: usize,
 }
 
@@ -585,6 +635,30 @@ impl NodeView {
 pub struct RosterView {
     pub nodes: [NodeView; ROSTER_CAP],
     pub count: usize,
+}
+
+/// #27: a bounded `core::fmt::Write` sink over a caller-owned `&mut [u8]`. Writes
+/// TRUNCATE (never panic) once the buffer is full — so any serializer built on it
+/// is total. `len` = committed bytes (always ≤ `buf.len()`); `overflow` latches
+/// true if a `write_str` couldn't fit in full, letting the caller roll `len` back
+/// to a clean boundary and drop the offending item rather than emit a half-record.
+struct SliceWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+    overflow: bool,
+}
+
+impl core::fmt::Write for SliceWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = self.buf.len().saturating_sub(self.len);
+        if s.len() > room {
+            self.overflow = true;
+        }
+        let n = s.len().min(room);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
 }
 
 // =========================================================================
@@ -1142,6 +1216,19 @@ pub struct RadioManager {
     /// Twin of `batt` (issue #16): most-recent inbound SMOLv1 GRID payload, buffered
     /// for `main` to store into its `GridCache`.
     grid: GridTracker,
+    /// #21 leaf-relay (LEAF side): most-recent inbound `SMOLv1 CFG` value that
+    /// targeted THIS leaf, buffered for `main` to apply via `take_cfg_offer`.
+    cfg: CfgTracker,
+    /// #21 leaf-relay (GATEWAY side): per-leaf default-screen cache, filled from the
+    /// MQTT wildcard during a flush and re-broadcast as `SMOLv1 CFG` on the ~10 s
+    /// cadence. Lives here so it persists across bursts (a (re)joined leaf converges
+    /// without HA re-publishing). Unused on a leaf (never flushes).
+    cfg_cache: crate::net::wifi::CfgCache,
+    /// #25 WLED: monotonic WiZmote sequence, ++ per emitted button. Wraps safely
+    /// (reboot-to-0 is panic-safe; WLED's per-remote dedup may drop the first few
+    /// post-reboot presses until it re-exceeds the pre-reboot value — accepted MVP).
+    #[cfg(feature = "wled")]
+    wled_seq: u32,
     /// #23: the elected mesh owner's id (the single coexist gateway). Set at boot from
     /// the broker election; a leaf scans for THIS id's HELLO to find the mesh channel.
     elected_owner: u8,
@@ -1215,6 +1302,10 @@ impl RadioManager {
             roster: Roster::new(),
             batt: BattTracker::new(),
             grid: GridTracker::new(),
+            cfg: CfgTracker::new(),
+            cfg_cache: crate::net::wifi::CfgCache::new(),
+            #[cfg(feature = "wled")]
+            wled_seq: 0,
             elected_owner: id,
             scan_locked: false,
             scan_idx: 0,
@@ -1324,6 +1415,8 @@ impl RadioManager {
                     &mut ota_offer,
                     &mut config_offer,
                     &mut install_requested,
+                    &[], // #27: election-only recovery burst publishes no peers (leaf/v1)
+                    None, // #21: a leaf's recovery burst is not a gateway relay
                     tick,
                 )
             }
@@ -1587,6 +1680,84 @@ impl RadioManager {
         }
     }
 
+    /// #21 leaf-relay: broadcast one targeted `SMOLv1 CFG` frame — tag + 3-ASCII
+    /// zero-padded `target_id` + the verbatim `value`. Mirror of [`broadcast_batt`]:
+    /// fixed frame → `send_to(&BROADCAST_ADDRESS, ..)` (fire-and-forget). Every leaf
+    /// hears it; only the `target` acts (leaf-side target-filter). Value truncated to
+    /// `CFG_VALUE_MAX`; empty value = clear.
+    ///
+    /// [`broadcast_batt`]: RadioManager::broadcast_batt
+    pub fn broadcast_config(&mut self, target_id: u8, value: &[u8]) {
+        let base = CFG_PREFIX.len();
+        let mut msg = [0u8; CFG_PREFIX.len() + 3 + crate::net::wifi::CFG_VALUE_MAX];
+        msg[..base].copy_from_slice(CFG_PREFIX);
+        // 3-ASCII zero-padded target id (matches `parse_id`; u8 ⇒ each digit 0–9).
+        msg[base] = b'0' + target_id / 100;
+        msg[base + 1] = b'0' + (target_id / 10) % 10;
+        msg[base + 2] = b'0' + target_id % 10;
+        let n = value.len().min(crate::net::wifi::CFG_VALUE_MAX);
+        msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
+    }
+
+    /// #21 leaf-relay: GATEWAY-only. Broadcast one `SMOLv1 CFG` per CACHED leaf
+    /// config (skipping the gateway's OWN id — it self-applies via the credentialed
+    /// MQTT path). Single-hop (leaves never re-broadcast → no flood/loop). No-op on a
+    /// leaf or an empty cache. `main` gates the call on `is_gateway` + the ~10 s tick,
+    /// mirroring the BATT/GRID re-broadcast cadence; edge-trigger on the leaf side
+    /// makes the periodic resend idempotent (never yanks a user off their screen).
+    pub fn broadcast_cached_configs(&mut self) {
+        if !self.relay.is_gateway {
+            return;
+        }
+        let own = self.id;
+        let count = self.cfg_cache.count();
+        for i in 0..count {
+            // Copy the entry out to release the `cfg_cache` borrow before the
+            // `&mut self` broadcast_config call (disjoint-borrow discipline).
+            let mut vbuf = [0u8; crate::net::wifi::CFG_VALUE_MAX];
+            let (id, vlen) = match self.cfg_cache.entry(i) {
+                Some((id, v)) => {
+                    let l = v.len();
+                    vbuf[..l].copy_from_slice(v);
+                    (id, l)
+                }
+                None => continue,
+            };
+            if id == own {
+                continue;
+            }
+            self.broadcast_config(id, &vbuf[..vlen]);
+        }
+    }
+
+    /// #21 leaf-relay: take the buffered inbound CFG value that targeted us (if any),
+    /// clearing it. Twin of [`take_batt_offer`]; `main` runs the bytes through
+    /// `parse_default_screen` and edge-trigger-applies the result.
+    ///
+    /// [`take_batt_offer`]: RadioManager::take_batt_offer
+    pub fn take_cfg_offer(&mut self) -> Option<CfgOffer> {
+        if self.cfg.have {
+            self.cfg.have = false;
+            Some(CfgOffer { buf: self.cfg.buf, len: self.cfg.len })
+        } else {
+            None
+        }
+    }
+
+    /// #25 WLED: broadcast one WiZmote button over ESP-NOW on the CURRENT channel.
+    /// Mirror of [`broadcast_batt`]: build the fixed 13-B frame → `send_to(&
+    /// BROADCAST_ADDRESS, ..)` (fire-and-forget, exactly like BATT/TIME; the
+    /// underlying `esp_now.send` result is already discarded). `wled_seq` wraps
+    /// (reboot-to-0 panic-safe). The WLED controller acts only on frames from its
+    /// linked-remote MAC, so this broadcast is harmless to other boards.
+    #[cfg(feature = "wled")]
+    pub fn broadcast_wled_button(&mut self, btn: crate::net::wled::WledButton, bat_level: u8) {
+        let frame = crate::net::wled::encode_wizmote(btn, self.wled_seq, bat_level);
+        self.wled_seq = self.wled_seq.wrapping_add(1);
+        self.send_to(&BROADCAST_ADDRESS, &frame);
+    }
+
     /// Broadcast one MMO-snake state frame (issue #5). 18 B; `main` calls this
     /// on the per-id phase-jittered 200 ms schedule while MeshSnake is active.
     pub fn broadcast_snk(&mut self, f: &SnkFrame) {
@@ -1627,6 +1798,64 @@ impl RadioManager {
     /// only, since a peer's role is never on the wire (bench-mesh-view-spec §3).
     pub fn is_gateway(&self) -> bool {
         self.relay.is_gateway
+    }
+
+    /// #27: this node's current ESP-NOW channel for the peers publish. Leaf = its
+    /// locked scan channel (`CANDIDATES[scan_idx]` while `scan_locked`); gateway = 0
+    /// (its AP channel isn't read on-device yet — #29's `rx_control` capture will
+    /// populate it). Both `0` today ⇒ HA treats the `<ch>` field as advisory and does
+    /// NOT roam-flag until real channels land, so #27 ships no false positives.
+    fn current_channel(&self) -> u8 {
+        const CANDIDATES: [u8; 3] = [1, 6, 11]; // must match the scan plan above
+        if self.relay.is_gateway || !self.scan_locked {
+            0
+        } else {
+            CANDIDATES[self.scan_idx % CANDIDATES.len()]
+        }
+    }
+
+    /// #27: serialize the #8 roster into `out` as the retained `smol/<id>/peers`
+    /// payload — `PEERS|<role>|<ch>|id,rssi,age,ch,flags;…` — and return the byte
+    /// length. GATEWAY-primary (the hub hears every leaf + flushes ~30 s); a leaf
+    /// passes an empty slice in v1. Total/panic-free: a bounded [`SliceWriter`]
+    /// (writes truncate, never panic) + integer formatting only — no
+    /// `unwrap`/index-on-external/alloc. Peers emit in the roster's RSSI-desc order,
+    /// so a full buffer keeps the STRONGEST; a peer that wouldn't fit is dropped at a
+    /// clean `;` boundary and the dropped count is logged (no silent truncation —
+    /// per the no-silent-cap rule). Only `id_known` peers emit (HA needs an id to
+    /// place a node). `flags` = bit0 `connected` | bit1 `has_mesh_time`.
+    pub fn serialize_peers(&self, now: u64, out: &mut [u8]) -> usize {
+        use core::fmt::Write as _;
+        let view = self.roster(now);
+        let ch = self.current_channel();
+        let role = if self.relay.is_gateway { 'G' } else { 'L' };
+        let mut w = SliceWriter { buf: out, len: 0, overflow: false };
+        let _ = write!(w, "PEERS|{}|{}|", role, ch);
+        let mut dropped = 0u32;
+        let mut emitted = 0usize;
+        for i in 0..view.count {
+            let p = view.nodes[i];
+            if !p.id_known {
+                continue; // no id ⇒ HA can't place it; skip (never emit an unknown id)
+            }
+            let flags: u8 = (p.connected as u8) | ((p.has_mesh_time as u8) << 1);
+            let sep = if emitted == 0 { "" } else { ";" };
+            let start = w.len;
+            let _ = write!(w, "{}{},{},{},{},{}", sep, p.id, p.rssi, p.age_s, ch, flags);
+            if w.overflow {
+                // Roll the partial peer back → clean boundary; a later (differently
+                // sized) peer may still fit, so keep scanning rather than break.
+                w.len = start;
+                w.overflow = false;
+                dropped += 1;
+            } else {
+                emitted += 1;
+            }
+        }
+        if dropped > 0 {
+            log::info!("smol: #27 peers publish truncated — dropped {} weakest peer(s)", dropped);
+        }
+        w.len
     }
 
     // --- Relay bridge (see the "Relay bridge" section) -----------------------
@@ -1804,6 +2033,13 @@ impl RadioManager {
         let _ = self.switch(Mode::WifiSta);
         let id = self.id;
         let now = now_ms();
+        // #27: serialize the roster into a stack buffer BEFORE the mutable-borrow burst
+        // — the resulting slice is disjoint from `self` (same disjoint-borrow discipline
+        // as `own_telemetry`), so it threads through with no borrow conflict. Worst case
+        // (ROSTER_CAP=16 peers) ≈ 298 B; 320 matches the MqttScratch budget from #33.
+        let mut peers_buf = [0u8; 320];
+        let peers_len = self.serialize_peers(now, &mut peers_buf);
+        let peers = &peers_buf[..peers_len];
         // #23 fix: seed the election from the live role + persistent staleness so THIS
         // flush RE-DECIDES ownership (demote a duplicate gateway that now sees a LIVE
         // lower-id owner — oracle #2). Read back below and applied to the live role.
@@ -1853,6 +2089,8 @@ impl RadioManager {
                     &mut ota_offer,
                     &mut config_offer,
                     &mut install_requested,
+                    peers, // #27: gateway publishes its roster as retained smol/<id>/peers
+                    Some(&mut self.cfg_cache), // #21: gateway caches leaf configs to relay
                     tick,
                 )
             }
@@ -2211,6 +2449,22 @@ impl RadioManager {
                     self.roster.heard(src, None, rssi, now);
                     label = Some(alloc::string::String::from("grid"));
                 }
+                Some(Frame::Cfg { target, value }) => {
+                    // #21 leaf-relay: a gateway's CONFIG downlink. Target-filter FIRST
+                    // (per-leaf) — only buffer if it's addressed to US; a config for any
+                    // other leaf is ignored here. The value is the #21 default-screen
+                    // grammar; `main` validates it via the strict/panic-free
+                    // `parse_default_screen` (unknown/wrong-tier/bad-page → keep current;
+                    // empty → clear). HARD BOUNDARY: screen config ONLY — never OTA.
+                    // Buffering the raw bytes (not parsing here) keeps this arm total.
+                    if target == self.id {
+                        self.cfg.set(value);
+                        log::info!("smol #21: CFG frame for us ({} B value) — buffered", value.len());
+                    }
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, None, rssi, now);
+                    label = Some(alloc::string::String::from("cfg"));
+                }
                 None => {
                     // Unrecognised payload (other ESP-NOW traffic on-channel);
                     // surface it on the OLED but don't touch the handshake.
@@ -2353,6 +2607,13 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
     if let Some(rest) = data.strip_prefix(GRID_PREFIX) {
         // Twin of BATT (issue #16): the rest is the verbatim `GRID|…` payload.
         return Some(Frame::Grid(rest));
+    }
+    if let Some(rest) = data.strip_prefix(CFG_PREFIX) {
+        // #21 leaf-relay: "NNN<value>" — 3-ASCII target id then the verbatim value
+        // (to end-of-frame; empty = clear). `parse_id` rejects short/non-digit and
+        // guarantees `rest.len() >= 3`, so `&rest[3..]` never panics.
+        let target = parse_id(rest)?;
+        return Some(Frame::Cfg { target, value: &rest[3..] });
     }
     None
 }

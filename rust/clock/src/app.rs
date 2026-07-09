@@ -157,6 +157,10 @@ pub enum AppKind {
     Bench,
     #[cfg(feature = "espnow")]
     MeshSnake,
+    // #25 WLED remote. LIVE whenever compiled (REGISTRY row + `enter` + `from_wire`
+    // construct it), like Batt/Grid → no dead_code allow needed. cfg(wled) = espnow+.
+    #[cfg(feature = "wled")]
+    WledRemote,
 }
 
 /// #21 node-manager CONSUME — the parsed retained `smol/<id>/config/default_screen`
@@ -197,6 +201,9 @@ impl AppKind {
             "Bench" => AppKind::Bench,
             #[cfg(feature = "espnow")]
             "MeshSnake" => AppKind::MeshSnake,
+            // #25: a leaf's default screen can be set to the WLED remote via #21 too.
+            #[cfg(feature = "wled")]
+            "WledRemote" => AppKind::WledRemote,
             _ => return None,
         })
     }
@@ -248,6 +255,8 @@ pub enum App {
     Bench(crate::bench::BenchState),
     #[cfg(feature = "espnow")]
     MeshSnake(crate::mesh_snake::MeshSnake),
+    #[cfg(feature = "wled")]
+    WledRemote(crate::net::wled::WledRemoteState),
 }
 
 impl App {
@@ -268,6 +277,10 @@ impl App {
             #[cfg(feature = "espnow")]
             AppKind::MeshSnake => {
                 App::MeshSnake(crate::mesh_snake::MeshSnake::new(ctx.node_id, ctx.now_ms as u32))
+            }
+            #[cfg(feature = "wled")]
+            AppKind::WledRemote => {
+                App::WledRemote(crate::net::wled::WledRemoteState::new(ctx.now_ms))
             }
         }
     }
@@ -294,6 +307,8 @@ impl App {
             App::Bench(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "espnow")]
             App::MeshSnake(s) => Plugin::on_button(s, press, ctx),
+            #[cfg(feature = "wled")]
+            App::WledRemote(s) => Plugin::on_button(s, press, ctx),
         }
     }
 
@@ -312,6 +327,8 @@ impl App {
             App::Bench(s) => Plugin::update(s, ctx),
             #[cfg(feature = "espnow")]
             App::MeshSnake(s) => Plugin::update(s, ctx),
+            #[cfg(feature = "wled")]
+            App::WledRemote(s) => Plugin::update(s, ctx),
         }
     }
 
@@ -359,5 +376,9 @@ pub const REGISTRY: &[AppDesc] = &[
     AppDesc { title: "Batt", kind: AppKind::Batt },
     #[cfg(feature = "wifi")]
     AppDesc { title: "Grid", kind: AppKind::Grid },
+    // #25 WLED remote — only in a wled build (menu grows by one row; the scrolling
+    // window math in menu.rs is length-relative, so it just works).
+    #[cfg(feature = "wled")]
+    AppDesc { title: "WLED", kind: AppKind::WledRemote },
     AppDesc { title: "About", kind: AppKind::About },
 ];

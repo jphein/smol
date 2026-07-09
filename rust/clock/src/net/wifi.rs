@@ -127,12 +127,14 @@ impl MeshElect {
     }
 }
 
-/// OTA (issue #6): retained per-fleet announce topic (`OTA|build|size|sha|url`). The
-/// per-BOARD topic `smol/ota/announce/<id>` is built at runtime from `node_id` — the
-/// CANARY path (spec §4b-4 Option 1): JP publishes to one id, watches it reach the new
-/// build, then publishes the next / the `all` topic. A board subscribes to BOTH.
+/// OTA (#33 Model-A): the ONE retained fleet STAGING topic (`OTA|build|size|sha256|url`)
+/// published by `ota_publish.sh stage`. Every board subscribes it as its `latest_version`
+/// source + the fetch TARGET — but a staged line NEVER auto-fetches; the board fetches only
+/// on its own per-device HA Update `install` command. There is deliberately NO per-id
+/// `smol/ota/announce/<id>` act-topic (that path is dropped) — so no publish can trigger a
+/// fleet fetch. That structural absence is the #32 canary-discipline closure.
 #[cfg(feature = "wifi")]
-const OTA_ANNOUNCE_ALL_TOPIC: &[u8] = b"smol/ota/announce/all";
+const OTA_STAGED_TOPIC: &[u8] = b"smol/ota/staged";
 
 /// A retained owner whose `seq` has not advanced for this long is presumed DEAD and
 /// may be taken over. The owner re-publishes `MC` (seq++) every gateway flush (~30 s),
@@ -153,6 +155,32 @@ fn parse_mesh_channel(payload: &[u8]) -> Option<(u8, u8, u32)> {
     let ch: u8 = it.next()?.parse().ok()?;
     let seq: u32 = it.next()?.parse().ok()?;
     Some((owner, ch, seq))
+}
+
+/// #21 leaf-relay: extract the leaf id `N` from a `smol/<N>/config/default_screen`
+/// topic (the shape the wildcard subscribe delivers). Total/panic-free: fixed
+/// prefix + exact suffix match + 1–3 ASCII-digit parse clamped to u8; anything else
+/// → `None`. The topic is broker-supplied, so parse defensively (not just trust the
+/// subscribe filter).
+#[cfg(feature = "wifi")]
+fn parse_leaf_config_topic(topic: &[u8]) -> Option<u8> {
+    let rest = topic.strip_prefix(b"smol/")?;
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let (idb, tail) = rest.split_at(slash);
+    if tail != b"/config/default_screen" {
+        return None;
+    }
+    if idb.is_empty() || idb.len() > 3 {
+        return None;
+    }
+    let mut val: u16 = 0;
+    for &b in idb {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val * 10 + (b - b'0') as u16;
+    }
+    (val <= 255).then_some(val as u8)
 }
 
 /// Budget for one full MQTT session (TCP connect → CONNECT/CONNACK → publishes →
@@ -447,6 +475,8 @@ pub fn run_ntp_burst(
         ota_offer,
         config_offer,
         install_requested,
+        &[], // #27: boot NTP+downlink burst publishes no peers (no roster yet)
+        None, // #21: boot burst is not a gateway relay (no leaf-config cache)
         mqtt_deadline,
         tick,
     );
@@ -538,6 +568,13 @@ use core::fmt::Write as _;
 /// sequentially so only one need fit at a time — with headroom for future fields.
 #[cfg(feature = "wifi")]
 struct MqttScratch {
+    // Stays 320: it backs 11 short scratch instances (topics ≤64 B, #33 djson 214 B,
+    // sjson 96 B, MC 20 B…) that all fit. Bumping it to 512 would have grown EVERY
+    // one of those stack locals in mqtt_session — argus/team-lead's F1-must-not-undo-F2
+    // warning. The ONLY payload that exceeded 320 is the #12 discovery JSON (373 B);
+    // that one alone moved to a `.bss` static (`MQTT_JSON`/`JsonScratch`), so the
+    // mqtt_session frame nets SMALLER than pre-F1 (−320 for json off-stack, +192 for
+    // the pkt bump) → the F1 fix cannot reintroduce the F2 stack overflow.
     buf: [u8; 320],
     len: usize,
 }
@@ -562,6 +599,141 @@ impl core::fmt::Write for MqttScratch {
             }
         }
         Ok(())
+    }
+}
+
+/// F1 (oracle): a 512-B scratch for the ONE oversized MQTT payload — the #12 typed
+/// discovery JSON (373 B, which overflowed the 320-B [`MqttScratch`] → silent truncate
+/// → HA rejected the config → typed entities never appeared). Held in a `.bss` static
+/// ([`MQTT_JSON`]), NOT on the mqtt_session stack, so fixing the capacity does NOT grow
+/// the stack frame (F1-must-not-reintroduce-F2). Single-caller (one burst at a time)
+/// → the `&'static mut` borrow is alias-safe. Same `write!`/`as_bytes` shape as
+/// `MqttScratch`; `clear()` resets it between the 3 per-node configs.
+#[cfg(feature = "wifi")]
+struct JsonScratch {
+    buf: [u8; 512],
+    len: usize,
+}
+
+#[cfg(feature = "wifi")]
+impl JsonScratch {
+    const fn new() -> Self {
+        Self { buf: [0; 512], len: 0 }
+    }
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+#[cfg(feature = "wifi")]
+impl core::fmt::Write for JsonScratch {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len < self.buf.len() {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// F1: the static backing for [`JsonScratch`] — off the mqtt_session stack (see above).
+#[cfg(feature = "wifi")]
+static mut MQTT_JSON: JsonScratch = JsonScratch::new();
+
+/// F4 (oracle): the inbound MQTT byte-stream accumulation buffer, 512 B, in a `.bss`
+/// static — NOT on the mqtt_session stack. At 256 B it OVERFLOWED on a long-url #33
+/// staged announce (`OTA|build|size|sha|url`, url ≤160 B ⇒ packet ~380–410 B): the
+/// PUBLISH never fully accumulated, so `parse_packet` never returned it and the
+/// announce was silently never read (F1-class, on the CORE OTA path — and it blocks
+/// the OTA-proof: the release board can't read the canary's staged announce). 512 also
+/// covers the #32 signed 6-field announce (~410 B) → zero rework for that wave. Held in
+/// a static (like `MQTT_JSON`) so the +256 does NOT grow the stack frame → cannot
+/// reintroduce F2. Single-caller (one burst) → alias-safe.
+#[cfg(feature = "wifi")]
+static mut MQTT_ACC: [u8; 512] = [0; 512];
+
+/// #21 leaf-relay: max bytes of a relayed default-screen value (`<AppKind>:<page>`,
+/// ≤ 12 by the #21 grammar; 16 gives margin). Lives here (not `net::mode`) because
+/// the gateway FILLS the cache from MQTT in `mqtt_session` (compiled under `wifi`),
+/// while the ESP-NOW frame layer that CONSUMES it is `#[cfg(espnow)]` — and
+/// `espnow ⊃ wifi`, so a wifi-level type is namable from both with no signature cfg.
+#[cfg(feature = "wifi")]
+pub const CFG_VALUE_MAX: usize = 16;
+
+#[cfg(feature = "wifi")]
+const CFG_CACHE_CAP: usize = 16;
+
+/// #21 leaf-relay: the GATEWAY's per-leaf default-screen cache. Filled from the
+/// retained wildcard `smol/+/config/default_screen` during a flush; re-broadcast as
+/// `SMOLv1 CFG` frames on the ~10 s cadence (mode.rs `broadcast_cached_configs`) so
+/// credential-less leaves converge on their dashboard-set screen — and a (re)joined
+/// leaf still gets its config without HA re-publishing. Bounded `.bss`, no heap.
+#[cfg(feature = "wifi")]
+pub struct CfgCache {
+    ids: [u8; CFG_CACHE_CAP],
+    vals: [[u8; CFG_VALUE_MAX]; CFG_CACHE_CAP],
+    lens: [u8; CFG_CACHE_CAP],
+    count: usize,
+}
+
+#[cfg(feature = "wifi")]
+impl CfgCache {
+    // `new`/`count`/`entry` are called only by the espnow gateway (RadioManager +
+    // broadcast_cached_configs); in a wifi-only build they're unused (the RadioManager
+    // doesn't exist) → allow dead_code so the clippy gate stays clean in BOTH configs.
+    #[allow(dead_code)]
+    pub const fn new() -> Self {
+        Self {
+            ids: [0; CFG_CACHE_CAP],
+            vals: [[0; CFG_VALUE_MAX]; CFG_CACHE_CAP],
+            lens: [0; CFG_CACHE_CAP],
+            count: 0,
+        }
+    }
+
+    /// Upsert a leaf's config value (truncated to `CFG_VALUE_MAX`). A full cache drops
+    /// the entry and logs it (no silent cap). Value bytes are opaque here — the gateway
+    /// RELAYS them verbatim; the leaf's `parse_default_screen` is the strict validator.
+    pub fn set(&mut self, id: u8, value: &[u8]) {
+        let n = value.len().min(CFG_VALUE_MAX);
+        for i in 0..self.count {
+            if self.ids[i] == id {
+                self.vals[i][..n].copy_from_slice(&value[..n]);
+                self.lens[i] = n as u8;
+                return;
+            }
+        }
+        if self.count < CFG_CACHE_CAP {
+            let i = self.count;
+            self.ids[i] = id;
+            self.vals[i][..n].copy_from_slice(&value[..n]);
+            self.lens[i] = n as u8;
+            self.count += 1;
+        } else {
+            log::warn!("smol #21: cfg cache full ({}) — dropping config for id{}", CFG_CACHE_CAP, id);
+        }
+    }
+
+    /// Number of cached leaf configs.
+    #[allow(dead_code)]
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// The `i`-th cached entry as `(leaf_id, value_bytes)`, or `None` if out of range.
+    #[allow(dead_code)]
+    pub fn entry(&self, i: usize) -> Option<(u8, &[u8])> {
+        if i < self.count {
+            let n = self.lens[i] as usize;
+            Some((self.ids[i], &self.vals[i][..n]))
+        } else {
+            None
+        }
     }
 }
 
@@ -650,19 +822,23 @@ fn mqtt_session(
     // #33 HA Update entity: set true iff a retained `install` command is present for this
     // board (the native Install button) — the caller AND-gates the fetch on it.
     install_requested: &mut bool,
+    // #27: this node's serialized roster (`PEERS|…`); published retained to
+    // `smol/<node_id>/peers` after the telemetry loop iff non-empty.
+    peers: &[u8],
+    // #21 leaf-relay: `Some` on a GATEWAY flush → subscribe the wildcard
+    // `smol/+/config/default_screen` and cache every OTHER leaf's value here for the
+    // ESP-NOW relay. `None` on boot/leaf/election bursts (no relay duty).
+    mut cfg_cache: Option<&mut CfgCache>,
     deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let broker = (IpAddress::Ipv4(MQTT_BROKER_IP), MQTT_BROKER_PORT);
-    // Per-board OTA announce topic (the canary path), built from node_id.
-    let mut ota_topic = MqttScratch::new();
-    let _ = write!(ota_topic, "smol/ota/announce/{}", node_id);
     // #21 per-board node-manager config topic (retained default-screen command).
     let mut cfg_topic = MqttScratch::new();
     let _ = write!(cfg_topic, "smol/{}/config/default_screen", node_id);
-    // #33 per-board OTA command topic (HA Update entity → `install`).
+    // #33 Model-A per-board OTA install command topic (native HA Update button → INSTALL).
     let mut cmd_topic = MqttScratch::new();
-    let _ = write!(cmd_topic, "smol/{}/ota/cmd", node_id);
+    let _ = write!(cmd_topic, "smol/{}/ota/install", node_id);
 
     // --- TCP connect ---
     {
@@ -686,8 +862,15 @@ fn mqtt_session(
         }
     }
 
-    let mut pkt = [0u8; 320];
-    let mut acc = [0u8; 256];
+    // F1 (oracle): 320→512. The full #12 discovery PUBLISH packet (topic ~38 B +
+    // ~377 B JSON + MQTT framing ≈ 420 B) overflowed the old 320 B `pkt` →
+    // `encode_publish` returned None → the publish was SILENTLY DROPPED (typed
+    // entities never created). 512 holds it with margin (+ #27 peers + #21 CFG).
+    let mut pkt = [0u8; 512];
+    // F4: 512-B inbound accumulator in a `.bss` static (`MQTT_ACC`), NOT on the stack —
+    // 256 overflowed on a long-url/signed OTA announce → the PUBLISH never accumulated →
+    // announce silently never read. Static keeps the +256 off the mqtt_session frame.
+    let acc: &mut [u8; 512] = unsafe { &mut *core::ptr::addr_of_mut!(MQTT_ACC) };
     let mut acc_len = 0usize;
 
     // --- CONNECT ---
@@ -714,7 +897,7 @@ fn mqtt_session(
             return false; // #20 abort during CONNACK wait (not yet connected)
         }
         iface.poll(smoltcp_now(), device, sockets);
-        recv_into(sockets, tcp_handle, &mut acc, &mut acc_len);
+        recv_into(sockets, tcp_handle, &mut acc[..], &mut acc_len);
         loop {
             // Extract Copy scalars inside the match so the borrow of `acc` (via the
             // parsed packet) is released before the `copy_within` compaction below.
@@ -758,12 +941,10 @@ fn mqtt_session(
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 3, MESH_CHANNEL_TOPIC) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
     }
-    // #6 OTA: subscribe this board's canary topic (packet-id 4) + the fleet topic
-    // (packet-id 5). Retained announces stream in with the batt/grid/mc downlinks.
-    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 4, ota_topic.as_bytes()) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
-    }
-    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 5, OTA_ANNOUNCE_ALL_TOPIC) {
+    // #33 Model-A: subscribe the ONE retained fleet STAGING topic (packet-id 4) as the
+    // latest_version source + fetch target. No per-id announce-act topic exists (dropped
+    // — the #32 closure): staging only advertises "update available"; it never fetches.
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 4, OTA_STAGED_TOPIC) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
     }
     // #21 node-manager: subscribe this board's retained default-screen config (pid 6).
@@ -773,6 +954,18 @@ fn mqtt_session(
     // #33 HA Update entity: subscribe this board's OTA command topic (pid 7).
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 7, cmd_topic.as_bytes()) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
+    // #21 leaf-relay: a GATEWAY (cfg_cache = Some) also subscribes the WILDCARD leaf
+    // config topic (pid 8) so it caches every leaf's default-screen to relay over
+    // ESP-NOW. `+` is a single-level MQTT wildcard → matches `smol/<any>/config/
+    // default_screen`. The board's OWN config still arrives via `cfg_topic` (pid 6,
+    // matched first below) → self-apply; the wildcard feeds ONLY other ids (§2).
+    if cfg_cache.is_some() {
+        if let Some(n) =
+            crate::net::mqtt::encode_subscribe(&mut pkt, 8, b"smol/+/config/default_screen")
+        {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
     }
 
     // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
@@ -786,20 +979,66 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, topic.as_bytes(), line, false) {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
-        // Discovery: retained config so HA auto-creates a registry-managed sensor.
-        // `expire_after: 300` (issue #12): leaves emit telemetry ~15 s and gateways
-        // flush ~30 s, so 300 s is a ~10× margin — HA auto-marks a node `unavailable`
-        // if nothing arrives for 5 min (silent/dead node) without any firmware ping.
-        let mut dtopic = MqttScratch::new();
-        let _ = write!(dtopic, "homeassistant/sensor/smol{}/telemetry/config", id);
-        let mut json = MqttScratch::new();
+        // #12: THREE TYPED discovery configs (retained) instead of the old single
+        // `telemetry/config`. The old single config (name "smol <id>" + no
+        // has_entity_name) made HA concatenate the device name → the doubled
+        // `sensor.smol_<id>_dominion_smol_<id>`. Each typed config carries
+        // has_entity_name + a terse name + an explicit object_id (kills the doubling)
+        // + the SAME device block (grouped under the one device) + a value_template
+        // that extracts one field from the UNCHANGED space-positional telemetry line
+        // (`<tempInt>F <volt.1f>V <status…>`) — CONFIG-ONLY, no payload change.
+        // Templates use single quotes internally → no `\"`-escaping; they're passed as
+        // `&str` args so their Jinja `{ }` need no `{{`/`}}` escaping. All length-guarded
+        // → a short/garbage line yields "" (never an HA template error).
         let noun = crate::net::names::name_for_id(id).1;
-        let _ = write!(
-            json,
-            "{{\"unique_id\":\"smol{}_telemetry\",\"state_topic\":\"smol/{}/telemetry\",\"name\":\"smol {}\",\"expire_after\":300,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {}\"}}}}",
-            id, id, id, id, id, noun
-        );
-        if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), json.as_bytes(), true) {
+        let cfgs: [(&str, &str, &str, &str); 3] = [
+            (
+                "temp", "Temp",
+                "{% set p = value.split(' ') %}{{ p[0][:-1] if p|length>0 and p[0].endswith('F') else '' }}",
+                ",\"unit_of_measurement\":\"°F\",\"device_class\":\"temperature\"",
+            ),
+            (
+                "voltage", "Voltage",
+                "{% set p = value.split(' ') %}{{ p[1][:-1] if p|length>1 and p[1].endswith('V') else '' }}",
+                ",\"unit_of_measurement\":\"V\",\"device_class\":\"voltage\"",
+            ),
+            (
+                "status", "Status",
+                "{% set p = value.split(' ') %}{{ p[2:]|join(' ') if p|length>2 else '' }}",
+                "",
+            ),
+        ];
+        for (field, name, tmpl, extra) in cfgs {
+            if Instant::now() > deadline {
+                break;
+            }
+            let mut dtopic = MqttScratch::new();
+            let _ = write!(dtopic, "homeassistant/sensor/smol{}/{}/config", id, field);
+            // F1: build the 373-B config in the `.bss` static JsonScratch (512), NOT a
+            // stack MqttScratch — keeps the oversized payload off the mqtt_session frame.
+            // Single-caller → the &'static mut borrow is alias-safe; clear() per config.
+            let json = unsafe { &mut *core::ptr::addr_of_mut!(MQTT_JSON) };
+            json.clear();
+            let _ = write!(
+                json,
+                "{{\"unique_id\":\"smol{}_{}\",\"object_id\":\"smol_{}_{}\",\"has_entity_name\":true,\"name\":\"{}\",\"state_topic\":\"smol/{}/telemetry\",\"value_template\":\"{}\"{},\"expire_after\":300,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {}\"}}}}",
+                id, field, id, field, name, id, tmpl, extra, id, id, noun
+            );
+            if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), json.as_bytes(), true) {
+                let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            }
+        }
+    }
+
+    // #27: publish this node's serialized roster as RETAINED `smol/<id>/peers`, if any.
+    // GATEWAY-primary — the caller (`flush_telemetry`) serializes the roster and passes
+    // it; leaves / the boot + election-only bursts pass an empty slice (skipped here).
+    // One retained publish per flush ≈ the ~30 s topology heartbeat; identical
+    // encode_publish/tcp_send path as the discovery configs above.
+    if !peers.is_empty() {
+        let mut ptopic = MqttScratch::new();
+        let _ = write!(ptopic, "smol/{}/peers", node_id);
+        if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, ptopic.as_bytes(), peers, true) {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
     }
@@ -830,7 +1069,7 @@ fn mqtt_session(
             break; // #20 abort during downlink wait → fall through to clean DISCONNECT
         }
         iface.poll(smoltcp_now(), device, sockets);
-        recv_into(sockets, tcp_handle, &mut acc, &mut acc_len);
+        recv_into(sockets, tcp_handle, &mut acc[..], &mut acc_len);
         loop {
             let consumed = match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
                 None => break,
@@ -848,28 +1087,29 @@ fn mqtt_session(
                     } else if topic == MESH_CHANNEL_TOPIC {
                         mc = parse_mesh_channel(payload); // #23 election record
                         got_mc = true; // present (unparseable → treated as claimable below)
-                    } else if topic == ota_topic.as_bytes() || topic == OTA_ANNOUNCE_ALL_TOPIC {
-                        // #6 OTA: parse + GATE the retained announce (monotonicity +
-                        // host allowlist + size). Only an actionable one becomes an
-                        // offer; a stale/foreign/oversize one is logged + ignored (so a
-                        // retained announce for the running build is a no-op every burst).
+                    } else if topic == OTA_STAGED_TOPIC {
+                        // #33 Model-A: parse + GATE the retained STAGED line (monotonicity +
+                        // host allowlist + size). A gate-passing staged build becomes the
+                        // latest_version + fetch TARGET (ota_offer) — but it does NOT fetch;
+                        // the fetch is AND-gated on this board's own `install` command below.
+                        // Stale/foreign/oversize → ignored (up-to-date; no offer).
                         match crate::ota::parse_announce(payload) {
                             Some(a) => match crate::ota::gate(&a) {
                                 Ok(()) => {
                                     log::info!(
-                                        "smol OTA: announce build {} accepted (running {})",
+                                        "smol OTA: staged build {} available (running {})",
                                         a.build,
                                         crate::ota::BUILD_NUMBER
                                     );
                                     *ota_offer = Some(a);
                                 }
                                 Err(why) => log::info!(
-                                    "smol OTA: announce build {} ignored ({:?})",
+                                    "smol OTA: staged build {} not newer/ineligible ({:?})",
                                     a.build,
                                     why
                                 ),
                             },
-                            None => log::warn!("smol OTA: malformed announce ignored"),
+                            None => log::warn!("smol OTA: malformed staged line ignored"),
                         }
                     } else if topic == cfg_topic.as_bytes() {
                         // #21: parse the retained default-screen command (panic-free).
@@ -882,14 +1122,31 @@ fn mqtt_session(
                             None => log::info!("smol #21: default-screen config absent/invalid — keeping current"),
                         }
                     } else if topic == cmd_topic.as_bytes() {
-                        // #33 HA Update entity: the install command. PANIC-FREE exact byte
-                        // compare only (untrusted RETAINED payload = boot-loop-brick class):
-                        // `install` → arm the flag (the caller AND-gates the fetch on an
-                        // already-`gate()`d target — this bool never itself touches flash);
-                        // any other bytes → ignore. Cleared (empty retained publish) below.
-                        if payload == b"install" {
+                        // #33 Model-A: the native HA Update INSTALL command. PANIC-FREE
+                        // exact byte compare only (untrusted RETAINED payload = boot-loop-
+                        // brick class): `INSTALL` → arm the flag (the caller AND-gates the
+                        // fetch on the already-`gate()`d staged target — this bool never
+                        // itself touches flash); any other bytes → ignore. Cleared (empty
+                        // retained publish) below so it can't replay next boot.
+                        if payload == b"INSTALL" {
                             *install_requested = true;
                             log::info!("smol #33: OTA install command received");
+                        }
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic) {
+                        // #21 leaf-relay: a wildcard-delivered OTHER leaf's config. Cache
+                        // the verbatim value bytes for the ESP-NOW relay (mode.rs
+                        // broadcast_cached_configs). `leaf_id == node_id` is the gateway's
+                        // OWN config — already handled by the `cfg_topic` arm above; guard
+                        // anyway. Only present when cfg_cache = Some (gateway flush).
+                        if leaf_id != node_id {
+                            if let Some(cache) = cfg_cache.as_deref_mut() {
+                                cache.set(leaf_id, payload);
+                                log::info!(
+                                    "smol #21: cached leaf id{} config for relay ({} B)",
+                                    leaf_id,
+                                    payload.len()
+                                );
+                            }
                         }
                     }
                     consumed
@@ -991,8 +1248,8 @@ fn mqtt_session(
         let mut djson = MqttScratch::new();
         let _ = write!(
             djson,
-            "{{\"~\":\"smol/{}/ota\",\"stat_t\":\"~/state\",\"cmd_t\":\"~/cmd\",\"pl_inst\":\"install\",\"dev_cla\":\"firmware\",\"name\":\"firmware\",\"uniq_id\":\"smol{}_fw\",\"dev\":{{\"ids\":[\"smol{}\"]}}}}",
-            node_id, node_id, node_id
+            "{{\"~\":\"smol/{}/ota\",\"stat_t\":\"~/state\",\"cmd_t\":\"~/install\",\"pl_inst\":\"INSTALL\",\"dev_cla\":\"firmware\",\"name\":\"Update\",\"has_entity_name\":true,\"uniq_id\":\"smol{}_update\",\"object_id\":\"smol_{}_update\",\"dev\":{{\"ids\":[\"smol{}\"]}}}}",
+            node_id, node_id, node_id, node_id
         );
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), djson.as_bytes(), true) {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
@@ -1062,6 +1319,12 @@ pub fn run_mqtt_burst(
     config_offer: &mut Option<crate::app::DefaultScreen>,
     // #33: set true iff a retained OTA `install` command is present for this board.
     install_requested: &mut bool,
+    // #27: this node's serialized roster (`PEERS|…`) to publish retained as
+    // `smol/<id>/peers`. Empty ⇒ nothing published (leaf / election-only burst).
+    peers: &[u8],
+    // #21 leaf-relay: `Some` on a gateway flush → wildcard-subscribe + cache leaf
+    // configs for the ESP-NOW relay; `None` otherwise (see `mqtt_session`).
+    cfg_cache: Option<&mut CfgCache>,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
@@ -1163,6 +1426,8 @@ pub fn run_mqtt_burst(
         ota_offer,
         config_offer,
         install_requested,
+        peers, // #27: forward the caller's serialized roster to publish retained
+        cfg_cache, // #21: forward the gateway's leaf-config cache (or None)
         deadline,
         tick,
     )
@@ -1172,7 +1437,14 @@ pub fn run_mqtt_burst(
 /// the whole ~0.6 MB HTTP download (spec §6-R4), so the window is minutes-scale. It is
 /// user/announce-initiated + abortable (`tick` long-press), never auto-fleet-wide.
 #[cfg(feature = "espnow")]
-const OTA_FETCH_BUDGET: Duration = Duration::from_secs(180);
+// OTA throughput fix (lucid's OTA-proof: engine passed to the download, then the
+// 655 KB body clipped the old 180 s budget at <3.6 KB/s — a WINDOW-bound throughput
+// bug, not reachability). Root cause: the 1536 B rx SocketBuffer (below) advertised a
+// tiny TCP window, so the transfer was round-trip-bound. Primary fix = the 4 KB rx
+// window + a prompt post-recv poll (below); this raised budget is the BACKSTOP: at the
+// expected post-fix rate (~10-18 KB/s) a full image lands in <70 s, so 300 s is a
+// comfortable ~4-8× margin without being recklessly long for the mesh-deaf window.
+const OTA_FETCH_BUDGET: Duration = Duration::from_secs(300);
 
 /// Parse a dotted-quad IPv4 literal (the allowlist is IP-only → no DNS on-device).
 #[cfg(feature = "espnow")]
@@ -1229,7 +1501,19 @@ pub fn run_ota_fetch(
         data: b"smol",
     }]);
     let dhcp_handle = sockets.add(dhcp_socket);
-    let mut tcp_rx = [0u8; 1536];
+    // OTA throughput fix: 4 KB rx window (was 1536 B). The download was round-trip-bound
+    // — the server sent one window's worth then waited a full RTT for the window to
+    // reopen on the next poll, capping throughput at ~1536 B / cycle. 4096 nearly triples
+    // the in-flight window (→ ~2.6× fewer stalls). tx stays 512 B — the request is small.
+    //
+    // F2 (oracle): the 4 KB rx buffer lives in a `static`, NOT on the stack. On the stack
+    // it + `ImageWriter.stage` (also now static) + tcp_tx + header_buf ≈ 9.2 KB overflowed
+    // the 8 KB task stack on the download. `run_ota_fetch` is ONE-SHOT + single-caller
+    // (mesh-deaf, reboots on success, never re-entered concurrently), so a `static mut`
+    // buffer is alias-safe — the previous borrow always ends when the fn returns before
+    // any next call. `addr_of_mut!` avoids the reference-to-`static mut` lint.
+    static mut OTA_TCP_RX: [u8; 4096] = [0; 4096];
+    let tcp_rx: &mut [u8; 4096] = unsafe { &mut *core::ptr::addr_of_mut!(OTA_TCP_RX) };
     let mut tcp_tx = [0u8; 512];
     let tcp_socket = tcp::Socket::new(
         tcp::SocketBuffer::new(&mut tcp_rx[..]),
@@ -1376,6 +1660,11 @@ pub fn run_ota_fetch(
                 closed = true; // peer closed (Connection: close) + rx drained
             }
         }
+        // OTA throughput fix: poll AGAIN right after draining the rx ring so the
+        // reopened window (and its ACK) hits the wire this iteration instead of
+        // waiting for the next loop's top-of-loop poll — halves the window-closed gap
+        // that made the transfer round-trip-bound.
+        iface.poll(smoltcp_now(), device, &mut sockets);
         if headers_done && writer.written() >= announce.size {
             break;
         }

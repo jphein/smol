@@ -255,6 +255,14 @@ pub fn content_length(headers: &[u8]) -> Option<u32> {
 /// word boundary (the esp-image header carries the true length, so trailing 0xFF in
 /// the slot is inert). otadata is NOT touched here — activation is a separate, gated
 /// step, so a partial/failed write leaves the good slot booting. (Download-only → `espnow`.)
+/// F2 (oracle): the OTA stage buffer, moved OFF the `run_ota_fetch` stack into `.bss`.
+/// One sector (`CHUNK`), borrowed once per OTA by [`ImageWriter::begin`]. Alias-safe:
+/// OTA is single-caller + one-shot (mesh-deaf, reboots on success), so the `&'static mut`
+/// borrow always ends before any next `begin`. `addr_of_mut!` avoids the ref-to-static-mut
+/// lint. Init `0xFF` (erased-flash inert), though `flush_stage` re-pads regardless.
+#[cfg(feature = "espnow")]
+static mut OTA_STAGE: [u8; CHUNK] = [0xFF; CHUNK];
+
 #[cfg(feature = "espnow")]
 pub struct ImageWriter {
     flash: FlashStorage,
@@ -268,7 +276,12 @@ pub struct ImageWriter {
     flushed: u32,
     /// Absolute address erased through (sector granularity).
     erased_upto: u32,
-    stage: [u8; CHUNK],
+    /// F2 (oracle): the one-sector stage buffer lives in a `static` (see `OTA_STAGE`),
+    /// NOT inline — a 4 KB inline array here put it on `run_ota_fetch`'s stack alongside
+    /// the 4 KB rx window, overflowing the 8 KB task stack on the download. All
+    /// `self.stage[..]` accesses are unchanged (a `&mut [u8; CHUNK]` indexes/slices like
+    /// the array did). Alias-safe: one OTA at a time (`begin` is single-caller, one-shot).
+    stage: &'static mut [u8; CHUNK],
     stage_len: usize,
     hasher: sha2::Sha256,
     target: Slot,
@@ -302,7 +315,11 @@ impl ImageWriter {
             written: 0,
             flushed: 0,
             erased_upto: base,
-            stage: [0xFF; CHUNK],
+            // F2: borrow the static stage buffer (off the stack). Alias-safe — one OTA
+            // at a time. No stale-data risk: `flush_stage` re-pads `[len..padded]` to
+            // 0xFF and writes only `stage[..padded]`, so a reused buffer never leaks
+            // prior bytes to flash. `stage_len: 0` starts the accumulation fresh.
+            stage: unsafe { &mut *core::ptr::addr_of_mut!(OTA_STAGE) },
             stage_len: 0,
             hasher: sha2::Sha256::new(),
             target,

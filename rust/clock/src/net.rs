@@ -17,6 +17,13 @@ mod mqtt;
 #[cfg(feature = "espnow")]
 pub mod mode;
 
+// #25 WLED WiZmote-emit (smol as a WLED "linked remote"). `wled = ["espnow"]`, so
+// this is present only in a wled build; the default/wifi/espnow builds are byte-free
+// of it (the module is `#![cfg(feature = "wled")]`). Referenced by `app` (the
+// WledRemote screen) + `mode` (broadcast_wled_button), so it is `pub`.
+#[cfg(feature = "wled")]
+pub mod wled;
+
 // Deterministic magical node names (realm-sigil port). Needs no radio — a node
 // derives its OWN name and any peer's name from the logical id alone — so it is
 // compiled in ALL builds (peer names are only *displayed* under espnow, but our
