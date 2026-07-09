@@ -31,9 +31,11 @@ out the two "richer-looking" options:
 On each burst the gateway publishes retained **MQTT-discovery** configs, so each node
 appears in HA as a native `sensor.smol_<id>_*` entity with **zero HA-side YAML**. Leaf
 telemetry is relayed leaf→gateway over ESP-NOW ([RELAY](protocol.md#relay--relayack--espnow--internet-telemetry)),
-then the gateway publishes it. 🟢 hardware-verified (build 45). *Follow-up (#12): group a
-node's entities under one HA **device** and split the single telemetry line into typed
-`_voltage`/`_soc`/`_rssi` entities — the WLED-legibility lesson.*
+then the gateway publishes it. 🟢 hardware-verified. **#12 (everything-release):** each node now
+groups under one HA **device** with **typed child entities** (`_voltage`/`_temp`/`_status`, each with
+`object_id` + `expire_after`) replacing the single packed telemetry line — **verified on-wire (id7);
+fleet on build 58**. A one-time HA retained-clear (morpheus-ha, **running now**) removes the legacy
+build-56 config (a stale-retained artifact, not a firmware defect; #36 closed as a no-op).
 
 ### Downlink — HA → every display (retained + mesh re-broadcast)
 HA automations publish **retained**, display-ready payloads that the gateway grabs in its
@@ -52,27 +54,29 @@ See [protocol.md](protocol.md#batt--ha-battery-snapshot) for the frames and
 ## Node manager (#21) — remote screen config
 
 Set each node's **default screen + page** from HA, no reflash. HA publishes a **retained**
-`smol/<id>/config/default_screen` = `<AppKind>:<page>`; once the firmware consume side lands, the board will read it on its next
-burst and apply it (empty payload = clear → the board.rs compile-time default). The
+`smol/<id>/config/default_screen` = `<AppKind>:<page>`; the board reads it on its next
+burst and applies it (empty payload = clear → the board.rs compile-time default). The
 control surface is HA **Lovelace** (not an on-device web UI — a burst radio can't host
 one; the node manager IS smol's WLED-web-UI analog, relocated to where a burst device is
 reachable). "Set all" writes every per-node topic — there is **no broadcast topic**, and
 **no ESP-NOW command relay** (the unauthenticated mesh must never become a command
-channel). **Status:** 🟡 HA publish/GUI side **deployed**; the firmware consume side
-(strict, panic-free parse) is the next wave. Protocol: [protocol.md → CONFIG](protocol.md#config--retained-per-node-default-screen-21-specd--firmware-pending);
+channel). **Status:** 🟢 **shipped** — gateway-self default-screen **verified on glass** (id7), plus
+**leaf-relay** (a gateway relays a leaf's screen over a SMOLv1 CFG frame; strict, panic-free allowlist
+parse). Protocol: [protocol.md → CONFIG](protocol.md#config--retained-per-node-default-screen-21-specd--firmware-pending);
 GUI/entities: [`ha/README.md`](../ha/README.md).
 
-## OTA (#6) — retained announce (built + deployed; HW-verify-pending)
+## OTA (#6) — retained announce (🟢 PROVEN: canary self-updated 58→59 OTA in ~17 s)
 Firmware updates ride the same MQTT-native pattern: a retained
 `smol/ota/announce` = `OTA|build|size|sha256|url`; the board fetches the image over
 HTTP to its inactive A/B slot, verifies (sha256), and activates it. Recovery is
 **app-side self-rollback + canary-one-board-at-a-time** — the bundled bootloader
 slot-selects, but **revert-on-boot-fail is OFF** (unproven/likely disabled), so a bad
 image is contained by pushing to one board at a time (never fleet-unison), not by an
-automatic bootloader revert. 🟡 engine + publish tooling + HA panel are **built and deployed**;
-end-to-end canary is **hardware-verify-pending** — an offer-surfacing bug meant the engine never
-ran on hardware; the fix has since landed, canary next
-(`scratch/smol-ha-batt/ota-plan.md`).
+automatic bootloader revert. 🟢 engine + publish tooling + HA panel + native HA **Update entity** (#33)
+are landed and **OTA is proven**: a canary **self-updated build 58→59 over the air in ~17 s** (fetch →
+verify → boot `ota_1` → `Valid`). The first attempt had failed for an **infra** reason (a missing firewall
+allow-rule to reach the image host, since added; [#37](https://github.com/jphein/smol/issues/37) resolved)
+— **not a firmware bug**. Rollout stays canary-one-board-at-a-time. See [ota.md](ota.md).
 
 ## Collector retirement
 The MQTT link **retires the old Python UDP collector** (`collector/`, which ran on

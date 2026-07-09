@@ -8,10 +8,11 @@ self-tests. This is the *how-to-run-it* guide; the design/rationale is in
 
 Verification legend: 🟢 hardware-verified · 🟡 works, not fully hardware-proven · ⚪ design.
 
-> **Status: built + deployed, NOT yet hardware-verified.** The engine, `ota_publish.sh`, and the HA
-> panel are all landed — but an offer-surfacing bug meant the OTA engine **hadn't run on hardware**; the offer-surfacing
-> fix has since landed and its first **canary** follows. Treat this as the procedure to run **once
-> that canary passes**, not a production-proven flow yet.
+> **Status: 🟢 PROVEN.** The engine, `ota_publish.sh`, and the HA panel are all landed, and a canary
+> **self-updated build 58→59 over the air in ~17 s** — fetch → SHA-verify → boot `ota_1` → `Valid`. The
+> first attempt had failed for an **infra** reason (a missing firewall allow-rule to reach the image host);
+> once that rule was added, the end-to-end update succeeded ([#37](https://github.com/jphein/smol/issues/37)
+> resolved). This is now a production-proven flow — still **canary one board at a time** (see the one rule below).
 
 ## ⚠️ The one rule: CANARY, one board at a time
 
@@ -63,8 +64,8 @@ tools/ota_publish.sh clear <id|all>                         # retain-delete the 
 
 3. **Watch it update.** **On its next burst** the board sees the gated announce (newer build,
    host allowed, size OK) and runs the update — **the mesh is deaf for the whole download**
-   (longer than a normal burst). Mid-run pickup arrived with the offer-surfacing fix; like the
-   whole flow it is **hardware-canary-pending**, so still canary one board at a time. Watch the gateway's serial:
+   (longer than a normal burst; a proven canary self-updated build 58→59 in **~17 s**). Canary one board
+   at a time. Watch the gateway's serial:
    ```
    smol OTA: opening update burst (mesh deaf for the whole download)
    smol OTA: image verified — activating new slot, rebooting
@@ -172,11 +173,10 @@ defence-in-depth, not authentication. Do not treat `sha256` as trust. Documented
 
 ## Status
 
-🟡 **Canary OTA is built + deployed, NOT yet hardware-verified; fleet-unison is off.** Engine +
-`ota_publish.sh` + HA panel are landed; the fetch → SHA-verify → activate → app-side-rollback path
-is written but **HW-verify-pending** (an offer-surfacing bug meant the engine hadn't run on hardware;
-the fix has since landed, canary next). With that fix a running board picks up an
-OTA on its next burst (still hardware-canary-pending). **Bootloader revert-on-boot-fail is
-unproven → canary-one-board-at-a-time is the mass-brick defense; never `push all` blind.** The
-HA "running build" / rollout gate awaits the firmware `smol/<id>/status` publish (F4) — until
-then confirm canaries by serial + boot-splash version name. Issue #6.
+🟢 **Canary OTA is PROVEN; fleet-unison stays off.** Engine + `ota_publish.sh` + HA panel are landed, and
+a canary **self-updated build 58→59 over the air in ~17 s** — fetch → SHA-verify → activate → boot `ota_1`
+→ `Valid`. The first attempt had failed for an **infra** reason (a missing firewall allow-rule to reach the
+image host, since added; [#37](https://github.com/jphein/smol/issues/37) resolved) — **not a firmware bug.**
+**Bootloader revert-on-boot-fail is still unproven → canary-one-board-at-a-time remains the mass-brick
+defense; never `push all` blind.** The HA "running build" / rollout gate awaits the firmware `smol/<id>/status`
+publish (F4) — until then confirm canaries by serial + boot-splash version name. Issue #6 (#37 resolved).
