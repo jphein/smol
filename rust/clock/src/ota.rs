@@ -41,6 +41,16 @@ use esp_bootloader_esp_idf::partitions::AppPartitionSubType;
 /// comparison that blocks BOTH downgrades and retained-announce replay loops.
 pub const BUILD_NUMBER: u32 = parse_u32(env!("BUILD_NUMBER"));
 
+/// #33 SINGLE TOGGLE (auto-install vs command). `false` (default, recommended) =
+/// install-on-command: a gated announce only advertises `latest_version` to the HA
+/// Update entity; the fetch arms ONLY on the native Install button's `install` command.
+/// `true` = legacy auto-install: a gated announce fetches on the next burst. Flip this
+/// one line to change the posture (closes the reload-misfire class when false, D2).
+// Consumed by the espnow main-loop OTA trigger; a wifi-only build compiles the OTA
+// engine but has no such trigger, so it's intentionally unread there.
+#[allow(dead_code)]
+pub const OTA_AUTO_INSTALL: bool = false;
+
 /// Image-host allowlist (spec §4b-5): an announce whose URL host is not one of these
 /// is refused BEFORE any socket opens. The real LAN host(s) live in the GIT-IGNORED
 /// `crate::secrets` (this repo is PUBLIC — never commit a LAN IP), mirroring how

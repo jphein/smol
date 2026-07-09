@@ -159,6 +159,69 @@ pub enum AppKind {
     MeshSnake,
 }
 
+/// #21 node-manager CONSUME — the parsed retained `smol/<id>/config/default_screen`
+/// command. `Set(kind, page)` = boot into / switch to that screen at that page;
+/// `Clear` (empty payload) = fall back to the `board.rs` compiled default. A
+/// malformed / unknown / wrong-tier payload parses to `None` (the caller keeps the
+/// current screen — never applies garbage). `wifi`-only (the fetch path is wifi+).
+#[cfg(feature = "wifi")]
+#[derive(Clone, Copy)]
+// The `Set` fields are READ by the espnow main-loop apply (which switches the screen);
+// a wifi-only build parses the config but has no RadioManager/apply, so there they are
+// intentionally unread. allow(dead_code) covers that tier — never a bug.
+#[allow(dead_code)]
+pub enum DefaultScreen {
+    Set(AppKind, u8),
+    Clear,
+}
+
+#[cfg(feature = "wifi")]
+impl AppKind {
+    /// Resolve a node-manager wire token (EXACT case-sensitive `app.rs` spelling) to an
+    /// AppKind — ONLY if THIS build tier can construct it via [`App::enter`]. A token for
+    /// a screen not in this tier returns `None` → the config is IGNORED (never enters a
+    /// screen this build can't build, never crashes). nodemgr-design §2.3.
+    pub fn from_wire(s: &str) -> Option<AppKind> {
+        Some(match s {
+            "Menu" => AppKind::Menu,
+            "Clock" => AppKind::Clock,
+            // "Snake" maps to SNAKE_KIND — the SAME target the menu's "Snake" row
+            // launches: MeshSnake on espnow, single-player Snake on default/wifi. So
+            // the node-manager "Snake" option behaves identically to tapping "Snake"
+            // in the menu. ("MeshSnake" below is the explicit espnow-only alias.)
+            "Snake" => SNAKE_KIND,
+            "About" => AppKind::About,
+            "Batt" => AppKind::Batt,
+            "Grid" => AppKind::Grid,
+            #[cfg(feature = "espnow")]
+            "Bench" => AppKind::Bench,
+            #[cfg(feature = "espnow")]
+            "MeshSnake" => AppKind::MeshSnake,
+            _ => return None,
+        })
+    }
+}
+
+/// Parse a retained `smol/<id>/config/default_screen` payload (#21): `<AppKind>[:<page>]`
+/// (e.g. `Grid:1`, `Clock`, `Batt:0`). Empty → `Some(Clear)`. Valid token + optional page
+/// (0/1; anything else clamps to 0) → `Some(Set)`. Non-UTF8 / unknown token / wrong-tier
+/// → `None` (keep current). TOTAL + panic-free — no unwrap/index/alloc: this untrusted
+/// RETAINED payload is a boot-loop-brick class (a panic → reset → re-delivery every boot).
+#[cfg(feature = "wifi")]
+pub fn parse_default_screen(payload: &[u8]) -> Option<DefaultScreen> {
+    let s = core::str::from_utf8(payload).ok()?.trim();
+    if s.is_empty() {
+        return Some(DefaultScreen::Clear);
+    }
+    let mut it = s.splitn(2, ':');
+    let kind = AppKind::from_wire(it.next().unwrap_or(""))?;
+    let page = match it.next() {
+        None => 0,
+        Some(p) => p.trim().parse::<u8>().ok().filter(|&n| n <= 1).unwrap_or(0),
+    };
+    Some(DefaultScreen::Set(kind, page))
+}
+
 /// Active screen + its state — a tagged union (§spec): on the stack, zero alloc,
 /// sized to the largest variant; only one exists at a time.
 ///

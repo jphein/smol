@@ -406,6 +406,12 @@ fn main() -> ! {
     // first tick below, where the real `Ctx` is in hand. `DEFAULT_APP == Menu`
     // (the default) makes that switch a no-op.
     let mut boot_default_pending = !matches!(DEFAULT_APP, app::AppKind::Menu);
+    // #21 node-manager: the last default-screen config this board APPLIED (None = using
+    // the board.rs default / nothing commanded). Consumed edge-triggered — re-reading
+    // the SAME retained config each burst is a no-op, so it never yanks the user off
+    // their current screen; only a CHANGE (or the boot seed) switches. espnow-only.
+    #[cfg(feature = "espnow")]
+    let mut applied_default: Option<(app::AppKind, u8)> = None;
 
     // Phase 3: last ESP-NOW peer message, shown as the CLOCK bottom-line label
     // (handed to plugins via `Ctx::label`). Idle default = our OWN noun ("I am …"
@@ -499,27 +505,33 @@ fn main() -> ! {
                     redraw = true; // a recovery burst ran → role may have changed; repaint
                 }
             }
-            // #6 OTA: if a burst (boot or gateway flush) surfaced a gated announce for
-            // this board, run the update — download → SHA verify → activate → reboot.
-            // Heavy + mesh-deaf + abortable, so it uses the SAME responsive tick as a
-            // flush (LED + throttled spinner + latching long-press abort). A success
-            // reboots inside the burst; a failure/abort leaves the good image running.
-            if let Some(announce) = r.take_ota_offer() {
-                let mut ota_draw_ms = 0u64;
-                let mut ota_abort = false;
-                r.run_ota_update(&announce, &mut || {
-                    let t = millis();
-                    led.apply(led::LedState::WifiSync, t);
-                    if matches!(button.poll(t), Some(input::Press::Long)) {
-                        ota_abort = true;
-                    }
-                    if t.saturating_sub(ota_draw_ms) >= SYNC_REDRAW_MS {
-                        ota_draw_ms = t;
-                        draw_syncing(&mut display, (t / SYNC_REDRAW_MS) as u8);
-                    }
-                    ota_abort
-                });
-                redraw = true;
+            // #6/#33 OTA: a burst (boot or gateway flush) surfaces a gated announce as the
+            // "latest available" TARGET (its state is published to the HA Update entity by
+            // the burst). Fetch it ONLY when an install was COMMANDED — the native HA
+            // Update Install button publishes `smol/<id>/ota/cmd = install`, consumed +
+            // cleared by the burst → `take_install_request()`. `ota::OTA_AUTO_INSTALL`
+            // (default false) is the single legacy-auto-install toggle. Heavy + mesh-deaf
+            // + abortable → same responsive tick as a flush; success reboots inside the
+            // burst, failure/abort leaves the good image running (HA re-offers = retry).
+            let do_install = crate::ota::OTA_AUTO_INSTALL || r.take_install_request();
+            if do_install {
+                if let Some(announce) = r.take_ota_offer() {
+                    let mut ota_draw_ms = 0u64;
+                    let mut ota_abort = false;
+                    r.run_ota_update(&announce, &mut || {
+                        let t = millis();
+                        led.apply(led::LedState::WifiSync, t);
+                        if matches!(button.poll(t), Some(input::Press::Long)) {
+                            ota_abort = true;
+                        }
+                        if t.saturating_sub(ota_draw_ms) >= SYNC_REDRAW_MS {
+                            ota_draw_ms = t;
+                            draw_syncing(&mut display, (t / SYNC_REDRAW_MS) as u8);
+                        }
+                        ota_abort
+                    });
+                    redraw = true;
+                }
             }
             // A gateway's SMOLv1 BATT downlink (buffered in `service`) → store it in
             // our cache so LEAVES render HA battery voltages too. `store` validates
@@ -736,6 +748,10 @@ fn main() -> ! {
         // base, since the background block ran first) for the Clock + MeshSnake —
         // computed in ALL builds (base_unix/anchor_ms exist everywhere).
         let unix_now = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
+        // #21: pull any pending default-screen command BEFORE `ctx` borrows `radio`
+        // (ctx holds `radio.as_mut()`), so the apply below can use `ctx` freely.
+        #[cfg(feature = "espnow")]
+        let config_cmd = radio.as_mut().and_then(|r| r.take_config_offer());
         let mut ctx = Ctx {
             display: &mut display,
             sensors: &mut sensors,
@@ -774,6 +790,33 @@ fn main() -> ! {
             // ignore it. Only this boot one-shot applies it — Menu entry keeps page 0.
             app.set_page(DEFAULT_PAGE);
             ctx.redraw = true;
+        }
+
+        // #21 node-manager CONSUME: apply a default-screen command surfaced by the boot
+        // burst or a gateway flush. Edge-triggered vs `applied_default` — re-reading the
+        // SAME retained config each burst is a no-op (never yanks the user off their
+        // current screen); only a CHANGE (or the first boot seed) switches. At boot this
+        // runs right after the DEFAULT_APP one-shot above, so a commanded screen takes
+        // PRECEDENCE over board.rs DEFAULT_APP. Applies live on the gateway (which reads
+        // its own config each flush). Malformed/unknown/wrong-tier never reaches here
+        // (parsed to None upstream → keep current). `Clear` reverts to the board default.
+        #[cfg(feature = "espnow")]
+        match config_cmd {
+            Some(app::DefaultScreen::Set(kind, page)) if applied_default != Some((kind, page)) => {
+                app = App::enter(kind, &ctx);
+                app.set_page(page);
+                applied_default = Some((kind, page));
+                ctx.redraw = true;
+                log::info!("smol #21: default screen applied");
+            }
+            Some(app::DefaultScreen::Clear) if applied_default.is_some() => {
+                app = App::enter(DEFAULT_APP, &ctx);
+                app.set_page(DEFAULT_PAGE);
+                applied_default = None;
+                ctx.redraw = true;
+                log::info!("smol #21: default screen cleared → board default");
+            }
+            _ => {}
         }
 
         // One debounced BOOT-button gesture → the active plugin. ANY press forces

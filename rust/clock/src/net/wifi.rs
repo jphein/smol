@@ -242,8 +242,10 @@ pub fn try_time_sync(
     let mut reached_dhcp = false;
     // wifi-only build has no mesh election; pass a throwaway result.
     let mut elect = MeshElect::new(crate::NODE_ID);
-    // wifi-only build has no main-loop OTA fetch trigger; capture (unused) offer.
+    // wifi-only build has no main-loop OTA/config consume; capture (unused) offers.
     let mut _ota_offer: Option<crate::ota::Announce> = None;
+    let mut _config_offer: Option<crate::app::DefaultScreen> = None;
+    let mut _install_requested = false;
     let synced = run_ntp_burst(
         &mut controller,
         &mut device,
@@ -255,6 +257,8 @@ pub fn try_time_sync(
         grid,
         &mut elect,
         &mut _ota_offer,
+        &mut _config_offer,
+        &mut _install_requested,
     );
     // OTA MF-1 (wifi-only build): confirm/rollback the running image on its first boot.
     // self-test = reached DHCP (a broken-WiFi image can't reach it; the just-run OTA
@@ -299,6 +303,10 @@ pub fn run_ntp_burst(
     elect: &mut MeshElect,
     // #6 OTA: filled with a gated retained announce, if one is present for this board.
     ota_offer: &mut Option<crate::ota::Announce>,
+    // #21: filled with the parsed default-screen config for this board, if present.
+    config_offer: &mut Option<crate::app::DefaultScreen>,
+    // #33: set true iff a retained OTA `install` command is present for this board.
+    install_requested: &mut bool,
 ) -> Option<u32> {
     // --- smoltcp stack: DHCP + UDP (SNTP) + TCP (MQTT) sockets -----------
     let mut iface = create_interface(device);
@@ -437,6 +445,8 @@ pub fn run_ntp_burst(
         grid,
         elect,
         ota_offer,
+        config_offer,
+        install_requested,
         mqtt_deadline,
         tick,
     );
@@ -523,17 +533,19 @@ fn sntp_query(
 use core::fmt::Write as _;
 
 /// Heap-free scratch buffer for building an MQTT topic / client-id / discovery JSON
-/// via `write!`. 224 bytes holds the largest discovery config (~150 B) with margin.
+/// via `write!`. 320 bytes (bumped from 224 for #33, D6) holds the largest discovery
+/// config (~170 B) + the update state JSON with `title` (~140 B), each built + sent
+/// sequentially so only one need fit at a time — with headroom for future fields.
 #[cfg(feature = "wifi")]
 struct MqttScratch {
-    buf: [u8; 224],
+    buf: [u8; 320],
     len: usize,
 }
 
 #[cfg(feature = "wifi")]
 impl MqttScratch {
     fn new() -> Self {
-        Self { buf: [0; 224], len: 0 }
+        Self { buf: [0; 320], len: 0 }
     }
     fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len]
@@ -632,6 +644,12 @@ fn mqtt_session(
     // #6 OTA: filled with a GATED (build>running, host-allowed, size-ok) retained
     // announce if one is present for this board; the caller then triggers the fetch.
     ota_offer: &mut Option<crate::ota::Announce>,
+    // #21 node-manager: filled with the parsed retained default-screen command for
+    // this board (Set/Clear), if present + valid; None = absent/invalid (keep current).
+    config_offer: &mut Option<crate::app::DefaultScreen>,
+    // #33 HA Update entity: set true iff a retained `install` command is present for this
+    // board (the native Install button) — the caller AND-gates the fetch on it.
+    install_requested: &mut bool,
     deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
@@ -639,6 +657,12 @@ fn mqtt_session(
     // Per-board OTA announce topic (the canary path), built from node_id.
     let mut ota_topic = MqttScratch::new();
     let _ = write!(ota_topic, "smol/ota/announce/{}", node_id);
+    // #21 per-board node-manager config topic (retained default-screen command).
+    let mut cfg_topic = MqttScratch::new();
+    let _ = write!(cfg_topic, "smol/{}/config/default_screen", node_id);
+    // #33 per-board OTA command topic (HA Update entity → `install`).
+    let mut cmd_topic = MqttScratch::new();
+    let _ = write!(cmd_topic, "smol/{}/ota/cmd", node_id);
 
     // --- TCP connect ---
     {
@@ -742,6 +766,14 @@ fn mqtt_session(
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 5, OTA_ANNOUNCE_ALL_TOPIC) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
     }
+    // #21 node-manager: subscribe this board's retained default-screen config (pid 6).
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 6, cfg_topic.as_bytes()) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
+    // #33 HA Update entity: subscribe this board's OTA command topic (pid 7).
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 7, cmd_topic.as_bytes()) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
 
     // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
     for &(id, line) in telemetry {
@@ -782,7 +814,18 @@ fn mqtt_session(
     // #23 election: capture the retained MC|owner|ch|seq (None = topic empty/absent).
     let mut got_mc = false;
     let mut mc: Option<(u8, u8, u32)> = None;
-    while !(got_batt && got_grid && got_mc) {
+    // #6/#21 FIX (reboot-free OTA + running-gateway config): after the primary downlinks
+    // (batt/grid/mc) are in, keep draining for a bounded SETTLE window so the retained
+    // OTA announce + node-manager config — subscribed AFTER mc (pids 4/5/6), so they
+    // arrive slightly later in the SAME broker burst — are captured on a RUNNING gateway
+    // too. Previously the loop exited the instant batt/grid/mc landed (all retained +
+    // instant on a live gateway), draining neither; they were only ever seen at BOOT,
+    // where an absent retained MC made the loop wait to `deadline` and drain them
+    // incidentally. Bounded → an ABSENT announce/config costs only the settle window,
+    // never the full session budget.
+    const DOWNLINK_SETTLE: Duration = Duration::from_millis(300);
+    let mut settle_deadline: Option<Instant> = None;
+    loop {
         if tick() {
             break; // #20 abort during downlink wait → fall through to clean DISCONNECT
         }
@@ -828,6 +871,26 @@ fn mqtt_session(
                             },
                             None => log::warn!("smol OTA: malformed announce ignored"),
                         }
+                    } else if topic == cfg_topic.as_bytes() {
+                        // #21: parse the retained default-screen command (panic-free).
+                        // Some(Set/Clear) → offer to `main`; None → invalid/unknown/
+                        // wrong-tier → keep current (never apply garbage; the payload is
+                        // an untrusted retained value = boot-loop-brick class).
+                        *config_offer = crate::app::parse_default_screen(payload);
+                        match config_offer {
+                            Some(_) => log::info!("smol #21: default-screen config accepted"),
+                            None => log::info!("smol #21: default-screen config absent/invalid — keeping current"),
+                        }
+                    } else if topic == cmd_topic.as_bytes() {
+                        // #33 HA Update entity: the install command. PANIC-FREE exact byte
+                        // compare only (untrusted RETAINED payload = boot-loop-brick class):
+                        // `install` → arm the flag (the caller AND-gates the fetch on an
+                        // already-`gate()`d target — this bool never itself touches flash);
+                        // any other bytes → ignore. Cleared (empty retained publish) below.
+                        if payload == b"install" {
+                            *install_requested = true;
+                            log::info!("smol #33: OTA install command received");
+                        }
                     }
                     consumed
                 }
@@ -835,6 +898,17 @@ fn mqtt_session(
             };
             acc.copy_within(consumed..acc_len, 0);
             acc_len -= consumed;
+        }
+        // Primary downlinks in → drain the bounded settle window (catches the retained
+        // OTA announce + config that arrive just after mc), then finish. If batt/grid/mc
+        // never all arrive (e.g. absent MC at boot), fall through to the `deadline` break
+        // — which still drains ota/config during the wait (the original boot behaviour).
+        if got_batt && got_grid && got_mc {
+            match settle_deadline {
+                None => settle_deadline = Some(Instant::now() + DOWNLINK_SETTLE),
+                Some(sd) if Instant::now() > sd => break,
+                _ => {}
+            }
         }
         if Instant::now() > deadline {
             log::info!("smol: MQTT downlink(s) not all received in budget (keeping cache)");
@@ -898,6 +972,51 @@ fn mqtt_session(
         elect.seen_seq
     );
 
+    // --- #33 HA Update entity: self-publish retained discovery + state, clear the cmd ---
+    // The board is still connected here (free). `installed_version` = our BUILD_NUMBER;
+    // `latest_version` = the gated announce's build if one is present (`ota_offer`), else
+    // our own build (= up-to-date). `title` carries the sigil forge name. `in_progress`
+    // is true iff we just accepted an install this session (fetch fires right after).
+    {
+        let installed = crate::ota::BUILD_NUMBER;
+        let latest = match ota_offer.as_ref() {
+            Some(a) => a.build,
+            None => installed,
+        };
+        let noun = crate::net::names::version_name().1;
+        // Discovery config (retained) — bound to the SAME device as telemetry via
+        // identifiers:["smol<id>"], so Update lands on the existing device card.
+        let mut dtopic = MqttScratch::new();
+        let _ = write!(dtopic, "homeassistant/update/smol{}/config", node_id);
+        let mut djson = MqttScratch::new();
+        let _ = write!(
+            djson,
+            "{{\"~\":\"smol/{}/ota\",\"stat_t\":\"~/state\",\"cmd_t\":\"~/cmd\",\"pl_inst\":\"install\",\"dev_cla\":\"firmware\",\"name\":\"firmware\",\"uniq_id\":\"smol{}_fw\",\"dev\":{{\"ids\":[\"smol{}\"]}}}}",
+            node_id, node_id, node_id
+        );
+        if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), djson.as_bytes(), true) {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        // State JSON (retained): installed + latest + in_progress + title.
+        let mut sjson = MqttScratch::new();
+        let _ = write!(
+            sjson,
+            "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":{},\"title\":\"v{} {}\"}}",
+            installed, latest, *install_requested, latest, noun
+        );
+        let mut stopic = MqttScratch::new();
+        let _ = write!(stopic, "smol/{}/ota/state", node_id);
+        if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, stopic.as_bytes(), sjson.as_bytes(), true) {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        // Clear the retained install command once consumed, so it can't replay next boot.
+        if *install_requested {
+            if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, cmd_topic.as_bytes(), &[], true) {
+                let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            }
+        }
+    }
+
     // --- DISCONNECT (clean goodbye) + close the socket ---
     if let Some(n) = crate::net::mqtt::encode_disconnect(&mut pkt) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
@@ -939,6 +1058,10 @@ pub fn run_mqtt_burst(
     elect: &mut MeshElect,
     // #6 OTA: filled with a gated retained announce, if one is present for this board.
     ota_offer: &mut Option<crate::ota::Announce>,
+    // #21: filled with the parsed default-screen config for this board, if present.
+    config_offer: &mut Option<crate::app::DefaultScreen>,
+    // #33: set true iff a retained OTA `install` command is present for this board.
+    install_requested: &mut bool,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
@@ -1038,6 +1161,8 @@ pub fn run_mqtt_burst(
         grid,
         elect,
         ota_offer,
+        config_offer,
+        install_requested,
         deadline,
         tick,
     )

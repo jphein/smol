@@ -1164,6 +1164,12 @@ pub struct RadioManager {
     /// #6 OTA: a gated retained announce surfaced by a burst (boot or gateway flush),
     /// pending `main`'s `take_ota_offer` → fetch. `None` when nothing is pending.
     ota_offer: Option<crate::ota::Announce>,
+    /// #21 node-manager: the parsed default-screen command surfaced by a burst,
+    /// pending `main`'s `take_config_offer` → apply. `None` when nothing is pending.
+    config_offer: Option<crate::app::DefaultScreen>,
+    /// #33 HA Update entity: a retained `install` command was seen on a burst, pending
+    /// `main`'s `take_install_request` → AND-gate the fetch. One-shot (cleared on take).
+    install_requested: bool,
 }
 
 /// Monotonic milliseconds since boot — the single time base for both the
@@ -1219,6 +1225,8 @@ impl RadioManager {
             mc_seen_ms: 0,
             last_reelect_ms: 0,
             ota_offer: None,
+            config_offer: None,
+            install_requested: false,
         })
     }
 
@@ -1296,8 +1304,10 @@ impl RadioManager {
         elect.seen_owner = self.mc_seen_owner;
         elect.seen_seq = self.mc_seen_seq;
         elect.seen_ms = self.mc_seen_ms;
-        // #6 OTA: a leaf's recovery burst can also surface a gated announce.
+        // #6 OTA / #21 config / #33 install: a leaf's recovery burst can also surface these.
         let mut ota_offer: Option<crate::ota::Announce> = None;
+        let mut config_offer: Option<crate::app::DefaultScreen> = None;
+        let mut install_requested = false;
         let reached = match self.sta.as_mut() {
             None => false,
             Some(sta) => {
@@ -1312,12 +1322,20 @@ impl RadioManager {
                     grid,
                     &mut elect,
                     &mut ota_offer,
+                    &mut config_offer,
+                    &mut install_requested,
                     tick,
                 )
             }
         };
         if ota_offer.is_some() {
             self.ota_offer = ota_offer;
+        }
+        if config_offer.is_some() {
+            self.config_offer = config_offer;
+        }
+        if install_requested {
+            self.install_requested = true;
         }
         if !reached {
             // Broker unreachable (AP down / off our scan channel): do NOT claim on a
@@ -1363,12 +1381,15 @@ impl RadioManager {
     /// for periodic relay flushes (`flush_telemetry`); the smoltcp interface is
     /// built + dropped INSIDE `run_ntp_burst`, so no live stack contends with
     /// ESP-NOW between bursts.
+    #[allow(clippy::too_many_arguments)] // +ota/config/install offer out-params (#6/#21/#33)
     pub fn burst_ntp(
         &mut self,
         batt: &mut crate::batt::BattCache,
         grid: &mut crate::grid::GridCache,
         elect: &mut crate::net::wifi::MeshElect,
         ota_offer: &mut Option<crate::ota::Announce>,
+        config_offer: &mut Option<crate::app::DefaultScreen>,
+        install_requested: &mut bool,
         tick: &mut dyn FnMut() -> bool,
     ) -> (bool, Option<u32>) {
         // Disjoint field borrows: &mut self.controller, &mut *sta, Copy of rng/id.
@@ -1390,6 +1411,8 @@ impl RadioManager {
             grid,
             elect,
             ota_offer,
+            config_offer,
+            install_requested,
         );
         (reached_dhcp, synced)
     }
@@ -1732,6 +1755,19 @@ impl RadioManager {
         self.ota_offer.take()
     }
 
+    /// #21 node-manager: take a pending default-screen command (surfaced by a
+    /// boot/flush burst) for `main` to apply — the pull pattern mirroring the others.
+    pub fn take_config_offer(&mut self) -> Option<crate::app::DefaultScreen> {
+        self.config_offer.take()
+    }
+
+    /// #33 HA Update entity: take (and clear) the one-shot install-command flag. `main`
+    /// AND-gates the OTA fetch on this, so the native Install button is the sole trigger
+    /// (unless `ota::OTA_AUTO_INSTALL` is set).
+    pub fn take_install_request(&mut self) -> bool {
+        core::mem::take(&mut self.install_requested)
+    }
+
     /// #6 OTA: run the update burst for a gated announce — re-associate, stream the
     /// image to the inactive slot, verify, activate + reboot. Returns only on a
     /// non-activating outcome (a SUCCESS reboots inside the fetch). Mesh-deaf for the
@@ -1778,6 +1814,10 @@ impl RadioManager {
         elect.seen_ms = self.mc_seen_ms;
         // #6 OTA: capture any gated retained announce this flush surfaces.
         let mut ota_offer: Option<crate::ota::Announce> = None;
+        // #21: capture any default-screen config this flush surfaces.
+        let mut config_offer: Option<crate::app::DefaultScreen> = None;
+        // #33: capture any OTA install command this flush surfaces.
+        let mut install_requested = false;
         let sta = self.sta.as_mut();
         let ok = match sta {
             None => false,
@@ -1811,6 +1851,8 @@ impl RadioManager {
                     grid,
                     &mut elect,
                     &mut ota_offer,
+                    &mut config_offer,
+                    &mut install_requested,
                     tick,
                 )
             }
@@ -1818,6 +1860,14 @@ impl RadioManager {
         // #6 OTA: stash any announce this flush surfaced for `main` to act on.
         if ota_offer.is_some() {
             self.ota_offer = ota_offer;
+        }
+        // #21: stash any default-screen config this flush surfaced for `main`.
+        if config_offer.is_some() {
+            self.config_offer = config_offer;
+        }
+        // #33: OR-in an install command (one-shot; `main`'s take clears it).
+        if install_requested {
+            self.install_requested = true;
         }
         // #23 fix (oracle #2): APPLY the re-election result to the LIVE role. On a
         // connected flush, persist the refreshed staleness observation; if a LIVE
@@ -2479,9 +2529,24 @@ pub fn start(
     let mut elect = crate::net::wifi::MeshElect::new(id);
     elect.now_ms = now_ms(); // seed the ONE clock the stale-owner timeout runs on
     let mut ota_offer: Option<crate::ota::Announce> = None;
-    let (reached_dhcp, synced) = radio.burst_ntp(batt, grid, &mut elect, &mut ota_offer, tick);
+    let mut config_offer: Option<crate::app::DefaultScreen> = None;
+    let mut install_requested = false;
+    let (reached_dhcp, synced) = radio.burst_ntp(
+        batt,
+        grid,
+        &mut elect,
+        &mut ota_offer,
+        &mut config_offer,
+        &mut install_requested,
+        tick,
+    );
     // #6 OTA: stash any gated boot-time announce for `main` to fetch after boot.
     radio.ota_offer = ota_offer;
+    // #21: stash the boot-time default-screen config so `main` seeds the boot screen
+    // from it (the reconciled per-node config), falling back to DEFAULT_APP if absent.
+    radio.config_offer = config_offer;
+    // #33: stash a boot-time install command (retained) so `main` fetches after boot.
+    radio.install_requested = install_requested;
 
     // OTA MF-1: confirm/rollback the running image on its first boot, NOW that the
     // WiFi/DHCP result is known. self-test = reached DHCP (a broken-WiFi image can't;
