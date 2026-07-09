@@ -2,30 +2,25 @@
 # ota_publish.sh — the smol OTA server-side publish pipeline (issue #6).
 #
 # Build (or take) an esp-image, host it on the LAN image server, and publish the
-# RETAINED announce the boards fetch from. Matches the firmware parse contract
-# (ota-firmware-spec.md, LOCKED):
-#   topic   smol/ota/announce/<id>   (per-id canary)   ·  smol/ota/announce/all (fleet)
+# RETAINED staged line every board's native HA Update entity reads as latest_version
+# (Model-A #33). Matches the firmware parse contract (issue-33-modelA-design.md):
+#   topic   smol/ota/staged   (retained; arms ALL boards, triggers NO fetch)
 #   payload OTA|<build>|<size>|<sha256hex>|<url>        (url is LAST — contains no '|')
-# Plus a NON-acted staging topic  smol/ota/staged  that the HA OTA panel mirrors, so
-# the GUI can do per-id canary targeting WITHOUT rebuilding/re-hashing.
+# Install is per-device: HA's native Update `Install` button (or `install <id>` here)
+# publishes INSTALL → smol/<id>/ota/install; only that board fetches the staged image.
+# The per-id announce act-path is RETIRED (Model-A #32 closure — no fleet-fetch topic).
 #
-# MODES
-#   ota_publish.sh stage    [<commit>] [--bin <file>] [--build N]           # build+host+publish smol/ota/staged (no board acts)
-#   ota_publish.sh push <id> [<commit>] [--bin <file>] [--build N]           # stage, then publish smol/ota/announce/<id> (CANARY — frictionless)
-#   ota_publish.sh push all  [<commit>] [--bin <file>] [--build N] [--force] # FLEET — SEATBELTED (see below)
-#   ota_publish.sh clear <id|all>                                            # retain-delete the announce (R-P1 lifecycle)
+# MODES (Model-A #33: stage arms every board's native Update entity; Install is per-device)
+#   ota_publish.sh stage      [<commit>] [--bin <file>] [--build N]  # build+host+publish smol/ota/staged (arms all boards; NO board fetches)
+#   ota_publish.sh install <id>                                      # publish INSTALL → smol/<id>/ota/install (headless per-node canary; the HA Update button is the GUI path)
 # <commit> defaults to HEAD. --bin <file> skips the cargo build and hosts an existing .bin.
-# --build N overrides the git-derived BUILD number in the announce — canary an uncommitted
+# --build N overrides the git-derived BUILD number in the staged line — canary an uncommitted
 #   image without a throwaway commit to bump the count (default: `git rev-list --count`).
-# --force applies ONLY to `push all`: it skips the interactive typed confirmation (for
-# scripted/non-interactive use). The per-id canary `push <id>` is NEVER gated. Without
-# --force, `push all` requires typing the exact staged build number to confirm, and
-# refuses outright if stdin is not a TTY. (Mass-brick seatbelt — ROADMAP D2.)
 #
-# SAFETY: canary-first. Prefer `push <id>` (one board), verify it comes back healthy
-# (its running build advances — HA reads smol/<id>/status), THEN `push` the rest or use
-# the HA "roll out to rest" button. NEVER `push all` blind while bootloader
-# revert-on-boot-fail is unproven (ota-firmware-spec §4 / ROADMAP D2).
+# SAFETY: canary is STRUCTURAL now — Install is per-device (native Update entity); there
+# is no fleet-fetch topic (Model-A #32 closure). Install one board, verify its version
+# advances (a graceful-fail re-shows update-available), THEN the next. NEVER script all
+# three Installs at once while bootloader revert-on-boot-fail is unproven (ROADMAP D2).
 #
 # Broker creds: sourced from the Mosquitto/JuicePassProxy addon option — NEVER printed.
 set -euo pipefail
@@ -76,21 +71,24 @@ pub_retained(){ # topic, payload  (payload may be empty = retain-delete)
   fi
 }
 
-# ---- clear mode -------------------------------------------------------------
-if [ "$MODE" = "clear" ]; then
-  TGT="${2:?usage: ota_publish.sh clear <id|all>}"
-  pub_retained "smol/ota/announce/$TGT" ""
-  echo "cleared retained smol/ota/announce/$TGT"
+# ---- install mode (Model-A per-node canary; parity with the HA Update button) --
+if [ "$MODE" = "install" ]; then
+  ID="${2:?usage: ota_publish.sh install <id>}"
+  case "$ID" in ''|*[!0-9]*) die "install <id>: id must be a positive integer (got '$ID')";; esac
+  # RETAINED (-r): the fw does a retained-read on subscribe (wifi.rs:1126); a non-retained INSTALL
+  # is missed by id7's bursty subscribe window (lucid A/B: retained→fetch 6s; non-retained→miss).
+  # Idempotent: fw gate is staged.build > running, so a retained re-fire won't re-install same build.
+  mosquitto_pub -h "$BROKER" -p 1883 -u "$MQTT_USER" -P "$(mqtt_pw)" -r -t "smol/${ID}/ota/install" -m "INSTALL"
+  echo "install  smol/${ID}/ota/install  <-  INSTALL (RETAINED — id${ID} reliably catches it; fetches STAGED if staged.build>running)"
   exit 0
 fi
 
-[ "$MODE" = "stage" ] || [ "$MODE" = "push" ] || usage 1
-if [ "$MODE" = "push" ]; then TARGET="${2:?usage: ota_publish.sh push <id|all> [<commit>]}"; shift 2; else shift 1; fi
-COMMIT="HEAD"; BIN=""; FORCE=0; BUILD_OVERRIDE=""
+[ "$MODE" = "stage" ] || usage 1
+shift 1
+COMMIT="HEAD"; BIN=""; BUILD_OVERRIDE=""
 while [ $# -gt 0 ]; do case "$1" in
   --bin) BIN="${2:?}"; shift 2;;
   --build) BUILD_OVERRIDE="${2:?}"; shift 2;;
-  --force) FORCE=1; shift;;
   *) COMMIT="$1"; shift;;
 esac; done
 
@@ -100,7 +98,7 @@ HASH="$(git rev-parse --short=7 "$COMMIT")"
 BUILD="$(git rev-list --count "$COMMIT")"
 # --build N overrides the git-derived count — lets an operator canary an UNCOMMITTED image
 # without a throwaway commit to bump the number (collision-risky on a busy repo). It becomes
-# the announce BUILD the firmware compares (monotonicity), so it must be a positive integer.
+# the staged BUILD the firmware compares (monotonicity), so it must be a positive integer.
 if [ -n "$BUILD_OVERRIDE" ]; then
   case "$BUILD_OVERRIDE" in ''|*[!0-9]*) die "--build must be a positive integer (got '$BUILD_OVERRIDE')";; esac
   BUILD="$BUILD_OVERRIDE"
@@ -132,24 +130,8 @@ URL="http://${OTA_HOST_IP}:${OTA_PORT}/ota/${REMOTE}"
 
 LINE="OTA|${BUILD}|${SIZE}|${SHA}|${URL}"
 
-# ---- publish: always stage; push targets the acted announce topic -----------
+# ---- publish: stage the retained line (arms every board's native Update) -----
 pub_retained "smol/ota/staged" "$LINE"
 echo "staged  smol/ota/staged  <-  build $BUILD ($HASH) ${SIZE}B sha ${SHA:0:12}… @ $URL"
-if [ "$MODE" = "push" ]; then
-  # SEATBELT — fleet path ONLY. The per-id canary (`push <id>`) never enters this block.
-  if [ "$TARGET" = "all" ] && [ "$FORCE" != "1" ]; then
-    if [ -t 0 ]; then
-      echo "⚠️  FLEET push of build $BUILD to ALL boards — mass-brick risk (bootloader"
-      echo "    revert-on-boot-fail is UNPROVEN on hardware; ROADMAP D2). Prefer canary."
-      printf "    Type the build number (%s) to confirm, anything else aborts: " "$BUILD"
-      read -r ans
-      [ "$ans" = "$BUILD" ] || die "fleet push aborted — confirmation ('$ans') != build $BUILD"
-    else
-      die "fleet push to ALL refused without --force (stdin not a TTY). Prefer canary: ota_publish.sh push <id>. Use --force only if you truly mean a fleet push."
-    fi
-  fi
-  pub_retained "smol/ota/announce/$TARGET" "$LINE"
-  echo "PUSHED  smol/ota/announce/$TARGET  (boards on that id act on next burst)"
-  [ "$TARGET" = "all" ] && echo "⚠️  FLEET push done — verify EACH board comes back healthy (its running build advances)."
-fi
-echo "done. HA OTA panel mirrors smol/ota/staged; use its per-node canary buttons, or: ota_publish.sh push <id> --bin $BIN"
+echo "done. Every board's native HA Update entity now shows build $BUILD as available."
+echo "      Install per-node from HA (the Update entity's Install button) or: ota_publish.sh install <id>"
