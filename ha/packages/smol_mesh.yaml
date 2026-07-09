@@ -274,7 +274,7 @@ mqtt:
       json_attributes_topic: "smol/ota/staged"
       json_attributes_template: >-
         {% set p = value.split('|') %}
-        {{ {'build': p[1], 'size': p[2], 'sha256': p[3], 'url': p[4]} if (p | length >= 5 and p[0] == 'OTA') else {} }}
+        {{ ({'build': p[1], 'size': p[2], 'sha256': p[3], 'url': p[4]} if (p | length >= 5 and p[0] == 'OTA') else {}) | tojson }}
       icon: "mdi:package-up"
     # Per-node LIVE status — NEEDS firmware smol/<id>/status = STAT|<screen>:<page>|<build>
     # (design F4; unknown until the firmware wave ships it). Feeds the OTA no-downgrade
@@ -284,21 +284,21 @@ mqtt:
       state_topic: "smol/7/status"
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/7/status"
-      json_attributes_template: "{% set p = value.split('|') %}{{ {'build': p[2]} if p | length >= 3 else {} }}"
+      json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
       icon: "mdi:chip"
     - name: "smol 8 status"
       unique_id: smol_8_status_mirror
       state_topic: "smol/8/status"
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/8/status"
-      json_attributes_template: "{% set p = value.split('|') %}{{ {'build': p[2]} if p | length >= 3 else {} }}"
+      json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
       icon: "mdi:chip"
     - name: "smol 9 status"
       unique_id: smol_9_status_mirror
       state_topic: "smol/9/status"
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/9/status"
-      json_attributes_template: "{% set p = value.split('|') %}{{ {'build': p[2]} if p | length >= 3 else {} }}"
+      json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
       icon: "mdi:chip"
     # --- MESH TOPOLOGY (issue #27) — HELD; needs the firmware peers/channel publish ---
     # NOT YET PUBLISHED BY FIRMWARE. These + the template block below back the topology
@@ -312,7 +312,7 @@ mqtt:
       state_topic: "smol/mesh/channel"
       value_template: "{% set p = value.split('|') %}{{ p[3] if p | length >= 4 else 'unknown' }}"
       json_attributes_topic: "smol/mesh/channel"
-      json_attributes_template: "{% set p = value.split('|') %}{{ {'owner': p[1], 'channel': p[2], 'seq': p[3]} if p | length >= 4 else {} }}"
+      json_attributes_template: "{% set p = value.split('|') %}{{ ({'owner': p[1], 'channel': p[2], 'seq': p[3]} if p | length >= 4 else {}) | tojson }}"
       expire_after: 90
       icon: "mdi:lan"
     - name: "smol 7 peers"
@@ -320,7 +320,7 @@ mqtt:
       state_topic: "smol/7/peers"
       value_template: "{% set p = value.split('|') %}{{ 'gateway' if (p | length > 1 and p[1] == 'G') else 'leaf' }}"
       json_attributes_topic: "smol/7/peers"
-      json_attributes_template: "{% set p = value.split('|') %}{{ {'ch': p[2], 'peers': p[3:]} if p | length >= 3 else {'peers': []} }}"
+      json_attributes_template: "{% set p = value.split('|') %}{{ ({'ch': p[2], 'peers': p[3:]} if p | length >= 3 else {'peers': []}) | tojson }}"
       expire_after: 90
       icon: "mdi:lan-connect"
     - name: "smol 8 peers"
@@ -328,7 +328,7 @@ mqtt:
       state_topic: "smol/8/peers"
       value_template: "{% set p = value.split('|') %}{{ 'gateway' if (p | length > 1 and p[1] == 'G') else 'leaf' }}"
       json_attributes_topic: "smol/8/peers"
-      json_attributes_template: "{% set p = value.split('|') %}{{ {'ch': p[2], 'peers': p[3:]} if p | length >= 3 else {'peers': []} }}"
+      json_attributes_template: "{% set p = value.split('|') %}{{ ({'ch': p[2], 'peers': p[3:]} if p | length >= 3 else {'peers': []}) | tojson }}"
       expire_after: 90
       icon: "mdi:lan-connect"
     - name: "smol 9 peers"
@@ -336,7 +336,7 @@ mqtt:
       state_topic: "smol/9/peers"
       value_template: "{% set p = value.split('|') %}{{ 'gateway' if (p | length > 1 and p[1] == 'G') else 'leaf' }}"
       json_attributes_topic: "smol/9/peers"
-      json_attributes_template: "{% set p = value.split('|') %}{{ {'ch': p[2], 'peers': p[3:]} if p | length >= 3 else {'peers': []} }}"
+      json_attributes_template: "{% set p = value.split('|') %}{{ ({'ch': p[2], 'peers': p[3:]} if p | length >= 3 else {'peers': []}) | tojson }}"
       expire_after: 90
       icon: "mdi:lan-connect"
 
@@ -570,6 +570,9 @@ automation:
     trigger:
       - platform: state
         entity_id: input_button.smol_7_apply
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
     action:
       - service: mqtt.publish
         data:
@@ -586,6 +589,9 @@ automation:
     trigger:
       - platform: state
         entity_id: input_button.smol_7_reset
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
     action:
       - service: mqtt.publish
         data:
@@ -601,6 +607,9 @@ automation:
     trigger:
       - platform: state
         entity_id: input_button.smol_8_apply
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
     action:
       - service: mqtt.publish
         data:
@@ -616,6 +625,9 @@ automation:
     trigger:
       - platform: state
         entity_id: input_button.smol_8_reset
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
     action:
       - service: mqtt.publish
         data:
@@ -631,6 +643,9 @@ automation:
     trigger:
       - platform: state
         entity_id: input_button.smol_9_apply
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
     action:
       - service: mqtt.publish
         data:
@@ -646,6 +661,9 @@ automation:
     trigger:
       - platform: state
         entity_id: input_button.smol_9_reset
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
     action:
       - service: mqtt.publish
         data:
@@ -663,6 +681,9 @@ automation:
     trigger:
       - platform: state
         entity_id: input_button.smol_all_apply
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
     action:
       - service: mqtt.publish
         data:
@@ -701,6 +722,8 @@ automation:
         entity_id: input_button.smol_ota_push_7
     condition:
       - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
+      - condition: template
         value_template: "{{ state_attr('sensor.smol_ota_staged', 'build') not in [none, 'none'] }}"
     action:
       - service: mqtt.publish
@@ -717,6 +740,8 @@ automation:
         entity_id: input_button.smol_ota_push_8
     condition:
       - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
+      - condition: template
         value_template: "{{ state_attr('sensor.smol_ota_staged', 'build') not in [none, 'none'] }}"
     action:
       - service: mqtt.publish
@@ -732,6 +757,8 @@ automation:
       - platform: state
         entity_id: input_button.smol_ota_push_9
     condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
       - condition: template
         value_template: "{{ state_attr('sensor.smol_ota_staged', 'build') not in [none, 'none'] }}"
     action:
@@ -753,6 +780,8 @@ automation:
       - platform: state
         entity_id: input_button.smol_ota_rollout
     condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
       - condition: template
         value_template: "{{ state_attr('sensor.smol_ota_staged', 'build') not in [none, 'none'] }}"
       - condition: template
@@ -779,6 +808,9 @@ automation:
     trigger:
       - platform: state
         entity_id: input_button.smol_ota_clear
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unknown', 'unavailable'] }}"
     action:
       - service: mqtt.publish
         data: { topic: "smol/ota/announce/7", retain: true, payload: "" }
