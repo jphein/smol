@@ -4,6 +4,9 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>smol · a fingertip game console</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%23070b0c'/><g fill='%237df9ff'><rect x='3' y='7' width='2' height='2'/><rect x='5' y='7' width='2' height='2'/><rect x='7' y='7' width='2' height='2'/><rect x='7' y='5' width='2' height='2'/><rect x='9' y='5' width='2' height='2'/></g><rect x='11' y='9' width='2' height='2' fill='%23ffb454'/></svg>" />
+<meta name="theme-color" content="#070b0c" media="(prefers-color-scheme: dark)" />
+<meta name="theme-color" content="#e9efee" media="(prefers-color-scheme: light)" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Silkscreen:wght@400;700&family=JetBrains+Mono:wght@400;500;700&family=Sora:wght@300;400;600;800&display=swap" rel="stylesheet" />
@@ -249,6 +252,76 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
   color:var(--ink);font-family:var(--mono);font-size:.8rem;padding:11px 18px;border-radius:12px;opacity:0;pointer-events:none;transition:.3s;box-shadow:0 0 30px -8px var(--glow-soft)}
 .toast.show{opacity:1;transform:translate(-50%,0)}
 .toast.err{border-color:var(--red);box-shadow:0 0 30px -8px var(--red)}
+/* ===================== GAMES (consolidated) ===================== */
+.games-intro{max-width:62ch}
+.ws{display:grid;grid-template-columns:1.02fr .98fr;gap:40px;align-items:start;margin-top:6px}
+@media(max-width:900px){.ws{grid-template-columns:1fr;gap:30px}}
+.ws-media{display:flex;flex-direction:column;gap:16px}
+.ws-tag{display:flex;align-items:center;gap:12px;font-family:var(--mono);font-size:.66rem;letter-spacing:.18em;text-transform:uppercase;color:var(--glow)}
+.ws-tag .pill{border:1px solid var(--line);border-radius:999px;padding:3px 10px;background:rgba(125,249,255,.05)}
+.ws-live{display:inline-flex;align-items:center;gap:7px;color:var(--lime);margin-left:auto}
+.ws-live i{width:7px;height:7px;border-radius:50%;background:var(--lime);box-shadow:0 0 9px var(--lime);animation:pulse 1.6s ease-in-out infinite}
+.ws-stage{background:#05090a;border-radius:12px;padding:12px;border:1px solid var(--line);box-shadow:inset 0 0 26px rgba(0,0,0,.7),0 0 50px -26px var(--glow-soft)}
+.ws-screen{position:relative;border-radius:5px;overflow:hidden;background:#02100f;box-shadow:inset 0 0 40px rgba(0,0,0,.6)}
+.ws-screen svg{display:block;width:100%;height:auto}
+.ws-screen::after{content:"";position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(0,0,0,.24) 0 1px,transparent 1px 3px);mix-blend-mode:multiply;opacity:.5}
+.ws-cap{font-family:var(--mono);font-size:.7rem;color:var(--faint);text-align:center;margin-top:2px}
+.ws-treasure{animation:blink 1.15s steps(1) infinite;transform-origin:center}
+.ws-peer{animation:wsfade 4.6s ease-in-out infinite}
+.ws-peer.b{animation-delay:2.3s}
+@keyframes wsfade{0%,100%{opacity:.4}46%{opacity:1}}
+.ws-board{border:1px solid var(--line);border-radius:12px;background:linear-gradient(180deg,var(--panel),var(--bg2));padding:15px 16px}
+.lb-head{display:flex;justify-content:space-between;align-items:center;font-family:var(--mono);font-size:.66rem;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);margin-bottom:12px}
+.lb-row{display:grid;grid-template-columns:auto 1fr 66px auto;align-items:center;gap:11px;padding:8px 0;border-bottom:1px dashed var(--line2)}
+.lb-row:last-child{border-bottom:0}
+.lb-rank{font-family:var(--pixel);font-size:.72rem;color:var(--faint);width:16px;text-align:center}
+.lb-name{font-family:var(--mono);font-size:.82rem;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lb-bar{height:6px;border-radius:3px;background:rgba(125,249,255,.08);overflow:hidden}
+.lb-bar i{display:block;height:100%;background:var(--glow);opacity:.55;box-shadow:0 0 10px -1px var(--glow-soft)}
+.lb-len{font-family:var(--mono);font-size:.78rem;color:var(--dim);text-align:right}
+.lb-row.top .lb-rank{color:var(--amber)}
+.lb-row.top .lb-name{color:var(--ink)}
+.lb-row.top .lb-bar i{background:var(--amber);opacity:.85;box-shadow:0 0 12px -1px var(--amber);animation:lbpulse 2.4s ease-in-out infinite}
+@keyframes lbpulse{50%{opacity:.5}}
+.lb-row.me .lb-name,.lb-row.me .lb-rank{color:var(--glow)}
+.ws-story h3{font-size:clamp(1.5rem,3vw,2rem);font-weight:800;letter-spacing:-.02em;margin:8px 0 12px;line-height:1.06}
+.ws-story p{color:var(--dim);margin:0 0 14px}
+.ws-status{font-family:var(--mono);font-size:.74rem;color:var(--faint);border-left:2px solid var(--glow);padding:4px 0 4px 12px;margin:0 0 22px}
+.ws-status b{color:var(--lime);font-weight:500}
+.how{list-style:none;padding:0;margin:0;display:grid;gap:10px}
+.how li{position:relative;padding:1px 0 1px 40px;font-size:.92rem;color:var(--dim);line-height:1.55;min-height:26px}
+.how li b{color:var(--ink);font-weight:600}
+.how li i{position:absolute;left:0;top:0;width:26px;height:26px;border-radius:8px;border:1px solid var(--line);background:rgba(125,249,255,.04);color:var(--glow);font-family:var(--pixel);font-size:.66rem;font-style:normal;display:grid;place-items:center}
+.g-sub{margin:58px 0 24px;max-width:58ch}
+.g-sub h3{font-size:clamp(1.4rem,2.6vw,1.9rem);font-weight:800;letter-spacing:-.02em;margin:10px 0 8px}
+.g-sub p{color:var(--dim);margin:0}
+.ctrls{margin-top:22px;border:1px solid var(--line2);border-radius:12px;padding:14px 16px;background:rgba(125,249,255,.02);display:flex;flex-wrap:wrap;align-items:center;gap:12px 22px}
+.ctrls-lbl{font-family:var(--mono);font-size:.72rem;color:var(--glow)}
+.ctrls-maps{display:flex;flex-wrap:wrap;gap:9px 18px;font-family:var(--mono);font-size:.8rem;color:var(--dim)}
+.ctrls-maps span{display:inline-flex;align-items:center;gap:7px}
+#games a:focus-visible{outline:2px solid var(--glow);outline-offset:3px;border-radius:12px}
+
+/* ===================== light theme ===================== */
+@media (prefers-color-scheme: light){
+  :root{
+    --bg:#e9efee; --bg2:#dde7e6; --panel:#f7fbfa; --panel2:#e8f1f0;
+    --ink:#0a1a1c; --dim:#41595d; --faint:#7f989b;
+    --line:rgba(7,104,116,.22); --line2:rgba(7,104,116,.10);
+    --glow:#06697a; --glow-soft:rgba(7,120,134,.30);
+    --amber:#a75e06; --lime:#3c860f; --red:#cc3444;
+  }
+  body{background-image:
+    radial-gradient(900px 500px at 72% -8%, rgba(7,120,134,.10), transparent 60%),
+    radial-gradient(700px 600px at 8% 108%, rgba(167,94,6,.07), transparent 55%),
+    radial-gradient(circle at center, rgba(7,104,116,.06) 1px, transparent 1.4px);}
+  body::after{opacity:.028}
+  header{background:linear-gradient(to bottom,rgba(233,239,238,.92),rgba(233,239,238,.6))}
+  .lb-bar{background:rgba(7,104,116,.10)}
+}
+/* ===================== reduced motion (a11y) ===================== */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important;scroll-behavior:auto!important}
+}
 </style>
 </head>
 <body>
@@ -257,7 +330,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
   <div class="wrap bar">
     <div class="brand">smol<span class="dot">▚</span><span class="cursor"></span></div>
     <nav>
-      <a href="#vitals">vitals</a><a href="#game">the game</a><a href="#controls">controls</a><a href="#builds">apps</a><a href="#powers">powers</a>
+      <a href="#vitals">vitals</a><a href="#games">games</a><a href="#builds">apps</a>
       <a href="#mission">mission control</a><a href="#roadmap">roadmap</a><a href="#research">research</a><a href="#board">board</a><a href="#influences">influences</a><a href="#pocketwatch">watch</a><a href="#case">case</a>
     </nav>
     <div class="live" id="live"><span class="led"></span><span id="liveTxt">connecting…</span></div>
@@ -318,126 +391,71 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
   </div>
 </div></section>
 
-<!-- GAME -->
-<section id="game"><div class="wrap two">
-  <div class="reveal">
-    <div class="sec-head" style="margin-bottom:20px">
-      <span class="kicker">02 — The Game</span>
-      <h2>Block Digger</h2>
-    </div>
-    <div class="body">
-      <p data-edit="game.desc">Gravity pulls you down. Walk the surface, dig blocks into your inventory, then place them back to build. It's Minecraft distilled to its purest loop and squeezed onto 2,880 pixels — the whole world fits in a screen the size of a postage stamp.</p>
-      <ul class="feat" data-edit="game.features">
-        <li>Procedural world: sky, grass, dirt, stone</li>
-        <li>Real gravity + auto step-up walking</li>
-        <li>Dig / place with a live inventory counter</li>
-        <li>Renders to a 1-bit framebuffer at ~60 fps</li>
-      </ul>
-    </div>
-  </div>
-  <div class="reveal">
-    <div class="sec-head" style="margin-bottom:20px">
-      <span class="kicker">Why not real Minecraft?</span>
-      <h2 style="font-size:1.5rem">The honest math.</h2>
-    </div>
-    <div class="body">
-      <p data-edit="game.why">Bedrock needs ~2–4 GB of RAM and a GPU. smol has <b>400 KB</b> and a 1-bit screen — off by roughly 10,000×. So instead of faking it, Block Digger keeps the <b>soul</b> of Minecraft (dig, gather, build) at a scale the hardware loves. The mockup on the left is the actual render logic, running in your browser.</p>
-    </div>
-  </div>
-</div></section>
-
-<!-- CONTROLS -->
-<section id="controls"><div class="wrap two">
-  <div class="reveal">
-    <div class="sec-head" style="margin-bottom:20px">
-      <span class="kicker">03 — Controls</span>
-      <h2>A Stadia pad over Bluetooth.</h2>
-    </div>
-    <div class="body">
-      <p data-edit="controls.desc">The board has just two buttons — one of them is RESET — so a real controller matters. A Stadia controller flashed to Bluetooth mode is a standard BLE gamepad, and the C3 is BLE-only, so it's a perfect match. The <b>Bluepad32</b> library handles pairing; the game reads the D-pad and face buttons.</p>
-    </div>
-  </div>
-  <div class="reveal">
-    <div class="sec-head" style="margin-bottom:20px"><span class="kicker">Mapping</span><h2 style="font-size:1.5rem">Button layout.</h2></div>
-    <div class="maps">
-      <div class="map"><span class="keycap">◀ ▶</span> walk left / right</div>
-      <div class="map"><span class="keycap">▲</span> jump one tile</div>
-      <div class="map"><span class="keycap">A</span> dig the block you face</div>
-      <div class="map"><span class="keycap">B</span> place a block from inventory</div>
-      <div class="map"><span class="keycap">stick</span> also drives movement</div>
-    </div>
-  </div>
-</div></section>
-
-<!-- APPS / MODES GALLERY -->
-<section id="builds"><div class="wrap">
+<!-- GAMES -->
+<section id="games"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">04 — Apps</span>
-    <h2>What runs on smol.</h2>
-    <p data-edit="apps.intro">Every "app" smol can run, picked from a BOOT-button menu — the unified Rust firmware folds Clock, Snake and the Benchmark into one binary. The ESP-NOW mesh now also carries the time (boards agree on the clock — newest NTP sync wins) and gives every board a magical realm name that shows on screen. Nearly everything here is now flashed and confirmed on real hardware — including the shared-world MMO snake and the ESP-NOW→internet relay, the latter proven end-to-end. Each card links to its source.</p>
+    <span class="kicker">02 — Games</span>
+    <h2>A game console you can lose in your pocket.</h2>
+    <p class="games-intro" data-edit="games.intro">smol is one <b>no_std</b> Rust binary with a BOOT-button menu — a fistful of games sharing the glass with a clock and live telemetry. The headline act is mesh multiplayer: a shared world every board roams at once, over an ESP-NOW mesh, no server in sight. The Block Digger up top is running its actual render logic in your browser — that's the kind of thing that fits.</p>
   </div>
-  <div class="apps-grid reveal">
-    <a class="app-card" href="https://github.com/jphein/smol/tree/main/rust/clock" target="_blank">
-      <div class="app-screen"><svg viewBox="0 0 72 40"><text x="36" y="23" text-anchor="middle" font-family="monospace" font-weight="bold" font-size="16" fill="#7df9ff">12:34</text><text x="36" y="34" text-anchor="middle" font-family="monospace" font-size="6" fill="#7df9ff">PDT 21C 3.9V</text></svg></div>
-      <div class="app-body"><div class="app-name">Clock <span class="app-badge on">flashed</span></div><div class="app-desc">NTP + Pacific time, big digits, chip-temp & battery readout. Now mesh-time-synced (boards agree over ESP-NOW, newest sync wins) and shows the board's magical name. Bare-metal Rust.</div><div class="app-tags">#rust #wifi #mesh #sensors</div></div>
-    </a>
-    <a class="app-card" href="https://github.com/jphein/smol/tree/main/blockdigger" target="_blank">
-      <div class="app-screen"><svg viewBox="0 0 72 40"><g fill="#7df9ff"><rect x="6" y="27" width="60" height="6"/><rect x="6" y="33" width="60" height="5" opacity=".55"/><rect x="31" y="19" width="7" height="7"/></g><g fill="none" stroke="#7df9ff" stroke-width="1"><rect x="14" y="27" width="6" height="6"/></g><text x="5" y="12" font-family="monospace" font-size="8" fill="#7df9ff">&#9670; 3</text></svg></div>
-      <div class="app-body"><div class="app-name">Block Digger <span class="app-badge on">flashed</span></div><div class="app-desc">Minecraft-ish dig/build on a grid. Bluetooth Stadia pad. The one that started it all.</div><div class="app-tags">#game #ble</div></div>
-    </a>
-    <a class="app-card" href="https://github.com/jphein/smol/tree/main/games/snake" target="_blank">
-      <div class="app-screen"><svg viewBox="0 0 72 40"><g fill="#7df9ff"><rect x="18" y="18" width="4" height="4"/><rect x="22" y="18" width="4" height="4"/><rect x="26" y="18" width="4" height="4"/><rect x="30" y="18" width="4" height="4"/><rect x="34" y="18" width="4" height="4"/><rect x="34" y="22" width="4" height="4"/><rect x="34" y="26" width="4" height="4"/></g><rect x="52" y="26" width="4" height="4" fill="#7df9ff"/><text x="4" y="9" font-family="monospace" font-size="7" fill="#7df9ff">7</text></svg></div>
-      <div class="app-body"><div class="app-name">Snake <span class="app-badge on">flashed</span></div><div class="app-desc">Classic Snake on the 72×40 grid. One-button steering. Ported to the Rust menu.</div><div class="app-tags">#game</div></div>
-    </a>
-    <a class="app-card" href="https://github.com/jphein/smol/tree/main/games/snake-2p" target="_blank">
-      <div class="app-screen"><svg viewBox="0 0 72 40"><g fill="#7df9ff"><rect x="12" y="13" width="4" height="4"/><rect x="16" y="13" width="4" height="4"/><rect x="20" y="13" width="4" height="4"/><rect x="24" y="13" width="4" height="4"/></g><g fill="none" stroke="#7df9ff" stroke-width="1"><rect x="42" y="25" width="4" height="4"/><rect x="46" y="25" width="4" height="4"/><rect x="50" y="25" width="4" height="4"/><rect x="54" y="25" width="4" height="4"/></g><text x="36" y="37" text-anchor="middle" font-family="monospace" font-size="6" fill="#7df9ff">P1  vs  P2</text></svg></div>
-      <div class="app-body"><div class="app-name">Mesh Snake <span class="app-badge on">flashed</span></div><div class="app-desc">Two smols, head-to-head over ESP-NOW. Verified 2-board play. Yours filled, foe outlined.</div><div class="app-tags">#game #espnow</div></div>
-    </a>
-    <a class="app-card" href="https://github.com/jphein/smol/tree/main/rust/clock" target="_blank">
-      <div class="app-screen"><svg viewBox="0 0 72 40"><g font-family="monospace" font-size="8" fill="#7df9ff"><text x="6" y="13">FPS 58</text><text x="6" y="25">RTT 7ms</text><text x="6" y="37">-54dBm</text></g></svg></div>
-      <div class="app-body"><div class="app-name">Benchmark <span class="app-badge on">flashed</span></div><div class="app-desc">Live ESP-NOW link test: FPS, TX/RX rate, round-trip latency, loss %, RSSI. A mode in the Rust firmware. Its <b>mesh-view</b> — a per-node table of magical names, RSSI, sync state and roles — landed on the build-45 fleet (issue #8).</div><div class="app-tags">#espnow #diag</div></div>
-    </a>
-    <a class="app-card" href="https://github.com/jphein/smol/tree/main/experiments/atomic14-games" target="_blank">
-      <div class="app-screen"><svg viewBox="0 0 72 40"><g fill="#7df9ff"><rect x="8" y="7" width="10" height="4"/><rect x="20" y="7" width="10" height="4"/><rect x="32" y="7" width="10" height="4"/><rect x="44" y="7" width="10" height="4"/><rect x="56" y="7" width="9" height="4"/><rect x="40" y="24" width="3" height="3"/><rect x="28" y="34" width="16" height="3"/></g></svg></div>
-      <div class="app-body"><div class="app-name">atomic14 pack <span class="app-badge on">flashed</span></div><div class="app-desc">5 single-button games (Breakout, racer, Defender, jumper, Heli Cave) + menu. Built for this exact board.</div><div class="app-tags">#games</div></div>
-    </a>
-    <a class="app-card" href="https://github.com/jphein/smol/blob/main/docs/nes-on-c3.md" target="_blank">
-      <div class="app-screen"><svg viewBox="0 0 72 40"><text x="36" y="19" text-anchor="middle" font-family="monospace" font-weight="bold" font-size="12" fill="#7df9ff">NES</text><text x="36" y="31" text-anchor="middle" font-family="monospace" font-size="6" fill="#ffb454">needs color TFT</text></svg></div>
-      <div class="app-body"><div class="app-name">NES <span class="app-badge plan">planned</span></div><div class="app-desc">Emulation is possible — but needs an added ST7735 color TFT + an ESP-IDF port. Build plan in docs.</div><div class="app-tags">#emu #future</div></div>
-    </a>
-    <a class="app-card" href="https://github.com/jphein/smol/blob/main/docs/walkie-talkie.md" target="_blank">
-      <div class="app-screen"><svg viewBox="0 0 72 40"><polyline points="4,20 12,20 16,10 20,30 24,14 28,26 32,20 68,20" fill="none" stroke="#7df9ff" stroke-width="1.5"/><text x="36" y="35" text-anchor="middle" font-family="monospace" font-size="6" fill="#7df9ff">PTT · ESP-NOW</text></svg></div>
-      <div class="app-body"><div class="app-name">Walkie-talkie <span class="app-badge plan">planned</span></div><div class="app-desc">Push-to-talk voice over ESP-NOW — feasible on the bare C3 with an I²S mic + amp. Parts in docs.</div><div class="app-tags">#voice #espnow</div></div>
-    </a>
-    <a class="app-card" href="https://github.com/jphein/smol/issues/5" target="_blank">
-      <div class="app-screen"><svg viewBox="0 0 72 40"><g fill="#7df9ff"><rect x="8" y="20" width="4" height="4"/><rect x="12" y="20" width="4" height="4"/><rect x="16" y="20" width="4" height="4"/><rect x="20" y="20" width="4" height="4"/><rect x="20" y="16" width="4" height="4"/></g><g fill="none" stroke="#7df9ff" stroke-width="1"><rect x="44" y="9" width="3" height="3"/><rect x="47" y="9" width="3" height="3"/><rect x="53" y="27" width="3" height="3"/><rect x="56" y="27" width="3" height="3"/></g><text x="66" y="9" text-anchor="end" font-family="monospace" font-size="5" fill="#7df9ff">Nexus</text><text x="36" y="38" text-anchor="middle" font-family="monospace" font-size="6" fill="#7df9ff">&#8734; shared world</text></svg></div>
-      <div class="app-body"><div class="app-name">World Snake <span class="app-badge on">running</span></div><div class="app-desc">Every board's snake shares one 256×256 world — a scrolling viewport follows your head, no walls, peers drawn by their magical name, a mesh leaderboard by rank, six treasure-powers. All in code + committed, now <b>flashed + running on all 3 boards</b> (waves 3+4); live multiplayer verification next. 18 B frames @5 Hz, N≈16. Issue #5.</div><div class="app-tags">#game #espnow #mesh</div></div>
-    </a>
-    <a class="app-card" href="https://github.com/jphein/smol/issues/3" target="_blank">
-      <div class="app-screen"><svg viewBox="0 0 72 40"><g fill="#7df9ff"><circle cx="9" cy="21" r="3"/><circle cx="35" cy="21" r="3"/></g><line x1="12" y1="21" x2="32" y2="21" stroke="#7df9ff" stroke-width="1" stroke-dasharray="2 2"/><line x1="38" y1="21" x2="55" y2="21" stroke="#7df9ff" stroke-width="1"/><path d="M55 24 q-1 -7 6 -7 q4 0 4 4 q4 0 3 3 z" fill="none" stroke="#7df9ff" stroke-width="1"/><text x="9" y="33" text-anchor="middle" font-family="monospace" font-size="5" fill="#7df9ff">far</text><text x="35" y="33" text-anchor="middle" font-family="monospace" font-size="5" fill="#7df9ff">gw</text><text x="36" y="10" text-anchor="middle" font-family="monospace" font-size="5" fill="#7df9ff">ESP-NOW&#8594;WiFi</text></svg></div>
-      <div class="app-body"><div class="app-name">Relay Bridge <span class="app-badge on">verified</span></div><div class="app-desc">An in-range board relays a far peer's telemetry out: ESP-NOW → WiFi burst → Home Assistant over MQTT. Single-hop; browsing ruled out (250 B MTU). <b>End-to-end proven on hardware and sustained</b> — leaf → gateway → WiFi → HA, still flowing across a firmware upgrade. Fixes landed for a DHCP-budget stall and a drain race; one follow-up: a cold-ARP first-round retry. Issue #3.</div><div class="app-tags">#espnow #wifi #mesh</div></div>
-    </a>
-    <a class="app-card" href="https://github.com/jphein/smol/issues/6" target="_blank">
-      <div class="app-screen"><svg viewBox="0 0 72 40"><text x="36" y="11" text-anchor="middle" font-family="monospace" font-size="7" fill="#7df9ff">OTA v45</text><rect x="9" y="16" width="54" height="6" fill="none" stroke="#7df9ff" stroke-width="1"/><rect x="10" y="17" width="44" height="4" fill="#7df9ff"/><text x="36" y="34" text-anchor="middle" font-family="monospace" font-size="6" fill="#ffb454">Oxidized Die</text></svg></div>
-      <div class="app-body"><div class="app-name">OTA Update <span class="app-badge wip">in progress</span></div><div class="app-desc">Over-the-air firmware over a WiFi burst, dual-slot with rollback on a bad boot. Each build wears a sigil VERSION name — <b>live on real glass</b>: boot shows <code>build 45 "Oxidized Die"</code> (forge realm), provenance visibly working. The bootloader spike confirmed slot-select and the update path is fully designed — but rollback-on-bad-boot isn't hardware-proven yet, so it rolls out <b>one board at a time (canary)</b>, never fleet-wide. Not yet shipped. Issue #6.</div><div class="app-tags">#ota #wifi #sigil</div></div>
-    </a>
-    <a class="app-card" href="https://github.com/jphein/smol/issues/10" target="_blank">
-      <div class="app-screen"><svg viewBox="0 0 72 40"><text x="6" y="9" font-family="monospace" font-size="5" fill="#7df9ff">HA · MQTT</text><rect x="6" y="13" width="28" height="15" rx="2" fill="none" stroke="#7df9ff" stroke-width="1.5"/><rect x="34" y="17" width="3" height="7" fill="#7df9ff"/><rect x="8" y="15" width="17" height="11" fill="#7df9ff"/><text x="44" y="20" font-family="monospace" font-size="9" fill="#7df9ff">88%</text><text x="44" y="31" font-family="monospace" font-size="6" fill="#7df9ff">48V</text></svg></div>
-      <div class="app-body"><div class="app-name">Home Assistant Link <span class="app-badge on">verified</span></div><div class="app-desc">Every board mirrors live Home Assistant data on its OLED — battery voltage, a 6-segment state-of-charge page, and grid power — pushed over MQTT and cached so it survives the radio's sync gaps. MQTT-native, no cloud. Hardware-verified on all three boards. Issues #10/#16/#17.</div><div class="app-tags">#ha #mqtt #display</div></div>
-    </a>
-    <a class="app-card" href="https://github.com/jphein/smol/issues/23" target="_blank">
-      <div class="app-screen"><svg viewBox="0 0 72 40"><text x="36" y="9" text-anchor="middle" font-family="monospace" font-size="6" fill="#ffb454">WiFi sync · no deaf gap</text><g fill="#7df9ff"><circle cx="12" cy="26" r="3"/><circle cx="36" cy="18" r="3"/><circle cx="60" cy="26" r="3"/></g><g stroke="#7df9ff" stroke-width="1" fill="none"><line x1="12" y1="26" x2="36" y2="18"/><line x1="36" y1="18" x2="60" y2="26"/><line x1="12" y1="26" x2="60" y2="26"/></g></svg></div>
-      <div class="app-body"><div class="app-name">No-Burst Mesh <span class="app-badge wip">in progress</span></div><div class="app-desc">Retire the burst: today a board goes briefly mesh-deaf while it syncs over WiFi — this keeps the radio awake so the mesh never drops. A hardware soak proved <b>zero mesh loss</b> across dozens of sync windows; the roaming half + full hardware-verify are in progress. Issue #23.</div><div class="app-tags">#mesh #espnow #wifi</div></div>
-    </a>
-  </div>
-</div></section>
 
-<!-- TREASURE POWERS -->
-<section id="powers"><div class="wrap">
-  <div class="sec-head reveal">
-    <span class="kicker">05 — Treasure Powers</span>
-    <h2>Six spells for the shared world.</h2>
-    <p data-edit="powers.intro">In World Snake, rare treasures grant a single timed power. They spawn <b>deterministically</b> — every board computes the same treasure, in the same cell, from the shared mesh clock, so nobody negotiates — and each reads in a single bit of ink. All six are <b>in code and committed</b> alongside the mesh core (compile-verified, phasing tested 52/52) — and now <b>flashed + running on all three boards</b> (waves 3+4). Names are drawn from the same realm-sigil corpus that names the boards.</p>
+  <!-- FLAGSHIP: World Snake MMO -->
+  <div class="ws reveal">
+    <div class="ws-media">
+      <div class="ws-tag"><span class="pill">◆ MMO · flagship</span><span class="ws-live"><i></i>running on 3 boards</span></div>
+      <div class="ws-stage"><div class="ws-screen">
+        <svg viewBox="0 0 260 150" role="img" aria-label="A viewport into World Snake's shared 256 by 256 world: your cyan snake near center, peer snakes Jade Herald and Draconic Dominion roaming in labelled by their magical names, and a treasure glinting.">
+          <defs><pattern id="wsg" width="10" height="10" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r=".6" fill="#0e3b39"/></pattern></defs>
+          <rect width="260" height="150" fill="#02100f"/><rect width="260" height="150" fill="url(#wsg)"/>
+          <g stroke="#7df9ff" stroke-width="1" opacity=".35" fill="none">
+            <path d="M6 16 V6 H16"/><path d="M244 6 H254 V16"/><path d="M6 134 V144 H16"/><path d="M244 144 H254 V134"/>
+          </g>
+          <text x="254" y="13" text-anchor="end" font-family="monospace" font-size="6.5" fill="#7df9ff" opacity=".7">SHARED WORLD · 256²</text>
+          <text x="8" y="144" font-family="monospace" font-size="6.5" fill="#7df9ff" opacity=".6">◇ x128 y92</text>
+          <g fill="#7df9ff">
+            <rect x="128" y="66" width="8" height="8"/><rect x="120" y="67" width="7" height="7"/><rect x="112" y="67" width="7" height="7"/><rect x="104" y="67" width="7" height="7"/><rect x="104" y="75" width="7" height="7"/><rect x="104" y="83" width="7" height="7"/><rect x="112" y="83" width="7" height="7"/>
+          </g>
+          <rect x="132" y="68" width="2.4" height="2.4" fill="#02100f"/>
+          <text x="139" y="64" font-family="monospace" font-size="7" fill="#7df9ff">you</text>
+          <rect x="150" y="52" width="5" height="5" fill="#7df9ff" opacity=".9"/>
+          <g class="ws-peer" fill="none" stroke="#7df9ff" stroke-width="1.2">
+            <rect x="26" y="34" width="6" height="6"/><rect x="33" y="34" width="6" height="6"/><rect x="40" y="34" width="6" height="6"/><rect x="47" y="34" width="6" height="6"/><rect x="47" y="41" width="6" height="6"/>
+          </g>
+          <text x="26" y="30" font-family="monospace" font-size="7" fill="#7df9ff" class="ws-peer">◈ Jade Herald</text>
+          <g class="ws-peer b" fill="none" stroke="#7df9ff" stroke-width="1.2">
+            <rect x="210" y="112" width="6" height="6"/><rect x="217" y="112" width="6" height="6"/><rect x="224" y="112" width="6" height="6"/><rect x="231" y="112" width="6" height="6"/>
+          </g>
+          <text x="250" y="108" text-anchor="end" font-family="monospace" font-size="7" fill="#7df9ff" class="ws-peer b">Draconic Dominion ◈</text>
+          <polygon class="ws-treasure" points="182,100 189,107 182,114 175,107" fill="#ffb454"/>
+        </svg>
+      </div></div>
+      <p class="ws-cap">one board's viewport into the shared 256×256 world — peers dead-reckoned so a dropped frame never ghosts them</p>
+      <div class="ws-board" aria-label="Mesh leaderboard, ranked by length">
+        <div class="lb-head"><span>◈ mesh leaderboard</span><span class="ws-live"><i></i>live</span></div>
+        <div class="lb-row top"><span class="lb-rank">1</span><span class="lb-name">Jade Herald</span><span class="lb-bar"><i style="width:94%"></i></span><span class="lb-len">214</span></div>
+        <div class="lb-row me"><span class="lb-rank">2</span><span class="lb-name">you · Eldritch Nexus</span><span class="lb-bar"><i style="width:80%"></i></span><span class="lb-len">188</span></div>
+        <div class="lb-row"><span class="lb-rank">3</span><span class="lb-name">Draconic Dominion</span><span class="lb-bar"><i style="width:64%"></i></span><span class="lb-len">151</span></div>
+      </div>
+    </div>
+    <div class="ws-story">
+      <span class="kicker">World Snake · MMO</span>
+      <h3>One world. Every board. Over the mesh.</h3>
+      <p>A single <b>256×256</b> world that every board's snake roams at once. Your viewport scrolls with your head — <b>no walls</b>, the world wraps — and rival boards slide into view drawn by their <b>magical realm names</b>. Score is length, and length is your seat on a <b>mesh leaderboard</b> every node agrees on. It runs on <b>18-byte</b> state frames at <b>5 Hz</b>; peers are dead-reckoned between frames, so lag never turns a snake into a ghost.</p>
+      <p class="ws-status"><b>Flashed &amp; running on all three boards</b> (waves 3+4) · live N-board play is the last check · <a href="https://github.com/jphein/smol/issues/5" target="_blank" style="color:var(--glow)">issue #5 ↗</a></p>
+      <ol class="how">
+        <li><i>1</i>Tap the one button to turn — the only control the shared world asks of you.</li>
+        <li><i>2</i>Eat to grow. On the mesh, <b>length is rank</b>.</li>
+        <li><i>3</i>Peers roam into your viewport <b>by name</b> — real boards, live over ESP-NOW.</li>
+        <li><i>4</i>Grab a treasure for a timed power, then outlast the field.</li>
+      </ol>
+    </div>
+  </div>
+
+  <!-- GAMES · treasure powers -->
+  <div class="g-sub reveal" id="powers">
+    <span class="kicker">Treasure Powers</span>
+    <h3>Six spells for the shared world.</h3>
+    <p data-edit="powers.intro">In World Snake, rare treasures grant a single timed power. They spawn <b>deterministically</b> — every board computes the same treasure, in the same cell, from the shared mesh clock, so nobody negotiates — and each reads in a single bit of ink. All six are <b>flashed + running on all three boards</b> (waves 3+4, phasing tested 52/52). Names are drawn from the same realm-sigil corpus that names the boards.</p>
   </div>
   <div class="powers-grid reveal">
     <div class="pcard">
@@ -484,12 +502,89 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
     </div>
   </div>
   <p class="powers-note reveal">One power at a time · effects expire on the shared clock · a lost frame can't leave you ghosted · <a href="https://github.com/jphein/smol/blob/main/docs/mesh-snake.md" target="_blank" style="color:var(--glow)">player guide ↗</a></p>
+
+  <!-- THE LINEUP -->
+  <div class="g-sub reveal">
+    <span class="kicker">The lineup</span>
+    <h3>More to play.</h3>
+    <p>Everything below lives in the same binary — pick it from the BOOT-button menu. From the one that started it all to five games built for this exact board.</p>
+  </div>
+  <div class="apps-grid reveal">
+    <a class="app-card" href="https://github.com/jphein/smol/tree/main/blockdigger" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><g fill="#7df9ff"><rect x="6" y="27" width="60" height="6"/><rect x="6" y="33" width="60" height="5" opacity=".55"/><rect x="31" y="19" width="7" height="7"/></g><g fill="none" stroke="#7df9ff" stroke-width="1"><rect x="14" y="27" width="6" height="6"/></g><text x="5" y="12" font-family="monospace" font-size="8" fill="#7df9ff">&#9670; 3</text></svg></div>
+      <div class="app-body"><div class="app-name">Block Digger <span class="app-badge on">flashed</span></div><div class="app-desc">Minecraft-ish dig/build on a grid. Bluetooth Stadia pad. The one that started it all.</div><div class="app-tags">#game #ble</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/tree/main/games/snake" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><g fill="#7df9ff"><rect x="18" y="18" width="4" height="4"/><rect x="22" y="18" width="4" height="4"/><rect x="26" y="18" width="4" height="4"/><rect x="30" y="18" width="4" height="4"/><rect x="34" y="18" width="4" height="4"/><rect x="34" y="22" width="4" height="4"/><rect x="34" y="26" width="4" height="4"/></g><rect x="52" y="26" width="4" height="4" fill="#7df9ff"/><text x="4" y="9" font-family="monospace" font-size="7" fill="#7df9ff">7</text></svg></div>
+      <div class="app-body"><div class="app-name">Snake <span class="app-badge on">flashed</span></div><div class="app-desc">Classic Snake on the 72×40 grid. One-button steering. Ported to the Rust menu.</div><div class="app-tags">#game</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/tree/main/games/snake-2p" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><g fill="#7df9ff"><rect x="12" y="13" width="4" height="4"/><rect x="16" y="13" width="4" height="4"/><rect x="20" y="13" width="4" height="4"/><rect x="24" y="13" width="4" height="4"/></g><g fill="none" stroke="#7df9ff" stroke-width="1"><rect x="42" y="25" width="4" height="4"/><rect x="46" y="25" width="4" height="4"/><rect x="50" y="25" width="4" height="4"/><rect x="54" y="25" width="4" height="4"/></g><text x="36" y="37" text-anchor="middle" font-family="monospace" font-size="6" fill="#7df9ff">P1  vs  P2</text></svg></div>
+      <div class="app-body"><div class="app-name">Mesh Snake <span class="app-badge on">flashed</span></div><div class="app-desc">Two smols, head-to-head over ESP-NOW. Verified 2-board play. Yours filled, foe outlined.</div><div class="app-tags">#game #espnow</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/tree/main/experiments/atomic14-games" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><g fill="#7df9ff"><rect x="8" y="7" width="10" height="4"/><rect x="20" y="7" width="10" height="4"/><rect x="32" y="7" width="10" height="4"/><rect x="44" y="7" width="10" height="4"/><rect x="56" y="7" width="9" height="4"/><rect x="40" y="24" width="3" height="3"/><rect x="28" y="34" width="16" height="3"/></g></svg></div>
+      <div class="app-body"><div class="app-name">atomic14 pack <span class="app-badge on">flashed</span></div><div class="app-desc">5 single-button games (Breakout, racer, Defender, jumper, Heli Cave) + menu. Built for this exact board.</div><div class="app-tags">#games</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/blob/main/docs/nes-on-c3.md" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><text x="36" y="19" text-anchor="middle" font-family="monospace" font-weight="bold" font-size="12" fill="#7df9ff">NES</text><text x="36" y="31" text-anchor="middle" font-family="monospace" font-size="6" fill="#ffb454">needs color TFT</text></svg></div>
+      <div class="app-body"><div class="app-name">NES <span class="app-badge plan">planned</span></div><div class="app-desc">Emulation is possible — but needs an added ST7735 color TFT + an ESP-IDF port. Build plan in docs.</div><div class="app-tags">#emu #future</div></div>
+    </a>
+  </div>
+  <div class="ctrls reveal">
+    <span class="ctrls-lbl">Block Digger · Bluetooth Stadia pad (Bluepad32)</span>
+    <div class="ctrls-maps">
+      <span><b class="keycap">◀ ▶</b> walk</span>
+      <span><b class="keycap">▲</b> jump</span>
+      <span><b class="keycap">A</b> dig</span>
+      <span><b class="keycap">B</b> place</span>
+    </div>
+  </div>
+</div></section>
+
+<!-- APPS / MODES GALLERY -->
+<section id="builds"><div class="wrap">
+  <div class="sec-head reveal">
+    <span class="kicker">03 — Apps</span>
+    <h2>Everything else it runs.</h2>
+    <p data-edit="apps.intro">The games live in their own section now — this is everything else smol runs, all folded into the same one-binary BOOT-button menu. The ESP-NOW mesh carries the time (boards agree on the clock — newest NTP sync wins) and gives every board a magical realm name; a live benchmark watches the link; and an MQTT-native Home Assistant bridge mirrors battery, state-of-charge and grid readings on the glass. Each card links to its source.</p>
+  </div>
+  <div class="apps-grid reveal">
+    <a class="app-card" href="https://github.com/jphein/smol/tree/main/rust/clock" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><text x="36" y="23" text-anchor="middle" font-family="monospace" font-weight="bold" font-size="16" fill="#7df9ff">12:34</text><text x="36" y="34" text-anchor="middle" font-family="monospace" font-size="6" fill="#7df9ff">PDT 21C 3.9V</text></svg></div>
+      <div class="app-body"><div class="app-name">Clock <span class="app-badge on">flashed</span></div><div class="app-desc">NTP + Pacific time, big digits, chip-temp & battery readout. Now mesh-time-synced (boards agree over ESP-NOW, newest sync wins) and shows the board's magical name. Bare-metal Rust.</div><div class="app-tags">#rust #wifi #mesh #sensors</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/tree/main/rust/clock" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><g font-family="monospace" font-size="8" fill="#7df9ff"><text x="6" y="13">FPS 58</text><text x="6" y="25">RTT 7ms</text><text x="6" y="37">-54dBm</text></g></svg></div>
+      <div class="app-body"><div class="app-name">Benchmark <span class="app-badge on">flashed</span></div><div class="app-desc">Live ESP-NOW link test: FPS, TX/RX rate, round-trip latency, loss %, RSSI. A mode in the Rust firmware. Its <b>mesh-view</b> — a per-node table of magical names, RSSI, sync state and roles — landed on the build-45 fleet (issue #8).</div><div class="app-tags">#espnow #diag</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/blob/main/docs/walkie-talkie.md" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><polyline points="4,20 12,20 16,10 20,30 24,14 28,26 32,20 68,20" fill="none" stroke="#7df9ff" stroke-width="1.5"/><text x="36" y="35" text-anchor="middle" font-family="monospace" font-size="6" fill="#7df9ff">PTT · ESP-NOW</text></svg></div>
+      <div class="app-body"><div class="app-name">Walkie-talkie <span class="app-badge plan">planned</span></div><div class="app-desc">Push-to-talk voice over ESP-NOW — feasible on the bare C3 with an I²S mic + amp. Parts in docs.</div><div class="app-tags">#voice #espnow</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/issues/3" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><g fill="#7df9ff"><circle cx="9" cy="21" r="3"/><circle cx="35" cy="21" r="3"/></g><line x1="12" y1="21" x2="32" y2="21" stroke="#7df9ff" stroke-width="1" stroke-dasharray="2 2"/><line x1="38" y1="21" x2="55" y2="21" stroke="#7df9ff" stroke-width="1"/><path d="M55 24 q-1 -7 6 -7 q4 0 4 4 q4 0 3 3 z" fill="none" stroke="#7df9ff" stroke-width="1"/><text x="9" y="33" text-anchor="middle" font-family="monospace" font-size="5" fill="#7df9ff">far</text><text x="35" y="33" text-anchor="middle" font-family="monospace" font-size="5" fill="#7df9ff">gw</text><text x="36" y="10" text-anchor="middle" font-family="monospace" font-size="5" fill="#7df9ff">ESP-NOW&#8594;WiFi</text></svg></div>
+      <div class="app-body"><div class="app-name">Relay Bridge <span class="app-badge on">verified</span></div><div class="app-desc">An in-range board relays a far peer's telemetry out: ESP-NOW → WiFi burst → Home Assistant over MQTT. Single-hop; browsing ruled out (250 B MTU). <b>End-to-end proven on hardware and sustained</b> — leaf → gateway → WiFi → HA, still flowing across a firmware upgrade. Fixes landed for a DHCP-budget stall and a drain race; one follow-up: a cold-ARP first-round retry. Issue #3.</div><div class="app-tags">#espnow #wifi #mesh</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/issues/6" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><text x="36" y="11" text-anchor="middle" font-family="monospace" font-size="7" fill="#7df9ff">OTA v45</text><rect x="9" y="16" width="54" height="6" fill="none" stroke="#7df9ff" stroke-width="1"/><rect x="10" y="17" width="44" height="4" fill="#7df9ff"/><text x="36" y="34" text-anchor="middle" font-family="monospace" font-size="6" fill="#ffb454">Oxidized Die</text></svg></div>
+      <div class="app-body"><div class="app-name">OTA Update <span class="app-badge wip">in progress</span></div><div class="app-desc">Over-the-air firmware over a WiFi burst, dual-slot with rollback on a bad boot. Each build wears a sigil VERSION name — <b>live on real glass</b>: boot shows <code>build 45 "Oxidized Die"</code> (forge realm), provenance visibly working. The bootloader spike confirmed slot-select and the update path is fully designed — but rollback-on-bad-boot isn't hardware-proven yet, so it rolls out <b>one board at a time (canary)</b>, never fleet-wide. Not yet shipped. Issue #6.</div><div class="app-tags">#ota #wifi #sigil</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/issues/10" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><text x="6" y="9" font-family="monospace" font-size="5" fill="#7df9ff">HA · MQTT</text><rect x="6" y="13" width="28" height="15" rx="2" fill="none" stroke="#7df9ff" stroke-width="1.5"/><rect x="34" y="17" width="3" height="7" fill="#7df9ff"/><rect x="8" y="15" width="17" height="11" fill="#7df9ff"/><text x="44" y="20" font-family="monospace" font-size="9" fill="#7df9ff">88%</text><text x="44" y="31" font-family="monospace" font-size="6" fill="#7df9ff">48V</text></svg></div>
+      <div class="app-body"><div class="app-name">Home Assistant Link <span class="app-badge on">verified</span></div><div class="app-desc">Every board mirrors live Home Assistant data on its OLED — battery voltage, a 6-segment state-of-charge page, and grid power — pushed over MQTT and cached so it survives the radio's sync gaps. MQTT-native, no cloud. Hardware-verified on all three boards. Issues #10/#16/#17.</div><div class="app-tags">#ha #mqtt #display</div></div>
+    </a>
+    <a class="app-card" href="https://github.com/jphein/smol/issues/23" target="_blank">
+      <div class="app-screen"><svg viewBox="0 0 72 40"><text x="36" y="9" text-anchor="middle" font-family="monospace" font-size="6" fill="#ffb454">WiFi sync · no deaf gap</text><g fill="#7df9ff"><circle cx="12" cy="26" r="3"/><circle cx="36" cy="18" r="3"/><circle cx="60" cy="26" r="3"/></g><g stroke="#7df9ff" stroke-width="1" fill="none"><line x1="12" y1="26" x2="36" y2="18"/><line x1="36" y1="18" x2="60" y2="26"/><line x1="12" y1="26" x2="60" y2="26"/></g></svg></div>
+      <div class="app-body"><div class="app-name">No-Burst Mesh <span class="app-badge on">verified</span></div><div class="app-desc">Retire the burst + self-heal the mesh: the radio stays awake through a WiFi sync so the mesh never drops, and the single-active-gateway election auto-recovers a dead owner. <b>Verified on hardware</b> (all 3 boards): zero mesh loss across dozens of sync windows, same-channel reassociation, and fully-dark dead-owner takeover + split-brain co-boot. Caveats: cross-channel roam not yet forced (#35); broker-dead-HELLOing residual (#31). Closes #23 + #14.</div><div class="app-tags">#mesh #espnow #wifi</div></div>
+    </a>
+  </div>
 </div></section>
 
 <!-- MISSION CONTROL -->
 <section id="mission"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">06 — Mission Control</span>
+    <span class="kicker">04 — Mission Control</span>
     <h2>Live build status.</h2>
     <p data-edit="mission.intro">This board updates itself. Tasks and the agents working them are tracked in real time as smol comes together — flashing firmware, wrangling git, freeing disk, and more.</p>
   </div>
@@ -510,12 +605,12 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- ROADMAP -->
 <section id="roadmap" class="road"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">07 — Roadmap</span>
+    <span class="kicker">05 — Roadmap</span>
     <h2>Where smol goes next.</h2>
     <p class="body" data-edit="roadmap.intro">Ideas we're kicking around. Edit this list as the project grows — it's your design doc.</p>
   </div>
   <ul class="reveal" data-edit="roadmap.list">
-    <li><b>NO-BURST ROAMING MESH</b>Keep the mesh alive during WiFi sync — coexistence hardware-proven; roaming + full verify in progress (#23).</li>
+    <li><b>NO-BURST MESH + SELF-HEAL</b>Radio stays awake through a WiFi sync (no mesh-deaf window) + single-active-gateway auto-recovers a dead owner — verified on 3 boards; cross-channel roam still to force (#35). Closes #23 + #14.</li>
     <li><b>OTA UPDATES</b>Dual-slot over-the-air firmware with rollback — toolchain proven, canary-first, not yet shipped (#6).</li>
     <li><b>NODE MANAGER</b>Set each board's screen from Home Assistant — HA panel deployed, firmware consume next (#21).</li>
     <li><b>BLE PRESENCE</b>Advertise a beacon for room-level presence in Home Assistant (#22).</li>
@@ -526,7 +621,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- RESEARCH -->
 <section id="research"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">08 — Research</span>
+    <span class="kicker">06 — Research</span>
     <h2>What the agents found.</h2>
     <p data-edit="research.intro">Six agents scouted the ESP32-C3 landscape while smol came together. The full reports live in the repo — here's the map.</p>
   </div>
@@ -547,7 +642,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- BUILT FOR THIS BOARD -->
 <section id="board" class="road"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">09 — Built for this board</span>
+    <span class="kicker">07 — Built for this board</span>
     <h2>You're not alone.</h2>
     <p class="body" data-edit="board.intro">Projects that run on this exact ESP32-C3 + 0.42″ OLED (72×40). A couple need their art re-drawn for the tiny screen — noted inline.</p>
   </div>
@@ -575,7 +670,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- INFLUENCES / PRIOR ART -->
 <section id="influences" class="road"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">10 — Influences</span>
+    <span class="kicker">08 — Influences</span>
     <h2>Standing on shoulders.</h2>
     <p class="body" data-edit="influences.intro">smol didn't appear from nowhere. Its ESP-NOW → MQTT → Home Assistant plumbing is <b>commodity</b> — a well-trodden pattern many have built. What's actually novel is the <b>whole</b>: a no_std Rust game-console mesh on $3 boards, a deliberate single-radio burst time-share, and a retained-payload → mesh-rebroadcast downlink to display-only leaves. Below are the projects that shaped it, grouped by the thread each runs in — credited honestly, with what smol borrows and where it diverges. A few handed over portable ideas; most gave lineage, identity and nerve rather than code.</p>
   </div>
@@ -619,7 +714,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- POCKET WATCH -->
 <section id="pocketwatch"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">11 — Pocket Watch</span>
+    <span class="kicker">09 — Pocket Watch</span>
     <h2>We designed smol a pocket watch.</h2>
     <p data-edit="pw.intro">No printable pocket-watch case existed for this board, so an agent generated one from scratch — a parametric round shell in the classic orientation: the chain bail and a removable crown-style USB-C cover stack at the top, with the OLED window, BOOT/RESET plunger bores and two clear-PLA LED light-pipes below. Inside: pockets for the board + a 502030 LiPo, a TP4056 charge slot, and a press-fit back lid. Three printable parts — body, lid, crown — and the OLED is rotated 180° in firmware so it reads upright when hung. These are live renders of the actual STL.</p>
   </div>
@@ -647,7 +742,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- PRINT A CASE -->
 <section id="case" class="road"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">12 — Print a case</span>
+    <span class="kicker">10 — Print a case</span>
     <h2>Give smol a shell.</h2>
     <p class="body" data-edit="case.intro">Exact-fit 3D-printable cases for the 0.42″ OLED SuperMini. No dedicated handheld shell exists yet — so for a pocket player, start from an editable one and add a button perch at GPIO9. Board is ~24.8×20.45 mm, USB-C on the short edge opposite the OLED. Full ranked list in <a href="https://github.com/jphein/smol/blob/main/docs/cases.md" target="_blank" style="color:var(--glow)">docs/cases.md</a>.</p>
   </div>
