@@ -33,3 +33,8 @@ wifi_secrets.*
 # version stamp). The tracked template is board.rs.example (cp it on a fresh clone).
 board.rs
 **/board.rs
+
+# OTA publish infra config (issue #6) — real host/broker/addon values for
+# tools/ota_publish.sh. Git-ignored (repo is public); the tracked template is
+# tools/ota_publish.env.example (cp it → tools/ota_publish.env, edit). No password here.
+tools/ota_publish.env

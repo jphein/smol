@@ -10,11 +10,13 @@
 # the GUI can do per-id canary targeting WITHOUT rebuilding/re-hashing.
 #
 # MODES
-#   ota_publish.sh stage        [<commit>] [--bin <file>]           # build+host+publish smol/ota/staged (no board acts)
-#   ota_publish.sh push <id>     [<commit>] [--bin <file>]           # stage, then publish smol/ota/announce/<id> (CANARY — frictionless)
-#   ota_publish.sh push all      [<commit>] [--bin <file>] [--force] # FLEET — SEATBELTED (see below)
-#   ota_publish.sh clear <id|all>                                    # retain-delete the announce (R-P1 lifecycle)
+#   ota_publish.sh stage    [<commit>] [--bin <file>] [--build N]           # build+host+publish smol/ota/staged (no board acts)
+#   ota_publish.sh push <id> [<commit>] [--bin <file>] [--build N]           # stage, then publish smol/ota/announce/<id> (CANARY — frictionless)
+#   ota_publish.sh push all  [<commit>] [--bin <file>] [--build N] [--force] # FLEET — SEATBELTED (see below)
+#   ota_publish.sh clear <id|all>                                            # retain-delete the announce (R-P1 lifecycle)
 # <commit> defaults to HEAD. --bin <file> skips the cargo build and hosts an existing .bin.
+# --build N overrides the git-derived BUILD number in the announce — canary an uncommitted
+#   image without a throwaway commit to bump the count (default: `git rev-list --count`).
 # --force applies ONLY to `push all`: it skips the interactive typed confirmation (for
 # scripted/non-interactive use). The per-id canary `push <id>` is NEVER gated. Without
 # --force, `push all` requires typing the exact staged build number to confirm, and
@@ -33,9 +35,13 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLOCK="$REPO/rust/clock"
 ESPFLASH="${ESPFLASH:-$HOME/.cargo/bin/espflash}"
 # ⚙️ INFRA CONFIG — the defaults below are non-real PLACEHOLDERS (this repo is public).
-# Set them to YOUR infra here, or override any via env — all are ${VAR:-default}, so an
-# env value always wins:  OTA_HOST_IP=10.0.0.5 BROKER=10.0.0.6 OTA_HOST_SSH=myhost \
-#   ADDON=myaddon MQTT_USER=me  tools/ota_publish.sh push 7
+# Put YOUR real infra in a git-ignored `tools/ota_publish.env` (copy the tracked
+# `tools/ota_publish.env.example` → `tools/ota_publish.env`, edit) — it's sourced here if
+# present (dotenv-style) and its values fill in the placeholders below, so operators don't
+# retype env overrides. Precedence: env file > a var the file leaves unset (pre-set env) >
+# placeholder default. Nothing real ever lives in this committed script.
+_OTA_ENV="$(dirname "${BASH_SOURCE[0]}")/ota_publish.env"
+[ -f "$_OTA_ENV" ] && . "$_OTA_ENV"
 OTA_HOST_SSH="${OTA_HOST_SSH:-<ssh-host>}"      # scp target (ssh alias for the image host)
 OTA_HOST_IP="${OTA_HOST_IP:-10.0.0.0}"          # image host on the boards' VLAN (same subnet as boards)
 OTA_PORT="${OTA_PORT:-8087}"                    # smol-ota static HTTP server port
@@ -80,9 +86,10 @@ fi
 
 [ "$MODE" = "stage" ] || [ "$MODE" = "push" ] || usage 1
 if [ "$MODE" = "push" ]; then TARGET="${2:?usage: ota_publish.sh push <id|all> [<commit>]}"; shift 2; else shift 1; fi
-COMMIT="HEAD"; BIN=""; FORCE=0
+COMMIT="HEAD"; BIN=""; FORCE=0; BUILD_OVERRIDE=""
 while [ $# -gt 0 ]; do case "$1" in
   --bin) BIN="${2:?}"; shift 2;;
+  --build) BUILD_OVERRIDE="${2:?}"; shift 2;;
   --force) FORCE=1; shift;;
   *) COMMIT="$1"; shift;;
 esac; done
@@ -91,6 +98,13 @@ esac; done
 cd "$REPO"
 HASH="$(git rev-parse --short=7 "$COMMIT")"
 BUILD="$(git rev-list --count "$COMMIT")"
+# --build N overrides the git-derived count — lets an operator canary an UNCOMMITTED image
+# without a throwaway commit to bump the number (collision-risky on a busy repo). It becomes
+# the announce BUILD the firmware compares (monotonicity), so it must be a positive integer.
+if [ -n "$BUILD_OVERRIDE" ]; then
+  case "$BUILD_OVERRIDE" in ''|*[!0-9]*) die "--build must be a positive integer (got '$BUILD_OVERRIDE')";; esac
+  BUILD="$BUILD_OVERRIDE"
+fi
 
 # ---- build (or take a prebuilt .bin) ----------------------------------------
 if [ -z "$BIN" ]; then
