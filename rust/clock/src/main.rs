@@ -685,6 +685,12 @@ fn main() -> ! {
                         sensors::format_sensor_line(&reading).as_str(),
                         bottom_line.as_str()
                     );
+                    // #50: the LIVE screen:page the render loop draws NOW — read from the
+                    // running `app` (captures manual BOOT-button nav; NOT the commanded
+                    // config, the stopgap JP rejected). Published retained as
+                    // `smol/<id>/status` for the HA live-screen readback.
+                    let (live_kind, live_page) = app.live_screen();
+                    let stat = alloc::format!("STAT|{}:{}", live_kind.as_wire(), live_page);
                     // #20 (1b RESPONSIVE): the tick keeps the UI alive during the
                     // burst — LED blink + throttled "Syncing…" spinner + a LATCHING
                     // long-press ABORT. Abort returns the burst's fail value (queue
@@ -696,7 +702,7 @@ fn main() -> ! {
                     let (_, soak_rx0, soak_lost0, _) = r.soak_counts();
                     let mut flush_abort = false;
                     let mut flush_draw_ms = 0u64;
-                    r.flush_telemetry(own.as_bytes(), &mut batt_cache, &mut grid_cache, &mut || {
+                    r.flush_telemetry(own.as_bytes(), stat.as_bytes(), &mut batt_cache, &mut grid_cache, &mut || {
                         let t = millis();
                         led.apply(led::LedState::WifiSync, t);
                         if matches!(button.poll(t), Some(input::Press::Long)) {

@@ -176,6 +176,12 @@ impl GridState {
     pub fn set_page(&mut self, page: u8) {
         self.page = page;
     }
+
+    /// #50: the live page index (raw; the renderer clamps `% PAGE_COUNT`). Read for
+    /// the `smol/<id>/status` readback of the ACTUAL screen state.
+    pub fn page(&self) -> u8 {
+        self.page
+    }
 }
 
 impl Plugin for GridState {

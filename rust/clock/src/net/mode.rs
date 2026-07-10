@@ -1416,6 +1416,7 @@ impl RadioManager {
                     &mut config_offer,
                     &mut install_requested,
                     &[], // #27: election-only recovery burst publishes no peers (leaf/v1)
+            &[], // #50: recovery burst publishes no live-screen status
                     None, // #21: a leaf's recovery burst is not a gateway relay
                     tick,
                 )
@@ -2020,6 +2021,9 @@ impl RadioManager {
     pub fn flush_telemetry(
         &mut self,
         own_telemetry: &[u8],
+        // #50: the gateway's live `STAT|<screen>:<page>` (main passes it from
+        // `App::live_screen`) → forwarded to run_mqtt_burst → retained `smol/<id>/status`.
+        status: &[u8],
         batt: &mut crate::batt::BattCache,
         grid: &mut crate::grid::GridCache,
         tick: &mut dyn FnMut() -> bool,
@@ -2090,6 +2094,7 @@ impl RadioManager {
                     &mut config_offer,
                     &mut install_requested,
                     peers, // #27: gateway publishes its roster as retained smol/<id>/peers
+                    status, // #50: gateway publishes its live screen as smol/<id>/status
                     Some(&mut self.cfg_cache), // #21: gateway caches leaf configs to relay
                     tick,
                 )
