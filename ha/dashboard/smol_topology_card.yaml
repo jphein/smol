@@ -4,7 +4,7 @@
 # ha/packages/smol_mesh.yaml by ha-wave2. This card + those entities go live ONLY
 # once the firmware publishes the #27 topics (morpheus-fw Task 3, optional/do-last):
 #   smol/mesh/channel = MC|owner|channel|seq
-#   smol/<id>/peers   = PEERS|role|ch|id,rssi,age,flags|…
+#   smol/<id>/peers   = PEERS|role|ch|<peer>;<peer>;…   (peers ';'-separated; each = id,rssi,age,ch,flags — spec §6)
 # Until then every entity reads unknown/unavailable → an all-"unknown" panel, so
 # HOLD this card from the ship deploy (see ha/README.md + the deploy runbook §8).
 #
