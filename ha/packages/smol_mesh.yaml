@@ -253,7 +253,9 @@ mqtt:
       state_topic: "smol/9/config/default_screen"
       icon: "mdi:cog"
     # --- OTA panel (issue #6) ---
-    # The STAGED target — set by tools/ota_publish.sh (OTA|build|size|sha256|url).
+    # The STAGED target — set by tools/ota_publish.sh. Unsigned: OTA|build|size|sha256|url;
+    # signed (#32): OTA|build|size|sha256|sig|url. The url is ALWAYS the LAST field (its index
+    # shifts with the sig), so extract it with `last`; `sig` exists only in the 6-field signed form.
     # State = the build number; the full fields are attributes (read-only operator
     # visibility; the board fetches the staged image on native Update Install).
     - name: "smol ota staged"
@@ -263,7 +265,7 @@ mqtt:
       json_attributes_topic: "smol/ota/staged"
       json_attributes_template: >-
         {% set p = value.split('|') %}
-        {{ ({'build': p[1], 'size': p[2], 'sha256': p[3], 'url': p[4]} if (p | length >= 5 and p[0] == 'OTA') else {}) | tojson }}
+        {{ ({'build': p[1], 'size': p[2], 'sha256': p[3], 'url': (p | last), 'sig': (p[4] if p | length >= 6 else '')} if (p | length >= 5 and p[0] == 'OTA') else {}) | tojson }}
       icon: "mdi:package-up"
     # Per-node LIVE status — NEEDS firmware smol/<id>/status = STAT|<screen>:<page>|<build>
     # (design F4; unknown until the firmware wave ships it). Feeds the OTA no-downgrade

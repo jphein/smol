@@ -30,6 +30,10 @@ cards:
         entity: sensor.smol_ota_staged
         attribute: size
         name: Size (bytes)
+      - type: attribute
+        entity: sensor.smol_ota_staged
+        attribute: sig
+        name: Signature (ed25519, #32 — blank until signed)
   - type: entities
     title: Per-node firmware (native Update — canary Install)
     show_header_toggle: false
