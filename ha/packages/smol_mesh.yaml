@@ -147,6 +147,17 @@ input_boolean:
 # F5/F6/F7 + firmware smol/<id>/status F4); v1 reflects COMMANDED config only.
 # =====================================================================
 input_select:
+  # --- #43 display units (GLOBAL: one setting, whole fleet) → retained smol/config/units ---
+  smol_temp_unit:
+    name: "smol · temperature unit"
+    options: ["°F", "°C"]
+    initial: "°F"          # default °F = current firmware behavior
+    icon: mdi:thermometer
+  smol_clock_format:
+    name: "smol · clock format"
+    options: ["24h", "12h"]
+    initial: "24h"         # default 24h = current firmware behavior
+    icon: mdi:clock-outline
   # --- set-all (writes every per-node topic) ---
   smol_all_screen:
     name: "smol all · default screen"
@@ -252,6 +263,21 @@ mqtt:
       unique_id: smol_9_config_mirror
       state_topic: "smol/9/config/default_screen"
       icon: "mdi:cog"
+    # --- #43 display units (GLOBAL) — mirror of the retained smol/config/units ---
+    - name: "smol units"
+      unique_id: smol_units_mirror
+      state_topic: "smol/config/units"
+      value_template: >-
+        {% set p = value.split('|') %}
+        {% set t = p[0] if (p | length >= 1 and p[0] in ['F', 'C']) else 'F' %}
+        {% set c = p[1] if (p | length >= 2 and p[1] in ['12', '24']) else '24' %}
+        {{ ('°F' if t == 'F' else '°C') ~ ' · ' ~ c ~ 'h' }}
+      json_attributes_topic: "smol/config/units"
+      json_attributes_template: >-
+        {% set p = value.split('|') %}
+        {{ {'temp': (p[0] if (p | length >= 1 and p[0] in ['F', 'C']) else 'F'),
+            'clock': (p[1] if (p | length >= 2 and p[1] in ['12', '24']) else '24')} | tojson }}
+      icon: "mdi:tune-variant"
     # --- OTA panel (issue #6) ---
     # The STAGED target — set by tools/ota_publish.sh. Unsigned: OTA|build|size|sha256|url;
     # signed (#32): OTA|build|size|sha256|sig|url. The url is ALWAYS the LAST field (its index
@@ -562,6 +588,34 @@ automation:
             {%- endif -%}
             {%- endmacro -%}
             GRID|{{ pcell('', 'sensor.yurt_consumption', 1000) | trim }}|{{ pcell('L1', 'sensor.l1_power_clamp', 1) | trim }}|{{ pcell('L2', 'sensor.l2_power_clamp', 1) | trim }}
+
+  # =====================================================================
+  # #43 DISPLAY UNITS automation — publish the GLOBAL retained units config.
+  # Trigger = either units input_select changing; payload = <F|C>|<12|24> from the
+  # closed-set selects (always a valid token). GLOBAL: one topic, whole fleet (the
+  # gateway relays it to leaves over the mesh — FW/lucid). Default (never published) = F|24.
+  # =====================================================================
+  - id: smol_units_publish
+    alias: "smol #43: publish global display units"
+    description: >-
+      On either units select changing, publish retained smol/config/units =
+      <F|C>|<12|24> (broker retention = persistence; the gateway reads it on its burst).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id:
+          - input_select.smol_temp_unit
+          - input_select.smol_clock_format
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/config/units"
+          retain: true
+          qos: 0
+          payload: "{{ 'F' if is_state('input_select.smol_temp_unit', '°F') else 'C' }}|{{ '24' if is_state('input_select.smol_clock_format', '24h') else '12' }}"
 
   # =====================================================================
   # NODE MANAGER automations (issue #21) — publish the retained per-node config.
