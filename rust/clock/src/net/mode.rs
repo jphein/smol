@@ -1278,6 +1278,16 @@ pub struct RadioManager {
     /// #33 HA Update entity: a retained `install` command was seen on a burst, pending
     /// `main`'s `take_install_request` → AND-gate the fetch. One-shot (cleared on take).
     install_requested: bool,
+    /// #51 A1 — SILENT-UNTIL-RELOCK: set true when this board ABDICATES (R-DEMOTE: its
+    /// uplink died) so `broadcast_hello` goes quiet. Leaves lock strictly on the OWNER's
+    /// HELLO (`peer_id == elected_owner`), so a demoted ex-owner that kept HELLOing would
+    /// pin them forever and block re-election (issue #51/#31). Cleared when we re-lock a
+    /// new owner's HELLO or win a fresh election — then normal 2 Hz HELLO resumes.
+    silent_until_relock: bool,
+    /// #51 B — last RSSI-to-AP (dBm, signed) captured after a successful association.
+    /// Seeded into the recovery `MeshElect` so the strongest-uplink survivor wins the
+    /// re-election. Weak default until the first burst measures it.
+    my_rssi_to_ap: i8,
 }
 
 /// Monotonic milliseconds since boot — the single time base for both the
@@ -1340,6 +1350,8 @@ impl RadioManager {
             ota_offer: None,
             config_offer: None,
             install_requested: false,
+            silent_until_relock: false,
+            my_rssi_to_ap: -99,
         })
     }
 
@@ -1417,6 +1429,11 @@ impl RadioManager {
         elect.seen_owner = self.mc_seen_owner;
         elect.seen_seq = self.mc_seen_seq;
         elect.seen_ms = self.mc_seen_ms;
+        // #51: this is a LEAF RECOVERY election → select the WiFi-strength rule (sticky live
+        // owner + RSSI-weighted dead-owner takeover). Seed our last-measured RSSI-to-AP so
+        // the strongest-uplink survivor wins; node-id only breaks exact-signal ties.
+        elect.recovery = true;
+        elect.my_rssi = self.my_rssi_to_ap;
         // #6 OTA / #21 config / #33 install: a leaf's recovery burst can also surface these.
         let mut ota_offer: Option<crate::ota::Announce> = None;
         let mut config_offer: Option<crate::app::DefaultScreen> = None;
@@ -1461,6 +1478,11 @@ impl RadioManager {
             log::info!("smol: leaf re-election — broker unreachable, still scanning");
             return true;
         }
+        // #51 B: we're still associated here (pre-EspNow-switch) → capture a fresh
+        // RSSI-to-AP for the NEXT recovery election's strength comparison.
+        if let Ok(r) = self.controller.rssi() {
+            self.my_rssi_to_ap = r.clamp(-127, 0) as i8;
+        }
         // Persist the refreshed staleness observation (so takeover accrues across bursts).
         self.mc_seen_owner = elect.seen_owner;
         self.mc_seen_seq = elect.seen_seq;
@@ -1470,16 +1492,28 @@ impl RadioManager {
         if elect.i_am_owner {
             // Took over a dead/stale owner (or empty topic): become the coexist GATEWAY.
             self.relay.is_gateway = true;
+            // #51 A1: we own the mesh now → resume HELLO (leaves lock on the owner's HELLO).
+            self.silent_until_relock = false;
+            // #51 A2: freshly-elected grace — clear the fail counter so a single transient
+            // flush miss can't immediately re-demote us (the mandatory anti-flap window).
+            self.relay.flush_fails = 0;
             log::info!("smol: leaf re-election WON — now GATEWAY (owner id{})", id);
             // switch() already left us in WifiSta — stay associated (coexist gateway).
         } else {
             // A LIVE owner holds the mesh (possibly a new lower id): stay leaf, re-scan.
             self.relay.is_gateway = false;
-            self.last_owner_heard_ms = now; // grace: give the scan time to re-lock it
+            // #51 speed-up: grace-reset the owner-silence clock ONLY for a GENUINELY LIVE
+            // owner (give the scan time to re-lock it). A dead-but-inside-our-backoff owner
+            // (owner_alive == false) gets NO reset, so the next recovery burst fires on
+            // cadence and the deferred takeover isn't pushed out an extra window.
+            if elect.owner_alive {
+                self.last_owner_heard_ms = now;
+            }
             let _ = self.switch(Mode::EspNow);
             log::info!(
-                "smol: leaf re-election → live owner id{} (re-scanning)",
-                self.elected_owner
+                "smol: leaf re-election → owner id{} ({})",
+                self.elected_owner,
+                if elect.owner_alive { "live — re-scanning" } else { "dead — deferring takeover" }
             );
         }
         true
@@ -1584,6 +1618,13 @@ impl RadioManager {
     /// Safe in either radio mode; in `WifiSta` it rides the AP channel, in
     /// `EspNow` the fixed one. Called by `main` a few times per second.
     pub fn broadcast_hello(&mut self) {
+        // #51 A1: an abdicated board (uplink died → R-DEMOTE) stays HELLO-silent until it
+        // re-locks a new owner. Leaves pin on the OWNER's HELLO, so a demoted ex-owner that
+        // kept HELLOing would block them from ever re-electing (the #51/#31 wedge). TIME and
+        // other frames are unaffected — only HELLO drives the owner-silence clock.
+        if self.silent_until_relock {
+            return;
+        }
         let mut msg = [0u8; 16];
         let len = encode_id_frame(HELLO_PREFIX, self.id, &mut msg);
         self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
@@ -2163,6 +2204,11 @@ impl RadioManager {
         // — the runtime convergence the boot-only election never had. A NON-connected
         // flush (transient broker outage) is NOT trusted → keep the current role.
         if ok {
+            // #51 B: still associated after a good flush → refresh RSSI-to-AP so a later
+            // demote-then-recover election compares this board's real signal strength.
+            if let Ok(r) = self.controller.rssi() {
+                self.my_rssi_to_ap = r.clamp(-127, 0) as i8;
+            }
             self.mc_seen_owner = elect.seen_owner;
             self.mc_seen_seq = elect.seen_seq;
             self.mc_seen_ms = elect.seen_ms;
@@ -2213,9 +2259,13 @@ impl RadioManager {
                 self.relay.is_gateway = false;
                 self.scan_locked = false;
                 self.last_owner_heard_ms = now;
+                // #51 A1: this is an ABDICATION (our uplink is genuinely dead). Go
+                // HELLO-silent until we re-lock a new owner — otherwise our stale HELLO
+                // keeps the leaves pinned to us and no successor can ever be elected.
+                self.silent_until_relock = true;
                 let _ = self.switch(Mode::EspNow);
                 log::warn!(
-                    "smol: gateway DEMOTED after {} failed flushes — AP unreachable, leaf-scanning",
+                    "smol: gateway DEMOTED after {} failed flushes — AP unreachable, HELLO-silent + leaf-scanning",
                     self.relay.flush_fails
                 );
             }
@@ -2320,6 +2370,9 @@ impl RadioManager {
                     if !self.relay.is_gateway && peer_id == self.elected_owner {
                         self.scan_locked = true;
                         self.last_owner_heard_ms = now;
+                        // #51 A1: re-locked a valid owner's HELLO → resume normal HELLO
+                        // (we are a healthy leaf again, no longer an abdicated ghost).
+                        self.silent_until_relock = false;
                     }
 
                     // Register the broadcaster so the ACK below can be unicast.
@@ -2895,6 +2948,13 @@ pub fn start(
     // `synced` stays best-effort for TIME (mesh-time adoption handles an unsynced GW).
     radio.relay.is_gateway = reached_dhcp && elect.i_am_owner;
     radio.elected_owner = elect.owner_id;
+    // #51 B: if we associated, seed the initial RSSI-to-AP so the first recovery
+    // election already has a real signal-strength reading to compare on.
+    if reached_dhcp {
+        if let Ok(r) = radio.controller.rssi() {
+            radio.my_rssi_to_ap = r.clamp(-127, 0) as i8;
+        }
+    }
     // #23 fix: persist the boot election's staleness observation → a leaf's later
     // recovery re-election measures the owner's seq freshness FROM this first sample.
     radio.mc_seen_owner = elect.seen_owner;
