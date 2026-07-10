@@ -5,6 +5,10 @@
 //!     name (`net::names::version_name`). Falls back to `"dev"`.
 //!   * `BUILD_NUMBER` — monotonic build count (`git rev-list --count HEAD`) shown
 //!     as `v<N>`. Falls back to `"0"`.
+//!   * `SMOL_NODE_ID` — (#42) OPTIONAL per-board id override, emitted ONLY when the
+//!     env var is set, so `SMOL_NODE_ID=8 cargo build` builds an id-8 image without
+//!     hand-editing `board.rs` (which reads it via `option_env!`, fallback = its own
+//!     `NODE_ID` literal). Guards the one-image-to-many flash that collides node ids.
 //!
 //! Source order (per field): (a) an explicit env var, else (b) `git`, else (c) a
 //! fallback constant.
@@ -27,11 +31,22 @@ fn main() {
     println!("cargo:rustc-env=BUILD_HASH={hash}");
     println!("cargo:rustc-env=BUILD_NUMBER={number}");
 
-    // Rebuild when the commit moves (real checkout) or the override env changes;
-    // both are harmless no-ops in an archive build with neither present.
+    // #42: OPTIONAL per-board NODE_ID override. Emitted ONLY when set → a normal build
+    // is byte-unchanged; `SMOL_NODE_ID=8 cargo build` overrides board.rs's fallback
+    // (read there via `option_env!`). Guards the one-image-to-many id collision.
+    if let Ok(node_id) = std::env::var("SMOL_NODE_ID") {
+        let node_id = node_id.trim();
+        if !node_id.is_empty() {
+            println!("cargo:rustc-env=SMOL_NODE_ID={node_id}");
+        }
+    }
+
+    // Rebuild when the commit moves (real checkout) or an override env changes;
+    // all are harmless no-ops in an archive build with none present.
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-env-changed=SMOL_GIT_HASH");
     println!("cargo:rerun-if-env-changed=SMOL_BUILD_NUMBER");
+    println!("cargo:rerun-if-env-changed=SMOL_NODE_ID");
 }
 
 /// Prefer the explicit env override (archive builds), else run `git`; `None` if
