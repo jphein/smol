@@ -210,8 +210,9 @@ impl AppKind {
 }
 
 /// Parse a retained `smol/<id>/config/default_screen` payload (#21): `<AppKind>[:<page>]`
-/// (e.g. `Grid:1`, `Clock`, `Batt:0`). Empty → `Some(Clear)`. Valid token + optional page
-/// (0/1; anything else clamps to 0) → `Some(Set)`. Non-UTF8 / unknown token / wrong-tier
+/// (e.g. `Grid:1`, `Clock`, `Batt:3`). Empty → `Some(Clear)`. Valid token + optional page
+/// (#46: any `0..=255`; the target screen clamps out-of-range to its live page count at
+/// render, so this stays panic-free) → `Some(Set)`. Non-UTF8 / unknown token / wrong-tier
 /// → `None` (keep current). TOTAL + panic-free — no unwrap/index/alloc: this untrusted
 /// RETAINED payload is a boot-loop-brick class (a panic → reset → re-delivery every boot).
 #[cfg(feature = "wifi")]
@@ -224,7 +225,11 @@ pub fn parse_default_screen(payload: &[u8]) -> Option<DefaultScreen> {
     let kind = AppKind::from_wire(it.next().unwrap_or(""))?;
     let page = match it.next() {
         None => 0,
-        Some(p) => p.trim().parse::<u8>().ok().filter(|&n| n <= 1).unwrap_or(0),
+        // #46: accept ANY page `0..=255`. The target screen stores it raw and clamps
+        // `% page_count` at render (batt.rs/grid.rs), so an over-range page resolves to
+        // a valid one — panic-free. The old `.filter(|&n| n <= 1)` silently dropped
+        // `Batt:2`/`Batt:3`/etc. to page 0 (the leaf-PAGE-not-applied bug).
+        Some(p) => p.trim().parse::<u8>().ok().unwrap_or(0),
     };
     Some(DefaultScreen::Set(kind, page))
 }
