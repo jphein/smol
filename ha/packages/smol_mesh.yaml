@@ -202,6 +202,28 @@ input_select:
     options: ["0", "1", "2", "3"]   # 0=voltage/entry; 1-3 = Batt SOC detail pages (#17); fw wraps % page_count for screens with fewer
     initial: "0"
     icon: mdi:book-open-page-variant
+  # --- #48 blue-LED mode (per-node: status/on/off, default status) → retained smol/<id>/config/led ---
+  # status = LED tracks node state (fw default) · on = force on · off = force off.
+  smol_all_led:
+    name: "smol all · LED mode"
+    options: [status, "on", "off"]
+    initial: status
+    icon: mdi:led-on
+  smol_7_led:
+    name: "smol id7 · LED mode"
+    options: [status, "on", "off"]
+    initial: status
+    icon: mdi:led-on
+  smol_8_led:
+    name: "smol id8 · LED mode"
+    options: [status, "on", "off"]
+    initial: status
+    icon: mdi:led-on
+  smol_9_led:
+    name: "smol id9 · LED mode"
+    options: [status, "on", "off"]
+    initial: status
+    icon: mdi:led-on
 
 input_button:
   smol_all_apply:
@@ -317,6 +339,19 @@ mqtt:
       json_attributes_topic: "smol/9/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
       icon: "mdi:chip"
+    # --- #48 LED mode — mirror of the retained smol/<id>/config/led (commanded value) ---
+    - name: "smol 7 LED"
+      unique_id: smol_7_led_mirror
+      state_topic: "smol/7/config/led"
+      icon: "mdi:led-on"
+    - name: "smol 8 LED"
+      unique_id: smol_8_led_mirror
+      state_topic: "smol/8/config/led"
+      icon: "mdi:led-on"
+    - name: "smol 9 LED"
+      unique_id: smol_9_led_mirror
+      state_topic: "smol/9/config/led"
+      icon: "mdi:led-on"
     # --- MESH TOPOLOGY (issue #27) — HELD; needs the firmware peers/channel publish ---
     # NOT YET PUBLISHED BY FIRMWARE. These + the template block below back the topology
     # card (ha/dashboard/smol_topology_card.yaml). Contract (#27, fw morpheus-fw Task 3):
@@ -616,6 +651,56 @@ automation:
           retain: true
           qos: 0
           payload: "{{ 'F' if is_state('input_select.smol_temp_unit', '°F') else 'C' }}|{{ '24' if is_state('input_select.smol_clock_format', '24h') else '12' }}"
+
+  # =====================================================================
+  # #48 blue-LED mode — per-node select → retained smol/<id>/config/led. status/on/off,
+  # default status. Set-all fans out to every per-node select (no broadcast topic).
+  # =====================================================================
+  - id: smol_led_publish
+    alias: "smol #48: publish per-node LED mode"
+    description: >-
+      On any per-node LED select changing, publish retained smol/<id>/config/led =
+      status|on|off (broker retention = persistence; the gateway relays it to leaves).
+    mode: parallel
+    max: 10
+    trigger:
+      - platform: state
+        entity_id:
+          - input_select.smol_7_led
+          - input_select.smol_8_led
+          - input_select.smol_9_led
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/config/led"
+          retain: true
+          qos: 0
+          payload: "{{ trigger.to_state.state }}"
+
+  - id: smol_all_led_fanout
+    alias: "smol #48: set-all LED mode → per-node selects"
+    description: >-
+      On the ALL LED select changing, fan out to every per-node LED select (which each
+      then publish their retained smol/<id>/config/led). No broadcast topic.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.smol_all_led
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id:
+            - input_select.smol_7_led
+            - input_select.smol_8_led
+            - input_select.smol_9_led
+        data:
+          option: "{{ trigger.to_state.state }}"
 
   # =====================================================================
   # NODE MANAGER automations (issue #21) — publish the retained per-node config.
