@@ -45,6 +45,7 @@ SLOT_MAX=$((0x1F0000))                          # 2,031,616 B — hard ceiling p
 BROKER="${BROKER:-10.0.0.1}"                    # Mosquitto broker leg reachable from where you run this
 MQTT_USER="${MQTT_USER:-<mqtt-user>}"           # broker username (password sourced from the addon, never here)
 ADDON="${ADDON:-<addon-slug>}"                  # supervisor addon slug carrying mqtt_password
+SMOL_OTA_SIGNING_KEY_ITEM="${SMOL_OTA_SIGNING_KEY_ITEM:-smol-ota-signing-ed25519}"  # Vaultwarden secureNote holding the ed25519 signing PEM (#32)
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
 usage(){ sed -n '2,20p' "${BASH_SOURCE[0]}"; exit "${1:-1}"; }
@@ -128,10 +129,27 @@ ssh "$OTA_HOST_SSH" "mkdir -p '$OTA_REMOTE_DIR'"
 scp -q "$BIN" "$OTA_HOST_SSH:$OTA_REMOTE_DIR/$REMOTE"
 URL="http://${OTA_HOST_IP}:${OTA_PORT}/ota/${REMOTE}"
 
-LINE="OTA|${BUILD}|${SIZE}|${SHA}|${URL}"
+# ---- #32: ed25519-sign M = "build|size|sha256" (the fw verifies this EXACT string) ----------
+# openssl Ed25519 is ONESHOT → SEEKABLE FILES only (stdin/process-sub fail: "unable to determine
+# file size for oneshot operation"). Key from Vault → temp file in RAM (/dev/shm), shredded right
+# after signing (never echoed). printf (NOT echo): M must be the exact wire bytes, no newline.
+_msgf="$(mktemp)"; _keyf="$(mktemp -p /dev/shm 2>/dev/null || mktemp)"
+# Shred the key/msg temps even on interrupt (SIGINT/TERM) in the window before the
+# inline shred below — else a Ctrl-C mid-sign could leave the key in /dev/shm.
+trap 'shred -u "$_msgf" "$_keyf" 2>/dev/null' EXIT INT TERM
+printf '%s' "${BUILD}|${SIZE}|${SHA}" > "$_msgf"
+bw get notes "$SMOL_OTA_SIGNING_KEY_ITEM" > "$_keyf" 2>/dev/null \
+  || { shred -u "$_msgf" "$_keyf" 2>/dev/null; die "bw: couldn't read signing key '$SMOL_OTA_SIGNING_KEY_ITEM' (locked?)"; }
+SIG="$(openssl pkeyutl -sign -rawin -inkey "$_keyf" -in "$_msgf" | xxd -p -c 64)"
+shred -u "$_msgf" "$_keyf" 2>/dev/null
+case "$SIG" in *[!0-9a-f]*|"") die "ed25519 signing failed (empty/non-hex sig — openssl >=3.0 + valid key?)";; esac
+[ "${#SIG}" -eq 128 ] || die "ed25519 sig wrong length ${#SIG} (want 128 hex)"
+
+# 6-field SIGNED announce (was 4-field unsigned): url stays LAST (may contain no '|').
+LINE="OTA|${BUILD}|${SIZE}|${SHA}|${SIG}|${URL}"
 
 # ---- publish: stage the retained line (arms every board's native Update) -----
 pub_retained "smol/ota/staged" "$LINE"
-echo "staged  smol/ota/staged  <-  build $BUILD ($HASH) ${SIZE}B sha ${SHA:0:12}… @ $URL"
+echo "staged  smol/ota/staged  <-  build $BUILD ($HASH) ${SIZE}B sha ${SHA:0:12}… sig ${SIG:0:12}… @ $URL"
 echo "done. Every board's native HA Update entity now shows build $BUILD as available."
 echo "      Install per-node from HA (the Update entity's Install button) or: ota_publish.sh install <id>"
