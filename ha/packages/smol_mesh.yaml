@@ -256,6 +256,20 @@ input_button:
   smol_ota_install_9:
     name: "smol OTA · install staged → id9"
     icon: mdi:download
+  # --- #52 remote REBOOT (TRANSIENT cmd) — named *_reboot to avoid colliding with the #21
+  # "*_reset to board default" config buttons above. Topic = smol/<id>/cmd/reset (locked). ---
+  smol_all_reboot:
+    name: "smol all · reboot"
+    icon: mdi:restart-alert
+  smol_7_reboot:
+    name: "smol id7 · reboot"
+    icon: mdi:restart
+  smol_8_reboot:
+    name: "smol id8 · reboot"
+    icon: mdi:restart
+  smol_9_reboot:
+    name: "smol id9 · reboot"
+    icon: mdi:restart
 
 # --- Dashboard mirror: subscribe the retained topic so a card shows exactly ---
 # what the boards fetch (the payload is <=96 chars, well under the 255 state cap).
@@ -701,6 +715,58 @@ automation:
             - input_select.smol_9_led
         data:
           option: "{{ trigger.to_state.state }}"
+
+  # =====================================================================
+  # #52 remote REBOOT — per-node button → TRANSIENT smol/<id>/cmd/reset (retain:FALSE).
+  # ⚠️ HARD SAFETY: the reset command is NEVER retained — a retained reset = reboot-loop /
+  # soft-brick (same discipline as OTA-install). cmd/ = transient commands; config/ = retained.
+  # =====================================================================
+  - id: smol_reboot_publish
+    alias: "smol #52: per-node remote reboot (transient)"
+    description: >-
+      On a per-node reboot button, publish TRANSIENT (retain:false) smol/<id>/cmd/reset =
+      RESET. HARD SAFETY: never retained — a retained reset would reboot-loop the node.
+    mode: parallel
+    max: 10
+    trigger:
+      - platform: state
+        entity_id:
+          - input_button.smol_7_reboot
+          - input_button.smol_8_reboot
+          - input_button.smol_9_reboot
+    condition:
+      # Button guard: allow 'unknown' (a button's pre-first-press state) so the FIRST press
+      # fires; `from_state is not none` still blocks the None->unknown startup event.
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/cmd/reset"
+          retain: false
+          qos: 0
+          payload: "RESET"
+
+  - id: smol_all_reboot_fanout
+    alias: "smol #52: reboot-all → per-node reboot buttons"
+    description: >-
+      On the ALL reboot button, fan out to every per-node reboot button (each then publishes
+      its TRANSIENT smol/<id>/cmd/reset). Reboots the whole fleet — deliberate + recoverable.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_all_reboot
+    condition:
+      # Button guard: allow 'unknown' (first-press state); block only the None->unknown startup.
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
+    action:
+      - service: input_button.press
+        target:
+          entity_id:
+            - input_button.smol_7_reboot
+            - input_button.smol_8_reboot
+            - input_button.smol_9_reboot
 
   # =====================================================================
   # NODE MANAGER automations (issue #21) — publish the retained per-node config.
