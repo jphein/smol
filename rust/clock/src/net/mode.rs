@@ -167,6 +167,16 @@ const GRID_PAYLOAD_MAX: usize = 96;
 /// a brick. The value length is bounded by `CFG_VALUE_MAX`; the leaf validates it
 /// with the strict/panic-free `parse_default_screen`.
 const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + verbatim "<AppKind>:<page>"
+/// #50b leaf-status UPLINK tag: `"SMOLv1 STAT "` (12 B, trailing space) then `"NNN"`
+/// (3-ASCII zero-padded SENDER leaf id) then the verbatim live `<AppKind>:<page>` value
+/// (empty = none). Mirror of `CFG` but UPLINK (leaf → gateway): a leaf with no MQTT
+/// broadcasts its live render-state; the GATEWAY caches it (`stat_cache`) and republishes
+/// it as retained `smol/<id>/status`. Diverges from `SNK` at byte 8 (`'T'` vs `'N'`) so
+/// `strip_prefix` never confuses them. Single-hop (the gateway never re-broadcasts a leaf
+/// STAT → no flood/loop). Same unauthed, low-blast threat model as CFG: worst case a stray
+/// frame yields a bad screen STRING on a status topic — never code exec, self-corrected
+/// next cadence. Value bounded by `CFG_VALUE_MAX`.
+const STAT_PREFIX: &[u8] = b"SMOLv1 STAT "; // + "NNN" + verbatim "<AppKind>:<page>"
 
 use crate::mesh_snake::snake_core::{self, SnkFrame};
 
@@ -260,6 +270,11 @@ enum Frame<'a> {
     /// default-screen `value` bytes (`value` borrows the RX buffer; the leaf buffers
     /// it in `CfgTracker` in `service` IFF `target == self.id`). Screen config ONLY.
     Cfg { target: u8, value: &'a [u8] },
+    /// #50b leaf-status uplink: a leaf's live screen readback — `src` sender leaf id +
+    /// the verbatim `<AppKind>:<page>` `value` bytes (`value` borrows the RX buffer; the
+    /// GATEWAY caches it in `stat_cache` in `service`, keyed by `src`). Twin of `Cfg` but
+    /// UPLINK — republished as retained `smol/<src>/status`.
+    Stat { src: u8, value: &'a [u8] },
 }
 
 /// Tracks the two timestamps that define the peer link state. Monotonic ms
@@ -1224,6 +1239,12 @@ pub struct RadioManager {
     /// cadence. Lives here so it persists across bursts (a (re)joined leaf converges
     /// without HA re-publishing). Unused on a leaf (never flushes).
     cfg_cache: crate::net::wifi::CfgCache,
+    /// #50b leaf-status uplink (GATEWAY side): per-leaf live `<screen>:<page>` cache,
+    /// filled by the `SMOLv1 STAT` service arm from leaf uplinks (leaves have no MQTT) and
+    /// republished as retained `smol/<leaf>/status` on each gateway flush. Twin of
+    /// `cfg_cache` but UPLINK-sourced. Unused on a leaf (never flushes/publishes). REUSES
+    /// `CfgCache` verbatim — a generic id→value upsert map (`Batt:3` fits `CFG_VALUE_MAX`).
+    stat_cache: crate::net::wifi::CfgCache,
     /// #25 WLED: monotonic WiZmote sequence, ++ per emitted button. Wraps safely
     /// (reboot-to-0 is panic-safe; WLED's per-remote dedup may drop the first few
     /// post-reboot presses until it re-exceeds the pre-reboot value — accepted MVP).
@@ -1304,6 +1325,7 @@ impl RadioManager {
             grid: GridTracker::new(),
             cfg: CfgTracker::new(),
             cfg_cache: crate::net::wifi::CfgCache::new(),
+            stat_cache: crate::net::wifi::CfgCache::new(),
             #[cfg(feature = "wled")]
             wled_seq: 0,
             elected_owner: id,
@@ -1418,6 +1440,7 @@ impl RadioManager {
                     &[], // #27: election-only recovery burst publishes no peers (leaf/v1)
             &[], // #50: recovery burst publishes no live-screen status
                     None, // #21: a leaf's recovery burst is not a gateway relay
+                    None, // #50b: recovery burst republishes no cached leaf status
                     tick,
                 )
             }
@@ -1696,6 +1719,27 @@ impl RadioManager {
         msg[base] = b'0' + target_id / 100;
         msg[base + 1] = b'0' + (target_id / 10) % 10;
         msg[base + 2] = b'0' + target_id % 10;
+        let n = value.len().min(crate::net::wifi::CFG_VALUE_MAX);
+        msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
+    }
+
+    /// #50b leaf-status uplink: a LEAF broadcasts its OWN live `<screen>:<page>` as a
+    /// `SMOLv1 STAT` frame (own id + verbatim value). Mirror of [`broadcast_config`] but
+    /// UPLINK — the id is OURS (the sender), not a target. Fire-and-forget broadcast; the
+    /// gateway caches it and republishes retained `smol/<id>/status`. Value truncated to
+    /// `CFG_VALUE_MAX`. `main` gates the call on `!is_gateway` + the ~10 s cadence.
+    ///
+    /// [`broadcast_config`]: RadioManager::broadcast_config
+    pub fn broadcast_stat(&mut self, value: &[u8]) {
+        let base = STAT_PREFIX.len();
+        let mut msg = [0u8; STAT_PREFIX.len() + 3 + crate::net::wifi::CFG_VALUE_MAX];
+        msg[..base].copy_from_slice(STAT_PREFIX);
+        // 3-ASCII zero-padded OWN id (matches `parse_id`; u8 ⇒ each digit 0–9).
+        let own = self.id;
+        msg[base] = b'0' + own / 100;
+        msg[base + 1] = b'0' + (own / 10) % 10;
+        msg[base + 2] = b'0' + own % 10;
         let n = value.len().min(crate::net::wifi::CFG_VALUE_MAX);
         msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
@@ -2096,6 +2140,7 @@ impl RadioManager {
                     peers, // #27: gateway publishes its roster as retained smol/<id>/peers
                     status, // #50: gateway publishes its live screen as smol/<id>/status
                     Some(&mut self.cfg_cache), // #21: gateway caches leaf configs to relay
+                    Some(&self.stat_cache), // #50b: gateway republishes cached leaf statuses
                     tick,
                 )
             }
@@ -2470,6 +2515,24 @@ impl RadioManager {
                     self.roster.heard(src, None, rssi, now);
                     label = Some(alloc::string::String::from("cfg"));
                 }
+                Some(Frame::Stat { src: leaf_id, value }) => {
+                    // #50b leaf-status uplink: a leaf's LIVE screen:page. GATEWAY-only
+                    // cache — a leaf hearing another leaf's STAT ignores it (no MQTT to
+                    // publish from). Buffer the raw `<screen>:<page>` value keyed by the
+                    // SENDER leaf id; the MQTT flush republishes it as retained
+                    // `smol/<leaf_id>/status`. Opaque bytes (mirror CFG) — a stray/foreign
+                    // frame can at worst set a bad screen string, self-corrected next
+                    // cadence; never a brick. NOTE: `src` stays the frame's SOURCE MAC for
+                    // the roster liveness update (mirrors the BATT/GRID/CFG arms); the
+                    // leaf's id↔MAC mapping is already learned from its 2 s HELLOs, so the
+                    // `None` id here is correct + side-effect-free.
+                    if self.relay.is_gateway {
+                        self.stat_cache.set(leaf_id, value);
+                    }
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, None, rssi, now);
+                    label = Some(alloc::string::String::from("stat"));
+                }
                 None => {
                     // Unrecognised payload (other ESP-NOW traffic on-channel);
                     // surface it on the OLED but don't touch the handshake.
@@ -2619,6 +2682,13 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
         // guarantees `rest.len() >= 3`, so `&rest[3..]` never panics.
         let target = parse_id(rest)?;
         return Some(Frame::Cfg { target, value: &rest[3..] });
+    }
+    if let Some(rest) = data.strip_prefix(STAT_PREFIX) {
+        // #50b leaf-status uplink: "NNN<value>" — 3-ASCII SENDER id then the verbatim
+        // `<screen>:<page>` value (to end-of-frame; empty = none). `parse_id` rejects
+        // short/non-digit and guarantees `rest.len() >= 3`, so `&rest[3..]` never panics.
+        let src = parse_id(rest)?;
+        return Some(Frame::Stat { src, value: &rest[3..] });
     }
     None
 }

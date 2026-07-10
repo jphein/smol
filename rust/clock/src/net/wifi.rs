@@ -478,6 +478,7 @@ pub fn run_ntp_burst(
         &[], // #27: boot NTP+downlink burst publishes no peers (no roster yet)
         &[], // #50: boot burst publishes no live-screen status
         None, // #21: boot burst is not a gateway relay (no leaf-config cache)
+        None, // #50b: boot burst republishes no cached leaf status
         mqtt_deadline,
         tick,
     );
@@ -834,6 +835,11 @@ fn mqtt_session(
     // `smol/+/config/default_screen` and cache every OTHER leaf's value here for the
     // ESP-NOW relay. `None` on boot/leaf/election bursts (no relay duty).
     mut cfg_cache: Option<&mut CfgCache>,
+    // #50b leaf-status uplink: `Some` on a GATEWAY flush → after publishing THIS node's
+    // own status, republish each CACHED leaf status as retained `smol/<leaf>/status`.
+    // `None` on boot/leaf/election bursts (no republish duty). Read-only (the cache is
+    // filled by the ESP-NOW `SMOLv1 STAT` service arm, not here).
+    stat_cache: Option<&CfgCache>,
     deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
@@ -1057,6 +1063,31 @@ fn mqtt_session(
         let _ = write!(stopic, "smol/{}/status", node_id);
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, stopic.as_bytes(), status, true) {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+    }
+
+    // #50b: republish each CACHED leaf status (filled by the ESP-NOW `SMOLv1 STAT` service
+    // arm — leaves have no MQTT) as RETAINED `smol/<leaf>/status`. Skip our OWN id (self-
+    // published just above via #50a) and empty values. Prepend `STAT|` so EVERY status
+    // topic is uniform (`STAT|<screen>:<page>`), self + leaves, for the one HA template.
+    if let Some(sc) = stat_cache {
+        for i in 0..sc.count() {
+            if let Some((lid, val)) = sc.entry(i) {
+                if lid == node_id || val.is_empty() {
+                    continue;
+                }
+                let mut ltopic = MqttScratch::new();
+                let _ = write!(ltopic, "smol/{}/status", lid);
+                let mut sbuf = [0u8; 5 + CFG_VALUE_MAX];
+                sbuf[..5].copy_from_slice(b"STAT|");
+                let m = val.len().min(CFG_VALUE_MAX);
+                sbuf[5..5 + m].copy_from_slice(&val[..m]);
+                if let Some(n) =
+                    crate::net::mqtt::encode_publish(&mut pkt, ltopic.as_bytes(), &sbuf[..5 + m], true)
+                {
+                    let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                }
+            }
         }
     }
 
@@ -1344,6 +1375,9 @@ pub fn run_mqtt_burst(
     // #21 leaf-relay: `Some` on a gateway flush → wildcard-subscribe + cache leaf
     // configs for the ESP-NOW relay; `None` otherwise (see `mqtt_session`).
     cfg_cache: Option<&mut CfgCache>,
+    // #50b: `Some` on a gateway flush → republish cached leaf statuses (see `mqtt_session`);
+    // `None` otherwise.
+    stat_cache: Option<&CfgCache>,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
@@ -1481,6 +1515,7 @@ pub fn run_mqtt_burst(
         peers, // #27: forward the caller's serialized roster to publish retained
         status, // #50: forward the live STAT|screen:page for smol/<id>/status
         cfg_cache, // #21: forward the gateway's leaf-config cache (or None)
+        stat_cache, // #50b: forward the gateway's cached leaf statuses (or None)
         deadline,
         tick,
     )

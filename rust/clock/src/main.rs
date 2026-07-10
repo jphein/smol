@@ -637,6 +637,20 @@ fn main() -> ! {
             {
                 r.broadcast_cached_configs();
             }
+            // #50b: a LEAF broadcasts its LIVE screen:page as a SMOLv1 STAT frame on the
+            // SAME ~10 s cadence — the gateway caches it (stat_cache) and republishes it as
+            // retained smol/<leaf>/status (leaves have no MQTT of their own). LEAF-ONLY: a
+            // gateway self-publishes via #50a's MQTT path, so this is the exact inverse of
+            // the gateway BATT/GRID/CFG re-broadcasts above. Value is the render-state read
+            // (App::live_screen — captures manual BOOT-nav); the gateway prepends "STAT|" at
+            // publish so every smol/<id>/status is uniform. Single-hop (no re-broadcast).
+            if !r.is_gateway()
+                && (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000)
+            {
+                let (live_kind, live_page) = app.live_screen();
+                let val = alloc::format!("{}:{}", live_kind.as_wire(), live_page);
+                r.broadcast_stat(val.as_bytes());
+            }
 
             // NOTE: the MMO-snake SNK drain+broadcast used to live here. It MOVED
             // into `MeshSnake::update` (it needs the game state, now owned by the
