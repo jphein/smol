@@ -106,11 +106,27 @@ pub struct MeshElect {
     /// When the current `(seen_owner, seen_seq)` pair was FIRST seen (ms). An owner
     /// whose seq stays frozen past `MC_STALE_MS` from here is presumed dead.
     pub seen_ms: u64,
+    // --- #51 inputs (seeded by the caller) ---
+    /// This board's live RSSI-to-AP (dBm, signed; weaker = more negative). Captured
+    /// after association and persisted on the RadioManager. Consumed by the #51 leaf
+    /// RECOVERY election so the strongest-uplink survivor takes over a dead owner
+    /// FIRST (weaker boards defer + adopt it). Ignored on the boot/flush paths.
+    pub my_rssi: i8,
+    /// #51: true ONLY on a LEAF's recovery re-election (a lost owner). Selects the
+    /// WiFi-strength "sticky live owner + RSSI-weighted takeover" rule. On boot and
+    /// gateway-flush this is false → the original, hardware-validated lowest-id
+    /// election runs UNCHANGED (preserves #2 split-brain + fast cold-start).
+    pub recovery: bool,
     // --- outputs (applied to the live role by the caller) ---
     /// True iff I claimed / hold ownership (I am the coexist gateway).
     pub i_am_owner: bool,
     /// The elected owner's id (== my_id when I own it).
     pub owner_id: u8,
+    /// #51: true iff the adopted owner was GENUINELY LIVE (fresh seq), false iff it
+    /// was dead-but-inside-our-backoff (a deferred takeover). The caller grace-resets
+    /// its owner-silence clock ONLY for a genuinely-live owner — a dead-deferred owner
+    /// gets no reset, so the next recovery burst fires on cadence (faster failover).
+    pub owner_alive: bool,
 }
 
 #[cfg(feature = "wifi")]
@@ -121,10 +137,37 @@ impl MeshElect {
             seen_owner: 0,
             seen_seq: 0,
             seen_ms: 0,
+            my_rssi: -99, // weak default until the first association captures it
+            recovery: false,
             i_am_owner: false,
             owner_id: my_id,
+            owner_alive: false,
         }
     }
+}
+
+/// #51: map a board's RSSI-to-AP (dBm) → how long it must WAIT, beyond `MC_STALE_MS`,
+/// before it may take over a dead owner. Stronger signal → shorter wait, so the
+/// best-uplink survivor claims the vacated ownership FIRST and publishes a fresh `MC`;
+/// weaker survivors, still inside their (longer) backoff, then observe that LIVE owner
+/// and adopt it — the WiFi-strength election JP asked for in #51, with node-id only
+/// breaking exact-bucket ties. Buckets are whole re-election cycles (~`REELECT_RETRY_MS`)
+/// so the winner's claim lands a full recovery burst before a weaker board would claim.
+/// No new `MC` wire field: a board only ever compares its OWN rssi against this threshold.
+#[cfg(feature = "wifi")]
+fn reelect_backoff_ms(rssi: i8, node_id: u8) -> u64 {
+    // Bucket by signal strength (typical STA range ≈ -30 strong … -90 weak dBm).
+    let bucket: u64 = if rssi >= -60 {
+        0
+    } else if rssi >= -75 {
+        1
+    } else {
+        2
+    };
+    // 30 s per weaker bucket (≈ one recovery-burst cycle) + a sub-cycle per-id term
+    // (200 ms/id) so two boards in the SAME rssi bucket still resolve deterministically
+    // to the lower id without ever colliding on the same burst.
+    bucket * 30_000 + (node_id as u64) * 200
 }
 
 /// OTA (#33 Model-A): the ONE retained fleet STAGING topic (`OTA|build|size|sha256|url`)
@@ -1227,10 +1270,14 @@ fn mqtt_session(
     //
     // 1. Refresh the persistent staleness observation: a *changed* (owner,seq) resets the
     //    "first seen" clock (fresh liveness); an unchanged pair keeps it (staleness accrues).
-    // 2. Adopt a lower-id owner ONLY while it is ALIVE (seq advanced within MC_STALE_MS).
-    //    A stale (frozen-seq) lower-id owner is DEAD → fall through to CLAIM (take over).
-    //    id >= mine, or empty/absent/unparseable, also CLAIM. `channel` stays 0 (advisory;
-    //    leaves discover the real channel by scanning the owner's HELLO).
+    // 2. TWO election rules, selected by `elect.recovery`:
+    //    * boot / gateway-flush (`recovery == false`): the ORIGINAL, hardware-validated
+    //      lowest-id election — adopt a LIVE lower-id owner, else claim. UNCHANGED, so
+    //      cold-start stays fast + #2 split-brain resolution stays as-verified.
+    //    * #51 LEAF RECOVERY (`recovery == true`): WiFi-strength election — NEVER override a
+    //      LIVE owner (sticky), and take over a DEAD owner only after this board's
+    //      RSSI-weighted backoff, so the strongest-uplink survivor wins (node-id breaks
+    //      ties). `channel` stays 0 (advisory; leaves discover it by scanning the HELLO).
     let claim_seq: Option<u32> = match mc {
         Some((owner, _ch, seq)) => {
             if owner != elect.seen_owner || seq != elect.seen_seq {
@@ -1238,19 +1285,54 @@ fn mqtt_session(
                 elect.seen_seq = seq;
                 elect.seen_ms = elect.now_ms;
             }
-            let stale = elect.now_ms.saturating_sub(elect.seen_ms) >= MC_STALE_MS;
-            if owner < node_id && !stale {
+            let alive = elect.now_ms.saturating_sub(elect.seen_ms) < MC_STALE_MS;
+            elect.owner_alive = alive;
+            if !elect.recovery {
+                // BOOT / gateway-flush — original lowest-id rule (byte-for-byte as verified).
+                if owner < node_id && alive {
+                    elect.i_am_owner = false;
+                    elect.owner_id = owner;
+                    None
+                } else {
+                    // id >= mine, or a STALE (dead) lower-id owner → claim / take over.
+                    elect.i_am_owner = true;
+                    elect.owner_id = node_id;
+                    Some(seq.wrapping_add(1))
+                }
+            } else if owner == node_id {
+                // #51 recovery: our own retained record → hold ownership.
+                elect.i_am_owner = true;
+                elect.owner_id = node_id;
+                Some(seq.wrapping_add(1))
+            } else if alive {
+                // #51 recovery: a LIVE owner (any id) is sticky — never override it. This is
+                // what makes the strongest board, once it claims, stay owner as the weaker
+                // survivors observe its fresh MC and adopt it.
                 elect.i_am_owner = false;
                 elect.owner_id = owner;
                 None
             } else {
-                // id >= mine, or a STALE (dead) lower-id owner → claim / take over.
-                elect.i_am_owner = true;
-                elect.owner_id = node_id;
-                Some(seq.wrapping_add(1))
+                // #51 recovery: owner is DEAD. Take over only once we're past MC_STALE_MS PLUS
+                // our RSSI-weighted backoff — the strongest-uplink survivor crosses first.
+                let backoff = reelect_backoff_ms(elect.my_rssi, node_id);
+                if elect.now_ms.saturating_sub(elect.seen_ms) >= MC_STALE_MS.saturating_add(backoff)
+                {
+                    elect.i_am_owner = true;
+                    elect.owner_id = node_id;
+                    Some(seq.wrapping_add(1))
+                } else {
+                    // Dead, but still inside OUR backoff → defer so a stronger board claims
+                    // first. Marked not-alive so the caller skips the owner-silence grace reset.
+                    elect.i_am_owner = false;
+                    elect.owner_id = owner;
+                    None
+                }
             }
         }
         None => {
+            // Empty/absent/unparseable topic → claim immediately (fast cold-start; a recovery
+            // that finds the record cleared also claims — sticky-adopt converges any race).
+            elect.owner_alive = false;
             elect.i_am_owner = true;
             elect.owner_id = node_id;
             Some(1)
@@ -1264,10 +1346,22 @@ fn mqtt_session(
         elect.seen_ms = elect.now_ms;
         let mut mcp = MqttScratch::new();
         let _ = write!(mcp, "MC|{}|0|{}", node_id, newseq);
-        if let Some(n) =
-            crate::net::mqtt::encode_publish(&mut pkt, MESH_CHANNEL_TOPIC, mcp.as_bytes(), true)
-        {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        // #51 A2 — CLAIM-AFTER-PUBLISH: only actually hold ownership if the retained MC
+        // write reached the broker (proof our uplink is alive). If the publish fails, we
+        // are NOT a valid owner — revert to leaf so ownership can't land on a board whose
+        // broker link just died (prevents a dead-uplink board re-pinning the mesh).
+        let published = match crate::net::mqtt::encode_publish(
+            &mut pkt,
+            MESH_CHANNEL_TOPIC,
+            mcp.as_bytes(),
+            true,
+        ) {
+            Some(n) => tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick),
+            None => false,
+        };
+        if !published {
+            elect.i_am_owner = false; // couldn't prove uplink → stay leaf, retry next burst
+            log::warn!("smol: mesh election — MC publish FAILED, not claiming ownership");
         }
     }
     log::info!(
