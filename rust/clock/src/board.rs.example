@@ -20,7 +20,34 @@ use crate::app::AppKind;
 /// (`net::names::name_for_id`). Give each physical board a DISTINCT value (we flashed
 /// 7 / 8 / 9). Changing it changes BOTH the on-wire id and the displayed name (the
 /// name is *derived* from the id and is never itself transmitted).
-pub const NODE_ID: u8 = 7;
+///
+/// **Per-board builds without hand-editing (#42):** pass `SMOL_NODE_ID=<n>` at build
+/// time — e.g. `SMOL_NODE_ID=8 cargo build --release --features espnow` — which
+/// overrides the fallback below (build.rs threads the env; see its doc). This guards
+/// the one-image-to-many flash that collides ids (the whole fleet defaulting to 7).
+/// The literal is only the fallback when `SMOL_NODE_ID` is unset.
+pub const NODE_ID: u8 = match option_env!("SMOL_NODE_ID") {
+    Some(s) => parse_node_id(s),
+    None => 7, // fallback — prefer `SMOL_NODE_ID=<n>` for distinct per-board images
+};
+
+/// Const-parse `SMOL_NODE_ID` (decimal `0..=255`) at compile time. A non-numeric,
+/// empty, or out-of-range value **fails the build** — a deliberate guard: a build
+/// error is far better than a silently-wrong id colliding on the wire.
+const fn parse_node_id(s: &str) -> u8 {
+    let b = s.as_bytes();
+    assert!(!b.is_empty(), "SMOL_NODE_ID must not be empty");
+    let mut n: u16 = 0;
+    let mut i = 0;
+    while i < b.len() {
+        let d = b[i];
+        assert!(d >= b'0' && d <= b'9', "SMOL_NODE_ID must be a decimal number");
+        n = n * 10 + (d - b'0') as u16;
+        assert!(n <= 255, "SMOL_NODE_ID must be in 0..=255");
+        i += 1;
+    }
+    n as u8
+}
 
 /// The screen this board enters at BOOT instead of the Home menu (issue #18).
 /// Valid values, by the feature tier the firmware is built with:
