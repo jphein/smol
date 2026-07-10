@@ -20,6 +20,9 @@ smol:
   card-mod-root: |
     @font-face { font-family: 'VT323'; src: url('/local/luna-fonts/vt323.woff2') format('woff2'); font-display: swap; }
     @font-face { font-family: 'IBM Plex Mono'; src: url('/local/luna-fonts/ibmplexmono.woff2') format('woff2'); font-display: swap; }
+    @keyframes smolpulse { 50% { opacity:.35 } }
+    .smol-live { animation: smolpulse 1.7s ease-in-out infinite; display:inline-block }
+    @media (prefers-reduced-motion: reduce) { .smol-live { animation:none } }
   # ---- state / icon ----
   state-icon-color: "#5bff9a"
   state-icon-active-color: "#5bff9a"
@@ -64,6 +67,9 @@ smol:
   paper-font-title_-_font-family: "'VT323','IBM Plex Mono',monospace"
   ha-heading-card-title-font-family: "'VT323','IBM Plex Mono',monospace"
   ha-heading-card-title-font-size: "1.2rem"
+  # VT323 is a WIDE face → shrink card titles a notch so node names / "OLED display · override"
+  # never wrap-per-word or truncate (JP screenshot #15). Applies to glance/entities titles.
+  ha-card-header-font-size: "1.3rem"
   # ---- backgrounds ----
   primary-background-color: "#060906"
   secondary-background-color: "#0b100b"

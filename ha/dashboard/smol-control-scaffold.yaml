@@ -1,0 +1,204 @@
+# smol · Control Room — LAYOUT-CARD 12-col grid (edge-to-edge, scalable) — v2 REAL CARDS.
+# =====================================================================
+# v1 used inline-styled markdown HTML → HA's sanitizer STRIPS style/class (JP screenshot:
+# unstyled text) + CSP blocks data:svg in picture (broken topology). v2 fix:
+#   • data → REAL cards (glance/entities/gauge); VT323 titles come from the theme.
+#   • text → markdown SYNTAX (#, **) styled via card_mod `ha-markdown$` (shadow), readable fallback.
+#   • topology → picture pointing at a SERVED FILE (/local/luna-cards/smol-topology.svg).
+# build_control_room.py injects: TOPO url · LEGEND→entities card · fleet node cards (discovered).
+# =====================================================================
+title: smol · Control Room
+path: smol-control
+icon: mdi:chip
+theme: smol
+type: custom:grid-layout
+layout:
+  grid-template-columns: repeat(12, 1fr)
+  grid-gap: 16px
+  margin: 0
+  mediaquery:
+    "(max-width: 1000px)": {grid-template-columns: "repeat(6, 1fr)"}
+    "(max-width: 720px)": {grid-template-columns: "1fr"}
+cards:
+
+  # ---- BANNER (span 12) ----
+  - type: markdown
+    view_layout: {grid-column: "span 12"}
+    content: |
+      {% set on = states.binary_sensor | selectattr('state','eq','on') | map(attribute='entity_id') | select('search','^binary_sensor\.smol_\d+_online$') | list | count %}
+      {% set tot = states.binary_sensor | map(attribute='entity_id') | select('search','^binary_sensor\.smol_\d+_online$') | list | count %}
+      {% set owner = state_attr('sensor.smol_mesh_channel','owner') %}
+      # control room
+      **smol · esp-now mesh · home assistant**
+
+      🟢 **MESH LIVE**{% if is_state('binary_sensor.smol_mesh_reelecting','on') %} · re-electing…{% endif %} · the Seat **id{{ owner if owner not in ['unknown','unavailable','none',None] else '7' }} · Draconic Dominion** · **{{ on }}/{{ tot }}** sigils lit · retained MQTT, applies on next burst
+    card_mod:
+      style:
+        .: |
+          ha-card { background:none; border:none; box-shadow:none; padding:0 4px; }
+        ha-markdown$: |
+          h1 { font-family:'VT323','IBM Plex Mono',monospace; font-size:54px; line-height:.8; margin:0; color:var(--primary-color); text-shadow:0 0 22px rgba(91,255,154,.35); letter-spacing:2px; }
+          p { margin:5px 0 0; color:var(--secondary-text-color); font-size:12.5px; line-height:1.7; }
+          strong { color:var(--primary-color); font-weight:600; }
+
+  # ---- 01 · THE MESH (topology span 7 + legend span 5) ----
+  - type: markdown
+    view_layout: {grid-column: "span 12"}
+    content: "**01**&nbsp;&nbsp;the mesh · topology"
+    card_mod: &kick
+      style:
+        .: |
+          ha-card { background:none; border:none; box-shadow:none; padding:10px 4px 0; }
+        ha-markdown$: |
+          p { margin:0; font-size:11px; letter-spacing:4px; text-transform:uppercase; color:var(--secondary-text-color); }
+          strong { color:var(--primary-color); }
+
+  - type: picture
+    image: "TOPO"        # ← build script replaces with /local/luna-cards/smol-topology.svg?v=…
+    view_layout: {grid-column: "span 7"}
+    card_mod:
+      style: |
+        ha-card { border:1px solid var(--ha-card-border-color); border-radius:8px; overflow:hidden;
+          box-shadow: inset 0 0 26px rgba(0,0,0,.9), var(--ha-card-box-shadow); position:relative; }
+        ha-card:after { content:''; position:absolute; inset:0; pointer-events:none;
+          background:repeating-linear-gradient(0deg,transparent 0 2px,rgba(0,0,0,.28) 2px 3px); }
+
+  - type: markdown
+    content: "LEGEND"    # ← build script replaces this card with a generated entities legend (span 5)
+    view_layout: {grid-column: "span 5"}
+
+  # ---- 02 · THE FLEET ----
+  - type: markdown
+    view_layout: {grid-column: "span 12"}
+    content: |
+      {% set on = states.binary_sensor | selectattr('state','eq','on') | map(attribute='entity_id') | select('search','^binary_sensor\.smol_\d+_online$') | list | count %}
+      {% set tot = states.binary_sensor | map(attribute='entity_id') | select('search','^binary_sensor\.smol_\d+_online$') | list | count %}
+      **02**&nbsp;&nbsp;the fleet · {{ tot }} sigils · {{ on }} online · nodes &amp; firmware
+    card_mod: *kick
+
+  - type: entities
+    view_layout: {grid-column: "span 12"}
+    title: set all sigils → default screen
+    show_header_toggle: false
+    entities:
+      - entity: input_select.smol_all_screen
+        name: Screen (all nodes)
+      - entity: input_select.smol_all_page
+        name: Page (all)
+      - entity: input_button.smol_all_apply
+        name: Apply to all — retained, on next burst
+        icon: mdi:send-check
+    card_mod:
+      style: |
+        ha-card { position:relative; overflow:hidden; }
+        ha-card:before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,transparent,var(--accent-color),transparent); opacity:.55; }
+
+  - type: markdown
+    content: "FLEET"   # ← build script REPLACES this with N node cards spliced DIRECTLY into the view grid
+                       #    (each view_layout: span 4). Nested grid-layout rendered EMPTY (JP screenshot) — avoided.
+
+  # ---- 03 · GLASS · POWER · FORGE ----
+  - type: markdown
+    view_layout: {grid-column: "span 12"}
+    content: "**03**&nbsp;&nbsp;the glass · power · the forge"
+    card_mod: *kick
+
+  # THE GLASS
+  - type: entities
+    view_layout: {grid-column: "span 4"}
+    title: the glass · what boards mirror
+    show_header_toggle: false
+    entities:
+      - type: section
+        label: override
+      - entity: input_boolean.smol_display_override
+        name: Override — hand-write lines
+        icon: mdi:pencil
+      - entity: input_text.smol_display_line1
+        name: Line 1
+      - entity: input_text.smol_display_line2
+        name: Line 2
+      - entity: input_text.smol_display_line3
+        name: Line 3
+      - type: section
+        label: live mirror — what boards fetch
+      - entity: sensor.smol_display_batt
+        name: batt line
+        icon: mdi:battery-high
+      - entity: sensor.smol_display_grid
+        name: grid line
+        icon: mdi:transmission-tower
+    card_mod:
+      style: |
+        ha-card { position:relative; overflow:hidden; }
+        ha-card:before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,transparent,var(--primary-color),transparent); opacity:.55; }
+
+  # POWER & SOLAR
+  - type: vertical-stack
+    view_layout: {grid-column: "span 4"}
+    cards:
+      - type: horizontal-stack
+        cards:
+          - type: gauge
+            entity: sensor.battery_bank_soc
+            name: battery bank
+            unit: "%"
+            min: 0
+            max: 100
+            severity: {green: 60, yellow: 35, red: 0}
+          - type: gauge
+            entity: sensor.ev_battery_soc
+            name: EV HV
+            unit: "%"
+            min: 0
+            max: 100
+            severity: {green: 50, yellow: 25, red: 0}
+      - type: entities
+        title: power & solar · sources on the glass
+        show_header_toggle: false
+        entities:
+          - entity: sensor.house_load
+            name: house load
+          - entity: sensor.solar_charge_current
+            name: solar charge
+        card_mod:
+          style: |
+            ha-card { position:relative; overflow:hidden; margin-top:-2px; }
+            ha-card:before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,transparent,var(--primary-color),transparent); opacity:.55; }
+
+  # THE FORGE · OTA
+  - type: entities
+    view_layout: {grid-column: "span 4"}
+    title: the forge · OTA (canary-first)
+    show_header_toggle: false
+    entities:
+      - entity: sensor.smol_ota_staged
+        name: Staged build
+        icon: mdi:package-up
+      - type: attribute
+        entity: sensor.smol_ota_staged
+        attribute: url
+        name: Image URL
+      - type: divider
+      - entity: input_button.smol_ota_install_7
+        name: Install → id7 (canary / the Seat)
+        icon: mdi:rocket-launch
+    card_mod:
+      style: |
+        ha-card { position:relative; overflow:hidden; }
+        ha-card:before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,transparent,var(--accent-color),transparent); opacity:.55; }
+
+  # ---- FOOTER (span 12) ----
+  - type: markdown
+    view_layout: {grid-column: "span 12"}
+    content: >
+      **smol · Control Room** — one phosphor surface for the ESP-NOW mesh: live topology,
+      per-node screens + firmware, the shared glass, power, and the OTA forge. Retained MQTT
+      everywhere; nodes apply on their next burst — no reflash. Fleet + topology auto-scale as sigils join.
+    card_mod:
+      style:
+        .: |
+          ha-card { background:none; border:none; box-shadow:none; }
+        ha-markdown$: |
+          p { font-size:11px; color:var(--secondary-text-color); line-height:1.8; border-top:1px solid var(--ha-card-border-color); padding-top:12px; }
+          strong { color:var(--primary-text-color); }
