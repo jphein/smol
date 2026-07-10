@@ -1328,7 +1328,7 @@ pub fn run_mqtt_burst(
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
-    let mut sockets_storage: [SocketStorage; 2] = Default::default();
+    let mut sockets_storage: [SocketStorage; 3] = Default::default();
     let mut sockets = SocketSet::new(&mut sockets_storage[..]);
 
     let mut dhcp_socket = dhcpv4::Socket::new();
@@ -1346,6 +1346,20 @@ pub fn run_mqtt_burst(
         tcp::SocketBuffer::new(&mut tcp_tx[..]),
     );
     let tcp_handle = sockets.add(tcp_socket);
+
+    // #9 item-1: throwaway UDP socket used ONLY to pre-warm the next-hop (router) ARP
+    // right after DHCP (see the warm-up below). Tiny buffers — stack-negligible next to
+    // the 512 B TCP buffers above, so the F1/F2 frame headroom is preserved. mqtt_session
+    // never touches it.
+    let mut warm_rx_meta = [udp::PacketMetadata::EMPTY; 1];
+    let mut warm_tx_meta = [udp::PacketMetadata::EMPTY; 1];
+    let mut warm_rx = [0u8; 1];
+    let mut warm_tx = [0u8; 4];
+    let warm_socket = udp::Socket::new(
+        udp::PacketBuffer::new(&mut warm_rx_meta[..], &mut warm_rx[..]),
+        udp::PacketBuffer::new(&mut warm_tx_meta[..], &mut warm_tx[..]),
+    );
+    let warm_handle = sockets.add(warm_socket);
 
     // FINDING 1b (retained): bound the ENTIRE flush by the short RELAY_FLUSH_BUDGET,
     // not the 30 s NTP budget — a dead AP fails fast so the loop isn't frozen 30 s.
@@ -1398,6 +1412,25 @@ pub fn run_mqtt_burst(
         if let Some((addr, router)) = configured {
             apply_dhcp(&mut iface, addr, router);
             log::info!("smol: MQTT flush DHCP {}", addr);
+            // #9 item-1: pre-warm the next-hop (router) ARP in a tight, bounded poll so
+            // the timed MQTT TCP connect below is not delayed by a COLD first-ARP
+            // round-trip — which occasionally overran the 15 s flush window and forced a
+            // 30 s retry (the interface is rebuilt each flush → empty neighbour cache).
+            // A throwaway datagram to the router's discard port (9) triggers neighbour
+            // discovery; poll it out over ≤300 ms (and never past `deadline`). Purely
+            // additive: if it does not resolve, the connect still does its own ARP —
+            // identical to prior behavior, just without the warm cache.
+            if let Some(router) = router {
+                {
+                    let s = sockets.get_mut::<udp::Socket>(warm_handle);
+                    let _ = s.bind(49152 + (rng.random() % 16384) as u16);
+                    let _ = s.send_slice(b"warm", (IpAddress::Ipv4(router), 9u16));
+                }
+                let warm_cap = Instant::now() + Duration::from_millis(300);
+                while Instant::now() < warm_cap && Instant::now() < deadline {
+                    iface.poll(smoltcp_now(), device, &mut sockets);
+                }
+            }
             break;
         }
         if Instant::now() > deadline {
