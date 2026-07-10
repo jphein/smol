@@ -72,6 +72,9 @@ pub const CHUNK: usize = 4096;
 /// Max announce URL length kept in an owned [`Announce`] (bounded, no alloc).
 pub const URL_MAX: usize = 160;
 
+/// #32: max bytes of the signed manifest M = `"build|size|sha256hex"` (≤10+1+10+1+64 = 86).
+pub const SIGNED_MSG_MAX: usize = 96;
+
 /// Partition-table read scratch (an ESP-IDF table is ≤ 0xC00 bytes). Stack-only,
 /// used transiently by the flash helpers.
 const PT_SCRATCH: usize = 0xC00;
@@ -105,6 +108,15 @@ pub struct Announce {
     // Read by the fetch (espnow) integrity gate; parsed but unused in a wifi-only build.
     #[allow(dead_code)]
     pub sha256: [u8; 32],
+    // #32: the 64-byte Ed25519 signature over M, and the exact signed manifest bytes.
+    // Parsed (written) in every build; READ only by the espnow verify-before-activate →
+    // unused in a wifi-only build.
+    #[allow(dead_code)]
+    sig: [u8; 64],
+    #[allow(dead_code)]
+    signed_msg: [u8; SIGNED_MSG_MAX],
+    #[allow(dead_code)]
+    signed_len: usize,
     url: [u8; URL_MAX],
     url_len: usize,
 }
@@ -115,41 +127,72 @@ impl Announce {
     pub fn url(&self) -> &str {
         core::str::from_utf8(&self.url[..self.url_len]).unwrap_or("")
     }
+    /// #32: the exact signed manifest M = `"build|size|sha256hex"` wire bytes (espnow verify).
+    #[cfg(feature = "espnow")]
+    pub fn signed_msg(&self) -> &[u8] {
+        &self.signed_msg[..self.signed_len]
+    }
+    /// #32: the 64-byte Ed25519 signature (espnow verify).
+    #[cfg(feature = "espnow")]
+    pub fn sig(&self) -> &[u8; 64] {
+        &self.sig
+    }
 }
 
-/// Parse `OTA|build|size|sha256hex|url` (ASCII, decimal build/size, 64-hex sha, url
-/// last so it may contain no `|`). Panic-free — returns `None` on ANY malformed field.
+/// Parse `OTA|build|size|sha256hex|sighex|url` (#32: `sighex` = 128-hex Ed25519 sig; url
+/// last so it may contain no `|`). ASCII, decimal build/size. Panic-free — `None` on ANY
+/// malformed field. An OLD unsigned 5-field-less announce (`OTA|build|size|sha|url`) fails
+/// closed: its `url` lands in the `sig` slot and fails the 128-hex parse.
 pub fn parse_announce(payload: &[u8]) -> Option<Announce> {
     let s = core::str::from_utf8(payload).ok()?;
     let rest = s.strip_prefix("OTA|")?;
-    let mut it = rest.splitn(4, '|');
-    let build: u32 = it.next()?.parse().ok()?;
-    let size: u32 = it.next()?.parse().ok()?;
-    let sha256 = parse_sha256(it.next()?)?;
+    // Keep the field &strs so M can be rebuilt from their EXACT wire bytes (no re-serialize).
+    let mut it = rest.splitn(5, '|');
+    let build_s = it.next()?;
+    let size_s = it.next()?;
+    let sha_s = it.next()?;
+    let sig_s = it.next()?;
     let url = it.next()?;
+    let build: u32 = build_s.parse().ok()?;
+    let size: u32 = size_s.parse().ok()?;
+    let sha256 = parse_hex_n::<32>(sha_s)?;
+    let sig = parse_hex_n::<64>(sig_s)?;
     if url.is_empty() || url.len() > URL_MAX || !url.is_ascii() {
         return None;
     }
+    // #32: M = the EXACT wire bytes "build|size|sha256hex" (fields 1-3 + their two '|'),
+    // reconstructed from the field lengths so it is byte-identical to what the host signed
+    // (no decimal/hex re-serialization). M is a prefix of `rest`, so the slice is in-bounds.
+    let m_len = build_s.len() + 1 + size_s.len() + 1 + sha_s.len();
+    if m_len > SIGNED_MSG_MAX {
+        return None;
+    }
+    let mut signed_msg = [0u8; SIGNED_MSG_MAX];
+    signed_msg[..m_len].copy_from_slice(&rest.as_bytes()[..m_len]);
     let mut buf = [0u8; URL_MAX];
     buf[..url.len()].copy_from_slice(url.as_bytes());
     Some(Announce {
         build,
         size,
         sha256,
+        sig,
+        signed_msg,
+        signed_len: m_len,
         url: buf,
         url_len: url.len(),
     })
 }
 
-/// 64 hex chars → 32 bytes. `None` on wrong length or a non-hex char.
-fn parse_sha256(hex: &str) -> Option<[u8; 32]> {
+/// `N*2` hex chars → `N` bytes. `None` on wrong length or a non-hex char. Panic-free.
+/// (#32 generalized the old `parse_sha256`; used for BOTH the 32-byte sha and the 64-byte sig.)
+fn parse_hex_n<const N: usize>(hex: &str) -> Option<[u8; N]> {
     let b = hex.as_bytes();
-    if b.len() != 64 {
+    if b.len() != N * 2 {
         return None;
     }
-    let mut out = [0u8; 32];
+    let mut out = [0u8; N];
     let mut i = 0;
-    while i < 32 {
+    while i < N {
         out[i] = (hexval(b[i * 2])? << 4) | hexval(b[i * 2 + 1])?;
         i += 1;
     }
@@ -163,6 +206,43 @@ fn hexval(c: u8) -> Option<u8> {
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// #32 — Ed25519 verify-before-activate (AUTHENTICITY). The announced SHA-256 proves
+// INTEGRITY (the bytes are what the announce claims); the signature proves the announce
+// came from the offline key-holder (AUTHENTICITY) — closing the "sha256 == integrity,
+// NOT authentication" gap. We sign the MANIFEST M = "build|size|sha256hex", not the bare
+// digest: binding `build` into the signature blocks a rollback/mislabel replay (an old
+// genuinely-signed image re-announced under a false higher build#). espnow-only: only
+// run_ota_fetch verifies, so a wifi-only build parses the sig field but links NEITHER this
+// code NOR the ed25519-compact crate. See issue-32-ed25519-design.md.
+// ---------------------------------------------------------------------------
+
+/// #32 fleet root-of-trust — the PUBLIC Ed25519 verify key (32 bytes). PUBLIC by design →
+/// committed here (NOT `crate::secrets`); the PRIVATE key lives ONLY in Vaultwarden
+/// (securenote `smol-ota-signing-ed25519`, never on disk) and signs in `tools/ota_publish.sh`.
+/// Rotating the key = a firmware rebuild. Real key hex:
+/// `774f8ad71d3752ffe8f90a7bde1c1e7d334b55cd9ace40e4df2b5f5bd5f76709` (team-lead keygen,
+/// JP-authorized; round-trip sign→verify confirmed).
+#[cfg(feature = "espnow")]
+pub const OTA_SIGNING_PUBKEY: [u8; 32] = [
+    0x77, 0x4f, 0x8a, 0xd7, 0x1d, 0x37, 0x52, 0xff, 0xe8, 0xf9, 0x0a, 0x7b, 0xde, 0x1c, 0x1e, 0x7d,
+    0x33, 0x4b, 0x55, 0xcd, 0x9a, 0xce, 0x40, 0xe4, 0xdf, 0x2b, 0x5f, 0x5b, 0xd5, 0xf7, 0x67, 0x09,
+];
+
+/// #32: Ed25519-verify `signed_msg` (the wire bytes `"build|size|sha256hex"`) against
+/// [`OTA_SIGNING_PUBKEY`]. Returns FALSE on ANY error (bad key/sig encoding, or a failed
+/// check) — fail-closed. No alloc, no RNG. Called at the integrity gate BEFORE `activate`.
+#[cfg(feature = "espnow")]
+pub fn verify_signature(signed_msg: &[u8], sig: &[u8; 64]) -> bool {
+    let Ok(pk) = ed25519_compact::PublicKey::from_slice(&OTA_SIGNING_PUBKEY) else {
+        return false;
+    };
+    let Ok(s) = ed25519_compact::Signature::from_slice(sig) else {
+        return false;
+    };
+    pk.verify(signed_msg, &s).is_ok()
 }
 
 /// Split `http://host[:port]/path` → `(host, port, path)`. Only plaintext `http://`

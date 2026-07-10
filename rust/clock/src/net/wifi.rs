@@ -1677,13 +1677,25 @@ pub fn run_ota_fetch(
         }
     }
 
-    // Integrity gate: exact size + SHA-256. Pass ⇒ activate (reboots). Fail ⇒ discard.
-    if writer.finalize(announce.size, &announce.sha256) {
-        log::info!("smol OTA: image VERIFIED — activating the new slot");
+    // Integrity gate (exact size + SHA-256) AND #32 authenticity gate (Ed25519 over the
+    // signed manifest "build|size|sha256hex"). BOTH must pass before otadata is touched;
+    // either failure discards with the good slot still active. `finalize` runs FIRST
+    // (flushes the last stage → the integrity proof); `verify_signature` is a pure,
+    // fail-closed, panic-free check. Coverage: reaching here at all requires a 5-field
+    // signed announce (`parse_announce` `splitn(5)`) → a MISSING sig is a 4-field announce
+    // that never parses → never fetched (reject-missing = the parser). This gate is the
+    // reject-BAD-sig half. Together: accept-good only. (#32 always-enforces — with strict
+    // `splitn(5)` a require-off flag would only fail-OPEN on a bad 5-field sig, pointless;
+    // the "deliver #32 UNSIGNED" rollout is a publish-format choice — a 4-field announce
+    // pre-#32 boards parse — not a board flag.)
+    if writer.finalize(announce.size, &announce.sha256)
+        && crate::ota::verify_signature(announce.signed_msg(), announce.sig())
+    {
+        log::info!("smol OTA: image VERIFIED (SHA-256 + ed25519) — activating the new slot");
         crate::ota::activate(target); // reboots on success
         false // reached only if the otadata write failed
     } else {
-        log::error!("smol OTA: size/SHA-256 verify FAILED — discarded (good slot intact)");
+        log::error!("smol OTA: verify FAILED (size/SHA-256 or ed25519 signature) — discarded (good slot intact)");
         false
     }
 }

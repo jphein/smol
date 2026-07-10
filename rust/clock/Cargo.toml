@@ -107,6 +107,12 @@ sha2 = { version = "0.10", default-features = false, optional = true }
 # The `NorFlash` trait (erase/write) whose impl on esp-storage's FlashStorage the OTA
 # ImageWriter drives. Trait-only crate; pin to the 0.3.x esp-storage already links.
 embedded-storage = { version = "0.3", optional = true }
+# #32 OTA authenticity: Ed25519 VERIFY-ONLY over the signed manifest ("build|size|sha256").
+# no_std, pure-Rust, no getrandom/curve25519 (self-contained) — spike-proven co-compile vs the
+# pinned quartet on riscv32imc (issue-32-spike-result.md). Gated in `espnow` (only run_ota_fetch
+# verifies) → default/wifi-only builds pull NO crypto. ⚠️ REQUIRES the opt-z per-pkg override in
+# [profile.release.package.ed25519-compact] below — without it the scalar-mult unrolls to ~1.19 MB.
+ed25519-compact = { version = "2", default-features = false, optional = true }
 
 # --- ESP-NOW (Phase 3, feature = "espnow") -------------------------------
 # ESP-NOW support lives inside esp-wifi behind its `esp-now` feature.
@@ -135,7 +141,7 @@ wifi = [
 
 # Phase 3: ESP-NOW peer messaging + WiFi<->ESP-NOW switching.
 # Builds on `wifi` (shares the radio init path) and turns on esp-wifi/esp-now.
-espnow = ["wifi", "esp-wifi/esp-now"]
+espnow = ["wifi", "esp-wifi/esp-now", "dep:ed25519-compact"]
 
 # #25 WLED WiZmote-emit: smol impersonates a WLED "linked remote" (13-B WiZmote
 # ESP-NOW broadcast). Needs the ESP-NOW broadcast path + RadioManager, so it builds
@@ -158,6 +164,15 @@ opt-level = "s"
 lto = "fat"
 codegen-units = 1
 overflow-checks = false
+
+# 🟥 #32 BUILD GATE (MANDATORY — spike-proven, issue-32-spike-result.md): without this,
+# ed25519-compact's `double_scalarmult_vartime` inlines/unrolls under opt="s"+fat-LTO into a
+# single ~1 MB function → total ed25519 symbols ~1.19 MB → the OTA image overflows the slot
+# (0x1F0000). opt="z" collapses it 32× (~93 KB) → production image ~37% of slot. Per-PACKAGE
+# only: the global stays opt="s" (the radio blobs' required timing). Verify runs once per OTA
+# (~ms) on PUBLIC data, so size-over-speed here is free (constant-time not a concern).
+[profile.release.package.ed25519-compact]
+opt-level = "z"
 
 [profile.dev]
 opt-level = "s"
