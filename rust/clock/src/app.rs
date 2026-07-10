@@ -207,6 +207,27 @@ impl AppKind {
             _ => return None,
         })
     }
+
+    /// #50: inverse of [`from_wire`] — the wire token for a live screen, for the
+    /// `STAT|<screen>:<page>` status readback publish. Total (every variant maps).
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            AppKind::Menu => "Menu",
+            AppKind::Clock => "Clock",
+            AppKind::Snake => "Snake",
+            AppKind::About => "About",
+            #[cfg(feature = "wifi")]
+            AppKind::Batt => "Batt",
+            #[cfg(feature = "wifi")]
+            AppKind::Grid => "Grid",
+            #[cfg(feature = "espnow")]
+            AppKind::Bench => "Bench",
+            #[cfg(feature = "espnow")]
+            AppKind::MeshSnake => "MeshSnake",
+            #[cfg(feature = "wled")]
+            AppKind::WledRemote => "WledRemote",
+        }
+    }
 }
 
 /// Parse a retained `smol/<id>/config/default_screen` payload (#21): `<AppKind>[:<page>]`
@@ -347,6 +368,30 @@ impl App {
             App::Batt(s) => s.set_page(_page),
             App::Grid(s) => s.set_page(_page),
             _ => {}
+        }
+    }
+
+    /// #50: the LIVE screen + page the render loop is drawing NOW — read at telemetry
+    /// time for the `smol/<id>/status` readback. Reflects MANUAL BOOT-button nav (the
+    /// button handler mutates this live state), unlike the commanded `DefaultScreen`
+    /// config (reading the config misses manual nav — the stopgap JP rejected).
+    /// Page-capable screens (Batt/Grid) report their real page; others report 0.
+    pub fn live_screen(&self) -> (AppKind, u8) {
+        match self {
+            App::Menu(_) => (AppKind::Menu, 0),
+            App::Clock(_) => (AppKind::Clock, 0),
+            App::Snake(_) => (AppKind::Snake, 0),
+            App::About(_) => (AppKind::About, 0),
+            #[cfg(feature = "wifi")]
+            App::Batt(s) => (AppKind::Batt, s.page()),
+            #[cfg(feature = "wifi")]
+            App::Grid(s) => (AppKind::Grid, s.page()),
+            #[cfg(feature = "espnow")]
+            App::Bench(_) => (AppKind::Bench, 0),
+            #[cfg(feature = "espnow")]
+            App::MeshSnake(_) => (AppKind::MeshSnake, 0),
+            #[cfg(feature = "wled")]
+            App::WledRemote(_) => (AppKind::WledRemote, 0),
         }
     }
 }

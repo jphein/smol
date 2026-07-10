@@ -185,6 +185,12 @@ impl BattState {
     pub fn set_page(&mut self, page: u8) {
         self.page = page;
     }
+
+    /// #50: the live page index (raw; the renderer clamps `% page_count`). Read for
+    /// the `smol/<id>/status` readback of the ACTUAL screen state.
+    pub fn page(&self) -> u8 {
+        self.page
+    }
 }
 
 impl Plugin for BattState {

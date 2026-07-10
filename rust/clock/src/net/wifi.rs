@@ -476,6 +476,7 @@ pub fn run_ntp_burst(
         config_offer,
         install_requested,
         &[], // #27: boot NTP+downlink burst publishes no peers (no roster yet)
+        &[], // #50: boot burst publishes no live-screen status
         None, // #21: boot burst is not a gateway relay (no leaf-config cache)
         mqtt_deadline,
         tick,
@@ -825,6 +826,10 @@ fn mqtt_session(
     // #27: this node's serialized roster (`PEERS|…`); published retained to
     // `smol/<node_id>/peers` after the telemetry loop iff non-empty.
     peers: &[u8],
+    // #50: this node's live `STAT|<screen>:<page>` (from `App::live_screen`) → retained
+    // `smol/<node_id>/status`. Empty ⇒ skipped. (Built once; carries build#/installed for
+    // #40 Tier-2 later.)
+    status: &[u8],
     // #21 leaf-relay: `Some` on a GATEWAY flush → subscribe the wildcard
     // `smol/+/config/default_screen` and cache every OTHER leaf's value here for the
     // ESP-NOW relay. `None` on boot/leaf/election bursts (no relay duty).
@@ -1039,6 +1044,18 @@ fn mqtt_session(
         let mut ptopic = MqttScratch::new();
         let _ = write!(ptopic, "smol/{}/peers", node_id);
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, ptopic.as_bytes(), peers, true) {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+    }
+
+    // #50: publish this node's LIVE screen:page as RETAINED `smol/<id>/status`, if any.
+    // Same path as peers — the caller passes `STAT|<screen>:<page>` from the live render
+    // state (`App::live_screen`, captures manual BOOT-nav); empty ⇒ skipped (boot/election
+    // bursts). Backward-compat: purely additive, a new topic (old HA/fw ignore it).
+    if !status.is_empty() {
+        let mut stopic = MqttScratch::new();
+        let _ = write!(stopic, "smol/{}/status", node_id);
+        if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, stopic.as_bytes(), status, true) {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
     }
@@ -1322,6 +1339,8 @@ pub fn run_mqtt_burst(
     // #27: this node's serialized roster (`PEERS|…`) to publish retained as
     // `smol/<id>/peers`. Empty ⇒ nothing published (leaf / election-only burst).
     peers: &[u8],
+    // #50: live `STAT|<screen>:<page>` → retained `smol/<id>/status` (empty ⇒ none).
+    status: &[u8],
     // #21 leaf-relay: `Some` on a gateway flush → wildcard-subscribe + cache leaf
     // configs for the ESP-NOW relay; `None` otherwise (see `mqtt_session`).
     cfg_cache: Option<&mut CfgCache>,
@@ -1460,6 +1479,7 @@ pub fn run_mqtt_burst(
         config_offer,
         install_requested,
         peers, // #27: forward the caller's serialized roster to publish retained
+        status, // #50: forward the live STAT|screen:page for smol/<id>/status
         cfg_cache, // #21: forward the gateway's leaf-config cache (or None)
         deadline,
         tick,
