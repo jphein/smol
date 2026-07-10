@@ -295,7 +295,7 @@ mqtt:
     # NOT YET PUBLISHED BY FIRMWARE. These + the template block below back the topology
     # card (ha/dashboard/smol_topology_card.yaml). Contract (#27, fw morpheus-fw Task 3):
     #   smol/mesh/channel = MC|owner|channel|seq         (the elected gateway + mesh ch)
-    #   smol/<id>/peers   = PEERS|role|ch|id,rssi,age,flags|…   (each connected board's roster)
+    #   smol/<id>/peers   = PEERS|role|ch|<peer>;<peer>;…   (peers ';'-separated; each = id,rssi,age,ch,flags)
     # Parsing mirrors the batt/grid/config discipline (guarded split, panic-free). Until
     # firmware publishes these, every entity below reads unknown/unavailable (harmless).
     - name: "smol mesh channel"
@@ -311,7 +311,7 @@ mqtt:
       state_topic: "smol/7/peers"
       value_template: "{% set p = value.split('|') %}{{ 'gateway' if (p | length > 1 and p[1] == 'G') else 'leaf' }}"
       json_attributes_topic: "smol/7/peers"
-      json_attributes_template: "{% set p = value.split('|') %}{{ ({'ch': p[2], 'peers': p[3:]} if p | length >= 3 else {'peers': []}) | tojson }}"
+      json_attributes_template: "{% set p = value.split('|') %}{{ ({'ch': p[2], 'peers': (p[3].split(';') if p | length >= 4 and p[3] else [])} if p | length >= 3 else {'peers': []}) | tojson }}"
       expire_after: 90
       icon: "mdi:lan-connect"
     - name: "smol 8 peers"
@@ -319,7 +319,7 @@ mqtt:
       state_topic: "smol/8/peers"
       value_template: "{% set p = value.split('|') %}{{ 'gateway' if (p | length > 1 and p[1] == 'G') else 'leaf' }}"
       json_attributes_topic: "smol/8/peers"
-      json_attributes_template: "{% set p = value.split('|') %}{{ ({'ch': p[2], 'peers': p[3:]} if p | length >= 3 else {'peers': []}) | tojson }}"
+      json_attributes_template: "{% set p = value.split('|') %}{{ ({'ch': p[2], 'peers': (p[3].split(';') if p | length >= 4 and p[3] else [])} if p | length >= 3 else {'peers': []}) | tojson }}"
       expire_after: 90
       icon: "mdi:lan-connect"
     - name: "smol 9 peers"
@@ -327,7 +327,7 @@ mqtt:
       state_topic: "smol/9/peers"
       value_template: "{% set p = value.split('|') %}{{ 'gateway' if (p | length > 1 and p[1] == 'G') else 'leaf' }}"
       json_attributes_topic: "smol/9/peers"
-      json_attributes_template: "{% set p = value.split('|') %}{{ ({'ch': p[2], 'peers': p[3:]} if p | length >= 3 else {'peers': []}) | tojson }}"
+      json_attributes_template: "{% set p = value.split('|') %}{{ ({'ch': p[2], 'peers': (p[3].split(';') if p | length >= 4 and p[3] else [])} if p | length >= 3 else {'peers': []}) | tojson }}"
       expire_after: 90
       icon: "mdi:lan-connect"
 
