@@ -157,9 +157,44 @@ cards:
     name: Screen (all nodes)
   - entity: input_select.smol_all_page
     name: Page (all)
+  - entity: input_select.smol_all_led
+    name: LED (all nodes)
+    icon: mdi:led-on
   - entity: input_button.smol_all_apply
     name: Apply to all — retained, on next burst
     icon: mdi:send-check
+  - entity: input_button.smol_all_reboot
+    name: Reboot ALL nodes
+    icon: mdi:restart-alert
+    tap_action:
+      action: perform-action
+      perform_action: input_button.press
+      target:
+        entity_id: input_button.smol_all_reboot
+      confirmation:
+        text: Reboot ALL smol nodes? The whole fleet drops off the mesh briefly.
+  card_mod:
+    style: 'ha-card { position:relative; overflow:hidden; }
+
+      ha-card:before { content:''''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,transparent,var(--accent-color),transparent); opacity:.55; }
+
+      '
+- type: entities
+  view_layout:
+    grid-column: span 12
+  title: display units · fleet-wide
+  show_header_toggle: false
+  entities:
+  - entity: input_select.smol_temp_unit
+    name: Temperature (°F / °C)
+    icon: mdi:thermometer
+  - entity: input_select.smol_clock_format
+    name: Clock (24h / 12h)
+    icon: mdi:clock-outline
+  - type: divider
+  - entity: sensor.smol_units
+    name: Applied (retained → smol/config/units)
+    icon: mdi:cog-sync
   card_mod:
     style: 'ha-card { position:relative; overflow:hidden; }
 
@@ -182,8 +217,8 @@ cards:
         .: ha-card{position:relative;overflow:hidden}ha-card:before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent-color),transparent);opacity:.55}ha-card{border-radius:10px 10px 0 0;border-bottom:none}
         mushroom-state-info$: .primary{font-family:'VT323','IBM Plex Mono',monospace;font-size:26px;line-height:.9}.secondary{font-size:11px}
   - type: custom:mushroom-template-card
-    primary: '{% set scr=states(''input_select.smol_7_screen'') %}{% set t=states(''sensor.smol_7_temp'') %}{% set g=states(''sensor.smol_display_grid'') %}{% set na=[''unavailable'',''unknown'',''none'',''None'',''''] %}{% if not is_state(''binary_sensor.smol_7_online'',''on'') %}—{% elif scr==''Grid'' %}{{ g.split(''|'')[1] if ''|'' in g else ''—'' }}{% elif scr==''Batt'' %}{{ states(''sensor.ev_battery_soc'') }}%{% elif scr==''Clock'' %}{{ now().strftime(''%H:%M'') }}{% else %}{{ t if t not in na else ''—'' }}{% endif %}'
-    secondary: '{% set scr=states(''input_select.smol_7_screen'') %}{{ scr|upper }} · {% if not is_state(''binary_sensor.smol_7_online'',''on'') %}no link{% elif scr==''Grid'' %}shared glass{% elif scr==''Batt'' %}HV pack{% elif scr==''Clock'' %}mesh time{% else %}live °F{% endif %}'
+    primary: '{% set scr=(states(''sensor.smol_7_screen'') if states(''sensor.smol_7_screen'') not in [''unavailable'',''unknown'',''none'',''None'',''''] else states(''input_select.smol_7_screen'')) %}{% set t=states(''sensor.smol_7_temp'') %}{% set g=states(''sensor.smol_display_grid'') %}{% set na=[''unavailable'',''unknown'',''none'',''None'',''''] %}{% if not is_state(''binary_sensor.smol_7_online'',''on'') %}—{% elif scr==''Grid'' %}{{ g.split(''|'')[1] if ''|'' in g else ''—'' }}{% elif scr==''Batt'' %}{{ states(''sensor.ev_battery_soc'') }}%{% elif scr==''Clock'' %}{{ now().strftime(''%H:%M'') }}{% else %}{{ t if t not in na else ''—'' }}{% endif %}'
+    secondary: '{% set scr=(states(''sensor.smol_7_screen'') if states(''sensor.smol_7_screen'') not in [''unavailable'',''unknown'',''none'',''None'',''''] else states(''input_select.smol_7_screen'')) %}{{ scr|upper }} · {% if not is_state(''binary_sensor.smol_7_online'',''on'') %}no link{% elif scr==''Grid'' %}shared glass{% elif scr==''Batt'' %}HV pack{% elif scr==''Clock'' %}mesh time{% else %}live °F{% endif %}'
     icon: mdi:blank
     card_mod:
       style:
@@ -198,17 +233,33 @@ cards:
       name: default screen
     - entity: input_select.smol_7_page
       name: page
+    - entity: input_select.smol_7_led
+      name: LED (status / on / off)
+      icon: mdi:led-on
     - entity: input_button.smol_7_apply
       name: Apply → id7
       icon: mdi:send
     - entity: input_button.smol_7_reset
       name: Reset to board default
       icon: mdi:backup-restore
+    - entity: input_button.smol_7_reboot
+      name: Reboot node
+      icon: mdi:restart-alert
+      tap_action:
+        action: perform-action
+        perform_action: input_button.press
+        target:
+          entity_id: input_button.smol_7_reboot
+        confirmation:
+          text: Reboot id7 (Draconic Dominion)? It drops off the mesh briefly.
     - type: section
       label: readback
     - entity: sensor.smol_7_config
-      name: screen · page (commanded)
+      name: default screen (commanded)
       icon: mdi:monitor-dashboard
+    - entity: sensor.smol_7_screen
+      name: current screen (live)
+      icon: mdi:monitor-eye
     - entity: sensor.smol_7_status
       name: activity
       icon: mdi:pulse
@@ -237,8 +288,8 @@ cards:
         .: ha-card{position:relative;overflow:hidden}ha-card:before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--primary-color),transparent);opacity:.55}ha-card{border-radius:10px 10px 0 0;border-bottom:none}
         mushroom-state-info$: .primary{font-family:'VT323','IBM Plex Mono',monospace;font-size:26px;line-height:.9}.secondary{font-size:11px}
   - type: custom:mushroom-template-card
-    primary: '{% set scr=states(''input_select.smol_8_screen'') %}{% set t=states(''sensor.smol_8_temp'') %}{% set g=states(''sensor.smol_display_grid'') %}{% set na=[''unavailable'',''unknown'',''none'',''None'',''''] %}{% if not is_state(''binary_sensor.smol_8_online'',''on'') %}—{% elif scr==''Grid'' %}{{ g.split(''|'')[1] if ''|'' in g else ''—'' }}{% elif scr==''Batt'' %}{{ states(''sensor.ev_battery_soc'') }}%{% elif scr==''Clock'' %}{{ now().strftime(''%H:%M'') }}{% else %}{{ t if t not in na else ''—'' }}{% endif %}'
-    secondary: '{% set scr=states(''input_select.smol_8_screen'') %}{{ scr|upper }} · {% if not is_state(''binary_sensor.smol_8_online'',''on'') %}no link{% elif scr==''Grid'' %}shared glass{% elif scr==''Batt'' %}HV pack{% elif scr==''Clock'' %}mesh time{% else %}live °F{% endif %}'
+    primary: '{% set scr=(states(''sensor.smol_8_screen'') if states(''sensor.smol_8_screen'') not in [''unavailable'',''unknown'',''none'',''None'',''''] else states(''input_select.smol_8_screen'')) %}{% set t=states(''sensor.smol_8_temp'') %}{% set g=states(''sensor.smol_display_grid'') %}{% set na=[''unavailable'',''unknown'',''none'',''None'',''''] %}{% if not is_state(''binary_sensor.smol_8_online'',''on'') %}—{% elif scr==''Grid'' %}{{ g.split(''|'')[1] if ''|'' in g else ''—'' }}{% elif scr==''Batt'' %}{{ states(''sensor.ev_battery_soc'') }}%{% elif scr==''Clock'' %}{{ now().strftime(''%H:%M'') }}{% else %}{{ t if t not in na else ''—'' }}{% endif %}'
+    secondary: '{% set scr=(states(''sensor.smol_8_screen'') if states(''sensor.smol_8_screen'') not in [''unavailable'',''unknown'',''none'',''None'',''''] else states(''input_select.smol_8_screen'')) %}{{ scr|upper }} · {% if not is_state(''binary_sensor.smol_8_online'',''on'') %}no link{% elif scr==''Grid'' %}shared glass{% elif scr==''Batt'' %}HV pack{% elif scr==''Clock'' %}mesh time{% else %}live °F{% endif %}'
     icon: mdi:blank
     card_mod:
       style:
@@ -253,17 +304,33 @@ cards:
       name: default screen
     - entity: input_select.smol_8_page
       name: page
+    - entity: input_select.smol_8_led
+      name: LED (status / on / off)
+      icon: mdi:led-on
     - entity: input_button.smol_8_apply
       name: Apply → id8
       icon: mdi:send
     - entity: input_button.smol_8_reset
       name: Reset to board default
       icon: mdi:backup-restore
+    - entity: input_button.smol_8_reboot
+      name: Reboot node
+      icon: mdi:restart-alert
+      tap_action:
+        action: perform-action
+        perform_action: input_button.press
+        target:
+          entity_id: input_button.smol_8_reboot
+        confirmation:
+          text: Reboot id8 (Eldritch Nexus)? It drops off the mesh briefly.
     - type: section
       label: readback
     - entity: sensor.smol_8_config
-      name: screen · page (commanded)
+      name: default screen (commanded)
       icon: mdi:monitor-dashboard
+    - entity: sensor.smol_8_screen
+      name: current screen (live)
+      icon: mdi:monitor-eye
     - entity: sensor.smol_8_status
       name: activity
       icon: mdi:pulse
@@ -301,8 +368,8 @@ cards:
         .: ha-card{position:relative;overflow:hidden}ha-card:before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--primary-color),transparent);opacity:.55}ha-card{border-radius:10px 10px 0 0;border-bottom:none}
         mushroom-state-info$: .primary{font-family:'VT323','IBM Plex Mono',monospace;font-size:26px;line-height:.9}.secondary{font-size:11px}
   - type: custom:mushroom-template-card
-    primary: '{% set scr=states(''input_select.smol_9_screen'') %}{% set t=states(''sensor.smol_9_temp'') %}{% set g=states(''sensor.smol_display_grid'') %}{% set na=[''unavailable'',''unknown'',''none'',''None'',''''] %}{% if not is_state(''binary_sensor.smol_9_online'',''on'') %}—{% elif scr==''Grid'' %}{{ g.split(''|'')[1] if ''|'' in g else ''—'' }}{% elif scr==''Batt'' %}{{ states(''sensor.ev_battery_soc'') }}%{% elif scr==''Clock'' %}{{ now().strftime(''%H:%M'') }}{% else %}{{ t if t not in na else ''—'' }}{% endif %}'
-    secondary: '{% set scr=states(''input_select.smol_9_screen'') %}{{ scr|upper }} · {% if not is_state(''binary_sensor.smol_9_online'',''on'') %}no link{% elif scr==''Grid'' %}shared glass{% elif scr==''Batt'' %}HV pack{% elif scr==''Clock'' %}mesh time{% else %}live °F{% endif %}'
+    primary: '{% set scr=(states(''sensor.smol_9_screen'') if states(''sensor.smol_9_screen'') not in [''unavailable'',''unknown'',''none'',''None'',''''] else states(''input_select.smol_9_screen'')) %}{% set t=states(''sensor.smol_9_temp'') %}{% set g=states(''sensor.smol_display_grid'') %}{% set na=[''unavailable'',''unknown'',''none'',''None'',''''] %}{% if not is_state(''binary_sensor.smol_9_online'',''on'') %}—{% elif scr==''Grid'' %}{{ g.split(''|'')[1] if ''|'' in g else ''—'' }}{% elif scr==''Batt'' %}{{ states(''sensor.ev_battery_soc'') }}%{% elif scr==''Clock'' %}{{ now().strftime(''%H:%M'') }}{% else %}{{ t if t not in na else ''—'' }}{% endif %}'
+    secondary: '{% set scr=(states(''sensor.smol_9_screen'') if states(''sensor.smol_9_screen'') not in [''unavailable'',''unknown'',''none'',''None'',''''] else states(''input_select.smol_9_screen'')) %}{{ scr|upper }} · {% if not is_state(''binary_sensor.smol_9_online'',''on'') %}no link{% elif scr==''Grid'' %}shared glass{% elif scr==''Batt'' %}HV pack{% elif scr==''Clock'' %}mesh time{% else %}live °F{% endif %}'
     icon: mdi:blank
     card_mod:
       style:
@@ -317,17 +384,33 @@ cards:
       name: default screen
     - entity: input_select.smol_9_page
       name: page
+    - entity: input_select.smol_9_led
+      name: LED (status / on / off)
+      icon: mdi:led-on
     - entity: input_button.smol_9_apply
       name: Apply → id9
       icon: mdi:send
     - entity: input_button.smol_9_reset
       name: Reset to board default
       icon: mdi:backup-restore
+    - entity: input_button.smol_9_reboot
+      name: Reboot node
+      icon: mdi:restart-alert
+      tap_action:
+        action: perform-action
+        perform_action: input_button.press
+        target:
+          entity_id: input_button.smol_9_reboot
+        confirmation:
+          text: Reboot id9 (Jade Herald)? It drops off the mesh briefly.
     - type: section
       label: readback
     - entity: sensor.smol_9_config
-      name: screen · page (commanded)
+      name: default screen (commanded)
       icon: mdi:monitor-dashboard
+    - entity: sensor.smol_9_screen
+      name: current screen (live)
+      icon: mdi:monitor-eye
     - entity: sensor.smol_9_status
       name: activity
       icon: mdi:pulse

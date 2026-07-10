@@ -1,6 +1,4 @@
-<!-- README delta for ha/ — smol · Control Room dashboard. Merge into ha/dashboard/README.md (or ha/README.md). -->
-
-## smol · Control Room — Home Assistant dashboard
+# smol · Control Room — Home Assistant dashboard
 
 A single phosphor-CRT Lovelace view for the ESP-NOW mesh: live topology, per-node
 screen/firmware/telemetry boxes, the shared glass, power sources, and the OTA forge.
@@ -41,9 +39,12 @@ a blank gap that looks exactly like a stale cache. Place child cards **directly 
 via `view_layout: {grid-column: "span N"}`. The generator splices node boxes into the view's card
 list for this reason (the `FLEET` placeholder is replaced in-place, not wrapped in a nested grid).
 
-### Firmware dependency: LIVE current screen (design F4)
-The node box shows the **commanded** screen (`sensor.smol_<id>_config`, the retained
-`smol/<id>/config/default_screen`) — the effective screen the node applies. The **live actual**
-screen (`sensor.smol_<id>_screen`, mirroring `smol/<id>/status = STAT|<screen>:<page>|<build>`)
-is `unknown` until the firmware publishes that topic (design F4). The live-readback row is omitted
-until F4 ships; the generator re-adds it when the entity leaves `unknown`.
+### Live current screen (shipped — #50)
+Each node box shows **two rows**: the **commanded** default (`sensor.smol_<id>_config`, the
+retained `smol/<id>/config/default_screen`) and the **live actual** screen
+(`sensor.smol_<id>_screen`). The firmware publishes the live screen as
+`smol/<id>/status = STAT|<screen>:<page>|<build>` — the gateway self-reads; leaves broadcast it
+over ESP-NOW and the gateway decodes + republishes — so the live row tracks manual BOOT-menu
+navigation, not just the command. (Shipped fleet-wide 2026-07-10 as #50; this was formerly the
+`unknown`-until-published "design F4" placeholder. The generator prefers the live value and falls
+back to commanded only while `sensor.smol_<id>_screen` is `unknown`.)

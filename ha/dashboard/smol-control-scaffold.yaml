@@ -90,9 +90,44 @@ cards:
         name: Screen (all nodes)
       - entity: input_select.smol_all_page
         name: Page (all)
+      - entity: input_select.smol_all_led
+        name: LED (all nodes)
+        icon: mdi:led-on
       - entity: input_button.smol_all_apply
         name: Apply to all — retained, on next burst
         icon: mdi:send-check
+      - entity: input_button.smol_all_reboot
+        name: Reboot ALL nodes
+        icon: mdi:restart-alert
+        tap_action:
+          action: perform-action
+          perform_action: input_button.press
+          target: {entity_id: input_button.smol_all_reboot}
+          confirmation:
+            text: "Reboot ALL smol nodes? The whole fleet drops off the mesh briefly."
+    card_mod:
+      style: |
+        ha-card { position:relative; overflow:hidden; }
+        ha-card:before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,transparent,var(--accent-color),transparent); opacity:.55; }
+
+  # ---- #43 DISPLAY UNITS · fleet-wide (°F/°C · 12h/24h) — STAGED; deploys with #46 CFG-relay proof ----
+  # Global (not per-node): HA input_selects → retained smol/config/units=<F|C>|<12|24>, gateway relays to leaves.
+  # Entities land with 1add131 (HA package) + fw read (lucid) + leaf relay (#46). HOLD live deploy until #46.
+  - type: entities
+    view_layout: {grid-column: "span 12"}
+    title: display units · fleet-wide
+    show_header_toggle: false
+    entities:
+      - entity: input_select.smol_temp_unit
+        name: Temperature (°F / °C)
+        icon: mdi:thermometer
+      - entity: input_select.smol_clock_format
+        name: Clock (24h / 12h)
+        icon: mdi:clock-outline
+      - type: divider
+      - entity: sensor.smol_units
+        name: Applied (retained → smol/config/units)
+        icon: mdi:cog-sync
     card_mod:
       style: |
         ha-card { position:relative; overflow:hidden; }

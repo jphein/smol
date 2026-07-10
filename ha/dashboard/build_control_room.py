@@ -4,7 +4,7 @@
 # card that renders EMPTY. Fix = splice node cards DIRECTLY into the view grid (span 4, like
 # glass/power/forge which render). Node cards stay LIVE mushroom boxes (header + OLED + entities).
 # If mushroom still doesn't render un-nested → it's mushroom, swap to SVG faceplate then.
-#   HA_TOKEN=<your-HA-long-lived-access-token> python3 build_control_room.py
+#   HA_TOKEN=<your-ha-long-lived-token> python3 build_control_room.py
 import asyncio, json, os, re, subprocess, hashlib, yaml, websockets
 try:
     from defusedxml.minidom import parseString as xml_parse
@@ -37,8 +37,9 @@ def node_card(nid, meta, present):
             "badge_color":"amber" if gate else ("{{ 'green' if "+on+" else 'red' }}"),
             "card_mod":{"style":{".":accent_top(ACCENT if gate else PHOS)+"ha-card{border-radius:10px 10px 0 0;border-bottom:none}",
                 "mushroom-state-info$":".primary{font-family:"+VT+";font-size:26px;line-height:.9}.secondary{font-size:11px}"}}}
-    # mini-OLED shows the SCREEN's content (like the board): Grid→grid W, Batt→HV SOC, Clock→time, else temp
-    scr="states('input_select.smol_"+I+"_screen')"
+    # mini-OLED shows the SCREEN's content (like the board): Grid→grid W, Batt→HV SOC, Clock→time, else temp.
+    # Prefers the LIVE actual screen (sensor._screen, incl. manual nav) once #50 ships; falls to commanded while unknown.
+    scr="(states('sensor.smol_"+I+"_screen') if states('sensor.smol_"+I+"_screen') not in "+NAJ+" else states('input_select.smol_"+I+"_screen'))"
     oled_p=("{% set scr="+scr+" %}{% set t=states('sensor.smol_"+I+"_temp') %}{% set g=states('sensor.smol_display_grid') %}{% set na="+NAJ+" %}"
             "{% if not "+on+" %}—{% elif scr=='Grid' %}{{ g.split('|')[1] if '|' in g else '—' }}"
             "{% elif scr=='Batt' %}{{ states('sensor.ev_battery_soc') }}%{% elif scr=='Clock' %}{{ now().strftime('%H:%M') }}"
@@ -59,13 +60,18 @@ def node_card(nid, meta, present):
     sec("screen & mode")
     row(f"input_select.smol_{nid}_screen","default screen")
     row(f"input_select.smol_{nid}_page","page")
+    row(f"input_select.smol_{nid}_led","LED (status / on / off)","mdi:led-on")   # #48
     row(f"input_button.smol_{nid}_apply",f"Apply → id{nid}","mdi:send")
     row(f"input_button.smol_{nid}_reset","Reset to board default","mdi:backup-restore")
+    rb=f"input_button.smol_{nid}_reboot"                                          # #52 remote reboot — tap-guarded (destructive)
+    if rb in present:
+        ents.append({"entity":rb,"name":"Reboot node","icon":"mdi:restart-alert",
+            "tap_action":{"action":"perform-action","perform_action":"input_button.press","target":{"entity_id":rb},
+                          "confirmation":{"text":f"Reboot id{nid} ({meta['name']})? It drops off the mesh briefly."}}})
     sec("readback")
-    row(f"sensor.smol_{nid}_config","screen · page (commanded)","mdi:monitor-dashboard")
-    # NOTE: sensor.smol_<id>_screen (LIVE current screen) omitted — it's 'unknown' until firmware
-    # publishes smol/<id>/status = STAT|screen:page|build (design F4). Commanded config above is the
-    # effective screen the node applies. Row returns when F4 ships the live readback.
+    # TWO rows, ALWAYS both (JP: see commanded-vs-actual DRIFT — no fallback):
+    row(f"sensor.smol_{nid}_config","default screen (commanded)","mdi:monitor-dashboard")   # retained default_screen; works now
+    row(f"sensor.smol_{nid}_screen","current screen (live)","mdi:monitor-eye")              # ACTUAL screen incl. manual BOOT-menu nav; 'unknown' until #50 fw, then auto-populates
     row(f"sensor.smol_{nid}_status","activity","mdi:pulse")
     row(f"sensor.smol_{nid}_rssi","bond (RSSI)","mdi:signal")
     row(f"sensor.smol_{nid}_rssi_band","bond band","mdi:signal-cellular-2")
