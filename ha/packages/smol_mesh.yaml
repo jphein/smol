@@ -155,7 +155,7 @@ input_select:
     icon: mdi:monitor-multiple
   smol_all_page:
     name: "smol all · default page"
-    options: ["0", "1"]
+    options: ["0", "1", "2", "3"]   # 0=voltage/entry; 1-3 = Batt SOC detail pages (#17); fw wraps % page_count for screens with fewer
     initial: "0"
     icon: mdi:book-open-page-variant
   # --- id7 (one copy-paste block per node; new node = duplicate + renumber) ---
@@ -166,7 +166,7 @@ input_select:
     icon: mdi:monitor
   smol_7_page:
     name: "smol id7 · default page"
-    options: ["0", "1"]
+    options: ["0", "1", "2", "3"]   # 0=voltage/entry; 1-3 = Batt SOC detail pages (#17); fw wraps % page_count for screens with fewer
     initial: "0"
     icon: mdi:book-open-page-variant
   # --- id8 ---
@@ -177,7 +177,7 @@ input_select:
     icon: mdi:monitor
   smol_8_page:
     name: "smol id8 · default page"
-    options: ["0", "1"]
+    options: ["0", "1", "2", "3"]   # 0=voltage/entry; 1-3 = Batt SOC detail pages (#17); fw wraps % page_count for screens with fewer
     initial: "0"
     icon: mdi:book-open-page-variant
   # --- id9 ---
@@ -188,7 +188,7 @@ input_select:
     icon: mdi:monitor
   smol_9_page:
     name: "smol id9 · default page"
-    options: ["0", "1"]
+    options: ["0", "1", "2", "3"]   # 0=voltage/entry; 1-3 = Batt SOC detail pages (#17); fw wraps % page_count for screens with fewer
     initial: "0"
     icon: mdi:book-open-page-variant
 
