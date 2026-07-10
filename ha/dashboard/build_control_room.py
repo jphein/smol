@@ -24,9 +24,12 @@ def accent_top(c): return ("ha-card{position:relative;overflow:hidden}ha-card:be
 # ---------- node box = mushroom header + mushroom OLED + entities; span-4 in the VIEW grid ----------
 def node_card(nid, meta, present):
     gate=meta["gate"]; I=str(nid); on=f"is_state('binary_sensor.smol_{I}_online','on')"
+    # RSSI in EVERY node: leaves show dBm; gateway (no mesh-RSSI to itself) shows WiFi uplink
+    has_rssi=f"sensor.smol_{I}_rssi" in present
+    rssi_pip=(" · {{ states('sensor.smol_"+I+"_rssi') if states('sensor.smol_"+I+"_rssi') not in na else '—' }} dBm") if has_rssi else " · WiFi"
     hdr=("{% set on="+on+" %}{% set t=states('sensor.smol_"+I+"_temp') %}{% set v=states('sensor.smol_"+I+"_voltage') %}"
          "{% set na="+NAJ+" %}id"+I+" · "+meta["role"]+" · {{ '🟢 online' if on else '🔴 offline' }}"
-         " · {{ t if t not in na else '—' }}° · {{ v if v not in na else '—' }}V")
+         " · {{ t if t not in na else '—' }}° · {{ v if v not in na else '—' }}V"+rssi_pip)
     header={"type":"custom:mushroom-template-card","primary":meta["name"],"secondary":hdr,
             "icon":"mdi:crown" if gate else "mdi:chip",
             "icon_color":"amber" if gate else ("{{ 'green' if "+on+" else 'red' }}"),
@@ -34,10 +37,14 @@ def node_card(nid, meta, present):
             "badge_color":"amber" if gate else ("{{ 'green' if "+on+" else 'red' }}"),
             "card_mod":{"style":{".":accent_top(ACCENT if gate else PHOS)+"ha-card{border-radius:10px 10px 0 0;border-bottom:none}",
                 "mushroom-state-info$":".primary{font-family:"+VT+";font-size:26px;line-height:.9}.secondary{font-size:11px}"}}}
-    oled={"type":"custom:mushroom-template-card",
-          "primary":"{% set t=states('sensor.smol_"+I+"_temp') %}{% set na="+NAJ+" %}{{ t if (t not in na and "+on+") else '—' }}",
-          "secondary":"{{ states('input_select.smol_"+I+"_screen')|upper }} · {{ 'live °F' if "+on+" else 'no link' }}",
-          "icon":"mdi:blank",
+    # mini-OLED shows the SCREEN's content (like the board): Grid→grid W, Batt→HV SOC, Clock→time, else temp
+    scr="states('input_select.smol_"+I+"_screen')"
+    oled_p=("{% set scr="+scr+" %}{% set t=states('sensor.smol_"+I+"_temp') %}{% set g=states('sensor.smol_display_grid') %}{% set na="+NAJ+" %}"
+            "{% if not "+on+" %}—{% elif scr=='Grid' %}{{ g.split('|')[1] if '|' in g else '—' }}"
+            "{% elif scr=='Batt' %}{{ states('sensor.ev_battery_soc') }}%{% elif scr=='Clock' %}{{ now().strftime('%H:%M') }}"
+            "{% else %}{{ t if t not in na else '—' }}{% endif %}")
+    oled_s=("{% set scr="+scr+" %}{{ scr|upper }} · {% if not "+on+" %}no link{% elif scr=='Grid' %}shared glass{% elif scr=='Batt' %}HV pack{% elif scr=='Clock' %}mesh time{% else %}live °F{% endif %}")
+    oled={"type":"custom:mushroom-template-card","primary":oled_p,"secondary":oled_s,"icon":"mdi:blank",
           "card_mod":{"style":{".":("ha-card{background:#020402;border:1px solid var(--ha-card-border-color);border-radius:0;"
                 "box-shadow:inset 0 0 12px rgba(0,0,0,.9);position:relative;overflow:hidden;margin-top:-2px}mushroom-shape-icon{display:none}"),
                 "mushroom-state-info$":(".primary{font-family:"+VT+";font-size:44px;line-height:.8;color:var(--primary-color);"
@@ -55,10 +62,13 @@ def node_card(nid, meta, present):
     row(f"input_button.smol_{nid}_apply",f"Apply → id{nid}","mdi:send")
     row(f"input_button.smol_{nid}_reset","Reset to board default","mdi:backup-restore")
     sec("readback")
-    row(f"sensor.smol_{nid}_config","commanded (retained)","mdi:cog")
-    row(f"sensor.smol_{nid}_screen","current screen","mdi:monitor-eye")
+    row(f"sensor.smol_{nid}_config","screen · page (commanded)","mdi:monitor-dashboard")
+    # NOTE: sensor.smol_<id>_screen (LIVE current screen) omitted — it's 'unknown' until firmware
+    # publishes smol/<id>/status = STAT|screen:page|build (design F4). Commanded config above is the
+    # effective screen the node applies. Row returns when F4 ships the live readback.
     row(f"sensor.smol_{nid}_status","activity","mdi:pulse")
-    row(f"sensor.smol_{nid}_rssi_band","bond band","mdi:signal")
+    row(f"sensor.smol_{nid}_rssi","bond (RSSI)","mdi:signal")
+    row(f"sensor.smol_{nid}_rssi_band","bond band","mdi:signal-cellular-2")
     row(f"binary_sensor.smol_{nid}_resync","re-syncing","mdi:sync")
     sec("firmware")
     fw=next((e for e in present if re.match(rf"update\.smol_{nid}_.*_firmware$",e)),None)
@@ -79,9 +89,22 @@ def legend_card(nodes, present):
     ents.append({"type":"section","label":"sigils & bonds (bond=RSSI · adrift when ch≠mesh)"})
     for n in nodes:
         ents.append({"entity":f"binary_sensor.smol_{n['id']}_online","name":f"{'♛ ' if n['gate'] else ''}{n['name']} · id{n['id']}"})
+        if f"sensor.smol_{n['id']}_rssi" in present: ents.append({"entity":f"sensor.smol_{n['id']}_rssi","name":"   ↳ bond (RSSI)","icon":"mdi:signal"})
         if f"sensor.smol_{n['id']}_peers" in present: ents.append({"entity":f"sensor.smol_{n['id']}_peers","name":"   ↳ peers","icon":"mdi:lan"})
     return {"type":"entities","title":"the mesh","show_header_toggle":False,"entities":ents,
             "card_mod":{"style":accent_top(PHOS)},"view_layout":{"grid-column":"span 5"}}
+
+# ---------- forge per-node OTA summary (generated markdown; scales) ----------
+FORGE_ROW=("id__ID____TAG__ — {% if is_state('__FW__','on') %}**{{ state_attr('__FW__','installed_version') }} → {{ state_attr('__FW__','latest_version') }} ready**"
+           "{% elif is_state('binary_sensor.smol___ID___online','on') %}✓ {{ state_attr('__FW__','installed_version') }} up-to-date"
+           "{% else %}offline{% endif %}")
+def forge_ota_md(nodes, present):
+    out=["**per-node OTA**"]
+    for n in nodes:
+        I=str(n["id"]); fw=next((e for e in present if re.match(rf"update\.smol_{I}_.*_firmware$",e)),None)
+        tag=" · canary" if n["gate"] else ""
+        out.append(FORGE_ROW.replace("__ID__",I).replace("__FW__",fw).replace("__TAG__",tag) if fw else f"id{I}{tag} — n/a")
+    return "\n\n".join(out)
 
 def gen_topology(nodes, seat):
     W,H=680,300; cx,cy=W/2,H*0.40; F="ui-monospace,'DejaVu Sans Mono',monospace"
@@ -93,12 +116,13 @@ def gen_topology(nodes, seat):
     leaves=[n for n in nodes if n["id"]!=seat["id"]]; m=len(leaves); ly=H*0.80
     for i,lf in enumerate(leaves):
         lx=W*0.16+(W*0.68)*(i/(m-1) if m>1 else .5); on=lf["on"]; col="#5bff9a" if on else "#ff6b6b"
-        P.append(f'<line x1="{cx:.0f}" y1="{cy:.0f}" x2="{lx:.0f}" y2="{ly:.0f}" stroke="{col}" stroke-width="{3 if on else 1.5}"{"" if on else " stroke-dasharray=\"6 5\""} opacity="{.85 if on else .7}"/>')
+        anim='<animate attributeName="opacity" values="0.9;0.5;0.9" dur="3s" repeatCount="indefinite"/>' if on else ''
+        P.append(f'<line x1="{cx:.0f}" y1="{cy:.0f}" x2="{lx:.0f}" y2="{ly:.0f}" stroke="{col}" stroke-width="{3 if on else 1.5}"{"" if on else " stroke-dasharray=\"6 5\""} opacity="{.85 if on else .7}">{anim}</line>')
         P.append(f'<circle cx="{lx:.0f}" cy="{ly:.0f}" r="11" fill="#020402" stroke="{col}" stroke-width="{2.5 if on else 2}"/>')
         P.append(f'<text x="{lx:.0f}" y="{ly+27:.0f}" text-anchor="middle" font-family="{F}" font-size="16" font-weight="600" fill="{"#c9e8d2" if on else "#6f8f78"}">{esc(lf["name"])}</text>')
         P.append(f'<text x="{lx:.0f}" y="{ly+43:.0f}" text-anchor="middle" font-family="{F}" font-size="11" fill="{col}">id{lf["id"]} · {"attuned" if on else "offline"}</text>')
     P.append(f'<circle cx="{cx:.0f}" cy="{cy:.0f}" r="46" fill="url(#sg)"/>')
-    P.append(f'<circle cx="{cx:.0f}" cy="{cy:.0f}" r="13" fill="#020402" stroke="#ffc24b" stroke-width="2.5"/>')
+    P.append(f'<circle cx="{cx:.0f}" cy="{cy:.0f}" r="13" fill="#020402" stroke="#ffc24b" stroke-width="2.5"><animate attributeName="r" values="13;15.5;13" dur="2.6s" repeatCount="indefinite"/></circle>')
     P.append(f'<text x="{cx:.0f}" y="{cy+6:.0f}" text-anchor="middle" font-family="{F}" font-size="18" fill="#ffc24b">&#9819;</text>')
     P.append(f'<text x="{cx:.0f}" y="{cy-30:.0f}" text-anchor="middle" font-family="{F}" font-size="20" font-weight="600" fill="#c9e8d2">the Seat · id{seat["id"]}</text>')
     P.append(f'<text x="{cx:.0f}" y="{cy+34:.0f}" text-anchor="middle" font-family="{F}" font-size="12" fill="#ffc24b">{esc(seat["name"])} · GATE</text>')
@@ -136,7 +160,7 @@ async def main():
         topo_url=serve("smol-topology.svg", gen_topology(nodes,seat))
         node_cards=[node_card(n["id"],n,present) for n in nodes]
         legend=legend_card(nodes,present)
-        cards=view["cards"]; out=[]; done={"topo":0,"legend":0,"fleet":0}
+        cards=view["cards"]; out=[]; done={"topo":0,"legend":0,"fleet":0,"forge":0}
         for c in cards:
             if c.get("type")=="picture" and c.get("image")=="TOPO": c["image"]=topo_url; done["topo"]+=1; out.append(c)
             elif c.get("type")=="markdown" and c.get("content")=="LEGEND":
@@ -145,6 +169,11 @@ async def main():
                 out.extend(node_cards); done["fleet"]+=1
             else: out.append(c)
         view["cards"]=out
+        def fill_forge(cs):                                   # FORGE_OTA is nested in the forge vertical-stack
+            for c in cs:
+                if c.get("type")=="markdown" and c.get("content")=="FORGE_OTA": c["content"]=forge_ota_md(nodes,present); done["forge"]+=1
+                if isinstance(c,dict) and "cards" in c: fill_forge(c["cards"])
+        fill_forge(view["cards"])
         assert all(done.values()), f"placeholders not all filled: {done}"
         cfg=(await rpc(ws,{"type":"lovelace/config","url_path":DASH}))["result"]
         json.dump(cfg,open("lovelace_PRESAVE_backup.json","w"),indent=1)

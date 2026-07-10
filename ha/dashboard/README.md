@@ -40,3 +40,10 @@ inside a view holding other cards) it renders **silently empty** — the childre
 a blank gap that looks exactly like a stale cache. Place child cards **directly in the view grid**
 via `view_layout: {grid-column: "span N"}`. The generator splices node boxes into the view's card
 list for this reason (the `FLEET` placeholder is replaced in-place, not wrapped in a nested grid).
+
+### Firmware dependency: LIVE current screen (design F4)
+The node box shows the **commanded** screen (`sensor.smol_<id>_config`, the retained
+`smol/<id>/config/default_screen`) — the effective screen the node applies. The **live actual**
+screen (`sensor.smol_<id>_screen`, mirroring `smol/<id>/status = STAT|<screen>:<page>|<build>`)
+is `unknown` until the firmware publishes that topic (design F4). The live-readback row is omitted
+until F4 ships; the generator re-adds it when the entity leaves `unknown`.
