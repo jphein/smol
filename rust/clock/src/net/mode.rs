@@ -3030,11 +3030,18 @@ pub fn start(
     // #33: stash a boot-time install command (retained) so `main` fetches after boot.
     radio.install_requested = install_requested;
 
-    // OTA MF-1: confirm/rollback the running image on its first boot, NOW that the
-    // WiFi/DHCP result is known. self-test = reached DHCP (a broken-WiFi image can't;
-    // the just-run download proved the net is up, so a healthy image won't
-    // false-rollback). May `software_reset` (rollback) → never returns in that case.
-    crate::ota::boot_confirm(reached_dhcp);
+    // OTA MF-1 / #40 HOLE-1 — ROLE-AWARE first-boot self-test.
+    // A node that reached DHCP has a working uplink → confirm NOW (DHCP is the gateway's
+    // health proof; a broken-WiFi image can't reach it, so a healthy image won't
+    // false-rollback). A node that did NOT reach DHCP is a LEAF (it can never win the
+    // gateway election): confirming on `reached_dhcp=false` here would roll back EVERY
+    // mesh-OTA (the credential-less leaf never does DHCP). So a leaf DEFERS its self-test
+    // to the main loop, which confirms on the mesh predicate (heard ≥1 valid SMOLv1 frame
+    // within N s) instead. `boot_confirm(true)` may still reboot-on-nothing (no-op if the
+    // image is already Valid). See main.rs `leaf_selftest_pending`.
+    if reached_dhcp {
+        crate::ota::boot_confirm(true);
+    }
 
     // #23: GATEWAY iff we reached DHCP AND won the election (lowest-id owner). A board
     // that reached DHCP but LOST (a lower-id owner already holds it) demotes to leaf.

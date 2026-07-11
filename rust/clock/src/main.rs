@@ -198,6 +198,20 @@ const FLUSH_DEFER_CAP_MS: u64 = 120_000;
 /// the actual rotation is confirmed when flashing.
 const DISPLAY_ROTATION: DisplayRotation = DisplayRotation::Rotate180;
 
+/// #40 self-test §5: max unconfirmed (New) boots before the app forces a rollback to the
+/// good slot. Bounds a boots-but-crashes image to K reboots then auto-recovery (bootloader
+/// auto-revert is OFF). RTC-fast counter; cleared on a confirm / power-loss.
+#[cfg(feature = "espnow")]
+const OTA_MAX_UNCONFIRMED_BOOTS: u32 = 3;
+
+/// #40 HOLE-1 §2: the leaf post-OTA self-test window (ms). A freshly-activated LEAF image
+/// must hear ≥1 valid inbound SMOLv1 frame within this window (its mesh-terms health proof,
+/// the analog of `reached_dhcp` a credential-less leaf never hits) or it rolls back. 60 s
+/// is generous vs the ~10 s HELLO cadence → several chances, minimizing a false-fail on a
+/// quiet mesh. (A genuinely isolated leaf can't prove RX health → rolls back; documented.)
+#[cfg(feature = "espnow")]
+const LEAF_SELFTEST_WINDOW_MS: u64 = 60_000;
+
 /// Monotonic milliseconds since boot — the single time base for the clock, the
 /// button debounce, Snake movement, the LED blink phase, and BENCH rates.
 /// (`net::mode::now_ms` is the same value; this is the always-available copy.)
@@ -231,6 +245,27 @@ fn main() -> ! {
         v_noun,
         env!("BUILD_HASH"),
     );
+
+    // --- #40 leaf-mesh-OTA: EARLIEST-boot self-test bookkeeping ---------------
+    // Runs BEFORE any subsystem that can panic (I2C/display/radio) so an early-init
+    // crash still trips the crash-loop bound. Only fires when otadata is New/Pending
+    // (a freshly-activated image on its first boot):
+    //   • §3C freshness FLOOR — raise fresh_floor to this build (idempotent, power-loss
+    //     safe; closes the signed-intermediate / rolled-back-build mesh replay).
+    //   • §C#5 K-counter — bump the unconfirmed-boot counter; at K, force the app-side
+    //     rollback NOW (a New image that panics before the deferred self-test would
+    //     otherwise boot-loop the bad slot forever, bootloader auto-revert being OFF).
+    // A confirmed (Valid) boot resets the counter. `boot_confirm(false)` reboots.
+    #[cfg(feature = "espnow")]
+    if ota::otadata_unconfirmed() {
+        ota::fresh_floor_bump(ota::BUILD_NUMBER);
+        if ota::unconfirmed_boot_bump() >= OTA_MAX_UNCONFIRMED_BOOTS {
+            log::warn!("smol #40: {} unconfirmed boots — forcing app-side rollback", OTA_MAX_UNCONFIRMED_BOOTS);
+            ota::boot_confirm(false); // flips to the good slot + resets — never returns
+        }
+    } else {
+        ota::unconfirmed_boot_reset();
+    }
 
     // --- I2C bus to the OLED -------------------------------------------------
     let i2c = I2c::new(
@@ -370,6 +405,15 @@ fn main() -> ! {
     // can re-anchor them on adoption; nothing mutates them in the smaller builds
     // (hence the cfg'd `allow(unused_mut)`).
     let boot_ms = millis();
+
+    // #40 HOLE-1: deferred LEAF self-test. `otadata` is still unconfirmed here iff the
+    // boot burst did NOT confirm it (a leaf that never reached DHCP — `mode::start` only
+    // confirms a DHCP-reaching node). For such a leaf the main loop runs the mesh-terms
+    // self-test (below): confirm on the first heard SMOLv1 frame, else roll back after N s.
+    // A gateway / DHCP-reached board already confirmed at boot → this is false → no-op.
+    #[cfg(feature = "espnow")]
+    let mut leaf_selftest_pending = ota::otadata_unconfirmed();
+
     #[cfg_attr(not(feature = "espnow"), allow(unused_mut))]
     let mut base_unix: u32 = match synced {
         Some(unix) => {
@@ -483,6 +527,25 @@ fn main() -> ! {
         if let Some(r) = radio.as_mut() {
             if let Some(text) = r.service() {
                 bottom_line = text;
+            }
+
+            // #40 HOLE-1: LEAF post-OTA self-test (mesh-terms, NOT DHCP). A freshly
+            // mesh-OTA'd leaf must prove radio+parse+RX work on the NEW image by hearing
+            // ≥1 valid inbound SMOLv1 frame within LEAF_SELFTEST_WINDOW_MS → confirm
+            // (otadata Valid, the update sticks). No frame in the window → app-side
+            // rollback to the good slot (`boot_confirm(false)` flips + resets). Runs at
+            // most once; a gateway/DHCP board already confirmed at boot (pending=false).
+            if leaf_selftest_pending {
+                if r.heard_valid_frame() {
+                    ota::unconfirmed_boot_reset();
+                    leaf_selftest_pending = false;
+                    log::info!("smol #40: leaf self-test PASS (heard a mesh peer) — image CONFIRMED");
+                    ota::boot_confirm(true);
+                } else if now.saturating_sub(boot_ms) >= LEAF_SELFTEST_WINDOW_MS {
+                    leaf_selftest_pending = false;
+                    log::warn!("smol #40: leaf self-test FAIL (no mesh peer in {} ms) — ROLLING BACK", LEAF_SELFTEST_WINDOW_MS);
+                    ota::boot_confirm(false); // flips to the good slot + resets — never returns
+                }
             }
             // #23 stage 2: a LEAF scans 1/6/11 for the elected gateway's HELLO and
             // locks onto its channel (a no-op on the gateway, which rides its AP ch).
