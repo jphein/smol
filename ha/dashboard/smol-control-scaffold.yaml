@@ -30,11 +30,13 @@ cards:
       {% set tot = states.binary_sensor | map(attribute='entity_id') | select('search','^binary_sensor\.smol_\d+_online$') | list | count %}
       {% set owner = state_attr('sensor.smol_mesh_channel','owner') %}
       {% set ch = states('sensor.smol_mesh_channel') %}
+      {% set seq = state_attr('sensor.smol_mesh_channel','seq') %}
+      {% set re = is_state('binary_sensor.smol_mesh_reelecting','on') %}
       {% set bt = state_attr('update.smol_7_dominion_firmware','title') or ('build ' ~ (state_attr('update.smol_7_dominion_firmware','installed_version') or '—')) %}
       # control room
       **smol · esp-now mesh · home assistant**
 
-      🟢 **MESH LIVE** · ch **{{ ch if ch not in na else '—' }}**{% if is_state('binary_sensor.smol_mesh_reelecting','on') %} · re-electing…{% endif %} · the Seat **id{{ owner if owner not in na else '7' }} · Draconic Dominion** · **{{ on }}/{{ tot }}** sigils lit
+      {% if re %}⚠️ **RE-ELECTING** — mesh choosing a new gateway…{% else %}🟢 **MESH LIVE** · gateway **id{{ owner if owner not in na else '?' }}** · seq **{{ seq if seq not in na else '—' }}** (advancing = alive) · ch {{ ch if ch not in na else '—' }}{% endif %} · **{{ on }}/{{ tot }}** sigils lit
 
       build **{{ bt }}** · last sync **{{ relative_time(states.sensor.smol_7_status.last_changed) if states.sensor.smol_7_status else '—' }}** ago · retained MQTT, applies on next burst
     card_mod:

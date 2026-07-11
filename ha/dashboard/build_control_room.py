@@ -27,15 +27,22 @@ def node_card(nid, meta, present):
     # RSSI in EVERY node: leaves show dBm; gateway (no mesh-RSSI to itself) shows WiFi uplink
     has_rssi=f"sensor.smol_{I}_rssi" in present
     rssi_pip=(" · {{ states('sensor.smol_"+I+"_rssi') if states('sensor.smol_"+I+"_rssi') not in na else '—' }} dBm") if has_rssi else " · WiFi"
-    hdr=("{% set on="+on+" %}{% set t=states('sensor.smol_"+I+"_temp') %}{% set v=states('sensor.smol_"+I+"_voltage') %}"
-         "{% set na="+NAJ+" %}id"+I+" · "+meta["role"]+" · {{ '🟢 online' if on else '🔴 offline' }}"
+    # LIVE gateway = this node == MC owner attr (moves on #51 takeover). Indicators are template-driven, not build-time.
+    gw="(state_attr('sensor.smol_mesh_channel','owner')|string == '"+I+"')"
+    hdr=("{% set on="+on+" %}{% set gw="+gw+" %}{% set t=states('sensor.smol_"+I+"_temp') %}{% set v=states('sensor.smol_"+I+"_voltage') %}"
+         "{% set na="+NAJ+" %}{% if not on %}⛔ OFFLINE{% elif gw %}👑 GATEWAY{% else %}◈ leaf{% endif %} · id"+I+""
          " · {{ t if t not in na else '—' }}° · {{ v if v not in na else '—' }}V"+rssi_pip)
     header={"type":"custom:mushroom-template-card","primary":meta["name"],"secondary":hdr,
-            "icon":"mdi:crown" if gate else "mdi:chip",
-            "icon_color":"amber" if gate else ("{{ 'green' if "+on+" else 'red' }}"),
-            "badge_icon":"mdi:crown" if gate else "mdi:leaf",
-            "badge_color":"amber" if gate else ("{{ 'green' if "+on+" else 'red' }}"),
-            "card_mod":{"style":{".":accent_top(ACCENT if gate else PHOS)+"ha-card{border-radius:10px 10px 0 0;border-bottom:none}",
+            "icon":"{% if "+gw+" %}mdi:crown{% else %}mdi:chip{% endif %}",
+            "icon_color":"{% if "+gw+" %}amber{% elif "+on+" %}green{% else %}red{% endif %}",
+            "badge_icon":"{% if "+gw+" %}mdi:crown{% elif "+on+" %}mdi:leaf-circle{% else %}mdi:lan-disconnect{% endif %}",
+            "badge_color":"{% if "+gw+" %}amber{% elif "+on+" %}green{% else %}red{% endif %}",
+            "card_mod":{"style":{
+                ".":("ha-card{border-radius:10px 10px 0 0;border-bottom:none;position:relative;overflow:hidden;"
+                     "border:2px solid {% if "+gw+" %}var(--accent-color){% elif "+on+" %}var(--ha-card-border-color){% else %}#ff6b6b{% endif %};"
+                     "opacity:{% if "+on+" %}1{% else %}.6{% endif %};"
+                     "box-shadow:{% if "+gw+" %}0 0 18px -3px var(--accent-color){% else %}none{% endif %}}"
+                     "ha-card:before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,{% if "+gw+" %}var(--accent-color){% else %}var(--primary-color){% endif %},transparent);opacity:.6}"),
                 "mushroom-state-info$":".primary{font-family:"+VT+";font-size:26px;line-height:.9}.secondary{font-size:11px}"}}}
     # mini-OLED shows the SCREEN's content (like the board): Grid→grid W, Batt→HV SOC, Clock→time, else temp.
     # Prefers the LIVE actual screen (sensor._screen, incl. manual nav) once #50 ships; falls to commanded while unknown.
@@ -47,7 +54,7 @@ def node_card(nid, meta, present):
     oled_s=("{% set scr="+scr+" %}{{ scr|upper }} · {% if not "+on+" %}no link{% elif scr=='Grid' %}shared glass{% elif scr=='Batt' %}HV pack{% elif scr=='Clock' %}mesh time{% else %}live °F{% endif %}")
     oled={"type":"custom:mushroom-template-card","primary":oled_p,"secondary":oled_s,"icon":"mdi:blank",
           "card_mod":{"style":{".":("ha-card{background:#020402;border:1px solid var(--ha-card-border-color);border-radius:0;"
-                "box-shadow:inset 0 0 12px rgba(0,0,0,.9);position:relative;overflow:hidden;margin-top:-2px}mushroom-shape-icon{display:none}"),
+                "box-shadow:inset 0 0 12px rgba(0,0,0,.9);position:relative;overflow:hidden;margin-top:-2px;opacity:{% if "+on+" %}1{% else %}.6{% endif %}}mushroom-shape-icon{display:none}"),
                 "mushroom-state-info$":(".primary{font-family:"+VT+";font-size:44px;line-height:.8;color:var(--primary-color);"
                 "text-shadow:0 0 7px rgba(91,255,154,.55)}.secondary{color:var(--primary-color);opacity:.7;font-size:10px}")}}}
     ents=[]
@@ -82,7 +89,7 @@ def node_card(nid, meta, present):
     inst=f"input_button.smol_ota_install_{nid}"
     if inst in present: ents.append({"entity":inst,"name":"Install staged (canary)" if gate else "Install (when this leads)","icon":"mdi:rocket-launch"})
     ctrl={"type":"entities","show_header_toggle":False,"entities":ents,
-          "card_mod":{"style":"ha-card{border-radius:0 0 10px 10px;border-top:none;margin-top:-1px}"}}
+          "card_mod":{"style":"ha-card{border-radius:0 0 10px 10px;border-top:none;margin-top:-1px;opacity:{% if "+on+" %}1{% else %}.6{% endif %}}"}}
     return {"type":"vertical-stack","view_layout":{"grid-column":"span 4"},"cards":[header,oled,ctrl]}
 
 def legend_card(nodes, present):
