@@ -61,14 +61,17 @@ pub const OTAN_PREFIX: &[u8] = b"SMOLv1 OTAN "; // leaf→gateway (UNICAST): win
 /// sent[2 LE]. Broadcast on the HELLO cadence so the gateway's relay RX loop CAPTURES it while
 /// the leaf is provably online (rx>0), naming WHY a `relay-failed` had `otan=0` (see `RelayDiag`).
 pub const LDBG_PREFIX: &[u8] = b"SMOLv1 LDBG "; // leaf→broadcast: OTA receive-side self-report
-/// `LDBG` payload: id[3 ASCII] + otam_heard[2 LE] + verdict[1] + otan_sent[2 LE].
-pub const LDBG_FRAME_LEN: usize = 12 + 3 + 2 + 1 + 2;
+/// `LDBG` payload: id[3 ASCII] + otam_heard[2 LE] + verdict[1] + otan_sent[2 LE] + ch[1].
+/// #3b `ch` = the leaf's `current_channel()` at beacon time (0 = SCANNING/unlocked, else the
+/// locked channel 1/6/11). Decisive for the H0 fork: ch=6 means the leaf was ON ch6 yet still
+/// heard no OTAM (RX issue); ch≠6 means it drifted off ch6 during the gateway's fetch window.
+pub const LDBG_FRAME_LEN: usize = 12 + 3 + 2 + 1 + 2 + 1;
 
-/// Parse a leaf `LDBG` beacon → `(otam_heard, verdict, otan_sent)` iff it is well-formed AND
-/// addressed-from `want_id` (the 3-ASCII id field). `None` otherwise.
-pub fn parse_ldbg(data: &[u8], want_id: u8) -> Option<(u16, u8, u16)> {
+/// Parse a leaf `LDBG` beacon → `(otam_heard, verdict, otan_sent, leaf_ch)` iff it is well-formed
+/// AND addressed-from `want_id` (the 3-ASCII id field). `None` otherwise.
+pub fn parse_ldbg(data: &[u8], want_id: u8) -> Option<(u16, u8, u16, u8)> {
     let rest = data.strip_prefix(LDBG_PREFIX)?;
-    if rest.len() < 3 + 2 + 1 + 2 {
+    if rest.len() < 3 + 2 + 1 + 2 + 1 {
         return None;
     }
     if parse_id3(&rest[0..3])? != want_id {
@@ -77,7 +80,8 @@ pub fn parse_ldbg(data: &[u8], want_id: u8) -> Option<(u16, u8, u16)> {
     let heard = u16::from_le_bytes([rest[3], rest[4]]);
     let verdict = rest[5];
     let sent = u16::from_le_bytes([rest[6], rest[7]]);
-    Some((heard, verdict, sent))
+    let leaf_ch = rest[8];
+    Some((heard, verdict, sent, leaf_ch))
 }
 
 /// Max `OTAM` frame: 12 + 3 + 2 + 1 + `SIGNED_MSG_MAX` (M) + 64 (sig).

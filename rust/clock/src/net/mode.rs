@@ -1879,12 +1879,14 @@ impl RadioManager {
     /// `espnow`-scoped: the `LDBG` frame + `ota_leaf` self-report only exist in the mesh build.
     #[cfg(feature = "espnow")]
     pub fn broadcast_ldbg(&mut self, heard: u16, verdict: u8, sent: u16) {
+        let ch = self.current_channel(); // #3b: 0 = scanning/unlocked, else the locked channel
         let mut msg = [0u8; crate::ota_mesh::LDBG_FRAME_LEN];
         let base = encode_id_frame(crate::ota_mesh::LDBG_PREFIX, self.id, &mut msg);
         msg[base..base + 2].copy_from_slice(&heard.to_le_bytes());
         msg[base + 2] = verdict;
         msg[base + 3..base + 5].copy_from_slice(&sent.to_le_bytes());
-        self.send_to(&BROADCAST_ADDRESS, &msg[..base + 5]);
+        msg[base + 5] = ch;
+        self.send_to(&BROADCAST_ADDRESS, &msg[..base + 6]);
     }
 
     /// #21 leaf-relay: GATEWAY-only. Broadcast one `SMOLv1 CFG` per CACHED leaf
@@ -2377,6 +2379,7 @@ impl RadioManager {
         let mut ldbg_heard: u16 = 0;
         let mut ldbg_verdict: u8 = 255;
         let mut ldbg_sent: u16 = 0;
+        let mut ldbg_ch: u8 = 0; // #3b: leaf's channel at beacon time (0=scanning, 6=locked ch6)
         // #3b OTAM TX-diag: broadcast sends attempted vs returned-Ok (queued + TX-callback ok).
         let mut otam_tx: u16 = 0;
         let mut otam_ok: u16 = 0;
@@ -2398,6 +2401,7 @@ impl RadioManager {
                     leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
                     otam_tx, otam_ok,
                     settle,
+                    leaf_ch: ldbg_ch,
                 });
                 let _ = self.switch(Mode::EspNow);
                 return LeafOtaOutcome::RelayFailed;
@@ -2454,10 +2458,11 @@ impl RadioManager {
                             rx_any = rx_any.saturating_add(1); // #3: heard SOMETHING from the leaf
                             // #3: capture the leaf's LDBG self-report (latest wins) — names WHY
                             // otan=0 without needing the leaf back online post-relay.
-                            if let Some((h, v, n)) = om::parse_ldbg(recv.data(), leaf_id) {
+                            if let Some((h, v, n, c)) = om::parse_ldbg(recv.data(), leaf_id) {
                                 ldbg_heard = h;
                                 ldbg_verdict = v;
                                 ldbg_sent = n;
+                                ldbg_ch = c;
                             }
                             if let Some(om::OtaFrame::Nak { origin, session: s, window_base, bitmap }) =
                                 om::parse_ota_frame(recv.data())
@@ -2495,6 +2500,7 @@ impl RadioManager {
                     leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
                     otam_tx, otam_ok,
                     settle,
+                    leaf_ch: ldbg_ch,
                 });
                     return LeafOtaOutcome::RelayFailed;
                 }
@@ -2507,6 +2513,7 @@ impl RadioManager {
             leaf_id, rx_any, otan_valid, last_wb: total as u16, total: total as u16,
             leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
             otam_tx, otam_ok, settle,
+            leaf_ch: ldbg_ch,
         });
 
         // --- CONFIRMING (Tier-2, build-matched): sample the leaf's SETTLED build over the

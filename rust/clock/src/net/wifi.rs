@@ -804,6 +804,10 @@ pub struct RelayDiag {
     /// (confirms the OTAM was egressing off-channel → the leaf H0 cause); `settle=0` ⇒ STA already
     /// down, so a persistent H0 is NOT the channel (→ leaf RX-filter, instrument the leaf next).
     pub settle: u16,
+    /// #3b LEAF-CHANNEL: the leaf's `current_channel()` from its captured LDBG (0=scanning/unlocked,
+    /// else the locked channel). Splits the settle=0 H0 fork: leaf_ch=6 ⇒ leaf on ch6 yet no OTAM
+    /// (RX issue); leaf_ch≠6 ⇒ leaf drifted off ch6 during the gateway's mesh-deaf fetch window.
+    pub leaf_ch: u8,
 }
 
 #[cfg(feature = "wifi")]
@@ -1500,7 +1504,7 @@ fn mqtt_session(
         if d.leaf_verdict == 255 {
             let _ = write!(rval, "none");
         } else {
-            let _ = write!(rval, "H{}V{}N{}", d.leaf_heard, d.leaf_verdict, d.leaf_sent);
+            let _ = write!(rval, "H{}V{}N{}ch{}", d.leaf_heard, d.leaf_verdict, d.leaf_sent, d.leaf_ch);
         }
         if let Some(n) =
             crate::net::mqtt::encode_publish(&mut pkt, rtopic.as_bytes(), rval.as_bytes(), true)
