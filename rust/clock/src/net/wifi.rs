@@ -117,6 +117,13 @@ pub struct MeshElect {
     /// gateway-flush this is false → the original, hardware-validated lowest-id
     /// election runs UNCHANGED (preserves #2 split-brain + fast cold-start).
     pub recovery: bool,
+    /// #51 return-flap fix: true ONLY on the one-shot BOOT election. A freshly-booted board
+    /// must NEVER claim over a DIFFERENT owner already present in the retained MC — it comes
+    /// up as a leaf and lets leaf-scan (fast HELLO lock) + the recovery election decide (live
+    /// owner → adopt, no flap; dead → take over after the recovery window). Only claims at
+    /// boot when the MC is empty or already names THIS board. Gateway-flush keeps `boot=false`
+    /// so a running gateway's lowest-id split-brain resolution (#2) is unchanged.
+    pub boot: bool,
     // --- outputs (applied to the live role by the caller) ---
     /// True iff I claimed / hold ownership (I am the coexist gateway).
     pub i_am_owner: bool,
@@ -139,6 +146,7 @@ impl MeshElect {
             seen_ms: 0,
             my_rssi: -99, // weak default until the first association captures it
             recovery: false,
+            boot: false,
             i_am_owner: false,
             owner_id: my_id,
             owner_alive: false,
@@ -1326,9 +1334,21 @@ fn mqtt_session(
             elect.seen_seq = seq;
             let stale_limit = if elect.recovery { RECOVERY_STALE_MS } else { MC_STALE_MS };
             let alive = elect.now_ms.saturating_sub(elect.seen_ms) < stale_limit;
-            if !elect.recovery {
+            if elect.boot && owner != node_id {
+                // #51 return-flap fix: a FRESH-booting board never displaces a DIFFERENT owner
+                // already in the retained MC. Come up as a leaf and defer — leaf-scan locks a
+                // LIVE owner's HELLO in seconds (no re-claim bounce), and the recovery election
+                // takes over a genuinely DEAD one after its window. (At boot we have only ONE
+                // MC sample so we can't tell live from dead here; deferring lets the fast HELLO
+                // path decide. The COMMON cold-boot has no delay: the prior gateway reads
+                // owner==self below and re-claims its own record immediately; only peers defer.)
                 elect.owner_alive = alive;
-                // BOOT / gateway-flush — original lowest-id rule (byte-for-byte as verified).
+                elect.i_am_owner = false;
+                elect.owner_id = owner;
+                None
+            } else if !elect.recovery {
+                elect.owner_alive = alive;
+                // BOOT (empty/own MC) / gateway-flush — original lowest-id rule (as verified).
                 if owner < node_id && alive {
                     elect.i_am_owner = false;
                     elect.owner_id = owner;
