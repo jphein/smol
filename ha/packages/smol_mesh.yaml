@@ -398,6 +398,28 @@ mqtt:
       value_template: "{{ value if value else 'none' }}"
       entity_category: diagnostic
       icon: "mdi:cloud-upload-outline"
+    # --- #40 leaf-mesh-OTA ARM-CHAIN trace (headless) — the GATEWAY dumps this every flush:
+    # "install-caught=<id|none> pending=<id|none> staged_raw=<build|none> leaf_ota=<0|1>".
+    # Pinpoints which arm link is null in one reflash (the C3 has no serial). Published by
+    # whichever node is currently the gateway; the others read `none`.
+    - name: "smol 7 ota armdiag"
+      unique_id: smol_7_ota_armdiag_mirror
+      state_topic: "smol/7/ota/armdiag"
+      value_template: "{{ value if value else 'none' }}"
+      entity_category: diagnostic
+      icon: "mdi:link-variant"
+    - name: "smol 8 ota armdiag"
+      unique_id: smol_8_ota_armdiag_mirror
+      state_topic: "smol/8/ota/armdiag"
+      value_template: "{{ value if value else 'none' }}"
+      entity_category: diagnostic
+      icon: "mdi:link-variant"
+    - name: "smol 9 ota armdiag"
+      unique_id: smol_9_ota_armdiag_mirror
+      state_topic: "smol/9/ota/armdiag"
+      value_template: "{{ value if value else 'none' }}"
+      entity_category: diagnostic
+      icon: "mdi:link-variant"
     # --- #48 LED mode — mirror of the retained smol/<id>/config/led (commanded value) ---
     - name: "smol 7 LED"
       unique_id: smol_7_led_mirror
