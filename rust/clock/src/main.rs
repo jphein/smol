@@ -792,7 +792,10 @@ fn main() -> ! {
                     let (_, soak_rx0, soak_lost0, _) = r.soak_counts();
                     let mut flush_abort = false;
                     let mut flush_draw_ms = 0u64;
-                    r.flush_telemetry(own.as_bytes(), stat.as_bytes(), &mut batt_cache, &mut grid_cache, &mut || {
+                    // #40: a flush that hears a leaf's retained OTA install surfaces
+                    // `(leaf_id, staged announce)` here → relayed below.
+                    let mut leaf_ota: Option<(u8, ota::Announce)> = None;
+                    r.flush_telemetry(own.as_bytes(), stat.as_bytes(), &mut batt_cache, &mut grid_cache, &mut leaf_ota, &mut || {
                         let t = millis();
                         led.apply(led::LedState::WifiSync, t);
                         if matches!(button.poll(t), Some(input::Press::Long)) {
@@ -805,6 +808,33 @@ fn main() -> ! {
                         flush_abort
                     });
                     flush_defer_since_ms = 0;
+                    // #40 leaf-mesh-OTA orchestration: the flush surfaced a leaf install →
+                    // relay the staged image to that leaf over ESP-NOW (canary-one-leaf; the
+                    // relay does its own WiFi fetch then an ESP-NOW relay, minutes-scale +
+                    // mesh-degrading, UI-alive + long-press abortable). Skipped if the leaf's
+                    // MAC hasn't been learned from its HELLOs yet (retry on the next install).
+                    if let Some((leaf_id, ann)) = leaf_ota.take() {
+                        if let Some(mac) = r.mac_for_id(leaf_id) {
+                            let mut relay_draw_ms = 0u64;
+                            let mut relay_abort = false;
+                            let outcome = r.run_leaf_ota_relay(leaf_id, mac, &ann, &mut || {
+                                let t = millis();
+                                led.apply(led::LedState::WifiSync, t);
+                                if matches!(button.poll(t), Some(input::Press::Long)) {
+                                    relay_abort = true;
+                                }
+                                if t.saturating_sub(relay_draw_ms) >= SYNC_REDRAW_MS {
+                                    relay_draw_ms = t;
+                                    draw_syncing(&mut display, (t / SYNC_REDRAW_MS) as u8);
+                                }
+                                relay_abort
+                            });
+                            log::info!("smol #40: leaf id{} OTA relay outcome = {:?}", leaf_id, outcome);
+                            redraw = true;
+                        } else {
+                            log::warn!("smol #40: leaf id{} install requested but its MAC isn't known yet — skipped (retry after it HELLOs)", leaf_id);
+                        }
+                    }
                     // Coexist soak (#23 PART 1): the during-window RX loss — how many
                     // leaf BEACONs the gateway's 10-deep ESP-NOW RX queue dropped while
                     // the CPU-blocking flush starved `service()`. THIS is the number.

@@ -536,6 +536,17 @@ impl Roster {
         Self { nodes: [Node::EMPTY; ROSTER_CAP] }
     }
 
+    /// #40: the MAC last heard for a KNOWN leaf `id` (learned from its HELLOs), for the
+    /// unicast OTA relay. `None` if that id hasn't been heard yet.
+    fn mac_for_id(&self, id: u8) -> Option<[u8; 6]> {
+        for n in &self.nodes {
+            if n.used && n.id_known && n.id == id {
+                return Some(n.mac);
+            }
+        }
+        None
+    }
+
     /// Find the slot for `mac`: existing match, else a free slot, else evict the
     /// oldest-heard (bounded — a new MAC past capacity drops the stalest).
     fn slot(&mut self, mac: [u8; 6]) -> usize {
@@ -1484,6 +1495,7 @@ impl RadioManager {
             &[], // #50: recovery burst publishes no live-screen status
                     None, // #21: a leaf's recovery burst is not a gateway relay
                     None, // #50b: recovery burst republishes no cached leaf status
+                    &mut None, // #40: a leaf's recovery burst never relays a leaf OTA
                     tick,
                 )
             }
@@ -2339,6 +2351,9 @@ impl RadioManager {
         status: &[u8],
         batt: &mut crate::batt::BattCache,
         grid: &mut crate::grid::GridCache,
+        // #40: filled with `(leaf_id, staged announce)` if this flush surfaced a leaf OTA
+        // install → `main` then calls `run_leaf_ota_relay` for that leaf. `None` otherwise.
+        leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
         tick: &mut dyn FnMut() -> bool,
     ) -> bool {
         if !self.relay.is_gateway {
@@ -2415,6 +2430,7 @@ impl RadioManager {
                     status, // #50: gateway publishes its live screen as smol/<id>/status
                     Some(&mut self.cfg_cache), // #21: gateway caches leaf configs to relay
                     Some(&self.stat_cache), // #50b: gateway republishes cached leaf statuses
+                    leaf_ota, // #40: surface a pending leaf-OTA install for main to relay
                     tick,
                 )
             }
@@ -2893,16 +2909,17 @@ impl RadioManager {
         }
     }
 
-    /// #40: is a leaf mesh-OTA transfer in progress? (`main` shows a maintenance state.)
-    pub fn ota_leaf_active(&self) -> bool {
-        self.ota_leaf.is_active()
-    }
-
     /// #40 self-test (HOLE-1): has this node decoded ≥1 valid inbound `SMOLv1` frame since
     /// boot? This is the leaf's mesh-terms health proof (radio+parse+RX work on the new
     /// image) — the leaf analog of `reached_dhcp`, which a credential-less leaf never hits.
     pub fn heard_valid_frame(&self) -> bool {
         self.peers.last_hello_ms != 0
+    }
+
+    /// #40: look up a leaf's MAC (from the #27 roster, learned via its HELLOs) so the
+    /// gateway can unicast an OTA relay to it. `None` until the leaf has been heard.
+    pub fn mac_for_id(&self, id: u8) -> Option<[u8; 6]> {
+        self.roster.mac_for_id(id)
     }
 
     /// Current peer-link state as an [`LedState`], evaluated at `now_ms`.

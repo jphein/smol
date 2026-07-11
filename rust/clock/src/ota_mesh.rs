@@ -301,6 +301,7 @@ const LEAF_PROGRESS_STALL_MS: u64 = 30_000;
 const LEAF_SESSION_MAX_MS: u64 = 600_000;
 
 /// Outcome of a GATEWAY → leaf relay+confirm session — drives `smol/<leaf>/ota/state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeafOtaOutcome {
     /// Leaf reappeared at the NEW build (Tier-2 build-matched) — the update stuck.
     Confirmed,
@@ -366,11 +367,6 @@ impl OtaLeafSession {
             last_nak_ms: 0,
             writer: None,
         }
-    }
-
-    /// Is a transfer in progress? (Used by `main` to know the mesh is in a maintenance op.)
-    pub fn is_active(&self) -> bool {
-        self.active
     }
 
     /// The gateway MAC this session locked onto (unicast target for NAKs). Zero if idle.

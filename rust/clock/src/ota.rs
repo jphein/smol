@@ -678,11 +678,6 @@ impl LeafImageWriter {
         self.target
     }
 
-    /// Real image bytes accepted so far (for the OLED progress line).
-    pub fn written(&self) -> u32 {
-        self.written
-    }
-
     /// Append one COMPLETED WINDOW's bytes (in strict image order) to the inactive
     /// slot. The write offset is `self.written` (word-aligned by construction — every
     /// non-final window is exactly 64·231 bytes). Erases sector-ahead, then writes the

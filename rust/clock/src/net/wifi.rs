@@ -260,6 +260,32 @@ fn parse_leaf_config_topic(topic: &[u8]) -> Option<u8> {
     (val <= 255).then_some(val as u8)
 }
 
+/// #40: parse a leaf id out of the wildcard-delivered `smol/<id>/ota/install` topic
+/// (the shape `smol/+/ota/install` delivers). Twin of [`parse_leaf_config_topic`] —
+/// same defensive parse (broker-supplied topic; 1–3 ASCII digits clamped to u8).
+/// `cfg(wifi)`: it is called from the shared `mqtt_session` (a gateway is `espnow`, but
+/// the function must still compile in the `wifi`-only build, where it is simply never hit).
+#[cfg(feature = "wifi")]
+fn parse_leaf_install_topic(topic: &[u8]) -> Option<u8> {
+    let rest = topic.strip_prefix(b"smol/")?;
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let (idb, tail) = rest.split_at(slash);
+    if tail != b"/ota/install" {
+        return None;
+    }
+    if idb.is_empty() || idb.len() > 3 {
+        return None;
+    }
+    let mut val: u16 = 0;
+    for &b in idb {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val * 10 + (b - b'0') as u16;
+    }
+    (val <= 255).then_some(val as u8)
+}
+
 /// Budget for one full MQTT session (TCP connect → CONNECT/CONNACK → publishes →
 /// SUBSCRIBE → retained downlink → DISCONNECT). Sub-bound of the enclosing burst
 /// so MQTT can't eat the whole flush/NTP window; a miss just leaves the cache be.
@@ -556,6 +582,7 @@ pub fn run_ntp_burst(
         &[], // #50: boot burst publishes no live-screen status
         None, // #21: boot burst is not a gateway relay (no leaf-config cache)
         None, // #50b: boot burst republishes no cached leaf status
+        &mut None, // #40: boot burst never relays a leaf OTA
         mqtt_deadline,
         tick,
     );
@@ -917,6 +944,11 @@ fn mqtt_session(
     // `None` on boot/leaf/election bursts (no republish duty). Read-only (the cache is
     // filled by the ESP-NOW `SMOLv1 STAT` service arm, not here).
     stat_cache: Option<&CfgCache>,
+    // #40 leaf-mesh-OTA: on a GATEWAY flush, filled with `(leaf_id, raw staged announce)`
+    // when a retained `smol/<leaf>/ota/install = INSTALL` is present for a leaf id ≠ self
+    // AND a staged image is available — the caller then relays it over ESP-NOW. The retained
+    // cmd is CLEARED here (consumed) so an HA reload can't replay it. `&mut None` off-gateway.
+    leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
     deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
@@ -1052,6 +1084,14 @@ fn mqtt_session(
         if let Some(n) =
             crate::net::mqtt::encode_subscribe(&mut pkt, 8, b"smol/+/config/default_screen")
         {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        // #40 leaf-mesh-OTA (§B3): a GATEWAY also wildcard-subscribes the leaf OTA install
+        // command (pid 9), twin of the config wildcard above → it acts on a leaf's native
+        // HA Update Install button (`smol/<leaf>/ota/install = INSTALL`) by relaying the
+        // staged image over ESP-NOW. The board's OWN install still arrives via `cmd_topic`
+        // (pid 7) → self-OTA; the wildcard feeds ONLY other leaf ids.
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 9, b"smol/+/ota/install") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
     }
@@ -1228,6 +1268,13 @@ fn mqtt_session(
     // never the full session budget.
     const DOWNLINK_SETTLE: Duration = Duration::from_millis(300);
     let mut settle_deadline: Option<Instant> = None;
+    // #40: the RAW (ungated) staged announce + a leaf id whose retained install cmd is
+    // present. Paired AFTER the drain (both are retained → arrive in the same broker burst)
+    // → `*leaf_ota`. Raw (not the gate()d `ota_offer`) because the LEAF, not the gateway,
+    // owns the freshness gate (the OTAM handler rejects `build ≤ leaf.build`); the gateway
+    // may be NEWER than the leaf's target, so a gateway-build gate would wrongly drop it.
+    let mut raw_staged: Option<crate::ota::Announce> = None;
+    let mut pending_leaf: Option<u8> = None;
     loop {
         if tick() {
             break; // #20 abort during downlink wait → fall through to clean DISCONNECT
@@ -1258,21 +1305,27 @@ fn mqtt_session(
                         // the fetch is AND-gated on this board's own `install` command below.
                         // Stale/foreign/oversize → ignored (up-to-date; no offer).
                         match crate::ota::parse_announce(payload) {
-                            Some(a) => match crate::ota::gate(&a) {
-                                Ok(()) => {
-                                    log::info!(
-                                        "smol OTA: staged build {} available (running {})",
+                            Some(a) => {
+                                // #40: keep the RAW announce (pre-gate) for a possible leaf
+                                // relay — the leaf owns its own freshness gate, so a
+                                // gateway-build gate must NOT drop it here.
+                                raw_staged = Some(a);
+                                match crate::ota::gate(&a) {
+                                    Ok(()) => {
+                                        log::info!(
+                                            "smol OTA: staged build {} available (running {})",
+                                            a.build,
+                                            crate::ota::BUILD_NUMBER
+                                        );
+                                        *ota_offer = Some(a);
+                                    }
+                                    Err(why) => log::info!(
+                                        "smol OTA: staged build {} not newer/ineligible ({:?})",
                                         a.build,
-                                        crate::ota::BUILD_NUMBER
-                                    );
-                                    *ota_offer = Some(a);
+                                        why
+                                    ),
                                 }
-                                Err(why) => log::info!(
-                                    "smol OTA: staged build {} not newer/ineligible ({:?})",
-                                    a.build,
-                                    why
-                                ),
-                            },
+                            }
                             None => log::warn!("smol OTA: malformed staged line ignored"),
                         }
                     } else if topic == cfg_topic.as_bytes() {
@@ -1312,6 +1365,24 @@ fn mqtt_session(
                                 );
                             }
                         }
+                    } else if let Some(leaf_id) = parse_leaf_install_topic(topic) {
+                        // #40 (§B3): a wildcard-delivered leaf OTA install command. On a
+                        // GATEWAY flush (cfg_cache = Some), an `INSTALL` for a leaf id ≠ self
+                        // arms a mesh-OTA relay to that leaf (paired with `raw_staged` after
+                        // the drain). PANIC-FREE exact byte compare (untrusted retained). The
+                        // retained cmd is CLEARED (empty retained publish) so an HA reload
+                        // can't replay it — the exact closure as the self-OTA `cmd_topic`.
+                        if leaf_id != node_id && cfg_cache.is_some() && payload == b"INSTALL" {
+                            pending_leaf = Some(leaf_id);
+                            log::info!("smol #40: leaf id{} OTA install command received", leaf_id);
+                            let mut itopic = MqttScratch::new();
+                            let _ = write!(itopic, "smol/{}/ota/install", leaf_id);
+                            if let Some(n) =
+                                crate::net::mqtt::encode_publish(&mut pkt, itopic.as_bytes(), b"", true)
+                            {
+                                let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                            }
+                        }
                     }
                     consumed
                 }
@@ -1335,6 +1406,13 @@ fn mqtt_session(
             log::info!("smol: MQTT downlink(s) not all received in budget (keeping cache)");
             break;
         }
+    }
+
+    // #40: pair a pending leaf install with the staged image (both retained → both drained
+    // above). The caller relays it over ESP-NOW. A leaf install with NO staged image → no-op
+    // (nothing to relay). `Announce` is `Copy`, so the pair moves out cleanly.
+    if let (Some(leaf_id), Some(ann)) = (pending_leaf, raw_staged) {
+        *leaf_ota = Some((leaf_id, ann));
     }
 
     // --- #23 single-gateway ELECTION with RUNTIME re-decision + stale-owner takeover ---
@@ -1584,6 +1662,9 @@ pub fn run_mqtt_burst(
     // #50b: `Some` on a gateway flush → republish cached leaf statuses (see `mqtt_session`);
     // `None` otherwise.
     stat_cache: Option<&CfgCache>,
+    // #40: on a gateway flush, filled with `(leaf_id, staged announce)` when a leaf install
+    // is pending → the caller relays it over ESP-NOW. `&mut None` on boot/leaf bursts.
+    leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
@@ -1732,6 +1813,7 @@ pub fn run_mqtt_burst(
         status, // #50: forward the live STAT|screen:page for smol/<id>/status
         cfg_cache, // #21: forward the gateway's leaf-config cache (or None)
         stat_cache, // #50b: forward the gateway's cached leaf statuses (or None)
+        leaf_ota, // #40: forward the leaf-OTA install pairing (or &mut None)
         deadline,
         tick,
     )
