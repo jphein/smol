@@ -125,6 +125,12 @@ mod grid;
 #[cfg(feature = "wifi")]
 mod ota;
 
+// #40 leaf-mesh-OTA transport (OTAM/OTAD/OTAN wire codec + leaf receive session +
+// gateway relay orchestration). espnow-only (the mesh + the ed25519 verify live there);
+// the default/wifi-only builds link NONE of it.
+#[cfg(feature = "espnow")]
+mod ota_mesh;
+
 // LOCAL git-ignored WiFi credentials, used by the `wifi`/`espnow` radio bring-up.
 #[cfg(feature = "wifi")]
 mod secrets;

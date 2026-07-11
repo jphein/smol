@@ -1246,6 +1246,10 @@ pub struct RadioManager {
     /// `cfg_cache` but UPLINK-sourced. Unused on a leaf (never flushes/publishes). REUSES
     /// `CfgCache` verbatim — a generic id→value upsert map (`Batt:3` fits `CFG_VALUE_MAX`).
     stat_cache: crate::net::wifi::CfgCache,
+    /// #40 leaf-mesh-OTA: the LEAF receive state machine (verify-sig → signed-bounds →
+    /// window reassembly → readback verify → activate). Idle except during a transfer.
+    /// Unused on a gateway (which drives the RELAY side via `run_leaf_ota_relay`).
+    ota_leaf: crate::ota_mesh::OtaLeafSession,
     /// #25 WLED: monotonic WiZmote sequence, ++ per emitted button. Wraps safely
     /// (reboot-to-0 is panic-safe; WLED's per-remote dedup may drop the first few
     /// post-reboot presses until it re-exceeds the pre-reboot value — accepted MVP).
@@ -1337,6 +1341,7 @@ impl RadioManager {
             cfg: CfgTracker::new(),
             cfg_cache: crate::net::wifi::CfgCache::new(),
             stat_cache: crate::net::wifi::CfgCache::new(),
+            ota_leaf: crate::ota_mesh::OtaLeafSession::new(),
             #[cfg(feature = "wled")]
             wled_seq: 0,
             elected_owner: id,
@@ -2349,6 +2354,15 @@ impl RadioManager {
             let rssi = recv.info.rx_control.rssi;
             let now = now_ms();
 
+            // #40 leaf-mesh-OTA transport (OTAM/OTAD/OTAN). Dispatched BEFORE the generic
+            // Frame parse — the 64-B signed manifest / raw image chunk don't fit the Frame
+            // enum. A LEAF drives its receive session here; a GATEWAY's relay is the
+            // dedicated blocking `run_leaf_ota_relay`, so it no-ops these in this drain.
+            if let Some(otaf) = crate::ota_mesh::parse_ota_frame(recv.data()) {
+                self.handle_ota_frame(otaf, src, rssi, now);
+                continue;
+            }
+
             match parse_frame(recv.data()) {
                 Some(Frame::Snk(f)) => {
                     // An MMO-snake frame proves the peer is audible → counts
@@ -2607,7 +2621,71 @@ impl RadioManager {
                 }
             }
         }
+        // #40: nudge the leaf OTA session once per service pass (idle-NAK a stalled
+        // window; abort on a progress/hard-cap timeout). No-op unless a transfer is live.
+        {
+            let mut out = [0u8; crate::ota_mesh::OTAN_FRAME_MAX];
+            if let crate::ota_mesh::LeafAction::Nak(n) = self.ota_leaf.tick(self.id, now_ms(), &mut out) {
+                let gw = self.ota_leaf.gateway_mac();
+                self.send_to(&gw, &out[..n]);
+            }
+        }
         label
+    }
+
+    /// #40: dispatch one decoded leaf-mesh-OTA frame. Updates peer liveness (an OTA frame
+    /// proves the gateway is audible — it also satisfies the leaf self-test's "heard a
+    /// valid SMOLv1 frame"), registers the sender for the unicast NAK back-channel, then
+    /// drives the receive session. On `Complete` [`crate::ota::activate`] reboots into the
+    /// new slot; on `Nak` we unicast the OTAN to the gateway; `Abort`/`None` do nothing.
+    fn handle_ota_frame(&mut self, f: crate::ota_mesh::OtaFrame<'_>, src: [u8; 6], rssi: i32, now: u64) {
+        use crate::ota_mesh::{LeafAction, OtaFrame};
+        self.peers.last_hello_ms = now;
+        self.roster.heard(src, None, rssi, now);
+        if !self.esp_now.peer_exists(&src) {
+            let _ = self.esp_now.add_peer(PeerInfo {
+                interface: EspNowWifiInterface::Sta,
+                peer_address: src,
+                lmk: None,
+                channel: None,
+                encrypt: false,
+            });
+        }
+        let mut out = [0u8; crate::ota_mesh::OTAN_FRAME_MAX];
+        let id = self.id;
+        let action = match f {
+            OtaFrame::Meta { target, session, m, sig } => {
+                self.ota_leaf.on_meta(target, session, m, sig, src, id, now)
+            }
+            OtaFrame::Data { target, session, seq, payload } => {
+                self.ota_leaf.on_data(target, session, seq, payload, src, id, now, &mut out)
+            }
+            // A NAK is leaf→gateway; the gateway consumes it inside its blocking relay
+            // loop, never here. A leaf ignores it.
+            OtaFrame::Nak { .. } => LeafAction::None,
+        };
+        match action {
+            LeafAction::Nak(n) => {
+                let gw = self.ota_leaf.gateway_mac();
+                self.send_to(&gw, &out[..n]);
+            }
+            LeafAction::Complete(slot) => {
+                crate::ota::activate(slot); // reboots on success; returns only on otadata-write fail
+            }
+            LeafAction::None | LeafAction::Abort => {}
+        }
+    }
+
+    /// #40: is a leaf mesh-OTA transfer in progress? (`main` shows a maintenance state.)
+    pub fn ota_leaf_active(&self) -> bool {
+        self.ota_leaf.is_active()
+    }
+
+    /// #40 self-test (HOLE-1): has this node decoded ≥1 valid inbound `SMOLv1` frame since
+    /// boot? This is the leaf's mesh-terms health proof (radio+parse+RX work on the new
+    /// image) — the leaf analog of `reached_dhcp`, which a credential-less leaf never hits.
+    pub fn heard_valid_frame(&self) -> bool {
+        self.peers.last_hello_ms != 0
     }
 
     /// Current peer-link state as an [`LedState`], evaluated at `now_ms`.
