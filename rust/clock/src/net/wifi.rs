@@ -1606,6 +1606,58 @@ fn mqtt_session(
         }
     }
 
+    // --- #40 §B2: publish each RELAYED LEAF's Update discovery + ota/state ON ITS BEHALF ---
+    // A credential-less leaf never opens MQTT, so the gateway is its proxy (the same role it
+    // plays for the leaf's telemetry/status relay). SAME `smol<leaf>_update` unique_id +
+    // topics as self-OTA → ONE entity, device-merged onto the leaf's existing card; the
+    // gateway keeps `installed_version` fresh from the RELAYED STAT build, so a leaf-mesh-OTA
+    // result — the new build, or a self-test rollback to the old — shows in HA HEADLESS
+    // (the whole point: the C3 USB-JTAG boards give no reliable headless serial). Gateway-only
+    // (stat_cache = Some). Idempotent retained publishes, bounded to the heard-leaf set.
+    #[cfg(feature = "espnow")]
+    if let Some(sc) = stat_cache {
+        let latest_staged = raw_staged.as_ref().map(|a| a.build);
+        for i in 0..sc.count() {
+            let (lid, val) = match sc.entry(i) {
+                Some(x) => x,
+                None => continue,
+            };
+            if lid == node_id {
+                continue; // the gateway's own Update is self-published above
+            }
+            let noun = crate::net::names::name_for_id(lid).1;
+            // Discovery (retained) — the self-OTA template, for <leaf>. `cmd_t=~/install`
+            // = `smol/<leaf>/ota/install`, which the gateway wildcard-subs → relay (§B3).
+            let mut dtopic = MqttScratch::new();
+            let _ = write!(dtopic, "homeassistant/update/smol{}/config", lid);
+            let mut djson = MqttScratch::new();
+            let _ = write!(
+                djson,
+                "{{\"~\":\"smol/{}/ota\",\"stat_t\":\"~/state\",\"cmd_t\":\"~/install\",\"pl_inst\":\"INSTALL\",\"dev_cla\":\"firmware\",\"name\":\"Update\",\"has_entity_name\":true,\"uniq_id\":\"smol{}_update\",\"object_id\":\"smol_{}_update\",\"dev\":{{\"ids\":[\"smol{}\"],\"name\":\"smol {} {}\"}}}}",
+                lid, lid, lid, lid, lid, noun
+            );
+            if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), djson.as_bytes(), true) {
+                let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            }
+            // State (retained) ONLY if the leaf reported a build (STAT `|<build>` field) —
+            // don't clobber a self-published value with "unknown" for a leaf on old firmware.
+            if let Some(installed) = crate::ota_mesh::stat_build(val) {
+                let latest = latest_staged.unwrap_or(installed);
+                let mut sjson = MqttScratch::new();
+                let _ = write!(
+                    sjson,
+                    "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":false,\"title\":\"smol v{}\"}}",
+                    installed, latest, latest
+                );
+                let mut stopic = MqttScratch::new();
+                let _ = write!(stopic, "smol/{}/ota/state", lid);
+                if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, stopic.as_bytes(), sjson.as_bytes(), true) {
+                    let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                }
+            }
+        }
+    }
+
     // --- DISCONNECT (clean goodbye) + close the socket ---
     if let Some(n) = crate::net::mqtt::encode_disconnect(&mut pkt) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
