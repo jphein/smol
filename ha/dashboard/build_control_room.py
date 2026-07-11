@@ -80,9 +80,16 @@ def node_card(nid, meta, present):
     row(f"sensor.smol_{nid}_config","default screen (commanded)","mdi:monitor-dashboard")   # retained default_screen; works now
     row(f"sensor.smol_{nid}_screen","current screen (live)","mdi:monitor-eye")              # ACTUAL screen incl. manual BOOT-menu nav; 'unknown' until #50 fw, then auto-populates
     row(f"sensor.smol_{nid}_status","activity","mdi:pulse")
-    row(f"sensor.smol_{nid}_rssi","bond (RSSI)","mdi:signal")
-    row(f"sensor.smol_{nid}_rssi_band","bond band","mdi:signal-cellular-2")
-    row(f"binary_sensor.smol_{nid}_resync","re-syncing","mdi:sync")
+    if has_rssi:                                                    # LEAF — mesh bond to the gateway
+        row(f"sensor.smol_{nid}_rssi","bond (RSSI)","mdi:signal")
+        row(f"sensor.smol_{nid}_rssi_band","bond band","mdi:signal-cellular-2")
+        row(f"binary_sensor.smol_{nid}_resync","re-syncing","mdi:sync")
+    else:                                                           # GATEWAY anchor — WiFi-uplinked, no mesh bond/resync → show what it OWNS/serves (fills Dominion's gap, no fake rows)
+        sec("gateway anchor · WiFi uplink")
+        if "sensor.smol_mesh_channel" in present:
+            ents.append({"type":"attribute","entity":"sensor.smol_mesh_channel","attribute":"channel","name":"mesh channel (owned)","icon":"mdi:wifi"})
+            ents.append({"type":"attribute","entity":"sensor.smol_mesh_channel","attribute":"seq","name":"mesh seq (advancing)","icon":"mdi:counter"})
+        row(f"sensor.smol_{nid}_peers","peers / roster","mdi:lan")
     sec("firmware")
     fw=next((e for e in present if re.match(rf"update\.smol_{nid}_.*_firmware$",e)),None)
     if fw: ents.append({"entity":fw,"name":"firmware (version + update)"})

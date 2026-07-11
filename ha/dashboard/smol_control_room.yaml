@@ -268,6 +268,21 @@ cards:
       name: activity
       icon: mdi:pulse
     - type: section
+      label: gateway anchor · WiFi uplink
+    - type: attribute
+      entity: sensor.smol_mesh_channel
+      attribute: channel
+      name: mesh channel (owned)
+      icon: mdi:wifi
+    - type: attribute
+      entity: sensor.smol_mesh_channel
+      attribute: seq
+      name: mesh seq (advancing)
+      icon: mdi:counter
+    - entity: sensor.smol_7_peers
+      name: peers / roster
+      icon: mdi:lan
+    - type: section
       label: firmware
     - entity: update.smol_7_dominion_firmware
       name: firmware (version + update)
