@@ -509,13 +509,18 @@ fn inactive_slot() -> Option<Slot> {
 /// (`New`), then REBOOT into it. Call ONLY after [`ImageWriter::finalize`] returned
 /// true. If the otadata write fails, we do NOT reboot — the good slot stays active.
 #[cfg(feature = "espnow")]
-pub fn activate(target: Slot, new_build: u32) {
+pub fn activate(target: Slot, new_build: u32, is_leaf_ota: bool) {
     if set_slot_new(target).is_some() {
-        // #40: tag the marker with the NEW image's build# so the next boot's `boot_confirm`
-        // self-tests IFF the running build matches (i.e. this exact OTA image booted). A USB
-        // flash of a different build won't match a stale RTC marker → accepted (bug #5 fix).
-        mark_ota_activated(new_build);
-        log::info!("smol OTA: image verified — activating new slot (build {}), rebooting", new_build);
+        // #40: tag the marker with the NEW image's build# + OTA type. `boot_confirm` self-tests
+        // IFF the running build matches (bug #5 — a USB flash of a different build won't match a
+        // stale marker), and the deferred LEAF self-test runs only for `is_leaf_ota` (so a
+        // self-OTA'd gateway confirms via DHCP, never the hear-a-frame path → no 113↔114 loop).
+        mark_ota_activated(new_build, is_leaf_ota);
+        log::info!(
+            "smol OTA: image verified — activating new slot (build {}, {}), rebooting",
+            new_build,
+            if is_leaf_ota { "leaf-mesh-OTA" } else { "self-OTA" }
+        );
         esp_hal::system::software_reset();
     } else {
         log::error!("smol OTA: activation (otadata write) failed — staying on current image");
@@ -1054,26 +1059,32 @@ const BOOT_GUARD_MAGIC: u32 = 0x736D_6C4B; // "smlK"
 // edge — it'd self-test, but brick-safely.) `wifi`-scoped so `boot_confirm` can read it.
 // ---------------------------------------------------------------------------
 
-/// `[magic, activated_build]` in persistent RTC-fast RAM (survives `software_reset` AND a
-/// USB-JTAG reflash; only a power cycle clears it). `activated_build` = the build# passed to
-/// the `activate()` that produced this boot chain; matched against the running `BUILD_NUMBER`.
+/// `[magic, activated_build, is_leaf_ota]` in persistent RTC-fast RAM (survives
+/// `software_reset` AND a USB-JTAG reflash; only a power cycle clears it). `activated_build`
+/// = the build# passed to the `activate()` that produced this boot chain (matched against the
+/// running `BUILD_NUMBER`); `is_leaf_ota` = 1 for a mesh-OTA (confirm via hear-a-frame), 0 for
+/// a self-OTA (confirm via reached-DHCP). The OTA TYPE, not the runtime role, decides the
+/// confirm path — a self-OTA'd gateway that transiently misses DHCP at one boot must NOT be
+/// rolled back by the leaf hear-a-frame path (the 113↔114 oscillation), and its role is
+/// ambiguous at that boot anyway.
 #[cfg(feature = "wifi")]
 #[esp_hal::ram(rtc_fast, persistent)]
-static mut OTA_ACTIVATE_GUARD: [u32; 2] = [0u32; 2];
+static mut OTA_ACTIVATE_GUARD: [u32; 3] = [0u32; 3];
 
 #[cfg(feature = "wifi")]
 const ACTIVATE_GUARD_MAGIC: u32 = 0x736D_6C41; // "smlA"
 
-/// Tag the marker with the build# of the image being activated (call inside `activate()`,
-/// passing the NEW image's build# — from the signed manifest for a mesh-OTA, or the announce
-/// for a self-OTA). Survives the reset AND a USB reflash; only a power cycle clears it.
-/// `espnow`-scoped (only `activate()` — itself espnow — sets it; wifi-only never OTAs).
+/// Tag the marker with the build# + OTA type of the image being activated (call inside
+/// `activate()`, passing the NEW image's build# and whether this is a LEAF mesh-OTA). Survives
+/// the reset AND a USB reflash; only a power cycle clears it. `espnow`-scoped (only `activate()`
+/// — itself espnow — sets it; wifi-only never OTAs).
 #[cfg(feature = "espnow")]
-pub fn mark_ota_activated(build: u32) {
+pub fn mark_ota_activated(build: u32, is_leaf_ota: bool) {
     unsafe {
         let g = &mut *core::ptr::addr_of_mut!(OTA_ACTIVATE_GUARD);
         g[0] = ACTIVATE_GUARD_MAGIC;
         g[1] = build;
+        g[2] = is_leaf_ota as u32;
     }
 }
 
@@ -1088,6 +1099,19 @@ pub fn ota_was_activated_for(running_build: u32) -> bool {
     }
 }
 
+/// True iff the current OTA-activate boot chain is a LEAF mesh-OTA (confirm via hear-a-frame).
+/// A self-OTA (is_leaf_ota=0) confirms via reached-DHCP only and NEVER runs the deferred leaf
+/// self-test — so a transient DHCP miss can't roll a self-OTA'd gateway back on a quiet mesh.
+/// `cfg(espnow)`, not `wifi`: the ONLY caller is the `#[cfg(espnow)]` deferred-leaf-selftest gate
+/// in `main`; a wifi-only (gateway) build confirms via DHCP and never reads this (would warn-unused).
+#[cfg(feature = "espnow")]
+pub fn ota_activated_is_leaf() -> bool {
+    unsafe {
+        let g = &*core::ptr::addr_of!(OTA_ACTIVATE_GUARD);
+        g[0] == ACTIVATE_GUARD_MAGIC && g[2] == 1
+    }
+}
+
 /// Clear the activate marker (call once the image's fate is decided — confirmed / rolled
 /// back / accepted — so a later crash-reset doesn't re-run the self-test on the same chain).
 #[cfg(feature = "wifi")]
@@ -1096,6 +1120,7 @@ fn clear_ota_activated() {
         let g = &mut *core::ptr::addr_of_mut!(OTA_ACTIVATE_GUARD);
         g[0] = ACTIVATE_GUARD_MAGIC;
         g[1] = 0;
+        g[2] = 0;
     }
 }
 

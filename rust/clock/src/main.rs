@@ -422,9 +422,16 @@ fn main() -> ! {
     // A gateway / DHCP-reached board already confirmed at boot → this is false → no-op.
     // Only a GENUINE mesh-OTA boot (activated) runs the deferred self-test; a USB-flashed
     // `New` image is accepted as-is by `boot_confirm` and never reaches here as pending.
+    // #2 (oscillation fix): gate on `ota_activated_is_leaf()` — ONLY a LEAF mesh-OTA confirms
+    // via hear-a-frame here. A SELF-OTA image confirms via reached-DHCP in `mode::start`; if it
+    // transiently misses DHCP at one boot it stays `New` + running (self-heals next boot), and
+    // is NEVER rolled back by the hear-a-frame path on a quiet mesh (which was the 113↔114
+    // gateway loop). The OTA type — not the ambiguous runtime role at a flaky-DHCP boot — is
+    // the correct discriminator.
     #[cfg(feature = "espnow")]
-    let mut leaf_selftest_pending =
-        ota::otadata_unconfirmed() && ota::ota_was_activated_for(ota::BUILD_NUMBER);
+    let mut leaf_selftest_pending = ota::otadata_unconfirmed()
+        && ota::ota_was_activated_for(ota::BUILD_NUMBER)
+        && ota::ota_activated_is_leaf();
 
     #[cfg_attr(not(feature = "espnow"), allow(unused_mut))]
     let mut base_unix: u32 = match synced {
@@ -594,7 +601,12 @@ fn main() -> ! {
             // (default false) is the single legacy-auto-install toggle. Heavy + mesh-deaf
             // + abortable → same responsive tick as a flush; success reboots inside the
             // burst, failure/abort leaves the good image running (HA re-offers = retry).
-            let do_install = crate::ota::OTA_AUTO_INSTALL || r.take_install_request();
+            // #1 DECOUPLE: suppress the gateway's OWN self-OTA while a leaf-OTA relay is
+            // pending — else the self-OTA reboots the gateway mid-session and the two OTAs
+            // collide/thrash the fleet. Short-circuit BEFORE `take_install_request()` so the
+            // gateway's install is PRESERVED (not consumed) and fires once the relay resolves.
+            let do_install = !r.leaf_ota_pending()
+                && (crate::ota::OTA_AUTO_INSTALL || r.take_install_request());
             if do_install {
                 if let Some(announce) = r.take_ota_offer() {
                     let mut ota_draw_ms = 0u64;
@@ -826,6 +838,12 @@ fn main() -> ! {
                     // mesh-degrading, UI-alive + long-press abortable). Skipped if the leaf's
                     // MAC hasn't been learned from its HELLOs yet (retry on the next install).
                     if let Some((leaf_id, ann)) = leaf_ota.take() {
+                        // #1 DECOUPLE: latch "a leaf relay is owed" the moment this flush
+                        // surfaces the leaf install. It persists across loop iterations (cleared
+                        // only by a TERMINAL `record_leaf_ota`), so the gateway's own self-OTA
+                        // gate (`do_install`) stays suppressed until the relay resolves — even
+                        // across the mac-unknown retry path below, which also keeps it latched.
+                        r.note_leaf_ota_armed();
                         if let Some(mac) = r.mac_for_id(leaf_id) {
                             let mut relay_draw_ms = 0u64;
                             let mut relay_abort = false;

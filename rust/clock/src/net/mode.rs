@@ -1321,6 +1321,11 @@ pub struct RadioManager {
     /// The phase is stored as the rendered `&'static str` (not the espnow-only enum) so the
     /// shared `wifi::mqtt_session` signature stays buildable in the wifi-only profile.
     leaf_ota_diag: Option<(u8, &'static str, bool)>,
+    /// #40 #1 DECOUPLE: true while a leaf-OTA relay is pending/in-flight (armed until its
+    /// outcome is terminal or the retry cap is hit). While set, the gateway SUPPRESSES its own
+    /// self-OTA (`do_install`) so a relay is never interrupted by the gateway rebooting into a
+    /// fresh build mid-session (and the two OTAs never collide/thrash the fleet).
+    leaf_ota_pending: bool,
     /// #40: consecutive non-terminal (transient) relay attempts for the current install —
     /// caps the auto-retry so a persistently-failing leaf can't loop the mesh-deaf relay.
     leaf_ota_retries: u8,
@@ -1404,6 +1409,7 @@ impl RadioManager {
             staged_raw: None,
             leaf_ota_diag: None,
             leaf_ota_retries: 0,
+            leaf_ota_pending: false,
             config_offer: None,
             install_requested: false,
             silent_until_relock: false,
@@ -2193,6 +2199,24 @@ impl RadioManager {
             leaf_id, outcome.as_str(), clear, self.leaf_ota_retries
         );
         self.leaf_ota_diag = Some((leaf_id, outcome.as_str(), clear));
+        // #1 DECOUPLE: the relay session is done for this install iff we're clearing it
+        // (terminal outcome or retry cap). While NOT cleared (transient retry) it stays
+        // pending so the gateway keeps suppressing its own self-OTA until the leaf resolves.
+        if clear {
+            self.leaf_ota_pending = false;
+        }
+    }
+
+    /// #40 #1: mark that a leaf-OTA relay has been armed (called by `main` when it takes an
+    /// armed `leaf_ota`). Suppresses the gateway's own self-OTA until the relay resolves.
+    pub fn note_leaf_ota_armed(&mut self) {
+        self.leaf_ota_pending = true;
+    }
+
+    /// #40 #1: is a leaf-OTA relay pending/in-flight? `main` gates the gateway's self-OTA
+    /// (`do_install`) on `!leaf_ota_pending()` so a relay is never interrupted.
+    pub fn leaf_ota_pending(&self) -> bool {
+        self.leaf_ota_pending
     }
 
     /// #40 GATEWAY leaf-mesh-OTA orchestration (§B4). Fetch the staged image (WiFi) into
@@ -2990,7 +3014,8 @@ impl RadioManager {
                 self.send_to(&gw, &out[..n]);
             }
             LeafAction::Complete(slot, build) => {
-                crate::ota::activate(slot, build); // reboots on success; returns only on otadata-write fail
+                // Leaf mesh-OTA → is_leaf_ota=true → confirm via hear-a-frame on next boot.
+                crate::ota::activate(slot, build, true); // reboots on success
             }
             LeafAction::None | LeafAction::Abort => {}
         }

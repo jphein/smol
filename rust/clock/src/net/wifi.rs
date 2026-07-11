@@ -2237,7 +2237,7 @@ pub fn run_ota_fetch(
             return true;
         }
         log::info!("smol OTA: image VERIFIED (SHA-256 + ed25519) — activating the new slot");
-        crate::ota::activate(target, announce.build); // reboots on success
+        crate::ota::activate(target, announce.build, false); // self-OTA → confirm via DHCP
         false // reached only if the otadata write failed
     } else {
         log::error!("smol OTA: verify FAILED (size/SHA-256 or ed25519 signature) — discarded (good slot intact)");
