@@ -670,15 +670,6 @@ fn main() -> ! {
             // 2000 ms / SUBTICK_MS aligned via the monotonic clock.
             if (now / 2000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 2000) {
                 r.broadcast_hello();
-                // #40 #3: leaf-only OTA RX-diag beacon on the HELLO cadence, so a relaying
-                // gateway captures the leaf's `on_meta` verdict / OTAM-heard / OTAN-sent counts
-                // LIVE (folded into `smol/<leaf>/ota/relaydiag`) — names WHY a relay had otan=0.
-                // espnow-only: the LDBG frame + leaf receive-session self-report are mesh-build.
-                #[cfg(feature = "espnow")]
-                if !r.is_gateway() {
-                    let (dh, dv, dn) = r.ota_leaf_dbg();
-                    r.broadcast_ldbg(dh, dv, dn);
-                }
                 // Advertise our current Unix time + the sync it descends from on
                 // the SAME tick, so a peer with an older sync can adopt ours.
                 // (A separate frame from HELLO — the LED handshake wire format is
@@ -693,6 +684,21 @@ fn main() -> ! {
                 if matches!(app, App::Bench(_)) {
                     r.broadcast_beacon();
                 }
+            }
+
+            // #40 #3: leaf OTA RX-diag beacon (LDBG) on its OWN ~2 s tick, phase-OFFSET 1 s from
+            // the HELLO burst above. Root cause of the f6f7a28 canary's `leaf=none`: the leaf sent
+            // HELLO→LDBG→TIME back-to-back and the gateway systematically caught the HELLO (rx>0)
+            // but DROPPED the 2nd-of-burst LDBG (TX radio still busy on the rapid 2nd send / RX
+            // overrun). A standalone, temporally-separated tick lets the radio settle so a relaying
+            // gateway reliably captures one → `smol/<leaf>/ota/relaydiag leaf=HxVxNx`. Leaf-only,
+            // unconditional (reports the lifetime dbg counters), mesh build.
+            #[cfg(feature = "espnow")]
+            if !r.is_gateway()
+                && ((now + 1000) / 2000) != ((now.saturating_sub(SUBTICK_MS as u64) + 1000) / 2000)
+            {
+                let (dh, dv, dn) = r.ota_leaf_dbg();
+                r.broadcast_ldbg(dh, dv, dn);
             }
 
             // COEXIST SOAK (#23 PART 1): beacon 1/s (independent of the 2 s HELLO) so
