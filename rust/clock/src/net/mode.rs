@@ -2407,7 +2407,12 @@ impl RadioManager {
         // ch6 windows. The first OTAM the leaf catches locks it to ch6 (`handle_ota_frame`) and
         // arms its session → it then holds ch6 (`leaf_scan_tick` is_active) for the transfer. Stop
         // early the instant the leaf NAKs (it's armed + ready for the windowed transfer).
-        const WAKE_MS: u64 = 20_000;
+        // #3b: 90s (was 20s) so the burst spans several of the leaf's re-election/hop cycles —
+        // after the off-ch6 fetch the leaf needs ~10-30s to stabilize + hop back onto ch6, and a
+        // longer flood raises the odds it catches one OTAM while there. Self-stops on first NAK,
+        // so a leaf that locks early doesn't pay the full window. (Band-aid for the coexist wall —
+        // the real cure is a ch6-locked fetch AP so the leaf never leaves ch6; flagged to JP.)
+        const WAKE_MS: u64 = 90_000;
         const WAKE_GAP_MS: u64 = 120;
         let wake_deadline = now_ms() + WAKE_MS;
         let mut last_wake_ms = 0u64;
