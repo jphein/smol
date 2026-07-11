@@ -799,6 +799,11 @@ pub struct RelayDiag {
     /// `otam_ok>0` while leaf stays H0 ⇒ frame egresses but the leaf's RX drops it (deeper).
     pub otam_tx: u16,
     pub otam_ok: u16,
+    /// #3b CHANNEL-diag: iterations spent waiting for the WiFi STA to release the PHY after the
+    /// fetch, before pinning ch6. `settle>0` ⇒ the STA WAS still holding the AP channel post-fetch
+    /// (confirms the OTAM was egressing off-channel → the leaf H0 cause); `settle=0` ⇒ STA already
+    /// down, so a persistent H0 is NOT the channel (→ leaf RX-filter, instrument the leaf next).
+    pub settle: u16,
 }
 
 #[cfg(feature = "wifi")]
@@ -1490,8 +1495,8 @@ fn mqtt_session(
         let mut rval = MqttScratch::new();
         // Gateway RX evidence + the leaf's own LDBG self-report. `leaf=none` ⇒ no LDBG captured
         // (old leaf fw / leaf off-air during the relay); else `H<heard>V<verdict>N<sent>`.
-        let _ = write!(rval, "rx={} otan={} last_wb={}/{} otam_tx={}/{} leaf=",
-            d.rx_any, d.otan_valid, d.last_wb, d.total, d.otam_tx, d.otam_ok);
+        let _ = write!(rval, "rx={} otan={} last_wb={}/{} otam_tx={}/{} settle={} leaf=",
+            d.rx_any, d.otan_valid, d.last_wb, d.total, d.otam_tx, d.otam_ok, d.settle);
         if d.leaf_verdict == 255 {
             let _ = write!(rval, "none");
         } else {

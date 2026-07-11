@@ -2340,6 +2340,25 @@ impl RadioManager {
                 encrypt: false,
             });
         }
+        // #3b CHANNEL FIX (the real one — canary 7708b20 proved otam_tx=17/17 egress OK, yet leaf
+        // H0 with rx collapsed 10→2): the OTAM fires right after the WiFi FETCH. `switch(EspNow)`
+        // above issued an ASYNC `disconnect()` + `set_channel(ch6)`, but while the STA is still
+        // tearing down it HOLDS the AP's channel → the OTAM broadcast egresses on the AP channel,
+        // not ch6, so the ch6 leaf never hears it. SPIN until the STA truly releases the PHY, THEN
+        // pin ch6 (and re-pin right before each OTAM send below). `settle` (published) = how long
+        // the STA held on — settle>0 confirms this WAS the off-channel egress.
+        let mut settle: u16 = 0;
+        while settle < 40 {
+            if !matches!(self.controller.is_connected(), Ok(true)) {
+                break;
+            }
+            let _ = self.controller.disconnect();
+            settle = settle.saturating_add(1);
+            if tick() {
+                return LeafOtaOutcome::Aborted;
+            }
+        }
+        let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
         let gwbuf = unsafe { &mut *core::ptr::addr_of_mut!(GW_OTA_WINDOW) };
         let mut otam = [0u8; om::OTAM_FRAME_MAX];
         let Some(otam_len) =
@@ -2378,6 +2397,7 @@ impl RadioManager {
                     leaf_id, rx_any, otan_valid, last_wb: wb as u16, total: total as u16,
                     leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
                     otam_tx, otam_ok,
+                    settle,
                 });
                 let _ = self.switch(Mode::EspNow);
                 return LeafOtaOutcome::RelayFailed;
@@ -2402,7 +2422,10 @@ impl RadioManager {
                 // the image (OTAD) stays unicast — "no broadcast image push" preserved. The
                 // `target` id in the frame keeps canary-one-leaf semantics (only leaf_id arms).
                 if wb == 0 {
-                    // #3b: capture the send Result (send_to swallows it) to prove egress.
+                    // #3b: re-pin ch6 right before the announce (self-healing if the post-fetch
+                    // STA teardown released the channel late), then capture the send Result
+                    // (send_to swallows it) to prove egress.
+                    let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
                     otam_tx = otam_tx.saturating_add(1);
                     if let Ok(waiter) = self.esp_now.send(&BROADCAST_ADDRESS, &otam[..otam_len]) {
                         if waiter.wait().is_ok() {
@@ -2471,6 +2494,7 @@ impl RadioManager {
                     leaf_id, rx_any, otan_valid, last_wb: wb as u16, total: total as u16,
                     leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
                     otam_tx, otam_ok,
+                    settle,
                 });
                     return LeafOtaOutcome::RelayFailed;
                 }
@@ -2482,7 +2506,7 @@ impl RadioManager {
         self.leaf_relay_rx = Some(crate::net::wifi::RelayDiag {
             leaf_id, rx_any, otan_valid, last_wb: total as u16, total: total as u16,
             leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
-            otam_tx, otam_ok,
+            otam_tx, otam_ok, settle,
         });
 
         // --- CONFIRMING (Tier-2, build-matched): sample the leaf's SETTLED build over the
