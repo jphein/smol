@@ -2989,8 +2989,8 @@ impl RadioManager {
                 let gw = self.ota_leaf.gateway_mac();
                 self.send_to(&gw, &out[..n]);
             }
-            LeafAction::Complete(slot) => {
-                crate::ota::activate(slot); // reboots on success; returns only on otadata-write fail
+            LeafAction::Complete(slot, build) => {
+                crate::ota::activate(slot, build); // reboots on success; returns only on otadata-write fail
             }
             LeafAction::None | LeafAction::Abort => {}
         }

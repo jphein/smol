@@ -351,8 +351,9 @@ pub enum LeafAction {
     /// Unicast `out[..len]` (an `OTAN`) back to the gateway's MAC.
     Nak(usize),
     /// The image is fully received AND verified (sig + size + readback sha). Activate
-    /// this slot — [`crate::ota::activate`] reboots into it (never returns on success).
-    Complete(Slot),
+    /// this slot with the manifest build# — [`crate::ota::activate`] reboots into it
+    /// (never returns on success); the build# tags the self-test exemption marker.
+    Complete(Slot, u32),
     /// The session aborted (bad frame class handled internally) — discard; nothing to send.
     Abort,
 }
@@ -366,6 +367,7 @@ static mut OTA_WINDOW_BUF: [u8; WINDOW_BYTES] = [0u8; WINDOW_BYTES];
 pub struct OtaLeafSession {
     active: bool,
     session_id: u16,
+    build: u32,
     size: u32,
     sha256: [u8; 32],
     total_chunks: u32,
@@ -385,6 +387,7 @@ impl OtaLeafSession {
         Self {
             active: false,
             session_id: 0,
+            build: 0,
             size: 0,
             sha256: [0u8; 32],
             total_chunks: 0,
@@ -462,6 +465,7 @@ impl OtaLeafSession {
         };
         self.active = true;
         self.session_id = session;
+        self.build = build;
         self.size = size;
         self.sha256 = sha256;
         self.total_chunks = total_chunks(size);
@@ -586,15 +590,15 @@ impl OtaLeafSession {
         }
 
         // ---- LAST window done → FINALIZE (readback verify) → activate. ------------
-        let (size, sha) = (self.size, self.sha256);
+        let (size, sha, build) = (self.size, self.sha256, self.build);
         let writer = self.writer.take();
         self.active = false;
         match writer {
             Some(w) => {
                 let target_slot = w.target();
                 if w.finalize(size, &sha) {
-                    log::info!("smol #40: image VERIFIED (readback SHA-256, ed25519 already ok) — activating");
-                    LeafAction::Complete(target_slot)
+                    log::info!("smol #40: image VERIFIED (readback SHA-256, ed25519 already ok) — activating build {}", build);
+                    LeafAction::Complete(target_slot, build)
                 } else {
                     log::error!("smol #40: readback verify FAILED — discarded (good slot intact)");
                     LeafAction::Abort

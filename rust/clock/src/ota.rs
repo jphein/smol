@@ -509,12 +509,13 @@ fn inactive_slot() -> Option<Slot> {
 /// (`New`), then REBOOT into it. Call ONLY after [`ImageWriter::finalize`] returned
 /// true. If the otadata write fails, we do NOT reboot — the good slot stays active.
 #[cfg(feature = "espnow")]
-pub fn activate(target: Slot) {
+pub fn activate(target: Slot, new_build: u32) {
     if set_slot_new(target).is_some() {
-        // #40: mark this boot-chain as a genuine OTA activate so the next boot's `boot_confirm`
-        // runs the self-test (a USB flash, which power-cycles, clears this → no self-test).
-        mark_ota_activated();
-        log::info!("smol OTA: image verified — activating new slot, rebooting");
+        // #40: tag the marker with the NEW image's build# so the next boot's `boot_confirm`
+        // self-tests IFF the running build matches (i.e. this exact OTA image booted). A USB
+        // flash of a different build won't match a stale RTC marker → accepted (bug #5 fix).
+        mark_ota_activated(new_build);
+        log::info!("smol OTA: image verified — activating new slot (build {}), rebooting", new_build);
         esp_hal::system::software_reset();
     } else {
         log::error!("smol OTA: activation (otadata write) failed — staying on current image");
@@ -606,13 +607,15 @@ pub fn boot_confirm(self_test_passed: bool) {
     if !matches!(state, OtaImageState::New | OtaImageState::PendingVerify) {
         return; // Valid/Undefined/etc — a normal, already-confirmed boot
     }
-    // #40 USB-flash EXEMPTION: a `New` image that did NOT come from our `activate()` this
-    // power-cycle (a USB flash, or a power-cycled OTA) must NOT self-test — else a freshly
-    // USB-flashed image gets reverted/rolled back for hearing no mesh frame. It's operator-
-    // intended (USB) or already ed25519+sha verified (OTA), so ACCEPT it as-is.
-    if !ota_was_activated() {
+    // #40 USB-flash EXEMPTION (build#-tagged, bug #5): self-test ONLY if the RUNNING build# is
+    // the one our `activate()` tagged — i.e. this exact OTA image booted. A `New` image whose
+    // build# doesn't match the marker (a USB flash, incl. a STALE marker that survived the
+    // USB-JTAG reflash, or a power-cycled OTA) must NOT self-test — else a freshly USB-flashed
+    // image gets reverted for hearing no mesh frame. It's operator-intended (USB) or already
+    // ed25519+sha verified (OTA), so ACCEPT it as-is.
+    if !ota_was_activated_for(BUILD_NUMBER) {
         let _ = ota.set_current_ota_state(OtaImageState::Valid);
-        log::info!("smol OTA: unconfirmed image but not a fresh OTA activate (USB flash / power-cycle) — accepting, no self-test");
+        log::info!("smol OTA: unconfirmed image but build# doesn't match a fresh OTA activate (USB flash / stale marker) — accepting, no self-test");
         return;
     }
     let bl_auto_revert = matches!(state, OtaImageState::PendingVerify);
@@ -1034,19 +1037,26 @@ static mut OTA_BOOT_GUARD: [u32; 2] = [0u32; 2];
 const BOOT_GUARD_MAGIC: u32 = 0x736D_6C4B; // "smlK"
 
 // ---------------------------------------------------------------------------
-// #40 USB-flash EXEMPTION — only a genuine OTA-`activate()` boot should self-test.
+// #40 USB-flash EXEMPTION — only a genuine OTA-`activate()` of THIS EXACT image self-tests.
 //
 // A USB-flashed image boots as `New` (unconfirmed) just like an OTA image, so `boot_confirm`
 // couldn't tell them apart → EVERY USB flash ran the self-test → false rollback (or, before
-// the brick-safe fix, a brick). Distinguish them with an RTC-fast marker set ONLY inside
-// `activate()`: a genuine OTA does `activate()` → `software_reset()` (marker persists across
-// the reset). A USB flash / power-cycle CLEARS RTC RAM → marker absent → `boot_confirm`
-// ACCEPTS the image without self-testing (it's operator-intended; an OTA image was already
-// ed25519+sha verified before activate). `wifi`-scoped so `boot_confirm` can read it.
+// the brick-safe fix, a brick). We tag an RTC-fast marker with the ACTIVATED image's build#
+// inside `activate()`; `boot_confirm` self-tests ONLY when the RUNNING `BUILD_NUMBER` matches
+// the marker's build#.
+//
+// ⚠️ CRITICAL (bug #5): a bare "an OTA happened" flag is NOT enough — RTC-fast RAM SURVIVES a
+// USB-JTAG reflash (`rst:0x15` is a peripheral reset, NOT power-off; only a true power cycle
+// clears it). A board that self-OTA'd earlier and stayed powered would carry a STALE marker
+// into a USB flash → false self-test → rollback (exactly what bricked/reverted id7). Tagging
+// the SPECIFIC build# fixes it: a USB flash of a DIFFERENT build won't match the stale marker
+// → accepted as operator-confirmed. (Re-flashing the byte-identical build# is a harmless
+// edge — it'd self-test, but brick-safely.) `wifi`-scoped so `boot_confirm` can read it.
 // ---------------------------------------------------------------------------
 
-/// `[magic, activated_flag]` in persistent RTC-fast RAM (survives `software_reset`, cleared
-/// on power-loss). `activated_flag == 1` ⇔ this boot descends from a genuine `activate()`.
+/// `[magic, activated_build]` in persistent RTC-fast RAM (survives `software_reset` AND a
+/// USB-JTAG reflash; only a power cycle clears it). `activated_build` = the build# passed to
+/// the `activate()` that produced this boot chain; matched against the running `BUILD_NUMBER`.
 #[cfg(feature = "wifi")]
 #[esp_hal::ram(rtc_fast, persistent)]
 static mut OTA_ACTIVATE_GUARD: [u32; 2] = [0u32; 2];
@@ -1054,25 +1064,27 @@ static mut OTA_ACTIVATE_GUARD: [u32; 2] = [0u32; 2];
 #[cfg(feature = "wifi")]
 const ACTIVATE_GUARD_MAGIC: u32 = 0x736D_6C41; // "smlA"
 
-/// Mark the current boot-chain as a genuine OTA activate (call inside `activate()` right
-/// before the reset). Survives the `software_reset`; cleared by power-loss. `espnow`-scoped
-/// (only `activate()` — itself espnow — sets it; the wifi-only build never OTAs).
+/// Tag the marker with the build# of the image being activated (call inside `activate()`,
+/// passing the NEW image's build# — from the signed manifest for a mesh-OTA, or the announce
+/// for a self-OTA). Survives the reset AND a USB reflash; only a power cycle clears it.
+/// `espnow`-scoped (only `activate()` — itself espnow — sets it; wifi-only never OTAs).
 #[cfg(feature = "espnow")]
-pub fn mark_ota_activated() {
+pub fn mark_ota_activated(build: u32) {
     unsafe {
         let g = &mut *core::ptr::addr_of_mut!(OTA_ACTIVATE_GUARD);
         g[0] = ACTIVATE_GUARD_MAGIC;
-        g[1] = 1;
+        g[1] = build;
     }
 }
 
-/// True iff the running image was activated by our `activate()` this power-cycle (i.e. a
-/// genuine OTA, not a USB flash). Uninitialized RTC RAM (bad magic) ⇒ false (not activated).
+/// True iff the RUNNING image (`running_build`) is the exact image our `activate()` produced —
+/// i.e. a genuine OTA of THIS build, not a USB flash (whose build# won't match a stale marker)
+/// nor uninitialized RTC RAM (bad magic ⇒ false).
 #[cfg(feature = "wifi")]
-pub fn ota_was_activated() -> bool {
+pub fn ota_was_activated_for(running_build: u32) -> bool {
     unsafe {
         let g = &*core::ptr::addr_of!(OTA_ACTIVATE_GUARD);
-        g[0] == ACTIVATE_GUARD_MAGIC && g[1] == 1
+        g[0] == ACTIVATE_GUARD_MAGIC && g[1] == running_build && running_build != 0
     }
 }
 

@@ -266,7 +266,7 @@ fn main() -> ! {
     #[cfg(feature = "espnow")]
     if ota::otadata_unconfirmed() {
         ota::fresh_floor_bump(ota::BUILD_NUMBER); // floor tracks any booted build (USB or OTA)
-        if ota::ota_was_activated()
+        if ota::ota_was_activated_for(ota::BUILD_NUMBER)
             && ota::unconfirmed_boot_bump() >= OTA_MAX_UNCONFIRMED_BOOTS
         {
             log::warn!("smol #40: {} unconfirmed OTA boots — forcing app-side rollback", OTA_MAX_UNCONFIRMED_BOOTS);
@@ -423,7 +423,8 @@ fn main() -> ! {
     // Only a GENUINE mesh-OTA boot (activated) runs the deferred self-test; a USB-flashed
     // `New` image is accepted as-is by `boot_confirm` and never reaches here as pending.
     #[cfg(feature = "espnow")]
-    let mut leaf_selftest_pending = ota::otadata_unconfirmed() && ota::ota_was_activated();
+    let mut leaf_selftest_pending =
+        ota::otadata_unconfirmed() && ota::ota_was_activated_for(ota::BUILD_NUMBER);
 
     #[cfg_attr(not(feature = "espnow"), allow(unused_mut))]
     let mut base_unix: u32 = match synced {
