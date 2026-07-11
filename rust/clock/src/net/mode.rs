@@ -2296,20 +2296,32 @@ impl RadioManager {
             }
         }
 
-        // --- CONFIRMING (Tier-2, build-matched): sample the leaf's SETTLED build after its
-        // self-test window elapses. The leaf runs the NEW image immediately post-activate,
-        // so it would STAT the new build even mid-self-test; a FAILED self-test then rolls
-        // it back to an OLDER build. So: an older-build sighting is a DEFINITIVE rollback
-        // (early-out); a new-build sighting only CONFIRMS if no rollback lands before the
-        // window closes (> the leaf self-test window + a STAT cadence). No STAT at all → a
-        // possible brick (USB recovery). This is the progression gate, not the safety gate
-        // (the leaf's local Tier-1 is what actually protects it).
+        // --- CONFIRMING (Tier-2, build-matched): sample the leaf's SETTLED build over the
+        // full confirm window. The leaf runs the NEW image immediately post-activate, so it
+        // STATs the new build even mid-self-test; a FAILED self-test then rolls it back to an
+        // OLDER build (and STATs that). We must NOT early-out:
+        //   • an early-out on a NEW-build sighting would miss a later rollback;
+        //   • an early-out on an OLD-build sighting would false-fail on a STALE STAT the leaf
+        //     broadcast at its old build DURING the (minutes-long) relay, still buffered in
+        //     the 10-deep ESP-NOW RX queue.
+        // So: DRAIN the stale queue first, then track the LAST-seen build across the whole
+        // window (> the leaf self-test window + a STAT cadence) → the settled verdict.
+        // A stale old-build STAT is overwritten by the post-reboot new-build STAT; a genuine
+        // rollback's old-build STAT is the last one seen. No STAT at all → possible brick.
+        // This is the PROGRESSION gate, not the safety gate (the leaf's local Tier-1 protects
+        // it); a wrong verdict at worst mis-labels the HA card, never bricks/compromises.
         log::info!(
             "smol #40: all {} chunks relayed — awaiting leaf id{} Tier-2 confirm at build {}",
             total, leaf_id, announce.build
         );
+        // Discard any frames buffered during the relay (incl. the leaf's stale old-build STAT).
+        for _ in 0..64 {
+            if self.esp_now.receive().is_none() {
+                break;
+            }
+        }
         let cdeadline = now_ms() + GW_CONFIRM_TIMEOUT_MS;
-        let mut saw_new = false;
+        let mut last_build: Option<u32> = None;
         while now_ms() < cdeadline {
             if tick() {
                 return LeafOtaOutcome::Aborted;
@@ -2318,28 +2330,31 @@ impl RadioManager {
                 if let Some(Frame::Stat { src, value }) = parse_frame(recv.data()) {
                     if src == leaf_id {
                         if let Some(b) = om::stat_build(value) {
-                            if b < announce.build {
-                                log::warn!(
-                                    "smol #40: leaf id{} reappeared at OLD build {} — self-test rolled it back",
-                                    leaf_id, b
-                                );
-                                return LeafOtaOutcome::RolledBack;
-                            }
-                            saw_new = true; // b >= pushed build → running the new image
+                            last_build = Some(b); // keep the latest — the settled state wins
                         }
                     }
                 }
             }
         }
-        if saw_new {
-            log::info!("smol #40: leaf id{} CONFIRMED at build {} — update stuck", leaf_id, announce.build);
-            LeafOtaOutcome::Confirmed
-        } else {
-            log::error!(
-                "smol #40: leaf id{} did not reappear at build {} within the confirm window — possible brick (USB recovery)",
-                leaf_id, announce.build
-            );
-            LeafOtaOutcome::Timeout
+        match last_build {
+            Some(b) if b >= announce.build => {
+                log::info!("smol #40: leaf id{} CONFIRMED at build {} — update stuck", leaf_id, b);
+                LeafOtaOutcome::Confirmed
+            }
+            Some(b) => {
+                log::warn!(
+                    "smol #40: leaf id{} settled at OLD build {} — self-test rolled it back (HA re-offers)",
+                    leaf_id, b
+                );
+                LeafOtaOutcome::RolledBack
+            }
+            None => {
+                log::error!(
+                    "smol #40: leaf id{} did not reappear at build {} within the confirm window — possible brick (USB recovery)",
+                    leaf_id, announce.build
+                );
+                LeafOtaOutcome::Timeout
+            }
         }
     }
 
