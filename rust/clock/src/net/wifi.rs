@@ -1416,6 +1416,11 @@ fn mqtt_session(
         }
     }
 
+    // #40 ARMDIAG: snapshot whether THIS flush caught an install (before the diag block below
+    // may null `pending_leaf`) — dumped to `smol/<gw>/ota/armdiag` after the arm, so one
+    // reflash shows EXACTLY which arm-chain link is null (headless arm trace).
+    let install_caught = pending_leaf;
+
     // #40 DIAG + clear/retry (from the PRIOR attempt, recorded by `main` after the relay):
     // publish the phase to retained `smol/<leaf>/ota/diag` (headless observability — the
     // mesh-only leaf has no serial), then either CLEAR the retained install (terminal phase
@@ -1461,6 +1466,38 @@ fn mqtt_session(
             );
         }
         _ => {}
+    }
+
+    // #40 ARMDIAG — dump the arm-chain state EVERY gateway flush to retained
+    // `smol/<gw>/ota/armdiag`, so ONE reflash shows exactly which link is null (the C3 gives
+    // no serial). `install-caught` = an INSTALL for a leaf hit this flush; `staged_raw` = the
+    // persisted staged build; `leaf_ota` = the pair armed. If install-caught=<id> +
+    // staged_raw=<b> + leaf_ota=1 → armed (issue is downstream, in the relay). If
+    // staged_raw=none → the persist path never wrote it. If install-caught=none → the wildcard
+    // sub / arm never fired. Gateway-only (cfg_cache = Some).
+    if cfg_cache.is_some() {
+        let mut adtopic = MqttScratch::new();
+        let _ = write!(adtopic, "smol/{}/ota/armdiag", node_id);
+        let mut adval = MqttScratch::new();
+        let _ = write!(adval, "install-caught=");
+        match install_caught {
+            Some(x) => { let _ = write!(adval, "{}", x); }
+            None => { let _ = write!(adval, "none"); }
+        }
+        let _ = write!(adval, " pending=");
+        match pending_leaf {
+            Some(x) => { let _ = write!(adval, "{}", x); }
+            None => { let _ = write!(adval, "none"); }
+        }
+        let _ = write!(adval, " staged_raw=");
+        match staged_raw.as_ref() {
+            Some(a) => { let _ = write!(adval, "{}", a.build); }
+            None => { let _ = write!(adval, "none"); }
+        }
+        let _ = write!(adval, " leaf_ota={}", if leaf_ota.is_some() { 1 } else { 0 });
+        if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, adtopic.as_bytes(), adval.as_bytes(), true) {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
     }
 
     // --- #23 single-gateway ELECTION with RUNTIME re-decision + stale-owner takeover ---
