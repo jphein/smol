@@ -511,6 +511,9 @@ fn inactive_slot() -> Option<Slot> {
 #[cfg(feature = "espnow")]
 pub fn activate(target: Slot) {
     if set_slot_new(target).is_some() {
+        // #40: mark this boot-chain as a genuine OTA activate so the next boot's `boot_confirm`
+        // runs the self-test (a USB flash, which power-cycles, clears this → no self-test).
+        mark_ota_activated();
         log::info!("smol OTA: image verified — activating new slot, rebooting");
         esp_hal::system::software_reset();
     } else {
@@ -603,6 +606,15 @@ pub fn boot_confirm(self_test_passed: bool) {
     if !matches!(state, OtaImageState::New | OtaImageState::PendingVerify) {
         return; // Valid/Undefined/etc — a normal, already-confirmed boot
     }
+    // #40 USB-flash EXEMPTION: a `New` image that did NOT come from our `activate()` this
+    // power-cycle (a USB flash, or a power-cycled OTA) must NOT self-test — else a freshly
+    // USB-flashed image gets reverted/rolled back for hearing no mesh frame. It's operator-
+    // intended (USB) or already ed25519+sha verified (OTA), so ACCEPT it as-is.
+    if !ota_was_activated() {
+        let _ = ota.set_current_ota_state(OtaImageState::Valid);
+        log::info!("smol OTA: unconfirmed image but not a fresh OTA activate (USB flash / power-cycle) — accepting, no self-test");
+        return;
+    }
     let bl_auto_revert = matches!(state, OtaImageState::PendingVerify);
     log::info!(
         "smol OTA: unconfirmed image on boot — running self-test (bootloader auto-revert {})",
@@ -610,6 +622,7 @@ pub fn boot_confirm(self_test_passed: bool) {
     );
     if self_test_passed {
         let _ = ota.set_current_ota_state(OtaImageState::Valid);
+        clear_ota_activated(); // fate decided — don't re-self-test on a later crash-reset
         log::info!("smol OTA: self-test PASS — image CONFIRMED (Valid)");
     } else {
         // #40 BRICK-SAFETY (was a hard brick): roll back ONLY if the target slot holds a
@@ -621,6 +634,7 @@ pub fn boot_confirm(self_test_passed: bool) {
         // safe; bricking is not.
         let target = ota.current_slot().ok().map(|c| c.next());
         let can_rollback = target.map(slot_has_valid_image).unwrap_or(false);
+        clear_ota_activated(); // fate decided either way
         if can_rollback {
             if let Some(t) = target {
                 let _ = ota.set_current_slot(t);
@@ -1018,6 +1032,60 @@ static mut OTA_BOOT_GUARD: [u32; 2] = [0u32; 2];
 
 #[cfg(feature = "espnow")]
 const BOOT_GUARD_MAGIC: u32 = 0x736D_6C4B; // "smlK"
+
+// ---------------------------------------------------------------------------
+// #40 USB-flash EXEMPTION — only a genuine OTA-`activate()` boot should self-test.
+//
+// A USB-flashed image boots as `New` (unconfirmed) just like an OTA image, so `boot_confirm`
+// couldn't tell them apart → EVERY USB flash ran the self-test → false rollback (or, before
+// the brick-safe fix, a brick). Distinguish them with an RTC-fast marker set ONLY inside
+// `activate()`: a genuine OTA does `activate()` → `software_reset()` (marker persists across
+// the reset). A USB flash / power-cycle CLEARS RTC RAM → marker absent → `boot_confirm`
+// ACCEPTS the image without self-testing (it's operator-intended; an OTA image was already
+// ed25519+sha verified before activate). `wifi`-scoped so `boot_confirm` can read it.
+// ---------------------------------------------------------------------------
+
+/// `[magic, activated_flag]` in persistent RTC-fast RAM (survives `software_reset`, cleared
+/// on power-loss). `activated_flag == 1` ⇔ this boot descends from a genuine `activate()`.
+#[cfg(feature = "wifi")]
+#[esp_hal::ram(rtc_fast, persistent)]
+static mut OTA_ACTIVATE_GUARD: [u32; 2] = [0u32; 2];
+
+#[cfg(feature = "wifi")]
+const ACTIVATE_GUARD_MAGIC: u32 = 0x736D_6C41; // "smlA"
+
+/// Mark the current boot-chain as a genuine OTA activate (call inside `activate()` right
+/// before the reset). Survives the `software_reset`; cleared by power-loss. `espnow`-scoped
+/// (only `activate()` — itself espnow — sets it; the wifi-only build never OTAs).
+#[cfg(feature = "espnow")]
+pub fn mark_ota_activated() {
+    unsafe {
+        let g = &mut *core::ptr::addr_of_mut!(OTA_ACTIVATE_GUARD);
+        g[0] = ACTIVATE_GUARD_MAGIC;
+        g[1] = 1;
+    }
+}
+
+/// True iff the running image was activated by our `activate()` this power-cycle (i.e. a
+/// genuine OTA, not a USB flash). Uninitialized RTC RAM (bad magic) ⇒ false (not activated).
+#[cfg(feature = "wifi")]
+pub fn ota_was_activated() -> bool {
+    unsafe {
+        let g = &*core::ptr::addr_of!(OTA_ACTIVATE_GUARD);
+        g[0] == ACTIVATE_GUARD_MAGIC && g[1] == 1
+    }
+}
+
+/// Clear the activate marker (call once the image's fate is decided — confirmed / rolled
+/// back / accepted — so a later crash-reset doesn't re-run the self-test on the same chain).
+#[cfg(feature = "wifi")]
+fn clear_ota_activated() {
+    unsafe {
+        let g = &mut *core::ptr::addr_of_mut!(OTA_ACTIVATE_GUARD);
+        g[0] = ACTIVATE_GUARD_MAGIC;
+        g[1] = 0;
+    }
+}
 
 /// Bump the unconfirmed-boot counter and return the new value. Call at the absolute
 /// earliest boot point when `otadata` is `New`/`PendingVerify`, BEFORE anything that

@@ -261,12 +261,16 @@ fn main() -> ! {
     //     rollback NOW (a New image that panics before the deferred self-test would
     //     otherwise boot-loop the bad slot forever, bootloader auto-revert being OFF).
     // A confirmed (Valid) boot resets the counter. `boot_confirm(false)` reboots.
+    // The K-counter only counts GENUINE OTA boots (`ota_was_activated`) — a USB flash boots
+    // as New too but isn't a crash-looping OTA image, so it must not trip the flip.
     #[cfg(feature = "espnow")]
     if ota::otadata_unconfirmed() {
-        ota::fresh_floor_bump(ota::BUILD_NUMBER);
-        if ota::unconfirmed_boot_bump() >= OTA_MAX_UNCONFIRMED_BOOTS {
-            log::warn!("smol #40: {} unconfirmed boots — forcing app-side rollback", OTA_MAX_UNCONFIRMED_BOOTS);
-            ota::boot_confirm(false); // flips to the good slot + resets — never returns
+        ota::fresh_floor_bump(ota::BUILD_NUMBER); // floor tracks any booted build (USB or OTA)
+        if ota::ota_was_activated()
+            && ota::unconfirmed_boot_bump() >= OTA_MAX_UNCONFIRMED_BOOTS
+        {
+            log::warn!("smol #40: {} unconfirmed OTA boots — forcing app-side rollback", OTA_MAX_UNCONFIRMED_BOOTS);
+            ota::boot_confirm(false); // brick-safe flip to the good slot + reset — never returns
         }
     } else {
         ota::unconfirmed_boot_reset();
@@ -416,8 +420,10 @@ fn main() -> ! {
     // confirms a DHCP-reaching node). For such a leaf the main loop runs the mesh-terms
     // self-test (below): confirm on the first heard SMOLv1 frame, else roll back after N s.
     // A gateway / DHCP-reached board already confirmed at boot → this is false → no-op.
+    // Only a GENUINE mesh-OTA boot (activated) runs the deferred self-test; a USB-flashed
+    // `New` image is accepted as-is by `boot_confirm` and never reaches here as pending.
     #[cfg(feature = "espnow")]
-    let mut leaf_selftest_pending = ota::otadata_unconfirmed();
+    let mut leaf_selftest_pending = ota::otadata_unconfirmed() && ota::ota_was_activated();
 
     #[cfg_attr(not(feature = "espnow"), allow(unused_mut))]
     let mut base_unix: u32 = match synced {
