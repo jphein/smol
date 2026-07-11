@@ -2371,8 +2371,19 @@ impl RadioManager {
                     return LeafOtaOutcome::Aborted;
                 }
                 // (Re)send OTAM during window 0 so a leaf that missed it can still arm.
+                // #3b: BROADCAST the announce (not unicast to leaf_mac). Root cause of the
+                // a949574 canary's `leaf=H0V0N0` (leaf hears ZERO OTAMs while rx=10 proves the
+                // reverse path works): ESP-NOW unicast RX requires the SENDER be a registered
+                // peer on the receiver, but the leaf only adds the gateway as a peer WHEN it
+                // receives an OTA frame (handle_ota_frame) or a gateway HELLO — and the gateway
+                // is HELLO-silent during the mesh-deaf relay → bootstrap deadlock. A BROADCAST
+                // needs no peer (that's why HELLOs land), so the leaf receives it, arms, and
+                // adds the gateway peer → the subsequent UNICAST OTAD/OTAN then flow to the
+                // (correct, roster-learned) MACs. Design §B: only the small ANNOUNCE broadcasts;
+                // the image (OTAD) stays unicast — "no broadcast image push" preserved. The
+                // `target` id in the frame keeps canary-one-leaf semantics (only leaf_id arms).
                 if wb == 0 {
-                    self.send_to(&leaf_mac, &otam[..otam_len]);
+                    self.send_to(&BROADCAST_ADDRESS, &otam[..otam_len]);
                 }
                 for i in 0..wlen_chunks as usize {
                     if (missing >> i) & 1 == 1 {
