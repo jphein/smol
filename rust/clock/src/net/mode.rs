@@ -2923,6 +2923,7 @@ pub fn start(
     // mesh (coexist gateway) or must demote to a scanning leaf.
     let mut elect = crate::net::wifi::MeshElect::new(id);
     elect.now_ms = now_ms(); // seed the ONE clock the stale-owner timeout runs on
+    elect.boot = true; // #51 return-flap: never displace a different owner already in the MC
     let mut ota_offer: Option<crate::ota::Announce> = None;
     let mut config_offer: Option<crate::app::DefaultScreen> = None;
     let mut install_requested = false;
