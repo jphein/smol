@@ -836,7 +836,7 @@ fn main() -> ! {
                     // relay the staged image to that leaf over ESP-NOW (canary-one-leaf; the
                     // relay does its own WiFi fetch then an ESP-NOW relay, minutes-scale +
                     // mesh-degrading, UI-alive + long-press abortable). Skipped if the leaf's
-                    // MAC hasn't been learned from its HELLOs yet (retry on the next install).
+                    // MAC has NEVER been learned (retry on the next install once it HELLOs).
                     if let Some((leaf_id, ann)) = leaf_ota.take() {
                         // #1 DECOUPLE: latch "a leaf relay is owed" the moment this flush
                         // surfaces the leaf install. It persists across loop iterations (cleared
@@ -844,7 +844,15 @@ fn main() -> ! {
                         // gate (`do_install`) stays suppressed until the relay resolves — even
                         // across the mac-unknown retry path below, which also keeps it latched.
                         r.note_leaf_ota_armed();
-                        if let Some(mac) = r.mac_for_id(leaf_id) {
+                        // #3 STICKY MAC: the roster is a bounded 16-slot LRU with NO staleness
+                        // reaping — but during the minutes-long mesh-deaf relay the gateway stops
+                        // hearing this leaf, so it becomes the LRU victim and is EVICTED when any
+                        // new MAC arrives → a plain `mac_for_id` reverts to None → `mac-unknown`
+                        // churn (the canary's dominant diag). `mac_for_id_sticky` caches the MAC
+                        // the moment it's ever addressable and holds it for the install session
+                        // (cleared on a terminal `record_leaf_ota`), so eviction can't strand the
+                        // relay. Root-caused from the a5d9b33 canary: mac-unknown ↔ brief relay.
+                        if let Some(mac) = r.mac_for_id_sticky(leaf_id) {
                             let mut relay_draw_ms = 0u64;
                             let mut relay_abort = false;
                             let outcome = r.run_leaf_ota_relay(leaf_id, mac, &ann, &mut || {

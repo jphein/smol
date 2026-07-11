@@ -585,6 +585,7 @@ pub fn run_ntp_burst(
         &mut None, // #40: boot burst never relays a leaf OTA
         &mut None, // #40: boot burst has no persistent staged to carry
         &mut None, // #40: boot burst has no relay diag to publish
+        &mut None, // #3: boot burst has no relay RX-diag to publish
         mqtt_deadline,
         tick,
     );
@@ -962,6 +963,9 @@ fn mqtt_session(
     // terminal/exhausted phase) vs retry (transient). Consumed (set None) after publish.
     // `&mut None` off-gateway.
     leaf_diag: &mut Option<(u8, &'static str, bool)>,
+    // #3 RELAY RX-DIAG: the last relay's `(leaf_id, rx_any, otan_valid, last_wb, total)`.
+    // PUBLISHED to retained `smol/<leaf>/ota/relaydiag` here, consumed after. `&mut None` off-gw.
+    leaf_relay_rx: &mut Option<(u8, u16, u16, u16, u16)>,
     deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
@@ -1449,6 +1453,27 @@ fn mqtt_session(
         *leaf_diag = None; // consumed — published once
     }
 
+    // #3 RELAY RX-DIAG: publish the last relay attempt's RX evidence to retained
+    // `smol/<leaf>/ota/relaydiag` (headless #3 disambiguation). rx=0 → gateway heard NOTHING
+    // from the leaf (leaf offline / OTAD not landing); rx>0 & otan=0 → leaf alive but never
+    // NAK'd this session; otan>0 & last_wb<total → chunk-loss stall. Consumed after publish.
+    if let Some((lid, rx_any, otan_valid, last_wb, total)) = *leaf_relay_rx {
+        let mut rtopic = MqttScratch::new();
+        let _ = write!(rtopic, "smol/{}/ota/relaydiag", lid);
+        let mut rval = MqttScratch::new();
+        let _ = write!(rval, "rx={} otan={} last_wb={}/{}", rx_any, otan_valid, last_wb, total);
+        if let Some(n) =
+            crate::net::mqtt::encode_publish(&mut pkt, rtopic.as_bytes(), rval.as_bytes(), true)
+        {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        log::info!(
+            "smol #3: published smol/{}/ota/relaydiag = rx={} otan={} last_wb={}/{}",
+            lid, rx_any, otan_valid, last_wb, total
+        );
+        *leaf_relay_rx = None; // consumed — published once
+    }
+
     // #40: ARM a pending leaf install by pairing it with the (persisted) staged image. Does
     // NOT clear the install here — the clear is OUTCOME-driven (the diag block above, once
     // `main` reports the relay result), so a mac-unknown / fetch-fail / relay-fail LEAVES the
@@ -1808,6 +1833,9 @@ pub fn run_mqtt_burst(
     // #40: last relay attempt's `(leaf_id, phase, clear)` → published to `smol/<leaf>/ota/diag`
     // (see `mqtt_session`). `&mut None` on boot/leaf bursts.
     leaf_diag: &mut Option<(u8, &'static str, bool)>,
+    // #3: last relay attempt's RX evidence → published to `smol/<leaf>/ota/relaydiag` (see
+    // `mqtt_session`). `&mut None` on boot/leaf bursts.
+    leaf_relay_rx: &mut Option<(u8, u16, u16, u16, u16)>,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
@@ -1959,6 +1987,7 @@ pub fn run_mqtt_burst(
         leaf_ota, // #40: forward the leaf-OTA install pairing (or &mut None)
         staged_raw, // #40: forward the persistent staged announce (or &mut None)
         leaf_diag, // #40: forward the diag/clear state (or &mut None)
+        leaf_relay_rx, // #3: forward the relay RX-diag (or &mut None)
         deadline,
         tick,
     )

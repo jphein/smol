@@ -1326,6 +1326,19 @@ pub struct RadioManager {
     /// self-OTA (`do_install`) so a relay is never interrupted by the gateway rebooting into a
     /// fresh build mid-session (and the two OTAs never collide/thrash the fleet).
     leaf_ota_pending: bool,
+    /// #40 #3 STICKY MAC: `(leaf_id, mac)` captured the moment an armed leaf became addressable,
+    /// held for the whole install session (cleared on a terminal `record_leaf_ota`). The roster
+    /// is a bounded 16-slot LRU that EVICTS this leaf while the mesh-deaf relay stops hearing it
+    /// → `mac_for_id` reverts to None (canary `mac-unknown` churn); this cache survives eviction.
+    leaf_ota_mac: Option<(u8, [u8; 6])>,
+    /// #40 #3 RELAY RX-DIAG (instrumentation): from the last `run_leaf_ota_relay` —
+    /// `(leaf_id, rx_frames_from_leaf, valid_otan, last_window_reached, total_windows)`.
+    /// Published to retained `smol/<leaf>/ota/relaydiag` on the next flush so a headless
+    /// `relay-failed` says WHETHER the leaf NAK'd at all (valid_otan>0) and HOW FAR it got
+    /// (last_wb/total): rx=0 → gateway heard nothing from the leaf (leaf offline / OTAD not
+    /// landing); rx>0,otan=0 → leaf alive but never NAK'd this session; otan>0,last_wb<total →
+    /// chunk-loss stall. `last_wb` is in chunk units (matches `total = om::total_chunks`).
+    leaf_relay_rx: Option<(u8, u16, u16, u16, u16)>,
     /// #40: consecutive non-terminal (transient) relay attempts for the current install —
     /// caps the auto-retry so a persistently-failing leaf can't loop the mesh-deaf relay.
     leaf_ota_retries: u8,
@@ -1410,6 +1423,8 @@ impl RadioManager {
             leaf_ota_diag: None,
             leaf_ota_retries: 0,
             leaf_ota_pending: false,
+            leaf_ota_mac: None,
+            leaf_relay_rx: None,
             config_offer: None,
             install_requested: false,
             silent_until_relock: false,
@@ -1528,6 +1543,7 @@ impl RadioManager {
                     &mut None, // #40: a leaf's recovery burst never relays a leaf OTA
                     &mut None, // #40: recovery burst carries no persistent staged
                     &mut None, // #40: recovery burst publishes no relay diag
+                    &mut None, // #3: recovery burst publishes no relay RX-diag
                     tick,
                 )
             }
@@ -2202,8 +2218,11 @@ impl RadioManager {
         // #1 DECOUPLE: the relay session is done for this install iff we're clearing it
         // (terminal outcome or retry cap). While NOT cleared (transient retry) it stays
         // pending so the gateway keeps suppressing its own self-OTA until the leaf resolves.
+        // #3: the sticky MAC is likewise session-scoped — drop it on the same terminal edge so
+        // a FUTURE install re-learns the (possibly re-homed) leaf from a live roster hit.
         if clear {
             self.leaf_ota_pending = false;
+            self.leaf_ota_mac = None;
         }
     }
 
@@ -2300,6 +2319,11 @@ impl RadioManager {
         };
         let mut otad = [0u8; om::OTAD_FRAME_MAX];
 
+        // #3 RX-DIAG counters: rx_any = frames heard FROM this leaf during the relay windows;
+        // otan_valid = valid advancing/NAK OTANs for the live session. Stored into
+        // `leaf_relay_rx` at each terminal exit → published next flush to `…/ota/relaydiag`.
+        let mut rx_any: u16 = 0;
+        let mut otan_valid: u16 = 0;
         let mut wb: u32 = 0;
         while wb < total {
             if tick() {
@@ -2313,6 +2337,7 @@ impl RadioManager {
             let read_len = ((window_bytes as u32).div_ceil(4) * 4) as usize;
             if !reader.read(window_off, &mut gwbuf[..read_len]) {
                 log::error!("smol #40: slot readback failed at window {} — aborting", wb);
+                self.leaf_relay_rx = Some((leaf_id, rx_any, otan_valid, wb as u16, total as u16));
                 let _ = self.switch(Mode::EspNow);
                 return LeafOtaOutcome::RelayFailed;
             }
@@ -2345,10 +2370,12 @@ impl RadioManager {
                 while now_ms() < deadline {
                     if let Some(recv) = self.esp_now.receive() {
                         if recv.info.src_address == leaf_mac {
+                            rx_any = rx_any.saturating_add(1); // #3: heard SOMETHING from the leaf
                             if let Some(om::OtaFrame::Nak { origin, session: s, window_base, bitmap }) =
                                 om::parse_ota_frame(recv.data())
                             {
                                 if origin == leaf_id && s == session && window_base as u32 == wb {
+                                    otan_valid = otan_valid.saturating_add(1); // #3: valid OTAN
                                     let miss = om::bitmap_to_u64(bitmap) & full;
                                     if miss == 0 {
                                         advanced = true;
@@ -2372,13 +2399,18 @@ impl RadioManager {
                 rounds += 1;
                 if rounds > GW_WINDOW_ROUNDS_MAX {
                     log::error!(
-                        "smol #40: window {} exceeded {} retransmit rounds — aborting (R2 bound)",
-                        wb, GW_WINDOW_ROUNDS_MAX
+                        "smol #40: window {} exceeded {} retransmit rounds (rx_any={} otan={}) — aborting (R2 bound)",
+                        wb, GW_WINDOW_ROUNDS_MAX, rx_any, otan_valid
                     );
+                    self.leaf_relay_rx = Some((leaf_id, rx_any, otan_valid, wb as u16, total as u16));
                     return LeafOtaOutcome::RelayFailed;
                 }
             }
         }
+        // #3 RX-DIAG: relay TX phase COMPLETE — all chunks delivered + acked (wb==total). Record
+        // the full-progress RX evidence for the relaydiag; the confirm outcome (below) is the
+        // separate Tier-2 verdict published to `…/ota/diag`.
+        self.leaf_relay_rx = Some((leaf_id, rx_any, otan_valid, total as u16, total as u16));
 
         // --- CONFIRMING (Tier-2, build-matched): sample the leaf's SETTLED build over the
         // full confirm window. The leaf runs the NEW image immediately post-activate, so it
@@ -2532,6 +2564,7 @@ impl RadioManager {
                     leaf_ota, // #40: surface a pending leaf-OTA install for main to relay
                     &mut self.staged_raw, // #40: persist the staged across flushes (pair-safe)
                     &mut self.leaf_ota_diag, // #40: publish smol/<leaf>/ota/diag + clear/retry
+                    &mut self.leaf_relay_rx, // #3: publish smol/<leaf>/ota/relaydiag (RX evidence)
                     tick,
                 )
             }
@@ -3032,6 +3065,23 @@ impl RadioManager {
     /// gateway can unicast an OTA relay to it. `None` until the leaf has been heard.
     pub fn mac_for_id(&self, id: u8) -> Option<[u8; 6]> {
         self.roster.mac_for_id(id)
+    }
+
+    /// #40 #3: eviction-proof MAC lookup for the armed leaf-OTA install. Prefers the LIVE
+    /// roster (refreshing the sticky cache whenever the leaf is addressable), and falls back
+    /// to the cached `(leaf_id, mac)` when the LRU roster has EVICTED the leaf during the
+    /// mesh-deaf relay. The cache is set here on first sight and cleared by `record_leaf_ota`
+    /// on a terminal/exhausted outcome — so it holds for exactly one install session. This is
+    /// the fix for the a5d9b33 canary's `mac-unknown` dominance (relay could rarely even start).
+    pub fn mac_for_id_sticky(&mut self, id: u8) -> Option<[u8; 6]> {
+        if let Some(mac) = self.mac_for_id(id) {
+            self.leaf_ota_mac = Some((id, mac)); // freshest wins; refresh the session cache
+            return Some(mac);
+        }
+        match self.leaf_ota_mac {
+            Some((cid, mac)) if cid == id => Some(mac), // roster evicted it → use the cache
+            _ => None,
+        }
     }
 
     /// Current peer-link state as an [`LedState`], evaluated at `now_ms`.
