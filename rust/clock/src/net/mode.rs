@@ -2226,6 +2226,15 @@ impl RadioManager {
         );
 
         // --- FETCH (WiFi) → stage+verify into THIS gateway's inactive slot (no activate).
+        // CRITICAL: `run_leaf_ota_relay` is called IMMEDIATELY after `flush_telemetry`, which
+        // leaves the radio in WifiSta. `switch()` is a NO-OP when already in-mode → it would
+        // NOT issue a fresh `connect()`, but `run_ota_fetch` ASSUMES the caller's switch just
+        // connect()'d (its own contract). If the flush's association has gone stale, the fetch
+        // then spins its whole 5-min budget waiting for `is_connected` (no SYN, mesh-deaf) —
+        // exactly the observed "no fetch + long offline". Self-OTA avoids this because it runs
+        // from EspNow mode (its switch DOES connect). So force a fresh association here:
+        // EspNow (drop the stale link) → WifiSta (issue a real connect), mirroring self-OTA.
+        let _ = self.switch(Mode::EspNow);
         let _ = self.switch(Mode::WifiSta);
         let rng = self.rng;
         let mut staged: Option<Slot> = None;
