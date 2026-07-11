@@ -5,13 +5,16 @@
 # glass/power/forge which render). Node cards stay LIVE mushroom boxes (header + OLED + entities).
 # If mushroom still doesn't render un-nested → it's mushroom, swap to SVG faceplate then.
 #   HA_TOKEN=<your-ha-long-lived-token> python3 build_control_room.py
-import asyncio, json, os, re, subprocess, hashlib, yaml, websockets
+import asyncio, json, os, re, ssl, subprocess, hashlib, yaml, websockets
 try:
     from defusedxml.minidom import parseString as xml_parse
 except ImportError:
     from xml.dom.minidom import parseString as xml_parse
-URI="wss://homeassistant.local:8123/api/websocket"; TOKEN=os.environ["HA_TOKEN"]; DASH="dashboard-dashboard"
-HA="user@homeassistant.local"; WWW="/config/www/luna-cards"; LOCAL="/local/luna-cards"
+URI=os.environ.get("HA_WS_URI","wss://homeassistant.local:8123/api/websocket"); TOKEN=os.environ["HA_TOKEN"]; DASH="dashboard-dashboard"
+SSLCTX=ssl.create_default_context()  # verifies by default
+if os.environ.get("HA_WS_INSECURE"):  # explicit opt-out for a LAN self-signed HA cert (like curl -k)
+    SSLCTX.check_hostname=False; SSLCTX.verify_mode=ssl.CERT_NONE
+HA=os.environ.get("HA_SSH","user@homeassistant.local"); WWW="/config/www/luna-cards"; LOCAL="/local/luna-cards"
 KNOWN={7:{"name":"Draconic Dominion","role":"the Seat","gate":True},
        8:{"name":"Eldritch Nexus","role":"leaf"},
        9:{"name":"Jade Herald","role":"leaf"}}
@@ -24,8 +27,13 @@ def accent_top(c): return ("ha-card{position:relative;overflow:hidden}ha-card:be
 # ---------- node box = mushroom header + mushroom OLED + entities; span-4 in the VIEW grid ----------
 def node_card(nid, meta, present):
     gate=meta["gate"]; I=str(nid); on=f"is_state('binary_sensor.smol_{I}_online','on')"
-    # RSSI pip LIVE (re-evaluates on takeover): gateway → WiFi (no self mesh-rssi); leaf → dBm
-    rssi_pip=(" · {% if gw %}WiFi{% else %}{{ states('sensor.smol_"+I+"_rssi') if states('sensor.smol_"+I+"_rssi') not in na else '—' }} dBm{% endif %}")
+    # #64: the gateway's WiFi-uplink RSSI entity is device-name-derived (HA discovery names
+    # it sensor.smol_<id>_<noun>_uplink, where <noun> is the fantasy noun = last name word).
+    up=f"sensor.smol_{nid}_{meta['name'].split()[-1].lower()}_uplink"
+    # RSSI pip LIVE (re-evaluates on takeover): gateway → its WiFi-uplink dBm (#64, falls to
+    # 'WiFi' until the first burst publishes it); leaf → mesh-bond dBm.
+    rssi_pip=(" · {% if gw %}{% set u=states('"+up+"') %}{% if u not in na %}{{ u }} dBm ↑{% else %}WiFi{% endif %}"
+              "{% else %}{{ states('sensor.smol_"+I+"_rssi') if states('sensor.smol_"+I+"_rssi') not in na else '—' }} dBm{% endif %}")
     # LIVE gateway signal = peers-state 'gateway' (an entity STATE → works in mushroom templates AND legacy conditional-card conditions).
     gw="is_state('sensor.smol_"+I+"_peers','gateway')"
     hdr=("{% set on="+on+" %}{% set gw="+gw+" %}{% set t=states('sensor.smol_"+I+"_temp') %}{% set v=states('sensor.smol_"+I+"_voltage') %}"
@@ -94,6 +102,7 @@ def node_card(nid, meta, present):
         "conditions":[{"entity":f"sensor.smol_{nid}_peers","state":"gateway"}],
         "card":{"type":"entities","show_header_toggle":False,"card_mod":{"style":JOIN},"entities":[
             {"type":"section","label":"gateway anchor · WiFi uplink"},
+            {"entity":up,"name":"WiFi uplink (RSSI)","icon":"mdi:wifi-arrow-up"},  # #64: gateway AP-uplink RSSI (sensor.smol_<id>_<noun>_uplink)
             {"type":"attribute","entity":"sensor.smol_mesh_channel","attribute":"channel","name":"mesh channel (owned)","icon":"mdi:wifi"},
             {"type":"attribute","entity":"sensor.smol_mesh_channel","attribute":"seq","name":"mesh seq (advancing)","icon":"mdi:counter"},
             {"entity":f"sensor.smol_{nid}_peers","name":"peers / roster","icon":"mdi:lan"}]}}
@@ -170,7 +179,7 @@ async def rpc(ws,m,_i=[1]):
 
 async def main():
     view=yaml.safe_load(open("smol-control-scaffold.yaml"))
-    async with websockets.connect(URI,max_size=16*1024*1024) as ws:
+    async with websockets.connect(URI,max_size=16*1024*1024,ssl=SSLCTX) as ws:
         json.loads(await ws.recv()); await ws.send(json.dumps({"type":"auth","access_token":TOKEN})); await ws.recv()
         st={s["entity_id"]:s for s in (await rpc(ws,{"type":"get_states"}))["result"]}; present=set(st)
         ids=sorted(int(m.group(1)) for e in present if (m:=re.match(r"binary_sensor\.smol_(\d+)_online$",e))) or [7,8,9]

@@ -1118,6 +1118,45 @@ fn mqtt_session(
         }
     }
 
+    // #64: publish THIS gateway's WiFi-uplink RSSI (RSSI-to-AP). Only the associated
+    // gateway has it — leaves are ESP-NOW-only — so it's published for `node_id` (self)
+    // alone, not per queued leaf. `elect.my_rssi` carries the caller's last-good capture;
+    // -99 = "never associated" sentinel → skip (a real gateway link is never that weak).
+    // Transient value topic + a RETAINED discovery config auto-creates
+    // `sensor.smol_<id>_uplink`; `expire_after` clears a demoted node's stale reading, so
+    // the value follows the crown across #51 role swaps with no dynamic-owner template.
+    if elect.my_rssi > -99 {
+        let mut utopic = MqttScratch::new();
+        let _ = write!(utopic, "smol/{}/uplink", node_id);
+        let mut uval = MqttScratch::new();
+        let _ = write!(uval, "{}", elect.my_rssi);
+        if let Some(n) =
+            crate::net::mqtt::encode_publish(&mut pkt, utopic.as_bytes(), uval.as_bytes(), false)
+        {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        let mut dtopic = MqttScratch::new();
+        let _ = write!(dtopic, "homeassistant/sensor/smol{}/uplink/config", node_id);
+        let unoun = crate::net::names::name_for_id(node_id).1;
+        // F1 discipline: build the config in the .bss JsonScratch (512), not on-stack.
+        let json = unsafe { &mut *core::ptr::addr_of_mut!(MQTT_JSON) };
+        json.clear();
+        let _ = write!(
+            json,
+            // Mirror the telemetry discovery pattern EXACTLY (terse name + object_id, NO
+            // entity_category) so HA derives the clean entity_id `sensor.smol_<id>_uplink`
+            // from object_id instead of the device-name-concatenated form. unique_id bumped
+            // (_uplk) to force HA to re-derive the entity_id for the corrected config.
+            "{{\"unique_id\":\"smol{}_uplk\",\"object_id\":\"smol_{}_uplink\",\"has_entity_name\":true,\"name\":\"Uplink\",\"state_topic\":\"smol/{}/uplink\",\"unit_of_measurement\":\"dBm\",\"device_class\":\"signal_strength\",\"expire_after\":120,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {}\"}}}}",
+            node_id, node_id, node_id, node_id, node_id, unoun
+        );
+        if let Some(n) =
+            crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), json.as_bytes(), true)
+        {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+    }
+
     // #27: publish this node's serialized roster as RETAINED `smol/<id>/peers`, if any.
     // GATEWAY-primary — the caller (`flush_telemetry`) serializes the roster and passes
     // it; leaves / the boot + election-only bursts pass an empty slice (skipped here).
@@ -1615,6 +1654,16 @@ pub fn run_mqtt_burst(
     // MQTT stream (the old UDP path only needed the ARP reply). Same reasoning,
     // same placement (must be AFTER the reconnect). Tradeoff: higher idle draw.
     let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
+
+    // #64: capture the WiFi-uplink RSSI HERE — the STA is confirmed connected (the loop
+    // above waited for is_connected()==Ok(true)), so esp_wifi_sta_get_rssi has a live
+    // association to read. The old #51 capture ran AFTER the whole burst returned, where
+    // the STA state was unreliable, so it errored and my_rssi stayed at its -99 sentinel
+    // (dead election tiebreak + no #64 publish). Set elect.my_rssi so mqtt_session
+    // publishes it this same burst and the caller persists it for #51's tiebreak.
+    if let Ok(r) = controller.rssi() {
+        elect.my_rssi = r.clamp(-127, 0) as i8;
+    }
 
     // Fresh DHCP lease each burst (the interface was just rebuilt).
     loop {

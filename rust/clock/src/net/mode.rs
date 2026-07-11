@@ -2143,6 +2143,11 @@ impl RadioManager {
         elect.seen_owner = self.mc_seen_owner;
         elect.seen_seq = self.mc_seen_seq;
         elect.seen_ms = self.mc_seen_ms;
+        // #64: carry the last-good RSSI-to-AP into the burst so the gateway PUBLISHES its
+        // WiFi-uplink signal. Captured post-flush below (#51 B) → this is the previous
+        // good flush's reading (~one heartbeat of lag, fine for a display value); -99
+        // until the first good flush, which mqtt_session's publish guard skips.
+        elect.my_rssi = self.my_rssi_to_ap;
         // #6 OTA: capture any gated retained announce this flush surfaces.
         let mut ota_offer: Option<crate::ota::Announce> = None;
         // #21: capture any default-screen config this flush surfaces.
@@ -2210,10 +2215,13 @@ impl RadioManager {
         // — the runtime convergence the boot-only election never had. A NON-connected
         // flush (transient broker outage) is NOT trusted → keep the current role.
         if ok {
-            // #51 B: still associated after a good flush → refresh RSSI-to-AP so a later
-            // demote-then-recover election compares this board's real signal strength.
-            if let Ok(r) = self.controller.rssi() {
-                self.my_rssi_to_ap = r.clamp(-127, 0) as i8;
+            // #64 fix: the RSSI-to-AP is now captured DURING the burst (run_mqtt_burst, while
+            // is_connected()==true) into elect.my_rssi — persist it here across bursts for the
+            // leaf-reelect path. The old post-burst self.controller.rssi() ran when the STA
+            // state was unreliable → returned Err → my_rssi_to_ap stuck at -99 (dead #51
+            // tiebreak + no #64 uplink publish).
+            if elect.my_rssi > -99 {
+                self.my_rssi_to_ap = elect.my_rssi;
             }
             self.mc_seen_owner = elect.seen_owner;
             self.mc_seen_seq = elect.seen_seq;
