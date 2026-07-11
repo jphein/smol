@@ -1446,11 +1446,18 @@ impl RadioManager {
         if self.relay.is_gateway {
             return; // gateway owns its channel via association; never scans
         }
-        if self.scan_locked && now.saturating_sub(self.last_owner_heard_ms) > SCAN_SILENCE_MS {
-            self.scan_locked = false;
-            log::info!("smol: leaf lost gateway id{} — re-scanning", self.elected_owner);
-        }
+        // #3b: DON'T unlock+hop on mere owner-silence. The gateway TIME-SHARES — its ESP-NOW
+        // stays on ESP_NOW_FIXED_CHANNEL; only its WiFi rides the multi-channel roam SSID during
+        // a minutes-long OTA fetch (OTA_FETCH_BUDGET=300s). The old 6 s unlock made the leaf hop
+        // [1,6,11] and DRIFT off ch6 for the whole fetch → it never heard the relay OTAM and the
+        // gateway stopped hearing it (canary #3b: leaf H0, rx→0, bidirectional collapse). So HOLD
+        // the fixed channel and re-assert it (a live gateway will return here). A truly dead/moved
+        // gateway is still recovered by `maybe_leaf_reelect` (15 s, independent), and genuine
+        // owner/role CHANGES unlock explicitly at their own sites (post-reelect / gateway-demote).
         if self.scan_locked {
+            if now.saturating_sub(self.last_owner_heard_ms) > SCAN_SILENCE_MS {
+                let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+            }
             return;
         }
         if now.saturating_sub(self.last_scan_hop_ms) >= DWELL_MS {
