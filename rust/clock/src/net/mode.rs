@@ -866,12 +866,13 @@ const RELAY_FLUSH_INTERVAL_MS: u64 = 30_000;
 const FLUSH_FAILS_BEFORE_DROP: u8 = 2;
 /// R-DEMOTE (oracle audit-#1): after this many CONSECUTIVE failed flushes the AP is
 /// GENUINELY gone (R-CONNECT would have recovered a mere roam within seconds), so the
-/// gateway relinquishes ownership — `is_gateway=false` + drop to leaf-scan — and its
-/// HELLO stops pinning leaves to a HA-unreachable owner, letting a reachable board
-/// take over. Set well above `FLUSH_FAILS_BEFORE_DROP` (≈`FLUSH_FAILS_BEFORE_DEMOTE` ×
-/// RELAY_FLUSH_INTERVAL_MS ≈ 2.5 min of no AP) so a transient broker blip never
-/// flap-demotes; the election re-promotes once an AP is reachable again.
-const FLUSH_FAILS_BEFORE_DEMOTE: u8 = 5;
+/// gateway relinquishes ownership — `is_gateway=false` + drop to leaf-scan — and (with the
+/// #51 A1 silence gate) stops HELLOing, letting a reachable board take over. Set above
+/// `FLUSH_FAILS_BEFORE_DROP` so a transient broker blip never flap-demotes.
+/// #51 speed-up: 3 (≈`FLUSH_FAILS_BEFORE_DEMOTE` × RELAY_FLUSH_INTERVAL_MS ≈ 90 s of
+/// sustained no-AP) — still safely past a transient blip / roam (R-CONNECT recovers those in
+/// seconds), but ~60 s snappier than the prior 5 for the powered-uplink-loss (R4) failover.
+const FLUSH_FAILS_BEFORE_DEMOTE: u8 = 3;
 /// Recently-completed `(src_mac, msgid)` memory. A lost RELAYACK makes a leaf
 /// retransmit an ALREADY-complete message; we must re-ACK it but NOT re-enqueue
 /// (else duplicate UDP delivery — finding 3). Ring of the last few completions.
@@ -1405,8 +1406,12 @@ impl RadioManager {
         now: u64,
         tick: &mut dyn FnMut() -> bool,
     ) -> bool {
-        const REELECT_SILENCE_MS: u64 = 30_000; // owner HELLO gone this long → recover
-        const REELECT_RETRY_MS: u64 = 30_000; // min gap between recovery bursts
+        // #51 speed-up: owner HELLOs every 2 s, so 15 s silence ≈ 7 missed HELLOs = gone
+        // (a live owner that merely roamed is re-locked by leaf_scan_tick's 6 s re-scan long
+        // before this). Retry every 10 s — MUST be < RSSI_BUCKET_STEP_MS (15 s) so a weaker
+        // board gets a burst (reads the winner's retained MC → adopts) before its claim window.
+        const REELECT_SILENCE_MS: u64 = 15_000; // owner HELLO gone this long → recover
+        const REELECT_RETRY_MS: u64 = 10_000; // min gap between recovery bursts
         if self.relay.is_gateway {
             return false; // a gateway re-decides on its own flush; only leaves recover here
         }
@@ -1426,14 +1431,15 @@ impl RadioManager {
         let id = self.id;
         let mut elect = crate::net::wifi::MeshElect::new(id);
         elect.now_ms = now;
+        // #51: this is a LEAF RECOVERY election → select the WiFi-strength rule (sticky live
+        // owner + RSSI-weighted dead-owner takeover on the shorter RECOVERY_STALE_MS window).
+        // Seed our last-measured RSSI-to-AP so the strongest-uplink survivor wins; node-id
+        // only breaks exact-signal ties.
+        elect.recovery = true;
+        elect.my_rssi = self.my_rssi_to_ap;
         elect.seen_owner = self.mc_seen_owner;
         elect.seen_seq = self.mc_seen_seq;
         elect.seen_ms = self.mc_seen_ms;
-        // #51: this is a LEAF RECOVERY election → select the WiFi-strength rule (sticky live
-        // owner + RSSI-weighted dead-owner takeover). Seed our last-measured RSSI-to-AP so
-        // the strongest-uplink survivor wins; node-id only breaks exact-signal ties.
-        elect.recovery = true;
-        elect.my_rssi = self.my_rssi_to_ap;
         // #6 OTA / #21 config / #33 install: a leaf's recovery burst can also surface these.
         let mut ota_offer: Option<crate::ota::Announce> = None;
         let mut config_offer: Option<crate::app::DefaultScreen> = None;

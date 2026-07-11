@@ -146,29 +146,42 @@ impl MeshElect {
     }
 }
 
-/// #51: map a board's RSSI-to-AP (dBm) → how long it must WAIT, beyond `MC_STALE_MS`,
-/// before it may take over a dead owner. Stronger signal → shorter wait, so the
-/// best-uplink survivor claims the vacated ownership FIRST and publishes a fresh `MC`;
-/// weaker survivors, still inside their (longer) backoff, then observe that LIVE owner
-/// and adopt it — the WiFi-strength election JP asked for in #51, with node-id only
-/// breaking exact-bucket ties. Buckets are whole re-election cycles (~`REELECT_RETRY_MS`)
-/// so the winner's claim lands a full recovery burst before a weaker board would claim.
+/// #51: map a board's RSSI-to-AP (dBm) → how long it must WAIT, beyond `RECOVERY_STALE_MS`,
+/// before it may take over a dead owner. Stronger signal → shorter wait, so the best-uplink
+/// survivor claims the vacated ownership FIRST and publishes a fresh (retained) `MC`; weaker
+/// survivors, still inside their (longer) backoff, then observe that LIVE owner and adopt it
+/// — the WiFi-strength election JP asked for in #51, node-id only breaking exact-bucket ties.
+///
+/// The bucket step (`RSSI_BUCKET_STEP_MS`) is deliberately LARGER than the recovery-burst
+/// cadence (`REELECT_RETRY_MS`), so a weaker board always has a recovery burst BETWEEN the
+/// stronger board's claim and its own claim threshold — it reads the stronger board's retained
+/// MC and adopts it, and thus NEVER claims. That is what keeps the RSSI winner STABLE: with no
+/// competing claim, the gateway-flush path's lowest-id resolver never fires to undo it. (Two
+/// boards in the SAME bucket can still co-claim in one window → resolved deterministically by
+/// that lowest-id flush path = the intended node-id tiebreak for equal signal.)
 /// No new `MC` wire field: a board only ever compares its OWN rssi against this threshold.
 #[cfg(feature = "wifi")]
 fn reelect_backoff_ms(rssi: i8, node_id: u8) -> u64 {
     // Bucket by signal strength (typical STA range ≈ -30 strong … -90 weak dBm).
-    let bucket: u64 = if rssi >= -60 {
+    let bucket: u64 = if rssi >= -65 {
         0
-    } else if rssi >= -75 {
+    } else if rssi >= -78 {
         1
     } else {
         2
     };
-    // 30 s per weaker bucket (≈ one recovery-burst cycle) + a sub-cycle per-id term
-    // (200 ms/id) so two boards in the SAME rssi bucket still resolve deterministically
-    // to the lower id without ever colliding on the same burst.
-    bucket * 30_000 + (node_id as u64) * 200
+    // One bucket step per weaker bucket (> the burst cadence, see above) + a small per-id
+    // term so same-bucket boards prefer the lower id (final tiebreak; sub-cadence, so it
+    // only orders an already-converging same-window co-claim, never separates buckets).
+    bucket * RSSI_BUCKET_STEP_MS + (node_id as u64) * 200
 }
+
+/// #51 recovery: RSSI backoff step. MUST exceed `REELECT_RETRY_MS` (10 s) so a weaker board
+/// gets a recovery burst (→ reads the winner's retained MC → adopts) before its own claim
+/// threshold — that's what keeps the stronger board's win stable (no competing claim, so the
+/// lowest-id flush resolver never fires to undo it).
+#[cfg(feature = "wifi")]
+const RSSI_BUCKET_STEP_MS: u64 = 15_000;
 
 /// OTA (#33 Model-A): the ONE retained fleet STAGING topic (`OTA|build|size|sha256|url`)
 /// published by `ota_publish.sh stage`. Every board subscribes it as its `latest_version`
@@ -186,6 +199,19 @@ const OTA_STAGED_TOPIC: &[u8] = b"smol/ota/staged";
 /// after a prolonged HELLO silence, giving the stale check a second sample to fire on).
 #[cfg(feature = "wifi")]
 const MC_STALE_MS: u64 = 90_000;
+
+/// #51 speed-up: the dead-owner window used ONLY on a LEAF RECOVERY election. It can be far
+/// shorter than `MC_STALE_MS` because recovery carries INDEPENDENT corroboration — the leaf
+/// only re-elects after `REELECT_SILENCE_MS` of owner-HELLO silence (a live gateway HELLOs
+/// every 2 s, so an audible one never reaches here). A takeover thus means the owner is quiet
+/// on BOTH the mesh (HELLO) AND the broker (MC seq frozen this long).
+/// LOWER BOUND: it MUST stay above the gateway's MC-republish cadence (`RELAY_FLUSH_INTERVAL_MS`
+/// ≈ 30 s) — a genuinely-alive gateway's seq is frozen up to one flush interval between flushes,
+/// and the seq-advance-resets-`alive` guard only protects us if our window spans a full flush.
+/// 35 s = one flush + margin → confidently dead, ~half the old MC_STALE_MS latency. Boot/
+/// gateway-flush keep `MC_STALE_MS` (single-signal, no HELLO corroboration → keep the 3× margin).
+#[cfg(feature = "wifi")]
+const RECOVERY_STALE_MS: u64 = 35_000;
 
 /// Parse a retained `MC|<owner_id>|<channel>|<seq>` election payload → (owner, ch, seq).
 /// ASCII, decimal fields. Returns `None` on any malformed field (panic-free).
@@ -1278,16 +1304,30 @@ fn mqtt_session(
     //      LIVE owner (sticky), and take over a DEAD owner only after this board's
     //      RSSI-weighted backoff, so the strongest-uplink survivor wins (node-id breaks
     //      ties). `channel` stays 0 (advisory; leaves discover it by scanning the HELLO).
+    // The owner the leaf was following (recovery seeds `seen_owner` from its last MC read).
+    // Captured before the observation below mutates it — lets us tell "the same owner we're
+    // waiting out" (defer, keep accruing) from "a different owner that just claimed" (a live
+    // successor to adopt + grace).
+    let lost_owner = elect.seen_owner;
     let claim_seq: Option<u32> = match mc {
         Some((owner, _ch, seq)) => {
-            if owner != elect.seen_owner || seq != elect.seen_seq {
-                elect.seen_owner = owner;
-                elect.seen_seq = seq;
+            // Refresh the staleness observation: a *changed* (owner,seq) resets the first-seen
+            // clock. Same rule on BOTH paths — an ADVANCING seq is the authoritative
+            // broker-liveness signal (a dead board can't publish), so it MUST reset "alive"
+            // even in recovery. That's the split-brain guard: an owner we lost on the mesh
+            // (HELLO) but is still flushing MC (seq climbing) is ALIVE → we adopt, never take
+            // over. Recovery differs ONLY in the shorter `RECOVERY_STALE_MS` window (a frozen
+            // seq is confidently dead sooner, because HELLO-silence already corroborates).
+            let reset = owner != elect.seen_owner || seq != elect.seen_seq;
+            if reset {
                 elect.seen_ms = elect.now_ms;
             }
-            let alive = elect.now_ms.saturating_sub(elect.seen_ms) < MC_STALE_MS;
-            elect.owner_alive = alive;
+            elect.seen_owner = owner;
+            elect.seen_seq = seq;
+            let stale_limit = if elect.recovery { RECOVERY_STALE_MS } else { MC_STALE_MS };
+            let alive = elect.now_ms.saturating_sub(elect.seen_ms) < stale_limit;
             if !elect.recovery {
+                elect.owner_alive = alive;
                 // BOOT / gateway-flush — original lowest-id rule (byte-for-byte as verified).
                 if owner < node_id && alive {
                     elect.i_am_owner = false;
@@ -1301,6 +1341,7 @@ fn mqtt_session(
                 }
             } else if owner == node_id {
                 // #51 recovery: our own retained record → hold ownership.
+                elect.owner_alive = false;
                 elect.i_am_owner = true;
                 elect.owner_id = node_id;
                 Some(seq.wrapping_add(1))
@@ -1308,21 +1349,33 @@ fn mqtt_session(
                 // #51 recovery: a LIVE owner (any id) is sticky — never override it. This is
                 // what makes the strongest board, once it claims, stay owner as the weaker
                 // survivors observe its fresh MC and adopt it.
+                //
+                // `owner_alive` (→ caller grace-resets the owner-silence clock) is true only for
+                // a DIFFERENT owner than the one we lost — a genuine successor to follow. The
+                // SAME owner is the one we're waiting out: keep it false so the caller does NOT
+                // reset the clock and staleness keeps accruing to takeover. (Using `reset` here
+                // would misfire on the FIRST burst, where the dead owner's last seq differs from
+                // our stale pre-loss sample — that's a baseline, not proof of current life. The
+                // seq-advance reset above still keeps a genuinely-flushing owner `alive` so we
+                // never take it over; we just don't grace-reset the silence clock for it.)
+                elect.owner_alive = owner != lost_owner;
                 elect.i_am_owner = false;
                 elect.owner_id = owner;
                 None
             } else {
-                // #51 recovery: owner is DEAD. Take over only once we're past MC_STALE_MS PLUS
-                // our RSSI-weighted backoff — the strongest-uplink survivor crosses first.
+                // #51 recovery: owner is DEAD. Take over once past RECOVERY_STALE_MS PLUS our
+                // RSSI-weighted backoff — the strongest-uplink survivor crosses first.
+                elect.owner_alive = false;
                 let backoff = reelect_backoff_ms(elect.my_rssi, node_id);
-                if elect.now_ms.saturating_sub(elect.seen_ms) >= MC_STALE_MS.saturating_add(backoff)
+                if elect.now_ms.saturating_sub(elect.seen_ms)
+                    >= RECOVERY_STALE_MS.saturating_add(backoff)
                 {
                     elect.i_am_owner = true;
                     elect.owner_id = node_id;
                     Some(seq.wrapping_add(1))
                 } else {
                     // Dead, but still inside OUR backoff → defer so a stronger board claims
-                    // first. Marked not-alive so the caller skips the owner-silence grace reset.
+                    // first. owner_alive already false → caller keeps the silence anchor.
                     elect.i_am_owner = false;
                     elect.owner_id = owner;
                     None
