@@ -376,6 +376,28 @@ mqtt:
       value_template: "{% set p = value.split('|') %}{{ p[2] if p | length >= 3 else 'unknown' }}"
       entity_category: diagnostic
       icon: "mdi:tag-text"
+    # --- #40 leaf-mesh-OTA relay PHASE (headless diag) — gateway publishes on its next burst
+    # after relaying to this leaf: confirmed / rolled-back / fetch-failed / relay-failed /
+    # leaf-timeout / mac-unknown. The mesh-only leaf has no serial, so this retained topic is
+    # the ONLY window into a relay attempt's outcome. `none` until a relay is attempted.
+    - name: "smol 7 ota diag"
+      unique_id: smol_7_ota_diag_mirror
+      state_topic: "smol/7/ota/diag"
+      value_template: "{{ value if value else 'none' }}"
+      entity_category: diagnostic
+      icon: "mdi:cloud-upload-outline"
+    - name: "smol 8 ota diag"
+      unique_id: smol_8_ota_diag_mirror
+      state_topic: "smol/8/ota/diag"
+      value_template: "{{ value if value else 'none' }}"
+      entity_category: diagnostic
+      icon: "mdi:cloud-upload-outline"
+    - name: "smol 9 ota diag"
+      unique_id: smol_9_ota_diag_mirror
+      state_topic: "smol/9/ota/diag"
+      value_template: "{{ value if value else 'none' }}"
+      entity_category: diagnostic
+      icon: "mdi:cloud-upload-outline"
     # --- #48 LED mode — mirror of the retained smol/<id>/config/led (commanded value) ---
     - name: "smol 7 LED"
       unique_id: smol_7_led_mirror
