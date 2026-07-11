@@ -1507,6 +1507,13 @@ impl RadioManager {
         if self.relay.is_gateway {
             return false; // a gateway re-decides on its own flush; only leaves recover here
         }
+        // #3b: a leaf with a LIVE mesh-OTA session must NOT re-elect — re-election re-associates
+        // to WiFi (off-ch6) and took id8 OFFLINE mid-relay. While armed, the gateway is merely
+        // fetching (off-ch6, transiently silent), NOT dead; the leaf holds ch6 and waits for the
+        // OTAD. The session's own deadline/stall (ota_mesh) bounds a genuinely-abandoned relay.
+        if self.ota_leaf.is_active() {
+            return false;
+        }
         let silent = now.saturating_sub(self.last_owner_heard_ms) >= REELECT_SILENCE_MS;
         let retry_ok = now.saturating_sub(self.last_reelect_ms) >= REELECT_RETRY_MS;
         if !(silent && retry_ok) {
@@ -2300,6 +2307,77 @@ impl RadioManager {
             leaf_id, announce.build, size, total
         );
 
+        // --- #3b PRE-FETCH ARM (the AP-independent fix) ---------------------------------------
+        // Broadcast the OTAM to the leaf WHILE IT'S STILL RECEPTIVE ON ch6 — BEFORE the WiFi fetch
+        // takes the radio off-channel for minutes. At this point the leaf has only been
+        // gateway-silent for the just-finished flush (~seconds), so it's hopping [1,6,11] but
+        // still ONLINE (not yet the prolonged-re-election OFFLINE we saw post-fetch). The instant
+        // it catches an OTAM on a ch6 dwell it (a) locks ch6 via `handle_ota_frame` and (b) arms
+        // its session → `ota_leaf.is_active()` then PINS it on ch6 through the whole fetch (no
+        // scan, no re-election — see leaf_scan_tick + maybe_leaf_reelect gates). Post-fetch OTAD
+        // lands on the still-locked leaf. (The post-fetch wake-burst failed because it chased an
+        // ALREADY-scanning/offline leaf — canary leaf_ch=0. Arming pre-fetch stops the scan before
+        // it starts.) Bounded; breaks early once the leaf's LDBG shows armed (verdict=1) or it NAKs.
+        {
+            let _ = self.switch(Mode::EspNow); // ch6 (the flush left us in WifiSta)
+            let mut s = 0u16;
+            while s < 40 {
+                if !matches!(self.controller.is_connected(), Ok(true)) {
+                    break;
+                }
+                let _ = self.controller.disconnect();
+                s = s.saturating_add(1);
+                if tick() {
+                    return LeafOtaOutcome::Aborted;
+                }
+            }
+            let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+            if !self.esp_now.peer_exists(&BROADCAST_ADDRESS) {
+                let _ = self.esp_now.add_peer(PeerInfo {
+                    interface: EspNowWifiInterface::Sta,
+                    peer_address: BROADCAST_ADDRESS,
+                    lmk: None,
+                    channel: None,
+                    encrypt: false,
+                });
+            }
+            let mut otam_pre = [0u8; om::OTAM_FRAME_MAX];
+            if let Some(pre_len) = om::encode_otam(
+                leaf_id, session, announce.signed_msg(), announce.sig(), &mut otam_pre,
+            ) {
+                const PREARM_MS: u64 = 15_000;
+                const PREARM_GAP_MS: u64 = 120;
+                let deadline = now_ms() + PREARM_MS;
+                let mut last = 0u64;
+                while now_ms() < deadline {
+                    if tick() {
+                        return LeafOtaOutcome::Aborted;
+                    }
+                    let t = now_ms();
+                    if t.saturating_sub(last) >= PREARM_GAP_MS {
+                        let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+                        let _ = self.esp_now.send(&BROADCAST_ADDRESS, &otam_pre[..pre_len]);
+                        last = t;
+                    }
+                    if let Some(recv) = self.esp_now.receive() {
+                        if recv.info.src_address == leaf_mac {
+                            let armed = matches!(
+                                om::parse_ldbg(recv.data(), leaf_id),
+                                Some((_, 1, _, _))
+                            ) || matches!(
+                                om::parse_ota_frame(recv.data()),
+                                Some(om::OtaFrame::Nak { .. })
+                            );
+                            if armed {
+                                break; // leaf armed pre-fetch → its is_active hold now carries ch6
+                            }
+                        }
+                    }
+                }
+                log::info!("smol #3b: pre-fetch arm burst done (leaf id{})", leaf_id);
+            }
+        }
+
         // --- FETCH (WiFi) → stage+verify into THIS gateway's inactive slot (no activate).
         // CRITICAL: `run_leaf_ota_relay` is called IMMEDIATELY after `flush_telemetry`, which
         // leaves the radio in WifiSta. `switch()` is a NO-OP when already in-mode → it would
@@ -2407,12 +2485,13 @@ impl RadioManager {
         // ch6 windows. The first OTAM the leaf catches locks it to ch6 (`handle_ota_frame`) and
         // arms its session → it then holds ch6 (`leaf_scan_tick` is_active) for the transfer. Stop
         // early the instant the leaf NAKs (it's armed + ready for the windowed transfer).
-        // #3b: 90s (was 20s) so the burst spans several of the leaf's re-election/hop cycles —
-        // after the off-ch6 fetch the leaf needs ~10-30s to stabilize + hop back onto ch6, and a
-        // longer flood raises the odds it catches one OTAM while there. Self-stops on first NAK,
-        // so a leaf that locks early doesn't pay the full window. (Band-aid for the coexist wall —
-        // the real cure is a ch6-locked fetch AP so the leaf never leaves ch6; flagged to JP.)
-        const WAKE_MS: u64 = 90_000;
+        // #3b: this post-fetch burst is now a short FALLBACK + diag capture — the PRIMARY arming
+        // happens PRE-fetch (above), so a leaf that pre-armed is already locked+active here and
+        // this just backstops the case where pre-arm missed. Kept short (was 90s) since a leaf
+        // that didn't pre-arm has drifted off-ch6 for the whole fetch and a long post-fetch flood
+        // was proven dead (canary leaf_ch=0). Self-stops on first NAK. Also captures the leaf's
+        // LDBG (leaf_ch/verdict) for relaydiag. Real coexist cure stays infra (ch6 fetch AP, JP).
+        const WAKE_MS: u64 = 15_000;
         const WAKE_GAP_MS: u64 = 120;
         let wake_deadline = now_ms() + WAKE_MS;
         let mut last_wake_ms = 0u64;

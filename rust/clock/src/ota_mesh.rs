@@ -323,6 +323,13 @@ use esp_bootloader_esp_idf::ota::Slot;
 const LEAF_IDLE_NAK_MS: u64 = 500;
 /// Abort the session if NO new chunk arrives for this long (a jam / dead gateway, ms).
 const LEAF_PROGRESS_STALL_MS: u64 = 30_000;
+/// #3b: grace for the ARMED-but-no-chunk-yet phase. Pre-fetch-arm arms the leaf via the OTAM
+/// BEFORE the gateway's WiFi fetch, so the FIRST OTAD arrives only after the fetch (up to
+/// `OTA_FETCH_BUDGET`=300s later). Without a longer grace the 30 s stall would abort the armed
+/// session mid-fetch (→ leaf drops the hold + scans → the bug we're fixing). Applies ONLY while
+/// window 0 has received nothing; once chunks flow, the tight 30 s stall resumes. Still bounded
+/// by `LEAF_SESSION_MAX_MS` (600s) → brick-safe (otadata untouched on abort).
+const LEAF_FIRST_CHUNK_GRACE_MS: u64 = 330_000;
 /// Hard total-session cap (ms) — a runaway transfer aborts → good slot boots (R1: USB).
 const LEAF_SESSION_MAX_MS: u64 = 600_000;
 
@@ -675,8 +682,16 @@ impl OtaLeafSession {
         if !self.active {
             return LeafAction::None;
         }
+        // #3b: while ARMED but still awaiting the very first chunk (window 0, nothing received),
+        // allow the fetch-spanning grace — the gateway is fetching off-ch6, not dead. Once any
+        // chunk lands, the tight progress stall resumes. The hard session cap still bounds it.
+        let stall_ms = if self.window_base == 0 && self.window_recv == 0 {
+            LEAF_FIRST_CHUNK_GRACE_MS
+        } else {
+            LEAF_PROGRESS_STALL_MS
+        };
         if now >= self.session_deadline_ms
-            || now.saturating_sub(self.last_new_chunk_ms) >= LEAF_PROGRESS_STALL_MS
+            || now.saturating_sub(self.last_new_chunk_ms) >= stall_ms
         {
             log::warn!("smol #40: mesh-OTA stalled — session discarded (good slot intact; USB recovery)");
             self.discard();
