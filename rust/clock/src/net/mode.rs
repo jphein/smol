@@ -1303,6 +1303,13 @@ pub struct RadioManager {
     /// #6 OTA: a gated retained announce surfaced by a burst (boot or gateway flush),
     /// pending `main`'s `take_ota_offer` → fetch. `None` when nothing is pending.
     ota_offer: Option<crate::ota::Announce>,
+    /// #40: the LAST raw (ungated) `smol/ota/staged` announce this gateway drained,
+    /// PERSISTED across flushes. A leaf-OTA install pairs with THIS (not a session-local
+    /// capture), so the pair is independent of whether the staged retained was re-drained
+    /// in the SAME flush that consumed the install — closing the "install consumed but
+    /// relay never armed" race (the staged and install are separate retained topics with
+    /// independent drain timing). Persists the current staged image for every leaf relay.
+    staged_raw: Option<crate::ota::Announce>,
     /// #21 node-manager: the parsed default-screen command surfaced by a burst,
     /// pending `main`'s `take_config_offer` → apply. `None` when nothing is pending.
     config_offer: Option<crate::app::DefaultScreen>,
@@ -1380,6 +1387,7 @@ impl RadioManager {
             mc_seen_ms: 0,
             last_reelect_ms: 0,
             ota_offer: None,
+            staged_raw: None,
             config_offer: None,
             install_requested: false,
             silent_until_relock: false,
@@ -1496,6 +1504,7 @@ impl RadioManager {
                     None, // #21: a leaf's recovery burst is not a gateway relay
                     None, // #50b: recovery burst republishes no cached leaf status
                     &mut None, // #40: a leaf's recovery burst never relays a leaf OTA
+                    &mut None, // #40: recovery burst carries no persistent staged
                     tick,
                 )
             }
@@ -2446,6 +2455,7 @@ impl RadioManager {
                     Some(&mut self.cfg_cache), // #21: gateway caches leaf configs to relay
                     Some(&self.stat_cache), // #50b: gateway republishes cached leaf statuses
                     leaf_ota, // #40: surface a pending leaf-OTA install for main to relay
+                    &mut self.staged_raw, // #40: persist the staged across flushes (pair-safe)
                     tick,
                 )
             }

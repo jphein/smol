@@ -583,6 +583,7 @@ pub fn run_ntp_burst(
         None, // #21: boot burst is not a gateway relay (no leaf-config cache)
         None, // #50b: boot burst republishes no cached leaf status
         &mut None, // #40: boot burst never relays a leaf OTA
+        &mut None, // #40: boot burst has no persistent staged to carry
         mqtt_deadline,
         tick,
     );
@@ -949,6 +950,12 @@ fn mqtt_session(
     // AND a staged image is available — the caller then relays it over ESP-NOW. The retained
     // cmd is CLEARED here (consumed) so an HA reload can't replay it. `&mut None` off-gateway.
     leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
+    // #40: PERSISTENT (caller-owned, survives across flushes) last raw staged announce. The
+    // staged arm updates it when drained; the leaf-install pairing reads it — so a pair works
+    // even if the staged retained wasn't re-drained in the SAME flush that consumed the
+    // install (the race that left the install consumed but the relay never armed). `&mut None`
+    // on boot/leaf bursts (no persistence needed).
+    staged_raw: &mut Option<crate::ota::Announce>,
     deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
@@ -1270,10 +1277,11 @@ fn mqtt_session(
     let mut settle_deadline: Option<Instant> = None;
     // #40: the RAW (ungated) staged announce + a leaf id whose retained install cmd is
     // present. Paired AFTER the drain (both are retained → arrive in the same broker burst)
-    // → `*leaf_ota`. Raw (not the gate()d `ota_offer`) because the LEAF, not the gateway,
-    // owns the freshness gate (the OTAM handler rejects `build ≤ leaf.build`); the gateway
-    // may be NEWER than the leaf's target, so a gateway-build gate would wrongly drop it.
-    let mut raw_staged: Option<crate::ota::Announce> = None;
+    // → `*leaf_ota`. The staged is the caller-PERSISTED `staged_raw` (updated below when a
+    // staged retained is drained), so an install is paired with the last-known staged even
+    // if THIS flush didn't re-drain it. Raw (not the gate()d `ota_offer`) because the LEAF,
+    // not the gateway, owns the freshness gate (the OTAM handler rejects `build ≤ leaf.build`);
+    // the gateway may be NEWER than the leaf's target, so a gateway-build gate would drop it.
     let mut pending_leaf: Option<u8> = None;
     loop {
         if tick() {
@@ -1306,10 +1314,10 @@ fn mqtt_session(
                         // Stale/foreign/oversize → ignored (up-to-date; no offer).
                         match crate::ota::parse_announce(payload) {
                             Some(a) => {
-                                // #40: keep the RAW announce (pre-gate) for a possible leaf
+                                // #40: PERSIST the RAW announce (pre-gate) for a possible leaf
                                 // relay — the leaf owns its own freshness gate, so a
                                 // gateway-build gate must NOT drop it here.
-                                raw_staged = Some(a);
+                                *staged_raw = Some(a);
                                 match crate::ota::gate(&a) {
                                     Ok(()) => {
                                         log::info!(
@@ -1408,7 +1416,7 @@ fn mqtt_session(
     // replay it, twin of the self-OTA close) — an install with NO staged image is LEFT
     // retained so the NEXT flush (once staged is drained) can still arm it, instead of
     // silently consuming+losing it. The pairing result is logged either way (diagnostic).
-    match (pending_leaf, raw_staged) {
+    match (pending_leaf, *staged_raw) {
         (Some(leaf_id), Some(ann)) => {
             *leaf_ota = Some((leaf_id, ann));
             log::info!(
@@ -1631,7 +1639,7 @@ fn mqtt_session(
     // (stat_cache = Some). Idempotent retained publishes, bounded to the heard-leaf set.
     #[cfg(feature = "espnow")]
     if let Some(sc) = stat_cache {
-        let latest_staged = raw_staged.as_ref().map(|a| a.build);
+        let latest_staged = staged_raw.as_ref().map(|a| a.build);
         for i in 0..sc.count() {
             let (lid, val) = match sc.entry(i) {
                 Some(x) => x,
@@ -1732,6 +1740,9 @@ pub fn run_mqtt_burst(
     // #40: on a gateway flush, filled with `(leaf_id, staged announce)` when a leaf install
     // is pending → the caller relays it over ESP-NOW. `&mut None` on boot/leaf bursts.
     leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
+    // #40: caller-persisted last raw staged announce (see `mqtt_session`). `&mut None` on
+    // boot/leaf bursts.
+    staged_raw: &mut Option<crate::ota::Announce>,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
@@ -1881,6 +1892,7 @@ pub fn run_mqtt_burst(
         cfg_cache, // #21: forward the gateway's leaf-config cache (or None)
         stat_cache, // #50b: forward the gateway's cached leaf statuses (or None)
         leaf_ota, // #40: forward the leaf-OTA install pairing (or &mut None)
+        staged_raw, // #40: forward the persistent staged announce (or &mut None)
         deadline,
         tick,
     )
