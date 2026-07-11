@@ -417,6 +417,17 @@ mqtt:
 # =====================================================================
 template:
   - sensor:
+      # --- #51 dynamic-role gap fix: EVERY node needs leaf-bond entities (any node can be a leaf now).
+      # id7 was gateway-only, so its rssi/band/resync were never defined; #51 (id8 can take over) makes
+      # id7 a leaf → its dashboard box showed 'entity not found' ×3. Defined for id7 here, mirroring 8/9;
+      # they read the DYNAMIC elected owner's peers (sensor.smol_<owner>_peers → the '7,' entry). ---
+      - name: "smol 7 rssi"
+        unique_id: smol_7_rssi
+        state: >-
+          {% set owner = state_attr('sensor.smol_mesh_channel', 'owner') or '7' %}
+          {% set ps = state_attr('sensor.smol_' ~ owner ~ '_peers', 'peers') or [] %}
+          {% set m = ps | select('match', '^7,') | list %}
+          {% if m %}{% set v = m[0].split(',')[1] | int(-999) %}{{ v - 256 if v > 127 else v }}{% else %}unknown{% endif %}
       - name: "smol 8 rssi"
         unique_id: smol_8_rssi
         state: >-
@@ -441,6 +452,11 @@ template:
       - name: "smol 9 online"
         unique_id: smol_9_online
         state: "{{ states('sensor.smol_9_voltage') not in ['unavailable', 'unknown', 'none', ''] }}"
+      - name: "smol 7 resync"
+        unique_id: smol_7_resync
+        state: >-
+          {% set ch = state_attr('sensor.smol_7_peers', 'ch') %}
+          {{ ch is not none and ch != state_attr('sensor.smol_mesh_channel', 'channel') }}
       - name: "smol 8 resync"
         unique_id: smol_8_resync
         state: >-
@@ -460,6 +476,11 @@ template:
 
   # --- #27 topology edge-weighting helpers (luna, issue-27 Appendix A) ---
   - sensor:
+      - name: "smol 7 rssi band"
+        unique_id: smol_7_rssi_band
+        state: >-
+          {% set r = states('sensor.smol_7_rssi') | int(-999) %}
+          {{ 'unknown' if r == -999 else 'strong' if r >= -55 else 'good' if r >= -70 else 'weak' if r >= -82 else 'faint' }}
       - name: "smol 8 rssi band"
         unique_id: smol_8_rssi_band
         state: >-

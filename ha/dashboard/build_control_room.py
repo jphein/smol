@@ -24,11 +24,10 @@ def accent_top(c): return ("ha-card{position:relative;overflow:hidden}ha-card:be
 # ---------- node box = mushroom header + mushroom OLED + entities; span-4 in the VIEW grid ----------
 def node_card(nid, meta, present):
     gate=meta["gate"]; I=str(nid); on=f"is_state('binary_sensor.smol_{I}_online','on')"
-    # RSSI in EVERY node: leaves show dBm; gateway (no mesh-RSSI to itself) shows WiFi uplink
-    has_rssi=f"sensor.smol_{I}_rssi" in present
-    rssi_pip=(" · {{ states('sensor.smol_"+I+"_rssi') if states('sensor.smol_"+I+"_rssi') not in na else '—' }} dBm") if has_rssi else " · WiFi"
-    # LIVE gateway = this node == MC owner attr (moves on #51 takeover). Indicators are template-driven, not build-time.
-    gw="(state_attr('sensor.smol_mesh_channel','owner')|string == '"+I+"')"
+    # RSSI pip LIVE (re-evaluates on takeover): gateway → WiFi (no self mesh-rssi); leaf → dBm
+    rssi_pip=(" · {% if gw %}WiFi{% else %}{{ states('sensor.smol_"+I+"_rssi') if states('sensor.smol_"+I+"_rssi') not in na else '—' }} dBm{% endif %}")
+    # LIVE gateway signal = peers-state 'gateway' (an entity STATE → works in mushroom templates AND legacy conditional-card conditions).
+    gw="is_state('sensor.smol_"+I+"_peers','gateway')"
     hdr=("{% set on="+on+" %}{% set gw="+gw+" %}{% set t=states('sensor.smol_"+I+"_temp') %}{% set v=states('sensor.smol_"+I+"_voltage') %}"
          "{% set na="+NAJ+" %}{% if not on %}⛔ OFFLINE{% elif gw %}👑 GATEWAY{% else %}◈ leaf{% endif %} · id"+I+""
          " · {{ t if t not in na else '—' }}° · {{ v if v not in na else '—' }}V"+rssi_pip)
@@ -57,47 +56,56 @@ def node_card(nid, meta, present):
                 "box-shadow:inset 0 0 12px rgba(0,0,0,.9);position:relative;overflow:hidden;margin-top:-2px;opacity:{% if "+on+" %}1{% else %}.6{% endif %}}mushroom-shape-icon{display:none}"),
                 "mushroom-state-info$":(".primary{font-family:"+VT+";font-size:44px;line-height:.8;color:var(--primary-color);"
                 "text-shadow:0 0 7px rgba(91,255,154,.55)}.secondary{color:var(--primary-color);opacity:.7;font-size:10px}")}}}
-    ents=[]
-    def sec(l): ents.append({"type":"section","label":l})
-    def row(eid,nm,icon=None):
+    OP="opacity:{% if "+on+" %}1{% else %}.6{% endif %}"
+    def prow(lst,eid,nm,icon=None):
         if eid in present:
             r={"entity":eid,"name":nm}
             if icon: r["icon"]=icon
-            ents.append(r)
-    sec("screen & mode")
-    row(f"input_select.smol_{nid}_screen","default screen")
-    row(f"input_select.smol_{nid}_page","page")
-    row(f"input_select.smol_{nid}_led","LED (status / on / off)","mdi:led-on")   # #48
-    row(f"input_button.smol_{nid}_apply",f"Apply → id{nid}","mdi:send")
-    row(f"input_button.smol_{nid}_reset","Reset to board default","mdi:backup-restore")
-    rb=f"input_button.smol_{nid}_reboot"                                          # #52 remote reboot — tap-guarded (destructive)
+            lst.append(r)
+    # ---- ctrl_top: screen & mode + readback-always (config/screen/activity) ----
+    top=[{"type":"section","label":"screen & mode"}]
+    prow(top,f"input_select.smol_{nid}_screen","default screen")
+    prow(top,f"input_select.smol_{nid}_page","page")
+    prow(top,f"input_select.smol_{nid}_led","LED (status / on / off)","mdi:led-on")            # #48
+    prow(top,f"input_button.smol_{nid}_apply",f"Apply → id{nid}","mdi:send")
+    prow(top,f"input_button.smol_{nid}_reset","Reset to board default","mdi:backup-restore")
+    rb=f"input_button.smol_{nid}_reboot"                                                       # #52 tap-guarded reboot
     if rb in present:
-        ents.append({"entity":rb,"name":"Reboot node","icon":"mdi:restart-alert",
+        top.append({"entity":rb,"name":"Reboot node","icon":"mdi:restart-alert",
             "tap_action":{"action":"perform-action","perform_action":"input_button.press","target":{"entity_id":rb},
                           "confirmation":{"text":f"Reboot id{nid} ({meta['name']})? It drops off the mesh briefly."}}})
-    sec("readback")
-    # TWO rows, ALWAYS both (JP: see commanded-vs-actual DRIFT — no fallback):
-    row(f"sensor.smol_{nid}_config","default screen (commanded)","mdi:monitor-dashboard")   # retained default_screen; works now
-    row(f"sensor.smol_{nid}_screen","current screen (live)","mdi:monitor-eye")              # ACTUAL screen incl. manual BOOT-menu nav; 'unknown' until #50 fw, then auto-populates
-    row(f"sensor.smol_{nid}_status","activity","mdi:pulse")
-    if has_rssi:                                                    # LEAF — mesh bond to the gateway
-        row(f"sensor.smol_{nid}_rssi","bond (RSSI)","mdi:signal")
-        row(f"sensor.smol_{nid}_rssi_band","bond band","mdi:signal-cellular-2")
-        row(f"binary_sensor.smol_{nid}_resync","re-syncing","mdi:sync")
-    else:                                                           # GATEWAY anchor — WiFi-uplinked, no mesh bond/resync → show what it OWNS/serves (fills Dominion's gap, no fake rows)
-        sec("gateway anchor · WiFi uplink")
-        if "sensor.smol_mesh_channel" in present:
-            ents.append({"type":"attribute","entity":"sensor.smol_mesh_channel","attribute":"channel","name":"mesh channel (owned)","icon":"mdi:wifi"})
-            ents.append({"type":"attribute","entity":"sensor.smol_mesh_channel","attribute":"seq","name":"mesh seq (advancing)","icon":"mdi:counter"})
-        row(f"sensor.smol_{nid}_peers","peers / roster","mdi:lan")
-    sec("firmware")
+    top.append({"type":"section","label":"readback"})
+    prow(top,f"sensor.smol_{nid}_config","default screen (commanded)","mdi:monitor-dashboard") # commanded (works now)
+    prow(top,f"sensor.smol_{nid}_screen","current screen (live)","mdi:monitor-eye")            # actual incl. manual nav; 'unknown' until #50
+    prow(top,f"sensor.smol_{nid}_status","activity","mdi:pulse")
+    ctrl_top={"type":"entities","show_header_toggle":False,"entities":top,
+              "card_mod":{"style":"ha-card{border-radius:0;border-top:none;border-bottom:none;margin-top:-2px;"+OP+"}"}}
+    # ---- LIVE role-conditional groups: box RESTRUCTURES on #51 takeover (keyed to owner attr).
+    #      Rows added unconditionally; the hidden conditional also hides its (role-absent) entities → no 'entity not found'. ----
+    JOIN="ha-card{border-radius:0;border-top:none;border-bottom:none;margin-top:-1px;"+OP+"}"
+    cond_leaf={"type":"conditional",                                                           # shown when this node is NOT the gateway (leaf/offline) — legacy state condition (HA-supported)
+        "conditions":[{"entity":f"sensor.smol_{nid}_peers","state_not":"gateway"}],
+        "card":{"type":"entities","show_header_toggle":False,"card_mod":{"style":JOIN},"entities":[
+            {"type":"section","label":"mesh bond (leaf)"},
+            {"entity":f"sensor.smol_{nid}_rssi","name":"bond (RSSI)","icon":"mdi:signal"},
+            {"entity":f"sensor.smol_{nid}_rssi_band","name":"bond band","icon":"mdi:signal-cellular-2"},
+            {"entity":f"binary_sensor.smol_{nid}_resync","name":"re-syncing","icon":"mdi:sync"}]}}
+    cond_gw={"type":"conditional",                                                             # shown when this node IS the gateway — legacy state condition (HA-supported)
+        "conditions":[{"entity":f"sensor.smol_{nid}_peers","state":"gateway"}],
+        "card":{"type":"entities","show_header_toggle":False,"card_mod":{"style":JOIN},"entities":[
+            {"type":"section","label":"gateway anchor · WiFi uplink"},
+            {"type":"attribute","entity":"sensor.smol_mesh_channel","attribute":"channel","name":"mesh channel (owned)","icon":"mdi:wifi"},
+            {"type":"attribute","entity":"sensor.smol_mesh_channel","attribute":"seq","name":"mesh seq (advancing)","icon":"mdi:counter"},
+            {"entity":f"sensor.smol_{nid}_peers","name":"peers / roster","icon":"mdi:lan"}]}}
+    # ---- ctrl_bottom: firmware + install (always last → rounded bottom) ----
+    bot=[{"type":"section","label":"firmware"}]
     fw=next((e for e in present if re.match(rf"update\.smol_{nid}_.*_firmware$",e)),None)
-    if fw: ents.append({"entity":fw,"name":"firmware (version + update)"})
+    if fw: bot.append({"entity":fw,"name":"firmware (version + update)"})
     inst=f"input_button.smol_ota_install_{nid}"
-    if inst in present: ents.append({"entity":inst,"name":"Install staged (canary)" if gate else "Install (when this leads)","icon":"mdi:rocket-launch"})
-    ctrl={"type":"entities","show_header_toggle":False,"entities":ents,
-          "card_mod":{"style":"ha-card{border-radius:0 0 10px 10px;border-top:none;margin-top:-1px;opacity:{% if "+on+" %}1{% else %}.6{% endif %}}"}}
-    return {"type":"vertical-stack","view_layout":{"grid-column":"span 4"},"cards":[header,oled,ctrl]}
+    if inst in present: bot.append({"entity":inst,"name":"Install staged (gateway consumes)","icon":"mdi:rocket-launch"})
+    ctrl_bottom={"type":"entities","show_header_toggle":False,"entities":bot,
+                 "card_mod":{"style":"ha-card{border-radius:0 0 10px 10px;border-top:none;margin-top:-1px;"+OP+"}"}}
+    return {"type":"vertical-stack","view_layout":{"grid-column":"span 4"},"cards":[header,oled,ctrl_top,cond_leaf,cond_gw,ctrl_bottom]}
 
 def legend_card(nodes, present):
     ents=[{"type":"section","label":"the mesh"}]
