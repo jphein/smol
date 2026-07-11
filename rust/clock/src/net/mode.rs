@@ -1446,18 +1446,26 @@ impl RadioManager {
         if self.relay.is_gateway {
             return; // gateway owns its channel via association; never scans
         }
-        // #3b: DON'T unlock+hop on mere owner-silence. The gateway TIME-SHARES — its ESP-NOW
-        // stays on ESP_NOW_FIXED_CHANNEL; only its WiFi rides the multi-channel roam SSID during
-        // a minutes-long OTA fetch (OTA_FETCH_BUDGET=300s). The old 6 s unlock made the leaf hop
-        // [1,6,11] and DRIFT off ch6 for the whole fetch → it never heard the relay OTAM and the
-        // gateway stopped hearing it (canary #3b: leaf H0, rx→0, bidirectional collapse). So HOLD
-        // the fixed channel and re-assert it (a live gateway will return here). A truly dead/moved
-        // gateway is still recovered by `maybe_leaf_reelect` (15 s, independent), and genuine
-        // owner/role CHANGES unlock explicitly at their own sites (post-reelect / gateway-demote).
+        // #3b (regression fix): while ACTIVELY receiving a mesh-OTA, HOLD the channel — do NOT
+        // unlock/hop. The transfer runs on ESP_NOW_FIXED_CHANNEL and hopping mid-transfer drops
+        // chunks. NARROW + bounded: true only during a live session (`is_active`); with no OTA in
+        // flight this is a no-op and normal membership behaves EXACTLY as before. (60ff390 made
+        // the hold UNCONDITIONAL and broke basic mesh join — id8 couldn't re-acquire the gateway
+        // after routine beacon loss the way id9/pre-#40 does. This restores that path and scopes
+        // the hold to only when it's actually needed.)
+        if self.ota_leaf.is_active() {
+            let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+            return;
+        }
+        // RESTORED old behavior: unlock + re-scan on owner-silence. A leaf MUST re-acquire the
+        // gateway after routine beacon loss to keep mesh membership. The fetch-drift is handled
+        // narrowly instead: (i) receiving an OTA frame locks the leaf to ch6 (`handle_ota_frame`),
+        // (ii) the gateway's OTAM wake-burst lets a hopping leaf catch the first announce.
+        if self.scan_locked && now.saturating_sub(self.last_owner_heard_ms) > SCAN_SILENCE_MS {
+            self.scan_locked = false;
+            log::info!("smol: leaf lost gateway id{} — re-scanning", self.elected_owner);
+        }
         if self.scan_locked {
-            if now.saturating_sub(self.last_owner_heard_ms) > SCAN_SILENCE_MS {
-                let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
-            }
             return;
         }
         if now.saturating_sub(self.last_scan_hop_ms) >= DWELL_MS {
@@ -2390,6 +2398,53 @@ impl RadioManager {
         // #3b OTAM TX-diag: broadcast sends attempted vs returned-Ok (queued + TX-callback ok).
         let mut otam_tx: u16 = 0;
         let mut otam_ok: u16 = 0;
+
+        // #3b WAKE-BURST: the leaf lost the gateway during the off-ch6 fetch and is now hopping
+        // [1,6,11] (on ch6 only ~⅓ of the time) and/or re-electing over WiFi — so a single OTAM
+        // per window-0 round (spaced by the 800 ms OTAN wait) rarely coincides with the leaf's
+        // brief ch6 dwell (canary: leaf H0). OPEN the relay with a DENSE OTAM flood: rebroadcast
+        // the announce every ~120 ms for up to WAKE_MS, maximizing overlap with the leaf's sparse
+        // ch6 windows. The first OTAM the leaf catches locks it to ch6 (`handle_ota_frame`) and
+        // arms its session → it then holds ch6 (`leaf_scan_tick` is_active) for the transfer. Stop
+        // early the instant the leaf NAKs (it's armed + ready for the windowed transfer).
+        const WAKE_MS: u64 = 20_000;
+        const WAKE_GAP_MS: u64 = 120;
+        let wake_deadline = now_ms() + WAKE_MS;
+        let mut last_wake_ms = 0u64;
+        while now_ms() < wake_deadline {
+            if tick() {
+                return LeafOtaOutcome::Aborted;
+            }
+            let t = now_ms();
+            if t.saturating_sub(last_wake_ms) >= WAKE_GAP_MS {
+                let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+                otam_tx = otam_tx.saturating_add(1);
+                if let Ok(waiter) = self.esp_now.send(&BROADCAST_ADDRESS, &otam[..otam_len]) {
+                    if waiter.wait().is_ok() {
+                        otam_ok = otam_ok.saturating_add(1);
+                    }
+                }
+                last_wake_ms = t;
+            }
+            if let Some(recv) = self.esp_now.receive() {
+                if recv.info.src_address == leaf_mac {
+                    rx_any = rx_any.saturating_add(1);
+                    if let Some((h, v, n, c)) = om::parse_ldbg(recv.data(), leaf_id) {
+                        ldbg_heard = h;
+                        ldbg_verdict = v;
+                        ldbg_sent = n;
+                        ldbg_ch = c;
+                    }
+                    if matches!(
+                        om::parse_ota_frame(recv.data()),
+                        Some(om::OtaFrame::Nak { .. })
+                    ) {
+                        break; // leaf armed + NAKing → proceed to the windowed transfer
+                    }
+                }
+            }
+        }
+
         let mut wb: u32 = 0;
         while wb < total {
             if tick() {
@@ -3130,6 +3185,15 @@ impl RadioManager {
         use crate::ota_mesh::{LeafAction, OtaFrame};
         self.peers.last_hello_ms = now;
         self.roster.heard(src, None, rssi, now);
+        // #3b: an inbound OTA frame proves the gateway is audible on THIS channel (the relay
+        // runs on ESP_NOW_FIXED_CHANNEL). Treat it like the owner's HELLO — reset the
+        // owner-silence timer AND lock the channel — so the leaf STOPS the scan hop and STAYS on
+        // ch6 for the rest of the transfer. This is what lets the FIRST caught OTAM (caught while
+        // the leaf was mid-hop) pin the leaf so it hears the OTAD chunks + OTAM resends (#3b).
+        self.last_owner_heard_ms = now;
+        if !self.relay.is_gateway {
+            self.scan_locked = true;
+        }
         if !self.esp_now.peer_exists(&src) {
             let _ = self.esp_now.add_peer(PeerInfo {
                 interface: EspNowWifiInterface::Sta,

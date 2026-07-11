@@ -446,6 +446,12 @@ impl OtaLeafSession {
         (self.dbg_otam_heard, self.dbg_verdict, self.dbg_otan_sent)
     }
 
+    /// #3b: is a mesh-OTA transfer live? `leaf_scan_tick` holds ch6 (no hop) while true so the
+    /// windowed transfer isn't dropped by a channel hop. False in steady state → scan unaffected.
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
     /// The gateway MAC this session locked onto (unicast target for NAKs). Zero if idle.
     pub fn gateway_mac(&self) -> [u8; 6] {
         self.gateway_mac
