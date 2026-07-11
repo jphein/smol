@@ -353,6 +353,29 @@ mqtt:
       json_attributes_topic: "smol/9/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
       icon: "mdi:chip"
+    # --- #40 running BUILD# as a first-class device-merged value (JP ask 2026-07-11) ---
+    # Promotes the `build` attr of smol_<id>_screen to a plain visible sensor so the
+    # leaf-mesh-OTA canary is verifiable HEADLESS in HA (build# flipping = update stuck;
+    # the ESP32-C3 USB-JTAG boards give no reliable headless serial). Same
+    # STAT|<screen>:<page>|<build> source; length-guarded split (panic-free).
+    - name: "smol 7 build"
+      unique_id: smol_7_build_mirror
+      state_topic: "smol/7/status"
+      value_template: "{% set p = value.split('|') %}{{ p[2] if p | length >= 3 else 'unknown' }}"
+      entity_category: diagnostic
+      icon: "mdi:tag-text"
+    - name: "smol 8 build"
+      unique_id: smol_8_build_mirror
+      state_topic: "smol/8/status"
+      value_template: "{% set p = value.split('|') %}{{ p[2] if p | length >= 3 else 'unknown' }}"
+      entity_category: diagnostic
+      icon: "mdi:tag-text"
+    - name: "smol 9 build"
+      unique_id: smol_9_build_mirror
+      state_topic: "smol/9/status"
+      value_template: "{% set p = value.split('|') %}{{ p[2] if p | length >= 3 else 'unknown' }}"
+      entity_category: diagnostic
+      icon: "mdi:tag-text"
     # --- #48 LED mode — mirror of the retained smol/<id>/config/led (commanded value) ---
     - name: "smol 7 LED"
       unique_id: smol_7_led_mirror
