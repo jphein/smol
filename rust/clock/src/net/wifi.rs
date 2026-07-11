@@ -774,6 +774,27 @@ static mut MQTT_ACC: [u8; 512] = [0; 512];
 #[cfg(feature = "wifi")]
 pub const CFG_VALUE_MAX: usize = 16;
 
+/// #40 #3: one relay attempt's diagnostic snapshot — gateway-side RX evidence PLUS the leaf's
+/// self-reported OTA state (captured from its `LDBG` beacon during the relay). Published to
+/// retained `smol/<leaf>/ota/relaydiag`. Defined at the `wifi` level (not `ota_mesh`/`mode`,
+/// both espnow-only) so this `run_mqtt_burst` publish path names it in the wifi-only profile too.
+/// `leaf_verdict == 255` ⇒ no `LDBG` captured (old leaf fw / leaf off-air during the relay).
+/// Together they name a `rx>0 otan=0` relay-failed: leaf_heard=0 → OTAM TX not landing on the
+/// leaf; verdict 2-6 → `on_meta` rejected (which gate); verdict=1 & leaf_sent=0 → armed but never
+/// NAK'd (servicing); leaf_sent>0 & otan_valid=0 → leaf NAK'd but the gateway never heard it.
+#[cfg(feature = "wifi")]
+#[derive(Clone, Copy)]
+pub struct RelayDiag {
+    pub leaf_id: u8,
+    pub rx_any: u16,
+    pub otan_valid: u16,
+    pub last_wb: u16,
+    pub total: u16,
+    pub leaf_heard: u16,
+    pub leaf_verdict: u8,
+    pub leaf_sent: u16,
+}
+
 #[cfg(feature = "wifi")]
 const CFG_CACHE_CAP: usize = 16;
 
@@ -965,7 +986,7 @@ fn mqtt_session(
     leaf_diag: &mut Option<(u8, &'static str, bool)>,
     // #3 RELAY RX-DIAG: the last relay's `(leaf_id, rx_any, otan_valid, last_wb, total)`.
     // PUBLISHED to retained `smol/<leaf>/ota/relaydiag` here, consumed after. `&mut None` off-gw.
-    leaf_relay_rx: &mut Option<(u8, u16, u16, u16, u16)>,
+    leaf_relay_rx: &mut Option<RelayDiag>,
     deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
@@ -1457,19 +1478,26 @@ fn mqtt_session(
     // `smol/<leaf>/ota/relaydiag` (headless #3 disambiguation). rx=0 → gateway heard NOTHING
     // from the leaf (leaf offline / OTAD not landing); rx>0 & otan=0 → leaf alive but never
     // NAK'd this session; otan>0 & last_wb<total → chunk-loss stall. Consumed after publish.
-    if let Some((lid, rx_any, otan_valid, last_wb, total)) = *leaf_relay_rx {
+    if let Some(d) = *leaf_relay_rx {
         let mut rtopic = MqttScratch::new();
-        let _ = write!(rtopic, "smol/{}/ota/relaydiag", lid);
+        let _ = write!(rtopic, "smol/{}/ota/relaydiag", d.leaf_id);
         let mut rval = MqttScratch::new();
-        let _ = write!(rval, "rx={} otan={} last_wb={}/{}", rx_any, otan_valid, last_wb, total);
+        // Gateway RX evidence + the leaf's own LDBG self-report. `leaf=none` ⇒ no LDBG captured
+        // (old leaf fw / leaf off-air during the relay); else `H<heard>V<verdict>N<sent>`.
+        let _ = write!(rval, "rx={} otan={} last_wb={}/{} leaf=", d.rx_any, d.otan_valid, d.last_wb, d.total);
+        if d.leaf_verdict == 255 {
+            let _ = write!(rval, "none");
+        } else {
+            let _ = write!(rval, "H{}V{}N{}", d.leaf_heard, d.leaf_verdict, d.leaf_sent);
+        }
         if let Some(n) =
             crate::net::mqtt::encode_publish(&mut pkt, rtopic.as_bytes(), rval.as_bytes(), true)
         {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
         log::info!(
-            "smol #3: published smol/{}/ota/relaydiag = rx={} otan={} last_wb={}/{}",
-            lid, rx_any, otan_valid, last_wb, total
+            "smol #3: relaydiag id{} rx={} otan={} last_wb={}/{} leafV={}",
+            d.leaf_id, d.rx_any, d.otan_valid, d.last_wb, d.total, d.leaf_verdict
         );
         *leaf_relay_rx = None; // consumed — published once
     }
@@ -1835,7 +1863,7 @@ pub fn run_mqtt_burst(
     leaf_diag: &mut Option<(u8, &'static str, bool)>,
     // #3: last relay attempt's RX evidence → published to `smol/<leaf>/ota/relaydiag` (see
     // `mqtt_session`). `&mut None` on boot/leaf bursts.
-    leaf_relay_rx: &mut Option<(u8, u16, u16, u16, u16)>,
+    leaf_relay_rx: &mut Option<RelayDiag>,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);

@@ -1338,7 +1338,8 @@ pub struct RadioManager {
     /// (last_wb/total): rx=0 → gateway heard nothing from the leaf (leaf offline / OTAD not
     /// landing); rx>0,otan=0 → leaf alive but never NAK'd this session; otan>0,last_wb<total →
     /// chunk-loss stall. `last_wb` is in chunk units (matches `total = om::total_chunks`).
-    leaf_relay_rx: Option<(u8, u16, u16, u16, u16)>,
+    /// Carries the leaf's `LDBG` self-report too (captured during the relay) — see `RelayDiag`.
+    leaf_relay_rx: Option<crate::net::wifi::RelayDiag>,
     /// #40: consecutive non-terminal (transient) relay attempts for the current install —
     /// caps the auto-retry so a persistently-failing leaf can't loop the mesh-deaf relay.
     leaf_ota_retries: u8,
@@ -1872,6 +1873,20 @@ impl RadioManager {
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
     }
 
+    /// #40 #3: broadcast this LEAF's OTA RX-diag beacon (`LDBG` = id + heard/verdict/sent) so a
+    /// relaying gateway captures `on_meta`'s verdict LIVE (folded into `…/ota/relaydiag`). `main`
+    /// gates the call on `!is_gateway` + the ~2 s HELLO cadence. Payload is fixed-width binary.
+    /// `espnow`-scoped: the `LDBG` frame + `ota_leaf` self-report only exist in the mesh build.
+    #[cfg(feature = "espnow")]
+    pub fn broadcast_ldbg(&mut self, heard: u16, verdict: u8, sent: u16) {
+        let mut msg = [0u8; crate::ota_mesh::LDBG_FRAME_LEN];
+        let base = encode_id_frame(crate::ota_mesh::LDBG_PREFIX, self.id, &mut msg);
+        msg[base..base + 2].copy_from_slice(&heard.to_le_bytes());
+        msg[base + 2] = verdict;
+        msg[base + 3..base + 5].copy_from_slice(&sent.to_le_bytes());
+        self.send_to(&BROADCAST_ADDRESS, &msg[..base + 5]);
+    }
+
     /// #21 leaf-relay: GATEWAY-only. Broadcast one `SMOLv1 CFG` per CACHED leaf
     /// config (skipping the gateway's OWN id — it self-applies via the credentialed
     /// MQTT path). Single-hop (leaves never re-broadcast → no flood/loop). No-op on a
@@ -2320,10 +2335,14 @@ impl RadioManager {
         let mut otad = [0u8; om::OTAD_FRAME_MAX];
 
         // #3 RX-DIAG counters: rx_any = frames heard FROM this leaf during the relay windows;
-        // otan_valid = valid advancing/NAK OTANs for the live session. Stored into
-        // `leaf_relay_rx` at each terminal exit → published next flush to `…/ota/relaydiag`.
+        // otan_valid = valid advancing/NAK OTANs for the live session. Plus the leaf's own LDBG
+        // self-report (heard/verdict/sent), captured live from its beacon; verdict 255 = none seen.
+        // All stored into `leaf_relay_rx` at each terminal exit → published next flush (relaydiag).
         let mut rx_any: u16 = 0;
         let mut otan_valid: u16 = 0;
+        let mut ldbg_heard: u16 = 0;
+        let mut ldbg_verdict: u8 = 255;
+        let mut ldbg_sent: u16 = 0;
         let mut wb: u32 = 0;
         while wb < total {
             if tick() {
@@ -2337,7 +2356,10 @@ impl RadioManager {
             let read_len = ((window_bytes as u32).div_ceil(4) * 4) as usize;
             if !reader.read(window_off, &mut gwbuf[..read_len]) {
                 log::error!("smol #40: slot readback failed at window {} — aborting", wb);
-                self.leaf_relay_rx = Some((leaf_id, rx_any, otan_valid, wb as u16, total as u16));
+                self.leaf_relay_rx = Some(crate::net::wifi::RelayDiag {
+                    leaf_id, rx_any, otan_valid, last_wb: wb as u16, total: total as u16,
+                    leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
+                });
                 let _ = self.switch(Mode::EspNow);
                 return LeafOtaOutcome::RelayFailed;
             }
@@ -2371,6 +2393,13 @@ impl RadioManager {
                     if let Some(recv) = self.esp_now.receive() {
                         if recv.info.src_address == leaf_mac {
                             rx_any = rx_any.saturating_add(1); // #3: heard SOMETHING from the leaf
+                            // #3: capture the leaf's LDBG self-report (latest wins) — names WHY
+                            // otan=0 without needing the leaf back online post-relay.
+                            if let Some((h, v, n)) = om::parse_ldbg(recv.data(), leaf_id) {
+                                ldbg_heard = h;
+                                ldbg_verdict = v;
+                                ldbg_sent = n;
+                            }
                             if let Some(om::OtaFrame::Nak { origin, session: s, window_base, bitmap }) =
                                 om::parse_ota_frame(recv.data())
                             {
@@ -2402,7 +2431,10 @@ impl RadioManager {
                         "smol #40: window {} exceeded {} retransmit rounds (rx_any={} otan={}) — aborting (R2 bound)",
                         wb, GW_WINDOW_ROUNDS_MAX, rx_any, otan_valid
                     );
-                    self.leaf_relay_rx = Some((leaf_id, rx_any, otan_valid, wb as u16, total as u16));
+                    self.leaf_relay_rx = Some(crate::net::wifi::RelayDiag {
+                    leaf_id, rx_any, otan_valid, last_wb: wb as u16, total: total as u16,
+                    leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
+                });
                     return LeafOtaOutcome::RelayFailed;
                 }
             }
@@ -2410,7 +2442,10 @@ impl RadioManager {
         // #3 RX-DIAG: relay TX phase COMPLETE — all chunks delivered + acked (wb==total). Record
         // the full-progress RX evidence for the relaydiag; the confirm outcome (below) is the
         // separate Tier-2 verdict published to `…/ota/diag`.
-        self.leaf_relay_rx = Some((leaf_id, rx_any, otan_valid, total as u16, total as u16));
+        self.leaf_relay_rx = Some(crate::net::wifi::RelayDiag {
+            leaf_id, rx_any, otan_valid, last_wb: total as u16, total: total as u16,
+            leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
+        });
 
         // --- CONFIRMING (Tier-2, build-matched): sample the leaf's SETTLED build over the
         // full confirm window. The leaf runs the NEW image immediately post-activate, so it
@@ -3082,6 +3117,14 @@ impl RadioManager {
             Some((cid, mac)) if cid == id => Some(mac), // roster evicted it → use the cache
             _ => None,
         }
+    }
+
+    /// #40 #3: the leaf's OTA RX-diag `(otam_heard, on_meta_verdict, otan_sent)` — `main`
+    /// beacons it via `broadcast_ldbg` so a headless canary names (a)/(b)/(c) for a `relay-failed`.
+    /// `espnow`-scoped: `ota_leaf` (the receive session) only exists in the mesh build.
+    #[cfg(feature = "espnow")]
+    pub fn ota_leaf_dbg(&self) -> (u16, u8, u16) {
+        self.ota_leaf.dbg()
     }
 
     /// Current peer-link state as an [`LedState`], evaluated at `now_ms`.

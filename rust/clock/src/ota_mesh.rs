@@ -57,6 +57,28 @@ pub const OTAN_BITMAP_BYTES: usize = WINDOW_CHUNKS / 8;
 pub const OTAM_PREFIX: &[u8] = b"SMOLv1 OTAM "; // gateway→leaf: signed manifest / announce
 pub const OTAD_PREFIX: &[u8] = b"SMOLv1 OTAD "; // gateway→leaf: one image chunk
 pub const OTAN_PREFIX: &[u8] = b"SMOLv1 OTAN "; // leaf→gateway (UNICAST): windowed NAK
+/// #40 #3: leaf→(broadcast) OTA RX-diag beacon: `LDBG ` + id[3] + heard[2 LE] + verdict[1] +
+/// sent[2 LE]. Broadcast on the HELLO cadence so the gateway's relay RX loop CAPTURES it while
+/// the leaf is provably online (rx>0), naming WHY a `relay-failed` had `otan=0` (see `RelayDiag`).
+pub const LDBG_PREFIX: &[u8] = b"SMOLv1 LDBG "; // leaf→broadcast: OTA receive-side self-report
+/// `LDBG` payload: id[3 ASCII] + otam_heard[2 LE] + verdict[1] + otan_sent[2 LE].
+pub const LDBG_FRAME_LEN: usize = 12 + 3 + 2 + 1 + 2;
+
+/// Parse a leaf `LDBG` beacon → `(otam_heard, verdict, otan_sent)` iff it is well-formed AND
+/// addressed-from `want_id` (the 3-ASCII id field). `None` otherwise.
+pub fn parse_ldbg(data: &[u8], want_id: u8) -> Option<(u16, u8, u16)> {
+    let rest = data.strip_prefix(LDBG_PREFIX)?;
+    if rest.len() < 3 + 2 + 1 + 2 {
+        return None;
+    }
+    if parse_id3(&rest[0..3])? != want_id {
+        return None;
+    }
+    let heard = u16::from_le_bytes([rest[3], rest[4]]);
+    let verdict = rest[5];
+    let sent = u16::from_le_bytes([rest[6], rest[7]]);
+    Some((heard, verdict, sent))
+}
 
 /// Max `OTAM` frame: 12 + 3 + 2 + 1 + `SIGNED_MSG_MAX` (M) + 64 (sig).
 pub const OTAM_FRAME_MAX: usize = 12 + 3 + 2 + 1 + ota::SIGNED_MSG_MAX + 64;
@@ -380,6 +402,15 @@ pub struct OtaLeafSession {
     last_new_chunk_ms: u64,
     last_nak_ms: u64,
     writer: Option<crate::ota::LeafImageWriter>,
+    /// #40 #3 LEAF RX-DIAG (instrumentation): lifetime counters surfaced via the leaf's `LDBG`
+    /// beacon (captured by a relaying gateway → `smol/<leaf>/ota/relaydiag`) so a headless
+    /// `relay-failed` (gateway `rx>0 otan=0`) names WHY the leaf never NAK'd:
+    /// `dbg_otam_heard` = OTAMs addressed to us that reached `on_meta`; `dbg_verdict` = the last
+    /// `on_meta` outcome (0 never-heard, 1 armed, 2 sig-fail, 3 build≤running, 4 ≤fresh_floor,
+    /// 5 size, 6 writer-open-fail, 7 dedup/live); `dbg_otan_sent` = OTANs this leaf emitted.
+    dbg_otam_heard: u16,
+    dbg_verdict: u8,
+    dbg_otan_sent: u16,
 }
 
 impl OtaLeafSession {
@@ -398,7 +429,17 @@ impl OtaLeafSession {
             last_new_chunk_ms: 0,
             last_nak_ms: 0,
             writer: None,
+            dbg_otam_heard: 0,
+            dbg_verdict: 0,
+            dbg_otan_sent: 0,
         }
+    }
+
+    /// #40 #3: lifetime leaf RX-diag `(otam_heard, last_on_meta_verdict, otan_sent)` — the leaf
+    /// beacons this via `LDBG` so a headless canary can name (a) never-heard-OTAM /
+    /// (b) on_meta-rejected / (c) armed-but-never-NAK'd, splitting the gateway's `rx>0 otan=0`.
+    pub fn dbg(&self) -> (u16, u8, u16) {
+        (self.dbg_otam_heard, self.dbg_verdict, self.dbg_otan_sent)
     }
 
     /// The gateway MAC this session locked onto (unicast target for NAKs). Zero if idle.
@@ -431,12 +472,15 @@ impl OtaLeafSession {
         if target != my_id {
             return LeafAction::None; // not for us
         }
+        self.dbg_otam_heard = self.dbg_otam_heard.saturating_add(1); // #3: an OTAM reached us
         if self.active && self.session_id == session {
+            self.dbg_verdict = 7; // #3: dedup — already armed & live for this session
             return LeafAction::None; // periodic OTAM re-send for the live session — dedupe
         }
         // (1) AUTHENTICITY — the SOLE root of trust on the unauth mesh. Fail-closed.
         if !crate::ota::verify_signature(m, sig) {
             log::warn!("smol #40: OTAM sig FAILED — ignored (no state, no flash)");
+            self.dbg_verdict = 2; // #3: signature verify failed
             return LeafAction::None;
         }
         // (2) Only now is M trustworthy → parse build/size/sha.
@@ -446,23 +490,28 @@ impl OtaLeafSession {
         // (3) FRESHNESS + size gate (design §3C). Monotonicity ∧ floor ∧ slot bound.
         if build <= crate::ota::BUILD_NUMBER {
             log::info!("smol #40: OTAM build {} <= running {} — rejected", build, crate::ota::BUILD_NUMBER);
+            self.dbg_verdict = 3; // #3: build not fresh (<= running)
             return LeafAction::None;
         }
         let floor = crate::ota::fresh_floor_get();
         if build <= floor {
             log::info!("smol #40: OTAM build {} <= fresh_floor {} — replay rejected", build, floor);
+            self.dbg_verdict = 4; // #3: build <= fresh_floor (replay)
             return LeafAction::None;
         }
         if size == 0 || size > crate::ota::MAX_IMAGE_SIZE {
             log::info!("smol #40: OTAM size {} out of range — rejected", size);
+            self.dbg_verdict = 5; // #3: size out of range
             return LeafAction::None;
         }
         // (4) Open the inactive-slot writer. If a prior session was live, its writer is
         // dropped here (otadata untouched — it was never activated).
         let Some(writer) = crate::ota::LeafImageWriter::begin() else {
             log::error!("smol #40: cannot open inactive slot — OTAM ignored");
+            self.dbg_verdict = 6; // #3: inactive-slot writer open failed
             return LeafAction::None;
         };
+        self.dbg_verdict = 1; // #3: ARMED — session accepted (confirm via hear-a-frame)
         self.active = true;
         self.session_id = session;
         self.build = build;
@@ -541,6 +590,7 @@ impl OtaLeafSession {
             let acked_base = (seq / WINDOW_CHUNKS as u32) * WINDOW_CHUNKS as u32;
             let zero = [0u8; OTAN_BITMAP_BYTES];
             let n = encode_otan(my_id, self.session_id, acked_base as u16, &zero, out);
+            self.dbg_otan_sent = self.dbg_otan_sent.saturating_add(1); // #3: OTAN emitted
             return LeafAction::Nak(n);
         }
         if seq >= wb + WINDOW_CHUNKS as u32 {
@@ -586,6 +636,7 @@ impl OtaLeafSession {
             // More windows: ack this one (all-zero NAK) so the gateway sends the next.
             let zero = [0u8; OTAN_BITMAP_BYTES];
             let n = encode_otan(my_id, self.session_id, wb as u16, &zero, out);
+            self.dbg_otan_sent = self.dbg_otan_sent.saturating_add(1); // #3: OTAN emitted
             return LeafAction::Nak(n);
         }
 
@@ -634,6 +685,7 @@ impl OtaLeafSession {
         }
         self.last_nak_ms = now;
         let n = encode_otan(my_id, self.session_id, wb as u16, &missing.to_le_bytes(), out);
+        self.dbg_otan_sent = self.dbg_otan_sent.saturating_add(1); // #3: OTAN emitted
         LeafAction::Nak(n)
     }
 }

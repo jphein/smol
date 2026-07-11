@@ -670,6 +670,15 @@ fn main() -> ! {
             // 2000 ms / SUBTICK_MS aligned via the monotonic clock.
             if (now / 2000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 2000) {
                 r.broadcast_hello();
+                // #40 #3: leaf-only OTA RX-diag beacon on the HELLO cadence, so a relaying
+                // gateway captures the leaf's `on_meta` verdict / OTAM-heard / OTAN-sent counts
+                // LIVE (folded into `smol/<leaf>/ota/relaydiag`) — names WHY a relay had otan=0.
+                // espnow-only: the LDBG frame + leaf receive-session self-report are mesh-build.
+                #[cfg(feature = "espnow")]
+                if !r.is_gateway() {
+                    let (dh, dv, dn) = r.ota_leaf_dbg();
+                    r.broadcast_ldbg(dh, dv, dn);
+                }
                 // Advertise our current Unix time + the sync it descends from on
                 // the SAME tick, so a peer with an older sync can adopt ours.
                 // (A separate frame from HELLO — the LED handshake wire format is
