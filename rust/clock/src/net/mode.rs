@@ -2913,15 +2913,25 @@ impl RadioManager {
                     // SENDER leaf id; the MQTT flush republishes it as retained
                     // `smol/<leaf_id>/status`. Opaque bytes (mirror CFG) — a stray/foreign
                     // frame can at worst set a bad screen string, self-corrected next
-                    // cadence; never a brick. NOTE: `src` stays the frame's SOURCE MAC for
-                    // the roster liveness update (mirrors the BATT/GRID/CFG arms); the
-                    // leaf's id↔MAC mapping is already learned from its 2 s HELLOs, so the
-                    // `None` id here is correct + side-effect-free.
+                    // cadence; never a brick.
+                    //
+                    // #40 FIX (was `None`): LEARN the leaf's id↔MAC from its STAT. The STAT
+                    // frame CARRIES the sender's id (`leaf_id`), and the relay-eligible set is
+                    // exactly "leaves the gateway heard STAT from" (stat_cache / §B2). The old
+                    // `None` assumed the id↔MAC was already learned from the leaf's 2 s HELLOs
+                    // — but a leaf can be STAT-audible yet HELLO-silent to the gateway (e.g.
+                    // #51 silent-until-relock, or its HELLO simply not landing), leaving
+                    // `id_known=false` → `mac_for_id(leaf)` returned None → the relay armed but
+                    // bailed at the MAC lookup with no fetch (RUNTIME-confirmed via ota/diag=
+                    // mac-unknown). Recording `Some(leaf_id)` here makes the relay-set and the
+                    // MAC lookup consistent. Threat model unchanged: id↔MAC from an unauth STAT
+                    // is no weaker than from an unauth HELLO (both already trusted), and the
+                    // relayed image is ed25519-signed so a spoofed id→MAC only wastes a session.
                     if self.relay.is_gateway {
                         self.stat_cache.set(leaf_id, value);
                     }
                     self.peers.last_hello_ms = now;
-                    self.roster.heard(src, None, rssi, now);
+                    self.roster.heard(src, Some(leaf_id), rssi, now);
                     label = Some(alloc::string::String::from("stat"));
                 }
                 None => {
