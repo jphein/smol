@@ -1369,19 +1369,13 @@ fn mqtt_session(
                         // #40 (§B3): a wildcard-delivered leaf OTA install command. On a
                         // GATEWAY flush (cfg_cache = Some), an `INSTALL` for a leaf id ≠ self
                         // arms a mesh-OTA relay to that leaf (paired with `raw_staged` after
-                        // the drain). PANIC-FREE exact byte compare (untrusted retained). The
-                        // retained cmd is CLEARED (empty retained publish) so an HA reload
-                        // can't replay it — the exact closure as the self-OTA `cmd_topic`.
+                        // the drain). PANIC-FREE exact byte compare (untrusted retained). NOTE:
+                        // the retained cmd is CLEARED only AFTER a successful pair (below), NOT
+                        // here — else an install drained in a session with no staged image
+                        // (a drain-timing miss) would be consumed+lost without ever arming.
                         if leaf_id != node_id && cfg_cache.is_some() && payload == b"INSTALL" {
                             pending_leaf = Some(leaf_id);
                             log::info!("smol #40: leaf id{} OTA install command received", leaf_id);
-                            let mut itopic = MqttScratch::new();
-                            let _ = write!(itopic, "smol/{}/ota/install", leaf_id);
-                            if let Some(n) =
-                                crate::net::mqtt::encode_publish(&mut pkt, itopic.as_bytes(), b"", true)
-                            {
-                                let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
-                            }
                         }
                     }
                     consumed
@@ -1409,10 +1403,31 @@ fn mqtt_session(
     }
 
     // #40: pair a pending leaf install with the staged image (both retained → both drained
-    // above). The caller relays it over ESP-NOW. A leaf install with NO staged image → no-op
-    // (nothing to relay). `Announce` is `Copy`, so the pair moves out cleanly.
-    if let (Some(leaf_id), Some(ann)) = (pending_leaf, raw_staged) {
-        *leaf_ota = Some((leaf_id, ann));
+    // above). The caller relays it over ESP-NOW. `Announce` is `Copy`, so the pair moves out.
+    // The retained install is CLEARED only on a SUCCESSFUL pair (so an HA reload can't
+    // replay it, twin of the self-OTA close) — an install with NO staged image is LEFT
+    // retained so the NEXT flush (once staged is drained) can still arm it, instead of
+    // silently consuming+losing it. The pairing result is logged either way (diagnostic).
+    match (pending_leaf, raw_staged) {
+        (Some(leaf_id), Some(ann)) => {
+            *leaf_ota = Some((leaf_id, ann));
+            log::info!(
+                "smol #40: ARMED relay for leaf id{} (staged build {}) — clearing install cmd",
+                leaf_id, ann.build
+            );
+            let mut itopic = MqttScratch::new();
+            let _ = write!(itopic, "smol/{}/ota/install", leaf_id);
+            if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, itopic.as_bytes(), b"", true) {
+                let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            }
+        }
+        (Some(leaf_id), None) => {
+            log::warn!(
+                "smol #40: leaf id{} install pending but NO staged image drained this session — leaving retained for the next flush to arm",
+                leaf_id
+            );
+        }
+        _ => {}
     }
 
     // --- #23 single-gateway ELECTION with RUNTIME re-decision + stale-owner takeover ---
