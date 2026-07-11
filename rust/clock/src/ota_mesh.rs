@@ -254,6 +254,15 @@ pub fn total_chunks(size: u32) -> u32 {
     (size / CHUNK_PAYLOAD as u32).saturating_add((size % CHUNK_PAYLOAD as u32 != 0) as u32)
 }
 
+/// #40 §C#3: parse the running build# from a `SMOLv1 STAT` value `"<screen>:<page>|<build>"`
+/// (the last `|`-field). Used by the gateway's Tier-2 confirm — "reappeared AT THE NEW
+/// BUILD", never bare presence (so a rolled-back leaf HELLOing at the OLD build doesn't
+/// false-confirm). `None` on an old screen-only value / non-numeric build (backward-safe).
+pub fn stat_build(value: &[u8]) -> Option<u32> {
+    let s = core::str::from_utf8(value).ok()?;
+    s.rsplit('|').next()?.parse().ok()
+}
+
 // ===========================================================================
 // Leaf receive session (the brick-critical path).
 //

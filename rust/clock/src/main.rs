@@ -717,7 +717,11 @@ fn main() -> ! {
                 && (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000)
             {
                 let (live_kind, live_page) = app.live_screen();
-                let val = alloc::format!("{}:{}", live_kind.as_wire(), live_page);
+                // #40 §C#3: append the running build# as a 2nd '|'-field → the gateway's
+                // Tier-2 confirm ("STAT.build == pushed build") + HA installed_version read
+                // from ONE frame. Additive: `<screen>:<page>` stays split('|')[0], so the
+                // #50 screen template is unaffected.
+                let val = alloc::format!("{}:{}|{}", live_kind.as_wire(), live_page, ota::BUILD_NUMBER);
                 r.broadcast_stat(val.as_bytes());
             }
 
@@ -773,7 +777,10 @@ fn main() -> ! {
                     // config, the stopgap JP rejected). Published retained as
                     // `smol/<id>/status` for the HA live-screen readback.
                     let (live_kind, live_page) = app.live_screen();
-                    let stat = alloc::format!("STAT|{}:{}", live_kind.as_wire(), live_page);
+                    // #40 §C#3: append the running build# (2nd '|'-field) so a GATEWAY's own
+                    // `smol/<id>/status` also carries build → uniform installed_version across
+                    // self + relayed leaves. Additive (screen stays split('|')[0]).
+                    let stat = alloc::format!("STAT|{}:{}|{}", live_kind.as_wire(), live_page, ota::BUILD_NUMBER);
                     // #20 (1b RESPONSIVE): the tick keeps the UI alive during the
                     // burst — LED blink + throttled "Syncing…" spinner + a LATCHING
                     // long-press ABORT. Abort returns the burst's fail value (queue
