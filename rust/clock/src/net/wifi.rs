@@ -584,6 +584,7 @@ pub fn run_ntp_burst(
         None, // #50b: boot burst republishes no cached leaf status
         &mut None, // #40: boot burst never relays a leaf OTA
         &mut None, // #40: boot burst has no persistent staged to carry
+        &mut None, // #40: boot burst has no relay diag to publish
         mqtt_deadline,
         tick,
     );
@@ -956,6 +957,11 @@ fn mqtt_session(
     // install (the race that left the install consumed but the relay never armed). `&mut None`
     // on boot/leaf bursts (no persistence needed).
     staged_raw: &mut Option<crate::ota::Announce>,
+    // #40 headless diag + clear/retry: the last relay attempt's `(leaf_id, phase, clear)`.
+    // PUBLISHED to `smol/<leaf>/ota/diag` here, and drives the retained-install clear (on a
+    // terminal/exhausted phase) vs retry (transient). Consumed (set None) after publish.
+    // `&mut None` off-gateway.
+    leaf_diag: &mut Option<(u8, &'static str, bool)>,
     deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
@@ -1410,28 +1416,47 @@ fn mqtt_session(
         }
     }
 
-    // #40: pair a pending leaf install with the staged image (both retained → both drained
-    // above). The caller relays it over ESP-NOW. `Announce` is `Copy`, so the pair moves out.
-    // The retained install is CLEARED only on a SUCCESSFUL pair (so an HA reload can't
-    // replay it, twin of the self-OTA close) — an install with NO staged image is LEFT
-    // retained so the NEXT flush (once staged is drained) can still arm it, instead of
-    // silently consuming+losing it. The pairing result is logged either way (diagnostic).
-    match (pending_leaf, *staged_raw) {
-        (Some(leaf_id), Some(ann)) => {
-            *leaf_ota = Some((leaf_id, ann));
-            log::info!(
-                "smol #40: ARMED relay for leaf id{} (staged build {}) — clearing install cmd",
-                leaf_id, ann.build
-            );
+    // #40 DIAG + clear/retry (from the PRIOR attempt, recorded by `main` after the relay):
+    // publish the phase to retained `smol/<leaf>/ota/diag` (headless observability — the
+    // mesh-only leaf has no serial), then either CLEAR the retained install (terminal phase
+    // = the leaf installed/rolled-back, or the transient-retry cap was hit) or LEAVE it
+    // retained to retry. On a clear, also null `pending_leaf` for THIS flush so we don't
+    // re-arm a just-finished leaf. Runs BEFORE the arm below. Consumed after publish.
+    if let Some((lid, phase, clear)) = *leaf_diag {
+        let mut dtopic = MqttScratch::new();
+        let _ = write!(dtopic, "smol/{}/ota/diag", lid);
+        if let Some(n) =
+            crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), phase.as_bytes(), true)
+        {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        log::info!("smol #40: published smol/{}/ota/diag = {} (clear={})", lid, phase, clear);
+        if clear {
             let mut itopic = MqttScratch::new();
-            let _ = write!(itopic, "smol/{}/ota/install", leaf_id);
+            let _ = write!(itopic, "smol/{}/ota/install", lid);
             if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, itopic.as_bytes(), b"", true) {
                 let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
             }
+            if pending_leaf == Some(lid) {
+                pending_leaf = None; // don't re-arm a leaf we just consumed
+            }
+        }
+        *leaf_diag = None; // consumed — published once
+    }
+
+    // #40: ARM a pending leaf install by pairing it with the (persisted) staged image. Does
+    // NOT clear the install here — the clear is OUTCOME-driven (the diag block above, once
+    // `main` reports the relay result), so a mac-unknown / fetch-fail / relay-fail LEAVES the
+    // install retained → the next flush retries (bounded by LEAF_OTA_MAX_RETRIES). `Announce`
+    // is `Copy`, so the pair moves out cleanly.
+    match (pending_leaf, *staged_raw) {
+        (Some(leaf_id), Some(ann)) => {
+            *leaf_ota = Some((leaf_id, ann));
+            log::info!("smol #40: ARMED relay for leaf id{} (staged build {})", leaf_id, ann.build);
         }
         (Some(leaf_id), None) => {
             log::warn!(
-                "smol #40: leaf id{} install pending but NO staged image drained this session — leaving retained for the next flush to arm",
+                "smol #40: leaf id{} install pending but NO staged image known yet — leaving retained for the next flush to arm",
                 leaf_id
             );
         }
@@ -1743,6 +1768,9 @@ pub fn run_mqtt_burst(
     // #40: caller-persisted last raw staged announce (see `mqtt_session`). `&mut None` on
     // boot/leaf bursts.
     staged_raw: &mut Option<crate::ota::Announce>,
+    // #40: last relay attempt's `(leaf_id, phase, clear)` → published to `smol/<leaf>/ota/diag`
+    // (see `mqtt_session`). `&mut None` on boot/leaf bursts.
+    leaf_diag: &mut Option<(u8, &'static str, bool)>,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
@@ -1893,6 +1921,7 @@ pub fn run_mqtt_burst(
         stat_cache, // #50b: forward the gateway's cached leaf statuses (or None)
         leaf_ota, // #40: forward the leaf-OTA install pairing (or &mut None)
         staged_raw, // #40: forward the persistent staged announce (or &mut None)
+        leaf_diag, // #40: forward the diag/clear state (or &mut None)
         deadline,
         tick,
     )

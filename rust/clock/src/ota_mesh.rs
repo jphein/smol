@@ -300,19 +300,48 @@ const LEAF_PROGRESS_STALL_MS: u64 = 30_000;
 /// Hard total-session cap (ms) — a runaway transfer aborts → good slot boots (R1: USB).
 const LEAF_SESSION_MAX_MS: u64 = 600_000;
 
-/// Outcome of a GATEWAY → leaf relay+confirm session — drives `smol/<leaf>/ota/state`.
+/// Outcome/phase of a GATEWAY → leaf relay attempt — published to `smol/<leaf>/ota/diag`
+/// (headless observability: the mesh-only leaf gives no serial, so the gateway reports the
+/// terminal phase over MQTT on its next burst). Also drives the install clear/retry policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeafOtaOutcome {
     /// Leaf reappeared at the NEW build (Tier-2 build-matched) — the update stuck.
     Confirmed,
     /// Leaf reappeared at an OLDER build — its self-test failed → app-side rollback (HA re-offers).
     RolledBack,
-    /// The gateway couldn't fetch/stage/relay (never reached the leaf's verify).
+    /// The gateway could not FETCH/stage the image (WiFi/HTTP/verify) — never relayed.
+    FetchFailed,
+    /// The ESP-NOW relay loop exhausted its retransmit rounds (leaf not NAKing) — never confirmed.
     RelayFailed,
     /// No STAT reappearance within the confirm window — possible brick (USB recovery).
     Timeout,
+    /// The armed install's target leaf MAC isn't in the roster yet (never heard its HELLO).
+    MacUnknown,
     /// Operator aborted (long-press) mid-session.
     Aborted,
+}
+
+impl LeafOtaOutcome {
+    /// Short retained-payload phase string for `smol/<leaf>/ota/diag`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LeafOtaOutcome::Confirmed => "confirmed",
+            LeafOtaOutcome::RolledBack => "rolled-back",
+            LeafOtaOutcome::FetchFailed => "fetch-failed",
+            LeafOtaOutcome::RelayFailed => "relay-failed",
+            LeafOtaOutcome::Timeout => "leaf-timeout",
+            LeafOtaOutcome::MacUnknown => "mac-unknown",
+            LeafOtaOutcome::Aborted => "aborted",
+        }
+    }
+
+    /// Terminal ⇒ the leaf DEFINITIVELY acted on the image (installed the new build, or
+    /// self-tested + rolled back) → clear the install, don't auto-retry. The rest are
+    /// transient (no fetch / no relay / MAC not yet learned) → leave the install retained to
+    /// retry, bounded by a cap.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, LeafOtaOutcome::Confirmed | LeafOtaOutcome::RolledBack)
+    }
 }
 
 /// What `service()` must do after handing a frame / a tick to the leaf session.

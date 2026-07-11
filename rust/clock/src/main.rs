@@ -829,10 +829,15 @@ fn main() -> ! {
                                 }
                                 relay_abort
                             });
-                            log::info!("smol #40: leaf id{} OTA relay outcome = {:?}", leaf_id, outcome);
+                            // #40: record the phase → published to smol/<leaf>/ota/diag on the
+                            // next burst + drives the install clear/retry policy.
+                            r.record_leaf_ota(leaf_id, outcome);
                             redraw = true;
                         } else {
-                            log::warn!("smol #40: leaf id{} install requested but its MAC isn't known yet — skipped (retry after it HELLOs)", leaf_id);
+                            // MAC not learned yet (no HELLO heard) → record MacUnknown; the
+                            // install is LEFT retained (not cleared) → retried on a later flush
+                            // once the leaf HELLOs. Diag published so it's visible headless.
+                            r.record_leaf_ota(leaf_id, crate::ota_mesh::LeafOtaOutcome::MacUnknown);
                         }
                     }
                     // Coexist soak (#23 PART 1): the during-window RX loss — how many

@@ -188,6 +188,10 @@ const GW_WINDOW_ROUNDS_MAX: u32 = 16;
 /// WINDOW_MS` ≈ 60 s) + a STAT cadence (~10 s) so a late self-test rollback is observed
 /// before the gateway declares Confirmed.
 const GW_CONFIRM_TIMEOUT_MS: u64 = 120_000;
+/// #40: max consecutive TRANSIENT (mac-unknown / fetch / relay / timeout) relay attempts
+/// for one retained install before the gateway gives up + clears it — bounds the auto-retry
+/// so a persistently-failing leaf can't loop the (mesh-deaf) relay every flush forever.
+const LEAF_OTA_MAX_RETRIES: u8 = 3;
 /// One-window relay readback buffer (off the stack, in `.bss`). Alias-safe: a gateway
 /// relays to ONE leaf at a time (serial canary), and never runs a leaf receive session.
 static mut GW_OTA_WINDOW: [u8; crate::ota_mesh::WINDOW_BYTES] =
@@ -1310,6 +1314,16 @@ pub struct RadioManager {
     /// relay never armed" race (the staged and install are separate retained topics with
     /// independent drain timing). Persists the current staged image for every leaf relay.
     staged_raw: Option<crate::ota::Announce>,
+    /// #40 headless observability + clear/retry: the LAST leaf-OTA attempt's `(leaf_id,
+    /// phase, clear_install)`, set by `main` after `run_leaf_ota_relay`, PUBLISHED to
+    /// `smol/<leaf>/ota/diag` on the gateway's next burst and used to drive the install
+    /// clear (terminal/exhausted) vs retry (transient). `None` when nothing is pending.
+    /// The phase is stored as the rendered `&'static str` (not the espnow-only enum) so the
+    /// shared `wifi::mqtt_session` signature stays buildable in the wifi-only profile.
+    leaf_ota_diag: Option<(u8, &'static str, bool)>,
+    /// #40: consecutive non-terminal (transient) relay attempts for the current install —
+    /// caps the auto-retry so a persistently-failing leaf can't loop the mesh-deaf relay.
+    leaf_ota_retries: u8,
     /// #21 node-manager: the parsed default-screen command surfaced by a burst,
     /// pending `main`'s `take_config_offer` → apply. `None` when nothing is pending.
     config_offer: Option<crate::app::DefaultScreen>,
@@ -1388,6 +1402,8 @@ impl RadioManager {
             last_reelect_ms: 0,
             ota_offer: None,
             staged_raw: None,
+            leaf_ota_diag: None,
+            leaf_ota_retries: 0,
             config_offer: None,
             install_requested: false,
             silent_until_relock: false,
@@ -1505,6 +1521,7 @@ impl RadioManager {
                     None, // #50b: recovery burst republishes no cached leaf status
                     &mut None, // #40: a leaf's recovery burst never relays a leaf OTA
                     &mut None, // #40: recovery burst carries no persistent staged
+                    &mut None, // #40: recovery burst publishes no relay diag
                     tick,
                 )
             }
@@ -2154,6 +2171,30 @@ impl RadioManager {
         }
     }
 
+    /// #40: record a leaf-OTA attempt's outcome (called by `main` after `run_leaf_ota_relay`,
+    /// or with `MacUnknown` when the MAC wasn't in the roster). Decides whether to CLEAR the
+    /// retained install (terminal — the leaf installed or rolled back — or the transient-retry
+    /// cap is hit) vs LEAVE it retained to retry (mac-unknown / fetch / relay / timeout). The
+    /// phase is published to `smol/<leaf>/ota/diag` on the next burst (headless observability).
+    pub fn record_leaf_ota(&mut self, leaf_id: u8, outcome: crate::ota_mesh::LeafOtaOutcome) {
+        let clear = if outcome.is_terminal() {
+            self.leaf_ota_retries = 0;
+            true
+        } else {
+            self.leaf_ota_retries = self.leaf_ota_retries.saturating_add(1);
+            let exhausted = self.leaf_ota_retries >= LEAF_OTA_MAX_RETRIES;
+            if exhausted {
+                self.leaf_ota_retries = 0;
+            }
+            exhausted
+        };
+        log::info!(
+            "smol #40: leaf id{} OTA phase={} (clear_install={}, retries={})",
+            leaf_id, outcome.as_str(), clear, self.leaf_ota_retries
+        );
+        self.leaf_ota_diag = Some((leaf_id, outcome.as_str(), clear));
+    }
+
     /// #40 GATEWAY leaf-mesh-OTA orchestration (§B4). Fetch the staged image (WiFi) into
     /// THIS gateway's inactive slot → relay it over ESP-NOW to ONE leaf (windowed-NAK) →
     /// watch for the leaf's Tier-2 STAT reappearance at the NEW build. CANARY-ONE-LEAF:
@@ -2196,13 +2237,14 @@ impl RadioManager {
         };
         let staged = if fetched { staged } else { None };
         let Some(slot) = staged else {
-            log::error!("smol #40: relay fetch/stage failed — aborting (leaf untouched)");
+            log::error!("smol #40: relay FETCH/stage failed — aborting (leaf untouched)");
             let _ = self.switch(Mode::EspNow);
-            return LeafOtaOutcome::RelayFailed;
+            return LeafOtaOutcome::FetchFailed;
         };
         let Some(reader) = crate::ota::SlotReader::open(slot) else {
+            log::error!("smol #40: relay slot-open failed — aborting");
             let _ = self.switch(Mode::EspNow);
-            return LeafOtaOutcome::RelayFailed;
+            return LeafOtaOutcome::FetchFailed;
         };
 
         // --- RELAY (ESP-NOW) — windowed-NAK to the ONE leaf MAC. ---
@@ -2456,6 +2498,7 @@ impl RadioManager {
                     Some(&self.stat_cache), // #50b: gateway republishes cached leaf statuses
                     leaf_ota, // #40: surface a pending leaf-OTA install for main to relay
                     &mut self.staged_raw, // #40: persist the staged across flushes (pair-safe)
+                    &mut self.leaf_ota_diag, // #40: publish smol/<leaf>/ota/diag + clear/retry
                     tick,
                 )
             }
