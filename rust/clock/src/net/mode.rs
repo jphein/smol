@@ -2325,6 +2325,21 @@ impl RadioManager {
                 encrypt: false,
             });
         }
+        // #3b: DEFENSIVE — (re)add the broadcast peer in the relay ESP-NOW context. Normal HELLOs
+        // egress without an explicit broadcast peer, but this send follows a WiFi fetch
+        // (WifiSta→switch(EspNow)) which may have perturbed the peer table / TX state; a missing
+        // broadcast peer makes `esp_now_send(ff:ff:…)` return NOT_FOUND → the OTAM never egresses
+        // (candidate cause of leaf H0 with the gateway on-channel). The `otam_tx/otam_ok` diag
+        // below proves whether the send now succeeds.
+        if !self.esp_now.peer_exists(&BROADCAST_ADDRESS) {
+            let _ = self.esp_now.add_peer(PeerInfo {
+                interface: EspNowWifiInterface::Sta,
+                peer_address: BROADCAST_ADDRESS,
+                lmk: None,
+                channel: None,
+                encrypt: false,
+            });
+        }
         let gwbuf = unsafe { &mut *core::ptr::addr_of_mut!(GW_OTA_WINDOW) };
         let mut otam = [0u8; om::OTAM_FRAME_MAX];
         let Some(otam_len) =
@@ -2343,6 +2358,9 @@ impl RadioManager {
         let mut ldbg_heard: u16 = 0;
         let mut ldbg_verdict: u8 = 255;
         let mut ldbg_sent: u16 = 0;
+        // #3b OTAM TX-diag: broadcast sends attempted vs returned-Ok (queued + TX-callback ok).
+        let mut otam_tx: u16 = 0;
+        let mut otam_ok: u16 = 0;
         let mut wb: u32 = 0;
         while wb < total {
             if tick() {
@@ -2359,6 +2377,7 @@ impl RadioManager {
                 self.leaf_relay_rx = Some(crate::net::wifi::RelayDiag {
                     leaf_id, rx_any, otan_valid, last_wb: wb as u16, total: total as u16,
                     leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
+                    otam_tx, otam_ok,
                 });
                 let _ = self.switch(Mode::EspNow);
                 return LeafOtaOutcome::RelayFailed;
@@ -2383,7 +2402,13 @@ impl RadioManager {
                 // the image (OTAD) stays unicast — "no broadcast image push" preserved. The
                 // `target` id in the frame keeps canary-one-leaf semantics (only leaf_id arms).
                 if wb == 0 {
-                    self.send_to(&BROADCAST_ADDRESS, &otam[..otam_len]);
+                    // #3b: capture the send Result (send_to swallows it) to prove egress.
+                    otam_tx = otam_tx.saturating_add(1);
+                    if let Ok(waiter) = self.esp_now.send(&BROADCAST_ADDRESS, &otam[..otam_len]) {
+                        if waiter.wait().is_ok() {
+                            otam_ok = otam_ok.saturating_add(1);
+                        }
+                    }
                 }
                 for i in 0..wlen_chunks as usize {
                     if (missing >> i) & 1 == 1 {
@@ -2445,6 +2470,7 @@ impl RadioManager {
                     self.leaf_relay_rx = Some(crate::net::wifi::RelayDiag {
                     leaf_id, rx_any, otan_valid, last_wb: wb as u16, total: total as u16,
                     leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
+                    otam_tx, otam_ok,
                 });
                     return LeafOtaOutcome::RelayFailed;
                 }
@@ -2456,6 +2482,7 @@ impl RadioManager {
         self.leaf_relay_rx = Some(crate::net::wifi::RelayDiag {
             leaf_id, rx_any, otan_valid, last_wb: total as u16, total: total as u16,
             leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
+            otam_tx, otam_ok,
         });
 
         // --- CONFIRMING (Tier-2, build-matched): sample the leaf's SETTLED build over the

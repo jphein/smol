@@ -793,6 +793,12 @@ pub struct RelayDiag {
     pub leaf_heard: u16,
     pub leaf_verdict: u8,
     pub leaf_sent: u16,
+    /// #3b TX-diag: OTAM broadcast sends ATTEMPTED / that returned Ok (queued + TX-callback ok).
+    /// `otam_ok=0` while `otam_tx>0` ⇒ the send itself fails (peer-table / post-fetch ESP-NOW TX
+    /// state) → the announce never egresses (explains leaf H0 with the gateway on-channel).
+    /// `otam_ok>0` while leaf stays H0 ⇒ frame egresses but the leaf's RX drops it (deeper).
+    pub otam_tx: u16,
+    pub otam_ok: u16,
 }
 
 #[cfg(feature = "wifi")]
@@ -1484,7 +1490,8 @@ fn mqtt_session(
         let mut rval = MqttScratch::new();
         // Gateway RX evidence + the leaf's own LDBG self-report. `leaf=none` ⇒ no LDBG captured
         // (old leaf fw / leaf off-air during the relay); else `H<heard>V<verdict>N<sent>`.
-        let _ = write!(rval, "rx={} otan={} last_wb={}/{} leaf=", d.rx_any, d.otan_valid, d.last_wb, d.total);
+        let _ = write!(rval, "rx={} otan={} last_wb={}/{} otam_tx={}/{} leaf=",
+            d.rx_any, d.otan_valid, d.last_wb, d.total, d.otam_tx, d.otam_ok);
         if d.leaf_verdict == 255 {
             let _ = write!(rval, "none");
         } else {
