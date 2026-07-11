@@ -32,7 +32,7 @@ cards:
       {% set ch = states('sensor.smol_mesh_channel') %}
       {% set seq = state_attr('sensor.smol_mesh_channel','seq') %}
       {% set re = is_state('binary_sensor.smol_mesh_reelecting','on') %}
-      {% set bt = state_attr('update.smol_7_dominion_firmware','title') or ('build ' ~ (state_attr('update.smol_7_dominion_firmware','installed_version') or '—')) %}
+      {% set bt = state_attr('update.smol_7_dominion_update','title') or ('build ' ~ (state_attr('update.smol_7_dominion_update','installed_version') or '—')) %}
       # control room
       **smol · esp-now mesh · home assistant**
 

@@ -108,7 +108,7 @@ def node_card(nid, meta, present):
             {"entity":f"sensor.smol_{nid}_peers","name":"peers / roster","icon":"mdi:lan"}]}}
     # ---- ctrl_bottom: firmware + install (always last → rounded bottom) ----
     bot=[{"type":"section","label":"firmware"}]
-    fw=next((e for e in present if re.match(rf"update\.smol_{nid}_.*_firmware$",e)),None)
+    fw=next((e for e in present if re.match(rf"update\.smol_{nid}_.*_update$",e)),None)
     if fw: bot.append({"entity":fw,"name":"firmware (version + update)"})
     inst=f"input_button.smol_ota_install_{nid}"
     if inst in present: bot.append({"entity":inst,"name":"Install staged (gateway consumes)","icon":"mdi:rocket-launch"})
@@ -138,7 +138,7 @@ FORGE_ROW=("id__ID____TAG__ — {% if is_state('__FW__','on') %}**{{ state_attr(
 def forge_ota_md(nodes, present):
     out=["**per-node OTA**"]
     for n in nodes:
-        I=str(n["id"]); fw=next((e for e in present if re.match(rf"update\.smol_{I}_.*_firmware$",e)),None)
+        I=str(n["id"]); fw=next((e for e in present if re.match(rf"update\.smol_{I}_.*_update$",e)),None)
         tag=" · canary" if n["gate"] else ""
         out.append(FORGE_ROW.replace("__ID__",I).replace("__FW__",fw).replace("__TAG__",tag) if fw else f"id{I}{tag} — n/a")
     return "\n\n".join(out)
