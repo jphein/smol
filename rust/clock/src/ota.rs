@@ -533,6 +533,39 @@ fn set_slot_new(target: Slot) -> Option<()> {
     Some(())
 }
 
+/// #40 BRICK-SAFETY: does `slot` hold a bootable app image? Reads the slot's first word
+/// through a partition-scoped region and checks the ESP-IDF app-image magic byte `0xE9`.
+/// An erased/empty slot reads `0xFF` → `false`. Used to REFUSE a rollback that would flip
+/// otadata to a slot with no image (e.g. a USB-flashed board whose other slot was never
+/// written → both-slots-unbootable BRICK). Conservative: any read/partition error → `false`
+/// (don't roll back into the unknown). `wifi`-scoped so `boot_confirm` (also `wifi`) can call
+/// it; the types resolve from the `esp-bootloader-esp-idf` dep present in every radio build.
+#[cfg(feature = "wifi")]
+fn slot_has_valid_image(slot: esp_bootloader_esp_idf::ota::Slot) -> bool {
+    use embedded_storage::nor_flash::ReadNorFlash;
+    use esp_bootloader_esp_idf::ota::Slot;
+    use esp_bootloader_esp_idf::partitions::AppPartitionSubType;
+    let sub = match slot {
+        Slot::Slot0 => AppPartitionSubType::Ota0,
+        Slot::Slot1 => AppPartitionSubType::Ota1,
+        _ => return false, // >2-slot table we don't use — refuse (brick-safe)
+    };
+    let mut flash = FlashStorage::new();
+    let mut buf = [0u8; PT_SCRATCH];
+    let Ok(pt) = read_partition_table(&mut flash, &mut buf) else {
+        return false;
+    };
+    let Ok(Some(app)) = pt.find_partition(PartitionType::App(sub)) else {
+        return false;
+    };
+    let mut region = app.as_embedded_storage(&mut flash);
+    let mut hdr = [0u8; 4]; // word-aligned read of the image header start
+    if region.read(0, &mut hdr).is_err() {
+        return false;
+    }
+    hdr[0] == 0xE9 // ESP-IDF app-image magic; erased flash is 0xFF
+}
+
 /// MF-1 (spec §4, LOAD-BEARING): first-boot self-test + APP-SIDE rollback. Call VERY
 /// EARLY, once per boot, after the WiFi/DHCP result is known (`self_test_passed` =
 /// "reached DHCP" — a broken-WiFi image can't, and the just-finished download proves
@@ -579,12 +612,28 @@ pub fn boot_confirm(self_test_passed: bool) {
         let _ = ota.set_current_ota_state(OtaImageState::Valid);
         log::info!("smol OTA: self-test PASS — image CONFIRMED (Valid)");
     } else {
-        if let Ok(cur) = ota.current_slot() {
-            let _ = ota.set_current_slot(cur.next());
+        // #40 BRICK-SAFETY (was a hard brick): roll back ONLY if the target slot holds a
+        // valid bootable image. Flipping otadata to an EMPTY/invalid slot (a USB-flashed
+        // board's never-written other slot) marks BOTH slots unbootable → "No bootable app
+        // partitions" crash-loop. If the other slot has no image, DO NOT flip — ACCEPT the
+        // current image (mark Valid, keep running). A USB-flashed image is operator-intended
+        // and a mesh-OTA image was ed25519+sha verified before activate, so accepting it is
+        // safe; bricking is not.
+        let target = ota.current_slot().ok().map(|c| c.next());
+        let can_rollback = target.map(slot_has_valid_image).unwrap_or(false);
+        if can_rollback {
+            if let Some(t) = target {
+                let _ = ota.set_current_slot(t);
+            }
+            let _ = ota.set_current_ota_state(OtaImageState::Valid);
+            log::warn!("smol OTA: self-test FAIL — ROLLING BACK to the previous (valid) slot");
+            esp_hal::system::software_reset();
+        } else {
+            let _ = ota.set_current_ota_state(OtaImageState::Valid);
+            log::warn!(
+                "smol OTA: self-test FAIL, but the rollback target has NO valid image — ACCEPTING the current image (brick-safe: no flip, no reset)"
+            );
         }
-        let _ = ota.set_current_ota_state(OtaImageState::Valid);
-        log::warn!("smol OTA: self-test FAIL — ROLLING BACK to the previous slot");
-        esp_hal::system::software_reset();
     }
 }
 

@@ -206,11 +206,16 @@ const OTA_MAX_UNCONFIRMED_BOOTS: u32 = 3;
 
 /// #40 HOLE-1 §2: the leaf post-OTA self-test window (ms). A freshly-activated LEAF image
 /// must hear ≥1 valid inbound SMOLv1 frame within this window (its mesh-terms health proof,
-/// the analog of `reached_dhcp` a credential-less leaf never hits) or it rolls back. 60 s
-/// is generous vs the ~10 s HELLO cadence → several chances, minimizing a false-fail on a
-/// quiet mesh. (A genuinely isolated leaf can't prove RX health → rolls back; documented.)
+/// the analog of `reached_dhcp` a credential-less leaf never hits) or it rolls back.
+/// ⚠️ 180 s (was 60): a just-mesh-OTA'd leaf boots WHILE its gateway is still mesh-deaf —
+/// relaying, then in its ~120 s Tier-2 confirm loop (not HELLOing). A 60 s window expired
+/// before the gateway resumed HELLOs → the leaf heard nothing → FALSE rollback of a GOOD
+/// image. 180 s outlasts the gateway's confirm loop so the leaf catches a post-confirm HELLO.
+/// (Even so, a false-fail is now BRICK-SAFE — `boot_confirm` refuses to roll back to a slot
+/// with no valid image; see `ota::slot_has_valid_image`.) A gateway post-OTA HELLO burst is
+/// the cleaner follow-up.
 #[cfg(feature = "espnow")]
-const LEAF_SELFTEST_WINDOW_MS: u64 = 60_000;
+const LEAF_SELFTEST_WINDOW_MS: u64 = 180_000;
 
 /// Monotonic milliseconds since boot — the single time base for the clock, the
 /// button debounce, Snake movement, the LED blink phase, and BENCH rates.
