@@ -784,6 +784,62 @@ impl LeafImageWriter {
 }
 
 // ---------------------------------------------------------------------------
+// #40 gateway relay — read the staged image back from a slot to relay over ESP-NOW.
+//
+// After `run_ota_fetch(relay_mode=true)` stages+verifies a leaf's image into the gateway's
+// INACTIVE slot, the relay reads it back window-by-window (partition-scoped, word-aligned)
+// and sends the chunks. Read-only; never writes → cannot brick anything.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "espnow")]
+pub struct SlotReader {
+    sub: AppPartitionSubType,
+    part_len: u32,
+}
+
+#[cfg(feature = "espnow")]
+impl SlotReader {
+    /// Open a reader for `slot` (the gateway's just-staged inactive slot). `None` on error.
+    pub fn open(slot: Slot) -> Option<SlotReader> {
+        let sub = if slot == Slot::Slot1 {
+            AppPartitionSubType::Ota1
+        } else {
+            AppPartitionSubType::Ota0
+        };
+        let mut flash = FlashStorage::new();
+        let mut buf = [0u8; PT_SCRATCH];
+        let part_len = {
+            let pt = read_partition_table(&mut flash, &mut buf).ok()?;
+            let app = pt.find_partition(PartitionType::App(sub)).ok()??;
+            app.len()
+        };
+        Some(SlotReader { sub, part_len })
+    }
+
+    /// Read `out.len()` bytes at partition-relative `off` (both word-aligned by the caller).
+    /// `false` on any bound/flash error. Partition-scoped → an out-of-slot `off` errors, it
+    /// never reads foreign flash.
+    pub fn read(&self, off: u32, out: &mut [u8]) -> bool {
+        use embedded_storage::nor_flash::ReadNorFlash;
+        if off.saturating_add(out.len() as u32) > self.part_len {
+            return false;
+        }
+        let mut flash = FlashStorage::new();
+        let mut ptbuf = [0u8; PT_SCRATCH];
+        let pt = match read_partition_table(&mut flash, &mut ptbuf) {
+            Ok(pt) => pt,
+            Err(_) => return false,
+        };
+        let app = match pt.find_partition(PartitionType::App(self.sub)) {
+            Ok(Some(p)) => p,
+            _ => return false,
+        };
+        let mut region = app.as_embedded_storage(&mut flash);
+        region.read(off, out).is_ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // #40 §3C — the persistent signed-freshness FLOOR (NVS-backed).
 //
 // `fresh_floor` = the highest build ever booted-as-`New`. The leaf accepts a mesh OTA

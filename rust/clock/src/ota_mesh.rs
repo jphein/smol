@@ -254,6 +254,24 @@ pub fn total_chunks(size: u32) -> u32 {
     (size / CHUNK_PAYLOAD as u32).saturating_add((size % CHUNK_PAYLOAD as u32 != 0) as u32)
 }
 
+/// "All chunks present" bitmap mask for a window of `len` chunks (`len` ≤ 64). Shared by
+/// the leaf (completeness check) and the gateway (retransmit set).
+pub fn window_full_mask(len: u32) -> u64 {
+    if len >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << len) - 1
+    }
+}
+
+/// Decode a ≤8-byte LE `OTAN` missing-bitmap into a `u64` (bit `i` ⇒ chunk `base+i` missing).
+pub fn bitmap_to_u64(b: &[u8]) -> u64 {
+    let mut a = [0u8; 8];
+    let n = b.len().min(8);
+    a[..n].copy_from_slice(&b[..n]);
+    u64::from_le_bytes(a)
+}
+
 /// #40 §C#3: parse the running build# from a `SMOLv1 STAT` value `"<screen>:<page>|<build>"`
 /// (the last `|`-field). Used by the gateway's Tier-2 confirm — "reappeared AT THE NEW
 /// BUILD", never bare presence (so a rolled-back leaf HELLOing at the OLD build doesn't
@@ -281,6 +299,20 @@ const LEAF_IDLE_NAK_MS: u64 = 500;
 const LEAF_PROGRESS_STALL_MS: u64 = 30_000;
 /// Hard total-session cap (ms) — a runaway transfer aborts → good slot boots (R1: USB).
 const LEAF_SESSION_MAX_MS: u64 = 600_000;
+
+/// Outcome of a GATEWAY → leaf relay+confirm session — drives `smol/<leaf>/ota/state`.
+pub enum LeafOtaOutcome {
+    /// Leaf reappeared at the NEW build (Tier-2 build-matched) — the update stuck.
+    Confirmed,
+    /// Leaf reappeared at an OLDER build — its self-test failed → app-side rollback (HA re-offers).
+    RolledBack,
+    /// The gateway couldn't fetch/stage/relay (never reached the leaf's verify).
+    RelayFailed,
+    /// No STAT reappearance within the confirm window — possible brick (USB recovery).
+    Timeout,
+    /// Operator aborted (long-press) mid-session.
+    Aborted,
+}
 
 /// What `service()` must do after handing a frame / a tick to the leaf session.
 pub enum LeafAction {
@@ -427,15 +459,6 @@ impl OtaLeafSession {
         core::cmp::min(wb + WINDOW_CHUNKS as u32, self.total_chunks) - wb
     }
 
-    /// The "all chunks present" bitmap mask for a window of `len` chunks (`len` ≤ 64).
-    fn full_mask(len: u32) -> u64 {
-        if len >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << len) - 1
-        }
-    }
-
     /// Handle an `OTAD` image chunk. Enforces the HOLE-3 signed bounds BEFORE any buffer
     /// write, MAC-filters to the locked gateway, routes the chunk into the current window,
     /// and — on a completed window — flushes it to the (partition-scoped) inactive slot
@@ -508,7 +531,7 @@ impl OtaLeafSession {
 
         // Window complete?
         let wlen = self.window_len(wb);
-        let mask = Self::full_mask(wlen);
+        let mask = window_full_mask(wlen);
         if self.window_recv & mask != mask {
             return LeafAction::None; // still gaps — the idle timer will NAK them
         }
@@ -575,7 +598,7 @@ impl OtaLeafSession {
         // Current window incomplete → NAK its missing chunks.
         let wb = self.window_base;
         let wlen = self.window_len(wb);
-        let mask = Self::full_mask(wlen);
+        let mask = window_full_mask(wlen);
         let missing = mask & !self.window_recv;
         if missing == 0 {
             return LeafAction::None; // complete (an advance-ack is pending elsewhere)

@@ -1778,6 +1778,12 @@ pub fn run_ota_fetch(
     mut rng: Rng,
     announce: &crate::ota::Announce,
     tick: &mut dyn FnMut() -> bool,
+    // #40 relay-mode: when true, stage+verify the image to the inactive slot but do NOT
+    // activate — hand the staged slot back via `staged_slot` so a GATEWAY can relay FROM
+    // it to a leaf (no gateway reboot). Self-OTA passes `false` + `&mut None` → the fetch
+    // body is byte-identical, only the terminal action differs (activate-reboot vs return).
+    relay_mode: bool,
+    staged_slot: &mut Option<esp_bootloader_esp_idf::ota::Slot>,
 ) -> bool {
     let Some((host, port, path)) = crate::ota::split_url(announce.url()) else {
         log::error!("smol OTA: malformed announce URL — aborting fetch");
@@ -1995,6 +2001,14 @@ pub fn run_ota_fetch(
     if writer.finalize(announce.size, &announce.sha256)
         && crate::ota::verify_signature(announce.signed_msg(), announce.sig())
     {
+        if relay_mode {
+            // #40: the gateway staged+verified a leaf's image into ITS inactive slot; do
+            // NOT activate (this board isn't the one being updated). Hand back the slot so
+            // the relay reads it back chunk-by-chunk over ESP-NOW.
+            log::info!("smol #40: relay image staged+VERIFIED in the inactive slot (not activated)");
+            *staged_slot = Some(target);
+            return true;
+        }
         log::info!("smol OTA: image VERIFIED (SHA-256 + ed25519) — activating the new slot");
         crate::ota::activate(target); // reboots on success
         false // reached only if the otadata write failed

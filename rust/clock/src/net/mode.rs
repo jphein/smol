@@ -176,7 +176,22 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + verbatim "<AppKind>:<page
 /// STAT → no flood/loop). Same unauthed, low-blast threat model as CFG: worst case a stray
 /// frame yields a bad screen STRING on a status topic — never code exec, self-corrected
 /// next cadence. Value bounded by `CFG_VALUE_MAX`.
-const STAT_PREFIX: &[u8] = b"SMOLv1 STAT "; // + "NNN" + verbatim "<AppKind>:<page>"
+const STAT_PREFIX: &[u8] = b"SMOLv1 STAT "; // + "NNN" + verbatim "<AppKind>:<page>|<build>"
+
+// #40 leaf-mesh-OTA GATEWAY relay tuning (blocking maintenance op; hardware-tunable — see
+// lucid-40-build-handoff.md). The relay monopolizes the radio for its duration by design.
+/// Wait for a leaf OTAN after (re)sending a window before resending it (ms).
+const GW_OTAN_WAIT_MS: u64 = 800;
+/// Max retransmit rounds per window before aborting the relay (R2 spoof/DoS bound).
+const GW_WINDOW_ROUNDS_MAX: u32 = 16;
+/// Tier-2 confirm window (ms) — MUST exceed the leaf self-test window (`LEAF_SELFTEST_
+/// WINDOW_MS` ≈ 60 s) + a STAT cadence (~10 s) so a late self-test rollback is observed
+/// before the gateway declares Confirmed.
+const GW_CONFIRM_TIMEOUT_MS: u64 = 120_000;
+/// One-window relay readback buffer (off the stack, in `.bss`). Alias-safe: a gateway
+/// relays to ONE leaf at a time (serial canary), and never runs a leaf receive session.
+static mut GW_OTA_WINDOW: [u8; crate::ota_mesh::WINDOW_BYTES] =
+    [0u8; crate::ota_mesh::WINDOW_BYTES];
 
 use crate::mesh_snake::snake_core::{self, SnkFrame};
 
@@ -2109,8 +2124,210 @@ impl RadioManager {
         match self.sta.as_mut() {
             None => false,
             Some(sta) => {
-                crate::net::wifi::run_ota_fetch(&mut self.controller, sta, rng, announce, tick)
+                // Self-OTA: activate-on-success (relay_mode = false; the slot out-param is
+                // unused since a successful self-fetch reboots inside `activate`).
+                crate::net::wifi::run_ota_fetch(
+                    &mut self.controller, sta, rng, announce, tick, false, &mut None,
+                )
             }
+        }
+    }
+
+    /// #40 GATEWAY leaf-mesh-OTA orchestration (§B4). Fetch the staged image (WiFi) into
+    /// THIS gateway's inactive slot → relay it over ESP-NOW to ONE leaf (windowed-NAK) →
+    /// watch for the leaf's Tier-2 STAT reappearance at the NEW build. CANARY-ONE-LEAF:
+    /// targets exactly `leaf_mac`; there is NO broadcast image push. Blocking + mesh-
+    /// degrading for its duration (WiFi fetch then ESP-NOW relay — never concurrent, §D#1);
+    /// the UI-alive `tick` runs throughout and latches a long-press ABORT. Returns the
+    /// outcome for the HA `smol/<leaf>/ota/state` publish. No-op on a non-gateway.
+    pub fn run_leaf_ota_relay(
+        &mut self,
+        leaf_id: u8,
+        leaf_mac: [u8; 6],
+        announce: &crate::ota::Announce,
+        tick: &mut dyn FnMut() -> bool,
+    ) -> crate::ota_mesh::LeafOtaOutcome {
+        use crate::ota_mesh::{
+            self as om, LeafOtaOutcome, CHUNK_PAYLOAD, WINDOW_BYTES, WINDOW_CHUNKS,
+        };
+        use esp_bootloader_esp_idf::ota::Slot;
+        if !self.relay.is_gateway {
+            return LeafOtaOutcome::RelayFailed;
+        }
+        let size = announce.size;
+        let total = om::total_chunks(size);
+        // Session discriminator (retry/concurrency): low 16 bits of the monotonic build.
+        let session: u16 = (announce.build & 0xFFFF) as u16;
+        log::info!(
+            "smol #40: RELAY start → leaf id{} build {} ({} B, {} chunks)",
+            leaf_id, announce.build, size, total
+        );
+
+        // --- FETCH (WiFi) → stage+verify into THIS gateway's inactive slot (no activate).
+        let _ = self.switch(Mode::WifiSta);
+        let rng = self.rng;
+        let mut staged: Option<Slot> = None;
+        let fetched = match self.sta.as_mut() {
+            Some(sta) => crate::net::wifi::run_ota_fetch(
+                &mut self.controller, sta, rng, announce, tick, true, &mut staged,
+            ),
+            None => false,
+        };
+        let staged = if fetched { staged } else { None };
+        let Some(slot) = staged else {
+            log::error!("smol #40: relay fetch/stage failed — aborting (leaf untouched)");
+            let _ = self.switch(Mode::EspNow);
+            return LeafOtaOutcome::RelayFailed;
+        };
+        let Some(reader) = crate::ota::SlotReader::open(slot) else {
+            let _ = self.switch(Mode::EspNow);
+            return LeafOtaOutcome::RelayFailed;
+        };
+
+        // --- RELAY (ESP-NOW) — windowed-NAK to the ONE leaf MAC. ---
+        let _ = self.switch(Mode::EspNow);
+        if !self.esp_now.peer_exists(&leaf_mac) {
+            let _ = self.esp_now.add_peer(PeerInfo {
+                interface: EspNowWifiInterface::Sta,
+                peer_address: leaf_mac,
+                lmk: None,
+                channel: None,
+                encrypt: false,
+            });
+        }
+        let gwbuf = unsafe { &mut *core::ptr::addr_of_mut!(GW_OTA_WINDOW) };
+        let mut otam = [0u8; om::OTAM_FRAME_MAX];
+        let Some(otam_len) =
+            om::encode_otam(leaf_id, session, announce.signed_msg(), announce.sig(), &mut otam)
+        else {
+            return LeafOtaOutcome::RelayFailed;
+        };
+        let mut otad = [0u8; om::OTAD_FRAME_MAX];
+
+        let mut wb: u32 = 0;
+        while wb < total {
+            if tick() {
+                return LeafOtaOutcome::Aborted;
+            }
+            let wlen_chunks = core::cmp::min(WINDOW_CHUNKS as u32, total - wb);
+            let window_off = wb * CHUNK_PAYLOAD as u32;
+            let window_bytes = core::cmp::min(WINDOW_BYTES as u32, size - window_off) as usize;
+            // Read this window from the staged slot (word-aligned length; extra padding
+            // bytes past `window_bytes` are read but never sent).
+            let read_len = ((window_bytes as u32).div_ceil(4) * 4) as usize;
+            if !reader.read(window_off, &mut gwbuf[..read_len]) {
+                log::error!("smol #40: slot readback failed at window {} — aborting", wb);
+                let _ = self.switch(Mode::EspNow);
+                return LeafOtaOutcome::RelayFailed;
+            }
+            let full = om::window_full_mask(wlen_chunks);
+            let mut missing = full; // first pass: send every chunk in the window
+            let mut rounds: u32 = 0;
+            loop {
+                if tick() {
+                    return LeafOtaOutcome::Aborted;
+                }
+                // (Re)send OTAM during window 0 so a leaf that missed it can still arm.
+                if wb == 0 {
+                    self.send_to(&leaf_mac, &otam[..otam_len]);
+                }
+                for i in 0..wlen_chunks as usize {
+                    if (missing >> i) & 1 == 1 {
+                        let seq = wb + i as u32;
+                        let coff = i * CHUNK_PAYLOAD;
+                        let clen = core::cmp::min(CHUNK_PAYLOAD, window_bytes - coff);
+                        let n = om::encode_otad(
+                            leaf_id, session, seq as u16, &gwbuf[coff..coff + clen], &mut otad,
+                        );
+                        self.send_to(&leaf_mac, &otad[..n]);
+                    }
+                }
+                // Wait for this window's OTAN (all-zero = advance; else the missing set).
+                let deadline = now_ms() + GW_OTAN_WAIT_MS;
+                let mut advanced = false;
+                let mut got_nak = false;
+                while now_ms() < deadline {
+                    if let Some(recv) = self.esp_now.receive() {
+                        if recv.info.src_address == leaf_mac {
+                            if let Some(om::OtaFrame::Nak { origin, session: s, window_base, bitmap }) =
+                                om::parse_ota_frame(recv.data())
+                            {
+                                if origin == leaf_id && s == session && window_base as u32 == wb {
+                                    let miss = om::bitmap_to_u64(bitmap) & full;
+                                    if miss == 0 {
+                                        advanced = true;
+                                    } else {
+                                        missing = miss;
+                                        got_nak = true;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if advanced {
+                    wb += WINDOW_CHUNKS as u32;
+                    break;
+                }
+                if !got_nak {
+                    missing = full; // no NAK in the wait → resend the whole window
+                }
+                rounds += 1;
+                if rounds > GW_WINDOW_ROUNDS_MAX {
+                    log::error!(
+                        "smol #40: window {} exceeded {} retransmit rounds — aborting (R2 bound)",
+                        wb, GW_WINDOW_ROUNDS_MAX
+                    );
+                    return LeafOtaOutcome::RelayFailed;
+                }
+            }
+        }
+
+        // --- CONFIRMING (Tier-2, build-matched): sample the leaf's SETTLED build after its
+        // self-test window elapses. The leaf runs the NEW image immediately post-activate,
+        // so it would STAT the new build even mid-self-test; a FAILED self-test then rolls
+        // it back to an OLDER build. So: an older-build sighting is a DEFINITIVE rollback
+        // (early-out); a new-build sighting only CONFIRMS if no rollback lands before the
+        // window closes (> the leaf self-test window + a STAT cadence). No STAT at all → a
+        // possible brick (USB recovery). This is the progression gate, not the safety gate
+        // (the leaf's local Tier-1 is what actually protects it).
+        log::info!(
+            "smol #40: all {} chunks relayed — awaiting leaf id{} Tier-2 confirm at build {}",
+            total, leaf_id, announce.build
+        );
+        let cdeadline = now_ms() + GW_CONFIRM_TIMEOUT_MS;
+        let mut saw_new = false;
+        while now_ms() < cdeadline {
+            if tick() {
+                return LeafOtaOutcome::Aborted;
+            }
+            if let Some(recv) = self.esp_now.receive() {
+                if let Some(Frame::Stat { src, value }) = parse_frame(recv.data()) {
+                    if src == leaf_id {
+                        if let Some(b) = om::stat_build(value) {
+                            if b < announce.build {
+                                log::warn!(
+                                    "smol #40: leaf id{} reappeared at OLD build {} — self-test rolled it back",
+                                    leaf_id, b
+                                );
+                                return LeafOtaOutcome::RolledBack;
+                            }
+                            saw_new = true; // b >= pushed build → running the new image
+                        }
+                    }
+                }
+            }
+        }
+        if saw_new {
+            log::info!("smol #40: leaf id{} CONFIRMED at build {} — update stuck", leaf_id, announce.build);
+            LeafOtaOutcome::Confirmed
+        } else {
+            log::error!(
+                "smol #40: leaf id{} did not reappear at build {} within the confirm window — possible brick (USB recovery)",
+                leaf_id, announce.build
+            );
+            LeafOtaOutcome::Timeout
         }
     }
 
