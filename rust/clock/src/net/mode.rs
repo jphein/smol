@@ -1382,6 +1382,13 @@ pub struct RadioManager {
     scan_idx: usize,
     last_scan_hop_ms: u64,
     last_owner_heard_ms: u64,
+    /// #29: the gateway's operating ESP-NOW channel, LEARNED from the `rx_control` of received
+    /// frames (in `service`) — 0 until the first frame is heard. Published in the retained
+    /// `MC|owner|<ch>|seq` election record (via `current_channel`) so a re-electing / roaming leaf
+    /// can pre-tune to it instead of scanning 1/6/11 (issue #29, producer half). ADVISORY — a leaf
+    /// still HELLO-scans when it is 0/stale/absent (the proven fallback). Sourced from `rx_control`,
+    /// NOT the deliberately-sidestepped `esp_wifi_get_channel`.
+    learned_channel: u8,
     /// #23 fix (oracle #1/#2): persistent staleness observation of the retained `MC`
     /// record — the last owner id + seq seen and when that pair was FIRST seen. A seq
     /// frozen past `MC_STALE_MS` marks the owner DEAD (takeover-able). Seeded into the
@@ -1516,6 +1523,8 @@ impl RadioManager {
             elected_owner: id,
             scan_locked: false,
             scan_idx: 0,
+            learned_channel: 0, // #29: unknown until the first frame is heard
+
             last_scan_hop_ms: 0,
             last_owner_heard_ms: 0,
             mc_seen_owner: 0,
@@ -1640,6 +1649,7 @@ impl RadioManager {
         // only breaks exact-signal ties.
         elect.recovery = true;
         elect.my_rssi = self.my_rssi_to_ap;
+        elect.my_channel = self.learned_channel; // #29: seed the MC record's <ch> (0 until learned)
         elect.seen_owner = self.mc_seen_owner;
         elect.seen_seq = self.mc_seen_seq;
         elect.seen_ms = self.mc_seen_ms;
@@ -2119,14 +2129,16 @@ impl RadioManager {
         self.relay.is_gateway
     }
 
-    /// #27: this node's current ESP-NOW channel for the peers publish. Leaf = its
-    /// locked scan channel (`CANDIDATES[scan_idx]` while `scan_locked`); gateway = 0
-    /// (its AP channel isn't read on-device yet — #29's `rx_control` capture will
-    /// populate it). Both `0` today ⇒ HA treats the `<ch>` field as advisory and does
-    /// NOT roam-flag until real channels land, so #27 ships no false positives.
+    /// #27/#29: this node's current ESP-NOW channel for the peers + MC publish. Leaf = its
+    /// locked scan channel (`CANDIDATES[scan_idx]` while `scan_locked`), else 0 (scanning);
+    /// gateway = its `learned_channel` (#29 — the channel `rx_control` last saw a frame on;
+    /// 0 until the first frame). `0` ⇒ advisory-only: HA/leaves treat the `<ch>` field as absent
+    /// and fall back (no roam-flag / HELLO-scan), so this never ships a false positive.
     fn current_channel(&self) -> u8 {
         const CANDIDATES: [u8; 3] = [1, 6, 11]; // must match the scan plan above
-        if self.relay.is_gateway || !self.scan_locked {
+        if self.relay.is_gateway {
+            self.learned_channel // #29: real gateway channel from rx_control (0 until learned)
+        } else if !self.scan_locked {
             0
         } else {
             CANDIDATES[self.scan_idx % CANDIDATES.len()]
@@ -2928,6 +2940,7 @@ impl RadioManager {
         // good flush's reading (~one heartbeat of lag, fine for a display value); -99
         // until the first good flush, which mqtt_session's publish guard skips.
         elect.my_rssi = self.my_rssi_to_ap;
+        elect.my_channel = self.learned_channel; // #29: seed the MC record's <ch> (0 until learned)
         // #6 OTA: capture any gated retained announce this flush surfaces.
         let mut ota_offer: Option<crate::ota::Announce> = None;
         // #21: capture any default-screen config this flush surfaces.
@@ -3194,6 +3207,9 @@ impl RadioManager {
             // RSSI of this frame (dBm) from the ESP-NOW RX control info; used by
             // BENCH. Captured up front so each arm can record it if relevant.
             let rssi = recv.info.rx_control.rssi;
+            // #29: learn the channel this frame arrived on = this board's live ESP-NOW channel.
+            // Advisory; the gateway publishes it in the MC record so leaves can pre-tune on roam.
+            self.learned_channel = recv.info.rx_control.channel as u8;
             let now = now_ms();
 
             // #40 leaf-mesh-OTA transport (OTAM/OTAD/OTAN). Dispatched BEFORE the generic
