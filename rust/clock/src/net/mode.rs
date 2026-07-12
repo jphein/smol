@@ -2530,7 +2530,7 @@ impl RadioManager {
         }
 
         let mut wb: u32 = 0;
-        while wb < total {
+        'windows: while wb < total {
             if tick() {
                 return LeafOtaOutcome::Aborted;
             }
@@ -2637,17 +2637,31 @@ impl RadioManager {
                 }
                 rounds += 1;
                 if rounds > GW_WINDOW_ROUNDS_MAX {
+                    // #3b TAIL FIX: the LAST window never gets an advance-ack — the leaf
+                    // finalizes+Completes it (ota_mesh on_data sends the all-zero ack ONLY for
+                    // non-last windows, then reboots into the new image). So the gateway CANNOT
+                    // hear an advance for the last window; "exhaustion" here is EXPECTED, not a
+                    // failure. The blind full-window resends across these rounds delivered the
+                    // last chunks (98.8%→100% at the tail); the leaf's real completion signal is
+                    // its REBOOT (build flip), which the CONFIRM phase below detects. So fall
+                    // THROUGH to confirm — returning RelayFailed here failed even a perfect
+                    // transfer (canary 7ee3982: 4288/4341, last window, leaf never confirmed).
+                    if wb + WINDOW_CHUNKS as u32 >= total {
+                        log::info!(
+                            "smol #40: last window {} sent {} rounds (rx_any={} otan={}) — leaf finalizes w/o advance-ack → CONFIRM",
+                            wb, GW_WINDOW_ROUNDS_MAX, rx_any, otan_valid
+                        );
+                        break 'windows;
+                    }
                     log::error!(
                         "smol #40: window {} exceeded {} retransmit rounds (rx_any={} otan={}) — aborting (R2 bound)",
                         wb, GW_WINDOW_ROUNDS_MAX, rx_any, otan_valid
                     );
                     self.leaf_relay_rx = Some(crate::net::wifi::RelayDiag {
-                    leaf_id, rx_any, otan_valid, last_wb: wb as u16, total: total as u16,
-                    leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
-                    otam_tx, otam_ok,
-                    settle,
-                    leaf_ch: ldbg_ch,
-                });
+                        leaf_id, rx_any, otan_valid, last_wb: wb as u16, total: total as u16,
+                        leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
+                        otam_tx, otam_ok, settle, leaf_ch: ldbg_ch,
+                    });
                     return LeafOtaOutcome::RelayFailed;
                 }
             }
