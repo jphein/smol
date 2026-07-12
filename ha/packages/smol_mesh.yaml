@@ -1208,6 +1208,129 @@ mqtt:
         {% set ns = namespace(v='0') %}
         {% for kv in value.split('|') %}{% if kv.startswith('btnl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
         {{ ns.v | int(0) }}
+    # --- #49 DIAG counters (vesper folds into the same smol/<id>/diag record) —
+    # flush ok/fail + OTA-verify ok/fail. Same key-picker; forward-compat (parser
+    # already ignores unknown keys). total_increasing; degrade-safe (0 until fw). ---
+    - name: "smol 7 flush ok"
+      unique_id: smol_7_flush_ok_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:check-network-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('fok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 7 flush fail"
+      unique_id: smol_7_flush_fail_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:close-network-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('ffl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 7 verify ok"
+      unique_id: smol_7_verify_ok_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-check-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('vok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 7 verify fail"
+      unique_id: smol_7_verify_fail_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-alert-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('vfl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 8 flush ok"
+      unique_id: smol_8_flush_ok_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:check-network-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('fok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 8 flush fail"
+      unique_id: smol_8_flush_fail_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:close-network-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('ffl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 8 verify ok"
+      unique_id: smol_8_verify_ok_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-check-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('vok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 8 verify fail"
+      unique_id: smol_8_verify_fail_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-alert-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('vfl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 9 flush ok"
+      unique_id: smol_9_flush_ok_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:check-network-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('fok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 9 flush fail"
+      unique_id: smol_9_flush_fail_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:close-network-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('ffl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 9 verify ok"
+      unique_id: smol_9_verify_ok_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-check-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('vok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 9 verify fail"
+      unique_id: smol_9_verify_fail_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-alert-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('vfl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
 
 # =====================================================================
 # MESH TOPOLOGY derived sensors (issue #27) — HELD; back the topology card.
