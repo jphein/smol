@@ -13,9 +13,15 @@
 //! NOT a plugin) + a ~12-line dispatch core.
 
 use crate::input::Press;
+// Only the plain (non-cast) `Oled` alias below names these; under `feature = "cast"`
+// the alias is `CastOled` and these imports would be unused.
+#[cfg(not(feature = "cast"))]
 use ssd1306::mode::BufferedGraphicsMode;
+#[cfg(not(feature = "cast"))]
 use ssd1306::prelude::I2CInterface;
+#[cfg(not(feature = "cast"))]
 use ssd1306::size::DisplaySize72x40;
+#[cfg(not(feature = "cast"))]
 use ssd1306::Ssd1306;
 
 /// The one concrete OLED type in the firmware. `Ctx` holds this CONCRETELY (not a
@@ -23,11 +29,20 @@ use ssd1306::Ssd1306;
 /// and `flush` lives on `Ssd1306`, not the `DrawTarget` trait. The generic draw
 /// helpers (`draw_clock`, …) still take `&mut impl DrawTarget`; a plugin passes
 /// `ctx.display` (which coerces) and flushes it itself.
+#[cfg(not(feature = "cast"))]
 pub type Oled = Ssd1306<
     I2CInterface<esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>>,
     DisplaySize72x40,
     BufferedGraphicsMode<DisplaySize72x40>,
 >;
+
+/// #26 cast: under `feature = "cast"` the one concrete OLED becomes the tee-wrapper
+/// [`crate::net::cast_oled::CastOled`], which mirrors every draw into a shadow
+/// framebuffer for the WLED pixel-stream. It is a drop-in for the plain `Ssd1306`
+/// (same `DrawTarget` + inherent `flush()`/`init()`), so every plugin + `main` draw
+/// site is unchanged; only the boot construction in `main` wraps the raw panel.
+#[cfg(feature = "cast")]
+pub type Oled = crate::net::cast_oled::CastOled;
 
 /// How this node's clock was last set — surfaced to plugins (Bench own-status,
 /// future Clock/HUD provenance) via [`Ctx::mesh`]. `main` owns the transition:

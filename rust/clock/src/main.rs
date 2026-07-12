@@ -75,9 +75,12 @@ use esp_hal::{
     time::Instant,
     time::Rate,
 };
-use ssd1306::{
-    mode::DisplayConfig, prelude::*, size::DisplaySize72x40, I2CDisplayInterface, Ssd1306,
-};
+use ssd1306::{prelude::*, size::DisplaySize72x40, I2CDisplayInterface, Ssd1306};
+// `DisplayConfig::init` inits the PLAIN Ssd1306 (non-cast builds). Under `feature =
+// "cast"` the display is the `CastOled` tee, whose inherent `init()` forwards to the
+// inner panel (it imports `DisplayConfig` itself), so `main` no longer names the trait.
+#[cfg(not(feature = "cast"))]
+use ssd1306::mode::DisplayConfig;
 
 // App-plugin framework (issue #7): the `Oled` alias, `Ctx`, `Plugin` trait,
 // `AppKind`/`App` enum + centralized dispatch, and the `REGISTRY` that
@@ -320,8 +323,15 @@ fn main() -> ! {
     // --- SSD1306 display -----------------------------------------------------
     let interface = I2CDisplayInterface::new(i2c);
     // Rotated 180° (case hangs from the USB-C end) — see DISPLAY_ROTATION.
-    let mut display = Ssd1306::new(interface, DisplaySize72x40, DISPLAY_ROTATION)
+    let raw_display = Ssd1306::new(interface, DisplaySize72x40, DISPLAY_ROTATION)
         .into_buffered_graphics_mode();
+    // #26 cast: wrap the panel in the DrawTarget tee so every draw is mirrored into a
+    // shadow framebuffer for the WLED pixel-stream. Byte-identical `Oled` (plain
+    // Ssd1306) in every non-cast build — see `app::Oled`.
+    #[cfg(not(feature = "cast"))]
+    let mut display = raw_display;
+    #[cfg(feature = "cast")]
+    let mut display = crate::net::cast_oled::CastOled::new(raw_display);
     display.init().expect("display init");
 
     // (Text styles now live inside each plugin's render — CLOCK's big-digit
@@ -1088,6 +1098,12 @@ fn main() -> ! {
         // cadence + its framebuffer clear/flush — the old per-mode match arms,
         // relocated VERBATIM into each `Plugin::update` (the equivalence proof).
         app.update(&mut ctx);
+
+        // #26 cast: snapshot the just-rendered glass image into the shared cast frame
+        // (the `ctx` borrow of `display` has ended at the `update` call above), so the
+        // next gateway flush can stream it to the WLED matrix. No-op unless feature=cast.
+        #[cfg(feature = "cast")]
+        crate::net::cast::publish_frame(display.mirror());
 
         // The redraw latch is single-tick: this tick's `update` consumed it.
         redraw = false;
