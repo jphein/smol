@@ -121,6 +121,24 @@ input_text:
     name: "smol display line 3 (source)"
     max: 100
     initial: ""
+  # --- #45 Custom screen (per-node author string) — Model A: one helper/node.
+  # Grammar: "<size><align> <text>" per line, '|'-separated lines (≤4). size s/m/l
+  # (5x8/6x10/10x20), align l/c/r. {entity_id} refs are resolved HA-side (subst());
+  # the compose template sensor converts to the wire form <count>|<sa>text;… and
+  # publishes retained smol/<id>/config/custom (KV key Y, #56). e.g.
+  #   lc {sensor.smol_7_temp}°F|sl Bench|sl Door {binary_sensor.shed_door}
+  smol_7_custom:
+    name: "smol 7 Custom screen (author)"
+    max: 120
+    initial: ""
+  smol_8_custom:
+    name: "smol 8 Custom screen (author)"
+    max: 120
+    initial: ""
+  smol_9_custom:
+    name: "smol 9 Custom screen (author)"
+    max: 120
+    initial: ""
 
 input_boolean:
   smol_display_override:
@@ -161,7 +179,7 @@ input_select:
   # --- set-all (writes every per-node topic) ---
   smol_all_screen:
     name: "smol all · default screen"
-    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About]
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom]
     initial: Menu
     icon: mdi:monitor-multiple
   smol_all_page:
@@ -172,7 +190,7 @@ input_select:
   # --- id7 (one copy-paste block per node; new node = duplicate + renumber) ---
   smol_7_screen:
     name: "smol id7 · default screen"
-    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About]
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom]
     initial: Menu
     icon: mdi:monitor
   smol_7_page:
@@ -183,7 +201,7 @@ input_select:
   # --- id8 ---
   smol_8_screen:
     name: "smol id8 · default screen"
-    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About]
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom]
     initial: Menu
     icon: mdi:monitor
   smol_8_page:
@@ -194,7 +212,7 @@ input_select:
   # --- id9 ---
   smol_9_screen:
     name: "smol id9 · default screen"
-    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About]
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom]
     initial: Menu
     icon: mdi:monitor
   smol_9_page:
@@ -299,6 +317,27 @@ mqtt:
       unique_id: smol_9_config_mirror
       state_topic: "smol/9/config/default_screen"
       icon: "mdi:cog"
+    # --- #45 Custom-screen mirror: read back the retained wire payload the compose
+    # template sensor published (round-trip confirmation + dashboard preview). State =
+    # the FIRST line's resolved text (2-char size/align prefix stripped); '(none)' when empty. ---
+    - name: "smol 7 custom"
+      unique_id: smol_7_custom_mirror
+      state_topic: "smol/7/config/custom"
+      icon: "mdi:card-text-outline"
+      value_template: >-
+        {% set p = value.split('|', 1) %}{% if p | length > 1 and p[1] %}{{ p[1].split(';')[0][2:] }}{% else %}(none){% endif %}
+    - name: "smol 8 custom"
+      unique_id: smol_8_custom_mirror
+      state_topic: "smol/8/config/custom"
+      icon: "mdi:card-text-outline"
+      value_template: >-
+        {% set p = value.split('|', 1) %}{% if p | length > 1 and p[1] %}{{ p[1].split(';')[0][2:] }}{% else %}(none){% endif %}
+    - name: "smol 9 custom"
+      unique_id: smol_9_custom_mirror
+      state_topic: "smol/9/config/custom"
+      icon: "mdi:card-text-outline"
+      value_template: >-
+        {% set p = value.split('|', 1) %}{% if p | length > 1 and p[1] %}{{ p[1].split(';')[0][2:] }}{% else %}(none){% endif %}
     # --- #43 display units (GLOBAL) — mirror of the retained smol/config/units ---
     - name: "smol units"
       unique_id: smol_units_mirror
@@ -1157,6 +1196,92 @@ mqtt:
 # =====================================================================
 template:
   - sensor:
+      # --- #45 Custom-screen COMPOSE: turn each node's author string into the wire
+      # payload <count>|<size><align>text;… . A TEMPLATE sensor (not a static automation)
+      # so it auto-subscribes to whatever {entity_id}s the user references — the clean fix
+      # for #45's "trigger on each referenced entity" (a static trigger list can't know
+      # them). Reuses the Batt display-override subst() macro; strips ';', clips per size
+      # (7 for l, 12 for s/m). Empty author → '' (clears the custom). The publish
+      # automation ships this on change. ---
+      - name: "smol 7 custom lay"
+        unique_id: smol_7_custom_lay
+        state: >-
+          {%- macro subst(src) -%}
+          {%- set ns = namespace(out=src) -%}
+          {%- for id in src | regex_findall('\{([a-z0-9_.]+)\}') -%}
+          {%- set v = states(id) -%}
+          {%- set v = '--' if (v | lower) in ['unknown','unavailable','none',''] else v -%}
+          {%- set ns.out = ns.out | replace('{' ~ id ~ '}', v) -%}
+          {%- endfor -%}{{- ns.out -}}
+          {%- endmacro -%}
+          {%- set author = states('input_text.smol_7_custom') -%}
+          {%- if (author | lower) in ['unknown','unavailable','none',''] -%}{{- '' -}}
+          {%- else -%}
+          {%- set ns = namespace(segs=[]) -%}
+          {%- for raw in author.split('|')[:4] -%}
+          {%- set ln = raw.strip() -%}
+          {%- if ln | length >= 2 -%}
+          {%- set size = ln[0] if ln[0] in 'sml' else 's' -%}
+          {%- set align = ln[1] if ln[1] in 'lcr' else 'l' -%}
+          {%- set text = (subst(ln[2:] | trim) | replace(';','')) -%}
+          {%- set ns.segs = ns.segs + [size ~ align ~ text[:(7 if size == 'l' else 12)]] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- if ns.segs | length > 0 -%}{{- ns.segs | length -}}|{{- ns.segs | join(';') -}}{%- else -%}{{- '' -}}{%- endif -%}
+          {%- endif -%}
+      - name: "smol 8 custom lay"
+        unique_id: smol_8_custom_lay
+        state: >-
+          {%- macro subst(src) -%}
+          {%- set ns = namespace(out=src) -%}
+          {%- for id in src | regex_findall('\{([a-z0-9_.]+)\}') -%}
+          {%- set v = states(id) -%}
+          {%- set v = '--' if (v | lower) in ['unknown','unavailable','none',''] else v -%}
+          {%- set ns.out = ns.out | replace('{' ~ id ~ '}', v) -%}
+          {%- endfor -%}{{- ns.out -}}
+          {%- endmacro -%}
+          {%- set author = states('input_text.smol_8_custom') -%}
+          {%- if (author | lower) in ['unknown','unavailable','none',''] -%}{{- '' -}}
+          {%- else -%}
+          {%- set ns = namespace(segs=[]) -%}
+          {%- for raw in author.split('|')[:4] -%}
+          {%- set ln = raw.strip() -%}
+          {%- if ln | length >= 2 -%}
+          {%- set size = ln[0] if ln[0] in 'sml' else 's' -%}
+          {%- set align = ln[1] if ln[1] in 'lcr' else 'l' -%}
+          {%- set text = (subst(ln[2:] | trim) | replace(';','')) -%}
+          {%- set ns.segs = ns.segs + [size ~ align ~ text[:(7 if size == 'l' else 12)]] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- if ns.segs | length > 0 -%}{{- ns.segs | length -}}|{{- ns.segs | join(';') -}}{%- else -%}{{- '' -}}{%- endif -%}
+          {%- endif -%}
+      - name: "smol 9 custom lay"
+        unique_id: smol_9_custom_lay
+        state: >-
+          {%- macro subst(src) -%}
+          {%- set ns = namespace(out=src) -%}
+          {%- for id in src | regex_findall('\{([a-z0-9_.]+)\}') -%}
+          {%- set v = states(id) -%}
+          {%- set v = '--' if (v | lower) in ['unknown','unavailable','none',''] else v -%}
+          {%- set ns.out = ns.out | replace('{' ~ id ~ '}', v) -%}
+          {%- endfor -%}{{- ns.out -}}
+          {%- endmacro -%}
+          {%- set author = states('input_text.smol_9_custom') -%}
+          {%- if (author | lower) in ['unknown','unavailable','none',''] -%}{{- '' -}}
+          {%- else -%}
+          {%- set ns = namespace(segs=[]) -%}
+          {%- for raw in author.split('|')[:4] -%}
+          {%- set ln = raw.strip() -%}
+          {%- if ln | length >= 2 -%}
+          {%- set size = ln[0] if ln[0] in 'sml' else 's' -%}
+          {%- set align = ln[1] if ln[1] in 'lcr' else 'l' -%}
+          {%- set text = (subst(ln[2:] | trim) | replace(';','')) -%}
+          {%- set ns.segs = ns.segs + [size ~ align ~ text[:(7 if size == 'l' else 12)]] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- if ns.segs | length > 0 -%}{{- ns.segs | length -}}|{{- ns.segs | join(';') -}}{%- else -%}{{- '' -}}{%- endif -%}
+          {%- endif -%}
+  - sensor:
       # --- #51 dynamic-role gap fix: EVERY node needs leaf-bond entities (any node can be a leaf now).
       # id7 was gateway-only, so its rssi/band/resync were never defined; #51 (id8 can take over) makes
       # id7 a leaf → its dashboard box showed 'entity not found' ×3. Defined for id7 here, mirroring 8/9;
@@ -1782,3 +1907,31 @@ automation:
             {% set n = trigger.entity_id.split('_')[1] %}
             id{{ n }} rolled back its OTA (slot {{ states('sensor.smol_' ~ n ~ '_boot_slot') }},
             reset {{ states('sensor.smol_' ~ n ~ '_reset_reason') }}).
+
+  # --- #45 publish per-node Custom screen layouts (retained → smol/<id>/config/custom, KV key Y) ---
+  # The compose sensor (sensor.smol_<id>_custom_lay) auto-updates on the author string AND any
+  # referenced {entity}, so its state-change covers live-refresh; + HA start + a 5-min heartbeat.
+  - id: smol_publish_custom_lay
+    alias: "smol: publish per-node Custom screen layouts (retained, #45)"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id:
+          - sensor.smol_7_custom_lay
+          - sensor.smol_8_custom_lay
+          - sensor.smol_9_custom_lay
+      - platform: homeassistant
+        event: start
+      - platform: time_pattern
+        minutes: "/5"
+    action:
+      - repeat:
+          for_each: ["7", "8", "9"]
+          sequence:
+            - service: mqtt.publish
+              data:
+                topic: "smol/{{ repeat.item }}/config/custom"
+                retain: true
+                qos: 0
+                payload: "{{ states('sensor.smol_' ~ repeat.item ~ '_custom_lay') }}"
