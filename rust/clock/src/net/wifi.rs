@@ -234,17 +234,18 @@ fn parse_mesh_channel(payload: &[u8]) -> Option<(u8, u8, u32)> {
     Some((owner, ch, seq))
 }
 
-/// #21 leaf-relay: extract the leaf id `N` from a `smol/<N>/config/default_screen`
-/// topic (the shape the wildcard subscribe delivers). Total/panic-free: fixed
-/// prefix + exact suffix match + 1–3 ASCII-digit parse clamped to u8; anything else
-/// → `None`. The topic is broker-supplied, so parse defensively (not just trust the
-/// subscribe filter).
+/// #21/#48/#55 leaf-relay: extract the leaf id `N` from a `smol/<N><suffix>` topic (the shape
+/// the wildcard subscribe delivers), IFF the tail matches `suffix` (e.g. `/config/default_screen`,
+/// `/config/led`, `/config/plugins`). Total/panic-free: fixed prefix + exact suffix match + 1–3
+/// ASCII-digit parse clamped to u8; anything else → `None`. The topic is broker-supplied, so
+/// parse defensively (not just trust the subscribe filter). One helper serves every per-node
+/// config key so a new key = one call site, not a new parser.
 #[cfg(feature = "wifi")]
-fn parse_leaf_config_topic(topic: &[u8]) -> Option<u8> {
+fn parse_leaf_config_topic(topic: &[u8], suffix: &[u8]) -> Option<u8> {
     let rest = topic.strip_prefix(b"smol/")?;
     let slash = rest.iter().position(|&b| b == b'/')?;
     let (idb, tail) = rest.split_at(slash);
-    if tail != b"/config/default_screen" {
+    if tail != suffix {
         return None;
     }
     if idb.is_empty() || idb.len() > 3 {
@@ -784,6 +785,11 @@ pub const CFG_VALUE_MAX: usize = 16;
 /// ESP-NOW frame layer that RELAYS/parses it (espnow) both name it with no per-profile cfg.
 #[cfg(feature = "wifi")]
 pub const CFG_KEY_SCREEN: u8 = b'S';
+/// #48 blue-LED mode channel (`status`/`on`/`off`). Per-node retained `smol/<id>/config/led`.
+/// (#43/#55/#52 add their keys `U`/`P`/`R` + the `CFG_TARGET_ALL` global-units target here as
+/// each feature lands, so the const stays used — no dead_code in the interim.)
+#[cfg(feature = "wifi")]
+pub const CFG_KEY_LED: u8 = b'L';
 
 /// #40 #3: one relay attempt's diagnostic snapshot — gateway-side RX evidence PLUS the leaf's
 /// self-reported OTA state (captured from its `LDBG` beacon during the relay). Published to
@@ -1245,6 +1251,11 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 9, b"smol/+/ota/install") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
+        // #48 blue-LED mode (pid 10): wildcard-subscribe every leaf's retained led config so the
+        // gateway caches + relays it (key `L`) over ESP-NOW, twin of the default_screen wildcard.
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 10, b"smol/+/config/led") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
     }
 
     // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
@@ -1531,7 +1542,7 @@ fn mqtt_session(
                             crate::net::cast::set_enabled(on);
                             log::info!("smol #26: cast {}", if on { "ENABLED" } else { "disabled" });
                         }
-                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic) {
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/default_screen") {
                         // #21 leaf-relay: a wildcard-delivered OTHER leaf's config. Cache
                         // the verbatim value bytes for the ESP-NOW relay (mode.rs
                         // broadcast_cached_configs). `leaf_id == node_id` is the gateway's
@@ -1548,6 +1559,21 @@ fn mqtt_session(
                                 cache.set(leaf_id, CFG_KEY_SCREEN, payload, [0u8; 6], now);
                                 log::info!(
                                     "smol #21/#56: cached leaf id{} screen config for relay ({} B)",
+                                    leaf_id,
+                                    payload.len()
+                                );
+                            }
+                        }
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/led") {
+                        // #48 blue-LED mode: twin of the default_screen arm — cache a leaf's led
+                        // config under key `L` for the ESP-NOW relay. Verbatim bytes; the leaf's
+                        // LedMode::from_wire validates (unknown → keep current).
+                        if leaf_id != node_id {
+                            if let Some(cache) = cfg_cache.as_deref_mut() {
+                                let now = Instant::now().duration_since_epoch().as_millis();
+                                cache.set(leaf_id, CFG_KEY_LED, payload, [0u8; 6], now);
+                                log::info!(
+                                    "smol #48: cached leaf id{} led config for relay ({} B)",
                                     leaf_id,
                                     payload.len()
                                 );

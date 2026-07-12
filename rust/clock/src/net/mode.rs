@@ -180,7 +180,8 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 1] = [crate::net::wifi::CFG_KEY_SCREEN];
+const CFG_APPLY_KEYS: [u8; 2] =
+    [crate::net::wifi::CFG_KEY_SCREEN, crate::net::wifi::CFG_KEY_LED];
 /// #50b leaf-status UPLINK tag: `"SMOLv1 STAT "` (12 B, trailing space) then `"NNN"`
 /// (3-ASCII zero-padded SENDER leaf id) then the verbatim live `<AppKind>:<page>` value
 /// (empty = none). Mirror of `CFG` but UPLINK (leaf → gateway): a leaf with no MQTT

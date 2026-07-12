@@ -50,6 +50,10 @@ pub use wifi::WifiPeripherals;
 // espnow-only — a wifi-only build reaches the const in-module (no re-export → no unused-import).
 #[cfg(feature = "espnow")]
 pub use wifi::CFG_KEY_SCREEN;
+// #48 LED mode key — same `main`-bridge rationale as the screen key (espnow leaf-apply path).
+// #43/#55/#52 add their keys (U/P/R) + CFG_TARGET_ALL here as each feature wires its apply.
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_KEY_LED;
 
 // `try_time_sync` is the Phase-2 entry point; under `espnow`, `main` calls
 // `mode::start` instead, so only re-export it when espnow is NOT enabled.

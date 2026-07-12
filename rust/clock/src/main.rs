@@ -549,6 +549,10 @@ fn main() -> ! {
     // Phase 3: LED-state trace bookkeeping (LED stays a `main` concern).
     #[cfg(feature = "espnow")]
     let mut last_led_state: Option<led::LedState> = None;
+    // #48: dashboard LED mode (status/on/off). Held across the loop; updated from the relayed
+    // `smol/<id>/config/led` (key `L`). Default `Status` = the pre-#48 peer-state indicator.
+    #[cfg(feature = "espnow")]
+    let mut led_mode = led::LedMode::default();
 
     // #20 (1a): last BOOT-button activity + the current flush-deferral start, to
     // postpone a recurring flush while the user is interacting (capped).
@@ -963,12 +967,23 @@ fn main() -> ! {
                 flush_defer_since_ms = 0;
             }
 
+            // #48: pull the relayed LED-mode config (leaf) and update the held mode. Edge-safe:
+            // a garbage/unknown value parses to None → keep the current mode (never a bad LED).
+            // On the gateway, its OWN led config is applied via the gateway-own path (deferred).
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_LED) {
+                if let Some(m) = led::LedMode::from_wire(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
+                    if m != led_mode {
+                        log::info!("smol #48: LED mode -> {:?}", m);
+                    }
+                    led_mode = m;
+                }
+            }
             let state = r.peer_led_state(now);
             if last_led_state != Some(state) {
                 log::info!("smol: LED -> {:?}", state);
                 last_led_state = Some(state);
             }
-            led.apply(state, now);
+            led.apply_mode(led_mode, state, now);
         }
 
         // === FPS accounting (espnow / BENCH): count every loop iteration.
