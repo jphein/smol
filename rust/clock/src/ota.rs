@@ -1705,7 +1705,9 @@ pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
 
 /// RFC1918 private-range test (`10/8`, `172.16/12`, `192.168/16`). CFG-`B`/`O` overrides MUST pass
 /// this so a dashboard typo can never point a board off-LAN (the on-LAN guard JP named in #100).
-#[cfg(feature = "wifi")]
+/// `espnow`-gated: reached only through the two override parsers below, which the espnow-only CFG
+/// apply path calls (a wifi-only build has no `RadioManager`/apply, so it would be dead code there).
+#[cfg(feature = "espnow")]
 pub fn is_rfc1918(ip: [u8; 4]) -> bool {
     matches!(ip,
         [10, ..]
@@ -1716,7 +1718,8 @@ pub fn is_rfc1918(ip: [u8; 4]) -> bool {
 /// Parse a CFG-`B` broker override value `"a.b.c.d"` or `"a.b.c.d:port"` (port defaults to 1883,
 /// the plain-Mosquitto port). `None` unless the IP is RFC1918 and the port is non-zero — the apply
 /// path treats `None` as "invalid, keep current" and an empty string as an explicit CLEAR.
-#[cfg(feature = "wifi")]
+/// `espnow`-gated: called only from the espnow-only CFG-`B` apply path (see `is_rfc1918`).
+#[cfg(feature = "espnow")]
 pub fn parse_broker_override(s: &str) -> Option<([u8; 4], u16)> {
     let s = s.trim();
     let (ip_str, port) = match s.rsplit_once(':') {
@@ -1732,7 +1735,8 @@ pub fn parse_broker_override(s: &str) -> Option<([u8; 4], u16)> {
 
 /// Parse a CFG-`O` OTA-host override value `"a.b.c.d"`. `None` unless the IP is RFC1918 (keeps OTA
 /// fetches on-LAN; the image is still ed25519/monotonicity-gated regardless — belt-and-suspenders).
-#[cfg(feature = "wifi")]
+/// `espnow`-gated: called only from the espnow-only CFG-`O` apply path (see `is_rfc1918`).
+#[cfg(feature = "espnow")]
 pub fn parse_ota_host_override(s: &str) -> Option<[u8; 4]> {
     let ip = parse_ipv4(s.trim())?;
     if !is_rfc1918(ip) {
