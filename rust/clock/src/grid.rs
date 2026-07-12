@@ -179,6 +179,9 @@ impl GridState {
 
     /// #50: the live page index (raw; the renderer clamps `% PAGE_COUNT`). Read for
     /// the `smol/<id>/status` readback of the ACTUAL screen state.
+    // Sole caller is `App::live_screen` (espnow STAT readback); gate to espnow so it
+    // is not never-used in a wifi-only build. `set_page` (boot-page seed) stays wifi.
+    #[cfg(feature = "espnow")]
     pub fn page(&self) -> u8 {
         self.page
     }
