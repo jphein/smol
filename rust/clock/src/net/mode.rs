@@ -3298,7 +3298,10 @@ impl RadioManager {
                     // is no weaker than from an unauth HELLO (both already trusted), and the
                     // relayed image is ed25519-signed so a spoofed id→MAC only wastes a session.
                     if self.relay.is_gateway {
-                        self.stat_cache.set(leaf_id, value);
+                        // #68 F6/roster-robustness: stamp the STAT with the sender's MAC + time so
+                        // a stale leaf stops ghosting its status and stays mac-resolvable if the
+                        // LRU roster later evicts it.
+                        self.stat_cache.set(leaf_id, value, src, now);
                     }
                     self.peers.last_hello_ms = now;
                     self.roster.heard(src, Some(leaf_id), rssi, now);
@@ -3400,10 +3403,23 @@ impl RadioManager {
             self.leaf_ota_mac = Some((id, mac)); // freshest wins; refresh the session cache
             return Some(mac);
         }
-        match self.leaf_ota_mac {
-            Some((cid, mac)) if cid == id => Some(mac), // roster evicted it → use the cache
-            _ => None,
+        if let Some((cid, mac)) = self.leaf_ota_mac {
+            if cid == id {
+                return Some(mac); // roster evicted it mid-session → use the session cache
+            }
         }
+        // #68 roster-admission robustness: the roster (a 16-slot LRU with no staleness reaping)
+        // can EVICT a leaf that HELLOs sparsely while a chatty peer stays resident — so a leaf the
+        // gateway currently RELAYS/STATs (id8, live) can be absent from `mac_for_id`, silently
+        // no-arming its retained install. The stat_cache holds the id↔MAC of every recently-heard
+        // leaf (freshness-gated), so resolve from there as a last resort → any STAT-heard leaf
+        // stays armable. If it's genuinely off-air, the entry ages past STAT_FRESH_MS → None (no
+        // arm to a gone leaf; a stale ghost can't fake reachability).
+        let mac =
+            self.stat_cache
+                .mac_for(id, now_ms(), crate::net::wifi::STAT_FRESH_MS)?;
+        self.leaf_ota_mac = Some((id, mac));
+        Some(mac)
     }
 
     /// #40 #3: the leaf's OTA RX-diag `(otam_heard, on_meta_verdict, otan_sent)` — `main`

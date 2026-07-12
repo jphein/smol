@@ -815,6 +815,12 @@ pub struct RelayDiag {
 #[cfg(feature = "wifi")]
 const CFG_CACHE_CAP: usize = 16;
 
+/// #68 F6: a cached leaf STAT older than this (ms since last heard) is treated as STALE — its
+/// `smol/<id>/status` republish is skipped (no ghost) and its MAC no longer resolves a relay arm.
+/// ~4.5× the 10 s STAT cadence: a leaf that missed several STATs is genuinely gone, not just laggy.
+#[cfg(feature = "wifi")]
+pub const STAT_FRESH_MS: u64 = 45_000;
+
 /// #21 leaf-relay: the GATEWAY's per-leaf default-screen cache. Filled from the
 /// retained wildcard `smol/+/config/default_screen` during a flush; re-broadcast as
 /// `SMOLv1 CFG` frames on the ~10 s cadence (mode.rs `broadcast_cached_configs`) so
@@ -825,6 +831,16 @@ pub struct CfgCache {
     ids: [u8; CFG_CACHE_CAP],
     vals: [[u8; CFG_VALUE_MAX]; CFG_CACHE_CAP],
     lens: [u8; CFG_CACHE_CAP],
+    /// #68 F6: last-heard timestamp (now_ms) per entry. Gates the stat republish on freshness
+    /// (a leaf that goes off-air STOPS refreshing its retained smol/<id>/status → HA sees it go
+    /// stale instead of a perpetually-fresh GHOST — the ghost that masked id9's floor-wipe + faked
+    /// id8-alive all demo). Also bounds the `mac_for` fallback to recently-heard leaves.
+    last_ms: [u64; CFG_CACHE_CAP],
+    /// #68: the src MAC the entry was last heard from. Lets the relay arm resolve a STAT-heard
+    /// leaf's MAC even after the volatile 16-slot LRU roster evicts it (roster-admission robustness
+    /// — "any STAT-heard leaf stays mac_for_id-resolvable"). Only meaningful for stat_cache (uplink);
+    /// cfg_cache (downlink configs) passes a zero MAC + is never mac-queried.
+    macs: [[u8; 6]; CFG_CACHE_CAP],
     count: usize,
 }
 
@@ -839,6 +855,8 @@ impl CfgCache {
             ids: [0; CFG_CACHE_CAP],
             vals: [[0; CFG_VALUE_MAX]; CFG_CACHE_CAP],
             lens: [0; CFG_CACHE_CAP],
+            last_ms: [0; CFG_CACHE_CAP],
+            macs: [[0; 6]; CFG_CACHE_CAP],
             count: 0,
         }
     }
@@ -846,12 +864,14 @@ impl CfgCache {
     /// Upsert a leaf's config value (truncated to `CFG_VALUE_MAX`). A full cache drops
     /// the entry and logs it (no silent cap). Value bytes are opaque here — the gateway
     /// RELAYS them verbatim; the leaf's `parse_default_screen` is the strict validator.
-    pub fn set(&mut self, id: u8, value: &[u8]) {
+    pub fn set(&mut self, id: u8, value: &[u8], mac: [u8; 6], now: u64) {
         let n = value.len().min(CFG_VALUE_MAX);
         for i in 0..self.count {
             if self.ids[i] == id {
                 self.vals[i][..n].copy_from_slice(&value[..n]);
                 self.lens[i] = n as u8;
+                self.last_ms[i] = now; // #68 F6: freshen
+                self.macs[i] = mac;
                 return;
             }
         }
@@ -860,6 +880,8 @@ impl CfgCache {
             self.ids[i] = id;
             self.vals[i][..n].copy_from_slice(&value[..n]);
             self.lens[i] = n as u8;
+            self.last_ms[i] = now;
+            self.macs[i] = mac;
             self.count += 1;
         } else {
             log::warn!("smol #21: cfg cache full ({}) — dropping config for id{}", CFG_CACHE_CAP, id);
@@ -881,6 +903,32 @@ impl CfgCache {
         } else {
             None
         }
+    }
+
+    /// #68 F6: the `i`-th entry, but ONLY if it was heard within `ttl` ms of `now`. The stat
+    /// republish uses this so a leaf that stopped transmitting stops refreshing its retained
+    /// status → HA sees it go stale instead of a perpetually-fresh ghost.
+    #[allow(dead_code)]
+    pub fn entry_fresh(&self, i: usize, now: u64, ttl: u64) -> Option<(u8, &[u8])> {
+        if i < self.count && now.saturating_sub(self.last_ms[i]) <= ttl {
+            let n = self.lens[i] as usize;
+            Some((self.ids[i], &self.vals[i][..n]))
+        } else {
+            None
+        }
+    }
+
+    /// #68: the MAC last heard for `id`, IFF the entry is fresh (within `ttl`). Lets the relay
+    /// arm resolve a recently-STAT-heard leaf's MAC even after the LRU roster evicts it — so a
+    /// STAT-audible-but-roster-dropped leaf is still armable (vs the silent mac-unknown no-arm).
+    #[allow(dead_code)]
+    pub fn mac_for(&self, id: u8, now: u64, ttl: u64) -> Option<[u8; 6]> {
+        for i in 0..self.count {
+            if self.ids[i] == id && now.saturating_sub(self.last_ms[i]) <= ttl {
+                return Some(self.macs[i]);
+            }
+        }
+        None
     }
 }
 
@@ -1287,8 +1335,12 @@ fn mqtt_session(
     // published just above via #50a) and empty values. Prepend `STAT|` so EVERY status
     // topic is uniform (`STAT|<screen>:<page>`), self + leaves, for the one HA template.
     if let Some(sc) = stat_cache {
+        // #68 F6: freshness-gate the status republish. An off-air leaf's entry goes stale →
+        // its retained smol/<id>/status STOPS refreshing → HA sees it age out instead of a
+        // perpetually-fresh ghost (the ghost that faked id8-alive + masked id9's floor-wipe).
+        let now_ms = Instant::now().duration_since_epoch().as_millis();
         for i in 0..sc.count() {
-            if let Some((lid, val)) = sc.entry(i) {
+            if let Some((lid, val)) = sc.entry_fresh(i, now_ms, STAT_FRESH_MS) {
                 if lid == node_id || val.is_empty() {
                     continue;
                 }
@@ -1426,7 +1478,10 @@ fn mqtt_session(
                         // anyway. Only present when cfg_cache = Some (gateway flush).
                         if leaf_id != node_id {
                             if let Some(cache) = cfg_cache.as_deref_mut() {
-                                cache.set(leaf_id, payload);
+                                // #68: cfg_cache is DOWNLINK (never mac-queried) → zero MAC; the
+                                // timestamp is set for API uniformity (cfg_cache isn't freshness-gated).
+                                let now = Instant::now().duration_since_epoch().as_millis();
+                                cache.set(leaf_id, payload, [0u8; 6], now);
                                 log::info!(
                                     "smol #21: cached leaf id{} config for relay ({} B)",
                                     leaf_id,
