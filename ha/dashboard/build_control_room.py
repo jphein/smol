@@ -144,7 +144,10 @@ def node_card(nid, meta, present):
             {"entity":f"sensor.smol_{nid}_peers","name":"peers / roster","icon":"mdi:lan"}]}}
     # ---- ctrl_bottom: firmware + install (always last → rounded bottom) ----
     bot=[{"type":"section","label":"firmware"}]
-    fw=next((e for e in present if re.match(rf"update\.smol_{nid}_.*_update$",e)),None)
+    # #40 changed the Update discovery object_id noun-based → nounless (smol_<id>_update, wifi.rs 5efee40),
+    # so match BOTH the legacy noun form (update.smol_<id>_<noun>_update, kept by HA registry stickiness on
+    # id7/8/9) AND the new nounless form a fresh node (id10+) / a registry reset now creates.
+    fw=next((e for e in present if re.match(rf"update\.smol_{nid}(_.*)?_update$",e)),None)
     if fw: bot.append({"entity":fw,"name":"firmware (version + update)"})
     inst=f"input_button.smol_ota_install_{nid}"
     if inst in present: bot.append({"entity":inst,"name":"Install staged (gateway consumes)","icon":"mdi:rocket-launch"})
