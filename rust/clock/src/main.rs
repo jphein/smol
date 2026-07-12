@@ -920,7 +920,24 @@ fn main() -> ! {
                     app::TimeSource::Adopted(_) => "mesh",
                     app::TimeSource::None => "none",
                 };
-                r.set_diag_extra(led_mode.to_wire(), led_on, tage_s, tsrc);
+                // #74 item 3 (stage-2): build this node's APPLIED-config string for HA config-drift.
+                // Canonical wire form `<screen>:<page>,<led>,<mask4hexU>,<units>` (e.g.
+                // `Grid:1,status,0000,F24`) — sub-seps `,`/`:`, NEVER `|` (the DIAG separator). screen
+                // = the LIVE rendered screen (captures manual BOOT-nav, same source as #50 STAT, the
+                // "what's actually running" truth JP wants — not the commanded default). mask = #55's
+                // hex form (`parse_plugin_mask` reads hex). units = temp+clock, no sep. HA rebuilds the
+                // same string from its command topics + plain-string-compares → the drift sensor.
+                let (cfg_kind, cfg_page) = app.live_screen();
+                let cfg = alloc::format!(
+                    "{}:{},{},{:04X},{}{}",
+                    cfg_kind.as_wire(),
+                    cfg_page,
+                    led_mode.to_wire(),
+                    plugin_mask,
+                    if units.temp_f { "F" } else { "C" },
+                    if units.clk_24h { "24" } else { "12" },
+                );
+                r.set_diag_extra(led_mode.to_wire(), led_on, tage_s, tsrc, cfg.as_bytes());
             }
             // #70/#49: a LEAF broadcasts its compact DIAG record on a SLOW ~60 s cadence (diag is
             // slow-moving — keep mesh airtime low), expedited by a BOOT-button press (rate-limited

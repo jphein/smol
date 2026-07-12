@@ -480,11 +480,29 @@ struct DiagExtra {
     tage_s: u32,
     /// #74 item 8: time source token ("ntp"/"mesh"/"none") — maps `TimeSource`.
     tsrc: &'static str,
+    /// #74 item 3 (stage-2): the node's APPLIED-config string for HA config-drift — the compact
+    /// `<screen>:<page>,<led>,<mask4hexU>,<units>` (e.g. `Grid:1,status,0000,F24`), built in `main`
+    /// from live_screen/led/plugin_mask/units and mirrored here. Fixed buffer (Copy-safe, no heap);
+    /// `cfg_len == 0` = not populated (wifi-only build: `main` only sets it on the espnow path) →
+    /// `diag_record` OMITS the `cfg=` field rather than emit a misleading default.
+    cfg: [u8; DIAG_CFG_MAX],
+    cfg_len: u8,
 }
+
+/// Max bytes of the DIAG `cfg=` applied-config string (Copy buffer in [`DiagExtra`]). Worst real
+/// content is `WledRemote:255,status,FFFF,C12` ≈ 30 B; 40 leaves headroom for any future field.
+const DIAG_CFG_MAX: usize = 40;
 
 impl DiagExtra {
     const fn new() -> Self {
-        Self { led_mode: "status", led_on: false, tage_s: 0, tsrc: "none" }
+        Self {
+            led_mode: "status",
+            led_on: false,
+            tage_s: 0,
+            tsrc: "none",
+            cfg: [0; DIAG_CFG_MAX],
+            cfg_len: 0,
+        }
     }
 }
 
@@ -2342,8 +2360,27 @@ impl RadioManager {
     /// #74: mirror `main`-owned node state (LED mode + its lit state, time-sync age + source) into
     /// the RadioManager so the DIAG record can fold in `led`/`tage`/`tsrc`. `main` calls this on the
     /// ~10 s diag-sample tick; both diag builders (leaf broadcast + gateway flush) read the copy.
-    pub fn set_diag_extra(&mut self, led_mode: &'static str, led_on: bool, tage_s: u32, tsrc: &'static str) {
-        self.diag_extra = DiagExtra { led_mode, led_on, tage_s, tsrc };
+    pub fn set_diag_extra(
+        &mut self,
+        led_mode: &'static str,
+        led_on: bool,
+        tage_s: u32,
+        tsrc: &'static str,
+        cfg: &[u8],
+    ) {
+        // #74 stage-2: copy the applied-config string into the fixed Copy buffer (clamped). An empty
+        // `cfg` (never set by `main`) keeps `cfg_len == 0`, so `diag_record` omits the `cfg=` field.
+        let n = cfg.len().min(DIAG_CFG_MAX);
+        let mut buf = [0u8; DIAG_CFG_MAX];
+        buf[..n].copy_from_slice(&cfg[..n]);
+        self.diag_extra = DiagExtra {
+            led_mode,
+            led_on,
+            tage_s,
+            tsrc,
+            cfg: buf,
+            cfg_len: n as u8,
+        };
     }
 
     /// #70/#49: build this node's compact DIAG record for retained `smol/<id>/diag`. Format matches
@@ -2383,7 +2420,7 @@ impl RadioManager {
             fallback: false,
         });
         let net_fb = if net.fallback { "fb" } else { "ok" };
-        alloc::format!(
+        let mut rec = alloc::format!(
             "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}",
             d.boot_slot,
             d.reset_reason,
@@ -2408,7 +2445,18 @@ impl RadioManager {
             e.tsrc,
             net.active,
             net_fb,
-        )
+        );
+        // #74 item 3 (stage-2): fold in the APPLIED-config string for HA config-drift, ONLY when
+        // `main` populated it (espnow build). ASCII by construction (as_wire/to_wire/hex/F24). HA
+        // reconstructs the same string from its command topics + plain-string-compares (luna's
+        // `sensor.smol_<id>_config_applied` + drift binary_sensor) — no hash primitive needed.
+        if e.cfg_len > 0 {
+            if let Ok(cfg) = core::str::from_utf8(&e.cfg[..e.cfg_len as usize]) {
+                rec.push_str("|cfg=");
+                rec.push_str(cfg);
+            }
+        }
+        rec
     }
 
     /// #40 #3: broadcast this LEAF's OTA RX-diag beacon (`LDBG` = id + heard/verdict/sent) so a

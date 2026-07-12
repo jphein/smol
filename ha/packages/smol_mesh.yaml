@@ -1225,8 +1225,10 @@ mqtt:
         {% if f | length >= 4 %}{% set ns.rows = ns.rows + [{'builds': f[0], 'outcome': f[1], 'dur_s': f[2] | int(0), 'at_up': f[3] | int(0)}] %}{% endif %}{% endfor %}
         {{ {'entries': ns.rows} | tojson }}
     # --- #74 config-drift DEVICE ECHO (item 3) — applied-config string the node reports.
-    # HA-side _expected reconstruction + drift binary_sensor are HELD pending the cfg= canonical
-    # contract with the #70/#74 fw (luna-74-ha-staging.md §3) — they'd false-alarm until pinned.
+    # CONTRACT PINNED (fw #74 stage-2): the DIAG record now carries `cfg=<screen>:<page>,<led>,
+    # <mask4hexU>,<units>` (e.g. `Grid:1,status,0000,F24`; screen = the LIVE rendered screen, mask
+    # = #55's %04X hex, units = temp+clock e.g. F24). The `_expected` reconstruction + `config_drift`
+    # binary_sensor live in the template: section below (search "config-drift COMPARATOR").
     - name: "smol 7 config applied"
       unique_id: smol_7_cfg_applied_mirror
       state_topic: "smol/7/diag"
@@ -1643,6 +1645,128 @@ template:
               {% endfor %}
             {% endfor %}
             {{ ns.e }}
+
+  # =====================================================================================
+  # #74 item 3 — config-drift COMPARATOR (fw contract PINNED in #74 stage-2).
+  # `_expected` rebuilds the SAME canonical string the fw emits in `cfg=`, from the retained
+  # COMMAND topics HA published. `config_drift` does a ROBUST FIELD-BY-FIELD compare (not a
+  # brittle whole-string equality): a field is only judged when HA has actually commanded it
+  # (a still-unknown command topic = "no opinion" = never drift), and the screen field
+  # tolerates a commanded default that omits the `:page`. So a half-configured node does NOT
+  # false-alarm; drift lights only on a genuine live≠desired (dropped CFG relay / stale NVS /
+  # manual nav off the commanded default). Attributes surface applied-vs-expected for debug.
+  # NOTE: logic host-validated (jinja mocks, 10 scenarios); confirm on the id7 canary that the
+  # live cfg= string parses as expected before trusting the dashboard drift chip.
+  - sensor:
+      - name: "smol 7 config expected"
+        unique_id: smol_7_config_expected
+        icon: "mdi:cog-outline"
+        state: >-
+          {% set scr = states('sensor.smol_7_config') %}
+          {% set led = states('sensor.smol_7_led') %}
+          {% set mask = states('sensor.smol_7_plugins') %}
+          {% set units = (state_attr('sensor.smol_units','temp') or 'F') ~ (state_attr('sensor.smol_units','clock') or '24') %}
+          {{ scr }},{{ led }},{{ mask }},{{ units }}
+      - name: "smol 8 config expected"
+        unique_id: smol_8_config_expected
+        icon: "mdi:cog-outline"
+        state: >-
+          {% set scr = states('sensor.smol_8_config') %}
+          {% set led = states('sensor.smol_8_led') %}
+          {% set mask = states('sensor.smol_8_plugins') %}
+          {% set units = (state_attr('sensor.smol_units','temp') or 'F') ~ (state_attr('sensor.smol_units','clock') or '24') %}
+          {{ scr }},{{ led }},{{ mask }},{{ units }}
+      - name: "smol 9 config expected"
+        unique_id: smol_9_config_expected
+        icon: "mdi:cog-outline"
+        state: >-
+          {% set scr = states('sensor.smol_9_config') %}
+          {% set led = states('sensor.smol_9_led') %}
+          {% set mask = states('sensor.smol_9_plugins') %}
+          {% set units = (state_attr('sensor.smol_units','temp') or 'F') ~ (state_attr('sensor.smol_units','clock') or '24') %}
+          {{ scr }},{{ led }},{{ mask }},{{ units }}
+  - binary_sensor:
+      - name: "smol 7 config drift"
+        unique_id: smol_7_config_drift
+        device_class: problem
+        icon: "mdi:cog-sync"
+        state: >-
+          {% set ap = states('sensor.smol_7_config_applied') %}
+          {% set ns = namespace(drift=false) %}
+          {% if ap not in ['unknown','unavailable','none',''] %}
+            {% set f = ap.split(',') %}
+            {% if f | length >= 4 %}
+              {% set e_scr = states('sensor.smol_7_config') %}
+              {% set e_led = states('sensor.smol_7_led') %}
+              {% set e_mask = states('sensor.smol_7_plugins') %}
+              {% set e_units = (state_attr('sensor.smol_units','temp') or '') ~ (state_attr('sensor.smol_units','clock') or '') %}
+              {% if e_scr not in ['unknown','unavailable','none',''] %}
+                {% set a_cmp = f[0] if ':' in e_scr else f[0].split(':')[0] %}
+                {% if a_cmp != e_scr %}{% set ns.drift = true %}{% endif %}
+              {% endif %}
+              {% if e_led not in ['unknown','unavailable','none',''] and f[1] != e_led %}{% set ns.drift = true %}{% endif %}
+              {% if e_mask not in ['unknown','unavailable','none',''] and f[2] != e_mask %}{% set ns.drift = true %}{% endif %}
+              {% if e_units | length == 3 and f[3] != e_units %}{% set ns.drift = true %}{% endif %}
+            {% endif %}
+          {% endif %}
+          {{ ns.drift }}
+        attributes:
+          applied: "{{ states('sensor.smol_7_config_applied') }}"
+          expected: "{{ states('sensor.smol_7_config_expected') }}"
+      - name: "smol 8 config drift"
+        unique_id: smol_8_config_drift
+        device_class: problem
+        icon: "mdi:cog-sync"
+        state: >-
+          {% set ap = states('sensor.smol_8_config_applied') %}
+          {% set ns = namespace(drift=false) %}
+          {% if ap not in ['unknown','unavailable','none',''] %}
+            {% set f = ap.split(',') %}
+            {% if f | length >= 4 %}
+              {% set e_scr = states('sensor.smol_8_config') %}
+              {% set e_led = states('sensor.smol_8_led') %}
+              {% set e_mask = states('sensor.smol_8_plugins') %}
+              {% set e_units = (state_attr('sensor.smol_units','temp') or '') ~ (state_attr('sensor.smol_units','clock') or '') %}
+              {% if e_scr not in ['unknown','unavailable','none',''] %}
+                {% set a_cmp = f[0] if ':' in e_scr else f[0].split(':')[0] %}
+                {% if a_cmp != e_scr %}{% set ns.drift = true %}{% endif %}
+              {% endif %}
+              {% if e_led not in ['unknown','unavailable','none',''] and f[1] != e_led %}{% set ns.drift = true %}{% endif %}
+              {% if e_mask not in ['unknown','unavailable','none',''] and f[2] != e_mask %}{% set ns.drift = true %}{% endif %}
+              {% if e_units | length == 3 and f[3] != e_units %}{% set ns.drift = true %}{% endif %}
+            {% endif %}
+          {% endif %}
+          {{ ns.drift }}
+        attributes:
+          applied: "{{ states('sensor.smol_8_config_applied') }}"
+          expected: "{{ states('sensor.smol_8_config_expected') }}"
+      - name: "smol 9 config drift"
+        unique_id: smol_9_config_drift
+        device_class: problem
+        icon: "mdi:cog-sync"
+        state: >-
+          {% set ap = states('sensor.smol_9_config_applied') %}
+          {% set ns = namespace(drift=false) %}
+          {% if ap not in ['unknown','unavailable','none',''] %}
+            {% set f = ap.split(',') %}
+            {% if f | length >= 4 %}
+              {% set e_scr = states('sensor.smol_9_config') %}
+              {% set e_led = states('sensor.smol_9_led') %}
+              {% set e_mask = states('sensor.smol_9_plugins') %}
+              {% set e_units = (state_attr('sensor.smol_units','temp') or '') ~ (state_attr('sensor.smol_units','clock') or '') %}
+              {% if e_scr not in ['unknown','unavailable','none',''] %}
+                {% set a_cmp = f[0] if ':' in e_scr else f[0].split(':')[0] %}
+                {% if a_cmp != e_scr %}{% set ns.drift = true %}{% endif %}
+              {% endif %}
+              {% if e_led not in ['unknown','unavailable','none',''] and f[1] != e_led %}{% set ns.drift = true %}{% endif %}
+              {% if e_mask not in ['unknown','unavailable','none',''] and f[2] != e_mask %}{% set ns.drift = true %}{% endif %}
+              {% if e_units | length == 3 and f[3] != e_units %}{% set ns.drift = true %}{% endif %}
+            {% endif %}
+          {% endif %}
+          {{ ns.drift }}
+        attributes:
+          applied: "{{ states('sensor.smol_9_config_applied') }}"
+          expected: "{{ states('sensor.smol_9_config_expected') }}"
 
 automation:
   - id: smol_publish_batt_display
