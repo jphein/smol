@@ -680,7 +680,14 @@ fn main() -> ! {
             // pending — else the self-OTA reboots the gateway mid-session and the two OTAs
             // collide/thrash the fleet. Short-circuit BEFORE `take_install_request()` so the
             // gateway's install is PRESERVED (not consumed) and fires once the relay resolves.
+            // #3: ALSO suppress while ANY leaf still holds a retained install (the flush's
+            // authority), not just while THIS session's `leaf_ota_pending` is set — otherwise the
+            // gap between one leaf's terminal `record_leaf_ota` and the next flush surfacing the
+            // next leaf lets the gateway self-OTA first, starving the second leaf + inverting the
+            // order. Both gates short-circuit BEFORE `take_install_request()` so the gateway's own
+            // install command is PRESERVED (fires last, once every leaf's install has cleared).
             let do_install = !r.leaf_ota_pending()
+                && !r.leaf_installs_outstanding()
                 && (crate::ota::OTA_AUTO_INSTALL || r.take_install_request());
             if do_install {
                 if let Some(announce) = r.take_ota_offer() {
