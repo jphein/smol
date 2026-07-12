@@ -124,6 +124,10 @@ pub enum OtaFrame<'a> {
 
 /// Parse one #40 OTA frame. Returns `None` on ANY malformed input (never panics,
 /// never indexes past the slice) — the caller treats `None` as "not an OTA frame".
+// #69 IRAM: on the per-chunk RX hot path (parsed for every OTAD during a leaf mesh-OTA). Placed in
+// IRAM so it runs at full speed right after each flash write invalidates the XIP cache — fewer
+// stalled drain iterations → fewer dropped chunks → fewer NAK repairs. Small + pure → cheap IRAM.
+#[esp_hal::ram]
 pub fn parse_ota_frame(data: &[u8]) -> Option<OtaFrame<'_>> {
     if let Some(rest) = data.strip_prefix(OTAM_PREFIX) {
         // target[3] session[2] M_len[1] M[M_len] sig[64]
@@ -233,6 +237,9 @@ pub fn encode_otad(target_id: u8, session: u16, seq: u16, payload: &[u8], out: &
 }
 
 /// Encode an `OTAN`. `bitmap` is truncated to [`OTAN_BITMAP_BYTES`]; returns the length.
+// #69 IRAM: the NAK-send hot path — built every time a window has gaps / needs a re-ack during the
+// flash-write phase. IRAM-resident so it runs without a post-write XIP-refill stall. Small + pure.
+#[esp_hal::ram]
 pub fn encode_otan(origin_id: u8, session: u16, window_base: u16, bitmap: &[u8], out: &mut [u8]) -> usize {
     let blen = bitmap.len().min(OTAN_BITMAP_BYTES);
     let mut n = 0;
@@ -282,6 +289,8 @@ pub fn total_chunks(size: u32) -> u32 {
 
 /// "All chunks present" bitmap mask for a window of `len` chunks (`len` ≤ 64). Shared by
 /// the leaf (completeness check) and the gateway (retransmit set).
+// #69 IRAM: tiny + on the per-chunk completeness check inside `on_data`. Negligible IRAM cost.
+#[esp_hal::ram]
 pub fn window_full_mask(len: u32) -> u64 {
     if len >= 64 {
         u64::MAX
@@ -595,6 +604,13 @@ impl OtaLeafSession {
     // on the OTA receive path; bundling into a struct would just relocate the fields
     // without simplifying the call site. Lint-only allow — no restructuring the hot path.
     #[allow(clippy::too_many_arguments)]
+    // #69 IRAM: THE per-chunk hot path — bounds-check + window-buffer copy + bitmap track for every
+    // OTAD, and the once-per-window flash flush. Placed in IRAM so the per-chunk RX work runs at
+    // full speed immediately after each flash write cold-invalidates the XIP cache (the stall the
+    // #40 canary saw as 1721 NAK repairs). The `feed_window` flash write it calls owns its own
+    // cache-off window (unchanged). Largest of the #69 placements — first to back off if a profile
+    // overflows the IRAM region.
+    #[esp_hal::ram]
     pub fn on_data(
         &mut self,
         target: u8,
