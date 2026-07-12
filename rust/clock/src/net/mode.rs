@@ -1543,6 +1543,7 @@ impl RadioManager {
         let mut ota_offer: Option<crate::ota::Announce> = None;
         let mut config_offer: Option<crate::app::DefaultScreen> = None;
         let mut install_requested = false;
+        let mut _leaf_install_seen = false; // #40 #1: a leaf's recovery burst is not a gateway relay
         let reached = match self.sta.as_mut() {
             None => false,
             Some(sta) => {
@@ -1559,6 +1560,7 @@ impl RadioManager {
                     &mut ota_offer,
                     &mut config_offer,
                     &mut install_requested,
+                    &mut _leaf_install_seen, // #40 #1: leaf recovery burst — never a gateway relay
                     &[], // #27: election-only recovery burst publishes no peers (leaf/v1)
             &[], // #50: recovery burst publishes no live-screen status
                     None, // #21: a leaf's recovery burst is not a gateway relay
@@ -2800,6 +2802,8 @@ impl RadioManager {
         let mut config_offer: Option<crate::app::DefaultScreen> = None;
         // #33: capture any OTA install command this flush surfaces.
         let mut install_requested = false;
+        // #40 #1: set iff this flush SEES a retained leaf install (pre-arm) → latch pending below.
+        let mut leaf_install_seen = false;
         let sta = self.sta.as_mut();
         let ok = match sta {
             None => false,
@@ -2835,6 +2839,7 @@ impl RadioManager {
                     &mut ota_offer,
                     &mut config_offer,
                     &mut install_requested,
+                    &mut leaf_install_seen, // #40 #1: latch pending on install-SEEN (below)
                     peers, // #27: gateway publishes its roster as retained smol/<id>/peers
                     status, // #50: gateway publishes its live screen as smol/<id>/status
                     Some(&mut self.cfg_cache), // #21: gateway caches leaf configs to relay
@@ -2858,6 +2863,15 @@ impl RadioManager {
         // #33: OR-in an install command (one-shot; `main`'s take clears it).
         if install_requested {
             self.install_requested = true;
+        }
+        // #40 #1 (self-OTA-first fix): if this flush SAW a retained leaf install, latch
+        // `leaf_ota_pending` NOW — on install-SEEN, before the arm (which needs the cached staged
+        // image). Otherwise the gateway's own `do_install` (gated on !leaf_ota_pending) could fire
+        // in the window between seeing its own install and the leaf arming → self-OTA first,
+        // inverting the demo order + rebooting the gateway early. Cleared on the terminal
+        // `record_leaf_ota` (retained install goes away → not seen next flush).
+        if leaf_install_seen {
+            self.leaf_ota_pending = true;
         }
         // #23 fix (oracle #2): APPLY the re-election result to the LIVE role. On a
         // connected flush, persist the refreshed staleness observation; if a LIVE

@@ -564,6 +564,7 @@ pub fn run_ntp_burst(
     // costs nothing the mesh cares about; a miss still leaves the cache untouched.
     let mqtt_deadline = Instant::now() + MQTT_SESSION_BUDGET;
     let mqtt_port = 49152 + (rng.random() % 16384) as u16;
+    let mut _leaf_seen_boot = false; // #40 #1: boot burst is not a gateway relay → never set
     let _ = mqtt_session(
         &mut iface,
         device,
@@ -578,6 +579,7 @@ pub fn run_ntp_burst(
         ota_offer,
         config_offer,
         install_requested,
+        &mut _leaf_seen_boot, // #40 #1: boot burst sees no leaf installs
         &[], // #27: boot NTP+downlink burst publishes no peers (no roster yet)
         &[], // #50: boot burst publishes no live-screen status
         None, // #21: boot burst is not a gateway relay (no leaf-config cache)
@@ -967,6 +969,11 @@ fn mqtt_session(
     // #33 HA Update entity: set true iff a retained `install` command is present for this
     // board (the native Install button) — the caller AND-gates the fetch on it.
     install_requested: &mut bool,
+    // #40 #1: set true iff a retained `smol/<leaf>/ota/install` for ANOTHER node is SEEN this
+    // burst (install-seen, independent of whether it armed — arming needs the cached staged
+    // image). The gateway flush latches `leaf_ota_pending` on this so its OWN self-OTA is
+    // suppressed the moment a leaf install exists, closing the self-OTA-first race.
+    leaf_install_seen: &mut bool,
     // #27: this node's serialized roster (`PEERS|…`); published retained to
     // `smol/<node_id>/peers` after the telemetry loop iff non-empty.
     peers: &[u8],
@@ -1429,6 +1436,7 @@ fn mqtt_session(
                         // (a drain-timing miss) would be consumed+lost without ever arming.
                         if leaf_id != node_id && cfg_cache.is_some() && payload == b"INSTALL" {
                             pending_leaf = Some(leaf_id);
+                            *leaf_install_seen = true; // #40 #1: install-SEEN (pre-arm) → gateway suppresses its own self-OTA
                             log::info!("smol #40: leaf id{} OTA install command received", leaf_id);
                         }
                     }
@@ -1857,6 +1865,8 @@ pub fn run_mqtt_burst(
     config_offer: &mut Option<crate::app::DefaultScreen>,
     // #33: set true iff a retained OTA `install` command is present for this board.
     install_requested: &mut bool,
+    // #40 #1: set true iff a retained leaf `install` (for another node) is seen this burst.
+    leaf_install_seen: &mut bool,
     // #27: this node's serialized roster (`PEERS|…`) to publish retained as
     // `smol/<id>/peers`. Empty ⇒ nothing published (leaf / election-only burst).
     peers: &[u8],
@@ -2024,6 +2034,7 @@ pub fn run_mqtt_burst(
         ota_offer,
         config_offer,
         install_requested,
+        leaf_install_seen, // #40 #1: forward the leaf-install-seen latch
         peers, // #27: forward the caller's serialized roster to publish retained
         status, // #50: forward the live STAT|screen:page for smol/<id>/status
         cfg_cache, // #21: forward the gateway's leaf-config cache (or None)
