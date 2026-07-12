@@ -72,7 +72,7 @@ cards:
 
         '
 - type: picture
-  image: /local/luna-cards/smol-topology.svg?v=c8dbff72
+  image: /local/luna-cards/smol-topology.svg?v=4cf1878d
   view_layout:
     grid-column: span 7
   card_mod:
@@ -393,6 +393,12 @@ cards:
       icon_color: '{{ ''green'' if is_state(''input_boolean.smol_7_plugin_about'',''on'') else ''disabled'' }}'
       tap_action:
         action: toggle
+    - type: template
+      entity: input_boolean.smol_7_plugin_familiar
+      icon: mdi:paw
+      icon_color: '{{ ''green'' if is_state(''input_boolean.smol_7_plugin_familiar'',''on'') else ''disabled'' }}'
+      tap_action:
+        action: toggle
     card_mod:
       style: ha-card{border-radius:0;border-top:none;border-bottom:none;margin-top:-1px;padding:6px 8px 4px;background:var(--card-background-color);}
   - type: entities
@@ -592,6 +598,12 @@ cards:
       icon_color: '{{ ''green'' if is_state(''input_boolean.smol_8_plugin_about'',''on'') else ''disabled'' }}'
       tap_action:
         action: toggle
+    - type: template
+      entity: input_boolean.smol_8_plugin_familiar
+      icon: mdi:paw
+      icon_color: '{{ ''green'' if is_state(''input_boolean.smol_8_plugin_familiar'',''on'') else ''disabled'' }}'
+      tap_action:
+        action: toggle
     card_mod:
       style: ha-card{border-radius:0;border-top:none;border-bottom:none;margin-top:-1px;padding:6px 8px 4px;background:var(--card-background-color);}
   - type: entities
@@ -789,6 +801,12 @@ cards:
       entity: input_boolean.smol_9_plugin_about
       icon: mdi:information-outline
       icon_color: '{{ ''green'' if is_state(''input_boolean.smol_9_plugin_about'',''on'') else ''disabled'' }}'
+      tap_action:
+        action: toggle
+    - type: template
+      entity: input_boolean.smol_9_plugin_familiar
+      icon: mdi:paw
+      icon_color: '{{ ''green'' if is_state(''input_boolean.smol_9_plugin_familiar'',''on'') else ''disabled'' }}'
       tap_action:
         action: toggle
     card_mod:

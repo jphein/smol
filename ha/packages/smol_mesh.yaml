@@ -144,6 +144,105 @@ input_boolean:
   smol_display_override:
     name: "smol display override"
     icon: "mdi:pencil"
+  # --- #55 plugin visibility (per-node) — one input_boolean per maskable AppKind. The compose
+  # automation ORs the set bits (stable bit0..6) → retained smol/<id>/config/plugins = 4-hex u16.
+  # Default ALL ON (=007F); fw: 0000/bad/empty → keep-all (safety), masked live screen → board default.
+  smol_7_plugin_clock:
+    name: "smol 7 · Clock visible"
+    icon: "mdi:clock-outline"
+    initial: true
+  smol_7_plugin_snake:
+    name: "smol 7 · Snake visible"
+    icon: "mdi:snake"
+    initial: true
+  smol_7_plugin_bench:
+    name: "smol 7 · Bench visible"
+    icon: "mdi:test-tube"
+    initial: true
+  smol_7_plugin_batt:
+    name: "smol 7 · Batt visible"
+    icon: "mdi:battery"
+    initial: true
+  smol_7_plugin_grid:
+    name: "smol 7 · Grid visible"
+    icon: "mdi:transmission-tower"
+    initial: true
+  smol_7_plugin_wled:
+    name: "smol 7 · Wled visible"
+    icon: "mdi:led-strip-variant"
+    initial: true
+  smol_7_plugin_about:
+    name: "smol 7 · About visible"
+    icon: "mdi:information-outline"
+    initial: true
+  smol_7_plugin_familiar:
+    name: "smol 7 · Familiar visible"
+    icon: "mdi:paw"
+    initial: true
+  smol_8_plugin_clock:
+    name: "smol 8 · Clock visible"
+    icon: "mdi:clock-outline"
+    initial: true
+  smol_8_plugin_snake:
+    name: "smol 8 · Snake visible"
+    icon: "mdi:snake"
+    initial: true
+  smol_8_plugin_bench:
+    name: "smol 8 · Bench visible"
+    icon: "mdi:test-tube"
+    initial: true
+  smol_8_plugin_batt:
+    name: "smol 8 · Batt visible"
+    icon: "mdi:battery"
+    initial: true
+  smol_8_plugin_grid:
+    name: "smol 8 · Grid visible"
+    icon: "mdi:transmission-tower"
+    initial: true
+  smol_8_plugin_wled:
+    name: "smol 8 · Wled visible"
+    icon: "mdi:led-strip-variant"
+    initial: true
+  smol_8_plugin_about:
+    name: "smol 8 · About visible"
+    icon: "mdi:information-outline"
+    initial: true
+  smol_8_plugin_familiar:
+    name: "smol 8 · Familiar visible"
+    icon: "mdi:paw"
+    initial: true
+  smol_9_plugin_clock:
+    name: "smol 9 · Clock visible"
+    icon: "mdi:clock-outline"
+    initial: true
+  smol_9_plugin_snake:
+    name: "smol 9 · Snake visible"
+    icon: "mdi:snake"
+    initial: true
+  smol_9_plugin_bench:
+    name: "smol 9 · Bench visible"
+    icon: "mdi:test-tube"
+    initial: true
+  smol_9_plugin_batt:
+    name: "smol 9 · Batt visible"
+    icon: "mdi:battery"
+    initial: true
+  smol_9_plugin_grid:
+    name: "smol 9 · Grid visible"
+    icon: "mdi:transmission-tower"
+    initial: true
+  smol_9_plugin_wled:
+    name: "smol 9 · Wled visible"
+    icon: "mdi:led-strip-variant"
+    initial: true
+  smol_9_plugin_about:
+    name: "smol 9 · About visible"
+    icon: "mdi:information-outline"
+    initial: true
+  smol_9_plugin_familiar:
+    name: "smol 9 · Familiar visible"
+    icon: "mdi:paw"
+    initial: true
 
 # =====================================================================
 # KEYED CFG RELAY (issue #56) — the ONE wire that carries ALL per-node config
@@ -357,6 +456,19 @@ mqtt:
       icon: "mdi:card-text-outline"
       value_template: >-
         {% set p = value.split('|', 1) %}{% if p | length > 1 and p[1] %}{{ p[1].split(';')[0][2:] }}{% else %}(none){% endif %}
+    # --- #55 plugin-mask mirror (read back the retained hex the compose published) ---
+    - name: "smol 7 plugins"
+      unique_id: smol_7_plugins_mirror
+      state_topic: "smol/7/config/plugins"
+      icon: "mdi:puzzle-outline"
+    - name: "smol 8 plugins"
+      unique_id: smol_8_plugins_mirror
+      state_topic: "smol/8/config/plugins"
+      icon: "mdi:puzzle-outline"
+    - name: "smol 9 plugins"
+      unique_id: smol_9_plugins_mirror
+      state_topic: "smol/9/config/plugins"
+      icon: "mdi:puzzle-outline"
     # --- #43 display units (GLOBAL) — mirror of the retained smol/config/units ---
     - name: "smol units"
       unique_id: smol_units_mirror
@@ -396,7 +508,7 @@ mqtt:
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/7/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
-      expire_after: 90   # #68: STAT is cache-republished every flush (F6-gated 45s); ages out
+      expire_after: 90   # #68/#94: online source. Flap-tune (90→180) was CONSIDERED then DROPPED — the all-192 flap was a mesh-SETTLING artifact (cadence briefly ~90s); at healthy steady-state status republishes ~11s, far under 90, so online is stable. F6-gated republish, ages out
       # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
       icon: "mdi:chip"
     - name: "smol 8 screen"
@@ -405,7 +517,7 @@ mqtt:
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/8/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
-      expire_after: 90   # #68: STAT is cache-republished every flush (F6-gated 45s); ages out
+      expire_after: 90   # #68/#94: online source. Flap-tune (90→180) was CONSIDERED then DROPPED — the all-192 flap was a mesh-SETTLING artifact (cadence briefly ~90s); at healthy steady-state status republishes ~11s, far under 90, so online is stable. F6-gated republish, ages out
       # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
       icon: "mdi:chip"
     - name: "smol 9 screen"
@@ -414,7 +526,7 @@ mqtt:
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/9/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
-      expire_after: 90   # #68: STAT is cache-republished every flush (F6-gated 45s); ages out
+      expire_after: 90   # #68/#94: online source. Flap-tune (90→180) was CONSIDERED then DROPPED — the all-192 flap was a mesh-SETTLING artifact (cadence briefly ~90s); at healthy steady-state status republishes ~11s, far under 90, so online is stable. F6-gated republish, ages out
       # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
       icon: "mdi:chip"
     # --- #40 running BUILD# as a first-class device-merged value (JP ask 2026-07-11) ---
@@ -1208,6 +1320,129 @@ mqtt:
         {% set ns = namespace(v='0') %}
         {% for kv in value.split('|') %}{% if kv.startswith('btnl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
         {{ ns.v | int(0) }}
+    # --- #49 DIAG counters (vesper folds into the same smol/<id>/diag record) —
+    # flush ok/fail + OTA-verify ok/fail. Same key-picker; forward-compat (parser
+    # already ignores unknown keys). total_increasing; degrade-safe (0 until fw). ---
+    - name: "smol 7 flush ok"
+      unique_id: smol_7_flush_ok_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:check-network-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('fok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 7 flush fail"
+      unique_id: smol_7_flush_fail_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:close-network-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('ffl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 7 verify ok"
+      unique_id: smol_7_verify_ok_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-check-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('vok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 7 verify fail"
+      unique_id: smol_7_verify_fail_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-alert-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('vfl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 8 flush ok"
+      unique_id: smol_8_flush_ok_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:check-network-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('fok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 8 flush fail"
+      unique_id: smol_8_flush_fail_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:close-network-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('ffl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 8 verify ok"
+      unique_id: smol_8_verify_ok_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-check-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('vok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 8 verify fail"
+      unique_id: smol_8_verify_fail_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-alert-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('vfl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 9 flush ok"
+      unique_id: smol_9_flush_ok_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:check-network-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('fok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 9 flush fail"
+      unique_id: smol_9_flush_fail_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:close-network-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('ffl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 9 verify ok"
+      unique_id: smol_9_verify_ok_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-check-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('vok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 9 verify fail"
+      unique_id: smol_9_verify_fail_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-alert-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('vfl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
 
 # =====================================================================
 # MESH TOPOLOGY derived sensors (issue #27) — HELD; back the topology card.
@@ -1678,7 +1913,10 @@ automation:
         data:
           topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/cmd/reset"
           retain: false
-          qos: 0
+          qos: 1     # #52 transient cmd — qos:1 REQUIRED: the gateway drops qos:0 (~5% loss →
+          # unreliable reboot). retain:false stays (a retained reset = reboot-loop); qos:1 gives
+          # at-least-once delivery of the momentary RESET. (Retained config topics tolerate qos:0
+          # via reconnect-redelivery; only TRANSIENT cmd/ needs qos:1 — canary finding 2026-07-12.)
           payload: "RESET"
 
   - id: smol_all_reboot_fanout
@@ -1963,3 +2201,56 @@ automation:
                 retain: true
                 qos: 0
                 payload: "{{ states('sensor.smol_' ~ repeat.item ~ '_custom_lay') }}"
+
+  # --- #55 publish per-node plugin visibility mask (retained → smol/<id>/config/plugins) ---
+  - id: smol_publish_plugins
+    alias: "smol: publish per-node plugin visibility mask (retained, #55)"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id:
+          - input_boolean.smol_7_plugin_clock
+          - input_boolean.smol_7_plugin_snake
+          - input_boolean.smol_7_plugin_bench
+          - input_boolean.smol_7_plugin_batt
+          - input_boolean.smol_7_plugin_grid
+          - input_boolean.smol_7_plugin_wled
+          - input_boolean.smol_7_plugin_about
+          - input_boolean.smol_7_plugin_familiar
+          - input_boolean.smol_8_plugin_clock
+          - input_boolean.smol_8_plugin_snake
+          - input_boolean.smol_8_plugin_bench
+          - input_boolean.smol_8_plugin_batt
+          - input_boolean.smol_8_plugin_grid
+          - input_boolean.smol_8_plugin_wled
+          - input_boolean.smol_8_plugin_about
+          - input_boolean.smol_8_plugin_familiar
+          - input_boolean.smol_9_plugin_clock
+          - input_boolean.smol_9_plugin_snake
+          - input_boolean.smol_9_plugin_bench
+          - input_boolean.smol_9_plugin_batt
+          - input_boolean.smol_9_plugin_grid
+          - input_boolean.smol_9_plugin_wled
+          - input_boolean.smol_9_plugin_about
+          - input_boolean.smol_9_plugin_familiar
+      - platform: homeassistant
+        event: start
+    action:
+      - repeat:
+          for_each: ["7", "8", "9"]
+          sequence:
+            - variables:
+                n: "{{ repeat.item }}"
+                mask: >-
+                  {% set b = namespace(m=0) %}
+                  {% for name, val in [['clock',1],['snake',2],['bench',4],['batt',8],['grid',16],['wled',32],['about',64],['familiar',128]] %}
+                  {% if is_state('input_boolean.smol_' ~ n ~ '_plugin_' ~ name, 'on') %}{% set b.m = b.m + val %}{% endif %}
+                  {% endfor %}
+                  {{ '%04X' | format(b.m) }}
+            - service: mqtt.publish
+              data:
+                topic: "smol/{{ n }}/config/plugins"
+                retain: true
+                qos: 0
+                payload: "{{ mask }}"
