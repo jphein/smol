@@ -1278,6 +1278,10 @@ pub enum Mode {
 /// and, per esp-wifi's docs, must happen exactly once.
 pub struct RadioManager {
     controller: WifiController<'static>,
+    /// #68/#76 SELF-MAC: our own STA/ESP-NOW MAC, captured once at `new()`. `service()` drops
+    /// inbound frames whose `src` equals this — the esp-wifi RX path can loop our own broadcasts
+    /// back, which otherwise self-rosters us (roster anomaly #1) and pollutes PEERS.
+    self_mac: [u8; 6],
     esp_now: EspNow<'static>,
     /// The WiFi STA device, handed out once by esp-wifi's `Interfaces`. Held as
     /// an `Option` and BORROWED (never dropped) so it survives the boot NTP burst
@@ -1437,8 +1441,15 @@ impl RadioManager {
         controller.set_mode(WifiMode::Sta).ok()?;
         controller.start().ok()?;
 
+        // #68/#76 SELF-MAC: capture our STA MAC (ESP-NOW rides the STA interface) so service()
+        // can DROP frames from our own address. The esp-wifi RX queue can deliver our own
+        // broadcasts back to us; with no self-filter the gateway rosters ITSELF (constant-RSSI,
+        // age-0, flags-3 self-entry — roster anomaly #1) and wastes an eviction-immune slot.
+        let self_mac = interfaces.sta.mac_address();
+
         Some(Self {
             controller,
+            self_mac,
             esp_now: interfaces.esp_now,
             // Keep the STA device alive for the NTP burst; dropped afterward.
             sta: Some(interfaces.sta),
@@ -3076,6 +3087,14 @@ impl RadioManager {
                 break;
             };
             let src = recv.info.src_address;
+            // #68/#76 SELF-MAC FILTER: the esp-wifi RX path can deliver our OWN broadcasts back
+            // to us (HELLO/TIME/PEERS). With no guard the gateway rosters ITSELF (roster anomaly
+            // #1: a constant-RSSI, age-0, flags-3 self-entry that, being always freshest, is
+            // eviction-immune and permanently burns a 16-slot LRU slot — the #28 ceiling too).
+            // Drop our own frames before ANY handler (OTA dispatch + generic Frame parse below).
+            if src == self.self_mac {
+                continue;
+            }
             // RSSI of this frame (dBm) from the ESP-NOW RX control info; used by
             // BENCH. Captured up front so each arm can record it if relevant.
             let rssi = recv.info.rx_control.rssi;
