@@ -66,6 +66,14 @@ pub use wifi::CFG_KEY_PLUGINS;
 // take_cfg_offer(R), with a boot-debounce before software_reset()).
 #[cfg(feature = "espnow")]
 pub use wifi::CFG_KEY_REBOOT;
+// #45 custom-screen key — same `main`-bridge rationale (espnow leaf-apply path via
+// take_cfg_offer(Y); the held layout feeds the Custom plugin render).
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_KEY_CUSTOM;
+// #45: `main` sizes its held Custom-layout buffer to the max keyed value — bridge the const out
+// of the private `wifi` module (espnow-only: only the Custom apply path names it).
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_VALUE_MAX;
 
 // #71 on-demand WiFi-scan key — same `main`-bridge rationale (espnow apply path via
 // take_cfg_offer(W) → run_scan).

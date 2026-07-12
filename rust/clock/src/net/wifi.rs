@@ -786,13 +786,19 @@ static mut MQTT_JSON: JsonScratch = JsonScratch::new();
 #[cfg(feature = "wifi")]
 static mut MQTT_ACC: [u8; 512] = [0; 512];
 
-/// #21 leaf-relay: max bytes of a relayed default-screen value (`<AppKind>:<page>`,
-/// ≤ 12 by the #21 grammar; 16 gives margin). Lives here (not `net::mode`) because
-/// the gateway FILLS the cache from MQTT in `mqtt_session` (compiled under `wifi`),
-/// while the ESP-NOW frame layer that CONSUMES it is `#[cfg(espnow)]` — and
-/// `espnow ⊃ wifi`, so a wifi-level type is namable from both with no signature cfg.
+/// #21 leaf-relay: max bytes of a relayed keyed-CFG value. Lives here (not `net::mode`) because
+/// the gateway FILLS the cache from MQTT in `mqtt_session` (compiled under `wifi`), while the
+/// ESP-NOW frame layer that CONSUMES it is `#[cfg(espnow)]` — and `espnow ⊃ wifi`, so a
+/// wifi-level type is namable from both with no signature cfg.
+///
+/// **64** (was 16): the #45 Custom-screen wire (`<count>|<size><align>text;…`, up to 4 segments
+/// clipped to 12 chars → ≈ 61 B) is the largest keyed value; screen/led/units/plugins/reboot all
+/// stay ≤ 12 B. Sizing the ONE uniform buffer to the largest key reuses the CFG frame verbatim
+/// (issue #45: "reuse that frame, don't invent one") rather than a per-key buffer or a second
+/// transport. Also removes the old 16-B truncation risk on the STAT uplink (which reuses this).
+/// Cost: ~2 KB `.bss` across cfg_cache + stat_cache + the tracker — comfortable on the C3.
 #[cfg(feature = "wifi")]
-pub const CFG_VALUE_MAX: usize = 16;
+pub const CFG_VALUE_MAX: usize = 64;
 
 /// #56 keyed CFG: the single-ASCII config KEY that follows the 3-digit target id in a
 /// `SMOLv1 CFG` frame (`<NNN><KEY><value>`). ONE relay now carries N per-node config
@@ -836,6 +842,11 @@ pub const CFG_KEY_PLUGINS: u8 = b'P';
 #[cfg(feature = "wifi")]
 #[allow(dead_code)]
 pub const CFG_KEY_REBOOT: u8 = b'R';
+/// #45 Custom-screen channel (key `Y`). Per-node retained `smol/<id>/config/custom` = the compose
+/// wire `<count>|<size><align>text;…` (entities pre-resolved HA-side; empty = clear). A leaf gets
+/// it relayed; the gateway reads its own directly. The largest keyed value (drives CFG_VALUE_MAX).
+#[cfg(feature = "wifi")]
+pub const CFG_KEY_CUSTOM: u8 = b'Y';
 
 /// #71 on-demand WiFi-scan COMMAND (key `W`). EXACT twin of `R` (#52): rides the CFG WIRE
 /// (`SMOLv1 CFG <id>W`), IS in `CFG_APPLY_KEYS` (a node buffers + applies it), but is NEVER
@@ -871,12 +882,14 @@ pub struct GwOwnCfg {
     pub units: Option<([u8; CFG_VALUE_MAX], usize)>,
     /// #55 the gateway's own `smol/<id>/config/plugins` value `(buf, len)`, or `None` if absent.
     pub plugins: Option<([u8; CFG_VALUE_MAX], usize)>,
+    /// #45 the gateway's own `smol/<id>/config/custom` value `(buf, len)`, or `None` if absent.
+    pub custom: Option<([u8; CFG_VALUE_MAX], usize)>,
 }
 
 #[cfg(feature = "wifi")]
 impl GwOwnCfg {
     pub const fn new() -> Self {
-        Self { led: None, units: None, plugins: None }
+        Self { led: None, units: None, plugins: None, custom: None }
     }
     /// Pack a payload into the `(buf, len)` a field holds (truncated to `CFG_VALUE_MAX`), so the
     /// mqtt-drain arms stay one-liners: `gw_own.led = Some(GwOwnCfg::val(payload));`.
@@ -1597,6 +1610,12 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 14, b"smol/+/cmd/scan") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
+        // #45 Custom screen (pid 15): wildcard-subscribe every leaf's retained custom-screen layout
+        // so the gateway caches + relays it (key `Y`) over ESP-NOW, twin of the led/plugins wildcard.
+        // (pid 15 — #71's scan took 14 in the merge; distinct pid per concurrent SUBSCRIBE.)
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 15, b"smol/+/config/custom") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
     }
 
     // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
@@ -2023,6 +2042,25 @@ fn mqtt_session(
                         } else {
                             gw_own.plugins = Some(GwOwnCfg::val(payload));
                             log::info!("smol #55: gateway own plugin mask captured ({} B)", payload.len());
+                        }
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/custom") {
+                        // #45 Custom screen: twin of the led/plugins arm. OTHER leaf → cache under
+                        // key `Y` for the ESP-NOW relay; OUR OWN id → capture into gw_own so
+                        // `service()` self-applies it. Verbatim RESOLVED bytes (entities already
+                        // substituted HA-side); the Custom plugin parses the layout wire panic-free.
+                        if leaf_id != node_id {
+                            if let Some(cache) = cfg_cache.as_deref_mut() {
+                                let now = Instant::now().duration_since_epoch().as_millis();
+                                cache.set(leaf_id, CFG_KEY_CUSTOM, payload, [0u8; 6], now);
+                                log::info!(
+                                    "smol #45: cached leaf id{} custom screen for relay ({} B)",
+                                    leaf_id,
+                                    payload.len()
+                                );
+                            }
+                        } else {
+                            gw_own.custom = Some(GwOwnCfg::val(payload));
+                            log::info!("smol #45: gateway own custom screen captured ({} B)", payload.len());
                         }
                     } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/cmd/reset") {
                         // #52 remote reboot — a COMMAND on a TRANSIENT topic (retain:false), so we

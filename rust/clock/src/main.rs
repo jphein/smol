@@ -104,6 +104,10 @@ mod input;
 // the module only needs esp-hal GPIO so it could be reused elsewhere.
 #[cfg(feature = "espnow")]
 mod led;
+// #45 CUSTOM screen — per-node user text/entities, driven by the relayed CFG key `Y`.
+// espnow-only (the config only ever arrives over the radio path), like `led`.
+#[cfg(feature = "espnow")]
+mod custom;
 // Home menu + AppMode dispatcher enum. Always compiled.
 mod menu;
 // WiFi/SNTP (Phase 2) + ESP-NOW/radio switching (Phase 3). Feature-gated inside.
@@ -587,6 +591,14 @@ fn main() -> ! {
     // `smol/<id>/config/led` (key `L`). Default `Status` = the pre-#48 peer-state indicator.
     #[cfg(feature = "espnow")]
     let mut led_mode = led::LedMode::default();
+
+    // #45 CUSTOM screen layout — the resolved wire from `smol/<id>/config/custom` (key `Y`),
+    // held across the loop and updated via take_cfg_offer(Y). `custom_len` = 0 → no custom set
+    // (the Custom plugin then shows a placeholder). Sized to the max keyed value.
+    #[cfg(feature = "espnow")]
+    let mut custom_buf = [0u8; crate::net::CFG_VALUE_MAX];
+    #[cfg(feature = "espnow")]
+    let mut custom_len: usize = 0;
 
     // #43 display units (°F/°C · 12h/24h), fleet-global. Held across the loop; on espnow the
     // relayed / gateway-own `smol/config/units` (key `U`, broadcast target 255) updates it.
@@ -1103,6 +1115,17 @@ fn main() -> ! {
                 }
             }
 
+            // #45: pull the relayed / gateway-own Custom-screen layout (key `Y`) and store the raw
+            // RESOLVED wire (entities already substituted HA-side) for the Custom plugin to render.
+            // Edge-triggered; an empty value clears it (→ placeholder). No parse here — the Custom
+            // plugin parses the layout panic-free at render time.
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_CUSTOM) {
+                let n = o.len.min(custom_buf.len());
+                custom_buf[..n].copy_from_slice(&o.buf[..n]);
+                custom_len = n;
+                log::info!("smol #45: custom screen layout updated ({} B)", n);
+            }
+
             // #52: a remote reboot command (key `R`) — a COMMAND (cache-bypass, one-shot). Applied
             // once (edge — `take` clears it); the value is empty (the key IS the command). Feeds
             // BOTH a leaf (relayed `<id>R`) and the gateway's OWN reset (injected into `self.cfg`),
@@ -1203,6 +1226,9 @@ fn main() -> ! {
             },
             #[cfg(feature = "espnow")]
             radio: radio.as_mut(),
+            // #45 the held Custom-screen layout (empty slice = none) — read by the Custom plugin.
+            #[cfg(feature = "espnow")]
+            custom: &custom_buf[..custom_len],
         };
 
         // Issue #18: one-shot entry into the configured boot screen, now that a

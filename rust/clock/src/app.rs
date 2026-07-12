@@ -131,6 +131,11 @@ pub struct Ctx<'a> {
     /// relay/LED) is serviced by `main` BEFORE dispatch, so no double-drive.
     #[cfg(feature = "espnow")]
     pub radio: Option<&'a mut crate::net::mode::RadioManager>,
+    /// #45 the held Custom-screen layout wire (`<count>|<size><align>text;…`, entities
+    /// pre-resolved HA-side), owned by `main` and updated from the relayed / gateway-own
+    /// `smol/<id>/config/custom` (key `Y`). Empty = no custom set. Read by the Custom plugin.
+    #[cfg(feature = "espnow")]
+    pub custom: &'a [u8],
 }
 
 /// What a plugin asks `main` to do after a button gesture.
@@ -184,6 +189,11 @@ pub enum AppKind {
     // construct it), like Batt/Grid → no dead_code allow needed. cfg(wled) = espnow+.
     #[cfg(feature = "wled")]
     WledRemote,
+    // #45 Custom screen — per-node user text/entities. espnow-gated: its config arrives ONLY over
+    // the CFG relay / gateway-own MQTT (a radio path), so a default/wifi build has no way to fill
+    // it — a Custom menu row there would always be blank. LIVE on espnow (REGISTRY row + enter).
+    #[cfg(feature = "espnow")]
+    Custom,
 }
 
 /// #21 node-manager CONSUME — the parsed retained `smol/<id>/config/default_screen`
@@ -227,6 +237,10 @@ impl AppKind {
             // #25: a leaf's default screen can be set to the WLED remote via #21 too.
             #[cfg(feature = "wled")]
             "WledRemote" => AppKind::WledRemote,
+            // #45: a node's default screen can be set to Custom (matches luna's #81 screen
+            // input_select option "Custom"). espnow-only, like the AppKind variant.
+            #[cfg(feature = "espnow")]
+            "Custom" => AppKind::Custom,
             _ => return None,
         })
     }
@@ -253,6 +267,8 @@ impl AppKind {
             AppKind::MeshSnake => "MeshSnake",
             #[cfg(feature = "wled")]
             AppKind::WledRemote => "WledRemote",
+            #[cfg(feature = "espnow")]
+            AppKind::Custom => "Custom",
         }
     }
 }
@@ -310,6 +326,8 @@ pub enum App {
     MeshSnake(crate::mesh_snake::MeshSnake),
     #[cfg(feature = "wled")]
     WledRemote(crate::net::wled::WledRemoteState),
+    #[cfg(feature = "espnow")]
+    Custom(crate::custom::CustomState),
 }
 
 impl App {
@@ -335,6 +353,8 @@ impl App {
             AppKind::WledRemote => {
                 App::WledRemote(crate::net::wled::WledRemoteState::new(ctx.now_ms))
             }
+            #[cfg(feature = "espnow")]
+            AppKind::Custom => App::Custom(crate::custom::CustomState::new()),
         }
     }
 
@@ -362,6 +382,8 @@ impl App {
             App::MeshSnake(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "wled")]
             App::WledRemote(s) => Plugin::on_button(s, press, ctx),
+            #[cfg(feature = "espnow")]
+            App::Custom(s) => Plugin::on_button(s, press, ctx),
         }
     }
 
@@ -382,6 +404,8 @@ impl App {
             App::MeshSnake(s) => Plugin::update(s, ctx),
             #[cfg(feature = "wled")]
             App::WledRemote(s) => Plugin::update(s, ctx),
+            #[cfg(feature = "espnow")]
+            App::Custom(s) => Plugin::update(s, ctx),
         }
     }
 
@@ -422,6 +446,8 @@ impl App {
             App::MeshSnake(_) => (AppKind::MeshSnake, 0),
             #[cfg(feature = "wled")]
             App::WledRemote(_) => (AppKind::WledRemote, 0),
+            #[cfg(feature = "espnow")]
+            App::Custom(_) => (AppKind::Custom, 0),
         }
     }
 }
@@ -461,6 +487,10 @@ pub const REGISTRY: &[AppDesc] = &[
     #[cfg(feature = "wled")]
     AppDesc { title: "WLED", kind: AppKind::WledRemote },
     AppDesc { title: "About", kind: AppKind::About },
+    // #45 Custom — espnow-only (content arrives only over the radio config path). Last menu row,
+    // matching luna's #81 screen input_select order (…About, Custom).
+    #[cfg(feature = "espnow")]
+    AppDesc { title: "Custom", kind: AppKind::Custom },
 ];
 
 /// #55 plugin visibility: the STABLE mask bit for an app kind, INDEPENDENT of the (cfg-gated)
@@ -487,6 +517,11 @@ pub const fn plugin_bit(kind: AppKind) -> Option<u8> {
         #[cfg(feature = "wled")]
         AppKind::WledRemote => Some(5),
         AppKind::About => Some(6),
+        // #45 Custom is NON-maskable (like Menu): luna's #55 mask is the original 7 plugins
+        // (bits 0..6, all-on 007F) and predates Custom — giving Custom bit 7 would let a 007F
+        // mask HIDE it permanently. `None` ⇒ always shown, no rework to the live #55 contract.
+        #[cfg(feature = "espnow")]
+        AppKind::Custom => None,
         AppKind::Menu => None,
     }
 }
