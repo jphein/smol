@@ -1892,7 +1892,11 @@ fn mqtt_session(
         let mut djson = MqttScratch::new();
         let _ = write!(
             djson,
-            "{{\"~\":\"smol/{}/ota\",\"stat_t\":\"~/state\",\"cmd_t\":\"~/install\",\"pl_inst\":\"INSTALL\",\"dev_cla\":\"firmware\",\"name\":\"Update\",\"has_entity_name\":true,\"uniq_id\":\"smol{}_update\",\"object_id\":\"smol_{}_update\",\"dev\":{{\"ids\":[\"smol{}\"]}}}}",
+            // #39: `retain:true` → HA publishes update.install (native tile + Lovelace update-action)
+            // to cmd_t RETAINED, so the node catches it on its next ~2 s burst (the fw acts ONLY on a
+            // retained install; a non-retained one is missed between bursts). Unifies Install into the
+            // native Update tile and lets the HA-side retained install buttons retire.
+            "{{\"~\":\"smol/{}/ota\",\"stat_t\":\"~/state\",\"cmd_t\":\"~/install\",\"pl_inst\":\"INSTALL\",\"retain\":true,\"dev_cla\":\"firmware\",\"name\":\"Update\",\"has_entity_name\":true,\"uniq_id\":\"smol{}_update\",\"object_id\":\"smol_{}_update\",\"dev\":{{\"ids\":[\"smol{}\"]}}}}",
             node_id, node_id, node_id, node_id
         );
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), djson.as_bytes(), true) {
@@ -1946,7 +1950,10 @@ fn mqtt_session(
             let mut djson = MqttScratch::new();
             let _ = write!(
                 djson,
-                "{{\"~\":\"smol/{}/ota\",\"stat_t\":\"~/state\",\"cmd_t\":\"~/install\",\"pl_inst\":\"INSTALL\",\"dev_cla\":\"firmware\",\"name\":\"Update\",\"has_entity_name\":true,\"uniq_id\":\"smol{}_update\",\"object_id\":\"smol_{}_update\",\"dev\":{{\"ids\":[\"smol{}\"],\"name\":\"smol {} {}\"}}}}",
+                // #39: `retain:true` (see the gateway's own Update above) — HA publishes the leaf's
+                // install retained → the gateway wildcard-subs it + relays (§B3), so the native tile
+                // Install works for relayed leaves too, not just the retained HA-side buttons.
+                "{{\"~\":\"smol/{}/ota\",\"stat_t\":\"~/state\",\"cmd_t\":\"~/install\",\"pl_inst\":\"INSTALL\",\"retain\":true,\"dev_cla\":\"firmware\",\"name\":\"Update\",\"has_entity_name\":true,\"uniq_id\":\"smol{}_update\",\"object_id\":\"smol_{}_update\",\"dev\":{{\"ids\":[\"smol{}\"],\"name\":\"smol {} {}\"}}}}",
                 lid, lid, lid, lid, lid, noun
             );
             if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), djson.as_bytes(), true) {
