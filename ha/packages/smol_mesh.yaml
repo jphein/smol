@@ -139,6 +139,35 @@ input_text:
     name: "smol 9 Custom screen (author)"
     max: 120
     initial: ""
+  # --- #100 Stage 2/3 per-node network overrides (dashboard-managed, un-brickable). BROKER =
+  # MQTT leg "ip" or "ip:port" (RFC1918; empty = the slot's baked broker). OTA HOST = one extra
+  # RFC1918 image host appended to the fetch allowlist (empty = slot default). The board
+  # RFC1918-validates before applying and self-heals a wrong broker via the CONNACK fallback
+  # (surfaced as brk=fb in smol/<id>/diag); a wrong OTA host can only refuse a fetch (never a brick).
+  smol_7_broker:
+    name: "smol 7 broker override (ip[:port])"
+    max: 21
+    initial: ""
+  smol_8_broker:
+    name: "smol 8 broker override (ip[:port])"
+    max: 21
+    initial: ""
+  smol_9_broker:
+    name: "smol 9 broker override (ip[:port])"
+    max: 21
+    initial: ""
+  smol_7_ota_host:
+    name: "smol 7 OTA host override (ip)"
+    max: 15
+    initial: ""
+  smol_8_ota_host:
+    name: "smol 8 OTA host override (ip)"
+    max: 15
+    initial: ""
+  smol_9_ota_host:
+    name: "smol 9 OTA host override (ip)"
+    max: 15
+    initial: ""
 
 input_boolean:
   smol_display_override:
@@ -257,6 +286,9 @@ input_boolean:
 #     smol/<id>/config/led             → L   (blue-LED mode, #48)
 #     smol/config/units                → U   (display units, GLOBAL/#43)
 #     smol/<id>/config/plugins         → P   (plugin-enable mask, #55; topic TBD)
+#     smol/<id>/config/net             → N   (WiFi slot 0/1, #100 Stage 1; edge-triggered reboot)
+#     smol/<id>/config/broker          → B   (MQTT broker ip[:port], #100 Stage 2; reboot + fallback)
+#     smol/<id>/config/ota_host        → O   (extra OTA host ip, #100 Stage 3; no reboot)
 # #56 is FOUNDATION ONLY: the firmware relays the S channel (default_screen) exactly
 # as before — this file's default_screen PUBLISH half is UNCHANGED, and a leaf keeps
 # converging on its dashboard-set screen. The L/U/(P) topics + GUI below already exist
@@ -360,6 +392,31 @@ input_select:
     options: [status, "on", "off"]
     initial: status
     icon: mdi:led-on
+  # --- #100 network switch (per-node: iot/roam → slot 0/1) → retained smol/<id>/config/net (qos 1).
+  # ⚠️ MAPPING: option "iot (jplovescl)" = slot 0, "roam" = slot 1 — this MUST match the local
+  # secrets.rs WIFI_NETWORKS order. A wrong pick self-heals via the fw assoc fallback (visible as
+  # net=<slot>:fb in smol/<id>/diag) so it never bricks, but the label would mislead — verify against
+  # secrets.rs at canary. Set-all fans out to every per-node select (no broadcast topic).
+  smol_all_network:
+    name: "smol all · network"
+    options: ["iot (jplovescl)", "roam"]
+    initial: "iot (jplovescl)"
+    icon: mdi:wifi-sync
+  smol_7_network:
+    name: "smol id7 · network"
+    options: ["iot (jplovescl)", "roam"]
+    initial: "iot (jplovescl)"
+    icon: mdi:wifi
+  smol_8_network:
+    name: "smol id8 · network"
+    options: ["iot (jplovescl)", "roam"]
+    initial: "iot (jplovescl)"
+    icon: mdi:wifi
+  smol_9_network:
+    name: "smol id9 · network"
+    options: ["iot (jplovescl)", "roam"]
+    initial: "iot (jplovescl)"
+    icon: mdi:wifi
 
 input_button:
   smol_all_apply:
@@ -976,6 +1033,74 @@ mqtt:
       icon: "mdi:memory"
       value_template: >-
         {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('hmin=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    # --- #100 network identity (parsed from smol/<id>/diag; #100 Stage 1/2/3) ---
+    # net=<slot>:<ok|fb>  (fb = the WiFi assoc fallback fired — the commanded slot was unreachable)
+    # brk=<baked|ovr|fb>  (broker: baked slot leg | override active | override auto-disabled by CONNACK)
+    # otah=<slot|ovr>     (OTA fetch host: slot default | an override is appended to the allowlist)
+    # Degrades safe: 'unknown' until the Stage-2/3 firmware ships the keys.
+    - name: "smol 7 network"
+      unique_id: smol_7_network_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      icon: "mdi:wifi"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('net=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 7 broker state"
+      unique_id: smol_7_broker_state_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      icon: "mdi:server-network"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('brk=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 7 ota host state"
+      unique_id: smol_7_ota_host_state_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      icon: "mdi:cloud-download-outline"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('otah=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 8 network"
+      unique_id: smol_8_network_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      icon: "mdi:wifi"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('net=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 8 broker state"
+      unique_id: smol_8_broker_state_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      icon: "mdi:server-network"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('brk=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 8 ota host state"
+      unique_id: smol_8_ota_host_state_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      icon: "mdi:cloud-download-outline"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('otah=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 9 network"
+      unique_id: smol_9_network_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      icon: "mdi:wifi"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('net=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 9 broker state"
+      unique_id: smol_9_broker_state_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      icon: "mdi:server-network"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('brk=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 9 ota host state"
+      unique_id: smol_9_ota_host_state_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      icon: "mdi:cloud-download-outline"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('otah=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
     # --- id7 mesh-health + time-sync (#74 fold-ins) ---
     - name: "smol 7 led state"
       unique_id: smol_7_led_state_mirror
@@ -2039,6 +2164,113 @@ automation:
             - input_select.smol_9_led
         data:
           option: "{{ trigger.to_state.state }}"
+
+  # =====================================================================
+  # #100 network switch — per-node select → RETAINED smol/<id>/config/net = 0/1 (qos 1). Slot 0 =
+  # "iot (jplovescl)", slot 1 = "roam" (MUST match secrets.rs WIFI_NETWORKS order). qos 1 so the
+  # switch is delivered even through a flaky link (transient-command lesson). RETAINED = the gateway
+  # reads it on its burst + relays it to leaves; a wrong pick self-heals (fw fallback → net=<slot>:fb).
+  # =====================================================================
+  - id: smol_net_publish
+    alias: "smol #100: publish per-node network slot"
+    description: >-
+      On any per-node network select changing, publish retained smol/<id>/config/net = 0|1.
+    mode: parallel
+    max: 10
+    trigger:
+      - platform: state
+        entity_id:
+          - input_select.smol_7_network
+          - input_select.smol_8_network
+          - input_select.smol_9_network
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/config/net"
+          retain: true
+          qos: 1
+          payload: "{{ '0' if trigger.to_state.state == 'iot (jplovescl)' else '1' }}"
+
+  - id: smol_all_net_fanout
+    alias: "smol #100: set-all network → per-node selects"
+    description: >-
+      On the ALL network select changing, fan out to every per-node network select (each then
+      publishes its retained smol/<id>/config/net). No broadcast topic (mirrors the LED fanout).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.smol_all_network
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id:
+            - input_select.smol_7_network
+            - input_select.smol_8_network
+            - input_select.smol_9_network
+        data:
+          option: "{{ trigger.to_state.state }}"
+
+  # =====================================================================
+  # #100 Stage 2 broker override — per-node input_text → RETAINED smol/<id>/config/broker (qos 1).
+  # Value = "ip" or "ip:port" (empty = clear → the slot's baked broker). The board RFC1918-validates
+  # + self-heals a wrong value via the CONNACK fallback. RETAINED so the gateway relays to leaves.
+  # =====================================================================
+  - id: smol_broker_publish
+    alias: "smol #100: publish per-node broker override"
+    description: >-
+      On any per-node broker input_text changing, publish retained smol/<id>/config/broker (raw).
+    mode: parallel
+    max: 10
+    trigger:
+      - platform: state
+        entity_id:
+          - input_text.smol_7_broker
+          - input_text.smol_8_broker
+          - input_text.smol_9_broker
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/config/broker"
+          retain: true
+          qos: 1
+          payload: "{{ trigger.to_state.state }}"
+
+  # =====================================================================
+  # #100 Stage 3 OTA-host override — per-node input_text → RETAINED smol/<id>/config/ota_host (qos 1).
+  # Value = one extra RFC1918 image host (empty = clear → slot default). Applied WITHOUT a reboot;
+  # the board RFC1918-validates. RETAINED so the gateway relays to leaves.
+  # =====================================================================
+  - id: smol_ota_host_publish
+    alias: "smol #100: publish per-node OTA-host override"
+    description: >-
+      On any per-node OTA-host input_text changing, publish retained smol/<id>/config/ota_host (raw).
+    mode: parallel
+    max: 10
+    trigger:
+      - platform: state
+        entity_id:
+          - input_text.smol_7_ota_host
+          - input_text.smol_8_ota_host
+          - input_text.smol_9_ota_host
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/config/ota_host"
+          retain: true
+          qos: 1
+          payload: "{{ trigger.to_state.state }}"
 
   # =====================================================================
   # #52 remote REBOOT — per-node button → TRANSIENT smol/<id>/cmd/reset (retain:FALSE).

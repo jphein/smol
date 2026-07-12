@@ -1,0 +1,111 @@
+# smol network identity — dashboard-managed WiFi slot + broker + OTA host (#100)
+# ---------------------------------------------------------------------------
+# HA PUBLISH/GUI half of the #100 runtime network switcher. Per node you set:
+#   • Network  → retained smol/<id>/config/net = 0/1 (WiFi slot; edge-triggered reboot)
+#   • Broker   → retained smol/<id>/config/broker = ip[:port] (reboot; CONNACK fallback)
+#   • OTA host → retained smol/<id>/config/ota_host = ip (no reboot; extra allowlist host)
+# The board applies each on its next burst (no reflash) and self-heals a bad WiFi slot or
+# broker WITHOUT USB (the un-brickable fallback — surfaced live below as net=/brk= state).
+#
+# ⚠️ NETWORK MAPPING: "iot (jplovescl)" = slot 0, "roam" = slot 1 — this MUST match the
+# local secrets.rs WIFI_NETWORKS order. A wrong pick self-heals (net shows "<slot>:fb") but
+# the label would mislead; verify against secrets.rs at canary. NEVER switch a power-only
+# board's WiFi to a network you can't reach it on without confirming the fallback slot works.
+#
+# Broker/OTA-host overrides are RFC1918-validated on the board; an empty value CLEARS the
+# override (back to the active slot's baked broker / allowlist). A broker override that fails
+# to CONNACK 3× auto-disables (brk=fb) and reverts to the baked broker — re-type a NEW value
+# to retry. A bad OTA host can only refuse a fetch (the image stays signed/monotonicity-gated).
+#
+# Install at DEPLOY time via the WS lovelace/config/save API — do NOT hand-edit
+# .storage/lovelace* (HA caches + overwrites). See ha/README.md. (Deployment HELD for JP.)
+type: vertical-stack
+cards:
+  - type: markdown
+    content: >
+      ## smol · network identity
+
+      Switch each node's **WiFi network**, **MQTT broker**, and **OTA host** from the
+      dashboard — published as retained MQTT, applied on the node's next burst, no reflash.
+      A wrong WiFi slot or broker **self-heals without USB** (the un-brickable fallback);
+      the live state below shows `:fb` when a fallback has fired.
+
+  - type: entities
+    title: Set all nodes
+    show_header_toggle: false
+    entities:
+      - entity: input_select.smol_all_network
+        name: Network (all)
+        icon: mdi:wifi-sync
+
+  - type: entities
+    title: id7 · Dominion (gateway)
+    show_header_toggle: false
+    entities:
+      - type: section
+        label: Network
+      - entity: input_select.smol_7_network
+        name: WiFi network
+      - entity: sensor.smol_7_network
+        name: Active (net=slot:state)
+        icon: mdi:wifi-check
+      - type: section
+        label: Broker override
+      - entity: input_text.smol_7_broker
+        name: Broker ip[:port] (empty = baked)
+      - entity: sensor.smol_7_broker_state
+        name: Broker state
+      - type: section
+        label: OTA host override
+      - entity: input_text.smol_7_ota_host
+        name: Extra OTA host ip (empty = slot)
+      - entity: sensor.smol_7_ota_host_state
+        name: OTA host state
+
+  - type: entities
+    title: id8 · Nexus
+    show_header_toggle: false
+    entities:
+      - type: section
+        label: Network
+      - entity: input_select.smol_8_network
+        name: WiFi network
+      - entity: sensor.smol_8_network
+        name: Active (net=slot:state)
+        icon: mdi:wifi-check
+      - type: section
+        label: Broker override
+      - entity: input_text.smol_8_broker
+        name: Broker ip[:port] (empty = baked)
+      - entity: sensor.smol_8_broker_state
+        name: Broker state
+      - type: section
+        label: OTA host override
+      - entity: input_text.smol_8_ota_host
+        name: Extra OTA host ip (empty = slot)
+      - entity: sensor.smol_8_ota_host_state
+        name: OTA host state
+
+  - type: entities
+    title: id9 · Herald
+    show_header_toggle: false
+    entities:
+      - type: section
+        label: Network
+      - entity: input_select.smol_9_network
+        name: WiFi network
+      - entity: sensor.smol_9_network
+        name: Active (net=slot:state)
+        icon: mdi:wifi-check
+      - type: section
+        label: Broker override
+      - entity: input_text.smol_9_broker
+        name: Broker ip[:port] (empty = baked)
+      - entity: sensor.smol_9_broker_state
+        name: Broker state
+      - type: section
+        label: OTA host override
+      - entity: input_text.smol_9_ota_host
+        name: Extra OTA host ip (empty = slot)
+      - entity: sensor.smol_9_ota_host_state
+        name: OTA host state
