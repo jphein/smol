@@ -396,6 +396,8 @@ mqtt:
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/7/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
+      expire_after: 90   # #68: STAT is cache-republished every flush (F6-gated 45s); ages out
+      # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
       icon: "mdi:chip"
     - name: "smol 8 screen"
       unique_id: smol_8_status_mirror
@@ -403,6 +405,8 @@ mqtt:
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/8/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
+      expire_after: 90   # #68: STAT is cache-republished every flush (F6-gated 45s); ages out
+      # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
       icon: "mdi:chip"
     - name: "smol 9 screen"
       unique_id: smol_9_status_mirror
@@ -410,6 +414,8 @@ mqtt:
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/9/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
+      expire_after: 90   # #68: STAT is cache-republished every flush (F6-gated 45s); ages out
+      # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
       icon: "mdi:chip"
     # --- #40 running BUILD# as a first-class device-merged value (JP ask 2026-07-11) ---
     # Promotes the `build` attr of smol_<id>_screen to a plain visible sensor so the
@@ -1206,10 +1212,13 @@ mqtt:
 # =====================================================================
 # MESH TOPOLOGY derived sensors (issue #27) — HELD; back the topology card.
 # rssi = each spoke's signal as heard by the ELECTED owner (dynamic — reads the
-# owner's peers list, defaults id7). online = the node's telemetry voltage is present
-# (#12 CLOSED 2026-07-11: the fw telemetry discovery emits "expire_after":300 (net/wifi.rs:1260)
-# + the F6/#68 stat_cache staleness gate stops the gateway republishing a stale leaf → a
-# silently-dead node's voltage expires and `online` auto-flips offline; verified live).
+# owner's peers list, defaults id7). online = the node's STAT is fresh — reads
+# sensor.smol_<id>_screen (the cache-republished smol/<id>/status, reliable single-frame),
+# NOT the sparse relay-fragmented telemetry voltage that FALSE-offlined a live-but-sparse
+# leaf (#68). F6 (net/wifi.rs:1656) freshness-gates the gateway leaf-status republish at 45s
+# → a genuinely-dead node stops refreshing → _screen expire_after (90s) fires → online off;
+# an alive leaf keeps re-arming it. (Corrects the earlier #12 note that mis-credited F6 to the
+# telemetry path — F6 gates STATUS, which is exactly why online now reads it.)
 # resync = a leaf's self-reported ch != the elected channel.
 # reelecting = the elected owner is offline or the MC record went stale.
 # =====================================================================
@@ -1329,13 +1338,13 @@ template:
   - binary_sensor:
       - name: "smol 7 online"
         unique_id: smol_7_online
-        state: "{{ states('sensor.smol_7_voltage') not in ['unavailable', 'unknown', 'none', ''] }}"
+        state: "{{ states('sensor.smol_7_screen') not in ['unavailable', 'unknown', 'none', ''] }}"
       - name: "smol 8 online"
         unique_id: smol_8_online
-        state: "{{ states('sensor.smol_8_voltage') not in ['unavailable', 'unknown', 'none', ''] }}"
+        state: "{{ states('sensor.smol_8_screen') not in ['unavailable', 'unknown', 'none', ''] }}"
       - name: "smol 9 online"
         unique_id: smol_9_online
-        state: "{{ states('sensor.smol_9_voltage') not in ['unavailable', 'unknown', 'none', ''] }}"
+        state: "{{ states('sensor.smol_9_screen') not in ['unavailable', 'unknown', 'none', ''] }}"
       - name: "smol 7 resync"
         unique_id: smol_7_resync
         state: >-
