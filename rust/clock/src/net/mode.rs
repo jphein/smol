@@ -2702,9 +2702,23 @@ impl RadioManager {
         }
         let cdeadline = now_ms() + GW_CONFIRM_TIMEOUT_MS;
         let mut last_build: Option<u32> = None;
+        let mut last_hello_ms = 0u64;
         while now_ms() < cdeadline {
             if tick() {
                 return LeafOtaOutcome::Aborted;
+            }
+            // #3b REJOIN: HELLO on ch6 (~1 Hz) throughout the confirm window. The leaf just
+            // activated + REBOOTED into the new image and must HEAR A VALID FRAME to pass its
+            // hear-a-frame self-test (else it rolls back off the new build) AND lock onto us to
+            // STAT its new build (the confirm signal). The old confirm loop was SILENT — the
+            // rebooted leaf heard nothing → self-test never passed → it rolled back / never
+            // rejoined, so a SUCCESSFUL delivery (image activated + booted) looked like a failure
+            // (canary: leaf booted 126 from ota_1 but HA never saw a 126 STAT). Stay pinned ch6.
+            let t = now_ms();
+            if t.saturating_sub(last_hello_ms) >= 1000 {
+                let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+                self.broadcast_hello();
+                last_hello_ms = t;
             }
             if let Some(recv) = self.esp_now.receive() {
                 if let Some(Frame::Stat { src, value }) = parse_frame(recv.data()) {
