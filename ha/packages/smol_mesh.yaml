@@ -121,6 +121,24 @@ input_text:
     name: "smol display line 3 (source)"
     max: 100
     initial: ""
+  # --- #45 Custom screen (per-node author string) — Model A: one helper/node.
+  # Grammar: "<size><align> <text>" per line, '|'-separated lines (≤4). size s/m/l
+  # (5x8/6x10/10x20), align l/c/r. {entity_id} refs are resolved HA-side (subst());
+  # the compose template sensor converts to the wire form <count>|<sa>text;… and
+  # publishes retained smol/<id>/config/custom (KV key Y, #56). e.g.
+  #   lc {sensor.smol_7_temp}°F|sl Bench|sl Door {binary_sensor.shed_door}
+  smol_7_custom:
+    name: "smol 7 Custom screen (author)"
+    max: 120
+    initial: ""
+  smol_8_custom:
+    name: "smol 8 Custom screen (author)"
+    max: 120
+    initial: ""
+  smol_9_custom:
+    name: "smol 9 Custom screen (author)"
+    max: 120
+    initial: ""
 
 input_boolean:
   smol_display_override:
@@ -180,7 +198,7 @@ input_select:
   # --- set-all (writes every per-node topic) ---
   smol_all_screen:
     name: "smol all · default screen"
-    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About]
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom]
     initial: Menu
     icon: mdi:monitor-multiple
   smol_all_page:
@@ -191,7 +209,7 @@ input_select:
   # --- id7 (one copy-paste block per node; new node = duplicate + renumber) ---
   smol_7_screen:
     name: "smol id7 · default screen"
-    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About]
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom]
     initial: Menu
     icon: mdi:monitor
   smol_7_page:
@@ -202,7 +220,7 @@ input_select:
   # --- id8 ---
   smol_8_screen:
     name: "smol id8 · default screen"
-    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About]
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom]
     initial: Menu
     icon: mdi:monitor
   smol_8_page:
@@ -213,7 +231,7 @@ input_select:
   # --- id9 ---
   smol_9_screen:
     name: "smol id9 · default screen"
-    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About]
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom]
     initial: Menu
     icon: mdi:monitor
   smol_9_page:
@@ -318,6 +336,27 @@ mqtt:
       unique_id: smol_9_config_mirror
       state_topic: "smol/9/config/default_screen"
       icon: "mdi:cog"
+    # --- #45 Custom-screen mirror: read back the retained wire payload the compose
+    # template sensor published (round-trip confirmation + dashboard preview). State =
+    # the FIRST line's resolved text (2-char size/align prefix stripped); '(none)' when empty. ---
+    - name: "smol 7 custom"
+      unique_id: smol_7_custom_mirror
+      state_topic: "smol/7/config/custom"
+      icon: "mdi:card-text-outline"
+      value_template: >-
+        {% set p = value.split('|', 1) %}{% if p | length > 1 and p[1] %}{{ p[1].split(';')[0][2:] }}{% else %}(none){% endif %}
+    - name: "smol 8 custom"
+      unique_id: smol_8_custom_mirror
+      state_topic: "smol/8/config/custom"
+      icon: "mdi:card-text-outline"
+      value_template: >-
+        {% set p = value.split('|', 1) %}{% if p | length > 1 and p[1] %}{{ p[1].split(';')[0][2:] }}{% else %}(none){% endif %}
+    - name: "smol 9 custom"
+      unique_id: smol_9_custom_mirror
+      state_topic: "smol/9/config/custom"
+      icon: "mdi:card-text-outline"
+      value_template: >-
+        {% set p = value.split('|', 1) %}{% if p | length > 1 and p[1] %}{{ p[1].split(';')[0][2:] }}{% else %}(none){% endif %}
     # --- #43 display units (GLOBAL) — mirror of the retained smol/config/units ---
     - name: "smol units"
       unique_id: smol_units_mirror
@@ -597,16 +636,670 @@ mqtt:
       expire_after: 90
       icon: "mdi:lan-connect"
 
+    # =====================================================================
+    # #70 device-diag + #74 wave-2 observability sensors (Luna, ha-wave).
+    # ALL parse the single retained smol/<id>/diag record (+ /display, /ota/history).
+    # DEGRADES SAFE: read 'unknown'/empty until the #70/#74 FIRMWARE publishes the topics.
+    # =====================================================================
+    # --- id7 device diagnostics (#70) ---
+    - name: "smol 7 boot slot"
+      unique_id: smol_7_boot_slot_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      icon: "mdi:swap-horizontal-bold"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('slot=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ 'ota_' ~ ns.v if ns.v in ['0','1'] else 'unknown' }}
+    - name: "smol 7 ota outcome"
+      unique_id: smol_7_ota_outcome_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      icon: "mdi:history"
+      value_template: >-
+        {% set ns = namespace(v='none') %}{% for kv in value.split('|') %}{% if kv.startswith('ota=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 7 reset reason"
+      unique_id: smol_7_reset_reason_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      icon: "mdi:restart-alert"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('rst=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 7 boot count"
+      unique_id: smol_7_boot_count_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:counter"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('boot=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 7 uptime"
+      unique_id: smol_7_uptime_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      device_class: duration
+      unit_of_measurement: s
+      state_class: measurement
+      icon: "mdi:timer-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('up=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 7 heap free"
+      unique_id: smol_7_heap_free_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      device_class: data_size
+      unit_of_measurement: B
+      state_class: measurement
+      icon: "mdi:memory"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('heap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 7 heap min"
+      unique_id: smol_7_heap_min_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      device_class: data_size
+      unit_of_measurement: B
+      state_class: measurement
+      icon: "mdi:memory"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('hmin=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    # --- id8 device diagnostics (#70) ---
+    - name: "smol 8 boot slot"
+      unique_id: smol_8_boot_slot_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      icon: "mdi:swap-horizontal-bold"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('slot=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ 'ota_' ~ ns.v if ns.v in ['0','1'] else 'unknown' }}
+    - name: "smol 8 ota outcome"
+      unique_id: smol_8_ota_outcome_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      icon: "mdi:history"
+      value_template: >-
+        {% set ns = namespace(v='none') %}{% for kv in value.split('|') %}{% if kv.startswith('ota=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 8 reset reason"
+      unique_id: smol_8_reset_reason_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      icon: "mdi:restart-alert"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('rst=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 8 boot count"
+      unique_id: smol_8_boot_count_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:counter"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('boot=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 8 uptime"
+      unique_id: smol_8_uptime_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      device_class: duration
+      unit_of_measurement: s
+      state_class: measurement
+      icon: "mdi:timer-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('up=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 8 heap free"
+      unique_id: smol_8_heap_free_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      device_class: data_size
+      unit_of_measurement: B
+      state_class: measurement
+      icon: "mdi:memory"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('heap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 8 heap min"
+      unique_id: smol_8_heap_min_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      device_class: data_size
+      unit_of_measurement: B
+      state_class: measurement
+      icon: "mdi:memory"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('hmin=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    # --- id9 device diagnostics (#70) ---
+    - name: "smol 9 boot slot"
+      unique_id: smol_9_boot_slot_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      icon: "mdi:swap-horizontal-bold"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('slot=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ 'ota_' ~ ns.v if ns.v in ['0','1'] else 'unknown' }}
+    - name: "smol 9 ota outcome"
+      unique_id: smol_9_ota_outcome_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      icon: "mdi:history"
+      value_template: >-
+        {% set ns = namespace(v='none') %}{% for kv in value.split('|') %}{% if kv.startswith('ota=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 9 reset reason"
+      unique_id: smol_9_reset_reason_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      icon: "mdi:restart-alert"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('rst=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 9 boot count"
+      unique_id: smol_9_boot_count_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:counter"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('boot=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 9 uptime"
+      unique_id: smol_9_uptime_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      device_class: duration
+      unit_of_measurement: s
+      state_class: measurement
+      icon: "mdi:timer-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('up=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 9 heap free"
+      unique_id: smol_9_heap_free_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      device_class: data_size
+      unit_of_measurement: B
+      state_class: measurement
+      icon: "mdi:memory"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('heap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 9 heap min"
+      unique_id: smol_9_heap_min_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      device_class: data_size
+      unit_of_measurement: B
+      state_class: measurement
+      icon: "mdi:memory"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('hmin=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    # --- id7 mesh-health + time-sync (#74 fold-ins) ---
+    - name: "smol 7 led state"
+      unique_id: smol_7_led_state_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      icon: "mdi:led-on"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('led=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 7 mesh loss"
+      unique_id: smol_7_mesh_loss_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      unit_of_measurement: "%"
+      state_class: measurement
+      icon: "mdi:transmission-tower-off"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('loss=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 7 mesh rtt"
+      unique_id: smol_7_mesh_rtt_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      unit_of_measurement: ms
+      state_class: measurement
+      icon: "mdi:timer-sync-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('rtt=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 7 mesh rx"
+      unique_id: smol_7_mesh_rx_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:arrow-down-bold"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('rx=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 7 mesh tx"
+      unique_id: smol_7_mesh_tx_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:arrow-up-bold"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('tx=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 7 time offset"
+      unique_id: smol_7_time_offset_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      unit_of_measurement: ms
+      state_class: measurement
+      icon: "mdi:clock-alert-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('toff=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 7 time sync age"
+      unique_id: smol_7_time_sync_age_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      device_class: duration
+      unit_of_measurement: s
+      state_class: measurement
+      icon: "mdi:clock-check-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 7 time source"
+      unique_id: smol_7_time_source_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      icon: "mdi:source-branch"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('tsrc=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    # --- id7 display text mirror (#74 item 5) ---
+    - name: "smol 7 display"
+      unique_id: smol_7_display_mirror
+      state_topic: "smol/7/display"
+      entity_category: diagnostic
+      icon: "mdi:monitor-eye"
+      value_template: >-
+        {% set p = value.split('|') %}{{ (p[1].split(';') | join(' / ')) if p | length > 1 and p[1] else '' }}
+      json_attributes_topic: "smol/7/display"
+      json_attributes_template: >-
+        {% set p = value.split('|') %}{{ {'lines': (p[1].split(';') if p | length > 1 and p[1] else [])} | tojson }}
+    # --- id7 OTA history ring (#74 item 4) ---
+    - name: "smol 7 ota history"
+      unique_id: smol_7_ota_history_mirror
+      state_topic: "smol/7/ota/history"
+      entity_category: diagnostic
+      icon: "mdi:history"
+      value_template: >-
+        {% set p = value.split('|') %}{% set e = (p[1].split(';')[0] if p | length > 1 and p[1] else '') %}{{ e.split(':')[0] ~ (' ' ~ e.split(':')[1] if ':' in e else '') }}
+      json_attributes_topic: "smol/7/ota/history"
+      json_attributes_template: >-
+        {% set p = value.split('|') %}{% set ns = namespace(rows=[]) %}
+        {% for e in (p[1].split(';') if p | length > 1 and p[1] else []) %}{% set f = e.split(':') %}
+        {% if f | length >= 4 %}{% set ns.rows = ns.rows + [{'builds': f[0], 'outcome': f[1], 'dur_s': f[2] | int(0), 'at_up': f[3] | int(0)}] %}{% endif %}{% endfor %}
+        {{ {'entries': ns.rows} | tojson }}
+    # --- id8 mesh-health + time-sync (#74 fold-ins) ---
+    - name: "smol 8 led state"
+      unique_id: smol_8_led_state_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      icon: "mdi:led-on"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('led=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 8 mesh loss"
+      unique_id: smol_8_mesh_loss_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      unit_of_measurement: "%"
+      state_class: measurement
+      icon: "mdi:transmission-tower-off"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('loss=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 8 mesh rtt"
+      unique_id: smol_8_mesh_rtt_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      unit_of_measurement: ms
+      state_class: measurement
+      icon: "mdi:timer-sync-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('rtt=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 8 mesh rx"
+      unique_id: smol_8_mesh_rx_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:arrow-down-bold"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('rx=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 8 mesh tx"
+      unique_id: smol_8_mesh_tx_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:arrow-up-bold"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('tx=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 8 time offset"
+      unique_id: smol_8_time_offset_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      unit_of_measurement: ms
+      state_class: measurement
+      icon: "mdi:clock-alert-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('toff=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 8 time sync age"
+      unique_id: smol_8_time_sync_age_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      device_class: duration
+      unit_of_measurement: s
+      state_class: measurement
+      icon: "mdi:clock-check-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 8 time source"
+      unique_id: smol_8_time_source_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      icon: "mdi:source-branch"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('tsrc=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    # --- id8 display text mirror (#74 item 5) ---
+    - name: "smol 8 display"
+      unique_id: smol_8_display_mirror
+      state_topic: "smol/8/display"
+      entity_category: diagnostic
+      icon: "mdi:monitor-eye"
+      value_template: >-
+        {% set p = value.split('|') %}{{ (p[1].split(';') | join(' / ')) if p | length > 1 and p[1] else '' }}
+      json_attributes_topic: "smol/8/display"
+      json_attributes_template: >-
+        {% set p = value.split('|') %}{{ {'lines': (p[1].split(';') if p | length > 1 and p[1] else [])} | tojson }}
+    # --- id8 OTA history ring (#74 item 4) ---
+    - name: "smol 8 ota history"
+      unique_id: smol_8_ota_history_mirror
+      state_topic: "smol/8/ota/history"
+      entity_category: diagnostic
+      icon: "mdi:history"
+      value_template: >-
+        {% set p = value.split('|') %}{% set e = (p[1].split(';')[0] if p | length > 1 and p[1] else '') %}{{ e.split(':')[0] ~ (' ' ~ e.split(':')[1] if ':' in e else '') }}
+      json_attributes_topic: "smol/8/ota/history"
+      json_attributes_template: >-
+        {% set p = value.split('|') %}{% set ns = namespace(rows=[]) %}
+        {% for e in (p[1].split(';') if p | length > 1 and p[1] else []) %}{% set f = e.split(':') %}
+        {% if f | length >= 4 %}{% set ns.rows = ns.rows + [{'builds': f[0], 'outcome': f[1], 'dur_s': f[2] | int(0), 'at_up': f[3] | int(0)}] %}{% endif %}{% endfor %}
+        {{ {'entries': ns.rows} | tojson }}
+    # --- id9 mesh-health + time-sync (#74 fold-ins) ---
+    - name: "smol 9 led state"
+      unique_id: smol_9_led_state_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      icon: "mdi:led-on"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('led=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    - name: "smol 9 mesh loss"
+      unique_id: smol_9_mesh_loss_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      unit_of_measurement: "%"
+      state_class: measurement
+      icon: "mdi:transmission-tower-off"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('loss=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 9 mesh rtt"
+      unique_id: smol_9_mesh_rtt_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      unit_of_measurement: ms
+      state_class: measurement
+      icon: "mdi:timer-sync-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('rtt=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 9 mesh rx"
+      unique_id: smol_9_mesh_rx_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:arrow-down-bold"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('rx=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 9 mesh tx"
+      unique_id: smol_9_mesh_tx_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:arrow-up-bold"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('tx=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 9 time offset"
+      unique_id: smol_9_time_offset_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      unit_of_measurement: ms
+      state_class: measurement
+      icon: "mdi:clock-alert-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('toff=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 9 time sync age"
+      unique_id: smol_9_time_sync_age_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      device_class: duration
+      unit_of_measurement: s
+      state_class: measurement
+      icon: "mdi:clock-check-outline"
+      value_template: >-
+        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    - name: "smol 9 time source"
+      unique_id: smol_9_time_source_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      icon: "mdi:source-branch"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('tsrc=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
+    # --- id9 display text mirror (#74 item 5) ---
+    - name: "smol 9 display"
+      unique_id: smol_9_display_mirror
+      state_topic: "smol/9/display"
+      entity_category: diagnostic
+      icon: "mdi:monitor-eye"
+      value_template: >-
+        {% set p = value.split('|') %}{{ (p[1].split(';') | join(' / ')) if p | length > 1 and p[1] else '' }}
+      json_attributes_topic: "smol/9/display"
+      json_attributes_template: >-
+        {% set p = value.split('|') %}{{ {'lines': (p[1].split(';') if p | length > 1 and p[1] else [])} | tojson }}
+    # --- id9 OTA history ring (#74 item 4) ---
+    - name: "smol 9 ota history"
+      unique_id: smol_9_ota_history_mirror
+      state_topic: "smol/9/ota/history"
+      entity_category: diagnostic
+      icon: "mdi:history"
+      value_template: >-
+        {% set p = value.split('|') %}{% set e = (p[1].split(';')[0] if p | length > 1 and p[1] else '') %}{{ e.split(':')[0] ~ (' ' ~ e.split(':')[1] if ':' in e else '') }}
+      json_attributes_topic: "smol/9/ota/history"
+      json_attributes_template: >-
+        {% set p = value.split('|') %}{% set ns = namespace(rows=[]) %}
+        {% for e in (p[1].split(';') if p | length > 1 and p[1] else []) %}{% set f = e.split(':') %}
+        {% if f | length >= 4 %}{% set ns.rows = ns.rows + [{'builds': f[0], 'outcome': f[1], 'dur_s': f[2] | int(0), 'at_up': f[3] | int(0)}] %}{% endif %}{% endfor %}
+        {{ {'entries': ns.rows} | tojson }}
+    # --- #74 config-drift DEVICE ECHO (item 3) — applied-config string the node reports.
+    # HA-side _expected reconstruction + drift binary_sensor are HELD pending the cfg= canonical
+    # contract with the #70/#74 fw (luna-74-ha-staging.md §3) — they'd false-alarm until pinned.
+    - name: "smol 7 config applied"
+      unique_id: smol_7_cfg_applied_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      icon: "mdi:cog-sync"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('cfg=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v }}
+    - name: "smol 8 config applied"
+      unique_id: smol_8_cfg_applied_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      icon: "mdi:cog-sync"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('cfg=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v }}
+    - name: "smol 9 config applied"
+      unique_id: smol_9_cfg_applied_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      icon: "mdi:cog-sync"
+      value_template: >-
+        {% set ns = namespace(v='unknown') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('cfg=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v }}
+
+    # --- #70 button press COUNTERS — folded into the DIAG record (vesper fw contract, 2026-07-12) ---
+    # btn=<presses> btnl=<long-presses>, monotonic. A retained record can't carry a momentary event
+    # without replaying on HA restart / gateway republish, so a COUNTER (an INCREMENT = a press) is the
+    # mesh-safe form for WiFi-less leaves; total_increasing tolerates the per-boot reset. Trigger on the
+    # counter's increase for "button pressed" automations.
+    - name: "smol 7 button count"
+      unique_id: smol_7_btn_count_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:gesture-tap-button"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('btn=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 7 long press count"
+      unique_id: smol_7_btnl_count_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:gesture-tap-hold"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('btnl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 8 button count"
+      unique_id: smol_8_btn_count_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:gesture-tap-button"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('btn=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 8 long press count"
+      unique_id: smol_8_btnl_count_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:gesture-tap-hold"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('btnl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 9 button count"
+      unique_id: smol_9_btn_count_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:gesture-tap-button"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('btn=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 9 long press count"
+      unique_id: smol_9_btnl_count_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:gesture-tap-hold"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('btnl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+
 # =====================================================================
 # MESH TOPOLOGY derived sensors (issue #27) — HELD; back the topology card.
 # rssi = each spoke's signal as heard by the ELECTED owner (dynamic — reads the
-# owner's peers list, defaults id7). online = the telemetry entity is present
-# (⚠️ those discovery entities currently lack expire_after — a silently-dead node
-# won't auto-flip offline until #12 sets it; the doubled entity names are also
-# #12-cleanup-fragile). resync = a leaf's self-reported ch != the elected channel.
+# owner's peers list, defaults id7). online = the node's telemetry voltage is present
+# (#12 CLOSED 2026-07-11: the fw telemetry discovery emits "expire_after":300 (net/wifi.rs:1260)
+# + the F6/#68 stat_cache staleness gate stops the gateway republishing a stale leaf → a
+# silently-dead node's voltage expires and `online` auto-flips offline; verified live).
+# resync = a leaf's self-reported ch != the elected channel.
 # reelecting = the elected owner is offline or the MC record went stale.
 # =====================================================================
 template:
+  - sensor:
+      # --- #45 Custom-screen COMPOSE: turn each node's author string into the wire
+      # payload <count>|<size><align>text;… . A TEMPLATE sensor (not a static automation)
+      # so it auto-subscribes to whatever {entity_id}s the user references — the clean fix
+      # for #45's "trigger on each referenced entity" (a static trigger list can't know
+      # them). Reuses the Batt display-override subst() macro; strips ';', clips per size
+      # (7 for l, 12 for s/m). Empty author → '' (clears the custom). The publish
+      # automation ships this on change. ---
+      - name: "smol 7 custom lay"
+        unique_id: smol_7_custom_lay
+        state: >-
+          {%- macro subst(src) -%}
+          {%- set ns = namespace(out=src) -%}
+          {%- for id in src | regex_findall('\{([a-z0-9_.]+)\}') -%}
+          {%- set v = states(id) -%}
+          {%- set v = '--' if (v | lower) in ['unknown','unavailable','none',''] else v -%}
+          {%- set ns.out = ns.out | replace('{' ~ id ~ '}', v) -%}
+          {%- endfor -%}{{- ns.out -}}
+          {%- endmacro -%}
+          {%- set author = states('input_text.smol_7_custom') -%}
+          {%- if (author | lower) in ['unknown','unavailable','none',''] -%}{{- '' -}}
+          {%- else -%}
+          {%- set ns = namespace(segs=[]) -%}
+          {%- for raw in author.split('|')[:4] -%}
+          {%- set ln = raw.strip() -%}
+          {%- if ln | length >= 2 -%}
+          {%- set size = ln[0] if ln[0] in 'sml' else 's' -%}
+          {%- set align = ln[1] if ln[1] in 'lcr' else 'l' -%}
+          {%- set text = (subst(ln[2:] | trim) | replace(';','')) -%}
+          {%- set ns.segs = ns.segs + [size ~ align ~ text[:(7 if size == 'l' else 12)]] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- if ns.segs | length > 0 -%}{{- ns.segs | length -}}|{{- ns.segs | join(';') -}}{%- else -%}{{- '' -}}{%- endif -%}
+          {%- endif -%}
+      - name: "smol 8 custom lay"
+        unique_id: smol_8_custom_lay
+        state: >-
+          {%- macro subst(src) -%}
+          {%- set ns = namespace(out=src) -%}
+          {%- for id in src | regex_findall('\{([a-z0-9_.]+)\}') -%}
+          {%- set v = states(id) -%}
+          {%- set v = '--' if (v | lower) in ['unknown','unavailable','none',''] else v -%}
+          {%- set ns.out = ns.out | replace('{' ~ id ~ '}', v) -%}
+          {%- endfor -%}{{- ns.out -}}
+          {%- endmacro -%}
+          {%- set author = states('input_text.smol_8_custom') -%}
+          {%- if (author | lower) in ['unknown','unavailable','none',''] -%}{{- '' -}}
+          {%- else -%}
+          {%- set ns = namespace(segs=[]) -%}
+          {%- for raw in author.split('|')[:4] -%}
+          {%- set ln = raw.strip() -%}
+          {%- if ln | length >= 2 -%}
+          {%- set size = ln[0] if ln[0] in 'sml' else 's' -%}
+          {%- set align = ln[1] if ln[1] in 'lcr' else 'l' -%}
+          {%- set text = (subst(ln[2:] | trim) | replace(';','')) -%}
+          {%- set ns.segs = ns.segs + [size ~ align ~ text[:(7 if size == 'l' else 12)]] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- if ns.segs | length > 0 -%}{{- ns.segs | length -}}|{{- ns.segs | join(';') -}}{%- else -%}{{- '' -}}{%- endif -%}
+          {%- endif -%}
+      - name: "smol 9 custom lay"
+        unique_id: smol_9_custom_lay
+        state: >-
+          {%- macro subst(src) -%}
+          {%- set ns = namespace(out=src) -%}
+          {%- for id in src | regex_findall('\{([a-z0-9_.]+)\}') -%}
+          {%- set v = states(id) -%}
+          {%- set v = '--' if (v | lower) in ['unknown','unavailable','none',''] else v -%}
+          {%- set ns.out = ns.out | replace('{' ~ id ~ '}', v) -%}
+          {%- endfor -%}{{- ns.out -}}
+          {%- endmacro -%}
+          {%- set author = states('input_text.smol_9_custom') -%}
+          {%- if (author | lower) in ['unknown','unavailable','none',''] -%}{{- '' -}}
+          {%- else -%}
+          {%- set ns = namespace(segs=[]) -%}
+          {%- for raw in author.split('|')[:4] -%}
+          {%- set ln = raw.strip() -%}
+          {%- if ln | length >= 2 -%}
+          {%- set size = ln[0] if ln[0] in 'sml' else 's' -%}
+          {%- set align = ln[1] if ln[1] in 'lcr' else 'l' -%}
+          {%- set text = (subst(ln[2:] | trim) | replace(';','')) -%}
+          {%- set ns.segs = ns.segs + [size ~ align ~ text[:(7 if size == 'l' else 12)]] -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- if ns.segs | length > 0 -%}{{- ns.segs | length -}}|{{- ns.segs | join(';') -}}{%- else -%}{{- '' -}}{%- endif -%}
+          {%- endif -%}
   - sensor:
       # --- #51 dynamic-role gap fix: EVERY node needs leaf-bond entities (any node can be a leaf now).
       # id7 was gateway-only, so its rssi/band/resync were never defined; #51 (id8 can take over) makes
@@ -686,6 +1379,26 @@ template:
       - name: "smol mesh asleep"
         unique_id: smol_mesh_asleep
         state: "{{ states('sensor.smol_mesh_channel') in ['unknown','unavailable','none',''] }}"
+
+  - sensor:
+      # --- #74 RSSI-matrix union (HELD; populates when every node publishes smol/<id>/peers) ---
+      - name: "smol mesh matrix"
+        unique_id: smol_mesh_matrix
+        state: >-
+          {{ states.sensor | selectattr('entity_id','search','^sensor\\.smol_\\d+_peers$') | list | count }} nodes
+        attributes:
+          edges: >-
+            {% set ns = namespace(e=[]) %}
+            {% for s in states.sensor | selectattr('entity_id','search','^sensor\\.smol_\\d+_peers$') %}
+              {% set src = s.entity_id.split('_')[1] %}
+              {% for p in state_attr(s.entity_id,'peers') or [] %}
+                {% set f = p.split(',') %}
+                {% if f | length >= 2 %}
+                  {% set ns.e = ns.e + [{'from': src, 'to': f[0], 'rssi': f[1]|int(0), 'age': (f[2]|int(0) if f|length>2 else 0), 'ch': (f[3] if f|length>3 else ''), 'flags': (f[4] if f|length>4 else '')}] %}
+                {% endif %}
+              {% endfor %}
+            {% endfor %}
+            {{ ns.e }}
 
 automation:
   - id: smol_publish_batt_display
@@ -1194,3 +1907,50 @@ automation:
           retain: true
           qos: 0
           payload: "INSTALL"
+
+  # --- #70 silent-rollback alert — pushes the instant a node reports ota=rolled-back ---
+  - alias: "smol · OTA rolled back → alert (#70)"
+    id: smol_ota_rollback_alert
+    trigger:
+      - platform: state
+        entity_id:
+          - sensor.smol_7_ota_outcome
+          - sensor.smol_8_ota_outcome
+          - sensor.smol_9_ota_outcome
+        to: "rolled-back"
+    action:
+      - service: persistent_notification.create
+        data:
+          title: "smol OTA rollback"
+          message: >
+            {% set n = trigger.entity_id.split('_')[1] %}
+            id{{ n }} rolled back its OTA (slot {{ states('sensor.smol_' ~ n ~ '_boot_slot') }},
+            reset {{ states('sensor.smol_' ~ n ~ '_reset_reason') }}).
+
+  # --- #45 publish per-node Custom screen layouts (retained → smol/<id>/config/custom, KV key Y) ---
+  # The compose sensor (sensor.smol_<id>_custom_lay) auto-updates on the author string AND any
+  # referenced {entity}, so its state-change covers live-refresh; + HA start + a 5-min heartbeat.
+  - id: smol_publish_custom_lay
+    alias: "smol: publish per-node Custom screen layouts (retained, #45)"
+    mode: single
+    max_exceeded: silent
+    trigger:
+      - platform: state
+        entity_id:
+          - sensor.smol_7_custom_lay
+          - sensor.smol_8_custom_lay
+          - sensor.smol_9_custom_lay
+      - platform: homeassistant
+        event: start
+      - platform: time_pattern
+        minutes: "/5"
+    action:
+      - repeat:
+          for_each: ["7", "8", "9"]
+          sequence:
+            - service: mqtt.publish
+              data:
+                topic: "smol/{{ repeat.item }}/config/custom"
+                retain: true
+                qos: 0
+                payload: "{{ states('sensor.smol_' ~ repeat.item ~ '_custom_lay') }}"
