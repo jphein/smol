@@ -29,6 +29,10 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLOCK="$REPO/rust/clock"
 ESPFLASH="${ESPFLASH:-$HOME/.cargo/bin/espflash}"
+# #44: reproducible-build helpers — the release build below goes through repro_build_bin so
+# the announced sha256 is a stable, verifiable (commit) identity (see tools/verify_image.sh).
+# shellcheck source=tools/repro_build.sh
+. "$(dirname "${BASH_SOURCE[0]}")/repro_build.sh"
 # ⚙️ INFRA CONFIG — the defaults below are non-real PLACEHOLDERS (this repo is public).
 # Put YOUR real infra in a git-ignored `tools/ota_publish.env` (copy the tracked
 # `tools/ota_publish.env.example` → `tools/ota_publish.env`, edit) — it's sourced here if
@@ -114,13 +118,15 @@ fi
 # identity. DO NOT add SMOL_NODE_ID here (that would re-fragment one image per node); and
 # do NOT USB-flash this staged .bin as a factory image without SMOL_NODE_ID=<n>, or a
 # fresh (erased) board would seed NVS to the default id 7.
+# #44 REPRODUCIBLE — repro_build_bin pins the version stamp (as before) AND remaps absolute
+# build paths + pins SOURCE_DATE_EPOCH, so the same commit built anywhere yields the same
+# bytes → the SHA below is a stable identity an operator can pre/post-flash verify with
+# `verify_image.sh <commit>`. No node-id here is consistent with the fleet-shared design
+# above: ONE reproducible image, one sha per commit for the whole fleet.
 if [ -z "$BIN" ]; then
-  echo "building espnow release @ $HASH (build $BUILD) ..."
-  ( cd "$CLOCK" && SMOL_GIT_HASH="$HASH" SMOL_BUILD_NUMBER="$BUILD" \
-      cargo build --release --features espnow )
-  ELF="$CLOCK/target/riscv32imc-unknown-none-elf/release/clock"
+  echo "building reproducible espnow release @ $HASH (build $BUILD) ..."
   BIN="/tmp/smol-${BUILD}.bin"
-  "$ESPFLASH" save-image --chip esp32c3 "$ELF" "$BIN" >/dev/null
+  repro_build_bin "$CLOCK" "$BIN" "$HASH" "$BUILD" || die "reproducible build failed"
 fi
 [ -f "$BIN" ] || die "no image at $BIN"
 

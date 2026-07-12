@@ -113,6 +113,37 @@ example:   OTA|52|590304|6122578e…60ea|http://<image-host>:8080/ota/smol-52.bi
 - `sha256` — 64 lowercase hex over the exact `.bin`; the integrity gate.
 - `url` — HTTP (no TLS in `no_std`); it's the **last** field so it may contain no `|`.
 
+## Reproducible builds — verify image ↔ commit before/after a flash (#44)
+
+The release image is **byte-reproducible for a fixed commit**: build it on any machine and
+you get the same `.bin`, hence the same `sha256`. Three things make it deterministic — the
+version stamp is pinned from the commit (`SMOL_GIT_HASH`/`SMOL_BUILD_NUMBER`, the build.rs
+deploy contract); absolute build paths are canonicalised with `--remap-path-prefix`
+(dependency + `build-std` `file!()` strings would otherwise embed `$CARGO_HOME`/the rustc
+sysroot and differ per machine); and `SOURCE_DATE_EPOCH` is pinned to the commit's own time
+(esp-bootloader-esp-idf otherwise stamps the app descriptor from the wall clock). The
+mechanism lives in `tools/repro_build.sh`; a plain `cargo build` is untouched (all of it is
+applied only by the release/verify tooling).
+
+So the announced `sha256` is a stable **identity** you can check against what's actually on a
+board — which is exactly what would have caught the dup-`NODE_ID` outage (#42): the wrong
+image flashed to id8/id9 could not be detected by an image↔board hash check because the build
+wasn't reproducible.
+
+```
+tools/verify_image.sh <commit>                 # build → prints  build size sha256
+tools/verify_image.sh <commit> --expect <sha>  # exit 0 if the image is that commit, 3 if not
+tools/verify_image.sh <commit> --twice         # proof: two isolated builds → identical sha
+tools/verify_image.sh --bin <file>             # just hash an existing .bin (no build)
+```
+
+`ota_publish.sh stage` builds through the same reproducible path, so the sha it announces is
+the sha `verify_image.sh` reproduces. Since #40's runtime-NVS node-id, one image serves the
+whole fleet (the OTA image carries no `SMOL_NODE_ID`; each board reads its id from `nvs` at
+runtime) — so there's **one sha per commit**, no board dimension. `verify_image.sh <commit>`
+with no `--node-id` reproduces that fleet sha; `--node-id N` is only for a USB **factory**
+image built with `SMOL_NODE_ID=N`.
+
 ## How recovery works (why canary is enough)
 
 Three layers, in order of how bad the image is:
