@@ -64,6 +64,11 @@ esp_bootloader_esp_idf::esp_app_desc!();
 #[cfg(feature = "wifi")]
 #[no_mangle]
 extern "Rust" fn custom_halt() -> ! {
+    // #70 observability: record that THIS reset was a PANIC before we reboot. A panic halts
+    // here → software_reset, which the SoC logs as a plain `CoreSw` (same as an intentional
+    // reboot / OTA activate) — so the DIAG record would show `rr=sw` and hide the crash. The
+    // RTC-fast panic marker (read+cleared next boot) recovers `rr=panic`. Set BEFORE the reset.
+    ota::mark_panic();
     esp_hal::system::software_reset()
 }
 
@@ -201,6 +206,15 @@ pub(crate) const TZ_OFFSET_SECONDS: i64 = -7 * 3600;
 /// advance/redraw on their own schedules so the I²C bus isn't hammered.
 pub(crate) const SUBTICK_MS: u32 = 20;
 
+/// #70/#49 observability: LEAF DIAG-record broadcast cadence (ms). Deliberately slow — the diag
+/// signals are slow-moving, so a 60 s beat keeps mesh airtime negligible.
+#[cfg(feature = "espnow")]
+const DIAG_CADENCE_MS: u64 = 60_000;
+/// #70/#49: minimum spacing between BUTTON-expedited diag broadcasts (ms) — bounds a press-mash
+/// so it can't flood the mesh with off-cadence diags.
+#[cfg(feature = "espnow")]
+const DIAG_EXPEDITE_MIN_MS: u64 = 3_000;
+
 /// Minimum time the boot splash (node name + firmware version) stays on screen,
 /// even when radio bring-up was instant (default build). The espnow/wifi NTP burst
 /// usually already exceeds this, so the splash naturally rides the burst window.
@@ -323,6 +337,13 @@ fn main() -> ! {
     } else {
         ota::unconfirmed_boot_reset();
     }
+
+    // #70 observability: capture the per-boot diagnostics ONCE (persisted boot-count bump +
+    // reset reason + boot slot + otadata state) for the retained DIAG record. Placed AFTER the
+    // OTA bookkeeping block so a K-counter forced rollback reboots BEFORE this runs — the
+    // rolled-back (good-slot) boot is the one that counts, not the aborted crash-loop boot.
+    #[cfg(feature = "espnow")]
+    ota::capture_boot_diag();
 
     // --- I2C bus to the OLED -------------------------------------------------
     let i2c = I2c::new(
@@ -587,6 +608,13 @@ fn main() -> ! {
     let mut last_input_ms: u64 = 0;
     #[cfg(feature = "espnow")]
     let mut flush_defer_since_ms: u64 = 0;
+    // #70/#49 observability: last time this LEAF broadcast its DIAG record, and a "expedite"
+    // flag set by a BOOT-button press (so a press shows up in HA within a few seconds instead
+    // of waiting the full slow diag cadence). Gateway publishes its own diag via the MQTT flush.
+    #[cfg(feature = "espnow")]
+    let mut last_diag_ms: u64 = 0;
+    #[cfg(feature = "espnow")]
+    let mut diag_dirty: bool = false;
 
     // FPS measurement for BENCH: count frames, recompute once per second.
     #[cfg(feature = "espnow")]
@@ -844,6 +872,26 @@ fn main() -> ! {
                 // #50 screen template is unaffected.
                 let val = alloc::format!("{}:{}|{}", live_kind.as_wire(), live_page, ota::BUILD_NUMBER);
                 r.broadcast_stat(val.as_bytes());
+            }
+            // #70/#49 observability: sample the free-heap watermark on the ~10 s tick (all roles,
+            // cheap) so `hmin` tracks leak/pressure at finer resolution than the diag publish.
+            if (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000) {
+                r.diag_sample_heap();
+            }
+            // #70/#49: a LEAF broadcasts its compact DIAG record on a SLOW ~60 s cadence (diag is
+            // slow-moving — keep mesh airtime low), expedited by a BOOT-button press (rate-limited
+            // to ≥ DIAG_EXPEDITE_MIN_MS so a mash can't spam the mesh). The gateway caches it and
+            // republishes retained smol/<leaf>/diag. Gateway publishes ITS OWN diag via the flush,
+            // so this is leaf-only — the exact inverse of the gateway BATT/GRID/CFG re-broadcasts.
+            if !r.is_gateway() {
+                let due = (now / DIAG_CADENCE_MS) != ((now.saturating_sub(SUBTICK_MS as u64)) / DIAG_CADENCE_MS);
+                let expedite = diag_dirty && now.saturating_sub(last_diag_ms) >= DIAG_EXPEDITE_MIN_MS;
+                if due || expedite {
+                    let rec = r.diag_record();
+                    r.broadcast_diag(rec.as_bytes());
+                    last_diag_ms = now;
+                    diag_dirty = false;
+                }
             }
 
             // NOTE: the MMO-snake SNK drain+broadcast used to live here. It MOVED
@@ -1205,6 +1253,13 @@ fn main() -> ! {
             #[cfg(feature = "espnow")]
             {
                 last_input_ms = now;
+                // #70: record the BOOT-button press for the DIAG record's press counters (HA
+                // fires a distinct press / long-press event on each increment) and flag the next
+                // diag broadcast to expedite so it reaches HA within a few seconds, not 60.
+                if let Some(radio) = ctx.radio.as_deref_mut() {
+                    radio.note_button(matches!(press, input::Press::Long));
+                }
+                diag_dirty = true;
             }
             if let Transition::Switch(kind) = app.on_button(press, &mut ctx) {
                 app = App::enter(kind, &ctx); // lazy-construct the entered screen

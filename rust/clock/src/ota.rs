@@ -756,6 +756,7 @@ pub fn boot_confirm(self_test_passed: bool) {
     if self_test_passed {
         let _ = ota.set_current_ota_state(OtaImageState::Valid);
         clear_ota_activated(); // fate decided — don't re-self-test on a later crash-reset
+        mark_ota_outcome(false); // #70: DIAG ota=confirmed
         log::info!("smol OTA: self-test PASS — image CONFIRMED (Valid)");
     } else {
         // #40 BRICK-SAFETY (was a hard brick): roll back ONLY if the target slot holds a
@@ -773,10 +774,15 @@ pub fn boot_confirm(self_test_passed: bool) {
                 let _ = ota.set_current_slot(t);
             }
             let _ = ota.set_current_ota_state(OtaImageState::Valid);
+            mark_ota_outcome(true); // #70: DIAG ota=rolled-back — set BEFORE reset; the good-slot
+                                    // boot reports it (drives luna's rollback alert automation).
             log::warn!("smol OTA: self-test FAIL — ROLLING BACK to the previous (valid) slot");
             esp_hal::system::software_reset();
         } else {
             let _ = ota.set_current_ota_state(OtaImageState::Valid);
+            // #70: brick-safe accept (no valid rollback target) — the image IS running, so from
+            // HA's outcome view it's `confirmed` (no rollback occurred), not a silent failure.
+            mark_ota_outcome(false);
             log::warn!(
                 "smol OTA: self-test FAIL, but the rollback target has NO valid image — ACCEPTING the current image (brick-safe: no flip, no reset)"
             );
@@ -1316,4 +1322,277 @@ pub fn otadata_unconfirmed() -> bool {
         ota.current_ota_state(),
         Ok(OtaImageState::New) | Ok(OtaImageState::PendingVerify)
     )
+}
+
+// ===========================================================================
+// #70 observability — per-boot diagnostics for the retained DIAG record.
+//
+// Captured ONCE at boot (`capture_boot_diag`) into a `static mut` cache (rv32imc has
+// no atomics; single boot-path caller, no ISR — the same discipline as `NODE_ID_CACHE`
+// / the OTA scratch statics), then read every diag cadence by `boot_diag()`:
+//   • boot_count  — NVS-persisted, bumped once per boot (survives power-loss; the OTA
+//                   image write never touches nvs, so it survives every image too).
+//   • reset_reason— por / sw / panic / bo / wdt / usb / dslp / other / unk.
+//   • boot_slot   — the running app slot (0=ota_0 / 1=ota_1). A silent rollback FLIPS it.
+//   • ota_state   — otadata image state token (valid/new/pend/…).
+// All `espnow`-scoped: only the mesh DIAG record consumes them (a `wifi`-only build has
+// no `RadioManager` to build the frame). BRICK-SAFE: every read fails to a benign default
+// and never panics; the boot-count store is SECTOR-SEGREGATED from identity + the floor.
+// ---------------------------------------------------------------------------
+
+// #70 boot-count store: `[MAGIC(4 LE) | count(4 LE) | crc32(4 LE)]`, two ping-pong cells in
+// nvs SECTORS 3 & 4 (offsets 12288/16384). nvs is 0x6000 (6 sectors): sector 0 = identity,
+// sectors 1-2 = freshness floor, so 3/4 are free (5 left spare). Ping-pong = torn-write-safe
+// (a power-loss mid-bump keeps the other cell's prior count) AND halves per-sector flash wear
+// (each cell is erased only every OTHER boot). Same sector-segregation invariant as the floor:
+// a bump erases a whole 4 KB sector, so these MUST NOT share sector 0 (identity) or 1-2 (floor).
+#[cfg(feature = "espnow")]
+const BOOTCOUNT_MAGIC: u32 = 0x736D_6C42; // "smlB"
+#[cfg(feature = "espnow")]
+const BOOTCOUNT_CELL_BASE: u32 = 12288; // nvs sector 3 — NOT 0/1/2 (identity + floor)
+#[cfg(feature = "espnow")]
+const BOOTCOUNT_CELL_STRIDE: u32 = 4096; // one sector apart (erase granularity)
+#[cfg(feature = "espnow")]
+const BOOTCOUNT_RECORD_LEN: usize = 12;
+
+/// Read one boot-count cell at `rel` (nvs-relative). `None` on flash error / bad magic / crc.
+#[cfg(feature = "espnow")]
+fn bootcount_cell_read(rel: u32) -> Option<u32> {
+    use embedded_storage::nor_flash::ReadNorFlash;
+    let mut flash = FlashStorage::new();
+    let mut ptbuf = [0u8; PT_SCRATCH];
+    let pt = read_partition_table(&mut flash, &mut ptbuf).ok()?;
+    let nvs = pt
+        .find_partition(PartitionType::Data(DataPartitionSubType::Nvs))
+        .ok()??;
+    let mut region = nvs.as_embedded_storage(&mut flash);
+    let mut rec = [0u8; BOOTCOUNT_RECORD_LEN];
+    region.read(rel, &mut rec).ok()?;
+    let magic = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+    if magic != BOOTCOUNT_MAGIC {
+        return None; // erased (0xFFFFFFFF) or never written
+    }
+    let count = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
+    let crc = u32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+    (crc == crc32(&rec[0..8])).then_some(count)
+}
+
+/// Increment the NVS-persisted boot count and return the NEW value. Call ONCE per boot.
+/// Writes the incremented count to the cell holding the SMALLER/invalid count, so the other
+/// cell always retains the prior count → a torn write cannot lose it (power-loss safe).
+/// Best-effort: any flash error still returns the in-memory increment (the diag just isn't
+/// persisted this boot; the next boot re-reads the last good cell). Never panics, never
+/// touches identity (sector 0) or the floor (sectors 1-2).
+#[cfg(feature = "espnow")]
+pub fn boot_count_bump() -> u32 {
+    use embedded_storage::nor_flash::NorFlash;
+    let a = bootcount_cell_read(BOOTCOUNT_CELL_BASE);
+    let b = bootcount_cell_read(BOOTCOUNT_CELL_BASE + BOOTCOUNT_CELL_STRIDE);
+    let cur = a.unwrap_or(0).max(b.unwrap_or(0));
+    let next = cur.saturating_add(1);
+    // Target the cell with the smaller (or invalid) count; the other keeps the prior max.
+    // Both offsets are in sectors 3/4 — never sector 0/1/2, so this erase can't wipe identity
+    // or the freshness floor.
+    let target_rel = if a.unwrap_or(0) <= b.unwrap_or(0) {
+        BOOTCOUNT_CELL_BASE
+    } else {
+        BOOTCOUNT_CELL_BASE + BOOTCOUNT_CELL_STRIDE
+    };
+    let mut rec = [0u8; BOOTCOUNT_RECORD_LEN];
+    rec[0..4].copy_from_slice(&BOOTCOUNT_MAGIC.to_le_bytes());
+    rec[4..8].copy_from_slice(&next.to_le_bytes());
+    let crc = crc32(&rec[0..8]);
+    rec[8..12].copy_from_slice(&crc.to_le_bytes());
+    let mut flash = FlashStorage::new();
+    let mut ptbuf = [0u8; PT_SCRATCH];
+    let Ok(pt) = read_partition_table(&mut flash, &mut ptbuf) else {
+        return next;
+    };
+    let Ok(Some(nvs)) = pt.find_partition(PartitionType::Data(DataPartitionSubType::Nvs)) else {
+        return next;
+    };
+    let mut region = nvs.as_embedded_storage(&mut flash);
+    if region.erase(target_rel, target_rel + BOOTCOUNT_CELL_STRIDE).is_err() {
+        return next;
+    }
+    let _ = region.write(target_rel, &rec);
+    next
+}
+
+/// #70 panic marker: a panic on this fw halts via `custom_halt` → `software_reset`, which the
+/// SoC records as a plain software reset (`CoreSw`) — indistinguishable from an intentional
+/// reboot / OTA activate. `custom_halt` sets this RTC-fast persistent marker FIRST, so the
+/// next boot can tell a panic-reset (`rr=panic`) from a clean `rr=sw`. Survives the reset AND
+/// a USB reflash; a true power cycle clears it (a power-cycled board reports `por`, correct).
+#[cfg(feature = "wifi")]
+#[esp_hal::ram(rtc_fast, persistent)]
+static mut PANIC_MARK: [u32; 1] = [0u32; 1];
+
+#[cfg(feature = "wifi")]
+const PANIC_MARK_MAGIC: u32 = 0x736D_6C50; // "smlP"
+
+/// Set the panic marker (call from `custom_halt`, BEFORE `software_reset`).
+#[cfg(feature = "wifi")]
+pub fn mark_panic() {
+    unsafe {
+        let m = &mut *core::ptr::addr_of_mut!(PANIC_MARK);
+        m[0] = PANIC_MARK_MAGIC;
+    }
+}
+
+/// Read-and-clear the panic marker. `true` iff this boot chain began with a panic. Cleared on
+/// read so only the FIRST boot after the panic reports it. `espnow`-scoped: only the mesh diag
+/// path (`reset_reason_token`) reads it; a wifi-only build sets the marker (via `mark_panic`) but
+/// has no DIAG consumer, so it never takes it.
+#[cfg(feature = "espnow")]
+fn take_panic_mark() -> bool {
+    unsafe {
+        let m = &mut *core::ptr::addr_of_mut!(PANIC_MARK);
+        let hit = m[0] == PANIC_MARK_MAGIC;
+        m[0] = 0;
+        hit
+    }
+}
+
+/// The last reset reason as a short, stable token for the DIAG record. Reads (and clears) the
+/// panic marker first — a panic shows as `CoreSw` at the SoC level, so the marker recovers the
+/// `panic` distinction. Everything else maps the C3 `SocResetReason` set to a compact token.
+#[cfg(feature = "espnow")]
+pub fn reset_reason_token() -> &'static str {
+    if take_panic_mark() {
+        return "panic";
+    }
+    // Value strings match luna's DEPLOYED #70 HA parser (PR #81) exactly — the parser passes
+    // rst= through for display, so an out-of-enum value like "panic" still shows correctly.
+    use esp_hal::rtc_cntl::SocResetReason as R;
+    match esp_hal::system::reset_reason() {
+        Some(R::ChipPowerOn) => "power-on",
+        Some(R::CoreSw) | Some(R::Cpu0Sw) => "sw",
+        Some(R::CoreDeepSleep) => "deep-sleep",
+        Some(R::SysBrownOut) => "brownout",
+        Some(
+            R::CoreMwdt0
+            | R::CoreMwdt1
+            | R::Cpu0Mwdt0
+            | R::Cpu0Mwdt1
+            | R::CoreRtcWdt
+            | R::Cpu0RtcWdt
+            | R::SysRtcWdt
+            | R::SysSuperWdt,
+        ) => "wdt",
+        Some(R::CoreUsbUart | R::CoreUsbJtag) => "usb-jtag",
+        Some(R::SysClkGlitch | R::CorePwrGlitch) => "glitch",
+        Some(_) => "other",
+        None => "unk",
+    }
+}
+
+/// The running app slot as 0 (`ota_0`) / 1 (`ota_1`); 255 on a non-OTA board or any read
+/// error. A silent rollback flips this vs the pushed slot — the headline #70 signal.
+#[cfg(feature = "espnow")]
+pub fn boot_slot() -> u8 {
+    let mut flash = FlashStorage::new();
+    let mut buf = [0u8; PT_SCRATCH];
+    let Ok(pt) = read_partition_table(&mut flash, &mut buf) else {
+        return 255;
+    };
+    let Ok(Some(od)) = pt.find_partition(PartitionType::Data(DataPartitionSubType::Ota)) else {
+        return 255;
+    };
+    let mut region = od.as_embedded_storage(&mut flash);
+    let Ok(mut ota) = Ota::new(&mut region) else {
+        return 255;
+    };
+    match ota.current_slot() {
+        Ok(Slot::Slot0) => 0,
+        Ok(Slot::Slot1) => 1,
+        _ => 255,
+    }
+}
+
+/// #70 LAST OTA OUTCOME — the DIAG record's `ota=` field, matching luna's deployed parser
+/// (`confirmed` | `rolled-back` | `none`), which drives her rollback ALERT automation. This is
+/// an OUTCOME, not the raw otadata state: `boot_confirm` decides it (PASS → confirmed, self-test
+/// FAIL → rolled-back) AFTER `capture_boot_diag` runs, so it is read LIVE each diag cadence (not
+/// cached in `DiagBoot`). RTC-fast persistent (survives the rollback's `software_reset` so the
+/// good-slot boot reports `rolled-back`; a power cycle clears it → `none`, correct). Magic-gated
+/// so uninitialised RTC RAM reads as `none`, never a false outcome.
+#[cfg(feature = "wifi")]
+#[esp_hal::ram(rtc_fast, persistent)]
+static mut OTA_OUTCOME: [u32; 2] = [0u32; 2]; // [magic, 1=confirmed / 2=rolled-back]
+
+#[cfg(feature = "wifi")]
+const OTA_OUTCOME_MAGIC: u32 = 0x736D_6C4F; // "smlO"
+
+/// Record the last OTA outcome (call from `boot_confirm`): `rolled_back` true ⇒ `rolled-back`,
+/// else `confirmed`. Set before the rollback's `software_reset` so the next boot reports it.
+#[cfg(feature = "wifi")]
+pub fn mark_ota_outcome(rolled_back: bool) {
+    unsafe {
+        let m = &mut *core::ptr::addr_of_mut!(OTA_OUTCOME);
+        m[0] = OTA_OUTCOME_MAGIC;
+        m[1] = if rolled_back { 2 } else { 1 };
+    }
+}
+
+/// The last OTA outcome token for the DIAG `ota=` field. `none` until an OTA confirm/rollback
+/// happened this power-cycle (magic-gated: uninitialised RTC RAM ⇒ `none`).
+#[cfg(feature = "espnow")]
+pub fn ota_outcome_token() -> &'static str {
+    unsafe {
+        let m = core::ptr::addr_of!(OTA_OUTCOME).read();
+        if m[0] != OTA_OUTCOME_MAGIC {
+            return "none";
+        }
+        match m[1] {
+            1 => "confirmed",
+            2 => "rolled-back",
+            _ => "none",
+        }
+    }
+}
+
+/// The once-per-boot diagnostics, captured into a cache by `capture_boot_diag` and read every
+/// diag cadence by `boot_diag()`. `Copy` so it lives inline in the cache. (The OTA outcome is
+/// NOT here — it's decided by `boot_confirm` after capture, so it's read live via
+/// `ota_outcome_token`.)
+#[cfg(feature = "espnow")]
+#[derive(Clone, Copy)]
+pub struct DiagBoot {
+    pub boot_count: u32,
+    pub reset_reason: &'static str,
+    pub boot_slot: u8,
+}
+
+#[cfg(feature = "espnow")]
+static mut BOOT_DIAG: Option<DiagBoot> = None;
+
+/// Capture the per-boot diagnostics ONCE, very early in `main` (after the OTA bookkeeping, so a
+/// forced rollback reboots BEFORE the count bumps — the rolled-back boot counts, the aborted one
+/// does not). Bumps the persisted boot count, latches the reset reason (incl. the panic marker
+/// take), and reads the boot slot + otadata state. Single-threaded boot-path caller (no ISR).
+/// Call exactly once — a second call would double-bump the boot count.
+#[cfg(feature = "espnow")]
+pub fn capture_boot_diag() {
+    let d = DiagBoot {
+        boot_count: boot_count_bump(),
+        reset_reason: reset_reason_token(),
+        boot_slot: boot_slot(),
+    };
+    unsafe {
+        *core::ptr::addr_of_mut!(BOOT_DIAG) = Some(d);
+    }
+}
+
+/// The cached per-boot diagnostics (a benign all-unknown default if `capture_boot_diag` never
+/// ran). Read by the DIAG frame builder each cadence.
+#[cfg(feature = "espnow")]
+pub fn boot_diag() -> DiagBoot {
+    unsafe {
+        core::ptr::addr_of!(BOOT_DIAG).read().unwrap_or(DiagBoot {
+            boot_count: 0,
+            reset_reason: "unk",
+            boot_slot: 255,
+        })
+    }
 }

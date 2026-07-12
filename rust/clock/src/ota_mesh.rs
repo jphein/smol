@@ -434,6 +434,14 @@ pub struct OtaLeafSession {
     dbg_otam_heard: u16,
     dbg_verdict: u8,
     dbg_otan_sent: u16,
+    /// #49 observability: lifetime OTA integrity-verify outcomes on the leaf mesh-OTA receive
+    /// path, folded into the retained DIAG record (`vok`/`vfl`) — the on-device proof of the #32
+    /// signed-refuse that was previously UART0-only. `verify_fail` bumps on an ed25519-sig fail
+    /// (the #32 refuse line) OR a readback-SHA mismatch; `verify_ok` on a full readback-verified
+    /// image. Policy rejections (build≤running / ≤floor / size) are NOT counted here — they are
+    /// gating decisions over an already-valid signature, tracked by `dbg_verdict`/relaydiag.
+    verify_ok: u16,
+    verify_fail: u16,
 }
 
 impl OtaLeafSession {
@@ -455,7 +463,14 @@ impl OtaLeafSession {
             dbg_otam_heard: 0,
             dbg_verdict: 0,
             dbg_otan_sent: 0,
+            verify_ok: 0,
+            verify_fail: 0,
         }
+    }
+
+    /// #49: lifetime OTA integrity-verify counters `(ok, fail)` for the DIAG record (`vok`/`vfl`).
+    pub fn verify_counts(&self) -> (u16, u16) {
+        (self.verify_ok, self.verify_fail)
     }
 
     /// #40 #3: lifetime leaf RX-diag `(otam_heard, last_on_meta_verdict, otan_sent)` — the leaf
@@ -514,6 +529,7 @@ impl OtaLeafSession {
         if !crate::ota::verify_signature(m, sig) {
             log::warn!("smol #40: OTAM sig FAILED — ignored (no state, no flash)");
             self.dbg_verdict = 2; // #3: signature verify failed
+            self.verify_fail = self.verify_fail.saturating_add(1); // #49: the #32 refuse-line proof
             return LeafAction::None;
         }
         // (2) Only now is M trustworthy → parse build/size/sha.
@@ -686,9 +702,11 @@ impl OtaLeafSession {
                 let target_slot = w.target();
                 if w.finalize(size, &sha) {
                     log::info!("smol #40: image VERIFIED (readback SHA-256, ed25519 already ok) — activating build {}", build);
+                    self.verify_ok = self.verify_ok.saturating_add(1); // #49: full integrity-verified
                     LeafAction::Complete(target_slot, build)
                 } else {
                     log::error!("smol #40: readback verify FAILED — discarded (good slot intact)");
+                    self.verify_fail = self.verify_fail.saturating_add(1); // #49: readback SHA mismatch
                     LeafAction::Abort
                 }
             }
