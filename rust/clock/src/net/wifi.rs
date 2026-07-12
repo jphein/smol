@@ -929,6 +929,13 @@ pub const CFG_KEY_CUSTOM: u8 = b'Y';
 #[cfg(feature = "wifi")]
 #[allow(dead_code)]
 pub const CFG_KEY_SCAN: u8 = b'W';
+/// #100 network-switch CONFIG (key `N`) = the active WiFi-slot index (`0`/`1`). RETAINED/CACHED
+/// STATE (relayed like S/L/U/P/Y, NOT a one-shot command like R/W) — a node applies it by writing
+/// the NVS net-record + rebooting into the slot, EDGE-triggered on a change of the commanded slot
+/// (re-reading the same retained value is a no-op → never a reboot-loop). Per-node
+/// `smol/<id>/config/net` or fleet-wide `smol/config/net` (target 255). Value = one ASCII digit.
+#[cfg(feature = "wifi")]
+pub const CFG_KEY_NET: u8 = b'N';
 
 /// #48 (GwOwnCfg — approved arch): the GATEWAY's OWN per-node configs read from its own MQTT
 /// topics this burst. A leaf gets these RELAYED (→ its `CfgTracker`); the gateway reads them
@@ -955,12 +962,15 @@ pub struct GwOwnCfg {
     pub plugins: Option<([u8; CFG_VALUE_MAX], usize)>,
     /// #45 the gateway's own `smol/<id>/config/custom` value `(buf, len)`, or `None` if absent.
     pub custom: Option<([u8; CFG_VALUE_MAX], usize)>,
+    /// #100 the gateway's own `smol/<id>/config/net` (or global `smol/config/net`) active-slot
+    /// index value `(buf, len)`, or `None` if absent this burst.
+    pub net: Option<([u8; CFG_VALUE_MAX], usize)>,
 }
 
 #[cfg(feature = "wifi")]
 impl GwOwnCfg {
     pub const fn new() -> Self {
-        Self { led: None, units: None, plugins: None, custom: None }
+        Self { led: None, units: None, plugins: None, custom: None, net: None }
     }
     /// Pack a payload into the `(buf, len)` a field holds (truncated to `CFG_VALUE_MAX`), so the
     /// mqtt-drain arms stay one-liners: `gw_own.led = Some(GwOwnCfg::val(payload));`.
@@ -1691,6 +1701,16 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 15, b"smol/+/config/custom") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
+        // #100 network-switch (pid 16 per-node + pid 17 fleet-wide): the retained active-slot index.
+        // CONFIG/CACHED (key `N`, relayed like S/L/U/P/Y). Per-node `smol/<id>/config/net` + the
+        // global `smol/config/net` (→ target 255). Applying it writes the NVS net-record + reboots
+        // into the slot, edge-triggered on a commanded-slot CHANGE (a re-read is a no-op → no loop).
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 16, b"smol/+/config/net") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 17, b"smol/config/net") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
     }
 
     // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
@@ -2136,6 +2156,38 @@ fn mqtt_session(
                         } else {
                             gw_own.custom = Some(GwOwnCfg::val(payload));
                             log::info!("smol #45: gateway own custom screen captured ({} B)", payload.len());
+                        }
+                    } else if topic == b"smol/config/net" {
+                        // #100 GLOBAL network-switch (no id) → cache under the broadcast target 255
+                        // so ONE relayed `<255>N<slot>` frame reaches every leaf, + gw_own.net for the
+                        // gateway's own self-apply. Value = one ASCII slot digit; the apply validates.
+                        if let Some(cache) = cfg_cache.as_deref_mut() {
+                            let now = Instant::now().duration_since_epoch().as_millis();
+                            cache.set(CFG_TARGET_ALL, CFG_KEY_NET, payload, [0u8; 6], now);
+                        }
+                        gw_own.net = Some(GwOwnCfg::val(payload));
+                        log::info!(
+                            "smol #100: global net-slot captured ({} B) — cached (255,N) + self",
+                            payload.len()
+                        );
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/net") {
+                        // #100 PER-NODE network-switch: twin of the led/plugins arm. OTHER leaf →
+                        // cache under key `N` for the ESP-NOW relay; OUR OWN id → gw_own.net. The apply
+                        // (main) writes the NVS net-record + reboots into the slot, edge-triggered on a
+                        // commanded-slot CHANGE (a re-read of the same retained value is a no-op → no loop).
+                        if leaf_id != node_id {
+                            if let Some(cache) = cfg_cache.as_deref_mut() {
+                                let now = Instant::now().duration_since_epoch().as_millis();
+                                cache.set(leaf_id, CFG_KEY_NET, payload, [0u8; 6], now);
+                                log::info!(
+                                    "smol #100: cached leaf id{} net-slot for relay ({} B)",
+                                    leaf_id,
+                                    payload.len()
+                                );
+                            }
+                        } else {
+                            gw_own.net = Some(GwOwnCfg::val(payload));
+                            log::info!("smol #100: gateway own net-slot captured ({} B)", payload.len());
                         }
                     } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/cmd/reset") {
                         // #52 remote reboot — a COMMAND on a TRANSIENT topic (retain:false), so we

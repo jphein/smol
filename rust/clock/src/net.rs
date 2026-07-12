@@ -70,6 +70,10 @@ pub use wifi::CFG_KEY_REBOOT;
 // take_cfg_offer(Y); the held layout feeds the Custom plugin render).
 #[cfg(feature = "espnow")]
 pub use wifi::CFG_KEY_CUSTOM;
+// #100 network-switch key — same `main`-bridge rationale (espnow leaf-apply path via
+// take_cfg_offer(N); the apply writes the NVS net-record + reboots into the slot).
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_KEY_NET;
 // #45: `main` sizes its held Custom-layout buffer to the max keyed value — bridge the const out
 // of the private `wifi` module (espnow-only: only the Custom apply path names it).
 #[cfg(feature = "espnow")]

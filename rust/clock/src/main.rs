@@ -1167,6 +1167,33 @@ fn main() -> ! {
                 log::info!("smol #45: custom screen layout updated ({} B)", n);
             }
 
+            // #100: a network-switch config (key `N`) = the active WiFi-slot index. CONFIG/CACHED
+            // (retained), so it re-delivers every burst → EDGE-TRIGGERED on a change of the COMMANDED
+            // slot (NOT the active slot): a re-read of the same value is a no-op ⇒ never a reboot-loop
+            // (compare-to-commanded also means a latched fallback stays put — re-command to escape).
+            // A genuine change → persist {active=slot, commanded=slot, fallback=false} + reboot into
+            // the slot (the boot fallback then associates on it, self-healing if it's unreachable).
+            // Out-of-range / unparseable → ignored (keep current). software_reset() never returns.
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_NET) {
+                if let Some(slot) = core::str::from_utf8(&o.buf[..o.len])
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u8>().ok())
+                {
+                    if (slot as usize) < crate::secrets::WIFI_NETWORKS.len() {
+                        let cur = crate::ota::read_net_cfg().map_or(0, |c| c.commanded);
+                        if slot != cur {
+                            log::warn!("smol #100: network slot -> {} (was commanded {}) — reboot", slot, cur);
+                            crate::ota::write_net_cfg(crate::ota::NetCfg {
+                                active: slot,
+                                commanded: slot,
+                                fallback: false,
+                            });
+                            esp_hal::system::software_reset();
+                        }
+                    }
+                }
+            }
+
             // #52: a remote reboot command (key `R`) — a COMMAND (cache-bypass, one-shot). Applied
             // once (edge — `take` clears it); the value is empty (the key IS the command). Feeds
             // BOTH a leaf (relayed `<id>R`) and the gateway's OWN reset (injected into `self.cfg`),
