@@ -1340,11 +1340,8 @@ pub struct RadioManager {
     /// chunk-loss stall. `last_wb` is in chunk units (matches `total = om::total_chunks`).
     /// Carries the leaf's `LDBG` self-report too (captured during the relay) — see `RelayDiag`.
     leaf_relay_rx: Option<crate::net::wifi::RelayDiag>,
-    /// #40: consecutive non-terminal (transient) relay attempts — caps the auto-retry so a
-    /// persistently-failing leaf can't loop the mesh-deaf relay. SHARED across leaves: with
-    /// the #4 round-robin surfacing (wifi.rs), concurrent installs ALTERNATE, so this bounds
-    /// TOTAL wasted attempts (a per-leaf counter that reset on each rotation would never hit
-    /// the cap → an unbounded mesh-deaf loop; the shared cap is the safe choice).
+    /// #40: consecutive non-terminal (transient) relay attempts for the current install —
+    /// caps the auto-retry so a persistently-failing leaf can't loop the mesh-deaf relay.
     leaf_ota_retries: u8,
     /// #21 node-manager: the parsed default-screen command surfaced by a burst,
     /// pending `main`'s `take_config_offer` → apply. `None` when nothing is pending.

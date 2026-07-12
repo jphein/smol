@@ -495,11 +495,14 @@ impl ImageWriter {
 // default id (7) → a stolen identity → a duplicate-id roster → the gateway's confirm
 // waits for a STAT from an id that no longer exists → a structural leaf-timeout.
 //
-// Fix: the TRUE id lives in NVS. OTA writes ONLY the inactive app slot + `otadata`
-// (never the `nvs` partition at 0x9000), so identity survives ANY image. A USB flash
-// (`espflash erase-flash` + flash) wipes NVS to 0xFF; the first boot then SEEDS NVS
-// from the baked const — which the USB flow sets correctly via `SMOL_NODE_ID=<n>`.
-// Steady state after that: NVS is the single source of truth.
+// Fix: the TRUE id lives in NVS, in `nvs` SECTOR 0 (offset 0, 16 B). The OTA image
+// transfer writes ONLY the inactive app slot + `otadata` — never `nvs` — so identity
+// survives ANY image. The freshness-floor bump (below) DOES write `nvs`, but only sectors
+// 1-2 (offsets ≥ 4096); it never touches sector 0 (oracle F1 — a floor bump erases a whole
+// sector, so identity and the floor cells MUST live in different sectors, or the bump wipes
+// the id → fleet reverts to the baked default 7). A USB flash (`espflash erase-flash` +
+// flash) wipes NVS to 0xFF; the first boot then SEEDS sector 0 from the baked const — which
+// the USB flow sets correctly via `SMOL_NODE_ID=<n>`. Steady state: NVS is the id's truth.
 //
 // BRICK-SAFE: any flash/partition/parse error → fall back to the baked const and do
 // NOT write. The seed is best-effort (a failed seed just retries next boot). The
@@ -1036,21 +1039,34 @@ impl SlotReader {
 // over the unauth mesh). FLOOR-ONLY, #40-local: NO epoch, zero change to #32's signed M.
 //
 // ⚠️ #40 CLAIMS THE `nvs` PARTITION as a raw persistent store (smol uses no ESP-IDF NVS
-// today — verified). This is NOT the ESP-IDF NVS key/value format; if a future feature
-// ever needs real NVS, give it a different partition or coordinate this offset. All
-// access is through a partition-scoped `FlashRegion` (OOB-safe, like the slot writer),
-// so a bug here can only corrupt the floor cell — never the app slots or otadata, and
-// never a brick (the sig + monotonicity gates still hold; the floor is defense-in-depth).
+// today — verified). It is shared by TWO #40 users, SEGREGATED BY SECTOR: the IDENTITY
+// record owns sector 0 (offset 0); the freshness-floor cells own sectors 1-2 (offsets
+// 4096/8192). This is NOT the ESP-IDF NVS key/value format; a future feature needing real
+// NVS must get a different partition or coordinate these offsets. All access is through a
+// partition-scoped `FlashRegion` (OOB-safe, like the slot writer), so a bug here can only
+// corrupt a floor cell — never the app slots, otadata, OR the identity sector — and never a
+// brick (the sig + monotonicity gates still hold; the floor is defense-in-depth).
 //
-// Layout: two ping-pong cells at nvs relative offsets 0 and 4096, each a 12-byte record
-// `[MAGIC(4 LE) | build(4 LE) | crc32(4 LE)]`. Read = max valid build across both cells.
-// Write = erase the cell holding the SMALLER/invalid build, write the new record there;
-// the other cell always retains ≥ the erased one, so a torn write never regresses the
-// floor (power-loss-safe). One erase+write per OTA → negligible wear.
+// Layout: two ping-pong cells at nvs relative offsets 4096 and 8192 (sectors 1 and 2),
+// each a 12-byte record `[MAGIC(4 LE) | build(4 LE) | crc32(4 LE)]`. Read = max valid
+// build across both cells. Write = erase the cell holding the SMALLER/invalid build, write
+// the new record there; the other cell always retains ≥ the erased one, so a torn write
+// never regresses the floor (power-loss-safe). One erase+write per OTA → negligible wear.
+//
+// ⚠️ SECTOR SEGREGATION (brick-class, oracle F1): the floor cells MUST NOT share a 4 KB
+// sector with the #40 IDENTITY record (nvs offset 0, sector 0). The floor bump ERASES a
+// full sector (`erase(target_rel, target_rel + 4096)`); if a cell sat at offset 0 that
+// erase would DESTROY the identity record → the leaf falls back to the baked default id →
+// with the fleet-shared image, the whole fleet becomes id 7 on the next reboot. So the
+// cells live at sectors 1 & 2 (base 4096), leaving sector 0 exclusively for identity.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "espnow")]
 const FLOOR_MAGIC: u32 = 0x736D_6C46; // "smlF"
+/// First floor cell's nvs offset — SECTOR 1, NOT sector 0 (sector 0 is the identity record;
+/// a floor bump erases its whole target sector and would wipe identity if it sat at 0).
+#[cfg(feature = "espnow")]
+const FLOOR_CELL_BASE: u32 = 4096;
 #[cfg(feature = "espnow")]
 const FLOOR_CELL_STRIDE: u32 = 4096; // one sector apart (erase granularity)
 #[cfg(feature = "espnow")]
@@ -1098,8 +1114,8 @@ fn floor_cell_read(rel: u32) -> Option<u32> {
 /// The current freshness floor = max valid build across both cells (0 if none written).
 #[cfg(feature = "espnow")]
 pub fn fresh_floor_get() -> u32 {
-    let a = floor_cell_read(0).unwrap_or(0);
-    let b = floor_cell_read(FLOOR_CELL_STRIDE).unwrap_or(0);
+    let a = floor_cell_read(FLOOR_CELL_BASE).unwrap_or(0);
+    let b = floor_cell_read(FLOOR_CELL_BASE + FLOOR_CELL_STRIDE).unwrap_or(0);
     a.max(b)
 }
 
@@ -1110,14 +1126,19 @@ pub fn fresh_floor_get() -> u32 {
 #[cfg(feature = "espnow")]
 pub fn fresh_floor_bump(build: u32) {
     use embedded_storage::nor_flash::NorFlash;
-    let a = floor_cell_read(0);
-    let b = floor_cell_read(FLOOR_CELL_STRIDE);
+    let a = floor_cell_read(FLOOR_CELL_BASE);
+    let b = floor_cell_read(FLOOR_CELL_BASE + FLOOR_CELL_STRIDE);
     let cur = a.unwrap_or(0).max(b.unwrap_or(0));
     if build <= cur {
         return; // already covered — no write, no wear
     }
     // Target the cell with the smaller (or invalid) build; the other keeps the prior max.
-    let target_rel = if a.unwrap_or(0) <= b.unwrap_or(0) { 0 } else { FLOOR_CELL_STRIDE };
+    // Both offsets are in sectors 1/2 — NEVER sector 0, so this erase can't wipe identity.
+    let target_rel = if a.unwrap_or(0) <= b.unwrap_or(0) {
+        FLOOR_CELL_BASE
+    } else {
+        FLOOR_CELL_BASE + FLOOR_CELL_STRIDE
+    };
     let mut rec = [0u8; FLOOR_RECORD_LEN];
     rec[0..4].copy_from_slice(&FLOOR_MAGIC.to_le_bytes());
     rec[4..8].copy_from_slice(&build.to_le_bytes());
