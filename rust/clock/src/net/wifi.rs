@@ -1823,6 +1823,24 @@ fn mqtt_session(
         elect.seen_seq
     );
 
+    // #76 RETAINED-PEERS GHOST FIX (also closes the #68 retained-peers-cleanup item): the peers
+    // publish above (retained `smol/<id>/peers`) only fires while this board is the OWNER. When it
+    // DEMOTES to leaf it stops flushing, so its last `PEERS|G|…` persists on the broker forever as
+    // a GHOST → observability shows a phantom extra gateway. This was the bulk of the #40-sweep
+    // "election split-brain" (#76): the all-three-PEERS|G was largely these stale retained records,
+    // not a live triple-claim (the election itself reconverged to a single owner post-bounce). So
+    // the moment the election says we are NOT the owner, CLEAR our retained peers with an empty
+    // payload (the board is still connected here — same free window the HA block below uses).
+    // Idempotent: a steady leaf just re-clears an already-empty topic. Same retained-hygiene class
+    // as F6 / stat_cache / armdiag — a demoted role must not leave a live-looking retained trace.
+    if !elect.i_am_owner {
+        let mut ptopic = MqttScratch::new();
+        let _ = write!(ptopic, "smol/{}/peers", node_id);
+        if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, ptopic.as_bytes(), b"", true) {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+    }
+
     // --- #33 HA Update entity: self-publish retained discovery + state, clear the cmd ---
     // The board is still connected here (free). `installed_version` = our BUILD_NUMBER;
     // `latest_version` = the gated announce's build if one is present (`ota_offer`), else
