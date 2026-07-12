@@ -372,7 +372,7 @@ pub fn try_time_sync(
     // wifi-only build has no relay/gateway role, so the reached-DHCP flag is unused.
     let mut reached_dhcp = false;
     // wifi-only build has no mesh election; pass a throwaway result.
-    let mut elect = MeshElect::new(crate::NODE_ID);
+    let mut elect = MeshElect::new(crate::node_id());
     // wifi-only build has no main-loop OTA/config consume; capture (unused) offers.
     let mut _ota_offer: Option<crate::ota::Announce> = None;
     let mut _config_offer: Option<crate::app::DefaultScreen> = None;
@@ -383,7 +383,7 @@ pub fn try_time_sync(
         rng,
         &mut || false,
         &mut reached_dhcp,
-        crate::NODE_ID,
+        crate::node_id(),
         batt,
         grid,
         &mut elect,
@@ -1336,6 +1336,11 @@ fn mqtt_session(
     // not the gateway, owns the freshness gate (the OTAM handler rejects `build ≤ leaf.build`);
     // the gateway may be NEWER than the leaf's target, so a gateway-build gate would drop it.
     let mut pending_leaf: Option<u8> = None;
+    // #40 #4 ROUND-ROBIN: the leaf we serviced on the PRIOR attempt — read from `leaf_diag`
+    // (set by the prior `record_leaf_ota`, still present here; it's consumed further below).
+    // With >1 retained install we prefer a DIFFERENT leaf this burst so one leaf's retry
+    // cycle can't monopolize the (minutes-long, mesh-deaf) relay and starve the other.
+    let last_leaf_serviced: Option<u8> = leaf_diag.as_ref().map(|t| t.0);
     loop {
         if tick() {
             break; // #20 abort during downlink wait → fall through to clean DISCONNECT
@@ -1435,7 +1440,15 @@ fn mqtt_session(
                         // here — else an install drained in a session with no staged image
                         // (a drain-timing miss) would be consumed+lost without ever arming.
                         if leaf_id != node_id && cfg_cache.is_some() && payload == b"INSTALL" {
-                            pending_leaf = Some(leaf_id);
+                            // #40 #4 ROUND-ROBIN: take the first candidate that DIFFERS from the
+                            // last-serviced leaf; keep an already-fair pick; if the only candidate
+                            // IS the last-serviced one, service it (it's alone → no starvation).
+                            let differs = |id: u8| Some(id) != last_leaf_serviced;
+                            pending_leaf = match pending_leaf {
+                                None => Some(leaf_id),
+                                Some(cur) if !differs(cur) && differs(leaf_id) => Some(leaf_id),
+                                Some(cur) => Some(cur),
+                            };
                             *leaf_install_seen = true; // #40 #1: install-SEEN (pre-arm) → gateway suppresses its own self-OTA
                             log::info!("smol #40: leaf id{} OTA install command received", leaf_id);
                         }

@@ -104,7 +104,7 @@ fn draw_clock<D>(
     // No radio -> no peer chatter, so the bottom line is simply our own name (the
     // node's noun, derived from its id). Matches the espnow build's idle label.
     #[cfg(not(feature = "espnow"))]
-    let label: &str = crate::net::names::name_for_id(crate::NODE_ID).1;
+    let label: &str = crate::net::names::name_for_id(crate::node_id()).1;
 
     let bottom: &str = if show_sensors {
         sensor_line.as_str()

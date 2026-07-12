@@ -106,6 +106,14 @@ if [ -n "$BUILD_OVERRIDE" ]; then
 fi
 
 # ---- build (or take a prebuilt .bin) ----------------------------------------
+# #40 IDENTITY — the staged image is FLEET-SHARED BY DESIGN: it is built with NO
+# SMOL_NODE_ID, so it bakes the board.rs default id (7). That default is ONLY a factory
+# seed — every radio node reads its TRUE id from the `nvs` partition at runtime
+# (ota.rs::resolve_node_id, seeded on the first USB boot after an erase-flash). OTA never
+# touches `nvs`, so a single image installs onto id7/id8/id9/... and each KEEPS its own
+# identity. DO NOT add SMOL_NODE_ID here (that would re-fragment one image per node); and
+# do NOT USB-flash this staged .bin as a factory image without SMOL_NODE_ID=<n>, or a
+# fresh (erased) board would seed NVS to the default id 7.
 if [ -z "$BIN" ]; then
   echo "building espnow release @ $HASH (build $BUILD) ..."
   ( cd "$CLOCK" && SMOL_GIT_HASH="$HASH" SMOL_BUILD_NUMBER="$BUILD" \

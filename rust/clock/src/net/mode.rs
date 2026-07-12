@@ -1340,8 +1340,11 @@ pub struct RadioManager {
     /// chunk-loss stall. `last_wb` is in chunk units (matches `total = om::total_chunks`).
     /// Carries the leaf's `LDBG` self-report too (captured during the relay) — see `RelayDiag`.
     leaf_relay_rx: Option<crate::net::wifi::RelayDiag>,
-    /// #40: consecutive non-terminal (transient) relay attempts for the current install —
-    /// caps the auto-retry so a persistently-failing leaf can't loop the mesh-deaf relay.
+    /// #40: consecutive non-terminal (transient) relay attempts — caps the auto-retry so a
+    /// persistently-failing leaf can't loop the mesh-deaf relay. SHARED across leaves: with
+    /// the #4 round-robin surfacing (wifi.rs), concurrent installs ALTERNATE, so this bounds
+    /// TOTAL wasted attempts (a per-leaf counter that reset on each rotation would never hit
+    /// the cap → an unbounded mesh-deaf loop; the shared cap is the safe choice).
     leaf_ota_retries: u8,
     /// #21 node-manager: the parsed default-screen command surfaced by a burst,
     /// pending `main`'s `take_config_offer` → apply. `None` when nothing is pending.
@@ -2704,6 +2707,10 @@ impl RadioManager {
         }
         let cdeadline = now_ms() + GW_CONFIRM_TIMEOUT_MS;
         let mut last_build: Option<u32> = None;
+        // #40 IDENTITY GUARD: a logical id STATed by the TARGET MAC that isn't `leaf_id`.
+        // With the runtime-NVS identity fix this stays None; if it fires, the image booted
+        // with a stolen/wrong id → an explicit `id-mismatch` beats a silent leaf-timeout.
+        let mut mac_seen_id: Option<u8> = None;
         let mut last_hello_ms = 0u64;
         while now_ms() < cdeadline {
             if tick() {
@@ -2723,11 +2730,17 @@ impl RadioManager {
                 last_hello_ms = t;
             }
             if let Some(recv) = self.esp_now.receive() {
+                // Copy the source MAC out FIRST (Copy) so the `recv.data()` borrow in the
+                // parse below doesn't collide with the identity-guard MAC compare.
+                let src_mac = recv.info.src_address;
                 if let Some(Frame::Stat { src, value }) = parse_frame(recv.data()) {
                     if src == leaf_id {
                         if let Some(b) = om::stat_build(value) {
                             last_build = Some(b); // keep the latest — the settled state wins
                         }
+                    } else if src_mac == leaf_mac {
+                        // Our target board (matched by sticky MAC) is STATing a DIFFERENT id.
+                        mac_seen_id = Some(src);
                     }
                 }
             }
@@ -2745,11 +2758,22 @@ impl RadioManager {
                 LeafOtaOutcome::RolledBack
             }
             None => {
-                log::error!(
-                    "smol #40: leaf id{} did not reappear at build {} within the confirm window — possible brick (USB recovery)",
-                    leaf_id, announce.build
-                );
-                LeafOtaOutcome::Timeout
+                if let Some(wrong) = mac_seen_id {
+                    // The physical board booted + STATs, but under the WRONG id — a stolen
+                    // baked-default identity (NVS not seeded / shared image on a fresh board).
+                    // Explicit `id-mismatch` (terminal) instead of a mystery leaf-timeout.
+                    log::error!(
+                        "smol #40: leaf id{} target MAC now STATs as id{} — IDENTITY MISMATCH (stolen baked id / NVS unseeded), not a brick",
+                        leaf_id, wrong
+                    );
+                    LeafOtaOutcome::IdMismatch
+                } else {
+                    log::error!(
+                        "smol #40: leaf id{} did not reappear at build {} within the confirm window — possible brick (USB recovery)",
+                        leaf_id, announce.build
+                    );
+                    LeafOtaOutcome::Timeout
+                }
             }
         }
     }

@@ -350,6 +350,11 @@ pub enum LeafOtaOutcome {
     Timeout,
     /// The armed install's target leaf MAC isn't in the roster yet (never heard its HELLO).
     MacUnknown,
+    /// #40 IDENTITY: the physical leaf we targeted (by sticky MAC) reappeared STATing a
+    /// DIFFERENT logical id than we relayed to — the image booted with a stolen/wrong id
+    /// (baked-default collision / NVS not seeded). Explicit diag instead of a silent
+    /// leaf-timeout; TERMINAL (a bad NVS won't heal by re-relaying the same image).
+    IdMismatch,
     /// Operator aborted (long-press) mid-session.
     Aborted,
 }
@@ -364,6 +369,7 @@ impl LeafOtaOutcome {
             LeafOtaOutcome::RelayFailed => "relay-failed",
             LeafOtaOutcome::Timeout => "leaf-timeout",
             LeafOtaOutcome::MacUnknown => "mac-unknown",
+            LeafOtaOutcome::IdMismatch => "id-mismatch",
             LeafOtaOutcome::Aborted => "aborted",
         }
     }
@@ -373,7 +379,13 @@ impl LeafOtaOutcome {
     /// transient (no fetch / no relay / MAC not yet learned) → leave the install retained to
     /// retry, bounded by a cap.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, LeafOtaOutcome::Confirmed | LeafOtaOutcome::RolledBack)
+        // #40: IdMismatch is terminal — the image DID install (a board booted the new
+        // build), it just reports a wrong id; re-relaying can't fix a bad NVS, so clear
+        // the install + surface the diag rather than burn retries.
+        matches!(
+            self,
+            LeafOtaOutcome::Confirmed | LeafOtaOutcome::RolledBack | LeafOtaOutcome::IdMismatch
+        )
     }
 }
 

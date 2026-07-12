@@ -142,6 +142,38 @@ mod secrets;
 mod board;
 pub(crate) use board::{DEFAULT_APP, DEFAULT_PAGE, NODE_ID};
 
+/// #40 IDENTITY (runtime): the node's LOGICAL id. In the DEFAULT build this is EXACTLY
+/// the compile-time `NODE_ID` const — no flash, no new symbols — so the guaranteed-green
+/// baseline is byte-unaffected (prove via symbol absence, not the git-stamped ELF bytes).
+/// In wifi/espnow builds the id is read ONCE from the `nvs` partition (seeded from the
+/// baked const on first boot after an erase-flash) and cached — so a SINGLE shared OTA
+/// image can serve the whole fleet without any node stealing the baked default id.
+#[cfg(not(feature = "wifi"))]
+#[inline(always)]
+pub(crate) fn node_id() -> u8 {
+    NODE_ID
+}
+
+/// See the `not(wifi)` twin above. rv32imc has no atomics, so the one-time-init cache is a
+/// `static mut` — alias-safe because it is read/written ONLY from the single-threaded boot
+/// path + main loop (no ISR touches it), the same discipline as the OTA scratch statics.
+#[cfg(feature = "wifi")]
+pub(crate) fn node_id() -> u8 {
+    static mut NODE_ID_CACHE: Option<u8> = None;
+    // SAFETY: single-caller (boot/main loop, never an ISR) → the read-modify-write is
+    // race-free; `addr_of_mut!` avoids forming a reference to the `static mut`.
+    unsafe {
+        let p = core::ptr::addr_of_mut!(NODE_ID_CACHE);
+        if let Some(id) = *p {
+            id
+        } else {
+            let id = ota::resolve_node_id();
+            *p = Some(id);
+            id
+        }
+    }
+}
+
 use app::{App, Ctx, Transition};
 use input::Button;
 
@@ -238,11 +270,11 @@ fn main() -> ! {
     // short hash baked in by build.rs. The full "Adjective Noun" of each appears
     // ONLY in this log; the OLED (splash + menu) shows the noun handles. `env!`
     // reads the build.rs-emitted vars (archive builds pass SMOL_GIT_HASH/_NUMBER).
-    let (my_adj, my_noun) = net::names::name_for_id(NODE_ID);
+    let (my_adj, my_noun) = net::names::name_for_id(node_id());
     let (v_adj, v_noun) = net::names::version_name();
     log::info!(
         "smol id{} \"{} {}\" · build {} \"{} {}\" ({})",
-        NODE_ID,
+        node_id(),
         my_adj,
         my_noun,
         env!("BUILD_NUMBER"),
@@ -391,8 +423,10 @@ fn main() -> ! {
                 wifi: peripherals.WIFI,
             },
             // This unit's short id (see NODE_ID) — embedded in HELLO/ACK/BEACON/TIME
-            // frames and the single source of truth shared with the node's name.
-            NODE_ID,
+            // frames + the single source of truth shared with the node's name. Runtime
+            // `node_id()` (NVS, seeded from the baked const) so a shared OTA image never
+            // steals the default id (#40 identity fix).
+            node_id(),
             &mut boot_tick,
             &mut batt_cache,
             &mut grid_cache,
@@ -967,7 +1001,7 @@ fn main() -> ! {
             sensors: &mut sensors,
             now_ms: now,
             unix_now,
-            node_id: NODE_ID,
+            node_id: node_id(),
             redraw,
             #[cfg(feature = "wifi")]
             batt: &batt_cache,

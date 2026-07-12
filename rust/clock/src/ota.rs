@@ -487,6 +487,128 @@ impl ImageWriter {
 }
 
 // ---------------------------------------------------------------------------
+// #40 IDENTITY: runtime node-id persisted in the `nvs` data partition
+// ---------------------------------------------------------------------------
+// The compile-time `crate::NODE_ID` is only a FACTORY SEED. A single OTA image is
+// shared by the whole fleet — `ota_publish.sh` builds ONE image with no per-node
+// `SMOL_NODE_ID`, so a leaf that installs it would otherwise boot with the baked
+// default id (7) → a stolen identity → a duplicate-id roster → the gateway's confirm
+// waits for a STAT from an id that no longer exists → a structural leaf-timeout.
+//
+// Fix: the TRUE id lives in NVS. OTA writes ONLY the inactive app slot + `otadata`
+// (never the `nvs` partition at 0x9000), so identity survives ANY image. A USB flash
+// (`espflash erase-flash` + flash) wipes NVS to 0xFF; the first boot then SEEDS NVS
+// from the baked const — which the USB flow sets correctly via `SMOL_NODE_ID=<n>`.
+// Steady state after that: NVS is the single source of truth.
+//
+// BRICK-SAFE: any flash/partition/parse error → fall back to the baked const and do
+// NOT write. The seed is best-effort (a failed seed just retries next boot). The
+// record is self-validating (magic + version + id + ~id + checksum) so an erased or
+// corrupt sector is REJECTED (→ reseed), never misread as an id.
+
+/// Identity record magic ("smol identity, format v1").
+#[cfg(feature = "wifi")]
+const IDENT_MAGIC: [u8; 4] = *b"SMi1";
+#[cfg(feature = "wifi")]
+const IDENT_VERSION: u8 = 1;
+/// Record length — WRITE_SIZE(4)-aligned; the payload is 8 B, the rest reserved (0).
+#[cfg(feature = "wifi")]
+const IDENT_REC_LEN: usize = 16;
+
+/// Decode a stored identity record. `Some(id)` iff magic + version + both redundancy
+/// guards check out. Erased flash (all 0xFF) and any corruption fail every check.
+#[cfg(feature = "wifi")]
+fn parse_identity(rec: &[u8]) -> Option<u8> {
+    if rec.len() < 8 || rec[0..4] != IDENT_MAGIC || rec[4] != IDENT_VERSION {
+        return None;
+    }
+    let id = rec[5];
+    if rec[6] != id ^ 0xFF || rec[7] != id.wrapping_add(0x5A) {
+        return None; // complement + checksum guards
+    }
+    Some(id)
+}
+
+/// Encode the 16-byte identity record for `id`.
+#[cfg(feature = "wifi")]
+fn encode_identity(id: u8) -> [u8; IDENT_REC_LEN] {
+    let mut r = [0u8; IDENT_REC_LEN];
+    r[0..4].copy_from_slice(&IDENT_MAGIC);
+    r[4] = IDENT_VERSION;
+    r[5] = id;
+    r[6] = id ^ 0xFF;
+    r[7] = id.wrapping_add(0x5A);
+    r
+}
+
+/// Read the node id from the `nvs` partition. `None` on any flash/partition error OR
+/// when no valid record is present (erased/corrupt) — the caller then falls back to
+/// (and seeds from) the baked const.
+#[cfg(feature = "wifi")]
+fn read_identity_nvs() -> Option<u8> {
+    use embedded_storage::nor_flash::ReadNorFlash;
+    let mut flash = FlashStorage::new();
+    let mut buf = [0u8; PT_SCRATCH];
+    let pt = read_partition_table(&mut flash, &mut buf).ok()?;
+    let nvs = pt
+        .find_partition(PartitionType::Data(DataPartitionSubType::Nvs))
+        .ok()??;
+    let mut region = nvs.as_embedded_storage(&mut flash);
+    let mut rec = [0u8; IDENT_REC_LEN];
+    region.read(0, &mut rec).ok()?;
+    parse_identity(&rec)
+}
+
+/// Seed the `nvs` identity record from `id` — ONLY when the first sector is fully
+/// erased (0xFF), so we NEVER clobber foreign data. Best-effort: any error is swallowed
+/// (identity still works this boot from the baked const; the next boot retries the seed).
+#[cfg(feature = "wifi")]
+fn seed_identity_nvs(id: u8) {
+    use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
+    let mut flash = FlashStorage::new();
+    let mut buf = [0u8; PT_SCRATCH];
+    let Ok(pt) = read_partition_table(&mut flash, &mut buf) else {
+        return;
+    };
+    let Ok(Some(nvs)) = pt.find_partition(PartitionType::Data(DataPartitionSubType::Nvs)) else {
+        return;
+    };
+    let mut region = nvs.as_embedded_storage(&mut flash);
+    // Refuse to write unless the WHOLE first sector is erased (all 0xFF) — guards any
+    // (unexpected) real NVS content from being erased. An erase-flashed board's nvs is
+    // uniformly 0xFF, so a genuinely-fresh board always seeds.
+    let sector = <FlashStorage as NorFlash>::ERASE_SIZE as u32;
+    let mut chunk = [0u8; 64];
+    let mut off = 0u32;
+    while off < sector {
+        if region.read(off, &mut chunk).is_err() {
+            return;
+        }
+        if chunk.iter().any(|&b| b != 0xFF) {
+            return; // not erased → someone else owns this sector; don't touch it
+        }
+        off += chunk.len() as u32;
+    }
+    if region.erase(0, sector).is_err() {
+        return;
+    }
+    let _ = region.write(0, &encode_identity(id));
+}
+
+/// The node's RUNTIME identity: the NVS record if valid, else the baked `crate::NODE_ID`
+/// (which is ALSO seeded into NVS so it persists across every future OTA). Called once at
+/// boot and cached by `crate::node_id()`. BRICK-SAFE — never panics.
+#[cfg(feature = "wifi")]
+pub fn resolve_node_id() -> u8 {
+    if let Some(id) = read_identity_nvs() {
+        return id;
+    }
+    let baked = crate::NODE_ID;
+    seed_identity_nvs(baked);
+    baked
+}
+
+// ---------------------------------------------------------------------------
 // otadata operations: inactive-slot lookup, activation, first-boot confirm
 // ---------------------------------------------------------------------------
 
