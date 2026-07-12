@@ -180,8 +180,11 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 2] =
-    [crate::net::wifi::CFG_KEY_SCREEN, crate::net::wifi::CFG_KEY_LED];
+const CFG_APPLY_KEYS: [u8; 3] = [
+    crate::net::wifi::CFG_KEY_SCREEN,
+    crate::net::wifi::CFG_KEY_LED,
+    crate::net::wifi::CFG_KEY_UNITS,
+];
 /// #50b leaf-status UPLINK tag: `"SMOLv1 STAT "` (12 B, trailing space) then `"NNN"`
 /// (3-ASCII zero-padded SENDER leaf id) then the verbatim live `<AppKind>:<page>` value
 /// (empty = none). Mirror of `CFG` but UPLINK (leaf → gateway): a leaf with no MQTT
@@ -2952,6 +2955,10 @@ impl RadioManager {
         if let Some((buf, len)) = gw_own.led {
             self.cfg.set(crate::net::wifi::CFG_KEY_LED, &buf[..len]);
         }
+        // #43: the gateway's OWN global display units — same self-apply path (take_cfg_offer(U)).
+        if let Some((buf, len)) = gw_own.units {
+            self.cfg.set(crate::net::wifi::CFG_KEY_UNITS, &buf[..len]);
+        }
         // #33: OR-in an install command (one-shot; `main`'s take clears it).
         if install_requested {
             self.install_requested = true;
@@ -3341,15 +3348,17 @@ impl RadioManager {
                 }
                 Some(Frame::Cfg { target, key, value }) => {
                     // #21/#56 leaf-relay: a gateway's keyed CONFIG downlink. Target-filter
-                    // FIRST (per-leaf) — only buffer if addressed to US; a config for any
-                    // other leaf is ignored here. `CfgTracker::set` then per-KEY-filters:
+                    // FIRST — buffer if addressed to US (`self.id`) OR to the #43 broadcast
+                    // sentinel CFG_TARGET_ALL (255, a fleet-global config like display units);
+                    // a config for any OTHER specific leaf is ignored here. `CfgTracker::set`
+                    // then per-KEY-filters:
                     // a key this build doesn't apply (a future channel from a newer gateway)
                     // is DROPPED (#56 forward-compat, #46 clamp). The value is opaque here;
                     // the matching `main` dispatch validates it (screen → strict/panic-free
                     // `parse_default_screen`: unknown/wrong-tier/bad-page → keep current;
                     // empty → clear). HARD BOUNDARY: screen config ONLY on `S` — never OTA.
                     // Buffering the raw bytes (not parsing here) keeps this arm total.
-                    if target == self.id {
+                    if target == self.id || target == crate::net::wifi::CFG_TARGET_ALL {
                         if self.cfg.set(key, value) {
                             log::info!(
                                 "smol #56: CFG frame for us (key '{}', {} B value) — buffered",

@@ -111,6 +111,10 @@ mod snake;
 mod mesh_snake;
 // On-board sensors: chip die-temp (tsens) + battery ADC on GPIO4. Always on.
 mod sensors;
+// #43 display units (°F/°C · 12h/24h): the fleet-global `Units` config + wire parse.
+// Always compiled — the CLOCK screen (universal) renders through it; only espnow nodes
+// receive a config (the relay/apply path is radio-only, like the screen/LED channels).
+mod units;
 // HA battery-voltage screen (Batt): the display-only Plugin + its `BattCache`,
 // filled by the WiFi burst's MQTT downlink (SUBSCRIBE `smol/display/batt`; see
 // net/wifi.rs) — the fetch needs the radio (espnow ⊃ wifi); default build omits it.
@@ -554,6 +558,13 @@ fn main() -> ! {
     #[cfg(feature = "espnow")]
     let mut led_mode = led::LedMode::default();
 
+    // #43 display units (°F/°C · 12h/24h), fleet-global. Held across the loop; on espnow the
+    // relayed / gateway-own `smol/config/units` (key `U`, broadcast target 255) updates it.
+    // On a non-espnow build there's no relay path, so it stays the default — the render (CLOCK
+    // screen, universal) just reads it. `mut` is used only under espnow (the apply block below).
+    #[allow(unused_mut)]
+    let mut units = units::Units::default();
+
     // #20 (1a): last BOOT-button activity + the current flush-deferral start, to
     // postpone a recurring flush while the user is interacting (capped).
     #[cfg(feature = "espnow")]
@@ -832,7 +843,10 @@ fn main() -> ! {
                 let reading = sensors.read();
                 let tele = alloc::format!(
                     "{} {}",
-                    sensors::format_sensor_line(&reading).as_str(),
+                    // #43: telemetry/uplink keeps the CANONICAL °F wire format regardless of the
+                    // display units — HA parses this data channel; the units config is a
+                    // display-only (#43 scope) concern for the physical OLED.
+                    sensors::format_sensor_line(&reading, true).as_str(),
                     bottom_line.as_str()
                 );
                 r.relay_emit(tele.as_bytes(), now);
@@ -856,7 +870,9 @@ fn main() -> ! {
                     let reading = sensors.read();
                     let own = alloc::format!(
                         "{} {}",
-                        sensors::format_sensor_line(&reading).as_str(),
+                        // #43: uplink keeps the canonical °F wire format (see the relay_emit
+                        // site above) — display units never reshape a data channel.
+                        sensors::format_sensor_line(&reading, true).as_str(),
                         bottom_line.as_str()
                     );
                     // #50: the LIVE screen:page the render loop draws NOW — read from the
@@ -978,6 +994,19 @@ fn main() -> ! {
                     led_mode = m;
                 }
             }
+
+            // #43: pull the relayed/gateway-own display-units config (key `U`, fleet-global via
+            // broadcast target 255) and update the held `Units`. Edge-safe: a garbage/partial
+            // value parses to None → keep the current units (never a half-applied unit). Same
+            // unified path as LED: a leaf gets it relayed, the gateway injects its own (GwOwnCfg).
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_UNITS) {
+                if let Some(u) = units::Units::from_wire(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
+                    if u != units {
+                        log::info!("smol #43: display units -> {:?}", u);
+                    }
+                    units = u;
+                }
+            }
             let state = r.peer_led_state(now);
             if last_led_state != Some(state) {
                 log::info!("smol: LED -> {:?}", state);
@@ -1031,6 +1060,8 @@ fn main() -> ! {
             unix_now,
             node_id: node_id(),
             redraw,
+            // #43 fleet-global display units (°F/°C · 12h/24h) — read by the CLOCK render.
+            units,
             #[cfg(feature = "wifi")]
             batt: &batt_cache,
             #[cfg(feature = "wifi")]

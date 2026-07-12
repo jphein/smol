@@ -189,11 +189,16 @@ impl core::fmt::Write for LineBuf {
 ///
 /// Temperature is rounded to a whole °C and voltage to one decimal, keeping the
 /// string to ~8–10 chars so it never overflows 72 px in FONT_5X8 (~12 chars).
-pub fn format_sensor_line(r: &Reading) -> LineBuf {
+pub fn format_sensor_line(r: &Reading, temp_f: bool) -> LineBuf {
     use core::fmt::Write;
     let mut line = LineBuf::new();
-    // e.g. "73F 3.9V"  (chip temp in Fahrenheit, rounded to int; volts to 1 decimal)
-    let f = r.chip_c * 9.0 / 5.0 + 32.0;
-    let _ = write!(line, "{}F {:.1}V", f as i32, r.batt_v);
+    // #43: chip temp in °F (default) or °C per the fleet-global units, rounded to a whole
+    // degree; volts to one decimal. e.g. "73F 3.9V" / "23C 3.9V".
+    if temp_f {
+        let f = r.chip_c * 9.0 / 5.0 + 32.0;
+        let _ = write!(line, "{}F {:.1}V", f as i32, r.batt_v);
+    } else {
+        let _ = write!(line, "{}C {:.1}V", r.chip_c as i32, r.batt_v);
+    }
     line
 }

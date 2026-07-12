@@ -92,6 +92,10 @@ pub struct Ctx<'a> {
     /// Set by `main` after a mode switch; a plugin repaints when true OR when its
     /// own cadence (once/second, on-step, on-page-change, …) fires.
     pub redraw: bool,
+    /// #43 fleet-global display units (°F/°C · 12h/24h), owned by `main`. Read by the
+    /// CLOCK render (universal). On espnow it tracks the relayed / gateway-own
+    /// `smol/config/units`; on a non-espnow build it is always [`crate::units::Units::default`].
+    pub units: crate::units::Units,
     /// HA battery-voltage cache (the Batt screen), borrowed read-only. Owned by
     /// `main` and filled by the WiFi burst's MQTT downlink (`net/wifi.rs`'s
     /// `mqtt_session`) or an inbound SMOLv1 BATT frame — either can happen while

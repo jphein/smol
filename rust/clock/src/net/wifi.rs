@@ -792,6 +792,17 @@ pub const CFG_KEY_SCREEN: u8 = b'S';
 /// each feature lands, so the const stays used — no dead_code in the interim.)
 #[cfg(feature = "wifi")]
 pub const CFG_KEY_LED: u8 = b'L';
+/// #43 display-units channel (`<F|C>|<24|12>`). GLOBAL, not per-node: the retained topic is
+/// `smol/config/units` (no id). The gateway caches it under the broadcast target
+/// [`CFG_TARGET_ALL`] so ONE `SMOLv1 CFG <255>U<val>` frame reaches every leaf.
+#[cfg(feature = "wifi")]
+pub const CFG_KEY_UNITS: u8 = b'U';
+/// #43 broadcast TARGET sentinel for a fleet-global CFG frame. No node ever holds id 255
+/// (ids are 1..=254 by convention), so it can't collide with a real per-node target. A leaf
+/// applies a CFG frame whose target is its own id OR this sentinel (mode.rs `service()` CFG
+/// arm); the gateway caches global configs under `(255, key)` and relays them to all leaves.
+#[cfg(feature = "wifi")]
+pub const CFG_TARGET_ALL: u8 = 255;
 
 /// #48 (GwOwnCfg — approved arch): the GATEWAY's OWN per-node configs read from its own MQTT
 /// topics this burst. A leaf gets these RELAYED (→ its `CfgTracker`); the gateway reads them
@@ -805,12 +816,16 @@ pub const CFG_KEY_LED: u8 = b'L';
 pub struct GwOwnCfg {
     /// The gateway's own `smol/<id>/config/led` value `(buf, len)`, or `None` if absent this burst.
     pub led: Option<([u8; CFG_VALUE_MAX], usize)>,
+    /// #43 the GLOBAL `smol/config/units` value `(buf, len)`, or `None` if absent this burst.
+    /// The gateway applies its own display units directly (it also relays them to leaves under
+    /// the broadcast target); captured here so `service()` self-applies via the same path.
+    pub units: Option<([u8; CFG_VALUE_MAX], usize)>,
 }
 
 #[cfg(feature = "wifi")]
 impl GwOwnCfg {
     pub const fn new() -> Self {
-        Self { led: None }
+        Self { led: None, units: None }
     }
     /// Pack a payload into the `(buf, len)` a field holds (truncated to `CFG_VALUE_MAX`), so the
     /// mqtt-drain arms stay one-liners: `gw_own.led = Some(GwOwnCfg::val(payload));`.
@@ -1290,6 +1305,13 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 10, b"smol/+/config/led") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
+        // #43 display units (pid 11): the GLOBAL retained units topic `smol/config/units` (NO id
+        // — one setting for the whole fleet, so NOT a `smol/+/…` wildcard). The gateway caches it
+        // under the broadcast target CFG_TARGET_ALL (255) so ONE relayed `<255>U<val>` frame
+        // reaches every leaf, and self-applies its own display units (gw_own.units) below.
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 11, b"smol/config/units") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
     }
 
     // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
@@ -1617,6 +1639,23 @@ fn mqtt_session(
                             gw_own.led = Some(GwOwnCfg::val(payload));
                             log::info!("smol #48: gateway own led config captured ({} B)", payload.len());
                         }
+                    } else if topic == b"smol/config/units" {
+                        // #43 display units — GLOBAL (no id in the topic → an exact match, not the
+                        // `smol/<id>/…` wildcard parse). TWO effects, mirroring the own-led branch
+                        // above but fleet-wide: (1) cache under the broadcast target CFG_TARGET_ALL
+                        // so ONE relayed `<255>U<val>` frame reaches every leaf; (2) capture into
+                        // gw_own so `service()` self-applies the gateway's OWN display units. The
+                        // bytes are opaque here — the leaf's `Units::from_wire` validates them
+                        // (garbage/partial → keep current, #46 clamp).
+                        if let Some(cache) = cfg_cache.as_deref_mut() {
+                            let now = Instant::now().duration_since_epoch().as_millis();
+                            cache.set(CFG_TARGET_ALL, CFG_KEY_UNITS, payload, [0u8; 6], now);
+                        }
+                        gw_own.units = Some(GwOwnCfg::val(payload));
+                        log::info!(
+                            "smol #43: global display units captured ({} B) — cached (255,U) + self",
+                            payload.len()
+                        );
                     } else if let Some(leaf_id) = parse_leaf_install_topic(topic) {
                         // #40 (§B3): a wildcard-delivered leaf OTA install command. On a
                         // GATEWAY flush (cfg_cache = Some), an `INSTALL` for a leaf id ≠ self
