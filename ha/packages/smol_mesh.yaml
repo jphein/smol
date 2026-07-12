@@ -1913,7 +1913,10 @@ automation:
         data:
           topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/cmd/reset"
           retain: false
-          qos: 0
+          qos: 1     # #52 transient cmd — qos:1 REQUIRED: the gateway drops qos:0 (~5% loss →
+          # unreliable reboot). retain:false stays (a retained reset = reboot-loop); qos:1 gives
+          # at-least-once delivery of the momentary RESET. (Retained config topics tolerate qos:0
+          # via reconnect-redelivery; only TRANSIENT cmd/ needs qos:1 — canary finding 2026-07-12.)
           payload: "RESET"
 
   - id: smol_all_reboot_fanout
