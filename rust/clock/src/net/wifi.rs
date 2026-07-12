@@ -1341,6 +1341,13 @@ fn mqtt_session(
     // With >1 retained install we prefer a DIFFERENT leaf this burst so one leaf's retry
     // cycle can't monopolize the (minutes-long, mesh-deaf) relay and starve the other.
     let last_leaf_serviced: Option<u8> = leaf_diag.as_ref().map(|t| t.0);
+    // #40 REGRESSION DIAG (491b7e9 canary): count the RETAINED gateway-OTA topics this drain
+    // actually SEES, BEFORE any catch gate — to split "topics never delivered/drained this
+    // session" (delivery/settle-timing) from "delivered but the catch logic dropped them".
+    // inst_seen = how many `smol/<id>/ota/install` topics reached the parse (raw delivery);
+    // stg_seen = whether the retained staged line was drained. Published in armdiag below.
+    let mut inst_seen: u8 = 0;
+    let mut stg_seen: bool = false;
     loop {
         if tick() {
             break; // #20 abort during downlink wait → fall through to clean DISCONNECT
@@ -1365,6 +1372,7 @@ fn mqtt_session(
                         mc = parse_mesh_channel(payload); // #23 election record
                         got_mc = true; // present (unparseable → treated as claimable below)
                     } else if topic == OTA_STAGED_TOPIC {
+                        stg_seen = true; // #40 REGRESSION DIAG: the staged line WAS drained this session
                         // #33 Model-A: parse + GATE the retained STAGED line (monotonicity +
                         // host allowlist + size). A gate-passing staged build becomes the
                         // latest_version + fetch TARGET (ota_offer) — but it does NOT fetch;
@@ -1432,6 +1440,9 @@ fn mqtt_session(
                             }
                         }
                     } else if let Some(leaf_id) = parse_leaf_install_topic(topic) {
+                        // #40 REGRESSION DIAG: an install topic REACHED the drain (raw delivery),
+                        // counted BEFORE the id/cfg/payload catch gate below.
+                        inst_seen = inst_seen.saturating_add(1);
                         // #40 (§B3): a wildcard-delivered leaf OTA install command. On a
                         // GATEWAY flush (cfg_cache = Some), an `INSTALL` for a leaf id ≠ self
                         // arms a mesh-OTA relay to that leaf (paired with `raw_staged` after
@@ -1585,6 +1596,11 @@ fn mqtt_session(
             None => { let _ = write!(adval, "none"); }
         }
         let _ = write!(adval, " leaf_ota={}", if leaf_ota.is_some() { 1 } else { 0 });
+        // #40 REGRESSION DIAG: raw delivery counts. inst_seen=0 & stg_seen=0 ⇒ the retained
+        // OTA topics never reached the drain this session (delivery / settle-break timing, NOT
+        // the catch logic). inst_seen>0 with install-caught=none ⇒ the id/cfg/payload gate dropped
+        // them (a real catch bug). stg_seen=1 with staged_raw=none ⇒ the persist path.
+        let _ = write!(adval, " inst_seen={} stg_seen={}", inst_seen, if stg_seen { 1 } else { 0 });
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, adtopic.as_bytes(), adval.as_bytes(), true) {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
