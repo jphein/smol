@@ -128,6 +128,12 @@ mod watch;
 // #60 treasure-hunt — RSSI warmer/colder game over the roster.
 #[cfg(feature = "espnow")]
 mod hunt;
+// #57 The Mesh Familiar (flagship): one living creature that inhabits exactly one
+// board at a time + MIGRATES across the mesh. The FAM frame codec + the always-on
+// holder/arbitration/migration state machine + the procedural renderer. espnow-only
+// (needs the radio) → zero code in default/wifi builds (default-build invariant).
+#[cfg(feature = "espnow")]
+mod familiar;
 // On-board sensors: chip die-temp (tsens) + battery ADC on GPIO4. Always on.
 mod sensors;
 // #43 display units (°F/°C · 12h/24h): the fleet-global `Units` config + wire parse.
@@ -939,6 +945,15 @@ fn main() -> ! {
             // off-screen nobody drains it and it simply self-limits — no background
             // drain needed (design §SNK-drain; ≤8 stale frames ingested + culled
             // on entry). Everything else in this block is unchanged infrastructure.
+
+            // #57 Mesh Familiar (INFRA — wisp §7): drain inbound FAM frames + run the
+            // holder / heartbeat / seq-arbitration / handoff / RSSI-weighted
+            // orphan-takeover step + broadcast any resulting frame — EVERY loop,
+            // regardless of the active screen, so the creature is always alive and
+            // migrates on unplug. Uses the freshest clock (post-adoption above). The
+            // Familiar SCREEN only renders a snapshot of what this tick produced.
+            let fam_unix = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
+            r.fam_tick(now, fam_unix);
 
             // --- Relay bridge (see net::mode's "Relay bridge" section) --------
             // LEAF: emit short telemetry (sensor line + current label) as RELAY

@@ -275,6 +275,12 @@ static mut GW_OTA_WINDOW: [u8; crate::ota_mesh::WINDOW_BYTES] =
 
 use crate::mesh_snake::snake_core::{self, SnkFrame};
 
+// #57 Mesh Familiar: the FAM frame codec + the always-on holder/arbitration/
+// migration state machine live in `crate::familiar`; RadioManager owns a `FamState`
+// beside the roster it elects from (wisp §7 "holder/election = infra"). This module
+// only buffers inbound FAM frames + broadcasts, exactly as it does for SNK.
+use crate::familiar::{encode_fam, parse_fam, FamFrame, FamState, FAM_FRAME_LEN, FAM_PREFIX};
+
 /// Depth of the decoded MMO-snake RX ring. A full 16-peer broadcast burst plus
 /// background traffic can land between two 20 ms `service()` calls; 8 covers a
 /// realistic burst and, like the ESP-NOW hardware queue, DROPS OLDEST on
@@ -315,6 +321,51 @@ impl SnkInbox {
         }
         let f = self.buf[self.tail].take();
         self.tail = (self.tail + 1) % SNK_RX_RING;
+        self.len -= 1;
+        f
+    }
+}
+
+/// #57: depth of the decoded FAM RX ring. FAM is a LOW-rate frame (one holder
+/// beats ~1.5 s), so a handful of slots absorbs any realistic burst; like the SNK
+/// inbox it DROPS OLDEST on overflow — the familiar's absolute-state + seq
+/// arbitration tolerate a dropped beat by design (the next beat re-converges).
+const FAM_RX_RING: usize = 4;
+
+/// #57: a tiny FIFO of decoded [`FamFrame`]s (+ their RX RSSI, needed by the
+/// orphan-takeover weighting) buffered by `service()` for [`RadioManager::fam_tick`]
+/// to drain into the [`FamState`]. Mirrors [`SnkInbox`]: all `Copy`, fixed size →
+/// `.bss`, no heap, drop-oldest on overflow.
+struct FamInbox {
+    buf: [Option<(FamFrame, i32)>; FAM_RX_RING],
+    head: usize,
+    tail: usize,
+    len: usize,
+}
+
+impl FamInbox {
+    const fn new() -> Self {
+        Self { buf: [None; FAM_RX_RING], head: 0, tail: 0, len: 0 }
+    }
+
+    /// Push a frame (+ its RSSI); drop the OLDEST if full.
+    fn push(&mut self, f: FamFrame, rssi: i32) {
+        self.buf[self.head] = Some((f, rssi));
+        self.head = (self.head + 1) % FAM_RX_RING;
+        if self.len < FAM_RX_RING {
+            self.len += 1;
+        } else {
+            self.tail = (self.tail + 1) % FAM_RX_RING;
+        }
+    }
+
+    /// Pop the oldest buffered `(frame, rssi)`, or `None` if empty.
+    fn pop(&mut self) -> Option<(FamFrame, i32)> {
+        if self.len == 0 {
+            return None;
+        }
+        let f = self.buf[self.tail].take();
+        self.tail = (self.tail + 1) % FAM_RX_RING;
         self.len -= 1;
         f
     }
@@ -378,6 +429,9 @@ enum Frame<'a> {
     /// #71 observability uplink: a node's one-shot WiFi-scan record. Twin of `Diag` (own cache
     /// `scan_cache`) → retained `smol/<src>/scan`.
     Scan { src: u8, value: &'a [u8] },
+    /// #57 Mesh Familiar: a decoded FAM frame (heartbeat / handoff / call). Scalar-only
+    /// (no borrow) — buffered into the [`FamInbox`] for [`RadioManager::fam_tick`] to ingest.
+    Fam(FamFrame),
 }
 
 /// #70/#49 observability: a node's own live diag counters, folded into the retained DIAG record
@@ -877,6 +931,10 @@ pub struct RosterView {
     pub nodes: [NodeView; ROSTER_CAP],
     pub count: usize,
 }
+
+/// #57: the `RosterView.nodes` array length, exposed so the familiar's wander
+/// candidate buffer can be sized to match without hard-coding 16.
+pub const ROSTER_VIEW_CAP: usize = ROSTER_CAP;
 
 /// #27: a bounded `core::fmt::Write` sink over a caller-owned `&mut [u8]`. Writes
 /// TRUNCATE (never panic) once the buffer is full — so any serializer built on it
@@ -1592,6 +1650,14 @@ pub struct RadioManager {
     /// Seeded into the recovery `MeshElect` so the strongest-uplink survivor wins the
     /// re-election. Weak default until the first burst measures it.
     my_rssi_to_ap: i8,
+    /// #57 Mesh Familiar: the ALWAYS-ON living-creature state machine (holder /
+    /// heartbeat / seq-arbitration / handoff / RSSI-weighted orphan-takeover). Lives
+    /// here beside the `roster` it elects from; ticked every main loop by `fam_tick`
+    /// so the pet stays alive even when its screen isn't the active plugin (wisp §7).
+    fam: FamState,
+    /// #57: decoded inbound FAM frames (+ RSSI) buffered by `service()` for `fam_tick`
+    /// to drain into `fam`. Bounded, drop-oldest — mirror of `snk`.
+    fam_inbox: FamInbox,
 }
 
 /// Monotonic milliseconds since boot — the single time base for both the
@@ -1678,6 +1744,10 @@ impl RadioManager {
             install_requested: false,
             silent_until_relock: false,
             my_rssi_to_ap: -99,
+            // #57: seed the familiar with our id (heartbeat phase + arbitration id).
+            // No creature exists until one is heard or first-birthed on a cold mesh.
+            fam: FamState::new(id),
+            fam_inbox: FamInbox::new(),
         })
     }
 
@@ -2413,6 +2483,60 @@ impl RadioManager {
     /// `main` loops this each subtick into `MeshSnake::ingest`.
     pub fn take_snk(&mut self) -> Option<SnkFrame> {
         self.snk.pop()
+    }
+
+    // =====================================================================
+    // #57 Mesh Familiar — the always-on creature, ticked from main's background
+    // block. This module buffers/broadcasts; the LIVING happens in `FamState`.
+    // =====================================================================
+
+    /// Broadcast a FAM frame (heartbeat / handoff / call) — mirror of
+    /// [`broadcast_snk`]: encode into a stack buffer, fire-and-forget to the
+    /// broadcast address. `pub` so the Familiar plugin's CALL path can send too.
+    pub fn broadcast_fam(&mut self, f: &FamFrame) {
+        let mut msg = [0u8; FAM_FRAME_LEN];
+        if let Some(len) = encode_fam(f, &mut msg) {
+            self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
+        }
+    }
+
+    /// #57 the ALWAYS-ON familiar tick (called every main loop, all screens): drain
+    /// inbound FAM frames into the state machine, then run the holder / heartbeat /
+    /// arbitration / migration / orphan-takeover step and broadcast any resulting
+    /// frame. The pet keeps living regardless of which screen is on top.
+    pub fn fam_tick(&mut self, now_ms: u64, unix_now: u32) {
+        // Ingest everything `service()` buffered this subtick (+ its RX RSSI).
+        while let Some((f, rssi)) = self.fam_inbox.pop() {
+            self.fam.ingest(&f, rssi, now_ms, unix_now);
+        }
+        // Elect / beat / migrate from the LIVE roster (RSSI-desc). `view` returns an
+        // owned `Copy` snapshot, so `fam` + `broadcast_fam` borrow cleanly after it.
+        let roster = self.roster.view(now_ms);
+        if let Some(frame) = self.fam.tick(&roster, now_ms, unix_now) {
+            self.broadcast_fam(&frame);
+        }
+    }
+
+    /// #57 a `Copy` render snapshot for the Familiar plugin (no live borrow).
+    pub fn fam_view(&self, now_ms: u64) -> crate::familiar::FamView {
+        self.fam.view(now_ms)
+    }
+
+    /// #57 are WE the current holder? (holder → FEED on tap; else → CALL.)
+    pub fn fam_is_holder(&self) -> bool {
+        self.fam.is_holder()
+    }
+
+    /// #57 FEED the creature (holder BOOT tap) — resets hunger + a happy wiggle
+    /// propagates on the next heartbeat.
+    pub fn fam_feed(&mut self, unix_now: u32) {
+        self.fam.feed(unix_now);
+    }
+
+    /// #57 build a CALL frame (non-holder BOOT tap) — the plugin broadcasts it to
+    /// bias the holder's wander toward this node. `None` if no familiar is known.
+    pub fn fam_call_frame(&self) -> Option<FamFrame> {
+        self.fam.call_frame()
     }
 
     /// Take the freshest buffered peer TIME offer, clearing it so a later call
@@ -3582,6 +3706,20 @@ impl RadioManager {
                     // set `label` — the MeshSnake screen owns its own render.
                     self.snk.push(f);
                 }
+                Some(Frame::Fam(f)) => {
+                    // #57 Mesh Familiar: a FAM frame proves the peer is audible → counts
+                    // toward the LED "detected" state like HELLO/SNK.
+                    self.peers.last_hello_ms = now;
+                    // Roster (additive): learn the SENDER's logical id — the holder for
+                    // a heartbeat/handoff (`f.holder`), the caller for a call (`f.target`).
+                    let sender_id = if f.kind == crate::familiar::FAM_CALL { f.target } else { f.holder };
+                    self.roster.heard(src, Some(sender_id), rssi, now);
+                    // Register the peer so a future unicast can reach it (#28: bounded LRU).
+                    self.ensure_peer(src, now);
+                    // Buffer (+ RSSI, for the orphan-takeover weighting) for `fam_tick` to
+                    // ingest; do NOT set `label` — the Familiar screen owns its own render.
+                    self.fam_inbox.push(f, rssi);
+                }
                 Some(Frame::Hello(peer_id)) => {
                     // We can hear a peer -> at least "detected".
                     self.peers.last_hello_ms = now;
@@ -4127,6 +4265,11 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
     // validates prefix/length/ver itself and degrades on unknown ver.
     if data.starts_with(snake_core::SNK_PREFIX) {
         return snake_core::parse_snk(data).map(Frame::Snk);
+    }
+    // #57 Mesh Familiar: FAM diverges from SNK at prefix byte 7 ('F' vs 'S'), so this
+    // prefix check never collides. `parse_fam` validates length/kind/seed itself.
+    if data.starts_with(FAM_PREFIX.as_slice()) {
+        return parse_fam(data).map(Frame::Fam);
     }
     if let Some(rest) = data.strip_prefix(HELLO_PREFIX) {
         return parse_id(rest).map(Frame::Hello);

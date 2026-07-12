@@ -191,6 +191,11 @@ pub enum AppKind {
     Watch,
     #[cfg(feature = "espnow")]
     Hunt,
+    // #57 The Mesh Familiar (flagship). LIVE whenever compiled (REGISTRY row + `enter` +
+    // `from_wire` construct it), like Batt/Grid → no dead_code allow needed. cfg(espnow)
+    // = it needs the radio (the creature lives on the mesh).
+    #[cfg(feature = "espnow")]
+    Familiar,
     // #25 WLED remote. LIVE whenever compiled (REGISTRY row + `enter` + `from_wire`
     // construct it), like Batt/Grid → no dead_code allow needed. cfg(wled) = espnow+.
     #[cfg(feature = "wled")]
@@ -244,6 +249,9 @@ impl AppKind {
             "Watch" => AppKind::Watch,
             #[cfg(feature = "espnow")]
             "Hunt" => AppKind::Hunt,
+            // #57: a leaf's default screen can be set to the Familiar via #21 too.
+            #[cfg(feature = "espnow")]
+            "Familiar" => AppKind::Familiar,
             // #25: a leaf's default screen can be set to the WLED remote via #21 too.
             #[cfg(feature = "wled")]
             "WledRemote" => AppKind::WledRemote,
@@ -279,6 +287,7 @@ impl AppKind {
             AppKind::Watch => "Watch",
             #[cfg(feature = "espnow")]
             AppKind::Hunt => "Hunt",
+            AppKind::Familiar => "Familiar",
             #[cfg(feature = "wled")]
             AppKind::WledRemote => "WledRemote",
             #[cfg(feature = "espnow")]
@@ -342,6 +351,8 @@ pub enum App {
     Watch(crate::watch::WatchState),
     #[cfg(feature = "espnow")]
     Hunt(crate::hunt::HuntState),
+    #[cfg(feature = "espnow")]
+    Familiar(crate::familiar::FamiliarState),
     #[cfg(feature = "wled")]
     WledRemote(crate::net::wled::WledRemoteState),
     #[cfg(feature = "espnow")]
@@ -371,6 +382,8 @@ impl App {
             AppKind::Watch => App::Watch(crate::watch::WatchState::new()),
             #[cfg(feature = "espnow")]
             AppKind::Hunt => App::Hunt(crate::hunt::HuntState::new()),
+            #[cfg(feature = "espnow")]
+            AppKind::Familiar => App::Familiar(crate::familiar::FamiliarState::new(ctx.node_id)),
             #[cfg(feature = "wled")]
             AppKind::WledRemote => {
                 App::WledRemote(crate::net::wled::WledRemoteState::new(ctx.now_ms))
@@ -406,6 +419,8 @@ impl App {
             App::Watch(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "espnow")]
             App::Hunt(s) => Plugin::on_button(s, press, ctx),
+            #[cfg(feature = "espnow")]
+            App::Familiar(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "wled")]
             App::WledRemote(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "espnow")]
@@ -432,6 +447,8 @@ impl App {
             App::Watch(s) => Plugin::update(s, ctx),
             #[cfg(feature = "espnow")]
             App::Hunt(s) => Plugin::update(s, ctx),
+            #[cfg(feature = "espnow")]
+            App::Familiar(s) => Plugin::update(s, ctx),
             #[cfg(feature = "wled")]
             App::WledRemote(s) => Plugin::update(s, ctx),
             #[cfg(feature = "espnow")]
@@ -478,6 +495,7 @@ impl App {
             App::Watch(_) => (AppKind::Watch, 0),
             #[cfg(feature = "espnow")]
             App::Hunt(_) => (AppKind::Hunt, 0),
+            App::Familiar(_) => (AppKind::Familiar, 0),
             #[cfg(feature = "wled")]
             App::WledRemote(_) => (AppKind::WledRemote, 0),
             #[cfg(feature = "espnow")]
@@ -501,12 +519,13 @@ pub const SNAKE_KIND: AppKind = AppKind::MeshSnake;
 pub const SNAKE_KIND: AppKind = AppKind::Snake;
 
 /// The Home list, in order. Batt + Grid (both cfg wifi; issue #16 added Grid) grow
-/// the `wifi` menu to 5 rows and the `espnow` menu to 6, so both exercise the
-/// ≤3-row scrolling window in `menu.rs` (the window math is `VISIBLE`-relative, so
-/// it holds for any length); only the default build stays at 3 and never scrolls:
-///   - default: Clock / Snake / About                       (3 rows — no scroll)
-///   - wifi:    Clock / Snake / Batt / Grid / About          (5 rows — scrolls)
-///   - espnow:  Clock / Snake / Bench / Batt / Grid / About  (6 rows — scrolls)
+/// the `wifi` menu to 5 rows and the `espnow` menu (with #57 Familiar) to 7, so both
+/// exercise the ≤3-row scrolling window in `menu.rs` (the window math is `VISIBLE`-
+/// relative, so it holds for any length); only the default build stays at 3 and never
+/// scrolls:
+///   - default: Clock / Snake / About                                  (3 rows — no scroll)
+///   - wifi:    Clock / Snake / Batt / Grid / About                     (5 rows — scrolls)
+///   - espnow:  Clock / Snake / Bench / Familiar / Batt / Grid / About  (7 rows — scrolls)
 pub const REGISTRY: &[AppDesc] = &[
     AppDesc { title: "Clock", kind: AppKind::Clock },
     AppDesc { title: "Snake", kind: SNAKE_KIND },
@@ -517,6 +536,9 @@ pub const REGISTRY: &[AppDesc] = &[
     AppDesc { title: "Watch", kind: AppKind::Watch },
     #[cfg(feature = "espnow")]
     AppDesc { title: "Hunt", kind: AppKind::Hunt },
+    // #57 The Mesh Familiar (flagship) — the living creature screen. espnow-only.
+    #[cfg(feature = "espnow")]
+    AppDesc { title: "Familiar", kind: AppKind::Familiar },
     #[cfg(feature = "wifi")]
     AppDesc { title: "Batt", kind: AppKind::Batt },
     #[cfg(feature = "wifi")]
@@ -538,9 +560,10 @@ pub const REGISTRY: &[AppDesc] = &[
 /// never tested. `Menu` is never maskable (it isn't a REGISTRY row) → `None`.
 ///
 /// Bit map (luna's HA contract): 0=Clock · 1=Snake · 2=Bench · 3=Batt · 4=Grid · 5=WledRemote
-/// · 6=About. The `SNAKE_KIND` alias (MeshSnake under espnow) shares the "Snake" bit (1), so a
-/// mask hides "Snake" whether the menu row launches solo Snake or MeshSnake. The cfg'd arms stay
-/// exhaustive in every profile: an absent variant's arm is removed exactly when the variant is.
+/// · 6=About · 7=Familiar (#57). The `SNAKE_KIND` alias (MeshSnake under espnow) shares the
+/// "Snake" bit (1), so a mask hides "Snake" whether the menu row launches solo Snake or
+/// MeshSnake. The cfg'd arms stay exhaustive in every profile: an absent variant's arm is
+/// removed exactly when the variant is.
 pub const fn plugin_bit(kind: AppKind) -> Option<u8> {
     match kind {
         AppKind::Clock => Some(0),
@@ -568,6 +591,8 @@ pub const fn plugin_bit(kind: AppKind) -> Option<u8> {
         // mask HIDE it permanently. `None` ⇒ always shown, no rework to the live #55 contract.
         #[cfg(feature = "espnow")]
         AppKind::Custom => None,
+        #[cfg(feature = "espnow")]
+        AppKind::Familiar => Some(7), // #57 flagship — its own stable mask bit
         AppKind::Menu => None,
     }
 }
