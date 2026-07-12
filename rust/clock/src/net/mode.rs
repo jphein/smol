@@ -180,11 +180,12 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 6] = [
+const CFG_APPLY_KEYS: [u8; 7] = [
     crate::net::wifi::CFG_KEY_SCREEN,
     crate::net::wifi::CFG_KEY_LED,
     crate::net::wifi::CFG_KEY_UNITS,
     crate::net::wifi::CFG_KEY_PLUGINS,
+    crate::net::wifi::CFG_KEY_CUSTOM, // #45 custom-screen layout (cached + relayed like S/L/U/P)
     // #52 remote reboot: R IS a buffered/applied key (a leaf takes it via take_cfg_offer(R)) but
     // is NEVER put in cfg_cache/broadcast_cached_configs — the one-shot relay uses broadcast_config
     // directly. The anti-reboot-loop invariant: R rides the CFG wire + apply path, not the cache.
@@ -3311,6 +3312,10 @@ impl RadioManager {
         // #55: the gateway's OWN plugin-visibility mask — same self-apply path (take_cfg_offer(P)).
         if let Some((buf, len)) = gw_own.plugins {
             self.cfg.set(crate::net::wifi::CFG_KEY_PLUGINS, &buf[..len]);
+        }
+        // #45: the gateway's OWN custom-screen layout — same self-apply path (take_cfg_offer(Y)).
+        if let Some((buf, len)) = gw_own.custom {
+            self.cfg.set(crate::net::wifi::CFG_KEY_CUSTOM, &buf[..len]);
         }
         // #52 remote reboot — a COMMAND, not a config. Fire a ONE-SHOT `<id>R` frame per queued
         // leaf target via `broadcast_config` DIRECTLY (NOT `cfg_cache` / `broadcast_cached_configs`):
