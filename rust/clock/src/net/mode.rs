@@ -559,6 +559,13 @@ const ROSTER_CAP: usize = 16;
 /// Bench "recently seen" window — deliberately longer than the LED's
 /// `PEER_STALE_MS` (3 s) so a node lingers on the list ~30 s after going quiet.
 const ROSTER_STALE_MS: u64 = 30_000;
+/// #28: the ESP-NOW *hardware* peer-table cap. `ESP_NOW_MAX_TOTAL_PEER_NUM` = 20 on the
+/// ESP32-C3 (esp-wifi-sys), and it INCLUDES the broadcast peer. esp-wifi never auto-evicts and
+/// `add_peer` silently `Err`s once full — so without our own bound the table grows monotonically
+/// (every heard MAC is added, never removed) and the mesh ceilings at ~20 nodes: the 20th+ node's
+/// unicast (ACK / RELAYACK / OTAN) can never register. We LRU-evict before `add_peer` (see
+/// `ensure_peer`). Kept as `i32` to match `PeerCount::total_count` from esp-wifi.
+const ESP_NOW_PEER_CAP: i32 = 20;
 
 /// One tracked peer, keyed by MAC. `Copy` so the table lives in `.bss` (no heap).
 #[derive(Clone, Copy)]
@@ -603,6 +610,25 @@ impl Roster {
         for n in &self.nodes {
             if n.used && n.id_known && n.id == id {
                 return Some(n.mac);
+            }
+        }
+        None
+    }
+
+    /// #28: eviction value-key for a MAC — LOWER is LESS valuable (evicted first). Orders by
+    /// usability (`id_known` — a MAC we can't place in HA / can't relay to is worthless), then
+    /// liveness (`connected` = a fresh ACK within `PEER_STALE_MS`), then signal (`rssi`), then
+    /// age (`last_heard_ms`). `None` when the MAC isn't in the roster at all — i.e. a HW peer the
+    /// roster has already dropped (a ghost), which `ensure_peer` treats as the first to evict.
+    fn value_key_for_mac(&self, mac: [u8; 6], now: u64) -> Option<(bool, bool, i32, u64)> {
+        for n in &self.nodes {
+            if n.used && n.mac == mac {
+                return Some((
+                    n.id_known,
+                    PeerTracker::fresh(n.last_ack_ms, now),
+                    n.rssi,
+                    n.last_heard_ms,
+                ));
             }
         }
         None
@@ -1356,6 +1382,13 @@ pub struct RadioManager {
     scan_idx: usize,
     last_scan_hop_ms: u64,
     last_owner_heard_ms: u64,
+    /// #29: the gateway's operating ESP-NOW channel, LEARNED from the `rx_control` of received
+    /// frames (in `service`) — 0 until the first frame is heard. Published in the retained
+    /// `MC|owner|<ch>|seq` election record (via `current_channel`) so a re-electing / roaming leaf
+    /// can pre-tune to it instead of scanning 1/6/11 (issue #29, producer half). ADVISORY — a leaf
+    /// still HELLO-scans when it is 0/stale/absent (the proven fallback). Sourced from `rx_control`,
+    /// NOT the deliberately-sidestepped `esp_wifi_get_channel`.
+    learned_channel: u8,
     /// #23 fix (oracle #1/#2): persistent staleness observation of the retained `MC`
     /// record — the last owner id + seq seen and when that pair was FIRST seen. A seq
     /// frozen past `MC_STALE_MS` marks the owner DEAD (takeover-able). Seeded into the
@@ -1388,6 +1421,14 @@ pub struct RadioManager {
     /// self-OTA (`do_install`) so a relay is never interrupted by the gateway rebooting into a
     /// fresh build mid-session (and the two OTAs never collide/thrash the fleet).
     leaf_ota_pending: bool,
+    /// #3 (self-OTA-first, multi-leaf gap): true while ANY leaf still holds a retained OTA install,
+    /// as observed by the last TRUSTED gateway flush. Distinct from the per-session
+    /// `leaf_ota_pending` (which a terminal `record_leaf_ota` clears the instant ONE leaf resolves):
+    /// this stays latched across the terminal→next-flush gap until a completed flush sees ZERO
+    /// installs. `main` gates the gateway's self-OTA on `!leaf_installs_outstanding()` TOO, so the
+    /// gateway can't self-OTA (rebooting) in that gap — starving a second leaf + inverting the order.
+    /// The gateway updates itself LAST, only once every leaf's install has cleared.
+    leaf_installs_outstanding: bool,
     /// #40 #3 STICKY MAC: `(leaf_id, mac)` captured the moment an armed leaf became addressable,
     /// held for the whole install session (cleared on a terminal `record_leaf_ota`). The roster
     /// is a bounded 16-slot LRU that EVICTS this leaf while the mesh-deaf relay stops hearing it
@@ -1482,6 +1523,8 @@ impl RadioManager {
             elected_owner: id,
             scan_locked: false,
             scan_idx: 0,
+            learned_channel: 0, // #29: unknown until the first frame is heard
+
             last_scan_hop_ms: 0,
             last_owner_heard_ms: 0,
             mc_seen_owner: 0,
@@ -1493,6 +1536,7 @@ impl RadioManager {
             leaf_ota_diag: None,
             leaf_ota_retries: 0,
             leaf_ota_pending: false,
+            leaf_installs_outstanding: false,
             leaf_ota_mac: None,
             leaf_relay_rx: None,
             config_offer: None,
@@ -1605,6 +1649,7 @@ impl RadioManager {
         // only breaks exact-signal ties.
         elect.recovery = true;
         elect.my_rssi = self.my_rssi_to_ap;
+        elect.my_channel = self.learned_channel; // #29: seed the MC record's <ch> (0 until learned)
         elect.seen_owner = self.mc_seen_owner;
         elect.seen_seq = self.mc_seen_seq;
         elect.seen_ms = self.mc_seen_ms;
@@ -2084,14 +2129,16 @@ impl RadioManager {
         self.relay.is_gateway
     }
 
-    /// #27: this node's current ESP-NOW channel for the peers publish. Leaf = its
-    /// locked scan channel (`CANDIDATES[scan_idx]` while `scan_locked`); gateway = 0
-    /// (its AP channel isn't read on-device yet — #29's `rx_control` capture will
-    /// populate it). Both `0` today ⇒ HA treats the `<ch>` field as advisory and does
-    /// NOT roam-flag until real channels land, so #27 ships no false positives.
+    /// #27/#29: this node's current ESP-NOW channel for the peers + MC publish. Leaf = its
+    /// locked scan channel (`CANDIDATES[scan_idx]` while `scan_locked`), else 0 (scanning);
+    /// gateway = its `learned_channel` (#29 — the channel `rx_control` last saw a frame on;
+    /// 0 until the first frame). `0` ⇒ advisory-only: HA/leaves treat the `<ch>` field as absent
+    /// and fall back (no roam-flag / HELLO-scan), so this never ships a false positive.
     fn current_channel(&self) -> u8 {
         const CANDIDATES: [u8; 3] = [1, 6, 11]; // must match the scan plan above
-        if self.relay.is_gateway || !self.scan_locked {
+        if self.relay.is_gateway {
+            self.learned_channel // #29: real gateway channel from rx_control (0 until learned)
+        } else if !self.scan_locked {
             0
         } else {
             CANDIDATES[self.scan_idx % CANDIDATES.len()]
@@ -2350,6 +2397,16 @@ impl RadioManager {
         self.leaf_ota_pending
     }
 
+    /// #3: is ANY leaf still holding a retained OTA install, as of the last TRUSTED gateway flush?
+    /// `main` AND-gates the gateway's self-OTA on `!leaf_installs_outstanding()` too — not just the
+    /// per-session `!leaf_ota_pending()` — so the gateway can't self-OTA in the gap between one
+    /// leaf's terminal `record_leaf_ota` (which clears `leaf_ota_pending`) and the next flush
+    /// surfacing the next leaf. Goes false only when a completed flush sees zero installs, i.e.
+    /// every leaf is done → the gateway updates itself LAST.
+    pub fn leaf_installs_outstanding(&self) -> bool {
+        self.leaf_installs_outstanding
+    }
+
     /// #40 GATEWAY leaf-mesh-OTA orchestration (§B4). Fetch the staged image (WiFi) into
     /// THIS gateway's inactive slot → relay it over ESP-NOW to ONE leaf (windowed-NAK) →
     /// watch for the leaf's Tier-2 STAT reappearance at the NEW build. CANARY-ONE-LEAF:
@@ -2484,15 +2541,10 @@ impl RadioManager {
 
         // --- RELAY (ESP-NOW) — windowed-NAK to the ONE leaf MAC. ---
         let _ = self.switch(Mode::EspNow);
-        if !self.esp_now.peer_exists(&leaf_mac) {
-            let _ = self.esp_now.add_peer(PeerInfo {
-                interface: EspNowWifiInterface::Sta,
-                peer_address: leaf_mac,
-                lmk: None,
-                channel: None,
-                encrypt: false,
-            });
-        }
+        // #28: ensure the relay target is registered even when the HW peer table is full — evict
+        // the least-valuable peer to make room (never this target: it is both `adding` and the
+        // protected `leaf_ota_mac` sticky, nor the broadcast peer).
+        self.ensure_peer(leaf_mac, now_ms());
         // #3b: DEFENSIVE — (re)add the broadcast peer in the relay ESP-NOW context. Normal HELLOs
         // egress without an explicit broadcast peer, but this send follows a WiFi fetch
         // (WifiSta→switch(EspNow)) which may have perturbed the peer table / TX state; a missing
@@ -2888,6 +2940,7 @@ impl RadioManager {
         // good flush's reading (~one heartbeat of lag, fine for a display value); -99
         // until the first good flush, which mqtt_session's publish guard skips.
         elect.my_rssi = self.my_rssi_to_ap;
+        elect.my_channel = self.learned_channel; // #29: seed the MC record's <ch> (0 until learned)
         // #6 OTA: capture any gated retained announce this flush surfaces.
         let mut ota_offer: Option<crate::ota::Announce> = None;
         // #21: capture any default-screen config this flush surfaces.
@@ -2998,6 +3051,15 @@ impl RadioManager {
         // `record_leaf_ota` (retained install goes away → not seen next flush).
         if leaf_install_seen {
             self.leaf_ota_pending = true;
+        }
+        // #3 (self-OTA-first, multi-leaf gap): the flush is the AUTHORITY on "any leaf still has a
+        // retained install." Latch it separately from the per-session `leaf_ota_pending` so the
+        // gateway's self-OTA stays suppressed across the terminal→next-flush gap — after one leaf's
+        // `record_leaf_ota` clears `leaf_ota_pending`, this stays true until a completed flush sees
+        // NO installs (every leaf done). Only a TRUSTED flush (`ok`) updates the view: an aborted /
+        // disconnected flush read no install topics, so it must NOT be taken as "no installs left."
+        if ok {
+            self.leaf_installs_outstanding = leaf_install_seen;
         }
         // #23 fix (oracle #2): APPLY the re-election result to the LIVE role. On a
         // connected flush, persist the refreshed staleness observation; if a LIVE
@@ -3145,6 +3207,9 @@ impl RadioManager {
             // RSSI of this frame (dBm) from the ESP-NOW RX control info; used by
             // BENCH. Captured up front so each arm can record it if relevant.
             let rssi = recv.info.rx_control.rssi;
+            // #29: learn the channel this frame arrived on = this board's live ESP-NOW channel.
+            // Advisory; the gateway publishes it in the MC record so leaves can pre-tune on roam.
+            self.learned_channel = recv.info.rx_control.channel as u8;
             let now = now_ms();
 
             // #40 leaf-mesh-OTA transport (OTAM/OTAD/OTAN). Dispatched BEFORE the generic
@@ -3164,16 +3229,8 @@ impl RadioManager {
                     // Roster (additive; never touches the LED): learn this peer's
                     // id (SNK frames carry it) + freshen heard/rssi.
                     self.roster.heard(src, Some(f.id), rssi, now);
-                    // Register the peer so any future unicast can reach it.
-                    if !self.esp_now.peer_exists(&src) {
-                        let _ = self.esp_now.add_peer(PeerInfo {
-                            interface: EspNowWifiInterface::Sta,
-                            peer_address: src,
-                            lmk: None,
-                            channel: None,
-                            encrypt: false,
-                        });
-                    }
+                    // Register the peer so any future unicast can reach it (#28: bounded LRU).
+                    self.ensure_peer(src, now);
                     // Buffer for `main` to drain into the game PeerTable; do NOT
                     // set `label` — the MeshSnake screen owns its own render.
                     self.snk.push(f);
@@ -3196,16 +3253,8 @@ impl RadioManager {
                         self.silent_until_relock = false;
                     }
 
-                    // Register the broadcaster so the ACK below can be unicast.
-                    if !self.esp_now.peer_exists(&src) {
-                        let _ = self.esp_now.add_peer(PeerInfo {
-                            interface: EspNowWifiInterface::Sta,
-                            peer_address: src,
-                            lmk: None,
-                            channel: None,
-                            encrypt: false,
-                        });
-                    }
+                    // Register the broadcaster so the ACK below can be unicast (#28: bounded LRU).
+                    self.ensure_peer(src, now);
 
                     // Reply "I heard you, <peer_id>" so the peer can confirm the
                     // link is two-way from its side.
@@ -3274,16 +3323,8 @@ impl RadioManager {
                         self.bench.last_rtt_ms = Some((now - sent) as u32);
                     }
 
-                    // Register the peer so future unicast (if any) can reach it.
-                    if !self.esp_now.peer_exists(&src) {
-                        let _ = self.esp_now.add_peer(PeerInfo {
-                            interface: EspNowWifiInterface::Sta,
-                            peer_address: src,
-                            lmk: None,
-                            channel: None,
-                            encrypt: false,
-                        });
-                    }
+                    // Register the peer so future unicast (if any) can reach it (#28: bounded LRU).
+                    self.ensure_peer(src, now);
                     label = Some(alloc::format!("bench seq {}", seq));
                 }
                 Some(Frame::Time { id, unix, synced_at }) => {
@@ -3317,17 +3358,9 @@ impl RadioManager {
                     if self.relay.is_gateway {
                         let (bitmap, complete) =
                             self.relay.accept(src, (src_id, msgid, frag, count), chunk, now);
-                        // Register the source so the RELAYACK can be unicast back
-                        // (same pattern as the HELLO -> ACK reply).
-                        if !self.esp_now.peer_exists(&src) {
-                            let _ = self.esp_now.add_peer(PeerInfo {
-                                interface: EspNowWifiInterface::Sta,
-                                peer_address: src,
-                                lmk: None,
-                                channel: None,
-                                encrypt: false,
-                            });
-                        }
+                        // Register the source so the RELAYACK can be unicast back (same pattern
+                        // as the HELLO -> ACK reply; #28: bounded LRU eviction when the table fills).
+                        self.ensure_peer(src, now);
                         let mut ack = [0u8; RELAYACK_FRAME_MAX];
                         let len = encode_relayack(msgid, bitmap, &mut ack);
                         self.send_to(&src, &ack[..len]);
@@ -3460,26 +3493,12 @@ impl RadioManager {
     /// new slot; on `Nak` we unicast the OTAN to the gateway; `Abort`/`None` do nothing.
     fn handle_ota_frame(&mut self, f: crate::ota_mesh::OtaFrame<'_>, src: [u8; 6], rssi: i32, now: u64) {
         use crate::ota_mesh::{LeafAction, OtaFrame};
+        // Benign "heard a frame" liveness — safe to record for ANY decoded OTA-shaped frame:
+        // both only feed roster freshness + the self-test hear-a-frame proof, and neither gates
+        // trust. The VOLATILE mutations (owner-silence reset, channel lock, peer insert) are
+        // deferred to the `authed` block below — see F2.
         self.peers.last_hello_ms = now;
         self.roster.heard(src, None, rssi, now);
-        // #3b: an inbound OTA frame proves the gateway is audible on THIS channel (the relay
-        // runs on ESP_NOW_FIXED_CHANNEL). Treat it like the owner's HELLO — reset the
-        // owner-silence timer AND lock the channel — so the leaf STOPS the scan hop and STAYS on
-        // ch6 for the rest of the transfer. This is what lets the FIRST caught OTAM (caught while
-        // the leaf was mid-hop) pin the leaf so it hears the OTAD chunks + OTAM resends (#3b).
-        self.last_owner_heard_ms = now;
-        if !self.relay.is_gateway {
-            self.scan_locked = true;
-        }
-        if !self.esp_now.peer_exists(&src) {
-            let _ = self.esp_now.add_peer(PeerInfo {
-                interface: EspNowWifiInterface::Sta,
-                peer_address: src,
-                lmk: None,
-                channel: None,
-                encrypt: false,
-            });
-        }
         let mut out = [0u8; crate::ota_mesh::OTAN_FRAME_MAX];
         let id = self.id;
         let action = match f {
@@ -3493,6 +3512,30 @@ impl RadioManager {
             // loop, never here. A leaf ignores it.
             OtaFrame::Nak { .. } => LeafAction::None,
         };
+        // F2 (oracle LOW): only a frame the leaf-OTA state machine ACCEPTED may mutate volatile
+        // mesh state. A valid Meta arms the session (on_meta sets `active` + `gateway_mac = src`
+        // ONLY after the ed25519 + freshness gates pass); a valid Data/Complete belongs to that
+        // armed session (on_data rejects any other src/session). A spoofed or replayed OTA-shaped
+        // frame fails those gates → never arms → NOT authed → it cannot pin the leaf's channel,
+        // reset its owner-silence (suppressing re-election), or squat a peer-table slot pre-auth.
+        // (The relayed image is itself ed25519-signed, so this only closes the pre-session spoof
+        // window — hence LOW — but it keeps unauthenticated frames off the volatile mesh state.)
+        let authed = matches!(action, LeafAction::Nak(_) | LeafAction::Complete(_, _))
+            || (self.ota_leaf.is_active() && self.ota_leaf.gateway_mac() == src);
+        if authed {
+            // #3b: an ACCEPTED OTA frame proves the gateway is audible on THIS channel (the relay
+            // runs on ESP_NOW_FIXED_CHANNEL). Treat it like the owner's HELLO — reset the
+            // owner-silence timer AND lock the channel — so the leaf STOPS the scan hop and STAYS
+            // on ch6 for the rest of the transfer. This is what lets the FIRST caught OTAM (caught
+            // while the leaf was mid-hop) pin the leaf so it hears the OTAD chunks + OTAM resends.
+            self.last_owner_heard_ms = now;
+            if !self.relay.is_gateway {
+                self.scan_locked = true;
+            }
+            // Register the gateway for the unicast OTAN back-channel (needed before the Nak send;
+            // #28: bounded LRU eviction when the table fills).
+            self.ensure_peer(src, now);
+        }
         match action {
             LeafAction::Nak(n) => {
                 let gw = self.ota_leaf.gateway_mac();
@@ -3547,6 +3590,74 @@ impl RadioManager {
                 .mac_for(id, now_ms(), crate::net::wifi::STAT_FRESH_MS)?;
         self.leaf_ota_mac = Some((id, mac));
         Some(mac)
+    }
+
+    /// #28: register `mac` as an ESP-NOW unicast peer, evicting the least-valuable existing peer
+    /// first when the HW table is full (`ESP_NOW_PEER_CAP`, which includes the broadcast peer).
+    /// This is the bound that stops the mesh ceilinging at ~20 nodes: esp-wifi has no auto-eviction
+    /// and `add_peer` silently `Err`s once full, so a large fleet's later joiners could otherwise
+    /// never be unicast (HELLO→ACK never latches `Connected`; a gateway's RELAYACK/OTAN never
+    /// lands). No-op if the peer already exists. Routed through by every unicast-reply add-peer site
+    /// (SNK / HELLO / BEACON / RELAY frames, the OTA back-channel, and the relay target).
+    fn ensure_peer(&self, mac: [u8; 6], now: u64) {
+        if self.esp_now.peer_exists(&mac) {
+            return;
+        }
+        // Evict the least-valuable peer(s) until under cap. Bounded: a `None` victim (everything
+        // left is protected) or a `remove_peer` error breaks out rather than spinning — leaving
+        // the final `add_peer` to `Err` exactly as it did before the fix (never worse than today).
+        while matches!(self.esp_now.peer_count(), Ok(c) if c.total_count >= ESP_NOW_PEER_CAP) {
+            let Some(victim) = self.peer_evict_victim(mac, now) else {
+                break;
+            };
+            if self.esp_now.remove_peer(&victim).is_err() {
+                break;
+            }
+        }
+        let _ = self.esp_now.add_peer(PeerInfo {
+            interface: EspNowWifiInterface::Sta,
+            peer_address: mac,
+            lmk: None,
+            channel: None,
+            encrypt: false,
+        });
+    }
+
+    /// #28: pick the least-valuable HW peer to evict. Walks the ESP-NOW peer list (`fetch_peer`
+    /// SKIPS broadcast/multicast, so only unicast peers are candidates) and ranks each by the
+    /// roster value-key, with a peer no longer in the roster (a ghost the roster already dropped)
+    /// sorted BELOW every live peer so it goes first. NEVER evicts the MAC we're about to add, the
+    /// BROADCAST peer, or the active leaf-OTA relay target (`leaf_ota_mac` — its sticky MAC must
+    /// survive the mesh-deaf relay). `None` when nothing is evictable (all remaining peers protected).
+    ///
+    /// Broadcast belt-and-suspenders (nebula finding): `fetch_peer` is documented to already skip
+    /// broadcast/multicast (so it can't be a candidate), and evicting broadcast would be
+    /// catastrophic — `esp_now_send(ff:ff…)` would return NOT_FOUND and this node's HELLOs would
+    /// silently stop egressing, dropping it off the mesh. We therefore ALSO guard it explicitly, so
+    /// the code is self-evidently safe without depending on that external `fetch_peer` contract.
+    fn peer_evict_victim(&self, adding: [u8; 6], now: u64) -> Option<[u8; 6]> {
+        let protect = self.leaf_ota_mac.map(|(_, m)| m);
+        let mut victim: Option<[u8; 6]> = None;
+        let mut victim_rank: (bool, bool, bool, i32, u64) = (true, true, true, i32::MAX, u64::MAX);
+        let mut from_head = true;
+        while let Ok(p) = self.esp_now.fetch_peer(from_head) {
+            from_head = false;
+            let mac = p.peer_address;
+            if mac == adding || mac == BROADCAST_ADDRESS || Some(mac) == protect {
+                continue;
+            }
+            // Rank = (is_live, id_known, connected, rssi, last_heard); LOWER = evict first. A ghost
+            // (not in the roster) is `is_live=false` → below any live peer regardless of the rest.
+            let rank = match self.roster.value_key_for_mac(mac, now) {
+                Some((idk, conn, rssi, heard)) => (true, idk, conn, rssi, heard),
+                None => (false, false, false, i32::MIN, 0),
+            };
+            if victim.is_none() || rank < victim_rank {
+                victim = Some(mac);
+                victim_rank = rank;
+            }
+        }
+        victim
     }
 
     /// #40 #3: the leaf's OTA RX-diag `(otam_heard, on_meta_verdict, otan_sent)` — `main`

@@ -112,6 +112,12 @@ pub struct MeshElect {
     /// RECOVERY election so the strongest-uplink survivor takes over a dead owner
     /// FIRST (weaker boards defer + adopt it). Ignored on the boot/flush paths.
     pub my_rssi: i8,
+    /// #29: the owner's LEARNED ESP-NOW channel (from `rx_control`; 0 until known). Seeded by the
+    /// caller from the live RadioManager; written into the retained `MC|owner|<ch>|seq` record when
+    /// this board publishes as owner, so a roaming/re-electing leaf can pre-tune to it instead of
+    /// scanning 1/6/11. ADVISORY: `0` ⇒ leaves keep HELLO-scanning (the proven fallback). The
+    /// election destructures the channel field as `_ch` (ignored), so this can never perturb it.
+    pub my_channel: u8,
     /// #51: true ONLY on a LEAF's recovery re-election (a lost owner). Selects the
     /// WiFi-strength "sticky live owner + RSSI-weighted takeover" rule. On boot and
     /// gateway-flush this is false → the original, hardware-validated lowest-id
@@ -145,6 +151,7 @@ impl MeshElect {
             seen_seq: 0,
             seen_ms: 0,
             my_rssi: -99, // weak default until the first association captures it
+            my_channel: 0, // #29: advisory 0 until a frame's rx_control is learned
             recovery: false,
             boot: false,
             i_am_owner: false,
@@ -2059,7 +2066,7 @@ fn mqtt_session(
         elect.seen_seq = newseq;
         elect.seen_ms = elect.now_ms;
         let mut mcp = MqttScratch::new();
-        let _ = write!(mcp, "MC|{}|0|{}", node_id, newseq);
+        let _ = write!(mcp, "MC|{}|{}|{}", node_id, elect.my_channel, newseq); // #29: real ch (0 until learned)
         // #51 A2 — CLAIM-AFTER-PUBLISH: only actually hold ownership if the retained MC
         // write reached the broker (proof our uplink is alive). If the publish fails, we
         // are NOT a valid owner — revert to leaf so ownership can't land on a board whose
