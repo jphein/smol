@@ -156,17 +156,31 @@ const GRID_PREFIX: &[u8] = b"SMOLv1 GRID "; // + verbatim "GRID|l1|l2|l3"
 /// Max GRID payload retained/echoed — matches `GridCache` (LOCKED ≤ 96 B).
 const GRID_PAYLOAD_MAX: usize = 96;
 
-/// #21 leaf-relay config-downlink tag: `"SMOLv1 CFG "` (11 B, trailing space) then
-/// `"NNN"` (3-ASCII zero-padded TARGET leaf id) then the VERBATIM default-screen
-/// value (`<AppKind>:<page>`, empty = clear). Diverges from HELLO/BATT/GRID/TIME/OTA
-/// at byte 7 (`'C'`), so `strip_prefix` never confuses them. Single-hop gateway →
-/// leaf (leaves never re-broadcast). **HARD BOUNDARY (oracle R-P3, §0 of the #21
-/// design):** this frame carries SCREEN CONFIG ONLY — never OTA/url/install. It's a
-/// low-blast, reversible, escapable command (long-press → Menu is universal), so a
-/// forged frame's worst case is a valid screen or an ignore — never code exec, never
-/// a brick. The value length is bounded by `CFG_VALUE_MAX`; the leaf validates it
-/// with the strict/panic-free `parse_default_screen`.
-const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + verbatim "<AppKind>:<page>"
+/// #21/#56 leaf-relay config-downlink tag: `"SMOLv1 CFG "` (11 B, trailing space) then
+/// `"NNN"` (3-ASCII zero-padded TARGET leaf id), then a 1-byte config `KEY` (#56), then
+/// the VERBATIM value for that channel (empty = clear). Diverges from HELLO/BATT/GRID/
+/// TIME/OTA at byte 7 (`'C'`), so `strip_prefix` never confuses them. Single-hop gateway
+/// → leaf (leaves never re-broadcast).
+///
+/// **#56 keyed channel:** ONE relay carries N per-node config types — the KEY dispatches:
+/// `S` = default screen (#21; the ONLY channel #56 ships) · `L` = blue-LED mode (#48) ·
+/// `U` = display units (#43) · `P` = plugin-enable mask (#55). A leaf applies only the keys
+/// in [`CFG_APPLY_KEYS`]; a key its firmware predates is DROPPED (forward-compat, the #46
+/// clamp discipline — never mis-applied). Back-compat: a key-less frame (id only, empty
+/// tail) is read as an empty-value clear on the SCREEN key, matching the pre-#56 wire.
+///
+/// **HARD BOUNDARY (oracle R-P3, §0 of the #21 design):** the SCREEN key carries screen
+/// config ONLY — never OTA/url/install. It's a low-blast, reversible, escapable command
+/// (long-press → Menu is universal), so a forged frame's worst case is a valid screen or an
+/// ignore — never code exec, never a brick. Each key's value is bounded by `CFG_VALUE_MAX`;
+/// the leaf validates the screen value with the strict/panic-free `parse_default_screen`.
+const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
+/// #56 keyed CFG: the config keys THIS build knows how to APPLY on a leaf. #56 ships only
+/// the screen key; #48/#43/#55 each add their letter here alongside a `main` dispatch arm
+/// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
+/// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
+/// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
+const CFG_APPLY_KEYS: [u8; 1] = [crate::net::wifi::CFG_KEY_SCREEN];
 /// #50b leaf-status UPLINK tag: `"SMOLv1 STAT "` (12 B, trailing space) then `"NNN"`
 /// (3-ASCII zero-padded SENDER leaf id) then the verbatim live `<AppKind>:<page>` value
 /// (empty = none). Mirror of `CFG` but UPLINK (leaf → gateway): a leaf with no MQTT
@@ -285,10 +299,11 @@ enum Frame<'a> {
     /// A grid-downlink payload from a gateway (issue #16): the verbatim `GRID|…`
     /// bytes (twin of `Batt`; copied into `GridTracker` in `service`).
     Grid(&'a [u8]),
-    /// #21 leaf-relay: a gateway's CONFIG downlink — `target` leaf id + the verbatim
-    /// default-screen `value` bytes (`value` borrows the RX buffer; the leaf buffers
-    /// it in `CfgTracker` in `service` IFF `target == self.id`). Screen config ONLY.
-    Cfg { target: u8, value: &'a [u8] },
+    /// #21/#56 leaf-relay: a gateway's keyed CONFIG downlink — `target` leaf id, the config
+    /// channel `key` (`S`=screen/…), + the verbatim `value` bytes (`value` borrows the RX
+    /// buffer; the leaf buffers it per-key in `CfgTracker` in `service` IFF `target ==
+    /// self.id` AND the key is one it applies). Screen config ONLY on the `S` key.
+    Cfg { target: u8, key: u8, value: &'a [u8] },
     /// #50b leaf-status uplink: a leaf's live screen readback — `src` sender leaf id +
     /// the verbatim `<AppKind>:<page>` `value` bytes (`value` borrows the RX buffer; the
     /// GATEWAY caches it in `stat_cache` in `service`, keyed by `src`). Twin of `Cfg` but
@@ -447,34 +462,67 @@ pub struct GridOffer {
     pub len: usize,
 }
 
-/// #21 leaf-relay: buffers the most-recent inbound `SMOLv1 CFG` VALUE that targeted
-/// THIS leaf (the `service()` arm target-filters on `self.id` before buffering, so a
-/// config for another leaf never lands here). `main` takes it via
-/// [`RadioManager::take_cfg_offer`] and runs the bytes through the strict
-/// `parse_default_screen`. Fixed `.bss` buffer, no heap. Twin of [`BattTracker`].
+/// #21/#56 leaf-relay: buffers the most-recent inbound `SMOLv1 CFG` value that targeted
+/// THIS leaf, held in ONE `.bss` slot PER config key (#56) so keyed frames arriving in the
+/// same relay burst (the gateway broadcasts every cached key back-to-back) don't clobber
+/// each other. The `service()` arm target-filters on `self.id` before buffering (a config
+/// for another leaf never lands here) and `set` key-filters on [`CFG_APPLY_KEYS`] (an
+/// unapplied key is dropped). `main` takes a channel via [`RadioManager::take_cfg_offer`]
+/// and runs the bytes through that channel's validator (screen → `parse_default_screen`).
+/// Fixed `.bss`, no heap. Twin of [`BattTracker`], generalised to N keyed slots.
 struct CfgTracker {
-    buf: [u8; crate::net::wifi::CFG_VALUE_MAX],
-    len: usize,
-    have: bool,
+    vals: [[u8; crate::net::wifi::CFG_VALUE_MAX]; CFG_APPLY_KEYS.len()],
+    lens: [u8; CFG_APPLY_KEYS.len()],
+    have: [bool; CFG_APPLY_KEYS.len()],
 }
 
 impl CfgTracker {
     const fn new() -> Self {
-        Self { buf: [0; crate::net::wifi::CFG_VALUE_MAX], len: 0, have: false }
+        Self {
+            vals: [[0; crate::net::wifi::CFG_VALUE_MAX]; CFG_APPLY_KEYS.len()],
+            lens: [0; CFG_APPLY_KEYS.len()],
+            have: [false; CFG_APPLY_KEYS.len()],
+        }
     }
 
-    /// Buffer a freshly-received value (truncated to capacity).
-    fn set(&mut self, value: &[u8]) {
-        let n = value.len().min(crate::net::wifi::CFG_VALUE_MAX);
-        self.buf[..n].copy_from_slice(&value[..n]);
-        self.len = n;
-        self.have = true;
+    /// The `.bss` slot for `key`, or `None` if this build doesn't apply that key.
+    fn slot(key: u8) -> Option<usize> {
+        CFG_APPLY_KEYS.iter().position(|&k| k == key)
+    }
+
+    /// Buffer a freshly-received value under its `key` (truncated to capacity); returns
+    /// `true` if buffered. A `key` not in [`CFG_APPLY_KEYS`] is DROPPED and returns `false`
+    /// (#56 forward-compat — a newer gateway may relay a config channel this firmware
+    /// predates; ignore it rather than mis-apply, per the #46 clamp discipline).
+    fn set(&mut self, key: u8, value: &[u8]) -> bool {
+        match Self::slot(key) {
+            Some(i) => {
+                let n = value.len().min(crate::net::wifi::CFG_VALUE_MAX);
+                self.vals[i][..n].copy_from_slice(&value[..n]);
+                self.lens[i] = n as u8;
+                self.have[i] = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Take (clear) the buffered value for `key`, or `None` if none pending / unapplied key.
+    fn take(&mut self, key: u8) -> Option<CfgOffer> {
+        let i = Self::slot(key)?;
+        if self.have[i] {
+            self.have[i] = false;
+            Some(CfgOffer { buf: self.vals[i], len: self.lens[i] as usize })
+        } else {
+            None
+        }
     }
 }
 
-/// A `Copy` snapshot of a buffered CFG value handed to `main` by
-/// [`RadioManager::take_cfg_offer`]. `buf[..len]` is the verbatim `<AppKind>:<page>`
-/// value (empty = clear → board default); `main` parses it via `parse_default_screen`.
+/// A `Copy` snapshot of one keyed CFG channel's buffered value, handed to `main` by
+/// [`RadioManager::take_cfg_offer`]. For the screen key, `buf[..len]` is the verbatim
+/// `<AppKind>:<page>` value (empty = clear → board default) that `main` parses via
+/// `parse_default_screen`; other keys (#48/#43/#55) interpret their own value grammar.
 #[derive(Clone, Copy)]
 pub struct CfgOffer {
     pub buf: [u8; crate::net::wifi::CFG_VALUE_MAX],
@@ -1262,19 +1310,20 @@ pub struct RadioManager {
     /// Twin of `batt` (issue #16): most-recent inbound SMOLv1 GRID payload, buffered
     /// for `main` to store into its `GridCache`.
     grid: GridTracker,
-    /// #21 leaf-relay (LEAF side): most-recent inbound `SMOLv1 CFG` value that
-    /// targeted THIS leaf, buffered for `main` to apply via `take_cfg_offer`.
+    /// #21/#56 leaf-relay (LEAF side): most-recent inbound `SMOLv1 CFG` value PER config
+    /// key that targeted THIS leaf, buffered for `main` to apply via `take_cfg_offer(key)`.
     cfg: CfgTracker,
-    /// #21 leaf-relay (GATEWAY side): per-leaf default-screen cache, filled from the
-    /// MQTT wildcard during a flush and re-broadcast as `SMOLv1 CFG` on the ~10 s
-    /// cadence. Lives here so it persists across bursts (a (re)joined leaf converges
-    /// without HA re-publishing). Unused on a leaf (never flushes).
+    /// #21/#56 leaf-relay (GATEWAY side): per-(leaf, key) config cache, filled from the
+    /// MQTT wildcard during a flush and re-broadcast as keyed `SMOLv1 CFG` frames on the
+    /// ~10 s cadence. Lives here so it persists across bursts (a (re)joined leaf converges
+    /// without HA re-publishing). #56 fills only the screen key. Unused on a leaf.
     cfg_cache: crate::net::wifi::CfgCache,
     /// #50b leaf-status uplink (GATEWAY side): per-leaf live `<screen>:<page>` cache,
     /// filled by the `SMOLv1 STAT` service arm from leaf uplinks (leaves have no MQTT) and
     /// republished as retained `smol/<leaf>/status` on each gateway flush. Twin of
     /// `cfg_cache` but UPLINK-sourced. Unused on a leaf (never flushes/publishes). REUSES
-    /// `CfgCache` verbatim — a generic id→value upsert map (`Batt:3` fits `CFG_VALUE_MAX`).
+    /// `CfgCache` as a single-channel map — pinned to one fixed key so its (id, key) upsert
+    /// behaves id-keyed (`Batt:3` fits `CFG_VALUE_MAX`); the key column is inert here.
     stat_cache: crate::net::wifi::CfgCache,
     /// #40 leaf-mesh-OTA: the LEAF receive state machine (verify-sig → signed-bounds →
     /// window reassembly → readback verify → activate). Idle except during a transfer.
@@ -1856,24 +1905,26 @@ impl RadioManager {
         }
     }
 
-    /// #21 leaf-relay: broadcast one targeted `SMOLv1 CFG` frame — tag + 3-ASCII
-    /// zero-padded `target_id` + the verbatim `value`. Mirror of [`broadcast_batt`]:
-    /// fixed frame → `send_to(&BROADCAST_ADDRESS, ..)` (fire-and-forget). Every leaf
-    /// hears it; only the `target` acts (leaf-side target-filter). Value truncated to
-    /// `CFG_VALUE_MAX`; empty value = clear.
+    /// #21/#56 leaf-relay: broadcast one targeted keyed `SMOLv1 CFG` frame — tag + 3-ASCII
+    /// zero-padded `target_id` + the 1-byte config `key` (#56) + the verbatim `value`.
+    /// Mirror of [`broadcast_batt`]: fixed frame → `send_to(&BROADCAST_ADDRESS, ..)`
+    /// (fire-and-forget). Every leaf hears it; only the `target` acts, and only if it
+    /// applies `key` (leaf-side target + key filter). Value truncated to `CFG_VALUE_MAX`;
+    /// empty value = clear that key.
     ///
     /// [`broadcast_batt`]: RadioManager::broadcast_batt
-    pub fn broadcast_config(&mut self, target_id: u8, value: &[u8]) {
+    pub fn broadcast_config(&mut self, target_id: u8, key: u8, value: &[u8]) {
         let base = CFG_PREFIX.len();
-        let mut msg = [0u8; CFG_PREFIX.len() + 3 + crate::net::wifi::CFG_VALUE_MAX];
+        let mut msg = [0u8; CFG_PREFIX.len() + 3 + 1 + crate::net::wifi::CFG_VALUE_MAX];
         msg[..base].copy_from_slice(CFG_PREFIX);
         // 3-ASCII zero-padded target id (matches `parse_id`; u8 ⇒ each digit 0–9).
         msg[base] = b'0' + target_id / 100;
         msg[base + 1] = b'0' + (target_id / 10) % 10;
         msg[base + 2] = b'0' + target_id % 10;
+        msg[base + 3] = key; // #56: config channel key (S=screen / L=led / U=units / P=plugins)
         let n = value.len().min(crate::net::wifi::CFG_VALUE_MAX);
-        msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
-        self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
+        msg[base + 4..base + 4 + n].copy_from_slice(&value[..n]);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..base + 4 + n]);
     }
 
     /// #50b leaf-status uplink: a LEAF broadcasts its OWN live `<screen>:<page>` as a
@@ -1929,33 +1980,29 @@ impl RadioManager {
             // Copy the entry out to release the `cfg_cache` borrow before the
             // `&mut self` broadcast_config call (disjoint-borrow discipline).
             let mut vbuf = [0u8; crate::net::wifi::CFG_VALUE_MAX];
-            let (id, vlen) = match self.cfg_cache.entry(i) {
-                Some((id, v)) => {
+            let (id, key, vlen) = match self.cfg_cache.entry(i) {
+                Some((id, key, v)) => {
                     let l = v.len();
                     vbuf[..l].copy_from_slice(v);
-                    (id, l)
+                    (id, key, l)
                 }
                 None => continue,
             };
             if id == own {
                 continue;
             }
-            self.broadcast_config(id, &vbuf[..vlen]);
+            self.broadcast_config(id, key, &vbuf[..vlen]);
         }
     }
 
-    /// #21 leaf-relay: take the buffered inbound CFG value that targeted us (if any),
-    /// clearing it. Twin of [`take_batt_offer`]; `main` runs the bytes through
-    /// `parse_default_screen` and edge-trigger-applies the result.
+    /// #21/#56 leaf-relay: take the buffered inbound value for config channel `key` that
+    /// targeted us (if any), clearing it. `None` if nothing pending or this build doesn't
+    /// apply `key`. Twin of [`take_batt_offer`]; for the screen key `main` runs the bytes
+    /// through `parse_default_screen` and edge-trigger-applies the result.
     ///
     /// [`take_batt_offer`]: RadioManager::take_batt_offer
-    pub fn take_cfg_offer(&mut self) -> Option<CfgOffer> {
-        if self.cfg.have {
-            self.cfg.have = false;
-            Some(CfgOffer { buf: self.cfg.buf, len: self.cfg.len })
-        } else {
-            None
-        }
+    pub fn take_cfg_offer(&mut self, key: u8) -> Option<CfgOffer> {
+        self.cfg.take(key)
     }
 
     /// #25 WLED: broadcast one WiZmote button over ESP-NOW on the CURRENT channel.
@@ -3260,17 +3307,28 @@ impl RadioManager {
                     self.roster.heard(src, None, rssi, now);
                     label = Some(alloc::string::String::from("grid"));
                 }
-                Some(Frame::Cfg { target, value }) => {
-                    // #21 leaf-relay: a gateway's CONFIG downlink. Target-filter FIRST
-                    // (per-leaf) — only buffer if it's addressed to US; a config for any
-                    // other leaf is ignored here. The value is the #21 default-screen
-                    // grammar; `main` validates it via the strict/panic-free
-                    // `parse_default_screen` (unknown/wrong-tier/bad-page → keep current;
-                    // empty → clear). HARD BOUNDARY: screen config ONLY — never OTA.
+                Some(Frame::Cfg { target, key, value }) => {
+                    // #21/#56 leaf-relay: a gateway's keyed CONFIG downlink. Target-filter
+                    // FIRST (per-leaf) — only buffer if addressed to US; a config for any
+                    // other leaf is ignored here. `CfgTracker::set` then per-KEY-filters:
+                    // a key this build doesn't apply (a future channel from a newer gateway)
+                    // is DROPPED (#56 forward-compat, #46 clamp). The value is opaque here;
+                    // the matching `main` dispatch validates it (screen → strict/panic-free
+                    // `parse_default_screen`: unknown/wrong-tier/bad-page → keep current;
+                    // empty → clear). HARD BOUNDARY: screen config ONLY on `S` — never OTA.
                     // Buffering the raw bytes (not parsing here) keeps this arm total.
                     if target == self.id {
-                        self.cfg.set(value);
-                        log::info!("smol #21: CFG frame for us ({} B value) — buffered", value.len());
+                        if self.cfg.set(key, value) {
+                            log::info!(
+                                "smol #56: CFG frame for us (key '{}', {} B value) — buffered",
+                                key as char,
+                                value.len()
+                            );
+                        } else {
+                            // Forward-compat: a key this firmware predates (newer gateway
+                            // mid rolling-OTA). Dropped, not mis-applied (#46 clamp).
+                            log::info!("smol #56: CFG frame for us (unknown key '{}') — ignored", key as char);
+                        }
                     }
                     self.peers.last_hello_ms = now;
                     self.roster.heard(src, None, rssi, now);
@@ -3300,8 +3358,9 @@ impl RadioManager {
                     if self.relay.is_gateway {
                         // #68 F6/roster-robustness: stamp the STAT with the sender's MAC + time so
                         // a stale leaf stops ghosting its status and stays mac-resolvable if the
-                        // LRU roster later evicts it.
-                        self.stat_cache.set(leaf_id, value, src, now);
+                        // LRU roster later evicts it. #56: pin the single-channel stat cache to one
+                        // fixed key (screen key) so its (id, key) upsert behaves id-keyed.
+                        self.stat_cache.set(leaf_id, crate::net::wifi::CFG_KEY_SCREEN, value, src, now);
                     }
                     self.peers.last_hello_ms = now;
                     self.roster.heard(src, Some(leaf_id), rssi, now);
@@ -3564,11 +3623,19 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
         return Some(Frame::Grid(rest));
     }
     if let Some(rest) = data.strip_prefix(CFG_PREFIX) {
-        // #21 leaf-relay: "NNN<value>" — 3-ASCII target id then the verbatim value
-        // (to end-of-frame; empty = clear). `parse_id` rejects short/non-digit and
-        // guarantees `rest.len() >= 3`, so `&rest[3..]` never panics.
+        // #21/#56 leaf-relay: "NNN<KEY><value>" — 3-ASCII target id, a 1-byte config KEY,
+        // then the verbatim value (to end-of-frame; empty = clear that key). `parse_id`
+        // rejects short/non-digit and guarantees `rest.len() >= 3`. The byte after the id
+        // is the KEY; `&rest[4..]` is its value (an empty slice for a keyed clear like
+        // "007S"). A key-less frame (id only, `rest.len() == 3`) is read as an empty-value
+        // clear on the SCREEN key — #56 back-compat with the pre-key `default_screen` wire.
+        // Unknown keys parse fine here and are dropped at the leaf's per-key dispatch.
         let target = parse_id(rest)?;
-        return Some(Frame::Cfg { target, value: &rest[3..] });
+        let (key, value): (u8, &[u8]) = match rest.get(3) {
+            Some(&k) => (k, &rest[4..]),
+            None => (crate::net::wifi::CFG_KEY_SCREEN, &rest[3..]),
+        };
+        return Some(Frame::Cfg { target, key, value });
     }
     if let Some(rest) = data.strip_prefix(STAT_PREFIX) {
         // #50b leaf-status uplink: "NNN<value>" — 3-ASCII SENDER id then the verbatim

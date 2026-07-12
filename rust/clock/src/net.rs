@@ -33,6 +33,14 @@ pub mod names;
 #[cfg(feature = "wifi")]
 pub use wifi::WifiPeripherals;
 
+// #56 keyed CFG: re-export the screen config-channel key so `main` (crate root, outside
+// this module) can name it when pulling the screen offer from the keyed relay. `wifi` is
+// private to `net`; `mode`/`wifi` reach the const directly, but `main` needs this bridge.
+// espnow-gated: `main` consumes it ONLY on the leaf-apply path (`take_cfg_offer`), which is
+// espnow-only — a wifi-only build reaches the const in-module (no re-export → no unused-import).
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_KEY_SCREEN;
+
 // `try_time_sync` is the Phase-2 entry point; under `espnow`, `main` calls
 // `mode::start` instead, so only re-export it when espnow is NOT enabled.
 #[cfg(all(feature = "wifi", not(feature = "espnow")))]

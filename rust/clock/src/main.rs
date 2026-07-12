@@ -992,7 +992,10 @@ fn main() -> ! {
             if let Some(c) = r.take_config_offer() {
                 Some(c)
             } else {
-                r.take_cfg_offer()
+                // #56: pull the SCREEN config channel (`S`) of the keyed CFG relay. Future
+                // channels (#48 led / #43 units / #55 plugins) each add their own
+                // `take_cfg_offer(key)` + apply beside this one — the S path is unchanged.
+                r.take_cfg_offer(crate::net::CFG_KEY_SCREEN)
                     .and_then(|o| app::parse_default_screen(&o.buf[..o.len]))
             }
         });

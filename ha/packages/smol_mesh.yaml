@@ -128,6 +128,25 @@ input_boolean:
     icon: "mdi:pencil"
 
 # =====================================================================
+# KEYED CFG RELAY (issue #56) — the ONE wire that carries ALL per-node config
+# to the credential-less, ESP-NOW-only leaves.
+# ---------------------------------------------------------------------
+# A gateway subscribes each retained config topic below and re-broadcasts it to
+# its leaves as a SINGLE keyed ESP-NOW frame — `SMOLv1 CFG <NNN><KEY><value>` —
+# on the ~10 s cadence (NNN = 3-digit target leaf id; KEY = 1 ASCII channel byte;
+# value = the verbatim retained payload). The leaf DISPATCHES on KEY and ignores
+# any key its firmware predates (forward-compat). Topic → KEY contract:
+#     smol/<id>/config/default_screen  → S   (screen, issue #21)   ← the ONLY key #56 ships
+#     smol/<id>/config/led             → L   (blue-LED mode, #48)
+#     smol/config/units                → U   (display units, GLOBAL/#43)
+#     smol/<id>/config/plugins         → P   (plugin-enable mask, #55; topic TBD)
+# #56 is FOUNDATION ONLY: the firmware relays the S channel (default_screen) exactly
+# as before — this file's default_screen PUBLISH half is UNCHANGED, and a leaf keeps
+# converging on its dashboard-set screen. The L/U/(P) topics + GUI below already exist
+# HA-side; their gateway relay + leaf apply land with #48/#43/#55 (each adds one fill
+# site + one dispatch arm on top of this keyed channel — no new wire frame). HA never
+# emits a KEY: it publishes to the topic, the gateway maps topic → KEY on relay.
+# =====================================================================
 # NODE MANAGER (issue #21) — remotely set each node's DEFAULT SCREEN + page
 # via retained  smol/<id>/config/default_screen = <AppKind>:<page>.
 # Protocol LOCKED per nodemgr-design.md §2. This is the HA PUBLISH/GUI half;
