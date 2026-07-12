@@ -434,10 +434,8 @@ fn associate_slot(
     {
         return AssocResult::TimedOut;
     }
-    if !matches!(controller.is_started(), Ok(true)) {
-        if controller.start().is_err() {
-            return AssocResult::TimedOut;
-        }
+    if !matches!(controller.is_started(), Ok(true)) && controller.start().is_err() {
+        return AssocResult::TimedOut;
     }
     if controller.connect().is_err() {
         return AssocResult::TimedOut;
@@ -587,6 +585,7 @@ pub fn run_ntp_burst(
     // Poll the stack until DHCP yields an address. The DHCP `Event` borrows
     // the socket, so we extract the plain (Ipv4Cidr, router) data inside a
     // short scope, then apply it to the interface once the borrow is released.
+    let deadline = Instant::now() + SYNC_BUDGET; // DHCP+SNTP budget (assoc has its own per-slot budget in try_time_sync)
     loop {
         if tick() {
             return None; // #20 abort during DHCP wait
