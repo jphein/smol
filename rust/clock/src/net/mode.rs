@@ -1405,6 +1405,14 @@ pub struct RadioManager {
     /// self-OTA (`do_install`) so a relay is never interrupted by the gateway rebooting into a
     /// fresh build mid-session (and the two OTAs never collide/thrash the fleet).
     leaf_ota_pending: bool,
+    /// #3 (self-OTA-first, multi-leaf gap): true while ANY leaf still holds a retained OTA install,
+    /// as observed by the last TRUSTED gateway flush. Distinct from the per-session
+    /// `leaf_ota_pending` (which a terminal `record_leaf_ota` clears the instant ONE leaf resolves):
+    /// this stays latched across the terminal→next-flush gap until a completed flush sees ZERO
+    /// installs. `main` gates the gateway's self-OTA on `!leaf_installs_outstanding()` TOO, so the
+    /// gateway can't self-OTA (rebooting) in that gap — starving a second leaf + inverting the order.
+    /// The gateway updates itself LAST, only once every leaf's install has cleared.
+    leaf_installs_outstanding: bool,
     /// #40 #3 STICKY MAC: `(leaf_id, mac)` captured the moment an armed leaf became addressable,
     /// held for the whole install session (cleared on a terminal `record_leaf_ota`). The roster
     /// is a bounded 16-slot LRU that EVICTS this leaf while the mesh-deaf relay stops hearing it
@@ -1510,6 +1518,7 @@ impl RadioManager {
             leaf_ota_diag: None,
             leaf_ota_retries: 0,
             leaf_ota_pending: false,
+            leaf_installs_outstanding: false,
             leaf_ota_mac: None,
             leaf_relay_rx: None,
             config_offer: None,
@@ -2363,6 +2372,16 @@ impl RadioManager {
         self.leaf_ota_pending
     }
 
+    /// #3: is ANY leaf still holding a retained OTA install, as of the last TRUSTED gateway flush?
+    /// `main` AND-gates the gateway's self-OTA on `!leaf_installs_outstanding()` too — not just the
+    /// per-session `!leaf_ota_pending()` — so the gateway can't self-OTA in the gap between one
+    /// leaf's terminal `record_leaf_ota` (which clears `leaf_ota_pending`) and the next flush
+    /// surfacing the next leaf. Goes false only when a completed flush sees zero installs, i.e.
+    /// every leaf is done → the gateway updates itself LAST.
+    pub fn leaf_installs_outstanding(&self) -> bool {
+        self.leaf_installs_outstanding
+    }
+
     /// #40 GATEWAY leaf-mesh-OTA orchestration (§B4). Fetch the staged image (WiFi) into
     /// THIS gateway's inactive slot → relay it over ESP-NOW to ONE leaf (windowed-NAK) →
     /// watch for the leaf's Tier-2 STAT reappearance at the NEW build. CANARY-ONE-LEAF:
@@ -2972,6 +2991,15 @@ impl RadioManager {
         // `record_leaf_ota` (retained install goes away → not seen next flush).
         if leaf_install_seen {
             self.leaf_ota_pending = true;
+        }
+        // #3 (self-OTA-first, multi-leaf gap): the flush is the AUTHORITY on "any leaf still has a
+        // retained install." Latch it separately from the per-session `leaf_ota_pending` so the
+        // gateway's self-OTA stays suppressed across the terminal→next-flush gap — after one leaf's
+        // `record_leaf_ota` clears `leaf_ota_pending`, this stays true until a completed flush sees
+        // NO installs (every leaf done). Only a TRUSTED flush (`ok`) updates the view: an aborted /
+        // disconnected flush read no install topics, so it must NOT be taken as "no installs left."
+        if ok {
+            self.leaf_installs_outstanding = leaf_install_seen;
         }
         // #23 fix (oracle #2): APPLY the re-election result to the LIVE role. On a
         // connected flush, persist the refreshed staleness observation; if a LIVE
