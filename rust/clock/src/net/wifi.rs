@@ -322,6 +322,11 @@ pub struct WifiPeripherals {
     pub timg0: TIMG0<'static>,
     pub rng: RNG<'static>,
     pub wifi: WIFI<'static>,
+    /// #22: the Bluetooth controller peripheral, handed to the passive BLE scanner
+    /// in `RadioManager::new`. Only present in a `ble` build (⊃ `espnow`) — the
+    /// wifi-only `try_time_sync` path never constructs this field.
+    #[cfg(feature = "ble")]
+    pub bt: esp_hal::peripherals::BT<'static>,
 }
 
 /// smoltcp wants a monotonic timestamp; derive it from the HAL's clock.
@@ -671,6 +676,8 @@ pub fn run_ntp_burst(
         None, // #70/#49: boot burst republishes no cached diag
         &[], // #71: boot burst publishes no own scan
         None, // #71: boot burst republishes no cached scan
+        &[], // #22: boot burst publishes no own BLE record
+        None, // #22: boot burst republishes no cached BLE record
         &mut _ntp_scan_req, // #71: boot burst subscribes no cmd/scan (cfg_cache=None)
         &mut None, // #40: boot burst never relays a leaf OTA
         &mut None, // #40: boot burst has no persistent staged to carry
@@ -1483,6 +1490,12 @@ fn mqtt_session(
     // #71: `Some` on a GATEWAY flush → republish each CACHED relayed-node SCAN record as retained
     // `smol/<id>/scan` (F6-gated). `None` off-gateway. Twin of `diag_cache`.
     scan_cache: Option<&RelayCache>,
+    // #22: this node's own compact BLE-sightings record → retained `smol/<id>/ble` (empty ⇒
+    // skipped — no sighting yet / not a ble build). Twin of `diag`/`scan`.
+    ble: &[u8],
+    // #22: `Some` on a GATEWAY flush → republish each CACHED relayed-node BLE record as retained
+    // `smol/<id>/ble` (F6-gated). `None` off-gateway / non-ble build. Twin of `scan_cache`.
+    ble_cache: Option<&RelayCache>,
     // #71: filled with the scan COMMANDS seen on the transient `smol/+/cmd/scan` topics this burst
     // (leaf targets to one-shot-relay `<id>W` + own flag). Twin of `reset_req`; NEVER cached.
     scan_req: &mut ScanReq,
@@ -1951,6 +1964,37 @@ fn mqtt_session(
                 let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
             }
         });
+    }
+
+    // #22: publish this node's OWN compact BLE-sightings record as RETAINED `smol/<id>/ble`, if
+    // the scanner produced one this cycle (empty = not a ble build / nothing in range → skipped).
+    // Twin of the diag/scan own-publish. HA parses it package-side (room-presence per node).
+    if !ble.is_empty() {
+        let mut btopic = MqttScratch::new();
+        let _ = write!(btopic, "smol/{}/ble", node_id);
+        if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, btopic.as_bytes(), ble, true) {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+    }
+
+    // #22: republish each CACHED relayed-node BLE record (filled by the `SMOLv1 BLE` service arm —
+    // leaves have no MQTT) as RETAINED `smol/<id>/ble`. Skip OWN id + empty. Twin of the scan
+    // republish, F6-gated on DIAG_FRESH_MS so an off-air observer's presence record ages out.
+    if let Some(bc) = ble_cache {
+        let now_ms = Instant::now().duration_since_epoch().as_millis();
+        for i in 0..bc.count() {
+            if let Some((nid, val)) = bc.entry_fresh(i, now_ms, DIAG_FRESH_MS) {
+                if nid == node_id || val.is_empty() {
+                    continue;
+                }
+                let mut btopic = MqttScratch::new();
+                let _ = write!(btopic, "smol/{}/ble", nid);
+                if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, btopic.as_bytes(), val, true)
+                {
+                    let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                }
+            }
+        }
     }
 
     // --- Receive the retained battery + grid payloads (both SUBSCRIBEs above) ---
@@ -2750,6 +2794,10 @@ pub fn run_mqtt_burst(
     scan: &[u8],
     // #71: `Some` on a gateway flush → republish cached relayed scans; `None` otherwise.
     scan_cache: Option<&RelayCache>,
+    // #22: this node's own compact BLE-sightings record → retained `smol/<id>/ble` (empty ⇒ none).
+    ble: &[u8],
+    // #22: `Some` on a gateway flush → republish cached relayed BLE records; `None` otherwise.
+    ble_cache: Option<&RelayCache>,
     // #71: filled with the scan commands seen on `smol/+/cmd/scan` this burst (one-shot relay below).
     scan_req: &mut ScanReq,
     // #40: on a gateway flush, filled with `(leaf_id, staged announce)` when a leaf install
@@ -2948,6 +2996,8 @@ pub fn run_mqtt_burst(
         diag_cache, // #70/#49: forward the gateway's cached relayed diags (or None)
         scan, // #71: forward this node's own scan record (or empty)
         scan_cache, // #71: forward the gateway's cached relayed scans (or None)
+        ble, // #22: forward this node's own BLE-sightings record (or empty)
+        ble_cache, // #22: forward the gateway's cached relayed BLE records (or None)
         scan_req, // #71: forward the scan-command capture (one-shot relay)
         leaf_ota, // #40: forward the leaf-OTA install pairing (or &mut None)
         staged_raw, // #40: forward the persistent staged announce (or &mut None)

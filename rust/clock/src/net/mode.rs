@@ -222,6 +222,14 @@ const DIAG_PREFIX: &[u8] = b"SMOLv1 DIAG "; // + "NNN" + verbatim "up=.. bt=.. r
 /// never confuses them. Value bounded by `RELAY_VALUE_MAX`.
 const SCAN_PREFIX: &[u8] = b"SMOLv1 SCAN "; // + "NNN" + verbatim "<ssid>,<bssid3>,<ch>,<rssi>|…"
 
+/// #22 BLE-sightings UPLINK tag: `"SMOLv1 BLE "` (11 B, trailing space) then `"NNN"` (SENDER id)
+/// then the verbatim compact sightings record (`BLE|n=..|hex,rssi,ad;…`). Exact twin of `DIAG`/
+/// `SCAN` (own gateway cache `ble_cache` → retained `smol/<id>/ble`). Diverges from `BATT`/`BEACON`
+/// at byte 8 (`'L'` vs `'A'`/`'E'`), so `strip_prefix` never confuses them. Value bounded by
+/// `RELAY_VALUE_MAX`. `ble`-gated: the frame only exists in the passive-observer build.
+#[cfg(feature = "ble")]
+const BLE_PREFIX: &[u8] = b"SMOLv1 BLE "; // + "NNN" + verbatim "BLE|n=..|hex,rssi,ad;…"
+
 /// #71: max APs in one scan record (strongest-RSSI first) — bounds the record under
 /// `RELAY_VALUE_MAX` and keeps the mesh frame small.
 const SCAN_MAX_APS: usize = 5;
@@ -430,6 +438,11 @@ enum Frame<'a> {
     /// #71 observability uplink: a node's one-shot WiFi-scan record. Twin of `Diag` (own cache
     /// `scan_cache`) → retained `smol/<src>/scan`.
     Scan { src: u8, value: &'a [u8] },
+    /// #22 BLE-sightings uplink: a node's compact passive-BLE presence record. Twin of `Diag`/
+    /// `Scan` (own cache `ble_cache`) → retained `smol/<src>/ble`. `ble`-gated (the frame is only
+    /// produced/consumed by the passive-observer build).
+    #[cfg(feature = "ble")]
+    Ble { src: u8, value: &'a [u8] },
     /// #57 Mesh Familiar: a decoded FAM frame (heartbeat / handoff / call). Scalar-only
     /// (no borrow) — buffered into the [`FamInbox`] for [`RadioManager::fam_tick`] to ingest.
     Fam(FamFrame),
@@ -1677,6 +1690,16 @@ pub struct RadioManager {
     /// #57: decoded inbound FAM frames (+ RSSI) buffered by `service()` for `fam_tick`
     /// to drain into `fam`. Bounded, drop-oldest — mirror of `snk`.
     fam_inbox: FamInbox,
+    /// #22: the passive BLE observer — owns the esp-wifi `BleConnector` + the heapless
+    /// sighting table. Ticked every main loop by `ble_scan_tick`; its `live_count` feeds
+    /// the DIAG `ble=` scalar and its `record` feeds retained `smol/<id>/ble`.
+    #[cfg(feature = "ble")]
+    ble_scanner: crate::net::ble_scan::BleScanner,
+    /// #22 (GATEWAY side): per-node relayed BLE-sightings cache, filled by the `SMOLv1 BLE`
+    /// service arm from node uplinks and republished as retained `smol/<id>/ble` on each flush
+    /// (F6 freshness-gated). Twin of `diag_cache`/`scan_cache`. Unused leaf-side.
+    #[cfg(feature = "ble")]
+    ble_cache: crate::net::wifi::RelayCache,
 }
 
 /// Monotonic milliseconds since boot — the single time base for both the
@@ -1711,6 +1734,13 @@ impl RadioManager {
         // broadcasts back to us; with no self-filter the gateway rosters ITSELF (constant-RSSI,
         // age-0, flags-3 self-entry — roster anomaly #1) and wastes an eviction-immune slot.
         let self_mac = interfaces.sta.mac_address();
+
+        // #22: bring up the passive BLE observer on the SAME leaked controller (one
+        // `esp_wifi::init` per program) + the `BT` peripheral. AFTER `wifi::new`/`start`
+        // so the coex arbiter is up before the BT controller. `ctrl` is a `Copy` `'static`
+        // shared ref, so reusing it here does not disturb the WiFi controller.
+        #[cfg(feature = "ble")]
+        let ble_scanner = crate::net::ble_scan::BleScanner::new(ctrl, p.bt);
 
         Some(Self {
             controller,
@@ -1767,6 +1797,10 @@ impl RadioManager {
             // No creature exists until one is heard or first-birthed on a cold mesh.
             fam: FamState::new(id),
             fam_inbox: FamInbox::new(),
+            #[cfg(feature = "ble")]
+            ble_scanner,
+            #[cfg(feature = "ble")]
+            ble_cache: crate::net::wifi::RelayCache::new(),
         })
     }
 
@@ -1912,6 +1946,8 @@ impl RadioManager {
                     None, // #70/#49: recovery burst republishes no cached diag
                     &[], // #71: recovery burst publishes no own scan
                     None, // #71: recovery burst republishes no cached scan
+                    &[], // #22: recovery burst publishes no own BLE record
+                    None, // #22: recovery burst republishes no cached BLE record
                     &mut _scan_req, // #71: recovery burst subscribes no cmd/scan (cfg_cache=None)
                     &mut None, // #40: a leaf's recovery burst never relays a leaf OTA
                     &mut None, // #40: recovery burst carries no persistent staged
@@ -2284,6 +2320,59 @@ impl RadioManager {
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
     }
 
+    /// #22: service the passive BLE observer once (enable-on-first-call, then drain any
+    /// queued advertising reports into the sighting table). Cheap + non-blocking; `main`
+    /// calls it every subtick beside `leaf_scan_tick`. A no-op-safe wrapper so the tick
+    /// site stays feature-agnostic.
+    #[cfg(feature = "ble")]
+    pub fn ble_scan_tick(&mut self, now: u64) {
+        self.ble_scanner.tick(now);
+    }
+
+    /// #22: distinct BLE devices currently present — the `ble=` DIAG scalar.
+    #[cfg(feature = "ble")]
+    pub fn ble_live_count(&self) -> usize {
+        self.ble_scanner.live_count(now_ms())
+    }
+
+    /// #22: cumulative advertising reports heard since boot (the soak `advrpt=` liveness).
+    #[cfg(feature = "ble")]
+    pub fn ble_total_reports(&self) -> u32 {
+        self.ble_scanner.total_reports()
+    }
+
+    /// #22: HCI command-write failures since boot (0 = controller healthy; the soak `cmderr=`).
+    #[cfg(feature = "ble")]
+    pub fn ble_cmd_errs(&self) -> u32 {
+        self.ble_scanner.cmd_errs()
+    }
+
+    /// #22: this node's compact sightings record (nearest-first top-N) for retained
+    /// `smol/<id>/ble` (gateway self-publish) or the `SMOLv1 BLE` relay (leaf uplink).
+    #[cfg(feature = "ble")]
+    pub fn ble_record(&self) -> alloc::string::String {
+        self.ble_scanner.record(now_ms())
+    }
+
+    /// #22: broadcast this node's BLE-sightings record as a `SMOLv1 BLE` frame — twin of
+    /// [`broadcast_scan`]. Leaf path: the gateway caches it (`ble_cache`) + republishes
+    /// retained `smol/<id>/ble`. Value truncated to `RELAY_VALUE_MAX`.
+    ///
+    /// [`broadcast_scan`]: RadioManager::broadcast_scan
+    #[cfg(feature = "ble")]
+    pub fn broadcast_ble(&mut self, value: &[u8]) {
+        let base = BLE_PREFIX.len();
+        let mut msg = [0u8; BLE_PREFIX.len() + 3 + crate::net::wifi::RELAY_VALUE_MAX];
+        msg[..base].copy_from_slice(BLE_PREFIX);
+        let own = self.id;
+        msg[base] = b'0' + own / 100;
+        msg[base + 1] = b'0' + (own / 10) % 10;
+        msg[base + 2] = b'0' + own % 10;
+        let n = value.len().min(crate::net::wifi::RELAY_VALUE_MAX);
+        msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
+    }
+
     /// #71: run ONE on-demand WiFi AP scan (triggered by applying the `W` command) → publish the
     /// strongest APs to `smol/<id>/scan`.
     ///
@@ -2455,6 +2544,15 @@ impl RadioManager {
                 rec.push_str("|cfg=");
                 rec.push_str(cfg);
             }
+        }
+        // #22: append the passive-BLE sighting count (distinct devices in the live window) as one
+        // more fixed-key field, AFTER #74's cfg= (HA parsers are order-tolerant prefix scans). Only
+        // in the `ble` build → every other build's DIAG record is byte-identical (the #70 contract's
+        // fixed-key set is unchanged for them).
+        #[cfg(feature = "ble")]
+        {
+            use core::fmt::Write as _;
+            let _ = write!(rec, "|ble={}", self.ble_scanner.live_count(now_ms()));
         }
         rec
     }
@@ -3462,6 +3560,19 @@ impl RadioManager {
         // self-scanned) — one-shot: publish it THIS flush (retained holds it), then it's cleared.
         let own_scan = self.own_scan.take();
         let scan_bytes: &[u8] = own_scan.as_deref().map(|s| s.as_bytes()).unwrap_or(&[]);
+        // #22: the gateway's OWN sightings record (built before the `sta` borrow, mirroring
+        // `diag_rec`) + the relayed-node BLE cache. Both cfg-gated: a non-ble build passes an
+        // empty record + a None cache, so its flush is byte-identical.
+        #[cfg(feature = "ble")]
+        let own_ble = self.ble_scanner.record(now_ms());
+        #[cfg(feature = "ble")]
+        let ble_bytes: &[u8] = own_ble.as_bytes();
+        #[cfg(not(feature = "ble"))]
+        let ble_bytes: &[u8] = &[];
+        #[cfg(feature = "ble")]
+        let ble_cache_opt: Option<&crate::net::wifi::RelayCache> = Some(&self.ble_cache);
+        #[cfg(not(feature = "ble"))]
+        let ble_cache_opt: Option<&crate::net::wifi::RelayCache> = None;
         let sta = self.sta.as_mut();
         let ok = match sta {
             None => false,
@@ -3508,6 +3619,8 @@ impl RadioManager {
                     Some(&self.diag_cache), // #70/#49: republish cached relayed-node diags
                     scan_bytes, // #71: gateway publishes its own smol/<id>/scan (empty unless it self-scanned)
                     Some(&self.scan_cache), // #71: republish cached relayed-node scans
+                    ble_bytes, // #22: gateway publishes its own smol/<id>/ble (empty in non-ble builds)
+                    ble_cache_opt, // #22: republish cached relayed-node BLE records (None in non-ble builds)
                     &mut scan_req, // #71: capture on-demand scan commands (one-shot relay below)
                     leaf_ota, // #40: surface a pending leaf-OTA install for main to relay
                     &mut self.staged_raw, // #40: persist the staged across flushes (pair-safe)
@@ -4038,6 +4151,19 @@ impl RadioManager {
                     self.roster.heard(src, Some(node_id), rssi, now);
                     label = Some(alloc::string::String::from("scan"));
                 }
+                #[cfg(feature = "ble")]
+                Some(Frame::Ble { src: node_id, value }) => {
+                    // #22 BLE-sightings uplink: a leaf's compact passive-BLE presence record.
+                    // GATEWAY-only cache (twin of the DIAG/SCAN arm) → republished retained
+                    // `smol/<id>/ble`. Opaque bytes — a stray frame at worst yields a bad ble
+                    // string, self-corrected next cadence; never a brick.
+                    if self.relay.is_gateway {
+                        self.ble_cache.set(node_id, value, now);
+                    }
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, Some(node_id), rssi, now);
+                    label = Some(alloc::string::String::from("ble"));
+                }
                 None => {
                     // Unrecognised payload (other ESP-NOW traffic on-channel);
                     // surface it on the OLED but don't touch the handshake.
@@ -4410,6 +4536,13 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
         // record (to end-of-frame; empty = none). Twin of the DIAG arm.
         let src = parse_id(rest)?;
         return Some(Frame::Scan { src, value: &rest[3..] });
+    }
+    #[cfg(feature = "ble")]
+    if let Some(rest) = data.strip_prefix(BLE_PREFIX) {
+        // #22 BLE-sightings uplink: "NNN<record>" — 3-ASCII SENDER id then the verbatim compact
+        // sightings record (to end-of-frame; empty = none). Twin of the DIAG/SCAN arm.
+        let src = parse_id(rest)?;
+        return Some(Frame::Ble { src, value: &rest[3..] });
     }
     None
 }

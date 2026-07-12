@@ -485,6 +485,9 @@ fn main() -> ! {
                 timg0: peripherals.TIMG0,
                 rng: peripherals.RNG,
                 wifi: peripherals.WIFI,
+                // #22: hand the BT controller to the passive BLE scanner (ble build only).
+                #[cfg(feature = "ble")]
+                bt: peripherals.BT,
             },
             // This unit's short id (see NODE_ID) — embedded in HELLO/ACK/BEACON/TIME
             // frames + the single source of truth shared with the node's name. Runtime
@@ -700,6 +703,11 @@ fn main() -> ! {
             // #23 stage 2: a LEAF scans 1/6/11 for the elected gateway's HELLO and
             // locks onto its channel (a no-op on the gateway, which rides its AP ch).
             r.leaf_scan_tick(now);
+            // #22: service the passive BLE observer (enable-on-first-call, then drain any
+            // queued advertising reports). Non-blocking + cheap; shares the single radio with
+            // ESP-NOW/WiFi under the coex arbiter. ble build only.
+            #[cfg(feature = "ble")]
+            r.ble_scan_tick(now);
             // #23 fix (oracle #1): a LEAF whose owner has gone silent for a PROLONGED
             // period re-opens the broker election — the ONLY runtime path that takes
             // over a DEAD lowest-id owner (leaves never flush). Cheap: early-returns
@@ -950,8 +958,36 @@ fn main() -> ! {
                 if due || expedite {
                     let rec = r.diag_record();
                     r.broadcast_diag(rec.as_bytes());
+                    // #22: a LEAF (no MQTT) relays its compact BLE-sightings record on the SAME
+                    // slow cadence → the gateway caches it (`ble_cache`) + republishes retained
+                    // smol/<leaf>/ble. The gateway publishes ITS OWN sightings via the flush, so
+                    // this is leaf-only (mirror of the DIAG relay). ble build only.
+                    #[cfg(feature = "ble")]
+                    {
+                        let ble_rec = r.ble_record();
+                        r.broadcast_ble(ble_rec.as_bytes());
+                    }
                     last_diag_ms = now;
                     diag_dirty = false;
+                }
+            }
+
+            // #22 soak observability: on the DIAG cadence, emit a BLESOAK serial line for
+            // EVERY role (leaf + gateway) so the team-lead's ≥1 h mesh-stability soak can
+            // correlate scan activity (tags/advrpt) + controller health (cmderr) + heap with
+            // the DIAG loss/rtt/hmin already on the wire. Serial-only; no mesh airtime.
+            #[cfg(feature = "ble")]
+            {
+                let ble_due =
+                    (now / DIAG_CADENCE_MS) != ((now.saturating_sub(SUBTICK_MS as u64)) / DIAG_CADENCE_MS);
+                if ble_due {
+                    log::info!(
+                        "smol: BLESOAK tags={} advrpt={} cmderr={} heap_free={}",
+                        r.ble_live_count(),
+                        r.ble_total_reports(),
+                        r.ble_cmd_errs(),
+                        esp_alloc::HEAP.free(),
+                    );
                 }
             }
 
