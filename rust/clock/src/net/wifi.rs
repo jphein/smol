@@ -970,6 +970,14 @@ const CFG_CACHE_CAP: usize = 16;
 #[cfg(feature = "wifi")]
 pub const STAT_FRESH_MS: u64 = 45_000;
 
+/// #70/#49 F6 (diag twin): a cached node DIAG older than this is STALE — its `smol/<id>/diag`
+/// republish is skipped so an off-air node ages out (no ghost). Sized off the SLOW ~60 s DIAG
+/// broadcast cadence (diag is slow-moving, kept low-airtime), NOT the 10 s STAT cadence: at ~2.5×
+/// the beat a node that missed 2 diags is gone. MUST exceed the diag cadence or a live node's
+/// record would flicker stale between broadcasts (the STAT gate's 45 s would wrongly drop it).
+#[cfg(feature = "wifi")]
+pub const DIAG_FRESH_MS: u64 = 150_000;
+
 /// #21 leaf-relay: the GATEWAY's per-leaf default-screen cache. Filled from the
 /// retained wildcard `smol/+/config/default_screen` during a flush; re-broadcast as
 /// `SMOLv1 CFG` frames on the ~10 s cadence (mode.rs `broadcast_cached_configs`) so
@@ -1688,7 +1696,9 @@ fn mqtt_session(
     if let Some(dc) = diag_cache {
         let now_ms = Instant::now().duration_since_epoch().as_millis();
         for i in 0..dc.count() {
-            if let Some((nid, val)) = dc.entry_fresh(i, now_ms, STAT_FRESH_MS) {
+            // #70 F6: DIAG's own (longer) freshness window — the ~60 s diag cadence would flicker
+            // stale under STAT's 45 s gate. A node that missed ~2 diags is genuinely gone.
+            if let Some((nid, val)) = dc.entry_fresh(i, now_ms, DIAG_FRESH_MS) {
                 if nid == node_id || val.is_empty() {
                     continue;
                 }

@@ -2121,37 +2121,43 @@ impl RadioManager {
         }
     }
 
-    /// #70/#49: build this node's compact key=val DIAG record for retained `smol/<id>/diag`. ONE
-    /// record carrying the whole observability signal set — per the #70 HA contract, HA parses this
-    /// package-side (NO per-signal MQTT discovery). Space-separated `key=val` tokens (the relaydiag
-    /// idiom): `up`=uptime_s, `bt`=boot#, `rr`=reset reason, `slot`=running OTA slot (255=unknown),
-    /// `ota`=otadata state, `heap`=free bytes, `hmin`=min-free watermark, `fok`/`ffl`=flush ok/fail
-    /// (#9 proof), `vok`/`vfl`=OTA verify ok/fail (#32 proof, leaf mesh-OTA), `loss`=mesh loss %,
-    /// `btn`/`btnl`=BOOT short/long press counts. Samples heap first so `hmin <= heap` holds. Uses
-    /// the heap `String` (like the STAT/telemetry builders) — panic-free, bounded by the format.
+    /// #70/#49: build this node's compact DIAG record for retained `smol/<id>/diag`. Format matches
+    /// luna's DEPLOYED HA parser (PR #81): literal `DIAG` first field, then `key=value` pairs
+    /// PIPE-separated, order-independent, forward-compatible (HA picks by key, unknown keys ignored,
+    /// missing → safe default). ONE record carries the whole signal set — HA parses it package-side,
+    /// NO per-signal MQTT discovery (no entity doubling).
+    ///
+    /// Keys: `slot`=running OTA slot (0/1, 255=unknown), `rst`=reset reason (luna's enum + `panic`),
+    /// `boot`=boot count, `ota`=last OTA OUTCOME (confirmed/rolled-back/none — read LIVE, set by
+    /// `boot_confirm`; drives luna's rollback alert), `up`=uptime_s, `heap`=free bytes, `hmin`=min-
+    /// free watermark, `btn`/`btnl`=BOOT short/long press counts. #49 extras (folded in, ignored by
+    /// HA until it adds sensors): `fok`/`ffl`=flush ok/fail (#9 proof), `vok`/`vfl`=OTA verify ok/fail
+    /// (#32 proof), `loss`=mesh loss % (luna's #74-reserved `loss` key, same semantic). Samples heap
+    /// first so `hmin <= heap` holds. Heap `String` (like the STAT/telemetry builders) — panic-free.
     pub fn diag_record(&mut self) -> alloc::string::String {
         self.diag_sample_heap();
         let up_s = now_ms() / 1000;
         let d = crate::ota::boot_diag();
+        let ota = crate::ota::ota_outcome_token(); // live — boot_confirm sets it after capture
         let heap = esp_alloc::HEAP.free();
         let (vok, vfl) = self.ota_leaf.verify_counts();
         let loss = self.bench.loss_pct();
         alloc::format!(
-            "up={} bt={} rr={} slot={} ota={} heap={} hmin={} fok={} ffl={} vok={} vfl={} loss={} btn={} btnl={}",
-            up_s,
-            d.boot_count,
-            d.reset_reason,
+            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}",
             d.boot_slot,
-            d.ota_state,
+            d.reset_reason,
+            d.boot_count,
+            ota,
+            up_s,
             heap,
             self.diag.heap_min,
+            self.diag.btn,
+            self.diag.btnl,
             self.diag.flush_ok,
             self.diag.flush_fail,
             vok,
             vfl,
             loss,
-            self.diag.btn,
-            self.diag.btnl,
         )
     }
 

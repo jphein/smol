@@ -756,6 +756,7 @@ pub fn boot_confirm(self_test_passed: bool) {
     if self_test_passed {
         let _ = ota.set_current_ota_state(OtaImageState::Valid);
         clear_ota_activated(); // fate decided — don't re-self-test on a later crash-reset
+        mark_ota_outcome(false); // #70: DIAG ota=confirmed
         log::info!("smol OTA: self-test PASS — image CONFIRMED (Valid)");
     } else {
         // #40 BRICK-SAFETY (was a hard brick): roll back ONLY if the target slot holds a
@@ -773,10 +774,15 @@ pub fn boot_confirm(self_test_passed: bool) {
                 let _ = ota.set_current_slot(t);
             }
             let _ = ota.set_current_ota_state(OtaImageState::Valid);
+            mark_ota_outcome(true); // #70: DIAG ota=rolled-back — set BEFORE reset; the good-slot
+                                    // boot reports it (drives luna's rollback alert automation).
             log::warn!("smol OTA: self-test FAIL — ROLLING BACK to the previous (valid) slot");
             esp_hal::system::software_reset();
         } else {
             let _ = ota.set_current_ota_state(OtaImageState::Valid);
+            // #70: brick-safe accept (no valid rollback target) — the image IS running, so from
+            // HA's outcome view it's `confirmed` (no rollback occurred), not a silent failure.
+            mark_ota_outcome(false);
             log::warn!(
                 "smol OTA: self-test FAIL, but the rollback target has NO valid image — ACCEPTING the current image (brick-safe: no flip, no reset)"
             );
@@ -1456,12 +1462,14 @@ pub fn reset_reason_token() -> &'static str {
     if take_panic_mark() {
         return "panic";
     }
+    // Value strings match luna's DEPLOYED #70 HA parser (PR #81) exactly — the parser passes
+    // rst= through for display, so an out-of-enum value like "panic" still shows correctly.
     use esp_hal::rtc_cntl::SocResetReason as R;
     match esp_hal::system::reset_reason() {
-        Some(R::ChipPowerOn) => "por",
+        Some(R::ChipPowerOn) => "power-on",
         Some(R::CoreSw) | Some(R::Cpu0Sw) => "sw",
-        Some(R::CoreDeepSleep) => "dslp",
-        Some(R::SysBrownOut) => "bo",
+        Some(R::CoreDeepSleep) => "deep-sleep",
+        Some(R::SysBrownOut) => "brownout",
         Some(
             R::CoreMwdt0
             | R::CoreMwdt1
@@ -1472,7 +1480,8 @@ pub fn reset_reason_token() -> &'static str {
             | R::SysRtcWdt
             | R::SysSuperWdt,
         ) => "wdt",
-        Some(R::CoreUsbUart | R::CoreUsbJtag) => "usb",
+        Some(R::CoreUsbUart | R::CoreUsbJtag) => "usb-jtag",
+        Some(R::SysClkGlitch | R::CorePwrGlitch) => "glitch",
         Some(_) => "other",
         None => "unk",
     }
@@ -1501,42 +1510,58 @@ pub fn boot_slot() -> u8 {
     }
 }
 
-/// The otadata image-state as a short token. After a confirmed boot this is `valid`;
-/// `new`/`pend` means the first-boot self-test has not committed yet.
+/// #70 LAST OTA OUTCOME — the DIAG record's `ota=` field, matching luna's deployed parser
+/// (`confirmed` | `rolled-back` | `none`), which drives her rollback ALERT automation. This is
+/// an OUTCOME, not the raw otadata state: `boot_confirm` decides it (PASS → confirmed, self-test
+/// FAIL → rolled-back) AFTER `capture_boot_diag` runs, so it is read LIVE each diag cadence (not
+/// cached in `DiagBoot`). RTC-fast persistent (survives the rollback's `software_reset` so the
+/// good-slot boot reports `rolled-back`; a power cycle clears it → `none`, correct). Magic-gated
+/// so uninitialised RTC RAM reads as `none`, never a false outcome.
+#[cfg(feature = "wifi")]
+#[esp_hal::ram(rtc_fast, persistent)]
+static mut OTA_OUTCOME: [u32; 2] = [0u32; 2]; // [magic, 1=confirmed / 2=rolled-back]
+
+#[cfg(feature = "wifi")]
+const OTA_OUTCOME_MAGIC: u32 = 0x736D_6C4F; // "smlO"
+
+/// Record the last OTA outcome (call from `boot_confirm`): `rolled_back` true ⇒ `rolled-back`,
+/// else `confirmed`. Set before the rollback's `software_reset` so the next boot reports it.
+#[cfg(feature = "wifi")]
+pub fn mark_ota_outcome(rolled_back: bool) {
+    unsafe {
+        let m = &mut *core::ptr::addr_of_mut!(OTA_OUTCOME);
+        m[0] = OTA_OUTCOME_MAGIC;
+        m[1] = if rolled_back { 2 } else { 1 };
+    }
+}
+
+/// The last OTA outcome token for the DIAG `ota=` field. `none` until an OTA confirm/rollback
+/// happened this power-cycle (magic-gated: uninitialised RTC RAM ⇒ `none`).
 #[cfg(feature = "espnow")]
-pub fn ota_state_token() -> &'static str {
-    let mut flash = FlashStorage::new();
-    let mut buf = [0u8; PT_SCRATCH];
-    let Ok(pt) = read_partition_table(&mut flash, &mut buf) else {
-        return "err";
-    };
-    let Ok(Some(od)) = pt.find_partition(PartitionType::Data(DataPartitionSubType::Ota)) else {
-        return "n/a";
-    };
-    let mut region = od.as_embedded_storage(&mut flash);
-    let Ok(mut ota) = Ota::new(&mut region) else {
-        return "err";
-    };
-    match ota.current_ota_state() {
-        Ok(OtaImageState::Valid) => "valid",
-        Ok(OtaImageState::New) => "new",
-        Ok(OtaImageState::PendingVerify) => "pend",
-        Ok(OtaImageState::Invalid) => "inval",
-        Ok(OtaImageState::Aborted) => "abort",
-        Ok(OtaImageState::Undefined) => "undef",
-        Err(_) => "err",
+pub fn ota_outcome_token() -> &'static str {
+    unsafe {
+        let m = core::ptr::addr_of!(OTA_OUTCOME).read();
+        if m[0] != OTA_OUTCOME_MAGIC {
+            return "none";
+        }
+        match m[1] {
+            1 => "confirmed",
+            2 => "rolled-back",
+            _ => "none",
+        }
     }
 }
 
 /// The once-per-boot diagnostics, captured into a cache by `capture_boot_diag` and read every
-/// diag cadence by `boot_diag()`. `Copy` so it lives inline in the cache.
+/// diag cadence by `boot_diag()`. `Copy` so it lives inline in the cache. (The OTA outcome is
+/// NOT here — it's decided by `boot_confirm` after capture, so it's read live via
+/// `ota_outcome_token`.)
 #[cfg(feature = "espnow")]
 #[derive(Clone, Copy)]
 pub struct DiagBoot {
     pub boot_count: u32,
     pub reset_reason: &'static str,
     pub boot_slot: u8,
-    pub ota_state: &'static str,
 }
 
 #[cfg(feature = "espnow")]
@@ -1553,7 +1578,6 @@ pub fn capture_boot_diag() {
         boot_count: boot_count_bump(),
         reset_reason: reset_reason_token(),
         boot_slot: boot_slot(),
-        ota_state: ota_state_token(),
     };
     unsafe {
         *core::ptr::addr_of_mut!(BOOT_DIAG) = Some(d);
@@ -1569,7 +1593,6 @@ pub fn boot_diag() -> DiagBoot {
             boot_count: 0,
             reset_reason: "unk",
             boot_slot: 255,
-            ota_state: "n/a",
         })
     }
 }
