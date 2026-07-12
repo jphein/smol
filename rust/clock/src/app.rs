@@ -225,6 +225,10 @@ impl AppKind {
 
     /// #50: inverse of [`from_wire`] — the wire token for a live screen, for the
     /// `STAT|<screen>:<page>` status readback publish. Total (every variant maps).
+    // The only caller is the #50 STAT readback in `main` (`live_kind.as_wire()`),
+    // which is espnow-only — so gate to espnow to stay never-used-clean in a
+    // wifi-only build (the enclosing impl is cfg(wifi); espnow ⊃ wifi).
+    #[cfg(feature = "espnow")]
     pub fn as_wire(&self) -> &'static str {
         match self {
             AppKind::Menu => "Menu",
@@ -391,6 +395,9 @@ impl App {
     /// button handler mutates this live state), unlike the commanded `DefaultScreen`
     /// config (reading the config misses manual nav — the stopgap JP rejected).
     /// Page-capable screens (Batt/Grid) report their real page; others report 0.
+    // The only caller is the #50 STAT readback in `main`, which is espnow-only —
+    // gate to espnow so it is not never-used in the default/wifi builds.
+    #[cfg(feature = "espnow")]
     pub fn live_screen(&self) -> (AppKind, u8) {
         match self {
             App::Menu(_) => (AppKind::Menu, 0),

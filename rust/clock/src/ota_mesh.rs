@@ -277,7 +277,7 @@ fn write_id3(id: u8, out: &mut [u8]) {
 
 /// `ceil(size / CHUNK_PAYLOAD)` — total chunks for an image of `size` bytes. Saturating.
 pub fn total_chunks(size: u32) -> u32 {
-    (size / CHUNK_PAYLOAD as u32).saturating_add((size % CHUNK_PAYLOAD as u32 != 0) as u32)
+    (size / CHUNK_PAYLOAD as u32).saturating_add((!size.is_multiple_of(CHUNK_PAYLOAD as u32)) as u32)
 }
 
 /// "All chunks present" bitmap mask for a window of `len` chunks (`len` ≤ 64). Shared by
@@ -488,6 +488,10 @@ impl OtaLeafSession {
     /// a flash op — the DoS/wear bound, attack row E). Then, and only then, parse M and
     /// apply the freshness gate (`build > running ∧ build > fresh_floor ∧ size ok`).
     /// `src` is the OTAM sender's MAC (the gateway); `my_id` is this leaf's id.
+    // Load-bearing signature: each param is a distinct signed-wire / RX-context value
+    // on the OTA receive path; bundling into a struct would just relocate the fields
+    // without simplifying the call site. Lint-only allow — no restructuring the hot path.
+    #[allow(clippy::too_many_arguments)]
     pub fn on_meta(
         &mut self,
         target: u8,
@@ -571,6 +575,10 @@ impl OtaLeafSession {
     /// and — on a completed window — flushes it to the (partition-scoped) inactive slot
     /// and advances (acking with an all-zero NAK). On the final window it finalizes
     /// (readback verify) and returns `Complete`. `out` receives an OTAN when one is due.
+    // Load-bearing signature: each param is a distinct signed-wire / RX-context value
+    // on the OTA receive path; bundling into a struct would just relocate the fields
+    // without simplifying the call site. Lint-only allow — no restructuring the hot path.
+    #[allow(clippy::too_many_arguments)]
     pub fn on_data(
         &mut self,
         target: u8,
