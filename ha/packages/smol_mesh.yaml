@@ -1079,28 +1079,71 @@ mqtt:
         {% for kv in value.split('|') %}{% if kv.startswith('cfg=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
         {{ ns.v }}
 
-  event:
-    - name: "smol 7 button"
-      unique_id: smol_7_button_evt
-      state_topic: "smol/7/button"
-      event_types: [press, long]
+    # --- #70 button press COUNTERS — folded into the DIAG record (vesper fw contract, 2026-07-12) ---
+    # btn=<presses> btnl=<long-presses>, monotonic. A retained record can't carry a momentary event
+    # without replaying on HA restart / gateway republish, so a COUNTER (an INCREMENT = a press) is the
+    # mesh-safe form for WiFi-less leaves; total_increasing tolerates the per-boot reset. Trigger on the
+    # counter's increase for "button pressed" automations.
+    - name: "smol 7 button count"
+      unique_id: smol_7_btn_count_mirror
+      state_topic: "smol/7/diag"
       entity_category: diagnostic
+      state_class: total_increasing
       icon: "mdi:gesture-tap-button"
-      value_template: "{{ {'event_type': value} | tojson }}"
-    - name: "smol 8 button"
-      unique_id: smol_8_button_evt
-      state_topic: "smol/8/button"
-      event_types: [press, long]
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('btn=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 7 long press count"
+      unique_id: smol_7_btnl_count_mirror
+      state_topic: "smol/7/diag"
       entity_category: diagnostic
-      icon: "mdi:gesture-tap-button"
-      value_template: "{{ {'event_type': value} | tojson }}"
-    - name: "smol 9 button"
-      unique_id: smol_9_button_evt
-      state_topic: "smol/9/button"
-      event_types: [press, long]
+      state_class: total_increasing
+      icon: "mdi:gesture-tap-hold"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('btnl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 8 button count"
+      unique_id: smol_8_btn_count_mirror
+      state_topic: "smol/8/diag"
       entity_category: diagnostic
+      state_class: total_increasing
       icon: "mdi:gesture-tap-button"
-      value_template: "{{ {'event_type': value} | tojson }}"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('btn=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 8 long press count"
+      unique_id: smol_8_btnl_count_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:gesture-tap-hold"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('btnl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 9 button count"
+      unique_id: smol_9_btn_count_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:gesture-tap-button"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('btn=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
+    - name: "smol 9 long press count"
+      unique_id: smol_9_btnl_count_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:gesture-tap-hold"
+      value_template: >-
+        {% set ns = namespace(v='0') %}
+        {% for kv in value.split('|') %}{% if kv.startswith('btnl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) }}
 
 # =====================================================================
 # MESH TOPOLOGY derived sensors (issue #27) — HELD; back the topology card.
