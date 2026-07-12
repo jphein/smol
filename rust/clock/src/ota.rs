@@ -1488,6 +1488,120 @@ pub fn reset_reason_token() -> &'static str {
     }
 }
 
+// =========================================================================
+// #100 network-switcher: persisted network selection (nvs SECTOR 5, offset 0x5000).
+// =========================================================================
+//
+// The runtime WiFi-slot selection lives in its OWN nvs sector, SEGREGATED from identity
+// (sector 0), the freshness-floor (sectors 1-2 @ 4096/8192) and the boot-count (sectors 3-4 @
+// 12288/16384) — verified the ONLY free sector in the 0x6000 (6-sector) nvs partition. A write
+// erases the whole sector, so own-sector segregation is the #40/#70 brick-class discipline: this
+// record can NEVER wipe identity/floor/boot-count, and they can never wipe it. Corrupt / erased /
+// out-of-range → `None` → the caller defaults to slot 0 (the boot-default network — SAFE: a
+// garbage record never strands the node on a phantom slot). Brick-safe: never panics, best-effort.
+#[cfg(feature = "wifi")]
+const NET_MAGIC: [u8; 4] = *b"SMn1";
+#[cfg(feature = "wifi")]
+const NET_VERSION: u8 = 1;
+/// nvs sector 5 = 0x5000 = 20480 (the one free sector; see the segregation note above).
+#[cfg(feature = "wifi")]
+const NET_REC_OFF: u32 = 5 * 4096;
+#[cfg(feature = "wifi")]
+const NET_REC_LEN: usize = 16;
+
+/// The persisted network selection. `active` = the slot we associate on NOW; `commanded` = the
+/// last slot HA asked for via CFG-`N` — it differs from `active` iff we auto-reverted; `fallback`
+/// = we're running on a reverted slot, not the commanded one (surfaced as `net=<slot>:fb` in DIAG).
+#[cfg(feature = "wifi")]
+#[derive(Clone, Copy)]
+// #100 Stage 1b WIP: the record + its read/write are wired by the assoc-fallback + CFG-N apply in
+// the NEXT commit; this `allow(dead_code)` comes OFF then (the whole net-record becomes live).
+#[allow(dead_code)]
+pub struct NetCfg {
+    pub active: u8,
+    pub commanded: u8,
+    pub fallback: bool,
+}
+
+/// Decode a stored net record. `Some` iff magic + version + both redundancy guards pass AND every
+/// slot index is in range (0/1 — `WIFI_NETWORKS.len() == 2`). Erased flash (0xFF) / corruption /
+/// an out-of-range slot all fail → `None` → caller uses slot 0.
+#[cfg(feature = "wifi")]
+#[allow(dead_code)] // #100 Stage 1b WIP — wired next commit (see NetCfg note).
+fn parse_net_cfg(rec: &[u8]) -> Option<NetCfg> {
+    if rec.len() < 10 || rec[0..4] != NET_MAGIC || rec[4] != NET_VERSION {
+        return None;
+    }
+    let (active, commanded, fb) = (rec[5], rec[6], rec[7]);
+    // complement + checksum guards (mirror the identity record).
+    if rec[8] != active ^ 0xFF || rec[9] != (active ^ commanded ^ fb).wrapping_add(0x5A) {
+        return None;
+    }
+    // Slot indices MUST be valid (< 2) and fallback a clean bool — else treat as corrupt.
+    if active > 1 || commanded > 1 || fb > 1 {
+        return None;
+    }
+    Some(NetCfg { active, commanded, fallback: fb != 0 })
+}
+
+/// Encode the 16-byte net record.
+#[cfg(feature = "wifi")]
+#[allow(dead_code)] // #100 Stage 1b WIP — wired next commit (see NetCfg note).
+fn encode_net_cfg(c: NetCfg) -> [u8; NET_REC_LEN] {
+    let mut r = [0u8; NET_REC_LEN];
+    r[0..4].copy_from_slice(&NET_MAGIC);
+    r[4] = NET_VERSION;
+    r[5] = c.active;
+    r[6] = c.commanded;
+    r[7] = c.fallback as u8;
+    r[8] = c.active ^ 0xFF;
+    r[9] = (c.active ^ c.commanded ^ c.fallback as u8).wrapping_add(0x5A);
+    r
+}
+
+/// Read the persisted net selection. `None` on any flash/partition error, erased, or corrupt →
+/// the caller defaults to slot 0 (boot-default network — SAFE). Brick-safe (never panics).
+#[cfg(feature = "wifi")]
+#[allow(dead_code)] // #100 Stage 1b WIP — called by the boot slot-select + fallback next commit.
+pub fn read_net_cfg() -> Option<NetCfg> {
+    use embedded_storage::nor_flash::ReadNorFlash;
+    let mut flash = FlashStorage::new();
+    let mut buf = [0u8; PT_SCRATCH];
+    let pt = read_partition_table(&mut flash, &mut buf).ok()?;
+    let nvs = pt
+        .find_partition(PartitionType::Data(DataPartitionSubType::Nvs))
+        .ok()??;
+    let mut region = nvs.as_embedded_storage(&mut flash);
+    let mut rec = [0u8; NET_REC_LEN];
+    region.read(NET_REC_OFF, &mut rec).ok()?;
+    parse_net_cfg(&rec)
+}
+
+/// Persist the net selection (erase + write nvs sector 5). Best-effort — any error is swallowed
+/// (the in-RAM selection still governs THIS boot; the next boot retries). Sector 5 is the net
+/// record's OWN sector (segregated), so the erase+write can never touch identity/floor/boot-count.
+/// Called ONLY on a genuine change (CFG-`N` apply, or the ONE-per-boot fallback revert) — never in
+/// a retry loop, so no flash wear / NVS ping-pong even during a total-outage stay-put.
+#[cfg(feature = "wifi")]
+#[allow(dead_code)] // #100 Stage 1b WIP — called by the one-per-boot fallback revert next commit.
+pub fn write_net_cfg(c: NetCfg) {
+    use embedded_storage::nor_flash::NorFlash;
+    let mut flash = FlashStorage::new();
+    let mut buf = [0u8; PT_SCRATCH];
+    let Ok(pt) = read_partition_table(&mut flash, &mut buf) else {
+        return;
+    };
+    let Ok(Some(nvs)) = pt.find_partition(PartitionType::Data(DataPartitionSubType::Nvs)) else {
+        return;
+    };
+    let mut region = nvs.as_embedded_storage(&mut flash);
+    let sector = <FlashStorage as NorFlash>::ERASE_SIZE as u32; // 4096
+    if region.erase(NET_REC_OFF, NET_REC_OFF + sector).is_err() {
+        return;
+    }
+    let _ = region.write(NET_REC_OFF, &encode_net_cfg(c));
+}
+
 /// The running app slot as 0 (`ota_0`) / 1 (`ota_1`); 255 on a non-OTA board or any read
 /// error. A silent rollback flips this vs the pushed slot — the headline #70 signal.
 #[cfg(feature = "espnow")]
