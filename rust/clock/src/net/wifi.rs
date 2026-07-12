@@ -260,6 +260,32 @@ fn parse_leaf_config_topic(topic: &[u8]) -> Option<u8> {
     (val <= 255).then_some(val as u8)
 }
 
+/// #40: parse a leaf id out of the wildcard-delivered `smol/<id>/ota/install` topic
+/// (the shape `smol/+/ota/install` delivers). Twin of [`parse_leaf_config_topic`] —
+/// same defensive parse (broker-supplied topic; 1–3 ASCII digits clamped to u8).
+/// `cfg(wifi)`: it is called from the shared `mqtt_session` (a gateway is `espnow`, but
+/// the function must still compile in the `wifi`-only build, where it is simply never hit).
+#[cfg(feature = "wifi")]
+fn parse_leaf_install_topic(topic: &[u8]) -> Option<u8> {
+    let rest = topic.strip_prefix(b"smol/")?;
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let (idb, tail) = rest.split_at(slash);
+    if tail != b"/ota/install" {
+        return None;
+    }
+    if idb.is_empty() || idb.len() > 3 {
+        return None;
+    }
+    let mut val: u16 = 0;
+    for &b in idb {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val * 10 + (b - b'0') as u16;
+    }
+    (val <= 255).then_some(val as u8)
+}
+
 /// Budget for one full MQTT session (TCP connect → CONNECT/CONNACK → publishes →
 /// SUBSCRIBE → retained downlink → DISCONNECT). Sub-bound of the enclosing burst
 /// so MQTT can't eat the whole flush/NTP window; a miss just leaves the cache be.
@@ -346,7 +372,7 @@ pub fn try_time_sync(
     // wifi-only build has no relay/gateway role, so the reached-DHCP flag is unused.
     let mut reached_dhcp = false;
     // wifi-only build has no mesh election; pass a throwaway result.
-    let mut elect = MeshElect::new(crate::NODE_ID);
+    let mut elect = MeshElect::new(crate::node_id());
     // wifi-only build has no main-loop OTA/config consume; capture (unused) offers.
     let mut _ota_offer: Option<crate::ota::Announce> = None;
     let mut _config_offer: Option<crate::app::DefaultScreen> = None;
@@ -357,7 +383,7 @@ pub fn try_time_sync(
         rng,
         &mut || false,
         &mut reached_dhcp,
-        crate::NODE_ID,
+        crate::node_id(),
         batt,
         grid,
         &mut elect,
@@ -538,6 +564,7 @@ pub fn run_ntp_burst(
     // costs nothing the mesh cares about; a miss still leaves the cache untouched.
     let mqtt_deadline = Instant::now() + MQTT_SESSION_BUDGET;
     let mqtt_port = 49152 + (rng.random() % 16384) as u16;
+    let mut _leaf_seen_boot = false; // #40 #1: boot burst is not a gateway relay → never set
     let _ = mqtt_session(
         &mut iface,
         device,
@@ -552,10 +579,15 @@ pub fn run_ntp_burst(
         ota_offer,
         config_offer,
         install_requested,
+        &mut _leaf_seen_boot, // #40 #1: boot burst sees no leaf installs
         &[], // #27: boot NTP+downlink burst publishes no peers (no roster yet)
         &[], // #50: boot burst publishes no live-screen status
         None, // #21: boot burst is not a gateway relay (no leaf-config cache)
         None, // #50b: boot burst republishes no cached leaf status
+        &mut None, // #40: boot burst never relays a leaf OTA
+        &mut None, // #40: boot burst has no persistent staged to carry
+        &mut None, // #40: boot burst has no relay diag to publish
+        &mut None, // #3: boot burst has no relay RX-diag to publish
         mqtt_deadline,
         tick,
     );
@@ -744,8 +776,50 @@ static mut MQTT_ACC: [u8; 512] = [0; 512];
 #[cfg(feature = "wifi")]
 pub const CFG_VALUE_MAX: usize = 16;
 
+/// #40 #3: one relay attempt's diagnostic snapshot — gateway-side RX evidence PLUS the leaf's
+/// self-reported OTA state (captured from its `LDBG` beacon during the relay). Published to
+/// retained `smol/<leaf>/ota/relaydiag`. Defined at the `wifi` level (not `ota_mesh`/`mode`,
+/// both espnow-only) so this `run_mqtt_burst` publish path names it in the wifi-only profile too.
+/// `leaf_verdict == 255` ⇒ no `LDBG` captured (old leaf fw / leaf off-air during the relay).
+/// Together they name a `rx>0 otan=0` relay-failed: leaf_heard=0 → OTAM TX not landing on the
+/// leaf; verdict 2-6 → `on_meta` rejected (which gate); verdict=1 & leaf_sent=0 → armed but never
+/// NAK'd (servicing); leaf_sent>0 & otan_valid=0 → leaf NAK'd but the gateway never heard it.
+#[cfg(feature = "wifi")]
+#[derive(Clone, Copy)]
+pub struct RelayDiag {
+    pub leaf_id: u8,
+    pub rx_any: u16,
+    pub otan_valid: u16,
+    pub last_wb: u16,
+    pub total: u16,
+    pub leaf_heard: u16,
+    pub leaf_verdict: u8,
+    pub leaf_sent: u16,
+    /// #3b TX-diag: OTAM broadcast sends ATTEMPTED / that returned Ok (queued + TX-callback ok).
+    /// `otam_ok=0` while `otam_tx>0` ⇒ the send itself fails (peer-table / post-fetch ESP-NOW TX
+    /// state) → the announce never egresses (explains leaf H0 with the gateway on-channel).
+    /// `otam_ok>0` while leaf stays H0 ⇒ frame egresses but the leaf's RX drops it (deeper).
+    pub otam_tx: u16,
+    pub otam_ok: u16,
+    /// #3b CHANNEL-diag: iterations spent waiting for the WiFi STA to release the PHY after the
+    /// fetch, before pinning ch6. `settle>0` ⇒ the STA WAS still holding the AP channel post-fetch
+    /// (confirms the OTAM was egressing off-channel → the leaf H0 cause); `settle=0` ⇒ STA already
+    /// down, so a persistent H0 is NOT the channel (→ leaf RX-filter, instrument the leaf next).
+    pub settle: u16,
+    /// #3b LEAF-CHANNEL: the leaf's `current_channel()` from its captured LDBG (0=scanning/unlocked,
+    /// else the locked channel). Splits the settle=0 H0 fork: leaf_ch=6 ⇒ leaf on ch6 yet no OTAM
+    /// (RX issue); leaf_ch≠6 ⇒ leaf drifted off ch6 during the gateway's mesh-deaf fetch window.
+    pub leaf_ch: u8,
+}
+
 #[cfg(feature = "wifi")]
 const CFG_CACHE_CAP: usize = 16;
+
+/// #68 F6: a cached leaf STAT older than this (ms since last heard) is treated as STALE — its
+/// `smol/<id>/status` republish is skipped (no ghost) and its MAC no longer resolves a relay arm.
+/// ~4.5× the 10 s STAT cadence: a leaf that missed several STATs is genuinely gone, not just laggy.
+#[cfg(feature = "wifi")]
+pub const STAT_FRESH_MS: u64 = 45_000;
 
 /// #21 leaf-relay: the GATEWAY's per-leaf default-screen cache. Filled from the
 /// retained wildcard `smol/+/config/default_screen` during a flush; re-broadcast as
@@ -757,6 +831,16 @@ pub struct CfgCache {
     ids: [u8; CFG_CACHE_CAP],
     vals: [[u8; CFG_VALUE_MAX]; CFG_CACHE_CAP],
     lens: [u8; CFG_CACHE_CAP],
+    /// #68 F6: last-heard timestamp (now_ms) per entry. Gates the stat republish on freshness
+    /// (a leaf that goes off-air STOPS refreshing its retained smol/<id>/status → HA sees it go
+    /// stale instead of a perpetually-fresh GHOST — the ghost that masked id9's floor-wipe + faked
+    /// id8-alive all demo). Also bounds the `mac_for` fallback to recently-heard leaves.
+    last_ms: [u64; CFG_CACHE_CAP],
+    /// #68: the src MAC the entry was last heard from. Lets the relay arm resolve a STAT-heard
+    /// leaf's MAC even after the volatile 16-slot LRU roster evicts it (roster-admission robustness
+    /// — "any STAT-heard leaf stays mac_for_id-resolvable"). Only meaningful for stat_cache (uplink);
+    /// cfg_cache (downlink configs) passes a zero MAC + is never mac-queried.
+    macs: [[u8; 6]; CFG_CACHE_CAP],
     count: usize,
 }
 
@@ -771,6 +855,8 @@ impl CfgCache {
             ids: [0; CFG_CACHE_CAP],
             vals: [[0; CFG_VALUE_MAX]; CFG_CACHE_CAP],
             lens: [0; CFG_CACHE_CAP],
+            last_ms: [0; CFG_CACHE_CAP],
+            macs: [[0; 6]; CFG_CACHE_CAP],
             count: 0,
         }
     }
@@ -778,12 +864,14 @@ impl CfgCache {
     /// Upsert a leaf's config value (truncated to `CFG_VALUE_MAX`). A full cache drops
     /// the entry and logs it (no silent cap). Value bytes are opaque here — the gateway
     /// RELAYS them verbatim; the leaf's `parse_default_screen` is the strict validator.
-    pub fn set(&mut self, id: u8, value: &[u8]) {
+    pub fn set(&mut self, id: u8, value: &[u8], mac: [u8; 6], now: u64) {
         let n = value.len().min(CFG_VALUE_MAX);
         for i in 0..self.count {
             if self.ids[i] == id {
                 self.vals[i][..n].copy_from_slice(&value[..n]);
                 self.lens[i] = n as u8;
+                self.last_ms[i] = now; // #68 F6: freshen
+                self.macs[i] = mac;
                 return;
             }
         }
@@ -792,6 +880,8 @@ impl CfgCache {
             self.ids[i] = id;
             self.vals[i][..n].copy_from_slice(&value[..n]);
             self.lens[i] = n as u8;
+            self.last_ms[i] = now;
+            self.macs[i] = mac;
             self.count += 1;
         } else {
             log::warn!("smol #21: cfg cache full ({}) — dropping config for id{}", CFG_CACHE_CAP, id);
@@ -813,6 +903,32 @@ impl CfgCache {
         } else {
             None
         }
+    }
+
+    /// #68 F6: the `i`-th entry, but ONLY if it was heard within `ttl` ms of `now`. The stat
+    /// republish uses this so a leaf that stopped transmitting stops refreshing its retained
+    /// status → HA sees it go stale instead of a perpetually-fresh ghost.
+    #[allow(dead_code)]
+    pub fn entry_fresh(&self, i: usize, now: u64, ttl: u64) -> Option<(u8, &[u8])> {
+        if i < self.count && now.saturating_sub(self.last_ms[i]) <= ttl {
+            let n = self.lens[i] as usize;
+            Some((self.ids[i], &self.vals[i][..n]))
+        } else {
+            None
+        }
+    }
+
+    /// #68: the MAC last heard for `id`, IFF the entry is fresh (within `ttl`). Lets the relay
+    /// arm resolve a recently-STAT-heard leaf's MAC even after the LRU roster evicts it — so a
+    /// STAT-audible-but-roster-dropped leaf is still armable (vs the silent mac-unknown no-arm).
+    #[allow(dead_code)]
+    pub fn mac_for(&self, id: u8, now: u64, ttl: u64) -> Option<[u8; 6]> {
+        for i in 0..self.count {
+            if self.ids[i] == id && now.saturating_sub(self.last_ms[i]) <= ttl {
+                return Some(self.macs[i]);
+            }
+        }
+        None
     }
 }
 
@@ -901,6 +1017,11 @@ fn mqtt_session(
     // #33 HA Update entity: set true iff a retained `install` command is present for this
     // board (the native Install button) — the caller AND-gates the fetch on it.
     install_requested: &mut bool,
+    // #40 #1: set true iff a retained `smol/<leaf>/ota/install` for ANOTHER node is SEEN this
+    // burst (install-seen, independent of whether it armed — arming needs the cached staged
+    // image). The gateway flush latches `leaf_ota_pending` on this so its OWN self-OTA is
+    // suppressed the moment a leaf install exists, closing the self-OTA-first race.
+    leaf_install_seen: &mut bool,
     // #27: this node's serialized roster (`PEERS|…`); published retained to
     // `smol/<node_id>/peers` after the telemetry loop iff non-empty.
     peers: &[u8],
@@ -917,6 +1038,25 @@ fn mqtt_session(
     // `None` on boot/leaf/election bursts (no republish duty). Read-only (the cache is
     // filled by the ESP-NOW `SMOLv1 STAT` service arm, not here).
     stat_cache: Option<&CfgCache>,
+    // #40 leaf-mesh-OTA: on a GATEWAY flush, filled with `(leaf_id, raw staged announce)`
+    // when a retained `smol/<leaf>/ota/install = INSTALL` is present for a leaf id ≠ self
+    // AND a staged image is available — the caller then relays it over ESP-NOW. The retained
+    // cmd is CLEARED here (consumed) so an HA reload can't replay it. `&mut None` off-gateway.
+    leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
+    // #40: PERSISTENT (caller-owned, survives across flushes) last raw staged announce. The
+    // staged arm updates it when drained; the leaf-install pairing reads it — so a pair works
+    // even if the staged retained wasn't re-drained in the SAME flush that consumed the
+    // install (the race that left the install consumed but the relay never armed). `&mut None`
+    // on boot/leaf bursts (no persistence needed).
+    staged_raw: &mut Option<crate::ota::Announce>,
+    // #40 headless diag + clear/retry: the last relay attempt's `(leaf_id, phase, clear)`.
+    // PUBLISHED to `smol/<leaf>/ota/diag` here, and drives the retained-install clear (on a
+    // terminal/exhausted phase) vs retry (transient). Consumed (set None) after publish.
+    // `&mut None` off-gateway.
+    leaf_diag: &mut Option<(u8, &'static str, bool)>,
+    // #3 RELAY RX-DIAG: the last relay's `(leaf_id, rx_any, otan_valid, last_wb, total)`.
+    // PUBLISHED to retained `smol/<leaf>/ota/relaydiag` here, consumed after. `&mut None` off-gw.
+    leaf_relay_rx: &mut Option<RelayDiag>,
     deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
@@ -1054,6 +1194,14 @@ fn mqtt_session(
         {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
+        // #40 leaf-mesh-OTA (§B3): a GATEWAY also wildcard-subscribes the leaf OTA install
+        // command (pid 9), twin of the config wildcard above → it acts on a leaf's native
+        // HA Update Install button (`smol/<leaf>/ota/install = INSTALL`) by relaying the
+        // staged image over ESP-NOW. The board's OWN install still arrives via `cmd_topic`
+        // (pid 7) → self-OTA; the wildcard feeds ONLY other leaf ids.
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 9, b"smol/+/ota/install") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
     }
 
     // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
@@ -1187,8 +1335,12 @@ fn mqtt_session(
     // published just above via #50a) and empty values. Prepend `STAT|` so EVERY status
     // topic is uniform (`STAT|<screen>:<page>`), self + leaves, for the one HA template.
     if let Some(sc) = stat_cache {
+        // #68 F6: freshness-gate the status republish. An off-air leaf's entry goes stale →
+        // its retained smol/<id>/status STOPS refreshing → HA sees it age out instead of a
+        // perpetually-fresh ghost (the ghost that faked id8-alive + masked id9's floor-wipe).
+        let now_ms = Instant::now().duration_since_epoch().as_millis();
         for i in 0..sc.count() {
-            if let Some((lid, val)) = sc.entry(i) {
+            if let Some((lid, val)) = sc.entry_fresh(i, now_ms, STAT_FRESH_MS) {
                 if lid == node_id || val.is_empty() {
                     continue;
                 }
@@ -1226,8 +1378,24 @@ fn mqtt_session(
     // where an absent retained MC made the loop wait to `deadline` and drain them
     // incidentally. Bounded → an ABSENT announce/config costs only the settle window,
     // never the full session budget.
-    const DOWNLINK_SETTLE: Duration = Duration::from_millis(300);
-    let mut settle_deadline: Option<Instant> = None;
+    // #40 QUIET-PERIOD (settle-break truncation fix): the drain must not exit until the retained
+    // backlog is COMPLETE. The batt/grid/mc "downlink complete" flags key on three RETAINED
+    // topics the broker delivers instantly on SUBACK, so a FIXED window from "3 flags complete"
+    // broke BEFORE the rest of the retained burst (staged/install/cfg) arrived → truncated them
+    // (armdiag staged_raw/install-caught/cfg_cache all none; the arm only fired on the rare burst
+    // ordering that front-loaded the OTA topics → the ~30-min "slow arm"). Fix: break only after
+    // the 3 flags AND a QUIET GAP — no new packet for DOWNLINK_SETTLE — so the drain rides out the
+    // whole retained burst regardless of order. `last_msg` resets on every parsed packet below.
+    const DOWNLINK_SETTLE: Duration = Duration::from_millis(400);
+    let mut last_msg: Instant = Instant::now();
+    // #40: the RAW (ungated) staged announce + a leaf id whose retained install cmd is
+    // present. Paired AFTER the drain (both are retained → arrive in the same broker burst)
+    // → `*leaf_ota`. The staged is the caller-PERSISTED `staged_raw` (updated below when a
+    // staged retained is drained), so an install is paired with the last-known staged even
+    // if THIS flush didn't re-drain it. Raw (not the gate()d `ota_offer`) because the LEAF,
+    // not the gateway, owns the freshness gate (the OTAM handler rejects `build ≤ leaf.build`);
+    // the gateway may be NEWER than the leaf's target, so a gateway-build gate would drop it.
+    let mut pending_leaf: Option<u8> = None;
     loop {
         if tick() {
             break; // #20 abort during downlink wait → fall through to clean DISCONNECT
@@ -1258,21 +1426,27 @@ fn mqtt_session(
                         // the fetch is AND-gated on this board's own `install` command below.
                         // Stale/foreign/oversize → ignored (up-to-date; no offer).
                         match crate::ota::parse_announce(payload) {
-                            Some(a) => match crate::ota::gate(&a) {
-                                Ok(()) => {
-                                    log::info!(
-                                        "smol OTA: staged build {} available (running {})",
+                            Some(a) => {
+                                // #40: PERSIST the RAW announce (pre-gate) for a possible leaf
+                                // relay — the leaf owns its own freshness gate, so a
+                                // gateway-build gate must NOT drop it here.
+                                *staged_raw = Some(a);
+                                match crate::ota::gate(&a) {
+                                    Ok(()) => {
+                                        log::info!(
+                                            "smol OTA: staged build {} available (running {})",
+                                            a.build,
+                                            crate::ota::BUILD_NUMBER
+                                        );
+                                        *ota_offer = Some(a);
+                                    }
+                                    Err(why) => log::info!(
+                                        "smol OTA: staged build {} not newer/ineligible ({:?})",
                                         a.build,
-                                        crate::ota::BUILD_NUMBER
-                                    );
-                                    *ota_offer = Some(a);
+                                        why
+                                    ),
                                 }
-                                Err(why) => log::info!(
-                                    "smol OTA: staged build {} not newer/ineligible ({:?})",
-                                    a.build,
-                                    why
-                                ),
-                            },
+                            }
                             None => log::warn!("smol OTA: malformed staged line ignored"),
                         }
                     } else if topic == cfg_topic.as_bytes() {
@@ -1304,7 +1478,10 @@ fn mqtt_session(
                         // anyway. Only present when cfg_cache = Some (gateway flush).
                         if leaf_id != node_id {
                             if let Some(cache) = cfg_cache.as_deref_mut() {
-                                cache.set(leaf_id, payload);
+                                // #68: cfg_cache is DOWNLINK (never mac-queried) → zero MAC; the
+                                // timestamp is set for API uniformity (cfg_cache isn't freshness-gated).
+                                let now = Instant::now().duration_since_epoch().as_millis();
+                                cache.set(leaf_id, payload, [0u8; 6], now);
                                 log::info!(
                                     "smol #21: cached leaf id{} config for relay ({} B)",
                                     leaf_id,
@@ -1312,28 +1489,159 @@ fn mqtt_session(
                                 );
                             }
                         }
+                    } else if let Some(leaf_id) = parse_leaf_install_topic(topic) {
+                        // #40 (§B3): a wildcard-delivered leaf OTA install command. On a
+                        // GATEWAY flush (cfg_cache = Some), an `INSTALL` for a leaf id ≠ self
+                        // arms a mesh-OTA relay to that leaf (paired with `raw_staged` after
+                        // the drain). PANIC-FREE exact byte compare (untrusted retained). NOTE:
+                        // the retained cmd is CLEARED only AFTER a successful pair (below), NOT
+                        // here — else an install drained in a session with no staged image
+                        // (a drain-timing miss) would be consumed+lost without ever arming.
+                        if leaf_id != node_id && cfg_cache.is_some() && payload == b"INSTALL" {
+                            // Surface this leaf's install (last-wins among concurrent retained
+                            // installs). Round-robin fairness across >1 leaf was REVERTED out of
+                            // this critical path (it rotated the surfaced leaf each burst, halving
+                            // the audible leaf's service rate → slow-arm); it rides the #68 pass.
+                            pending_leaf = Some(leaf_id);
+                            *leaf_install_seen = true; // #40 #1: install-SEEN (pre-arm) → gateway suppresses its own self-OTA
+                            log::info!("smol #40: leaf id{} OTA install command received", leaf_id);
+                        }
                     }
                     consumed
                 }
                 Some((_, consumed)) => consumed,
             };
+            // #40 QUIET-PERIOD: a packet was parsed (the `None` arm broke above) → reset the
+            // quiet timer so an in-flight retained burst keeps the drain alive.
+            last_msg = Instant::now();
             acc.copy_within(consumed..acc_len, 0);
             acc_len -= consumed;
         }
-        // Primary downlinks in → drain the bounded settle window (catches the retained
-        // OTA announce + config that arrive just after mc), then finish. If batt/grid/mc
-        // never all arrive (e.g. absent MC at boot), fall through to the `deadline` break
-        // — which still drains ota/config during the wait (the original boot behaviour).
-        if got_batt && got_grid && got_mc {
-            match settle_deadline {
-                None => settle_deadline = Some(Instant::now() + DOWNLINK_SETTLE),
-                Some(sd) if Instant::now() > sd => break,
-                _ => {}
-            }
+        // #40 QUIET-PERIOD break: exit once the 3 downlink flags are in AND no new packet has
+        // arrived for DOWNLINK_SETTLE. The retained backlog (staged/install/cfg) arrives as a
+        // contiguous SUBACK burst, so a quiet gap means it's fully drained — order-independent,
+        // unlike the old fixed window that truncated a late-arriving OTA topic. If batt/grid/mc
+        // never all arrive (e.g. absent MC at boot), fall through to the `deadline` break — which
+        // still drains ota/config during the wait (the original boot behaviour).
+        if got_batt && got_grid && got_mc && Instant::now() >= last_msg + DOWNLINK_SETTLE {
+            break;
         }
         if Instant::now() > deadline {
             log::info!("smol: MQTT downlink(s) not all received in budget (keeping cache)");
             break;
+        }
+    }
+
+    // #40 ARMDIAG: snapshot whether THIS flush caught an install (before the diag block below
+    // may null `pending_leaf`) — dumped to `smol/<gw>/ota/armdiag` after the arm, so one
+    // reflash shows EXACTLY which arm-chain link is null (headless arm trace).
+    let install_caught = pending_leaf;
+
+    // #40 DIAG + clear/retry (from the PRIOR attempt, recorded by `main` after the relay):
+    // publish the phase to retained `smol/<leaf>/ota/diag` (headless observability — the
+    // mesh-only leaf has no serial), then either CLEAR the retained install (terminal phase
+    // = the leaf installed/rolled-back, or the transient-retry cap was hit) or LEAVE it
+    // retained to retry. On a clear, also null `pending_leaf` for THIS flush so we don't
+    // re-arm a just-finished leaf. Runs BEFORE the arm below. Consumed after publish.
+    if let Some((lid, phase, clear)) = *leaf_diag {
+        let mut dtopic = MqttScratch::new();
+        let _ = write!(dtopic, "smol/{}/ota/diag", lid);
+        if let Some(n) =
+            crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), phase.as_bytes(), true)
+        {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        log::info!("smol #40: published smol/{}/ota/diag = {} (clear={})", lid, phase, clear);
+        if clear {
+            let mut itopic = MqttScratch::new();
+            let _ = write!(itopic, "smol/{}/ota/install", lid);
+            if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, itopic.as_bytes(), b"", true) {
+                let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            }
+            if pending_leaf == Some(lid) {
+                pending_leaf = None; // don't re-arm a leaf we just consumed
+            }
+        }
+        *leaf_diag = None; // consumed — published once
+    }
+
+    // #3 RELAY RX-DIAG: publish the last relay attempt's RX evidence to retained
+    // `smol/<leaf>/ota/relaydiag` (headless #3 disambiguation). rx=0 → gateway heard NOTHING
+    // from the leaf (leaf offline / OTAD not landing); rx>0 & otan=0 → leaf alive but never
+    // NAK'd this session; otan>0 & last_wb<total → chunk-loss stall. Consumed after publish.
+    if let Some(d) = *leaf_relay_rx {
+        let mut rtopic = MqttScratch::new();
+        let _ = write!(rtopic, "smol/{}/ota/relaydiag", d.leaf_id);
+        let mut rval = MqttScratch::new();
+        // Gateway RX evidence + the leaf's own LDBG self-report. `leaf=none` ⇒ no LDBG captured
+        // (old leaf fw / leaf off-air during the relay); else `H<heard>V<verdict>N<sent>`.
+        let _ = write!(rval, "rx={} otan={} last_wb={}/{} otam_tx={}/{} settle={} leaf=",
+            d.rx_any, d.otan_valid, d.last_wb, d.total, d.otam_tx, d.otam_ok, d.settle);
+        if d.leaf_verdict == 255 {
+            let _ = write!(rval, "none");
+        } else {
+            let _ = write!(rval, "H{}V{}N{}ch{}", d.leaf_heard, d.leaf_verdict, d.leaf_sent, d.leaf_ch);
+        }
+        if let Some(n) =
+            crate::net::mqtt::encode_publish(&mut pkt, rtopic.as_bytes(), rval.as_bytes(), true)
+        {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        log::info!(
+            "smol #3: relaydiag id{} rx={} otan={} last_wb={}/{} leafV={}",
+            d.leaf_id, d.rx_any, d.otan_valid, d.last_wb, d.total, d.leaf_verdict
+        );
+        *leaf_relay_rx = None; // consumed — published once
+    }
+
+    // #40: ARM a pending leaf install by pairing it with the (persisted) staged image. Does
+    // NOT clear the install here — the clear is OUTCOME-driven (the diag block above, once
+    // `main` reports the relay result), so a mac-unknown / fetch-fail / relay-fail LEAVES the
+    // install retained → the next flush retries (bounded by LEAF_OTA_MAX_RETRIES). `Announce`
+    // is `Copy`, so the pair moves out cleanly.
+    match (pending_leaf, *staged_raw) {
+        (Some(leaf_id), Some(ann)) => {
+            *leaf_ota = Some((leaf_id, ann));
+            log::info!("smol #40: ARMED relay for leaf id{} (staged build {})", leaf_id, ann.build);
+        }
+        (Some(leaf_id), None) => {
+            log::warn!(
+                "smol #40: leaf id{} install pending but NO staged image known yet — leaving retained for the next flush to arm",
+                leaf_id
+            );
+        }
+        _ => {}
+    }
+
+    // #40 ARMDIAG — dump the arm-chain state EVERY gateway flush to retained
+    // `smol/<gw>/ota/armdiag`, so ONE reflash shows exactly which link is null (the C3 gives
+    // no serial). `install-caught` = an INSTALL for a leaf hit this flush; `staged_raw` = the
+    // persisted staged build; `leaf_ota` = the pair armed. If install-caught=<id> +
+    // staged_raw=<b> + leaf_ota=1 → armed (issue is downstream, in the relay). If
+    // staged_raw=none → the persist path never wrote it. If install-caught=none → the wildcard
+    // sub / arm never fired. Gateway-only (cfg_cache = Some).
+    if cfg_cache.is_some() {
+        let mut adtopic = MqttScratch::new();
+        let _ = write!(adtopic, "smol/{}/ota/armdiag", node_id);
+        let mut adval = MqttScratch::new();
+        let _ = write!(adval, "install-caught=");
+        match install_caught {
+            Some(x) => { let _ = write!(adval, "{}", x); }
+            None => { let _ = write!(adval, "none"); }
+        }
+        let _ = write!(adval, " pending=");
+        match pending_leaf {
+            Some(x) => { let _ = write!(adval, "{}", x); }
+            None => { let _ = write!(adval, "none"); }
+        }
+        let _ = write!(adval, " staged_raw=");
+        match staged_raw.as_ref() {
+            Some(a) => { let _ = write!(adval, "{}", a.build); }
+            None => { let _ = write!(adval, "none"); }
+        }
+        let _ = write!(adval, " leaf_ota={}", if leaf_ota.is_some() { 1 } else { 0 });
+        if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, adtopic.as_bytes(), adval.as_bytes(), true) {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
     }
 
@@ -1528,6 +1836,58 @@ fn mqtt_session(
         }
     }
 
+    // --- #40 §B2: publish each RELAYED LEAF's Update discovery + ota/state ON ITS BEHALF ---
+    // A credential-less leaf never opens MQTT, so the gateway is its proxy (the same role it
+    // plays for the leaf's telemetry/status relay). SAME `smol<leaf>_update` unique_id +
+    // topics as self-OTA → ONE entity, device-merged onto the leaf's existing card; the
+    // gateway keeps `installed_version` fresh from the RELAYED STAT build, so a leaf-mesh-OTA
+    // result — the new build, or a self-test rollback to the old — shows in HA HEADLESS
+    // (the whole point: the C3 USB-JTAG boards give no reliable headless serial). Gateway-only
+    // (stat_cache = Some). Idempotent retained publishes, bounded to the heard-leaf set.
+    #[cfg(feature = "espnow")]
+    if let Some(sc) = stat_cache {
+        let latest_staged = staged_raw.as_ref().map(|a| a.build);
+        for i in 0..sc.count() {
+            let (lid, val) = match sc.entry(i) {
+                Some(x) => x,
+                None => continue,
+            };
+            if lid == node_id {
+                continue; // the gateway's own Update is self-published above
+            }
+            let noun = crate::net::names::name_for_id(lid).1;
+            // Discovery (retained) — the self-OTA template, for <leaf>. `cmd_t=~/install`
+            // = `smol/<leaf>/ota/install`, which the gateway wildcard-subs → relay (§B3).
+            let mut dtopic = MqttScratch::new();
+            let _ = write!(dtopic, "homeassistant/update/smol{}/config", lid);
+            let mut djson = MqttScratch::new();
+            let _ = write!(
+                djson,
+                "{{\"~\":\"smol/{}/ota\",\"stat_t\":\"~/state\",\"cmd_t\":\"~/install\",\"pl_inst\":\"INSTALL\",\"dev_cla\":\"firmware\",\"name\":\"Update\",\"has_entity_name\":true,\"uniq_id\":\"smol{}_update\",\"object_id\":\"smol_{}_update\",\"dev\":{{\"ids\":[\"smol{}\"],\"name\":\"smol {} {}\"}}}}",
+                lid, lid, lid, lid, lid, noun
+            );
+            if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), djson.as_bytes(), true) {
+                let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            }
+            // State (retained) ONLY if the leaf reported a build (STAT `|<build>` field) —
+            // don't clobber a self-published value with "unknown" for a leaf on old firmware.
+            if let Some(installed) = crate::ota_mesh::stat_build(val) {
+                let latest = latest_staged.unwrap_or(installed);
+                let mut sjson = MqttScratch::new();
+                let _ = write!(
+                    sjson,
+                    "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":false,\"title\":\"smol v{}\"}}",
+                    installed, latest, latest
+                );
+                let mut stopic = MqttScratch::new();
+                let _ = write!(stopic, "smol/{}/ota/state", lid);
+                if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, stopic.as_bytes(), sjson.as_bytes(), true) {
+                    let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                }
+            }
+        }
+    }
+
     // --- DISCONNECT (clean goodbye) + close the socket ---
     if let Some(n) = crate::net::mqtt::encode_disconnect(&mut pkt) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
@@ -1573,6 +1933,8 @@ pub fn run_mqtt_burst(
     config_offer: &mut Option<crate::app::DefaultScreen>,
     // #33: set true iff a retained OTA `install` command is present for this board.
     install_requested: &mut bool,
+    // #40 #1: set true iff a retained leaf `install` (for another node) is seen this burst.
+    leaf_install_seen: &mut bool,
     // #27: this node's serialized roster (`PEERS|…`) to publish retained as
     // `smol/<id>/peers`. Empty ⇒ nothing published (leaf / election-only burst).
     peers: &[u8],
@@ -1584,6 +1946,18 @@ pub fn run_mqtt_burst(
     // #50b: `Some` on a gateway flush → republish cached leaf statuses (see `mqtt_session`);
     // `None` otherwise.
     stat_cache: Option<&CfgCache>,
+    // #40: on a gateway flush, filled with `(leaf_id, staged announce)` when a leaf install
+    // is pending → the caller relays it over ESP-NOW. `&mut None` on boot/leaf bursts.
+    leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
+    // #40: caller-persisted last raw staged announce (see `mqtt_session`). `&mut None` on
+    // boot/leaf bursts.
+    staged_raw: &mut Option<crate::ota::Announce>,
+    // #40: last relay attempt's `(leaf_id, phase, clear)` → published to `smol/<leaf>/ota/diag`
+    // (see `mqtt_session`). `&mut None` on boot/leaf bursts.
+    leaf_diag: &mut Option<(u8, &'static str, bool)>,
+    // #3: last relay attempt's RX evidence → published to `smol/<leaf>/ota/relaydiag` (see
+    // `mqtt_session`). `&mut None` on boot/leaf bursts.
+    leaf_relay_rx: &mut Option<RelayDiag>,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
@@ -1728,10 +2102,15 @@ pub fn run_mqtt_burst(
         ota_offer,
         config_offer,
         install_requested,
+        leaf_install_seen, // #40 #1: forward the leaf-install-seen latch
         peers, // #27: forward the caller's serialized roster to publish retained
         status, // #50: forward the live STAT|screen:page for smol/<id>/status
         cfg_cache, // #21: forward the gateway's leaf-config cache (or None)
         stat_cache, // #50b: forward the gateway's cached leaf statuses (or None)
+        leaf_ota, // #40: forward the leaf-OTA install pairing (or &mut None)
+        staged_raw, // #40: forward the persistent staged announce (or &mut None)
+        leaf_diag, // #40: forward the diag/clear state (or &mut None)
+        leaf_relay_rx, // #3: forward the relay RX-diag (or &mut None)
         deadline,
         tick,
     )
@@ -1778,6 +2157,12 @@ pub fn run_ota_fetch(
     mut rng: Rng,
     announce: &crate::ota::Announce,
     tick: &mut dyn FnMut() -> bool,
+    // #40 relay-mode: when true, stage+verify the image to the inactive slot but do NOT
+    // activate — hand the staged slot back via `staged_slot` so a GATEWAY can relay FROM
+    // it to a leaf (no gateway reboot). Self-OTA passes `false` + `&mut None` → the fetch
+    // body is byte-identical, only the terminal action differs (activate-reboot vs return).
+    relay_mode: bool,
+    staged_slot: &mut Option<esp_bootloader_esp_idf::ota::Slot>,
 ) -> bool {
     let Some((host, port, path)) = crate::ota::split_url(announce.url()) else {
         log::error!("smol OTA: malformed announce URL — aborting fetch");
@@ -1995,8 +2380,16 @@ pub fn run_ota_fetch(
     if writer.finalize(announce.size, &announce.sha256)
         && crate::ota::verify_signature(announce.signed_msg(), announce.sig())
     {
+        if relay_mode {
+            // #40: the gateway staged+verified a leaf's image into ITS inactive slot; do
+            // NOT activate (this board isn't the one being updated). Hand back the slot so
+            // the relay reads it back chunk-by-chunk over ESP-NOW.
+            log::info!("smol #40: relay image staged+VERIFIED in the inactive slot (not activated)");
+            *staged_slot = Some(target);
+            return true;
+        }
         log::info!("smol OTA: image VERIFIED (SHA-256 + ed25519) — activating the new slot");
-        crate::ota::activate(target); // reboots on success
+        crate::ota::activate(target, announce.build, false); // self-OTA → confirm via DHCP
         false // reached only if the otadata write failed
     } else {
         log::error!("smol OTA: verify FAILED (size/SHA-256 or ed25519 signature) — discarded (good slot intact)");

@@ -89,7 +89,7 @@ impl Plugin for About {
         ctx.display.clear(BinaryColor::Off).ok();
 
         // WHO — the node noun (identity), matching the menu title + boot splash.
-        let noun = crate::net::names::name_for_id(crate::NODE_ID).1;
+        let noun = crate::net::names::name_for_id(crate::node_id()).1;
         Text::with_baseline(noun, Point::new(2, 0), title, Baseline::Top)
             .draw(ctx.display)
             .ok();

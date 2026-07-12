@@ -487,6 +487,131 @@ impl ImageWriter {
 }
 
 // ---------------------------------------------------------------------------
+// #40 IDENTITY: runtime node-id persisted in the `nvs` data partition
+// ---------------------------------------------------------------------------
+// The compile-time `crate::NODE_ID` is only a FACTORY SEED. A single OTA image is
+// shared by the whole fleet — `ota_publish.sh` builds ONE image with no per-node
+// `SMOL_NODE_ID`, so a leaf that installs it would otherwise boot with the baked
+// default id (7) → a stolen identity → a duplicate-id roster → the gateway's confirm
+// waits for a STAT from an id that no longer exists → a structural leaf-timeout.
+//
+// Fix: the TRUE id lives in NVS, in `nvs` SECTOR 0 (offset 0, 16 B). The OTA image
+// transfer writes ONLY the inactive app slot + `otadata` — never `nvs` — so identity
+// survives ANY image. The freshness-floor bump (below) DOES write `nvs`, but only sectors
+// 1-2 (offsets ≥ 4096); it never touches sector 0 (oracle F1 — a floor bump erases a whole
+// sector, so identity and the floor cells MUST live in different sectors, or the bump wipes
+// the id → fleet reverts to the baked default 7). A USB flash (`espflash erase-flash` +
+// flash) wipes NVS to 0xFF; the first boot then SEEDS sector 0 from the baked const — which
+// the USB flow sets correctly via `SMOL_NODE_ID=<n>`. Steady state: NVS is the id's truth.
+//
+// BRICK-SAFE: any flash/partition/parse error → fall back to the baked const and do
+// NOT write. The seed is best-effort (a failed seed just retries next boot). The
+// record is self-validating (magic + version + id + ~id + checksum) so an erased or
+// corrupt sector is REJECTED (→ reseed), never misread as an id.
+
+/// Identity record magic ("smol identity, format v1").
+#[cfg(feature = "wifi")]
+const IDENT_MAGIC: [u8; 4] = *b"SMi1";
+#[cfg(feature = "wifi")]
+const IDENT_VERSION: u8 = 1;
+/// Record length — WRITE_SIZE(4)-aligned; the payload is 8 B, the rest reserved (0).
+#[cfg(feature = "wifi")]
+const IDENT_REC_LEN: usize = 16;
+
+/// Decode a stored identity record. `Some(id)` iff magic + version + both redundancy
+/// guards check out. Erased flash (all 0xFF) and any corruption fail every check.
+#[cfg(feature = "wifi")]
+fn parse_identity(rec: &[u8]) -> Option<u8> {
+    if rec.len() < 8 || rec[0..4] != IDENT_MAGIC || rec[4] != IDENT_VERSION {
+        return None;
+    }
+    let id = rec[5];
+    if rec[6] != id ^ 0xFF || rec[7] != id.wrapping_add(0x5A) {
+        return None; // complement + checksum guards
+    }
+    Some(id)
+}
+
+/// Encode the 16-byte identity record for `id`.
+#[cfg(feature = "wifi")]
+fn encode_identity(id: u8) -> [u8; IDENT_REC_LEN] {
+    let mut r = [0u8; IDENT_REC_LEN];
+    r[0..4].copy_from_slice(&IDENT_MAGIC);
+    r[4] = IDENT_VERSION;
+    r[5] = id;
+    r[6] = id ^ 0xFF;
+    r[7] = id.wrapping_add(0x5A);
+    r
+}
+
+/// Read the node id from the `nvs` partition. `None` on any flash/partition error OR
+/// when no valid record is present (erased/corrupt) — the caller then falls back to
+/// (and seeds from) the baked const.
+#[cfg(feature = "wifi")]
+fn read_identity_nvs() -> Option<u8> {
+    use embedded_storage::nor_flash::ReadNorFlash;
+    let mut flash = FlashStorage::new();
+    let mut buf = [0u8; PT_SCRATCH];
+    let pt = read_partition_table(&mut flash, &mut buf).ok()?;
+    let nvs = pt
+        .find_partition(PartitionType::Data(DataPartitionSubType::Nvs))
+        .ok()??;
+    let mut region = nvs.as_embedded_storage(&mut flash);
+    let mut rec = [0u8; IDENT_REC_LEN];
+    region.read(0, &mut rec).ok()?;
+    parse_identity(&rec)
+}
+
+/// Seed the `nvs` identity record from `id` — ONLY when the first sector is fully
+/// erased (0xFF), so we NEVER clobber foreign data. Best-effort: any error is swallowed
+/// (identity still works this boot from the baked const; the next boot retries the seed).
+#[cfg(feature = "wifi")]
+fn seed_identity_nvs(id: u8) {
+    use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
+    let mut flash = FlashStorage::new();
+    let mut buf = [0u8; PT_SCRATCH];
+    let Ok(pt) = read_partition_table(&mut flash, &mut buf) else {
+        return;
+    };
+    let Ok(Some(nvs)) = pt.find_partition(PartitionType::Data(DataPartitionSubType::Nvs)) else {
+        return;
+    };
+    let mut region = nvs.as_embedded_storage(&mut flash);
+    // Refuse to write unless the WHOLE first sector is erased (all 0xFF) — guards any
+    // (unexpected) real NVS content from being erased. An erase-flashed board's nvs is
+    // uniformly 0xFF, so a genuinely-fresh board always seeds.
+    let sector = <FlashStorage as NorFlash>::ERASE_SIZE as u32;
+    let mut chunk = [0u8; 64];
+    let mut off = 0u32;
+    while off < sector {
+        if region.read(off, &mut chunk).is_err() {
+            return;
+        }
+        if chunk.iter().any(|&b| b != 0xFF) {
+            return; // not erased → someone else owns this sector; don't touch it
+        }
+        off += chunk.len() as u32;
+    }
+    if region.erase(0, sector).is_err() {
+        return;
+    }
+    let _ = region.write(0, &encode_identity(id));
+}
+
+/// The node's RUNTIME identity: the NVS record if valid, else the baked `crate::NODE_ID`
+/// (which is ALSO seeded into NVS so it persists across every future OTA). Called once at
+/// boot and cached by `crate::node_id()`. BRICK-SAFE — never panics.
+#[cfg(feature = "wifi")]
+pub fn resolve_node_id() -> u8 {
+    if let Some(id) = read_identity_nvs() {
+        return id;
+    }
+    let baked = crate::NODE_ID;
+    seed_identity_nvs(baked);
+    baked
+}
+
+// ---------------------------------------------------------------------------
 // otadata operations: inactive-slot lookup, activation, first-boot confirm
 // ---------------------------------------------------------------------------
 
@@ -509,9 +634,18 @@ fn inactive_slot() -> Option<Slot> {
 /// (`New`), then REBOOT into it. Call ONLY after [`ImageWriter::finalize`] returned
 /// true. If the otadata write fails, we do NOT reboot — the good slot stays active.
 #[cfg(feature = "espnow")]
-pub fn activate(target: Slot) {
+pub fn activate(target: Slot, new_build: u32, is_leaf_ota: bool) {
     if set_slot_new(target).is_some() {
-        log::info!("smol OTA: image verified — activating new slot, rebooting");
+        // #40: tag the marker with the NEW image's build# + OTA type. `boot_confirm` self-tests
+        // IFF the running build matches (bug #5 — a USB flash of a different build won't match a
+        // stale marker), and the deferred LEAF self-test runs only for `is_leaf_ota` (so a
+        // self-OTA'd gateway confirms via DHCP, never the hear-a-frame path → no 113↔114 loop).
+        mark_ota_activated(new_build, is_leaf_ota);
+        log::info!(
+            "smol OTA: image verified — activating new slot (build {}, {}), rebooting",
+            new_build,
+            if is_leaf_ota { "leaf-mesh-OTA" } else { "self-OTA" }
+        );
         esp_hal::system::software_reset();
     } else {
         log::error!("smol OTA: activation (otadata write) failed — staying on current image");
@@ -531,6 +665,39 @@ fn set_slot_new(target: Slot) -> Option<()> {
     ota.set_current_slot(target).ok()?;
     ota.set_current_ota_state(OtaImageState::New).ok()?;
     Some(())
+}
+
+/// #40 BRICK-SAFETY: does `slot` hold a bootable app image? Reads the slot's first word
+/// through a partition-scoped region and checks the ESP-IDF app-image magic byte `0xE9`.
+/// An erased/empty slot reads `0xFF` → `false`. Used to REFUSE a rollback that would flip
+/// otadata to a slot with no image (e.g. a USB-flashed board whose other slot was never
+/// written → both-slots-unbootable BRICK). Conservative: any read/partition error → `false`
+/// (don't roll back into the unknown). `wifi`-scoped so `boot_confirm` (also `wifi`) can call
+/// it; the types resolve from the `esp-bootloader-esp-idf` dep present in every radio build.
+#[cfg(feature = "wifi")]
+fn slot_has_valid_image(slot: esp_bootloader_esp_idf::ota::Slot) -> bool {
+    use embedded_storage::nor_flash::ReadNorFlash;
+    use esp_bootloader_esp_idf::ota::Slot;
+    use esp_bootloader_esp_idf::partitions::AppPartitionSubType;
+    let sub = match slot {
+        Slot::Slot0 => AppPartitionSubType::Ota0,
+        Slot::Slot1 => AppPartitionSubType::Ota1,
+        _ => return false, // >2-slot table we don't use — refuse (brick-safe)
+    };
+    let mut flash = FlashStorage::new();
+    let mut buf = [0u8; PT_SCRATCH];
+    let Ok(pt) = read_partition_table(&mut flash, &mut buf) else {
+        return false;
+    };
+    let Ok(Some(app)) = pt.find_partition(PartitionType::App(sub)) else {
+        return false;
+    };
+    let mut region = app.as_embedded_storage(&mut flash);
+    let mut hdr = [0u8; 4]; // word-aligned read of the image header start
+    if region.read(0, &mut hdr).is_err() {
+        return false;
+    }
+    hdr[0] == 0xE9 // ESP-IDF app-image magic; erased flash is 0xFF
 }
 
 /// MF-1 (spec §4, LOAD-BEARING): first-boot self-test + APP-SIDE rollback. Call VERY
@@ -570,6 +737,17 @@ pub fn boot_confirm(self_test_passed: bool) {
     if !matches!(state, OtaImageState::New | OtaImageState::PendingVerify) {
         return; // Valid/Undefined/etc — a normal, already-confirmed boot
     }
+    // #40 USB-flash EXEMPTION (build#-tagged, bug #5): self-test ONLY if the RUNNING build# is
+    // the one our `activate()` tagged — i.e. this exact OTA image booted. A `New` image whose
+    // build# doesn't match the marker (a USB flash, incl. a STALE marker that survived the
+    // USB-JTAG reflash, or a power-cycled OTA) must NOT self-test — else a freshly USB-flashed
+    // image gets reverted for hearing no mesh frame. It's operator-intended (USB) or already
+    // ed25519+sha verified (OTA), so ACCEPT it as-is.
+    if !ota_was_activated_for(BUILD_NUMBER) {
+        let _ = ota.set_current_ota_state(OtaImageState::Valid);
+        log::info!("smol OTA: unconfirmed image but build# doesn't match a fresh OTA activate (USB flash / stale marker) — accepting, no self-test");
+        return;
+    }
     let bl_auto_revert = matches!(state, OtaImageState::PendingVerify);
     log::info!(
         "smol OTA: unconfirmed image on boot — running self-test (bootloader auto-revert {})",
@@ -577,13 +755,565 @@ pub fn boot_confirm(self_test_passed: bool) {
     );
     if self_test_passed {
         let _ = ota.set_current_ota_state(OtaImageState::Valid);
+        clear_ota_activated(); // fate decided — don't re-self-test on a later crash-reset
         log::info!("smol OTA: self-test PASS — image CONFIRMED (Valid)");
     } else {
-        if let Ok(cur) = ota.current_slot() {
-            let _ = ota.set_current_slot(cur.next());
+        // #40 BRICK-SAFETY (was a hard brick): roll back ONLY if the target slot holds a
+        // valid bootable image. Flipping otadata to an EMPTY/invalid slot (a USB-flashed
+        // board's never-written other slot) marks BOTH slots unbootable → "No bootable app
+        // partitions" crash-loop. If the other slot has no image, DO NOT flip — ACCEPT the
+        // current image (mark Valid, keep running). A USB-flashed image is operator-intended
+        // and a mesh-OTA image was ed25519+sha verified before activate, so accepting it is
+        // safe; bricking is not.
+        let target = ota.current_slot().ok().map(|c| c.next());
+        let can_rollback = target.map(slot_has_valid_image).unwrap_or(false);
+        clear_ota_activated(); // fate decided either way
+        if can_rollback {
+            if let Some(t) = target {
+                let _ = ota.set_current_slot(t);
+            }
+            let _ = ota.set_current_ota_state(OtaImageState::Valid);
+            log::warn!("smol OTA: self-test FAIL — ROLLING BACK to the previous (valid) slot");
+            esp_hal::system::software_reset();
+        } else {
+            let _ = ota.set_current_ota_state(OtaImageState::Valid);
+            log::warn!(
+                "smol OTA: self-test FAIL, but the rollback target has NO valid image — ACCEPTING the current image (brick-safe: no flip, no reset)"
+            );
         }
-        let _ = ota.set_current_ota_state(OtaImageState::Valid);
-        log::warn!("smol OTA: self-test FAIL — ROLLING BACK to the previous slot");
-        esp_hal::system::software_reset();
     }
+}
+
+// ===========================================================================
+// #40 leaf-mesh-OTA additions (espnow-only). See `crate::ota_mesh` for the
+// transport; this module owns the flash/otadata/NVS engine the leaf path reuses.
+// ===========================================================================
+
+/// #40: parse a bare signed manifest `M = "build|size|sha256hex"` (the exact bytes the
+/// gateway relays inside an `OTAM`, byte-identical to fields 1–3 of `smol/ota/staged`).
+/// Returns `(build, size, sha256)`. Panic-free — `None` on ANY malformed field. The
+/// caller MUST have already verified the ed25519 signature over these bytes (§3, the
+/// verify-BEFORE-trust order) before acting on the result.
+#[cfg(feature = "espnow")]
+pub fn parse_manifest(m: &[u8]) -> Option<(u32, u32, [u8; 32])> {
+    let s = core::str::from_utf8(m).ok()?;
+    let mut it = s.splitn(3, '|');
+    let build: u32 = it.next()?.parse().ok()?;
+    let size: u32 = it.next()?.parse().ok()?;
+    let sha256 = parse_hex_n::<32>(it.next()?)?;
+    // The final field must be EXACTLY the 64-hex sha with nothing trailing (splitn(3)
+    // would otherwise fold a `build|size|sha|junk` tail into field 3 — parse_hex_n's
+    // strict length check rejects that, so a trailing field fails closed).
+    Some((build, size, sha256))
+}
+
+// ---------------------------------------------------------------------------
+// #40 HOLE-3b — the partition-scoped leaf image writer.
+//
+// The shipped `ImageWriter` writes to ABSOLUTE flash offsets on the whole-flash
+// `FlashStorage` (fine for its SEQUENTIAL append). The leaf reassembles from a lossy
+// mesh, so a hostile/buggy chunk seq must NEVER be able to write past the inactive
+// slot into the running slot / otadata (HOLE-3 = a mid-transfer BRICK, before the
+// end-of-transfer verify ever runs). `LeafImageWriter` writes ONLY through a
+// `FlashRegion` (`as_embedded_storage`) on the inactive app partition, which
+// bounds-checks every erase/write against `[offset, offset+len)` and returns
+// `OutOfBounds` otherwise — so a write physically cannot escape the slot regardless
+// of any missed logical bound. (a)=the session's signed-bounds check, (b)=this. Both.
+//
+// It is fed COMPLETED WINDOWS in strict image order (the session releases a window
+// only when all its chunks are present), so the flash write stays sequential +
+// sector-erase-ahead (identical discipline to `ImageWriter`), and every write offset
+// is word-aligned (window offset = k·(64·231) = k·14784, a word multiple). Integrity
+// is proven by a READBACK hash of `slot[..size]` at `finalize` (row H / TOCTOU: hash
+// the exact bytes that will boot, not an in-RAM copy).
+// ---------------------------------------------------------------------------
+
+/// One-window readback scratch for [`LeafImageWriter::finalize`] (off the stack, in
+/// `.bss`). Alias-safe: one leaf OTA at a time (canary), single-caller, one-shot.
+#[cfg(feature = "espnow")]
+static mut OTA_READBACK: [u8; 4096] = [0u8; 4096];
+
+#[cfg(feature = "espnow")]
+pub struct LeafImageWriter {
+    /// The inactive slot's app-partition subtype (re-found each flush so the
+    /// `FlashRegion` borrow — which needs the parsed table + flash together — is
+    /// re-derived from locals; identical pattern to `inactive_slot`/`set_slot_new`).
+    sub: AppPartitionSubType,
+    /// Inactive slot capacity (write bound; a defense-in-depth mirror of the region check).
+    part_len: u32,
+    /// Real image bytes accepted so far == the next (word-aligned) write offset.
+    written: u32,
+    /// Partition-relative address erased through (sector granularity, monotonic).
+    erased_upto: u32,
+    /// The slot [`activate`] targets after a good finalize.
+    target: Slot,
+}
+
+#[cfg(feature = "espnow")]
+impl LeafImageWriter {
+    /// Open a writer for the inactive slot. `None` on any partition/flash error.
+    pub fn begin() -> Option<LeafImageWriter> {
+        let target = inactive_slot()?;
+        let sub = if target == Slot::Slot1 {
+            AppPartitionSubType::Ota1
+        } else {
+            AppPartitionSubType::Ota0
+        };
+        let mut flash = FlashStorage::new();
+        let mut buf = [0u8; PT_SCRATCH];
+        let part_len = {
+            let pt = read_partition_table(&mut flash, &mut buf).ok()?;
+            let app = pt.find_partition(PartitionType::App(sub)).ok()??;
+            app.len()
+        };
+        Some(LeafImageWriter { sub, part_len, written: 0, erased_upto: 0, target })
+    }
+
+    /// The slot this writer targets (passed to [`activate`] after a good finalize).
+    pub fn target(&self) -> Slot {
+        self.target
+    }
+
+    /// Append one COMPLETED WINDOW's bytes (in strict image order) to the inactive
+    /// slot. The write offset is `self.written` (word-aligned by construction — every
+    /// non-final window is exactly 64·231 bytes). Erases sector-ahead, then writes the
+    /// word-aligned prefix + a 0xFF-padded ≤3-byte tail (the tail only ever occurs on
+    /// the FINAL window, so it never misaligns a following write). Returns `false` on
+    /// any bound/flash error → the caller ABORTS (otadata untouched, good slot boots).
+    pub fn feed_window(&mut self, data: &[u8]) -> bool {
+        use embedded_storage::nor_flash::NorFlash;
+        let real = data.len() as u32;
+        if real == 0 {
+            return true;
+        }
+        // Defense-in-depth spatial bound (the region also enforces this physically).
+        if self.written.saturating_add(real) > self.part_len {
+            return false;
+        }
+        // Re-derive the partition-scoped region from locals (table + flash borrowed
+        // together for the region's lifetime; dropped at end of this call).
+        let mut flash = FlashStorage::new();
+        let mut ptbuf = [0u8; PT_SCRATCH];
+        let pt = match read_partition_table(&mut flash, &mut ptbuf) {
+            Ok(pt) => pt,
+            Err(_) => return false,
+        };
+        let app = match pt.find_partition(PartitionType::App(self.sub)) {
+            Ok(Some(p)) => p,
+            _ => return false,
+        };
+        let mut region = app.as_embedded_storage(&mut flash);
+
+        let word = <FlashStorage as NorFlash>::WRITE_SIZE as u32; // 4
+        let sector = <FlashStorage as NorFlash>::ERASE_SIZE as u32; // 4096
+        let padded = real.div_ceil(word) * word;
+        let write_end = self.written + padded;
+        // Erase-ahead (sector granularity). Monotonic — never re-erases written bytes.
+        while self.erased_upto < write_end {
+            let s = self.erased_upto;
+            if region.erase(s, s + sector).is_err() {
+                return false;
+            }
+            self.erased_upto = self.erased_upto.saturating_add(sector);
+        }
+        // Word-aligned prefix, straight from `data` (no copy).
+        let prefix = (real & !(word - 1)) as usize;
+        if prefix > 0 && region.write(self.written, &data[..prefix]).is_err() {
+            return false;
+        }
+        // Sub-word tail (final window only) — 0xFF-pad to a word (inert; the image
+        // header carries the true length). Written at a word-aligned offset.
+        let tail = real as usize - prefix;
+        if tail > 0 {
+            let mut w = [0xFFu8; 4];
+            w[..tail].copy_from_slice(&data[prefix..real as usize]);
+            if region.write(self.written + prefix as u32, &w).is_err() {
+                return false;
+            }
+        }
+        self.written += real;
+        true
+    }
+
+    /// The INTEGRITY GATE: exact size match AND a READBACK SHA-256 of `slot[..size]`
+    /// (the exact bytes that will boot) == the signed sha. `true` ⇒ [`activate`] is
+    /// safe. otadata is still untouched here — a failure discards with the good slot
+    /// active. The caller has ALREADY verified the ed25519 sig over the manifest.
+    pub fn finalize(self, expected_size: u32, expected_sha: &[u8; 32]) -> bool {
+        use embedded_storage::nor_flash::ReadNorFlash;
+        use sha2::Digest;
+        if self.written != expected_size {
+            return false;
+        }
+        let mut flash = FlashStorage::new();
+        let mut ptbuf = [0u8; PT_SCRATCH];
+        let pt = match read_partition_table(&mut flash, &mut ptbuf) {
+            Ok(pt) => pt,
+            Err(_) => return false,
+        };
+        let app = match pt.find_partition(PartitionType::App(self.sub)) {
+            Ok(Some(p)) => p,
+            _ => return false,
+        };
+        let mut region = app.as_embedded_storage(&mut flash);
+        let buf = unsafe { &mut *core::ptr::addr_of_mut!(OTA_READBACK) };
+        let mut hasher = sha2::Sha256::new();
+        let mut off = 0u32;
+        while off < expected_size {
+            let want = core::cmp::min(buf.len() as u32, expected_size - off);
+            // Read word-aligned (offset is a multiple of 4096; round the length up so a
+            // non-word-aligned tail still reads legally — extra bytes are not hashed).
+            let read_len = (want.div_ceil(4) * 4) as usize;
+            if region.read(off, &mut buf[..read_len]).is_err() {
+                return false;
+            }
+            hasher.update(&buf[..want as usize]);
+            off += want;
+        }
+        hasher.finalize().as_slice() == &expected_sha[..]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #40 gateway relay — read the staged image back from a slot to relay over ESP-NOW.
+//
+// After `run_ota_fetch(relay_mode=true)` stages+verifies a leaf's image into the gateway's
+// INACTIVE slot, the relay reads it back window-by-window (partition-scoped, word-aligned)
+// and sends the chunks. Read-only; never writes → cannot brick anything.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "espnow")]
+pub struct SlotReader {
+    sub: AppPartitionSubType,
+    part_len: u32,
+}
+
+#[cfg(feature = "espnow")]
+impl SlotReader {
+    /// Open a reader for `slot` (the gateway's just-staged inactive slot). `None` on error.
+    pub fn open(slot: Slot) -> Option<SlotReader> {
+        let sub = if slot == Slot::Slot1 {
+            AppPartitionSubType::Ota1
+        } else {
+            AppPartitionSubType::Ota0
+        };
+        let mut flash = FlashStorage::new();
+        let mut buf = [0u8; PT_SCRATCH];
+        let part_len = {
+            let pt = read_partition_table(&mut flash, &mut buf).ok()?;
+            let app = pt.find_partition(PartitionType::App(sub)).ok()??;
+            app.len()
+        };
+        Some(SlotReader { sub, part_len })
+    }
+
+    /// Read `out.len()` bytes at partition-relative `off` (both word-aligned by the caller).
+    /// `false` on any bound/flash error. Partition-scoped → an out-of-slot `off` errors, it
+    /// never reads foreign flash.
+    pub fn read(&self, off: u32, out: &mut [u8]) -> bool {
+        use embedded_storage::nor_flash::ReadNorFlash;
+        if off.saturating_add(out.len() as u32) > self.part_len {
+            return false;
+        }
+        let mut flash = FlashStorage::new();
+        let mut ptbuf = [0u8; PT_SCRATCH];
+        let pt = match read_partition_table(&mut flash, &mut ptbuf) {
+            Ok(pt) => pt,
+            Err(_) => return false,
+        };
+        let app = match pt.find_partition(PartitionType::App(self.sub)) {
+            Ok(Some(p)) => p,
+            _ => return false,
+        };
+        let mut region = app.as_embedded_storage(&mut flash);
+        region.read(off, out).is_ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #40 §3C — the persistent signed-freshness FLOOR (NVS-backed).
+//
+// `fresh_floor` = the highest build ever booted-as-`New`. The leaf accepts a mesh OTA
+// iff `sig ok ∧ build > running ∧ build > fresh_floor ∧ size/sha ok`, closing the
+// signed-INTERMEDIATE / rolled-back-build replay (a genuinely-signed old build re-pushed
+// over the unauth mesh). FLOOR-ONLY, #40-local: NO epoch, zero change to #32's signed M.
+//
+// ⚠️ #40 CLAIMS THE `nvs` PARTITION as a raw persistent store (smol uses no ESP-IDF NVS
+// today — verified). It is shared by TWO #40 users, SEGREGATED BY SECTOR: the IDENTITY
+// record owns sector 0 (offset 0); the freshness-floor cells own sectors 1-2 (offsets
+// 4096/8192). This is NOT the ESP-IDF NVS key/value format; a future feature needing real
+// NVS must get a different partition or coordinate these offsets. All access is through a
+// partition-scoped `FlashRegion` (OOB-safe, like the slot writer), so a bug here can only
+// corrupt a floor cell — never the app slots, otadata, OR the identity sector — and never a
+// brick (the sig + monotonicity gates still hold; the floor is defense-in-depth).
+//
+// Layout: two ping-pong cells at nvs relative offsets 4096 and 8192 (sectors 1 and 2),
+// each a 12-byte record `[MAGIC(4 LE) | build(4 LE) | crc32(4 LE)]`. Read = max valid
+// build across both cells. Write = erase the cell holding the SMALLER/invalid build, write
+// the new record there; the other cell always retains ≥ the erased one, so a torn write
+// never regresses the floor (power-loss-safe). One erase+write per OTA → negligible wear.
+//
+// ⚠️ SECTOR SEGREGATION (brick-class, oracle F1): the floor cells MUST NOT share a 4 KB
+// sector with the #40 IDENTITY record (nvs offset 0, sector 0). The floor bump ERASES a
+// full sector (`erase(target_rel, target_rel + 4096)`); if a cell sat at offset 0 that
+// erase would DESTROY the identity record → the leaf falls back to the baked default id →
+// with the fleet-shared image, the whole fleet becomes id 7 on the next reboot. So the
+// cells live at sectors 1 & 2 (base 4096), leaving sector 0 exclusively for identity.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "espnow")]
+const FLOOR_MAGIC: u32 = 0x736D_6C46; // "smlF"
+/// First floor cell's nvs offset — SECTOR 1, NOT sector 0 (sector 0 is the identity record;
+/// a floor bump erases its whole target sector and would wipe identity if it sat at 0).
+#[cfg(feature = "espnow")]
+const FLOOR_CELL_BASE: u32 = 4096;
+#[cfg(feature = "espnow")]
+const FLOOR_CELL_STRIDE: u32 = 4096; // one sector apart (erase granularity)
+#[cfg(feature = "espnow")]
+const FLOOR_RECORD_LEN: usize = 12;
+
+/// CRC-32 (IEEE, reflected poly 0xEDB88320) over `data` — torn-write detector for the
+/// floor cell. Pure, panic-free, no table (small input, speed irrelevant).
+#[cfg(feature = "espnow")]
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        let mut i = 0;
+        while i < 8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            i += 1;
+        }
+    }
+    !crc
+}
+
+/// Read one floor cell at `rel` (nvs-relative). `None` on flash error / bad magic / bad crc.
+#[cfg(feature = "espnow")]
+fn floor_cell_read(rel: u32) -> Option<u32> {
+    use embedded_storage::nor_flash::ReadNorFlash;
+    let mut flash = FlashStorage::new();
+    let mut ptbuf = [0u8; PT_SCRATCH];
+    let pt = read_partition_table(&mut flash, &mut ptbuf).ok()?;
+    let nvs = pt
+        .find_partition(PartitionType::Data(DataPartitionSubType::Nvs))
+        .ok()??;
+    let mut region = nvs.as_embedded_storage(&mut flash);
+    let mut rec = [0u8; FLOOR_RECORD_LEN];
+    region.read(rel, &mut rec).ok()?;
+    let magic = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+    if magic != FLOOR_MAGIC {
+        return None; // erased (0xFFFFFFFF) or never written
+    }
+    let build = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
+    let crc = u32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+    (crc == crc32(&rec[0..8])).then_some(build)
+}
+
+/// The current freshness floor = max valid build across both cells (0 if none written).
+#[cfg(feature = "espnow")]
+pub fn fresh_floor_get() -> u32 {
+    let a = floor_cell_read(FLOOR_CELL_BASE).unwrap_or(0);
+    let b = floor_cell_read(FLOOR_CELL_BASE + FLOOR_CELL_STRIDE).unwrap_or(0);
+    a.max(b)
+}
+
+/// Raise the floor to `max(floor, build)`, persisting it. Idempotent (a no-op if the
+/// floor already covers `build`). Writes to the cell holding the SMALLER/invalid build
+/// so the other cell always retains the prior floor → a torn write cannot regress it.
+/// Called once at first-boot-pre-self-test on `otadata == New` (before radio init).
+#[cfg(feature = "espnow")]
+pub fn fresh_floor_bump(build: u32) {
+    use embedded_storage::nor_flash::NorFlash;
+    let a = floor_cell_read(FLOOR_CELL_BASE);
+    let b = floor_cell_read(FLOOR_CELL_BASE + FLOOR_CELL_STRIDE);
+    let cur = a.unwrap_or(0).max(b.unwrap_or(0));
+    if build <= cur {
+        return; // already covered — no write, no wear
+    }
+    // Target the cell with the smaller (or invalid) build; the other keeps the prior max.
+    // Both offsets are in sectors 1/2 — NEVER sector 0, so this erase can't wipe identity.
+    let target_rel = if a.unwrap_or(0) <= b.unwrap_or(0) {
+        FLOOR_CELL_BASE
+    } else {
+        FLOOR_CELL_BASE + FLOOR_CELL_STRIDE
+    };
+    let mut rec = [0u8; FLOOR_RECORD_LEN];
+    rec[0..4].copy_from_slice(&FLOOR_MAGIC.to_le_bytes());
+    rec[4..8].copy_from_slice(&build.to_le_bytes());
+    let crc = crc32(&rec[0..8]);
+    rec[8..12].copy_from_slice(&crc.to_le_bytes());
+
+    let mut flash = FlashStorage::new();
+    let mut ptbuf = [0u8; PT_SCRATCH];
+    let pt = match read_partition_table(&mut flash, &mut ptbuf) {
+        Ok(pt) => pt,
+        Err(_) => return,
+    };
+    let nvs = match pt.find_partition(PartitionType::Data(DataPartitionSubType::Nvs)) {
+        Ok(Some(p)) => p,
+        _ => return,
+    };
+    let mut region = nvs.as_embedded_storage(&mut flash);
+    if region.erase(target_rel, target_rel + FLOOR_CELL_STRIDE).is_err() {
+        return;
+    }
+    let _ = region.write(target_rel, &rec);
+}
+
+// ---------------------------------------------------------------------------
+// #40 §3/self-test §3 — the unconfirmed-boot (K) counter.
+//
+// A `New` image that PANICS before finishing the leaf self-test resets (MF-2
+// custom_halt→software_reset) STILL in `New` → it would re-run the self-test and could
+// boot-loop the bad slot forever (bootloader auto-revert is OFF). This bounds it: the
+// counter is bumped at the ABSOLUTE EARLIEST boot point (before any subsystem that can
+// panic); at K it forces the app-side flip to the good slot. Stored in RTC-fast RAM —
+// survives `software_reset`, cleared on power-loss (acceptable: a power-cycled leaf
+// re-runs the self-test cleanly, §5). Persistent RTC RAM is UNINITIALIZED at power-on,
+// so a magic word gates it: garbage magic ⇒ treat as a fresh (count 0) power-on.
+// ---------------------------------------------------------------------------
+
+/// `[magic, count]` in persistent RTC-fast RAM. `#[ram(rtc_fast, persistent)]` keeps it
+/// across a `software_reset`; it is uninitialized at power-on (magic detects that).
+#[cfg(feature = "espnow")]
+#[esp_hal::ram(rtc_fast, persistent)]
+static mut OTA_BOOT_GUARD: [u32; 2] = [0u32; 2];
+
+#[cfg(feature = "espnow")]
+const BOOT_GUARD_MAGIC: u32 = 0x736D_6C4B; // "smlK"
+
+// ---------------------------------------------------------------------------
+// #40 USB-flash EXEMPTION — only a genuine OTA-`activate()` of THIS EXACT image self-tests.
+//
+// A USB-flashed image boots as `New` (unconfirmed) just like an OTA image, so `boot_confirm`
+// couldn't tell them apart → EVERY USB flash ran the self-test → false rollback (or, before
+// the brick-safe fix, a brick). We tag an RTC-fast marker with the ACTIVATED image's build#
+// inside `activate()`; `boot_confirm` self-tests ONLY when the RUNNING `BUILD_NUMBER` matches
+// the marker's build#.
+//
+// ⚠️ CRITICAL (bug #5): a bare "an OTA happened" flag is NOT enough — RTC-fast RAM SURVIVES a
+// USB-JTAG reflash (`rst:0x15` is a peripheral reset, NOT power-off; only a true power cycle
+// clears it). A board that self-OTA'd earlier and stayed powered would carry a STALE marker
+// into a USB flash → false self-test → rollback (exactly what bricked/reverted id7). Tagging
+// the SPECIFIC build# fixes it: a USB flash of a DIFFERENT build won't match the stale marker
+// → accepted as operator-confirmed. (Re-flashing the byte-identical build# is a harmless
+// edge — it'd self-test, but brick-safely.) `wifi`-scoped so `boot_confirm` can read it.
+// ---------------------------------------------------------------------------
+
+/// `[magic, activated_build, is_leaf_ota]` in persistent RTC-fast RAM (survives
+/// `software_reset` AND a USB-JTAG reflash; only a power cycle clears it). `activated_build`
+/// = the build# passed to the `activate()` that produced this boot chain (matched against the
+/// running `BUILD_NUMBER`); `is_leaf_ota` = 1 for a mesh-OTA (confirm via hear-a-frame), 0 for
+/// a self-OTA (confirm via reached-DHCP). The OTA TYPE, not the runtime role, decides the
+/// confirm path — a self-OTA'd gateway that transiently misses DHCP at one boot must NOT be
+/// rolled back by the leaf hear-a-frame path (the 113↔114 oscillation), and its role is
+/// ambiguous at that boot anyway.
+#[cfg(feature = "wifi")]
+#[esp_hal::ram(rtc_fast, persistent)]
+static mut OTA_ACTIVATE_GUARD: [u32; 3] = [0u32; 3];
+
+#[cfg(feature = "wifi")]
+const ACTIVATE_GUARD_MAGIC: u32 = 0x736D_6C41; // "smlA"
+
+/// Tag the marker with the build# + OTA type of the image being activated (call inside
+/// `activate()`, passing the NEW image's build# and whether this is a LEAF mesh-OTA). Survives
+/// the reset AND a USB reflash; only a power cycle clears it. `espnow`-scoped (only `activate()`
+/// — itself espnow — sets it; wifi-only never OTAs).
+#[cfg(feature = "espnow")]
+pub fn mark_ota_activated(build: u32, is_leaf_ota: bool) {
+    unsafe {
+        let g = &mut *core::ptr::addr_of_mut!(OTA_ACTIVATE_GUARD);
+        g[0] = ACTIVATE_GUARD_MAGIC;
+        g[1] = build;
+        g[2] = is_leaf_ota as u32;
+    }
+}
+
+/// True iff the RUNNING image (`running_build`) is the exact image our `activate()` produced —
+/// i.e. a genuine OTA of THIS build, not a USB flash (whose build# won't match a stale marker)
+/// nor uninitialized RTC RAM (bad magic ⇒ false).
+#[cfg(feature = "wifi")]
+pub fn ota_was_activated_for(running_build: u32) -> bool {
+    unsafe {
+        let g = &*core::ptr::addr_of!(OTA_ACTIVATE_GUARD);
+        g[0] == ACTIVATE_GUARD_MAGIC && g[1] == running_build && running_build != 0
+    }
+}
+
+/// True iff the current OTA-activate boot chain is a LEAF mesh-OTA (confirm via hear-a-frame).
+/// A self-OTA (is_leaf_ota=0) confirms via reached-DHCP only and NEVER runs the deferred leaf
+/// self-test — so a transient DHCP miss can't roll a self-OTA'd gateway back on a quiet mesh.
+/// `cfg(espnow)`, not `wifi`: the ONLY caller is the `#[cfg(espnow)]` deferred-leaf-selftest gate
+/// in `main`; a wifi-only (gateway) build confirms via DHCP and never reads this (would warn-unused).
+#[cfg(feature = "espnow")]
+pub fn ota_activated_is_leaf() -> bool {
+    unsafe {
+        let g = &*core::ptr::addr_of!(OTA_ACTIVATE_GUARD);
+        g[0] == ACTIVATE_GUARD_MAGIC && g[2] == 1
+    }
+}
+
+/// Clear the activate marker (call once the image's fate is decided — confirmed / rolled
+/// back / accepted — so a later crash-reset doesn't re-run the self-test on the same chain).
+#[cfg(feature = "wifi")]
+fn clear_ota_activated() {
+    unsafe {
+        let g = &mut *core::ptr::addr_of_mut!(OTA_ACTIVATE_GUARD);
+        g[0] = ACTIVATE_GUARD_MAGIC;
+        g[1] = 0;
+        g[2] = 0;
+    }
+}
+
+/// Bump the unconfirmed-boot counter and return the new value. Call at the absolute
+/// earliest boot point when `otadata` is `New`/`PendingVerify`, BEFORE anything that
+/// can panic in init (so an early-init crash still trips the crash-loop bound).
+#[cfg(feature = "espnow")]
+pub fn unconfirmed_boot_bump() -> u32 {
+    unsafe {
+        let g = &mut *core::ptr::addr_of_mut!(OTA_BOOT_GUARD);
+        if g[0] != BOOT_GUARD_MAGIC {
+            g[0] = BOOT_GUARD_MAGIC;
+            g[1] = 0;
+        }
+        g[1] = g[1].saturating_add(1);
+        g[1]
+    }
+}
+
+/// Reset the counter (call on a successful self-test confirm).
+#[cfg(feature = "espnow")]
+pub fn unconfirmed_boot_reset() {
+    unsafe {
+        let g = &mut *core::ptr::addr_of_mut!(OTA_BOOT_GUARD);
+        g[0] = BOOT_GUARD_MAGIC;
+        g[1] = 0;
+    }
+}
+
+/// True iff `otadata`'s state is `New`/`PendingVerify` — i.e. a freshly-activated image
+/// on its FIRST boot, whose self-test has not yet confirmed. Drives the earliest-boot
+/// freshness-floor bump + K-counter (and the deferred leaf self-test in the main loop).
+/// Self-contained flash borrow; `false` on any flash/partition error (fail-safe: a board
+/// we can't read otadata on simply skips the OTA bookkeeping).
+#[cfg(feature = "espnow")]
+pub fn otadata_unconfirmed() -> bool {
+    let mut flash = FlashStorage::new();
+    let mut buf = [0u8; PT_SCRATCH];
+    let Ok(pt) = read_partition_table(&mut flash, &mut buf) else {
+        return false;
+    };
+    let Ok(Some(od)) = pt.find_partition(PartitionType::Data(DataPartitionSubType::Ota)) else {
+        return false;
+    };
+    let mut region = od.as_embedded_storage(&mut flash);
+    let Ok(mut ota) = Ota::new(&mut region) else {
+        return false;
+    };
+    matches!(
+        ota.current_ota_state(),
+        Ok(OtaImageState::New) | Ok(OtaImageState::PendingVerify)
+    )
 }

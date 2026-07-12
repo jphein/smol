@@ -176,7 +176,26 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + verbatim "<AppKind>:<page
 /// STAT → no flood/loop). Same unauthed, low-blast threat model as CFG: worst case a stray
 /// frame yields a bad screen STRING on a status topic — never code exec, self-corrected
 /// next cadence. Value bounded by `CFG_VALUE_MAX`.
-const STAT_PREFIX: &[u8] = b"SMOLv1 STAT "; // + "NNN" + verbatim "<AppKind>:<page>"
+const STAT_PREFIX: &[u8] = b"SMOLv1 STAT "; // + "NNN" + verbatim "<AppKind>:<page>|<build>"
+
+// #40 leaf-mesh-OTA GATEWAY relay tuning (blocking maintenance op; hardware-tunable — see
+// lucid-40-build-handoff.md). The relay monopolizes the radio for its duration by design.
+/// Wait for a leaf OTAN after (re)sending a window before resending it (ms).
+const GW_OTAN_WAIT_MS: u64 = 800;
+/// Max retransmit rounds per window before aborting the relay (R2 spoof/DoS bound).
+const GW_WINDOW_ROUNDS_MAX: u32 = 16;
+/// Tier-2 confirm window (ms) — MUST exceed the leaf self-test window (`LEAF_SELFTEST_
+/// WINDOW_MS` ≈ 60 s) + a STAT cadence (~10 s) so a late self-test rollback is observed
+/// before the gateway declares Confirmed.
+const GW_CONFIRM_TIMEOUT_MS: u64 = 120_000;
+/// #40: max consecutive TRANSIENT (mac-unknown / fetch / relay / timeout) relay attempts
+/// for one retained install before the gateway gives up + clears it — bounds the auto-retry
+/// so a persistently-failing leaf can't loop the (mesh-deaf) relay every flush forever.
+const LEAF_OTA_MAX_RETRIES: u8 = 3;
+/// One-window relay readback buffer (off the stack, in `.bss`). Alias-safe: a gateway
+/// relays to ONE leaf at a time (serial canary), and never runs a leaf receive session.
+static mut GW_OTA_WINDOW: [u8; crate::ota_mesh::WINDOW_BYTES] =
+    [0u8; crate::ota_mesh::WINDOW_BYTES];
 
 use crate::mesh_snake::snake_core::{self, SnkFrame};
 
@@ -519,6 +538,17 @@ struct Roster {
 impl Roster {
     const fn new() -> Self {
         Self { nodes: [Node::EMPTY; ROSTER_CAP] }
+    }
+
+    /// #40: the MAC last heard for a KNOWN leaf `id` (learned from its HELLOs), for the
+    /// unicast OTA relay. `None` if that id hasn't been heard yet.
+    fn mac_for_id(&self, id: u8) -> Option<[u8; 6]> {
+        for n in &self.nodes {
+            if n.used && n.id_known && n.id == id {
+                return Some(n.mac);
+            }
+        }
+        None
     }
 
     /// Find the slot for `mac`: existing match, else a free slot, else evict the
@@ -1246,6 +1276,10 @@ pub struct RadioManager {
     /// `cfg_cache` but UPLINK-sourced. Unused on a leaf (never flushes/publishes). REUSES
     /// `CfgCache` verbatim — a generic id→value upsert map (`Batt:3` fits `CFG_VALUE_MAX`).
     stat_cache: crate::net::wifi::CfgCache,
+    /// #40 leaf-mesh-OTA: the LEAF receive state machine (verify-sig → signed-bounds →
+    /// window reassembly → readback verify → activate). Idle except during a transfer.
+    /// Unused on a gateway (which drives the RELAY side via `run_leaf_ota_relay`).
+    ota_leaf: crate::ota_mesh::OtaLeafSession,
     /// #25 WLED: monotonic WiZmote sequence, ++ per emitted button. Wraps safely
     /// (reboot-to-0 is panic-safe; WLED's per-remote dedup may drop the first few
     /// post-reboot presses until it re-exceeds the pre-reboot value — accepted MVP).
@@ -1273,6 +1307,42 @@ pub struct RadioManager {
     /// #6 OTA: a gated retained announce surfaced by a burst (boot or gateway flush),
     /// pending `main`'s `take_ota_offer` → fetch. `None` when nothing is pending.
     ota_offer: Option<crate::ota::Announce>,
+    /// #40: the LAST raw (ungated) `smol/ota/staged` announce this gateway drained,
+    /// PERSISTED across flushes. A leaf-OTA install pairs with THIS (not a session-local
+    /// capture), so the pair is independent of whether the staged retained was re-drained
+    /// in the SAME flush that consumed the install — closing the "install consumed but
+    /// relay never armed" race (the staged and install are separate retained topics with
+    /// independent drain timing). Persists the current staged image for every leaf relay.
+    staged_raw: Option<crate::ota::Announce>,
+    /// #40 headless observability + clear/retry: the LAST leaf-OTA attempt's `(leaf_id,
+    /// phase, clear_install)`, set by `main` after `run_leaf_ota_relay`, PUBLISHED to
+    /// `smol/<leaf>/ota/diag` on the gateway's next burst and used to drive the install
+    /// clear (terminal/exhausted) vs retry (transient). `None` when nothing is pending.
+    /// The phase is stored as the rendered `&'static str` (not the espnow-only enum) so the
+    /// shared `wifi::mqtt_session` signature stays buildable in the wifi-only profile.
+    leaf_ota_diag: Option<(u8, &'static str, bool)>,
+    /// #40 #1 DECOUPLE: true while a leaf-OTA relay is pending/in-flight (armed until its
+    /// outcome is terminal or the retry cap is hit). While set, the gateway SUPPRESSES its own
+    /// self-OTA (`do_install`) so a relay is never interrupted by the gateway rebooting into a
+    /// fresh build mid-session (and the two OTAs never collide/thrash the fleet).
+    leaf_ota_pending: bool,
+    /// #40 #3 STICKY MAC: `(leaf_id, mac)` captured the moment an armed leaf became addressable,
+    /// held for the whole install session (cleared on a terminal `record_leaf_ota`). The roster
+    /// is a bounded 16-slot LRU that EVICTS this leaf while the mesh-deaf relay stops hearing it
+    /// → `mac_for_id` reverts to None (canary `mac-unknown` churn); this cache survives eviction.
+    leaf_ota_mac: Option<(u8, [u8; 6])>,
+    /// #40 #3 RELAY RX-DIAG (instrumentation): from the last `run_leaf_ota_relay` —
+    /// `(leaf_id, rx_frames_from_leaf, valid_otan, last_window_reached, total_windows)`.
+    /// Published to retained `smol/<leaf>/ota/relaydiag` on the next flush so a headless
+    /// `relay-failed` says WHETHER the leaf NAK'd at all (valid_otan>0) and HOW FAR it got
+    /// (last_wb/total): rx=0 → gateway heard nothing from the leaf (leaf offline / OTAD not
+    /// landing); rx>0,otan=0 → leaf alive but never NAK'd this session; otan>0,last_wb<total →
+    /// chunk-loss stall. `last_wb` is in chunk units (matches `total = om::total_chunks`).
+    /// Carries the leaf's `LDBG` self-report too (captured during the relay) — see `RelayDiag`.
+    leaf_relay_rx: Option<crate::net::wifi::RelayDiag>,
+    /// #40: consecutive non-terminal (transient) relay attempts for the current install —
+    /// caps the auto-retry so a persistently-failing leaf can't loop the mesh-deaf relay.
+    leaf_ota_retries: u8,
     /// #21 node-manager: the parsed default-screen command surfaced by a burst,
     /// pending `main`'s `take_config_offer` → apply. `None` when nothing is pending.
     config_offer: Option<crate::app::DefaultScreen>,
@@ -1337,6 +1407,7 @@ impl RadioManager {
             cfg: CfgTracker::new(),
             cfg_cache: crate::net::wifi::CfgCache::new(),
             stat_cache: crate::net::wifi::CfgCache::new(),
+            ota_leaf: crate::ota_mesh::OtaLeafSession::new(),
             #[cfg(feature = "wled")]
             wled_seq: 0,
             elected_owner: id,
@@ -1349,6 +1420,12 @@ impl RadioManager {
             mc_seen_ms: 0,
             last_reelect_ms: 0,
             ota_offer: None,
+            staged_raw: None,
+            leaf_ota_diag: None,
+            leaf_ota_retries: 0,
+            leaf_ota_pending: false,
+            leaf_ota_mac: None,
+            leaf_relay_rx: None,
             config_offer: None,
             install_requested: false,
             silent_until_relock: false,
@@ -1369,6 +1446,21 @@ impl RadioManager {
         if self.relay.is_gateway {
             return; // gateway owns its channel via association; never scans
         }
+        // #3b (regression fix): while ACTIVELY receiving a mesh-OTA, HOLD the channel — do NOT
+        // unlock/hop. The transfer runs on ESP_NOW_FIXED_CHANNEL and hopping mid-transfer drops
+        // chunks. NARROW + bounded: true only during a live session (`is_active`); with no OTA in
+        // flight this is a no-op and normal membership behaves EXACTLY as before. (60ff390 made
+        // the hold UNCONDITIONAL and broke basic mesh join — id8 couldn't re-acquire the gateway
+        // after routine beacon loss the way id9/pre-#40 does. This restores that path and scopes
+        // the hold to only when it's actually needed.)
+        if self.ota_leaf.is_active() {
+            let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+            return;
+        }
+        // RESTORED old behavior: unlock + re-scan on owner-silence. A leaf MUST re-acquire the
+        // gateway after routine beacon loss to keep mesh membership. The fetch-drift is handled
+        // narrowly instead: (i) receiving an OTA frame locks the leaf to ch6 (`handle_ota_frame`),
+        // (ii) the gateway's OTAM wake-burst lets a hopping leaf catch the first announce.
         if self.scan_locked && now.saturating_sub(self.last_owner_heard_ms) > SCAN_SILENCE_MS {
             self.scan_locked = false;
             log::info!("smol: leaf lost gateway id{} — re-scanning", self.elected_owner);
@@ -1415,6 +1507,13 @@ impl RadioManager {
         if self.relay.is_gateway {
             return false; // a gateway re-decides on its own flush; only leaves recover here
         }
+        // #3b: a leaf with a LIVE mesh-OTA session must NOT re-elect — re-election re-associates
+        // to WiFi (off-ch6) and took id8 OFFLINE mid-relay. While armed, the gateway is merely
+        // fetching (off-ch6, transiently silent), NOT dead; the leaf holds ch6 and waits for the
+        // OTAD. The session's own deadline/stall (ota_mesh) bounds a genuinely-abandoned relay.
+        if self.ota_leaf.is_active() {
+            return false;
+        }
         let silent = now.saturating_sub(self.last_owner_heard_ms) >= REELECT_SILENCE_MS;
         let retry_ok = now.saturating_sub(self.last_reelect_ms) >= REELECT_RETRY_MS;
         if !(silent && retry_ok) {
@@ -1444,6 +1543,7 @@ impl RadioManager {
         let mut ota_offer: Option<crate::ota::Announce> = None;
         let mut config_offer: Option<crate::app::DefaultScreen> = None;
         let mut install_requested = false;
+        let mut _leaf_install_seen = false; // #40 #1: a leaf's recovery burst is not a gateway relay
         let reached = match self.sta.as_mut() {
             None => false,
             Some(sta) => {
@@ -1460,10 +1560,15 @@ impl RadioManager {
                     &mut ota_offer,
                     &mut config_offer,
                     &mut install_requested,
+                    &mut _leaf_install_seen, // #40 #1: leaf recovery burst — never a gateway relay
                     &[], // #27: election-only recovery burst publishes no peers (leaf/v1)
             &[], // #50: recovery burst publishes no live-screen status
                     None, // #21: a leaf's recovery burst is not a gateway relay
                     None, // #50b: recovery burst republishes no cached leaf status
+                    &mut None, // #40: a leaf's recovery burst never relays a leaf OTA
+                    &mut None, // #40: recovery burst carries no persistent staged
+                    &mut None, // #40: recovery burst publishes no relay diag
+                    &mut None, // #3: recovery burst publishes no relay RX-diag
                     tick,
                 )
             }
@@ -1792,6 +1897,22 @@ impl RadioManager {
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
     }
 
+    /// #40 #3: broadcast this LEAF's OTA RX-diag beacon (`LDBG` = id + heard/verdict/sent) so a
+    /// relaying gateway captures `on_meta`'s verdict LIVE (folded into `…/ota/relaydiag`). `main`
+    /// gates the call on `!is_gateway` + the ~2 s HELLO cadence. Payload is fixed-width binary.
+    /// `espnow`-scoped: the `LDBG` frame + `ota_leaf` self-report only exist in the mesh build.
+    #[cfg(feature = "espnow")]
+    pub fn broadcast_ldbg(&mut self, heard: u16, verdict: u8, sent: u16) {
+        let ch = self.current_channel(); // #3b: 0 = scanning/unlocked, else the locked channel
+        let mut msg = [0u8; crate::ota_mesh::LDBG_FRAME_LEN];
+        let base = encode_id_frame(crate::ota_mesh::LDBG_PREFIX, self.id, &mut msg);
+        msg[base..base + 2].copy_from_slice(&heard.to_le_bytes());
+        msg[base + 2] = verdict;
+        msg[base + 3..base + 5].copy_from_slice(&sent.to_le_bytes());
+        msg[base + 5] = ch;
+        self.send_to(&BROADCAST_ADDRESS, &msg[..base + 6]);
+    }
+
     /// #21 leaf-relay: GATEWAY-only. Broadcast one `SMOLv1 CFG` per CACHED leaf
     /// config (skipping the gateway's OWN id — it self-applies via the credentialed
     /// MQTT path). Single-hop (leaves never re-broadcast → no flood/loop). No-op on a
@@ -2104,7 +2225,552 @@ impl RadioManager {
         match self.sta.as_mut() {
             None => false,
             Some(sta) => {
-                crate::net::wifi::run_ota_fetch(&mut self.controller, sta, rng, announce, tick)
+                // Self-OTA: activate-on-success (relay_mode = false; the slot out-param is
+                // unused since a successful self-fetch reboots inside `activate`).
+                crate::net::wifi::run_ota_fetch(
+                    &mut self.controller, sta, rng, announce, tick, false, &mut None,
+                )
+            }
+        }
+    }
+
+    /// #40: record a leaf-OTA attempt's outcome (called by `main` after `run_leaf_ota_relay`,
+    /// or with `MacUnknown` when the MAC wasn't in the roster). Decides whether to CLEAR the
+    /// retained install (terminal — the leaf installed or rolled back — or the transient-retry
+    /// cap is hit) vs LEAVE it retained to retry (mac-unknown / fetch / relay / timeout). The
+    /// phase is published to `smol/<leaf>/ota/diag` on the next burst (headless observability).
+    pub fn record_leaf_ota(&mut self, leaf_id: u8, outcome: crate::ota_mesh::LeafOtaOutcome) {
+        let clear = if outcome.is_terminal() {
+            self.leaf_ota_retries = 0;
+            true
+        } else {
+            self.leaf_ota_retries = self.leaf_ota_retries.saturating_add(1);
+            let exhausted = self.leaf_ota_retries >= LEAF_OTA_MAX_RETRIES;
+            if exhausted {
+                self.leaf_ota_retries = 0;
+            }
+            exhausted
+        };
+        log::info!(
+            "smol #40: leaf id{} OTA phase={} (clear_install={}, retries={})",
+            leaf_id, outcome.as_str(), clear, self.leaf_ota_retries
+        );
+        self.leaf_ota_diag = Some((leaf_id, outcome.as_str(), clear));
+        // #1 DECOUPLE: the relay session is done for this install iff we're clearing it
+        // (terminal outcome or retry cap). While NOT cleared (transient retry) it stays
+        // pending so the gateway keeps suppressing its own self-OTA until the leaf resolves.
+        // #3: the sticky MAC is likewise session-scoped — drop it on the same terminal edge so
+        // a FUTURE install re-learns the (possibly re-homed) leaf from a live roster hit.
+        if clear {
+            self.leaf_ota_pending = false;
+            self.leaf_ota_mac = None;
+        }
+    }
+
+    /// #40 #1: mark that a leaf-OTA relay has been armed (called by `main` when it takes an
+    /// armed `leaf_ota`). Suppresses the gateway's own self-OTA until the relay resolves.
+    pub fn note_leaf_ota_armed(&mut self) {
+        self.leaf_ota_pending = true;
+    }
+
+    /// #40 #1: is a leaf-OTA relay pending/in-flight? `main` gates the gateway's self-OTA
+    /// (`do_install`) on `!leaf_ota_pending()` so a relay is never interrupted.
+    pub fn leaf_ota_pending(&self) -> bool {
+        self.leaf_ota_pending
+    }
+
+    /// #40 GATEWAY leaf-mesh-OTA orchestration (§B4). Fetch the staged image (WiFi) into
+    /// THIS gateway's inactive slot → relay it over ESP-NOW to ONE leaf (windowed-NAK) →
+    /// watch for the leaf's Tier-2 STAT reappearance at the NEW build. CANARY-ONE-LEAF:
+    /// targets exactly `leaf_mac`; there is NO broadcast image push. Blocking + mesh-
+    /// degrading for its duration (WiFi fetch then ESP-NOW relay — never concurrent, §D#1);
+    /// the UI-alive `tick` runs throughout and latches a long-press ABORT. Returns the
+    /// outcome for the HA `smol/<leaf>/ota/state` publish. No-op on a non-gateway.
+    pub fn run_leaf_ota_relay(
+        &mut self,
+        leaf_id: u8,
+        leaf_mac: [u8; 6],
+        announce: &crate::ota::Announce,
+        tick: &mut dyn FnMut() -> bool,
+    ) -> crate::ota_mesh::LeafOtaOutcome {
+        use crate::ota_mesh::{
+            self as om, LeafOtaOutcome, CHUNK_PAYLOAD, WINDOW_BYTES, WINDOW_CHUNKS,
+        };
+        use esp_bootloader_esp_idf::ota::Slot;
+        if !self.relay.is_gateway {
+            return LeafOtaOutcome::RelayFailed;
+        }
+        let size = announce.size;
+        let total = om::total_chunks(size);
+        // Session discriminator (retry/concurrency): low 16 bits of the monotonic build.
+        let session: u16 = (announce.build & 0xFFFF) as u16;
+        log::info!(
+            "smol #40: RELAY start → leaf id{} build {} ({} B, {} chunks)",
+            leaf_id, announce.build, size, total
+        );
+
+        // --- #3b PRE-FETCH ARM (the AP-independent fix) ---------------------------------------
+        // Broadcast the OTAM to the leaf WHILE IT'S STILL RECEPTIVE ON ch6 — BEFORE the WiFi fetch
+        // takes the radio off-channel for minutes. At this point the leaf has only been
+        // gateway-silent for the just-finished flush (~seconds), so it's hopping [1,6,11] but
+        // still ONLINE (not yet the prolonged-re-election OFFLINE we saw post-fetch). The instant
+        // it catches an OTAM on a ch6 dwell it (a) locks ch6 via `handle_ota_frame` and (b) arms
+        // its session → `ota_leaf.is_active()` then PINS it on ch6 through the whole fetch (no
+        // scan, no re-election — see leaf_scan_tick + maybe_leaf_reelect gates). Post-fetch OTAD
+        // lands on the still-locked leaf. (The post-fetch wake-burst failed because it chased an
+        // ALREADY-scanning/offline leaf — canary leaf_ch=0. Arming pre-fetch stops the scan before
+        // it starts.) Bounded; breaks early once the leaf's LDBG shows armed (verdict=1) or it NAKs.
+        {
+            let _ = self.switch(Mode::EspNow); // ch6 (the flush left us in WifiSta)
+            let mut s = 0u16;
+            while s < 40 {
+                if !matches!(self.controller.is_connected(), Ok(true)) {
+                    break;
+                }
+                let _ = self.controller.disconnect();
+                s = s.saturating_add(1);
+                if tick() {
+                    return LeafOtaOutcome::Aborted;
+                }
+            }
+            let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+            if !self.esp_now.peer_exists(&BROADCAST_ADDRESS) {
+                let _ = self.esp_now.add_peer(PeerInfo {
+                    interface: EspNowWifiInterface::Sta,
+                    peer_address: BROADCAST_ADDRESS,
+                    lmk: None,
+                    channel: None,
+                    encrypt: false,
+                });
+            }
+            let mut otam_pre = [0u8; om::OTAM_FRAME_MAX];
+            if let Some(pre_len) = om::encode_otam(
+                leaf_id, session, announce.signed_msg(), announce.sig(), &mut otam_pre,
+            ) {
+                const PREARM_MS: u64 = 15_000;
+                const PREARM_GAP_MS: u64 = 120;
+                let deadline = now_ms() + PREARM_MS;
+                let mut last = 0u64;
+                while now_ms() < deadline {
+                    if tick() {
+                        return LeafOtaOutcome::Aborted;
+                    }
+                    let t = now_ms();
+                    if t.saturating_sub(last) >= PREARM_GAP_MS {
+                        let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+                        let _ = self.esp_now.send(&BROADCAST_ADDRESS, &otam_pre[..pre_len]);
+                        last = t;
+                    }
+                    if let Some(recv) = self.esp_now.receive() {
+                        if recv.info.src_address == leaf_mac {
+                            let armed = matches!(
+                                om::parse_ldbg(recv.data(), leaf_id),
+                                Some((_, 1, _, _))
+                            ) || matches!(
+                                om::parse_ota_frame(recv.data()),
+                                Some(om::OtaFrame::Nak { .. })
+                            );
+                            if armed {
+                                break; // leaf armed pre-fetch → its is_active hold now carries ch6
+                            }
+                        }
+                    }
+                }
+                log::info!("smol #3b: pre-fetch arm burst done (leaf id{})", leaf_id);
+            }
+        }
+
+        // --- FETCH (WiFi) → stage+verify into THIS gateway's inactive slot (no activate).
+        // CRITICAL: `run_leaf_ota_relay` is called IMMEDIATELY after `flush_telemetry`, which
+        // leaves the radio in WifiSta. `switch()` is a NO-OP when already in-mode → it would
+        // NOT issue a fresh `connect()`, but `run_ota_fetch` ASSUMES the caller's switch just
+        // connect()'d (its own contract). If the flush's association has gone stale, the fetch
+        // then spins its whole 5-min budget waiting for `is_connected` (no SYN, mesh-deaf) —
+        // exactly the observed "no fetch + long offline". Self-OTA avoids this because it runs
+        // from EspNow mode (its switch DOES connect). So force a fresh association here:
+        // EspNow (drop the stale link) → WifiSta (issue a real connect), mirroring self-OTA.
+        let _ = self.switch(Mode::EspNow);
+        let _ = self.switch(Mode::WifiSta);
+        let rng = self.rng;
+        let mut staged: Option<Slot> = None;
+        let fetched = match self.sta.as_mut() {
+            Some(sta) => crate::net::wifi::run_ota_fetch(
+                &mut self.controller, sta, rng, announce, tick, true, &mut staged,
+            ),
+            None => false,
+        };
+        let staged = if fetched { staged } else { None };
+        let Some(slot) = staged else {
+            log::error!("smol #40: relay FETCH/stage failed — aborting (leaf untouched)");
+            let _ = self.switch(Mode::EspNow);
+            return LeafOtaOutcome::FetchFailed;
+        };
+        let Some(reader) = crate::ota::SlotReader::open(slot) else {
+            log::error!("smol #40: relay slot-open failed — aborting");
+            let _ = self.switch(Mode::EspNow);
+            return LeafOtaOutcome::FetchFailed;
+        };
+
+        // --- RELAY (ESP-NOW) — windowed-NAK to the ONE leaf MAC. ---
+        let _ = self.switch(Mode::EspNow);
+        if !self.esp_now.peer_exists(&leaf_mac) {
+            let _ = self.esp_now.add_peer(PeerInfo {
+                interface: EspNowWifiInterface::Sta,
+                peer_address: leaf_mac,
+                lmk: None,
+                channel: None,
+                encrypt: false,
+            });
+        }
+        // #3b: DEFENSIVE — (re)add the broadcast peer in the relay ESP-NOW context. Normal HELLOs
+        // egress without an explicit broadcast peer, but this send follows a WiFi fetch
+        // (WifiSta→switch(EspNow)) which may have perturbed the peer table / TX state; a missing
+        // broadcast peer makes `esp_now_send(ff:ff:…)` return NOT_FOUND → the OTAM never egresses
+        // (candidate cause of leaf H0 with the gateway on-channel). The `otam_tx/otam_ok` diag
+        // below proves whether the send now succeeds.
+        if !self.esp_now.peer_exists(&BROADCAST_ADDRESS) {
+            let _ = self.esp_now.add_peer(PeerInfo {
+                interface: EspNowWifiInterface::Sta,
+                peer_address: BROADCAST_ADDRESS,
+                lmk: None,
+                channel: None,
+                encrypt: false,
+            });
+        }
+        // #3b CHANNEL FIX (the real one — canary 7708b20 proved otam_tx=17/17 egress OK, yet leaf
+        // H0 with rx collapsed 10→2): the OTAM fires right after the WiFi FETCH. `switch(EspNow)`
+        // above issued an ASYNC `disconnect()` + `set_channel(ch6)`, but while the STA is still
+        // tearing down it HOLDS the AP's channel → the OTAM broadcast egresses on the AP channel,
+        // not ch6, so the ch6 leaf never hears it. SPIN until the STA truly releases the PHY, THEN
+        // pin ch6 (and re-pin right before each OTAM send below). `settle` (published) = how long
+        // the STA held on — settle>0 confirms this WAS the off-channel egress.
+        let mut settle: u16 = 0;
+        while settle < 40 {
+            if !matches!(self.controller.is_connected(), Ok(true)) {
+                break;
+            }
+            let _ = self.controller.disconnect();
+            settle = settle.saturating_add(1);
+            if tick() {
+                return LeafOtaOutcome::Aborted;
+            }
+        }
+        let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+        let gwbuf = unsafe { &mut *core::ptr::addr_of_mut!(GW_OTA_WINDOW) };
+        let mut otam = [0u8; om::OTAM_FRAME_MAX];
+        let Some(otam_len) =
+            om::encode_otam(leaf_id, session, announce.signed_msg(), announce.sig(), &mut otam)
+        else {
+            return LeafOtaOutcome::RelayFailed;
+        };
+        let mut otad = [0u8; om::OTAD_FRAME_MAX];
+
+        // #3 RX-DIAG counters: rx_any = frames heard FROM this leaf during the relay windows;
+        // otan_valid = valid advancing/NAK OTANs for the live session. Plus the leaf's own LDBG
+        // self-report (heard/verdict/sent), captured live from its beacon; verdict 255 = none seen.
+        // All stored into `leaf_relay_rx` at each terminal exit → published next flush (relaydiag).
+        let mut rx_any: u16 = 0;
+        let mut otan_valid: u16 = 0;
+        let mut ldbg_heard: u16 = 0;
+        let mut ldbg_verdict: u8 = 255;
+        let mut ldbg_sent: u16 = 0;
+        let mut ldbg_ch: u8 = 0; // #3b: leaf's channel at beacon time (0=scanning, 6=locked ch6)
+        // #3b OTAM TX-diag: broadcast sends attempted vs returned-Ok (queued + TX-callback ok).
+        let mut otam_tx: u16 = 0;
+        let mut otam_ok: u16 = 0;
+
+        // #3b WAKE-BURST: the leaf lost the gateway during the off-ch6 fetch and is now hopping
+        // [1,6,11] (on ch6 only ~⅓ of the time) and/or re-electing over WiFi — so a single OTAM
+        // per window-0 round (spaced by the 800 ms OTAN wait) rarely coincides with the leaf's
+        // brief ch6 dwell (canary: leaf H0). OPEN the relay with a DENSE OTAM flood: rebroadcast
+        // the announce every ~120 ms for up to WAKE_MS, maximizing overlap with the leaf's sparse
+        // ch6 windows. The first OTAM the leaf catches locks it to ch6 (`handle_ota_frame`) and
+        // arms its session → it then holds ch6 (`leaf_scan_tick` is_active) for the transfer. Stop
+        // early the instant the leaf NAKs (it's armed + ready for the windowed transfer).
+        // #3b: this post-fetch burst is now a short FALLBACK + diag capture — the PRIMARY arming
+        // happens PRE-fetch (above), so a leaf that pre-armed is already locked+active here and
+        // this just backstops the case where pre-arm missed. Kept short (was 90s) since a leaf
+        // that didn't pre-arm has drifted off-ch6 for the whole fetch and a long post-fetch flood
+        // was proven dead (canary leaf_ch=0). Self-stops on first NAK. Also captures the leaf's
+        // LDBG (leaf_ch/verdict) for relaydiag. Real coexist cure stays infra (ch6 fetch AP, JP).
+        const WAKE_MS: u64 = 15_000;
+        const WAKE_GAP_MS: u64 = 120;
+        let wake_deadline = now_ms() + WAKE_MS;
+        let mut last_wake_ms = 0u64;
+        while now_ms() < wake_deadline {
+            if tick() {
+                return LeafOtaOutcome::Aborted;
+            }
+            let t = now_ms();
+            if t.saturating_sub(last_wake_ms) >= WAKE_GAP_MS {
+                let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+                otam_tx = otam_tx.saturating_add(1);
+                if let Ok(waiter) = self.esp_now.send(&BROADCAST_ADDRESS, &otam[..otam_len]) {
+                    if waiter.wait().is_ok() {
+                        otam_ok = otam_ok.saturating_add(1);
+                    }
+                }
+                last_wake_ms = t;
+            }
+            if let Some(recv) = self.esp_now.receive() {
+                if recv.info.src_address == leaf_mac {
+                    rx_any = rx_any.saturating_add(1);
+                    if let Some((h, v, n, c)) = om::parse_ldbg(recv.data(), leaf_id) {
+                        ldbg_heard = h;
+                        ldbg_verdict = v;
+                        ldbg_sent = n;
+                        ldbg_ch = c;
+                    }
+                    if matches!(
+                        om::parse_ota_frame(recv.data()),
+                        Some(om::OtaFrame::Nak { .. })
+                    ) {
+                        break; // leaf armed + NAKing → proceed to the windowed transfer
+                    }
+                }
+            }
+        }
+
+        let mut wb: u32 = 0;
+        'windows: while wb < total {
+            if tick() {
+                return LeafOtaOutcome::Aborted;
+            }
+            let wlen_chunks = core::cmp::min(WINDOW_CHUNKS as u32, total - wb);
+            let window_off = wb * CHUNK_PAYLOAD as u32;
+            let window_bytes = core::cmp::min(WINDOW_BYTES as u32, size - window_off) as usize;
+            // Read this window from the staged slot (word-aligned length; extra padding
+            // bytes past `window_bytes` are read but never sent).
+            let read_len = ((window_bytes as u32).div_ceil(4) * 4) as usize;
+            if !reader.read(window_off, &mut gwbuf[..read_len]) {
+                log::error!("smol #40: slot readback failed at window {} — aborting", wb);
+                self.leaf_relay_rx = Some(crate::net::wifi::RelayDiag {
+                    leaf_id, rx_any, otan_valid, last_wb: wb as u16, total: total as u16,
+                    leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
+                    otam_tx, otam_ok,
+                    settle,
+                    leaf_ch: ldbg_ch,
+                });
+                let _ = self.switch(Mode::EspNow);
+                return LeafOtaOutcome::RelayFailed;
+            }
+            let full = om::window_full_mask(wlen_chunks);
+            let mut missing = full; // first pass: send every chunk in the window
+            let mut rounds: u32 = 0;
+            loop {
+                if tick() {
+                    return LeafOtaOutcome::Aborted;
+                }
+                // (Re)send OTAM during window 0 so a leaf that missed it can still arm.
+                // #3b: BROADCAST the announce (not unicast to leaf_mac). Root cause of the
+                // a949574 canary's `leaf=H0V0N0` (leaf hears ZERO OTAMs while rx=10 proves the
+                // reverse path works): ESP-NOW unicast RX requires the SENDER be a registered
+                // peer on the receiver, but the leaf only adds the gateway as a peer WHEN it
+                // receives an OTA frame (handle_ota_frame) or a gateway HELLO — and the gateway
+                // is HELLO-silent during the mesh-deaf relay → bootstrap deadlock. A BROADCAST
+                // needs no peer (that's why HELLOs land), so the leaf receives it, arms, and
+                // adds the gateway peer → the subsequent UNICAST OTAD/OTAN then flow to the
+                // (correct, roster-learned) MACs. Design §B: only the small ANNOUNCE broadcasts;
+                // the image (OTAD) stays unicast — "no broadcast image push" preserved. The
+                // `target` id in the frame keeps canary-one-leaf semantics (only leaf_id arms).
+                if wb == 0 {
+                    // #3b: re-pin ch6 right before the announce (self-healing if the post-fetch
+                    // STA teardown released the channel late), then capture the send Result
+                    // (send_to swallows it) to prove egress.
+                    let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+                    otam_tx = otam_tx.saturating_add(1);
+                    if let Ok(waiter) = self.esp_now.send(&BROADCAST_ADDRESS, &otam[..otam_len]) {
+                        if waiter.wait().is_ok() {
+                            otam_ok = otam_ok.saturating_add(1);
+                        }
+                    }
+                }
+                for i in 0..wlen_chunks as usize {
+                    if (missing >> i) & 1 == 1 {
+                        let seq = wb + i as u32;
+                        let coff = i * CHUNK_PAYLOAD;
+                        let clen = core::cmp::min(CHUNK_PAYLOAD, window_bytes - coff);
+                        let n = om::encode_otad(
+                            leaf_id, session, seq as u16, &gwbuf[coff..coff + clen], &mut otad,
+                        );
+                        self.send_to(&leaf_mac, &otad[..n]);
+                    }
+                }
+                // Wait for this window's OTAN (all-zero = advance; else the missing set).
+                let deadline = now_ms() + GW_OTAN_WAIT_MS;
+                let mut advanced = false;
+                let mut got_nak = false;
+                while now_ms() < deadline {
+                    if let Some(recv) = self.esp_now.receive() {
+                        if recv.info.src_address == leaf_mac {
+                            rx_any = rx_any.saturating_add(1); // #3: heard SOMETHING from the leaf
+                            // #3: capture the leaf's LDBG self-report (latest wins) — names WHY
+                            // otan=0 without needing the leaf back online post-relay.
+                            if let Some((h, v, n, c)) = om::parse_ldbg(recv.data(), leaf_id) {
+                                ldbg_heard = h;
+                                ldbg_verdict = v;
+                                ldbg_sent = n;
+                                ldbg_ch = c;
+                            }
+                            if let Some(om::OtaFrame::Nak { origin, session: s, window_base, bitmap }) =
+                                om::parse_ota_frame(recv.data())
+                            {
+                                if origin == leaf_id && s == session && window_base as u32 == wb {
+                                    otan_valid = otan_valid.saturating_add(1); // #3: valid OTAN
+                                    let miss = om::bitmap_to_u64(bitmap) & full;
+                                    if miss == 0 {
+                                        advanced = true;
+                                    } else {
+                                        missing = miss;
+                                        got_nak = true;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if advanced {
+                    wb += WINDOW_CHUNKS as u32;
+                    break;
+                }
+                if !got_nak {
+                    missing = full; // no NAK in the wait → resend the whole window
+                }
+                rounds += 1;
+                if rounds > GW_WINDOW_ROUNDS_MAX {
+                    // #3b TAIL FIX: the LAST window never gets an advance-ack — the leaf
+                    // finalizes+Completes it (ota_mesh on_data sends the all-zero ack ONLY for
+                    // non-last windows, then reboots into the new image). So the gateway CANNOT
+                    // hear an advance for the last window; "exhaustion" here is EXPECTED, not a
+                    // failure. The blind full-window resends across these rounds delivered the
+                    // last chunks (98.8%→100% at the tail); the leaf's real completion signal is
+                    // its REBOOT (build flip), which the CONFIRM phase below detects. So fall
+                    // THROUGH to confirm — returning RelayFailed here failed even a perfect
+                    // transfer (canary 7ee3982: 4288/4341, last window, leaf never confirmed).
+                    if wb + WINDOW_CHUNKS as u32 >= total {
+                        log::info!(
+                            "smol #40: last window {} sent {} rounds (rx_any={} otan={}) — leaf finalizes w/o advance-ack → CONFIRM",
+                            wb, GW_WINDOW_ROUNDS_MAX, rx_any, otan_valid
+                        );
+                        break 'windows;
+                    }
+                    log::error!(
+                        "smol #40: window {} exceeded {} retransmit rounds (rx_any={} otan={}) — aborting (R2 bound)",
+                        wb, GW_WINDOW_ROUNDS_MAX, rx_any, otan_valid
+                    );
+                    self.leaf_relay_rx = Some(crate::net::wifi::RelayDiag {
+                        leaf_id, rx_any, otan_valid, last_wb: wb as u16, total: total as u16,
+                        leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
+                        otam_tx, otam_ok, settle, leaf_ch: ldbg_ch,
+                    });
+                    return LeafOtaOutcome::RelayFailed;
+                }
+            }
+        }
+        // #3 RX-DIAG: relay TX phase COMPLETE — all chunks delivered + acked (wb==total). Record
+        // the full-progress RX evidence for the relaydiag; the confirm outcome (below) is the
+        // separate Tier-2 verdict published to `…/ota/diag`.
+        self.leaf_relay_rx = Some(crate::net::wifi::RelayDiag {
+            leaf_id, rx_any, otan_valid, last_wb: total as u16, total: total as u16,
+            leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
+            otam_tx, otam_ok, settle,
+            leaf_ch: ldbg_ch,
+        });
+
+        // --- CONFIRMING (Tier-2, build-matched): sample the leaf's SETTLED build over the
+        // full confirm window. The leaf runs the NEW image immediately post-activate, so it
+        // STATs the new build even mid-self-test; a FAILED self-test then rolls it back to an
+        // OLDER build (and STATs that). We must NOT early-out:
+        //   • an early-out on a NEW-build sighting would miss a later rollback;
+        //   • an early-out on an OLD-build sighting would false-fail on a STALE STAT the leaf
+        //     broadcast at its old build DURING the (minutes-long) relay, still buffered in
+        //     the 10-deep ESP-NOW RX queue.
+        // So: DRAIN the stale queue first, then track the LAST-seen build across the whole
+        // window (> the leaf self-test window + a STAT cadence) → the settled verdict.
+        // A stale old-build STAT is overwritten by the post-reboot new-build STAT; a genuine
+        // rollback's old-build STAT is the last one seen. No STAT at all → possible brick.
+        // This is the PROGRESSION gate, not the safety gate (the leaf's local Tier-1 protects
+        // it); a wrong verdict at worst mis-labels the HA card, never bricks/compromises.
+        log::info!(
+            "smol #40: all {} chunks relayed — awaiting leaf id{} Tier-2 confirm at build {}",
+            total, leaf_id, announce.build
+        );
+        // Discard any frames buffered during the relay (incl. the leaf's stale old-build STAT).
+        for _ in 0..64 {
+            if self.esp_now.receive().is_none() {
+                break;
+            }
+        }
+        let cdeadline = now_ms() + GW_CONFIRM_TIMEOUT_MS;
+        let mut last_build: Option<u32> = None;
+        // #40 IDENTITY GUARD: a logical id STATed by the TARGET MAC that isn't `leaf_id`.
+        // With the runtime-NVS identity fix this stays None; if it fires, the image booted
+        // with a stolen/wrong id → an explicit `id-mismatch` beats a silent leaf-timeout.
+        let mut mac_seen_id: Option<u8> = None;
+        let mut last_hello_ms = 0u64;
+        while now_ms() < cdeadline {
+            if tick() {
+                return LeafOtaOutcome::Aborted;
+            }
+            // #3b REJOIN: HELLO on ch6 (~1 Hz) throughout the confirm window. The leaf just
+            // activated + REBOOTED into the new image and must HEAR A VALID FRAME to pass its
+            // hear-a-frame self-test (else it rolls back off the new build) AND lock onto us to
+            // STAT its new build (the confirm signal). The old confirm loop was SILENT — the
+            // rebooted leaf heard nothing → self-test never passed → it rolled back / never
+            // rejoined, so a SUCCESSFUL delivery (image activated + booted) looked like a failure
+            // (canary: leaf booted 126 from ota_1 but HA never saw a 126 STAT). Stay pinned ch6.
+            let t = now_ms();
+            if t.saturating_sub(last_hello_ms) >= 1000 {
+                let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+                self.broadcast_hello();
+                last_hello_ms = t;
+            }
+            if let Some(recv) = self.esp_now.receive() {
+                // Copy the source MAC out FIRST (Copy) so the `recv.data()` borrow in the
+                // parse below doesn't collide with the identity-guard MAC compare.
+                let src_mac = recv.info.src_address;
+                if let Some(Frame::Stat { src, value }) = parse_frame(recv.data()) {
+                    if src == leaf_id {
+                        if let Some(b) = om::stat_build(value) {
+                            last_build = Some(b); // keep the latest — the settled state wins
+                        }
+                    } else if src_mac == leaf_mac {
+                        // Our target board (matched by sticky MAC) is STATing a DIFFERENT id.
+                        mac_seen_id = Some(src);
+                    }
+                }
+            }
+        }
+        match last_build {
+            Some(b) if b >= announce.build => {
+                log::info!("smol #40: leaf id{} CONFIRMED at build {} — update stuck", leaf_id, b);
+                LeafOtaOutcome::Confirmed
+            }
+            Some(b) => {
+                log::warn!(
+                    "smol #40: leaf id{} settled at OLD build {} — self-test rolled it back (HA re-offers)",
+                    leaf_id, b
+                );
+                LeafOtaOutcome::RolledBack
+            }
+            None => {
+                if let Some(wrong) = mac_seen_id {
+                    // The physical board booted + STATs, but under the WRONG id — a stolen
+                    // baked-default identity (NVS not seeded / shared image on a fresh board).
+                    // Explicit `id-mismatch` (terminal) instead of a mystery leaf-timeout.
+                    log::error!(
+                        "smol #40: leaf id{} target MAC now STATs as id{} — IDENTITY MISMATCH (stolen baked id / NVS unseeded), not a brick",
+                        leaf_id, wrong
+                    );
+                    LeafOtaOutcome::IdMismatch
+                } else {
+                    log::error!(
+                        "smol #40: leaf id{} did not reappear at build {} within the confirm window — possible brick (USB recovery)",
+                        leaf_id, announce.build
+                    );
+                    LeafOtaOutcome::Timeout
+                }
             }
         }
     }
@@ -2117,6 +2783,9 @@ impl RadioManager {
         status: &[u8],
         batt: &mut crate::batt::BattCache,
         grid: &mut crate::grid::GridCache,
+        // #40: filled with `(leaf_id, staged announce)` if this flush surfaced a leaf OTA
+        // install → `main` then calls `run_leaf_ota_relay` for that leaf. `None` otherwise.
+        leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
         tick: &mut dyn FnMut() -> bool,
     ) -> bool {
         if !self.relay.is_gateway {
@@ -2154,6 +2823,8 @@ impl RadioManager {
         let mut config_offer: Option<crate::app::DefaultScreen> = None;
         // #33: capture any OTA install command this flush surfaces.
         let mut install_requested = false;
+        // #40 #1: set iff this flush SEES a retained leaf install (pre-arm) → latch pending below.
+        let mut leaf_install_seen = false;
         let sta = self.sta.as_mut();
         let ok = match sta {
             None => false,
@@ -2189,10 +2860,15 @@ impl RadioManager {
                     &mut ota_offer,
                     &mut config_offer,
                     &mut install_requested,
+                    &mut leaf_install_seen, // #40 #1: latch pending on install-SEEN (below)
                     peers, // #27: gateway publishes its roster as retained smol/<id>/peers
                     status, // #50: gateway publishes its live screen as smol/<id>/status
                     Some(&mut self.cfg_cache), // #21: gateway caches leaf configs to relay
                     Some(&self.stat_cache), // #50b: gateway republishes cached leaf statuses
+                    leaf_ota, // #40: surface a pending leaf-OTA install for main to relay
+                    &mut self.staged_raw, // #40: persist the staged across flushes (pair-safe)
+                    &mut self.leaf_ota_diag, // #40: publish smol/<leaf>/ota/diag + clear/retry
+                    &mut self.leaf_relay_rx, // #3: publish smol/<leaf>/ota/relaydiag (RX evidence)
                     tick,
                 )
             }
@@ -2208,6 +2884,15 @@ impl RadioManager {
         // #33: OR-in an install command (one-shot; `main`'s take clears it).
         if install_requested {
             self.install_requested = true;
+        }
+        // #40 #1 (self-OTA-first fix): if this flush SAW a retained leaf install, latch
+        // `leaf_ota_pending` NOW — on install-SEEN, before the arm (which needs the cached staged
+        // image). Otherwise the gateway's own `do_install` (gated on !leaf_ota_pending) could fire
+        // in the window between seeing its own install and the leaf arming → self-OTA first,
+        // inverting the demo order + rebooting the gateway early. Cleared on the terminal
+        // `record_leaf_ota` (retained install goes away → not seen next flush).
+        if leaf_install_seen {
+            self.leaf_ota_pending = true;
         }
         // #23 fix (oracle #2): APPLY the re-election result to the LIVE role. On a
         // connected flush, persist the refreshed staleness observation; if a LIVE
@@ -2348,6 +3033,15 @@ impl RadioManager {
             // BENCH. Captured up front so each arm can record it if relevant.
             let rssi = recv.info.rx_control.rssi;
             let now = now_ms();
+
+            // #40 leaf-mesh-OTA transport (OTAM/OTAD/OTAN). Dispatched BEFORE the generic
+            // Frame parse — the 64-B signed manifest / raw image chunk don't fit the Frame
+            // enum. A LEAF drives its receive session here; a GATEWAY's relay is the
+            // dedicated blocking `run_leaf_ota_relay`, so it no-ops these in this drain.
+            if let Some(otaf) = crate::ota_mesh::parse_ota_frame(recv.data()) {
+                self.handle_ota_frame(otaf, src, rssi, now);
+                continue;
+            }
 
             match parse_frame(recv.data()) {
                 Some(Frame::Snk(f)) => {
@@ -2589,15 +3283,28 @@ impl RadioManager {
                     // SENDER leaf id; the MQTT flush republishes it as retained
                     // `smol/<leaf_id>/status`. Opaque bytes (mirror CFG) — a stray/foreign
                     // frame can at worst set a bad screen string, self-corrected next
-                    // cadence; never a brick. NOTE: `src` stays the frame's SOURCE MAC for
-                    // the roster liveness update (mirrors the BATT/GRID/CFG arms); the
-                    // leaf's id↔MAC mapping is already learned from its 2 s HELLOs, so the
-                    // `None` id here is correct + side-effect-free.
+                    // cadence; never a brick.
+                    //
+                    // #40 FIX (was `None`): LEARN the leaf's id↔MAC from its STAT. The STAT
+                    // frame CARRIES the sender's id (`leaf_id`), and the relay-eligible set is
+                    // exactly "leaves the gateway heard STAT from" (stat_cache / §B2). The old
+                    // `None` assumed the id↔MAC was already learned from the leaf's 2 s HELLOs
+                    // — but a leaf can be STAT-audible yet HELLO-silent to the gateway (e.g.
+                    // #51 silent-until-relock, or its HELLO simply not landing), leaving
+                    // `id_known=false` → `mac_for_id(leaf)` returned None → the relay armed but
+                    // bailed at the MAC lookup with no fetch (RUNTIME-confirmed via ota/diag=
+                    // mac-unknown). Recording `Some(leaf_id)` here makes the relay-set and the
+                    // MAC lookup consistent. Threat model unchanged: id↔MAC from an unauth STAT
+                    // is no weaker than from an unauth HELLO (both already trusted), and the
+                    // relayed image is ed25519-signed so a spoofed id→MAC only wastes a session.
                     if self.relay.is_gateway {
-                        self.stat_cache.set(leaf_id, value);
+                        // #68 F6/roster-robustness: stamp the STAT with the sender's MAC + time so
+                        // a stale leaf stops ghosting its status and stays mac-resolvable if the
+                        // LRU roster later evicts it.
+                        self.stat_cache.set(leaf_id, value, src, now);
                     }
                     self.peers.last_hello_ms = now;
-                    self.roster.heard(src, None, rssi, now);
+                    self.roster.heard(src, Some(leaf_id), rssi, now);
                     label = Some(alloc::string::String::from("stat"));
                 }
                 None => {
@@ -2607,7 +3314,120 @@ impl RadioManager {
                 }
             }
         }
+        // #40: nudge the leaf OTA session once per service pass (idle-NAK a stalled
+        // window; abort on a progress/hard-cap timeout). No-op unless a transfer is live.
+        {
+            let mut out = [0u8; crate::ota_mesh::OTAN_FRAME_MAX];
+            if let crate::ota_mesh::LeafAction::Nak(n) = self.ota_leaf.tick(self.id, now_ms(), &mut out) {
+                let gw = self.ota_leaf.gateway_mac();
+                self.send_to(&gw, &out[..n]);
+            }
+        }
         label
+    }
+
+    /// #40: dispatch one decoded leaf-mesh-OTA frame. Updates peer liveness (an OTA frame
+    /// proves the gateway is audible — it also satisfies the leaf self-test's "heard a
+    /// valid SMOLv1 frame"), registers the sender for the unicast NAK back-channel, then
+    /// drives the receive session. On `Complete` [`crate::ota::activate`] reboots into the
+    /// new slot; on `Nak` we unicast the OTAN to the gateway; `Abort`/`None` do nothing.
+    fn handle_ota_frame(&mut self, f: crate::ota_mesh::OtaFrame<'_>, src: [u8; 6], rssi: i32, now: u64) {
+        use crate::ota_mesh::{LeafAction, OtaFrame};
+        self.peers.last_hello_ms = now;
+        self.roster.heard(src, None, rssi, now);
+        // #3b: an inbound OTA frame proves the gateway is audible on THIS channel (the relay
+        // runs on ESP_NOW_FIXED_CHANNEL). Treat it like the owner's HELLO — reset the
+        // owner-silence timer AND lock the channel — so the leaf STOPS the scan hop and STAYS on
+        // ch6 for the rest of the transfer. This is what lets the FIRST caught OTAM (caught while
+        // the leaf was mid-hop) pin the leaf so it hears the OTAD chunks + OTAM resends (#3b).
+        self.last_owner_heard_ms = now;
+        if !self.relay.is_gateway {
+            self.scan_locked = true;
+        }
+        if !self.esp_now.peer_exists(&src) {
+            let _ = self.esp_now.add_peer(PeerInfo {
+                interface: EspNowWifiInterface::Sta,
+                peer_address: src,
+                lmk: None,
+                channel: None,
+                encrypt: false,
+            });
+        }
+        let mut out = [0u8; crate::ota_mesh::OTAN_FRAME_MAX];
+        let id = self.id;
+        let action = match f {
+            OtaFrame::Meta { target, session, m, sig } => {
+                self.ota_leaf.on_meta(target, session, m, sig, src, id, now)
+            }
+            OtaFrame::Data { target, session, seq, payload } => {
+                self.ota_leaf.on_data(target, session, seq, payload, src, id, now, &mut out)
+            }
+            // A NAK is leaf→gateway; the gateway consumes it inside its blocking relay
+            // loop, never here. A leaf ignores it.
+            OtaFrame::Nak { .. } => LeafAction::None,
+        };
+        match action {
+            LeafAction::Nak(n) => {
+                let gw = self.ota_leaf.gateway_mac();
+                self.send_to(&gw, &out[..n]);
+            }
+            LeafAction::Complete(slot, build) => {
+                // Leaf mesh-OTA → is_leaf_ota=true → confirm via hear-a-frame on next boot.
+                crate::ota::activate(slot, build, true); // reboots on success
+            }
+            LeafAction::None | LeafAction::Abort => {}
+        }
+    }
+
+    /// #40 self-test (HOLE-1): has this node decoded ≥1 valid inbound `SMOLv1` frame since
+    /// boot? This is the leaf's mesh-terms health proof (radio+parse+RX work on the new
+    /// image) — the leaf analog of `reached_dhcp`, which a credential-less leaf never hits.
+    pub fn heard_valid_frame(&self) -> bool {
+        self.peers.last_hello_ms != 0
+    }
+
+    /// #40: look up a leaf's MAC (from the #27 roster, learned via its HELLOs) so the
+    /// gateway can unicast an OTA relay to it. `None` until the leaf has been heard.
+    pub fn mac_for_id(&self, id: u8) -> Option<[u8; 6]> {
+        self.roster.mac_for_id(id)
+    }
+
+    /// #40 #3: eviction-proof MAC lookup for the armed leaf-OTA install. Prefers the LIVE
+    /// roster (refreshing the sticky cache whenever the leaf is addressable), and falls back
+    /// to the cached `(leaf_id, mac)` when the LRU roster has EVICTED the leaf during the
+    /// mesh-deaf relay. The cache is set here on first sight and cleared by `record_leaf_ota`
+    /// on a terminal/exhausted outcome — so it holds for exactly one install session. This is
+    /// the fix for the a5d9b33 canary's `mac-unknown` dominance (relay could rarely even start).
+    pub fn mac_for_id_sticky(&mut self, id: u8) -> Option<[u8; 6]> {
+        if let Some(mac) = self.mac_for_id(id) {
+            self.leaf_ota_mac = Some((id, mac)); // freshest wins; refresh the session cache
+            return Some(mac);
+        }
+        if let Some((cid, mac)) = self.leaf_ota_mac {
+            if cid == id {
+                return Some(mac); // roster evicted it mid-session → use the session cache
+            }
+        }
+        // #68 roster-admission robustness: the roster (a 16-slot LRU with no staleness reaping)
+        // can EVICT a leaf that HELLOs sparsely while a chatty peer stays resident — so a leaf the
+        // gateway currently RELAYS/STATs (id8, live) can be absent from `mac_for_id`, silently
+        // no-arming its retained install. The stat_cache holds the id↔MAC of every recently-heard
+        // leaf (freshness-gated), so resolve from there as a last resort → any STAT-heard leaf
+        // stays armable. If it's genuinely off-air, the entry ages past STAT_FRESH_MS → None (no
+        // arm to a gone leaf; a stale ghost can't fake reachability).
+        let mac =
+            self.stat_cache
+                .mac_for(id, now_ms(), crate::net::wifi::STAT_FRESH_MS)?;
+        self.leaf_ota_mac = Some((id, mac));
+        Some(mac)
+    }
+
+    /// #40 #3: the leaf's OTA RX-diag `(otam_heard, on_meta_verdict, otan_sent)` — `main`
+    /// beacons it via `broadcast_ldbg` so a headless canary names (a)/(b)/(c) for a `relay-failed`.
+    /// `espnow`-scoped: `ota_leaf` (the receive session) only exists in the mesh build.
+    #[cfg(feature = "espnow")]
+    pub fn ota_leaf_dbg(&self) -> (u16, u8, u16) {
+        self.ota_leaf.dbg()
     }
 
     /// Current peer-link state as an [`LedState`], evaluated at `now_ms`.
@@ -2952,11 +3772,18 @@ pub fn start(
     // #33: stash a boot-time install command (retained) so `main` fetches after boot.
     radio.install_requested = install_requested;
 
-    // OTA MF-1: confirm/rollback the running image on its first boot, NOW that the
-    // WiFi/DHCP result is known. self-test = reached DHCP (a broken-WiFi image can't;
-    // the just-run download proved the net is up, so a healthy image won't
-    // false-rollback). May `software_reset` (rollback) → never returns in that case.
-    crate::ota::boot_confirm(reached_dhcp);
+    // OTA MF-1 / #40 HOLE-1 — ROLE-AWARE first-boot self-test.
+    // A node that reached DHCP has a working uplink → confirm NOW (DHCP is the gateway's
+    // health proof; a broken-WiFi image can't reach it, so a healthy image won't
+    // false-rollback). A node that did NOT reach DHCP is a LEAF (it can never win the
+    // gateway election): confirming on `reached_dhcp=false` here would roll back EVERY
+    // mesh-OTA (the credential-less leaf never does DHCP). So a leaf DEFERS its self-test
+    // to the main loop, which confirms on the mesh predicate (heard ≥1 valid SMOLv1 frame
+    // within N s) instead. `boot_confirm(true)` may still reboot-on-nothing (no-op if the
+    // image is already Valid). See main.rs `leaf_selftest_pending`.
+    if reached_dhcp {
+        crate::ota::boot_confirm(true);
+    }
 
     // #23: GATEWAY iff we reached DHCP AND won the election (lowest-id owner). A board
     // that reached DHCP but LOST (a lower-id owner already holds it) demotes to leaf.

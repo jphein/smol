@@ -353,6 +353,178 @@ mqtt:
       json_attributes_topic: "smol/9/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
       icon: "mdi:chip"
+    # --- #40 running BUILD# as a first-class device-merged value (JP ask 2026-07-11) ---
+    # Promotes the `build` attr of smol_<id>_screen to a plain visible sensor so the
+    # leaf-mesh-OTA canary is verifiable HEADLESS in HA (build# flipping = update stuck;
+    # the ESP32-C3 USB-JTAG boards give no reliable headless serial). Same
+    # STAT|<screen>:<page>|<build> source; length-guarded split (panic-free).
+    - name: "smol 7 build"
+      unique_id: smol_7_build_mirror
+      state_topic: "smol/7/status"
+      value_template: "{% set p = value.split('|') %}{{ p[2] if p | length >= 3 else 'unknown' }}"
+      entity_category: diagnostic
+      icon: "mdi:tag-text"
+    - name: "smol 8 build"
+      unique_id: smol_8_build_mirror
+      state_topic: "smol/8/status"
+      value_template: "{% set p = value.split('|') %}{{ p[2] if p | length >= 3 else 'unknown' }}"
+      entity_category: diagnostic
+      icon: "mdi:tag-text"
+    - name: "smol 9 build"
+      unique_id: smol_9_build_mirror
+      state_topic: "smol/9/status"
+      value_template: "{% set p = value.split('|') %}{{ p[2] if p | length >= 3 else 'unknown' }}"
+      entity_category: diagnostic
+      icon: "mdi:tag-text"
+    # --- #40 leaf-mesh-OTA relay PHASE (headless diag) — gateway publishes on its next burst
+    # after relaying to this leaf: confirmed / rolled-back / fetch-failed / relay-failed /
+    # leaf-timeout / mac-unknown. The mesh-only leaf has no serial, so this retained topic is
+    # the ONLY window into a relay attempt's outcome. `none` until a relay is attempted.
+    - name: "smol 7 ota diag"
+      unique_id: smol_7_ota_diag_mirror
+      state_topic: "smol/7/ota/diag"
+      value_template: "{{ value if value else 'none' }}"
+      entity_category: diagnostic
+      icon: "mdi:cloud-upload-outline"
+    - name: "smol 8 ota diag"
+      unique_id: smol_8_ota_diag_mirror
+      state_topic: "smol/8/ota/diag"
+      value_template: "{{ value if value else 'none' }}"
+      entity_category: diagnostic
+      icon: "mdi:cloud-upload-outline"
+    - name: "smol 9 ota diag"
+      unique_id: smol_9_ota_diag_mirror
+      state_topic: "smol/9/ota/diag"
+      value_template: "{{ value if value else 'none' }}"
+      entity_category: diagnostic
+      icon: "mdi:cloud-upload-outline"
+    # --- #40 leaf-mesh-OTA ARM-CHAIN trace (headless) — the GATEWAY dumps this every flush:
+    # "install-caught=<id|none> pending=<id|none> staged_raw=<build|none> leaf_ota=<0|1>".
+    # Pinpoints which arm link is null in one reflash (the C3 has no serial). Published by
+    # whichever node is currently the gateway; the others read `none`.
+    - name: "smol 7 ota armdiag"
+      unique_id: smol_7_ota_armdiag_mirror
+      state_topic: "smol/7/ota/armdiag"
+      value_template: "{{ value if value else 'none' }}"
+      entity_category: diagnostic
+      icon: "mdi:link-variant"
+    - name: "smol 8 ota armdiag"
+      unique_id: smol_8_ota_armdiag_mirror
+      state_topic: "smol/8/ota/armdiag"
+      value_template: "{{ value if value else 'none' }}"
+      entity_category: diagnostic
+      icon: "mdi:link-variant"
+    - name: "smol 9 ota armdiag"
+      unique_id: smol_9_ota_armdiag_mirror
+      state_topic: "smol/9/ota/armdiag"
+      value_template: "{{ value if value else 'none' }}"
+      entity_category: diagnostic
+      icon: "mdi:link-variant"
+    # --- #40 leaf-mesh-OTA RELAY PROGRESS (Luna · JP ask 2026-07-11) — the gateway publishes
+    # smol/<id>/ota/relaydiag on each burst while relaying the image to this leaf:
+    #   "rx=N otan=M last_wb=W/T otam_tx=A/B settle=S leaf=HxVyNzch<c>"
+    # last_wb=W/T is the LITERAL image-transfer progress (e.g. 4288/4343 = 98.7%). STATE = that
+    # percentage (numeric %, drives the dashboard progress bar); the raw fields ride as attributes
+    # so a stalling/tailing relay is diagnosable HEADLESS (the mesh-only leaf has no serial).
+    # Retained + STICKY: last_wb persists at 100% after a completed transfer — the dashboard gates
+    # visibility on build#-behind-staged / non-clean phase, NOT on this number alone. Length- and
+    # divide-guarded (panic-free): 'unknown' until a relay publishes a parseable last_wb.
+    - name: "smol 7 ota relaydiag"
+      unique_id: smol_7_ota_relaydiag_mirror
+      state_topic: "smol/7/ota/relaydiag"
+      unit_of_measurement: "%"
+      entity_category: diagnostic
+      icon: "mdi:progress-upload"
+      value_template: >-
+        {% set ns = namespace(w=0, t=0, ok=false) %}
+        {% for tok in value.split() %}
+          {% if tok.startswith('last_wb=') and '/' in tok %}
+            {% set f = tok.split('=', 1)[1].split('/') %}
+            {% set ns.w = f[0] | int(0) %}{% set ns.t = f[1] | int(0) %}{% set ns.ok = true %}
+          {% endif %}
+        {% endfor %}
+        {% if ns.ok and ns.t > 0 %}{{ (100.0 * ns.w / ns.t) | round(1) }}{% else %}unknown{% endif %}
+      json_attributes_topic: "smol/7/ota/relaydiag"
+      json_attributes_template: >-
+        {% set ns = namespace(rx='', otan='', wb='', otam='', settle='', leaf='') %}
+        {% for t in value.split() %}
+          {% if t.startswith('rx=') %}{% set ns.rx = t[3:] %}
+          {% elif t.startswith('otan=') %}{% set ns.otan = t[5:] %}
+          {% elif t.startswith('last_wb=') %}{% set ns.wb = t[8:] %}
+          {% elif t.startswith('otam_tx=') %}{% set ns.otam = t[8:] %}
+          {% elif t.startswith('settle=') %}{% set ns.settle = t[7:] %}
+          {% elif t.startswith('leaf=') %}{% set ns.leaf = t[5:] %}
+          {% endif %}
+        {% endfor %}
+        {% set wp = ns.wb.split('/') %}
+        {{ {'rx': ns.rx, 'otan': ns.otan, 'last_wb': ns.wb,
+            'wb_done': (wp[0] | int(0)) if wp | length == 2 else 0,
+            'wb_total': (wp[1] | int(0)) if wp | length == 2 else 0,
+            'otam_tx': ns.otam, 'settle': ns.settle, 'leaf': ns.leaf, 'raw': value} | tojson }}
+    - name: "smol 8 ota relaydiag"
+      unique_id: smol_8_ota_relaydiag_mirror
+      state_topic: "smol/8/ota/relaydiag"
+      unit_of_measurement: "%"
+      entity_category: diagnostic
+      icon: "mdi:progress-upload"
+      value_template: >-
+        {% set ns = namespace(w=0, t=0, ok=false) %}
+        {% for tok in value.split() %}
+          {% if tok.startswith('last_wb=') and '/' in tok %}
+            {% set f = tok.split('=', 1)[1].split('/') %}
+            {% set ns.w = f[0] | int(0) %}{% set ns.t = f[1] | int(0) %}{% set ns.ok = true %}
+          {% endif %}
+        {% endfor %}
+        {% if ns.ok and ns.t > 0 %}{{ (100.0 * ns.w / ns.t) | round(1) }}{% else %}unknown{% endif %}
+      json_attributes_topic: "smol/8/ota/relaydiag"
+      json_attributes_template: >-
+        {% set ns = namespace(rx='', otan='', wb='', otam='', settle='', leaf='') %}
+        {% for t in value.split() %}
+          {% if t.startswith('rx=') %}{% set ns.rx = t[3:] %}
+          {% elif t.startswith('otan=') %}{% set ns.otan = t[5:] %}
+          {% elif t.startswith('last_wb=') %}{% set ns.wb = t[8:] %}
+          {% elif t.startswith('otam_tx=') %}{% set ns.otam = t[8:] %}
+          {% elif t.startswith('settle=') %}{% set ns.settle = t[7:] %}
+          {% elif t.startswith('leaf=') %}{% set ns.leaf = t[5:] %}
+          {% endif %}
+        {% endfor %}
+        {% set wp = ns.wb.split('/') %}
+        {{ {'rx': ns.rx, 'otan': ns.otan, 'last_wb': ns.wb,
+            'wb_done': (wp[0] | int(0)) if wp | length == 2 else 0,
+            'wb_total': (wp[1] | int(0)) if wp | length == 2 else 0,
+            'otam_tx': ns.otam, 'settle': ns.settle, 'leaf': ns.leaf, 'raw': value} | tojson }}
+    - name: "smol 9 ota relaydiag"
+      unique_id: smol_9_ota_relaydiag_mirror
+      state_topic: "smol/9/ota/relaydiag"
+      unit_of_measurement: "%"
+      entity_category: diagnostic
+      icon: "mdi:progress-upload"
+      value_template: >-
+        {% set ns = namespace(w=0, t=0, ok=false) %}
+        {% for tok in value.split() %}
+          {% if tok.startswith('last_wb=') and '/' in tok %}
+            {% set f = tok.split('=', 1)[1].split('/') %}
+            {% set ns.w = f[0] | int(0) %}{% set ns.t = f[1] | int(0) %}{% set ns.ok = true %}
+          {% endif %}
+        {% endfor %}
+        {% if ns.ok and ns.t > 0 %}{{ (100.0 * ns.w / ns.t) | round(1) }}{% else %}unknown{% endif %}
+      json_attributes_topic: "smol/9/ota/relaydiag"
+      json_attributes_template: >-
+        {% set ns = namespace(rx='', otan='', wb='', otam='', settle='', leaf='') %}
+        {% for t in value.split() %}
+          {% if t.startswith('rx=') %}{% set ns.rx = t[3:] %}
+          {% elif t.startswith('otan=') %}{% set ns.otan = t[5:] %}
+          {% elif t.startswith('last_wb=') %}{% set ns.wb = t[8:] %}
+          {% elif t.startswith('otam_tx=') %}{% set ns.otam = t[8:] %}
+          {% elif t.startswith('settle=') %}{% set ns.settle = t[7:] %}
+          {% elif t.startswith('leaf=') %}{% set ns.leaf = t[5:] %}
+          {% endif %}
+        {% endfor %}
+        {% set wp = ns.wb.split('/') %}
+        {{ {'rx': ns.rx, 'otan': ns.otan, 'last_wb': ns.wb,
+            'wb_done': (wp[0] | int(0)) if wp | length == 2 else 0,
+            'wb_total': (wp[1] | int(0)) if wp | length == 2 else 0,
+            'otam_tx': ns.otam, 'settle': ns.settle, 'leaf': ns.leaf, 'raw': value} | tojson }}
     # --- #48 LED mode — mirror of the retained smol/<id>/config/led (commanded value) ---
     - name: "smol 7 LED"
       unique_id: smol_7_led_mirror

@@ -125,6 +125,12 @@ mod grid;
 #[cfg(feature = "wifi")]
 mod ota;
 
+// #40 leaf-mesh-OTA transport (OTAM/OTAD/OTAN wire codec + leaf receive session +
+// gateway relay orchestration). espnow-only (the mesh + the ed25519 verify live there);
+// the default/wifi-only builds link NONE of it.
+#[cfg(feature = "espnow")]
+mod ota_mesh;
+
 // LOCAL git-ignored WiFi credentials, used by the `wifi`/`espnow` radio bring-up.
 #[cfg(feature = "wifi")]
 mod secrets;
@@ -135,6 +141,38 @@ mod secrets;
 // node name in all builds). Fresh clone: `cp src/board.rs.example src/board.rs`.
 mod board;
 pub(crate) use board::{DEFAULT_APP, DEFAULT_PAGE, NODE_ID};
+
+/// #40 IDENTITY (runtime): the node's LOGICAL id. In the DEFAULT build this is EXACTLY
+/// the compile-time `NODE_ID` const — no flash, no new symbols — so the guaranteed-green
+/// baseline is byte-unaffected (prove via symbol absence, not the git-stamped ELF bytes).
+/// In wifi/espnow builds the id is read ONCE from the `nvs` partition (seeded from the
+/// baked const on first boot after an erase-flash) and cached — so a SINGLE shared OTA
+/// image can serve the whole fleet without any node stealing the baked default id.
+#[cfg(not(feature = "wifi"))]
+#[inline(always)]
+pub(crate) fn node_id() -> u8 {
+    NODE_ID
+}
+
+/// See the `not(wifi)` twin above. rv32imc has no atomics, so the one-time-init cache is a
+/// `static mut` — alias-safe because it is read/written ONLY from the single-threaded boot
+/// path + main loop (no ISR touches it), the same discipline as the OTA scratch statics.
+#[cfg(feature = "wifi")]
+pub(crate) fn node_id() -> u8 {
+    static mut NODE_ID_CACHE: Option<u8> = None;
+    // SAFETY: single-caller (boot/main loop, never an ISR) → the read-modify-write is
+    // race-free; `addr_of_mut!` avoids forming a reference to the `static mut`.
+    unsafe {
+        let p = core::ptr::addr_of_mut!(NODE_ID_CACHE);
+        if let Some(id) = *p {
+            id
+        } else {
+            let id = ota::resolve_node_id();
+            *p = Some(id);
+            id
+        }
+    }
+}
 
 use app::{App, Ctx, Transition};
 use input::Button;
@@ -192,6 +230,25 @@ const FLUSH_DEFER_CAP_MS: u64 = 120_000;
 /// the actual rotation is confirmed when flashing.
 const DISPLAY_ROTATION: DisplayRotation = DisplayRotation::Rotate180;
 
+/// #40 self-test §5: max unconfirmed (New) boots before the app forces a rollback to the
+/// good slot. Bounds a boots-but-crashes image to K reboots then auto-recovery (bootloader
+/// auto-revert is OFF). RTC-fast counter; cleared on a confirm / power-loss.
+#[cfg(feature = "espnow")]
+const OTA_MAX_UNCONFIRMED_BOOTS: u32 = 3;
+
+/// #40 HOLE-1 §2: the leaf post-OTA self-test window (ms). A freshly-activated LEAF image
+/// must hear ≥1 valid inbound SMOLv1 frame within this window (its mesh-terms health proof,
+/// the analog of `reached_dhcp` a credential-less leaf never hits) or it rolls back.
+/// ⚠️ 180 s (was 60): a just-mesh-OTA'd leaf boots WHILE its gateway is still mesh-deaf —
+/// relaying, then in its ~120 s Tier-2 confirm loop (not HELLOing). A 60 s window expired
+/// before the gateway resumed HELLOs → the leaf heard nothing → FALSE rollback of a GOOD
+/// image. 180 s outlasts the gateway's confirm loop so the leaf catches a post-confirm HELLO.
+/// (Even so, a false-fail is now BRICK-SAFE — `boot_confirm` refuses to roll back to a slot
+/// with no valid image; see `ota::slot_has_valid_image`.) A gateway post-OTA HELLO burst is
+/// the cleaner follow-up.
+#[cfg(feature = "espnow")]
+const LEAF_SELFTEST_WINDOW_MS: u64 = 180_000;
+
 /// Monotonic milliseconds since boot — the single time base for the clock, the
 /// button debounce, Snake movement, the LED blink phase, and BENCH rates.
 /// (`net::mode::now_ms` is the same value; this is the always-available copy.)
@@ -213,11 +270,11 @@ fn main() -> ! {
     // short hash baked in by build.rs. The full "Adjective Noun" of each appears
     // ONLY in this log; the OLED (splash + menu) shows the noun handles. `env!`
     // reads the build.rs-emitted vars (archive builds pass SMOL_GIT_HASH/_NUMBER).
-    let (my_adj, my_noun) = net::names::name_for_id(NODE_ID);
+    let (my_adj, my_noun) = net::names::name_for_id(node_id());
     let (v_adj, v_noun) = net::names::version_name();
     log::info!(
         "smol id{} \"{} {}\" · build {} \"{} {}\" ({})",
-        NODE_ID,
+        node_id(),
         my_adj,
         my_noun,
         env!("BUILD_NUMBER"),
@@ -225,6 +282,31 @@ fn main() -> ! {
         v_noun,
         env!("BUILD_HASH"),
     );
+
+    // --- #40 leaf-mesh-OTA: EARLIEST-boot self-test bookkeeping ---------------
+    // Runs BEFORE any subsystem that can panic (I2C/display/radio) so an early-init
+    // crash still trips the crash-loop bound. Only fires when otadata is New/Pending
+    // (a freshly-activated image on its first boot):
+    //   • §3C freshness FLOOR — raise fresh_floor to this build (idempotent, power-loss
+    //     safe; closes the signed-intermediate / rolled-back-build mesh replay).
+    //   • §C#5 K-counter — bump the unconfirmed-boot counter; at K, force the app-side
+    //     rollback NOW (a New image that panics before the deferred self-test would
+    //     otherwise boot-loop the bad slot forever, bootloader auto-revert being OFF).
+    // A confirmed (Valid) boot resets the counter. `boot_confirm(false)` reboots.
+    // The K-counter only counts GENUINE OTA boots (`ota_was_activated`) — a USB flash boots
+    // as New too but isn't a crash-looping OTA image, so it must not trip the flip.
+    #[cfg(feature = "espnow")]
+    if ota::otadata_unconfirmed() {
+        ota::fresh_floor_bump(ota::BUILD_NUMBER); // floor tracks any booted build (USB or OTA)
+        if ota::ota_was_activated_for(ota::BUILD_NUMBER)
+            && ota::unconfirmed_boot_bump() >= OTA_MAX_UNCONFIRMED_BOOTS
+        {
+            log::warn!("smol #40: {} unconfirmed OTA boots — forcing app-side rollback", OTA_MAX_UNCONFIRMED_BOOTS);
+            ota::boot_confirm(false); // brick-safe flip to the good slot + reset — never returns
+        }
+    } else {
+        ota::unconfirmed_boot_reset();
+    }
 
     // --- I2C bus to the OLED -------------------------------------------------
     let i2c = I2c::new(
@@ -341,8 +423,10 @@ fn main() -> ! {
                 wifi: peripherals.WIFI,
             },
             // This unit's short id (see NODE_ID) — embedded in HELLO/ACK/BEACON/TIME
-            // frames and the single source of truth shared with the node's name.
-            NODE_ID,
+            // frames + the single source of truth shared with the node's name. Runtime
+            // `node_id()` (NVS, seeded from the baked const) so a shared OTA image never
+            // steals the default id (#40 identity fix).
+            node_id(),
             &mut boot_tick,
             &mut batt_cache,
             &mut grid_cache,
@@ -364,6 +448,25 @@ fn main() -> ! {
     // can re-anchor them on adoption; nothing mutates them in the smaller builds
     // (hence the cfg'd `allow(unused_mut)`).
     let boot_ms = millis();
+
+    // #40 HOLE-1: deferred LEAF self-test. `otadata` is still unconfirmed here iff the
+    // boot burst did NOT confirm it (a leaf that never reached DHCP — `mode::start` only
+    // confirms a DHCP-reaching node). For such a leaf the main loop runs the mesh-terms
+    // self-test (below): confirm on the first heard SMOLv1 frame, else roll back after N s.
+    // A gateway / DHCP-reached board already confirmed at boot → this is false → no-op.
+    // Only a GENUINE mesh-OTA boot (activated) runs the deferred self-test; a USB-flashed
+    // `New` image is accepted as-is by `boot_confirm` and never reaches here as pending.
+    // #2 (oscillation fix): gate on `ota_activated_is_leaf()` — ONLY a LEAF mesh-OTA confirms
+    // via hear-a-frame here. A SELF-OTA image confirms via reached-DHCP in `mode::start`; if it
+    // transiently misses DHCP at one boot it stays `New` + running (self-heals next boot), and
+    // is NEVER rolled back by the hear-a-frame path on a quiet mesh (which was the 113↔114
+    // gateway loop). The OTA type — not the ambiguous runtime role at a flaky-DHCP boot — is
+    // the correct discriminator.
+    #[cfg(feature = "espnow")]
+    let mut leaf_selftest_pending = ota::otadata_unconfirmed()
+        && ota::ota_was_activated_for(ota::BUILD_NUMBER)
+        && ota::ota_activated_is_leaf();
+
     #[cfg_attr(not(feature = "espnow"), allow(unused_mut))]
     let mut base_unix: u32 = match synced {
         Some(unix) => {
@@ -478,6 +581,25 @@ fn main() -> ! {
             if let Some(text) = r.service() {
                 bottom_line = text;
             }
+
+            // #40 HOLE-1: LEAF post-OTA self-test (mesh-terms, NOT DHCP). A freshly
+            // mesh-OTA'd leaf must prove radio+parse+RX work on the NEW image by hearing
+            // ≥1 valid inbound SMOLv1 frame within LEAF_SELFTEST_WINDOW_MS → confirm
+            // (otadata Valid, the update sticks). No frame in the window → app-side
+            // rollback to the good slot (`boot_confirm(false)` flips + resets). Runs at
+            // most once; a gateway/DHCP board already confirmed at boot (pending=false).
+            if leaf_selftest_pending {
+                if r.heard_valid_frame() {
+                    ota::unconfirmed_boot_reset();
+                    leaf_selftest_pending = false;
+                    log::info!("smol #40: leaf self-test PASS (heard a mesh peer) — image CONFIRMED");
+                    ota::boot_confirm(true);
+                } else if now.saturating_sub(boot_ms) >= LEAF_SELFTEST_WINDOW_MS {
+                    leaf_selftest_pending = false;
+                    log::warn!("smol #40: leaf self-test FAIL (no mesh peer in {} ms) — ROLLING BACK", LEAF_SELFTEST_WINDOW_MS);
+                    ota::boot_confirm(false); // flips to the good slot + resets — never returns
+                }
+            }
             // #23 stage 2: a LEAF scans 1/6/11 for the elected gateway's HELLO and
             // locks onto its channel (a no-op on the gateway, which rides its AP ch).
             r.leaf_scan_tick(now);
@@ -513,7 +635,12 @@ fn main() -> ! {
             // (default false) is the single legacy-auto-install toggle. Heavy + mesh-deaf
             // + abortable → same responsive tick as a flush; success reboots inside the
             // burst, failure/abort leaves the good image running (HA re-offers = retry).
-            let do_install = crate::ota::OTA_AUTO_INSTALL || r.take_install_request();
+            // #1 DECOUPLE: suppress the gateway's OWN self-OTA while a leaf-OTA relay is
+            // pending — else the self-OTA reboots the gateway mid-session and the two OTAs
+            // collide/thrash the fleet. Short-circuit BEFORE `take_install_request()` so the
+            // gateway's install is PRESERVED (not consumed) and fires once the relay resolves.
+            let do_install = !r.leaf_ota_pending()
+                && (crate::ota::OTA_AUTO_INSTALL || r.take_install_request());
             if do_install {
                 if let Some(announce) = r.take_ota_offer() {
                     let mut ota_draw_ms = 0u64;
@@ -593,6 +720,21 @@ fn main() -> ! {
                 }
             }
 
+            // #40 #3: leaf OTA RX-diag beacon (LDBG) on its OWN ~2 s tick, phase-OFFSET 1 s from
+            // the HELLO burst above. Root cause of the f6f7a28 canary's `leaf=none`: the leaf sent
+            // HELLO→LDBG→TIME back-to-back and the gateway systematically caught the HELLO (rx>0)
+            // but DROPPED the 2nd-of-burst LDBG (TX radio still busy on the rapid 2nd send / RX
+            // overrun). A standalone, temporally-separated tick lets the radio settle so a relaying
+            // gateway reliably captures one → `smol/<leaf>/ota/relaydiag leaf=HxVxNx`. Leaf-only,
+            // unconditional (reports the lifetime dbg counters), mesh build.
+            #[cfg(feature = "espnow")]
+            if !r.is_gateway()
+                && ((now + 1000) / 2000) != ((now.saturating_sub(SUBTICK_MS as u64) + 1000) / 2000)
+            {
+                let (dh, dv, dn) = r.ota_leaf_dbg();
+                r.broadcast_ldbg(dh, dv, dn);
+            }
+
             // COEXIST SOAK (#23 PART 1): beacon 1/s (independent of the 2 s HELLO) so
             // the seq-gap loss instrument has fine resolution across flush windows;
             // log a cumulative loss report every 10 s (read off the measurer's serial).
@@ -648,7 +790,11 @@ fn main() -> ! {
                 && (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000)
             {
                 let (live_kind, live_page) = app.live_screen();
-                let val = alloc::format!("{}:{}", live_kind.as_wire(), live_page);
+                // #40 §C#3: append the running build# as a 2nd '|'-field → the gateway's
+                // Tier-2 confirm ("STAT.build == pushed build") + HA installed_version read
+                // from ONE frame. Additive: `<screen>:<page>` stays split('|')[0], so the
+                // #50 screen template is unaffected.
+                let val = alloc::format!("{}:{}|{}", live_kind.as_wire(), live_page, ota::BUILD_NUMBER);
                 r.broadcast_stat(val.as_bytes());
             }
 
@@ -704,7 +850,10 @@ fn main() -> ! {
                     // config, the stopgap JP rejected). Published retained as
                     // `smol/<id>/status` for the HA live-screen readback.
                     let (live_kind, live_page) = app.live_screen();
-                    let stat = alloc::format!("STAT|{}:{}", live_kind.as_wire(), live_page);
+                    // #40 §C#3: append the running build# (2nd '|'-field) so a GATEWAY's own
+                    // `smol/<id>/status` also carries build → uniform installed_version across
+                    // self + relayed leaves. Additive (screen stays split('|')[0]).
+                    let stat = alloc::format!("STAT|{}:{}|{}", live_kind.as_wire(), live_page, ota::BUILD_NUMBER);
                     // #20 (1b RESPONSIVE): the tick keeps the UI alive during the
                     // burst — LED blink + throttled "Syncing…" spinner + a LATCHING
                     // long-press ABORT. Abort returns the burst's fail value (queue
@@ -716,7 +865,10 @@ fn main() -> ! {
                     let (_, soak_rx0, soak_lost0, _) = r.soak_counts();
                     let mut flush_abort = false;
                     let mut flush_draw_ms = 0u64;
-                    r.flush_telemetry(own.as_bytes(), stat.as_bytes(), &mut batt_cache, &mut grid_cache, &mut || {
+                    // #40: a flush that hears a leaf's retained OTA install surfaces
+                    // `(leaf_id, staged announce)` here → relayed below.
+                    let mut leaf_ota: Option<(u8, ota::Announce)> = None;
+                    r.flush_telemetry(own.as_bytes(), stat.as_bytes(), &mut batt_cache, &mut grid_cache, &mut leaf_ota, &mut || {
                         let t = millis();
                         led.apply(led::LedState::WifiSync, t);
                         if matches!(button.poll(t), Some(input::Press::Long)) {
@@ -729,6 +881,52 @@ fn main() -> ! {
                         flush_abort
                     });
                     flush_defer_since_ms = 0;
+                    // #40 leaf-mesh-OTA orchestration: the flush surfaced a leaf install →
+                    // relay the staged image to that leaf over ESP-NOW (canary-one-leaf; the
+                    // relay does its own WiFi fetch then an ESP-NOW relay, minutes-scale +
+                    // mesh-degrading, UI-alive + long-press abortable). Skipped if the leaf's
+                    // MAC has NEVER been learned (retry on the next install once it HELLOs).
+                    if let Some((leaf_id, ann)) = leaf_ota.take() {
+                        // #1 DECOUPLE: latch "a leaf relay is owed" the moment this flush
+                        // surfaces the leaf install. It persists across loop iterations (cleared
+                        // only by a TERMINAL `record_leaf_ota`), so the gateway's own self-OTA
+                        // gate (`do_install`) stays suppressed until the relay resolves — even
+                        // across the mac-unknown retry path below, which also keeps it latched.
+                        r.note_leaf_ota_armed();
+                        // #3 STICKY MAC: the roster is a bounded 16-slot LRU with NO staleness
+                        // reaping — but during the minutes-long mesh-deaf relay the gateway stops
+                        // hearing this leaf, so it becomes the LRU victim and is EVICTED when any
+                        // new MAC arrives → a plain `mac_for_id` reverts to None → `mac-unknown`
+                        // churn (the canary's dominant diag). `mac_for_id_sticky` caches the MAC
+                        // the moment it's ever addressable and holds it for the install session
+                        // (cleared on a terminal `record_leaf_ota`), so eviction can't strand the
+                        // relay. Root-caused from the a5d9b33 canary: mac-unknown ↔ brief relay.
+                        if let Some(mac) = r.mac_for_id_sticky(leaf_id) {
+                            let mut relay_draw_ms = 0u64;
+                            let mut relay_abort = false;
+                            let outcome = r.run_leaf_ota_relay(leaf_id, mac, &ann, &mut || {
+                                let t = millis();
+                                led.apply(led::LedState::WifiSync, t);
+                                if matches!(button.poll(t), Some(input::Press::Long)) {
+                                    relay_abort = true;
+                                }
+                                if t.saturating_sub(relay_draw_ms) >= SYNC_REDRAW_MS {
+                                    relay_draw_ms = t;
+                                    draw_syncing(&mut display, (t / SYNC_REDRAW_MS) as u8);
+                                }
+                                relay_abort
+                            });
+                            // #40: record the phase → published to smol/<leaf>/ota/diag on the
+                            // next burst + drives the install clear/retry policy.
+                            r.record_leaf_ota(leaf_id, outcome);
+                            redraw = true;
+                        } else {
+                            // MAC not learned yet (no HELLO heard) → record MacUnknown; the
+                            // install is LEFT retained (not cleared) → retried on a later flush
+                            // once the leaf HELLOs. Diag published so it's visible headless.
+                            r.record_leaf_ota(leaf_id, crate::ota_mesh::LeafOtaOutcome::MacUnknown);
+                        }
+                    }
                     // Coexist soak (#23 PART 1): the during-window RX loss — how many
                     // leaf BEACONs the gateway's 10-deep ESP-NOW RX queue dropped while
                     // the CPU-blocking flush starved `service()`. THIS is the number.
@@ -803,7 +1001,7 @@ fn main() -> ! {
             sensors: &mut sensors,
             now_ms: now,
             unix_now,
-            node_id: NODE_ID,
+            node_id: node_id(),
             redraw,
             #[cfg(feature = "wifi")]
             batt: &batt_cache,
