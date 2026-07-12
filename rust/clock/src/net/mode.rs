@@ -201,6 +201,15 @@ const CFG_APPLY_KEYS: [u8; 5] = [
 /// next cadence. Value bounded by `CFG_VALUE_MAX`.
 const STAT_PREFIX: &[u8] = b"SMOLv1 STAT "; // + "NNN" + verbatim "<AppKind>:<page>|<build>"
 
+/// #70/#49 observability UPLINK tag: `"SMOLv1 DIAG "` (12 B, trailing space) then `"NNN"`
+/// (3-ASCII zero-padded SENDER id) then the verbatim key=val DIAG record. Exact mirror of
+/// `STAT` but a SEPARATE frame (the DIAG value is ~130 B, far past STAT's 16 B `CFG_VALUE_MAX`)
+/// with its own gateway cache (`diag_cache`) → retained `smol/<id>/diag`. Diverges from STAT at
+/// byte 7 (`'D'` vs `'S'`), so `strip_prefix` never confuses them. Same unauthed, low-blast
+/// threat model: worst case a stray frame yields a bad diag string, self-corrected next cadence.
+/// Value bounded by `RELAY_VALUE_MAX`.
+const DIAG_PREFIX: &[u8] = b"SMOLv1 DIAG "; // + "NNN" + verbatim "up=.. bt=.. rr=.. …"
+
 // #40 leaf-mesh-OTA GATEWAY relay tuning (blocking maintenance op; hardware-tunable — see
 // lucid-40-build-handoff.md). The relay monopolizes the radio for its duration by design.
 /// Wait for a leaf OTAN after (re)sending a window before resending it (ms).
@@ -318,6 +327,41 @@ enum Frame<'a> {
     /// GATEWAY caches it in `stat_cache` in `service`, keyed by `src`). Twin of `Cfg` but
     /// UPLINK — republished as retained `smol/<src>/status`.
     Stat { src: u8, value: &'a [u8] },
+    /// #70/#49 observability uplink: a node's compact key=val DIAG record — `src` sender id +
+    /// the verbatim record bytes (borrow the RX buffer; the GATEWAY caches it in `diag_cache`,
+    /// keyed by `src`). Twin of `Stat` but a bigger value → retained `smol/<src>/diag`.
+    Diag { src: u8, value: &'a [u8] },
+}
+
+/// #70/#49 observability: a node's own live diag counters, folded into the retained DIAG record
+/// each cadence. `Copy` (lives inline in `RadioManager`). All monotonic-since-boot except the
+/// min-heap watermark. Cheap to maintain; no heap, no flash.
+#[derive(Clone, Copy)]
+struct DiagCounters {
+    /// Lowest free-heap reading observed since boot (leak/pressure watermark). `u32::MAX` until
+    /// the first sample so `min()` latches the true low-water on the first `diag_sample_heap`.
+    heap_min: u32,
+    /// BOOT-button SHORT-press count (monotonic, wraps). HA fires a `press` event on each change.
+    btn: u16,
+    /// BOOT-button LONG-press count (monotonic, wraps). HA fires a `long-press` event on change.
+    btnl: u16,
+    /// #49 flush ok/fail (GATEWAY): MQTT bursts that reached CONNACK vs failed/timed-out. Proves
+    /// the #9 flush-win on hardware (was UART0-only). Leaf-side these stay 0 (a leaf never flushes).
+    /// (OTA verify ok/fail is read live from `OtaLeafSession`, not mirrored here.)
+    flush_ok: u32,
+    flush_fail: u32,
+}
+
+impl DiagCounters {
+    const fn new() -> Self {
+        Self {
+            heap_min: u32::MAX,
+            btn: 0,
+            btnl: 0,
+            flush_ok: 0,
+            flush_fail: 0,
+        }
+    }
 }
 
 /// Tracks the two timestamps that define the peer link state. Monotonic ms
@@ -1364,6 +1408,13 @@ pub struct RadioManager {
     /// `CfgCache` as a single-channel map — pinned to one fixed key so its (id, key) upsert
     /// behaves id-keyed (`Batt:3` fits `CFG_VALUE_MAX`); the key column is inert here.
     stat_cache: crate::net::wifi::CfgCache,
+    /// #70/#49 observability (GATEWAY side): per-node relayed DIAG record cache, filled by the
+    /// `SMOLv1 DIAG` service arm from node uplinks and republished as retained `smol/<id>/diag`
+    /// on each flush (F6 freshness-gated). Twin of `stat_cache` but a bigger value. Unused leaf-side.
+    diag_cache: crate::net::wifi::RelayCache,
+    /// #70/#49 observability: this node's own live diag counters (min-heap watermark + BOOT-button
+    /// press counters; #49 adds flush/verify counters). Folded into the DIAG record each cadence.
+    diag: DiagCounters,
     /// #40 leaf-mesh-OTA: the LEAF receive state machine (verify-sig → signed-bounds →
     /// window reassembly → readback verify → activate). Idle except during a transfer.
     /// Unused on a gateway (which drives the RELAY side via `run_leaf_ota_relay`).
@@ -1517,6 +1568,8 @@ impl RadioManager {
             cfg: CfgTracker::new(),
             cfg_cache: crate::net::wifi::CfgCache::new(),
             stat_cache: crate::net::wifi::CfgCache::new(),
+            diag_cache: crate::net::wifi::RelayCache::new(),
+            diag: DiagCounters::new(),
             ota_leaf: crate::ota_mesh::OtaLeafSession::new(),
             #[cfg(feature = "wled")]
             wled_seq: 0,
@@ -1683,6 +1736,8 @@ impl RadioManager {
             &[], // #50: recovery burst publishes no live-screen status
                     None, // #21: a leaf's recovery burst is not a gateway relay
                     None, // #50b: recovery burst republishes no cached leaf status
+                    &[], // #70/#49: recovery burst publishes no own diag
+                    None, // #70/#49: recovery burst republishes no cached diag
                     &mut None, // #40: a leaf's recovery burst never relays a leaf OTA
                     &mut None, // #40: recovery burst carries no persistent staged
                     &mut None, // #40: recovery burst publishes no relay diag
@@ -2015,6 +2070,89 @@ impl RadioManager {
         let n = value.len().min(crate::net::wifi::CFG_VALUE_MAX);
         msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
+    }
+
+    /// #70/#49: broadcast this node's compact key=val DIAG record as a `SMOLv1 DIAG` frame —
+    /// mirror of [`broadcast_stat`] but a bigger value (`RELAY_VALUE_MAX`). Fire-and-forget; the
+    /// gateway caches it (`diag_cache`) and republishes retained `smol/<id>/diag`. `main` gates on
+    /// the ~60 s diag cadence (a BOOT-button press expedites one). Value truncated to the cap.
+    ///
+    /// [`broadcast_stat`]: RadioManager::broadcast_stat
+    pub fn broadcast_diag(&mut self, value: &[u8]) {
+        let base = DIAG_PREFIX.len();
+        let mut msg = [0u8; DIAG_PREFIX.len() + 3 + crate::net::wifi::RELAY_VALUE_MAX];
+        msg[..base].copy_from_slice(DIAG_PREFIX);
+        let own = self.id;
+        msg[base] = b'0' + own / 100;
+        msg[base + 1] = b'0' + (own / 10) % 10;
+        msg[base + 2] = b'0' + own % 10;
+        let n = value.len().min(crate::net::wifi::RELAY_VALUE_MAX);
+        msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
+    }
+
+    /// #70: sample the live free-heap and lower the min-heap watermark. Cheap (one `HEAP.free()`);
+    /// `main` calls it on the ~10 s tick so the watermark tracks leak/pressure at finer resolution
+    /// than the slow diag publish cadence.
+    pub fn diag_sample_heap(&mut self) {
+        let free = esp_alloc::HEAP.free() as u32;
+        if free < self.diag.heap_min {
+            self.diag.heap_min = free;
+        }
+    }
+
+    /// #70: record a BOOT-button press (`long` = long-press). Bumps the monotonic press counter
+    /// that rides the DIAG record — HA fires a distinct press / long-press event on each increment.
+    pub fn note_button(&mut self, long: bool) {
+        if long {
+            self.diag.btnl = self.diag.btnl.wrapping_add(1);
+        } else {
+            self.diag.btn = self.diag.btn.wrapping_add(1);
+        }
+    }
+
+    /// #49: record an MQTT flush outcome (`ok` = reached CONNACK). The flush-success rate proves
+    /// the #9 flush-win on hardware (was UART0-only). Gateway-only in practice (leaves never flush).
+    pub fn note_flush(&mut self, ok: bool) {
+        if ok {
+            self.diag.flush_ok = self.diag.flush_ok.saturating_add(1);
+        } else {
+            self.diag.flush_fail = self.diag.flush_fail.saturating_add(1);
+        }
+    }
+
+    /// #70/#49: build this node's compact key=val DIAG record for retained `smol/<id>/diag`. ONE
+    /// record carrying the whole observability signal set — per the #70 HA contract, HA parses this
+    /// package-side (NO per-signal MQTT discovery). Space-separated `key=val` tokens (the relaydiag
+    /// idiom): `up`=uptime_s, `bt`=boot#, `rr`=reset reason, `slot`=running OTA slot (255=unknown),
+    /// `ota`=otadata state, `heap`=free bytes, `hmin`=min-free watermark, `fok`/`ffl`=flush ok/fail
+    /// (#9 proof), `vok`/`vfl`=OTA verify ok/fail (#32 proof, leaf mesh-OTA), `loss`=mesh loss %,
+    /// `btn`/`btnl`=BOOT short/long press counts. Samples heap first so `hmin <= heap` holds. Uses
+    /// the heap `String` (like the STAT/telemetry builders) — panic-free, bounded by the format.
+    pub fn diag_record(&mut self) -> alloc::string::String {
+        self.diag_sample_heap();
+        let up_s = now_ms() / 1000;
+        let d = crate::ota::boot_diag();
+        let heap = esp_alloc::HEAP.free();
+        let (vok, vfl) = self.ota_leaf.verify_counts();
+        let loss = self.bench.loss_pct();
+        alloc::format!(
+            "up={} bt={} rr={} slot={} ota={} heap={} hmin={} fok={} ffl={} vok={} vfl={} loss={} btn={} btnl={}",
+            up_s,
+            d.boot_count,
+            d.reset_reason,
+            d.boot_slot,
+            d.ota_state,
+            heap,
+            self.diag.heap_min,
+            self.diag.flush_ok,
+            self.diag.flush_fail,
+            vok,
+            vfl,
+            loss,
+            self.diag.btn,
+            self.diag.btnl,
+        )
     }
 
     /// #40 #3: broadcast this LEAF's OTA RX-diag beacon (`LDBG` = id + heard/verdict/sent) so a
@@ -2955,6 +3093,10 @@ impl RadioManager {
         let mut install_requested = false;
         // #40 #1: set iff this flush SEES a retained leaf install (pre-arm) → latch pending below.
         let mut leaf_install_seen = false;
+        // #70/#49: build the gateway's OWN DIAG record BEFORE the burst borrow (it takes `&mut self`
+        // — the run_mqtt_burst call below already holds disjoint field borrows). Published retained
+        // as `smol/<id>/diag`, and cached leaf diags are republished alongside via `diag_cache`.
+        let diag_rec = self.diag_record();
         let sta = self.sta.as_mut();
         let ok = match sta {
             None => false,
@@ -2997,6 +3139,8 @@ impl RadioManager {
                     status, // #50: gateway publishes its live screen as smol/<id>/status
                     Some(&mut self.cfg_cache), // #21: gateway caches leaf configs to relay
                     Some(&self.stat_cache), // #50b: gateway republishes cached leaf statuses
+                    diag_rec.as_bytes(), // #70/#49: gateway publishes its own smol/<id>/diag
+                    Some(&self.diag_cache), // #70/#49: republish cached relayed-node diags
                     leaf_ota, // #40: surface a pending leaf-OTA install for main to relay
                     &mut self.staged_raw, // #40: persist the staged across flushes (pair-safe)
                     &mut self.leaf_ota_diag, // #40: publish smol/<leaf>/ota/diag + clear/retry
@@ -3005,6 +3149,10 @@ impl RadioManager {
                 )
             }
         };
+        // #49: record the flush outcome (`ok` = reached CONNACK) into the diag counters — the
+        // flush-success rate is the on-device #9 flush-win proof (was UART0-only). Bumped here so
+        // it rides the NEXT diag record.
+        self.note_flush(ok);
         // #6 OTA: stash any announce this flush surfaced for `main` to act on.
         if ota_offer.is_some() {
             self.ota_offer = ota_offer;
@@ -3467,6 +3615,19 @@ impl RadioManager {
                     self.roster.heard(src, Some(leaf_id), rssi, now);
                     label = Some(alloc::string::String::from("stat"));
                 }
+                Some(Frame::Diag { src: node_id, value }) => {
+                    // #70/#49 observability uplink: a node's DIAG record. GATEWAY-only cache (a
+                    // leaf hearing another's DIAG ignores it — no MQTT). Buffer the raw record keyed
+                    // by SENDER id; the flush republishes it retained `smol/<id>/diag` (F6-gated).
+                    // Opaque bytes (mirror STAT) — a stray frame at worst yields a bad diag string,
+                    // self-corrected next cadence; never a brick.
+                    if self.relay.is_gateway {
+                        self.diag_cache.set(node_id, value, now);
+                    }
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, Some(node_id), rssi, now);
+                    label = Some(alloc::string::String::from("diag"));
+                }
                 None => {
                     // Unrecognised payload (other ESP-NOW traffic on-channel);
                     // surface it on the OLED but don't touch the handshake.
@@ -3822,6 +3983,12 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
         // short/non-digit and guarantees `rest.len() >= 3`, so `&rest[3..]` never panics.
         let src = parse_id(rest)?;
         return Some(Frame::Stat { src, value: &rest[3..] });
+    }
+    if let Some(rest) = data.strip_prefix(DIAG_PREFIX) {
+        // #70/#49 observability uplink: "NNN<record>" — 3-ASCII SENDER id then the verbatim
+        // key=val DIAG record (to end-of-frame; empty = none). Same `parse_id` guard as STAT.
+        let src = parse_id(rest)?;
+        return Some(Frame::Diag { src, value: &rest[3..] });
     }
     None
 }

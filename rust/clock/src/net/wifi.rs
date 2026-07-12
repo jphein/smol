@@ -596,6 +596,8 @@ pub fn run_ntp_burst(
         &[], // #50: boot burst publishes no live-screen status
         None, // #21: boot burst is not a gateway relay (no leaf-config cache)
         None, // #50b: boot burst republishes no cached leaf status
+        &[], // #70/#49: boot burst publishes no own diag
+        None, // #70/#49: boot burst republishes no cached diag
         &mut None, // #40: boot burst never relays a leaf OTA
         &mut None, // #40: boot burst has no persistent staged to carry
         &mut None, // #40: boot burst has no relay diag to publish
@@ -1098,6 +1100,96 @@ impl CfgCache {
     }
 }
 
+/// #70/#71 observability: max bytes of a relayed DIAG or SCAN record value. Larger than
+/// `CFG_VALUE_MAX` (16, sized for a screen string) because a diag/scan record is a multi-field
+/// line (~130 B) — but still well under the ~250 B ESP-NOW frame budget once the 12 B frame
+/// prefix + 3 B id are added.
+#[cfg(feature = "wifi")]
+pub const RELAY_VALUE_MAX: usize = 200;
+
+#[cfg(feature = "wifi")]
+const RELAY_CACHE_CAP: usize = 12;
+
+/// #70/#71: the GATEWAY's per-leaf cache of a relayed observability record (DIAG or SCAN). A
+/// leaf has no MQTT, so it broadcasts its record over ESP-NOW; the gateway caches the most
+/// recent per leaf id and republishes it RETAINED on each flush (`smol/<leaf>/diag`|`/scan`).
+/// Twin of [`CfgCache`] but id-keyed only (no config-key / MAC columns — MAC resolution stays
+/// with `stat_cache`) and a bigger value buffer. Bounded `.bss`, no heap; instantiated twice
+/// (diag + scan). #68 F6 freshness (`entry_fresh`) gates the republish so an off-air leaf's
+/// retained record ages out instead of ghosting.
+#[cfg(feature = "wifi")]
+pub struct RelayCache {
+    ids: [u8; RELAY_CACHE_CAP],
+    vals: [[u8; RELAY_VALUE_MAX]; RELAY_CACHE_CAP],
+    lens: [u16; RELAY_CACHE_CAP],
+    last_ms: [u64; RELAY_CACHE_CAP],
+    count: usize,
+}
+
+#[cfg(feature = "wifi")]
+impl RelayCache {
+    // Like `CfgCache`, these are called only by the espnow gateway (`RadioManager`); a
+    // wifi-only build (no `RadioManager`) leaves `new`/`set`/`count` unused → allow dead_code
+    // so the clippy gate stays clean in every profile.
+    #[allow(dead_code)]
+    pub const fn new() -> Self {
+        Self {
+            ids: [0; RELAY_CACHE_CAP],
+            vals: [[0; RELAY_VALUE_MAX]; RELAY_CACHE_CAP],
+            lens: [0; RELAY_CACHE_CAP],
+            last_ms: [0; RELAY_CACHE_CAP],
+            count: 0,
+        }
+    }
+
+    /// Upsert leaf `id`'s record (truncated to `RELAY_VALUE_MAX`), stamping `now` for the F6
+    /// freshness gate. A full cache drops the entry and logs it (no silent cap).
+    #[allow(dead_code)]
+    pub fn set(&mut self, id: u8, value: &[u8], now: u64) {
+        let n = value.len().min(RELAY_VALUE_MAX);
+        for i in 0..self.count {
+            if self.ids[i] == id {
+                self.vals[i][..n].copy_from_slice(&value[..n]);
+                self.lens[i] = n as u16;
+                self.last_ms[i] = now;
+                return;
+            }
+        }
+        if self.count < RELAY_CACHE_CAP {
+            let i = self.count;
+            self.ids[i] = id;
+            self.vals[i][..n].copy_from_slice(&value[..n]);
+            self.lens[i] = n as u16;
+            self.last_ms[i] = now;
+            self.count += 1;
+        } else {
+            log::warn!(
+                "smol #70/#71: relay cache full ({}) — dropping id{}",
+                RELAY_CACHE_CAP,
+                id
+            );
+        }
+    }
+
+    /// Number of cached leaf records.
+    #[allow(dead_code)]
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// The `i`-th entry as `(leaf_id, value)`, but ONLY if heard within `ttl` ms of `now`
+    /// (#68 F6 freshness gate). Off-air leaves age out instead of ghosting a retained record.
+    #[allow(dead_code)]
+    pub fn entry_fresh(&self, i: usize, now: u64, ttl: u64) -> Option<(u8, &[u8])> {
+        if i < self.count && now.saturating_sub(self.last_ms[i]) <= ttl {
+            let n = self.lens[i] as usize;
+            Some((self.ids[i], &self.vals[i][..n]))
+        } else {
+            None
+        }
+    }
+}
+
 /// Push `data` out a connected TCP socket, polling the stack until it is all queued
 /// or `deadline` passes. Our MQTT packets are tiny (< tx buffer), so this normally
 /// completes in one `send_slice`; returns false on a socket error or timeout.
@@ -1211,6 +1303,14 @@ fn mqtt_session(
     // `None` on boot/leaf/election bursts (no republish duty). Read-only (the cache is
     // filled by the ESP-NOW `SMOLv1 STAT` service arm, not here).
     stat_cache: Option<&CfgCache>,
+    // #70/#49: this node's OWN compact DIAG record → retained `smol/<node_id>/diag`. Empty ⇒
+    // skipped (boot/election bursts). Built by `RadioManager::diag_record` (uptime, boot-count,
+    // reset reason, boot slot, otadata state, heap, flush/verify counters, button counts).
+    diag: &[u8],
+    // #70/#49: `Some` on a GATEWAY flush → after publishing THIS node's own diag, republish each
+    // CACHED relayed-node DIAG record as retained `smol/<id>/diag` (leaves have no MQTT). F6
+    // freshness-gated (an off-air node ages out, no ghost). `None` off-gateway. Read-only.
+    diag_cache: Option<&RelayCache>,
     // #40 leaf-mesh-OTA: on a GATEWAY flush, filled with `(leaf_id, raw staged announce)`
     // when a retained `smol/<leaf>/ota/install = INSTALL` is present for a leaf id ≠ self
     // AND a staged image is available — the caller then relays it over ESP-NOW. The retained
@@ -1564,6 +1664,37 @@ fn mqtt_session(
                 sbuf[5..5 + m].copy_from_slice(&val[..m]);
                 if let Some(n) =
                     crate::net::mqtt::encode_publish(&mut pkt, ltopic.as_bytes(), &sbuf[..5 + m], true)
+                {
+                    let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                }
+            }
+        }
+    }
+
+    // #70/#49: publish this node's OWN compact DIAG record as RETAINED `smol/<id>/diag`, if any.
+    // ONE record — HA parses it package-side (no per-signal discovery, per the #70 contract).
+    if !diag.is_empty() {
+        let mut dtopic = MqttScratch::new();
+        let _ = write!(dtopic, "smol/{}/diag", node_id);
+        if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), diag, true) {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+    }
+
+    // #70/#49: republish each CACHED relayed-node DIAG record (filled by the ESP-NOW `SMOLv1 DIAG`
+    // service arm — leaves have no MQTT) as RETAINED `smol/<id>/diag`. Skip our OWN id (published
+    // just above) + empty values. Verbatim (the node already formatted the key=val record). #68 F6
+    // freshness-gated: an off-air node's entry ages out → its retained diag stops refreshing.
+    if let Some(dc) = diag_cache {
+        let now_ms = Instant::now().duration_since_epoch().as_millis();
+        for i in 0..dc.count() {
+            if let Some((nid, val)) = dc.entry_fresh(i, now_ms, STAT_FRESH_MS) {
+                if nid == node_id || val.is_empty() {
+                    continue;
+                }
+                let mut dtopic = MqttScratch::new();
+                let _ = write!(dtopic, "smol/{}/diag", nid);
+                if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), val, true)
                 {
                     let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
                 }
@@ -2277,6 +2408,10 @@ pub fn run_mqtt_burst(
     // #50b: `Some` on a gateway flush → republish cached leaf statuses (see `mqtt_session`);
     // `None` otherwise.
     stat_cache: Option<&CfgCache>,
+    // #70/#49: this node's own DIAG record → retained `smol/<id>/diag` (empty ⇒ none; see `mqtt_session`).
+    diag: &[u8],
+    // #70/#49: `Some` on a gateway flush → republish cached relayed diags (see `mqtt_session`); `None` otherwise.
+    diag_cache: Option<&RelayCache>,
     // #40: on a gateway flush, filled with `(leaf_id, staged announce)` when a leaf install
     // is pending → the caller relays it over ESP-NOW. `&mut None` on boot/leaf bursts.
     leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
@@ -2469,6 +2604,8 @@ pub fn run_mqtt_burst(
         status, // #50: forward the live STAT|screen:page for smol/<id>/status
         cfg_cache, // #21: forward the gateway's leaf-config cache (or None)
         stat_cache, // #50b: forward the gateway's cached leaf statuses (or None)
+        diag, // #70/#49: forward this node's own DIAG record (or empty)
+        diag_cache, // #70/#49: forward the gateway's cached relayed diags (or None)
         leaf_ota, // #40: forward the leaf-OTA install pairing (or &mut None)
         staged_raw, // #40: forward the persistent staged announce (or &mut None)
         leaf_diag, // #40: forward the diag/clear state (or &mut None)
