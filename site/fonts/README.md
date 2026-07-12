@@ -16,7 +16,9 @@ is render-identical and keeps the repo lean.
 
 ## Licensing
 All three are under the **SIL Open Font License 1.1** (OFL) — free to
-self-host and redistribute.
+self-host and redistribute. The OFL requires the license text + each
+family's copyright notice to accompany the fonts: they're bundled verbatim
+(from each family's upstream `OFL.txt`) in **`OFL.txt`** alongside this file.
 
 ## Regenerating
 Pull the current WOFF2s + rebuild `fonts.css` from Google's css2 API
