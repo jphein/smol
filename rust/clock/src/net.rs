@@ -67,6 +67,11 @@ pub use wifi::CFG_KEY_PLUGINS;
 #[cfg(feature = "espnow")]
 pub use wifi::CFG_KEY_REBOOT;
 
+// #71 on-demand WiFi-scan key — same `main`-bridge rationale (espnow apply path via
+// take_cfg_offer(W) → run_scan).
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_KEY_SCAN;
+
 // `try_time_sync` is the Phase-2 entry point; under `espnow`, `main` calls
 // `mode::start` instead, so only re-export it when espnow is NOT enabled.
 #[cfg(all(feature = "wifi", not(feature = "espnow")))]

@@ -575,6 +575,7 @@ pub fn run_ntp_burst(
     let mut _leaf_seen_boot = false; // #40 #1: boot burst is not a gateway relay → never set
     let mut _ntp_gw_own = GwOwnCfg::new(); // #48: boot/NTP burst never captures gateway-own cfg (cfg_cache=None)
     let mut _ntp_reset_req = ResetReq::new(); // #52: boot/NTP burst subscribes no cmd/reset (cfg_cache=None)
+    let mut _ntp_scan_req = ScanReq::new(); // #71: boot/NTP burst subscribes no cmd/scan (cfg_cache=None)
     let _ = mqtt_session(
         &mut iface,
         device,
@@ -598,6 +599,9 @@ pub fn run_ntp_burst(
         None, // #50b: boot burst republishes no cached leaf status
         &[], // #70/#49: boot burst publishes no own diag
         None, // #70/#49: boot burst republishes no cached diag
+        &[], // #71: boot burst publishes no own scan
+        None, // #71: boot burst republishes no cached scan
+        &mut _ntp_scan_req, // #71: boot burst subscribes no cmd/scan (cfg_cache=None)
         &mut None, // #40: boot burst never relays a leaf OTA
         &mut None, // #40: boot burst has no persistent staged to carry
         &mut None, // #40: boot burst has no relay diag to publish
@@ -833,6 +837,17 @@ pub const CFG_KEY_PLUGINS: u8 = b'P';
 #[allow(dead_code)]
 pub const CFG_KEY_REBOOT: u8 = b'R';
 
+/// #71 on-demand WiFi-scan COMMAND (key `W`). EXACT twin of `R` (#52): rides the CFG WIRE
+/// (`SMOLv1 CFG <id>W`), IS in `CFG_APPLY_KEYS` (a node buffers + applies it), but is NEVER
+/// cached / rebroadcast — a cached/periodic scan would take the single radio off the mesh
+/// channel every ~10 s (the exact coexist hazard #71 forbids). The gateway subscribes the
+/// TRANSIENT `smol/<id>/cmd/scan` (retain:false) and fires a ONE-SHOT `<id>W` frame on receipt
+/// (own id → self-scan via its own CfgTracker). Applying `W` runs ONE WiFi AP scan → the top APs
+/// are published to `smol/<id>/scan`. Same cache-BYPASS + wifi-tier-family rationale as `R`.
+#[cfg(feature = "wifi")]
+#[allow(dead_code)]
+pub const CFG_KEY_SCAN: u8 = b'W';
+
 /// #48 (GwOwnCfg — approved arch): the GATEWAY's OWN per-node configs read from its own MQTT
 /// topics this burst. A leaf gets these RELAYED (→ its `CfgTracker`); the gateway reads them
 /// DIRECTLY. Bundled into ONE `run_mqtt_burst`/`mqtt_session` out-param (net +1, not +N) — after
@@ -920,6 +935,52 @@ impl ResetReq {
         self.own
     }
     /// The queued leaf reboot targets (to relay one-shot; NEVER cached).
+    pub fn targets(&self) -> &[u8] {
+        &self.targets[..self.n]
+    }
+}
+
+/// #71 on-demand WiFi-scan capture — the scan COMMANDS seen on the TRANSIENT `smol/+/cmd/scan`
+/// topics this burst. EXACT twin of [`ResetReq`] (a target queue + own flag): NEVER cached (a
+/// cached scan = a periodic off-channel excursion, the #71 coexist hazard). After the burst
+/// `service()` fires a ONE-SHOT `broadcast_config(id, W, "")` per leaf target + injects `W` into
+/// its OWN `CfgTracker` if `own`, so `main`'s `take_cfg_offer(W)` runs the scan on the same path
+/// for a leaf or the gateway. `#[allow(dead_code)]`: read only on espnow, write-only on wifi-only.
+#[cfg(feature = "wifi")]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct ScanReq {
+    targets: [u8; RESET_REQ_MAX],
+    n: usize,
+    own: bool,
+}
+
+#[cfg(feature = "wifi")]
+#[allow(dead_code)]
+impl ScanReq {
+    pub const fn new() -> Self {
+        Self { targets: [0; RESET_REQ_MAX], n: 0, own: false }
+    }
+    /// Queue a leaf id for a one-shot scan relay (deduped; dropped if full — re-triggerable).
+    pub fn push_leaf(&mut self, id: u8) {
+        for i in 0..self.n {
+            if self.targets[i] == id {
+                return;
+            }
+        }
+        if self.n < RESET_REQ_MAX {
+            self.targets[self.n] = id;
+            self.n += 1;
+        }
+    }
+    /// Mark that THIS node's own `cmd/scan` fired this burst → self-scan after the burst.
+    pub fn set_own(&mut self) {
+        self.own = true;
+    }
+    pub fn own(&self) -> bool {
+        self.own
+    }
+    /// The queued leaf scan targets (to relay one-shot; NEVER cached).
     pub fn targets(&self) -> &[u8] {
         &self.targets[..self.n]
     }
@@ -1319,6 +1380,15 @@ fn mqtt_session(
     // CACHED relayed-node DIAG record as retained `smol/<id>/diag` (leaves have no MQTT). F6
     // freshness-gated (an off-air node ages out, no ghost). `None` off-gateway. Read-only.
     diag_cache: Option<&RelayCache>,
+    // #71: this node's OWN one-shot WiFi-scan record → retained `smol/<node_id>/scan`. Empty ⇒
+    // skipped (the common case — a scan is only produced when a `W` command fired). Twin of `diag`.
+    scan: &[u8],
+    // #71: `Some` on a GATEWAY flush → republish each CACHED relayed-node SCAN record as retained
+    // `smol/<id>/scan` (F6-gated). `None` off-gateway. Twin of `diag_cache`.
+    scan_cache: Option<&RelayCache>,
+    // #71: filled with the scan COMMANDS seen on the transient `smol/+/cmd/scan` topics this burst
+    // (leaf targets to one-shot-relay `<id>W` + own flag). Twin of `reset_req`; NEVER cached.
+    scan_req: &mut ScanReq,
     // #40 leaf-mesh-OTA: on a GATEWAY flush, filled with `(leaf_id, raw staged announce)`
     // when a retained `smol/<leaf>/ota/install = INSTALL` is present for a leaf id ≠ self
     // AND a staged image is available — the caller then relays it over ESP-NOW. The retained
@@ -1521,6 +1591,12 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 13, b"smol/+/cmd/reset") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
+        // #71 on-demand scan (pid 14): wildcard-subscribe the TRANSIENT `smol/+/cmd/scan` COMMAND
+        // topic (retain:false). On receipt the gateway fires a ONE-SHOT `<id>W` relay (never cached
+        // — a periodic scan is the coexist hazard); own id → self-scan. Twin of the pid-13 reset arm.
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 14, b"smol/+/cmd/scan") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
     }
 
     // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
@@ -1705,6 +1781,37 @@ fn mqtt_session(
                 let mut dtopic = MqttScratch::new();
                 let _ = write!(dtopic, "smol/{}/diag", nid);
                 if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), val, true)
+                {
+                    let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                }
+            }
+        }
+    }
+
+    // #71: publish this node's OWN one-shot WiFi-scan record as RETAINED `smol/<id>/scan`, if a
+    // scan was produced this cycle (empty = no scan → skipped). Twin of the diag own-publish.
+    if !scan.is_empty() {
+        let mut stopic = MqttScratch::new();
+        let _ = write!(stopic, "smol/{}/scan", node_id);
+        if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, stopic.as_bytes(), scan, true) {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+    }
+
+    // #71: republish each CACHED relayed-node SCAN record (filled by the `SMOLv1 SCAN` service
+    // arm — leaves have no MQTT) as RETAINED `smol/<id>/scan`. Skip OWN id + empty. Twin of the
+    // diag republish, F6-gated on DIAG_FRESH_MS (a scan is one-shot + on-demand, so an old cached
+    // scan aging out is correct — it reflects the last-heard environment, not a live stream).
+    if let Some(sc) = scan_cache {
+        let now_ms = Instant::now().duration_since_epoch().as_millis();
+        for i in 0..sc.count() {
+            if let Some((nid, val)) = sc.entry_fresh(i, now_ms, DIAG_FRESH_MS) {
+                if nid == node_id || val.is_empty() {
+                    continue;
+                }
+                let mut stopic = MqttScratch::new();
+                let _ = write!(stopic, "smol/{}/scan", nid);
+                if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, stopic.as_bytes(), val, true)
                 {
                     let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
                 }
@@ -1930,6 +2037,20 @@ fn mqtt_session(
                         } else {
                             reset_req.push_leaf(leaf_id);
                             log::info!("smol #52: leaf id{} reset command — one-shot relay queued", leaf_id);
+                        }
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/cmd/scan") {
+                        // #71 on-demand WiFi scan — a COMMAND on a TRANSIENT topic (retain:false),
+                        // twin of the reset arm above. NEVER cached (a cached scan = periodic
+                        // off-channel excursion, the #71 coexist hazard): capture into `scan_req`
+                        // for a ONE-SHOT `<id>W` relay after the burst. The topic IS the command
+                        // (any payload triggers). OWN id → self-scan (routed through our CfgTracker
+                        // → main's take_cfg_offer(W) → run_scan → publish smol/<id>/scan).
+                        if leaf_id == node_id {
+                            scan_req.set_own();
+                            log::info!("smol #71: OWN scan command — self-scan after burst");
+                        } else {
+                            scan_req.push_leaf(leaf_id);
+                            log::info!("smol #71: leaf id{} scan command — one-shot relay queued", leaf_id);
                         }
                     } else if let Some(leaf_id) = parse_leaf_install_topic(topic) {
                         // #40 (§B3): a wildcard-delivered leaf OTA install command. On a
@@ -2422,6 +2543,12 @@ pub fn run_mqtt_burst(
     diag: &[u8],
     // #70/#49: `Some` on a gateway flush → republish cached relayed diags (see `mqtt_session`); `None` otherwise.
     diag_cache: Option<&RelayCache>,
+    // #71: this node's own one-shot WiFi-scan record → retained `smol/<id>/scan` (empty ⇒ none).
+    scan: &[u8],
+    // #71: `Some` on a gateway flush → republish cached relayed scans; `None` otherwise.
+    scan_cache: Option<&RelayCache>,
+    // #71: filled with the scan commands seen on `smol/+/cmd/scan` this burst (one-shot relay below).
+    scan_req: &mut ScanReq,
     // #40: on a gateway flush, filled with `(leaf_id, staged announce)` when a leaf install
     // is pending → the caller relays it over ESP-NOW. `&mut None` on boot/leaf bursts.
     leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
@@ -2616,6 +2743,9 @@ pub fn run_mqtt_burst(
         stat_cache, // #50b: forward the gateway's cached leaf statuses (or None)
         diag, // #70/#49: forward this node's own DIAG record (or empty)
         diag_cache, // #70/#49: forward the gateway's cached relayed diags (or None)
+        scan, // #71: forward this node's own scan record (or empty)
+        scan_cache, // #71: forward the gateway's cached relayed scans (or None)
+        scan_req, // #71: forward the scan-command capture (one-shot relay)
         leaf_ota, // #40: forward the leaf-OTA install pairing (or &mut None)
         staged_raw, // #40: forward the persistent staged announce (or &mut None)
         leaf_diag, // #40: forward the diag/clear state (or &mut None)

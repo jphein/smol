@@ -180,7 +180,7 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 5] = [
+const CFG_APPLY_KEYS: [u8; 6] = [
     crate::net::wifi::CFG_KEY_SCREEN,
     crate::net::wifi::CFG_KEY_LED,
     crate::net::wifi::CFG_KEY_UNITS,
@@ -189,6 +189,9 @@ const CFG_APPLY_KEYS: [u8; 5] = [
     // is NEVER put in cfg_cache/broadcast_cached_configs — the one-shot relay uses broadcast_config
     // directly. The anti-reboot-loop invariant: R rides the CFG wire + apply path, not the cache.
     crate::net::wifi::CFG_KEY_REBOOT,
+    // #71 on-demand WiFi scan: W — same COMMAND discipline as R (buffered/applied via take_cfg_offer(W),
+    // NEVER cached — a cached scan = periodic off-channel excursion, the coexist hazard). One-shot relay.
+    crate::net::wifi::CFG_KEY_SCAN,
 ];
 /// #50b leaf-status UPLINK tag: `"SMOLv1 STAT "` (12 B, trailing space) then `"NNN"`
 /// (3-ASCII zero-padded SENDER leaf id) then the verbatim live `<AppKind>:<page>` value
@@ -209,6 +212,46 @@ const STAT_PREFIX: &[u8] = b"SMOLv1 STAT "; // + "NNN" + verbatim "<AppKind>:<pa
 /// threat model: worst case a stray frame yields a bad diag string, self-corrected next cadence.
 /// Value bounded by `RELAY_VALUE_MAX`.
 const DIAG_PREFIX: &[u8] = b"SMOLv1 DIAG "; // + "NNN" + verbatim "up=.. bt=.. rr=.. …"
+
+/// #71 observability UPLINK tag: `"SMOLv1 SCAN "` (12 B, trailing space) then `"NNN"` (SENDER id)
+/// then the verbatim one-shot WiFi-scan record. Exact twin of `DIAG` (own gateway cache
+/// `scan_cache` → retained `smol/<id>/scan`) but produced ON-DEMAND (a `W` command), never
+/// periodically. Diverges from DIAG at byte 9 (`'C'` vs `'I'`) + STAT at byte 8, so `strip_prefix`
+/// never confuses them. Value bounded by `RELAY_VALUE_MAX`.
+const SCAN_PREFIX: &[u8] = b"SMOLv1 SCAN "; // + "NNN" + verbatim "<ssid>,<bssid3>,<ch>,<rssi>|…"
+
+/// #71: max APs in one scan record (strongest-RSSI first) — bounds the record under
+/// `RELAY_VALUE_MAX` and keeps the mesh frame small.
+const SCAN_MAX_APS: usize = 5;
+/// #71: max SSID chars kept per AP (SSIDs are free-form up to 32 B; truncate for the record).
+const SCAN_SSID_MAX: usize = 12;
+
+/// #71: format the strongest scanned APs as a `SCAN`-record value for `smol/<id>/scan`:
+/// literal `SCAN` first field, then up to `SCAN_MAX_APS` `|`-separated groups
+/// `<ssid>,<bssid-3oct-hex>,<ch>,<rssi>`. SSIDs are truncated to `SCAN_SSID_MAX` and have `|`/`,`
+/// stripped (they're free-form → keep the record parseable); BSSIDs are truncated to 3 octets
+/// (PUBLIC-repo topic — a full BSSID is a privacy leak). `|none` when the scan found nothing.
+/// Panic-free (heap `String`); the caller bounds it to `RELAY_VALUE_MAX` at broadcast/publish.
+fn format_scan_record(aps: &[esp_wifi::wifi::AccessPointInfo]) -> alloc::string::String {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::from("SCAN");
+    for ap in aps.iter().take(SCAN_MAX_APS) {
+        let mut ssid = alloc::string::String::new();
+        for c in ap.ssid.chars().take(SCAN_SSID_MAX) {
+            ssid.push(if c == '|' || c == ',' { '_' } else { c });
+        }
+        let b = ap.bssid;
+        let _ = write!(
+            s,
+            "|{},{:02x}{:02x}{:02x},{},{}",
+            ssid, b[0], b[1], b[2], ap.channel, ap.signal_strength
+        );
+    }
+    if aps.is_empty() {
+        s.push_str("|none");
+    }
+    s
+}
 
 // #40 leaf-mesh-OTA GATEWAY relay tuning (blocking maintenance op; hardware-tunable — see
 // lucid-40-build-handoff.md). The relay monopolizes the radio for its duration by design.
@@ -331,6 +374,9 @@ enum Frame<'a> {
     /// the verbatim record bytes (borrow the RX buffer; the GATEWAY caches it in `diag_cache`,
     /// keyed by `src`). Twin of `Stat` but a bigger value → retained `smol/<src>/diag`.
     Diag { src: u8, value: &'a [u8] },
+    /// #71 observability uplink: a node's one-shot WiFi-scan record. Twin of `Diag` (own cache
+    /// `scan_cache`) → retained `smol/<src>/scan`.
+    Scan { src: u8, value: &'a [u8] },
 }
 
 /// #70/#49 observability: a node's own live diag counters, folded into the retained DIAG record
@@ -1412,6 +1458,14 @@ pub struct RadioManager {
     /// `SMOLv1 DIAG` service arm from node uplinks and republished as retained `smol/<id>/diag`
     /// on each flush (F6 freshness-gated). Twin of `stat_cache` but a bigger value. Unused leaf-side.
     diag_cache: crate::net::wifi::RelayCache,
+    /// #71 observability (GATEWAY side): per-node relayed one-shot WiFi-scan cache, twin of
+    /// `diag_cache` → retained `smol/<id>/scan`. Unused leaf-side.
+    scan_cache: crate::net::wifi::RelayCache,
+    /// #71: this GATEWAY's OWN pending scan record — set by `run_scan` when the gateway self-scans
+    /// (its own `W`), consumed by the next flush (published to `smol/<id>/scan`, then cleared —
+    /// one-shot; retained MQTT holds it). `None` when no gateway self-scan is pending. Leaf-side a
+    /// scan is relayed via `broadcast_scan` instead, so this stays `None`.
+    own_scan: Option<alloc::string::String>,
     /// #70/#49 observability: this node's own live diag counters (min-heap watermark + BOOT-button
     /// press counters; #49 adds flush/verify counters). Folded into the DIAG record each cadence.
     diag: DiagCounters,
@@ -1569,6 +1623,8 @@ impl RadioManager {
             cfg_cache: crate::net::wifi::CfgCache::new(),
             stat_cache: crate::net::wifi::CfgCache::new(),
             diag_cache: crate::net::wifi::RelayCache::new(),
+            scan_cache: crate::net::wifi::RelayCache::new(),
+            own_scan: None,
             diag: DiagCounters::new(),
             ota_leaf: crate::ota_mesh::OtaLeafSession::new(),
             #[cfg(feature = "wled")]
@@ -1711,6 +1767,7 @@ impl RadioManager {
         let mut config_offer: Option<crate::app::DefaultScreen> = None;
         let mut _gw_own = crate::net::wifi::GwOwnCfg::new(); // #48: recovery burst never captures gateway-own cfg
         let mut _reset_req = crate::net::wifi::ResetReq::new(); // #52: recovery burst issues no reboots
+        let mut _scan_req = crate::net::wifi::ScanReq::new(); // #71: recovery burst issues no scans
         let mut install_requested = false;
         let mut _leaf_install_seen = false; // #40 #1: a leaf's recovery burst is not a gateway relay
         let reached = match self.sta.as_mut() {
@@ -1738,6 +1795,9 @@ impl RadioManager {
                     None, // #50b: recovery burst republishes no cached leaf status
                     &[], // #70/#49: recovery burst publishes no own diag
                     None, // #70/#49: recovery burst republishes no cached diag
+                    &[], // #71: recovery burst publishes no own scan
+                    None, // #71: recovery burst republishes no cached scan
+                    &mut _scan_req, // #71: recovery burst subscribes no cmd/scan (cfg_cache=None)
                     &mut None, // #40: a leaf's recovery burst never relays a leaf OTA
                     &mut None, // #40: recovery burst carries no persistent staged
                     &mut None, // #40: recovery burst publishes no relay diag
@@ -2089,6 +2149,67 @@ impl RadioManager {
         let n = value.len().min(crate::net::wifi::RELAY_VALUE_MAX);
         msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
+    }
+
+    /// #71: broadcast this node's one-shot WiFi-scan record as a `SMOLv1 SCAN` frame — twin of
+    /// [`broadcast_diag`]. Leaf path: the gateway caches it (`scan_cache`) + republishes retained
+    /// `smol/<id>/scan`. Value truncated to `RELAY_VALUE_MAX`.
+    ///
+    /// [`broadcast_diag`]: RadioManager::broadcast_diag
+    pub fn broadcast_scan(&mut self, value: &[u8]) {
+        let base = SCAN_PREFIX.len();
+        let mut msg = [0u8; SCAN_PREFIX.len() + 3 + crate::net::wifi::RELAY_VALUE_MAX];
+        msg[..base].copy_from_slice(SCAN_PREFIX);
+        let own = self.id;
+        msg[base] = b'0' + own / 100;
+        msg[base + 1] = b'0' + (own / 10) % 10;
+        msg[base + 2] = b'0' + own % 10;
+        let n = value.len().min(crate::net::wifi::RELAY_VALUE_MAX);
+        msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
+    }
+
+    /// #71: run ONE on-demand WiFi AP scan (triggered by applying the `W` command) → publish the
+    /// strongest APs to `smol/<id>/scan`.
+    ///
+    /// ⚠️ COEXIST (the #71 caveat, the 2026-07-11 lesson): a scan takes the SINGLE radio OFF the
+    /// mesh channel for its duration — a mesh-deaf blip. So it is ON-DEMAND ONLY, NEVER periodic,
+    /// and HARD-SKIPPED while a mesh-OTA transfer is live. After the scan the ESP-NOW channel is
+    /// re-pinned (the scan hopped the PHY across 1/6/11). Record = up to `SCAN_MAX_APS`
+    /// `<ssid>,<bssid-3oct>,<ch>,<rssi>` groups `|`-joined, strongest-RSSI first; BSSIDs are
+    /// truncated to 3 octets (this is a PUBLIC-repo-documented topic — a full BSSID is a privacy
+    /// leak, per nebula's #71 note). Role: a GATEWAY stashes it in `own_scan` (its next flush
+    /// publishes it — the gateway has MQTT); a LEAF broadcasts it (the gateway republishes).
+    ///
+    /// ⚠️ HW-CANARY-GATED: the scan radio-path + channel-restore cannot be verified without
+    /// hardware — canary ONE node before any fleet-wide use (same discipline as OTA).
+    pub fn run_scan(&mut self) {
+        // COEXIST hard gate: never leave the mesh channel while a mesh-OTA transfer is live.
+        if self.ota_leaf.is_active() {
+            log::info!("smol #71: scan skipped — mesh-OTA session active (coexist)");
+            return;
+        }
+        let ch_before = self.current_channel();
+        // scan_n = scan_with_config_sync_max(Default, N): a synchronous full-band scan capped at N
+        // results. We cap generously then keep the strongest few, so a busy band still yields the
+        // most-relevant APs.
+        let record = match self.controller.scan_n(16) {
+            Ok(mut aps) => {
+                // Strongest RSSI first (descending → Reverse of the ascending key).
+                aps.sort_by_key(|a| core::cmp::Reverse(a.signal_strength));
+                format_scan_record(&aps)
+            }
+            Err(_) => alloc::string::String::from("SCAN|err"),
+        };
+        // Re-pin the mesh channel (the scan hopped the PHY off it). Prefer the pre-scan locked
+        // channel; fall back to the fixed ESP-NOW channel if we were unlocked (0 = scanning).
+        let restore = if ch_before != 0 { ch_before } else { ESP_NOW_FIXED_CHANNEL };
+        let _ = self.esp_now.set_channel(restore);
+        if self.relay.is_gateway {
+            self.own_scan = Some(record); // the next flush publishes smol/<id>/scan (then clears it)
+        } else {
+            self.broadcast_scan(record.as_bytes()); // relay → gateway caches + republishes
+        }
     }
 
     /// #70: sample the live free-heap and lower the min-heap watermark. Cheap (one `HEAP.free()`);
@@ -3095,6 +3216,9 @@ impl RadioManager {
         // #52: capture any remote-reboot COMMANDS this flush surfaces (transient cmd/reset). Drained
         // below into a ONE-SHOT relay per leaf target (NEVER cached) + a self-reboot inject if own.
         let mut reset_req = crate::net::wifi::ResetReq::new();
+        // #71: capture any on-demand WiFi-scan COMMANDS this flush surfaces (transient cmd/scan).
+        // Drained below like reset_req: ONE-SHOT `<id>W` relay per leaf target + a self-scan inject.
+        let mut scan_req = crate::net::wifi::ScanReq::new();
         // #33: capture any OTA install command this flush surfaces.
         let mut install_requested = false;
         // #40 #1: set iff this flush SEES a retained leaf install (pre-arm) → latch pending below.
@@ -3103,6 +3227,10 @@ impl RadioManager {
         // — the run_mqtt_burst call below already holds disjoint field borrows). Published retained
         // as `smol/<id>/diag`, and cached leaf diags are republished alongside via `diag_cache`.
         let diag_rec = self.diag_record();
+        // #71: take the gateway's pending own-scan record (set by `run_scan` when the gateway
+        // self-scanned) — one-shot: publish it THIS flush (retained holds it), then it's cleared.
+        let own_scan = self.own_scan.take();
+        let scan_bytes: &[u8] = own_scan.as_deref().map(|s| s.as_bytes()).unwrap_or(&[]);
         let sta = self.sta.as_mut();
         let ok = match sta {
             None => false,
@@ -3147,6 +3275,9 @@ impl RadioManager {
                     Some(&self.stat_cache), // #50b: gateway republishes cached leaf statuses
                     diag_rec.as_bytes(), // #70/#49: gateway publishes its own smol/<id>/diag
                     Some(&self.diag_cache), // #70/#49: republish cached relayed-node diags
+                    scan_bytes, // #71: gateway publishes its own smol/<id>/scan (empty unless it self-scanned)
+                    Some(&self.scan_cache), // #71: republish cached relayed-node scans
+                    &mut scan_req, // #71: capture on-demand scan commands (one-shot relay below)
                     leaf_ota, // #40: surface a pending leaf-OTA install for main to relay
                     &mut self.staged_raw, // #40: persist the staged across flushes (pair-safe)
                     &mut self.leaf_ota_diag, // #40: publish smol/<leaf>/ota/diag + clear/retry
@@ -3192,6 +3323,16 @@ impl RadioManager {
         }
         if reset_req.own() {
             self.cfg.set(crate::net::wifi::CFG_KEY_REBOOT, b"");
+        }
+        // #71 on-demand scan — twin of the reset drain: ONE-SHOT `<id>W` frame per queued leaf
+        // target (direct `broadcast_config`, NEVER cached — a cached scan = a periodic off-channel
+        // excursion, the coexist hazard). Own id → inject W into our OWN CfgTracker so `main`'s
+        // take_cfg_offer(W) runs the scan on the SAME path as a leaf. Empty value: the key IS the command.
+        for &leaf in scan_req.targets() {
+            self.broadcast_config(leaf, crate::net::wifi::CFG_KEY_SCAN, b"");
+        }
+        if scan_req.own() {
+            self.cfg.set(crate::net::wifi::CFG_KEY_SCAN, b"");
         }
         // #33: OR-in an install command (one-shot; `main`'s take clears it).
         if install_requested {
@@ -3634,6 +3775,16 @@ impl RadioManager {
                     self.roster.heard(src, Some(node_id), rssi, now);
                     label = Some(alloc::string::String::from("diag"));
                 }
+                Some(Frame::Scan { src: node_id, value }) => {
+                    // #71 observability uplink: a leaf's one-shot WiFi-scan record. GATEWAY-only
+                    // cache (twin of the DIAG arm) → republished retained `smol/<id>/scan`.
+                    if self.relay.is_gateway {
+                        self.scan_cache.set(node_id, value, now);
+                    }
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, Some(node_id), rssi, now);
+                    label = Some(alloc::string::String::from("scan"));
+                }
                 None => {
                     // Unrecognised payload (other ESP-NOW traffic on-channel);
                     // surface it on the OLED but don't touch the handshake.
@@ -3995,6 +4146,12 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
         // key=val DIAG record (to end-of-frame; empty = none). Same `parse_id` guard as STAT.
         let src = parse_id(rest)?;
         return Some(Frame::Diag { src, value: &rest[3..] });
+    }
+    if let Some(rest) = data.strip_prefix(SCAN_PREFIX) {
+        // #71 observability uplink: "NNN<record>" — 3-ASCII SENDER id then the verbatim WiFi-scan
+        // record (to end-of-frame; empty = none). Twin of the DIAG arm.
+        let src = parse_id(rest)?;
+        return Some(Frame::Scan { src, value: &rest[3..] });
     }
     None
 }

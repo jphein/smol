@@ -1120,6 +1120,14 @@ fn main() -> ! {
                     );
                 }
             }
+            // #71: an on-demand WiFi-scan command (key `W`) — a COMMAND (cache-bypass, one-shot),
+            // same apply path as `R`. Feeds BOTH a leaf (relayed `<id>W`) and the gateway's OWN
+            // scan (injected into `self.cfg`). `run_scan` self-gates on coexist (skips if a mesh-OTA
+            // is live), does ONE scan, re-pins the mesh channel, then relays/publishes the record.
+            if r.take_cfg_offer(crate::net::CFG_KEY_SCAN).is_some() {
+                log::info!("smol #71: on-demand WiFi scan commanded");
+                r.run_scan();
+            }
             let state = r.peer_led_state(now);
             if last_led_state != Some(state) {
                 log::info!("smol: LED -> {:?}", state);
