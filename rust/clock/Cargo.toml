@@ -118,6 +118,15 @@ ed25519-compact = { version = "2", default-features = false, optional = true }
 # ESP-NOW support lives inside esp-wifi behind its `esp-now` feature.
 # (No extra top-level crate; the feature is toggled on esp-wifi below.)
 
+# --- BLE observer (#22, feature = "ble") ---------------------------------
+# esp-wifi's blocking `BleConnector` sends/receives raw HCI via `embedded_io::{Read,
+# Write}`. We need the `Write` trait in scope to push the two passive-scan commands.
+# embedded-io is ALREADY in the tree (a transitive dep of esp-hal/esp-wifi — `=0.6.1`
+# in Cargo.lock); this just names it directly so `ble` code can call `.write()`. Pinned
+# to the locked version → no Cargo-pin churn against the frozen quartet. NO host BLE
+# stack (trouble-host/bleps) is pulled: passive scan is raw HCI (see net/ble.rs).
+embedded-io = { version = "=0.6.1", optional = true }
+
 [features]
 # Phase 1 only: clock on the OLED. This is the default so `cargo build
 # --release` with no flags exercises the guaranteed-green baseline.
@@ -168,6 +177,18 @@ cast = ["espnow"]
 # flushes run CONCURRENTLY while the Bench beacon seq-gap loss/RTT is logged to
 # serial. Builds on espnow. Everything it changes is `cfg(feature = "coexist-soak")`.
 coexist-soak = ["espnow"]
+
+# #22 passive BLE observer. A node runs the ESP32-C3's Bluetooth controller as a
+# PASSIVE scanner (never connects, never active-scans) sharing the single 2.4 GHz
+# radio with WiFi + ESP-NOW under Espressif's software coexistence arbiter, collects
+# room-presence sightings (MAC + RSSI + ad-type summary), and relays a summary
+# gateway-ward → retained `smol/<id>/ble` (the DIAG/SCAN relay twin) + a `ble=<count>`
+# DIAG scalar. Builds on `espnow` and turns on esp-wifi's `ble` (pulls bt-hci — ALREADY
+# in-tree) + `coex` (the 3rd-tenant time-slice arbiter). `default`/wifi/espnow/wled/cast
+# builds are BYTE-FREE of it (`net::ble`/`net::ble_scan` are `#![cfg(feature = "ble")]`
+# and every hook is cfg-gated). ⚠️ Experimental: gated on the #23 coexist proof + a
+# ≥1 h mesh-stability soak (issue #22). Bumps the shared heap 72→96 KB (net::init_heap).
+ble = ["espnow", "esp-wifi/ble", "esp-wifi/coex", "dep:embedded-io"]
 
 [profile.release]
 # esp-wifi strongly recommends opt-level "s"/2/3 and LTO; the radio blobs are

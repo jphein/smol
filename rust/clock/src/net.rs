@@ -34,6 +34,16 @@ pub mod cast;
 #[cfg(feature = "cast")]
 pub mod cast_oled;
 
+// #22 passive BLE observer: `ble = ["espnow", "esp-wifi/ble", "esp-wifi/coex", …]`.
+// `ble` is the PURE codec + heapless sighting table (host-testable, no HAL deps);
+// `ble_scan` is the esp-wifi `BleConnector` driver that feeds it (needs esp-wifi).
+// Absent from every non-ble build → the default / wifi / espnow / wled / cast
+// profiles are byte-free of it (mirror of the `cast` / `cast_oled` split).
+#[cfg(feature = "ble")]
+pub mod ble;
+#[cfg(feature = "ble")]
+pub mod ble_scan;
+
 // Deterministic magical node names (realm-sigil port). Needs no radio — a node
 // derives its OWN name and any peer's name from the logical id alone — so it is
 // compiled in ALL builds (peer names are only *displayed* under espnow, but our
@@ -94,9 +104,20 @@ pub use wifi::try_time_sync;
 /// it (the size the esp-wifi C3 examples use). Defined here so both the Phase 2
 /// (`wifi`) and Phase 3 (`espnow`) code paths share a single heap region rather
 /// than each reserving their own.
-#[cfg(feature = "wifi")]
+#[cfg(all(feature = "wifi", not(feature = "ble")))]
 pub fn init_heap() {
     esp_alloc::heap_allocator!(size: 72 * 1024);
+}
+
+/// #22: the passive BLE observer's `btdm` controller shares this same esp-alloc
+/// region, so the `ble` build reserves a larger slab (72 → 96 KiB) to keep the
+/// idle heap watermark (`hmin` in DIAG) above the soak's G3 floor. The bump is
+/// cfg-gated so every non-ble build keeps the exact 72 KiB region (their `hmin`
+/// is unchanged — the RAM-budget invariant). ⚠️ The 96 KiB slab is a link-checked
+/// static reservation; the soak confirms the runtime headroom on a no-PSRAM part.
+#[cfg(all(feature = "wifi", feature = "ble"))]
+pub fn init_heap() {
+    esp_alloc::heap_allocator!(size: 96 * 1024);
 }
 
 /// Phase-1 (default) placeholder used when no radio features are enabled: the
