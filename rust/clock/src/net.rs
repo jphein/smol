@@ -58,6 +58,10 @@ pub use wifi::CFG_KEY_LED;
 // take_cfg_offer(U)). CFG_TARGET_ALL stays wifi-internal (only mode.rs/wifi.rs name it).
 #[cfg(feature = "espnow")]
 pub use wifi::CFG_KEY_UNITS;
+// #55 plugin-mask key — same `main`-bridge rationale (espnow leaf-apply path via
+// take_cfg_offer(P)). #52 adds `R` here.
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_KEY_PLUGINS;
 
 // `try_time_sync` is the Phase-2 entry point; under `espnow`, `main` calls
 // `mode::start` instead, so only re-export it when espnow is NOT enabled.

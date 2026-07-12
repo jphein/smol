@@ -180,10 +180,11 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 3] = [
+const CFG_APPLY_KEYS: [u8; 4] = [
     crate::net::wifi::CFG_KEY_SCREEN,
     crate::net::wifi::CFG_KEY_LED,
     crate::net::wifi::CFG_KEY_UNITS,
+    crate::net::wifi::CFG_KEY_PLUGINS,
 ];
 /// #50b leaf-status UPLINK tag: `"SMOLv1 STAT "` (12 B, trailing space) then `"NNN"`
 /// (3-ASCII zero-padded SENDER leaf id) then the verbatim live `<AppKind>:<page>` value
@@ -2958,6 +2959,10 @@ impl RadioManager {
         // #43: the gateway's OWN global display units — same self-apply path (take_cfg_offer(U)).
         if let Some((buf, len)) = gw_own.units {
             self.cfg.set(crate::net::wifi::CFG_KEY_UNITS, &buf[..len]);
+        }
+        // #55: the gateway's OWN plugin-visibility mask — same self-apply path (take_cfg_offer(P)).
+        if let Some((buf, len)) = gw_own.plugins {
+            self.cfg.set(crate::net::wifi::CFG_KEY_PLUGINS, &buf[..len]);
         }
         // #33: OR-in an install command (one-shot; `main`'s take clears it).
         if install_requested {

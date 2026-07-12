@@ -43,6 +43,60 @@ const VISIBLE: usize = 3;
 const FIRST_Y: i32 = 11;
 const ROW_H: i32 = 9;
 
+/// #55: parse a `smol/<id>/config/plugins` payload — up to 4 ASCII-hex chars → a `u16` bit mask
+/// (e.g. `"007F"`, `"7f"`, `"5"`). Case-insensitive, panic-free. Empty / too long / any non-hex
+/// char → `None`, so the caller KEEPS its current mask (untrusted retained/relayed value — the
+/// #46 clamp). Bit `i` (see [`crate::app::plugin_bit`]) set = that app is shown in the Home menu.
+///
+/// espnow-only: the config apply path (`take_cfg_offer(P)`) is radio-only (like the screen/LED/
+/// units channels) — a non-espnow build never receives a mask (stays `0` = all shown).
+#[cfg(feature = "espnow")]
+pub fn parse_plugin_mask(s: &str) -> Option<u16> {
+    let s = s.trim();
+    if s.is_empty() || s.len() > 4 {
+        return None;
+    }
+    let mut v: u16 = 0;
+    for b in s.bytes() {
+        let d = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return None,
+        };
+        v = (v << 4) | d as u16;
+    }
+    Some(v)
+}
+
+/// #55: is `kind` shown under `mask`? A ZERO mask = keep all (the #55 safety: never blank the
+/// menu — also the non-espnow default, where the mask is never set). A kind with no plugin bit
+/// (`Menu`) is always shown. `mask` bit `plugin_bit(kind)` set = shown.
+pub fn kind_enabled(kind: crate::app::AppKind, mask: u16) -> bool {
+    mask == 0 || crate::app::plugin_bit(kind).is_none_or(|b| mask & (1 << b) != 0)
+}
+
+/// #55: the REGISTRY indices the mask ENABLES, in registry order (a fixed `.bss` buffer — at most
+/// `REGISTRY.len()` entries). SAFETY: if the mask enables NOTHING compiled, fall back to the whole
+/// registry — the menu is never blank (#55 safety / #46 clamp). Returns `(indices, count)`.
+fn enabled_indices(mask: u16) -> ([usize; REGISTRY.len()], usize) {
+    let mut buf = [0usize; REGISTRY.len()];
+    let mut n = 0;
+    for (i, desc) in REGISTRY.iter().enumerate() {
+        if kind_enabled(desc.kind, mask) {
+            buf[n] = i;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        for (i, slot) in buf.iter_mut().enumerate() {
+            *slot = i;
+        }
+        n = REGISTRY.len();
+    }
+    (buf, n)
+}
+
 /// Home-menu state: which item is highlighted, and the top of the scroll window.
 pub struct Menu {
     selected: usize,
@@ -59,7 +113,7 @@ impl Menu {
     /// Render the title (node noun) + the visible window of [`REGISTRY`] rows,
     /// the selection in inverse video, plus edge chevrons when items sit off the
     /// window. Heap-free; all labels are `'static`.
-    fn draw(&self, display: &mut crate::app::Oled) {
+    fn draw(&self, display: &mut crate::app::Oled, mask: u16) {
         let title: MonoTextStyle<BinaryColor> = MonoTextStyleBuilder::new()
             .font(&FONT_6X10)
             .text_color(BinaryColor::On)
@@ -83,12 +137,16 @@ impl Menu {
             .draw(display)
             .ok();
 
-        // The window of rows [win .. win+VISIBLE), clamped to the registry length.
-        let end = (self.win + VISIBLE).min(REGISTRY.len());
-        for (i, desc) in REGISTRY.iter().enumerate().skip(self.win).take(VISIBLE) {
-            let rel = (i - self.win) as i32;
+        // #55: `selected`/`win` index the ENABLED subset (the mask may hide rows). The window
+        // [win .. win+VISIBLE) walks that subset; each position maps to a REGISTRY row via `idx`.
+        // A zero mask → all rows enabled → identical to the pre-#55 behavior.
+        let (idx, n) = enabled_indices(mask);
+        let end = (self.win + VISIBLE).min(n);
+        for pos in self.win..end {
+            let desc = &REGISTRY[idx[pos]];
+            let rel = (pos - self.win) as i32;
             let y = FIRST_Y + rel * ROW_H;
-            if i == self.selected {
+            if pos == self.selected {
                 // Highlight bar spanning the 72 px width, then inverse text.
                 Rectangle::new(Point::new(0, y - 1), Size::new(72, ROW_H as u32))
                     .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
@@ -104,7 +162,7 @@ impl Menu {
             }
         }
 
-        // Edge chevrons: mark items above/below the window. Draw in inverse when
+        // Edge chevrons: mark enabled items above/below the window. Draw in inverse when
         // the marked row is the highlighted (white-bar) one so it stays visible.
         if self.win > 0 {
             let style = if self.selected == self.win { item_sel } else { item };
@@ -112,7 +170,7 @@ impl Menu {
                 .draw(display)
                 .ok();
         }
-        if end < REGISTRY.len() {
+        if end < n {
             let bottom = end - 1;
             let style = if self.selected == bottom { item_sel } else { item };
             let y = FIRST_Y + (VISIBLE as i32 - 1) * ROW_H;
@@ -125,10 +183,17 @@ impl Menu {
 
 impl Plugin for Menu {
     fn on_button(&mut self, press: Press, ctx: &mut Ctx) -> Transition {
+        // #55: `selected`/`win` index the ENABLED subset. Resolve it (a zero mask → the full
+        // list) and clamp first — the mask may have shrunk the subset since the last press.
+        // `n >= 1` always (enabled_indices falls back to the whole registry if nothing is on).
+        let (idx, n) = enabled_indices(ctx.plugin_mask);
+        if self.selected >= n {
+            self.selected = n - 1;
+        }
         match press {
-            // Short tap: advance the selection (wrapping) and follow the window.
+            // Short tap: advance the selection (wrapping over the enabled subset) + follow window.
             Press::Short => {
-                self.selected = (self.selected + 1) % REGISTRY.len();
+                self.selected = (self.selected + 1) % n;
                 if self.selected < self.win {
                     self.win = self.selected;
                 } else if self.selected >= self.win + VISIBLE {
@@ -137,9 +202,9 @@ impl Plugin for Menu {
                 ctx.redraw = true;
                 Transition::Stay
             }
-            // Long press: enter the highlighted app (the SNAKE_KIND merge means
-            // "Snake" launches MeshSnake under espnow — see the registry).
-            Press::Long => Transition::Switch(REGISTRY[self.selected].kind),
+            // Long press: enter the highlighted app (the SNAKE_KIND merge means "Snake" launches
+            // MeshSnake under espnow). `idx[selected]` maps the subset position to its REGISTRY row.
+            Press::Long => Transition::Switch(REGISTRY[idx[self.selected]].kind),
         }
     }
 
@@ -147,8 +212,19 @@ impl Plugin for Menu {
         // The menu is static between selections, so it repaints on `redraw` only
         // (mode entry or a tap) — same cadence as the old Menu render arm.
         if ctx.redraw {
+            // #55: clamp the selection/window to the enabled-row count before drawing — the mask
+            // may have shrunk the subset out from under us since the last paint.
+            let (_, n) = enabled_indices(ctx.plugin_mask);
+            if self.selected >= n {
+                self.selected = n - 1;
+            }
+            if self.selected < self.win {
+                self.win = self.selected;
+            } else if self.selected >= self.win + VISIBLE {
+                self.win = self.selected + 1 - VISIBLE;
+            }
             ctx.display.clear(BinaryColor::Off).ok();
-            self.draw(ctx.display);
+            self.draw(ctx.display, ctx.plugin_mask);
             ctx.display.flush().ok();
         }
     }

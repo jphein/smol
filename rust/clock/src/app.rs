@@ -96,6 +96,10 @@ pub struct Ctx<'a> {
     /// CLOCK render (universal). On espnow it tracks the relayed / gateway-own
     /// `smol/config/units`; on a non-espnow build it is always [`crate::units::Units::default`].
     pub units: crate::units::Units,
+    /// #55 per-node plugin-visibility mask (bit = shown; see [`plugin_bit`]), owned by `main`.
+    /// Read by the Home menu to filter rows. `0` = keep all (the #55 safety + the non-espnow
+    /// default — the relay/apply path is radio-only, so a non-espnow build never changes it).
+    pub plugin_mask: u16,
     /// HA battery-voltage cache (the Batt screen), borrowed read-only. Owned by
     /// `main` and filled by the WiFi burst's MQTT downlink (`net/wifi.rs`'s
     /// `mqtt_session`) or an inbound SMOLv1 BATT frame — either can happen while
@@ -458,3 +462,31 @@ pub const REGISTRY: &[AppDesc] = &[
     AppDesc { title: "WLED", kind: AppKind::WledRemote },
     AppDesc { title: "About", kind: AppKind::About },
 ];
+
+/// #55 plugin visibility: the STABLE mask bit for an app kind, INDEPENDENT of the (cfg-gated)
+/// REGISTRY index/order. Fixed per kind so HA sends ONE bit-map to the whole fleet and each node
+/// applies only the bits for the variants it compiles — a bit for an absent variant is simply
+/// never tested. `Menu` is never maskable (it isn't a REGISTRY row) → `None`.
+///
+/// Bit map (luna's HA contract): 0=Clock · 1=Snake · 2=Bench · 3=Batt · 4=Grid · 5=WledRemote
+/// · 6=About. The `SNAKE_KIND` alias (MeshSnake under espnow) shares the "Snake" bit (1), so a
+/// mask hides "Snake" whether the menu row launches solo Snake or MeshSnake. The cfg'd arms stay
+/// exhaustive in every profile: an absent variant's arm is removed exactly when the variant is.
+pub const fn plugin_bit(kind: AppKind) -> Option<u8> {
+    match kind {
+        AppKind::Clock => Some(0),
+        AppKind::Snake => Some(1),
+        #[cfg(feature = "espnow")]
+        AppKind::MeshSnake => Some(1), // SNAKE_KIND alias → same "Snake" bit
+        #[cfg(feature = "espnow")]
+        AppKind::Bench => Some(2),
+        #[cfg(feature = "wifi")]
+        AppKind::Batt => Some(3),
+        #[cfg(feature = "wifi")]
+        AppKind::Grid => Some(4),
+        #[cfg(feature = "wled")]
+        AppKind::WledRemote => Some(5),
+        AppKind::About => Some(6),
+        AppKind::Menu => None,
+    }
+}

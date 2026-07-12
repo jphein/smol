@@ -26,9 +26,12 @@ pub struct Units {
 
 impl Default for Units {
     fn default() -> Self {
-        // °F + 24h. Matches the HA input_select `initial:` values (smol_mesh.yaml #43),
-        // so the FW no-config default equals the fleet standard the gateway relays.
-        Self { temp_f: true, clk_24h: true }
+        // °F + 12h == the PRE-#43 hardcoded render (sensors.rs was °F; clock.rs was 12h). Chosen
+        // to preserve the DEFAULT-BUILD INVARIANT: a build with no config path (default/wifi, and
+        // an espnow node before its first config lands) renders EXACTLY as before — #43's render
+        // is inert without a config. HA's retained `smol/config/units` (initial 24h) then drives
+        // the espnow FLEET to its chosen units; the guaranteed-green baseline never changes.
+        Self { temp_f: true, clk_24h: false }
     }
 }
 
@@ -37,6 +40,10 @@ impl Units {
     /// unrecognised / malformed token → `None`, so the caller KEEPS its current units
     /// rather than half-applying a garbage frame (untrusted retained/relayed value — the
     /// #46 clamp discipline; never panics). Whitespace-tolerant; empty → `None`.
+    ///
+    /// espnow-only: the config apply path (`take_cfg_offer(U)`) is radio-only, exactly like the
+    /// screen/LED channels — a non-espnow build has no feed, so it never parses (would be dead).
+    #[cfg(feature = "espnow")]
     pub fn from_wire(s: &str) -> Option<Units> {
         let s = s.trim();
         if s.is_empty() {

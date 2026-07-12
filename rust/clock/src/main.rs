@@ -565,6 +565,13 @@ fn main() -> ! {
     #[allow(unused_mut)]
     let mut units = units::Units::default();
 
+    // #55 plugin-visibility mask (bit = shown; see `app::plugin_bit`). `0` = keep all — the
+    // default AND the non-espnow value (the relay/apply path is radio-only). Held across the
+    // loop; on espnow the relayed / gateway-own `smol/<id>/config/plugins` updates it. Read by
+    // the Home menu to filter rows; `mut` is used only under espnow (the apply block below).
+    #[allow(unused_mut)]
+    let mut plugin_mask: u16 = 0;
+
     // #20 (1a): last BOOT-button activity + the current flush-deferral start, to
     // postpone a recurring flush while the user is interacting (capped).
     #[cfg(feature = "espnow")]
@@ -1007,6 +1014,19 @@ fn main() -> ! {
                     units = u;
                 }
             }
+
+            // #55: pull the relayed/gateway-own plugin-visibility mask (key `P`) and update it.
+            // Edge-safe: garbage/partial hex parses to None → keep the current mask (never blanks
+            // the menu). The mask filters Home-menu rows; a masked-off LIVE screen is caught after
+            // `ctx` is built (below) and falls back to the board default.
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_PLUGINS) {
+                if let Some(m) = menu::parse_plugin_mask(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
+                    if m != plugin_mask {
+                        log::info!("smol #55: plugin mask -> {:#06x}", m);
+                    }
+                    plugin_mask = m;
+                }
+            }
             let state = r.peer_led_state(now);
             if last_led_state != Some(state) {
                 log::info!("smol: LED -> {:?}", state);
@@ -1062,6 +1082,8 @@ fn main() -> ! {
             redraw,
             // #43 fleet-global display units (°F/°C · 12h/24h) — read by the CLOCK render.
             units,
+            // #55 per-node plugin-visibility mask — read by the Home menu to filter rows.
+            plugin_mask,
             #[cfg(feature = "wifi")]
             batt: &batt_cache,
             #[cfg(feature = "wifi")]
@@ -1120,6 +1142,22 @@ fn main() -> ! {
                 log::info!("smol #21: default screen cleared → board default");
             }
             _ => {}
+        }
+
+        // #55: if the LIVE screen is now masked-off (a plugin the user is currently viewing was
+        // just hidden), fall back to the board default so the mask can never strand them on a
+        // hidden screen. Loop-safe: SKIP if we're already on the default kind — so even a mask
+        // that hides the default itself doesn't thrash (you land there once and stay; the menu's
+        // `enabled_indices` still guarantees a non-empty list). Edge-driven by any mask change.
+        #[cfg(feature = "espnow")]
+        {
+            let (live_kind, _) = app.live_screen();
+            if live_kind != DEFAULT_APP && !menu::kind_enabled(live_kind, plugin_mask) {
+                app = App::enter(DEFAULT_APP, &ctx);
+                app.set_page(DEFAULT_PAGE);
+                ctx.redraw = true;
+                log::info!("smol #55: live screen masked off → board default");
+            }
         }
 
         // One debounced BOOT-button gesture → the active plugin. ANY press forces

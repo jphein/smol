@@ -803,6 +803,11 @@ pub const CFG_KEY_UNITS: u8 = b'U';
 /// arm); the gateway caches global configs under `(255, key)` and relays them to all leaves.
 #[cfg(feature = "wifi")]
 pub const CFG_TARGET_ALL: u8 = 255;
+/// #55 plugin-visibility channel (ASCII-hex u16 mask, e.g. `007F`). Per-node retained
+/// `smol/<id>/config/plugins`. Bit i (see `app::plugin_bit`) set = that app is shown in the
+/// Home menu; a leaf gets it relayed (key `P`), the gateway reads its own directly.
+#[cfg(feature = "wifi")]
+pub const CFG_KEY_PLUGINS: u8 = b'P';
 
 /// #48 (GwOwnCfg — approved arch): the GATEWAY's OWN per-node configs read from its own MQTT
 /// topics this burst. A leaf gets these RELAYED (→ its `CfgTracker`); the gateway reads them
@@ -813,6 +818,11 @@ pub const CFG_TARGET_ALL: u8 = 255;
 /// on its own `config_offer` path (untouched). #43/#55 add `units`/`plugins` fields as they land.
 #[cfg(feature = "wifi")]
 #[derive(Clone, Copy)]
+// The fields are READ only on espnow (mode.rs gateway flush injects them into the CfgTracker);
+// a wifi-only build FILLS them in mqtt_session but has no RadioManager to read them back, so they
+// are write-only there → allow(dead_code) keeps the `-D warnings` clippy gate green in BOTH
+// configs (same cross-profile rationale as CfgCache above).
+#[allow(dead_code)]
 pub struct GwOwnCfg {
     /// The gateway's own `smol/<id>/config/led` value `(buf, len)`, or `None` if absent this burst.
     pub led: Option<([u8; CFG_VALUE_MAX], usize)>,
@@ -820,12 +830,14 @@ pub struct GwOwnCfg {
     /// The gateway applies its own display units directly (it also relays them to leaves under
     /// the broadcast target); captured here so `service()` self-applies via the same path.
     pub units: Option<([u8; CFG_VALUE_MAX], usize)>,
+    /// #55 the gateway's own `smol/<id>/config/plugins` value `(buf, len)`, or `None` if absent.
+    pub plugins: Option<([u8; CFG_VALUE_MAX], usize)>,
 }
 
 #[cfg(feature = "wifi")]
 impl GwOwnCfg {
     pub const fn new() -> Self {
-        Self { led: None, units: None }
+        Self { led: None, units: None, plugins: None }
     }
     /// Pack a payload into the `(buf, len)` a field holds (truncated to `CFG_VALUE_MAX`), so the
     /// mqtt-drain arms stay one-liners: `gw_own.led = Some(GwOwnCfg::val(payload));`.
@@ -1312,6 +1324,11 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 11, b"smol/config/units") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
+        // #55 plugin visibility (pid 12): wildcard-subscribe every leaf's retained plugin mask so
+        // the gateway caches + relays it (key `P`) over ESP-NOW, twin of the led wildcard.
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 12, b"smol/+/config/plugins") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
     }
 
     // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
@@ -1656,6 +1673,25 @@ fn mqtt_session(
                             "smol #43: global display units captured ({} B) — cached (255,U) + self",
                             payload.len()
                         );
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/plugins") {
+                        // #55 plugin visibility: twin of the led arm. OTHER leaf → cache under key
+                        // `P` for the ESP-NOW relay; OUR OWN id → capture into gw_own so `service()`
+                        // self-applies it. Verbatim bytes; the leaf's `parse_plugin_mask` validates
+                        // (bad/partial hex → keep current mask, never a blank menu).
+                        if leaf_id != node_id {
+                            if let Some(cache) = cfg_cache.as_deref_mut() {
+                                let now = Instant::now().duration_since_epoch().as_millis();
+                                cache.set(leaf_id, CFG_KEY_PLUGINS, payload, [0u8; 6], now);
+                                log::info!(
+                                    "smol #55: cached leaf id{} plugin mask for relay ({} B)",
+                                    leaf_id,
+                                    payload.len()
+                                );
+                            }
+                        } else {
+                            gw_own.plugins = Some(GwOwnCfg::val(payload));
+                            log::info!("smol #55: gateway own plugin mask captured ({} B)", payload.len());
+                        }
                     } else if let Some(leaf_id) = parse_leaf_install_topic(topic) {
                         // #40 (§B3): a wildcard-delivered leaf OTA install command. On a
                         // GATEWAY flush (cfg_cache = Some), an `INSTALL` for a leaf id ≠ self
