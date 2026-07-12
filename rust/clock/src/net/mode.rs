@@ -3460,26 +3460,12 @@ impl RadioManager {
     /// new slot; on `Nak` we unicast the OTAN to the gateway; `Abort`/`None` do nothing.
     fn handle_ota_frame(&mut self, f: crate::ota_mesh::OtaFrame<'_>, src: [u8; 6], rssi: i32, now: u64) {
         use crate::ota_mesh::{LeafAction, OtaFrame};
+        // Benign "heard a frame" liveness — safe to record for ANY decoded OTA-shaped frame:
+        // both only feed roster freshness + the self-test hear-a-frame proof, and neither gates
+        // trust. The VOLATILE mutations (owner-silence reset, channel lock, peer insert) are
+        // deferred to the `authed` block below — see F2.
         self.peers.last_hello_ms = now;
         self.roster.heard(src, None, rssi, now);
-        // #3b: an inbound OTA frame proves the gateway is audible on THIS channel (the relay
-        // runs on ESP_NOW_FIXED_CHANNEL). Treat it like the owner's HELLO — reset the
-        // owner-silence timer AND lock the channel — so the leaf STOPS the scan hop and STAYS on
-        // ch6 for the rest of the transfer. This is what lets the FIRST caught OTAM (caught while
-        // the leaf was mid-hop) pin the leaf so it hears the OTAD chunks + OTAM resends (#3b).
-        self.last_owner_heard_ms = now;
-        if !self.relay.is_gateway {
-            self.scan_locked = true;
-        }
-        if !self.esp_now.peer_exists(&src) {
-            let _ = self.esp_now.add_peer(PeerInfo {
-                interface: EspNowWifiInterface::Sta,
-                peer_address: src,
-                lmk: None,
-                channel: None,
-                encrypt: false,
-            });
-        }
         let mut out = [0u8; crate::ota_mesh::OTAN_FRAME_MAX];
         let id = self.id;
         let action = match f {
@@ -3493,6 +3479,37 @@ impl RadioManager {
             // loop, never here. A leaf ignores it.
             OtaFrame::Nak { .. } => LeafAction::None,
         };
+        // F2 (oracle LOW): only a frame the leaf-OTA state machine ACCEPTED may mutate volatile
+        // mesh state. A valid Meta arms the session (on_meta sets `active` + `gateway_mac = src`
+        // ONLY after the ed25519 + freshness gates pass); a valid Data/Complete belongs to that
+        // armed session (on_data rejects any other src/session). A spoofed or replayed OTA-shaped
+        // frame fails those gates → never arms → NOT authed → it cannot pin the leaf's channel,
+        // reset its owner-silence (suppressing re-election), or squat a peer-table slot pre-auth.
+        // (The relayed image is itself ed25519-signed, so this only closes the pre-session spoof
+        // window — hence LOW — but it keeps unauthenticated frames off the volatile mesh state.)
+        let authed = matches!(action, LeafAction::Nak(_) | LeafAction::Complete(_, _))
+            || (self.ota_leaf.is_active() && self.ota_leaf.gateway_mac() == src);
+        if authed {
+            // #3b: an ACCEPTED OTA frame proves the gateway is audible on THIS channel (the relay
+            // runs on ESP_NOW_FIXED_CHANNEL). Treat it like the owner's HELLO — reset the
+            // owner-silence timer AND lock the channel — so the leaf STOPS the scan hop and STAYS
+            // on ch6 for the rest of the transfer. This is what lets the FIRST caught OTAM (caught
+            // while the leaf was mid-hop) pin the leaf so it hears the OTAD chunks + OTAM resends.
+            self.last_owner_heard_ms = now;
+            if !self.relay.is_gateway {
+                self.scan_locked = true;
+            }
+            // Register the gateway for the unicast OTAN back-channel (needed before the Nak send).
+            if !self.esp_now.peer_exists(&src) {
+                let _ = self.esp_now.add_peer(PeerInfo {
+                    interface: EspNowWifiInterface::Sta,
+                    peer_address: src,
+                    lmk: None,
+                    channel: None,
+                    encrypt: false,
+                });
+            }
+        }
         match action {
             LeafAction::Nak(n) => {
                 let gw = self.ota_leaf.gateway_mac();
