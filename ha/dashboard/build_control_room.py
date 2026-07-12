@@ -24,6 +24,42 @@ def esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","
 def accent_top(c): return ("ha-card{position:relative;overflow:hidden}ha-card:before{content:'';position:absolute;top:0;left:0;right:0;height:2px;"
                            "background:linear-gradient(90deg,transparent,%s,transparent);opacity:.55}"%c)
 
+# ---------- #40 leaf-mesh-OTA relay PROGRESS: phosphor fill-bar + phase chip (conditional) ----------
+# ph=sensor.smol_<id>_ota_diag → [label, mushroom-color, fill-hex, mdi]. Default = relaying/pending.
+PMAP=("{'confirmed':['✓ confirmed','green','#5bff9a','mdi:check-decagram'],"
+      "'leaf-timeout':['⧗ leaf-timeout','amber','#ffc24b','mdi:timer-sand-complete'],"
+      "'relay-failed':['✗ relay-failed','red','#ff6b6b','mdi:close-octagon'],"
+      "'fetch-failed':['✗ fetch-failed','red','#ff6b6b','mdi:cloud-alert'],"
+      "'mac-unknown':['? mac-unknown','red','#ff6b6b','mdi:help-rhombus'],"
+      "'rolled-back':['↩ rolled-back','red','#ff6b6b','mdi:backup-restore']}")
+PDEF="['↑ relaying','blue','#5bd0ff','mdi:progress-upload']"
+def ota_progress_card(nid):
+    # Shown ONLY while a relay matters: staged build present & this node not yet on it, OR the phase
+    # is non-clean (leaf-timeout / *-failed / …). display:none when idle so the box stays calm.
+    # STATE = sensor.smol_<id>_ota_relaydiag (last_wb %, drives the fill); phase chip = ota_diag.
+    I=str(nid); rd=f"sensor.smol_{nid}_ota_relaydiag"; ph=f"sensor.smol_{nid}_ota_diag"; bd=f"sensor.smol_{nid}_build"
+    pre=("{% set na="+NAJ+" %}{% set p=states('"+rd+"') %}{% set pf=(p|float(0)) if p not in na else 0 %}"
+         "{% set ph=states('"+ph+"') %}{% set pm="+PMAP+" %}{% set pl=pm.get(ph,"+PDEF+") %}"
+         "{% set staged=states('sensor.smol_ota_staged') %}{% set build=states('"+bd+"') %}"
+         "{% set act=(staged not in na and staged!='none' and staged!=build) or (ph not in na and ph!='confirmed') %}")
+    primary=pre+"{{ (p ~ '%') if p not in na else '•••' }}"
+    secondary=(pre+"{% set wt=state_attr('"+rd+"','wb_total') %}{% set wd=state_attr('"+rd+"','wb_done') %}"
+               "{{ pl[0] }} · {% if wt %}{{ wd }}/{{ wt }} blk{% elif build not in na and staged not in na and staged!='none' %}run {{ build }}→{{ staged }}{% else %}awaiting relay{% endif %}")
+    style=(pre+
+        "ha-card{display:{% if act %}block{% else %}none{% endif %};border-radius:0;border-top:none;border-bottom:none;"
+        "margin-top:-2px;border-left:3px solid {{ pl[2] }};position:relative;overflow:hidden;"
+        "background:repeating-linear-gradient(0deg,transparent 0 2px,rgba(0,0,0,.30) 2px 3px),"
+        "linear-gradient(90deg,{{ pl[2] }}2e 0,{{ pl[2] }}2e {{ pf }}%,#04120a {{ pf }}%,#04120a 100%);}"
+        "ha-card:before{content:'';position:absolute;top:0;bottom:0;left:{{ pf }}%;width:2px;background:{{ pl[2] }};"
+        "box-shadow:0 0 9px {{ pl[2] }},0 0 3px {{ pl[2] }};opacity:{% if pf>0 and pf<100 %}.95{% else %}0{% endif %};}"
+        "ha-card:after{content:'◈ MESH-OTA · id"+I+"';position:absolute;top:6px;right:11px;font-size:8.5px;letter-spacing:1.5px;"
+        "color:{{ pl[2] }};opacity:.75;font-family:"+VT+";z-index:2;}")
+    info=(pre+".primary{font-family:"+VT+";font-size:30px;line-height:.85;color:{{ pl[2] }};text-shadow:0 0 8px {{ pl[2] }}66}"
+          ".secondary{font-size:10.5px;opacity:.85;letter-spacing:.3px}")
+    return {"type":"custom:mushroom-template-card","primary":primary,"secondary":secondary,
+            "icon":pre+"{{ pl[3] }}","icon_color":pre+"{{ pl[1] }}",
+            "card_mod":{"style":{".":style,"mushroom-state-info$":info,"mushroom-shape-icon$":"--icon-symbol-size:22px"}}}
+
 # ---------- node box = mushroom header + mushroom OLED + entities; span-4 in the VIEW grid ----------
 def node_card(nid, meta, present):
     gate=meta["gate"]; I=str(nid); on=f"is_state('binary_sensor.smol_{I}_online','on')"
@@ -114,7 +150,8 @@ def node_card(nid, meta, present):
     if inst in present: bot.append({"entity":inst,"name":"Install staged (gateway consumes)","icon":"mdi:rocket-launch"})
     ctrl_bottom={"type":"entities","show_header_toggle":False,"entities":bot,
                  "card_mod":{"style":"ha-card{border-radius:0 0 10px 10px;border-top:none;margin-top:-1px;"+OP+"}"}}
-    return {"type":"vertical-stack","view_layout":{"grid-column":"span 4"},"cards":[header,oled,ctrl_top,cond_leaf,cond_gw,ctrl_bottom]}
+    ota=ota_progress_card(nid)   # #40 relay progress bar + phase chip — self-hides (display:none) when idle
+    return {"type":"vertical-stack","view_layout":{"grid-column":"span 4"},"cards":[header,oled,ctrl_top,cond_leaf,cond_gw,ota,ctrl_bottom]}
 
 def legend_card(nodes, present):
     ents=[{"type":"section","label":"the mesh"}]
@@ -131,17 +168,35 @@ def legend_card(nodes, present):
     return {"type":"entities","title":"the mesh","show_header_toggle":False,"entities":ents,
             "card_mod":{"style":accent_top(PHOS)},"view_layout":{"grid-column":"span 5"}}
 
-# ---------- forge per-node OTA summary (generated markdown; scales) ----------
-FORGE_ROW=("id__ID____TAG__ — {% if is_state('__FW__','on') %}**{{ state_attr('__FW__','installed_version') }} → {{ state_attr('__FW__','latest_version') }} ready**"
-           "{% elif is_state('binary_sensor.smol___ID___online','on') %}✓ {{ state_attr('__FW__','installed_version') }} up-to-date"
-           "{% else %}offline{% endif %}")
+# ---------- FLEET-OTA row: staged build vs each node's RUNNING build# (+ live relay % / phase) ----------
+# Uses sensor.smol_<id>_build (running, #40) vs sensor.smol_ota_staged; when a node lags the staged
+# build it shows run **B** → **S** with the live relay % + phase chip. Scales with the fleet.
 def forge_ota_md(nodes, present):
-    out=["**per-node OTA**"]
+    out=["**fleet · staged vs running**",
+         "staged **{% set s=states('sensor.smol_ota_staged') %}{{ s if s not in "+NAJ+" else '— none' }}**"]
     for n in nodes:
-        I=str(n["id"]); fw=next((e for e in present if re.match(rf"update\.smol_{I}_.*_update$",e)),None)
-        tag=" · canary" if n["gate"] else ""
-        out.append(FORGE_ROW.replace("__ID__",I).replace("__FW__",fw).replace("__TAG__",tag) if fw else f"id{I}{tag} — n/a")
+        I=str(n["id"]); noun=n["name"].split()[-1]; tag=" ⚑" if n["gate"] else ""
+        row=("{% set na="+NAJ+" %}{% set s=states('sensor.smol_ota_staged') %}{% set b=states('sensor.smol_"+I+"_build') %}"
+             "{% set ph=states('sensor.smol_"+I+"_ota_diag') %}{% set p=states('sensor.smol_"+I+"_ota_relaydiag') %}"
+             "{% set on=is_state('binary_sensor.smol_"+I+"_online','on') %}{% set pm="+PMAP+" %}{% set pl=pm.get(ph,"+PDEF+") %}"
+             "**id"+I+"** "+noun+tag+" — "
+             "{% if not on %}·offline·"
+             "{% elif s in na or s=='none' %}run **{{ b }}** · no image staged"
+             "{% elif b==s %}✓ **{{ b }}** current"
+             "{% else %}run **{{ b }}** → **{{ s }}** · {% if p not in na %}**{{ p }}%** {% endif %}{{ pl[0] if ph not in na and ph!='none' else '↑ pending' }}"
+             "{% endif %}")
+        out.append(row)
     return "\n\n".join(out)
+
+# ---------- per-node install buttons, canary/gateway-first (replaces the FORGE_INSTALL marker) ----------
+def forge_install_rows(nodes, present):
+    rows=[{"type":"section","label":"install staged → node · canary-first, one at a time"}]
+    for n in nodes:   # nodes are pre-sorted gateway-first
+        I=str(n["id"]); inst=f"input_button.smol_ota_install_{I}"
+        if inst in present:
+            rows.append({"entity":inst,"name":f"Install → id{I} {n['name'].split()[-1]}"+(" · canary / the Seat" if n["gate"] else ""),
+                         "icon":"mdi:rocket-launch" if n["gate"] else "mdi:rocket-launch-outline"})
+    return rows
 
 def gen_topology(nodes, seat):
     W,H=680,300; cx,cy=W/2,H*0.40; F="ui-monospace,'DejaVu Sans Mono',monospace"
@@ -197,7 +252,7 @@ async def main():
         topo_url=serve("smol-topology.svg", gen_topology(nodes,seat))
         node_cards=[node_card(n["id"],n,present) for n in nodes]
         legend=legend_card(nodes,present)
-        cards=view["cards"]; out=[]; done={"topo":0,"legend":0,"fleet":0,"forge":0}
+        cards=view["cards"]; out=[]; done={"topo":0,"legend":0,"fleet":0,"forge":0,"install":0}
         for c in cards:
             if c.get("type")=="picture" and c.get("image")=="TOPO": c["image"]=topo_url; done["topo"]+=1; out.append(c)
             elif c.get("type")=="markdown" and c.get("content")=="LEGEND":
@@ -206,9 +261,11 @@ async def main():
                 out.extend(node_cards); done["fleet"]+=1
             else: out.append(c)
         view["cards"]=out
-        def fill_forge(cs):                                   # FORGE_OTA is nested in the forge vertical-stack
+        def fill_forge(cs):                                   # FORGE_OTA + FORGE_INSTALL nested in the forge vertical-stack
             for c in cs:
                 if c.get("type")=="markdown" and c.get("content")=="FORGE_OTA": c["content"]=forge_ota_md(nodes,present); done["forge"]+=1
+                if c.get("type")=="entities" and any(isinstance(e,dict) and e.get("entity")=="FORGE_INSTALL" for e in c.get("entities",[])):
+                    c["entities"]=forge_install_rows(nodes,present); done["install"]+=1
                 if isinstance(c,dict) and "cards" in c: fill_forge(c["cards"])
         fill_forge(view["cards"])
         assert all(done.values()), f"placeholders not all filled: {done}"
