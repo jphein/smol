@@ -180,11 +180,15 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 4] = [
+const CFG_APPLY_KEYS: [u8; 5] = [
     crate::net::wifi::CFG_KEY_SCREEN,
     crate::net::wifi::CFG_KEY_LED,
     crate::net::wifi::CFG_KEY_UNITS,
     crate::net::wifi::CFG_KEY_PLUGINS,
+    // #52 remote reboot: R IS a buffered/applied key (a leaf takes it via take_cfg_offer(R)) but
+    // is NEVER put in cfg_cache/broadcast_cached_configs — the one-shot relay uses broadcast_config
+    // directly. The anti-reboot-loop invariant: R rides the CFG wire + apply path, not the cache.
+    crate::net::wifi::CFG_KEY_REBOOT,
 ];
 /// #50b leaf-status UPLINK tag: `"SMOLv1 STAT "` (12 B, trailing space) then `"NNN"`
 /// (3-ASCII zero-padded SENDER leaf id) then the verbatim live `<AppKind>:<page>` value
@@ -1608,6 +1612,7 @@ impl RadioManager {
         let mut ota_offer: Option<crate::ota::Announce> = None;
         let mut config_offer: Option<crate::app::DefaultScreen> = None;
         let mut _gw_own = crate::net::wifi::GwOwnCfg::new(); // #48: recovery burst never captures gateway-own cfg
+        let mut _reset_req = crate::net::wifi::ResetReq::new(); // #52: recovery burst issues no reboots
         let mut install_requested = false;
         let mut _leaf_install_seen = false; // #40 #1: a leaf's recovery burst is not a gateway relay
         let reached = match self.sta.as_mut() {
@@ -1626,6 +1631,7 @@ impl RadioManager {
                     &mut ota_offer,
                     &mut config_offer,
                     &mut _gw_own,
+                    &mut _reset_req,
                     &mut install_requested,
                     &mut _leaf_install_seen, // #40 #1: leaf recovery burst — never a gateway relay
                     &[], // #27: election-only recovery burst publishes no peers (leaf/v1)
@@ -2889,6 +2895,9 @@ impl RadioManager {
         // #48: capture the GATEWAY's OWN keyed configs (led/…) this flush surfaces, then inject
         // them into our own CfgTracker below so `main`'s take_cfg_offer(key) self-applies them.
         let mut gw_own = crate::net::wifi::GwOwnCfg::new();
+        // #52: capture any remote-reboot COMMANDS this flush surfaces (transient cmd/reset). Drained
+        // below into a ONE-SHOT relay per leaf target (NEVER cached) + a self-reboot inject if own.
+        let mut reset_req = crate::net::wifi::ResetReq::new();
         // #33: capture any OTA install command this flush surfaces.
         let mut install_requested = false;
         // #40 #1: set iff this flush SEES a retained leaf install (pre-arm) → latch pending below.
@@ -2928,6 +2937,7 @@ impl RadioManager {
                     &mut ota_offer,
                     &mut config_offer,
                     &mut gw_own, // #48: capture the gateway's own keyed configs
+                    &mut reset_req, // #52: capture remote-reboot commands (one-shot relay below)
                     &mut install_requested,
                     &mut leaf_install_seen, // #40 #1: latch pending on install-SEEN (below)
                     peers, // #27: gateway publishes its roster as retained smol/<id>/peers
@@ -2963,6 +2973,18 @@ impl RadioManager {
         // #55: the gateway's OWN plugin-visibility mask — same self-apply path (take_cfg_offer(P)).
         if let Some((buf, len)) = gw_own.plugins {
             self.cfg.set(crate::net::wifi::CFG_KEY_PLUGINS, &buf[..len]);
+        }
+        // #52 remote reboot — a COMMAND, not a config. Fire a ONE-SHOT `<id>R` frame per queued
+        // leaf target via `broadcast_config` DIRECTLY (NOT `cfg_cache` / `broadcast_cached_configs`):
+        // a cached/rebroadcast reboot = a permanent ~10 s reboot-loop soft-brick — the anti-loop
+        // invariant. Own id → inject R into our OWN CfgTracker so `main`'s take_cfg_offer(R) reboots
+        // us on the SAME boot-debounced path as a leaf (never a raw reset here). Empty value: the
+        // key IS the command. `reset_req` is a local (not `self`) → the borrow is disjoint.
+        for &leaf in reset_req.targets() {
+            self.broadcast_config(leaf, crate::net::wifi::CFG_KEY_REBOOT, b"");
+        }
+        if reset_req.own() {
+            self.cfg.set(crate::net::wifi::CFG_KEY_REBOOT, b"");
         }
         // #33: OR-in an install command (one-shot; `main`'s take clears it).
         if install_requested {

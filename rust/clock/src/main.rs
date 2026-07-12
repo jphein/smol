@@ -225,6 +225,15 @@ const FLUSH_IDLE_MS: u64 = 3_000;
 #[cfg(feature = "espnow")]
 const FLUSH_DEFER_CAP_MS: u64 = 120_000;
 
+/// #52 remote-reboot boot-debounce: IGNORE (but consume) a reboot command (`take_cfg_offer(R)`)
+/// received within this window of boot. `millis()` is monotonic-since-boot, so the loop's `now`
+/// IS the uptime. Belt-and-suspenders against a reboot-loop soft-brick — the transient +
+/// cache-bypass design already prevents a cached reboot, but a one-shot R landing right as a leaf
+/// boots (e.g. a re-press racing the boot) would otherwise reset it before it stabilises. A
+/// genuinely-wanted reboot in the first ~10 s is just re-pressed once the node is up.
+#[cfg(feature = "espnow")]
+const REBOOT_DEBOUNCE_MS: u64 = 10_000;
+
 /// OLED panel rotation. The pocket-watch case hangs from the USB-C end, so the
 /// display is physically upside-down and must be rotated 180° to read upright.
 ///
@@ -1025,6 +1034,24 @@ fn main() -> ! {
                         log::info!("smol #55: plugin mask -> {:#06x}", m);
                     }
                     plugin_mask = m;
+                }
+            }
+
+            // #52: a remote reboot command (key `R`) — a COMMAND (cache-bypass, one-shot). Applied
+            // once (edge — `take` clears it); the value is empty (the key IS the command). Feeds
+            // BOTH a leaf (relayed `<id>R`) and the gateway's OWN reset (injected into `self.cfg`),
+            // so both self-reboot on this one debounced path. BOOT-DEBOUNCE: within
+            // REBOOT_DEBOUNCE_MS of boot, CONSUME but IGNORE it (never a reboot-loop soft-brick);
+            // `now` is millis()-since-boot = uptime. `software_reset()` never returns.
+            if r.take_cfg_offer(crate::net::CFG_KEY_REBOOT).is_some() {
+                if now >= REBOOT_DEBOUNCE_MS {
+                    log::warn!("smol #52: remote reboot commanded — software_reset()");
+                    esp_hal::system::software_reset();
+                } else {
+                    log::info!(
+                        "smol #52: reboot ignored — within {} ms of boot (debounce)",
+                        REBOOT_DEBOUNCE_MS
+                    );
                 }
             }
             let state = r.peer_led_state(now);
