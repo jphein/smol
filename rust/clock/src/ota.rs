@@ -1587,12 +1587,18 @@ pub fn write_net_cfg(c: NetCfg) {
     let Ok(Some(nvs)) = pt.find_partition(PartitionType::Data(DataPartitionSubType::Nvs)) else {
         return;
     };
-    let mut region = nvs.as_embedded_storage(&mut flash);
+    // Sector 5 is the LAST nvs sector: the FlashRegion erase API bounds-checks its EXCLUSIVE
+    // end with `contains(addr_to)` (strict `<`), so `erase(0x5000, 0x6000)` — ending exactly at
+    // the partition boundary — is structurally impossible through the region (OutOfBounds).
+    // Found on hardware (#100 canary reset-loop): the swallowed erase error meant the record
+    // never persisted. Erase+write RAW at absolute addresses instead — same 4 KB, same
+    // segregation (identity/floor/boot-count live in sectors 0-4, untouched).
+    let base = nvs.offset(); // absolute flash address of the nvs partition
     let sector = <FlashStorage as NorFlash>::ERASE_SIZE as u32; // 4096
-    if region.erase(NET_REC_OFF, NET_REC_OFF + sector).is_err() {
+    if flash.erase(base + NET_REC_OFF, base + NET_REC_OFF + sector).is_err() {
         return;
     }
-    let _ = region.write(NET_REC_OFF, &encode_net_cfg(c));
+    let _ = flash.write(base + NET_REC_OFF, &encode_net_cfg(c));
 }
 
 /// The running app slot as 0 (`ota_0`) / 1 (`ota_1`); 255 on a non-OTA board or any read

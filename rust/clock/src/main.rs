@@ -1188,7 +1188,20 @@ fn main() -> ! {
                                 commanded: slot,
                                 fallback: false,
                             });
-                            esp_hal::system::software_reset();
+                            // #100 canary lesson: VERIFY-AFTER-WRITE before the reset. If the
+                            // record didn't persist (any flash error — all swallowed above), a
+                            // reset would boot back on the old slot, re-receive the retained
+                            // command, and loop forever (~20 s reset cycle, observed on HW).
+                            // A failed readback = abort the switch this cycle; the retained
+                            // command retries next cycle, and the failure stays VISIBLE
+                            // (commanded stays != slot) instead of becoming a reboot loop.
+                            let persisted = crate::ota::read_net_cfg()
+                                .is_some_and(|c| c.commanded == slot);
+                            if persisted {
+                                esp_hal::system::software_reset();
+                            } else {
+                                log::warn!("smol #100: net record did NOT persist — switch aborted (no reset)");
+                            }
                         }
                     }
                 }
