@@ -1200,10 +1200,18 @@ fn main() -> ! {
                         let cur = crate::ota::read_net_cfg().map_or(0, |c| c.commanded);
                         if slot != cur {
                             log::warn!("smol #100: network slot -> {} (was commanded {}) — reboot", slot, cur);
+                            // A WiFi-slot switch resets to the new network's BAKED identity: the
+                            // broker + OTA-host overrides are cleared (they were set for the OLD
+                            // network's VLAN and would drop CONNACK cross-VLAN / point OTA off-net).
+                            // The slot IS the full network identity — re-apply an override after the
+                            // switch if still wanted.
                             crate::ota::write_net_cfg(crate::ota::NetCfg {
                                 active: slot,
                                 commanded: slot,
                                 fallback: false,
+                                broker: None,
+                                broker_fallback: false,
+                                ota_host: None,
                             });
                             // #100 canary lesson: VERIFY-AFTER-WRITE before the reset. If the
                             // record didn't persist (any flash error — all swallowed above), a
@@ -1219,6 +1227,73 @@ fn main() -> ! {
                             } else {
                                 log::warn!("smol #100: net record did NOT persist — switch aborted (no reset)");
                             }
+                        }
+                    }
+                }
+            }
+
+            // #100 Stage 2: a broker-override config (key `B`) = the MQTT broker leg (`ip` or
+            // `ip:port`). CONFIG/CACHED (retained) — EDGE-TRIGGERED on a change of the COMMANDED
+            // broker (`c.broker`), NOT the runtime one: a re-read is a no-op, and a CONNACK-fallback
+            // that DISABLED the override (broker_fallback=true, broker kept) does NOT re-fire the
+            // retained value → never the reboot-loop the #100 canary forbids. Escape a fallen-back
+            // override by commanding a NEW value (or empty = clear). Empty = CLEAR (baked broker). A
+            // non-empty value that isn't an RFC1918 ip[:port] is IGNORED (keep current). A genuine
+            // change → persist {broker=new, broker_fallback=false, ..cur} + VERIFY-AFTER-WRITE +
+            // reboot onto it (a wrong broker then self-heals via the CONNACK fallback). Never returns.
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_BROKER) {
+                let raw = core::str::from_utf8(&o.buf[..o.len]).unwrap_or("").trim();
+                let new_broker = if raw.is_empty() {
+                    None
+                } else {
+                    crate::ota::parse_broker_override(raw)
+                };
+                // Apply only a VALID command: an explicit clear (empty) OR a parsed override. A
+                // non-empty unparseable value is dropped (keep current) — never write garbage.
+                if raw.is_empty() || new_broker.is_some() {
+                    let cur = crate::ota::read_net_cfg();
+                    if new_broker != cur.and_then(|c| c.broker) {
+                        log::warn!("smol #100: broker override changed (set={}) — reboot", new_broker.is_some());
+                        crate::ota::write_net_cfg(crate::ota::NetCfg {
+                            broker: new_broker,
+                            broker_fallback: false,
+                            ..cur.unwrap_or_default()
+                        });
+                        let persisted = crate::ota::read_net_cfg()
+                            .is_some_and(|c| c.broker == new_broker && !c.broker_fallback);
+                        if persisted {
+                            esp_hal::system::software_reset();
+                        } else {
+                            log::warn!("smol #100: broker record did NOT persist — change aborted (no reset)");
+                        }
+                    }
+                }
+            }
+
+            // #100 Stage 3: an OTA-host-override config (key `O`) = one extra RFC1918 image host
+            // appended to the fetch allowlist. CONFIG/CACHED (retained) — EDGE-TRIGGERED on a change.
+            // Empty = CLEAR; a non-empty non-RFC1918 value is IGNORED. Applied WITHOUT a reboot: the
+            // allowlist is read at fetch/gate time, so the next OTA simply sees the new host. A bad
+            // value can only REFUSE a fetch (the image is still monotonicity-gated) — never a brick,
+            // so no fallback machinery is needed. VERIFY-AFTER-WRITE keeps a persist failure visible.
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_OTA) {
+                let raw = core::str::from_utf8(&o.buf[..o.len]).unwrap_or("").trim();
+                let new_host = if raw.is_empty() {
+                    None
+                } else {
+                    crate::ota::parse_ota_host_override(raw)
+                };
+                if raw.is_empty() || new_host.is_some() {
+                    let cur = crate::ota::read_net_cfg();
+                    if new_host != cur.and_then(|c| c.ota_host) {
+                        crate::ota::write_net_cfg(crate::ota::NetCfg {
+                            ota_host: new_host,
+                            ..cur.unwrap_or_default()
+                        });
+                        if crate::ota::read_net_cfg().is_some_and(|c| c.ota_host == new_host) {
+                            log::warn!("smol #100: OTA-host override changed (set={}) — no reboot", new_host.is_some());
+                        } else {
+                            log::warn!("smol #100: OTA-host record did NOT persist");
                         }
                     }
                 }
