@@ -1514,9 +1514,6 @@ const NET_REC_LEN: usize = 16;
 /// = we're running on a reverted slot, not the commanded one (surfaced as `net=<slot>:fb` in DIAG).
 #[cfg(feature = "wifi")]
 #[derive(Clone, Copy)]
-// #100 Stage 1b WIP: the record + its read/write are wired by the assoc-fallback + CFG-N apply in
-// the NEXT commit; this `allow(dead_code)` comes OFF then (the whole net-record becomes live).
-#[allow(dead_code)]
 pub struct NetCfg {
     pub active: u8,
     pub commanded: u8,
@@ -1527,7 +1524,6 @@ pub struct NetCfg {
 /// slot index is in range (0/1 — `WIFI_NETWORKS.len() == 2`). Erased flash (0xFF) / corruption /
 /// an out-of-range slot all fail → `None` → caller uses slot 0.
 #[cfg(feature = "wifi")]
-#[allow(dead_code)] // #100 Stage 1b WIP — wired next commit (see NetCfg note).
 fn parse_net_cfg(rec: &[u8]) -> Option<NetCfg> {
     if rec.len() < 10 || rec[0..4] != NET_MAGIC || rec[4] != NET_VERSION {
         return None;
@@ -1546,7 +1542,6 @@ fn parse_net_cfg(rec: &[u8]) -> Option<NetCfg> {
 
 /// Encode the 16-byte net record.
 #[cfg(feature = "wifi")]
-#[allow(dead_code)] // #100 Stage 1b WIP — wired next commit (see NetCfg note).
 fn encode_net_cfg(c: NetCfg) -> [u8; NET_REC_LEN] {
     let mut r = [0u8; NET_REC_LEN];
     r[0..4].copy_from_slice(&NET_MAGIC);
@@ -1562,7 +1557,6 @@ fn encode_net_cfg(c: NetCfg) -> [u8; NET_REC_LEN] {
 /// Read the persisted net selection. `None` on any flash/partition error, erased, or corrupt →
 /// the caller defaults to slot 0 (boot-default network — SAFE). Brick-safe (never panics).
 #[cfg(feature = "wifi")]
-#[allow(dead_code)] // #100 Stage 1b WIP — called by the boot slot-select + fallback next commit.
 pub fn read_net_cfg() -> Option<NetCfg> {
     use embedded_storage::nor_flash::ReadNorFlash;
     let mut flash = FlashStorage::new();
@@ -1583,7 +1577,6 @@ pub fn read_net_cfg() -> Option<NetCfg> {
 /// Called ONLY on a genuine change (CFG-`N` apply, or the ONE-per-boot fallback revert) — never in
 /// a retry loop, so no flash wear / NVS ping-pong even during a total-outage stay-put.
 #[cfg(feature = "wifi")]
-#[allow(dead_code)] // #100 Stage 1b WIP — called by the one-per-boot fallback revert next commit.
 pub fn write_net_cfg(c: NetCfg) {
     use embedded_storage::nor_flash::NorFlash;
     let mut flash = FlashStorage::new();
