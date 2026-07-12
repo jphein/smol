@@ -966,6 +966,17 @@ fn main() -> ! {
                     let (_, soak_rx0, soak_lost0, _) = r.soak_counts();
                     let mut flush_abort = false;
                     let mut flush_draw_ms = 0u64;
+                    // #30: draw the sync spinner ONLY on the idle Clock face. The flush is
+                    // sub-second and already deferred until >= FLUSH_IDLE_MS of no input (the #20
+                    // idle-defer above), so the user is never mid-navigation when it fires — the
+                    // one residual is the overlay flashing over whatever screen was LEFT on display
+                    // (e.g. a static Home menu). Suppressing it everywhere but the Clock lets that
+                    // frame simply hold for the sub-second flush (the render loop repaints after),
+                    // while the Clock — the ambient idle face — keeps its expected brief sync glyph.
+                    // The LED WifiSync cue below still fires on every screen (non-disruptive). This
+                    // retires the visible #20/#30 residual WITHOUT touching the HW-proven flush poll
+                    // (the cooperative/non-blocking-poll rewrite is filed separately, HW-canary-gated).
+                    let show_sync = matches!(app, App::Clock(_));
                     // #40: a flush that hears a leaf's retained OTA install surfaces
                     // `(leaf_id, staged announce)` here → relayed below.
                     let mut leaf_ota: Option<(u8, ota::Announce)> = None;
@@ -975,7 +986,7 @@ fn main() -> ! {
                         if matches!(button.poll(t), Some(input::Press::Long)) {
                             flush_abort = true;
                         }
-                        if t.saturating_sub(flush_draw_ms) >= SYNC_REDRAW_MS {
+                        if show_sync && t.saturating_sub(flush_draw_ms) >= SYNC_REDRAW_MS {
                             flush_draw_ms = t;
                             draw_syncing(&mut display, (t / SYNC_REDRAW_MS) as u8);
                         }
