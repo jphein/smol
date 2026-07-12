@@ -3626,9 +3626,15 @@ impl RadioManager {
     /// #28: pick the least-valuable HW peer to evict. Walks the ESP-NOW peer list (`fetch_peer`
     /// SKIPS broadcast/multicast, so only unicast peers are candidates) and ranks each by the
     /// roster value-key, with a peer no longer in the roster (a ghost the roster already dropped)
-    /// sorted BELOW every live peer so it goes first. NEVER evicts the MAC we're about to add or
-    /// the active leaf-OTA relay target (`leaf_ota_mac` — its sticky MAC must survive the
-    /// mesh-deaf relay). `None` when nothing is evictable (all remaining peers are protected).
+    /// sorted BELOW every live peer so it goes first. NEVER evicts the MAC we're about to add, the
+    /// BROADCAST peer, or the active leaf-OTA relay target (`leaf_ota_mac` — its sticky MAC must
+    /// survive the mesh-deaf relay). `None` when nothing is evictable (all remaining peers protected).
+    ///
+    /// Broadcast belt-and-suspenders (nebula finding): `fetch_peer` is documented to already skip
+    /// broadcast/multicast (so it can't be a candidate), and evicting broadcast would be
+    /// catastrophic — `esp_now_send(ff:ff…)` would return NOT_FOUND and this node's HELLOs would
+    /// silently stop egressing, dropping it off the mesh. We therefore ALSO guard it explicitly, so
+    /// the code is self-evidently safe without depending on that external `fetch_peer` contract.
     fn peer_evict_victim(&self, adding: [u8; 6], now: u64) -> Option<[u8; 6]> {
         let protect = self.leaf_ota_mac.map(|(_, m)| m);
         let mut victim: Option<[u8; 6]> = None;
@@ -3637,7 +3643,7 @@ impl RadioManager {
         while let Ok(p) = self.esp_now.fetch_peer(from_head) {
             from_head = false;
             let mac = p.peer_address;
-            if mac == adding || Some(mac) == protect {
+            if mac == adding || mac == BROADCAST_ADDRESS || Some(mac) == protect {
                 continue;
             }
             // Rank = (is_live, id_known, connected, rssi, last_heard); LOWER = evict first. A ghost
