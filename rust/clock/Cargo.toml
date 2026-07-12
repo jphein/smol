@@ -150,6 +150,18 @@ espnow = ["wifi", "esp-wifi/esp-now", "dep:ed25519-compact"]
 # `#![cfg(feature = "wled")]` and every hook is `#[cfg(feature = "wled")]`).
 wled = ["espnow"]
 
+# #26 smol Cast: mirror the gateway's OLED image onto a network WLED matrix as
+# realtime UDP pixels (DNRGB, :21324) — NOT ESP-NOW (cleaner than #25's control path).
+# Builds on `espnow` (⊃ `wifi`): casting is a GATEWAY-role activity — it needs an
+# associated STA to reach the matrix AND the recurring gateway flush that carries the
+# stream, both of which only the espnow build has (a wifi-only board only associates
+# once at boot). Pure-additive: NO new crate links — a DrawTarget tee mirrors the
+# framebuffer, a pure packer encodes DNRGB, and the existing flush association carries
+# it. The default / wifi / espnow / wled builds are BYTE-FREE of it (`net::cast*` is
+# `#[cfg(feature = "cast")]` and every hook is cfg-gated; the `Oled` type only swaps to
+# the tee under this flag).
+cast = ["espnow"]
+
 # COEXIST SOAK (issue #23 PART 1 — the gating experiment, NOT for production).
 # The gateway stays WiFi-associated after boot (no switch to ESP-NOW time-share),
 # the mesh rides the AP channel (pinned to ch1 = north-bedroom), and mesh + MQTT

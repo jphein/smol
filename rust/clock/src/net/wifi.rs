@@ -1095,6 +1095,11 @@ fn mqtt_session(
     // #33 Model-A per-board OTA install command topic (native HA Update button → INSTALL).
     let mut cmd_topic = MqttScratch::new();
     let _ = write!(cmd_topic, "smol/{}/ota/install", node_id);
+    // #26 cast: this board's retained cast-enable topic (payload ON/OFF). feature=cast.
+    #[cfg(feature = "cast")]
+    let mut cast_topic = MqttScratch::new();
+    #[cfg(feature = "cast")]
+    let _ = write!(cast_topic, "smol/{}/cast", node_id);
 
     // --- TCP connect ---
     {
@@ -1210,6 +1215,16 @@ fn mqtt_session(
     // #33 HA Update entity: subscribe this board's OTA command topic (pid 7).
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 7, cmd_topic.as_bytes()) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
+    // #26 cast: subscribe this board's retained cast-enable topic (pid 5). Reset the
+    // flag to OFF FIRST so an absent / cleared retained topic reads as disabled — the
+    // retained ON (if present) re-enables it during the drain below.
+    #[cfg(feature = "cast")]
+    {
+        crate::net::cast::set_enabled(false);
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 5, cast_topic.as_bytes()) {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
     }
     // #21 leaf-relay: a GATEWAY (cfg_cache = Some) also subscribes the WILDCARD leaf
     // config topic (pid 8) so it caches every leaf's default-screen to relay over
@@ -1435,6 +1450,13 @@ fn mqtt_session(
             let consumed = match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
                 None => break,
                 Some((crate::net::mqtt::Incoming::Publish { topic, payload }, consumed)) => {
+                    // #26 cast: precompute the cast-topic match as a plain bool (avoids a
+                    // block-in-`if`-condition; `false` in non-cast builds, where `cast_topic`
+                    // does not exist, so the arm below is inert there).
+                    #[cfg(feature = "cast")]
+                    let is_cast_topic = topic == cast_topic.as_bytes();
+                    #[cfg(not(feature = "cast"))]
+                    let is_cast_topic = false;
                     if topic == BATT_TOPIC {
                         let now = Instant::now().duration_since_epoch().as_millis();
                         batt.store(payload, now); // memcpy out before we compact `acc`
@@ -1498,6 +1520,16 @@ fn mqtt_session(
                         if payload == b"INSTALL" {
                             *install_requested = true;
                             log::info!("smol #33: OTA install command received");
+                        }
+                    } else if is_cast_topic {
+                        // Untrusted RETAINED payload → exact byte compare only (same
+                        // discipline as the OTA install arm): ON/on/1 enables the WLED
+                        // pixel-stream for this gateway's flush; anything else disables.
+                        #[cfg(feature = "cast")]
+                        {
+                            let on = payload == b"ON" || payload == b"on" || payload == b"1";
+                            crate::net::cast::set_enabled(on);
+                            log::info!("smol #26: cast {}", if on { "ENABLED" } else { "disabled" });
                         }
                     } else if let Some(leaf_id) = parse_leaf_config_topic(topic) {
                         // #21 leaf-relay: a wildcard-delivered OTHER leaf's config. Cache
@@ -2012,7 +2044,11 @@ pub fn run_mqtt_burst(
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
+    // #26 cast adds one UDP socket (the WLED pixel-stream) to the set.
+    #[cfg(not(feature = "cast"))]
     let mut sockets_storage: [SocketStorage; 3] = Default::default();
+    #[cfg(feature = "cast")]
+    let mut sockets_storage: [SocketStorage; 4] = Default::default();
     let mut sockets = SocketSet::new(&mut sockets_storage[..]);
 
     let mut dhcp_socket = dhcpv4::Socket::new();
@@ -2044,6 +2080,27 @@ pub fn run_mqtt_burst(
         udp::PacketBuffer::new(&mut warm_tx_meta[..], &mut warm_tx[..]),
     );
     let warm_handle = sockets.add(warm_socket);
+
+    // #26 cast: a real UDP socket for the WLED DNRGB pixel-stream (present only in a
+    // cast build). TX sized for one full DNRGB chunk (4 + 3*128 = 388 B ⇒ 512 with
+    // margin); RX tiny (WLED never replies to realtime frames). Streamed AFTER the
+    // MQTT session below, reusing this still-associated interface.
+    #[cfg(feature = "cast")]
+    let mut cast_rx_meta = [udp::PacketMetadata::EMPTY; 1];
+    #[cfg(feature = "cast")]
+    let mut cast_tx_meta = [udp::PacketMetadata::EMPTY; 4];
+    #[cfg(feature = "cast")]
+    let mut cast_rx = [0u8; 4];
+    #[cfg(feature = "cast")]
+    let mut cast_tx = [0u8; 512];
+    #[cfg(feature = "cast")]
+    let cast_handle = {
+        let s = udp::Socket::new(
+            udp::PacketBuffer::new(&mut cast_rx_meta[..], &mut cast_rx[..]),
+            udp::PacketBuffer::new(&mut cast_tx_meta[..], &mut cast_tx[..]),
+        );
+        sockets.add(s)
+    };
 
     // FINDING 1b (retained): bound the ENTIRE flush by the short RELAY_FLUSH_BUDGET,
     // not the 30 s NTP budget — a dead AP fails fast so the loop isn't frozen 30 s.
@@ -2139,7 +2196,11 @@ pub fn run_mqtt_burst(
     let src_port = 49152 + (rng.random() % 16384) as u16;
     // #23: refresh election/liveness each flush — the caller's `elect` carries the
     // persistent (owner,seq,seen_ms) observation IN and the re-decided role OUT.
-    mqtt_session(
+    // #26 cast: the result is bound (not tail-returned) so the cast stream can run
+    // BETWEEN the session and the return; in a non-cast build that stream is cfg'd
+    // away, leaving a `let … ; return` shape — a cfg-conditional `let_and_return`.
+    #[allow(clippy::let_and_return)]
+    let session_ok = mqtt_session(
         &mut iface,
         device,
         &mut sockets,
@@ -2164,7 +2225,130 @@ pub fn run_mqtt_burst(
         leaf_relay_rx, // #3: forward the relay RX-diag (or &mut None)
         deadline,
         tick,
-    )
+    );
+
+    // #26 cast: if HA enabled it (learned via the retained `smol/<id>/cast` topic during
+    // the session above), stream the mirrored glass image to the WLED matrix over the
+    // STILL-LIVE association — the MQTT DISCONNECT only closed the TCP socket, not the STA
+    // link (the caller re-pins ESP-NOW after we return). Bounded + long-press-abortable.
+    #[cfg(feature = "cast")]
+    if crate::net::cast::is_enabled() {
+        let cast_port = 49152 + (rng.random() % 16384) as u16;
+        cast_stream(
+            &mut iface,
+            device,
+            &mut sockets,
+            cast_handle,
+            cast_port,
+            deadline,
+            tick,
+        );
+    }
+
+    session_ok
+}
+
+/// #26 cast — hold the (already-associated) STA and stream the mirrored glass image to
+/// the WLED matrix as DNRGB realtime UDP frames at ~10 fps for a bounded window. The
+/// single radio is WiFi-committed (mesh-deaf) for the hold — the documented one-radio
+/// cost, same as any burst — so it is short and long-press-abortable (`tick`). WLED
+/// reverts to its normal render `DEFAULT_TIMEOUT_S` after the last frame, so simply
+/// ceasing to stream releases the matrix; no explicit off-frame is needed. NOTE: `main`
+/// is blocked in the flush while this runs, so the streamed image is the last-rendered
+/// glass (a per-flush snapshot); continuous live-motion mirroring is the coexist
+/// follow-on (it needs a persistent interleaved poll loop, which smol does not run).
+#[cfg(feature = "cast")]
+const CAST_HOLD: Duration = Duration::from_millis(3000);
+/// ~10 fps — modest so the single radio isn't monopolised harder than a normal flush.
+#[cfg(feature = "cast")]
+const CAST_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+
+#[cfg(feature = "cast")]
+fn cast_stream(
+    iface: &mut Interface,
+    device: &mut esp_wifi::wifi::WifiDevice<'static>,
+    sockets: &mut SocketSet,
+    cast_handle: smoltcp::iface::SocketHandle,
+    src_port: u16,
+    burst_deadline: Instant,
+    tick: &mut dyn FnMut() -> bool,
+) {
+    use crate::net::cast;
+    let cfg = cast::MatrixCfg {
+        w: crate::secrets::WLED_CAST_W,
+        h: crate::secrets::WLED_CAST_H,
+        serpentine: crate::secrets::WLED_CAST_SERPENTINE,
+        flip180: crate::secrets::WLED_CAST_FLIP180,
+        thresh_pct: crate::secrets::WLED_CAST_THRESH_PCT,
+        on: crate::secrets::WLED_CAST_ON,
+        off: crate::secrets::WLED_CAST_OFF,
+        timeout_s: cast::DEFAULT_TIMEOUT_S,
+    };
+    let host = crate::secrets::WLED_CAST_HOST;
+    let dst = (
+        IpAddress::Ipv4(Ipv4Addr::new(host[0], host[1], host[2], host[3])),
+        cast::WLED_PORT,
+    );
+
+    // Bind the cast UDP socket once (ephemeral local port).
+    {
+        let s = sockets.get_mut::<udp::Socket>(cast_handle);
+        if !s.is_open() && s.bind(src_port).is_err() {
+            log::warn!("smol #26: cast socket bind failed");
+            return;
+        }
+    }
+
+    let hold_deadline = {
+        let cap = Instant::now() + CAST_HOLD;
+        if cap < burst_deadline {
+            cap
+        } else {
+            burst_deadline
+        }
+    };
+    let total = cfg.total();
+    let mut next_frame = Instant::now();
+    let mut frames = 0u32;
+    loop {
+        if tick() {
+            break; // long-press → free the radio
+        }
+        iface.poll(smoltcp_now(), device, sockets);
+        if Instant::now() >= next_frame {
+            // One frame = all DNRGB chunks covering LEDs 0..total.
+            let mut start = 0usize;
+            let mut pkt = [0u8; 4 + 3 * cast::MAX_LEDS_PER_PKT];
+            while start < total {
+                let Some((n, next)) =
+                    cast::with_frame(|m| cast::pack_dnrgb(m, &cfg, start, &mut pkt))
+                else {
+                    break;
+                };
+                {
+                    let s = sockets.get_mut::<udp::Socket>(cast_handle);
+                    let _ = s.send_slice(&pkt[..n], dst);
+                }
+                iface.poll(smoltcp_now(), device, sockets); // push the datagram out
+                start = next;
+            }
+            frames += 1;
+            next_frame = Instant::now() + CAST_FRAME_INTERVAL;
+        }
+        if Instant::now() >= hold_deadline {
+            break;
+        }
+    }
+    log::info!(
+        "smol #26: cast streamed {} frame(s) to WLED {}.{}.{}.{} ({}x{})",
+        frames,
+        host[0],
+        host[1],
+        host[2],
+        host[3],
+        cfg.w,
+        cfg.h
+    );
 }
 
 /// OTA download budget. Unlike a ~1 s telemetry flush, the OTA burst is mesh-DEAF for
