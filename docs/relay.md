@@ -110,6 +110,35 @@ but **don't pair a high-rate game with a busy MQTT gateway** and expect both smo
 at both boot and flush, no panic; exact burst duration wasn't instrumented but it fits
 inside the 15 s budget. Leaf-side `SMOLv1 BATT`-frame receipt remains inferred — #15.)*
 
+## ESP-NOW peer table — the ~20-node ceiling + eviction (#28)
+The relay's **unicast** (`RELAYACK`, and the #40 OTA `OTAN`) rides the **ESP-NOW hardware peer
+table** — the radio can only unicast to a MAC registered with `add_peer`. That table is **capped
+at 20** (`ESP_NOW_MAX_TOTAL_PEER_NUM` on the C3 — a fixed esp-wifi driver limit, *not* a smol
+constant — and the cap **includes the broadcast peer**).
+
+**The bug (#28):** esp-wifi never auto-evicts, and `add_peer` **silently `Err`s once the table is
+full**. Without a bound the table grew monotonically — every heard MAC added, none removed — so
+the mesh ceilinged at ~20 nodes: the 20th-plus node's unicast could never register, and the
+gateway could neither `RELAYACK` nor OTA-relay to it.
+
+**The fix (shipped in #86):** `ensure_peer(mac)` evicts the least-valuable peer(s) **before**
+`add_peer` whenever the table is at cap. The victim comes from `peer_evict_victim`, a two-tier
+rank (lowest evicted first):
+- **L1 — ghost/stale-first:** a MAC not in the smol roster (already dropped there) sorts below
+  every live peer and goes first.
+- **L2 — value-weighted:** among live peers, worst-first by `!id_known` (can't place in HA / can't
+  relay to) → `!connected` (no fresh ACK) → weakest RSSI → oldest-heard.
+
+The **broadcast peer and the active OTA-relay target (`leaf_ota_mac`) are protected** — never
+evicted. If everything left is protected, the loop bails and the final `add_peer` just `Err`s —
+exactly as before the fix, never worse. The smol **roster** (a separate 16-slot software table for
+the Bench view / RSSI display / id lookup) is the **value oracle** for that ranking; it is *not*
+the hardware peer table and *not* the ceiling.
+
+**Getting past 20 nodes** is not a cap bump — 20 is a hardware/driver limit — it needs routed
+multi-hop (#13), where not every node is a direct ESP-NOW peer. Until then, #28 keeps the 20 slots
+holding the *most useful* peers, so the relay never loses the node it actually needs.
+
 ## Freeze-on-failed-flush: the fix + backoff semantics
 *(committed — `2ea7c4d` gateway liveness/dedup fix + `7b57216` live collector)*
 
