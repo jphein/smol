@@ -112,6 +112,18 @@ impl LedMode {
             _ => None,
         }
     }
+
+    /// #74: the wire token for the LED-mode readback (`led=<mode>:<state>` in the DIAG record).
+    /// Inverse of [`from_wire`]; matches luna's HA input_select options exactly.
+    ///
+    /// [`from_wire`]: LedMode::from_wire
+    pub fn to_wire(self) -> &'static str {
+        match self {
+            LedMode::Status => "status",
+            LedMode::On => "on",
+            LedMode::Off => "off",
+        }
+    }
 }
 
 /// Square-wave phase: true for the first half-period, false for the second.
