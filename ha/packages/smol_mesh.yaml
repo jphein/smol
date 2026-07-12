@@ -175,6 +175,10 @@ input_boolean:
     name: "smol 7 · About visible"
     icon: "mdi:information-outline"
     initial: true
+  smol_7_plugin_familiar:
+    name: "smol 7 · Familiar visible"
+    icon: "mdi:paw"
+    initial: true
   smol_8_plugin_clock:
     name: "smol 8 · Clock visible"
     icon: "mdi:clock-outline"
@@ -203,6 +207,10 @@ input_boolean:
     name: "smol 8 · About visible"
     icon: "mdi:information-outline"
     initial: true
+  smol_8_plugin_familiar:
+    name: "smol 8 · Familiar visible"
+    icon: "mdi:paw"
+    initial: true
   smol_9_plugin_clock:
     name: "smol 9 · Clock visible"
     icon: "mdi:clock-outline"
@@ -230,6 +238,10 @@ input_boolean:
   smol_9_plugin_about:
     name: "smol 9 · About visible"
     icon: "mdi:information-outline"
+    initial: true
+  smol_9_plugin_familiar:
+    name: "smol 9 · Familiar visible"
+    icon: "mdi:paw"
     initial: true
 
 # =====================================================================
@@ -496,7 +508,7 @@ mqtt:
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/7/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
-      expire_after: 90   # #68: STAT is cache-republished every flush (F6-gated 45s); ages out
+      expire_after: 180  # #68/#94 flap-tune: bumped 90→180 = 2x the ~90s status-republish cadence measured at the all-192 canary (90 sat on the edge → id7/8/9 online flapped). Ages out
       # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
       icon: "mdi:chip"
     - name: "smol 8 screen"
@@ -505,7 +517,7 @@ mqtt:
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/8/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
-      expire_after: 90   # #68: STAT is cache-republished every flush (F6-gated 45s); ages out
+      expire_after: 180  # #68/#94 flap-tune: bumped 90→180 = 2x the ~90s status-republish cadence measured at the all-192 canary (90 sat on the edge → id7/8/9 online flapped). Ages out
       # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
       icon: "mdi:chip"
     - name: "smol 9 screen"
@@ -514,7 +526,7 @@ mqtt:
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/9/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
-      expire_after: 90   # #68: STAT is cache-republished every flush (F6-gated 45s); ages out
+      expire_after: 180  # #68/#94 flap-tune: bumped 90→180 = 2x the ~90s status-republish cadence measured at the all-192 canary (90 sat on the edge → id7/8/9 online flapped). Ages out
       # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
       icon: "mdi:chip"
     # --- #40 running BUILD# as a first-class device-merged value (JP ask 2026-07-11) ---
@@ -2202,6 +2214,7 @@ automation:
           - input_boolean.smol_7_plugin_grid
           - input_boolean.smol_7_plugin_wled
           - input_boolean.smol_7_plugin_about
+          - input_boolean.smol_7_plugin_familiar
           - input_boolean.smol_8_plugin_clock
           - input_boolean.smol_8_plugin_snake
           - input_boolean.smol_8_plugin_bench
@@ -2209,6 +2222,7 @@ automation:
           - input_boolean.smol_8_plugin_grid
           - input_boolean.smol_8_plugin_wled
           - input_boolean.smol_8_plugin_about
+          - input_boolean.smol_8_plugin_familiar
           - input_boolean.smol_9_plugin_clock
           - input_boolean.smol_9_plugin_snake
           - input_boolean.smol_9_plugin_bench
@@ -2216,6 +2230,7 @@ automation:
           - input_boolean.smol_9_plugin_grid
           - input_boolean.smol_9_plugin_wled
           - input_boolean.smol_9_plugin_about
+          - input_boolean.smol_9_plugin_familiar
       - platform: homeassistant
         event: start
     action:
@@ -2226,7 +2241,7 @@ automation:
                 n: "{{ repeat.item }}"
                 mask: >-
                   {% set b = namespace(m=0) %}
-                  {% for name, val in [['clock',1],['snake',2],['bench',4],['batt',8],['grid',16],['wled',32],['about',64]] %}
+                  {% for name, val in [['clock',1],['snake',2],['bench',4],['batt',8],['grid',16],['wled',32],['about',64],['familiar',128]] %}
                   {% if is_state('input_boolean.smol_' ~ n ~ '_plugin_' ~ name, 'on') %}{% set b.m = b.m + val %}{% endif %}
                   {% endfor %}
                   {{ '%04X' | format(b.m) }}

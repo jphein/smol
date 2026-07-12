@@ -84,7 +84,8 @@ def device_card(nid):
 
 # ---------- #55 plugin visibility: compact toggle chips (fill = shown in boot menu) ----------
 PLUGS=[("clock","mdi:clock-outline"),("snake","mdi:snake"),("bench","mdi:test-tube"),("batt","mdi:battery"),
-       ("grid","mdi:transmission-tower"),("wled","mdi:led-strip-variant"),("about","mdi:information-outline")]
+       ("grid","mdi:transmission-tower"),("wled","mdi:led-strip-variant"),("about","mdi:information-outline"),
+       ("familiar","mdi:paw")]   # #57 bit-7 — Familiar screen toggle (all-on now composes 00FF)
 def plugin_chips(nid, present):
     chips=[{"type":"template","content":"plugins","icon":"mdi:puzzle-outline","icon_color":"grey"}]  # label chip
     for name,icon in PLUGS:
