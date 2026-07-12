@@ -88,6 +88,10 @@ stays well under 250 B.
 | [RELAY](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAY ` | ≤91 | broadcast | ~15 s (leaf) | espnow | 🟢 |
 | [RELAYACK](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAYACK ` | 25 | unicast | reactive | espnow | 🟢 |
 | [SNK](#snk--mmo-mesh-snake) | `SMOLv1 SNK ` | 18 | broadcast | 5 Hz jittered | espnow | 🟢 |
+| [OTAM](#leaf-mesh-ota-frames-40) | `SMOLv1 OTAM ` | ≤178 | gw→leaf broadcast | per session | espnow | 🟢 |
+| [OTAD](#leaf-mesh-ota-frames-40) | `SMOLv1 OTAD ` | ≤250 | gw→leaf broadcast | windowed burst | espnow | 🟢 |
+| [OTAN](#leaf-mesh-ota-frames-40) | `SMOLv1 OTAN ` | ≤27 | leaf→gw unicast | per window | espnow | 🟢 |
+| [LDBG](#leaf-mesh-ota-frames-40) | `SMOLv1 LDBG ` | 21 | leaf→broadcast | per fetch | espnow | 🟢 |
 
 > **The battery downlink is two hops.** The [`SMOLv1 BATT`](#batt--ha-battery-snapshot)
 > frame above is the *mesh* hop (gateway → leaves). It's **fed** by an
@@ -457,6 +461,68 @@ defined in `mesh_snake/snake_core.rs`.
 **Source.** `mmo-snake-netcode.md` (§1/§5) + `mmo-snake-design.md` (§7).
 
 ---
+
+## Leaf mesh-OTA frames (#40)
+
+Four frames deliver a **signed firmware image to an ESP-NOW-only leaf over the mesh** — the
+gateway is the leaf's OTA proxy (it fetches the staged image over WiFi into its own inactive
+slot, then relays it). **Canary-one-leaf:** exactly one leaf id is targeted; no image is ever
+broadcast to the whole mesh. Full operator flow in
+[ota.md](ota.md#leaf-mesh-ota--updating-esp-now-only-leaves-40).
+
+**OTAM** — `SMOLv1 OTAM ` — gateway→leaf, the signed session announce.
+
+| field | bytes | meaning |
+|---|---|---|
+| tag | 12 | `b"SMOLv1 OTAM "` |
+| target | 3 | ASCII leaf id (the canary target) |
+| session | 2 | LE session id (this transfer instance) |
+| mlen | 1 | manifest length |
+| manifest `M` | ≤96 | `"build\|size\|sha256hex"` — the exact signed bytes |
+| sig | 64 | Ed25519 signature over `M` |
+
+The leaf **verifies the signature before it flashes anything** — a bad sig changes no state.
+
+**OTAD** — `SMOLv1 OTAD ` — gateway→leaf, one image chunk (max **250 B** = the ESP-NOW MTU).
+
+| field | bytes | meaning |
+|---|---|---|
+| tag | 12 | `b"SMOLv1 OTAD "` |
+| target | 3 | ASCII leaf id |
+| session | 2 | LE session id |
+| seq | 2 | LE chunk index; image bytes land at `seq · 231` |
+| payload | ≤231 | image bytes |
+
+Every chunk is bounds-checked against the *signed* `size` before any write, and the writer is
+partition-scoped — an out-of-range `seq` physically cannot reach the active slot or `otadata`.
+
+**OTAN** — `SMOLv1 OTAN ` — leaf→gateway (**unicast**), the windowed NAK.
+
+| field | bytes | meaning |
+|---|---|---|
+| tag | 12 | `b"SMOLv1 OTAN "` |
+| target | 3 | ASCII leaf id (the sender) |
+| session | 2 | LE session id |
+| window | 2 | LE window base (chunk index of the window start) |
+| bitmap | 8 | one bit per chunk in the 64-chunk window; **set = still missing** |
+
+The gateway retransmits only the set bits. An **all-zero bitmap = "window complete, advance"** —
+the only positive ack. The **last** window gets no advance-ack (the leaf finalizes + reboots), so
+the gateway treats last-window exhaustion as a *confirm*, not a failure.
+
+**LDBG** — `SMOLv1 LDBG ` — leaf→broadcast, a fixed **21-byte** OTA receive-side self-report (diagnostic).
+
+| field | bytes | meaning |
+|---|---|---|
+| tag | 12 | `b"SMOLv1 LDBG "` |
+| id | 3 | ASCII leaf id |
+| otam_heard | 2 | LE count of OTAMs the leaf received (rx>0 proves it's online) |
+| verdict | 1 | receive-side outcome code |
+| otan_sent | 2 | LE count of NAKs the leaf sent |
+| ch | 1 | the leaf's current channel; `ch≠6` = it drifted off ch6 during the fetch |
+
+LDBG names *why* a `relay-failed` had `otan=0` (a leaf that heard no OTAM = an RX problem, not a
+dead leaf). It surfaces on the retained `smol/<leaf>/ota/relaydiag` topic.
 
 ## MQTT burst — the LAN transport that retires the UDP collector
 

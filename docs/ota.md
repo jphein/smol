@@ -1,10 +1,12 @@
 # OTA firmware updates — operator guide (#6)
 
-Update the fleet over WiFi instead of USB. You publish a retained MQTT **announce**; each
-board picks it up **on its next burst**, and — if it's for that board and newer — **auto-fetches**
-the image over HTTP into its inactive A/B flash slot, verifies it, activates, reboots, and
-self-tests. This is the *how-to-run-it* guide; the design/rationale is in
-[home-assistant.md](home-assistant.md) and `scratch/smol-ha-batt/ota-plan.md`.
+Update the fleet over the air instead of USB. You **stage** a signed image (a retained MQTT
+line that *arms* every board's HA Update entity but fetches nothing); then an **install** —
+HA's per-node Update button, or `install <id>` — tells **one** board to pull the staged image
+into its inactive A/B slot, verify it (SHA-256 **and** an ed25519 signature), activate, reboot,
+and self-test. **WiFi-capable boards fetch it themselves over HTTP; the WiFi-less mesh leaves
+receive it relayed over ESP-NOW from the gateway (#40).** This is the *how-to-run-it* guide;
+the design/rationale is in [home-assistant.md](home-assistant.md).
 
 Verification legend: 🟢 hardware-verified · 🟡 works, not fully hardware-proven · ⚪ design.
 
@@ -13,40 +15,46 @@ Verification legend: 🟢 hardware-verified · 🟡 works, not fully hardware-pr
 > first attempt had failed for an **infra** reason (a missing firewall allow-rule to reach the image host);
 > once that rule was added, the end-to-end update succeeded ([#37](https://github.com/jphein/smol/issues/37)
 > resolved). This is now a production-proven flow — still **canary one board at a time** (see the one rule below).
+> **Leaf mesh-OTA (#40) is also landed + hardware-proven** — the gateway relays a signed image over
+> ESP-NOW to a WiFi-less leaf that verifies the signature before flashing (full ~1 MB images delivered
+> over the mesh). See [Leaf mesh-OTA](#leaf-mesh-ota--updating-esp-now-only-leaves-40) below.
 
 ## ⚠️ The one rule: CANARY, one board at a time
 
 **Never blind-push the whole fleet.** A *broken* app cannot always roll itself back —
 app-side rollback (below) covers a boots-but-unhealthy image, but a hard panic/boot-loop can
 only be recovered by the 2nd-stage bootloader, whose **revert-on-boot-fail is OFF / unproven
-on hardware** (ROADMAP D2). So the mass-brick defense is procedural: **push to ONE board,
-confirm it comes back healthy, then push the next.** The tooling enforces this — the CLI's
-`push <id>` is frictionless while `push all` is seat-belted, and the HA panel has **no
-"push all" button at all**.
+on hardware** (ROADMAP D2). So the mass-brick defense is structural: **install to ONE board,
+confirm it comes back healthy, then install the next.** The tooling enforces this — `install`
+is per-device (there is **no fleet-fetch topic**), and the HA panel drives it one board at a
+time via each node's native Update button.
 
 ## Publish tool — `tools/ota_publish.sh`
 
-Server-side pipeline: build (or take) an esp-image, host it on the LAN image server, and
-publish the retained announce the boards fetch from.
+Server-side pipeline: build (or take) an esp-image, host it on the LAN image server, **sign it**,
+and publish the retained **staged** line every board's native HA Update entity reads.
 
 ```
-tools/ota_publish.sh stage      [<commit>] [--bin <file>]   # build+host+publish smol/ota/staged (NO board acts)
-tools/ota_publish.sh push <id>  [<commit>] [--bin <file>]   # stage, then announce to ONE board (CANARY)
-tools/ota_publish.sh push all   [<commit>] [--bin <file>] [--force]   # FLEET — seat-belted (see below)
-tools/ota_publish.sh clear <id|all>                         # retain-delete the announce (abort)
+tools/ota_publish.sh stage    [<commit>] [--bin <file>] [--build N]   # build+host+sign+publish smol/ota/staged (ARMS every board's Update entity; NO board fetches)
+tools/ota_publish.sh install <id>                                     # publish retained INSTALL → smol/<id>/ota/install (per-node canary; the HA Update button is the GUI path)
 ```
 
-- `<commit>` defaults to `HEAD`; `--bin <file>` hosts an existing `.bin` and skips the build.
-- **`push <id>` is the canary path** — never gated, run it freely.
-- **`push all` is the seatbelt:** without `--force` it makes you type the exact staged build
-  number to confirm and refuses if stdin isn't a TTY; `--force` (scripted use only) skips that.
+- `<commit>` defaults to `HEAD`; `--bin <file>` hosts an existing `.bin` and skips the build;
+  `--build N` overrides the git-derived build number (to canary an uncommitted image).
+- **Canary is STRUCTURAL.** `install` is per-device (it mirrors HA's native Update button) and
+  there is **no fleet-fetch topic** — the old per-id / `push all` announce act-path is retired
+  (Model-A #32 closure). Install one board, confirm its version advances, then the next; never
+  script all three at once while bootloader revert-on-boot-fail is unproven.
+- `install` is retained + **idempotent** — the firmware gate is `staged.build > running`, so a
+  re-fire never re-installs the same build.
 - Broker creds are sourced from the Mosquitto addon option and **never printed**.
-- The script hard-gates image `size ≤ 0x1F0000` (the slot size) before publishing.
+- The script **signs** the manifest with the offline ed25519 key and hard-gates image
+  `size ≤ 0x1F0000` (the slot size) before publishing.
 
-> **Public-repo config:** the infra constants in the script (image host, broker, SSH host,
-> addon, MQTT user) are **non-real placeholders** — set them to your own, or override any per
-> run via env (all are `${VAR:-default}`), e.g.
-> `OTA_HOST_IP=… BROKER=… OTA_HOST_SSH=… tools/ota_publish.sh push 7`.
+> **Public-repo config:** the infra constants (image host, broker, SSH host, addon, MQTT user)
+> are **non-real placeholders** — copy `tools/ota_publish.env.example` → the git-ignored
+> `tools/ota_publish.env` and set your own (or override any per run via env, all are
+> `${VAR:-default}`), then e.g. `tools/ota_publish.sh stage`.
 
 ## Canary an OTA — end to end
 
@@ -58,12 +66,12 @@ tools/ota_publish.sh clear <id|all>                         # retain-delete the 
    target to `smol/ota/staged` (a **non-acted** topic — no board updates yet; the HA panel
    mirrors it so it can canary without re-hashing).
 
-2. **Push to the canary board** — CLI **or** HA panel:
-   - CLI: `tools/ota_publish.sh push 7` (does stage+announce in one; publishes `smol/ota/announce/7`).
-   - HA: **smol · OTA push** panel → **"Push staged → id7 (canary)"**.
+2. **Install to the canary board** — HA **or** CLI:
+   - HA: the board's **native Update entity** → **Install** (the GUI canary path).
+   - CLI: `tools/ota_publish.sh install 7` (publishes retained `smol/7/ota/install`).
 
-3. **Watch it update.** **On its next burst** the board sees the gated announce (newer build,
-   host allowed, size OK) and runs the update — **the mesh is deaf for the whole download**
+3. **Watch it update.** **On its next burst** the board sees the install, checks the staged image
+   (newer build, host allowed, size OK) and runs the update — **the mesh is deaf for the whole download**
    (longer than a normal burst; a proven canary self-updated build 58→59 in **~17 s**). Canary one board
    at a time. Watch the gateway's serial:
    ```
@@ -73,45 +81,77 @@ tools/ota_publish.sh clear <id|all>                         # retain-delete the 
    (A long-press at the glass **aborts** mid-download — `aborted by long-press (slot
    untouched)` — the board stays on the current image.)
 
-4. **Confirm it came back healthy.** After the reboot the new image self-tests on first boot
-   (it must reach DHCP). Success looks like:
+4. **Confirm it came back healthy.** After the reboot the new image self-tests on first boot,
+   then confirms otadata or app-side rolls back. The self-test is **role-aware**: a **WiFi board**
+   (the gateway) confirms by reaching DHCP; a **mesh leaf** confirms by *hearing a mesh frame* —
+   it has no WiFi, so DHCP would never pass. Success looks like:
    ```
    smol OTA: unconfirmed image on boot — running self-test (bootloader auto-revert false)
    smol OTA: self-test PASS — image CONFIRMED (Valid)
    ```
    and the **boot splash shows the new sigil version name**. A failure logs
    `self-test FAIL — ROLLING BACK to the previous slot` and the board returns to the old
-   image on its own.
+   image on its own. (A USB/JTAG reflash or a plain power-cycle does **not** self-test — the
+   marker is build#-tagged, so only a genuine fresh OTA-activate arms it.)
    > 🟡 **The HA panel's "running build" readout is not live yet.** It needs the firmware to
    > publish `smol/<id>/status` (design F4), which hasn't shipped — until then the panel shows
    > **"unknown"** and the "roll out to rest" button stays **inert (safe)**. **Confirm the
    > canary via serial + the boot-splash version name**, not the panel number, for now.
 
 5. **Roll out to the rest — one at a time.** Only after the canary is confirmed healthy:
-   `tools/ota_publish.sh push 8`, then `push 9` (or the panel's per-node buttons). Do **not**
-   `push all` while bootloader-revert is unproven.
+   `tools/ota_publish.sh install 8`, then `install 9` (or each board's HA Update button). Do **not**
+   install all three at once while bootloader-revert is unproven.
 
-6. **Abort / clean up.** `tools/ota_publish.sh clear <id|all>` (or the panel's **"Clear all
-   announces (abort)"**) retain-deletes the announce so no board re-acts on it.
+6. **Re-stage to abort.** There is no separate clear step — `install` is idempotent (gated on
+   `staged.build > running`), so a board never re-installs the build it's already on. To cancel a
+   pending rollout, simply don't fire the remaining installs; to supersede, `stage` a newer build.
 
-## The announce (what's on the wire)
+## What's on the wire
 
 Retained MQTT, pipe-delimited (the board reuses its `split('|')` parser):
 
 ```
-topic:    smol/ota/announce/<id>    (per-id, the canary path)
-          smol/ota/announce/all     (fleet — seat-belted; the panel never writes this)
-          smol/ota/staged           (staging mirror for the HA panel — NON-acted)
-payload:   OTA|<build>|<size>|<sha256hex>|<url>
-example:   OTA|52|590304|6122578e…60ea|http://<image-host>:8080/ota/smol-52.bin
+topics:   smol/ota/staged            (retained; ARMS every board's HA Update entity — NO fetch)
+          smol/<id>/ota/install      (retained INSTALL; only that board fetches the staged image)
+staged payload:   OTA|<build>|<size>|<sha256hex>|<sighex>|<url>
+example:          OTA|52|590304|6122578e…60ea|<128-hex ed25519 sig>|http://<image-host>:8080/ota/smol-52.bin
+install payload:  INSTALL
 ```
 
 - `build` — decimal `BUILD_NUMBER`; a board acts **iff `build > its running build`** (this
-  monotonicity check blocks both downgrades and retained-announce replay loops).
-- `size` — image bytes; bounds-checked (`≤ 0x1F0000`) and cross-checked against HTTP
-  `Content-Length`.
-- `sha256` — 64 lowercase hex over the exact `.bin`; the integrity gate.
+  monotonicity check blocks both downgrades and retained replay loops).
+- `size` — image bytes; bounds-checked (`≤ 0x1F0000`) and cross-checked against HTTP `Content-Length`.
+- `sha256` — 64 lowercase hex over the exact `.bin`; the **integrity** gate.
+- `sighex` — 128 hex; the **Ed25519 signature** over the manifest `M = "build|size|sha256hex"`
+  (fields 1-3 + their two `|`); the **authenticity** gate (see Security posture below).
 - `url` — HTTP (no TLS in `no_std`); it's the **last** field so it may contain no `|`.
+
+## Leaf mesh-OTA — updating ESP-NOW-only leaves (#40)
+
+The mesh leaves have no WiFi/MQTT, so the elected **gateway is their OTA proxy.** The flow is
+**canary-one-leaf** — exactly one leaf MAC is ever targeted; there is never a broadcast image push:
+
+1. `stage` the fleet-shared, ed25519-signed image (arms every board).
+2. `install <leaf-id>` → the gateway **fetches the staged image into its own inactive slot**
+   (fetch only — it does not activate), then relays it to that one leaf over ESP-NOW.
+3. The relay is chunked with a **windowed NAK**: 231-byte chunks, 64 chunks per window; the leaf
+   returns a per-window missing-bitmap and the gateway retransmits only the gaps. An all-zero
+   bitmap = "window complete, advance" (the only positive ack). To stay co-channel, the leaf
+   **holds ch6 through the gateway's fetch** (the gateway briefly goes off-channel to pull the
+   image over WiFi — the leaf treats that silence as "fetching", not "gateway dead").
+4. The leaf **verifies the Ed25519 signature before any flash write**, reassembles into its
+   inactive slot (every chunk bounds-checked against the *signed* size, and the writer is
+   partition-scoped so an out-of-range offset physically cannot reach the active slot or
+   `otadata`), and activates only on a full-size + readback-SHA match.
+5. On reboot the leaf self-tests by **hearing a mesh frame** (not DHCP) → confirms `otadata` or
+   app-side rolls back. A signed-freshness floor (NVS) + build monotonicity block downgrade/replay.
+6. Ordering: while a leaf relay is in flight the **gateway suppresses its own self-OTA** (leaves
+   update first, the gateway last), so a relay is never cut short by the gateway rebooting.
+
+Diagnostics ride retained topics — `smol/<leaf>/ota/diag` (relay phase) and
+`smol/<leaf>/ota/relaydiag` (headless relay-progress %). The last window is expected to finish
+**without** an advance-ack (the leaf finalizes and reboots), so the gateway treats last-window
+exhaustion as a **confirm**, not a failure.
 
 ## Reproducible builds — verify image ↔ commit before/after a flash (#44)
 
@@ -174,10 +214,17 @@ espflash flash --monitor --partition-table partitions-ota.csv <known-good.bin> -
 ```
 
 This rewrites the partition table + a blank `otadata` (so the bootloader boots `ota_0`) plus
-the image — the board is back. Each board's identity (`NODE_ID`, secrets) comes from its
-git-ignored `board.rs`/`secrets.rs`, so flash from that board's own config (see
-[BUILDING.md](BUILDING.md)). Credential-less leaves can't OTA at all (the image never crosses
-ESP-NOW) — they're USB-only by nature.
+the image — the board is back. **Identity is runtime, from NVS:** the baked `board.rs` `NODE_ID`
+is only a first-boot **seed** (written to the `nvs` partition on the first USB boot after an
+erase-flash); thereafter the board reads its id from NVS. Because OTA writes only the inactive
+app slot + `otadata` and **never** touches `nvs`, identity survives any image — so a single
+fleet-shared OTA image (built with no `SMOL_NODE_ID`) installs onto id7/id8/id9/… and each keeps
+its own id. `board.rs`/`secrets.rs` still hold the per-board factory seed + creds (see
+[BUILDING.md](BUILDING.md)); do **not** USB-flash the fleet-staged `.bin` as a factory image
+without `SMOL_NODE_ID=<n>`, or a fresh (erased) board seeds NVS to the default id 7.
+
+**Leaves can now be updated over the mesh** — see [Leaf mesh-OTA](#leaf-mesh-ota--updating-esp-now-only-leaves-40)
+below. USB stays the recovery path for a hard brick (case 3), not the only update path.
 
 ## Partition layout (fixed — don't "tidy")
 
@@ -195,12 +242,15 @@ or slot-select fails to initialize.
 
 ## Security posture (honest)
 
-Plain HTTP + double SHA-256 (announced hash checked before activate; the bootloader's own
-esp-image hash at boot) give **integrity, not authenticity** — whoever can publish the
-announce controls both the URL and the hash. v1 accepts this because **OTA authority == MQTT
-broker write access**, and the broker sits on a trusted LAN; a URL-host allowlist is
-defence-in-depth, not authentication. Do not treat `sha256` as trust. Documented upgrade path
-(not v1): ed25519 image signing verified before activate.
+Integrity **and** authenticity. The announced SHA-256 proves **integrity** (the bytes are what
+the manifest claims), checked before `otadata` is touched; the bootloader re-checks the esp-image
+hash at boot. **Authenticity is enforced by Ed25519 (#32):** `ota_publish.sh stage` signs the
+manifest `M = "build|size|sha256hex"` with an **offline** key (kept out of the repo, never on
+disk in source); the firmware carries the matching **public** verify key baked in as its
+root-of-trust. Signing `M` — not the bare digest — binds `build` into the signature, blocking a
+rollback/mislabel replay. Over the **unauthenticated ESP-NOW mesh** this is load-bearing: a leaf
+**verifies the signature before it flashes a single byte** (see Leaf mesh-OTA below). A URL-host
+allowlist stays as defence-in-depth. Do not treat `sha256` alone as trust.
 
 ## Status
 
@@ -209,5 +259,5 @@ a canary **self-updated build 58→59 over the air in ~17 s** — fetch → SHA-
 → `Valid`. The first attempt had failed for an **infra** reason (a missing firewall allow-rule to reach the
 image host, since added; [#37](https://github.com/jphein/smol/issues/37) resolved) — **not a firmware bug.**
 **Bootloader revert-on-boot-fail is still unproven → canary-one-board-at-a-time remains the mass-brick
-defense; never `push all` blind.** The HA "running build" / rollout gate awaits the firmware `smol/<id>/status`
+defense; never install the whole fleet at once.** The HA "running build" / rollout gate awaits the firmware `smol/<id>/status`
 publish (F4) — until then confirm canaries by serial + boot-splash version name. Issue #6 (#37 resolved).
