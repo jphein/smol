@@ -60,6 +60,44 @@ def ota_progress_card(nid):
             "icon":pre+"{{ pl[3] }}","icon_color":pre+"{{ pl[1] }}",
             "card_mod":{"style":{".":style,"mushroom-state-info$":info,"mushroom-shape-icon$":"--icon-symbol-size:22px"}}}
 
+# ---------- #70/#74 device alarm: self-hides when clean, shows the rollback/abnormal-reset story ----------
+# Shown ONLY when ota_outcome is bad (rolled-back / *-failed) OR reset_reason is abnormal (panic/wdt/
+# brownout/glitch) — the "what just happened to this board" surface #70 exists for. display:none when clean.
+def device_card(nid):
+    I=str(nid); oo=f"sensor.smol_{nid}_ota_outcome"; rr=f"sensor.smol_{nid}_reset_reason"
+    sl=f"sensor.smol_{nid}_boot_slot"; up=f"sensor.smol_{nid}_uptime"; hp=f"sensor.smol_{nid}_heap_free"
+    pre=("{% set oo=states('"+oo+"') %}{% set rr=states('"+rr+"') %}"
+         "{% set bad_o=oo in ['rolled-back','relay-failed','fetch-failed','mac-unknown'] %}"
+         "{% set bad_r=rr in ['panic','wdt','brownout','glitch'] %}{% set act=bad_o or bad_r %}"
+         "{% set col='#ff6b6b' if (oo=='rolled-back' or rr in ['panic','brownout']) else ('#ffc24b' if act else '#5bff9a') %}")
+    primary=pre+"{% if oo=='rolled-back' %}↩ OTA rolled back{% elif bad_o %}✗ OTA {{ oo }}{% elif bad_r %}⚠ reset: {{ rr }}{% else %}device{% endif %}"
+    secondary=pre+"slot {{ states('"+sl+"') }} · reset {{ rr }} · up {{ states('"+up+"') }}s · heap {{ states('"+hp+"') }}"
+    style=(pre+"ha-card{display:{% if act %}block{% else %}none{% endif %};border-radius:0;border-top:none;border-bottom:none;"
+           "margin-top:-2px;border-left:3px solid {{ col }};background:#0b0402;position:relative;overflow:hidden;}"
+           "ha-card:after{content:'◈ DEVICE · id"+I+"';position:absolute;top:6px;right:11px;font-size:8.5px;letter-spacing:1.5px;"
+           "color:{{ col }};opacity:.7;font-family:"+VT+";z-index:2;}")
+    info=(pre+".primary{font-family:"+VT+";font-size:17px;line-height:1;color:{{ col }}}.secondary{font-size:10px;opacity:.85}")
+    return {"type":"custom:mushroom-template-card","primary":primary,"secondary":secondary,
+            "icon":pre+"{% if oo=='rolled-back' or bad_r %}mdi:alert-octagram{% else %}mdi:chip{% endif %}",
+            "icon_color":pre+"{{ 'red' if col=='#ff6b6b' else ('amber' if col=='#ffc24b' else 'green') }}",
+            "card_mod":{"style":{".":style,"mushroom-state-info$":info,"mushroom-shape-icon$":"--icon-symbol-size:20px"}}}
+
+# ---------- #55 plugin visibility: compact toggle chips (fill = shown in boot menu) ----------
+PLUGS=[("clock","mdi:clock-outline"),("snake","mdi:snake"),("bench","mdi:test-tube"),("batt","mdi:battery"),
+       ("grid","mdi:transmission-tower"),("wled","mdi:led-strip-variant"),("about","mdi:information-outline")]
+def plugin_chips(nid, present):
+    chips=[{"type":"template","content":"plugins","icon":"mdi:puzzle-outline","icon_color":"grey"}]  # label chip
+    for name,icon in PLUGS:
+        e=f"input_boolean.smol_{nid}_plugin_{name}"
+        if e not in present: continue
+        chips.append({"type":"template","entity":e,"icon":icon,
+            "icon_color":"{{ 'green' if is_state('"+e+"','on') else 'disabled' }}",
+            "tap_action":{"action":"toggle"}})
+    if len(chips)<=1: return None
+    return {"type":"custom:mushroom-chips-card","alignment":"start","chips":chips,
+            "card_mod":{"style":"ha-card{border-radius:0;border-top:none;border-bottom:none;margin-top:-1px;padding:6px 8px 4px;"
+                        "background:var(--card-background-color);}"}}
+
 # ---------- node box = mushroom header + mushroom OLED + entities; span-4 in the VIEW grid ----------
 def node_card(nid, meta, present):
     gate=meta["gate"]; I=str(nid); on=f"is_state('binary_sensor.smol_{I}_online','on')"
@@ -93,8 +131,9 @@ def node_card(nid, meta, present):
     oled_p=("{% set scr="+scr+" %}{% set t=states('sensor.smol_"+I+"_temp') %}{% set g=states('sensor.smol_display_grid') %}{% set na="+NAJ+" %}"
             "{% if not "+on+" %}—{% elif scr=='Grid' %}{{ g.split('|')[1] if '|' in g else '—' }}"
             "{% elif scr=='Batt' %}{{ states('sensor.ev_battery_soc') }}%{% elif scr=='Clock' %}{{ now().strftime('%H:%M') }}"
+            "{% elif scr=='Custom' %}{{ states('sensor.smol_"+I+"_custom')[:8] if states('sensor.smol_"+I+"_custom') not in na else '—' }}"  # #45
             "{% else %}{{ t if t not in na else '—' }}{% endif %}")
-    oled_s=("{% set scr="+scr+" %}{{ scr|upper }} · {% if not "+on+" %}no link{% elif scr=='Grid' %}shared glass{% elif scr=='Batt' %}HV pack{% elif scr=='Clock' %}mesh time{% else %}live °F{% endif %}")
+    oled_s=("{% set scr="+scr+" %}{{ scr|upper }} · {% if not "+on+" %}no link{% elif scr=='Grid' %}shared glass{% elif scr=='Batt' %}HV pack{% elif scr=='Clock' %}mesh time{% elif scr=='Custom' %}user lines{% else %}live °F{% endif %}")
     oled={"type":"custom:mushroom-template-card","primary":oled_p,"secondary":oled_s,"icon":"mdi:blank",
           "card_mod":{"style":{".":("ha-card{background:#020402;border:1px solid var(--ha-card-border-color);border-radius:0;"
                 "box-shadow:inset 0 0 12px rgba(0,0,0,.9);position:relative;overflow:hidden;margin-top:-2px;opacity:{% if "+on+" %}1{% else %}.6{% endif %}}mushroom-shape-icon{display:none}"),
@@ -111,6 +150,7 @@ def node_card(nid, meta, present):
     prow(top,f"input_select.smol_{nid}_screen","default screen")
     prow(top,f"input_select.smol_{nid}_page","page")
     prow(top,f"input_select.smol_{nid}_led","LED (status / on / off)","mdi:led-on")            # #48
+    prow(top,f"input_text.smol_{nid}_custom","Custom lines (‹sa› text, | per line)","mdi:card-text")  # #45 · edit when screen=Custom
     prow(top,f"input_button.smol_{nid}_apply",f"Apply → id{nid}","mdi:send")
     prow(top,f"input_button.smol_{nid}_reset","Reset to board default","mdi:backup-restore")
     rb=f"input_button.smol_{nid}_reboot"                                                       # #52 tap-guarded reboot
@@ -154,7 +194,12 @@ def node_card(nid, meta, present):
     ctrl_bottom={"type":"entities","show_header_toggle":False,"entities":bot,
                  "card_mod":{"style":"ha-card{border-radius:0 0 10px 10px;border-top:none;margin-top:-1px;"+OP+"}"}}
     ota=ota_progress_card(nid)   # #40 relay progress bar + phase chip — self-hides (display:none) when idle
-    return {"type":"vertical-stack","view_layout":{"grid-column":"span 4"},"cards":[header,oled,ctrl_top,cond_leaf,cond_gw,ota,ctrl_bottom]}
+    dev=device_card(nid)         # #70/#74 rollback / abnormal-reset alarm — self-hides when clean
+    plug=plugin_chips(nid,present)  # #55 plugin-visibility toggle chips
+    seq=[header,oled,ctrl_top,cond_leaf,cond_gw,ota,dev]
+    if plug: seq.append(plug)
+    seq.append(ctrl_bottom)
+    return {"type":"vertical-stack","view_layout":{"grid-column":"span 4"},"cards":seq}
 
 def legend_card(nodes, present):
     ents=[{"type":"section","label":"the mesh"}]
