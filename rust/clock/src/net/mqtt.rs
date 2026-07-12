@@ -91,7 +91,12 @@ pub fn encode_connect(out: &mut [u8], client_id: &[u8], user: &[u8], pass: &[u8]
     c.remaining_len(var + payload);
     c.str_field(b"MQTT");
     c.u8(0x04); // protocol level 4 (3.1.1)
-    c.u8(0xC2); // flags: username | password | clean session
+    // #101: clean_session=FALSE (0xC0 = username|password, clean-session bit CLEARED). A PERSISTENT
+    // session lets the broker QUEUE QoS1 command topics (cmd/reset, cmd/scan) between our per-flush
+    // connections and redeliver them on reconnect — the transient command was otherwise dropped
+    // unless it landed in the sub-second flush window (the #101 gateway self-reboot no-op). NB: 0xC0,
+    // NOT 0x82 — 0x82 would clear the PASSWORD flag (bit 0x40) → broker rejects CONNECT.
+    c.u8(0xC0); // flags: username | password (clean-session CLEARED → persistent, #101)
     c.u8(0x00); // keep-alive MSB
     c.u8(0x00); // keep-alive LSB (0 = disabled)
     c.str_field(client_id);
@@ -115,6 +120,19 @@ pub fn encode_publish(out: &mut [u8], topic: &[u8], payload: &[u8], retain: bool
 /// SUBSCRIBE (one topic filter, requested QoS 0). Byte 0 is `0x82` — the low nibble
 /// `0b0010` is mandatory for SUBSCRIBE. `packet_id` must be non-zero.
 pub fn encode_subscribe(out: &mut [u8], packet_id: u16, topic: &[u8]) -> Option<usize> {
+    encode_subscribe_qos(out, packet_id, topic, 0)
+}
+
+/// #101: SUBSCRIBE at requested QoS 1 — used ONLY for the transient COMMAND topics (cmd/reset,
+/// cmd/scan). With `clean_session=false`, a QoS1 subscription makes the broker QUEUE a one-shot
+/// command for our persistent session and redeliver it on the next flush reconnect (a QoS0 sub is
+/// never queued for an offline client). The receiver MUST PUBACK the delivered QoS1 PUBLISH (see
+/// [`encode_puback`]) or the broker redelivers it every reconnect → reboot loop.
+pub fn encode_subscribe_qos1(out: &mut [u8], packet_id: u16, topic: &[u8]) -> Option<usize> {
+    encode_subscribe_qos(out, packet_id, topic, 1)
+}
+
+fn encode_subscribe_qos(out: &mut [u8], packet_id: u16, topic: &[u8], qos: u8) -> Option<usize> {
     let remaining = 2 + (2 + topic.len()) + 1; // packet id + topic filter + requested-QoS byte
     let mut c = Cursor::new(out);
     c.u8(0x82);
@@ -122,7 +140,20 @@ pub fn encode_subscribe(out: &mut [u8], packet_id: u16, topic: &[u8]) -> Option<
     c.u8((packet_id >> 8) as u8);
     c.u8(packet_id as u8);
     c.str_field(topic);
-    c.u8(0x00); // requested QoS 0
+    c.u8(qos); // requested QoS (0 for downlinks; 1 for the #101 command topics)
+    c.done()
+}
+
+/// #101: PUBACK — acknowledge a received QoS1 PUBLISH so the broker drops it from our persistent
+/// session's outbound queue. WITHOUT this ack the broker redelivers the message on every reconnect
+/// (a queued `cmd/reset` → reboot every flush = soft-brick). Fixed 4 bytes: `0x40`, remaining-len 2,
+/// then the 2-byte packet identifier echoed back.
+pub fn encode_puback(out: &mut [u8], packet_id: u16) -> Option<usize> {
+    let mut c = Cursor::new(out);
+    c.u8(0x40); // PUBACK
+    c.u8(0x02); // remaining length = 2 (just the packet id)
+    c.u8((packet_id >> 8) as u8);
+    c.u8(packet_id as u8);
     c.done()
 }
 
@@ -142,7 +173,8 @@ pub enum Incoming<'a> {
     SubAck,
     /// An inbound PUBLISH: the retained downlink we subscribed for. `payload`
     /// borrows the accumulator; the caller copies it out before advancing.
-    Publish { topic: &'a [u8], payload: &'a [u8] },
+    /// `packet_id` is `Some` for a QoS>0 delivery (the caller MUST PUBACK it — #101); `None` at QoS0.
+    Publish { topic: &'a [u8], payload: &'a [u8], packet_id: Option<u16> },
     /// Any other packet type (PINGRESP, etc.) — skipped, but still consumed.
     Other,
 }
@@ -204,10 +236,16 @@ pub fn parse_packet(buf: &[u8]) -> Option<(Incoming<'_>, usize)> {
                 return Some((Incoming::Other, total));
             }
             let topic = &body[2..off];
-            if qos > 0 {
-                off += 2; // skip the packet identifier
-            }
-            Incoming::Publish { topic, payload: &body[off..] }
+            // #101: capture the packet id of a QoS>0 PUBLISH so the caller can PUBACK it (the bounds
+            // check above guarantees `body[off]`/`body[off+1]` exist when qos>0). QoS0 → None.
+            let packet_id = if qos > 0 {
+                let pid = ((body[off] as u16) << 8) | body[off + 1] as u16;
+                off += 2;
+                Some(pid)
+            } else {
+                None
+            };
+            Incoming::Publish { topic, payload: &body[off..], packet_id }
         }
         _ => Incoming::Other,
     };
