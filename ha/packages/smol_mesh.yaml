@@ -508,7 +508,7 @@ mqtt:
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/7/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
-      expire_after: 180  # #68/#94 flap-tune: bumped 90→180 = 2x the ~90s status-republish cadence measured at the all-192 canary (90 sat on the edge → id7/8/9 online flapped). Ages out
+      expire_after: 90   # #68/#94: online source. Flap-tune (90→180) was CONSIDERED then DROPPED — the all-192 flap was a mesh-SETTLING artifact (cadence briefly ~90s); at healthy steady-state status republishes ~11s, far under 90, so online is stable. F6-gated republish, ages out
       # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
       icon: "mdi:chip"
     - name: "smol 8 screen"
@@ -517,7 +517,7 @@ mqtt:
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/8/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
-      expire_after: 180  # #68/#94 flap-tune: bumped 90→180 = 2x the ~90s status-republish cadence measured at the all-192 canary (90 sat on the edge → id7/8/9 online flapped). Ages out
+      expire_after: 90   # #68/#94: online source. Flap-tune (90→180) was CONSIDERED then DROPPED — the all-192 flap was a mesh-SETTLING artifact (cadence briefly ~90s); at healthy steady-state status republishes ~11s, far under 90, so online is stable. F6-gated republish, ages out
       # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
       icon: "mdi:chip"
     - name: "smol 9 screen"
@@ -526,7 +526,7 @@ mqtt:
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/9/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
-      expire_after: 180  # #68/#94 flap-tune: bumped 90→180 = 2x the ~90s status-republish cadence measured at the all-192 canary (90 sat on the edge → id7/8/9 online flapped). Ages out
+      expire_after: 90   # #68/#94: online source. Flap-tune (90→180) was CONSIDERED then DROPPED — the all-192 flap was a mesh-SETTLING artifact (cadence briefly ~90s); at healthy steady-state status republishes ~11s, far under 90, so online is stable. F6-gated republish, ages out
       # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
       icon: "mdi:chip"
     # --- #40 running BUILD# as a first-class device-merged value (JP ask 2026-07-11) ---
