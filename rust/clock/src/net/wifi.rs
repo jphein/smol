@@ -776,6 +776,15 @@ static mut MQTT_ACC: [u8; 512] = [0; 512];
 #[cfg(feature = "wifi")]
 pub const CFG_VALUE_MAX: usize = 16;
 
+/// #56 keyed CFG: the single-ASCII config KEY that follows the 3-digit target id in a
+/// `SMOLv1 CFG` frame (`<NNN><KEY><value>`). ONE relay now carries N per-node config
+/// channels — `S` = default screen (#21, the only channel #56 ships); #48/#43/#55 add
+/// `L` (led) / `U` (units) / `P` (plugins). Defined at the `wifi` tier (like
+/// `CFG_VALUE_MAX`, §771) so the gateway FILL path (`mqtt_session`, wifi-only) and the
+/// ESP-NOW frame layer that RELAYS/parses it (espnow) both name it with no per-profile cfg.
+#[cfg(feature = "wifi")]
+pub const CFG_KEY_SCREEN: u8 = b'S';
+
 /// #40 #3: one relay attempt's diagnostic snapshot — gateway-side RX evidence PLUS the leaf's
 /// self-reported OTA state (captured from its `LDBG` beacon during the relay). Published to
 /// retained `smol/<leaf>/ota/relaydiag`. Defined at the `wifi` level (not `ota_mesh`/`mode`,
@@ -829,6 +838,12 @@ pub const STAT_FRESH_MS: u64 = 45_000;
 #[cfg(feature = "wifi")]
 pub struct CfgCache {
     ids: [u8; CFG_CACHE_CAP],
+    /// #56 keyed CFG: the config KEY (`S`/`L`/`U`/`P`) each entry belongs to. Upsert is
+    /// now on the COMPOSITE (id, key) so one leaf can hold N per-channel configs at once,
+    /// each relayed as its own `SMOLv1 CFG <NNN><KEY><value>` frame. #56 fills only `S`
+    /// (from `default_screen`); the column is inert for the single-channel `stat_cache`
+    /// reuse (it always upserts under one fixed key → identical id-keyed behaviour).
+    keys: [u8; CFG_CACHE_CAP],
     vals: [[u8; CFG_VALUE_MAX]; CFG_CACHE_CAP],
     lens: [u8; CFG_CACHE_CAP],
     /// #68 F6: last-heard timestamp (now_ms) per entry. Gates the stat republish on freshness
@@ -853,6 +868,7 @@ impl CfgCache {
     pub const fn new() -> Self {
         Self {
             ids: [0; CFG_CACHE_CAP],
+            keys: [0; CFG_CACHE_CAP],
             vals: [[0; CFG_VALUE_MAX]; CFG_CACHE_CAP],
             lens: [0; CFG_CACHE_CAP],
             last_ms: [0; CFG_CACHE_CAP],
@@ -861,13 +877,18 @@ impl CfgCache {
         }
     }
 
-    /// Upsert a leaf's config value (truncated to `CFG_VALUE_MAX`). A full cache drops
-    /// the entry and logs it (no silent cap). Value bytes are opaque here — the gateway
-    /// RELAYS them verbatim; the leaf's `parse_default_screen` is the strict validator.
-    pub fn set(&mut self, id: u8, value: &[u8], mac: [u8; 6], now: u64) {
+    /// #56: upsert a leaf's config value under its channel `key` (truncated to
+    /// `CFG_VALUE_MAX`). Match/insert is on the COMPOSITE (id, key) so one leaf holds N
+    /// keyed configs simultaneously — a `key` change never clobbers a different channel.
+    /// A full cache drops the entry and logs it (no silent cap). Value bytes are opaque
+    /// here — the gateway RELAYS them verbatim; the leaf's per-key dispatch validates
+    /// (screen → `parse_default_screen`). #68 F6: `mac`/`now` stamp the entry for the
+    /// stat-cache reuse (freshness gate + MAC-resolvable relay); the downlink cfg_cache
+    /// passes a zero MAC and is never mac-queried.
+    pub fn set(&mut self, id: u8, key: u8, value: &[u8], mac: [u8; 6], now: u64) {
         let n = value.len().min(CFG_VALUE_MAX);
         for i in 0..self.count {
-            if self.ids[i] == id {
+            if self.ids[i] == id && self.keys[i] == key {
                 self.vals[i][..n].copy_from_slice(&value[..n]);
                 self.lens[i] = n as u8;
                 self.last_ms[i] = now; // #68 F6: freshen
@@ -878,13 +899,19 @@ impl CfgCache {
         if self.count < CFG_CACHE_CAP {
             let i = self.count;
             self.ids[i] = id;
+            self.keys[i] = key;
             self.vals[i][..n].copy_from_slice(&value[..n]);
             self.lens[i] = n as u8;
             self.last_ms[i] = now;
             self.macs[i] = mac;
             self.count += 1;
         } else {
-            log::warn!("smol #21: cfg cache full ({}) — dropping config for id{}", CFG_CACHE_CAP, id);
+            log::warn!(
+                "smol #21/#56: cfg cache full ({}) — dropping id{} key '{}'",
+                CFG_CACHE_CAP,
+                id,
+                key as char
+            );
         }
     }
 
@@ -894,12 +921,13 @@ impl CfgCache {
         self.count
     }
 
-    /// The `i`-th cached entry as `(leaf_id, value_bytes)`, or `None` if out of range.
+    /// The `i`-th cached entry as `(leaf_id, key, value_bytes)`, or `None` if out of range.
+    /// #56: `key` is the config channel (`S`/…); the `stat_cache` reuse ignores it.
     #[allow(dead_code)]
-    pub fn entry(&self, i: usize) -> Option<(u8, &[u8])> {
+    pub fn entry(&self, i: usize) -> Option<(u8, u8, &[u8])> {
         if i < self.count {
             let n = self.lens[i] as usize;
-            Some((self.ids[i], &self.vals[i][..n]))
+            Some((self.ids[i], self.keys[i], &self.vals[i][..n]))
         } else {
             None
         }
@@ -1340,6 +1368,7 @@ fn mqtt_session(
         // perpetually-fresh ghost (the ghost that faked id8-alive + masked id9's floor-wipe).
         let now_ms = Instant::now().duration_since_epoch().as_millis();
         for i in 0..sc.count() {
+            // #68 F6 freshness gate; #56: the stat cache is single-channel, key column inert here.
             if let Some((lid, val)) = sc.entry_fresh(i, now_ms, STAT_FRESH_MS) {
                 if lid == node_id || val.is_empty() {
                     continue;
@@ -1478,12 +1507,15 @@ fn mqtt_session(
                         // anyway. Only present when cfg_cache = Some (gateway flush).
                         if leaf_id != node_id {
                             if let Some(cache) = cfg_cache.as_deref_mut() {
+                                // #56: `default_screen` is the SCREEN channel → cache under key
+                                // `S` (#48 led / #43 units / #55 plugins add their own topic + fill
+                                // site; the relay machinery is already key-generic).
                                 // #68: cfg_cache is DOWNLINK (never mac-queried) → zero MAC; the
                                 // timestamp is set for API uniformity (cfg_cache isn't freshness-gated).
                                 let now = Instant::now().duration_since_epoch().as_millis();
-                                cache.set(leaf_id, payload, [0u8; 6], now);
+                                cache.set(leaf_id, CFG_KEY_SCREEN, payload, [0u8; 6], now);
                                 log::info!(
-                                    "smol #21: cached leaf id{} config for relay ({} B)",
+                                    "smol #21/#56: cached leaf id{} screen config for relay ({} B)",
                                     leaf_id,
                                     payload.len()
                                 );
@@ -1848,7 +1880,8 @@ fn mqtt_session(
     if let Some(sc) = stat_cache {
         let latest_staged = staged_raw.as_ref().map(|a| a.build);
         for i in 0..sc.count() {
-            let (lid, val) = match sc.entry(i) {
+            // #56: the status cache is single-channel per leaf; its key column is inert here.
+            let (lid, _key, val) = match sc.entry(i) {
                 Some(x) => x,
                 None => continue,
             };
