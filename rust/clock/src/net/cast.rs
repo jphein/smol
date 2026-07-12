@@ -275,3 +275,140 @@ pub fn is_enabled() -> bool {
     // SAFETY: single-caller (flush/main path, never an ISR); no reference is formed.
     unsafe { core::ptr::addr_of!(CAST_ENABLED).read() }
 }
+
+// =========================================================================
+// #74 stage-2 — display mirror: the SAME shadow glass, encoded as a tiny 1-bit
+// BMP for HA to render as an `mqtt image`. Reuses the Cast tee (no new draw-path
+// tap — the invasive per-plugin text approach was deliberately NOT taken), so a
+// `cast` build gets the HA screen mirror for free alongside the WLED stream.
+// =========================================================================
+//
+// Why a DOWNSAMPLED BMP (not the full 72×40, not raw bits):
+//   * The gateway MQTT publish path is bounded to a 512 B packet buffer (`pkt` in
+//     net/wifi.rs) — a full 72×40 1-bit BMP is 542 B raw / 724 B base64, too big.
+//     A 64×32 BMP is 318 B raw / 424 B base64 → fits the packet with margin.
+//   * BMP (not PBM/XBM) because browsers render `image/bmp` inline — HA serves the
+//     bytes through its image proxy and a `<img>` in the dashboard shows it.
+//   * base64 (not raw binary) keeps `smol/<id>/screen` a text topic (greppable via
+//     mosquitto_sub, no binary-payload edge cases) — HA decodes with `image_encoding: b64`.
+// The down-sample + 180° flip reuse [`cell_on`] (the WLED path's box-sampler), so the
+// mirror matches the glass a viewer reads (the panel is mounted `Rotate180`).
+
+/// Mirror image geometry — chosen so the 1-bit BMP fits the 512 B MQTT packet.
+pub const SCREEN_W: usize = 64;
+pub const SCREEN_H: usize = 32;
+/// A target cell lights when ≥ this % of its (near-1:1) source block is lit. Low so
+/// thin OLED text survives the mild 72×40→64×32 down-sample.
+const SCREEN_THRESH_PCT: u32 = 25;
+/// 1-bit BMP: 14 (file hdr) + 40 (info hdr) + 8 (2-colour palette) + rows. Each row is
+/// `SCREEN_W` bits padded to a 4-byte boundary = 8 B for 64 px; 32 rows = 256 B.
+const SCREEN_ROW_BYTES: usize = SCREEN_W.div_ceil(32) * 4; // 8
+const SCREEN_BMP_LEN: usize = 62 + SCREEN_ROW_BYTES * SCREEN_H; // 318
+/// base64 of the BMP: ceil(318/3)*4 = 424.
+pub const SCREEN_B64_LEN: usize = SCREEN_BMP_LEN.div_ceil(3) * 4; // 424
+
+/// Encode the shadow glass as a 64×32 1-bit BMP into `out` (must be ≥ [`SCREEN_BMP_LEN`]),
+/// returning the byte length. PURE (no HAL / heap) — host-testable like [`pack_dnrgb`].
+/// Bottom-up rows (positive `biHeight`) + `flip180` reproduce what a viewer reads off the
+/// `Rotate180`-mounted glass. Down-sample via [`cell_on`] (shared with the WLED path).
+pub fn pack_bmp1(m: &Mirror, out: &mut [u8]) -> usize {
+    if out.len() < SCREEN_BMP_LEN {
+        return 0;
+    }
+    for b in out[..SCREEN_BMP_LEN].iter_mut() {
+        *b = 0;
+    }
+    // --- BITMAPFILEHEADER (14) ---
+    out[0] = b'B';
+    out[1] = b'M';
+    out[2..6].copy_from_slice(&(SCREEN_BMP_LEN as u32).to_le_bytes());
+    out[10..14].copy_from_slice(&62u32.to_le_bytes()); // pixel data offset
+    // --- BITMAPINFOHEADER (40) ---
+    out[14..18].copy_from_slice(&40u32.to_le_bytes());
+    out[18..22].copy_from_slice(&(SCREEN_W as i32).to_le_bytes());
+    out[22..26].copy_from_slice(&(SCREEN_H as i32).to_le_bytes()); // +H = bottom-up
+    out[26..28].copy_from_slice(&1u16.to_le_bytes()); // planes
+    out[28..30].copy_from_slice(&1u16.to_le_bytes()); // 1 bpp
+    out[34..38].copy_from_slice(&((SCREEN_ROW_BYTES * SCREEN_H) as u32).to_le_bytes()); // biSizeImage
+    out[46..50].copy_from_slice(&2u32.to_le_bytes()); // biClrUsed
+    out[50..54].copy_from_slice(&2u32.to_le_bytes()); // biClrImportant
+    // --- palette (8): idx0 = black (off), idx1 = white (lit). BMP order is B,G,R,0. ---
+    out[58] = 0xFF;
+    out[59] = 0xFF;
+    out[60] = 0xFF;
+    // --- pixels: 1 = lit. Bottom-up: file row r ↔ image row (H-1-r); MSB = leftmost px. ---
+    let cfg = MatrixCfg {
+        w: SCREEN_W,
+        h: SCREEN_H,
+        serpentine: false,
+        flip180: true,
+        thresh_pct: SCREEN_THRESH_PCT,
+        on: [0, 0, 0],
+        off: [0, 0, 0],
+        timeout_s: 0,
+    };
+    for r in 0..SCREEN_H {
+        let img_y = SCREEN_H - 1 - r;
+        let row0 = 62 + r * SCREEN_ROW_BYTES;
+        for x in 0..SCREEN_W {
+            if cell_on(m, x, img_y, &cfg) {
+                out[row0 + x / 8] |= 0x80u8 >> (x % 8);
+            }
+        }
+    }
+    SCREEN_BMP_LEN
+}
+
+/// Standard base64 (RFC 4648, `+`/`/`, `=` padded) of `src` into `out`, returning the
+/// byte length written. PURE + panic-free (writes at most `out.len()` bytes; stops if
+/// `out` is too small). Host-testable.
+pub fn base64_into(src: &[u8], out: &mut [u8]) -> usize {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut o = 0;
+    let mut i = 0;
+    while i < src.len() {
+        if o + 4 > out.len() {
+            break;
+        }
+        let b0 = src[i];
+        let b1 = if i + 1 < src.len() { src[i + 1] } else { 0 };
+        let b2 = if i + 2 < src.len() { src[i + 2] } else { 0 };
+        out[o] = A[(b0 >> 2) as usize];
+        out[o + 1] = A[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize];
+        out[o + 2] = if i + 1 < src.len() {
+            A[(((b1 & 0x0F) << 2) | (b2 >> 6)) as usize]
+        } else {
+            b'='
+        };
+        out[o + 3] = if i + 2 < src.len() {
+            A[(b2 & 0x3F) as usize]
+        } else {
+            b'='
+        };
+        o += 4;
+        i += 3;
+    }
+    o
+}
+
+/// Fixed scratch for the mirror BMP + its base64, kept off the (bounded) MQTT-flush stack
+/// in `.bss` — the same single-threaded main-path discipline as [`CAST_MIRROR`] (written
+/// and read only from the flush, never an ISR; `addr_of[_mut]!` keeps `static_mut_refs` quiet).
+static mut SCREEN_BMP: [u8; SCREEN_BMP_LEN] = [0; SCREEN_BMP_LEN];
+static mut SCREEN_B64: [u8; SCREEN_B64_LEN] = [0; SCREEN_B64_LEN];
+
+/// Gateway flush: build the current glass into a base64 BMP and hand it to `f` as a byte
+/// slice (the retained `smol/<id>/screen` payload). Closure form so no `&'static mut`
+/// escapes (`static_mut_refs`-clean), mirroring [`with_frame`].
+pub fn with_screen_b64<R>(f: impl FnOnce(&[u8]) -> R) -> R {
+    // SAFETY: single-caller (gateway flush on the main path, never an ISR); the three
+    // statics are distinct (no aliasing) and no reference to them outlives this call.
+    unsafe {
+        let m = &*core::ptr::addr_of!(CAST_MIRROR);
+        let bmp = &mut *core::ptr::addr_of_mut!(SCREEN_BMP);
+        let blen = pack_bmp1(m, bmp);
+        let b64 = &mut *core::ptr::addr_of_mut!(SCREEN_B64);
+        let n = base64_into(&bmp[..blen], b64);
+        f(&b64[..n])
+    }
+}

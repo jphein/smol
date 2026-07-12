@@ -1934,6 +1934,25 @@ fn mqtt_session(
         }
     }
 
+    // #74 stage-2 display mirror: publish the gateway's OWN glass as a 64×32 1-bit BMP (base64) to
+    // RETAINED `smol/<id>/screen` for HA to render as an `mqtt image`. `cast`-only — it reuses the
+    // #26 Cast tee's live `Mirror` (the tee already snapshots the glass every render tick, so there
+    // is NO new draw-path tap; the invasive per-plugin text approach was deliberately not taken).
+    // GATEWAY-only v1: leaves have no MQTT (Cast is a gateway-role activity) — a leaf-screen mirror
+    // is a mesh-frame follow-on. The b64 BMP is ~424 B → fits the 512 B `pkt` packet with margin.
+    #[cfg(feature = "cast")]
+    {
+        let mut sctopic = MqttScratch::new();
+        let _ = write!(sctopic, "smol/{}/screen", node_id);
+        crate::net::cast::with_screen_b64(|b64| {
+            if let Some(n) =
+                crate::net::mqtt::encode_publish(&mut pkt, sctopic.as_bytes(), b64, true)
+            {
+                let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            }
+        });
+    }
+
     // --- Receive the retained battery + grid payloads (both SUBSCRIBEs above) ---
     // Wait until BOTH retained downlinks land (they arrive back-to-back after the
     // subscribes) or the deadline — whichever first. A topic with no retained message

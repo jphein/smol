@@ -410,6 +410,37 @@ input_button:
 # --- Dashboard mirror: subscribe the retained topic so a card shows exactly ---
 # what the boards fetch (the payload is <=96 chars, well under the 255 state cap).
 mqtt:
+  # --- #74 item 5 (stage-2) DISPLAY MIRROR — the gateway's live OLED as an image ---
+  # The gateway publishes its glass as a base64 64×32 1-bit BMP to retained smol/<id>/screen
+  # (fw reuses the #26 Cast framebuffer tee — no new draw-path tap; GATEWAY-only v1, a leaf's
+  # screen needs a mesh-frame follow-on). HA decodes b64 → BMP and serves it as an image the
+  # dashboard renders (the node-box "mini-OLED" idiom made real). Downsampled to 64×32 so the
+  # 1-bit BMP (~424 B base64) fits the gateway's 512 B MQTT packet. Only the elected gateway
+  # publishes a live image; the other ids stay 'unknown' until they take the gateway role.
+  # NOTE: supersedes luna's staged TEXT `smol/<id>/display` (DISP|line;…) mirror — that HELD
+  # approach needed an invasive per-plugin text tap; this bitmap path is non-invasive + faithful.
+  image:
+    - name: "smol 7 screen"
+      unique_id: smol_7_screen_mirror
+      image_topic: "smol/7/screen"
+      image_encoding: b64
+      content_type: image/bmp
+      entity_category: diagnostic
+      icon: "mdi:monitor-screenshot"
+    - name: "smol 8 screen"
+      unique_id: smol_8_screen_mirror
+      image_topic: "smol/8/screen"
+      image_encoding: b64
+      content_type: image/bmp
+      entity_category: diagnostic
+      icon: "mdi:monitor-screenshot"
+    - name: "smol 9 screen"
+      unique_id: smol_9_screen_mirror
+      image_topic: "smol/9/screen"
+      image_encoding: b64
+      content_type: image/bmp
+      entity_category: diagnostic
+      icon: "mdi:monitor-screenshot"
   sensor:
     - name: "smol display batt"
       unique_id: smol_display_batt_mirror
