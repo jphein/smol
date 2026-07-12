@@ -185,6 +185,12 @@ pub enum AppKind {
     Bench,
     #[cfg(feature = "espnow")]
     MeshSnake,
+    // #58 Marauder's Watch + #60 treasure-hunt — roster-RSSI screens. LIVE whenever
+    // compiled (REGISTRY row + `enter` + `from_wire` construct them) → no dead_code allow.
+    #[cfg(feature = "espnow")]
+    Watch,
+    #[cfg(feature = "espnow")]
+    Hunt,
     // #25 WLED remote. LIVE whenever compiled (REGISTRY row + `enter` + `from_wire`
     // construct it), like Batt/Grid → no dead_code allow needed. cfg(wled) = espnow+.
     #[cfg(feature = "wled")]
@@ -234,6 +240,10 @@ impl AppKind {
             "Bench" => AppKind::Bench,
             #[cfg(feature = "espnow")]
             "MeshSnake" => AppKind::MeshSnake,
+            #[cfg(feature = "espnow")]
+            "Watch" => AppKind::Watch,
+            #[cfg(feature = "espnow")]
+            "Hunt" => AppKind::Hunt,
             // #25: a leaf's default screen can be set to the WLED remote via #21 too.
             #[cfg(feature = "wled")]
             "WledRemote" => AppKind::WledRemote,
@@ -265,6 +275,10 @@ impl AppKind {
             AppKind::Bench => "Bench",
             #[cfg(feature = "espnow")]
             AppKind::MeshSnake => "MeshSnake",
+            #[cfg(feature = "espnow")]
+            AppKind::Watch => "Watch",
+            #[cfg(feature = "espnow")]
+            AppKind::Hunt => "Hunt",
             #[cfg(feature = "wled")]
             AppKind::WledRemote => "WledRemote",
             #[cfg(feature = "espnow")]
@@ -324,6 +338,10 @@ pub enum App {
     Bench(crate::bench::BenchState),
     #[cfg(feature = "espnow")]
     MeshSnake(crate::mesh_snake::MeshSnake),
+    #[cfg(feature = "espnow")]
+    Watch(crate::watch::WatchState),
+    #[cfg(feature = "espnow")]
+    Hunt(crate::hunt::HuntState),
     #[cfg(feature = "wled")]
     WledRemote(crate::net::wled::WledRemoteState),
     #[cfg(feature = "espnow")]
@@ -349,6 +367,10 @@ impl App {
             AppKind::MeshSnake => {
                 App::MeshSnake(crate::mesh_snake::MeshSnake::new(ctx.node_id, ctx.now_ms as u32))
             }
+            #[cfg(feature = "espnow")]
+            AppKind::Watch => App::Watch(crate::watch::WatchState::new()),
+            #[cfg(feature = "espnow")]
+            AppKind::Hunt => App::Hunt(crate::hunt::HuntState::new()),
             #[cfg(feature = "wled")]
             AppKind::WledRemote => {
                 App::WledRemote(crate::net::wled::WledRemoteState::new(ctx.now_ms))
@@ -380,6 +402,10 @@ impl App {
             App::Bench(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "espnow")]
             App::MeshSnake(s) => Plugin::on_button(s, press, ctx),
+            #[cfg(feature = "espnow")]
+            App::Watch(s) => Plugin::on_button(s, press, ctx),
+            #[cfg(feature = "espnow")]
+            App::Hunt(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "wled")]
             App::WledRemote(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "espnow")]
@@ -402,6 +428,10 @@ impl App {
             App::Bench(s) => Plugin::update(s, ctx),
             #[cfg(feature = "espnow")]
             App::MeshSnake(s) => Plugin::update(s, ctx),
+            #[cfg(feature = "espnow")]
+            App::Watch(s) => Plugin::update(s, ctx),
+            #[cfg(feature = "espnow")]
+            App::Hunt(s) => Plugin::update(s, ctx),
             #[cfg(feature = "wled")]
             App::WledRemote(s) => Plugin::update(s, ctx),
             #[cfg(feature = "espnow")]
@@ -444,6 +474,10 @@ impl App {
             App::Bench(_) => (AppKind::Bench, 0),
             #[cfg(feature = "espnow")]
             App::MeshSnake(_) => (AppKind::MeshSnake, 0),
+            #[cfg(feature = "espnow")]
+            App::Watch(_) => (AppKind::Watch, 0),
+            #[cfg(feature = "espnow")]
+            App::Hunt(_) => (AppKind::Hunt, 0),
             #[cfg(feature = "wled")]
             App::WledRemote(_) => (AppKind::WledRemote, 0),
             #[cfg(feature = "espnow")]
@@ -478,6 +512,11 @@ pub const REGISTRY: &[AppDesc] = &[
     AppDesc { title: "Snake", kind: SNAKE_KIND },
     #[cfg(feature = "espnow")]
     AppDesc { title: "Bench", kind: AppKind::Bench },
+    // #58 Marauder's Watch + #60 treasure-hunt (roster-RSSI screens).
+    #[cfg(feature = "espnow")]
+    AppDesc { title: "Watch", kind: AppKind::Watch },
+    #[cfg(feature = "espnow")]
+    AppDesc { title: "Hunt", kind: AppKind::Hunt },
     #[cfg(feature = "wifi")]
     AppDesc { title: "Batt", kind: AppKind::Batt },
     #[cfg(feature = "wifi")]
@@ -510,6 +549,13 @@ pub const fn plugin_bit(kind: AppKind) -> Option<u8> {
         AppKind::MeshSnake => Some(1), // SNAKE_KIND alias → same "Snake" bit
         #[cfg(feature = "espnow")]
         AppKind::Bench => Some(2),
+        // #58/#60: not yet #55-maskable — `None` ⇒ always shown (`kind_enabled` treats
+        // `None` as visible). Wiring them into the plugins mask needs a paired HA change
+        // (new bits + toggles); until then a partial mask that predates them can't hide them.
+        #[cfg(feature = "espnow")]
+        AppKind::Watch => None,
+        #[cfg(feature = "espnow")]
+        AppKind::Hunt => None,
         #[cfg(feature = "wifi")]
         AppKind::Batt => Some(3),
         #[cfg(feature = "wifi")]

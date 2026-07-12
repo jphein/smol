@@ -118,6 +118,16 @@ mod snake;
 // espnow-only (needs the mesh) → zero code in default/wifi builds.
 #[cfg(feature = "espnow")]
 mod mesh_snake;
+// #58/#60 shared RSSI smoothing + proximity mapping for the roster-consuming screens.
+// espnow-only (consumes the mesh roster); no new frames / no radio traffic.
+#[cfg(feature = "espnow")]
+mod rssi;
+// #58 Marauder's Watch — every other node by name + a signal-strength glyph (roster RSSI).
+#[cfg(feature = "espnow")]
+mod watch;
+// #60 treasure-hunt — RSSI warmer/colder game over the roster.
+#[cfg(feature = "espnow")]
+mod hunt;
 // On-board sensors: chip die-temp (tsens) + battery ADC on GPIO4. Always on.
 mod sensors;
 // #43 display units (°F/°C · 12h/24h): the fleet-global `Units` config + wire parse.
