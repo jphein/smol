@@ -1603,6 +1603,7 @@ impl RadioManager {
         // #6 OTA / #21 config / #33 install: a leaf's recovery burst can also surface these.
         let mut ota_offer: Option<crate::ota::Announce> = None;
         let mut config_offer: Option<crate::app::DefaultScreen> = None;
+        let mut _gw_own = crate::net::wifi::GwOwnCfg::new(); // #48: recovery burst never captures gateway-own cfg
         let mut install_requested = false;
         let mut _leaf_install_seen = false; // #40 #1: a leaf's recovery burst is not a gateway relay
         let reached = match self.sta.as_mut() {
@@ -1620,6 +1621,7 @@ impl RadioManager {
                     &mut elect,
                     &mut ota_offer,
                     &mut config_offer,
+                    &mut _gw_own,
                     &mut install_requested,
                     &mut _leaf_install_seen, // #40 #1: leaf recovery burst — never a gateway relay
                     &[], // #27: election-only recovery burst publishes no peers (leaf/v1)
@@ -2880,6 +2882,9 @@ impl RadioManager {
         let mut ota_offer: Option<crate::ota::Announce> = None;
         // #21: capture any default-screen config this flush surfaces.
         let mut config_offer: Option<crate::app::DefaultScreen> = None;
+        // #48: capture the GATEWAY's OWN keyed configs (led/…) this flush surfaces, then inject
+        // them into our own CfgTracker below so `main`'s take_cfg_offer(key) self-applies them.
+        let mut gw_own = crate::net::wifi::GwOwnCfg::new();
         // #33: capture any OTA install command this flush surfaces.
         let mut install_requested = false;
         // #40 #1: set iff this flush SEES a retained leaf install (pre-arm) → latch pending below.
@@ -2918,6 +2923,7 @@ impl RadioManager {
                     &mut elect,
                     &mut ota_offer,
                     &mut config_offer,
+                    &mut gw_own, // #48: capture the gateway's own keyed configs
                     &mut install_requested,
                     &mut leaf_install_seen, // #40 #1: latch pending on install-SEEN (below)
                     peers, // #27: gateway publishes its roster as retained smol/<id>/peers
@@ -2939,6 +2945,12 @@ impl RadioManager {
         // #21: stash any default-screen config this flush surfaced for `main`.
         if config_offer.is_some() {
             self.config_offer = config_offer;
+        }
+        // #48 GwOwnCfg: inject the gateway's OWN keyed configs into our (gateway-idle) CfgTracker
+        // so `main`'s take_cfg_offer(key) self-applies them — same path as a leaf's relayed config.
+        // `CfgTracker::set` key-filters (only CFG_APPLY_KEYS land), so a stray key is a no-op.
+        if let Some((buf, len)) = gw_own.led {
+            self.cfg.set(crate::net::wifi::CFG_KEY_LED, &buf[..len]);
         }
         // #33: OR-in an install command (one-shot; `main`'s take clears it).
         if install_requested {

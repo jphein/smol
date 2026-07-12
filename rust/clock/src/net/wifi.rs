@@ -566,6 +566,7 @@ pub fn run_ntp_burst(
     let mqtt_deadline = Instant::now() + MQTT_SESSION_BUDGET;
     let mqtt_port = 49152 + (rng.random() % 16384) as u16;
     let mut _leaf_seen_boot = false; // #40 #1: boot burst is not a gateway relay → never set
+    let mut _ntp_gw_own = GwOwnCfg::new(); // #48: boot/NTP burst never captures gateway-own cfg (cfg_cache=None)
     let _ = mqtt_session(
         &mut iface,
         device,
@@ -579,6 +580,7 @@ pub fn run_ntp_burst(
         elect,
         ota_offer,
         config_offer,
+        &mut _ntp_gw_own,
         install_requested,
         &mut _leaf_seen_boot, // #40 #1: boot burst sees no leaf installs
         &[], // #27: boot NTP+downlink burst publishes no peers (no roster yet)
@@ -790,6 +792,35 @@ pub const CFG_KEY_SCREEN: u8 = b'S';
 /// each feature lands, so the const stays used — no dead_code in the interim.)
 #[cfg(feature = "wifi")]
 pub const CFG_KEY_LED: u8 = b'L';
+
+/// #48 (GwOwnCfg — approved arch): the GATEWAY's OWN per-node configs read from its own MQTT
+/// topics this burst. A leaf gets these RELAYED (→ its `CfgTracker`); the gateway reads them
+/// DIRECTLY. Bundled into ONE `run_mqtt_burst`/`mqtt_session` out-param (net +1, not +N) — after
+/// the burst `service()` injects each present value into the gateway's OWN (otherwise-idle)
+/// `CfgTracker`, so `main`'s `take_cfg_offer(key)` applies it on the EXACT same path as a leaf's
+/// relayed config (a node is gateway XOR leaf → the one tracker has a single feeder). Screen stays
+/// on its own `config_offer` path (untouched). #43/#55 add `units`/`plugins` fields as they land.
+#[cfg(feature = "wifi")]
+#[derive(Clone, Copy)]
+pub struct GwOwnCfg {
+    /// The gateway's own `smol/<id>/config/led` value `(buf, len)`, or `None` if absent this burst.
+    pub led: Option<([u8; CFG_VALUE_MAX], usize)>,
+}
+
+#[cfg(feature = "wifi")]
+impl GwOwnCfg {
+    pub const fn new() -> Self {
+        Self { led: None }
+    }
+    /// Pack a payload into the `(buf, len)` a field holds (truncated to `CFG_VALUE_MAX`), so the
+    /// mqtt-drain arms stay one-liners: `gw_own.led = Some(GwOwnCfg::val(payload));`.
+    pub fn val(value: &[u8]) -> ([u8; CFG_VALUE_MAX], usize) {
+        let mut b = [0u8; CFG_VALUE_MAX];
+        let n = value.len().min(CFG_VALUE_MAX);
+        b[..n].copy_from_slice(&value[..n]);
+        (b, n)
+    }
+}
 
 /// #40 #3: one relay attempt's diagnostic snapshot — gateway-side RX evidence PLUS the leaf's
 /// self-reported OTA state (captured from its `LDBG` beacon during the relay). Published to
@@ -1048,6 +1079,9 @@ fn mqtt_session(
     // #21 node-manager: filled with the parsed retained default-screen command for
     // this board (Set/Clear), if present + valid; None = absent/invalid (keep current).
     config_offer: &mut Option<crate::app::DefaultScreen>,
+    // #48 GwOwnCfg: filled with the GATEWAY's OWN keyed configs (led, +units/plugins later) read
+    // from its own MQTT topics this burst; `service()` injects them into the gateway's CfgTracker.
+    gw_own: &mut GwOwnCfg,
     // #33 HA Update entity: set true iff a retained `install` command is present for this
     // board (the native Install button) — the caller AND-gates the fetch on it.
     install_requested: &mut bool,
@@ -1565,9 +1599,10 @@ fn mqtt_session(
                             }
                         }
                     } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/led") {
-                        // #48 blue-LED mode: twin of the default_screen arm — cache a leaf's led
-                        // config under key `L` for the ESP-NOW relay. Verbatim bytes; the leaf's
-                        // LedMode::from_wire validates (unknown → keep current).
+                        // #48 blue-LED mode: twin of the default_screen arm. OTHER leaf → cache
+                        // under key `L` for the ESP-NOW relay; OUR OWN id → capture into gw_own so
+                        // `service()` self-applies it (the gateway reads its own led directly, not
+                        // relayed). Verbatim bytes; the leaf's LedMode::from_wire validates.
                         if leaf_id != node_id {
                             if let Some(cache) = cfg_cache.as_deref_mut() {
                                 let now = Instant::now().duration_since_epoch().as_millis();
@@ -1578,6 +1613,9 @@ fn mqtt_session(
                                     payload.len()
                                 );
                             }
+                        } else {
+                            gw_own.led = Some(GwOwnCfg::val(payload));
+                            log::info!("smol #48: gateway own led config captured ({} B)", payload.len());
                         }
                     } else if let Some(leaf_id) = parse_leaf_install_topic(topic) {
                         // #40 (§B3): a wildcard-delivered leaf OTA install command. On a
@@ -2047,6 +2085,8 @@ pub fn run_mqtt_burst(
     ota_offer: &mut Option<crate::ota::Announce>,
     // #21: filled with the parsed default-screen config for this board, if present.
     config_offer: &mut Option<crate::app::DefaultScreen>,
+    // #48 GwOwnCfg: the gateway's own keyed configs (led/…) — forwarded to `mqtt_session`.
+    gw_own: &mut GwOwnCfg,
     // #33: set true iff a retained OTA `install` command is present for this board.
     install_requested: &mut bool,
     // #40 #1: set true iff a retained leaf `install` (for another node) is seen this burst.
@@ -2246,6 +2286,7 @@ pub fn run_mqtt_burst(
         elect,
         ota_offer,
         config_offer,
+        gw_own, // #48: forward the gateway-own keyed-config capture
         install_requested,
         leaf_install_seen, // #40 #1: forward the leaf-install-seen latch
         peers, // #27: forward the caller's serialized roster to publish retained
