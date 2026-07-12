@@ -49,7 +49,11 @@ use smoltcp::{
 // -------------------------------------------------------------------------
 
 // Real values live in the git-ignored `crate::secrets` (repo is public).
-use crate::secrets::{WIFI_PASS as WIFI_PASSWORD, WIFI_SSID};
+// #100 Stage 1a: the single WiFi creds are now slot 0 of the dual-slot `WIFI_NETWORKS`. Kept as
+// these module consts (const-index [0]) so the assoc sites are unchanged and behaviour is identical
+// to the pre-#100 single-network build. Stage 1b threads the RUNTIME-selected slot (NVS `N`) here.
+const WIFI_SSID: &str = crate::secrets::WIFI_NETWORKS[0].ssid;
+const WIFI_PASSWORD: &str = crate::secrets::WIFI_NETWORKS[0].pass;
 
 /// NTP server IPv4. We hardcode an anycast IP so we need no DNS resolver in
 /// the smoltcp build. time.cloudflare.com's NTP anycast address:
@@ -60,15 +64,17 @@ const NTP_PORT: u16 = 123;
 /// Address/creds live in the git-ignored `crate::secrets` (retargetable one-liners —
 /// see the secrets comment for the VLAN11-leg rationale + the VLAN6 fallback). Built
 /// from the `[u8;4]` there so `secrets.rs` stays a plain imports-free consts file.
+// #100 Stage 1a: broker leg = slot 0's baked broker (const-index [0]); identical to pre-#100.
+// Stage 1b threads the runtime slot; Stage 2 adds the NVS broker override + CONNACK fallback.
 #[cfg(feature = "wifi")]
 const MQTT_BROKER_IP: Ipv4Addr = Ipv4Addr::new(
-    crate::secrets::MQTT_BROKER_IP[0],
-    crate::secrets::MQTT_BROKER_IP[1],
-    crate::secrets::MQTT_BROKER_IP[2],
-    crate::secrets::MQTT_BROKER_IP[3],
+    crate::secrets::WIFI_NETWORKS[0].broker_ip[0],
+    crate::secrets::WIFI_NETWORKS[0].broker_ip[1],
+    crate::secrets::WIFI_NETWORKS[0].broker_ip[2],
+    crate::secrets::WIFI_NETWORKS[0].broker_ip[3],
 );
 #[cfg(feature = "wifi")]
-const MQTT_BROKER_PORT: u16 = crate::secrets::MQTT_BROKER_PORT;
+const MQTT_BROKER_PORT: u16 = crate::secrets::WIFI_NETWORKS[0].broker_port;
 
 /// The retained downlink topic every node subscribes to for battery voltages, and
 /// the uplink topic template `smol/<id>/telemetry` — see `mqtt_session`.

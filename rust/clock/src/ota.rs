@@ -53,9 +53,10 @@ pub const OTA_AUTO_INSTALL: bool = false;
 
 /// Image-host allowlist (spec §4b-5): an announce whose URL host is not one of these
 /// is refused BEFORE any socket opens. The real LAN host(s) live in the GIT-IGNORED
-/// `crate::secrets` (this repo is PUBLIC — never commit a LAN IP), mirroring how
-/// `MQTT_BROKER_IP` is sourced. Rebuild to change the host. Gate logic is unchanged.
-pub const IMAGE_HOST_ALLOWLIST: &[&str] = crate::secrets::OTA_IMAGE_HOSTS;
+/// `crate::secrets` (this repo is PUBLIC — never commit a LAN IP). #100 Stage 1a: sourced
+/// from slot 0 of the dual-slot `WIFI_NETWORKS` (const-index [0]); identical to pre-#100.
+/// Stage 3 makes it the runtime-active slot's allowlist + an NVS CFG-`O` override.
+pub const IMAGE_HOST_ALLOWLIST: &[&str] = crate::secrets::WIFI_NETWORKS[0].ota_hosts;
 
 /// Max image = one app slot (`ota_0`/`ota_1` size from `partitions-ota.csv`). An
 /// announce larger than this is refused before any flash op; also cross-checked vs
