@@ -559,6 +559,13 @@ const ROSTER_CAP: usize = 16;
 /// Bench "recently seen" window — deliberately longer than the LED's
 /// `PEER_STALE_MS` (3 s) so a node lingers on the list ~30 s after going quiet.
 const ROSTER_STALE_MS: u64 = 30_000;
+/// #28: the ESP-NOW *hardware* peer-table cap. `ESP_NOW_MAX_TOTAL_PEER_NUM` = 20 on the
+/// ESP32-C3 (esp-wifi-sys), and it INCLUDES the broadcast peer. esp-wifi never auto-evicts and
+/// `add_peer` silently `Err`s once full — so without our own bound the table grows monotonically
+/// (every heard MAC is added, never removed) and the mesh ceilings at ~20 nodes: the 20th+ node's
+/// unicast (ACK / RELAYACK / OTAN) can never register. We LRU-evict before `add_peer` (see
+/// `ensure_peer`). Kept as `i32` to match `PeerCount::total_count` from esp-wifi.
+const ESP_NOW_PEER_CAP: i32 = 20;
 
 /// One tracked peer, keyed by MAC. `Copy` so the table lives in `.bss` (no heap).
 #[derive(Clone, Copy)]
@@ -603,6 +610,25 @@ impl Roster {
         for n in &self.nodes {
             if n.used && n.id_known && n.id == id {
                 return Some(n.mac);
+            }
+        }
+        None
+    }
+
+    /// #28: eviction value-key for a MAC — LOWER is LESS valuable (evicted first). Orders by
+    /// usability (`id_known` — a MAC we can't place in HA / can't relay to is worthless), then
+    /// liveness (`connected` = a fresh ACK within `PEER_STALE_MS`), then signal (`rssi`), then
+    /// age (`last_heard_ms`). `None` when the MAC isn't in the roster at all — i.e. a HW peer the
+    /// roster has already dropped (a ghost), which `ensure_peer` treats as the first to evict.
+    fn value_key_for_mac(&self, mac: [u8; 6], now: u64) -> Option<(bool, bool, i32, u64)> {
+        for n in &self.nodes {
+            if n.used && n.mac == mac {
+                return Some((
+                    n.id_known,
+                    PeerTracker::fresh(n.last_ack_ms, now),
+                    n.rssi,
+                    n.last_heard_ms,
+                ));
             }
         }
         None
@@ -2484,15 +2510,10 @@ impl RadioManager {
 
         // --- RELAY (ESP-NOW) — windowed-NAK to the ONE leaf MAC. ---
         let _ = self.switch(Mode::EspNow);
-        if !self.esp_now.peer_exists(&leaf_mac) {
-            let _ = self.esp_now.add_peer(PeerInfo {
-                interface: EspNowWifiInterface::Sta,
-                peer_address: leaf_mac,
-                lmk: None,
-                channel: None,
-                encrypt: false,
-            });
-        }
+        // #28: ensure the relay target is registered even when the HW peer table is full — evict
+        // the least-valuable peer to make room (never this target: it is both `adding` and the
+        // protected `leaf_ota_mac` sticky, nor the broadcast peer).
+        self.ensure_peer(leaf_mac, now_ms());
         // #3b: DEFENSIVE — (re)add the broadcast peer in the relay ESP-NOW context. Normal HELLOs
         // egress without an explicit broadcast peer, but this send follows a WiFi fetch
         // (WifiSta→switch(EspNow)) which may have perturbed the peer table / TX state; a missing
@@ -3164,16 +3185,8 @@ impl RadioManager {
                     // Roster (additive; never touches the LED): learn this peer's
                     // id (SNK frames carry it) + freshen heard/rssi.
                     self.roster.heard(src, Some(f.id), rssi, now);
-                    // Register the peer so any future unicast can reach it.
-                    if !self.esp_now.peer_exists(&src) {
-                        let _ = self.esp_now.add_peer(PeerInfo {
-                            interface: EspNowWifiInterface::Sta,
-                            peer_address: src,
-                            lmk: None,
-                            channel: None,
-                            encrypt: false,
-                        });
-                    }
+                    // Register the peer so any future unicast can reach it (#28: bounded LRU).
+                    self.ensure_peer(src, now);
                     // Buffer for `main` to drain into the game PeerTable; do NOT
                     // set `label` — the MeshSnake screen owns its own render.
                     self.snk.push(f);
@@ -3196,16 +3209,8 @@ impl RadioManager {
                         self.silent_until_relock = false;
                     }
 
-                    // Register the broadcaster so the ACK below can be unicast.
-                    if !self.esp_now.peer_exists(&src) {
-                        let _ = self.esp_now.add_peer(PeerInfo {
-                            interface: EspNowWifiInterface::Sta,
-                            peer_address: src,
-                            lmk: None,
-                            channel: None,
-                            encrypt: false,
-                        });
-                    }
+                    // Register the broadcaster so the ACK below can be unicast (#28: bounded LRU).
+                    self.ensure_peer(src, now);
 
                     // Reply "I heard you, <peer_id>" so the peer can confirm the
                     // link is two-way from its side.
@@ -3274,16 +3279,8 @@ impl RadioManager {
                         self.bench.last_rtt_ms = Some((now - sent) as u32);
                     }
 
-                    // Register the peer so future unicast (if any) can reach it.
-                    if !self.esp_now.peer_exists(&src) {
-                        let _ = self.esp_now.add_peer(PeerInfo {
-                            interface: EspNowWifiInterface::Sta,
-                            peer_address: src,
-                            lmk: None,
-                            channel: None,
-                            encrypt: false,
-                        });
-                    }
+                    // Register the peer so future unicast (if any) can reach it (#28: bounded LRU).
+                    self.ensure_peer(src, now);
                     label = Some(alloc::format!("bench seq {}", seq));
                 }
                 Some(Frame::Time { id, unix, synced_at }) => {
@@ -3317,17 +3314,9 @@ impl RadioManager {
                     if self.relay.is_gateway {
                         let (bitmap, complete) =
                             self.relay.accept(src, (src_id, msgid, frag, count), chunk, now);
-                        // Register the source so the RELAYACK can be unicast back
-                        // (same pattern as the HELLO -> ACK reply).
-                        if !self.esp_now.peer_exists(&src) {
-                            let _ = self.esp_now.add_peer(PeerInfo {
-                                interface: EspNowWifiInterface::Sta,
-                                peer_address: src,
-                                lmk: None,
-                                channel: None,
-                                encrypt: false,
-                            });
-                        }
+                        // Register the source so the RELAYACK can be unicast back (same pattern
+                        // as the HELLO -> ACK reply; #28: bounded LRU eviction when the table fills).
+                        self.ensure_peer(src, now);
                         let mut ack = [0u8; RELAYACK_FRAME_MAX];
                         let len = encode_relayack(msgid, bitmap, &mut ack);
                         self.send_to(&src, &ack[..len]);
@@ -3499,16 +3488,9 @@ impl RadioManager {
             if !self.relay.is_gateway {
                 self.scan_locked = true;
             }
-            // Register the gateway for the unicast OTAN back-channel (needed before the Nak send).
-            if !self.esp_now.peer_exists(&src) {
-                let _ = self.esp_now.add_peer(PeerInfo {
-                    interface: EspNowWifiInterface::Sta,
-                    peer_address: src,
-                    lmk: None,
-                    channel: None,
-                    encrypt: false,
-                });
-            }
+            // Register the gateway for the unicast OTAN back-channel (needed before the Nak send;
+            // #28: bounded LRU eviction when the table fills).
+            self.ensure_peer(src, now);
         }
         match action {
             LeafAction::Nak(n) => {
@@ -3564,6 +3546,68 @@ impl RadioManager {
                 .mac_for(id, now_ms(), crate::net::wifi::STAT_FRESH_MS)?;
         self.leaf_ota_mac = Some((id, mac));
         Some(mac)
+    }
+
+    /// #28: register `mac` as an ESP-NOW unicast peer, evicting the least-valuable existing peer
+    /// first when the HW table is full (`ESP_NOW_PEER_CAP`, which includes the broadcast peer).
+    /// This is the bound that stops the mesh ceilinging at ~20 nodes: esp-wifi has no auto-eviction
+    /// and `add_peer` silently `Err`s once full, so a large fleet's later joiners could otherwise
+    /// never be unicast (HELLO→ACK never latches `Connected`; a gateway's RELAYACK/OTAN never
+    /// lands). No-op if the peer already exists. Routed through by every unicast-reply add-peer site
+    /// (SNK / HELLO / BEACON / RELAY frames, the OTA back-channel, and the relay target).
+    fn ensure_peer(&self, mac: [u8; 6], now: u64) {
+        if self.esp_now.peer_exists(&mac) {
+            return;
+        }
+        // Evict the least-valuable peer(s) until under cap. Bounded: a `None` victim (everything
+        // left is protected) or a `remove_peer` error breaks out rather than spinning — leaving
+        // the final `add_peer` to `Err` exactly as it did before the fix (never worse than today).
+        while matches!(self.esp_now.peer_count(), Ok(c) if c.total_count >= ESP_NOW_PEER_CAP) {
+            let Some(victim) = self.peer_evict_victim(mac, now) else {
+                break;
+            };
+            if self.esp_now.remove_peer(&victim).is_err() {
+                break;
+            }
+        }
+        let _ = self.esp_now.add_peer(PeerInfo {
+            interface: EspNowWifiInterface::Sta,
+            peer_address: mac,
+            lmk: None,
+            channel: None,
+            encrypt: false,
+        });
+    }
+
+    /// #28: pick the least-valuable HW peer to evict. Walks the ESP-NOW peer list (`fetch_peer`
+    /// SKIPS broadcast/multicast, so only unicast peers are candidates) and ranks each by the
+    /// roster value-key, with a peer no longer in the roster (a ghost the roster already dropped)
+    /// sorted BELOW every live peer so it goes first. NEVER evicts the MAC we're about to add or
+    /// the active leaf-OTA relay target (`leaf_ota_mac` — its sticky MAC must survive the
+    /// mesh-deaf relay). `None` when nothing is evictable (all remaining peers are protected).
+    fn peer_evict_victim(&self, adding: [u8; 6], now: u64) -> Option<[u8; 6]> {
+        let protect = self.leaf_ota_mac.map(|(_, m)| m);
+        let mut victim: Option<[u8; 6]> = None;
+        let mut victim_rank: (bool, bool, bool, i32, u64) = (true, true, true, i32::MAX, u64::MAX);
+        let mut from_head = true;
+        while let Ok(p) = self.esp_now.fetch_peer(from_head) {
+            from_head = false;
+            let mac = p.peer_address;
+            if mac == adding || Some(mac) == protect {
+                continue;
+            }
+            // Rank = (is_live, id_known, connected, rssi, last_heard); LOWER = evict first. A ghost
+            // (not in the roster) is `is_live=false` → below any live peer regardless of the rest.
+            let rank = match self.roster.value_key_for_mac(mac, now) {
+                Some((idk, conn, rssi, heard)) => (true, idk, conn, rssi, heard),
+                None => (false, false, false, i32::MIN, 0),
+            };
+            if victim.is_none() || rank < victim_rank {
+                victim = Some(mac);
+                victim_rank = rank;
+            }
+        }
+        victim
     }
 
     /// #40 #3: the leaf's OTA RX-diag `(otam_heard, on_meta_verdict, otan_sent)` — `main`
