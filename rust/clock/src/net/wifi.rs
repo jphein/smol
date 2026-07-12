@@ -1603,13 +1603,13 @@ fn mqtt_session(
         // #52 remote reboot (pid 13): wildcard-subscribe the TRANSIENT `smol/+/cmd/reset` COMMAND
         // topic (retain:false → seen only while we're connected, never replayed). On receipt the
         // gateway fires a ONE-SHOT `<id>R` relay (never cached — anti-reboot-loop); own id → self.
-        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 13, b"smol/+/cmd/reset") {
+        if let Some(n) = crate::net::mqtt::encode_subscribe_qos1(&mut pkt, 13, b"smol/+/cmd/reset") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
         // #71 on-demand scan (pid 14): wildcard-subscribe the TRANSIENT `smol/+/cmd/scan` COMMAND
         // topic (retain:false). On receipt the gateway fires a ONE-SHOT `<id>W` relay (never cached
         // — a periodic scan is the coexist hazard); own id → self-scan. Twin of the pid-13 reset arm.
-        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 14, b"smol/+/cmd/scan") {
+        if let Some(n) = crate::net::mqtt::encode_subscribe_qos1(&mut pkt, 14, b"smol/+/cmd/scan") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
         // #45 Custom screen (pid 15): wildcard-subscribe every leaf's retained custom-screen layout
@@ -1884,9 +1884,9 @@ fn mqtt_session(
         iface.poll(smoltcp_now(), device, sockets);
         recv_into(sockets, tcp_handle, &mut acc[..], &mut acc_len);
         loop {
-            let consumed = match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
+            let (consumed, puback_id) = match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
                 None => break,
-                Some((crate::net::mqtt::Incoming::Publish { topic, payload }, consumed)) => {
+                Some((crate::net::mqtt::Incoming::Publish { topic, payload, packet_id }, consumed)) => {
                     // #26 cast: precompute the cast-topic match as a plain bool (avoids a
                     // block-in-`if`-condition; `false` in non-cast builds, where `cast_topic`
                     // does not exist, so the arm below is inert there).
@@ -2110,15 +2110,33 @@ fn mqtt_session(
                             log::info!("smol #40: leaf id{} OTA install command received", leaf_id);
                         }
                     }
-                    consumed
+                    // #101: a QoS1 command (cmd/reset / cmd/scan) carries a packet id → PUBACK it
+                    // below (after the acc compaction) so the broker drops the one-shot command.
+                    (consumed, packet_id)
                 }
-                Some((_, consumed)) => consumed,
+                Some((_, consumed)) => (consumed, None),
             };
             // #40 QUIET-PERIOD: a packet was parsed (the `None` arm broke above) → reset the
             // quiet timer so an in-flight retained burst keeps the drain alive.
             last_msg = Instant::now();
             acc.copy_within(consumed..acc_len, 0);
             acc_len -= consumed;
+            // #101: PUBACK a delivered QoS1 command so the broker drops it from our (now persistent)
+            // session — else it redelivers on every reconnect → reboot loop (the soft-brick the
+            // retain:false choice avoided). Sent AFTER the compaction so the `acc` borrow is
+            // released; reuses the same pkt/tcp_send/deadline/tick handles as the SUBSCRIBEs above.
+            // ACK-THEN-ACT egress guarantee (the crux): this PUBACK is pushed to the wire HERE
+            // (tcp_send + this loop's iface.poll), and the reset never fires in-handler — the only
+            // software_reset() is in main, AFTER flush_telemetry returns, i.e. AFTER the GRACEFUL
+            // DISCONNECT + `socket.close()` below (smoltcp close() = FIN with the TX buffer DRAINED,
+            // NOT abort()/RST that would discard a still-buffered PUBACK). Even an operator
+            // long-press abort BREAKS to that same clean DISCONNECT. So the ack always egresses
+            // before the post-flush reboot → the redelivery loop physically cannot occur.
+            if let Some(pid) = puback_id {
+                if let Some(n) = crate::net::mqtt::encode_puback(&mut pkt, pid) {
+                    let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                }
+            }
         }
         // #40 QUIET-PERIOD break: exit once the 3 downlink flags are in AND no new packet has
         // arrived for DOWNLINK_SETTLE. The retained backlog (staged/install/cfg) arrives as a
