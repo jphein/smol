@@ -1326,8 +1326,16 @@ fn mqtt_session(
     // where an absent retained MC made the loop wait to `deadline` and drain them
     // incidentally. Bounded → an ABSENT announce/config costs only the settle window,
     // never the full session budget.
-    const DOWNLINK_SETTLE: Duration = Duration::from_millis(300);
-    let mut settle_deadline: Option<Instant> = None;
+    // #40 QUIET-PERIOD (settle-break truncation fix): the drain must not exit until the retained
+    // backlog is COMPLETE. The batt/grid/mc "downlink complete" flags key on three RETAINED
+    // topics the broker delivers instantly on SUBACK, so a FIXED window from "3 flags complete"
+    // broke BEFORE the rest of the retained burst (staged/install/cfg) arrived → truncated them
+    // (armdiag staged_raw/install-caught/cfg_cache all none; the arm only fired on the rare burst
+    // ordering that front-loaded the OTA topics → the ~30-min "slow arm"). Fix: break only after
+    // the 3 flags AND a QUIET GAP — no new packet for DOWNLINK_SETTLE — so the drain rides out the
+    // whole retained burst regardless of order. `last_msg` resets on every parsed packet below.
+    const DOWNLINK_SETTLE: Duration = Duration::from_millis(400);
+    let mut last_msg: Instant = Instant::now();
     // #40: the RAW (ungated) staged announce + a leaf id whose retained install cmd is
     // present. Paired AFTER the drain (both are retained → arrive in the same broker burst)
     // → `*leaf_ota`. The staged is the caller-PERSISTED `staged_raw` (updated below when a
@@ -1448,19 +1456,20 @@ fn mqtt_session(
                 }
                 Some((_, consumed)) => consumed,
             };
+            // #40 QUIET-PERIOD: a packet was parsed (the `None` arm broke above) → reset the
+            // quiet timer so an in-flight retained burst keeps the drain alive.
+            last_msg = Instant::now();
             acc.copy_within(consumed..acc_len, 0);
             acc_len -= consumed;
         }
-        // Primary downlinks in → drain the bounded settle window (catches the retained
-        // OTA announce + config that arrive just after mc), then finish. If batt/grid/mc
-        // never all arrive (e.g. absent MC at boot), fall through to the `deadline` break
-        // — which still drains ota/config during the wait (the original boot behaviour).
-        if got_batt && got_grid && got_mc {
-            match settle_deadline {
-                None => settle_deadline = Some(Instant::now() + DOWNLINK_SETTLE),
-                Some(sd) if Instant::now() > sd => break,
-                _ => {}
-            }
+        // #40 QUIET-PERIOD break: exit once the 3 downlink flags are in AND no new packet has
+        // arrived for DOWNLINK_SETTLE. The retained backlog (staged/install/cfg) arrives as a
+        // contiguous SUBACK burst, so a quiet gap means it's fully drained — order-independent,
+        // unlike the old fixed window that truncated a late-arriving OTA topic. If batt/grid/mc
+        // never all arrive (e.g. absent MC at boot), fall through to the `deadline` break — which
+        // still drains ota/config during the wait (the original boot behaviour).
+        if got_batt && got_grid && got_mc && Instant::now() >= last_msg + DOWNLINK_SETTLE {
+            break;
         }
         if Instant::now() > deadline {
             log::info!("smol: MQTT downlink(s) not all received in budget (keeping cache)");
