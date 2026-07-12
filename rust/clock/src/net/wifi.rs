@@ -234,17 +234,18 @@ fn parse_mesh_channel(payload: &[u8]) -> Option<(u8, u8, u32)> {
     Some((owner, ch, seq))
 }
 
-/// #21 leaf-relay: extract the leaf id `N` from a `smol/<N>/config/default_screen`
-/// topic (the shape the wildcard subscribe delivers). Total/panic-free: fixed
-/// prefix + exact suffix match + 1–3 ASCII-digit parse clamped to u8; anything else
-/// → `None`. The topic is broker-supplied, so parse defensively (not just trust the
-/// subscribe filter).
+/// #21/#48/#55 leaf-relay: extract the leaf id `N` from a `smol/<N><suffix>` topic (the shape
+/// the wildcard subscribe delivers), IFF the tail matches `suffix` (e.g. `/config/default_screen`,
+/// `/config/led`, `/config/plugins`). Total/panic-free: fixed prefix + exact suffix match + 1–3
+/// ASCII-digit parse clamped to u8; anything else → `None`. The topic is broker-supplied, so
+/// parse defensively (not just trust the subscribe filter). One helper serves every per-node
+/// config key so a new key = one call site, not a new parser.
 #[cfg(feature = "wifi")]
-fn parse_leaf_config_topic(topic: &[u8]) -> Option<u8> {
+fn parse_leaf_config_topic(topic: &[u8], suffix: &[u8]) -> Option<u8> {
     let rest = topic.strip_prefix(b"smol/")?;
     let slash = rest.iter().position(|&b| b == b'/')?;
     let (idb, tail) = rest.split_at(slash);
-    if tail != b"/config/default_screen" {
+    if tail != suffix {
         return None;
     }
     if idb.is_empty() || idb.len() > 3 {
@@ -565,6 +566,8 @@ pub fn run_ntp_burst(
     let mqtt_deadline = Instant::now() + MQTT_SESSION_BUDGET;
     let mqtt_port = 49152 + (rng.random() % 16384) as u16;
     let mut _leaf_seen_boot = false; // #40 #1: boot burst is not a gateway relay → never set
+    let mut _ntp_gw_own = GwOwnCfg::new(); // #48: boot/NTP burst never captures gateway-own cfg (cfg_cache=None)
+    let mut _ntp_reset_req = ResetReq::new(); // #52: boot/NTP burst subscribes no cmd/reset (cfg_cache=None)
     let _ = mqtt_session(
         &mut iface,
         device,
@@ -578,6 +581,8 @@ pub fn run_ntp_burst(
         elect,
         ota_offer,
         config_offer,
+        &mut _ntp_gw_own,
+        &mut _ntp_reset_req,
         install_requested,
         &mut _leaf_seen_boot, // #40 #1: boot burst sees no leaf installs
         &[], // #27: boot NTP+downlink burst publishes no peers (no roster yet)
@@ -784,6 +789,132 @@ pub const CFG_VALUE_MAX: usize = 16;
 /// ESP-NOW frame layer that RELAYS/parses it (espnow) both name it with no per-profile cfg.
 #[cfg(feature = "wifi")]
 pub const CFG_KEY_SCREEN: u8 = b'S';
+/// #48 blue-LED mode channel (`status`/`on`/`off`). Per-node retained `smol/<id>/config/led`.
+/// (#43/#55/#52 add their keys `U`/`P`/`R` + the `CFG_TARGET_ALL` global-units target here as
+/// each feature lands, so the const stays used — no dead_code in the interim.)
+#[cfg(feature = "wifi")]
+pub const CFG_KEY_LED: u8 = b'L';
+/// #43 display-units channel (`<F|C>|<24|12>`). GLOBAL, not per-node: the retained topic is
+/// `smol/config/units` (no id). The gateway caches it under the broadcast target
+/// [`CFG_TARGET_ALL`] so ONE `SMOLv1 CFG <255>U<val>` frame reaches every leaf.
+#[cfg(feature = "wifi")]
+pub const CFG_KEY_UNITS: u8 = b'U';
+/// #43 broadcast TARGET sentinel for a fleet-global CFG frame. No node ever holds id 255
+/// (ids are 1..=254 by convention), so it can't collide with a real per-node target. A leaf
+/// applies a CFG frame whose target is its own id OR this sentinel (mode.rs `service()` CFG
+/// arm); the gateway caches global configs under `(255, key)` and relays them to all leaves.
+#[cfg(feature = "wifi")]
+pub const CFG_TARGET_ALL: u8 = 255;
+/// #55 plugin-visibility channel (ASCII-hex u16 mask, e.g. `007F`). Per-node retained
+/// `smol/<id>/config/plugins`. Bit i (see `app::plugin_bit`) set = that app is shown in the
+/// Home menu; a leaf gets it relayed (key `P`), the gateway reads its own directly.
+#[cfg(feature = "wifi")]
+pub const CFG_KEY_PLUGINS: u8 = b'P';
+/// #52 remote-reboot COMMAND (key `R`). Rides the CFG WIRE (`SMOLv1 CFG <id>R`) and IS in
+/// `CFG_APPLY_KEYS` (a leaf buffers + applies it) — but is NEVER cached / rebroadcast: a
+/// cached reboot = a permanent ~10 s reboot-loop soft-brick. The gateway subscribes the
+/// TRANSIENT `smol/<id>/cmd/reset` (retain:false) and fires a ONE-SHOT `<id>R` frame on
+/// receipt only (own id → self-reboot). The leaf applies it once, with a boot-debounce.
+// allow(dead_code): unlike S/L/U/P, the reboot key is NEVER named in a wifi-tier fill arm — R is
+// cache-BYPASS (the #52 anti-reboot-loop rule), so the `/cmd/reset` arm captures into `ResetReq`
+// WITHOUT a `cache.set(.., R, ..)`. It's referenced only on espnow (mode.rs CFG_APPLY_KEYS + the
+// one-shot drain, main's apply, the net re-export), so a wifi-only build sees it unused. Keeping it
+// in the wifi-tier CFG-key family (beside S/L/U/P) reads clearer than cfg(espnow)-gating one key.
+#[cfg(feature = "wifi")]
+#[allow(dead_code)]
+pub const CFG_KEY_REBOOT: u8 = b'R';
+
+/// #48 (GwOwnCfg — approved arch): the GATEWAY's OWN per-node configs read from its own MQTT
+/// topics this burst. A leaf gets these RELAYED (→ its `CfgTracker`); the gateway reads them
+/// DIRECTLY. Bundled into ONE `run_mqtt_burst`/`mqtt_session` out-param (net +1, not +N) — after
+/// the burst `service()` injects each present value into the gateway's OWN (otherwise-idle)
+/// `CfgTracker`, so `main`'s `take_cfg_offer(key)` applies it on the EXACT same path as a leaf's
+/// relayed config (a node is gateway XOR leaf → the one tracker has a single feeder). Screen stays
+/// on its own `config_offer` path (untouched). #43/#55 add `units`/`plugins` fields as they land.
+#[cfg(feature = "wifi")]
+#[derive(Clone, Copy)]
+// The fields are READ only on espnow (mode.rs gateway flush injects them into the CfgTracker);
+// a wifi-only build FILLS them in mqtt_session but has no RadioManager to read them back, so they
+// are write-only there → allow(dead_code) keeps the `-D warnings` clippy gate green in BOTH
+// configs (same cross-profile rationale as CfgCache above).
+#[allow(dead_code)]
+pub struct GwOwnCfg {
+    /// The gateway's own `smol/<id>/config/led` value `(buf, len)`, or `None` if absent this burst.
+    pub led: Option<([u8; CFG_VALUE_MAX], usize)>,
+    /// #43 the GLOBAL `smol/config/units` value `(buf, len)`, or `None` if absent this burst.
+    /// The gateway applies its own display units directly (it also relays them to leaves under
+    /// the broadcast target); captured here so `service()` self-applies via the same path.
+    pub units: Option<([u8; CFG_VALUE_MAX], usize)>,
+    /// #55 the gateway's own `smol/<id>/config/plugins` value `(buf, len)`, or `None` if absent.
+    pub plugins: Option<([u8; CFG_VALUE_MAX], usize)>,
+}
+
+#[cfg(feature = "wifi")]
+impl GwOwnCfg {
+    pub const fn new() -> Self {
+        Self { led: None, units: None, plugins: None }
+    }
+    /// Pack a payload into the `(buf, len)` a field holds (truncated to `CFG_VALUE_MAX`), so the
+    /// mqtt-drain arms stay one-liners: `gw_own.led = Some(GwOwnCfg::val(payload));`.
+    pub fn val(value: &[u8]) -> ([u8; CFG_VALUE_MAX], usize) {
+        let mut b = [0u8; CFG_VALUE_MAX];
+        let n = value.len().min(CFG_VALUE_MAX);
+        b[..n].copy_from_slice(&value[..n]);
+        (b, n)
+    }
+}
+
+/// #52 how many distinct leaf reboot targets one burst can queue. A reset is TRANSIENT +
+/// re-pressable, so a full queue just drops extras (the user re-presses) — no soft state lost.
+#[cfg(feature = "wifi")]
+pub const RESET_REQ_MAX: usize = 8;
+
+/// #52 remote-reboot capture — the reset COMMANDS seen on the TRANSIENT `smol/+/cmd/reset` topics
+/// this burst. NOT a config: NEVER cached / rebroadcast (a cached reboot = a permanent ~10 s
+/// reboot-loop soft-brick). Bundled into ONE `mqtt_session`/`run_mqtt_burst` out-param (like
+/// `GwOwnCfg`). After the burst, `service()` fires a ONE-SHOT `broadcast_config(id, R, "")` per
+/// leaf target (direct ESP-NOW, bypassing `cfg_cache`) and injects R into its OWN `CfgTracker`
+/// if `own` — so `main`'s `take_cfg_offer(R)` self-reboots on the SAME boot-debounced path as a
+/// leaf. `#[allow(dead_code)]`: read only on espnow (mode.rs), write-only on a wifi-only build.
+#[cfg(feature = "wifi")]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct ResetReq {
+    targets: [u8; RESET_REQ_MAX],
+    n: usize,
+    own: bool,
+}
+
+#[cfg(feature = "wifi")]
+#[allow(dead_code)]
+impl ResetReq {
+    pub const fn new() -> Self {
+        Self { targets: [0; RESET_REQ_MAX], n: 0, own: false }
+    }
+    /// Queue a leaf id for a one-shot reboot relay (deduped; dropped if full — re-pressable).
+    pub fn push_leaf(&mut self, id: u8) {
+        for i in 0..self.n {
+            if self.targets[i] == id {
+                return;
+            }
+        }
+        if self.n < RESET_REQ_MAX {
+            self.targets[self.n] = id;
+            self.n += 1;
+        }
+    }
+    /// Mark that THIS node's own `cmd/reset` fired this burst → self-reboot after the burst.
+    pub fn set_own(&mut self) {
+        self.own = true;
+    }
+    pub fn own(&self) -> bool {
+        self.own
+    }
+    /// The queued leaf reboot targets (to relay one-shot; NEVER cached).
+    pub fn targets(&self) -> &[u8] {
+        &self.targets[..self.n]
+    }
+}
 
 /// #40 #3: one relay attempt's diagnostic snapshot — gateway-side RX evidence PLUS the leaf's
 /// self-reported OTA state (captured from its `LDBG` beacon during the relay). Published to
@@ -1042,6 +1173,13 @@ fn mqtt_session(
     // #21 node-manager: filled with the parsed retained default-screen command for
     // this board (Set/Clear), if present + valid; None = absent/invalid (keep current).
     config_offer: &mut Option<crate::app::DefaultScreen>,
+    // #48 GwOwnCfg: filled with the GATEWAY's OWN keyed configs (led, +units/plugins later) read
+    // from its own MQTT topics this burst; `service()` injects them into the gateway's CfgTracker.
+    gw_own: &mut GwOwnCfg,
+    // #52 remote reboot: filled with the reset COMMANDS seen on the transient `smol/+/cmd/reset`
+    // topics this burst; `service()` fires a one-shot `<id>R` relay per target (NEVER cached) +
+    // self-reboots if own. Separate from `gw_own` because R is a COMMAND, not a cached config.
+    reset_req: &mut ResetReq,
     // #33 HA Update entity: set true iff a retained `install` command is present for this
     // board (the native Install button) — the caller AND-gates the fetch on it.
     install_requested: &mut bool,
@@ -1243,6 +1381,29 @@ fn mqtt_session(
         // staged image over ESP-NOW. The board's OWN install still arrives via `cmd_topic`
         // (pid 7) → self-OTA; the wildcard feeds ONLY other leaf ids.
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 9, b"smol/+/ota/install") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        // #48 blue-LED mode (pid 10): wildcard-subscribe every leaf's retained led config so the
+        // gateway caches + relays it (key `L`) over ESP-NOW, twin of the default_screen wildcard.
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 10, b"smol/+/config/led") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        // #43 display units (pid 11): the GLOBAL retained units topic `smol/config/units` (NO id
+        // — one setting for the whole fleet, so NOT a `smol/+/…` wildcard). The gateway caches it
+        // under the broadcast target CFG_TARGET_ALL (255) so ONE relayed `<255>U<val>` frame
+        // reaches every leaf, and self-applies its own display units (gw_own.units) below.
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 11, b"smol/config/units") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        // #55 plugin visibility (pid 12): wildcard-subscribe every leaf's retained plugin mask so
+        // the gateway caches + relays it (key `P`) over ESP-NOW, twin of the led wildcard.
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 12, b"smol/+/config/plugins") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        // #52 remote reboot (pid 13): wildcard-subscribe the TRANSIENT `smol/+/cmd/reset` COMMAND
+        // topic (retain:false → seen only while we're connected, never replayed). On receipt the
+        // gateway fires a ONE-SHOT `<id>R` relay (never cached — anti-reboot-loop); own id → self.
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 13, b"smol/+/cmd/reset") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
     }
@@ -1531,7 +1692,7 @@ fn mqtt_session(
                             crate::net::cast::set_enabled(on);
                             log::info!("smol #26: cast {}", if on { "ENABLED" } else { "disabled" });
                         }
-                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic) {
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/default_screen") {
                         // #21 leaf-relay: a wildcard-delivered OTHER leaf's config. Cache
                         // the verbatim value bytes for the ESP-NOW relay (mode.rs
                         // broadcast_cached_configs). `leaf_id == node_id` is the gateway's
@@ -1552,6 +1713,75 @@ fn mqtt_session(
                                     payload.len()
                                 );
                             }
+                        }
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/led") {
+                        // #48 blue-LED mode: twin of the default_screen arm. OTHER leaf → cache
+                        // under key `L` for the ESP-NOW relay; OUR OWN id → capture into gw_own so
+                        // `service()` self-applies it (the gateway reads its own led directly, not
+                        // relayed). Verbatim bytes; the leaf's LedMode::from_wire validates.
+                        if leaf_id != node_id {
+                            if let Some(cache) = cfg_cache.as_deref_mut() {
+                                let now = Instant::now().duration_since_epoch().as_millis();
+                                cache.set(leaf_id, CFG_KEY_LED, payload, [0u8; 6], now);
+                                log::info!(
+                                    "smol #48: cached leaf id{} led config for relay ({} B)",
+                                    leaf_id,
+                                    payload.len()
+                                );
+                            }
+                        } else {
+                            gw_own.led = Some(GwOwnCfg::val(payload));
+                            log::info!("smol #48: gateway own led config captured ({} B)", payload.len());
+                        }
+                    } else if topic == b"smol/config/units" {
+                        // #43 display units — GLOBAL (no id in the topic → an exact match, not the
+                        // `smol/<id>/…` wildcard parse). TWO effects, mirroring the own-led branch
+                        // above but fleet-wide: (1) cache under the broadcast target CFG_TARGET_ALL
+                        // so ONE relayed `<255>U<val>` frame reaches every leaf; (2) capture into
+                        // gw_own so `service()` self-applies the gateway's OWN display units. The
+                        // bytes are opaque here — the leaf's `Units::from_wire` validates them
+                        // (garbage/partial → keep current, #46 clamp).
+                        if let Some(cache) = cfg_cache.as_deref_mut() {
+                            let now = Instant::now().duration_since_epoch().as_millis();
+                            cache.set(CFG_TARGET_ALL, CFG_KEY_UNITS, payload, [0u8; 6], now);
+                        }
+                        gw_own.units = Some(GwOwnCfg::val(payload));
+                        log::info!(
+                            "smol #43: global display units captured ({} B) — cached (255,U) + self",
+                            payload.len()
+                        );
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/plugins") {
+                        // #55 plugin visibility: twin of the led arm. OTHER leaf → cache under key
+                        // `P` for the ESP-NOW relay; OUR OWN id → capture into gw_own so `service()`
+                        // self-applies it. Verbatim bytes; the leaf's `parse_plugin_mask` validates
+                        // (bad/partial hex → keep current mask, never a blank menu).
+                        if leaf_id != node_id {
+                            if let Some(cache) = cfg_cache.as_deref_mut() {
+                                let now = Instant::now().duration_since_epoch().as_millis();
+                                cache.set(leaf_id, CFG_KEY_PLUGINS, payload, [0u8; 6], now);
+                                log::info!(
+                                    "smol #55: cached leaf id{} plugin mask for relay ({} B)",
+                                    leaf_id,
+                                    payload.len()
+                                );
+                            }
+                        } else {
+                            gw_own.plugins = Some(GwOwnCfg::val(payload));
+                            log::info!("smol #55: gateway own plugin mask captured ({} B)", payload.len());
+                        }
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/cmd/reset") {
+                        // #52 remote reboot — a COMMAND on a TRANSIENT topic (retain:false), so we
+                        // only see it when HA publishes DURING this session. NEVER cache it (a
+                        // cached/rebroadcast reboot = a permanent ~10 s reboot-loop soft-brick):
+                        // capture into `reset_req` for a ONE-SHOT relay after the burst. The topic
+                        // IS the command — any payload (incl. empty) triggers. OWN id → self-reboot
+                        // (routed through our CfgTracker below → the boot-debounced apply in main).
+                        if leaf_id == node_id {
+                            reset_req.set_own();
+                            log::info!("smol #52: OWN reset command — self-reboot after burst");
+                        } else {
+                            reset_req.push_leaf(leaf_id);
+                            log::info!("smol #52: leaf id{} reset command — one-shot relay queued", leaf_id);
                         }
                     } else if let Some(leaf_id) = parse_leaf_install_topic(topic) {
                         // #40 (§B3): a wildcard-delivered leaf OTA install command. On a
@@ -1892,7 +2122,11 @@ fn mqtt_session(
         let mut djson = MqttScratch::new();
         let _ = write!(
             djson,
-            "{{\"~\":\"smol/{}/ota\",\"stat_t\":\"~/state\",\"cmd_t\":\"~/install\",\"pl_inst\":\"INSTALL\",\"dev_cla\":\"firmware\",\"name\":\"Update\",\"has_entity_name\":true,\"uniq_id\":\"smol{}_update\",\"object_id\":\"smol_{}_update\",\"dev\":{{\"ids\":[\"smol{}\"]}}}}",
+            // #39: `retain:true` → HA publishes update.install (native tile + Lovelace update-action)
+            // to cmd_t RETAINED, so the node catches it on its next ~2 s burst (the fw acts ONLY on a
+            // retained install; a non-retained one is missed between bursts). Unifies Install into the
+            // native Update tile and lets the HA-side retained install buttons retire.
+            "{{\"~\":\"smol/{}/ota\",\"stat_t\":\"~/state\",\"cmd_t\":\"~/install\",\"pl_inst\":\"INSTALL\",\"retain\":true,\"dev_cla\":\"firmware\",\"name\":\"Update\",\"has_entity_name\":true,\"uniq_id\":\"smol{}_update\",\"object_id\":\"smol_{}_update\",\"dev\":{{\"ids\":[\"smol{}\"]}}}}",
             node_id, node_id, node_id, node_id
         );
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), djson.as_bytes(), true) {
@@ -1946,7 +2180,10 @@ fn mqtt_session(
             let mut djson = MqttScratch::new();
             let _ = write!(
                 djson,
-                "{{\"~\":\"smol/{}/ota\",\"stat_t\":\"~/state\",\"cmd_t\":\"~/install\",\"pl_inst\":\"INSTALL\",\"dev_cla\":\"firmware\",\"name\":\"Update\",\"has_entity_name\":true,\"uniq_id\":\"smol{}_update\",\"object_id\":\"smol_{}_update\",\"dev\":{{\"ids\":[\"smol{}\"],\"name\":\"smol {} {}\"}}}}",
+                // #39: `retain:true` (see the gateway's own Update above) — HA publishes the leaf's
+                // install retained → the gateway wildcard-subs it + relays (§B3), so the native tile
+                // Install works for relayed leaves too, not just the retained HA-side buttons.
+                "{{\"~\":\"smol/{}/ota\",\"stat_t\":\"~/state\",\"cmd_t\":\"~/install\",\"pl_inst\":\"INSTALL\",\"retain\":true,\"dev_cla\":\"firmware\",\"name\":\"Update\",\"has_entity_name\":true,\"uniq_id\":\"smol{}_update\",\"object_id\":\"smol_{}_update\",\"dev\":{{\"ids\":[\"smol{}\"],\"name\":\"smol {} {}\"}}}}",
                 lid, lid, lid, lid, lid, noun
             );
             if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), djson.as_bytes(), true) {
@@ -2014,6 +2251,10 @@ pub fn run_mqtt_burst(
     ota_offer: &mut Option<crate::ota::Announce>,
     // #21: filled with the parsed default-screen config for this board, if present.
     config_offer: &mut Option<crate::app::DefaultScreen>,
+    // #48 GwOwnCfg: the gateway's own keyed configs (led/…) — forwarded to `mqtt_session`.
+    gw_own: &mut GwOwnCfg,
+    // #52 remote reboot: reset commands seen this burst — forwarded to `mqtt_session`.
+    reset_req: &mut ResetReq,
     // #33: set true iff a retained OTA `install` command is present for this board.
     install_requested: &mut bool,
     // #40 #1: set true iff a retained leaf `install` (for another node) is seen this burst.
@@ -2213,6 +2454,8 @@ pub fn run_mqtt_burst(
         elect,
         ota_offer,
         config_offer,
+        gw_own, // #48: forward the gateway-own keyed-config capture
+        reset_req, // #52: forward the remote-reboot command capture
         install_requested,
         leaf_install_seen, // #40 #1: forward the leaf-install-seen latch
         peers, // #27: forward the caller's serialized roster to publish retained

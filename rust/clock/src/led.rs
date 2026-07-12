@@ -85,6 +85,35 @@ impl LedState {
     }
 }
 
+/// #48 dashboard LED control — the per-node MODE that gates the auto-driven [`LedState`]
+/// indicator. `Status` (default) keeps the ESP-NOW peer-state machine (backward-compatible);
+/// `On`/`Off` force the LED solid/dark regardless of link state. Relayed to leaves over the
+/// keyed CFG channel (key `L`); the gateway reads its own `smol/<id>/config/led`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LedMode {
+    /// Auto-drive from the peer-state machine — the pre-#48 behavior. Default.
+    #[default]
+    Status,
+    /// Force the LED solid ON, ignoring link state.
+    On,
+    /// Force the LED dark, ignoring link state.
+    Off,
+}
+
+impl LedMode {
+    /// Parse a `smol/<id>/config/led` payload (`status`/`on`/`off`, case-sensitive to match
+    /// the HA input_select options). Unknown/garbage → `None` (caller keeps the current mode;
+    /// this is an untrusted retained/relayed value, so never panic — #46 clamp discipline).
+    pub fn from_wire(s: &str) -> Option<LedMode> {
+        match s.trim() {
+            "status" => Some(LedMode::Status),
+            "on" => Some(LedMode::On),
+            "off" => Some(LedMode::Off),
+            _ => None,
+        }
+    }
+}
+
 /// Square-wave phase: true for the first half-period, false for the second.
 #[inline]
 fn blink_phase(now_ms: u64, half_ms: u64) -> bool {
@@ -133,6 +162,18 @@ impl Led {
     /// sets the pin level. Idempotent for a given (state, now) pair.
     pub fn apply(&mut self, state: LedState, now_ms: u64) {
         let lit = state.is_lit(now_ms);
+        self.pin.set_level(Self::level_for(lit));
+    }
+
+    /// #48: drive the LED honoring the dashboard [`LedMode`]. `Status` defers to the auto
+    /// `state` (identical to [`Led::apply`]); `On`/`Off` force lit/dark. Same cheap
+    /// per-sub-tick contract as `apply`.
+    pub fn apply_mode(&mut self, mode: LedMode, state: LedState, now_ms: u64) {
+        let lit = match mode {
+            LedMode::Status => state.is_lit(now_ms),
+            LedMode::On => true,
+            LedMode::Off => false,
+        };
         self.pin.set_level(Self::level_for(lit));
     }
 }

@@ -111,6 +111,10 @@ mod snake;
 mod mesh_snake;
 // On-board sensors: chip die-temp (tsens) + battery ADC on GPIO4. Always on.
 mod sensors;
+// #43 display units (°F/°C · 12h/24h): the fleet-global `Units` config + wire parse.
+// Always compiled — the CLOCK screen (universal) renders through it; only espnow nodes
+// receive a config (the relay/apply path is radio-only, like the screen/LED channels).
+mod units;
 // HA battery-voltage screen (Batt): the display-only Plugin + its `BattCache`,
 // filled by the WiFi burst's MQTT downlink (SUBSCRIBE `smol/display/batt`; see
 // net/wifi.rs) — the fetch needs the radio (espnow ⊃ wifi); default build omits it.
@@ -220,6 +224,15 @@ const FLUSH_IDLE_MS: u64 = 3_000;
 /// so telemetry can't starve under continuous interaction.
 #[cfg(feature = "espnow")]
 const FLUSH_DEFER_CAP_MS: u64 = 120_000;
+
+/// #52 remote-reboot boot-debounce: IGNORE (but consume) a reboot command (`take_cfg_offer(R)`)
+/// received within this window of boot. `millis()` is monotonic-since-boot, so the loop's `now`
+/// IS the uptime. Belt-and-suspenders against a reboot-loop soft-brick — the transient +
+/// cache-bypass design already prevents a cached reboot, but a one-shot R landing right as a leaf
+/// boots (e.g. a re-press racing the boot) would otherwise reset it before it stabilises. A
+/// genuinely-wanted reboot in the first ~10 s is just re-pressed once the node is up.
+#[cfg(feature = "espnow")]
+const REBOOT_DEBOUNCE_MS: u64 = 10_000;
 
 /// OLED panel rotation. The pocket-watch case hangs from the USB-C end, so the
 /// display is physically upside-down and must be rotated 180° to read upright.
@@ -549,6 +562,24 @@ fn main() -> ! {
     // Phase 3: LED-state trace bookkeeping (LED stays a `main` concern).
     #[cfg(feature = "espnow")]
     let mut last_led_state: Option<led::LedState> = None;
+    // #48: dashboard LED mode (status/on/off). Held across the loop; updated from the relayed
+    // `smol/<id>/config/led` (key `L`). Default `Status` = the pre-#48 peer-state indicator.
+    #[cfg(feature = "espnow")]
+    let mut led_mode = led::LedMode::default();
+
+    // #43 display units (°F/°C · 12h/24h), fleet-global. Held across the loop; on espnow the
+    // relayed / gateway-own `smol/config/units` (key `U`, broadcast target 255) updates it.
+    // On a non-espnow build there's no relay path, so it stays the default — the render (CLOCK
+    // screen, universal) just reads it. `mut` is used only under espnow (the apply block below).
+    #[allow(unused_mut)]
+    let mut units = units::Units::default();
+
+    // #55 plugin-visibility mask (bit = shown; see `app::plugin_bit`). `0` = keep all — the
+    // default AND the non-espnow value (the relay/apply path is radio-only). Held across the
+    // loop; on espnow the relayed / gateway-own `smol/<id>/config/plugins` updates it. Read by
+    // the Home menu to filter rows; `mut` is used only under espnow (the apply block below).
+    #[allow(unused_mut)]
+    let mut plugin_mask: u16 = 0;
 
     // #20 (1a): last BOOT-button activity + the current flush-deferral start, to
     // postpone a recurring flush while the user is interacting (capped).
@@ -828,7 +859,10 @@ fn main() -> ! {
                 let reading = sensors.read();
                 let tele = alloc::format!(
                     "{} {}",
-                    sensors::format_sensor_line(&reading).as_str(),
+                    // #43: telemetry/uplink keeps the CANONICAL °F wire format regardless of the
+                    // display units — HA parses this data channel; the units config is a
+                    // display-only (#43 scope) concern for the physical OLED.
+                    sensors::format_sensor_line(&reading, true).as_str(),
                     bottom_line.as_str()
                 );
                 r.relay_emit(tele.as_bytes(), now);
@@ -852,7 +886,9 @@ fn main() -> ! {
                     let reading = sensors.read();
                     let own = alloc::format!(
                         "{} {}",
-                        sensors::format_sensor_line(&reading).as_str(),
+                        // #43: uplink keeps the canonical °F wire format (see the relay_emit
+                        // site above) — display units never reshape a data channel.
+                        sensors::format_sensor_line(&reading, true).as_str(),
                         bottom_line.as_str()
                     );
                     // #50: the LIVE screen:page the render loop draws NOW — read from the
@@ -963,12 +999,67 @@ fn main() -> ! {
                 flush_defer_since_ms = 0;
             }
 
+            // #48: pull the relayed LED-mode config (leaf) and update the held mode. Edge-safe:
+            // a garbage/unknown value parses to None → keep the current mode (never a bad LED).
+            // On the gateway, its OWN led config is applied via the gateway-own path (deferred).
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_LED) {
+                if let Some(m) = led::LedMode::from_wire(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
+                    if m != led_mode {
+                        log::info!("smol #48: LED mode -> {:?}", m);
+                    }
+                    led_mode = m;
+                }
+            }
+
+            // #43: pull the relayed/gateway-own display-units config (key `U`, fleet-global via
+            // broadcast target 255) and update the held `Units`. Edge-safe: a garbage/partial
+            // value parses to None → keep the current units (never a half-applied unit). Same
+            // unified path as LED: a leaf gets it relayed, the gateway injects its own (GwOwnCfg).
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_UNITS) {
+                if let Some(u) = units::Units::from_wire(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
+                    if u != units {
+                        log::info!("smol #43: display units -> {:?}", u);
+                    }
+                    units = u;
+                }
+            }
+
+            // #55: pull the relayed/gateway-own plugin-visibility mask (key `P`) and update it.
+            // Edge-safe: garbage/partial hex parses to None → keep the current mask (never blanks
+            // the menu). The mask filters Home-menu rows; a masked-off LIVE screen is caught after
+            // `ctx` is built (below) and falls back to the board default.
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_PLUGINS) {
+                if let Some(m) = menu::parse_plugin_mask(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
+                    if m != plugin_mask {
+                        log::info!("smol #55: plugin mask -> {:#06x}", m);
+                    }
+                    plugin_mask = m;
+                }
+            }
+
+            // #52: a remote reboot command (key `R`) — a COMMAND (cache-bypass, one-shot). Applied
+            // once (edge — `take` clears it); the value is empty (the key IS the command). Feeds
+            // BOTH a leaf (relayed `<id>R`) and the gateway's OWN reset (injected into `self.cfg`),
+            // so both self-reboot on this one debounced path. BOOT-DEBOUNCE: within
+            // REBOOT_DEBOUNCE_MS of boot, CONSUME but IGNORE it (never a reboot-loop soft-brick);
+            // `now` is millis()-since-boot = uptime. `software_reset()` never returns.
+            if r.take_cfg_offer(crate::net::CFG_KEY_REBOOT).is_some() {
+                if now >= REBOOT_DEBOUNCE_MS {
+                    log::warn!("smol #52: remote reboot commanded — software_reset()");
+                    esp_hal::system::software_reset();
+                } else {
+                    log::info!(
+                        "smol #52: reboot ignored — within {} ms of boot (debounce)",
+                        REBOOT_DEBOUNCE_MS
+                    );
+                }
+            }
             let state = r.peer_led_state(now);
             if last_led_state != Some(state) {
                 log::info!("smol: LED -> {:?}", state);
                 last_led_state = Some(state);
             }
-            led.apply(state, now);
+            led.apply_mode(led_mode, state, now);
         }
 
         // === FPS accounting (espnow / BENCH): count every loop iteration.
@@ -1016,6 +1107,10 @@ fn main() -> ! {
             unix_now,
             node_id: node_id(),
             redraw,
+            // #43 fleet-global display units (°F/°C · 12h/24h) — read by the CLOCK render.
+            units,
+            // #55 per-node plugin-visibility mask — read by the Home menu to filter rows.
+            plugin_mask,
             #[cfg(feature = "wifi")]
             batt: &batt_cache,
             #[cfg(feature = "wifi")]
@@ -1074,6 +1169,22 @@ fn main() -> ! {
                 log::info!("smol #21: default screen cleared → board default");
             }
             _ => {}
+        }
+
+        // #55: if the LIVE screen is now masked-off (a plugin the user is currently viewing was
+        // just hidden), fall back to the board default so the mask can never strand them on a
+        // hidden screen. Loop-safe: SKIP if we're already on the default kind — so even a mask
+        // that hides the default itself doesn't thrash (you land there once and stay; the menu's
+        // `enabled_indices` still guarantees a non-empty list). Edge-driven by any mask change.
+        #[cfg(feature = "espnow")]
+        {
+            let (live_kind, _) = app.live_screen();
+            if live_kind != DEFAULT_APP && !menu::kind_enabled(live_kind, plugin_mask) {
+                app = App::enter(DEFAULT_APP, &ctx);
+                app.set_page(DEFAULT_PAGE);
+                ctx.redraw = true;
+                log::info!("smol #55: live screen masked off → board default");
+            }
         }
 
         // One debounced BOOT-button gesture → the active plugin. ANY press forces

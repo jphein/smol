@@ -57,6 +57,7 @@ impl Plugin for ClockState {
                 ctx.display,
                 sod,
                 ctx.sensors,
+                ctx.units,
                 #[cfg(feature = "espnow")]
                 ctx.label,
             );
@@ -74,6 +75,7 @@ fn draw_clock<D>(
     display: &mut D,
     sod: u32,
     sensors: &mut sensors::Sensors,
+    units: crate::units::Units,
     #[cfg(feature = "espnow")] label: &str,
 ) where
     D: DrawTarget<Color = BinaryColor>,
@@ -89,7 +91,8 @@ fn draw_clock<D>(
 
     // Refresh the sensor sample (chip °C + battery V).
     let reading = sensors.read();
-    let sensor_line = sensors::format_sensor_line(&reading);
+    // #43: temperature unit (°F/°C) per the fleet-global config.
+    let sensor_line = sensors::format_sensor_line(&reading, units.temp_f);
     log::debug!(
         "smol: chip {}C, batt {:.2}V (~{}%)",
         reading.chip_c as i32,
@@ -112,23 +115,28 @@ fn draw_clock<D>(
         label
     };
 
-    // 12-hour clock with AM/PM and a colon that blinks once per second.
+    // #43: 24-hour (`HH:MM`, no AM/PM — default) or 12-hour (`H:MM` + AM/PM, the pre-#43
+    // behavior), per the fleet-global units. A colon blinks once per second either way.
     let h24 = (sod / 3600) % 24;
     let mm = (sod / 60) % 60;
-    let pm = h24 >= 12;
-    let h12 = {
+    // Displayed hour + how to render it. 24h: 0..23, ALWAYS two digits (leading zero), no
+    // AM/PM. 12h: 1..12, NO leading zero (4 or 5 chars) + an AM/PM tag.
+    let (hh, two_digit, pm) = if units.clk_24h {
+        (h24, true, false)
+    } else {
         let h = h24 % 12;
-        if h == 0 { 12 } else { h }
+        let h12 = if h == 0 { 12 } else { h };
+        (h12, h12 >= 10, h24 >= 12)
     };
     let colon = if sod % 2 == 1 { b' ' } else { b':' };
-    // Build "H:MM" or "HH:MM" (no leading zero on the hour) — 4 or 5 chars.
+    // Build "HH:MM" (5 chars) or 12h single-digit "H:MM" (4 chars).
     let mut tb = [0u8; 5];
     let mut ti = 0usize;
-    if h12 >= 10 {
-        tb[ti] = b'1';
+    if two_digit {
+        tb[ti] = b'0' + (hh / 10) as u8;
         ti += 1;
     }
-    tb[ti] = b'0' + (h12 % 10) as u8;
+    tb[ti] = b'0' + (hh % 10) as u8;
     ti += 1;
     tb[ti] = colon;
     ti += 1;
@@ -138,14 +146,17 @@ fn draw_clock<D>(
     ti += 1;
     let hm = core::str::from_utf8(&tb[..ti]).unwrap_or("--:--");
     // Center: "12:34" (5ch/50px) -> x=11; "1:34" (4ch/40px) -> x=16.
-    let tx = if h12 >= 10 { 11 } else { 16 };
+    let tx = if two_digit { 11 } else { 16 };
 
-    // AM/PM small in the top-right (its own row above the big digits — no overlap).
-    let ampm = if pm { "PM" } else { "AM" };
-    Text::with_baseline(ampm, Point::new(59, 0), label_style, Baseline::Top)
-        .draw(display)
-        .ok();
-    // Big 12-hour time, 20px tall from y=8 (AM/PM row sits above it).
+    // AM/PM small in the top-right (its own row above the big digits — no overlap). 12h ONLY;
+    // a 24-hour clock has no AM/PM tag.
+    if !units.clk_24h {
+        let ampm = if pm { "PM" } else { "AM" };
+        Text::with_baseline(ampm, Point::new(59, 0), label_style, Baseline::Top)
+            .draw(display)
+            .ok();
+    }
+    // Big time, 20px tall from y=8 (the AM/PM row, if present, sits above it).
     Text::with_baseline(hm, Point::new(tx, 8), time_style, Baseline::Top)
         .draw(display)
         .ok();

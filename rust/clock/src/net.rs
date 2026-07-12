@@ -50,6 +50,22 @@ pub use wifi::WifiPeripherals;
 // espnow-only — a wifi-only build reaches the const in-module (no re-export → no unused-import).
 #[cfg(feature = "espnow")]
 pub use wifi::CFG_KEY_SCREEN;
+// #48 LED mode key — same `main`-bridge rationale as the screen key (espnow leaf-apply path).
+// #55/#52 add their keys (P/R) here as each feature wires its apply.
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_KEY_LED;
+// #43 display-units key — same `main`-bridge rationale (espnow leaf-apply path via
+// take_cfg_offer(U)). CFG_TARGET_ALL stays wifi-internal (only mode.rs/wifi.rs name it).
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_KEY_UNITS;
+// #55 plugin-mask key — same `main`-bridge rationale (espnow leaf-apply path via
+// take_cfg_offer(P)).
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_KEY_PLUGINS;
+// #52 remote-reboot key — same `main`-bridge rationale (espnow leaf-apply path via
+// take_cfg_offer(R), with a boot-debounce before software_reset()).
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_KEY_REBOOT;
 
 // `try_time_sync` is the Phase-2 entry point; under `espnow`, `main` calls
 // `mode::start` instead, so only re-export it when espnow is NOT enabled.
