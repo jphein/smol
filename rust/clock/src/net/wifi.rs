@@ -1185,9 +1185,11 @@ impl CfgCache {
 /// #70/#71 observability: max bytes of a relayed DIAG or SCAN record value. Larger than
 /// `CFG_VALUE_MAX` (16, sized for a screen string) because a diag/scan record is a multi-field
 /// line (~130 B) — but still well under the ~250 B ESP-NOW frame budget once the 12 B frame
-/// prefix + 3 B id are added.
+/// prefix + 3 B id are added. #74 wave-2 folds ~7 more keys onto the DIAG record (led/rtt/rx/tx/
+/// tage/tsrc/loss), so 224 — the ESP-NOW frame is then 12 (prefix) + 3 (id) + 224 = 239 B, still
+/// under the ~250 B ESP-NOW ceiling with margin.
 #[cfg(feature = "wifi")]
-pub const RELAY_VALUE_MAX: usize = 200;
+pub const RELAY_VALUE_MAX: usize = 224;
 
 #[cfg(feature = "wifi")]
 const RELAY_CACHE_CAP: usize = 12;

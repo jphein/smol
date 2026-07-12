@@ -899,6 +899,22 @@ fn main() -> ! {
             // cheap) so `hmin` tracks leak/pressure at finer resolution than the diag publish.
             if (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000) {
                 r.diag_sample_heap();
+                // #74 wave-2: mirror main-owned node state into the DIAG builder — the LED mode +
+                // its actual lit state (mode `Status` resolves via the live peer-link state), and
+                // the time-sync age + source. Read back by `diag_record` as led/tage/tsrc.
+                let ls = r.peer_led_state(now);
+                let led_on = match led_mode {
+                    led::LedMode::Status => ls.is_lit(now),
+                    led::LedMode::On => true,
+                    led::LedMode::Off => false,
+                };
+                let tage_s = (now.saturating_sub(anchor_ms) / 1000) as u32;
+                let tsrc = match time_source {
+                    app::TimeSource::NtpRoot => "ntp",
+                    app::TimeSource::Adopted(_) => "mesh",
+                    app::TimeSource::None => "none",
+                };
+                r.set_diag_extra(led_mode.to_wire(), led_on, tage_s, tsrc);
             }
             // #70/#49: a LEAF broadcasts its compact DIAG record on a SLOW ~60 s cadence (diag is
             // slow-moving — keep mesh airtime low), expedited by a BOOT-button press (rate-limited

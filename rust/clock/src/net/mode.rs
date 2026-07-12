@@ -411,6 +411,28 @@ impl DiagCounters {
     }
 }
 
+/// #74 obs wave-2: node state that lives in `main` (the LED mode + the clock), pushed into the
+/// RadioManager each cadence via `set_diag_extra` so BOTH diag builders (the leaf broadcast + the
+/// gateway flush) read one stored copy — `main` owns these, RadioManager only mirrors them for the
+/// DIAG record. `Copy`. Folds `led`/`tage`/`tsrc` onto the record (rtt/rx/tx come from `bench`).
+#[derive(Clone, Copy)]
+struct DiagExtra {
+    /// #74 item 6: commanded LED mode wire token ("status"/"on"/"off").
+    led_mode: &'static str,
+    /// #74 item 6: the LED's actual lit state right now (mode `Status` resolves via link state).
+    led_on: bool,
+    /// #74 item 8: seconds since the last time-sync (`(now - anchor)/1000`).
+    tage_s: u32,
+    /// #74 item 8: time source token ("ntp"/"mesh"/"none") — maps `TimeSource`.
+    tsrc: &'static str,
+}
+
+impl DiagExtra {
+    const fn new() -> Self {
+        Self { led_mode: "status", led_on: false, tage_s: 0, tsrc: "none" }
+    }
+}
+
 /// Tracks the two timestamps that define the peer link state. Monotonic ms
 /// (`Instant::now().duration_since_epoch().as_millis()`); 0 = "never seen".
 struct PeerTracker {
@@ -1470,6 +1492,8 @@ pub struct RadioManager {
     /// #70/#49 observability: this node's own live diag counters (min-heap watermark + BOOT-button
     /// press counters; #49 adds flush/verify counters). Folded into the DIAG record each cadence.
     diag: DiagCounters,
+    /// #74 obs wave-2: node state mirrored from `main` (LED mode + time-sync) for the DIAG record.
+    diag_extra: DiagExtra,
     /// #40 leaf-mesh-OTA: the LEAF receive state machine (verify-sig → signed-bounds →
     /// window reassembly → readback verify → activate). Idle except during a transfer.
     /// Unused on a gateway (which drives the RELAY side via `run_leaf_ota_relay`).
@@ -1627,6 +1651,7 @@ impl RadioManager {
             scan_cache: crate::net::wifi::RelayCache::new(),
             own_scan: None,
             diag: DiagCounters::new(),
+            diag_extra: DiagExtra::new(),
             ota_leaf: crate::ota_mesh::OtaLeafSession::new(),
             #[cfg(feature = "wled")]
             wled_seq: 0,
@@ -2243,6 +2268,13 @@ impl RadioManager {
         }
     }
 
+    /// #74: mirror `main`-owned node state (LED mode + its lit state, time-sync age + source) into
+    /// the RadioManager so the DIAG record can fold in `led`/`tage`/`tsrc`. `main` calls this on the
+    /// ~10 s diag-sample tick; both diag builders (leaf broadcast + gateway flush) read the copy.
+    pub fn set_diag_extra(&mut self, led_mode: &'static str, led_on: bool, tage_s: u32, tsrc: &'static str) {
+        self.diag_extra = DiagExtra { led_mode, led_on, tage_s, tsrc };
+    }
+
     /// #70/#49: build this node's compact DIAG record for retained `smol/<id>/diag`. Format matches
     /// luna's DEPLOYED HA parser (PR #81): literal `DIAG` first field, then `key=value` pairs
     /// PIPE-separated, order-independent, forward-compatible (HA picks by key, unknown keys ignored,
@@ -2264,8 +2296,16 @@ impl RadioManager {
         let heap = esp_alloc::HEAP.free();
         let (vok, vfl) = self.ota_leaf.verify_counts();
         let loss = self.bench.loss_pct();
+        // #74 wave-2 fold-ins: mesh RTT + cumulative rx/tx (from `bench`), LED mode:state + time
+        // age/source (mirrored from `main` via `set_diag_extra`). `loss`/`rtt`/`rx`/`tx` = the #49
+        // link-quality set; `led`/`tage`/`tsrc` = items 6/8. (`toff`/`cfg` deferred — see luna Q.)
+        let rtt = self.bench.last_rtt_ms.unwrap_or(0);
+        let rx = self.bench.rx_count;
+        let tx = self.bench.tx_count;
+        let e = self.diag_extra;
+        let led_state = if e.led_on { "on" } else { "off" };
         alloc::format!(
-            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}",
+            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}",
             d.boot_slot,
             d.reset_reason,
             d.boot_count,
@@ -2280,6 +2320,13 @@ impl RadioManager {
             vok,
             vfl,
             loss,
+            rtt,
+            rx,
+            tx,
+            e.led_mode,
+            led_state,
+            e.tage_s,
+            e.tsrc,
         )
     }
 
