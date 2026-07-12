@@ -180,12 +180,13 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 7] = [
+const CFG_APPLY_KEYS: [u8; 8] = [
     crate::net::wifi::CFG_KEY_SCREEN,
     crate::net::wifi::CFG_KEY_LED,
     crate::net::wifi::CFG_KEY_UNITS,
     crate::net::wifi::CFG_KEY_PLUGINS,
     crate::net::wifi::CFG_KEY_CUSTOM, // #45 custom-screen layout (cached + relayed like S/L/U/P)
+    crate::net::wifi::CFG_KEY_NET, // #100 active WiFi-slot index (cached + relayed; edge-triggered reboot)
     // #52 remote reboot: R IS a buffered/applied key (a leaf takes it via take_cfg_offer(R)) but
     // is NEVER put in cfg_cache/broadcast_cached_configs — the one-shot relay uses broadcast_config
     // directly. The anti-reboot-loop invariant: R rides the CFG wire + apply path, not the cache.
@@ -2374,8 +2375,16 @@ impl RadioManager {
         let tx = self.bench.tx_count;
         let e = self.diag_extra;
         let led_state = if e.led_on { "on" } else { "off" };
+        // #100: active WiFi slot + fallback state (net=<slot>:<ok|fb>). `fb` = we auto-reverted off
+        // the commanded slot (the un-brick fallback fired) — HA surfaces "the network switch failed".
+        let net = crate::ota::read_net_cfg().unwrap_or(crate::ota::NetCfg {
+            active: 0,
+            commanded: 0,
+            fallback: false,
+        });
+        let net_fb = if net.fallback { "fb" } else { "ok" };
         alloc::format!(
-            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}",
+            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}",
             d.boot_slot,
             d.reset_reason,
             d.boot_count,
@@ -2397,6 +2406,8 @@ impl RadioManager {
             led_state,
             e.tage_s,
             e.tsrc,
+            net.active,
+            net_fb,
         )
     }
 
@@ -3487,6 +3498,10 @@ impl RadioManager {
         // #45: the gateway's OWN custom-screen layout — same self-apply path (take_cfg_offer(Y)).
         if let Some((buf, len)) = gw_own.custom {
             self.cfg.set(crate::net::wifi::CFG_KEY_CUSTOM, &buf[..len]);
+        }
+        // #100: the gateway's OWN active-slot index — same self-apply path (take_cfg_offer(N)).
+        if let Some((buf, len)) = gw_own.net {
+            self.cfg.set(crate::net::wifi::CFG_KEY_NET, &buf[..len]);
         }
         // #52 remote reboot — a COMMAND, not a config. Fire a ONE-SHOT `<id>R` frame per queued
         // leaf target via `broadcast_config` DIRECTLY (NOT `cfg_cache` / `broadcast_cached_configs`):

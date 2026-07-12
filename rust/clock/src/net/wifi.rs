@@ -48,27 +48,18 @@ use smoltcp::{
 // Configuration (compile-time placeholders — set before flashing).
 // -------------------------------------------------------------------------
 
-// Real values live in the git-ignored `crate::secrets` (repo is public).
-use crate::secrets::{WIFI_PASS as WIFI_PASSWORD, WIFI_SSID};
+// #100 Stage 1b: WiFi creds are read PER-SLOT at runtime (`WIFI_NETWORKS[active].ssid/pass`) inside
+// `associate_slot`, selected by the NVS net-record + the un-brickable fallback — no fixed SSID const.
 
 /// NTP server IPv4. We hardcode an anycast IP so we need no DNS resolver in
 /// the smoltcp build. time.cloudflare.com's NTP anycast address:
 const NTP_SERVER_IP: Ipv4Addr = Ipv4Addr::new(162, 159, 200, 123);
 const NTP_PORT: u16 = 123;
 
-/// HA Mosquitto broker (v2 MQTT-native bridge — the old LAN UDP collector is retired).
-/// Address/creds live in the git-ignored `crate::secrets` (retargetable one-liners —
-/// see the secrets comment for the VLAN11-leg rationale + the VLAN6 fallback). Built
-/// from the `[u8;4]` there so `secrets.rs` stays a plain imports-free consts file.
-#[cfg(feature = "wifi")]
-const MQTT_BROKER_IP: Ipv4Addr = Ipv4Addr::new(
-    crate::secrets::MQTT_BROKER_IP[0],
-    crate::secrets::MQTT_BROKER_IP[1],
-    crate::secrets::MQTT_BROKER_IP[2],
-    crate::secrets::MQTT_BROKER_IP[3],
-);
-#[cfg(feature = "wifi")]
-const MQTT_BROKER_PORT: u16 = crate::secrets::MQTT_BROKER_PORT;
+// #100 HA Mosquitto broker (v2 MQTT-native bridge): the leg is now the ACTIVE slot's own-VLAN
+// broker, resolved at RUNTIME in `mqtt_session` from the NVS net-record (`active_broker()`) — a
+// slot IS a (ssid, broker, ota) tuple, so the broker MUST follow the associated network (the
+// quad-homed-broker rule: a cross-VLAN leg drops CONNACK). Not a compile-time const any more.
 
 /// The retained downlink topic every node subscribes to for battery voltages, and
 /// the uplink topic template `smol/<id>/telemetry` — see `mqtt_session`.
@@ -407,10 +398,80 @@ pub fn try_time_sync(
     synced
 }
 
+/// #100: outcome of ONE association attempt — drives the slot-fallback loop. Only `TimedOut`
+/// counts toward a revert; `Aborted` (a #20 long-press) unwinds the burst without touching NVS.
+#[cfg(feature = "wifi")]
+enum AssocResult {
+    Associated,
+    TimedOut,
+    Aborted,
+}
+
+/// #100: one association attempt on `WIFI_NETWORKS[slot]`. Disconnect-then-(re)configure so a
+/// slot SWITCH (different SSID) re-associates cleanly, then wait for `is_connected` within
+/// `SYNC_BUDGET`. Extracted from `run_ntp_burst` so the fallback loop can retry PER-SLOT and
+/// revert on `TimedOut` ONLY (never on a long-press abort or a later DHCP/SNTP failure).
+#[cfg(feature = "wifi")]
+fn associate_slot(
+    controller: &mut esp_wifi::wifi::WifiController<'static>,
+    slot: u8,
+    tick: &mut dyn FnMut() -> bool,
+) -> AssocResult {
+    let net = &crate::secrets::WIFI_NETWORKS[slot as usize];
+    // Drop any prior association before reconfiguring (harmless if not connected) so switching
+    // SSIDs between slots doesn't leave a stale config. Errors are non-fatal → treated as a miss.
+    let _ = controller.disconnect();
+    if controller
+        .set_configuration(&Configuration::Client(ClientConfiguration {
+            ssid: net.ssid.into(),
+            password: net.pass.into(),
+            // COEXIST SOAK (#23 PART 1): pin association to ch1 (see the pre-#100 note).
+            #[cfg(feature = "coexist-soak")]
+            channel: Some(1),
+            ..Default::default()
+        }))
+        .is_err()
+    {
+        return AssocResult::TimedOut;
+    }
+    if !matches!(controller.is_started(), Ok(true)) && controller.start().is_err() {
+        return AssocResult::TimedOut;
+    }
+    if controller.connect().is_err() {
+        return AssocResult::TimedOut;
+    }
+    let deadline = Instant::now() + SYNC_BUDGET;
+    while !matches!(controller.is_connected(), Ok(true)) {
+        if tick() {
+            return AssocResult::Aborted; // #20 long-press mid-sync
+        }
+        if Instant::now() > deadline {
+            log::warn!("smol #100: assoc timed out on slot {} ('{}')", slot, net.ssid);
+            return AssocResult::TimedOut;
+        }
+    }
+    log::info!("smol #100: associated to slot {} ('{}')", slot, net.ssid);
+    AssocResult::Associated
+}
+
+/// #100: the ACTIVE slot's broker leg (IPv4, port), resolved at RUNTIME from the NVS net-record
+/// (default slot 0 if erased/corrupt). The broker MUST follow the associated network — own-VLAN
+/// leg rule, a cross-VLAN leg drops CONNACK. Stage 2 layers an NVS broker OVERRIDE + CONNACK
+/// fallback on top of this. Panic-free slot index (clamped to the array).
+#[cfg(feature = "wifi")]
+fn active_broker() -> (Ipv4Addr, u16) {
+    let active = crate::ota::read_net_cfg().map_or(0usize, |c| c.active as usize);
+    let net = &crate::secrets::WIFI_NETWORKS[active.min(crate::secrets::WIFI_NETWORKS.len() - 1)];
+    (
+        Ipv4Addr::new(net.broker_ip[0], net.broker_ip[1], net.broker_ip[2], net.broker_ip[3]),
+        net.broker_port,
+    )
+}
+
 /// Shared WiFi -> DHCP -> SNTP burst, reused by both the Phase-2 `wifi`-only
-/// build and the Phase-3 `espnow` build. Associates using the `crate::secrets`
-/// credentials, drives a `smoltcp` DHCP+UDP stack over `device`, runs one SNTP
-/// exchange, and returns the Unix time (seconds) or `None` on any timeout.
+/// build and the Phase-3 `espnow` build. #100: associates on the NVS-selected slot with the
+/// un-brickable fallback (see the assoc loop below), drives a `smoltcp` DHCP+UDP stack over
+/// `device`, runs one SNTP exchange, and returns the Unix time (seconds) or `None` on any timeout.
 ///
 /// `tick` is invoked frequently inside every busy-wait loop; the `espnow` build
 /// passes a closure that fast-blinks the blue LED so "WiFi/NTP in progress" is
@@ -480,42 +541,51 @@ pub fn run_ntp_burst(
     );
     let tcp_handle = sockets.add(tcp_socket);
 
-    // --- WiFi connect ----------------------------------------------------
-    controller
-        .set_configuration(&Configuration::Client(ClientConfiguration {
-            ssid: WIFI_SSID.into(),
-            password: WIFI_PASSWORD.into(),
-            // COEXIST SOAK (#23 PART 1): pin association to ch1 so the gateway lands
-            // on the same channel the leaf pins to (mesh ch == AP ch). The `roam`
-            // SSID spans 1/6/11; this restricts the STA to the ch1 AP (north-bedroom).
-            #[cfg(feature = "coexist-soak")]
-            channel: Some(1),
-            ..Default::default()
-        }))
-        .ok()?;
-    if !matches!(controller.is_started(), Ok(true)) {
-        controller.start().ok()?;
-    }
-    controller.connect().ok()?;
-
-    let deadline = Instant::now() + SYNC_BUDGET;
-
-    // Wait for association.
-    while !matches!(controller.is_connected(), Ok(true)) {
-        // #20 abort: a long-press mid-sync bails the burst (tick latches true).
-        if tick() {
+    // --- #100 WiFi connect with the UN-BRICKABLE slot fallback -----------
+    // Associate on the NVS-selected slot (default 0 if the record is erased/corrupt). A wrong or
+    // unreachable selection SELF-HEALS without USB: up to ASSOC_ATTEMPTS × SYNC_BUDGET on the
+    // active slot; all TimedOut → the ONE revert to the other slot (write NVS {active=other,
+    // fallback=1}) → retry it. BOTH slots fail → STAY PUT (return None; the boot free-runs and the
+    // next burst/boot retries). The NVS `fallback` flag GATES the cross-reboot revert: an
+    // already-reverted boot never reverts again → provably ONE revert-write per commanded
+    // selection, ZERO flash wear during a sustained total outage. Only a `TimedOut` counts toward a
+    // revert — a `#20 long-press Aborted` unwinds without ever touching NVS.
+    const ASSOC_ATTEMPTS: u8 = 3;
+    let mut sel = crate::ota::read_net_cfg().unwrap_or(crate::ota::NetCfg {
+        active: 0,
+        commanded: 0,
+        fallback: false,
+    });
+    'assoc: loop {
+        let mut attempt = 0u8;
+        loop {
+            match associate_slot(controller, sel.active, tick) {
+                AssocResult::Associated => break 'assoc,
+                AssocResult::Aborted => return None, // long-press → never a revert
+                AssocResult::TimedOut => {
+                    attempt += 1;
+                    if attempt >= ASSOC_ATTEMPTS {
+                        break; // active slot exhausted → revert or stay-put
+                    }
+                }
+            }
+        }
+        if sel.fallback {
+            // Already reverted (this boot, or a prior one — the NVS flag) and the fallback slot ALSO
+            // failed → STAY PUT. No revert, no NVS write (the anti-ping-pong / zero-wear guarantee).
+            log::warn!("smol #100: both slots unreachable (fallback latched) — staying put, no NVS write");
             return None;
         }
-        if Instant::now() > deadline {
-            log::warn!("smol: WiFi connect timed out");
-            return None;
-        }
+        let other = 1 - sel.active;
+        sel = crate::ota::NetCfg { active: other, commanded: sel.commanded, fallback: true };
+        crate::ota::write_net_cfg(sel); // the ONE revert-write
+        log::warn!("smol #100: selected slot unreachable — reverted to slot {} (fallback), retrying", other);
     }
-    log::info!("smol: WiFi associated to '{}'", WIFI_SSID);
 
     // Poll the stack until DHCP yields an address. The DHCP `Event` borrows
     // the socket, so we extract the plain (Ipv4Cidr, router) data inside a
     // short scope, then apply it to the interface once the borrow is released.
+    let deadline = Instant::now() + SYNC_BUDGET; // DHCP+SNTP budget (assoc has its own per-slot budget in try_time_sync)
     loop {
         if tick() {
             return None; // #20 abort during DHCP wait
@@ -858,6 +928,13 @@ pub const CFG_KEY_CUSTOM: u8 = b'Y';
 #[cfg(feature = "wifi")]
 #[allow(dead_code)]
 pub const CFG_KEY_SCAN: u8 = b'W';
+/// #100 network-switch CONFIG (key `N`) = the active WiFi-slot index (`0`/`1`). RETAINED/CACHED
+/// STATE (relayed like S/L/U/P/Y, NOT a one-shot command like R/W) — a node applies it by writing
+/// the NVS net-record + rebooting into the slot, EDGE-triggered on a change of the commanded slot
+/// (re-reading the same retained value is a no-op → never a reboot-loop). Per-node
+/// `smol/<id>/config/net` or fleet-wide `smol/config/net` (target 255). Value = one ASCII digit.
+#[cfg(feature = "wifi")]
+pub const CFG_KEY_NET: u8 = b'N';
 
 /// #48 (GwOwnCfg — approved arch): the GATEWAY's OWN per-node configs read from its own MQTT
 /// topics this burst. A leaf gets these RELAYED (→ its `CfgTracker`); the gateway reads them
@@ -884,12 +961,15 @@ pub struct GwOwnCfg {
     pub plugins: Option<([u8; CFG_VALUE_MAX], usize)>,
     /// #45 the gateway's own `smol/<id>/config/custom` value `(buf, len)`, or `None` if absent.
     pub custom: Option<([u8; CFG_VALUE_MAX], usize)>,
+    /// #100 the gateway's own `smol/<id>/config/net` (or global `smol/config/net`) active-slot
+    /// index value `(buf, len)`, or `None` if absent this burst.
+    pub net: Option<([u8; CFG_VALUE_MAX], usize)>,
 }
 
 #[cfg(feature = "wifi")]
 impl GwOwnCfg {
     pub const fn new() -> Self {
-        Self { led: None, units: None, plugins: None, custom: None }
+        Self { led: None, units: None, plugins: None, custom: None, net: None }
     }
     /// Pack a payload into the `(buf, len)` a field holds (truncated to `CFG_VALUE_MAX`), so the
     /// mqtt-drain arms stay one-liners: `gw_own.led = Some(GwOwnCfg::val(payload));`.
@@ -1426,7 +1506,9 @@ fn mqtt_session(
     deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
-    let broker = (IpAddress::Ipv4(MQTT_BROKER_IP), MQTT_BROKER_PORT);
+    // #100: broker = the ACTIVE slot's own-VLAN leg (runtime, from the NVS net-record).
+    let (broker_ip, broker_port) = active_broker();
+    let broker = (IpAddress::Ipv4(broker_ip), broker_port);
     // #21 per-board node-manager config topic (retained default-screen command).
     let mut cfg_topic = MqttScratch::new();
     let _ = write!(cfg_topic, "smol/{}/config/default_screen", node_id);
@@ -1616,6 +1698,16 @@ fn mqtt_session(
         // so the gateway caches + relays it (key `Y`) over ESP-NOW, twin of the led/plugins wildcard.
         // (pid 15 — #71's scan took 14 in the merge; distinct pid per concurrent SUBSCRIBE.)
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 15, b"smol/+/config/custom") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        // #100 network-switch (pid 16 per-node + pid 17 fleet-wide): the retained active-slot index.
+        // CONFIG/CACHED (key `N`, relayed like S/L/U/P/Y). Per-node `smol/<id>/config/net` + the
+        // global `smol/config/net` (→ target 255). Applying it writes the NVS net-record + reboots
+        // into the slot, edge-triggered on a commanded-slot CHANGE (a re-read is a no-op → no loop).
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 16, b"smol/+/config/net") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 17, b"smol/config/net") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
     }
@@ -2063,6 +2155,38 @@ fn mqtt_session(
                         } else {
                             gw_own.custom = Some(GwOwnCfg::val(payload));
                             log::info!("smol #45: gateway own custom screen captured ({} B)", payload.len());
+                        }
+                    } else if topic == b"smol/config/net" {
+                        // #100 GLOBAL network-switch (no id) → cache under the broadcast target 255
+                        // so ONE relayed `<255>N<slot>` frame reaches every leaf, + gw_own.net for the
+                        // gateway's own self-apply. Value = one ASCII slot digit; the apply validates.
+                        if let Some(cache) = cfg_cache.as_deref_mut() {
+                            let now = Instant::now().duration_since_epoch().as_millis();
+                            cache.set(CFG_TARGET_ALL, CFG_KEY_NET, payload, [0u8; 6], now);
+                        }
+                        gw_own.net = Some(GwOwnCfg::val(payload));
+                        log::info!(
+                            "smol #100: global net-slot captured ({} B) — cached (255,N) + self",
+                            payload.len()
+                        );
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/net") {
+                        // #100 PER-NODE network-switch: twin of the led/plugins arm. OTHER leaf →
+                        // cache under key `N` for the ESP-NOW relay; OUR OWN id → gw_own.net. The apply
+                        // (main) writes the NVS net-record + reboots into the slot, edge-triggered on a
+                        // commanded-slot CHANGE (a re-read of the same retained value is a no-op → no loop).
+                        if leaf_id != node_id {
+                            if let Some(cache) = cfg_cache.as_deref_mut() {
+                                let now = Instant::now().duration_since_epoch().as_millis();
+                                cache.set(leaf_id, CFG_KEY_NET, payload, [0u8; 6], now);
+                                log::info!(
+                                    "smol #100: cached leaf id{} net-slot for relay ({} B)",
+                                    leaf_id,
+                                    payload.len()
+                                );
+                            }
+                        } else {
+                            gw_own.net = Some(GwOwnCfg::val(payload));
+                            log::info!("smol #100: gateway own net-slot captured ({} B)", payload.len());
                         }
                     } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/cmd/reset") {
                         // #52 remote reboot — a COMMAND on a TRANSIENT topic (retain:false), so we
