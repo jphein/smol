@@ -1,0 +1,13 @@
+# #13 host-test harness for the PURE managed-flood core (net/flood.rs). Runs OFF-target
+# on the host (std) via `cargo run` — the firmware crate is no_std/riscv32imc and can't
+# host-test, so this #[path]-includes the real flood.rs (no drift) and exercises it.
+[package]
+name = "flood_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "flood_verify"
+path = "src/main.rs"
+[profile.dev]
+opt-level = 0

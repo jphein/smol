@@ -17,6 +17,13 @@ mod mqtt;
 #[cfg(feature = "espnow")]
 pub mod mode;
 
+// #13 routed multi-hop mesh: the PURE managed-flood decision core (SeenSet + forward
+// decision + HopLatch escalation state machine), host-testable, no HAL deps. Driven by
+// the relay path in `mode`, so espnow-gated. (wip: host-tested but not yet wired — see
+// the module-level allow(dead_code) in flood.rs, dropped once mode.rs uses it.)
+#[cfg(feature = "espnow")]
+pub mod flood;
+
 // #25 WLED WiZmote-emit (smol as a WLED "linked remote"). `wled = ["espnow"]`, so
 // this is present only in a wled build; the default/wifi/espnow builds are byte-free
 // of it (the module is `#![cfg(feature = "wled")]`). Referenced by `app` (the
