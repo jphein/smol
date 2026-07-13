@@ -350,7 +350,7 @@ and #45/#48/#43/#55/#52/#71/#100 hung the rest of the family off the same wire.
 | `key` | 1 | ASCII | which knob (table below) |
 | `value` | ≤64 | bytes | key-specific payload, `CFG_VALUE_MAX = 64` |
 
-**The key family (`CFG_APPLY_KEYS`, merged main @ `feee183` — 10 keys).** A key a leaf's
+**The key family (`CFG_APPLY_KEYS`, merged main @ `95747b1` — 12 keys).** A key a leaf's
 firmware predates is DROPPED (forward-compat, #46). Parse is panic-free/heap-free/bounded
 (a LAN-writable broker + a payload that panicked would re-deliver every boot → boot-loop brick).
 
@@ -366,12 +366,14 @@ firmware predates is DROPPED (forward-compat, #46). Parse is panic-free/heap-fre
 | `O` | #100 S3 | **OTA-host** override — one RFC1918 host appended to the fetch allowlist (`b08204d`, #110) | yes | live, **no reboot** |
 | `R` | #52 | **remote reboot** | **NO** — transient, never cached/retained | reboots (that is its function) |
 | `W` | #71 | on-demand **WiFi scan** trigger | **NO** — transient (a *cached* scan = a periodic off-channel excursion, the coexist hazard) | live one-shot, no reboot |
+| `G` | #72 | **IO pin-map** — the whole per-node driver map (see below) (`5689b1b`, #113) | yes | live, **no reboot** (edge-triggered re-bind) |
+| `g` | #72 | **IO output states** — commanded output levels (see below) (`5689b1b`, #113) | yes | live, no reboot |
 
-- **Reboot vs live.** Live-apply (no reboot): `S L U P Y O W`. Reboot on apply: `N` (WiFi-slot
+- **Reboot vs live.** Live-apply (no reboot): `S L U P Y O W G g`. Reboot on apply: `N` (WiFi-slot
   switch), `B` (broker-leg change) — both **edge-triggered** (only when the value changes, so
   the ~10 s re-arm never reboot-loops); `R` reboots by design. `O` takes effect on the next OTA
   fetch without a reboot.
-- **Cached + re-armed vs transient.** `S L U P Y N B O` live in the gateway's `cfg_cache` and are
+- **Cached + re-armed vs transient.** `S L U P Y N B O G g` live in the gateway's `cfg_cache` and are
   **re-broadcast every ~10 s** (`broadcast_cached_configs`), so a rebooted leaf re-arms within ~10 s
   with **no leaf-side NVS** — except the network state (`N`/`B`/`O`), which *also* persists in the
   NVS net record below (needed to reach the broker at all before the first relay). `R`/`W` are
@@ -386,9 +388,30 @@ firmware predates is DROPPED (forward-compat, #46). Parse is panic-free/heap-fre
 - **Status.** 🟢 **shipped + hardware-proven.** `mode.rs` `CFG_PREFIX`/`CFG_APPLY_KEYS`;
   `wifi.rs` `CFG_KEY_*`/`CfgCache`.
 
-> **Pending #113 (#72 IO/component registry):** adds key `G` (a compact per-pin driver map:
-> `<pin><type>;…` over the same channel) and surfaces `io=` in the DIAG record. **Not on merged
-> main yet** — this doc will gain the `G`/`g` rows + the `io=` field when PR #113 lands.
+### The IO/component registry — keys `G` + `g` (#72)
+
+ESPHome inverted: every digital driver is compiled into one image; a **runtime pin-map** (relayed
+over `G`, never rebuilt) selects which driver binds to which GPIO at boot — no recompile. Shipped
+`5689b1b` (#113); digital-only in v1 (ADC/RMT/WS2812 deferred — `Flex` re-types digital in/out
+cleanly, those don't). Source: `io.rs` (`PinMap`/`apply_wire`/`apply_set`), `wifi.rs`
+`CFG_KEY_IO`/`CFG_KEY_IO_SET`.
+
+- **`G` = the pin-map descriptor** — `;`-separated `<pin><kind>` tokens (e.g. `0L;7B;10R`), ≤64 B.
+  Kinds: **`B`** Button (input, debounced), **`S`** BinarySensor (input, level), **`R`** Relay
+  (output), **`L`** Led (output) → HA `event`/`binary_sensor`/`switch`/`light`. Retained per-node on
+  **`smol/<id>/config/io`**; applied by (re)binding the free GPIOs via `io::apply_wire`,
+  **edge-triggered** on a *change* of the map (a re-read of the same retained value is a no-op).
+  Writes **NO NVS** (zero flash wear — the nvs partition is full); survives reboot purely via the
+  ~10 s config re-relay (leaf re-arms within ~10 s of the gateway being up).
+- **`g` = the output states** — `;`-separated `<pin>=<0|1>` (e.g. `0=1;10=0`), ≤64 B. Retained per-node
+  on **`smol/<id>/io/set`**; applied via `io::apply_set` (no-op on an unbound/input slot). Retained
+  (not a one-shot command) so a lamp/relay **holds its commanded level** across reboot/relay-loss,
+  re-asserted after a re-relay or a `G` re-bind. Writes NO NVS.
+- **Pin budget (`io.rs`).** Bindable **`FREE_PINS = [0, 1, 3, 7, 10]`**; a descriptor naming a
+  **`RESERVED_PIN` `[2, 4, 5, 6, 8, 9, 20, 21]`** (OLED I²C 5/6, batt ADC 4, LED 8, BOOT 9, strapping
+  2, USB-serial 20/21) is rejected and surfaced in DIAG, never bound.
+- This is the **dollhouse per-room lamp + button foundation** (#75): a room LED on `7L`, a doll's
+  button on `10B`, driven/observed entirely from HA.
 
 ### The NVS net record — 28-byte v2 (#100)
 
@@ -434,7 +457,7 @@ caches it (`diag_cache`) and republishes it retained to `smol/<id>/diag`.
 DIAG|slot=<bootslot>|rst=<reset-reason>|boot=<bootcount>|ota=<outcome>|up=<sec>|heap=<free>
     |hmin=<heap-min>|btn=<short>|btnl=<long>|fok=<flush-ok>|ffl=<flush-fail>|vok=<verify-ok>
     |vfl=<verify-fail>|loss=<pct>|rtt=<ms>|rx=<n>|tx=<n>|led=<mode>:<on|off>|tage=<sec-since-sync>
-    |tsrc=<ntp|mesh|none>|net=<slot>:<ok|fb>|brk=<baked|ovr|fb>|otah=<slot|ovr>[|cfg=<applied-config>]
+    |tsrc=<ntp|mesh|none>|net=<slot>:<ok|fb>|brk=<baked|ovr|fb>|otah=<slot|ovr>[|cfg=<applied-config>][|io=<pin>:<count>,…]
 ```
 
 (one line on the wire; wrapped here for reading.)
@@ -452,6 +475,7 @@ DIAG|slot=<bootslot>|rst=<reset-reason>|boot=<bootcount>|ota=<outcome>|up=<sec>|
 | `brk=<baked\|ovr\|fb>` | broker: baked-in · override active · override auto-disabled | #100 S2 (#110) |
 | `otah=<slot\|ovr>` | OTA host: slot allowlist · runtime override appended | #100 S3 (#110) |
 | `cfg=<applied-config>` | **optional** (espnow): the applied-config echo (≤40 B, `DIAG_CFG_MAX`) HA plain-string-compares against its command topics for **config-drift** detection | #74 S2 (`b1c2c5c`, #109) |
+| `io=<pin>:<count>,…` | **optional** (`io` feature, appended after `cfg=`): per-bound-**input** press/edge counters, so a doll's button push is visible in HA. Byte-identical omission on a non-io build | #72 (`5689b1b`, #113) |
 
 **Companion (#74 S2, `51052fc`):** the gateway's OLED is also mirrored to HA as an MQTT image via
 the Cast tee (`smol/<id>/screen`) — the **display-mirror** — so a node's actual screen is visible in
