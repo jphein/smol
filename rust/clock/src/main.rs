@@ -972,24 +972,9 @@ fn main() -> ! {
                 }
             }
 
-            // #22 soak observability: on the DIAG cadence, emit a BLESOAK serial line for
-            // EVERY role (leaf + gateway) so the team-lead's ≥1 h mesh-stability soak can
-            // correlate scan activity (tags/advrpt) + controller health (cmderr) + heap with
-            // the DIAG loss/rtt/hmin already on the wire. Serial-only; no mesh airtime.
-            #[cfg(feature = "ble")]
-            {
-                let ble_due =
-                    (now / DIAG_CADENCE_MS) != ((now.saturating_sub(SUBTICK_MS as u64)) / DIAG_CADENCE_MS);
-                if ble_due {
-                    log::info!(
-                        "smol: BLESOAK tags={} advrpt={} cmderr={} heap_free={}",
-                        r.ble_live_count(),
-                        r.ble_total_reports(),
-                        r.ble_cmd_errs(),
-                        esp_alloc::HEAP.free(),
-                    );
-                }
-            }
+            // #22 soak observability lives in the DIAG record (`ble=<live>:<advrpt>:<cmderr>`),
+            // NOT a serial line: `log::info!` is compile-time-gated OFF on release builds, so a
+            // serial BLESOAK line would be invisible to the soak. DIAG rides MQTT → HA sees it.
 
             // NOTE: the MMO-snake SNK drain+broadcast used to live here. It MOVED
             // into `MeshSnake::update` (it needs the game state, now owned by the

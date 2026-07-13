@@ -1691,10 +1691,20 @@ pub struct RadioManager {
     /// to drain into `fam`. Bounded, drop-oldest — mirror of `snk`.
     fam_inbox: FamInbox,
     /// #22: the passive BLE observer — owns the esp-wifi `BleConnector` + the heapless
-    /// sighting table. Ticked every main loop by `ble_scan_tick`; its `live_count` feeds
-    /// the DIAG `ble=` scalar and its `record` feeds retained `smol/<id>/ble`.
+    /// sighting table. `None` until the mesh is JOINED: `BleConnector::new` runs the C3 BT
+    /// controller's `ble_init` (which activates the coex arbiter), and calling THAT in the boot
+    /// init path DEADLOCKS the controller (HW-confirmed on id9 — boot hangs before the radio
+    /// even reports). So construction is DEFERRED to the first `ble_scan_tick` after join (see
+    /// `ble_scan_tick`), which also keeps the join RX window BLE-free. `coex` stays dormant
+    /// until `ble_init`'s `coex_enable` runs, so the pre-join path is the proven espnow one.
     #[cfg(feature = "ble")]
-    ble_scanner: crate::net::ble_scan::BleScanner,
+    ble: Option<crate::net::ble_scan::BleScanner>,
+    /// #22: the leaked `'static` controller (Copy shared ref) + the `BT` peripheral, held so the
+    /// deferred `BleScanner::new` can run post-join. `ble_bt` is `take`n on first construction.
+    #[cfg(feature = "ble")]
+    ble_ctrl: &'static EspWifiController<'static>,
+    #[cfg(feature = "ble")]
+    ble_bt: Option<esp_hal::peripherals::BT<'static>>,
     /// #22 (GATEWAY side): per-node relayed BLE-sightings cache, filled by the `SMOLv1 BLE`
     /// service arm from node uplinks and republished as retained `smol/<id>/ble` on each flush
     /// (F6 freshness-gated). Twin of `diag_cache`/`scan_cache`. Unused leaf-side.
@@ -1735,12 +1745,10 @@ impl RadioManager {
         // age-0, flags-3 self-entry — roster anomaly #1) and wastes an eviction-immune slot.
         let self_mac = interfaces.sta.mac_address();
 
-        // #22: bring up the passive BLE observer on the SAME leaked controller (one
-        // `esp_wifi::init` per program) + the `BT` peripheral. AFTER `wifi::new`/`start`
-        // so the coex arbiter is up before the BT controller. `ctrl` is a `Copy` `'static`
-        // shared ref, so reusing it here does not disturb the WiFi controller.
-        #[cfg(feature = "ble")]
-        let ble_scanner = crate::net::ble_scan::BleScanner::new(ctrl, p.bt);
+        // #22: do NOT construct the BLE observer here — `BleConnector::new`'s `ble_init`
+        // deadlocks the C3 BT controller when run in the boot init path (HW-confirmed). Stash
+        // the leaked `'static` controller (Copy) + the `BT` peripheral so `ble_scan_tick` can
+        // build it lazily once the mesh is joined (see the `ble` field docs).
 
         Some(Self {
             controller,
@@ -1798,7 +1806,11 @@ impl RadioManager {
             fam: FamState::new(id),
             fam_inbox: FamInbox::new(),
             #[cfg(feature = "ble")]
-            ble_scanner,
+            ble: None,
+            #[cfg(feature = "ble")]
+            ble_ctrl: ctrl,
+            #[cfg(feature = "ble")]
+            ble_bt: Some(p.bt),
             #[cfg(feature = "ble")]
             ble_cache: crate::net::wifi::RelayCache::new(),
         })
@@ -2320,38 +2332,37 @@ impl RadioManager {
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
     }
 
-    /// #22: service the passive BLE observer once (enable-on-first-call, then drain any
-    /// queued advertising reports into the sighting table). Cheap + non-blocking; `main`
-    /// calls it every subtick beside `leaf_scan_tick`. A no-op-safe wrapper so the tick
-    /// site stays feature-agnostic.
+    /// #22: service the passive BLE observer once. LAZILY constructs the scanner (running the
+    /// C3 BT controller's `ble_init` + activating coex) on the first call AFTER the mesh is
+    /// joined — NEVER in the boot init path, where `ble_init` deadlocks the controller
+    /// (HW-confirmed). "Joined" = this node is the elected gateway OR a leaf that has locked
+    /// onto the owner's channel (`scan_locked`); until then this is a no-op, so the proven
+    /// espnow join path runs BLE-free (coex dormant). Once built, drains queued advertising
+    /// reports (cheap, non-blocking). `main` calls it every subtick beside `leaf_scan_tick`.
     #[cfg(feature = "ble")]
     pub fn ble_scan_tick(&mut self, now: u64) {
-        self.ble_scanner.tick(now);
-    }
-
-    /// #22: distinct BLE devices currently present — the `ble=` DIAG scalar.
-    #[cfg(feature = "ble")]
-    pub fn ble_live_count(&self) -> usize {
-        self.ble_scanner.live_count(now_ms())
-    }
-
-    /// #22: cumulative advertising reports heard since boot (the soak `advrpt=` liveness).
-    #[cfg(feature = "ble")]
-    pub fn ble_total_reports(&self) -> u32 {
-        self.ble_scanner.total_reports()
-    }
-
-    /// #22: HCI command-write failures since boot (0 = controller healthy; the soak `cmderr=`).
-    #[cfg(feature = "ble")]
-    pub fn ble_cmd_errs(&self) -> u32 {
-        self.ble_scanner.cmd_errs()
+        if self.ble.is_none() {
+            let joined = self.relay.is_gateway || self.scan_locked;
+            if joined {
+                if let Some(bt) = self.ble_bt.take() {
+                    log::info!("smol: #22 BLE observer starting — mesh joined, running ble_init");
+                    self.ble = Some(crate::net::ble_scan::BleScanner::new(self.ble_ctrl, bt));
+                }
+            }
+        }
+        if let Some(s) = self.ble.as_mut() {
+            s.tick(now);
+        }
     }
 
     /// #22: this node's compact sightings record (nearest-first top-N) for retained
-    /// `smol/<id>/ble` (gateway self-publish) or the `SMOLv1 BLE` relay (leaf uplink).
+    /// `smol/<id>/ble` (gateway self-publish) or the `SMOLv1 BLE` relay (leaf uplink). Empty
+    /// until the observer has started (pre-join / not-yet-built).
     #[cfg(feature = "ble")]
     pub fn ble_record(&self) -> alloc::string::String {
-        self.ble_scanner.record(now_ms())
+        self.ble
+            .as_ref()
+            .map_or_else(alloc::string::String::new, |s| s.record(now_ms()))
     }
 
     /// #22: broadcast this node's BLE-sightings record as a `SMOLv1 BLE` frame — twin of
@@ -2545,14 +2556,30 @@ impl RadioManager {
                 rec.push_str(cfg);
             }
         }
-        // #22: append the passive-BLE sighting count (distinct devices in the live window) as one
-        // more fixed-key field, AFTER #74's cfg= (HA parsers are order-tolerant prefix scans). Only
-        // in the `ble` build → every other build's DIAG record is byte-identical (the #70 contract's
-        // fixed-key set is unchanged for them).
+        // #22: append the passive-BLE health as one more fixed-key field, AFTER #74's cfg= (HA
+        // parsers are order-tolerant prefix scans). This is the ONLY soak-visible BLE signal on a
+        // release build — `log::info!` is compile-time-gated OFF there, so serial BLESOAK lines are
+        // invisible; DIAG rides MQTT. `ble=off` until the observer starts (deferred to post-join),
+        // then `ble=<live>:<advrpt>:<cmderr>` = devices present : cumulative adv reports (climbs =
+        // scanner hearing RF) : HCI cmd-write failures (0 = controller healthy). Only in the `ble`
+        // build → every other build's DIAG record is byte-identical (#70 fixed-key set unchanged).
         #[cfg(feature = "ble")]
         {
             use core::fmt::Write as _;
-            let _ = write!(rec, "|ble={}", self.ble_scanner.live_count(now_ms()));
+            match self.ble.as_ref() {
+                Some(s) => {
+                    let _ = write!(
+                        rec,
+                        "|ble={}:{}:{}",
+                        s.live_count(now_ms()),
+                        s.total_reports(),
+                        s.cmd_errs()
+                    );
+                }
+                None => {
+                    let _ = write!(rec, "|ble=off");
+                }
+            }
         }
         rec
     }
@@ -3564,7 +3591,7 @@ impl RadioManager {
         // `diag_rec`) + the relayed-node BLE cache. Both cfg-gated: a non-ble build passes an
         // empty record + a None cache, so its flush is byte-identical.
         #[cfg(feature = "ble")]
-        let own_ble = self.ble_scanner.record(now_ms());
+        let own_ble = self.ble_record();
         #[cfg(feature = "ble")]
         let ble_bytes: &[u8] = own_ble.as_bytes();
         #[cfg(not(feature = "ble"))]
