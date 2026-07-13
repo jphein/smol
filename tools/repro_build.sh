@@ -97,7 +97,11 @@ repro_build_bin() {
     # (empty ⇒ build.rs omits it ⇒ board.rs NODE_ID fallback — the fleet-shared image).
     export SMOL_GIT_HASH="$hash" SMOL_BUILD_NUMBER="$number" SOURCE_DATE_EPOCH="$sde"
     [ -n "$node_id" ] && export SMOL_NODE_ID="$node_id"
-    cargo build --release --features espnow "${REPRO_CARGO_ARGS[@]}"
+    # #119: the canonical fleet image is espnow + cast (#26 WLED-cast + the #74 crown
+    # display-mirror) + io (#72 registry — inert until a G config binds pins, and the
+    # dollhouse's dashboard-only pin-binding depends on it being resident). Changing this
+    # list changes the reproducible-image definition (#44): a new sha lineage per commit.
+    cargo build --release --features espnow,cast,io "${REPRO_CARGO_ARGS[@]}"
   ) || return 1
   # Honor CARGO_TARGET_DIR (verify_image.sh --twice points each build at an isolated dir);
   # default to the in-tree target/ (ota_publish.sh's path) when unset.
