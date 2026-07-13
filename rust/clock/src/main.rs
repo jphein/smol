@@ -1007,6 +1007,12 @@ fn main() -> ! {
                 let due = (now / DIAG_CADENCE_MS) != ((now.saturating_sub(SUBTICK_MS as u64)) / DIAG_CADENCE_MS);
                 let expedite = diag_dirty && now.saturating_sub(last_diag_ms) >= DIAG_EXPEDITE_MIN_MS;
                 if due || expedite {
+                    // #114 U2 canary observability: distinguish an EXPEDITED broadcast (config-apply
+                    // triggered) from the steady 60 s cadence — the serial proof the leaf-side
+                    // mechanism fired, independent of the crown's republish quantization.
+                    if expedite && !due {
+                        log::info!("smol #114: diag expedited (config change, {} ms since last)", now.saturating_sub(last_diag_ms));
+                    }
                     let rec = r.diag_record();
                     r.broadcast_diag(rec.as_bytes());
                     last_diag_ms = now;
