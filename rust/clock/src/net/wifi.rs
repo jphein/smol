@@ -1266,10 +1266,12 @@ impl CfgCache {
 /// `CFG_VALUE_MAX` (16, sized for a screen string) because a diag/scan record is a multi-field
 /// line (~130 B) — but still well under the ~250 B ESP-NOW frame budget once the 12 B frame
 /// prefix + 3 B id are added. #74 wave-2 folds ~7 more keys onto the DIAG record (led/rtt/rx/tx/
-/// tage/tsrc/loss), so 224 — the ESP-NOW frame is then 12 (prefix) + 3 (id) + 224 = 239 B, still
-/// under the ~250 B ESP-NOW ceiling with margin.
+/// tage/tsrc/loss); stage-2 adds the ~24 B `cfg=` applied-config string (config-drift). 232 — the
+/// ESP-NOW frame is then 12 (prefix) + 3 (id) + 232 = 247 B, still under the ~250 B ceiling. This
+/// bounds ONLY relayed LEAF records (the gateway self-publishes its own full record via MQTT); the
+/// ~24 B headroom absorbs long-uptime counter growth (up/rx/tx) so `cfg=` (record tail) survives.
 #[cfg(feature = "wifi")]
-pub const RELAY_VALUE_MAX: usize = 224;
+pub const RELAY_VALUE_MAX: usize = 232;
 
 #[cfg(feature = "wifi")]
 const RELAY_CACHE_CAP: usize = 12;
@@ -1930,6 +1932,25 @@ fn mqtt_session(
                 }
             }
         }
+    }
+
+    // #74 stage-2 display mirror: publish the gateway's OWN glass as a 64×32 1-bit BMP (base64) to
+    // RETAINED `smol/<id>/screen` for HA to render as an `mqtt image`. `cast`-only — it reuses the
+    // #26 Cast tee's live `Mirror` (the tee already snapshots the glass every render tick, so there
+    // is NO new draw-path tap; the invasive per-plugin text approach was deliberately not taken).
+    // GATEWAY-only v1: leaves have no MQTT (Cast is a gateway-role activity) — a leaf-screen mirror
+    // is a mesh-frame follow-on. The b64 BMP is ~424 B → fits the 512 B `pkt` packet with margin.
+    #[cfg(feature = "cast")]
+    {
+        let mut sctopic = MqttScratch::new();
+        let _ = write!(sctopic, "smol/{}/screen", node_id);
+        crate::net::cast::with_screen_b64(|b64| {
+            if let Some(n) =
+                crate::net::mqtt::encode_publish(&mut pkt, sctopic.as_bytes(), b64, true)
+            {
+                let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            }
+        });
     }
 
     // --- Receive the retained battery + grid payloads (both SUBSCRIBEs above) ---
