@@ -92,6 +92,10 @@ stays well under 250 B.
 | [OTAD](#leaf-mesh-ota-frames-40) | `SMOLv1 OTAD ` | ≤250 | gw→leaf broadcast | windowed burst | espnow | 🟢 |
 | [OTAN](#leaf-mesh-ota-frames-40) | `SMOLv1 OTAN ` | ≤27 | leaf→gw unicast | per window | espnow | 🟢 |
 | [LDBG](#leaf-mesh-ota-frames-40) | `SMOLv1 LDBG ` | 21 | leaf→broadcast | per fetch | espnow | 🟢 |
+| [CFG](#cfg--keyed-per-node-config-channel-56) | `SMOLv1 CFG ` | ≤79 | gw→leaf broadcast | per config change / ~10 s re-arm | espnow | 🟢 |
+| [DIAG](#diag--retained-per-node-health-record-704974100) | `SMOLv1 DIAG ` | ≤250 | leaf→broadcast | ~10 s | espnow | 🟢 |
+| [SCAN](#scan--on-demand-wifi-scan-uplink-71) | `SMOLv1 SCAN ` | ≤250 | leaf→broadcast | on-demand (#71) | espnow | 🟢 |
+| [FAM](#fam--the-mesh-familiar-57) | `SMOLv1 FAM ` | 29 | holder broadcast | ~1.5 s (holder only) | espnow | 🟢 |
 
 > **The battery downlink is two hops.** The [`SMOLv1 BATT`](#batt--ha-battery-snapshot)
 > frame above is the *mesh* hop (gateway → leaves). It's **fed** by an
@@ -329,30 +333,139 @@ all-gateway-fleet caveat as BATT — no leaf has cached one yet).
 `broadcast_grid` (`:1374`); RX `Frame::Grid`; render + `GridCache` in `grid.rs`; fed by
 `GRID_TOPIC` (`net/wifi.rs:81`, `smol/display/grid`) in the same burst as BATT.
 
-## CONFIG — retained per-node default screen (#21, spec'd — firmware pending)
+## CFG — keyed per-node config channel (#56)
 
-**Purpose.** Set a node's boot **default screen + page** remotely, no reflash. This is
-**MQTT-only, not an ESP-NOW frame** (deliberately — the unauthenticated mesh must never
-become a command channel; security ruling R-P3). Documented here so the wire contract
-is one place; the **HA publish side is deployed**, the **firmware consume side is a
-pending wave**.
+**Purpose.** One frame carries *every* per-node runtime knob over the mesh, no reflash.
+HA publishes a **retained MQTT** topic per node/key; the gateway relays each as a
+`SMOLv1 CFG` ESP-NOW frame to the leaf. This supersedes the original MQTT-only
+"default screen" spec (#21) — the keyed channel (#56) shipped it as a real relayed frame,
+and #45/#48/#43/#55/#52/#71/#100 hung the rest of the family off the same wire.
+
+**Frame layout (≤79 B).**
+
+| Field | Bytes | Encoding | Meaning |
+|---|---|---|---|
+| tag | 11 | `b"SMOLv1 CFG "` | namespace (`CFG_PREFIX`) |
+| `target` | 3 | ASCII `NNN` | destination leaf id, or `255` = `CFG_TARGET_ALL` (fleet-global) |
+| `key` | 1 | ASCII | which knob (table below) |
+| `value` | ≤64 | bytes | key-specific payload, `CFG_VALUE_MAX = 64` |
+
+**The key family (`CFG_APPLY_KEYS`, merged main @ `feee183` — 10 keys).** A key a leaf's
+firmware predates is DROPPED (forward-compat, #46). Parse is panic-free/heap-free/bounded
+(a LAN-writable broker + a payload that panicked would re-deliver every boot → boot-loop brick).
+
+| Key | Issue | What it sets | Cached + re-armed? | Apply |
+|---|---|---|---|---|
+| `S` | #21/#18 | boot **default screen** `<AppKind>:<page>` | yes | live, no reboot |
+| `L` | #48 | **LED** mode (`status`/`on`/`off`) | yes | live |
+| `U` | #43 | **display units** — °F/°C + 12/24h (fleet-global via `CFG_TARGET_ALL`) | yes | live |
+| `P` | #55 | **plugin visibility** bitmask per node | yes | live |
+| `Y` | #45 | **Custom screen** layout (the largest value → drives `CFG_VALUE_MAX = 64`) | yes | live |
+| `N` | #100 S1b | active **WiFi slot** index (`fd3b439`) | yes | **edge-triggered reboot** |
+| `B` | #100 S2 | **broker** leg override (IPv4 + port) (`b08204d`, #110) | yes | **edge-triggered reboot** |
+| `O` | #100 S3 | **OTA-host** override — one RFC1918 host appended to the fetch allowlist (`b08204d`, #110) | yes | live, **no reboot** |
+| `R` | #52 | **remote reboot** | **NO** — transient, never cached/retained | reboots (that is its function) |
+| `W` | #71 | on-demand **WiFi scan** trigger | **NO** — transient (a *cached* scan = a periodic off-channel excursion, the coexist hazard) | live one-shot, no reboot |
+
+- **Reboot vs live.** Live-apply (no reboot): `S L U P Y O W`. Reboot on apply: `N` (WiFi-slot
+  switch), `B` (broker-leg change) — both **edge-triggered** (only when the value changes, so
+  the ~10 s re-arm never reboot-loops); `R` reboots by design. `O` takes effect on the next OTA
+  fetch without a reboot.
+- **Cached + re-armed vs transient.** `S L U P Y N B O` live in the gateway's `cfg_cache` and are
+  **re-broadcast every ~10 s** (`broadcast_cached_configs`), so a rebooted leaf re-arms within ~10 s
+  with **no leaf-side NVS** — except the network state (`N`/`B`/`O`), which *also* persists in the
+  NVS net record below (needed to reach the broker at all before the first relay). `R`/`W` are
+  one-shot and never cached (an anti-reboot-loop / anti-off-channel invariant).
+- **`S` default-screen value.** `<AppKind>:<page>` — `AppKind` is the exact `app.rs` spelling
+  (`Menu Clock Batt Grid Snake Bench MeshSnake About`; wire `Snake` → MeshSnake on espnow); `page`
+  is one digit, out-of-range clamps to 0; empty value clears → compile-time `board.rs`
+  `DEFAULT_APP`/`DEFAULT_PAGE` (#18/#19).
+- **Retained MQTT feed.** Each key is fed by a retained per-node topic (`smol/<id>/config/…`); the
+  gateway self-applies its own id via the credentialed MQTT path and relays the rest single-hop
+  (leaves never re-broadcast → no flood/loop).
+- **Status.** 🟢 **shipped + hardware-proven.** `mode.rs` `CFG_PREFIX`/`CFG_APPLY_KEYS`;
+  `wifi.rs` `CFG_KEY_*`/`CfgCache`.
+
+> **Pending #113 (#72 IO/component registry):** adds key `G` (a compact per-pin driver map:
+> `<pin><type>;…` over the same channel) and surfaces `io=` in the DIAG record. **Not on merged
+> main yet** — this doc will gain the `G`/`g` rows + the `io=` field when PR #113 lands.
+
+### The NVS net record — 28-byte v2 (#100)
+
+The network state set by `CFG-N/B/O` also persists in NVS **sector 5** (`0x5000`), so a leaf can
+reach the broker before the first relay arrives. Brick-safe: any read failure/corruption → `None` →
+the caller defaults to slot 0 (the boot-default network).
+
+| Bytes | Field | Notes |
+|---|---|---|
+| 0–3 | magic `"SMn1"` | `NET_MAGIC` |
+| 4 | version | v1 = 10-B core (slot only); **v2 = 28 B** (written today), adds the ext |
+| 5 | `active` | WiFi slot associated NOW (`<2`) |
+| 6 | `commanded` | last slot CFG-`N` asked for (differs from `active` iff auto-reverted) |
+| 7 | `fallback` | the un-brick WiFi fallback fired → DIAG `net=<slot>:fb` |
+| 8 | `active ^ 0xFF` | core complement guard |
+| 9 | `(active^commanded^fb)+0x5A` | core checksum guard *(v1 core ends here — 10 B)* |
+| 10 | broker present (1/0) | v2 ext (Stage 2) |
+| 11 | `broker_fallback` | override auto-disabled after repeated CONNACK fails → `brk=fb` |
+| 12–15 | broker IPv4 octets | RFC1918, gated at CFG apply |
+| 16–17 | broker port | u16 LE |
+| 18 | ota_host present (1/0) | v2 ext (Stage 3) |
+| 19–22 | ota_host IPv4 octets | RFC1918 |
+| 23 | ext checksum | `sum(rec[10..23]) + 0x5A` |
+| 24 | ext checksum `^ 0xFF` | ext complement guard |
+| 25–27 | zero pad | word-alignment only — esp-storage `WRITE_SIZE = 4`, so 25→**28** (`1b52456`); outside the checksum |
+
+- **v1 ↔ v2 compat.** A v2 firmware reading a v1 record treats it as "no overrides"; a v1 firmware
+  reading a v2 record rejects it (version mismatch) → slot 0 (a **safe** rollback). No forced
+  migration — the first v2 write (a CFG-`N`/`B`/`O` apply, or a fallback) upgrades the record in place.
+- **Why 28, not 25.** A non-word-aligned write returns `NotAligned`; the swallowed error had made the
+  record silently never persist (HW-canary find 2026-07-12 — the edge-trigger fired, then
+  verify-after-write aborted every apply). Source: `ota.rs` `NetCfg`/`encode_net_cfg`/`parse_net_cfg`.
+
+## DIAG — retained per-node health record (#70/#49/#74/#100)
+
+**Purpose.** One retained record per node makes a silent rollback / a failed network switch /
+config drift visible in HA at a glance. A leaf **broadcasts** `SMOLv1 DIAG NNN<record>`; the gateway
+caches it (`diag_cache`) and republishes it retained to `smol/<id>/diag`.
+
+**Record (merged main @ `feee183`, built by `RadioManager::diag_record`):**
 
 ```
-smol/<id>/config/default_screen   (retain: true, qos: 0)   payload: <AppKind>:<page>
+DIAG|slot=<bootslot>|rst=<reset-reason>|boot=<bootcount>|ota=<outcome>|up=<sec>|heap=<free>
+    |hmin=<heap-min>|btn=<short>|btnl=<long>|fok=<flush-ok>|ffl=<flush-fail>|vok=<verify-ok>
+    |vfl=<verify-fail>|loss=<pct>|rtt=<ms>|rx=<n>|tx=<n>|led=<mode>:<on|off>|tage=<sec-since-sync>
+    |tsrc=<ntp|mesh|none>|net=<slot>:<ok|fb>|brk=<baked|ovr|fb>|otah=<slot|ovr>[|cfg=<applied-config>]
 ```
 
-- **AppKind** = the exact `app.rs` enum spelling (case-sensitive), full espnow set:
-  `Menu Clock Batt Grid Snake Bench MeshSnake About` (wire `Snake` maps to `SNAKE_KIND`
-  = MeshSnake on espnow). **page** = one digit; flat, firmware clamps out-of-range → 0.
-- **Empty retained payload = clear** → the node falls back to its compile-time
-  `board.rs` `DEFAULT_APP`/`DEFAULT_PAGE` (#18/#19). There is **no broadcast topic** —
-  "set all" writes every per-node topic.
-- **Firmware parse MUST be panic-free** (strict allowlist, heap-free, bounded, unknown/
-  wrong-tier/bad-page → ignore + keep current): the broker is LAN-writable, and a
-  retained payload that panicked would be re-delivered every boot → **boot-loop brick**.
-- **Status.** 🟡 **spec'd + HA-side deployed; firmware consume side not yet built.**
-  Protocol LOCKED in `scratch/smol-ha-batt/nodemgr-design.md §2`; HA helpers/automations/
-  Lovelace live (see [ha/README.md](../ha/README.md) → "Node manager").
+(one line on the wire; wrapped here for reading.)
+
+| Field | Meaning | Since |
+|---|---|---|
+| `slot`/`rst`/`boot`/`ota` | boot slot · reset reason · boot count · last-OTA outcome | #70 |
+| `up`/`heap`/`hmin` | uptime s · free heap · heap low-water | #70/#49 |
+| `btn`/`btnl` | BOOT short-/long-press counters (HA fires events on change) | #49 |
+| `fok`/`ffl` | gateway MQTT bursts to CONNACK vs failed (leaf-side 0) | #49 |
+| `vok`/`vfl` | OTA image verify ok/fail | #49 |
+| `loss`/`rtt`/`rx`/`tx` | mesh link-quality set (packet-loss % · RTT ms · rx/tx counts) | #49/#74 |
+| `led`/`tage`/`tsrc` | commanded LED mode:lit-state · seconds since sync · time source | #74 |
+| `net=<slot>:<ok\|fb>` | active WiFi slot + whether the un-brick fallback fired | #100 S1b (`fd3b439`) |
+| `brk=<baked\|ovr\|fb>` | broker: baked-in · override active · override auto-disabled | #100 S2 (#110) |
+| `otah=<slot\|ovr>` | OTA host: slot allowlist · runtime override appended | #100 S3 (#110) |
+| `cfg=<applied-config>` | **optional** (espnow): the applied-config echo (≤40 B, `DIAG_CFG_MAX`) HA plain-string-compares against its command topics for **config-drift** detection | #74 S2 (`b1c2c5c`, #109) |
+
+**Companion (#74 S2, `51052fc`):** the gateway's OLED is also mirrored to HA as an MQTT image via
+the Cast tee (`smol/<id>/screen`) — the **display-mirror** — so a node's actual screen is visible in
+the dashboard beside its DIAG. **Status.** 🟢 shipped.
+
+## SCAN — on-demand WiFi scan uplink (#71)
+
+**Purpose.** A node scans nearby APs **only on request** (CFG-`W`) and uplinks the result — never a
+periodic background scan (that would take the radio off-channel and go mesh-deaf). Leaf broadcasts
+`SMOLv1 SCAN NNN<value>`; the gateway republishes to `smol/<id>/scan`.
+
+**Value:** literal `SCAN` then up to `SCAN_MAX_APS = 5` `|`-separated groups
+`<ssid>,<bssid-3oct-hex>,<ch>,<rssi>` (SSID truncated to `SCAN_SSID_MAX = 12`, `|`/`,` stripped).
+**Status.** 🟢 shipped. Source: `mode.rs` `SCAN_PREFIX`.
 
 ## RELAY / RELAYACK — ESP-NOW → internet telemetry
 
@@ -459,6 +572,35 @@ all three boards; powers + leaderboard live (compile-clean across all 3 builds).
 bit-layout is **final** (bit 0 alive · bits 1–2 heading · bits 3–7 active-power, `POWER_COUNT = 6`),
 defined in `mesh_snake/snake_core.rs`.
 **Source.** `mmo-snake-netcode.md` (§1/§5) + `mmo-snake-design.md` (§7).
+
+---
+
+## FAM — the Mesh Familiar (#57)
+
+**Purpose.** One living creature inhabits **exactly one board at a time** and migrates across the
+mesh when the holder is unplugged. Only the current holder beats `SMOLv1 FAM`; every other board
+reconstructs a Weasley-clock pointer ("@ &lt;holder&gt;") from the last beat it heard.
+
+**Frame layout (`FAM_FRAME_LEN = 29 B`, `familiar/mod.rs`).**
+
+| Field | Bytes | Meaning |
+|---|---|---|
+| tag | 11 | `b"SMOLv1 FAM "` (byte 7 = `F`, unique vs TIME/OTA) |
+| `kind` | 1 | `H` heartbeat · `X` handoff (full state) · `C` call ("come here") |
+| `holder` | 1 | id of the board the creature is on |
+| `target` | 1 | handoff/call destination id |
+| `seq` | 2 | u16 LE — monotonic beat counter (RFC-1982 wrap-aware) |
+| `seed` | 4 | u32 — identity: derives name + species deterministically on every node (`seed != 0`) |
+| `birth` | 4 | u32 — birth time (age/growth stage) |
+| `fed` | 4 | u32 — last-fed time (hunger) |
+| `mood` | 1 | holder-computed mood token |
+
+- **Exactly-one invariant.** Only the holder beats (~1.5 s, phase-jittered). A holder that hears a
+  newer `seq` (or equal `seq` + lower holder-id) yields; a handoff is a type-`X` beat then silence;
+  orphan takeover fires after `FAM_LOST_MS` (~12 s) → the nearest survivor re-births from the cached
+  seed/birth (same creature, same age). Migration is human-verified on glass.
+- **Flag.** espnow. **Status.** 🟢 **merged + on-glass** (#57, PR #99). Source: `familiar/mod.rs`
+  (`FAM_PREFIX`, `encode_fam`/`parse_fam`); state machine in `net/mode.rs` (`fam_tick`).
 
 ---
 

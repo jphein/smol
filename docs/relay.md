@@ -242,3 +242,11 @@ downlink, `sensor.smol_7…`/`sensor.smol_8…` live in HA (incl. a leaf's telem
 relayed leaf→gateway→cloud). The **UDP collector is retired** (stopped/disabled, JSONL
 archived). Still open: leaf-side BATT-frame *receipt* is inferred (finding #15), plus
 one SNTP-starved-boot-MQTT edge (#15).
+
+**v2.1 — runtime-overridable broker + OTA host (#100 Stage 2/3, PR #110).** The MQTT broker leg
+is no longer baked-only: it can be **overridden at runtime from the HA dashboard** via keyed-CFG
+`B` (broker IPv4 + port) and the OTA image-host via `O` — both persisted in the 28-byte NVS net
+record (see [protocol.md → CFG](protocol.md#cfg--keyed-per-node-config-channel-56) and the net
+record). A broker override that can't reach CONNACK **auto-reverts** to the slot's baked broker
+(surfaced as `brk=fb` in the [DIAG record](protocol.md#diag--retained-per-node-health-record-704974100)),
+so a bad broker change can't strand a gateway. The relay/reassembly path here is unchanged.
