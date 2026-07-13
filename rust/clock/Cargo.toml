@@ -190,6 +190,13 @@ coexist-soak = ["espnow"]
 # ≥1 h mesh-stability soak (issue #22). Bumps the shared heap 72→96 KB (net::init_heap).
 ble = ["espnow", "esp-wifi/ble", "esp-wifi/coex", "dep:embedded-io"]
 
+# #22 DIAGNOSTIC ONLY (not for production/soak): `ble` + esp-wifi's own internal logging. smol
+# does NOT enable `esp-wifi/log-04` normally, so esp-wifi's `debug!`/`info!` (incl. ble_init's
+# step logs — "BT controller compile version", "The btdm_controller_init was initialized", …)
+# compile to no-ops and are invisible on serial. Build `--features ble-debug` with ESP_LOG=debug
+# to surface them → pinpoints exactly which ble_init blob call hangs, if one still does.
+ble-debug = ["ble", "esp-wifi/log-04"]
+
 [profile.release]
 # esp-wifi strongly recommends opt-level "s"/2/3 and LTO; the radio blobs are
 # timing-sensitive and misbehave when built at opt-level 0.

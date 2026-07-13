@@ -1690,21 +1690,14 @@ pub struct RadioManager {
     /// #57: decoded inbound FAM frames (+ RSSI) buffered by `service()` for `fam_tick`
     /// to drain into `fam`. Bounded, drop-oldest — mirror of `snk`.
     fam_inbox: FamInbox,
-    /// #22: the passive BLE observer — owns the esp-wifi `BleConnector` + the heapless
-    /// sighting table. `None` until the mesh is JOINED: `BleConnector::new` runs the C3 BT
-    /// controller's `ble_init` (which activates the coex arbiter), and calling THAT in the boot
-    /// init path DEADLOCKS the controller (HW-confirmed on id9 — boot hangs before the radio
-    /// even reports). So construction is DEFERRED to the first `ble_scan_tick` after join (see
-    /// `ble_scan_tick`), which also keeps the join RX window BLE-free. `coex` stays dormant
-    /// until `ble_init`'s `coex_enable` runs, so the pre-join path is the proven espnow one.
+    /// #22: the passive BLE observer — owns the esp-wifi `BleConnector` + the heapless sighting
+    /// table. Its `ble_init` (BT controller bring-up) runs at `new()` BEFORE WiFi starts (the
+    /// coex-correct order — running it after WiFi start deadlocks the C3, HW-confirmed). The
+    /// passive SCAN is enabled lazily on the first `ble_scan_tick` after mesh-join (airtime), so
+    /// the idle controller here doesn't perturb the join. Ticked every main loop by
+    /// `ble_scan_tick`; feeds the DIAG `ble=` field + retained `smol/<id>/ble`.
     #[cfg(feature = "ble")]
-    ble: Option<crate::net::ble_scan::BleScanner>,
-    /// #22: the leaked `'static` controller (Copy shared ref) + the `BT` peripheral, held so the
-    /// deferred `BleScanner::new` can run post-join. `ble_bt` is `take`n on first construction.
-    #[cfg(feature = "ble")]
-    ble_ctrl: &'static EspWifiController<'static>,
-    #[cfg(feature = "ble")]
-    ble_bt: Option<esp_hal::peripherals::BT<'static>>,
+    ble: crate::net::ble_scan::BleScanner,
     /// #22 (GATEWAY side): per-node relayed BLE-sightings cache, filled by the `SMOLv1 BLE`
     /// service arm from node uplinks and republished as retained `smol/<id>/ble` on each flush
     /// (F6 freshness-gated). Twin of `diag_cache`/`scan_cache`. Unused leaf-side.
@@ -1735,6 +1728,19 @@ impl RadioManager {
         let ctrl: &'static EspWifiController<'static> =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(ctrl));
 
+        // #22: bring up the BLE controller (`ble_init`) NOW — BEFORE `wifi::new`/`start`. Under
+        // coex the BT controller must be initialised before WiFi runs (the arbiter is set up for
+        // both, then WiFi starts) — the order the esp-rs coex examples use. Running `ble_init`
+        // AFTER WiFi start deadlocks the C3 controller (HW-confirmed on id9, both boot-after-start
+        // and post-join). The passive SCAN is NOT enabled here — that's deferred to the first
+        // `ble_scan_tick` after mesh-join (airtime), so bringing the (idle) controller up now does
+        // not perturb the join. `ctrl` is a Copy `'static` ref, reused for `wifi::new` below.
+        #[cfg(feature = "ble")]
+        let ble = {
+            log::info!("smol: #22 ble_init (pre-wifi-start, coex order) — bringing up BT controller");
+            crate::net::ble_scan::BleScanner::new(ctrl, p.bt)
+        };
+
         let (mut controller, interfaces) = esp_wifi::wifi::new(ctrl, p.wifi).ok()?;
         controller.set_mode(WifiMode::Sta).ok()?;
         controller.start().ok()?;
@@ -1744,11 +1750,6 @@ impl RadioManager {
         // broadcasts back to us; with no self-filter the gateway rosters ITSELF (constant-RSSI,
         // age-0, flags-3 self-entry — roster anomaly #1) and wastes an eviction-immune slot.
         let self_mac = interfaces.sta.mac_address();
-
-        // #22: do NOT construct the BLE observer here — `BleConnector::new`'s `ble_init`
-        // deadlocks the C3 BT controller when run in the boot init path (HW-confirmed). Stash
-        // the leaked `'static` controller (Copy) + the `BT` peripheral so `ble_scan_tick` can
-        // build it lazily once the mesh is joined (see the `ble` field docs).
 
         Some(Self {
             controller,
@@ -1806,11 +1807,7 @@ impl RadioManager {
             fam: FamState::new(id),
             fam_inbox: FamInbox::new(),
             #[cfg(feature = "ble")]
-            ble: None,
-            #[cfg(feature = "ble")]
-            ble_ctrl: ctrl,
-            #[cfg(feature = "ble")]
-            ble_bt: Some(p.bt),
+            ble,
             #[cfg(feature = "ble")]
             ble_cache: crate::net::wifi::RelayCache::new(),
         })
@@ -2341,28 +2338,19 @@ impl RadioManager {
     /// reports (cheap, non-blocking). `main` calls it every subtick beside `leaf_scan_tick`.
     #[cfg(feature = "ble")]
     pub fn ble_scan_tick(&mut self, now: u64) {
-        if self.ble.is_none() {
-            let joined = self.relay.is_gateway || self.scan_locked;
-            if joined {
-                if let Some(bt) = self.ble_bt.take() {
-                    log::info!("smol: #22 BLE observer starting — mesh joined, running ble_init");
-                    self.ble = Some(crate::net::ble_scan::BleScanner::new(self.ble_ctrl, bt));
-                }
-            }
-        }
-        if let Some(s) = self.ble.as_mut() {
-            s.tick(now);
-        }
+        // The BT controller is already up (ble_init ran at `new()`). ENABLE the passive scan
+        // only once the mesh is joined — gateway (elected) or a leaf that has locked onto the
+        // owner's channel — so the join RX window stays scan-free (airtime); a no-op until then.
+        let joined = self.relay.is_gateway || self.scan_locked;
+        self.ble.tick(now, joined);
     }
 
     /// #22: this node's compact sightings record (nearest-first top-N) for retained
     /// `smol/<id>/ble` (gateway self-publish) or the `SMOLv1 BLE` relay (leaf uplink). Empty
-    /// until the observer has started (pre-join / not-yet-built).
+    /// (`BLE|n=0`) until the scan has started (pre-join).
     #[cfg(feature = "ble")]
     pub fn ble_record(&self) -> alloc::string::String {
-        self.ble
-            .as_ref()
-            .map_or_else(alloc::string::String::new, |s| s.record(now_ms()))
+        self.ble.record(now_ms())
     }
 
     /// #22: broadcast this node's BLE-sightings record as a `SMOLv1 BLE` frame — twin of
@@ -2566,19 +2554,17 @@ impl RadioManager {
         #[cfg(feature = "ble")]
         {
             use core::fmt::Write as _;
-            match self.ble.as_ref() {
-                Some(s) => {
-                    let _ = write!(
-                        rec,
-                        "|ble={}:{}:{}",
-                        s.live_count(now_ms()),
-                        s.total_reports(),
-                        s.cmd_errs()
-                    );
-                }
-                None => {
-                    let _ = write!(rec, "|ble=off");
-                }
+            if self.ble.started() {
+                let _ = write!(
+                    rec,
+                    "|ble={}:{}:{}",
+                    self.ble.live_count(now_ms()),
+                    self.ble.total_reports(),
+                    self.ble.cmd_errs()
+                );
+            } else {
+                // Controller up (ble_init done at boot) but scan not yet enabled (pre-join).
+                let _ = write!(rec, "|ble=off");
             }
         }
         rec

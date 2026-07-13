@@ -7,15 +7,22 @@
 //!
 //! ## Lifecycle
 //! Constructed once from the leaked `'static` [`EspWifiController`] (the same one
-//! `RadioManager` uses for WiFi/ESP-NOW) plus the `BT` peripheral, AFTER
-//! `esp_wifi::init` + `wifi::new` have run — the coex arbiter must be up before
-//! the BT controller starts. [`BleConnector::new`] calls the controller's
-//! `ble_init`; dropping it calls `ble_deinit`, so the scanner is held for the
-//! program's life (never dropped → BT stays initialised).
+//! `RadioManager` uses for WiFi/ESP-NOW) plus the `BT` peripheral, after
+//! `esp_wifi::init` but BEFORE `wifi::new` + `WifiController::start()`. THE ORDER
+//! MATTERS: under coex the BT controller must be initialised before WiFi starts
+//! (the arbiter is set up for both controllers, then WiFi runs) — running
+//! [`BleConnector::new`]'s `ble_init` AFTER WiFi start deadlocks the C3 controller
+//! (HW-confirmed on id9, both at boot-after-start and post-join). Matches the
+//! esp-rs coex examples (BLE controller created before the WiFi controller).
+//! Dropping it calls `ble_deinit`, so the scanner is held for the program's life
+//! (never dropped → BT stays initialised).
 //!
 //! ## Passive-only, non-blocking drain
-//! On the first [`tick`], we send `LE Set Scan Parameters` (passive) + `LE Set
-//! Scan Enable`. Thereafter each tick drains the controller's event queue via the
+//! `ble_init` (controller bring-up) happens at construction; the passive SCAN is
+//! enabled lazily on the first [`tick`] with `allow_scan` true (the caller gates
+//! that on mesh-join, so the join RX window is scan-free). Enabling sends `LE Set
+//! Scan Parameters` (passive) + `LE Set Scan Enable`. Thereafter each tick drains
+//! the controller's event queue via the
 //! **non-blocking** `BleConnector::next` (it returns 0 when empty — it never
 //! parks the single-threaded main loop) and folds any advertising reports into
 //! the [`SightingTable`]. We never issue a connection or an active-scan probe.
@@ -81,11 +88,21 @@ impl BleScanner {
         }
     }
 
-    /// Drive one service pass: enable the scan on the first call, then drain any
-    /// queued advertising reports into the table and age out stale devices. Cheap
-    /// and non-blocking — safe to call every main-loop iteration.
-    pub fn tick(&mut self, now: u64) {
+    /// True once the passive scan has been enabled (i.e. we're joined + scanning).
+    pub fn started(&self) -> bool {
+        self.started
+    }
+
+    /// Drive one service pass. The BT controller itself is already up (`ble_init` ran at
+    /// construction, before WiFi started — the coex-correct order). This ENABLES the passive
+    /// scan on the first call with `allow_scan` true (gated by the caller on mesh-join, so the
+    /// join RX window stays scan-free), then drains queued advertising reports. Cheap +
+    /// non-blocking — safe every main-loop iteration; a no-op until `allow_scan` first holds.
+    pub fn tick(&mut self, now: u64, allow_scan: bool) {
         if !self.started {
+            if !allow_scan {
+                return; // controller up, but hold the scan until the mesh is joined
+            }
             self.enable_scan();
             self.started = true;
         }
