@@ -114,6 +114,13 @@ pub struct MeshElect {
     /// gateway-flush this is false → the original, hardware-validated lowest-id
     /// election runs UNCHANGED (preserves #2 split-brain + fast cold-start).
     pub recovery: bool,
+    /// #114 H1: (recovery only) true iff this leaf has NEVER heard a HELLO from the owner it is
+    /// following. A DEAD owner (frozen seq) that was never heard is a forged / phantom retained MC
+    /// (the crown-handover standoff) — there is no live board to stagger against, so the resolver
+    /// takes it over PROMPTLY (id-only tiebreak) instead of waiting the full RSSI backoff. Never
+    /// overrides the FROZEN-seq safety gate: an owner whose seq still advances is alive and is never
+    /// taken over regardless of this flag (RF-dead-zone protection intact).
+    pub owner_never_heard: bool,
     /// #51 return-flap fix: true ONLY on the one-shot BOOT election. A freshly-booted board
     /// must NEVER claim over a DIFFERENT owner already present in the retained MC — it comes
     /// up as a leaf and lets leaf-scan (fast HELLO lock) + the recovery election decide (live
@@ -144,6 +151,7 @@ impl MeshElect {
             my_rssi: -99, // weak default until the first association captures it
             my_channel: 0, // #29: advisory 0 until a frame's rx_control is learned
             recovery: false,
+            owner_never_heard: false,
             boot: false,
             i_am_owner: false,
             owner_id: my_id,
@@ -2676,7 +2684,15 @@ fn mqtt_session(
                 // #51 recovery: owner is DEAD. Take over once past RECOVERY_STALE_MS PLUS our
                 // RSSI-weighted backoff — the strongest-uplink survivor crosses first.
                 elect.owner_alive = false;
-                let backoff = reelect_backoff_ms(elect.my_rssi, node_id);
+                // #114 H1: a dead owner this leaf NEVER heard a HELLO from is a forged / phantom
+                // retained MC (the standoff) — there is no live board to stagger against, so skip
+                // the RSSI backoff and take over promptly on an id-only tiebreak (lowest id first).
+                // A heard-then-died owner keeps the RSSI-weighted stagger (pick the best survivor).
+                let backoff = if elect.owner_never_heard {
+                    (node_id as u64) * 200
+                } else {
+                    reelect_backoff_ms(elect.my_rssi, node_id)
+                };
                 if elect.now_ms.saturating_sub(elect.seen_ms)
                     >= RECOVERY_STALE_MS.saturating_add(backoff)
                 {
@@ -2725,6 +2741,72 @@ fn mqtt_session(
         if !published {
             elect.i_am_owner = false; // couldn't prove uplink → stay leaf, retry next burst
             log::warn!("smol: mesh election — MC publish FAILED, not claiming ownership");
+        }
+        // #114 H2: seq-claim RACE tie-break. Two candidates that hit an EMPTY MC simultaneously both
+        // claim seq=1 (last-write-wins on the broker) and both would burst as gateway — a split-brain
+        // that today only reconverges via the lowest-id flush resolver (~1–2 flushes). After OUR claim
+        // publish, briefly re-read the retained MC: a DIFFERENT owner appearing means a concurrent
+        // claim landed → resolve DETERMINISTICALLY by lowest id (the HIGHER id always YIELDS; a lower
+        // id re-asserts seq+1 so the retained record names it). Bounded (≤400 ms, tick-abortable) +
+        // FAIL-SAFE: a timeout / parse-miss keeps our original verdict (never a regression), and we
+        // never yield to — nor claim over — an owner we haven't out-ranked by id.
+        if elect.i_am_owner && published {
+            let reread_deadline = Instant::now() + Duration::from_millis(400);
+            let mut competitor: Option<(u8, u8, u32)> = None;
+            while Instant::now() < reread_deadline {
+                if tick() {
+                    break;
+                }
+                iface.poll(smoltcp_now(), device, sockets);
+                recv_into(sockets, tcp_handle, &mut acc[..], &mut acc_len);
+                loop {
+                    match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
+                        Some((crate::net::mqtt::Incoming::Publish { topic, payload, .. }, consumed)) => {
+                            if topic == MESH_CHANNEL_TOPIC {
+                                if let Some(mc2) = parse_mesh_channel(payload) {
+                                    competitor = Some(mc2);
+                                }
+                            }
+                            acc.copy_within(consumed..acc_len, 0);
+                            acc_len -= consumed;
+                        }
+                        Some((_, consumed)) => {
+                            acc.copy_within(consumed..acc_len, 0);
+                            acc_len -= consumed;
+                        }
+                        None => break,
+                    }
+                }
+                // Stop as soon as we've seen a competing owner (a concurrent claim landed).
+                if competitor.map(|(o, _, _)| o != node_id).unwrap_or(false) {
+                    break;
+                }
+            }
+            if let Some((owner2, _ch2, seq2)) = competitor {
+                if owner2 > node_id {
+                    // A HIGHER id overwrote our claim, but we out-rank it → re-assert with seq+1 so
+                    // the retained record names us (the lowest); it yields when it re-reads.
+                    let reseq = seq2.wrapping_add(1);
+                    let mut mcp2 = MqttScratch::new();
+                    let _ = write!(mcp2, "MC|{}|{}|{}", node_id, elect.my_channel, reseq);
+                    if let Some(n) =
+                        crate::net::mqtt::encode_publish(&mut pkt, MESH_CHANNEL_TOPIC, mcp2.as_bytes(), true)
+                    {
+                        if tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick) {
+                            elect.seen_seq = reseq;
+                            log::info!("smol: #114 H2 — re-asserted claim over higher-id {} (seq {})", owner2, reseq);
+                        }
+                    }
+                } else if owner2 < node_id {
+                    // A LOWER id also claimed and holds the slot → YIELD (no duplicate gateway).
+                    elect.i_am_owner = false;
+                    elect.owner_id = owner2;
+                    elect.seen_owner = owner2;
+                    elect.seen_seq = seq2;
+                    elect.seen_ms = elect.now_ms;
+                    log::info!("smol: #114 H2 — yielding to lower-id owner {} (claim race)", owner2);
+                }
+            }
         }
     }
     log::info!(
