@@ -236,10 +236,14 @@ pub(crate) const SUBTICK_MS: u32 = 20;
 /// signals are slow-moving, so a 60 s beat keeps mesh airtime negligible.
 #[cfg(feature = "espnow")]
 const DIAG_CADENCE_MS: u64 = 60_000;
-/// #70/#49: minimum spacing between BUTTON-expedited diag broadcasts (ms) — bounds a press-mash
-/// so it can't flood the mesh with off-cadence diags.
+/// #70/#49 + #114 U2: minimum spacing between EXPEDITED diag broadcasts (ms) — the per-node rate
+/// cap on off-cadence diags. Bounds BOTH a BOOT-button press-mash (#70) and a #114 config-apply
+/// flap (a misbehaving HA automation toggling LED/units/plugins) so neither can flood the mesh.
+/// COALESCED: `diag_dirty` is a single latch, so any number of changes between broadcasts collapse
+/// into ONE expedited diag carrying the latest state. 5 s (team-lead #114 cap "≤1 per ~5 s"); the
+/// steady-state cadence (`DIAG_CADENCE_MS`) is unchanged.
 #[cfg(feature = "espnow")]
-const DIAG_EXPEDITE_MIN_MS: u64 = 3_000;
+const DIAG_EXPEDITE_MIN_MS: u64 = 5_000;
 
 /// Minimum time the boot splash (node name + firmware version) stays on screen,
 /// even when radio bring-up was instant (default build). The espnow/wifi NTP burst
@@ -1003,6 +1007,12 @@ fn main() -> ! {
                 let due = (now / DIAG_CADENCE_MS) != ((now.saturating_sub(SUBTICK_MS as u64)) / DIAG_CADENCE_MS);
                 let expedite = diag_dirty && now.saturating_sub(last_diag_ms) >= DIAG_EXPEDITE_MIN_MS;
                 if due || expedite {
+                    // #114 U2 canary observability: distinguish an EXPEDITED broadcast (config-apply
+                    // triggered) from the steady 60 s cadence — the serial proof the leaf-side
+                    // mechanism fired, independent of the crown's republish quantization.
+                    if expedite && !due {
+                        log::info!("smol #114: diag expedited (config change, {} ms since last)", now.saturating_sub(last_diag_ms));
+                    }
                     let rec = r.diag_record();
                     r.broadcast_diag(rec.as_bytes());
                     last_diag_ms = now;
@@ -1197,6 +1207,10 @@ fn main() -> ! {
                 if let Some(m) = led::LedMode::from_wire(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
                     if m != led_mode {
                         log::info!("smol #48: LED mode -> {:?}", m);
+                        // #114 U2: an APPLIED config change rides the DIAG record's cfg= field —
+                        // expedite the next DIAG so HA's config-applied/drift updates in ~3 s
+                        // (DIAG_EXPEDITE_MIN_MS) instead of waiting up to the 60 s steady cadence.
+                        diag_dirty = true;
                     }
                     led_mode = m;
                 }
@@ -1210,6 +1224,7 @@ fn main() -> ! {
                 if let Some(u) = units::Units::from_wire(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
                     if u != units {
                         log::info!("smol #43: display units -> {:?}", u);
+                        diag_dirty = true; // #114 U2: expedite DIAG (units ride cfg=) — see LED above
                     }
                     units = u;
                 }
@@ -1223,6 +1238,7 @@ fn main() -> ! {
                 if let Some(m) = menu::parse_plugin_mask(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
                     if m != plugin_mask {
                         log::info!("smol #55: plugin mask -> {:#06x}", m);
+                        diag_dirty = true; // #114 U2: expedite DIAG (mask rides cfg=) — see LED above
                     }
                     plugin_mask = m;
                 }
