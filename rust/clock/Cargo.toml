@@ -123,6 +123,17 @@ ed25519-compact = { version = "2", default-features = false, optional = true }
 # --release` with no flags exercises the guaranteed-green baseline.
 default = []
 
+# #72 IO/component registry (ESPHome inverted, "fat image / thin runtime config").
+# Compiles the digital-`Flex` driver menu into ONE image; a runtime pin-map relayed
+# over the #56 keyed-CFG `G` channel selects which driver binds each free GPIO at
+# boot — no recompile. Default-OFF so the default/wifi/espnow builds stay BYTE-FREE
+# of it (#44): `src/io.rs` is `#![cfg(feature = "io")]` and every hook is cfg-gated.
+# Implies `espnow`: the pin-map's transport (the CfgTracker relay + `take_cfg_offer`
+# apply) lives in the ESP-NOW radio manager, and the fleet runs espnow end-to-end.
+# v1 = digital in/out only (the provably-feasible `Flex` case); ADC/PWM/WS2812-RMT
+# are deferred to v1.5/v2 behind the §2.4 bind-time spike.
+io = ["espnow"]
+
 # Phase 2: WiFi STA + SNTP time sync (+ optional weather).
 # Also carries OTA (issue #6): the flash/otadata crates + esp-backtrace's
 # `custom-halt` (panic→software_reset, MF-2) are pulled in HERE, not on the base

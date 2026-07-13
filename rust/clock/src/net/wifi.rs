@@ -1017,6 +1017,31 @@ pub const CFG_KEY_BROKER: u8 = b'B';
 #[cfg(feature = "wifi")]
 pub const CFG_KEY_OTA: u8 = b'O';
 
+/// #72 IO/component registry CONFIG (key `G`) = the node's whole pin-map descriptor:
+/// `;`-separated `<pin><kind>` tokens (e.g. `0L;7B;10R`), ≤ `CFG_VALUE_MAX`. RETAINED /
+/// CACHED (relayed like S/L/U/P/Y/N, not a one-shot command). Per-node
+/// `smol/<id>/config/io`. Applied by (re)binding the free GPIOs via
+/// `crate::io::apply_wire`, EDGE-triggered on a CHANGE of the map (a re-read of the same
+/// retained value is a no-op). Writes NO NVS (zero flash wear / sector risk — the nvs
+/// partition is full); survives reboot purely via the gateway's ~10 s config re-relay.
+// allow(dead_code): named in `CFG_APPLY_KEYS` (espnow) unconditionally so a G slot exists
+// for the relay, and in the `io`-gated fill/apply plumbing — but NOT in any wifi-tier fill
+// arm, so a wifi-only (no-espnow, no-io) build sees it unused. Same rationale as R/W.
+#[cfg(feature = "wifi")]
+#[allow(dead_code)]
+pub const CFG_KEY_IO: u8 = b'G';
+
+/// #72 IO output CONTROL (key `g`, lowercase — distinct from the `G` config map) = the
+/// node's output STATES: `;`-separated `<pin>=<0|1>` (e.g. `0=1;10=0`), ≤ `CFG_VALUE_MAX`.
+/// RETAINED / CACHED (relayed like G), NOT a command — a lamp/relay holds its commanded
+/// level across reboot / relay-loss (re-asserted from the retained value after a re-relay
+/// or a `G` re-bind). Applied by driving each named OUTPUT slot via `crate::io::apply_set`
+/// (no-op on an unbound / input slot). Per-node `smol/<id>/io/set`. Writes NO NVS.
+/// Same allow(dead_code) rationale as `G` (unused in a wifi-only build).
+#[cfg(feature = "wifi")]
+#[allow(dead_code)]
+pub const CFG_KEY_IO_SET: u8 = b'g';
+
 /// #48 (GwOwnCfg — approved arch): the GATEWAY's OWN per-node configs read from its own MQTT
 /// topics this burst. A leaf gets these RELAYED (→ its `CfgTracker`); the gateway reads them
 /// DIRECTLY. Bundled into ONE `run_mqtt_burst`/`mqtt_session` out-param (net +1, not +N) — after
@@ -1051,12 +1076,31 @@ pub struct GwOwnCfg {
     /// #100 Stage 3 the gateway's own `smol/<id>/config/ota_host` (or global `smol/config/ota_host`)
     /// OTA-host override value `(buf, len)`, or `None` if absent this burst.
     pub ota: Option<([u8; CFG_VALUE_MAX], usize)>,
+    /// #72 the gateway's own `smol/<id>/config/io` pin-map value `(buf, len)`, or `None` if
+    /// absent this burst. `io`-gated so a non-io build's struct is byte-unchanged.
+    #[cfg(feature = "io")]
+    pub io: Option<([u8; CFG_VALUE_MAX], usize)>,
+    /// #72 the gateway's own `smol/<id>/io/set` output-states value `(buf, len)`, or `None`.
+    #[cfg(feature = "io")]
+    pub io_set: Option<([u8; CFG_VALUE_MAX], usize)>,
 }
 
 #[cfg(feature = "wifi")]
 impl GwOwnCfg {
     pub const fn new() -> Self {
-        Self { led: None, units: None, plugins: None, custom: None, net: None, broker: None, ota: None }
+        Self {
+            led: None,
+            units: None,
+            plugins: None,
+            custom: None,
+            net: None,
+            broker: None,
+            ota: None,
+            #[cfg(feature = "io")]
+            io: None,
+            #[cfg(feature = "io")]
+            io_set: None,
+        }
     }
     /// Pack a payload into the `(buf, len)` a field holds (truncated to `CFG_VALUE_MAX`), so the
     /// mqtt-drain arms stay one-liners: `gw_own.led = Some(GwOwnCfg::val(payload));`.
@@ -1812,14 +1856,28 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 21, b"smol/config/ota_host") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
+        // #72 IO registry (pid 22): wildcard-subscribe every node's retained pin-map so the
+        // gateway caches + relays it (key `G`) over ESP-NOW, twin of the custom/led wildcard.
+        // `io`-gated (⊃ espnow) → non-io builds emit no SUBSCRIBE. (pids 18-21 are #100/#110's
+        // broker/ota_host per-node+global — #72 is last on the merge ladder, so it takes 22/23.)
+        // Kept BEFORE the batt/grid/mc drain-gate below (that ordering is load-bearing — see #110).
+        #[cfg(feature = "io")]
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 22, b"smol/+/config/io") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        // #72 IO output control (pid 23): every node's retained output-states topic (key `g`).
+        #[cfg(feature = "io")]
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 23, b"smol/+/io/set") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
     }
 
     // #100 DRAIN-ORDER FIX (HW canary #110): the batt/grid/mc primary downlinks are the
     // retained-drain break-gate (`got_batt && got_grid && got_mc && <quiet>`), so they MUST be
     // the LAST retained to arrive — subscribe them AFTER every config topic above. A broker sends
     // retained in SUBSCRIBE order, so the gate now cannot complete until the whole config backlog
-    // (screen/led/…/net/broker/ota, pids 6-21) has been delivered and drained → CFG-B/O reliably
-    // apply. (Boot burst: cfg_cache=None skips the gateway block, so these are effectively first,
+    // (screen/led/…/net/broker/ota/io, pids 6-23) has been delivered and drained → CFG reliably
+    // applies. (Boot burst: cfg_cache=None skips the gateway block, so these are effectively first,
     // as before — mc is usually absent at boot, so that path still drains to the deadline.) Pids
     // stay 1/2/3 (identifiers, not order); only the SEND order moved. Still before the PUBLISH loop.
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 1, BATT_TOPIC) {
@@ -2385,6 +2443,54 @@ fn mqtt_session(
                         } else {
                             gw_own.ota = Some(GwOwnCfg::val(payload));
                             log::info!("smol #100: gateway own OTA-host override captured ({} B)", payload.len());
+                        }
+                    } else if let Some(_leaf_id) = parse_leaf_config_topic(topic, b"/config/io") {
+                        // #72 IO registry pin-map: twin of the custom/net arms. OTHER node →
+                        // cache under key `G` for the ESP-NOW relay; OUR OWN id → gw_own.io for
+                        // self-apply. Verbatim bytes; the node's `io::apply_wire` validates + binds
+                        // (unknown type / reserved pin rejected, #46 clamp). Body is `io`-gated
+                        // (the arm CONDITION matches the cast-arm precedent above — a feature's
+                        // topic string in the always-compiled match, io-specific work cfg-gated).
+                        #[cfg(feature = "io")]
+                        {
+                            let leaf_id = _leaf_id;
+                            if leaf_id != node_id {
+                                if let Some(cache) = cfg_cache.as_deref_mut() {
+                                    let now = Instant::now().duration_since_epoch().as_millis();
+                                    cache.set(leaf_id, CFG_KEY_IO, payload, [0u8; 6], now);
+                                    log::info!(
+                                        "smol #72: cached leaf id{} io-map for relay ({} B)",
+                                        leaf_id,
+                                        payload.len()
+                                    );
+                                }
+                            } else {
+                                gw_own.io = Some(GwOwnCfg::val(payload));
+                                log::info!("smol #72: gateway own io-map captured ({} B)", payload.len());
+                            }
+                        }
+                    } else if let Some(_leaf_id) = parse_leaf_config_topic(topic, b"/io/set") {
+                        // #72 IO output states: twin of the config/io arm. OTHER node → cache under
+                        // key `g` for the ESP-NOW relay; OUR OWN id → gw_own.io_set for self-apply.
+                        // Verbatim bytes; `io::apply_set` drives the named OUTPUT slots (no-op on an
+                        // unbound / input slot). Body `io`-gated (arm matches the cast-arm precedent).
+                        #[cfg(feature = "io")]
+                        {
+                            let leaf_id = _leaf_id;
+                            if leaf_id != node_id {
+                                if let Some(cache) = cfg_cache.as_deref_mut() {
+                                    let now = Instant::now().duration_since_epoch().as_millis();
+                                    cache.set(leaf_id, CFG_KEY_IO_SET, payload, [0u8; 6], now);
+                                    log::info!(
+                                        "smol #72: cached leaf id{} io-set for relay ({} B)",
+                                        leaf_id,
+                                        payload.len()
+                                    );
+                                }
+                            } else {
+                                gw_own.io_set = Some(GwOwnCfg::val(payload));
+                                log::info!("smol #72: gateway own io-set captured ({} B)", payload.len());
+                            }
                         }
                     } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/cmd/reset") {
                         // #52 remote reboot — a COMMAND on a TRANSIENT topic (retain:false), so we
