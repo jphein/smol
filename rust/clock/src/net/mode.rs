@@ -1591,6 +1591,15 @@ pub struct RadioManager {
     scan_idx: usize,
     last_scan_hop_ms: u64,
     last_owner_heard_ms: u64,
+    /// #114 H1: has this leaf heard a HELLO from its CURRENT `elected_owner` since adopting it?
+    /// Reset on every owner change, set in the HELLO arm. Distinguishes a NEVER-heard dead owner
+    /// (a forged / phantom retained `MC` — the #114 crown-handover standoff) from a heard-then-died
+    /// owner. A never-heard dead owner has no live board to stagger against, so recovery takes it
+    /// over PROMPTLY (id-only tiebreak, skipping the RSSI backoff meant for a possibly-live vacated
+    /// owner); a heard-then-died owner keeps the RSSI-weighted stagger. Best-effort: the HARD safety
+    /// gate is still the FROZEN-seq test (a live owner's seq advances every ≤30 s flush), so a stale
+    /// value only changes WHICH backoff is used — never causes a false takeover of a live owner.
+    owner_hello_seen: bool,
     /// #29: the gateway's operating ESP-NOW channel, LEARNED from the `rx_control` of received
     /// frames (in `service`) — 0 until the first frame is heard. Published in the retained
     /// `MC|owner|<ch>|seq` election record (via `current_channel`) so a re-electing / roaming leaf
@@ -1749,6 +1758,7 @@ impl RadioManager {
 
             last_scan_hop_ms: 0,
             last_owner_heard_ms: 0,
+            owner_hello_seen: false,
             mc_seen_owner: 0,
             mc_seen_seq: 0,
             mc_seen_ms: 0,
@@ -1879,6 +1889,10 @@ impl RadioManager {
         elect.seen_owner = self.mc_seen_owner;
         elect.seen_seq = self.mc_seen_seq;
         elect.seen_ms = self.mc_seen_ms;
+        // #114 H1: tell the resolver whether we've EVER heard this owner's HELLO. A dead owner we
+        // never heard (a forged/phantom retained MC — the standoff) is taken over promptly instead
+        // of waiting the RSSI backoff (which exists to stagger takeover of a possibly-live owner).
+        elect.owner_never_heard = !self.owner_hello_seen;
         // #6 OTA / #21 config / #33 install: a leaf's recovery burst can also surface these.
         let mut ota_offer: Option<crate::ota::Announce> = None;
         let mut config_offer: Option<crate::app::DefaultScreen> = None;
@@ -1948,6 +1962,10 @@ impl RadioManager {
         self.mc_seen_owner = elect.seen_owner;
         self.mc_seen_seq = elect.seen_seq;
         self.mc_seen_ms = elect.seen_ms;
+        // #114 H1: a CHANGED owner must re-prove itself by HELLO before we trust it as heard.
+        if elect.owner_id != self.elected_owner {
+            self.owner_hello_seen = false;
+        }
         self.elected_owner = elect.owner_id;
         self.scan_locked = false;
         if elect.i_am_owner {
@@ -3636,6 +3654,10 @@ impl RadioManager {
             self.mc_seen_owner = elect.seen_owner;
             self.mc_seen_seq = elect.seen_seq;
             self.mc_seen_ms = elect.seen_ms;
+            // #114 H1: a CHANGED owner must re-prove itself by HELLO before we trust it as heard.
+            if elect.owner_id != self.elected_owner {
+                self.owner_hello_seen = false;
+            }
             self.elected_owner = elect.owner_id;
             if !elect.i_am_owner {
                 self.relay.is_gateway = false;
@@ -3820,6 +3842,9 @@ impl RadioManager {
                     if !self.relay.is_gateway && peer_id == self.elected_owner {
                         self.scan_locked = true;
                         self.last_owner_heard_ms = now;
+                        // #114 H1: our elected owner is provably ALIVE on the mesh (heard its
+                        // HELLO) — so it is NOT a phantom; recovery keeps the RSSI stagger for it.
+                        self.owner_hello_seen = true;
                         // #51 A1: re-locked a valid owner's HELLO → resume normal HELLO
                         // (we are a healthy leaf again, no longer an abdicated ghost).
                         self.silent_until_relock = false;

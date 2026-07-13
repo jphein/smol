@@ -114,6 +114,13 @@ pub struct MeshElect {
     /// gateway-flush this is false → the original, hardware-validated lowest-id
     /// election runs UNCHANGED (preserves #2 split-brain + fast cold-start).
     pub recovery: bool,
+    /// #114 H1: (recovery only) true iff this leaf has NEVER heard a HELLO from the owner it is
+    /// following. A DEAD owner (frozen seq) that was never heard is a forged / phantom retained MC
+    /// (the crown-handover standoff) — there is no live board to stagger against, so the resolver
+    /// takes it over PROMPTLY (id-only tiebreak) instead of waiting the full RSSI backoff. Never
+    /// overrides the FROZEN-seq safety gate: an owner whose seq still advances is alive and is never
+    /// taken over regardless of this flag (RF-dead-zone protection intact).
+    pub owner_never_heard: bool,
     /// #51 return-flap fix: true ONLY on the one-shot BOOT election. A freshly-booted board
     /// must NEVER claim over a DIFFERENT owner already present in the retained MC — it comes
     /// up as a leaf and lets leaf-scan (fast HELLO lock) + the recovery election decide (live
@@ -144,6 +151,7 @@ impl MeshElect {
             my_rssi: -99, // weak default until the first association captures it
             my_channel: 0, // #29: advisory 0 until a frame's rx_control is learned
             recovery: false,
+            owner_never_heard: false,
             boot: false,
             i_am_owner: false,
             owner_id: my_id,
@@ -2676,7 +2684,15 @@ fn mqtt_session(
                 // #51 recovery: owner is DEAD. Take over once past RECOVERY_STALE_MS PLUS our
                 // RSSI-weighted backoff — the strongest-uplink survivor crosses first.
                 elect.owner_alive = false;
-                let backoff = reelect_backoff_ms(elect.my_rssi, node_id);
+                // #114 H1: a dead owner this leaf NEVER heard a HELLO from is a forged / phantom
+                // retained MC (the standoff) — there is no live board to stagger against, so skip
+                // the RSSI backoff and take over promptly on an id-only tiebreak (lowest id first).
+                // A heard-then-died owner keeps the RSSI-weighted stagger (pick the best survivor).
+                let backoff = if elect.owner_never_heard {
+                    (node_id as u64) * 200
+                } else {
+                    reelect_backoff_ms(elect.my_rssi, node_id)
+                };
                 if elect.now_ms.saturating_sub(elect.seen_ms)
                     >= RECOVERY_STALE_MS.saturating_add(backoff)
                 {
