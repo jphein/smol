@@ -1525,10 +1525,15 @@ const NET_VERSION: u8 = 2;
 const NET_REC_OFF: u32 = 5 * 4096;
 /// v2 record length. The v1 core is 10 B (magic..guard2); the v2 ext ([10..25]) adds the broker
 /// override (present + fallback flags, 4-B IP, 2-B port), the OTA-host override (present + 4-B IP),
-/// and a sum-checksum + complement guard. Read fixed-width: a stored v1 record leaves [16..25]
-/// erased (0xFF), which the v1 parse path never inspects.
+/// and a sum-checksum + complement guard at [23]/[24]. Read fixed-width: a stored v1 record leaves
+/// [16..] erased (0xFF), which the v1 parse path never inspects.
+///
+/// 28, NOT 25: esp-storage's `NorFlash::WRITE_SIZE == WORD_SIZE == 4` — a write whose length isn't
+/// word-aligned returns `NotAligned`, which `write_net_cfg`'s swallowed error turned into "record
+/// never persists" (HW-canary find, 2026-07-12: capture + edge-trigger fired, then verify-after-write
+/// aborted EVERY apply). [25..28] is zero pad outside the checksum; the guards stay at [23]/[24].
 #[cfg(feature = "wifi")]
-const NET_REC_LEN: usize = 25;
+const NET_REC_LEN: usize = 28;
 
 /// The persisted network identity. `active` = the WiFi slot we associate on NOW; `commanded` = the
 /// last slot HA asked for via CFG-`N` (differs from `active` iff we auto-reverted); `fallback` = the
