@@ -1197,6 +1197,10 @@ fn main() -> ! {
                 if let Some(m) = led::LedMode::from_wire(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
                     if m != led_mode {
                         log::info!("smol #48: LED mode -> {:?}", m);
+                        // #114 U2: an APPLIED config change rides the DIAG record's cfg= field —
+                        // expedite the next DIAG so HA's config-applied/drift updates in ~3 s
+                        // (DIAG_EXPEDITE_MIN_MS) instead of waiting up to the 60 s steady cadence.
+                        diag_dirty = true;
                     }
                     led_mode = m;
                 }
@@ -1210,6 +1214,7 @@ fn main() -> ! {
                 if let Some(u) = units::Units::from_wire(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
                     if u != units {
                         log::info!("smol #43: display units -> {:?}", u);
+                        diag_dirty = true; // #114 U2: expedite DIAG (units ride cfg=) — see LED above
                     }
                     units = u;
                 }
@@ -1223,6 +1228,7 @@ fn main() -> ! {
                 if let Some(m) = menu::parse_plugin_mask(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
                     if m != plugin_mask {
                         log::info!("smol #55: plugin mask -> {:#06x}", m);
+                        diag_dirty = true; // #114 U2: expedite DIAG (mask rides cfg=) — see LED above
                     }
                     plugin_mask = m;
                 }
