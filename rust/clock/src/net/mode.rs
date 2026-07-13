@@ -180,13 +180,15 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 8] = [
+const CFG_APPLY_KEYS: [u8; 10] = [
     crate::net::wifi::CFG_KEY_SCREEN,
     crate::net::wifi::CFG_KEY_LED,
     crate::net::wifi::CFG_KEY_UNITS,
     crate::net::wifi::CFG_KEY_PLUGINS,
     crate::net::wifi::CFG_KEY_CUSTOM, // #45 custom-screen layout (cached + relayed like S/L/U/P)
     crate::net::wifi::CFG_KEY_NET, // #100 active WiFi-slot index (cached + relayed; edge-triggered reboot)
+    crate::net::wifi::CFG_KEY_BROKER, // #100 Stage 2 broker-leg override (cached + relayed; edge-triggered reboot)
+    crate::net::wifi::CFG_KEY_OTA, // #100 Stage 3 OTA-host override (cached + relayed; applied WITHOUT reboot)
     // #52 remote reboot: R IS a buffered/applied key (a leaf takes it via take_cfg_offer(R)) but
     // is NEVER put in cfg_cache/broadcast_cached_configs — the one-shot relay uses broadcast_config
     // directly. The anti-reboot-loop invariant: R rides the CFG wire + apply path, not the cache.
@@ -2414,14 +2416,26 @@ impl RadioManager {
         let led_state = if e.led_on { "on" } else { "off" };
         // #100: active WiFi slot + fallback state (net=<slot>:<ok|fb>). `fb` = we auto-reverted off
         // the commanded slot (the un-brick fallback fired) — HA surfaces "the network switch failed".
+        // Stage 2/3: brk=<baked|ovr|fb> (broker override state — `fb` = the override was auto-disabled
+        // after repeated CONNACK failures, running the baked broker) + otah=<slot|ovr> (an OTA-host
+        // override is appended to the allowlist). All read live from the one NVS net-record.
         let net = crate::ota::read_net_cfg().unwrap_or(crate::ota::NetCfg {
             active: 0,
             commanded: 0,
             fallback: false,
+            broker: None,
+            broker_fallback: false,
+            ota_host: None,
         });
         let net_fb = if net.fallback { "fb" } else { "ok" };
+        let brk = match (net.broker.is_some(), net.broker_fallback) {
+            (true, false) => "ovr",
+            (true, true) => "fb",
+            _ => "baked",
+        };
+        let otah = if net.ota_host.is_some() { "ovr" } else { "slot" };
         let mut rec = alloc::format!(
-            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}",
+            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}|brk={}|otah={}",
             d.boot_slot,
             d.reset_reason,
             d.boot_count,
@@ -2445,6 +2459,8 @@ impl RadioManager {
             e.tsrc,
             net.active,
             net_fb,
+            brk,
+            otah,
         );
         // #74 item 3 (stage-2): fold in the APPLIED-config string for HA config-drift, ONLY when
         // `main` populated it (espnow build). ASCII by construction (as_wire/to_wire/hex/F24). HA
@@ -3550,6 +3566,14 @@ impl RadioManager {
         // #100: the gateway's OWN active-slot index — same self-apply path (take_cfg_offer(N)).
         if let Some((buf, len)) = gw_own.net {
             self.cfg.set(crate::net::wifi::CFG_KEY_NET, &buf[..len]);
+        }
+        // #100 Stage 2: the gateway's OWN broker override — same self-apply path (take_cfg_offer(B)).
+        if let Some((buf, len)) = gw_own.broker {
+            self.cfg.set(crate::net::wifi::CFG_KEY_BROKER, &buf[..len]);
+        }
+        // #100 Stage 3: the gateway's OWN OTA-host override — same self-apply path (take_cfg_offer(O)).
+        if let Some((buf, len)) = gw_own.ota {
+            self.cfg.set(crate::net::wifi::CFG_KEY_OTA, &buf[..len]);
         }
         // #52 remote reboot — a COMMAND, not a config. Fire a ONE-SHOT `<id>R` frame per queued
         // leaf target via `broadcast_config` DIRECTLY (NOT `cfg_cache` / `broadcast_cached_configs`):

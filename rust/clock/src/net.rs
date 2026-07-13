@@ -74,6 +74,12 @@ pub use wifi::CFG_KEY_CUSTOM;
 // take_cfg_offer(N); the apply writes the NVS net-record + reboots into the slot).
 #[cfg(feature = "espnow")]
 pub use wifi::CFG_KEY_NET;
+// #100 Stage 2/3 broker + OTA-host override keys — same `main`-bridge rationale (espnow apply path
+// via take_cfg_offer(B)/(O); B writes the NVS record + reboots, O writes it WITHOUT a reboot).
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_KEY_BROKER;
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_KEY_OTA;
 // #45: `main` sizes its held Custom-layout buffer to the max keyed value — bridge the const out
 // of the private `wifi` module (espnow-only: only the Custom apply path names it).
 #[cfg(feature = "espnow")]

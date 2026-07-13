@@ -22,7 +22,7 @@
 //! The announced SHA-256 proves "not corrupted in transit"; it does **NOT** prove
 //! "from a trusted source." Whoever can publish to the broker controls both the URL
 //! and the hash. v1 posture: **OTA authority == MQTT broker write access**, acceptable
-//! only because the broker sits on a trusted VLAN. The URL-host allowlist ([`IMAGE_HOST_ALLOWLIST`])
+//! only because the broker sits on a trusted VLAN. The URL-host allowlist (`host_allowed`)
 //! is defence-in-depth, not authentication. Do NOT let any code imply sha256 == trust.
 
 use esp_bootloader_esp_idf::ota::{Ota, OtaImageState};
@@ -51,12 +51,24 @@ pub const BUILD_NUMBER: u32 = parse_u32(env!("BUILD_NUMBER"));
 #[allow(dead_code)]
 pub const OTA_AUTO_INSTALL: bool = false;
 
-/// Image-host allowlist (spec §4b-5): an announce whose URL host is not one of these
-/// is refused BEFORE any socket opens. The real LAN host(s) live in the GIT-IGNORED
-/// `crate::secrets` (this repo is PUBLIC — never commit a LAN IP). #100 Stage 1a: sourced
-/// from slot 0 of the dual-slot `WIFI_NETWORKS` (const-index [0]); identical to pre-#100.
-/// Stage 3 makes it the runtime-active slot's allowlist + an NVS CFG-`O` override.
-pub const IMAGE_HOST_ALLOWLIST: &[&str] = crate::secrets::WIFI_NETWORKS[0].ota_hosts;
+/// Image-host allowlist test (spec §4b-5): an announce whose URL host is not allowed is refused
+/// BEFORE any socket opens. The real LAN host(s) live in the GIT-IGNORED `crate::secrets` (this repo
+/// is PUBLIC — never commit a LAN IP). #100 Stage 3: the base allowlist is the RUNTIME-active slot's
+/// baked `ota_hosts` (was a slot-0 const), PLUS the NVS CFG-`O` override (one extra RFC1918 host,
+/// dashboard-set). Read at gate time — no reboot. A bad override can only ever REFUSE a fetch (it is
+/// merely an additional allowed host); the image itself stays monotonicity-gated, so this is
+/// defense-in-depth, never a brick surface.
+#[cfg(feature = "wifi")]
+fn host_allowed(host: &str) -> bool {
+    let cfg = read_net_cfg();
+    let active = cfg.map_or(0usize, |c| c.active as usize);
+    let slot = &crate::secrets::WIFI_NETWORKS[active.min(crate::secrets::WIFI_NETWORKS.len() - 1)];
+    if slot.ota_hosts.contains(&host) {
+        return true;
+    }
+    // Stage 3: the CFG-`O` override — one extra RFC1918 host, matched by parsing the URL host.
+    matches!(cfg.and_then(|c| c.ota_host), Some(ovr) if parse_ipv4(host) == Some(ovr))
+}
 
 /// Max image = one app slot (`ota_0`/`ota_1` size from `partitions-ota.csv`). An
 /// announce larger than this is refused before any flash op; also cross-checked vs
@@ -269,7 +281,7 @@ pub fn split_url(url: &str) -> Option<(&str, u16, &str)> {
 pub enum Reject {
     /// `build <= BUILD_NUMBER` — downgrade or stale-retained replay (§4b-1).
     NotNewer,
-    /// URL host not on [`IMAGE_HOST_ALLOWLIST`] (§4b-5).
+    /// URL host not allowed by `host_allowed` (§4b-5).
     HostNotAllowed,
     /// `size` is 0 or larger than a slot (§4b-2 bound).
     BadSize,
@@ -285,7 +297,7 @@ pub fn gate(a: &Announce) -> Result<(), Reject> {
         return Err(Reject::NotNewer);
     }
     let (host, _port, _path) = split_url(a.url()).ok_or(Reject::BadUrl)?;
-    if !IMAGE_HOST_ALLOWLIST.contains(&host) {
+    if !host_allowed(host) {
         return Err(Reject::HostNotAllowed);
     }
     if a.size == 0 || a.size > MAX_IMAGE_SIZE {
@@ -1501,35 +1513,75 @@ pub fn reset_reason_token() -> &'static str {
 // garbage record never strands the node on a phantom slot). Brick-safe: never panics, best-effort.
 #[cfg(feature = "wifi")]
 const NET_MAGIC: [u8; 4] = *b"SMn1";
+/// Record version WRITTEN by this firmware. v1 (Stage 1) = the 10-byte core (slot selection only);
+/// v2 (Stage 2/3) appends the broker + OTA-host overrides. `parse_net_cfg` accepts BOTH: a v2 fw
+/// reading a Stage-1 v1 record treats it as "no overrides"; a v1 fw reading a v2 record rejects it
+/// (version mismatch) → slot 0 (a SAFE rollback default). No forced migration — the first v2 write
+/// (CFG-`N`/`B`/`O` apply or a fallback) upgrades the record in place.
 #[cfg(feature = "wifi")]
-const NET_VERSION: u8 = 1;
+const NET_VERSION: u8 = 2;
 /// nvs sector 5 = 0x5000 = 20480 (the one free sector; see the segregation note above).
 #[cfg(feature = "wifi")]
 const NET_REC_OFF: u32 = 5 * 4096;
+/// v2 record length. The v1 core is 10 B (magic..guard2); the v2 ext ([10..25]) adds the broker
+/// override (present + fallback flags, 4-B IP, 2-B port), the OTA-host override (present + 4-B IP),
+/// and a sum-checksum + complement guard at [23]/[24]. Read fixed-width: a stored v1 record leaves
+/// [16..] erased (0xFF), which the v1 parse path never inspects.
+///
+/// 28, NOT 25: esp-storage's `NorFlash::WRITE_SIZE == WORD_SIZE == 4` — a write whose length isn't
+/// word-aligned returns `NotAligned`, which `write_net_cfg`'s swallowed error turned into "record
+/// never persists" (HW-canary find, 2026-07-12: capture + edge-trigger fired, then verify-after-write
+/// aborted EVERY apply). [25..28] is zero pad outside the checksum; the guards stay at [23]/[24].
 #[cfg(feature = "wifi")]
-const NET_REC_LEN: usize = 16;
+const NET_REC_LEN: usize = 28;
 
-/// The persisted network selection. `active` = the slot we associate on NOW; `commanded` = the
-/// last slot HA asked for via CFG-`N` — it differs from `active` iff we auto-reverted; `fallback`
-/// = we're running on a reverted slot, not the commanded one (surfaced as `net=<slot>:fb` in DIAG).
+/// The persisted network identity. `active` = the WiFi slot we associate on NOW; `commanded` = the
+/// last slot HA asked for via CFG-`N` (differs from `active` iff we auto-reverted); `fallback` = the
+/// WiFi assoc fallback fired (surfaced as `net=<slot>:fb`). #100 Stage 2/3 overrides (all runtime,
+/// NVS-persisted, RFC1918-gated at the CFG apply): `broker` = the COMMANDED broker leg override (the
+/// slot's baked broker is used when `None`); `broker_fallback` = the override was auto-disabled after
+/// repeated CONNACK failures — `broker` is KEPT (for DIAG + the edge-trigger) but ignored at runtime,
+/// mirroring the WiFi `fallback`; `ota_host` = one extra RFC1918 host appended to the OTA allowlist.
 #[cfg(feature = "wifi")]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct NetCfg {
     pub active: u8,
     pub commanded: u8,
     pub fallback: bool,
+    /// Stage 2: broker leg override (IPv4 octets + port). `None` = use the active slot's baked broker.
+    pub broker: Option<([u8; 4], u16)>,
+    /// Stage 2: the `broker` override was auto-disabled (N failed CONNACKs). Runtime uses the baked
+    /// broker; `broker` is retained so DIAG shows `brk=fb` and CFG-`B` edge-triggers correctly.
+    pub broker_fallback: bool,
+    /// Stage 3: one extra OTA image-host (RFC1918) appended to the fetch allowlist. `None` = none.
+    pub ota_host: Option<[u8; 4]>,
 }
 
-/// Decode a stored net record. `Some` iff magic + version + both redundancy guards pass AND every
-/// slot index is in range (0/1 — `WIFI_NETWORKS.len() == 2`). Erased flash (0xFF) / corruption /
-/// an out-of-range slot all fail → `None` → caller uses slot 0.
+/// The v2 extension checksum over `rec[10..23]` (the override bytes). A wrapping sum + `0x5A` bias,
+/// stored at `[23]` with its complement at `[24]` — the same two-guard scheme as the v1 core.
+#[cfg(feature = "wifi")]
+fn net_ext_checksum(rec: &[u8]) -> u8 {
+    rec[10..23]
+        .iter()
+        .fold(0u8, |a, &b| a.wrapping_add(b))
+        .wrapping_add(0x5A)
+}
+
+/// Decode a stored net record. `Some` iff magic + a known version + the core redundancy guards pass
+/// AND the slot indices are in range (< 2). A v1 record yields no overrides; a v2 record must ALSO
+/// pass the ext checksum + complement (else the overrides are corrupt → the whole record is rejected
+/// → caller uses slot 0, no override). Erased flash (0xFF) / corruption all fail → `None`.
 #[cfg(feature = "wifi")]
 fn parse_net_cfg(rec: &[u8]) -> Option<NetCfg> {
-    if rec.len() < 10 || rec[0..4] != NET_MAGIC || rec[4] != NET_VERSION {
+    if rec.len() < 10 || rec[0..4] != NET_MAGIC {
+        return None;
+    }
+    let ver = rec[4];
+    if ver != 1 && ver != 2 {
         return None;
     }
     let (active, commanded, fb) = (rec[5], rec[6], rec[7]);
-    // complement + checksum guards (mirror the identity record).
+    // Core complement + checksum guards (mirror the identity record) — present in v1 AND v2.
     if rec[8] != active ^ 0xFF || rec[9] != (active ^ commanded ^ fb).wrapping_add(0x5A) {
         return None;
     }
@@ -1537,10 +1589,38 @@ fn parse_net_cfg(rec: &[u8]) -> Option<NetCfg> {
     if active > 1 || commanded > 1 || fb > 1 {
         return None;
     }
-    Some(NetCfg { active, commanded, fallback: fb != 0 })
+    let core = NetCfg {
+        active,
+        commanded,
+        fallback: fb != 0,
+        broker: None,
+        broker_fallback: false,
+        ota_host: None,
+    };
+    if ver == 1 {
+        return Some(core); // Stage-1 record: no overrides.
+    }
+    // v2 ext: require the full record + a matching checksum/complement before trusting the overrides.
+    if rec.len() < NET_REC_LEN || rec[23] != net_ext_checksum(rec) || rec[24] != rec[23] ^ 0xFF {
+        return None;
+    }
+    let broker = (rec[10] == 1).then(|| {
+        (
+            [rec[12], rec[13], rec[14], rec[15]],
+            u16::from_le_bytes([rec[16], rec[17]]),
+        )
+    });
+    let ota_host = (rec[18] == 1).then_some([rec[19], rec[20], rec[21], rec[22]]);
+    Some(NetCfg {
+        broker,
+        broker_fallback: rec[11] == 1,
+        ota_host,
+        ..core
+    })
 }
 
-/// Encode the 16-byte net record.
+/// Encode the v2 net record (always written at [`NET_VERSION`] = 2). Absent overrides zero their
+/// present-flag + bytes so the record is deterministic; the ext checksum + complement close it.
 #[cfg(feature = "wifi")]
 fn encode_net_cfg(c: NetCfg) -> [u8; NET_REC_LEN] {
     let mut r = [0u8; NET_REC_LEN];
@@ -1551,6 +1631,18 @@ fn encode_net_cfg(c: NetCfg) -> [u8; NET_REC_LEN] {
     r[7] = c.fallback as u8;
     r[8] = c.active ^ 0xFF;
     r[9] = (c.active ^ c.commanded ^ c.fallback as u8).wrapping_add(0x5A);
+    if let Some((ip, port)) = c.broker {
+        r[10] = 1;
+        r[12..16].copy_from_slice(&ip);
+        r[16..18].copy_from_slice(&port.to_le_bytes());
+    }
+    r[11] = c.broker_fallback as u8;
+    if let Some(ip) = c.ota_host {
+        r[18] = 1;
+        r[19..23].copy_from_slice(&ip);
+    }
+    r[23] = net_ext_checksum(&r);
+    r[24] = r[23] ^ 0xFF;
     r
 }
 
@@ -1599,6 +1691,63 @@ pub fn write_net_cfg(c: NetCfg) {
         return;
     }
     let _ = flash.write(base + NET_REC_OFF, &encode_net_cfg(c));
+}
+
+/// Parse a dotted-quad IPv4 (`"10.0.8.111"`) into four octets. Panic-free, `no_std`: rejects any
+/// part that isn't a 0..=255 decimal and anything other than exactly four parts. `None` on garbage.
+#[cfg(feature = "wifi")]
+pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut it = s.split('.');
+    for o in octets.iter_mut() {
+        *o = it.next()?.parse::<u8>().ok()?;
+    }
+    if it.next().is_some() {
+        return None; // more than four parts
+    }
+    Some(octets)
+}
+
+/// RFC1918 private-range test (`10/8`, `172.16/12`, `192.168/16`). CFG-`B`/`O` overrides MUST pass
+/// this so a dashboard typo can never point a board off-LAN (the on-LAN guard JP named in #100).
+/// `espnow`-gated: reached only through the two override parsers below, which the espnow-only CFG
+/// apply path calls (a wifi-only build has no `RadioManager`/apply, so it would be dead code there).
+#[cfg(feature = "espnow")]
+pub fn is_rfc1918(ip: [u8; 4]) -> bool {
+    matches!(ip,
+        [10, ..]
+        | [172, 16..=31, ..]
+        | [192, 168, ..])
+}
+
+/// Parse a CFG-`B` broker override value `"a.b.c.d"` or `"a.b.c.d:port"` (port defaults to 1883,
+/// the plain-Mosquitto port). `None` unless the IP is RFC1918 and the port is non-zero — the apply
+/// path treats `None` as "invalid, keep current" and an empty string as an explicit CLEAR.
+/// `espnow`-gated: called only from the espnow-only CFG-`B` apply path (see `is_rfc1918`).
+#[cfg(feature = "espnow")]
+pub fn parse_broker_override(s: &str) -> Option<([u8; 4], u16)> {
+    let s = s.trim();
+    let (ip_str, port) = match s.rsplit_once(':') {
+        Some((ip, p)) => (ip, p.parse::<u16>().ok()?),
+        None => (s, 1883u16),
+    };
+    let ip = parse_ipv4(ip_str)?;
+    if !is_rfc1918(ip) || port == 0 {
+        return None;
+    }
+    Some((ip, port))
+}
+
+/// Parse a CFG-`O` OTA-host override value `"a.b.c.d"`. `None` unless the IP is RFC1918 (keeps OTA
+/// fetches on-LAN; the image is still ed25519/monotonicity-gated regardless — belt-and-suspenders).
+/// `espnow`-gated: called only from the espnow-only CFG-`O` apply path (see `is_rfc1918`).
+#[cfg(feature = "espnow")]
+pub fn parse_ota_host_override(s: &str) -> Option<[u8; 4]> {
+    let ip = parse_ipv4(s.trim())?;
+    if !is_rfc1918(ip) {
+        return None;
+    }
+    Some(ip)
 }
 
 /// The running app slot as 0 (`ota_0`) / 1 (`ota_1`); 255 on a non-OTA board or any read

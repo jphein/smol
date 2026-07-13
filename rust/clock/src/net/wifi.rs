@@ -454,18 +454,81 @@ fn associate_slot(
     AssocResult::Associated
 }
 
-/// #100: the ACTIVE slot's broker leg (IPv4, port), resolved at RUNTIME from the NVS net-record
-/// (default slot 0 if erased/corrupt). The broker MUST follow the associated network — own-VLAN
-/// leg rule, a cross-VLAN leg drops CONNACK. Stage 2 layers an NVS broker OVERRIDE + CONNACK
-/// fallback on top of this. Panic-free slot index (clamped to the array).
+/// #100: the broker leg (IPv4, port) to connect THIS burst, resolved at RUNTIME from the NVS
+/// net-record (default slot 0 if erased/corrupt). Precedence: a Stage-2 CFG-`B` OVERRIDE wins
+/// UNLESS it has been auto-disabled (`broker_fallback`, after repeated CONNACK failures) — then, or
+/// when there is no override, the ACTIVE slot's baked broker is used. The baked broker is the
+/// un-brickable FLOOR: it follows the associated network (own-VLAN leg rule, a cross-VLAN leg drops
+/// CONNACK), so a wrong override always self-heals back to a reachable broker. Panic-free slot index.
 #[cfg(feature = "wifi")]
 fn active_broker() -> (Ipv4Addr, u16) {
-    let active = crate::ota::read_net_cfg().map_or(0usize, |c| c.active as usize);
+    let cfg = crate::ota::read_net_cfg();
+    // A CFG-`B` override wins UNLESS it has been auto-disabled (`broker_fallback`).
+    if let Some((ip, port)) = cfg.and_then(|c| c.broker.filter(|_| !c.broker_fallback)) {
+        return (Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]), port);
+    }
+    let active = cfg.map_or(0usize, |c| c.active as usize);
     let net = &crate::secrets::WIFI_NETWORKS[active.min(crate::secrets::WIFI_NETWORKS.len() - 1)];
     (
         Ipv4Addr::new(net.broker_ip[0], net.broker_ip[1], net.broker_ip[2], net.broker_ip[3]),
         net.broker_port,
     )
+}
+
+/// #100 Stage 2: consecutive broker-connect failures WHILE a CFG-`B` override is active, counted
+/// IN-RAM across bursts (resets on reboot — a fresh boot re-tries the override from scratch). At
+/// [`BROKER_FAIL_LIMIT`] the override is auto-disabled (see [`note_broker_connect`]). Single-core,
+/// main-thread-only (the flush path), so a plain `static mut` matches the OTA-outcome idiom here.
+#[cfg(feature = "espnow")]
+static mut BROKER_FAIL_STREAK: u8 = 0;
+
+/// #100 Stage 2: how many consecutive failed CONNACKs on an override broker trigger the self-heal.
+#[cfg(feature = "espnow")]
+const BROKER_FAIL_LIMIT: u8 = 3;
+
+/// #100 Stage 2 un-brickable broker fallback. Called after each gateway MQTT flush with whether the
+/// broker CONNACK'd. It only acts when a CFG-`B` override is ACTIVE (set AND not already fallen
+/// back) — the baked broker is the floor, so a baked-broker miss never counts. Called ONLY after the
+/// WiFi association already succeeded (see the call site), so a failure here is genuinely a
+/// broker/TCP problem, not a WiFi flap. On [`BROKER_FAIL_LIMIT`] consecutive misses it disables the
+/// override with ONE NVS write (`broker_fallback = true`, keeping `broker` for DIAG + the CFG-`B`
+/// edge-trigger); the next flush uses the slot's baked broker. A success resets the streak. Once
+/// fallen back it early-returns (zero further writes — the anti-ping-pong / zero-wear guarantee,
+/// mirroring the WiFi assoc fallback). The escape is a NEW CFG-`B` value (which clears the flag).
+#[cfg(feature = "espnow")]
+pub fn note_broker_connect(connected: bool) {
+    let Some(cfg) = crate::ota::read_net_cfg() else {
+        return;
+    };
+    // No ACTIVE override (none set, or already fallen back to baked) → nothing to self-heal from.
+    if cfg.broker.is_none() || cfg.broker_fallback {
+        unsafe {
+            *core::ptr::addr_of_mut!(BROKER_FAIL_STREAK) = 0;
+        }
+        return;
+    }
+    if connected {
+        unsafe {
+            *core::ptr::addr_of_mut!(BROKER_FAIL_STREAK) = 0;
+        }
+        return;
+    }
+    let streak = unsafe {
+        let p = core::ptr::addr_of_mut!(BROKER_FAIL_STREAK);
+        *p = (*p).saturating_add(1);
+        *p
+    };
+    if streak >= BROKER_FAIL_LIMIT {
+        // ONE NVS write: disable the override (keep `broker` for DIAG + edge-trigger) → baked broker.
+        crate::ota::write_net_cfg(crate::ota::NetCfg { broker_fallback: true, ..cfg });
+        unsafe {
+            *core::ptr::addr_of_mut!(BROKER_FAIL_STREAK) = 0;
+        }
+        log::warn!(
+            "smol #100: broker override unreachable x{} — disabled, reverting to the slot's baked broker",
+            streak
+        );
+    }
 }
 
 /// Shared WiFi -> DHCP -> SNTP burst, reused by both the Phase-2 `wifi`-only
@@ -555,6 +618,9 @@ pub fn run_ntp_burst(
         active: 0,
         commanded: 0,
         fallback: false,
+        broker: None,
+        broker_fallback: false,
+        ota_host: None,
     });
     'assoc: loop {
         let mut attempt = 0u8;
@@ -577,7 +643,9 @@ pub fn run_ntp_burst(
             return None;
         }
         let other = 1 - sel.active;
-        sel = crate::ota::NetCfg { active: other, commanded: sel.commanded, fallback: true };
+        // Preserve commanded + the broker/OTA overrides (`..sel`) — the WiFi revert only flips the
+        // active slot; a broker/OTA override survives a slot fallback (and CFG-`N` clears them).
+        sel = crate::ota::NetCfg { active: other, fallback: true, ..sel };
         crate::ota::write_net_cfg(sel); // the ONE revert-write
         log::warn!("smol #100: selected slot unreachable — reverted to slot {} (fallback), retrying", other);
     }
@@ -935,6 +1003,19 @@ pub const CFG_KEY_SCAN: u8 = b'W';
 /// `smol/<id>/config/net` or fleet-wide `smol/config/net` (target 255). Value = one ASCII digit.
 #[cfg(feature = "wifi")]
 pub const CFG_KEY_NET: u8 = b'N';
+/// #100 Stage 2 broker-override CONFIG (key `B`) = the MQTT broker leg `"a.b.c.d"` or `"a.b.c.d:port"`
+/// (RFC1918-gated, IP-only v1; empty = clear back to the slot's baked broker). RETAINED/CACHED STATE
+/// (relayed like `N`). A node applies it by writing the NVS net-record + rebooting; EDGE-triggered on
+/// a change of the COMMANDED broker (a re-read is a no-op → never a reboot-loop, even after the CONNACK
+/// fallback disables the override). Per-node `smol/<id>/config/broker` or fleet-wide `smol/config/broker`.
+#[cfg(feature = "wifi")]
+pub const CFG_KEY_BROKER: u8 = b'B';
+/// #100 Stage 3 OTA-host-override CONFIG (key `O`) = one extra RFC1918 image host `"a.b.c.d"` appended
+/// to the fetch allowlist (empty = clear). RETAINED/CACHED STATE (relayed like `N`). Applied by writing
+/// the NVS net-record — NO reboot (the allowlist is read at fetch/gate time). EDGE-triggered on a change.
+/// Per-node `smol/<id>/config/ota_host` or fleet-wide `smol/config/ota_host`.
+#[cfg(feature = "wifi")]
+pub const CFG_KEY_OTA: u8 = b'O';
 
 /// #48 (GwOwnCfg — approved arch): the GATEWAY's OWN per-node configs read from its own MQTT
 /// topics this burst. A leaf gets these RELAYED (→ its `CfgTracker`); the gateway reads them
@@ -964,12 +1045,18 @@ pub struct GwOwnCfg {
     /// #100 the gateway's own `smol/<id>/config/net` (or global `smol/config/net`) active-slot
     /// index value `(buf, len)`, or `None` if absent this burst.
     pub net: Option<([u8; CFG_VALUE_MAX], usize)>,
+    /// #100 Stage 2 the gateway's own `smol/<id>/config/broker` (or global `smol/config/broker`)
+    /// broker-leg override value `(buf, len)`, or `None` if absent this burst.
+    pub broker: Option<([u8; CFG_VALUE_MAX], usize)>,
+    /// #100 Stage 3 the gateway's own `smol/<id>/config/ota_host` (or global `smol/config/ota_host`)
+    /// OTA-host override value `(buf, len)`, or `None` if absent this burst.
+    pub ota: Option<([u8; CFG_VALUE_MAX], usize)>,
 }
 
 #[cfg(feature = "wifi")]
 impl GwOwnCfg {
     pub const fn new() -> Self {
-        Self { led: None, units: None, plugins: None, custom: None, net: None }
+        Self { led: None, units: None, plugins: None, custom: None, net: None, broker: None, ota: None }
     }
     /// Pack a payload into the `(buf, len)` a field holds (truncated to `CFG_VALUE_MAX`), so the
     /// mqtt-drain arms stay one-liners: `gw_own.led = Some(GwOwnCfg::val(payload));`.
@@ -1608,22 +1695,18 @@ fn mqtt_session(
         }
     }
 
-    // --- SUBSCRIBE smol/display/batt + smol/display/grid FIRST ---
-    // Subscribe before publishing so the broker queues the RETAINED downlink payloads
-    // to us immediately — the downlinks (which every node needs) are prioritized over
-    // the loss-tolerant telemetry uplink, and the retained replies stream in while we
-    // publish. Both are drained into their caches after the publishes, below. GRID
-    // (issue #16) is one extra SUBSCRIBE on the already-open connection (packet-id 2).
-    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 1, BATT_TOPIC) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
-    }
-    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 2, GRID_TOPIC) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
-    }
-    // #23 election: subscribe the retained single-gateway topic (packet-id 3).
-    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 3, MESH_CHANNEL_TOPIC) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
-    }
+    // --- SUBSCRIBE order (subscribe before publishing so the broker queues the RETAINED
+    // downlink payloads while we publish; all drained after the publishes, below) ---
+    // #100 DRAIN-ORDER FIX (HW canary #110): the batt/grid/mc primary-downlink SUBSCRIBEs
+    // (pids 1/2/3) are deferred to the END of the subscribe sequence — see the block just
+    // before the PUBLISH loop. The retained-drain loop breaks on `got_batt && got_grid &&
+    // got_mc && <400ms quiet>`; a broker delivers retained in SUBSCRIBE order, so subscribing
+    // these three FIRST completed the break-gate before the later config retained (net/broker/
+    // ota, pids 16-21) arrived in a subsequent TCP-window chunk >400ms later → the drain exited
+    // and CFG-B/O never applied (deterministic miss, HW-observed). Subscribing them LAST makes
+    // the gate structurally unable to trip until the whole config backlog is drained — order-
+    // and buffer-size-independent. (The "subscribe before publish" priority is preserved: all
+    // subscribes, batt/grid/mc included, still precede the telemetry PUBLISH.)
     // #33 Model-A: subscribe the ONE retained fleet STAGING topic (packet-id 4) as the
     // latest_version source + fetch target. No per-id announce-act topic exists (dropped
     // — the #32 closure): staging only advertises "update available"; it never fetches.
@@ -1712,6 +1795,42 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 17, b"smol/config/net") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
+        // #100 Stage 2 broker override (pid 18 per-node + pid 19 fleet-wide): the retained broker leg.
+        // Twin of net (key `B`, relayed + cached + edge-triggered reboot). Applying it writes the NVS
+        // net-record + reboots onto the new broker; a wrong value self-heals via the CONNACK fallback.
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 18, b"smol/+/config/broker") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 19, b"smol/config/broker") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        // #100 Stage 3 OTA-host override (pid 20 per-node + pid 21 fleet-wide): one extra RFC1918 image
+        // host (key `O`, relayed + cached). Applied WITHOUT reboot — the allowlist is read at fetch time.
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 20, b"smol/+/config/ota_host") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 21, b"smol/config/ota_host") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+    }
+
+    // #100 DRAIN-ORDER FIX (HW canary #110): the batt/grid/mc primary downlinks are the
+    // retained-drain break-gate (`got_batt && got_grid && got_mc && <quiet>`), so they MUST be
+    // the LAST retained to arrive — subscribe them AFTER every config topic above. A broker sends
+    // retained in SUBSCRIBE order, so the gate now cannot complete until the whole config backlog
+    // (screen/led/…/net/broker/ota, pids 6-21) has been delivered and drained → CFG-B/O reliably
+    // apply. (Boot burst: cfg_cache=None skips the gateway block, so these are effectively first,
+    // as before — mc is usually absent at boot, so that path still drains to the deadline.) Pids
+    // stay 1/2/3 (identifiers, not order); only the SEND order moved. Still before the PUBLISH loop.
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 1, BATT_TOPIC) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 2, GRID_TOPIC) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
+    // #23 election: subscribe the retained single-gateway topic (packet-id 3).
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 3, MESH_CHANNEL_TOPIC) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
     }
 
     // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
@@ -2208,6 +2327,64 @@ fn mqtt_session(
                         } else {
                             gw_own.net = Some(GwOwnCfg::val(payload));
                             log::info!("smol #100: gateway own net-slot captured ({} B)", payload.len());
+                        }
+                    } else if topic == b"smol/config/broker" {
+                        // #100 Stage 2 GLOBAL broker override (no id) → cache under target 255 + gw_own.
+                        // Twin of the global-net arm. Opaque bytes; the apply (main) RFC1918-validates.
+                        if let Some(cache) = cfg_cache.as_deref_mut() {
+                            let now = Instant::now().duration_since_epoch().as_millis();
+                            cache.set(CFG_TARGET_ALL, CFG_KEY_BROKER, payload, [0u8; 6], now);
+                        }
+                        gw_own.broker = Some(GwOwnCfg::val(payload));
+                        log::info!(
+                            "smol #100: global broker override captured ({} B) — cached (255,B) + self",
+                            payload.len()
+                        );
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/broker") {
+                        // #100 Stage 2 PER-NODE broker override: twin of the per-node net arm. OTHER
+                        // leaf → cache under key `B` for the ESP-NOW relay; OUR OWN id → gw_own.broker.
+                        if leaf_id != node_id {
+                            if let Some(cache) = cfg_cache.as_deref_mut() {
+                                let now = Instant::now().duration_since_epoch().as_millis();
+                                cache.set(leaf_id, CFG_KEY_BROKER, payload, [0u8; 6], now);
+                                log::info!(
+                                    "smol #100: cached leaf id{} broker override for relay ({} B)",
+                                    leaf_id,
+                                    payload.len()
+                                );
+                            }
+                        } else {
+                            gw_own.broker = Some(GwOwnCfg::val(payload));
+                            log::info!("smol #100: gateway own broker override captured ({} B)", payload.len());
+                        }
+                    } else if topic == b"smol/config/ota_host" {
+                        // #100 Stage 3 GLOBAL OTA-host override (no id) → cache under target 255 + gw_own.
+                        // Twin of the global-net arm. Opaque bytes; the apply (main) RFC1918-validates.
+                        if let Some(cache) = cfg_cache.as_deref_mut() {
+                            let now = Instant::now().duration_since_epoch().as_millis();
+                            cache.set(CFG_TARGET_ALL, CFG_KEY_OTA, payload, [0u8; 6], now);
+                        }
+                        gw_own.ota = Some(GwOwnCfg::val(payload));
+                        log::info!(
+                            "smol #100: global OTA-host override captured ({} B) — cached (255,O) + self",
+                            payload.len()
+                        );
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/ota_host") {
+                        // #100 Stage 3 PER-NODE OTA-host override: twin of the per-node net arm. OTHER
+                        // leaf → cache under key `O` for the ESP-NOW relay; OUR OWN id → gw_own.ota.
+                        if leaf_id != node_id {
+                            if let Some(cache) = cfg_cache.as_deref_mut() {
+                                let now = Instant::now().duration_since_epoch().as_millis();
+                                cache.set(leaf_id, CFG_KEY_OTA, payload, [0u8; 6], now);
+                                log::info!(
+                                    "smol #100: cached leaf id{} OTA-host override for relay ({} B)",
+                                    leaf_id,
+                                    payload.len()
+                                );
+                            }
+                        } else {
+                            gw_own.ota = Some(GwOwnCfg::val(payload));
+                            log::info!("smol #100: gateway own OTA-host override captured ({} B)", payload.len());
                         }
                     } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/cmd/reset") {
                         // #52 remote reboot — a COMMAND on a TRANSIENT topic (retain:false), so we
@@ -2956,6 +3133,11 @@ pub fn run_mqtt_burst(
         deadline,
         tick,
     );
+
+    // #100 Stage 2: feed the broker-override fallback. We only reach here AFTER the WiFi
+    // association succeeded (the assoc wait above returns early on failure), so `session_ok`
+    // reflects the broker CONNACK, not a WiFi flap. A no-op unless a CFG-`B` override is active.
+    note_broker_connect(session_ok);
 
     // #26 cast: if HA enabled it (learned via the retained `smol/<id>/cast` topic during
     // the session above), stream the mirrored glass image to the WLED matrix over the
