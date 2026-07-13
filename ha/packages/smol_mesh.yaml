@@ -2193,6 +2193,32 @@ automation:
           retain: true
           qos: 1
           payload: "{{ '0' if trigger.to_state.state == 'iot (jplovescl)' else '1' }}"
+      # #116: the slot IS the full network identity — clear the broker + OTA-host override
+      # retained topics (and their inputs) on every switch, else the stale retained override
+      # RESURRECTS on the node's next burst (one avoidable reboot + a cross-VLAN fallback
+      # dance; the fw self-heals via the CONNACK fallback, this just skips the detour).
+      - service: mqtt.publish
+        data:
+          topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/config/broker"
+          retain: true
+          qos: 1
+          payload: ""
+      - service: mqtt.publish
+        data:
+          topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/config/ota_host"
+          retain: true
+          qos: 1
+          payload: ""
+      - service: input_text.set_value
+        target:
+          entity_id: "input_text.smol_{{ trigger.entity_id.split('.')[1].split('_')[1] }}_broker"
+        data:
+          value: ""
+      - service: input_text.set_value
+        target:
+          entity_id: "input_text.smol_{{ trigger.entity_id.split('.')[1].split('_')[1] }}_ota_host"
+        data:
+          value: ""
 
   - id: smol_all_net_fanout
     alias: "smol #100: set-all network → per-node selects"
