@@ -1695,22 +1695,18 @@ fn mqtt_session(
         }
     }
 
-    // --- SUBSCRIBE smol/display/batt + smol/display/grid FIRST ---
-    // Subscribe before publishing so the broker queues the RETAINED downlink payloads
-    // to us immediately — the downlinks (which every node needs) are prioritized over
-    // the loss-tolerant telemetry uplink, and the retained replies stream in while we
-    // publish. Both are drained into their caches after the publishes, below. GRID
-    // (issue #16) is one extra SUBSCRIBE on the already-open connection (packet-id 2).
-    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 1, BATT_TOPIC) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
-    }
-    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 2, GRID_TOPIC) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
-    }
-    // #23 election: subscribe the retained single-gateway topic (packet-id 3).
-    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 3, MESH_CHANNEL_TOPIC) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
-    }
+    // --- SUBSCRIBE order (subscribe before publishing so the broker queues the RETAINED
+    // downlink payloads while we publish; all drained after the publishes, below) ---
+    // #100 DRAIN-ORDER FIX (HW canary #110): the batt/grid/mc primary-downlink SUBSCRIBEs
+    // (pids 1/2/3) are deferred to the END of the subscribe sequence — see the block just
+    // before the PUBLISH loop. The retained-drain loop breaks on `got_batt && got_grid &&
+    // got_mc && <400ms quiet>`; a broker delivers retained in SUBSCRIBE order, so subscribing
+    // these three FIRST completed the break-gate before the later config retained (net/broker/
+    // ota, pids 16-21) arrived in a subsequent TCP-window chunk >400ms later → the drain exited
+    // and CFG-B/O never applied (deterministic miss, HW-observed). Subscribing them LAST makes
+    // the gate structurally unable to trip until the whole config backlog is drained — order-
+    // and buffer-size-independent. (The "subscribe before publish" priority is preserved: all
+    // subscribes, batt/grid/mc included, still precede the telemetry PUBLISH.)
     // #33 Model-A: subscribe the ONE retained fleet STAGING topic (packet-id 4) as the
     // latest_version source + fetch target. No per-id announce-act topic exists (dropped
     // — the #32 closure): staging only advertises "update available"; it never fetches.
@@ -1816,6 +1812,25 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 21, b"smol/config/ota_host") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
+    }
+
+    // #100 DRAIN-ORDER FIX (HW canary #110): the batt/grid/mc primary downlinks are the
+    // retained-drain break-gate (`got_batt && got_grid && got_mc && <quiet>`), so they MUST be
+    // the LAST retained to arrive — subscribe them AFTER every config topic above. A broker sends
+    // retained in SUBSCRIBE order, so the gate now cannot complete until the whole config backlog
+    // (screen/led/…/net/broker/ota, pids 6-21) has been delivered and drained → CFG-B/O reliably
+    // apply. (Boot burst: cfg_cache=None skips the gateway block, so these are effectively first,
+    // as before — mc is usually absent at boot, so that path still drains to the deadline.) Pids
+    // stay 1/2/3 (identifiers, not order); only the SEND order moved. Still before the PUBLISH loop.
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 1, BATT_TOPIC) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 2, GRID_TOPIC) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
+    // #23 election: subscribe the retained single-gateway topic (packet-id 3).
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 3, MESH_CHANNEL_TOPIC) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
     }
 
     // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
