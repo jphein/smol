@@ -180,7 +180,7 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 10] = [
+const CFG_APPLY_KEYS: [u8; 12] = [
     crate::net::wifi::CFG_KEY_SCREEN,
     crate::net::wifi::CFG_KEY_LED,
     crate::net::wifi::CFG_KEY_UNITS,
@@ -196,6 +196,14 @@ const CFG_APPLY_KEYS: [u8; 10] = [
     // #71 on-demand WiFi scan: W — same COMMAND discipline as R (buffered/applied via take_cfg_offer(W),
     // NEVER cached — a cached scan = periodic off-channel excursion, the coexist hazard). One-shot relay.
     crate::net::wifi::CFG_KEY_SCAN,
+    // #72 IO registry pin-map: G — cached + relayed like S/L/U/P/Y/N. Present UNCONDITIONALLY (not
+    // `io`-gated) so the leaf-apply slot + relay path exist without splitting this array per-feature;
+    // the config PLUMBING (subscribe/fill/apply) is `io`-gated, so a non-io build never feeds it →
+    // the slot is inert (one CfgTracker slot, ~66 B .bss). A leaf takes it via take_cfg_offer(G).
+    crate::net::wifi::CFG_KEY_IO,
+    // #72 IO output states: g — same unconditional-slot rationale as G above (the config
+    // PLUMBING is `io`-gated; a non-io build's slot is inert). Leaf takes it via take_cfg_offer(g).
+    crate::net::wifi::CFG_KEY_IO_SET,
 ];
 /// #50b leaf-status UPLINK tag: `"SMOLv1 STAT "` (12 B, trailing space) then `"NNN"`
 /// (3-ASCII zero-padded SENDER leaf id) then the verbatim live `<AppKind>:<page>` value
@@ -507,6 +515,10 @@ impl DiagExtra {
         }
     }
 }
+
+/// #72 io registry: max bytes of the `io=` DIAG field (≤ 5 inputs × `<pin>:<count>,` ≈ 45 B).
+#[cfg(feature = "io")]
+const IO_DIAG_MAX: usize = 48;
 
 /// Tracks the two timestamps that define the peer link state. Monotonic ms
 /// (`Instant::now().duration_since_epoch().as_millis()`); 0 = "never seen".
@@ -1573,6 +1585,12 @@ pub struct RadioManager {
     diag: DiagCounters,
     /// #74 obs wave-2: node state mirrored from `main` (LED mode + time-sync) for the DIAG record.
     diag_extra: DiagExtra,
+    /// #72 io registry: this node's compact `io=<pin>:<count>,…` DIAG field (bound-input press
+    /// counters), pushed from `main` via `set_diag_io` each diag-sample tick. Fixed buffer, no heap.
+    #[cfg(feature = "io")]
+    diag_io: [u8; IO_DIAG_MAX],
+    #[cfg(feature = "io")]
+    diag_io_len: usize,
     /// #40 leaf-mesh-OTA: the LEAF receive state machine (verify-sig → signed-bounds →
     /// window reassembly → readback verify → activate). Idle except during a transfer.
     /// Unused on a gateway (which drives the RELAY side via `run_leaf_ota_relay`).
@@ -1748,6 +1766,10 @@ impl RadioManager {
             own_scan: None,
             diag: DiagCounters::new(),
             diag_extra: DiagExtra::new(),
+            #[cfg(feature = "io")]
+            diag_io: [0u8; IO_DIAG_MAX],
+            #[cfg(feature = "io")]
+            diag_io_len: 0,
             ota_leaf: crate::ota_mesh::OtaLeafSession::new(),
             #[cfg(feature = "wled")]
             wled_seq: 0,
@@ -2403,6 +2425,16 @@ impl RadioManager {
         };
     }
 
+    /// #72: mirror `main`-built `io=` DIAG field (bound-input press counters `<pin>:<count>,…`)
+    /// into the RadioManager so BOTH diag builders (leaf broadcast + gateway flush) fold it in.
+    /// `main` calls this on the ~10 s diag-sample tick. Truncated to [`IO_DIAG_MAX`].
+    #[cfg(feature = "io")]
+    pub fn set_diag_io(&mut self, s: &[u8]) {
+        let n = s.len().min(IO_DIAG_MAX);
+        self.diag_io[..n].copy_from_slice(&s[..n]);
+        self.diag_io_len = n;
+    }
+
     /// #70/#49: build this node's compact DIAG record for retained `smol/<id>/diag`. Format matches
     /// luna's DEPLOYED HA parser (PR #81): literal `DIAG` first field, then `key=value` pairs
     /// PIPE-separated, order-independent, forward-compatible (HA picks by key, unknown keys ignored,
@@ -2488,6 +2520,15 @@ impl RadioManager {
             if let Ok(cfg) = core::str::from_utf8(&e.cfg[..e.cfg_len as usize]) {
                 rec.push_str("|cfg=");
                 rec.push_str(cfg);
+            }
+        }
+        // #72: append the io registry's bound-input press counters (io=<pin>:<count>,…) AFTER cfg=.
+        // `io`-gated + only when populated → the DIAG string is byte-identical on a non-io build.
+        #[cfg(feature = "io")]
+        if self.diag_io_len > 0 {
+            if let Ok(io) = core::str::from_utf8(&self.diag_io[..self.diag_io_len]) {
+                rec.push_str("|io=");
+                rec.push_str(io);
             }
         }
         rec
@@ -3592,6 +3633,16 @@ impl RadioManager {
         // #100 Stage 3: the gateway's OWN OTA-host override — same self-apply path (take_cfg_offer(O)).
         if let Some((buf, len)) = gw_own.ota {
             self.cfg.set(crate::net::wifi::CFG_KEY_OTA, &buf[..len]);
+        }
+        // #72: the gateway's OWN io pin-map — same self-apply path (take_cfg_offer(G)).
+        #[cfg(feature = "io")]
+        if let Some((buf, len)) = gw_own.io {
+            self.cfg.set(crate::net::wifi::CFG_KEY_IO, &buf[..len]);
+        }
+        // #72: the gateway's OWN io output-states — same self-apply path (take_cfg_offer(g)).
+        #[cfg(feature = "io")]
+        if let Some((buf, len)) = gw_own.io_set {
+            self.cfg.set(crate::net::wifi::CFG_KEY_IO_SET, &buf[..len]);
         }
         // #52 remote reboot — a COMMAND, not a config. Fire a ONE-SHOT `<id>R` frame per queued
         // leaf target via `broadcast_config` DIRECTLY (NOT `cfg_cache` / `broadcast_cached_configs`):

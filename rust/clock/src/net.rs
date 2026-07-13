@@ -80,6 +80,14 @@ pub use wifi::CFG_KEY_NET;
 pub use wifi::CFG_KEY_BROKER;
 #[cfg(feature = "espnow")]
 pub use wifi::CFG_KEY_OTA;
+// #72 IO-registry key — the leaf/own apply path (take_cfg_offer(G) → io::apply_wire re-binds
+// the free GPIOs). `io`-gated (⊃ espnow): only the io apply path names it here.
+#[cfg(feature = "io")]
+pub use wifi::CFG_KEY_IO;
+// #72 IO output-control key — the leaf/own apply path (take_cfg_offer(g) → io::apply_set drives
+// the bound OUTPUT slots). `io`-gated, same rationale.
+#[cfg(feature = "io")]
+pub use wifi::CFG_KEY_IO_SET;
 // #45: `main` sizes its held Custom-layout buffer to the max keyed value — bridge the const out
 // of the private `wifi` module (espnow-only: only the Custom apply path names it).
 #[cfg(feature = "espnow")]

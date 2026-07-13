@@ -136,6 +136,12 @@ mod hunt;
 mod familiar;
 // On-board sensors: chip die-temp (tsens) + battery ADC on GPIO4. Always on.
 mod sensors;
+// #72 IO/component registry (ESPHome inverted): the digital-`Flex` driver menu +
+// runtime pin-map for the free GPIOs (0/1/3/7/10), configured live over the #56
+// keyed-CFG `G` channel — no recompile. Default-OFF (`io` feature, implies `espnow`)
+// so the default/wifi/espnow builds are BYTE-FREE of it (#44). v1 = digital in/out.
+#[cfg(feature = "io")]
+mod io;
 // #43 display units (°F/°C · 12h/24h): the fleet-global `Units` config + wire parse.
 // Always compiled — the CLOCK screen (universal) renders through it; only espnow nodes
 // receive a config (the relay/apply path is radio-only, like the screen/LED channels).
@@ -412,6 +418,40 @@ fn main() -> ! {
         sensors::BATT_ADC_GPIO,
         sensors::BATT_DIVIDER as u32,
     );
+
+    // --- #72 IO registry: claim the free GPIOs as runtime-bindable Flex pins --
+    // Hold GPIO0/1/3/7/10 as type-erased `Flex` so a runtime pin-map (relayed over
+    // the #56 keyed-CFG `G` channel) can bind each as a digital input/output at
+    // boot — no recompile. The boot self-test proves the runtime out<->in re-type
+    // (issue #72 §2.4, the one real unknown) on real silicon, then leaves every pin
+    // Hi-Z. Held for the whole run; the CFG `G` apply (below) re-binds slots live.
+    // Default-OFF (`io` feature) → the default/wifi/espnow builds never link this.
+    #[cfg(feature = "io")]
+    let mut io_pins = {
+        use esp_hal::gpio::Flex;
+        let mut m = io::PinMap::new([
+            Flex::new(peripherals.GPIO0),
+            Flex::new(peripherals.GPIO1),
+            Flex::new(peripherals.GPIO3),
+            Flex::new(peripherals.GPIO7),
+            Flex::new(peripherals.GPIO10),
+        ]);
+        io::boot_selftest(&mut m);
+        m
+    };
+    // #72: last-applied `G` pin-map wire — edge-triggers the re-bind. The retained config
+    // re-delivers every ~10 s; re-binding every burst would stomp output (relay/LED) state,
+    // so `apply_wire` runs only when the wire CHANGES.
+    #[cfg(feature = "io")]
+    let mut io_wire = [0u8; crate::net::CFG_VALUE_MAX];
+    #[cfg(feature = "io")]
+    let mut io_wire_len: usize = 0;
+    // #72: last-applied `g` output-states wire — held so it can be RE-ASSERTED after a `G`
+    // re-bind (apply_wire binds every output OFF), restoring the commanded lamp/relay levels.
+    #[cfg(feature = "io")]
+    let mut io_set_wire = [0u8; crate::net::CFG_VALUE_MAX];
+    #[cfg(feature = "io")]
+    let mut io_set_len: usize = 0;
 
     // --- HA battery-voltage cache (Batt screen) ------------------------------
     // Owned by `main`, borrowed read-only to the Batt plugin via `Ctx::batt`. Filled
@@ -938,6 +978,21 @@ fn main() -> ! {
                     if units.clk_24h { "24" } else { "12" },
                 );
                 r.set_diag_extra(led_mode.to_wire(), led_on, tage_s, tsrc, cfg.as_bytes());
+                // #72: fold the bound-input press counters into the DIAG record (io=<pin>:<count>,…).
+                #[cfg(feature = "io")]
+                {
+                    use core::fmt::Write as _;
+                    let mut io_field = alloc::string::String::new();
+                    for slot in 0..io::NPIN {
+                        if let Some(c) = io_pins.input_count(slot) {
+                            if !io_field.is_empty() {
+                                io_field.push(',');
+                            }
+                            let _ = write!(io_field, "{}:{}", io::FREE_PINS[slot], c);
+                        }
+                    }
+                    r.set_diag_io(io_field.as_bytes());
+                }
             }
             // #70/#49: a LEAF broadcasts its compact DIAG record on a SLOW ~60 s cadence (diag is
             // slow-moving — keep mesh airtime low), expedited by a BOOT-button press (rate-limited
@@ -1298,6 +1353,36 @@ fn main() -> ! {
                     }
                 }
             }
+            // #72: the relayed / gateway-own IO pin-map (key `G`). EDGE-triggered on a CHANGE of
+            // the wire (the retained value re-delivers every ~10 s; re-binding every burst would
+            // reset outputs). On change: re-bind the free GPIOs via io::apply_wire (validates +
+            // rejects reserved/unknown pins). No NVS — survives reboot via the gateway's re-relay.
+            #[cfg(feature = "io")]
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_IO) {
+                if o.len != io_wire_len || io_wire[..o.len] != o.buf[..o.len] {
+                    io_wire[..o.len].copy_from_slice(&o.buf[..o.len]);
+                    io_wire_len = o.len;
+                    let n = io::apply_wire(&mut io_pins, &o.buf[..o.len]);
+                    // apply_wire bound every output OFF — re-assert the last commanded output
+                    // states so a lamp/relay stays at its level across a config edit.
+                    if io_set_len > 0 {
+                        io::apply_set(&mut io_pins, &io_set_wire[..io_set_len]);
+                    }
+                    log::info!("smol #72 io: pin-map applied ({} B, {} pins bound)", o.len, n);
+                }
+            }
+            // #72: the relayed / gateway-own output states (key `g`). EDGE-triggered on a CHANGE;
+            // drives each bound OUTPUT to its commanded level (io::apply_set no-ops on unbound /
+            // input slots). Held in io_set_wire so a later `G` re-bind re-asserts it.
+            #[cfg(feature = "io")]
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_IO_SET) {
+                if o.len != io_set_len || io_set_wire[..o.len] != o.buf[..o.len] {
+                    io_set_wire[..o.len].copy_from_slice(&o.buf[..o.len]);
+                    io_set_len = o.len;
+                    let n = io::apply_set(&mut io_pins, &o.buf[..o.len]);
+                    log::info!("smol #72 io: output states set ({} B, {} driven)", o.len, n);
+                }
+            }
 
             // #52: a remote reboot command (key `R`) — a COMMAND (cache-bypass, one-shot). Applied
             // once (edge — `take` clears it); the value is empty (the key IS the command). Feeds
@@ -1465,6 +1550,9 @@ fn main() -> ! {
         // the plugin performs its app-specific action and returns Stay/Switch. A
         // long press universally maps to `Switch(Menu)` (the global gesture grammar
         // is enforced centrally: `main` acts only on the returned `Transition`).
+        // #72: advance the bound-input debouncers every subtick (press-edge counting for DIAG).
+        #[cfg(feature = "io")]
+        io_pins.poll_inputs(now);
         if let Some(press) = button.poll(now) {
             ctx.redraw = true;
             // #20 (1a): any press marks activity so the next recurring flush defers.
