@@ -177,6 +177,22 @@ const GRID_PREFIX: &[u8] = b"SMOLv1 GRID "; // + verbatim "GRID|l1|l2|l3"
 /// Max GRID payload retained/echoed — matches `GridCache` (LOCKED ≤ 96 B).
 const GRID_PAYLOAD_MAX: usize = 96;
 
+/// #13 Stage B — downlink FRESHNESS tags. The v1 `BATT`/`GRID` frames carry NO freshness
+/// field (a locked no-length-byte memcpy — a header can't be inserted), so a relay can't tell
+/// new data from a replay and downlink stays single-hop. `BATT2`/`GRID2` prepend a 10-digit
+/// monotonic `dl_seq` (the gateway's unix-second of the last VALUE CHANGE — survives a gateway
+/// reboot + never wraps, exactly like `TIME`'s `synced_at`): a node adopts + RE-FLOODS only a
+/// STRICTLY-NEWER `dl_seq` (the `TIME` strict-newer template), so downlink reaches a stranded
+/// leaf via a relay AND an older/replayed frame is dropped (no loop). `BATT2` diverges from
+/// `BATT` at byte 11 (`'2'` vs `' '`) and from `GRID2` at byte 7, so `strip_prefix` never
+/// confuses them. NEW tags: an old node `classify()`s them to `None` (harmless) — the same
+/// fleet-flash / no-flag-day discipline as `RELAY2`.
+const BATT2_PREFIX: &[u8] = b"SMOLv1 BATT2 "; // + "SSSSSSSSSS " + verbatim "BATT|…"
+const GRID2_PREFIX: &[u8] = b"SMOLv1 GRID2 "; // + "SSSSSSSSSS " + verbatim "GRID|…"
+/// Max BATT2/GRID2 frame on the wire: 13-B prefix + 10-digit `dl_seq` + space + ≤96-B payload
+/// = ≤120; 128 leaves headroom. Sizes the emit stack buffer.
+const DL_FRAME_MAX: usize = 128;
+
 /// #21/#56 leaf-relay config-downlink tag: `"SMOLv1 CFG "` (11 B, trailing space) then
 /// `"NNN"` (3-ASCII zero-padded TARGET leaf id), then a 1-byte config `KEY` (#56), then
 /// the VERBATIM value for that channel (empty = clear). Diverges from HELLO/BATT/GRID/
@@ -462,6 +478,12 @@ enum Frame<'a> {
     /// A grid-downlink payload from a gateway (issue #16): the verbatim `GRID|…`
     /// bytes (twin of `Batt`; copied into `GridTracker` in `service`).
     Grid(&'a [u8]),
+    /// #13 Stage B: a battery downlink carrying a monotonic freshness `seq` (the gateway's
+    /// unix-second of the last value change). A node adopts + re-floods only a STRICTLY-NEWER
+    /// `seq`; `payload` is the verbatim `BATT|…` bytes (borrows the RX buffer).
+    Batt2 { seq: u32, payload: &'a [u8] },
+    /// #13 Stage B: the grid twin of [`Frame::Batt2`].
+    Grid2 { seq: u32, payload: &'a [u8] },
     /// #21/#56 leaf-relay: a gateway's keyed CONFIG downlink — `target` leaf id, the config
     /// channel `key` (`S`=screen/…), + the verbatim `value` bytes (`value` borrows the RX
     /// buffer; the leaf buffers it per-key in `CfgTracker` in `service` IFF `target ==
@@ -671,11 +693,14 @@ struct BattTracker {
     buf: [u8; BATT_PAYLOAD_MAX],
     len: usize,
     have: bool,
+    /// #13 Stage B: the freshness `seq` of the last-adopted BATT2 (0 = none / v1 BATT only). A
+    /// higher `seq` is strictly newer; drives the strict-newer adopt + relay re-flood decision.
+    dl_seq: u32,
 }
 
 impl BattTracker {
     const fn new() -> Self {
-        Self { buf: [0; BATT_PAYLOAD_MAX], len: 0, have: false }
+        Self { buf: [0; BATT_PAYLOAD_MAX], len: 0, have: false, dl_seq: 0 }
     }
 
     /// Buffer a freshly-received payload (truncated to capacity; ≤ 96 B by spec).
@@ -684,6 +709,19 @@ impl BattTracker {
         self.buf[..n].copy_from_slice(&payload[..n]);
         self.len = n;
         self.have = true;
+    }
+
+    /// #13 Stage B: adopt a BATT2 payload IFF its `seq` is STRICTLY NEWER than the last adopted
+    /// (the `TIME` strict-newer template). Returns true if adopted → the caller re-floods it.
+    /// A first sight always adopts (so a stranded leaf catches up); a same/older `seq` is a
+    /// replay/echo → dropped (bounds the flood, no loop).
+    fn set_fresh(&mut self, payload: &[u8], seq: u32) -> bool {
+        if self.have && seq <= self.dl_seq {
+            return false;
+        }
+        self.set(payload);
+        self.dl_seq = seq;
+        true
     }
 }
 
@@ -703,11 +741,13 @@ struct GridTracker {
     buf: [u8; GRID_PAYLOAD_MAX],
     len: usize,
     have: bool,
+    /// #13 Stage B: freshness `seq` of the last-adopted GRID2 (twin of `BattTracker::dl_seq`).
+    dl_seq: u32,
 }
 
 impl GridTracker {
     const fn new() -> Self {
-        Self { buf: [0; GRID_PAYLOAD_MAX], len: 0, have: false }
+        Self { buf: [0; GRID_PAYLOAD_MAX], len: 0, have: false, dl_seq: 0 }
     }
 
     /// Buffer a freshly-received payload (truncated to capacity; ≤ 96 B by spec).
@@ -717,6 +757,16 @@ impl GridTracker {
         self.len = n;
         self.have = true;
     }
+
+    /// #13 Stage B: strict-newer adopt + re-flood decision (twin of `BattTracker::set_fresh`).
+    fn set_fresh(&mut self, payload: &[u8], seq: u32) -> bool {
+        if self.have && seq <= self.dl_seq {
+            return false;
+        }
+        self.set(payload);
+        self.dl_seq = seq;
+        true
+    }
 }
 
 /// A `Copy` snapshot of a buffered GRID payload handed to `main` by
@@ -725,6 +775,38 @@ impl GridTracker {
 pub struct GridOffer {
     pub buf: [u8; GRID_PAYLOAD_MAX],
     pub len: usize,
+}
+
+/// #13 Stage B GATEWAY-origin state for ONE downlink channel (BATT2 or GRID2): the last payload
+/// broadcast + the freshness `seq` assigned to it. `broadcast_batt`/`broadcast_grid` bump `seq`
+/// to the gateway's current unix-second ONLY when the payload CHANGES, so an unchanged periodic
+/// re-broadcast keeps the same `seq` (relays don't re-flood it) while a genuine new value floods
+/// once. Fixed `.bss`, no heap. Only a gateway writes it (a leaf never originates downlink).
+struct DlOrigin {
+    seq: u32,
+    last: [u8; BATT_PAYLOAD_MAX], // BATT_PAYLOAD_MAX == GRID_PAYLOAD_MAX (96); reused for both
+    len: usize,
+}
+
+impl DlOrigin {
+    const fn new() -> Self {
+        Self { seq: 0, last: [0; BATT_PAYLOAD_MAX], len: 0 }
+    }
+
+    /// The freshness `seq` to stamp on `payload`. On a CHANGE, bump to `now_unix` but never below
+    /// `seq+1` — so the seq is strictly monotonic across changes even if the clock is unsynced
+    /// (small `now_unix`) or two changes land in the same second, yet tracks wall-time so it
+    /// survives a gateway reboot (a post-reboot `now_unix` outranks any pre-reboot seq a leaf holds).
+    fn seq_for(&mut self, payload: &[u8], now_unix: u32) -> u32 {
+        let n = payload.len().min(BATT_PAYLOAD_MAX);
+        let changed = n != self.len || self.last[..n] != payload[..n];
+        if changed {
+            self.seq = now_unix.max(self.seq.saturating_add(1));
+            self.last[..n].copy_from_slice(&payload[..n]);
+            self.len = n;
+        }
+        self.seq
+    }
 }
 
 /// #21/#56 leaf-relay: buffers the most-recent inbound `SMOLv1 CFG` value that targeted
@@ -1630,6 +1712,11 @@ pub struct RadioManager {
     /// Twin of `batt` (issue #16): most-recent inbound SMOLv1 GRID payload, buffered
     /// for `main` to store into its `GridCache`.
     grid: GridTracker,
+    /// #13 Stage B: GATEWAY-origin freshness state for the BATT2/GRID2 downlink — assigns the
+    /// monotonic `dl_seq` (bumped only on a value change) so relays re-flood strictly-newer data.
+    /// Inert on a leaf (a leaf never originates downlink; it adopts via the trackers above).
+    dl_batt: DlOrigin,
+    dl_grid: DlOrigin,
     /// #21/#56 leaf-relay (LEAF side): most-recent inbound `SMOLv1 CFG` value PER config
     /// key that targeted THIS leaf, buffered for `main` to apply via `take_cfg_offer(key)`.
     cfg: CfgTracker,
@@ -1842,6 +1929,8 @@ impl RadioManager {
             roster: Roster::new(),
             batt: BattTracker::new(),
             grid: GridTracker::new(),
+            dl_batt: DlOrigin::new(),
+            dl_grid: DlOrigin::new(),
             cfg: CfgTracker::new(),
             cfg_cache: crate::net::wifi::CfgCache::new(),
             stat_cache: crate::net::wifi::CfgCache::new(),
@@ -2279,18 +2368,18 @@ impl RadioManager {
 
     // --- Battery downlink relay (see the BATT_PREFIX + BattTracker sections) ---
 
-    /// Broadcast one SMOLv1 BATT frame: the 12-B tag + the verbatim `BATT|…`
-    /// `payload` (byte-for-byte the gateway's `BattCache`). GATEWAY-ONLY by
-    /// convention — `main` calls this on a slow cadence while `is_gateway` and the
-    /// cache is non-empty, so neighbour leaves fill their own cache. No length byte
-    /// (payload is the rest of the frame); safe in either radio mode.
-    pub fn broadcast_batt(&mut self, payload: &[u8]) {
-        // 12-B tag + ≤ 96-B payload = ≤ 108 B, well under the 250-B ESP-NOW limit.
-        let mut msg = [0u8; BATT_PREFIX.len() + BATT_PAYLOAD_MAX];
-        msg[..BATT_PREFIX.len()].copy_from_slice(BATT_PREFIX);
-        let n = payload.len().min(BATT_PAYLOAD_MAX);
-        msg[BATT_PREFIX.len()..BATT_PREFIX.len() + n].copy_from_slice(&payload[..n]);
-        self.send_to(&BROADCAST_ADDRESS, &msg[..BATT_PREFIX.len() + n]);
+    /// #13 Stage B: broadcast the battery downlink as a `SMOLv1 BATT2` frame — the tag + a
+    /// 10-digit freshness `dl_seq` + the verbatim `BATT|…` `payload` (byte-for-byte the gateway's
+    /// `BattCache`). GATEWAY-ONLY — `main` calls this on a slow cadence while `is_gateway` + the
+    /// cache is non-empty, passing the gateway's current `now_unix`. The `dl_seq` is bumped only
+    /// when the payload CHANGES (see [`DlOrigin::seq_for`]), so an unchanged periodic re-broadcast
+    /// isn't re-flooded by relays while a genuine new value floods to stranded leaves once.
+    /// (Supersedes the v1 single-hop `BATT` send; leaves still PARSE v1 `BATT` from an old gateway.)
+    pub fn broadcast_batt(&mut self, payload: &[u8], now_unix: u32) {
+        let seq = self.dl_batt.seq_for(payload, now_unix);
+        let mut msg = [0u8; DL_FRAME_MAX];
+        let len = encode_dl(BATT2_PREFIX, seq, payload, &mut msg);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
     }
 
     /// Take the buffered inbound BATT payload (if any), clearing it. `main` stores
@@ -2306,17 +2395,16 @@ impl RadioManager {
         }
     }
 
-    /// Broadcast one SMOLv1 GRID frame — the exact TWIN of [`broadcast_batt`]
-    /// (issue #16). GATEWAY-ONLY by convention (`main` gates on `is_gateway` + a
-    /// non-empty cache); 12-B tag + verbatim `GRID|…` payload, no length byte.
+    /// #13 Stage B: broadcast the grid downlink as a `SMOLv1 GRID2` frame — the exact TWIN of
+    /// [`broadcast_batt`] (issue #16): tag + 10-digit `dl_seq` + verbatim `GRID|…` payload, seq
+    /// bumped only on a value change. GATEWAY-ONLY.
     ///
     /// [`broadcast_batt`]: RadioManager::broadcast_batt
-    pub fn broadcast_grid(&mut self, payload: &[u8]) {
-        let mut msg = [0u8; GRID_PREFIX.len() + GRID_PAYLOAD_MAX];
-        msg[..GRID_PREFIX.len()].copy_from_slice(GRID_PREFIX);
-        let n = payload.len().min(GRID_PAYLOAD_MAX);
-        msg[GRID_PREFIX.len()..GRID_PREFIX.len() + n].copy_from_slice(&payload[..n]);
-        self.send_to(&BROADCAST_ADDRESS, &msg[..GRID_PREFIX.len() + n]);
+    pub fn broadcast_grid(&mut self, payload: &[u8], now_unix: u32) {
+        let seq = self.dl_grid.seq_for(payload, now_unix);
+        let mut msg = [0u8; DL_FRAME_MAX];
+        let len = encode_dl(GRID2_PREFIX, seq, payload, &mut msg);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
     }
 
     /// Take the buffered inbound GRID payload (if any), clearing it. Twin of
@@ -2576,7 +2664,7 @@ impl RadioManager {
         // score P2/P3; `fwd == 0` fleet-wide is the C0 all-hear byte-identical canary).
         let mesh_hop = if self.relay.latch.latched() { crate::net::flood::MAX_HOP } else { 1 };
         let mut rec = alloc::format!(
-            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}|brk={}|otah={}|fwd={}|dedup={}|ttl={}|hop={}",
+            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}|brk={}|otah={}|fwd={}|dedup={}|ttl={}|hop={}|dlseq={}",
             d.boot_slot,
             d.reset_reason,
             d.boot_count,
@@ -2606,6 +2694,10 @@ impl RadioManager {
             self.diag.dedup,
             self.diag.ttl,
             mesh_hop,
+            // #13 Stage B: the leaf's last-adopted BATT2 downlink freshness (rig P4 watches this
+            // stay unchanged when an older/replayed dl_seq is dropped). 0 on a gateway (source) or
+            // a v1-only leaf. Representative of the downlink channel; GRID2 uses the same mechanism.
+            self.batt.dl_seq,
         );
         // #74 item 3 (stage-2): fold in the APPLIED-config string for HA config-drift, ONLY when
         // `main` populated it (espnow build). ASCII by construction (as_wire/to_wire/hex/F24). HA
@@ -4297,6 +4389,45 @@ impl RadioManager {
                     self.roster.heard(src, None, rssi, now);
                     label = Some(alloc::string::String::from("grid"));
                 }
+                Some(Frame::Batt2 { seq, payload }) => {
+                    // #13 Stage B: a freshness-stamped battery downlink. A LEAF adopts + RE-FLOODS
+                    // it ONLY when strictly newer than what it holds (the TIME strict-newer template)
+                    // — that both bounds the flood (a replay/echo is dropped, no loop) and carries a
+                    // genuinely-new value one hop further toward a stranded leaf. A GATEWAY ignores
+                    // inbound downlink entirely: it IS the source (its `BattCache` comes from HA), so
+                    // it must never adopt a mesh value back into its own cache. Only a well-formed
+                    // `BATT|` is kept (a stray frame can't wipe a good reading).
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, None, rssi, now);
+                    if !self.relay.is_gateway
+                        && payload.starts_with(b"BATT|")
+                        && self.batt.set_fresh(payload, seq)
+                    {
+                        // Re-broadcast the SAME frame verbatim (payload + seq). `payload` borrows the
+                        // RX buffer; it's copied into the local frame buffer before the &mut-self send.
+                        let mut fb = [0u8; DL_FRAME_MAX];
+                        let len = encode_dl(BATT2_PREFIX, seq, payload, &mut fb);
+                        self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+                        log::info!("smol: BATT2 seq {} adopted + reflooded", seq);
+                    }
+                    label = Some(alloc::format!("batt2 {}", seq));
+                }
+                Some(Frame::Grid2 { seq, payload }) => {
+                    // #13 Stage B: the grid twin of the Batt2 arm — leaf adopts + re-floods strictly
+                    // newer; gateway ignores (it's the source).
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, None, rssi, now);
+                    if !self.relay.is_gateway
+                        && payload.starts_with(b"GRID|")
+                        && self.grid.set_fresh(payload, seq)
+                    {
+                        let mut fb = [0u8; DL_FRAME_MAX];
+                        let len = encode_dl(GRID2_PREFIX, seq, payload, &mut fb);
+                        self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+                        log::info!("smol: GRID2 seq {} adopted + reflooded", seq);
+                    }
+                    label = Some(alloc::format!("grid2 {}", seq));
+                }
                 Some(Frame::Cfg { target, key, value }) => {
                     // #21/#56 leaf-relay: a gateway's keyed CONFIG downlink. Target-filter
                     // FIRST — buffer if addressed to US (`self.id`) OR to the #43 broadcast
@@ -4730,6 +4861,14 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
         // Twin of BATT (issue #16): the rest is the verbatim `GRID|…` payload.
         return Some(Frame::Grid(rest));
     }
+    // #13 Stage B freshness variants. Exclusive from BATT/GRID (the `2` at byte 11 vs the
+    // trailing space), so order is moot; kept adjacent to their base tag.
+    if let Some((seq, payload)) = parse_dl(BATT2_PREFIX, data) {
+        return Some(Frame::Batt2 { seq, payload });
+    }
+    if let Some((seq, payload)) = parse_dl(GRID2_PREFIX, data) {
+        return Some(Frame::Grid2 { seq, payload });
+    }
     if let Some(rest) = data.strip_prefix(CFG_PREFIX) {
         // #21/#56 leaf-relay: "NNN<KEY><value>" — 3-ASCII target id, a 1-byte config KEY,
         // then the verbatim value (to end-of-frame; empty = clear that key). `parse_id`
@@ -5011,6 +5150,38 @@ fn parse_relayack2(data: &[u8]) -> Option<(u8, u16, u8, u8)> {
 /// all-zero, so this synthetic key can never alias a single-hop leaf's real MAC.
 fn synth_origin_mac(origin: u8) -> [u8; 6] {
     [0, 0, 0, 0, 0, origin]
+}
+
+// --- #13 Stage B downlink freshness codec (BATT2 / GRID2) ------------------
+
+/// Encode a downlink freshness frame `<prefix> + "SSSSSSSSSS " + <payload>` into `out`; returns
+/// length. `prefix` is `BATT2_PREFIX`/`GRID2_PREFIX`; `seq` is the 10-digit freshness (full u32,
+/// like TIME's `synced_at` — see [`write_u10`]); `payload` is the verbatim `BATT|…`/`GRID|…` bytes
+/// (truncated to `BATT_PAYLOAD_MAX`). Mirrors [`encode_time`]'s fixed-width discipline.
+fn encode_dl(prefix: &[u8], seq: u32, payload: &[u8], out: &mut [u8]) -> usize {
+    let mut n = 0;
+    out[..prefix.len()].copy_from_slice(prefix);
+    n += prefix.len();
+    write_u10(seq, &mut out[n..]);
+    n += 10;
+    out[n] = b' ';
+    n += 1;
+    let len = payload.len().min(BATT_PAYLOAD_MAX);
+    out[n..n + len].copy_from_slice(&payload[..len]);
+    n + len
+}
+
+/// Parse a downlink freshness frame with `prefix` into `(seq, payload)`, or `None`. `payload`
+/// borrows `data` (the verbatim `BATT|…`/`GRID|…` bytes after the 10-digit seq + its space). The
+/// caller validates the `BATT|`/`GRID|` marker (a stray frame can't wipe a good reading).
+fn parse_dl<'a>(prefix: &[u8], data: &'a [u8]) -> Option<(u32, &'a [u8])> {
+    let rest = data.strip_prefix(prefix)?;
+    // "SSSSSSSSSS " = 10 seq digits + a space, then the payload.
+    if rest.len() < 11 {
+        return None;
+    }
+    let seq = parse_u10(&rest[0..10])?;
+    Some((seq, &rest[11..]))
 }
 
 // -------------------------------------------------------------------------
