@@ -14,8 +14,13 @@
 #   ota_publish.sh stage      [<commit>] [--bin <file>] [--build N]  # build+host+publish smol/ota/staged (arms all boards; NO board fetches)
 #   ota_publish.sh install <id>                                      # publish INSTALL → smol/<id>/ota/install (headless per-node canary; the HA Update button is the GUI path)
 # <commit> defaults to HEAD. --bin <file> skips the cargo build and hosts an existing .bin.
-# --build N overrides the git-derived BUILD number in the staged line — canary an uncommitted
-#   image without a throwaway commit to bump the count (default: `git rev-list --count`).
+# BUILD number (the staged-line monotonicity value the fw compares): stage RATCHETS it forward —
+#   build = max(`git rev-list --count`, <retained smol/ota/staged build> + 1) — so a prior canary
+#   pin (a --build N left ahead of the count) HEALS the fleet number forward automatically instead
+#   of poisoning the gate (issue #128). Broker unreachable → falls back to the raw count with a
+#   WARNING (no ratchet). --build N still forces an explicit override (canary an uncommitted image
+#   with no throwaway commit); N is used AS-IS and, when N > count, prints a loud canary-pin
+#   warning + the heal path. See choose_build() (unit-tested by tools/test_ota_ratchet.sh).
 #
 # SAFETY: canary is STRUCTURAL now — Install is per-device (native Update entity); there
 # is no fleet-fetch topic (Model-A #32 closure). Install one board, verify its version
@@ -40,6 +45,7 @@ ESPFLASH="${ESPFLASH:-$HOME/.cargo/bin/espflash}"
 # retype env overrides. Precedence: env file > a var the file leaves unset (pre-set env) >
 # placeholder default. Nothing real ever lives in this committed script.
 _OTA_ENV="$(dirname "${BASH_SOURCE[0]}")/ota_publish.env"
+# shellcheck source=/dev/null  # operator-supplied, git-ignored, path known only at runtime
 [ -f "$_OTA_ENV" ] && . "$_OTA_ENV"
 OTA_HOST_SSH="${OTA_HOST_SSH:-<ssh-host>}"      # scp target (ssh alias for the image host)
 OTA_HOST_IP="${OTA_HOST_IP:-10.0.0.0}"          # image host on the boards' VLAN (same subnet as boards)
@@ -52,18 +58,23 @@ ADDON="${ADDON:-<addon-slug>}"                  # supervisor addon slug carrying
 SMOL_OTA_SIGNING_KEY_ITEM="${SMOL_OTA_SIGNING_KEY_ITEM:-smol-ota-signing-ed25519}"  # Vaultwarden secureNote holding the ed25519 signing PEM (#32)
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
-usage(){ sed -n '2,20p' "${BASH_SOURCE[0]}"; exit "${1:-1}"; }
+usage(){ sed -n '2,23p' "${BASH_SOURCE[0]}"; exit "${1:-1}"; }
 
 MODE="${1:-}"; [ -n "$MODE" ] || usage 1
 
 # ---- source the broker password (NEVER printed) -----------------------------
+# #128: memoize — the ratchet's retained-read AND the publish both need the pw; without this
+# they'd each hit bw + the HA supervisor (slow + two failure points). Cached in-process only.
+_MQTT_PW=""
 mqtt_pw(){
+  [ -n "$_MQTT_PW" ] && { printf '%s' "$_MQTT_PW"; return 0; }
   local tok pw
   tok="$(bw get password ha-llat 2>/dev/null)" || die "bw locked? couldn't read ha-llat"
   pw="$(HA_TOKEN="$tok" python3 "$HOME/Projects/ha/tools/ha_supervisor.py" GET "/addons/$ADDON/info" \
         | python3 -c "import sys,json;print(json.load(sys.stdin)['options']['mqtt_password'])")" \
      || die "couldn't source mqtt_password from addon $ADDON"
   [ -n "$pw" ] || die "empty mqtt_password"
+  _MQTT_PW="$pw"
   printf '%s' "$pw"
 }
 
@@ -74,6 +85,71 @@ pub_retained(){ # topic, payload  (payload may be empty = retain-delete)
   else
     mosquitto_pub -h "$BROKER" -p 1883 -u "$MQTT_USER" -P "$pw" -r -t "$topic" -m "$payload"
   fi
+}
+
+# ---- #128: read the retained staged BUILD (for the ratchet) ------------------
+# Prints the current retained `smol/ota/staged` build number (field 2 of OTA|<build>|…) with
+# NO trailing newline, or nothing if the topic is empty / carries a non-OTA payload. Returns 0
+# when the broker was reachable (record found OR topic empty), 1 when the broker is UNREACHABLE
+# (so the caller can WARN + fall back to the raw count). A retained message arrives immediately
+# on subscribe, so -C 1 returns in ms; -W 3 bounds an empty topic. The reachable-but-empty case
+# and the unreachable case both exit non-zero, so we disambiguate on the stderr text (a real
+# connect failure always prints one of these; a bare -W timeout on an empty topic does not).
+read_staged_build(){
+  local pw msg rc err
+  pw="$(mqtt_pw)"
+  err="$(mktemp)"
+  msg="$(mosquitto_sub -h "$BROKER" -p 1883 -u "$MQTT_USER" -P "$pw" -C 1 -W 3 \
+        -t "smol/ota/staged" 2>"$err")" && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if grep -qiE 'connection refused|connection error|unable to connect|getaddrinfo|unknown host|name or service|network is unreachable|no route to host|not authorised|error: connect' "$err"; then
+      rm -f "$err"; return 1   # broker unreachable / auth-failed → caller falls back to count
+    fi
+    rm -f "$err"; return 0      # connected, empty topic (no prior stage) → no build, reachable
+  fi
+  rm -f "$err"
+  case "$msg" in
+    OTA\|*) printf '%s' "$msg" | cut -d'|' -f2 | tr -d '\n' ;;  # field 2 = build
+    *) : ;;                                                     # non-OTA payload → treat as none
+  esac
+  return 0
+}
+
+# ---- #128: choose the staged BUILD number (pure decision — unit-tested) ------
+# Args: <commit-count> <retained-staged-build|""> <override|"">  → echoes the BUILD to stage;
+# warnings/notes go to STDERR only. Kept side-effect-free so tools/test_ota_ratchet.sh can
+# exercise every branch without a broker, a build, or a publish.
+#
+# INCIDENT (2026-07-14, issue #128): canary staging with --build 300/320/330 left id8 pinned
+# NUMERICALLY AHEAD of the honest commit count (254); honest-numbered stages then read as
+# NotNewer and #120's cleanup (correctly) cleared their orders → id8 silently refused real
+# updates until a 331 re-pin. The ratchet below (build = max(count, staged+1)) makes the fleet
+# number heal FORWARD automatically instead of poisoning the monotonicity gate.
+choose_build(){
+  local count="$1" staged="$2" override="$3" build
+  if [ -n "$override" ]; then
+    # Explicit operator override (canary an uncommitted image without a throwaway commit).
+    # Used AS-IS — but if it out-runs the honest count it re-creates the #128 incident, so warn.
+    build="$override"
+    if [ "$override" -gt "$count" ]; then
+      cat >&2 <<WARN
+⚠️  #128: --build $override is AHEAD of the honest commit count ($count). This PINS the fleet's
+    monotonicity gate above main — honest-numbered stages will read as NotNewer (and #120 cleanup
+    clears their orders) until main's count passes $override or the board is USB-reflashed.
+    HEAL PATH: stage ONE more pinned build (> the pinned board's current) to converge it, then
+    numbering self-heals at the next USB access / once the commit count overtakes the pin.
+WARN
+    fi
+  else
+    # Ratchet: never regress below the retained record — heal forward past any prior canary pin.
+    build="$count"
+    if [ -n "$staged" ] && [ "$((staged + 1))" -gt "$build" ]; then
+      build="$((staged + 1))"
+      echo "note: #128 ratchet — retained staged build ($staged) is ahead of the commit count ($count);" \
+           "staging $build to heal the fleet number forward past a prior canary pin." >&2
+    fi
+  fi
+  printf '%s' "$build"
 }
 
 # ---- install mode (Model-A per-node canary; parity with the HA Update button) --
@@ -100,14 +176,26 @@ esac; done
 # ---- identity (matches build.rs deploy contract; archive builds have no .git) -
 cd "$REPO"
 HASH="$(git rev-parse --short=7 "$COMMIT")"
-BUILD="$(git rev-list --count "$COMMIT")"
-# --build N overrides the git-derived count — lets an operator canary an UNCOMMITTED image
-# without a throwaway commit to bump the number (collision-risky on a busy repo). It becomes
-# the staged BUILD the firmware compares (monotonicity), so it must be a positive integer.
+COUNT="$(git rev-list --count "$COMMIT")"
+# #128: --build N stays an explicit operator override (canary an UNCOMMITTED image with no
+# throwaway commit to bump the count). Must be a positive integer.
 if [ -n "$BUILD_OVERRIDE" ]; then
   case "$BUILD_OVERRIDE" in ''|*[!0-9]*) die "--build must be a positive integer (got '$BUILD_OVERRIDE')";; esac
-  BUILD="$BUILD_OVERRIDE"
 fi
+# #128 RATCHET: with no override, stage build = max(commit count, retained staged build + 1) so
+# a prior canary pin heals the fleet number FORWARD instead of poisoning the monotonicity gate
+# (see choose_build + the incident note there). Only the ratchet path needs the broker read; an
+# explicit override skips it. Broker unreachable → WARN and fall back to the raw count.
+STAGED=""
+if [ -z "$BUILD_OVERRIDE" ]; then
+  if STAGED="$(read_staged_build)"; then :; else
+    echo "WARNING: #128 — broker $BROKER unreachable; can't read retained smol/ota/staged." >&2
+    echo "         Falling back to the raw commit count ($COUNT) with NO ratchet — if a prior" >&2
+    echo "         canary pin is live, this stage may re-collide with it (read fw DIAG to confirm)." >&2
+    STAGED=""
+  fi
+fi
+BUILD="$(choose_build "$COUNT" "$STAGED" "$BUILD_OVERRIDE")"
 
 # ---- build (or take a prebuilt .bin) ----------------------------------------
 # #40 IDENTITY — the staged image is FLEET-SHARED BY DESIGN: it is built with NO
