@@ -1459,6 +1459,10 @@ struct Relay {
     /// (each inner frame / RELAY fragment gets a unique one), the FLOOD-DEDUP key. DISTINCT from the
     /// inner RELAY `msgid` (`tx.msgid`), which stays the reassembly/RELAYACK2 key. Wraps like `next_msgid`.
     up_env_msgid: u16,
+    /// #126 leaf-role: the latched-leaf channel-parking state machine. Inert until the leaf latches
+    /// multi-hop; then it parks on the channel that drew a relay-echo/`RELAYACK2` instead of blind-
+    /// hopping (raising the ~1/3 channel-coincidence throughput). See `net/flood.rs`.
+    park: crate::net::flood::ChannelPark,
 }
 
 impl Relay {
@@ -1477,6 +1481,7 @@ impl Relay {
             seen: crate::net::flood::SeenSet::new(),
             latch: crate::net::flood::HopLatch::new(),
             up_env_msgid: 0,
+            park: crate::net::flood::ChannelPark::new(),
         }
     }
 
@@ -2002,6 +2007,26 @@ impl RadioManager {
         if self.scan_locked {
             return;
         }
+        // #126 channel parking: a LATCHED leaf (stranded — never locked an owner) delegates its
+        // channel choice to ChannelPark, which parks on the channel that drew a relay-echo/RELAYACK2
+        // instead of blind-hopping (raising the ~1/3 channel-coincidence throughput). It hunts the
+        // SAME candidates when bootstrapping / after a park goes stale, so a not-yet-signalled latched
+        // leaf behaves like today's blind scan. `poll` returns Some only on an actual change, so we
+        // re-tune the radio exactly as sparsely as the round-robin did (never mid-dwell).
+        if self.relay.latch.latched() {
+            if let Some(ch) = self.relay.park.poll(now, &CANDIDATES) {
+                let _ = self.esp_now.set_channel(ch);
+                log::info!(
+                    "smol #126: latched-leaf channel {} ({})",
+                    ch,
+                    if self.relay.park.parked() == Some(ch) { "parked" } else { "hunting" }
+                );
+            }
+            return;
+        }
+        // NOT latched → the ordinary blind scan for our owner. Forget any stale park so a future
+        // latch re-bootstraps from a clean hunt.
+        self.relay.park.reset();
         if now.saturating_sub(self.last_scan_hop_ms) >= DWELL_MS {
             self.scan_idx = (self.scan_idx + 1) % CANDIDATES.len();
             let ch = CANDIDATES[self.scan_idx];
@@ -4339,7 +4364,12 @@ impl RadioManager {
                     self.roster.heard(src, Some(origin), rssi, now);
                     if origin == self.id {
                         // Our OWN envelope echoed back by a relay — never re-forward/reassemble it
-                        // (bogus fwd + could loop). Just drop it.
+                        // (bogus fwd + could loop). But the echo PROVES a relay heard + forwarded us
+                        // on the channel we're physically on → the #126 early park signal (arrives a
+                        // hop sooner than the gateway's RELAYACK2). Feed it while latched.
+                        if self.relay.latch.latched() {
+                            self.relay.park.on_signal(now);
+                        }
                         label = Some(alloc::format!("up2 self {:03}", origin));
                     } else if self.relay.is_gateway {
                         // GATEWAY SINK: dispatch by the INNER frame type (#124 Stage 2). Everything is
@@ -4433,6 +4463,11 @@ impl RadioManager {
                         // the escalation streak (does NOT un-latch — that still needs a direct probe).
                         if bitmap != 0 {
                             self.relay.latch.on_uplink_progress();
+                        }
+                        // #126: the ACK reached us on the channel we're physically on → the round-trip
+                        // works HERE. Park on it (confirming signal; complements the earlier UP2-echo).
+                        if self.relay.latch.latched() {
+                            self.relay.park.on_signal(now);
                         }
                         label = Some(alloc::format!("ack2 {:05}", msgid));
                     } else if hop > 1 {
