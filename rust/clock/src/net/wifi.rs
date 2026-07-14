@@ -2773,11 +2773,9 @@ fn mqtt_session(
     //      LIVE owner (sticky), and take over a DEAD owner only after this board's
     //      RSSI-weighted backoff, so the strongest-uplink survivor wins (node-id breaks
     //      ties). `channel` stays 0 (advisory; leaves discover it by scanning the HELLO).
-    // The owner the leaf was following (recovery seeds `seen_owner` from its last MC read).
-    // Captured before the observation below mutates it — lets us tell "the same owner we're
-    // waiting out" (defer, keep accruing) from "a different owner that just claimed" (a live
-    // successor to adopt + grace).
-    let lost_owner = elect.seen_owner;
+    // NB: the "same owner we're waiting out" vs "a live owner to grace" distinction is now made
+    // by `reset` (owner-changed OR seq-advanced this burst — see the alive branch + #114 churn
+    // residual note), so no separate pre-observation snapshot of `seen_owner` is needed here.
     let claim_seq: Option<u32> = match mc {
         Some((owner, _ch, seq)) => {
             // Refresh the staleness observation: a *changed* (owner,seq) resets the first-seen
@@ -2851,15 +2849,28 @@ fn mqtt_session(
                 // what makes the strongest board, once it claims, stay owner as the weaker
                 // survivors observe its fresh MC and adopt it.
                 //
-                // `owner_alive` (→ caller grace-resets the owner-silence clock) is true only for
-                // a DIFFERENT owner than the one we lost — a genuine successor to follow. The
-                // SAME owner is the one we're waiting out: keep it false so the caller does NOT
-                // reset the clock and staleness keeps accruing to takeover. (Using `reset` here
-                // would misfire on the FIRST burst, where the dead owner's last seq differs from
-                // our stale pre-loss sample — that's a baseline, not proof of current life. The
-                // seq-advance reset above still keeps a genuinely-flushing owner `alive` so we
-                // never take it over; we just don't grace-reset the silence clock for it.)
-                elect.owner_alive = owner != lost_owner;
+                // #114 churn residual (issue #122, item 2): `owner_alive` grace-resets the caller's
+                // owner-silence clock (mode.rs). It was `owner != lost_owner` (a DIFFERENT owner
+                // only), so a leaf re-adopting the SAME live owner NEVER reset the clock → it
+                // re-elected every REELECT_RETRY_MS forever, and each recovery burst re-associates
+                // OFF the ESP-NOW channel, starving its own HELLO lock (owner_hello_seen stays
+                // false) — the perpetual recovery-burst churn. Fix: reset on FRESH liveness
+                // evidence = `reset` (a DIFFERENT owner — a successor to follow — OR the SAME owner
+                // whose seq ADVANCED this burst, i.e. it published a new MC since our last read →
+                // provably alive NOW). Each genuine seq advance pauses the redundant bursts, giving
+                // the leaf on-channel time to lock the owner's HELLO, which then ends recovery.
+                //
+                // NO liveness blind spot — this SUPERSEDES the old "first-burst baseline" worry:
+                // `owner_alive`/`last_owner_heard_ms` gates only WHEN recovery bursts FIRE, NOT the
+                // takeover ANCHOR. The takeover window is measured from `seen_ms`, which the `reset`
+                // arm above sets INDEPENDENTLY of `owner_alive`. So a genuinely-dead owner (seq
+                // frozen ⇒ reset=false after at most ONE first-burst catch-up) still accrues to
+                // takeover on `seen_ms` and is taken over on schedule; a same-owner reset only ever
+                // pauses bursts by < REELECT_SILENCE_MS (15s) — far inside the stale window — so it
+                // has ZERO net effect on failover timing. A live owner (seq advancing) is correctly
+                // never taken over. The dead-but-inside-backoff path (the `else` arm) still sets
+                // owner_alive=false, so a deferred takeover keeps firing on cadence, unchanged.
+                elect.owner_alive = reset;
                 elect.i_am_owner = false;
                 elect.owner_id = owner;
                 None
