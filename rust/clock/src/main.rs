@@ -396,7 +396,16 @@ fn main() -> ! {
     let mut display = raw_display;
     #[cfg(feature = "cast")]
     let mut display = crate::net::cast_oled::CastOled::new(raw_display);
-    display.init().expect("display init");
+    // Headless boards (screenless C3 superminis — the fleet's 2026-07-14 growth): a
+    // missing OLED NACKs this init. TOLERATE it and run headless: draws land in the
+    // in-RAM buffer (buffered-graphics mode) and every flush in the codebase is already
+    // `.ok()`-tolerated, so the whole render path degrades to a silent no-op while the
+    // radio/mesh/MQTT stack runs unaffected. The only per-cycle cost is one fast I2C
+    // NACK per flush attempt. (Cast still works headless — the tee mirrors the RAM
+    // buffer, which draws fill regardless of the panel.)
+    if display.init().is_err() {
+        log::warn!("smol: no OLED responded on I2C — running HEADLESS (renders buffered, flushes no-op)");
+    }
 
     // (Text styles now live inside each plugin's render — CLOCK's big-digit
     // FONT_10X20 moved to clock.rs; Snake/Menu/Bench/About build their own.)
