@@ -2983,6 +2983,25 @@ impl RadioManager {
         if self.relay.is_gateway {
             return;
         }
+        // #13 P1 fix (deaf-list rig): the escalation streak must NOT depend solely on the
+        // retry-exhaustion path. A totally-deaf gateway yields ZERO ACKs, and the retransmit loop
+        // that feeds `on_relay_exhausted` can be starved — a stranded leaf is pinned in blocking
+        // WiFi recovery bursts, and the 15 s emit re-stages `tries=1` before `relay_retransmit`
+        // accumulates to `RELAY_MAX_TRIES` — so a fully-out-of-earshot leaf (the flagship case!)
+        // never latched. Feed the streak at SUPERSESSION too: the message we're about to replace,
+        // if still active with ZERO acks, went fully un-ACKed. Mutually exclusive with the
+        // retry-exhaustion feed (which clears `active`), so no double-count; a totally-silent
+        // gateway now latches in ESCALATE_STREAK emit cycles (~45 s) regardless of retransmit timing.
+        let was_latched = self.relay.latch.latched();
+        if self.relay.tx.active && self.relay.tx.acked == 0 {
+            self.relay.latch.on_relay_exhausted(false);
+        }
+        if !was_latched && self.relay.latch.latched() {
+            log::info!(
+                "smol #13: leaf escalated to multi-hop (RELAY2) — gateway unreachable, {} un-ACKed msgs",
+                crate::net::flood::ESCALATE_STREAK
+            );
+        }
         let count = self.relay.stage_tx(telemetry, now);
         if count == 0 {
             return;
