@@ -2793,7 +2793,27 @@ fn mqtt_session(
             }
             elect.seen_owner = owner;
             elect.seen_seq = seq;
-            let stale_limit = if elect.recovery { RECOVERY_STALE_MS } else { MC_STALE_MS };
+            // #114 H3 (stale-self-reclaim fix): choose the dead-owner window by CORROBORATION.
+            // `owner_never_heard` was introduced by H1 to mean "a forged/phantom retained MC no
+            // board ever heard — take it over promptly". But it is ALSO true for EVERY freshly
+            // booted (or freshly roamed) leaf in its first seconds of life: it hasn't had a chance
+            // to hear the LIVE owner's HELLO yet. So a short window here let a just-booted board
+            // seize the crown from a healthy, actively-flushing owner it simply hadn't heard —
+            // the H3 sighting (`MC|<self>|0|seq+N` over a live foreign owner). The seq is the only
+            // signal that disambiguates a phantom from a not-yet-heard live owner: a live gateway
+            // flushes MC every <=RELAY_FLUSH_INTERVAL_MS (30s) so its seq advances (→ our anchor
+            // resets → `alive`), while a phantom's seq is frozen forever. So require the CONSERVATIVE
+            // MC_STALE_MS (90s = 3 missed flushes) freeze before taking over an owner we've NEVER
+            // heard: a live owner provably bumps its seq ~3x inside that window and is adopted, and
+            // only a genuinely-dead phantom survives to be taken over (still heals the H1 standoff,
+            // just at 90s instead of 35s — election stability > speed). A HEARD-then-lost owner keeps
+            // the fast RECOVERY_STALE_MS (35s): the owner-HELLO silence that opened this recovery is
+            // independent corroboration of death, so no live board can be misjudged there.
+            let stale_limit = if elect.recovery {
+                if elect.owner_never_heard { MC_STALE_MS } else { RECOVERY_STALE_MS }
+            } else {
+                MC_STALE_MS
+            };
             let alive = elect.now_ms.saturating_sub(elect.seen_ms) < stale_limit;
             if elect.boot && owner != node_id {
                 // #51 return-flap fix: a FRESH-booting board never displaces a DIFFERENT owner
@@ -2844,20 +2864,26 @@ fn mqtt_session(
                 elect.owner_id = owner;
                 None
             } else {
-                // #51 recovery: owner is DEAD. Take over once past RECOVERY_STALE_MS PLUS our
-                // RSSI-weighted backoff — the strongest-uplink survivor crosses first.
+                // #51 recovery: owner is DEAD (its seq stayed frozen past `stale_limit` — 35s if
+                // we HEARD-then-lost it, 90s if we NEVER heard it; see the H3 note above). Take
+                // over once past that window PLUS our stagger backoff — the best survivor crosses
+                // first; the others read its fresh MC and adopt it.
                 elect.owner_alive = false;
                 // #114 H1: a dead owner this leaf NEVER heard a HELLO from is a forged / phantom
-                // retained MC (the standoff) — there is no live board to stagger against, so skip
-                // the RSSI backoff and take over promptly on an id-only tiebreak (lowest id first).
-                // A heard-then-died owner keeps the RSSI-weighted stagger (pick the best survivor).
+                // retained MC (the standoff) confirmed dead by the conservative 90s freeze above —
+                // there is no live board to RSSI-stagger against, so use a small id-only tiebreak
+                // (lowest id first) rather than the RSSI ladder. A heard-then-died owner keeps the
+                // RSSI-weighted stagger (pick the best survivor).
                 let backoff = if elect.owner_never_heard {
                     (node_id as u64) * 200
                 } else {
                     reelect_backoff_ms(elect.my_rssi, node_id)
                 };
+                // #114 H3: gate on `stale_limit` (not a hardcoded RECOVERY_STALE_MS) so the
+                // never-heard takeover honours the SAME conservative 90s window used for `alive`
+                // above — otherwise a never-heard owner could re-enter here and claim at 35s.
                 if elect.now_ms.saturating_sub(elect.seen_ms)
-                    >= RECOVERY_STALE_MS.saturating_add(backoff)
+                    >= stale_limit.saturating_add(backoff)
                 {
                     elect.i_am_owner = true;
                     elect.owner_id = node_id;
