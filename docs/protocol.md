@@ -85,8 +85,12 @@ stays well under 250 B.
 | [TIME](#time--mesh-time-sync) | `SMOLv1 TIME ` | 37 | broadcast | ~2 s | espnow | 🟢 |
 | [BATT](#batt--ha-battery-snapshot) | `SMOLv1 BATT ` | ≤108 | broadcast | on-recv + periodic | espnow | 🟡 |
 | [GRID](#grid--ha-grid-power-snapshot-16) | `SMOLv1 GRID ` | ≤108 | broadcast | on-recv + periodic | espnow | 🟡 |
+| [BATT2](#batt2--grid2--downlink-freshness-13-stage-b) | `SMOLv1 BATT2 ` | ≤120 | broadcast | on-change + strict-newer re-flood | espnow | 🟢 |
+| [GRID2](#batt2--grid2--downlink-freshness-13-stage-b) | `SMOLv1 GRID2 ` | ≤120 | broadcast | on-change + strict-newer re-flood | espnow | 🟢 |
 | [RELAY](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAY ` | ≤91 | broadcast | ~15 s (leaf) | espnow | 🟢 |
 | [RELAYACK](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAYACK ` | 25 | unicast | reactive | espnow | 🟢 |
+| [RELAY2](#relay2--relayack2--routed-multi-hop-uplink-13) | `SMOLv1 RELAY2 ` | ≤94 | broadcast (flood) | ~15 s (stranded leaf) | espnow | 🟢 |
+| [RELAYACK2](#relay2--relayack2--routed-multi-hop-uplink-13) | `SMOLv1 RELAYACK2 ` | 32 | broadcast (flood) | reactive | espnow | 🟢 |
 | [SNK](#snk--mmo-mesh-snake) | `SMOLv1 SNK ` | 18 | broadcast | 5 Hz jittered | espnow | 🟢 |
 | [OTAM](#leaf-mesh-ota-frames-40) | `SMOLv1 OTAM ` | ≤178 | gw→leaf broadcast | per session | espnow | 🟢 |
 | [OTAD](#leaf-mesh-ota-frames-40) | `SMOLv1 OTAD ` | ≤250 | gw→leaf broadcast | windowed burst | espnow | 🟢 |
@@ -213,7 +217,9 @@ from cache too. The **gateway is the sole broadcaster** (it's the single source 
 HA): it emits **on receipt** of a fresh downlink, then **periodically re-emits**
 (borrowing the TIME frame's tick) so a leaf that missed a burst still converges.
 **Unlike TIME, leaves do *not* re-broadcast** — so BATT is **single-hop**: gateway →
-its direct ESP-NOW neighbours only (see Cadence for why). (This is the *HA* battery
+its direct ESP-NOW neighbours only (see Cadence for why). *(A freshness-gated multi-hop twin,
+[BATT2](#batt2--grid2--downlink-freshness-13-stage-b), reaches a **stranded** leaf via a relay —
+#13 Stage B.)* (This is the *HA* battery
 — distinct from a board's own on-board LiPo readout, `sensors::batt_v`, shown by the
 Clock app.)
 
@@ -306,7 +312,8 @@ consumption power. A gateway fetches a display-ready line set from HA's retained
 renders it on its **Grid** screen, and re-broadcasts it single-hop as a GRID frame so
 its neighbour leaves cache it too. All the shared mechanics — verbatim framing, no
 length byte, gateway-only single-hop broadcast, receive-only leaves, fetch-age
-staleness, security posture — are identical to BATT.
+staleness, security posture — are identical to BATT. *(Its freshness-gated multi-hop twin is
+[GRID2](#batt2--grid2--downlink-freshness-13-stage-b), #13 Stage B — same `dl_seq` mechanism.)*
 
 **Layout (≤ 108 B).**
 
@@ -451,13 +458,16 @@ the caller defaults to slot 0 (the boot-default network).
 config drift visible in HA at a glance. A leaf **broadcasts** `SMOLv1 DIAG NNN<record>`; the gateway
 caches it (`diag_cache`) and republishes it retained to `smol/<id>/diag`.
 
-**Record (merged main @ `feee183`, built by `RadioManager::diag_record`):**
+**Record (merged main @ `0b83714`, built by `RadioManager::diag_record` — #13 added the
+`fwd`/`dedup`/`ttl`/`hop`/`dlseq`/`dfwd` tail + the `mesh-test` `deaf`/`ddrops`):**
 
 ```
 DIAG|slot=<bootslot>|rst=<reset-reason>|boot=<bootcount>|ota=<outcome>|up=<sec>|heap=<free>
     |hmin=<heap-min>|btn=<short>|btnl=<long>|fok=<flush-ok>|ffl=<flush-fail>|vok=<verify-ok>
     |vfl=<verify-fail>|loss=<pct>|rtt=<ms>|rx=<n>|tx=<n>|led=<mode>:<on|off>|tage=<sec-since-sync>
-    |tsrc=<ntp|mesh|none>|net=<slot>:<ok|fb>|brk=<baked|ovr|fb>|otah=<slot|ovr>[|cfg=<applied-config>][|io=<pin>:<count>,…]
+    |tsrc=<ntp|mesh|none>|net=<slot>:<ok|fb>|brk=<baked|ovr|fb>|otah=<slot|ovr>
+    |fwd=<uplink-fwds>|dedup=<dup-drops>|ttl=<ttl-drops>|hop=<1|2>|dlseq=<last-adopted>|dfwd=<downlink-refloods>
+    [|cfg=<applied-config>][|io=<pin>:<count>,…][|deaf=<n>|ddrops=<n>]
 ```
 
 (one line on the wire; wrapped here for reading.)
@@ -474,8 +484,29 @@ DIAG|slot=<bootslot>|rst=<reset-reason>|boot=<bootcount>|ota=<outcome>|up=<sec>|
 | `net=<slot>:<ok\|fb>` | active WiFi slot + whether the un-brick fallback fired | #100 S1b (`fd3b439`) |
 | `brk=<baked\|ovr\|fb>` | broker: baked-in · override active · override auto-disabled | #100 S2 (#110) |
 | `otah=<slot\|ovr>` | OTA host: slot allowlist · runtime override appended | #100 S3 (#110) |
+| `fwd` | **uplink** RELAY2 re-broadcasts forwarded by this node — the C0 byte-identical invariant: **must be 0 fleet-wide in all-hear** (increments at exactly one site, the RELAY2 forward arm) | #13 |
+| `dedup` | inbound RELAY2 fragments dropped as already-seen (the `(origin,msgid,frag)` seen-set — bounds the flood) | #13 |
+| `ttl` | RELAY2 frames dropped with hop budget exhausted (`hop ≤ 1` at a non-gateway) | #13 |
+| `hop` | this leaf's **current origin hop**: `1` = single-hop (normal / byte-identical), `2` (= `MAX_HOP`) = escalated & emitting RELAY2. A gateway always reads `1` | #13 |
+| `dlseq` | last-adopted BATT2/GRID2 downlink `dl_seq` (rig P4: advances on a value change, unchanged on a replayed/older seq). `0` on a gateway (source) or a v1-only leaf | #13 |
+| `dfwd` | **downlink** BATT2/GRID2 strictly-newer re-floods — **nonzero by design** (like TIME), kept separate from `fwd` so the uplink invariant stays machine-checkable | #13 |
 | `cfg=<applied-config>` | **optional** (espnow): the applied-config echo (≤40 B, `DIAG_CFG_MAX`) HA plain-string-compares against its command topics for **config-drift** detection | #74 S2 (`b1c2c5c`, #109) |
 | `io=<pin>:<count>,…` | **optional** (`io` feature, appended after `cfg=`): per-bound-**input** press/edge counters, so a doll's button push is visible in HA. Byte-identical omission on a non-io build | #72 (`5689b1b`, #113) |
+| `deaf=<n>\|ddrops=<n>` | **optional** (`mesh-test` feature only — the #13 rig): active deaf-list entries · frames dropped by it, so a leftover test entry is visible. **Absent entirely on a production build** | #13 |
+
+**Counter & uptime semantics (authoritative — #13).**
+- **`fwd` vs `dfwd` are split on purpose.** `fwd` = **uplink** RELAY2 forwards only (the C0
+  invariant, 0 fleet-wide in all-hear); `dfwd` = **downlink** BATT2/GRID2 re-floods (nonzero by
+  design). The split keeps the uplink invariant machine-checkable, so any nonzero `fwd` in all-hear
+  is always a real uplink signal (e.g. storm-tail residue from a pre-quiet convergence window),
+  never a downlink artifact.
+- **The `DiagCounters` (`fwd`/`dfwd`/`dedup`/`ttl`) are plain RAM — reset to 0 on every boot**
+  (not `noinit`). Absolute values are same-boot accumulation, so **score invariants off the delta**
+  over the observation window, not the absolute count (which can hold same-boot storm residue).
+- **`boot` (`boot_count`) is the sole authoritative reboot marker** — NVS-persisted, +1 per boot.
+  **`up` is systimer-based and *survives* `software_reset`** (it continues across an OTA / soft
+  reboot) — it is **not** a reboot indicator. A genuine reboot shows `boot`+1 **and** `fwd`→0
+  together.
 
 **Companion (#74 S2, `51052fc`):** the gateway's OLED is also mirrored to HA as an MQTT image via
 the Cast tee (`smol/<id>/screen`) — the **display-mirror** — so a node's actual screen is visible in
@@ -545,8 +576,12 @@ the oldest queued message so a dead AP can't freeze the node (finding-1 fix).
 the [MQTT burst](#mqtt-burst--the-lan-transport-that-retires-the-udp-collector) straight
 to Home Assistant (the collector is retired) — the ESP-NOW RELAY frame here is
 **unchanged**, only the gateway's internet hop moved.
-**Out of scope (documented stubs):** downlink (server → leaf) and multi-hop
-routing (needs a next-hop/TTL header, +200–400 LOC).
+**Multi-hop (shipped, #13).** The "next-hop/TTL header" stub that used to live here is
+now real: a stranded leaf escalates plain `RELAY` → [`RELAY2`](#relay2--relayack2--routed-multi-hop-uplink-13)
+(hop-limited managed flood) so its telemetry reaches the gateway **through a relay**, and
+[`BATT2`/`GRID2`](#batt2--grid2--downlink-freshness-13-stage-b) carry the downlink the other way
+with a freshness gate. The plain `RELAY`/`RELAYACK` frames above are **unchanged** — a
+non-escalated leaf never emits `RELAY2`, so the all-hear case is byte-identical to pre-#13.
 **Flag.** espnow. **Status.** 🟢 **hardware-proven end-to-end** — on the wave-6 fleet
 (build 36 "Oxidized Spark", `bcafa7e`) leaf id8's telemetry reaches
 `disks:~/smol-collector/collector.jsonl` as `node_id 8`, sustained ~02:06Z→02:44Z. The
@@ -556,6 +591,197 @@ non-blocking cold-ARP first-round nit remains — see [relay.md](relay.md#the-fl
 **Security.** Unauthenticated → a forged RELAYACK can stall a leaf's retransmit.
 **Source.** `mode.rs` relay-bridge section (`RELAY_PREFIX`, `RELAYACK_PREFIX`,
 `Relay`/`RelayTx`/reassembly); spec `relay-bridge-spec.md`.
+
+## RELAY2 / RELAYACK2 — routed multi-hop uplink (#13)
+
+**Purpose.** Carry a **stranded** leaf's telemetry home when it is out of direct ESP-NOW
+range of the elected gateway — the single-hop [RELAY](#relay--relayack--espnow--internet-telemetry)
+above can't. #13 adds **Meshtastic-lineage managed flood**: a hop-limit (`H`) + an
+`(origin, msgid, frag)` seen-set + a forward path, rooted at the #76-elected owner and
+**table-free** (so it rides roam/re-election for free). A leaf only ever emits `RELAY2`
+**after it escalates** (see the latch below); in the ordinary all-hear case no `RELAY2`
+frame is ever on the wire.
+
+**RELAY2 layout (30 B header + ≤64 B chunk = ≤94 B).**
+
+| Field | Bytes | Encoding | Meaning |
+|---|---|---|---|
+| tag | 14 | `b"SMOLv1 RELAY2 "` | namespace (diverges from `RELAY` at byte 12: `'2'` vs `' '`) |
+| `origin` | 3 | ASCII `OOO` | **originating** leaf id — stamped by the true source, **survives every hop** (unlike a src MAC, which changes per hop) |
+| ` ` | 1 | space | |
+| `msgid` | 5 | ASCII `MMMMM` (u16) | per-origin rolling message id |
+| ` ` | 1 | space | |
+| `hop` | 1 | ASCII `H` | hop-limit remaining — originated at `MAX_HOP = 2`, each relay decrements by 1 |
+| ` ` | 1 | space | |
+| `frag` | 1 | ASCII `F` | fragment index (0 … count−1) |
+| ` ` | 1 | space | |
+| `count` | 1 | ASCII `C` | total fragments |
+| ` ` | 1 | space | |
+| `chunk` | ≤64 | bytes | telemetry payload fragment (same `RELAY_CHUNK = 64`) |
+
+**RELAYACK2 layout (32 B), broadcast — flooded leaf-ward (NOT unicast).** The gateway can't
+unicast an ACK back to a leaf it can't hear directly, so `RELAYACK2` is **flooded** back at
+`MAX_HOP` and rides the same relay path in reverse.
+
+| Field | Bytes | Encoding | Meaning |
+|---|---|---|---|
+| tag | 17 | `b"SMOLv1 RELAYACK2 "` | namespace (diverges from `RELAYACK` at byte 15) |
+| `target` | 3 | ASCII `TTT` | the **origin** id being acked |
+| ` ` | 1 | space | |
+| `msgid` | 5 | ASCII `MMMMM` | message being acked |
+| ` ` | 1 | space | |
+| `bitmap` | 3 | ASCII `BBB` (u8) | bit *i* set = fragment *i* received |
+| ` ` | 1 | space | |
+| `hop` | 1 | ASCII `H` | hop-limit remaining (flooded back at `MAX_HOP`) |
+
+**The managed flood (loop-free by construction).** A node deciding what to do with an inbound
+`RELAY2` uses `flood::forward_decision(is_gateway, hop, already_seen)`:
+- **already in the seen-set** → drop, bump `dedup`. The `(origin, msgid, frag)` seen-set
+  (16-slot `.bss` ring, drop-oldest) is what makes the flood **terminate**. It is keyed
+  **per-fragment** on purpose — a fragmented message shares one `msgid`, so a per-`(origin,msgid)`
+  key would mark the whole message "seen" on fragment 0 and a relay would drop fragments 1..N →
+  a multi-fragment message could never reassemble. *(This was the one correctness fix to the
+  inherited host-tested core; `flood_verify` gained a multi-fragment regression assert.)*
+- **`is_gateway`** → **reassemble** the fragment, re-keyed by a **synthetic origin MAC**
+  `00:00:00:00:00:<origin>` (a real Espressif STA MAC is never all-zero, so it can't alias a
+  single-hop leaf's real MAC), and on completion **flood a `RELAYACK2` back**. A gateway never
+  re-forwards (it's the sink).
+- **relay, `hop > 1`** → re-broadcast as `RELAY2` at `hop − 1`, bump `fwd`, record in the seen-set.
+- **relay, `hop ≤ 1`** → hop budget exhausted, drop, bump `ttl`.
+
+**Escalation latch + hysteresis (`flood::HopLatch`).** A leaf starts single-hop (`H = 1`, plain
+`RELAY`) and only latches into multi-hop under **genuine** strandedness — the hysteresis is what
+keeps the byte-identical `fwd = 0` invariant intact under ordinary packet loss:
+- **Escalate (down→up):** latch to `RELAY2` at `MAX_HOP` only after `ESCALATE_STREAK = 3`
+  **consecutive fully-un-ACKed** messages (~45 s at the 15 s cadence). **Any** ACK — a fully- or
+  even partially-ACKed message — **resets the streak to 0**, so a single transient full-loss in a
+  healthy all-hear mesh never escalates. The streak is fed both by retry-exhaustion
+  (`RELAY_MAX_TRIES`) **and** by message **supersession** — a totally-deaf leaf pinned in blocking
+  recovery bursts yields zero ACKs and would otherwise starve the retry-exhaustion path, so the
+  next `msgid` superseding an un-ACKed one also feeds the streak (the #13 P1 fix, `e0554a7`).
+- **Un-latch (up→down):** while latched, emit a 1-in-`PROBE_EVERY = 8` **direct** `H = 1` probe —
+  but **only** while the owner's HELLO is heard **directly + fresh** (else the leaf is definitely
+  still stranded and a probe would just waste airtime). After `UNLATCH_STREAK = 2` consecutive
+  **direct**-ACK probes succeed, drop back to single-hop. A latched leaf whose `RELAY2` is ACKed
+  *via the flood* is still stranded on the direct path, so a flooded ACK does **not** un-latch.
+
+**Best-effort ACK — a documented v1 limit.** Multi-hop uplink is **best-effort**. In a
+single-relay topology a lost `RELAYACK2` isn't recovered within the message (the relay's seen-set
+suppresses the retransmit forward) — telemetry is loss-tolerant, and the next `msgid` is a fresh
+flood. `RELAYACK2` loop-safety rides the `MAX_HOP = 2` hop decrement, not a seen-set; a 3-hop
+follow-up would add a `RELAYACK2` seen-set. **Scan-hop throughput** is the other v1 limit: a
+stranded leaf never locks a channel (it never hears its owner's HELLO), so it keeps hopping
+ch 1/6/11 while scanning and its `RELAY2` lands on the relay's channel only ~⅓ of the time — the
+rig saw R forward ~1 of ~30. **Pre-#13 the delivered count was ZERO**, so v1's bar (a stranded
+leaf *can* reach home) is met; **[#126](https://github.com/jphein/smol/issues/126)** (latched-leaf
+channel parking) raises the rate.
+
+**The byte-identical invariant (the uplink safety gate).** A non-escalated leaf emits ONLY plain
+`RELAY` (`H = 1`), so in the all-hear case **no `RELAY2`/`RELAYACK2` frame ever exists and nobody
+forwards** — behaviour is byte-for-byte identical to pre-#13. The machine-checkable measurement of
+this is canary gate **C0 = `fwd = 0` on every node** across a normal all-hear window. Proven
+byte-free by cfg-gating, not ELF equality; and a permanent bidirectional wire-compat guard
+(`experiments/relay_compat`) `#[path]`-includes the real codec and asserts a new-code frame parses
+under a vendored **pre-#13** parser and an old `RELAYACK` parses under the new matcher — the
+mixed-fleet / [#124](https://github.com/jphein/smol/issues/124) UP2-migration checkpoint.
+
+**Mixed-fleet compat.** All new tags are **additions** (not appends to the fixed-offset
+`RELAY`/`RELAYACK` headers): old firmware `classify()`s them to `None` (harmless) and cannot relay
+anyway — no flag-day flash. A leaf that needs `H ≥ 2` was, by definition, already stranded pre-#13,
+so no rolling-upgrade window can strand a leaf that worked before. #13 only ever **adds** reach.
+
+**Flag.** espnow. **Status.** 🟢 **hardware-verified — the first routed frame in smol's history.**
+On the deaf-list rig (G = id7 crown ↔ F = id9 mutually deaf, R = id8 relaying), F latched at
+exactly 3 emit cycles (`escalated to multi-hop (RELAY2) — gateway unreachable, 3 un-ACKed msgs`),
+emitted at hop 2, R forwarded, and at **2026-07-14 11:03:19 `smol/9/telemetry` arrived at the
+broker from a leaf that provably cannot hear its crown.** The pure decision core
+(`SeenSet`/`forward_decision`/`HopLatch`) is host-tested in `experiments/flood_verify` (ALL PASS,
+incl. the multi-fragment + hysteresis regressions). v1 limits above; observability-via-relay
+(`/stat`+`/diag`+`deaf=`) is the [#124](https://github.com/jphein/smol/issues/124) UP2 follow-up.
+
+**Source.** `net/wire.rs` (pure codec: `RELAY2_PREFIX`/`RELAYACK2_PREFIX`, `encode_relay2`/
+`parse_relay2`, `encode_relayack2`/`parse_relayack2`, `synth_origin_mac`); `net/flood.rs` (pure
+decision core: `MAX_HOP`/`ESCALATE_STREAK`/`UNLATCH_STREAK`/`PROBE_EVERY`, `SeenSet`,
+`forward_decision`, `HopLatch`); live path in `net/mode.rs` (RELAY2 service arm + `HopLatch`
+drive). Design: `scratch/13-multihop/scope-proposal.md`.
+
+## BATT2 / GRID2 — downlink freshness (#13 Stage B)
+
+**Purpose.** Reach a **stranded** leaf with the HA battery/grid downlink the same way `RELAY2`
+reaches the gateway on the uplink. Plain [BATT](#batt--ha-battery-snapshot)/[GRID](#grid--ha-grid-power-snapshot-16)
+are **single-hop** (leaves never re-broadcast — no freshness field, so a re-flood could loop or
+overwrite a fresher cache). `BATT2`/`GRID2` add a monotonic freshness counter (`dl_seq`) so a leaf
+can **re-flood strictly-newer** data safely — the same strict-newer template `TIME`'s `synced_at`
+already uses.
+
+**Layout (13 B tag + 10 B `dl_seq` + 1 B space + ≤96 B payload = ≤120 B).**
+
+| Field | Bytes | Encoding | Meaning |
+|---|---|---|---|
+| tag | 13 | `b"SMOLv1 BATT2 "` / `b"SMOLv1 GRID2 "` | namespace |
+| `dl_seq` | 10 | ASCII (full u32, zero-padded) | downlink freshness — see below |
+| ` ` | 1 | space | |
+| `payload` | ≤96 | ASCII, display-ready | the **verbatim** `BATT\|`/`GRID\|` payload — byte-identical to the v1 [BATT](#batt--ha-battery-snapshot)/[GRID](#grid--ha-grid-power-snapshot-16) frames |
+
+**`dl_seq` semantics.** The gateway sets `dl_seq` = the **unix-second of the last value change**
+(the `TIME synced_at` template — survives a gateway reboot, never wraps within a u32). It is bumped
+**only on an actual change**, so an unchanged periodic re-broadcast carries the same `dl_seq` and is
+**not** re-flooded (no churn).
+
+**Rules.**
+- A leaf **adopts + re-floods** a frame **only when its `dl_seq` is strictly newer** than the one it
+  holds — this reaches a stranded leaf via a relay while dropping replays and loops (a stale or
+  equal `dl_seq` is ignored). This is the bounded exception to "leaves don't re-flood": it re-floods,
+  but only strictly-newer, and only on a real value change (so the uplink `fwd = 0` invariant is
+  unaffected — downlink re-floods are counted separately as `dfwd`).
+- A **gateway ignores inbound** `BATT2`/`GRID2` — it **is** the source, so it never adopts a downlink
+  frame (prevents a relayed copy from racing the source).
+- A leaf still parses v1 `BATT`/`GRID` from an **old** gateway (mixed-fleet safe — the tags diverge
+  at byte 8, `BATT2` vs `BATT `).
+- The freshness is **an unauthenticated transport replay/loop guard only** — a spoofed `dl_seq` is a
+  display-DoS at worst, exactly like every other SMOLv1 frame (see Shared conventions → Security). It
+  never gates anything safety-critical (contrast #40 OTA's *authed* `fresh_floor` anti-rollback).
+
+**Cadence.** Emitted by the gateway on a value change (fresh `dl_seq`) + the periodic re-emit;
+re-flooded onward by a leaf only on strictly-newer adopt. DIAG surfaces the last-adopted `dlseq`
+per node (rig P4 watches it advance on a change and stay put on a replay).
+
+**Flag.** espnow. **Status.** 🟢 **hardware-verified end-to-end** (per the #13 close sign-off).
+Closes the #10 HA-staleness gap for a multi-hop leaf. The leaf **data-age render** (showing the
+downlink's own age on glass) is a small deferred follow-up in the screen domain — this stage
+delivers reach + freshness; the existing render shows the value.
+
+**Source.** `net/wire.rs` (`BATT2_PREFIX`/`GRID2_PREFIX`, `encode_dl`/`parse_dl`, `write_u10`/
+`parse_u10`); adopt/re-flood + gateway-ignore arms in `net/mode.rs` (`self.batt.dl_seq`).
+
+## mesh-test deaf-list rig hook (#13 Stage C, test-only)
+
+**Purpose.** Force a 2-hop topology (G→R→F) on today's co-located 3-board fleet **without physical
+RF attenuation**, so routed multi-hop is validatable before a 4th board / a real out-of-range
+placement exists. A node drops inbound frames from a configured set of source MACs at the very top
+of `service()` (before OTA dispatch, roster, and any `Frame` parse) — a deterministic stand-in for
+"out of RF range."
+
+- **Compile-time, not runtime.** The deaf-list is a per-board constant `board::DEAF_MACS:
+  [Option<[u8; 6]>; 4]`, gated behind the **default-OFF** `mesh-test` cargo feature
+  (`mesh-test = ["espnow"]`). It is **test scaffolding, per-board like `NODE_ID`**, set in the
+  git-ignored `board.rs` (the tracked `board.rs.example` template stays empty; **never commit real
+  MACs**). *(Note: an earlier rig design proposed a runtime CFG key `D`; the shipped implementation
+  is this simpler compile-time list — there is no CFG-`D` key.)*
+- **Never-retained anti-hazard (stronger than a transient CFG key).** Because the list is
+  compile-time, it **cannot** exist as a retained-MQTT ghost, and a **production** (non-`mesh-test`)
+  build has **no deaf field and no hook at all** — it *physically cannot* be made deaf. A leftover
+  entry is cleared only by **re-flashing with an empty list**, and DIAG surfaces `deaf=<active>` /
+  `ddrops=<frames-dropped>` (mesh-test-gated) so any leftover is visible in HA at a glance.
+- **DIAG.** `deaf`/`ddrops` are appended **only** on a `mesh-test` build → the DIAG string is
+  byte-identical on a production build.
+
+**Flag.** `mesh-test` (default off). **Status.** 🟢 the rig that **caught** (and #123 fixed) two
+escalation-trigger bugs the green build + host math could not — the C0 over-eager single-message
+latch (fixed: K=3 hysteresis) and the P1 under-eager total-deafness starvation (fixed: supersession
+feed) — then delivered the first routed frame. **Source.** `board.rs.example` (`DEAF_MACS` template
++ setup notes); drop hook + `deaf`/`ddrops` in `net/mode.rs` (`#[cfg(feature = "mesh-test")]`); rig
+design `scratch/smol-dreamteam/13-rig-design.md` (30-min run protocol + P1–P7 gates).
 
 ## SNK — MMO mesh snake
 
@@ -813,10 +1039,18 @@ from `run_mqtt_burst` (`net/wifi.rs:674`); broker addr/creds in `secrets.rs`. HA
 
 ## Honesty caveats
 
-- **Verification is per-frame and current as of 2026-07-07.** HELLO/ACK and **TIME
+- **Verification is per-frame and current as of 2026-07-14.** HELLO/ACK and **TIME
   (2-board adoption)** are hardware-verified. BEACON is compile-verified (runs in
   Bench mode, not accuracy-checked). RELAY/RELAYACK are **hardware-proven e2e** (sustained
   `node_id 8` telemetry to the collector, wave 6). SNK is **flashed on the fleet** (build 36).
+- **Routed multi-hop (#13) shipped 2026-07-14 (PR #123, `0b83714`).** RELAY2/RELAYACK2 +
+  BATT2/GRID2 are hardware-verified end-to-end — the **first routed frame** (a crown-deaf leaf's
+  telemetry home via a relay) landed at the broker 2026-07-14 11:03:19. Honest v1 limits: uplink
+  ACK is **best-effort**, and a stranded leaf's scan-hopping caps throughput (R forwarded ~1 of
+  ~30) — [#126](https://github.com/jphein/smol/issues/126) (channel parking) raises the rate, and
+  observability-via-relay (`/stat`+`/diag`+`deaf=`) is the [#124](https://github.com/jphein/smol/issues/124)
+  UP2-envelope follow-up. The all-hear byte-identical invariant (`fwd = 0`) is machine-checked (C0)
+  and guarded executable (`relay_compat`).
 - **MQTT burst is hardware-verified; the BATT frame's leaf delivery is not (build 40,
   2026-07-08).** The [MQTT burst](#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)
   ran on real boards — wireless CONNACK, retained downlink cached (31 B byte-exact),
@@ -836,6 +1070,8 @@ from `run_mqtt_burst` (`net/wifi.rs:674`); broker addr/creds in `secrets.rs`. HA
 
 ## Sources
 - `rust/clock/src/net/mode.rs` — frame consts, `Frame` enum, encode/parse helpers, relay bridge section (read-only).
+- `rust/clock/src/net/wire.rs` — the **pure** relay-family wire codec (#13): RELAY/RELAYACK + RELAY2/RELAYACK2 + BATT2/GRID2 encode/parse + ASCII field helpers; host-testable, no esp-hal deps.
+- `rust/clock/src/net/flood.rs` — the **pure** managed-flood decision core (#13): `SeenSet`, `forward_decision`, `HopLatch` + the `MAX_HOP`/`ESCALATE_STREAK`/`UNLATCH_STREAK`/`PROBE_EVERY` consts. Host-tested in `experiments/flood_verify`; wire-compat guarded by `experiments/relay_compat`.
 - `rust/clock/src/net/wifi.rs` — the MQTT burst (hand-rolled MQTT 3.1.1 client) + broker consts (v2); replaces the UDP collector egress.
 - `ha/packages/smol_mesh.yaml` + `ha/README.md` — the HA automation that publishes the retained `smol/display/batt` downlink + install/discovery notes.
 - `collector/collector.py` — the v1 UDP relay collector, **retired** as of build 40 (see [relay.md](relay.md)); superseded by the MQTT burst above.
