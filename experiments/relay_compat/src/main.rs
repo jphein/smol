@@ -135,5 +135,34 @@ fn main() {
     let (_, _, _, clamped) = wire::parse_up2(&up[..cn]).unwrap();
     assert_eq!(clamped.len(), wire::UP2_INNER_MAX, "inner clamped to UP2_INNER_MAX");
 
-    println!("relay_compat: ALL CHECKS PASSED (bidirectional byte-compat + golden bytes + #13/#124 tag round-trips + disambiguation + UP2 clamp)");
+    // #124 Stage 2 — field-boundary clamp (a wrapped DIAG/SCAN never truncates mid `key=val`).
+    // Fits: returns the full length, no clamp.
+    assert_eq!(wire::clamp_inner_field_boundary(b"aa|bb|cc", 100), 8, "clamp: fits => full len");
+    // Over budget: truncate at the LAST `|` at or before max, dropping the straddling tail field.
+    assert_eq!(wire::clamp_inner_field_boundary(b"aa|bb|cc", 5), 5, "clamp: cut at `|` index 5 => aa|bb");
+    assert_eq!(wire::clamp_inner_field_boundary(b"aa|bb|cc", 4), 2, "clamp: cut at `|` index 2 => aa");
+    // No `|` inside max (a single oversized field): raw fallback to max.
+    assert_eq!(wire::clamp_inner_field_boundary(b"aaaaaa", 3), 3, "clamp: no separator => raw max");
+
+    // A realistic over-budget DIAG frame: "SMOLv1 DIAG 007" + a long `|`-joined record (> MTU). The
+    // wrapped envelope must (a) fit ESP_NOW_MTU, (b) cut at a field boundary (the cut index is a `|`,
+    // and the surviving slice does NOT end mid-field), (c) keep the SMOLv1 DIAG prefix intact so the
+    // gateway still classifies + caches it.
+    let mut diag = b"SMOLv1 DIAG 007".to_vec();
+    for i in 0..40u32 {
+        diag.push(b'|');
+        diag.extend_from_slice(format!("k{i:02}=vvvvv").as_bytes());
+    }
+    assert!(diag.len() > wire::ESP_NOW_MTU, "test DIAG must exceed the MTU to exercise the clamp");
+    let cut = wire::clamp_inner_field_boundary(&diag, wire::UP2_INNER_MAX);
+    assert!(cut <= wire::UP2_INNER_MAX, "clamp <= UP2_INNER_MAX");
+    assert_eq!(diag[cut], b'|', "clamp lands ON a `|` separator (dropped tail field starts here)");
+    assert_ne!(diag[cut - 1], b'|', "surviving slice ends on a complete field, not a bare `|`");
+    let dn = wire::encode_up2(7, 3, 2, &diag[..cut], &mut up);
+    assert!(dn <= wire::ESP_NOW_MTU, "wrapped over-budget DIAG still fits the MTU");
+    let (_, _, _, dinner) = wire::parse_up2(&up[..dn]).expect("parse wrapped DIAG");
+    assert_eq!(dinner, &diag[..cut], "unwrapped inner == the field-boundary-clamped DIAG verbatim");
+    assert!(dinner.starts_with(b"SMOLv1 DIAG 007"), "clamped DIAG keeps its classify-able prefix");
+
+    println!("relay_compat: ALL CHECKS PASSED (bidirectional byte-compat + golden bytes + #13/#124 tag round-trips + disambiguation + UP2 clamp + field-boundary DIAG clamp)");
 }

@@ -2449,6 +2449,7 @@ impl RadioManager {
         let n = value.len().min(crate::net::wifi::CFG_VALUE_MAX);
         msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
+        self.relay_wrap_observability(&msg[..base + 3 + n]);
     }
 
     /// #70/#49: broadcast this node's compact key=val DIAG record as a `SMOLv1 DIAG` frame —
@@ -2468,6 +2469,7 @@ impl RadioManager {
         let n = value.len().min(crate::net::wifi::RELAY_VALUE_MAX);
         msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
+        self.relay_wrap_observability(&msg[..base + 3 + n]);
     }
 
     /// #71: broadcast this node's one-shot WiFi-scan record as a `SMOLv1 SCAN` frame — twin of
@@ -2486,6 +2488,29 @@ impl RadioManager {
         let n = value.len().min(crate::net::wifi::RELAY_VALUE_MAX);
         msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
+        self.relay_wrap_observability(&msg[..base + 3 + n]);
+    }
+
+    /// #124 Stage 2 (observability closure) — when this leaf is LATCHED (multi-hop, gateway out of
+    /// direct earshot), ALSO emit `frame` (a fully-built plain STAT/DIAG/SCAN) wrapped in a UP2
+    /// envelope so a relay floods our /stat /diag /scan to the gateway. Closes the P1 gap: a
+    /// stranded leaf that can't RELAY-uplink was previously observability-DARK (STAT/DIAG/SCAN are
+    /// plain broadcasts, never forwarded). No-op on a gateway or when NOT latched — so a healthy
+    /// leaf's on-air behaviour is BYTE-IDENTICAL (only the plain broadcast, no UP2). The inner is
+    /// clamped at a FIELD BOUNDARY (last `|` ≤ [`UP2_INNER_MAX`]) so an over-budget DIAG/SCAN record
+    /// truncates its tail cleanly (never mid `key=val`); STAT (≤ 79 B) never clamps. Each wrap gets a
+    /// fresh envelope msgid (the flood-dedup key; fire-and-forget — no inner ACK). `frame` is a local
+    /// buffer in the caller, so no borrow of `self` is held across the `&mut self` send.
+    fn relay_wrap_observability(&mut self, frame: &[u8]) {
+        if self.relay.is_gateway || !self.relay.latch.latched() {
+            return;
+        }
+        let env_msgid = self.relay.up_env_msgid;
+        self.relay.up_env_msgid = self.relay.up_env_msgid.wrapping_add(1);
+        let ilen = clamp_inner_field_boundary(frame, UP2_INNER_MAX);
+        let mut fb = [0u8; ESP_NOW_MTU];
+        let len = encode_up2(self.id, env_msgid, crate::net::flood::MAX_HOP, &frame[..ilen], &mut fb);
+        self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
     }
 
     /// #71: run ONE on-demand WiFi AP scan (triggered by applying the `W` command) → publish the
@@ -4316,61 +4341,81 @@ impl RadioManager {
                         // Our OWN envelope echoed back by a relay — never re-forward/reassemble it
                         // (bogus fwd + could loop). Just drop it.
                         label = Some(alloc::format!("up2 self {:03}", origin));
-                    } else if let Some((_sid, imsgid, frag, count, chunk)) = parse_relay(inner) {
-                        // 1b: the inner is a plain RELAY (the RELAY2-subsuming case). `imsgid` is the
-                        // INNER RELAY msgid — the reassembly/ACK key, distinct from the envelope msgid.
-                        if self.relay.is_gateway {
-                            // GATEWAY sink: reassemble keyed by ORIGIN (synthetic MAC), NOT `src` (the
-                            // last relay). accept()+DONE_RING dedup fragments/retransmits, so we do NOT
-                            // consult the seen-set here (a seen-set drop would kill a lost-ACK
-                            // retransmit's re-ACK). On each accepted fragment flood a RELAYACK2 back
-                            // toward the origin (R1) carrying the cumulative bitmap, keyed on `imsgid`.
-                            let synth = synth_origin_mac(origin);
-                            let (bitmap, complete) =
-                                self.relay.accept(synth, (origin, imsgid, frag, count), chunk, now);
-                            self.flood_relayack2(origin, imsgid, bitmap);
-                            label = Some(if complete {
-                                alloc::format!("up2 {:03} ok", origin)
-                            } else {
-                                alloc::format!("up2 {:03} {}/{}", origin, bitmap.count_ones(), count)
-                            });
-                        } else {
-                            // RELAY role: seen-set-gated forward, keyed on the ENVELOPE msgid
-                            // `(origin, env_msgid, 0)` — each UP2 is one atomic frame (frag dimension
-                            // is absorbed into env_msgid, which is unique per emitted/retransmitted UP2).
-                            let seen = self.relay.seen.seen_or_insert(origin, env_msgid, 0);
-                            match crate::net::flood::forward_decision(false, hop, seen) {
-                                crate::net::flood::ForwardAction::Forward { hop: next_hop } => {
-                                    self.diag.fwd = self.diag.fwd.saturating_add(1);
-                                    // Re-wrap the SAME inner verbatim at hop-1 (env_msgid preserved).
-                                    // `inner` borrows the RX buffer; copied into `fb` before the send.
-                                    let mut fb = [0u8; ESP_NOW_MTU];
-                                    let len = encode_up2(origin, env_msgid, next_hop, inner, &mut fb);
-                                    self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
-                                    if self.diag.fwd.is_multiple_of(8) {
-                                        log::info!(
-                                            "smol #124: fwd {} (origin {:03} env_msgid {} -> h{})",
-                                            self.diag.fwd, origin, env_msgid, next_hop
-                                        );
-                                    }
-                                    label = Some(alloc::format!("fwd {:03} h{}", origin, next_hop));
-                                }
-                                crate::net::flood::ForwardAction::DedupDrop => {
-                                    self.diag.dedup = self.diag.dedup.saturating_add(1);
-                                    label = Some(alloc::format!("dedup {:03}", origin));
-                                }
-                                crate::net::flood::ForwardAction::TtlDrop => {
-                                    self.diag.ttl = self.diag.ttl.saturating_add(1);
-                                    label = Some(alloc::format!("ttl {:03}", origin));
-                                }
-                                // Reassemble is only returned for is_gateway=true (handled above).
-                                crate::net::flood::ForwardAction::Reassemble => {}
+                    } else if self.relay.is_gateway {
+                        // GATEWAY SINK: dispatch by the INNER frame type (#124 Stage 2). Everything is
+                        // keyed by the envelope `origin` (the stranded leaf), NOT `src` (the last relay):
+                        //   • RELAY → reassemble (synthetic origin MAC) + flood a RELAYACK2 back toward
+                        //     the origin. `imsgid` is the INNER RELAY msgid = reassembly/ACK key (distinct
+                        //     from env_msgid). accept()+DONE_RING dedup fragments/retransmits, so we do
+                        //     NOT consult the seen-set here (a seen-set drop would kill a lost-ACK
+                        //     retransmit's re-ACK).
+                        //   • STAT/DIAG/SCAN → the same gateway caches the DIRECT arms feed (the P1
+                        //     observability closure): a stranded leaf's /stat /diag /scan now reach HA.
+                        //     STAT stamps the synthetic origin MAC so the leaf stays mac-resolvable
+                        //     (mirror of the direct STAT arm, which stamps the real `src`).
+                        let synth = synth_origin_mac(origin);
+                        match parse_frame(inner) {
+                            Some(Frame::Relay { msgid: imsgid, frag, count, chunk, .. }) => {
+                                let (bitmap, complete) =
+                                    self.relay.accept(synth, (origin, imsgid, frag, count), chunk, now);
+                                self.flood_relayack2(origin, imsgid, bitmap);
+                                label = Some(if complete {
+                                    alloc::format!("up2 {:03} ok", origin)
+                                } else {
+                                    alloc::format!("up2 {:03} {}/{}", origin, bitmap.count_ones(), count)
+                                });
                             }
+                            Some(Frame::Stat { value, .. }) => {
+                                self.stat_cache.set(
+                                    origin, crate::net::wifi::CFG_KEY_SCREEN, value, synth, now,
+                                );
+                                label = Some(alloc::format!("up2 {:03} stat", origin));
+                            }
+                            Some(Frame::Diag { value, .. }) => {
+                                self.diag_cache.set(origin, value, now);
+                                label = Some(alloc::format!("up2 {:03} diag", origin));
+                            }
+                            Some(Frame::Scan { value, .. }) => {
+                                self.scan_cache.set(origin, value, now);
+                                label = Some(alloc::format!("up2 {:03} scan", origin));
+                            }
+                            // An inner we don't sink (nested/unknown) — drop, never re-wrap.
+                            _ => label = Some(alloc::format!("up2 {:03} ?inner", origin)),
                         }
                     } else {
-                        // Stage 2: a non-RELAY inner (STAT/DIAG/SCAN) — full parse_frame + dispatch to
-                        // the caches lands next stage; for 1b it's dropped (only RELAY is wrapped yet).
-                        label = Some(alloc::format!("up2 {:03} non-relay", origin));
+                        // RELAY role: envelope-only, inner-AGNOSTIC flood — forwards RELAY and
+                        // STAT/DIAG/SCAN alike (the relay never parses the inner). Seen-set-gated on
+                        // the ENVELOPE msgid `(origin, env_msgid, 0)` — each UP2 is one atomic frame
+                        // (the frag dimension is absorbed into env_msgid, unique per emitted/
+                        // retransmitted UP2).
+                        let seen = self.relay.seen.seen_or_insert(origin, env_msgid, 0);
+                        match crate::net::flood::forward_decision(false, hop, seen) {
+                            crate::net::flood::ForwardAction::Forward { hop: next_hop } => {
+                                self.diag.fwd = self.diag.fwd.saturating_add(1);
+                                // Re-wrap the SAME inner verbatim at hop-1 (env_msgid preserved).
+                                // `inner` borrows the RX buffer; copied into `fb` before the send.
+                                let mut fb = [0u8; ESP_NOW_MTU];
+                                let len = encode_up2(origin, env_msgid, next_hop, inner, &mut fb);
+                                self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+                                if self.diag.fwd.is_multiple_of(8) {
+                                    log::info!(
+                                        "smol #124: fwd {} (origin {:03} env_msgid {} -> h{})",
+                                        self.diag.fwd, origin, env_msgid, next_hop
+                                    );
+                                }
+                                label = Some(alloc::format!("fwd {:03} h{}", origin, next_hop));
+                            }
+                            crate::net::flood::ForwardAction::DedupDrop => {
+                                self.diag.dedup = self.diag.dedup.saturating_add(1);
+                                label = Some(alloc::format!("dedup {:03}", origin));
+                            }
+                            crate::net::flood::ForwardAction::TtlDrop => {
+                                self.diag.ttl = self.diag.ttl.saturating_add(1);
+                                label = Some(alloc::format!("ttl {:03}", origin));
+                            }
+                            // Reassemble is only returned for is_gateway=true (handled above).
+                            crate::net::flood::ForwardAction::Reassemble => {}
+                        }
                     }
                 }
                 Some(Frame::RelayAck2 { target, msgid, bitmap, hop }) => {

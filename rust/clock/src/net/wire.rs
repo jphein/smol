@@ -287,6 +287,33 @@ pub fn parse_up2(data: &[u8]) -> Option<(u8, u16, u8, &[u8])> {
     Some((origin, env_msgid, hop, &rest[12..]))
 }
 
+/// #124 Stage 2 — return a truncation length for `inner` that fits within `max` bytes AND ends on a
+/// FIELD BOUNDARY (the last `|` separator at or before `max`), so a wrapped DIAG/SCAN record that
+/// overflows [`UP2_INNER_MAX`] never truncates mid `key=val`. The dropped tail (the straddling field
+/// plus any fields past it) is what prefix-tolerant parsers would ignore anyway.
+///
+/// When `inner.len() <= max` it returns `inner.len()` (fits, no clamp). Otherwise it returns the
+/// index of the last `|` at position `<= max`, so bytes `[0..i)` are all whole fields (that `|` and
+/// the partial field after it are excluded). With no `|` inside `max` (a single oversized field —
+/// pathological; real DIAG/SCAN records are `|`-joined) it falls back to `max` (a raw cut). The frame
+/// prefix ("SMOLv1 DIAG " + "OOO") holds no `|`, so scanning the whole buffer is safe.
+///
+/// The result is always `<= max` and `<= inner.len()`; pass `&inner[..clamp_inner_field_boundary(..)]`
+/// to `encode_up2` (whose own raw clamp then never fires). Pure + deterministic — host-tested.
+pub fn clamp_inner_field_boundary(inner: &[u8], max: usize) -> usize {
+    if inner.len() <= max {
+        return inner.len();
+    }
+    // Largest `|` index at or before `max` (max < len here, so `max` indexes a real byte).
+    let mut cut = None;
+    for (i, &b) in inner.iter().enumerate().take(max + 1) {
+        if b == b'|' {
+            cut = Some(i);
+        }
+    }
+    cut.unwrap_or(max)
+}
+
 // ---- BATT2 / GRID2 (#13 Stage B downlink freshness) -----------------------
 
 /// Encode a downlink freshness frame `<prefix> + "SSSSSSSSSS " + <payload>` into `out`; returns
