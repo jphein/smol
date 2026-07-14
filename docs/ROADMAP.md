@@ -78,10 +78,14 @@ and [home-assistant.md](home-assistant.md).
   BT-proxy / boards-track-themselves: **NO** (single radio + the multi-second WiFi hold
   preclude it; room-level is the honest ceiling). Its own small HW spike; shares the coexist
   gate.
-- **4c. Multi-hop (#13) + self-healing gateway re-election (#14).** smol is single-hop-relay
-  today (covers the 3-board star). Routed multi-hop + runtime re-election are future work;
-  prior art exists (ZHNetwork does routed multi-hop ESP-NOW→MQTT→HA). **Defer** behind
-  coexist + OTA.
+- **4c. Multi-hop (#13) + self-healing gateway re-election (#14) — ✅ SHIPPED.** Both landed:
+  runtime re-election (#14 / #76, dead-owner takeover + split-brain heals) and routed multi-hop
+  (#13, PR #123, merged 2026-07-14). A stranded leaf reaches the gateway through a relay via a
+  Meshtastic-style **managed flood** (hop-limit + `(origin, msgid, frag)` seen-set, table-free so
+  it rides re-election for free); the **first routed frame** was hardware-proven 2026-07-14. Prior
+  art credited (ZHNetwork does routed multi-hop ESP-NOW→MQTT→HA). Honest v1 follow-ups: **#126**
+  (latched-leaf channel parking / throughput), **#124** (UP2 observability envelope). Byte contract
+  in [protocol.md](protocol.md) (RELAY2/RELAYACK2 + BATT2/GRID2).
 - **4d. ESPHome / WLED lessons (#12 polish).** No Rust ESPHome firmware exists and the native
   API fights the burst model — **stay on MQTT** (proven strictly better on fit/effort/reuse).
   Steal from WLED (cheap, high-legibility): put every entity under **one HA device** `smol
@@ -126,8 +130,9 @@ D2–D5 are the OTA safety envelope; D6–D9 node-manager polish; D10–D12 new-
   via external anchors). Full BT-proxy NO (single-radio precludes it). Shares the D1 coexist gate.*
 - [ ] **D11 — Structured HA entities + device grouping (#12)** · *Split the telemetry line into
   typed `_voltage`/`_soc`/`_rssi`/`_role` under one `smol <id>` device. Cheap WLED-lesson win.*
-- [ ] **D12 — Multi-hop #13 + self-healing #14** · *Defer behind coexist + OTA — single-hop
-  covers the 3-board fleet; revisit if the mesh grows past one hop.*
+- [x] **D12 — Multi-hop #13 + self-healing #14** · *SHIPPED — #14 (election #76) + #13 (routed
+  multi-hop, PR #123, merged 2026-07-14; first routed frame hardware-proven). Throughput +
+  observability follow-ups: #126 / #124.*
 
 ---
 
