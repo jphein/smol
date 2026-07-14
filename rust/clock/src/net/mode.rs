@@ -152,8 +152,8 @@ const RELAYACK2_FRAME_MAX: usize = 40;
 /// propagate a stale payload or loop; single-hop gateway → neighbour leaves is
 /// the safe, intended shape. Same threat model as every SMOLv1 frame (unauthed).
 const BATT_PREFIX: &[u8] = b"SMOLv1 BATT "; // + verbatim "BATT|l1|l2|l3"
-/// Max BATT payload retained/echoed — matches `BattCache` (LOCKED ≤ 96 B).
-const BATT_PAYLOAD_MAX: usize = 96;
+// `BATT_PAYLOAD_MAX` (≤ 96 B, matches BattCache/GridCache) lives in `net::wire` (glob-imported) —
+// the codec's `encode_dl` truncates to it, and this module's trackers/buffers size to it.
 
 /// Grid-downlink tag (issue #16): the exact TWIN of [`BATT_PREFIX`] — the 12-B
 /// `"SMOLv1 GRID "` (trailing space) then the VERBATIM `smol/display/grid` payload
@@ -1268,9 +1268,8 @@ pub struct BenchStats {
 //     header + a loop-prevention seen-set + a shared-channel invariant across
 //     every node (+200-400 LOC). This is single-hop uplink only.
 
-/// Max telemetry payload per RELAY fragment (bytes). On the wire a frame is the
-/// fixed 27-byte ASCII header + this, comfortably under the 250 B ESP-NOW limit.
-const RELAY_CHUNK: usize = 64;
+// `RELAY_CHUNK` (64 B max telemetry payload per fragment) lives in `net::wire` (glob-imported) —
+// the codec truncates chunks to it, and this module's reassembly/tx offsets index by it.
 /// Max fragments per message. Kept <= 8 so the received-fragment bitmap is a
 /// single `u8`; => max reassembled telemetry = CHUNK * FRAGS bytes.
 const RELAY_MAX_FRAGS: usize = 4;
