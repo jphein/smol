@@ -114,5 +114,37 @@ fn main() {
     // a BATT2 frame must not parse under the GRID2 prefix (tag isolation).
     assert!(wire::parse_dl(wire::GRID2_PREFIX, &dl[..dln]).is_none(), "BATT2 is not a GRID2");
 
-    println!("relay_compat: ALL CHECKS PASSED (bidirectional byte-compat + golden bytes + #13 tag round-trips + disambiguation)");
+    // #124 UP2 envelope — golden bytes + wrap→unwrap→re-parse-inner both directions + disambiguation.
+    // Wrap a plain RELAY (the RELAY2-subsuming case): the gateway unwraps → the inner is a verbatim
+    // RELAY that re-parses under the SAME parse_relay used for a single-hop leaf.
+    let inner_relay = {
+        let mut ib = [0u8; 128];
+        let iln = wire::encode_relay(7, 100, 0, 1, b"cpu=42", &mut ib);
+        ib[..iln].to_vec()
+    };
+    let mut up = [0u8; 256];
+    let upn = wire::encode_up2(7, 5, 2, &inner_relay, &mut up);
+    // GOLDEN: "SMOLv1 UP2 007 00005 2 " + <the verbatim RELAY frame>.
+    let mut golden_up = b"SMOLv1 UP2 007 00005 2 ".to_vec();
+    golden_up.extend_from_slice(&inner_relay);
+    assert_eq!(&up[..upn], &golden_up[..], "encode_up2 golden wire bytes");
+    let (o, em, h, inner) = wire::parse_up2(&up[..upn]).expect("parse_up2");
+    assert_eq!((o, em, h), (7, 5, 2), "UP2 header: origin / envelope-msgid / hop");
+    // the unwrapped inner is a verbatim RELAY → re-parses under the ordinary parser (gateway dispatch).
+    let (rid, rmid, rfrag, rcnt, rchunk) = wire::parse_relay(inner).expect("inner is a verbatim RELAY");
+    assert_eq!((rid, rmid, rfrag, rcnt, rchunk), (7, 100, 0, 1, &b"cpu=42"[..]), "inner RELAY round-trip");
+    // envelope msgid (5) is DISTINCT from the inner RELAY msgid (100) — the two-layer contract.
+    assert_ne!(em, rmid, "envelope msgid != inner RELAY msgid (flood-dedup vs reassembly layers)");
+    // disambiguation: UP2 must NOT classify as RELAY/RELAY2, and vice-versa.
+    assert!(wire::parse_relay(&up[..upn]).is_none(), "UP2 must NOT parse as plain RELAY");
+    assert!(wire::parse_relay2(&up[..upn]).is_none(), "UP2 must NOT parse as RELAY2");
+    assert!(wire::parse_up2(&fb[..n]).is_none(), "a plain RELAY must NOT parse as UP2");
+    // CONSTRAINT 1: a max inner is clamped so the envelope never exceeds ESP_NOW_MTU.
+    let big_inner = [b'z'; 240];
+    let cn = wire::encode_up2(9, 1, 2, &big_inner, &mut up);
+    assert!(cn <= wire::ESP_NOW_MTU, "UP2 clamps inner → frame never exceeds ESP_NOW_MTU");
+    let (_, _, _, clamped) = wire::parse_up2(&up[..cn]).unwrap();
+    assert_eq!(clamped.len(), wire::UP2_INNER_MAX, "inner clamped to UP2_INNER_MAX");
+
+    println!("relay_compat: ALL CHECKS PASSED (bidirectional byte-compat + golden bytes + #13/#124 tag round-trips + disambiguation + UP2 clamp)");
 }
