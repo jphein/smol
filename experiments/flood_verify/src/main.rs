@@ -6,9 +6,17 @@
 mod flood;
 
 use flood::{
-    forward_decision, ForwardAction, HopLatch, SeenSet, MAX_HOP, PROBE_EVERY, SEEN_RING,
-    UNLATCH_STREAK,
+    forward_decision, ForwardAction, HopLatch, SeenSet, ESCALATE_STREAK, MAX_HOP, PROBE_EVERY,
+    SEEN_RING, UNLATCH_STREAK,
 };
+
+/// Drive a fresh latch into multi-hop the way a genuinely-stranded leaf does: ESCALATE_STREAK
+/// consecutive fully-un-ACKed messages.
+fn latch_via_stranding(l: &mut HopLatch) {
+    for _ in 0..ESCALATE_STREAK {
+        l.on_relay_exhausted(false);
+    }
+}
 
 fn main() {
     // --- SeenSet (keyed per-FRAGMENT: origin, msgid, frag) ----------------
@@ -51,22 +59,36 @@ fn main() {
     assert_eq!(forward_decision(false, 1, false), ForwardAction::TtlDrop);
     assert_eq!(forward_decision(false, 0, false), ForwardAction::TtlDrop);
 
-    // --- HopLatch: escalation ---------------------------------------------
+    // --- HopLatch: escalation (CONSECUTIVE-un-ACK hysteresis) -------------
     let mut l = HopLatch::new();
     assert!(!l.latched());
     assert_eq!(l.origin_hop(false), 1, "single-hop by default (plain RELAY)");
     // a partially-acked exhaust does NOT latch (gateway heard us, just lossy).
     l.on_relay_exhausted(true);
     assert!(!l.latched(), "partial ack ⇒ not stranded");
-    // a fully-unacked exhaust latches multi-hop.
-    l.on_relay_exhausted(false);
-    assert!(l.latched(), "zero ack ⇒ stranded ⇒ latch");
+    // REGRESSION (C0 canary): fewer than ESCALATE_STREAK CONSECUTIVE full-un-ACKs must NOT latch —
+    // a single transient full-loss in a healthy all-hear mesh can't be allowed to escalate (that
+    // was the bug the bench caught: one dropped msg → hop=2 → forward-swarm → fwd!=0).
+    for i in 1..ESCALATE_STREAK {
+        l.on_relay_exhausted(false);
+        assert!(!l.latched(), "{i} consecutive full-un-ACKs (< ESCALATE_STREAK) ⇒ no latch");
+    }
+    // any ACK RESETS the streak — so losses must be CONSECUTIVE, not merely cumulative.
+    l.on_uplink_progress();
+    for _ in 1..ESCALATE_STREAK {
+        l.on_relay_exhausted(false);
+    }
+    assert!(!l.latched(), "progress reset the streak ⇒ still no latch");
+    // ESCALATE_STREAK consecutive full-un-ACKs (genuine stranding) DO latch.
+    l.on_uplink_progress();
+    latch_via_stranding(&mut l);
+    assert!(l.latched(), "ESCALATE_STREAK consecutive full-un-ACKs ⇒ stranded ⇒ latch");
     assert_eq!(l.origin_hop(false), MAX_HOP, "latched non-probe emits at MAX_HOP (RELAY2)");
     assert_eq!(l.origin_hop(true), 1, "a probe always emits H=1 (plain RELAY)");
 
     // --- HopLatch: probe gating (Gate A = downlink_up) --------------------
     let mut l2 = HopLatch::new();
-    l2.on_relay_exhausted(false); // latch
+    latch_via_stranding(&mut l2); // latch
     // while downlink is DOWN, never probe (don't waste airtime — definitely stranded).
     for _ in 0..(PROBE_EVERY * 3) {
         assert!(!l2.should_probe(false), "no probe while downlink down");
@@ -82,7 +104,7 @@ fn main() {
 
     // --- HopLatch: un-latch hysteresis (no flap) --------------------------
     let mut l3 = HopLatch::new();
-    l3.on_relay_exhausted(false);
+    latch_via_stranding(&mut l3);
     assert!(l3.latched());
     l3.on_direct_ack(); // streak 1 of UNLATCH_STREAK
     assert!(l3.latched(), "one direct ack is not enough (hysteresis)");

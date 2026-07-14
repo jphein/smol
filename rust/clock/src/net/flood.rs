@@ -131,6 +131,15 @@ pub fn forward_decision(is_gateway: bool, hop: u8, already_seen: bool) -> Forwar
 /// flapping a leaf between single- and multi-hop.
 pub const UNLATCH_STREAK: u8 = 2;
 
+/// Number of CONSECUTIVE fully-un-ACKed messages required to escalate INTO multi-hop.
+/// The down→up hysteresis (mirror of [`UNLATCH_STREAK`]): a genuinely-stranded leaf has
+/// EVERY message fully un-ACKed and latches in `ESCALATE_STREAK × emit-interval` (~45 s at
+/// 15 s), while a single transient full-loss in an otherwise-healthy all-hear mesh does NOT
+/// escalate — any ACKed message resets the streak. This is what keeps the byte-identical
+/// invariant (`fwd=0`) intact under normal packet loss: without it, ONE dropped message would
+/// latch a leaf to `RELAY2` and start a bounded forward-swarm that the C0 canary reads as failure.
+pub const ESCALATE_STREAK: u8 = 3;
+
 /// Send 1-in-N emits as an `H=1` direct probe while latched + downlink-present, so a
 /// leaf that moved back into range re-tests its uplink cheaply (~N × emit-interval).
 pub const PROBE_EVERY: u32 = 8;
@@ -138,8 +147,10 @@ pub const PROBE_EVERY: u32 = 8;
 /// The leaf's single-hop ⇄ multi-hop escalation state machine (pure).
 ///
 /// - Starts single-hop (`H=1`, plain `RELAY`).
-/// - [`on_relay_exhausted`] latches multi-hop when a message goes fully un-ACKed
-///   (the gateway heard NOTHING directly) → subsequent emits use `RELAY2` at [`MAX_HOP`].
+/// - [`on_relay_exhausted`] latches multi-hop only after [`ESCALATE_STREAK`] CONSECUTIVE
+///   fully-un-ACKed messages (genuine stranding, not a transient loss) → subsequent emits use
+///   `RELAY2` at [`MAX_HOP`]. [`on_uplink_progress`] resets that streak the moment the gateway
+///   ACKs anything — so normal packet loss never escalates (preserves the `fwd=0` invariant).
 /// - While latched, [`should_probe`] fires a 1-in-[`PROBE_EVERY`] plain-`RELAY` (`H=1`)
 ///   probe, but ONLY when the caller reports the owner's HELLO is heard directly
 ///   (`downlink_up` — else the leaf is definitely still stranded; don't waste airtime).
@@ -150,11 +161,14 @@ pub struct HopLatch {
     latched: bool,
     emit_count: u32,
     ack_streak: u8,
+    /// Consecutive fully-un-ACKed messages since the last ACK — the escalation (down→up)
+    /// hysteresis counter. Reaches [`ESCALATE_STREAK`] ⇒ latch; any ACK resets it to 0.
+    unack_streak: u8,
 }
 
 impl HopLatch {
     pub const fn new() -> Self {
-        Self { latched: false, emit_count: 0, ack_streak: 0 }
+        Self { latched: false, emit_count: 0, ack_streak: 0, unack_streak: 0 }
     }
 
     /// Are we currently in multi-hop mode?
@@ -184,13 +198,29 @@ impl HopLatch {
         downlink_up && self.emit_count.is_multiple_of(PROBE_EVERY)
     }
 
-    /// A message exhausted `RELAY_MAX_TRIES` with ZERO fragments ACKed → the gateway
-    /// can't hear us directly. Latch multi-hop (idempotent).
+    /// A message exhausted `RELAY_MAX_TRIES`. `any_frag_acked` = the gateway confirmed ≥1
+    /// fragment (directly, or via the flooded RELAYACK2 once already multi-hop) → it can hear
+    /// us, so reset the escalation streak. ZERO acks = a fully-lost message; latch multi-hop
+    /// ONLY after [`ESCALATE_STREAK`] such messages IN A ROW, so a single transient full-loss
+    /// in a healthy all-hear mesh does NOT escalate (that would break the `fwd=0` invariant).
     pub fn on_relay_exhausted(&mut self, any_frag_acked: bool) {
-        if !any_frag_acked {
+        if any_frag_acked {
+            self.unack_streak = 0;
+            return;
+        }
+        self.unack_streak = self.unack_streak.saturating_add(1);
+        if self.unack_streak >= ESCALATE_STREAK {
             self.latched = true;
             self.ack_streak = 0;
         }
+    }
+
+    /// Our uplink made progress — a message was fully ACKed (or any fragment ACKed): proof the
+    /// gateway hears us, so reset the escalation streak. Does NOT un-latch (that needs the
+    /// direct-ACK probe streak — a latched leaf whose `RELAY2` is ACKed via the flood is still
+    /// stranded on the DIRECT path). Called from the leaf's per-message complete path.
+    pub fn on_uplink_progress(&mut self) {
+        self.unack_streak = 0;
     }
 
     /// A DIRECT RELAYACK arrived (the gateway heard an `H=1` frame from us). While

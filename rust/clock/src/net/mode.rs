@@ -4275,11 +4275,17 @@ impl RadioManager {
                     // Leaf: the gateway confirmed these fragments — stop resending
                     // them. On a gateway (no outstanding tx) this is a no-op.
                     self.relay.apply_ack(msgid, bitmap);
-                    // #13: a DIRECT (unicast) RELAYACK proves the gateway heard an H=1 frame
+                    // #13: the gateway ACKed a fragment directly → it hears us → reset the
+                    // escalation streak so a LATER transient full-loss starts counting fresh
+                    // (escalation is CONSECUTIVE-only; this is what keeps fwd=0 under normal loss).
+                    if bitmap != 0 {
+                        self.relay.latch.on_uplink_progress();
+                    }
+                    // #13: a DIRECT (unicast) RELAYACK also proves the gateway heard an H=1 frame
                     // from us directly → the uplink is back. While latched, count it toward
-                    // un-latching (UNLATCH_STREAK consecutive drops the latch back to
-                    // single-hop). A no-op when not latched. NOTE: the flooded RELAYACK2 does
-                    // NOT call this — it proves only the multi-hop path, not direct reach.
+                    // un-latching (UNLATCH_STREAK consecutive drops the latch back to single-hop).
+                    // A no-op when not latched. NOTE: the flooded RELAYACK2 does NOT call this —
+                    // it proves only the multi-hop path, not direct reach.
                     self.relay.latch.on_direct_ack();
                     label = Some(alloc::format!("ack {:05}", msgid));
                 }
@@ -4323,6 +4329,14 @@ impl RadioManager {
                                 let len =
                                     encode_relay2(origin, msgid, next_hop, frag, count, chunk, &mut fb);
                                 self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+                                // Rate-limited serial trace (the forward path was previously OLED-only —
+                                // a rig watching serial saw the fwd counter climb with no log). Every 8th.
+                                if self.diag.fwd.is_multiple_of(8) {
+                                    log::info!(
+                                        "smol #13: fwd {} (origin {:03} msgid {} frag {} -> h{})",
+                                        self.diag.fwd, origin, msgid, frag, next_hop
+                                    );
+                                }
                                 label = Some(alloc::format!("fwd {:03} h{} f{}", origin, next_hop, frag));
                             }
                             crate::net::flood::ForwardAction::DedupDrop => {
@@ -4349,6 +4363,11 @@ impl RadioManager {
                         // works, NOT that the gateway can hear us DIRECTLY (only an H=1 probe drawing a
                         // direct RELAYACK un-latches us). Never re-forward an ACK addressed to us.
                         self.relay.apply_ack(msgid, bitmap);
+                        // Multi-hop delivery worked → the gateway hears us (via the relay) → reset
+                        // the escalation streak (does NOT un-latch — that still needs a direct probe).
+                        if bitmap != 0 {
+                            self.relay.latch.on_uplink_progress();
+                        }
                         label = Some(alloc::format!("ack2 {:05}", msgid));
                     } else if hop > 1 {
                         // Not for us + hops left: flood it one hop further toward the target. Loop
