@@ -1,0 +1,14 @@
+# #13 host byte-compat guard for the SMOLv1 relay wire codec (net/wire.rs). Runs OFF-target
+# on the host (std) via `cargo run` — the firmware crate is no_std/riscv32imc and can't host-test,
+# so this #[path]-includes the REAL wire.rs (no drift) and asserts the mixed-fleet byte contract
+# both directions + the exact golden wire layout. The permanent guard for the #124 UP2 migration.
+[package]
+name = "relay_compat"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "relay_compat"
+path = "src/main.rs"
+[profile.dev]
+opt-level = 0

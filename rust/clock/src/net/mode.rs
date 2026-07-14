@@ -55,6 +55,11 @@ use esp_wifi::{
 
 use crate::led::LedState;
 use crate::net::WifiPeripherals;
+// #13: the relay-family wire codec + ASCII field helpers live in the PURE, host-testable
+// `net::wire` module (extracted from here, byte-identical). Glob-imported so every call site
+// below (encode_relay, parse_relay[2], *relayack*, encode_dl, write_u5/u10, parse_id/u5/u10,
+// the *_PREFIX / RELAY_CHUNK / BATT_PAYLOAD_MAX consts, …) stays unqualified.
+use crate::net::wire::*;
 
 /// Fixed ESP-NOW channel used in TIME-SHARE mode. All smol units must agree on
 /// this value (1..=13). 6 is a common, low-congestion default.
@@ -123,28 +128,11 @@ const BEACON_PREFIX: &[u8] = b"SMOLv1 BEACON "; // + "NNN SSSSS EEEEE"
 /// on a private fixed channel; harden with a signed payload or an ESP-NOW LMK
 /// if it ever matters. Documented, not defended.
 const TIME_PREFIX: &[u8] = b"SMOLv1 TIME "; // + "NNN UUUUUUUUUU SSSSSSSSSS"
-/// Relay-bridge tags (see the "Relay bridge" section below). RELAY carries a
-/// fragment of a leaf's telemetry uplink; RELAYACK is the gateway's per-message
-/// received-fragment bitmap so the leaf can retransmit gaps. Distinct tags to
-/// keep the SMOLv1 namespace clean for the in-flight MMO-snake frames (issue #5).
-/// The trailing space on RELAY disambiguates it from RELAYACK at parse time
-/// (`"SMOLv1 RELAY "[12]` is ' ' where RELAYACK has 'A'), so match order is moot.
-const RELAY_PREFIX: &[u8] = b"SMOLv1 RELAY "; // + "NNN MMMMM F C " + chunk
-const RELAYACK_PREFIX: &[u8] = b"SMOLv1 RELAYACK "; // + "MMMMM BBB"
-/// #13 multi-hop uplink tags (see the "#13 routed multi-hop mesh" section below +
-/// `net/flood.rs`). A frame is byte-identical to today UNLESS a leaf is genuinely
-/// stranded (can't reach the gateway directly), so these tags appear ONLY when a hop
-/// count ≥ 2 is actually needed. Both are NEW tags (not an append to RELAY/RELAYACK,
-/// whose headers are fixed-offset): a stranded leaf emits `RELAY2` (hop-limited,
-/// origin-stamped) and a relay re-broadcasts it; the gateway floods `RELAYACK2` back
-/// (R1 table-free ACK). An OLD firmware `classify()`s both to `None` (harmless text) —
-/// it can't relay anyway — so no flag-day flash and no rolling-upgrade regression:
-/// a leaf that needs hop ≥ 2 was, by definition, out of direct gateway range, i.e.
-/// already stranded pre-#13. `RELAY2` diverges from `RELAY` at byte 12 (`'2'` vs `' '`)
-/// and `RELAYACK2` from `RELAYACK` at byte 15 (`'2'` vs `' '`), so `strip_prefix` never
-/// confuses the base tag with its multi-hop variant regardless of match order.
-const RELAY2_PREFIX: &[u8] = b"SMOLv1 RELAY2 "; // + "OOO MMMMM H F C " + chunk
-const RELAYACK2_PREFIX: &[u8] = b"SMOLv1 RELAYACK2 "; // + "TTT MMMMM BBB H"
+// #13: the RELAY / RELAYACK / RELAY2 / RELAYACK2 wire TAGS + their whole codec live in the
+// pure, host-testable `net::wire` module (glob-imported above — RELAY carries a leaf-telemetry
+// fragment; RELAYACK the gateway's fragment-bitmap; RELAY2/RELAYACK2 the #13 multi-hop variants,
+// NEW tags an old firmware classifies to None → no flag-day). The `*_FRAME_MAX` buffer-size
+// consts stay here — they size call-site stack buffers in this module, not the codec.
 /// Max RELAY2 frame length on the wire (30-byte header + full chunk); sizes stack buffers.
 /// Header = 14-byte prefix + "OOO MMMMM H F C " (16) = 30, vs RELAY's 27 (the extra 3 =
 /// the origin↔src split's `H ` hop field; `OOO` is the ORIGIN id, distinct from the
@@ -177,18 +165,11 @@ const GRID_PREFIX: &[u8] = b"SMOLv1 GRID "; // + verbatim "GRID|l1|l2|l3"
 /// Max GRID payload retained/echoed — matches `GridCache` (LOCKED ≤ 96 B).
 const GRID_PAYLOAD_MAX: usize = 96;
 
-/// #13 Stage B — downlink FRESHNESS tags. The v1 `BATT`/`GRID` frames carry NO freshness
-/// field (a locked no-length-byte memcpy — a header can't be inserted), so a relay can't tell
-/// new data from a replay and downlink stays single-hop. `BATT2`/`GRID2` prepend a 10-digit
-/// monotonic `dl_seq` (the gateway's unix-second of the last VALUE CHANGE — survives a gateway
-/// reboot + never wraps, exactly like `TIME`'s `synced_at`): a node adopts + RE-FLOODS only a
-/// STRICTLY-NEWER `dl_seq` (the `TIME` strict-newer template), so downlink reaches a stranded
-/// leaf via a relay AND an older/replayed frame is dropped (no loop). `BATT2` diverges from
-/// `BATT` at byte 11 (`'2'` vs `' '`) and from `GRID2` at byte 7, so `strip_prefix` never
-/// confuses them. NEW tags: an old node `classify()`s them to `None` (harmless) — the same
-/// fleet-flash / no-flag-day discipline as `RELAY2`.
-const BATT2_PREFIX: &[u8] = b"SMOLv1 BATT2 "; // + "SSSSSSSSSS " + verbatim "BATT|…"
-const GRID2_PREFIX: &[u8] = b"SMOLv1 GRID2 "; // + "SSSSSSSSSS " + verbatim "GRID|…"
+// #13 Stage B: the BATT2 / GRID2 downlink-freshness TAGS + their `encode_dl`/`parse_dl` codec
+// live in `net::wire` (glob-imported) — a 10-digit monotonic `dl_seq` (gateway unix-of-last-
+// value-change, TIME `synced_at`-style strict-newer) prepended to the verbatim BATT|/GRID|
+// payload so a relay re-floods only strictly-newer data. v1 `BATT`/`GRID` (above) stay here for
+// the back-compat receive path. `DL_FRAME_MAX` (this module's emit-buffer size) stays here.
 /// Max BATT2/GRID2 frame on the wire: 13-B prefix + 10-digit `dl_seq` + space + ≤96-B payload
 /// = ≤120; 128 leaves headroom. Sizes the emit stack buffer.
 const DL_FRAME_MAX: usize = 128;
@@ -4771,15 +4752,7 @@ fn encode_beacon(id: u8, seq: u32, echo: u32, out: &mut [u8]) -> usize {
     n
 }
 
-/// Write a 5-digit zero-padded decimal (value mod 100000) into `out[..5]`.
-fn write_u5(v: u32, out: &mut [u8]) {
-    let v = v % 100_000;
-    out[0] = b'0' + ((v / 10_000) % 10) as u8;
-    out[1] = b'0' + ((v / 1_000) % 10) as u8;
-    out[2] = b'0' + ((v / 100) % 10) as u8;
-    out[3] = b'0' + ((v / 10) % 10) as u8;
-    out[4] = b'0' + (v % 10) as u8;
-}
+// (write_u5 / write_u10 / parse_id / parse_u5 / parse_u10 moved to `net::wire`, glob-imported.)
 
 /// Encode a TIME frame `"SMOLv1 TIME NNN UUUUUUUUUU SSSSSSSSSS"` into `out`;
 /// returns length (37). `unix`/`synced_at` are 10-digit zero-padded decimals —
@@ -4803,16 +4776,6 @@ fn encode_time(id: u8, unix: u32, synced_at: u32, out: &mut [u8]) -> usize {
     write_u10(synced_at, &mut out[n..]);
     n += 10;
     n
-}
-
-/// Write a 10-digit zero-padded decimal into `out[..10]`. 10 digits holds every
-/// u32 (max 4_294_967_295), so no clamp is needed — the full value round-trips
-/// through [`parse_u10`]. Filled least-significant-digit first.
-fn write_u10(mut v: u32, out: &mut [u8]) {
-    for i in (0..10).rev() {
-        out[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
 }
 
 /// Parse an inbound payload into a [`Frame`], or `None` if it isn't ours.
@@ -4923,284 +4886,6 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
         return Some(Frame::Scan { src, value: &rest[3..] });
     }
     None
-}
-
-/// Parse a 3-digit ASCII id (`b"007"` -> 7). Rejects non-digits / short input.
-fn parse_id(rest: &[u8]) -> Option<u8> {
-    if rest.len() < 3 {
-        return None;
-    }
-    let mut val: u16 = 0;
-    for &b in &rest[..3] {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        val = val * 10 + (b - b'0') as u16;
-    }
-    (val <= 255).then_some(val as u8)
-}
-
-/// Parse exactly 5 ASCII digits into a u32. Rejects short/non-digit input.
-fn parse_u5(rest: &[u8]) -> Option<u32> {
-    if rest.len() < 5 {
-        return None;
-    }
-    let mut val: u32 = 0;
-    for &b in &rest[..5] {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        val = val * 10 + (b - b'0') as u32;
-    }
-    Some(val)
-}
-
-/// Parse exactly 10 ASCII digits into a u32. Accumulates in u64 and range-checks
-/// on the way out, so a garbled/hostile 10-digit field that exceeds u32::MAX
-/// (e.g. "9999999999") is rejected as `None` rather than silently wrapping —
-/// stricter than [`parse_u5`], where 5 digits always fit in u32.
-fn parse_u10(rest: &[u8]) -> Option<u32> {
-    if rest.len() < 10 {
-        return None;
-    }
-    let mut val: u64 = 0;
-    for &b in &rest[..10] {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        val = val * 10 + (b - b'0') as u64;
-    }
-    u32::try_from(val).ok()
-}
-
-// --- Relay wire codec (pure + fixed-width; host-unit-testable) --------------
-
-/// Encode a RELAY fragment `"SMOLv1 RELAY NNN MMMMM F C " + <chunk>` into `out`;
-/// returns total length (27-byte header + chunk). `NNN` = src id, `MMMMM` = msgid
-/// (5-digit u16), `F`/`C` = single-digit frag index / count (count <=
-/// RELAY_MAX_FRAGS <= 9). `chunk` is truncated to `RELAY_CHUNK`. Mirrors
-/// [`encode_beacon`]'s discipline.
-fn encode_relay(src_id: u8, msgid: u16, frag: u8, count: u8, chunk: &[u8], out: &mut [u8]) -> usize {
-    let mut n = 0;
-    out[..RELAY_PREFIX.len()].copy_from_slice(RELAY_PREFIX);
-    n += RELAY_PREFIX.len();
-    out[n] = b'0' + (src_id / 100) % 10;
-    out[n + 1] = b'0' + (src_id / 10) % 10;
-    out[n + 2] = b'0' + src_id % 10;
-    n += 3;
-    out[n] = b' ';
-    n += 1;
-    write_u5(msgid as u32, &mut out[n..]);
-    n += 5;
-    out[n] = b' ';
-    n += 1;
-    out[n] = b'0' + frag;
-    n += 1;
-    out[n] = b' ';
-    n += 1;
-    out[n] = b'0' + count;
-    n += 1;
-    out[n] = b' ';
-    n += 1;
-    let len = chunk.len().min(RELAY_CHUNK);
-    out[n..n + len].copy_from_slice(&chunk[..len]);
-    n + len
-}
-
-/// Parse a RELAY frame into `(src_id, msgid, frag, count, chunk)`, or `None` if it
-/// isn't a well-formed RELAY. `chunk` borrows `data`. The caller
-/// ([`Relay::accept`]) re-validates `count`/`frag`/`chunk.len()` against its caps.
-fn parse_relay(data: &[u8]) -> Option<(u8, u16, u8, u8, &[u8])> {
-    let rest = data.strip_prefix(RELAY_PREFIX)?;
-    if rest.len() < 14 {
-        return None;
-    }
-    let src_id = parse_id(&rest[0..3])?;
-    let msgid = u16::try_from(parse_u5(&rest[4..9])?).ok()?;
-    if !rest[10].is_ascii_digit() || !rest[12].is_ascii_digit() {
-        return None;
-    }
-    let frag = rest[10] - b'0';
-    let count = rest[12] - b'0';
-    Some((src_id, msgid, frag, count, &rest[14..]))
-}
-
-/// Encode a `"SMOLv1 RELAYACK MMMMM BBB"` frame into `out`; returns length (25).
-/// `MMMMM` = msgid (5-digit), `BBB` = the 3-digit received-fragment bitmap (0..255).
-fn encode_relayack(msgid: u16, bitmap: u8, out: &mut [u8]) -> usize {
-    let mut n = 0;
-    out[..RELAYACK_PREFIX.len()].copy_from_slice(RELAYACK_PREFIX);
-    n += RELAYACK_PREFIX.len();
-    write_u5(msgid as u32, &mut out[n..]);
-    n += 5;
-    out[n] = b' ';
-    n += 1;
-    out[n] = b'0' + (bitmap / 100) % 10;
-    out[n + 1] = b'0' + (bitmap / 10) % 10;
-    out[n + 2] = b'0' + bitmap % 10;
-    n += 3;
-    n
-}
-
-/// Parse a RELAYACK frame into `(msgid, bitmap)`, or `None`. The 3-digit bitmap
-/// reuses [`parse_id`] (both are a 3-ASCII-digit `u8` in 0..=255).
-fn parse_relayack(data: &[u8]) -> Option<(u16, u8)> {
-    let rest = data.strip_prefix(RELAYACK_PREFIX)?;
-    if rest.len() < 9 {
-        return None;
-    }
-    let msgid = u16::try_from(parse_u5(&rest[0..5])?).ok()?;
-    let bitmap = parse_id(&rest[6..9])?;
-    Some((msgid, bitmap))
-}
-
-// --- #13 multi-hop wire codec (RELAY2 / RELAYACK2) --------------------------
-
-/// Encode a RELAY2 fragment `"SMOLv1 RELAY2 " + "OOO MMMMM H F C " + <chunk>` into
-/// `out`; returns total length (30-byte header + chunk). `OOO` = ORIGIN id (the true
-/// source, distinct from the re-broadcasting relay's MAC), `MMMMM` = msgid, `H` = 1-digit
-/// hop-limit (1..=`MAX_HOP`), `F`/`C` = frag index / count. Twin of [`encode_relay`] with
-/// the origin + hop fields; `chunk` truncated to `RELAY_CHUNK`.
-fn encode_relay2(origin: u8, msgid: u16, hop: u8, frag: u8, count: u8, chunk: &[u8], out: &mut [u8]) -> usize {
-    let mut n = 0;
-    out[..RELAY2_PREFIX.len()].copy_from_slice(RELAY2_PREFIX);
-    n += RELAY2_PREFIX.len();
-    out[n] = b'0' + (origin / 100) % 10;
-    out[n + 1] = b'0' + (origin / 10) % 10;
-    out[n + 2] = b'0' + origin % 10;
-    n += 3;
-    out[n] = b' ';
-    n += 1;
-    write_u5(msgid as u32, &mut out[n..]);
-    n += 5;
-    out[n] = b' ';
-    n += 1;
-    out[n] = b'0' + hop; // hop is 1..=MAX_HOP (single digit)
-    n += 1;
-    out[n] = b' ';
-    n += 1;
-    out[n] = b'0' + frag;
-    n += 1;
-    out[n] = b' ';
-    n += 1;
-    out[n] = b'0' + count;
-    n += 1;
-    out[n] = b' ';
-    n += 1;
-    let len = chunk.len().min(RELAY_CHUNK);
-    out[n..n + len].copy_from_slice(&chunk[..len]);
-    n + len
-}
-
-/// Parse a RELAY2 frame into `(origin, msgid, hop, frag, count, chunk)`, or `None`.
-/// `chunk` borrows `data`. The caller re-validates `count`/`frag`/`chunk.len()`.
-// The return mirrors `parse_relay`'s tuple shape + the one `hop` field (6 = just over the
-// complexity heuristic); `parse_frame` immediately destructures it into `Frame::Relay2`, so
-// a named struct would add a type for no call-site clarity. (Codebase precedent: the
-// `#[allow(clippy::too_many_arguments)]` on the relay-offer service fn.)
-#[allow(clippy::type_complexity)]
-fn parse_relay2(data: &[u8]) -> Option<(u8, u16, u8, u8, u8, &[u8])> {
-    let rest = data.strip_prefix(RELAY2_PREFIX)?;
-    // "OOO MMMMM H F C " = 16 header bytes (origin 3, sp, msgid 5, sp, hop 1, sp, frag 1,
-    // sp, count 1, sp), then the chunk.
-    if rest.len() < 16 {
-        return None;
-    }
-    let origin = parse_id(&rest[0..3])?;
-    let msgid = u16::try_from(parse_u5(&rest[4..9])?).ok()?;
-    if !rest[10].is_ascii_digit() || !rest[12].is_ascii_digit() || !rest[14].is_ascii_digit() {
-        return None;
-    }
-    let hop = rest[10] - b'0';
-    let frag = rest[12] - b'0';
-    let count = rest[14] - b'0';
-    Some((origin, msgid, hop, frag, count, &rest[16..]))
-}
-
-/// Encode a `"SMOLv1 RELAYACK2 " + "TTT MMMMM BBB H"` frame into `out`; returns length (32).
-/// `TTT` = TARGET origin id being ACKed, `MMMMM` = msgid, `BBB` = 3-digit bitmap, `H` = hop.
-fn encode_relayack2(target: u8, msgid: u16, bitmap: u8, hop: u8, out: &mut [u8]) -> usize {
-    let mut n = 0;
-    out[..RELAYACK2_PREFIX.len()].copy_from_slice(RELAYACK2_PREFIX);
-    n += RELAYACK2_PREFIX.len();
-    out[n] = b'0' + (target / 100) % 10;
-    out[n + 1] = b'0' + (target / 10) % 10;
-    out[n + 2] = b'0' + target % 10;
-    n += 3;
-    out[n] = b' ';
-    n += 1;
-    write_u5(msgid as u32, &mut out[n..]);
-    n += 5;
-    out[n] = b' ';
-    n += 1;
-    out[n] = b'0' + (bitmap / 100) % 10;
-    out[n + 1] = b'0' + (bitmap / 10) % 10;
-    out[n + 2] = b'0' + bitmap % 10;
-    n += 3;
-    out[n] = b' ';
-    n += 1;
-    out[n] = b'0' + hop;
-    n += 1;
-    n
-}
-
-/// Parse a RELAYACK2 frame into `(target, msgid, bitmap, hop)`, or `None`.
-fn parse_relayack2(data: &[u8]) -> Option<(u8, u16, u8, u8)> {
-    let rest = data.strip_prefix(RELAYACK2_PREFIX)?;
-    // "TTT MMMMM BBB H" = 15 bytes (target 3, sp, msgid 5, sp, bitmap 3, sp, hop 1).
-    if rest.len() < 15 {
-        return None;
-    }
-    let target = parse_id(&rest[0..3])?;
-    let msgid = u16::try_from(parse_u5(&rest[4..9])?).ok()?;
-    let bitmap = parse_id(&rest[10..13])?;
-    if !rest[14].is_ascii_digit() {
-        return None;
-    }
-    let hop = rest[14] - b'0';
-    Some((target, msgid, bitmap, hop))
-}
-
-/// #13: the synthetic MAC a gateway keys a RELAY2 reassembly by — `00:00:00:00:00:<origin>`.
-/// Reassembly + late-retransmit dedup must key on the true SOURCE, but a RELAY2's `src_mac` is
-/// the LAST RELAY's MAC (changes per hop). The `origin` id (u8, stamped by the source, survives
-/// forwarding) maps into the existing `(src_mac, msgid)`-keyed `ReasmSlot`/`DONE_RING` tables
-/// WITHOUT collision: a real ESP32 STA MAC carries an Espressif OUI in its top bytes, never
-/// all-zero, so this synthetic key can never alias a single-hop leaf's real MAC.
-fn synth_origin_mac(origin: u8) -> [u8; 6] {
-    [0, 0, 0, 0, 0, origin]
-}
-
-// --- #13 Stage B downlink freshness codec (BATT2 / GRID2) ------------------
-
-/// Encode a downlink freshness frame `<prefix> + "SSSSSSSSSS " + <payload>` into `out`; returns
-/// length. `prefix` is `BATT2_PREFIX`/`GRID2_PREFIX`; `seq` is the 10-digit freshness (full u32,
-/// like TIME's `synced_at` — see [`write_u10`]); `payload` is the verbatim `BATT|…`/`GRID|…` bytes
-/// (truncated to `BATT_PAYLOAD_MAX`). Mirrors [`encode_time`]'s fixed-width discipline.
-fn encode_dl(prefix: &[u8], seq: u32, payload: &[u8], out: &mut [u8]) -> usize {
-    let mut n = 0;
-    out[..prefix.len()].copy_from_slice(prefix);
-    n += prefix.len();
-    write_u10(seq, &mut out[n..]);
-    n += 10;
-    out[n] = b' ';
-    n += 1;
-    let len = payload.len().min(BATT_PAYLOAD_MAX);
-    out[n..n + len].copy_from_slice(&payload[..len]);
-    n + len
-}
-
-/// Parse a downlink freshness frame with `prefix` into `(seq, payload)`, or `None`. `payload`
-/// borrows `data` (the verbatim `BATT|…`/`GRID|…` bytes after the 10-digit seq + its space). The
-/// caller validates the `BATT|`/`GRID|` marker (a stray frame can't wipe a good reading).
-fn parse_dl<'a>(prefix: &[u8], data: &'a [u8]) -> Option<(u32, &'a [u8])> {
-    let rest = data.strip_prefix(prefix)?;
-    // "SSSSSSSSSS " = 10 seq digits + a space, then the payload.
-    if rest.len() < 11 {
-        return None;
-    }
-    let seq = parse_u10(&rest[0..10])?;
-    Some((seq, &rest[11..]))
 }
 
 // -------------------------------------------------------------------------
