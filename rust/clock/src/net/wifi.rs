@@ -2175,6 +2175,13 @@ fn mqtt_session(
     // not the gateway, owns the freshness gate (the OTAM handler rejects `build ≤ leaf.build`);
     // the gateway may be NEWER than the leaf's target, so a gateway-build gate would drop it.
     let mut pending_leaf: Option<u8> = None;
+    // #111: every leaf id whose retained `smol/<id>/ota/install=INSTALL` was SEEN this burst
+    // (deduped, bounded). Unlike `pending_leaf` (last-wins, one relay/burst) this is the FULL
+    // armed set — the version-flip cleanup below clears a completed leaf's order even when it is
+    // not the one being relayed this burst (e.g. it installed under a PRIOR crown tenure). Dropped
+    // extras are re-seen next burst (retained), so an 8-slot cap never loses an order.
+    let mut armed_installs = [0u8; RESET_REQ_MAX];
+    let mut armed_n = 0usize;
     loop {
         if tick() {
             break; // #20 abort during downlink wait → fall through to clean DISCONNECT
@@ -2543,6 +2550,11 @@ fn mqtt_session(
                             // the audible leaf's service rate → slow-arm); it rides the #68 pass.
                             pending_leaf = Some(leaf_id);
                             *leaf_install_seen = true; // #40 #1: install-SEEN (pre-arm) → gateway suppresses its own self-OTA
+                            // #111: record it in the armed set (deduped) for the version-flip cleanup.
+                            if armed_n < armed_installs.len() && !armed_installs[..armed_n].contains(&leaf_id) {
+                                armed_installs[armed_n] = leaf_id;
+                                armed_n += 1;
+                            }
                             log::info!("smol #40: leaf id{} OTA install command received", leaf_id);
                         }
                     }
@@ -2620,6 +2632,51 @@ fn mqtt_session(
             }
         }
         *leaf_diag = None; // consumed — published once
+    }
+
+    // #111: CROWN-PORTABLE install cleanup — clear a leaf's retained `ota/install` once its FRESH
+    // STAT confirms the version-flip (reported build >= the staged build). This is the SUCCESS
+    // clear that survives a crown handover: the old design cleared only on the RELAY outcome
+    // (`record_leaf_ota`, in-RAM, dies with the gateway tenure), so an install caught by one crown
+    // and completed under another was never cleared here — it re-armed forever OR (worse, paired
+    // with the eager self-clear) evaporated. Now ANY crown that sees the flip clears it. The
+    // freshness gate (`entry_fresh`) IS the "seen a STAT since staging" guard: a stale/absent STAT
+    // → unknown build → left retained (unknown != completed). A fresh-but-old STAT has build <
+    // staged → also left (not flipped yet). Only armed ids (seen via the wildcard this burst) are
+    // considered, ≤1 clear/burst (extras re-clear next burst). `record_leaf_ota`'s retry-cap /
+    // rolled-back clear stays as the DOOMED-install backstop (a rollback never version-flips).
+    if let (Some(sc), Some(staged)) = (stat_cache, *staged_raw) {
+        let now_ms = Instant::now().duration_since_epoch().as_millis();
+        'flip: for i in 0..sc.count() {
+            let Some((lid, val)) = sc.entry_fresh(i, now_ms, STAT_FRESH_MS) else {
+                continue;
+            };
+            if lid == node_id || !armed_installs[..armed_n].contains(&lid) {
+                continue;
+            }
+            // Build = the last '|'-segment of the STAT value (mirrors `ota_mesh::stat_build`,
+            // inlined so this wifi-tier path carries no espnow-only dependency).
+            let flipped = core::str::from_utf8(val)
+                .ok()
+                .and_then(|s| s.rsplit('|').next())
+                .and_then(|b| b.parse::<u32>().ok())
+                .is_some_and(|b| b >= staged.build);
+            if flipped {
+                let mut itopic = MqttScratch::new();
+                let _ = write!(itopic, "smol/{}/ota/install", lid);
+                if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, itopic.as_bytes(), b"", true) {
+                    let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                }
+                log::info!(
+                    "smol #111: leaf id{} version-flipped (>= staged {}) — cleared retained install",
+                    lid, staged.build
+                );
+                if pending_leaf == Some(lid) {
+                    pending_leaf = None; // don't re-arm a leaf that already completed
+                }
+                break 'flip; // ≤1 clear/burst
+            }
+        }
     }
 
     // #3 RELAY RX-DIAG: publish the last relay attempt's RX evidence to retained
@@ -2981,8 +3038,18 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, stopic.as_bytes(), sjson.as_bytes(), true) {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
-        // Clear the retained install command once consumed, so it can't replay next boot.
-        if *install_requested {
+        // #111: clear our OWN retained install ONLY once the staged image is KNOWN (parsed this
+        // session) — not merely because we caught the INSTALL. The old eager clear-on-catch lost the
+        // order in the boot-race: a rebooting board caught its own retained INSTALL BEFORE it had
+        // drained `ota/staged`, so `staged_raw` was None, `main` had nothing to fetch, yet the order
+        // was cleared anyway (id7, 13:56). Gating on `staged_raw.is_some()` leaves the order retained
+        // until a staged image is actually in hand → it survives the racing boot and installs on the
+        // burst that parses staged. This stays a ONE-SHOT clear (fires at the install, not after a
+        // version-flip), which is deliberate: the OWN self-OTA gate is `build > BUILD_NUMBER` only
+        // (NOT floor-gated, unlike the leaf mesh path), so a version-flip-clear would re-fetch a
+        // rolled-back image forever — clearing at install-time is what keeps a bad self-image
+        // one-shot. `staged_raw` (the persisted raw announce) is Some iff we've parsed a staged line.
+        if *install_requested && staged_raw.is_some() {
             if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, cmd_topic.as_bytes(), &[], true) {
                 let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
             }
