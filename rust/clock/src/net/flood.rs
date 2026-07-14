@@ -276,31 +276,24 @@ impl Default for HopLatch {
 /// Candidate ESP-NOW channels a leaf sweeps while unlocked (JP's roam plan). SINGLE SOURCE OF
 /// TRUTH — `mode.rs::leaf_scan_tick`'s blind scan, `current_channel`, and #126 parking all index
 /// this, so the scan plan and the park plan can never silently drift apart.
-// #126 wip (Stage A): the whole ChannelPark block is host-tested in flood_verify but UNWIRED in the
-// clock crate — the allow(dead_code)s DROP in Stage B when leaf_scan_tick/emit start driving it.
-#[allow(dead_code)]
 pub const PARK_CHANNELS: [u8; 3] = [1, 6, 11];
 
 /// Per-candidate dwell while SWEEPING (ms). Matches `leaf_scan_tick`'s blind-scan dwell, so
 /// parking only re-orders WHICH channel a stranded leaf favours, not the dwell shape.
-#[allow(dead_code)]
 pub const PARK_DWELL_MS: u64 = 1500;
 
 /// Min gap between emission bursts within one dwell (ms). A "burst" re-broadcasts the leaf's
 /// staged uplink so a relay on THIS channel forwards it + the gateway floods a RELAYACK2 back —
 /// the ACK-feedback bootstrap. Only fires while LATCHED + sweeping (stranded); never on a healthy leaf.
-#[allow(dead_code)]
 pub const PARK_BURST_EVERY_MS: u64 = 400;
 
 /// Emission bursts per candidate before the sweep may hop off it — the "emit K frames per channel
 /// before hopping" bootstrap. Guarantees every candidate is actually probed, never skipped.
-#[allow(dead_code)]
 pub const PARK_BURSTS_PER_DWELL: u8 = 3;
 
 /// A PARKED channel that draws no forward/ACK for this long (ms) is assumed cold (relay roamed /
 /// re-elected) ⇒ resume sweeping. > 1 telemetry cycle (~15 s) so a single lost ACK on a live-but-
 /// lossy channel doesn't abandon a good park.
-#[allow(dead_code)]
 pub const PARK_SILENCE_MS: u64 = 30_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,7 +310,6 @@ enum ParkPhase {
 /// answers *single- or multi-hop?*, `ChannelPark` answers *which channel should a stranded leaf
 /// be on?*. Driven by the live `leaf_scan_tick`/emit path (which supplies `now` + acts on the
 /// outputs); host-unit-tested in `flood_verify` (state machine AND the emit-trigger contract).
-#[allow(dead_code)] // #126 wip: unwired in the clock crate until Stage B (see the block note above).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChannelPark {
     phase: ParkPhase,
@@ -333,7 +325,6 @@ pub struct ChannelPark {
     last_feedback_ms: u64,
 }
 
-#[allow(dead_code)] // #126 wip: the whole API is exercised by flood_verify; wired in Stage B.
 impl ChannelPark {
     pub const fn new() -> Self {
         Self {
@@ -458,4 +449,45 @@ impl Default for ChannelPark {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What a scan tick should DO this iteration for the channel-park path — the output of
+/// [`park_scan_action`], applied by the live `leaf_scan_tick` (set the channel, maybe burst).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParkAction {
+    /// Channel to switch to before (maybe) bursting. `None` ⇒ leave the channel alone (the caller's
+    /// blind scan governs, or we're locked onto an owner).
+    pub channel: Option<u8>,
+    /// Fire ONE dwell-per-channel emission burst (re-broadcast the staged uplink) on `channel` this
+    /// tick — the ACK-feedback bootstrap. Always `false` unless sweeping.
+    pub burst: bool,
+}
+
+/// The PURE per-tick channel-park decision, extracted from `leaf_scan_tick` so the emit-TRIGGER
+/// wiring — not just the state-machine math — is host-testable. This is the standing #123 lesson:
+/// the on-air bugs lived in the trigger wiring (which channel / when to emit / the gating), invisible
+/// to a green build, TWICE. Everything bug-prone now lives here and is covered by `flood_verify`.
+///
+/// Owns the whole decision + its ORDER: latch-sync, then (only when stranded AND not locked onto an
+/// owner) pick the swept/parked channel, decide the burst, and advance the sweep — the exact
+/// should_burst()→tick() sequence the SM contract requires. The caller supplies the CURRENT
+/// (`latched`, `scan_locked`) and mechanically APPLIES the returned [`ParkAction`] (no logic).
+///
+/// * not stranded (`!latched`) ⇒ park disengaged, `channel: None` (blind scan governs, byte-identical).
+/// * stranded but `scan_locked` (hears an owner directly) ⇒ `channel: None` (stay on the owner's channel).
+/// * stranded + unlocked ⇒ `channel: Some(swept/parked)`, `burst` per the bootstrap cadence.
+pub fn park_scan_action(
+    park: &mut ChannelPark,
+    latched: bool,
+    scan_locked: bool,
+    now: u64,
+) -> ParkAction {
+    park.sync(latched, now);
+    if scan_locked || !latched {
+        return ParkAction { channel: None, burst: false };
+    }
+    let channel = park.channel();
+    let burst = park.should_burst(now);
+    park.tick(now);
+    ParkAction { channel, burst }
 }

@@ -6,9 +6,9 @@
 mod flood;
 
 use flood::{
-    forward_decision, ChannelPark, ForwardAction, HopLatch, SeenSet, ESCALATE_STREAK, MAX_HOP,
-    PARK_BURSTS_PER_DWELL, PARK_BURST_EVERY_MS, PARK_CHANNELS, PARK_DWELL_MS, PARK_SILENCE_MS,
-    PROBE_EVERY, SEEN_RING, UNLATCH_STREAK,
+    forward_decision, park_scan_action, ChannelPark, ForwardAction, HopLatch, ParkAction, SeenSet,
+    ESCALATE_STREAK, MAX_HOP, PARK_BURSTS_PER_DWELL, PARK_BURST_EVERY_MS, PARK_CHANNELS,
+    PARK_DWELL_MS, PARK_SILENCE_MS, PROBE_EVERY, SEEN_RING, UNLATCH_STREAK,
 };
 
 /// Drive a fresh latch into multi-hop the way a genuinely-stranded leaf does: ESCALATE_STREAK
@@ -228,5 +228,51 @@ fn main() {
         assert!(!inert.engaged(), "inert leaf never engages parking");
     }
 
-    println!("flood_verify: ALL CHECKS PASSED (SeenSet + forward_decision + HopLatch + #126 ChannelPark)");
+    // --- #126 park_scan_action: the extracted TRIGGER decision (#123 lesson) -----
+    // The trigger wiring (which channel / when to burst / the latched+locked gating) is what hid
+    // the last two on-air bugs. It's now a pure fn covered here, not buried in the no_std tick.
+    let mut ps = ChannelPark::new();
+    // healthy leaf (not latched) ⇒ no channel override, no burst, park stays inert.
+    assert_eq!(
+        park_scan_action(&mut ps, false, false, 0),
+        ParkAction { channel: None, burst: false },
+        "not latched ⇒ blind scan governs (byte-identical)"
+    );
+    assert!(!ps.engaged(), "not latched ⇒ park inert");
+    // latched but LOCKED onto an owner ⇒ never override the locked channel (stay on the owner's).
+    let a = park_scan_action(&mut ps, true, true, 10);
+    assert_eq!(a.channel, None, "latched+locked ⇒ stay on the owner's channel");
+    assert!(!a.burst, "no burst while locked onto an owner");
+    assert!(ps.engaged(), "latched ⇒ park engaged (ready) even while locked");
+    // latched + UNLOCKED (stranded) ⇒ drive the sweep: candidate 0 + the first burst.
+    let a = park_scan_action(&mut ps, true, false, 20);
+    assert_eq!(a.channel, Some(PARK_CHANNELS[0]), "stranded+unlocked ⇒ sweep candidate 0");
+    assert!(a.burst, "first burst of the dwell fires");
+    // un-latch (uplink recovered) ⇒ disengage, channel None again.
+    assert_eq!(
+        park_scan_action(&mut ps, false, false, 30),
+        ParkAction { channel: None, burst: false },
+        "un-latch ⇒ disengage back to the blind scan"
+    );
+    assert!(!ps.engaged());
+    // through park_scan_action the sweep advances 1→6→11→1 across dwell-boundary calls (the hop is
+    // applied AFTER the channel is read, so a fresh candidate surfaces on the FOLLOWING boundary).
+    let mut sw2 = ChannelPark::new();
+    let a0 = park_scan_action(&mut sw2, true, false, 0);
+    assert_eq!(a0.channel, Some(PARK_CHANNELS[0]), "sweep starts on candidate 0");
+    let _ = park_scan_action(&mut sw2, true, false, PARK_DWELL_MS); // hops internally
+    assert_eq!(
+        park_scan_action(&mut sw2, true, false, PARK_DWELL_MS * 2).channel,
+        Some(PARK_CHANNELS[1]), "advanced to candidate 1"
+    );
+    assert_eq!(
+        park_scan_action(&mut sw2, true, false, PARK_DWELL_MS * 3).channel,
+        Some(PARK_CHANNELS[2]), "advanced to candidate 2"
+    );
+    assert_eq!(
+        park_scan_action(&mut sw2, true, false, PARK_DWELL_MS * 4).channel,
+        Some(PARK_CHANNELS[0]), "wrapped back to candidate 0"
+    );
+
+    println!("flood_verify: ALL CHECKS PASSED (SeenSet + forward_decision + HopLatch + #126 ChannelPark + park_scan_action trigger)");
 }

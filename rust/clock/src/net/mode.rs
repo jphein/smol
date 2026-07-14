@@ -1459,6 +1459,10 @@ struct Relay {
     /// (each inner frame / RELAY fragment gets a unique one), the FLOOD-DEDUP key. DISTINCT from the
     /// inner RELAY `msgid` (`tx.msgid`), which stays the reassembly/RELAYACK2 key. Wraps like `next_msgid`.
     up_env_msgid: u16,
+    /// #126 leaf-role: the channel-parking state machine. Inert until `latch` engages; then it biases
+    /// a stranded leaf toward the channel that drew a forward/ACK (sweep+burst → park), instead of the
+    /// blind 1/6/11 hop. Un-latch / #76 re-election disengage it. See `net/flood.rs::ChannelPark`.
+    park: crate::net::flood::ChannelPark,
 }
 
 impl Relay {
@@ -1477,6 +1481,7 @@ impl Relay {
             seen: crate::net::flood::SeenSet::new(),
             latch: crate::net::flood::HopLatch::new(),
             up_env_msgid: 0,
+            park: crate::net::flood::ChannelPark::new(),
         }
     }
 
@@ -1974,7 +1979,9 @@ impl RadioManager {
     /// roam), it unlocks + resumes scanning. Gateways never scan (they ride their AP
     /// channel via the live association).
     pub fn leaf_scan_tick(&mut self, now: u64) {
-        const CANDIDATES: [u8; 3] = [1, 6, 11]; // JP's roam plan
+        // #126: the blind-scan plan is now `net::flood::PARK_CHANNELS` (single source of truth,
+        // shared with channel parking so the two can never drift). Aliased to keep the blind path below.
+        use crate::net::flood::PARK_CHANNELS as CANDIDATES;
         const DWELL_MS: u64 = 1500; // listen this long per candidate before hopping
         const SCAN_SILENCE_MS: u64 = 6000; // owner silence → assume roam → re-scan
         if self.relay.is_gateway {
@@ -1994,14 +2001,33 @@ impl RadioManager {
         // RESTORED old behavior: unlock + re-scan on owner-silence. A leaf MUST re-acquire the
         // gateway after routine beacon loss to keep mesh membership. The fetch-drift is handled
         // narrowly instead: (i) receiving an OTA frame locks the leaf to ch6 (`handle_ota_frame`),
-        // (ii) the gateway's OTAM wake-burst lets a hopping leaf catch the first announce.
+        // (ii) the gateway's OTAM wake-burst lets a hopping leaf catch the first announce. This runs
+        // BEFORE the park decision so `scan_locked` is current when `park_scan_action` gates on it.
         if self.scan_locked && now.saturating_sub(self.last_owner_heard_ms) > SCAN_SILENCE_MS {
             self.scan_locked = false;
             log::info!("smol: leaf lost gateway id{} — re-scanning", self.elected_owner);
         }
-        if self.scan_locked {
-            return;
+        // #126 channel parking: the PURE per-tick decision (latch-sync + swept/parked channel +
+        // dwell-burst + advance, plus the latched/locked gating) lives in `net::flood::park_scan_action`
+        // so the emit TRIGGER is host-tested (the #123 lesson). Here we only APPLY it. A stranded leaf
+        // is LATCHED + never locks → parking drives its channel; a healthy leaf leaves it inert
+        // (`channel: None` ⇒ the blind scan below runs byte-identically).
+        let latched = self.relay.latch.latched();
+        let act =
+            crate::net::flood::park_scan_action(&mut self.relay.park, latched, self.scan_locked, now);
+        if let Some(ch) = act.channel {
+            let _ = self.esp_now.set_channel(ch);
         }
+        if act.burst {
+            self.relay_park_burst();
+        }
+        if self.scan_locked {
+            return; // we hear the owner directly → stay on its channel (park returned None).
+        }
+        if latched {
+            return; // parking governed the channel above → skip the blind hop.
+        }
+        // Healthy leaf: the original blind round-robin over PARK_CHANNELS (byte-identical behaviour).
         if now.saturating_sub(self.last_scan_hop_ms) >= DWELL_MS {
             self.scan_idx = (self.scan_idx + 1) % CANDIDATES.len();
             let ch = CANDIDATES[self.scan_idx];
@@ -2150,6 +2176,10 @@ impl RadioManager {
         // #114 H1: a CHANGED owner must re-prove itself by HELLO before we trust it as heard.
         if elect.owner_id != self.elected_owner {
             self.owner_hello_seen = false;
+            // #126: the elected owner (hence its mesh channel) changed under us — any parked/swept
+            // channel bias is now stale, so restart the sweep from candidate 0. No-op unless parking
+            // is engaged (a healthy re-election just re-scans normally).
+            self.relay.park.on_rechannel(now);
         }
         self.elected_owner = elect.owner_id;
         self.scan_locked = false;
@@ -2910,18 +2940,20 @@ impl RadioManager {
     }
 
     /// #27/#29: this node's current ESP-NOW channel for the peers + MC publish. Leaf = its
-    /// locked scan channel (`CANDIDATES[scan_idx]` while `scan_locked`), else 0 (scanning);
-    /// gateway = its `learned_channel` (#29 — the channel `rx_control` last saw a frame on;
-    /// 0 until the first frame). `0` ⇒ advisory-only: HA/leaves treat the `<ch>` field as absent
-    /// and fall back (no roam-flag / HELLO-scan), so this never ships a false positive.
+    /// swept/parked channel (#126) while stranded, its locked scan channel while `scan_locked`,
+    /// else 0 (scanning); gateway = its `learned_channel` (#29 — the channel `rx_control` last saw a
+    /// frame on; 0 until the first frame). `0` ⇒ advisory-only: HA/leaves treat the `<ch>` field as
+    /// absent and fall back (no roam-flag / HELLO-scan), so this never ships a false positive.
     fn current_channel(&self) -> u8 {
-        const CANDIDATES: [u8; 3] = [1, 6, 11]; // must match the scan plan above
+        use crate::net::flood::PARK_CHANNELS;
         if self.relay.is_gateway {
             self.learned_channel // #29: real gateway channel from rx_control (0 until learned)
+        } else if let Some(ch) = self.relay.park.channel() {
+            ch // #126: a stranded (latched) leaf reports its swept/parked channel (advisory)
         } else if !self.scan_locked {
             0
         } else {
-            CANDIDATES[self.scan_idx % CANDIDATES.len()]
+            PARK_CHANNELS[self.scan_idx % PARK_CHANNELS.len()]
         }
     }
 
@@ -3004,6 +3036,30 @@ impl RadioManager {
         self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
     }
 
+    /// #126: fire ONE dwell-per-channel emission burst — re-broadcast the currently-staged uplink on
+    /// the channel the park SM just selected, so a relay on THIS channel forwards it and the gateway
+    /// floods a RELAYACK2 back (attributed to this channel → the leaf parks). No-op if nothing is
+    /// staged. Re-sends every fragment at the staged hop (`tx.hop` = MAX_HOP while latched →
+    /// UP2-wrapped); each frag draws a FRESH env_msgid in `relay_send_frag`, so a relay's seen-set
+    /// never dedup-drops the re-broadcast. Only ever called for a LATCHED leaf (see `leaf_scan_tick`),
+    /// so a healthy leaf's airtime/behaviour is completely unchanged.
+    fn relay_park_burst(&mut self) {
+        if !self.relay.tx.active {
+            return; // nothing staged → nothing to probe the channel with
+        }
+        let (msgid, count, total_len, hop) = (
+            self.relay.tx.msgid,
+            self.relay.tx.count,
+            self.relay.tx.total_len,
+            self.relay.tx.hop,
+        );
+        for frag in 0..count {
+            let off = frag as usize * RELAY_CHUNK;
+            let end = (off + RELAY_CHUNK).min(total_len);
+            self.relay_send_frag(msgid, hop, frag, count, off, end);
+        }
+    }
+
     /// #13 gateway: flood a RELAYACK2 back toward the stranded `target` origin (R1,
     /// table-free) at `MAX_HOP`, so a relay carries it the same distance the RELAY2 came.
     /// Broadcast (the origin isn't directly reachable — that's why it's stranded).
@@ -3059,12 +3115,26 @@ impl RadioManager {
             let end = (off + RELAY_CHUNK).min(total_len);
             self.relay_send_frag(msgid, hop, frag, count, off, end);
         }
+        // #126: surface the stranded-leaf channel-park state in the emit log — the #123 lesson that
+        // on-air trigger state MUST be visible to the rig (a green build hid the last two on-air bugs).
+        // Blank on a healthy leaf (park inert), so a normal node's serial is unchanged.
+        let park = if self.relay.park.engaged() {
+            let ch = self.relay.park.channel().unwrap_or(0);
+            if self.relay.park.parked() {
+                alloc::format!(" [parked ch{}]", ch)
+            } else {
+                alloc::format!(" [sweep ch{}]", ch)
+            }
+        } else {
+            alloc::string::String::new()
+        };
         log::info!(
-            "smol: relay emit msgid {} ({} frag) hop {}{}",
+            "smol: relay emit msgid {} ({} frag) hop {}{}{}",
             msgid,
             count,
             hop,
-            if is_probe { " probe" } else { "" }
+            if is_probe { " probe" } else { "" },
+            park
         );
     }
 
@@ -4339,7 +4409,10 @@ impl RadioManager {
                     self.roster.heard(src, Some(origin), rssi, now);
                     if origin == self.id {
                         // Our OWN envelope echoed back by a relay — never re-forward/reassemble it
-                        // (bogus fwd + could loop). Just drop it.
+                        // (bogus fwd + could loop). Just drop it. #126: BUT hearing our own UP2
+                        // re-broadcast proves a relay on our CURRENT channel heard + forwarded us — an
+                        // (early) park-feedback signal, so bias/park toward this channel.
+                        self.relay.park.on_feedback(now);
                         label = Some(alloc::format!("up2 self {:03}", origin));
                     } else if self.relay.is_gateway {
                         // GATEWAY SINK: dispatch by the INNER frame type (#124 Stage 2). Everything is
@@ -4433,6 +4506,9 @@ impl RadioManager {
                         // the escalation streak (does NOT un-latch — that still needs a direct probe).
                         if bitmap != 0 {
                             self.relay.latch.on_uplink_progress();
+                            // #126: the flood-back reached us on our CURRENT channel → the full
+                            // uplink+return path works here → PARK on it (the strongest park signal).
+                            self.relay.park.on_feedback(now);
                         }
                         label = Some(alloc::format!("ack2 {:05}", msgid));
                     } else if hop > 1 {
