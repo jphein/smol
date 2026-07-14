@@ -16,18 +16,15 @@
 /// from RELAYACK at byte 12 (`' '` vs `'A'`), so match order is moot.
 pub const RELAY_PREFIX: &[u8] = b"SMOLv1 RELAY "; // + "NNN MMMMM F C " + chunk
 pub const RELAYACK_PREFIX: &[u8] = b"SMOLv1 RELAYACK "; // + "MMMMM BBB"
-/// #13 multi-hop uplink tags (see the `#13` section in `mode.rs` + `net/flood.rs`). NEW tags — an
-/// old firmware `classify()`s them to `None` (harmless). `RELAY2` diverges from `RELAY` at byte 12
-/// (`'2'` vs `' '`) and `RELAYACK2` from `RELAYACK` at byte 15, so `strip_prefix` never confuses a
-/// base tag with its variant regardless of order.
-pub const RELAY2_PREFIX: &[u8] = b"SMOLv1 RELAY2 "; // + "OOO MMMMM H F C " + chunk
+/// #13 multi-hop ACK tag (the R1 flooded RELAYACK2 — kept; the RELAY2 uplink tag was replaced by
+/// UP2 in #124). NEW tag — an old firmware `classify()`s it to `None` (harmless). Diverges from
+/// `RELAYACK` at byte 15, so `strip_prefix` never confuses them.
 pub const RELAYACK2_PREFIX: &[u8] = b"SMOLv1 RELAYACK2 "; // + "TTT MMMMM BBB H"
 /// #13 Stage B downlink freshness tags (10-digit `dl_seq` + verbatim `BATT|`/`GRID|` payload).
 pub const BATT2_PREFIX: &[u8] = b"SMOLv1 BATT2 ";
 pub const GRID2_PREFIX: &[u8] = b"SMOLv1 GRID2 ";
-/// #124 generic uplink envelope tag (see the UP2 section below). Diverges from `RELAY`/`RELAY2` at
-/// byte 7 (`'U'` vs `'R'`), so `strip_prefix` never confuses it. wip-unwired until Stage 1b.
-#[allow(dead_code)]
+/// #124 generic uplink envelope tag (see the UP2 section below). Diverges from `RELAY` at byte 7
+/// (`'U'` vs `'R'`), so `strip_prefix` never confuses it.
 pub const UP2_PREFIX: &[u8] = b"SMOLv1 UP2 "; // + "OOO MMMMM H " + <inner frame>
 
 /// Max telemetry payload per RELAY fragment (bytes) — encoders truncate the chunk to this.
@@ -177,59 +174,7 @@ pub fn parse_relayack(data: &[u8]) -> Option<(u16, u8)> {
     Some((msgid, bitmap))
 }
 
-// ---- RELAY2 / RELAYACK2 (#13 multi-hop) -----------------------------------
-
-/// Encode a RELAY2 fragment `"SMOLv1 RELAY2 OOO MMMMM H F C " + <chunk>` into `out`; returns total
-/// length (30-byte header + chunk). `OOO` = ORIGIN id, `H` = 1-digit hop-limit.
-pub fn encode_relay2(origin: u8, msgid: u16, hop: u8, frag: u8, count: u8, chunk: &[u8], out: &mut [u8]) -> usize {
-    let mut n = 0;
-    out[..RELAY2_PREFIX.len()].copy_from_slice(RELAY2_PREFIX);
-    n += RELAY2_PREFIX.len();
-    out[n] = b'0' + (origin / 100) % 10;
-    out[n + 1] = b'0' + (origin / 10) % 10;
-    out[n + 2] = b'0' + origin % 10;
-    n += 3;
-    out[n] = b' ';
-    n += 1;
-    write_u5(msgid as u32, &mut out[n..]);
-    n += 5;
-    out[n] = b' ';
-    n += 1;
-    out[n] = b'0' + hop;
-    n += 1;
-    out[n] = b' ';
-    n += 1;
-    out[n] = b'0' + frag;
-    n += 1;
-    out[n] = b' ';
-    n += 1;
-    out[n] = b'0' + count;
-    n += 1;
-    out[n] = b' ';
-    n += 1;
-    let len = chunk.len().min(RELAY_CHUNK);
-    out[n..n + len].copy_from_slice(&chunk[..len]);
-    n + len
-}
-
-/// Parse a RELAY2 frame into `(origin, msgid, hop, frag, count, chunk)`, or `None`.
-// Mirrors `parse_relay`'s tuple shape + the one `hop` field; the caller destructures immediately.
-#[allow(clippy::type_complexity)]
-pub fn parse_relay2(data: &[u8]) -> Option<(u8, u16, u8, u8, u8, &[u8])> {
-    let rest = data.strip_prefix(RELAY2_PREFIX)?;
-    if rest.len() < 16 {
-        return None;
-    }
-    let origin = parse_id(&rest[0..3])?;
-    let msgid = u16::try_from(parse_u5(&rest[4..9])?).ok()?;
-    if !rest[10].is_ascii_digit() || !rest[12].is_ascii_digit() || !rest[14].is_ascii_digit() {
-        return None;
-    }
-    let hop = rest[10] - b'0';
-    let frag = rest[12] - b'0';
-    let count = rest[14] - b'0';
-    Some((origin, msgid, hop, frag, count, &rest[16..]))
-}
+// ---- RELAYACK2 (#124/#13 flooded ACK — kept; RELAY2 removed, UP2 replaces it) ----------------
 
 /// Encode a `"SMOLv1 RELAYACK2 TTT MMMMM BBB H"` frame into `out`; returns length (32).
 pub fn encode_relayack2(target: u8, msgid: u16, bitmap: u8, hop: u8, out: &mut [u8]) -> usize {
@@ -280,36 +225,28 @@ pub fn synth_origin_mac(origin: u8) -> [u8; 6] {
     [0, 0, 0, 0, 0, origin]
 }
 
-// ---- UP2 generic uplink envelope (#124 — REPLACES RELAY2) ------------------
-// wip (Stage 1a): the codec + host tests land here host-verified but UNWIRED in the clock crate
-// (mode.rs still emits RELAY2). The allow(dead_code)s below DROP in Stage 1b when mode.rs migrates
-// RELAY2→UP2 + removes the RELAY2 codec — then the -D warnings gate applies. relay_compat (a
-// separate crate) exercises these NOW via #[path], so byte-format regressions are caught immediately.
-//
+// ---- UP2 generic uplink envelope (#124 — REPLACED RELAY2) -----------------
 // `SMOLv1 UP2 ` + `"OOO MMMMM H "` + <verbatim inner SMOLv1 frame (RELAY/STAT/DIAG/SCAN)>. A latched
 // leaf wraps ANY uplink frame so a stranded leaf's observability (/stat /diag /scan) reaches the
 // gateway via the relay — RELAY2 could only carry telemetry. `OOO` = origin id; `MMMMM` = the
 // ENVELOPE msgid (per-origin rolling, the FLOOD-DEDUP key — DISTINCT from any inner RELAY msgid,
 // which stays the reassembly/ACK key); `H` = hop-limit. Old firmware classify()s UP2 → None
 // (harmless) + can't relay anyway → no flag-day (a leaf needing H≥2 was already stranded pre-#13).
+// Host-tested in experiments/relay_compat (golden bytes + wrap→unwrap→re-parse-inner + clamp).
 
 /// Max ESP-NOW payload (bytes) — a frame MUST NOT exceed this on the wire.
-#[allow(dead_code)]
 pub const ESP_NOW_MTU: usize = 250;
 /// UP2 envelope overhead: prefix `"SMOLv1 UP2 "` (11) + header `"OOO MMMMM H "` (12) = 23 B.
-#[allow(dead_code)]
 pub const UP2_OVERHEAD: usize = UP2_PREFIX.len() + 12;
 /// Max inner frame a latched leaf may wrap so UP2 fits [`ESP_NOW_MTU`]: 250 − 23 = 227.
 /// `encode_up2` CLAMPS the inner to this + never emits > MTU. For a prefix-tolerant inner
 /// (DIAG/SCAN are `key=val`), clamping truncates the TAIL fields — the record still parses; the
 /// tail that falls off (cfg=/io=/dlseq=/dfwd=, appended last) matters less than the record arriving.
-#[allow(dead_code)]
 pub const UP2_INNER_MAX: usize = ESP_NOW_MTU - UP2_OVERHEAD;
 
 /// Encode a UP2 envelope: `"SMOLv1 UP2 " + "OOO MMMMM H " + <inner>`; returns total length (≤ MTU).
 /// `env_msgid` is the envelope's own per-origin rolling counter (flood dedup). The inner is CLAMPED
 /// to [`UP2_INNER_MAX`] so the frame never exceeds [`ESP_NOW_MTU`] (constraint: never emit > MTU).
-#[allow(dead_code)]
 pub fn encode_up2(origin: u8, env_msgid: u16, hop: u8, inner: &[u8], out: &mut [u8]) -> usize {
     let mut n = 0;
     out[..UP2_PREFIX.len()].copy_from_slice(UP2_PREFIX);
@@ -335,7 +272,6 @@ pub fn encode_up2(origin: u8, env_msgid: u16, hop: u8, inner: &[u8], out: &mut [
 
 /// Parse a UP2 envelope into `(origin, env_msgid, hop, inner)`, or `None`. `inner` borrows `data` —
 /// the verbatim inner SMOLv1 frame, which the caller re-runs through `parse_frame` + dispatches.
-#[allow(dead_code)]
 pub fn parse_up2(data: &[u8]) -> Option<(u8, u16, u8, &[u8])> {
     let rest = data.strip_prefix(UP2_PREFIX)?;
     // "OOO MMMMM H " = 12 header bytes (origin 3, sp, env_msgid 5, sp, hop 1, sp), then the inner frame.

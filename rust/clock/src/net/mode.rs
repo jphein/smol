@@ -128,16 +128,12 @@ const BEACON_PREFIX: &[u8] = b"SMOLv1 BEACON "; // + "NNN SSSSS EEEEE"
 /// on a private fixed channel; harden with a signed payload or an ESP-NOW LMK
 /// if it ever matters. Documented, not defended.
 const TIME_PREFIX: &[u8] = b"SMOLv1 TIME "; // + "NNN UUUUUUUUUU SSSSSSSSSS"
-// #13: the RELAY / RELAYACK / RELAY2 / RELAYACK2 wire TAGS + their whole codec live in the
+// #13/#124: the RELAY / RELAYACK / UP2 / RELAYACK2 wire TAGS + their whole codec live in the
 // pure, host-testable `net::wire` module (glob-imported above — RELAY carries a leaf-telemetry
-// fragment; RELAYACK the gateway's fragment-bitmap; RELAY2/RELAYACK2 the #13 multi-hop variants,
-// NEW tags an old firmware classifies to None → no flag-day). The `*_FRAME_MAX` buffer-size
-// consts stay here — they size call-site stack buffers in this module, not the codec.
-/// Max RELAY2 frame length on the wire (30-byte header + full chunk); sizes stack buffers.
-/// Header = 14-byte prefix + "OOO MMMMM H F C " (16) = 30, vs RELAY's 27 (the extra 3 =
-/// the origin↔src split's `H ` hop field; `OOO` is the ORIGIN id, distinct from the
-/// re-broadcasting relay's own src MAC).
-const RELAY2_FRAME_MAX: usize = 30 + RELAY_CHUNK;
+// fragment; RELAYACK the gateway's fragment-bitmap; UP2 the #124 generic uplink ENVELOPE that
+// wraps ANY inner frame from a stranded leaf (subsumes the retired RELAY2), RELAYACK2 the
+// flooded-back ACK — NEW tags an old firmware classifies to None → no flag-day). The
+// `*_FRAME_MAX`/`ESP_NOW_MTU` buffer-size consts size call-site stack buffers in this module.
 /// Max RELAYACK2 frame length ("SMOLv1 RELAYACK2 " + "TTT MMMMM BBB H" = 32); rounded up.
 const RELAYACK2_FRAME_MAX: usize = 40;
 /// Battery-downlink tag: the 12-B `"SMOLv1 BATT "` (trailing space, mirroring TIME)
@@ -435,18 +431,17 @@ enum Frame<'a> {
     /// A gateway's acknowledgement of a relay message: the `msgid` and the u8
     /// bitmap of fragments received so far, so the leaf resends only the gaps.
     RelayAck { msgid: u16, bitmap: u8 },
-    /// #13 multi-hop: one fragment of a STRANDED leaf's telemetry uplink, carrying the
-    /// true `origin` id (stamped by the source, survives forwarding — unlike `src_mac`,
-    /// which is the last relay) and a hop-limit `hop` (decremented at each forward,
-    /// dropped at ≤ 1 by a non-gateway). Otherwise identical to `Relay`. `chunk` borrows
-    /// the RX buffer. Emitted only by an escalated leaf + re-broadcast by relays.
-    Relay2 {
+    /// #124 UP2 generic uplink envelope from a STRANDED leaf: the true `origin` id (stamped by the
+    /// source, survives forwarding — unlike `src_mac`, the last relay), the envelope's own
+    /// `env_msgid` (per-origin rolling — the FLOOD-DEDUP key, distinct from any inner RELAY msgid),
+    /// a hop-limit `hop` (decremented per forward, dropped at ≤ 1 by a non-gateway), and the verbatim
+    /// `inner` SMOLv1 frame (RELAY/STAT/DIAG/SCAN — `inner` borrows the RX buffer). The gateway
+    /// unwraps + re-dispatches `inner`. Emitted only by an escalated leaf + re-broadcast by relays.
+    Up2 {
         origin: u8,
-        msgid: u16,
+        env_msgid: u16,
         hop: u8,
-        frag: u8,
-        count: u8,
-        chunk: &'a [u8],
+        inner: &'a [u8],
     },
     /// #13 multi-hop: the gateway's flooded-back ACK for a `Relay2` message (R1,
     /// table-free) — `target` = the origin leaf to ACK, `msgid` + `bitmap` as `RelayAck`,
@@ -1449,16 +1444,21 @@ struct Relay {
     /// retransmits so a message is never enqueued (UDP-delivered) twice (finding 3).
     done: [Option<([u8; 6], u16)>; DONE_RING],
     done_cursor: usize,
-    /// #13 relay-role: the `(origin, msgid, frag)` loop/dup guard for FORWARDING inbound
-    /// `RELAY2` frames. Only a NON-gateway consults it (the gateway reassembles + dedups
-    /// via its own `reasm`/`done`, so it never marks a frame "seen" — else a lost-ACK
-    /// retransmit would be dropped before it could be re-ACKed). See `net/flood.rs`.
+    /// #13 relay-role: the `(origin, env_msgid, 0)` loop/dup guard for FORWARDING inbound `UP2`
+    /// envelopes (#124: keyed on the envelope msgid; each UP2 is one atomic frame so `frag`=0). Only
+    /// a NON-gateway consults it (the gateway reassembles + dedups via its own `reasm`/`done`, so it
+    /// never marks a frame "seen" — else a lost-ACK retransmit would be dropped before it could be
+    /// re-ACKed). See `net/flood.rs`.
     seen: crate::net::flood::SeenSet,
     /// #13 leaf-role: the single-hop⇄multi-hop escalation state machine. Stays inert
     /// (single-hop, byte-identical) until this leaf's telemetry goes fully un-ACKed
-    /// (`relay_retransmit` exhaust) — then it latches `RELAY2` at `MAX_HOP` and probes
+    /// (`relay_retransmit` exhaust / supersession) — then it latches `UP2` at `MAX_HOP` and probes
     /// its way back down. See `net/flood.rs`.
     latch: crate::net::flood::HopLatch,
+    /// #124 leaf-role: the envelope's own per-origin rolling msgid — bumped once per `UP2` emitted
+    /// (each inner frame / RELAY fragment gets a unique one), the FLOOD-DEDUP key. DISTINCT from the
+    /// inner RELAY `msgid` (`tx.msgid`), which stays the reassembly/RELAYACK2 key. Wraps like `next_msgid`.
+    up_env_msgid: u16,
 }
 
 impl Relay {
@@ -1476,6 +1476,7 @@ impl Relay {
             done_cursor: 0,
             seen: crate::net::flood::SeenSet::new(),
             latch: crate::net::flood::HopLatch::new(),
+            up_env_msgid: 0,
         }
     }
 
@@ -2953,17 +2954,27 @@ impl RadioManager {
                 || now.saturating_sub(self.relay.last_emit_ms) >= RELAY_EMIT_INTERVAL_MS)
     }
 
-    /// #13: emit ONE fragment of OUR OWN uplink at the message's chosen framing.
-    /// `hop <= 1` → plain `RELAY` (the byte-identical single-hop case AND the `H=1`
-    /// un-latch probe); `hop > 1` → `RELAY2` (origin-stamped, hop-limited, forwarded by
-    /// relays). The chunk is copied into a LOCAL frame buffer BEFORE `send_to`, so no
-    /// borrow of `self.relay` is held across the `&mut self` send.
+    /// #124: emit ONE fragment of OUR OWN uplink at the message's chosen framing.
+    /// `hop <= 1` → plain `RELAY` (the byte-identical single-hop case AND the `H=1` un-latch probe);
+    /// `hop > 1` → the fragment's plain `RELAY` frame WRAPPED in a `UP2` envelope (origin-stamped,
+    /// hop-limited, forwarded by relays). Each wrapped fragment gets a FRESH per-origin envelope
+    /// msgid (the flood-dedup key — distinct from the inner RELAY `msgid`, which stays the gateway's
+    /// reassembly/RELAYACK2 key); a fresh env_msgid per (re)send means a retransmit is re-forwarded
+    /// (the relay's seen-set doesn't suppress it — closing #13's single-relay retransmit gap). The
+    /// inner + frame are built into LOCAL buffers before `send_to`, so no borrow of `self.relay` is
+    /// held across the `&mut self` send.
     fn relay_send_frag(&mut self, msgid: u16, hop: u8, frag: u8, count: u8, off: usize, end: usize) {
-        let mut fb = [0u8; RELAY2_FRAME_MAX];
+        let mut fb = [0u8; ESP_NOW_MTU];
         let len = if hop <= 1 {
             encode_relay(self.id, msgid, frag, count, &self.relay.tx.buf[off..end], &mut fb)
         } else {
-            encode_relay2(self.id, msgid, hop, frag, count, &self.relay.tx.buf[off..end], &mut fb)
+            // Build the inner plain RELAY, then wrap it in UP2 with a fresh envelope msgid.
+            let mut inner = [0u8; 96]; // RELAY frame ≤ 27-byte header + RELAY_CHUNK(64) = 91
+            let ilen =
+                encode_relay(self.id, msgid, frag, count, &self.relay.tx.buf[off..end], &mut inner);
+            let env_msgid = self.relay.up_env_msgid;
+            self.relay.up_env_msgid = self.relay.up_env_msgid.wrapping_add(1);
+            encode_up2(self.id, env_msgid, hop, &inner[..ilen], &mut fb)
         };
         self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
     }
@@ -4296,67 +4307,70 @@ impl RadioManager {
                     self.relay.latch.on_direct_ack();
                     label = Some(alloc::format!("ack {:05}", msgid));
                 }
-                Some(Frame::Relay2 { origin, msgid, hop, frag, count, chunk }) => {
-                    // #13 multi-hop uplink fragment. Proves the SENDER (the last relay, or the
-                    // origin itself) is audible (LED detected + roster, attributed to `origin`).
+                Some(Frame::Up2 { origin, env_msgid, hop, inner }) => {
+                    // #124 multi-hop uplink ENVELOPE. Proves the SENDER (last relay, or the origin)
+                    // is audible (LED detected + roster, attributed to `origin`).
                     self.peers.last_hello_ms = now;
                     self.roster.heard(src, Some(origin), rssi, now);
                     if origin == self.id {
-                        // Our OWN frame echoed back by a relay — never re-forward or reassemble it
-                        // (that would count as a bogus fwd + could loop). Just drop it.
-                        label = Some(alloc::format!("relay2 self {:03}", origin));
-                    } else if self.relay.is_gateway {
-                        // GATEWAY = the flood's sink. Reassemble keyed by ORIGIN (a synthetic MAC
-                        // `00:00:00:00:00:<origin>`), NOT `src` — `src` is the last relay's MAC, but
-                        // reassembly + late-retransmit dedup must key on the true source. We do NOT
-                        // consult the seen-set here: `accept()` + `DONE_RING` already dedup
-                        // fragments/retransmits, and a seen-set drop would kill a lost-RELAYACK2
-                        // retransmit's re-ACK (the single-hop path's finding 3, one hop out). On each
-                        // accepted fragment, FLOOD a RELAYACK2 back toward the origin (R1, table-free)
-                        // carrying the cumulative bitmap so the stranded leaf learns completion.
-                        let synth = synth_origin_mac(origin);
-                        let (bitmap, complete) =
-                            self.relay.accept(synth, (origin, msgid, frag, count), chunk, now);
-                        self.flood_relayack2(origin, msgid, bitmap);
-                        label = Some(if complete {
-                            alloc::format!("relay2 {:03} ok", origin)
+                        // Our OWN envelope echoed back by a relay — never re-forward/reassemble it
+                        // (bogus fwd + could loop). Just drop it.
+                        label = Some(alloc::format!("up2 self {:03}", origin));
+                    } else if let Some((_sid, imsgid, frag, count, chunk)) = parse_relay(inner) {
+                        // 1b: the inner is a plain RELAY (the RELAY2-subsuming case). `imsgid` is the
+                        // INNER RELAY msgid — the reassembly/ACK key, distinct from the envelope msgid.
+                        if self.relay.is_gateway {
+                            // GATEWAY sink: reassemble keyed by ORIGIN (synthetic MAC), NOT `src` (the
+                            // last relay). accept()+DONE_RING dedup fragments/retransmits, so we do NOT
+                            // consult the seen-set here (a seen-set drop would kill a lost-ACK
+                            // retransmit's re-ACK). On each accepted fragment flood a RELAYACK2 back
+                            // toward the origin (R1) carrying the cumulative bitmap, keyed on `imsgid`.
+                            let synth = synth_origin_mac(origin);
+                            let (bitmap, complete) =
+                                self.relay.accept(synth, (origin, imsgid, frag, count), chunk, now);
+                            self.flood_relayack2(origin, imsgid, bitmap);
+                            label = Some(if complete {
+                                alloc::format!("up2 {:03} ok", origin)
+                            } else {
+                                alloc::format!("up2 {:03} {}/{}", origin, bitmap.count_ones(), count)
+                            });
                         } else {
-                            alloc::format!("relay2 {:03} {}/{}", origin, bitmap.count_ones(), count)
-                        });
-                    } else {
-                        // RELAY role: the seen-set-gated forward. `forward_decision` (pure) picks
-                        // the fate from (is_gateway=false, hop, already-seen `(origin,msgid,frag)`).
-                        let seen = self.relay.seen.seen_or_insert(origin, msgid, frag);
-                        match crate::net::flood::forward_decision(false, hop, seen) {
-                            crate::net::flood::ForwardAction::Forward { hop: next_hop } => {
-                                self.diag.fwd = self.diag.fwd.saturating_add(1);
-                                // Re-broadcast at the decremented hop. `chunk` borrows the RX buffer;
-                                // it's copied into the local frame buffer before the `&mut self` send.
-                                let mut fb = [0u8; RELAY2_FRAME_MAX];
-                                let len =
-                                    encode_relay2(origin, msgid, next_hop, frag, count, chunk, &mut fb);
-                                self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
-                                // Rate-limited serial trace (the forward path was previously OLED-only —
-                                // a rig watching serial saw the fwd counter climb with no log). Every 8th.
-                                if self.diag.fwd.is_multiple_of(8) {
-                                    log::info!(
-                                        "smol #13: fwd {} (origin {:03} msgid {} frag {} -> h{})",
-                                        self.diag.fwd, origin, msgid, frag, next_hop
-                                    );
+                            // RELAY role: seen-set-gated forward, keyed on the ENVELOPE msgid
+                            // `(origin, env_msgid, 0)` — each UP2 is one atomic frame (frag dimension
+                            // is absorbed into env_msgid, which is unique per emitted/retransmitted UP2).
+                            let seen = self.relay.seen.seen_or_insert(origin, env_msgid, 0);
+                            match crate::net::flood::forward_decision(false, hop, seen) {
+                                crate::net::flood::ForwardAction::Forward { hop: next_hop } => {
+                                    self.diag.fwd = self.diag.fwd.saturating_add(1);
+                                    // Re-wrap the SAME inner verbatim at hop-1 (env_msgid preserved).
+                                    // `inner` borrows the RX buffer; copied into `fb` before the send.
+                                    let mut fb = [0u8; ESP_NOW_MTU];
+                                    let len = encode_up2(origin, env_msgid, next_hop, inner, &mut fb);
+                                    self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+                                    if self.diag.fwd.is_multiple_of(8) {
+                                        log::info!(
+                                            "smol #124: fwd {} (origin {:03} env_msgid {} -> h{})",
+                                            self.diag.fwd, origin, env_msgid, next_hop
+                                        );
+                                    }
+                                    label = Some(alloc::format!("fwd {:03} h{}", origin, next_hop));
                                 }
-                                label = Some(alloc::format!("fwd {:03} h{} f{}", origin, next_hop, frag));
+                                crate::net::flood::ForwardAction::DedupDrop => {
+                                    self.diag.dedup = self.diag.dedup.saturating_add(1);
+                                    label = Some(alloc::format!("dedup {:03}", origin));
+                                }
+                                crate::net::flood::ForwardAction::TtlDrop => {
+                                    self.diag.ttl = self.diag.ttl.saturating_add(1);
+                                    label = Some(alloc::format!("ttl {:03}", origin));
+                                }
+                                // Reassemble is only returned for is_gateway=true (handled above).
+                                crate::net::flood::ForwardAction::Reassemble => {}
                             }
-                            crate::net::flood::ForwardAction::DedupDrop => {
-                                self.diag.dedup = self.diag.dedup.saturating_add(1);
-                                label = Some(alloc::format!("dedup {:03}", origin));
-                            }
-                            crate::net::flood::ForwardAction::TtlDrop => {
-                                self.diag.ttl = self.diag.ttl.saturating_add(1);
-                                label = Some(alloc::format!("ttl {:03}", origin));
-                            }
-                            // Reassemble is only returned for is_gateway=true (handled above).
-                            crate::net::flood::ForwardAction::Reassemble => {}
                         }
+                    } else {
+                        // Stage 2: a non-RELAY inner (STAT/DIAG/SCAN) — full parse_frame + dispatch to
+                        // the caches lands next stage; for 1b it's dropped (only RELAY is wrapped yet).
+                        label = Some(alloc::format!("up2 {:03} non-relay", origin));
                     }
                 }
                 Some(Frame::RelayAck2 { target, msgid, bitmap, hop }) => {
@@ -4855,12 +4869,11 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
     if let Some((msgid, bitmap)) = parse_relayack(data) {
         return Some(Frame::RelayAck { msgid, bitmap });
     }
-    // #13 multi-hop variants. Order vs RELAY/RELAYACK is moot — `strip_prefix` is exact and
-    // the `2` at the disambiguating byte makes base + variant mutually exclusive — but keep
-    // them adjacent to their base tag. A plain-RELAY frame never matches RELAY2 (byte 12 is
-    // ' ' not '2') and vice-versa, so a non-escalated leaf's frames stay byte-identical.
-    if let Some((origin, msgid, hop, frag, count, chunk)) = parse_relay2(data) {
-        return Some(Frame::Relay2 { origin, msgid, hop, frag, count, chunk });
+    // #124 multi-hop variants. Order vs RELAY/RELAYACK is moot — `strip_prefix` is exact and UP2
+    // diverges from RELAY at byte 7 (`'U'` vs `'R'`), RELAYACK2 from RELAYACK at byte 15 — so a
+    // non-escalated leaf's plain frames never mis-classify (byte-identical) and vice-versa.
+    if let Some((origin, env_msgid, hop, inner)) = parse_up2(data) {
+        return Some(Frame::Up2 { origin, env_msgid, hop, inner });
     }
     if let Some((target, msgid, bitmap, hop)) = parse_relayack2(data) {
         return Some(Frame::RelayAck2 { target, msgid, bitmap, hop });

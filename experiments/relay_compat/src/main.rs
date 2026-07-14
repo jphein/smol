@@ -84,18 +84,8 @@ fn main() {
     let an = wire::encode_relayack(12345, 3, &mut ab);
     assert_eq!(&ab[..an], old_ack, "encode_relayack golden wire bytes");
 
-    // #13 tag round-trips + DISAMBIGUATION (the no-flag-day guarantee) ------------------------
-    // A RELAY2 frame must NEVER classify as a plain RELAY (old fw would mis-read it), and a plain
-    // RELAY must never classify as RELAY2. Same for RELAYACK/RELAYACK2.
-    let mut r2 = [0u8; 128];
-    let r2n = wire::encode_relay2(9, 42, 2, 1, 2, b"hi", &mut r2);
-    assert!(wire::parse_relay(&r2[..r2n]).is_none(), "RELAY2 must NOT parse as plain RELAY");
-    assert_eq!(
-        wire::parse_relay2(&r2[..r2n]).unwrap(),
-        (9, 42, 2, 1, 2, &b"hi"[..]),
-        "RELAY2 round-trip"
-    );
-    assert!(wire::parse_relay2(&fb[..n2]).is_none(), "plain RELAY must NOT parse as RELAY2");
+    // #13/#124 RELAYACK2 round-trip + DISAMBIGUATION (the no-flag-day guarantee) --------------
+    // (RELAY2 is retired — replaced by UP2 below; RELAYACK2 stays as the flooded ACK.)
     // the gateway's origin-keyed reassembly MAC (never aliases a real Espressif MAC).
     assert_eq!(wire::synth_origin_mac(9), [0, 0, 0, 0, 0, 9], "synth_origin_mac layout");
 
@@ -135,9 +125,8 @@ fn main() {
     assert_eq!((rid, rmid, rfrag, rcnt, rchunk), (7, 100, 0, 1, &b"cpu=42"[..]), "inner RELAY round-trip");
     // envelope msgid (5) is DISTINCT from the inner RELAY msgid (100) — the two-layer contract.
     assert_ne!(em, rmid, "envelope msgid != inner RELAY msgid (flood-dedup vs reassembly layers)");
-    // disambiguation: UP2 must NOT classify as RELAY/RELAY2, and vice-versa.
+    // disambiguation: UP2 must NOT classify as a plain RELAY, and vice-versa.
     assert!(wire::parse_relay(&up[..upn]).is_none(), "UP2 must NOT parse as plain RELAY");
-    assert!(wire::parse_relay2(&up[..upn]).is_none(), "UP2 must NOT parse as RELAY2");
     assert!(wire::parse_up2(&fb[..n]).is_none(), "a plain RELAY must NOT parse as UP2");
     // CONSTRAINT 1: a max inner is clamped so the envelope never exceeds ESP_NOW_MTU.
     let big_inner = [b'z'; 240];
