@@ -11,24 +11,30 @@ use flood::{
 };
 
 fn main() {
-    // --- SeenSet ----------------------------------------------------------
+    // --- SeenSet (keyed per-FRAGMENT: origin, msgid, frag) ----------------
     let mut s = SeenSet::new();
-    assert!(!s.contains(7, 100), "empty");
-    assert!(!s.seen_or_insert(7, 100), "first sight is new");
-    assert!(s.contains(7, 100), "recorded");
-    assert!(s.seen_or_insert(7, 100), "second sight is a dup");
-    assert!(!s.seen_or_insert(7, 101), "diff msgid is new");
-    assert!(!s.seen_or_insert(8, 100), "diff origin is new");
+    assert!(!s.contains(7, 100, 0), "empty");
+    assert!(!s.seen_or_insert(7, 100, 0), "first sight is new");
+    assert!(s.contains(7, 100, 0), "recorded");
+    assert!(s.seen_or_insert(7, 100, 0), "second sight is a dup");
+    assert!(!s.seen_or_insert(7, 101, 0), "diff msgid is new");
+    assert!(!s.seen_or_insert(8, 100, 0), "diff origin is new");
+    // REGRESSION (the multi-fragment bug): a DIFFERENT fragment of the SAME message is
+    // NOT a dup — else a relay drops frags 1..N and the gateway never reassembles a
+    // multi-fragment message. Each fragment must be independently forward-once.
+    assert!(!s.seen_or_insert(7, 100, 1), "frag 1 of a seen message is NEW (multi-frag)");
+    assert!(!s.seen_or_insert(7, 100, 2), "frag 2 of a seen message is NEW (multi-frag)");
+    assert!(s.seen_or_insert(7, 100, 1), "re-heard frag 1 is a dup");
     // idempotent insert doesn't consume extra ring slots
-    s.insert(7, 100);
-    s.insert(7, 100);
+    s.insert(7, 100, 0);
+    s.insert(7, 100, 0);
     // drop-oldest overflow: fill past capacity, the earliest ages out.
     let mut r = SeenSet::new();
     for m in 0..(SEEN_RING as u16 + 5) {
-        assert!(!r.seen_or_insert(1, m), "each new msgid is new on insert");
+        assert!(!r.seen_or_insert(1, m, 0), "each new msgid is new on insert");
     }
-    assert!(!r.contains(1, 0), "oldest (msgid 0) aged out after overflow");
-    assert!(r.contains(1, SEEN_RING as u16 + 4), "newest retained");
+    assert!(!r.contains(1, 0, 0), "oldest (msgid 0) aged out after overflow");
+    assert!(r.contains(1, SEEN_RING as u16 + 4, 0), "newest retained");
 
     // --- forward_decision -------------------------------------------------
     // already-seen → DedupDrop regardless of role/hop.

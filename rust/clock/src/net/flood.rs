@@ -21,27 +21,34 @@
 //! byte-identical to today (the canary proves it: `fwd=0` on every node). Multi-hop
 //! only engages for a genuinely-stranded leaf (see [`HopLatch`]).
 
-// wip: this module is committed host-tested but UNWIRED (the mode.rs wiring lands in the
-// next commit). Until then its items are unused in-crate → suppress dead_code so the wip
-// build is clean. DROP THIS ATTR in the wiring commit (the -D warnings PR gate then applies).
-#![allow(dead_code)]
-
 /// v1 hop ceiling: a stranded leaf originates `RELAY2` at this `H`; one relay hop
 /// decrements it to 1 and delivers to the gateway. 3-hop (`>2`) is a follow-up.
 pub const MAX_HOP: u8 = 2;
 
-/// Capacity of the `(origin, msgid)` seen-set ring. Sized to comfortably cover the
-/// in-flight window across the small fleet (a few origins × their recent msgids);
-/// drop-oldest on overflow. Small fixed `.bss`, no alloc.
+/// Capacity of the `(origin, msgid, frag)` seen-set ring. Sized to comfortably cover
+/// the in-flight window across the small fleet (a few origins × their recent msgids ×
+/// up to `RELAY_MAX_FRAGS` fragments each); drop-oldest on overflow. Small fixed `.bss`,
+/// no alloc. 16 slots ≈ 4 fully-fragmented messages in flight — ample for the stranded
+/// single-leaf case #13 v1 targets.
 pub const SEEN_RING: usize = 16;
 
-/// A bounded ring of recently-seen `(origin_id, msgid)` — the loop/dup guard that
-/// makes the flood terminate. DISTINCT from `mode.rs`'s `DONE_RING` (keyed on
+/// A bounded ring of recently-seen `(origin_id, msgid, frag)` — the loop/dup guard
+/// that makes the flood terminate. DISTINCT from `mode.rs`'s `DONE_RING` (keyed on
 /// `(src_mac, msgid)` for post-completion re-ACK dedup): `src_mac` changes at every
 /// hop, but `origin_id` is stamped by the true source and survives forwarding, so
-/// only an `(origin, msgid)` key can recognise "I already forwarded this message".
+/// only an origin-anchored key can recognise "I already forwarded this frame".
+///
+/// KEYED PER-FRAGMENT (`frag` included): a RELAY message is FRAGMENTED — every
+/// fragment rides its own frame sharing the message `msgid` (telemetry > `RELAY_CHUNK`
+/// spans 2+ frames). A per-`(origin, msgid)` key would mark the whole message "seen"
+/// on fragment 0 and a relay would then DROP fragments 1..N → the gateway could never
+/// reassemble a multi-fragment message. `frag` in the key makes each fragment
+/// independently forward-once. (A relay's per-frame forward mirrors the leaf's
+/// per-frame broadcast; the gateway reassembles from the forwarded frames + dedups
+/// late retransmits via its own `DONE_RING`, so the gateway never consults this set —
+/// see the RELAY2 service arm.)
 pub struct SeenSet {
-    ring: [Option<(u8, u16)>; SEEN_RING],
+    ring: [Option<(u8, u16, u8)>; SEEN_RING],
     cursor: usize,
 }
 
@@ -50,28 +57,29 @@ impl SeenSet {
         Self { ring: [None; SEEN_RING], cursor: 0 }
     }
 
-    /// True if `(origin, msgid)` is already in the ring.
-    pub fn contains(&self, origin: u8, msgid: u16) -> bool {
-        self.ring.contains(&Some((origin, msgid)))
+    /// True if `(origin, msgid, frag)` is already in the ring.
+    pub fn contains(&self, origin: u8, msgid: u16, frag: u8) -> bool {
+        self.ring.contains(&Some((origin, msgid, frag)))
     }
 
-    /// Record `(origin, msgid)` (drop-oldest on overflow). Idempotent — recording an
-    /// already-present key is a no-op (keeps the ring from filling with dups).
-    pub fn insert(&mut self, origin: u8, msgid: u16) {
-        if self.contains(origin, msgid) {
+    /// Record `(origin, msgid, frag)` (drop-oldest on overflow). Idempotent — recording
+    /// an already-present key is a no-op (keeps the ring from filling with dups).
+    pub fn insert(&mut self, origin: u8, msgid: u16, frag: u8) {
+        if self.contains(origin, msgid, frag) {
             return;
         }
-        self.ring[self.cursor] = Some((origin, msgid));
+        self.ring[self.cursor] = Some((origin, msgid, frag));
         self.cursor = (self.cursor + 1) % SEEN_RING;
     }
 
-    /// Atomic "have I seen this?" + record. Returns true if it was ALREADY seen
-    /// (caller drops as a dup); false if it's new (caller processes + it's now recorded).
-    pub fn seen_or_insert(&mut self, origin: u8, msgid: u16) -> bool {
-        if self.contains(origin, msgid) {
+    /// Atomic "have I seen this fragment?" + record. Returns true if it was ALREADY
+    /// seen (caller drops as a dup); false if it's new (caller processes + it's now
+    /// recorded).
+    pub fn seen_or_insert(&mut self, origin: u8, msgid: u16, frag: u8) -> bool {
+        if self.contains(origin, msgid, frag) {
             return true;
         }
-        self.insert(origin, msgid);
+        self.insert(origin, msgid, frag);
         false
     }
 }
