@@ -69,3 +69,25 @@ pub const DEFAULT_APP: AppKind = AppKind::Menu;
 ///   * Grid: 0 = breakdown (total / L1 / L2); 1 = BIG total power (full window).
 ///   * Clock / Snake / Bench / MeshSnake / About / Menu: no pages → ignored.
 pub const DEFAULT_PAGE: u8 = 0;
+
+/// #13 MESH-TEST rig (`--features mesh-test` ONLY): the MACs this board pretends it
+/// CANNOT hear. Inbound frames whose source MAC is in this list are silently dropped at
+/// the very top of `RadioManager::service()` — faithfully simulating "out of RF range" so
+/// the 3-board fleet forces a 2-hop topology (G→R→F) to validate routed multi-hop without
+/// physical RF attenuation (see `scratch/smol-dreamteam/13-rig-design.md`). Empty = normal.
+///
+/// TEST SCAFFOLDING, per-board (like `NODE_ID`): to force `F` deaf to gateway `G`, set this
+/// on board `F`'s git-ignored `board.rs` to `[Some(<G's MAC>), None, None, None]`, and the
+/// reciprocal on `G`. Read each board's MAC off its Bench screen / serial. DIAG surfaces
+/// `deaf=<n>` / `ddrops=<n>` so a leftover entry is visible in HA — clear it by re-flashing
+/// with an empty list. A production (non-`mesh-test`) build has NO deaf field or hook at all,
+/// so it can never be made deaf. NEVER commit real MACs — `board.rs` is git-ignored; this
+/// tracked template stays empty.
+///
+/// Example (board F deaf to gateway G at 24:6f:28:aa:bb:cc):
+/// ```ignore
+/// pub const DEAF_MACS: [Option<[u8; 6]>; 4] =
+///     [Some([0x24, 0x6f, 0x28, 0xaa, 0xbb, 0xcc]), None, None, None];
+/// ```
+#[cfg(feature = "mesh-test")]
+pub const DEAF_MACS: [Option<[u8; 6]>; 4] = [None; 4];

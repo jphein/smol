@@ -509,6 +509,10 @@ struct DiagCounters {
     fwd: u32,
     dedup: u32,
     ttl: u32,
+    /// #13 MESH-TEST rig ONLY: count of inbound frames dropped by the deaf-list (surfaced as
+    /// `ddrops=` in DIAG). A production build has no deaf-list, so this field doesn't exist.
+    #[cfg(feature = "mesh-test")]
+    ddrops: u32,
 }
 
 impl DiagCounters {
@@ -522,6 +526,8 @@ impl DiagCounters {
             fwd: 0,
             dedup: 0,
             ttl: 0,
+            #[cfg(feature = "mesh-test")]
+            ddrops: 0,
         }
     }
 }
@@ -1696,6 +1702,13 @@ pub struct RadioManager {
     /// still HELLO-scans when it is 0/stale/absent (the proven fallback). Sourced from `rx_control`,
     /// NOT the deliberately-sidestepped `esp_wifi_get_channel`.
     learned_channel: u8,
+    /// #13 MESH-TEST rig ONLY: MACs this board pretends it cannot hear. `service()` drops any
+    /// inbound frame from a listed source before it touches the roster/parse — a deterministic,
+    /// reproducible stand-in for physical RF attenuation that forces a 2-hop topology. Seeded
+    /// once from the per-board `board::DEAF_MACS`. Empty = normal. A production build has neither
+    /// this field nor the hook, so it can never be made deaf. See the `mesh-test` cargo feature.
+    #[cfg(feature = "mesh-test")]
+    deaf: [Option<[u8; 6]>; 4],
     /// #23 fix (oracle #1/#2): persistent staleness observation of the retained `MC`
     /// record — the last owner id + seq seen and when that pair was FIRST seen. A seq
     /// frozen past `MC_STALE_MS` marks the owner DEAD (takeover-able). Seeded into the
@@ -1848,6 +1861,8 @@ impl RadioManager {
             scan_locked: false,
             scan_idx: 0,
             learned_channel: 0, // #29: unknown until the first frame is heard
+            #[cfg(feature = "mesh-test")]
+            deaf: crate::board::DEAF_MACS, // #13 rig: baked per-board deaf-list (empty in prod)
 
             last_scan_hop_ms: 0,
             last_owner_heard_ms: 0,
@@ -2610,6 +2625,14 @@ impl RadioManager {
                 rec.push_str("|io=");
                 rec.push_str(io);
             }
+        }
+        // #13 MESH-TEST rig: surface the deaf-list state so a leftover entry is visible in HA at a
+        // glance (the anti-"won't-rejoin-ghost" guard) — `deaf` = active entries, `ddrops` = frames
+        // dropped by it. `mesh-test`-gated → the DIAG string is byte-identical on a production build.
+        #[cfg(feature = "mesh-test")]
+        {
+            let deaf_n = self.deaf.iter().flatten().count();
+            rec.push_str(&alloc::format!("|deaf={}|ddrops={}", deaf_n, self.diag.ddrops));
         }
         rec
     }
@@ -3961,6 +3984,15 @@ impl RadioManager {
             // eviction-immune and permanently burns a 16-slot LRU slot — the #28 ceiling too).
             // Drop our own frames before ANY handler (OTA dispatch + generic Frame parse below).
             if src == self.self_mac {
+                continue;
+            }
+            // #13 MESH-TEST rig: drop frames from a deaf-listed source BEFORE any handler
+            // (OTA dispatch, roster, parse) — a deterministic stand-in for "out of RF range"
+            // that forces a 2-hop topology. `ddrops` counts these so a leftover entry is
+            // visible in DIAG. Compiled out entirely in a production build (no `mesh-test`).
+            #[cfg(feature = "mesh-test")]
+            if self.deaf.iter().flatten().any(|m| *m == src) {
+                self.diag.ddrops = self.diag.ddrops.saturating_add(1);
                 continue;
             }
             // RSSI of this frame (dBm) from the ESP-NOW RX control info; used by
