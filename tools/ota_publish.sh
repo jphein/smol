@@ -44,7 +44,22 @@ ESPFLASH="${ESPFLASH:-$HOME/.cargo/bin/espflash}"
 # present (dotenv-style) and its values fill in the placeholders below, so operators don't
 # retype env overrides. Precedence: env file > a var the file leaves unset (pre-set env) >
 # placeholder default. Nothing real ever lives in this committed script.
-_OTA_ENV="$(dirname "${BASH_SOURCE[0]}")/ota_publish.env"
+_OTA_SELF_DIR="$(dirname "${BASH_SOURCE[0]}")"
+_OTA_ENV="$_OTA_SELF_DIR/ota_publish.env"
+# #128: the infra env is git-ignored, so it lives ONLY in the operator's MAIN checkout — a linked
+# git worktree (or a fresh clone) has no copy, and the tool then silently fell back to the
+# PLACEHOLDER broker (10.0.0.1). Resolve worktree-robustly: prefer a local tools/ota_publish.env,
+# else the MAIN worktree's copy via git-common-dir (its dir strips the trailing /.git). This makes
+# install AND the new ratchet-read reach the REAL broker from any worktree, resolved up-front (once,
+# before any mode runs) so every code path — install and stage — reads the identical $BROKER.
+if [ ! -f "$_OTA_ENV" ]; then
+  _OTA_COMMON="$(git -C "$_OTA_SELF_DIR" rev-parse --git-common-dir 2>/dev/null)" || _OTA_COMMON=""
+  case "$_OTA_COMMON" in
+    /*) _OTA_MAIN_ENV="${_OTA_COMMON%/.git}/tools/ota_publish.env"
+        [ -f "$_OTA_MAIN_ENV" ] && _OTA_ENV="$_OTA_MAIN_ENV" ;;
+    *)  : ;;  # empty (not a git dir) or relative (already IN the main tree) → nothing to fall back to
+  esac
+fi
 # shellcheck source=/dev/null  # operator-supplied, git-ignored, path known only at runtime
 [ -f "$_OTA_ENV" ] && . "$_OTA_ENV"
 OTA_HOST_SSH="${OTA_HOST_SSH:-<ssh-host>}"      # scp target (ssh alias for the image host)
