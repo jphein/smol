@@ -6,8 +6,9 @@
 mod flood;
 
 use flood::{
-    forward_decision, ForwardAction, HopLatch, SeenSet, ESCALATE_STREAK, MAX_HOP, PROBE_EVERY,
-    SEEN_RING, UNLATCH_STREAK,
+    forward_decision, ChannelPark, ForwardAction, HopLatch, SeenSet, ESCALATE_STREAK, MAX_HOP,
+    PARK_BURSTS_PER_DWELL, PARK_BURST_EVERY_MS, PARK_CHANNELS, PARK_DWELL_MS, PARK_SILENCE_MS,
+    PROBE_EVERY, SEEN_RING, UNLATCH_STREAK,
 };
 
 /// Drive a fresh latch into multi-hop the way a genuinely-stranded leaf does: ESCALATE_STREAK
@@ -120,5 +121,112 @@ fn main() {
     l3.on_direct_ack();
     assert!(!l3.latched());
 
-    println!("flood_verify: ALL CHECKS PASSED (SeenSet + forward_decision + HopLatch)");
+    // --- #126 ChannelPark: engage / disengage from the latch -------------
+    let mut p = ChannelPark::new();
+    assert!(!p.engaged(), "fresh park is inert");
+    assert_eq!(p.channel(), None, "idle ⇒ None ⇒ blind scan governs");
+    assert!(!p.should_burst(0), "idle never bursts");
+    p.on_feedback(0);
+    assert!(!p.engaged(), "feedback while idle is ignored (single-hop ACKs aren't park signals)");
+    // latched ⇒ engage, sweeping from candidate 0.
+    p.sync(true, 0);
+    assert!(p.engaged() && !p.parked(), "latched ⇒ sweeping");
+    assert_eq!(p.channel(), Some(PARK_CHANNELS[0]), "sweep starts on candidate 0");
+    // un-latched (uplink recovered) ⇒ disengage back to the blind scan.
+    p.sync(false, 10);
+    assert!(!p.engaged(), "un-latch disengages parking");
+    assert_eq!(p.channel(), None, "disengaged ⇒ blind scan governs again");
+
+    // --- ChannelPark: burst bootstrap (spacing + per-dwell cap) -----------
+    let mut sp = ChannelPark::new();
+    sp.sync(true, 0);
+    assert!(sp.should_burst(0), "first burst of a dwell fires immediately");
+    assert!(!sp.should_burst(PARK_BURST_EVERY_MS - 1), "next burst gated until PARK_BURST_EVERY_MS");
+    assert!(sp.should_burst(PARK_BURST_EVERY_MS), "next burst fires after the spacing gap");
+    // exactly PARK_BURSTS_PER_DWELL bursts fire per dwell, the rest are capped.
+    let mut cap = ChannelPark::new();
+    cap.sync(true, 0);
+    let mut fired = 0u8;
+    let mut t = 0u64;
+    for _ in 0..(PARK_BURSTS_PER_DWELL + 3) {
+        if cap.should_burst(t) {
+            fired += 1;
+        }
+        t += PARK_BURST_EVERY_MS;
+    }
+    assert_eq!(fired, PARK_BURSTS_PER_DWELL, "exactly PARK_BURSTS_PER_DWELL bursts per dwell");
+
+    // --- ChannelPark: TRIGGER CONTRACT (the #123 lesson) ------------------
+    // The emit-trigger wiring is where on-air bugs lived. Contract: the sweep must NOT hop off a
+    // candidate until ≥1 burst has actually probed it (no channel skipped), and it must visit
+    // 1→6→11→1 in order. This exercises the exact should_burst()-then-tick() call sequence the
+    // live `leaf_scan_tick` uses.
+    let mut noburst = ChannelPark::new();
+    noburst.sync(true, 0);
+    noburst.tick(PARK_DWELL_MS * 4); // dwell long past, but ZERO bursts fired
+    assert_eq!(noburst.channel(), Some(PARK_CHANNELS[0]), "no hop until ≥1 burst probes the candidate");
+    assert!(noburst.should_burst(PARK_DWELL_MS * 4), "now probe it");
+    noburst.tick(PARK_DWELL_MS * 4 + PARK_DWELL_MS); // dwell elapsed AND probed ⇒ hop
+    assert_eq!(noburst.channel(), Some(PARK_CHANNELS[1]), "hops once the candidate has been probed");
+    // full rotation 1→6→11→1, one burst + one full dwell per candidate.
+    let mut sw = ChannelPark::new();
+    sw.sync(true, 0);
+    let mut clk = 0u64;
+    for expect in [PARK_CHANNELS[0], PARK_CHANNELS[1], PARK_CHANNELS[2], PARK_CHANNELS[0]] {
+        assert_eq!(sw.channel(), Some(expect), "sweep visits each candidate in [1,6,11] order");
+        assert!(sw.should_burst(clk), "≥1 burst per candidate before hopping");
+        clk += PARK_DWELL_MS;
+        sw.tick(clk);
+    }
+
+    // --- ChannelPark: park on feedback, hold, un-park on silence ----------
+    let mut pk = ChannelPark::new();
+    pk.sync(true, 0);
+    assert!(pk.should_burst(0));
+    pk.tick(PARK_DWELL_MS); // hop to candidate 1 (ch6)
+    assert_eq!(pk.channel(), Some(PARK_CHANNELS[1]));
+    pk.on_feedback(PARK_DWELL_MS); // a RELAYACK2 came back on ch6 ⇒ PARK
+    assert!(pk.parked(), "feedback while sweeping parks on the current channel");
+    assert_eq!(pk.channel(), Some(PARK_CHANNELS[1]), "parked on the channel that drew the ACK");
+    assert!(!pk.should_burst(PARK_DWELL_MS + 100), "parked ⇒ no bursts (telemetry carries the held channel)");
+    // holds well within the silence window; a refresh resets the silence clock.
+    pk.tick(PARK_DWELL_MS + PARK_SILENCE_MS - 1);
+    assert!(pk.parked(), "still parked within PARK_SILENCE_MS");
+    pk.on_feedback(PARK_DWELL_MS + PARK_SILENCE_MS - 1); // refresh
+    pk.tick(PARK_DWELL_MS + PARK_SILENCE_MS - 1 + PARK_SILENCE_MS - 1);
+    assert!(pk.parked(), "a refresh keeps it parked past the original window");
+    // sustained silence past PARK_SILENCE_MS ⇒ channel went cold ⇒ resume sweeping from it.
+    let last_fb = PARK_DWELL_MS + PARK_SILENCE_MS - 1;
+    pk.tick(last_fb + PARK_SILENCE_MS + 1);
+    assert!(pk.engaged() && !pk.parked(), "cold parked channel ⇒ resume sweeping");
+    assert_eq!(pk.channel(), Some(PARK_CHANNELS[1]), "re-sweep starts from the last good channel");
+
+    // --- ChannelPark: #76 re-election restarts the sweep ------------------
+    let mut rc = ChannelPark::new();
+    rc.sync(true, 0);
+    rc.should_burst(0);
+    rc.tick(PARK_DWELL_MS); // → candidate 1
+    rc.should_burst(PARK_DWELL_MS);
+    rc.tick(PARK_DWELL_MS * 2); // → candidate 2
+    assert_eq!(rc.channel(), Some(PARK_CHANNELS[2]));
+    rc.on_rechannel(PARK_DWELL_MS * 2 + 50); // owner/channel changed under us
+    assert!(rc.engaged() && !rc.parked(), "re-election ⇒ back to sweeping");
+    assert_eq!(rc.channel(), Some(PARK_CHANNELS[0]), "#76 re-election restarts the sweep at candidate 0");
+    let mut rc2 = ChannelPark::new();
+    rc2.on_rechannel(0);
+    assert!(!rc2.engaged(), "on_rechannel while idle stays idle (not stranded)");
+
+    // --- ChannelPark: INVARIANT — a never-latched leaf is fully inert ------
+    // (mirrors HopLatch's fwd=0 gate: no parking, no bursts, feedback ignored, channel None).
+    let mut inert = ChannelPark::new();
+    for t in [0u64, 500, PARK_DWELL_MS, PARK_DWELL_MS * 2, PARK_SILENCE_MS] {
+        inert.sync(false, t); // healthy leaf: never latched
+        assert!(!inert.should_burst(t), "inert leaf never bursts");
+        inert.tick(t);
+        inert.on_feedback(t);
+        assert_eq!(inert.channel(), None, "inert leaf never overrides the blind scan");
+        assert!(!inert.engaged(), "inert leaf never engages parking");
+    }
+
+    println!("flood_verify: ALL CHECKS PASSED (SeenSet + forward_decision + HopLatch + #126 ChannelPark)");
 }

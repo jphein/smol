@@ -13,6 +13,8 @@
 //!   2. [`forward_decision`] — what a node does with an inbound multi-hop RELAY2 frame.
 //!   3. [`HopLatch`] — the leaf's single-hop⇄multi-hop escalation state machine with
 //!      un-latch hysteresis (so a leaf that moves back into range stops flooding).
+//!   4. [`ChannelPark`] (#126) — a stranded leaf's channel-bias state machine: sweep +
+//!      burst to find the channel that draws a forward/ACK, then park on it (throughput).
 //!
 //! ## The byte-identical invariant (team-lead's gate)
 //! A non-escalated leaf sends plain `SMOLv1 RELAY` with an implicit `H=1`; nodes
@@ -247,6 +249,212 @@ impl HopLatch {
 }
 
 impl Default for HopLatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---- #126 channel parking (latched-leaf multi-hop throughput) --------------
+//
+// A stranded (latched) leaf never hears its elected owner's HELLO, so it never LOCKS a
+// channel — `leaf_scan_tick` keeps it blind-hopping 1/6/11. Its uplink therefore lands on
+// the relay's channel only ~1/3 of the time (channel coincidence), and the flooded-back
+// RELAYACK2 hits the same ~1/3 in reverse. `ChannelPark` biases a LATCHED leaf toward the
+// channel that actually drew a forward/ACK, raising delivery toward ~1/1 (issue #126).
+//
+// The ACK-feedback bootstrap (chicken-and-egg: parking wants to key on "which channel drew a
+// forward/ACK", but that signal can't exist until we've emitted there): a `Sweeping` phase
+// dwells per candidate and fires short EMISSION BURSTS (K frames/channel, ≥1 guaranteed before
+// hopping) so a returning RELAYACK2 — or a relay re-broadcasting OUR origin — can be attributed
+// to the channel that worked. `on_feedback` then PARKS there; parked, the leaf simply HOLDS the
+// channel and lets the normal telemetry cadence flow (no extra airtime) — the bias IS the win.
+//
+// INVARIANT: parking engages ONLY while latched (`sync`), so a healthy (never-latched) leaf's
+// blind scan + byte-identical `fwd=0` behaviour is completely untouched. Un-latch (uplink
+// recovered) or a #76 re-election (`on_rechannel`) disengages/restarts the sweep.
+
+/// Candidate ESP-NOW channels a leaf sweeps while unlocked (JP's roam plan). SINGLE SOURCE OF
+/// TRUTH — `mode.rs::leaf_scan_tick`'s blind scan, `current_channel`, and #126 parking all index
+/// this, so the scan plan and the park plan can never silently drift apart.
+// #126 wip (Stage A): the whole ChannelPark block is host-tested in flood_verify but UNWIRED in the
+// clock crate — the allow(dead_code)s DROP in Stage B when leaf_scan_tick/emit start driving it.
+#[allow(dead_code)]
+pub const PARK_CHANNELS: [u8; 3] = [1, 6, 11];
+
+/// Per-candidate dwell while SWEEPING (ms). Matches `leaf_scan_tick`'s blind-scan dwell, so
+/// parking only re-orders WHICH channel a stranded leaf favours, not the dwell shape.
+#[allow(dead_code)]
+pub const PARK_DWELL_MS: u64 = 1500;
+
+/// Min gap between emission bursts within one dwell (ms). A "burst" re-broadcasts the leaf's
+/// staged uplink so a relay on THIS channel forwards it + the gateway floods a RELAYACK2 back —
+/// the ACK-feedback bootstrap. Only fires while LATCHED + sweeping (stranded); never on a healthy leaf.
+#[allow(dead_code)]
+pub const PARK_BURST_EVERY_MS: u64 = 400;
+
+/// Emission bursts per candidate before the sweep may hop off it — the "emit K frames per channel
+/// before hopping" bootstrap. Guarantees every candidate is actually probed, never skipped.
+#[allow(dead_code)]
+pub const PARK_BURSTS_PER_DWELL: u8 = 3;
+
+/// A PARKED channel that draws no forward/ACK for this long (ms) is assumed cold (relay roamed /
+/// re-elected) ⇒ resume sweeping. > 1 telemetry cycle (~15 s) so a single lost ACK on a live-but-
+/// lossy channel doesn't abandon a good park.
+#[allow(dead_code)]
+pub const PARK_SILENCE_MS: u64 = 30_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParkPhase {
+    /// Not stranded (or uplink recovered) — blind scan governs; parking is inert.
+    Idle,
+    /// Cycling candidates + bursting, waiting for the first forward/ACK to attribute.
+    Sweeping,
+    /// A candidate drew feedback — HOLD it (both uplink + RELAYACK2 land on the relay's channel).
+    Parked,
+}
+
+/// The leaf's #126 channel-parking state machine (pure). Companion to [`HopLatch`]: `HopLatch`
+/// answers *single- or multi-hop?*, `ChannelPark` answers *which channel should a stranded leaf
+/// be on?*. Driven by the live `leaf_scan_tick`/emit path (which supplies `now` + acts on the
+/// outputs); host-unit-tested in `flood_verify` (state machine AND the emit-trigger contract).
+#[allow(dead_code)] // #126 wip: unwired in the clock crate until Stage B (see the block note above).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelPark {
+    phase: ParkPhase,
+    /// Current candidate index into [`PARK_CHANNELS`].
+    idx: u8,
+    /// When we arrived on the current candidate (sweeping dwell clock).
+    dwell_started_ms: u64,
+    /// Emission bursts already fired on the current candidate this dwell.
+    bursts_this_dwell: u8,
+    /// Last burst emit time (spacing clock).
+    last_burst_ms: u64,
+    /// Last forward/ACK attributed to the parked channel (silence clock).
+    last_feedback_ms: u64,
+}
+
+#[allow(dead_code)] // #126 wip: the whole API is exercised by flood_verify; wired in Stage B.
+impl ChannelPark {
+    pub const fn new() -> Self {
+        Self {
+            phase: ParkPhase::Idle,
+            idx: 0,
+            dwell_started_ms: 0,
+            bursts_this_dwell: 0,
+            last_burst_ms: 0,
+            last_feedback_ms: 0,
+        }
+    }
+
+    /// Is parking active (leaf is stranded)? `false` ⇒ the blind scan governs the channel.
+    pub fn engaged(&self) -> bool {
+        !matches!(self.phase, ParkPhase::Idle)
+    }
+
+    /// Have we locked onto a working channel (as opposed to still sweeping)?
+    pub fn parked(&self) -> bool {
+        matches!(self.phase, ParkPhase::Parked)
+    }
+
+    /// The channel the leaf should be on right now, or `None` while [`ParkPhase::Idle`] (the
+    /// caller falls back to the normal blind scan). Indexes [`PARK_CHANNELS`].
+    pub fn channel(&self) -> Option<u8> {
+        match self.phase {
+            ParkPhase::Idle => None,
+            _ => Some(PARK_CHANNELS[(self.idx as usize) % PARK_CHANNELS.len()]),
+        }
+    }
+
+    fn start_sweep(&mut self, idx: u8, now: u64) {
+        self.phase = ParkPhase::Sweeping;
+        self.idx = idx % PARK_CHANNELS.len() as u8;
+        self.dwell_started_ms = now;
+        self.bursts_this_dwell = 0;
+        self.last_burst_ms = 0;
+    }
+
+    /// Drive from the escalation latch each tick (edge-safe / idempotent). Latched + inert ⇒
+    /// engage, sweeping from candidate 0. Un-latched (uplink recovered) + engaged ⇒ disengage to
+    /// [`ParkPhase::Idle`] so the blind scan resumes. Otherwise a no-op.
+    pub fn sync(&mut self, latched: bool, now: u64) {
+        if latched && !self.engaged() {
+            self.start_sweep(0, now);
+        } else if !latched && self.engaged() {
+            self.phase = ParkPhase::Idle;
+        }
+    }
+
+    /// #76: the elected owner / its channel changed under us, so the swept/parked channel is
+    /// stale — restart the sweep from candidate 0. No-op while [`ParkPhase::Idle`] (not stranded).
+    pub fn on_rechannel(&mut self, now: u64) {
+        if self.engaged() {
+            self.start_sweep(0, now);
+        }
+    }
+
+    /// Advance dwell/park timing. SWEEPING: hop to the next candidate once the dwell elapsed AND
+    /// ≥1 burst went out on this one (so no candidate is skipped un-probed — the caller MUST call
+    /// [`should_burst`] each tick BEFORE `tick`, see `flood_verify`'s trigger-contract test).
+    /// PARKED: if the channel has been silent past [`PARK_SILENCE_MS`] it went cold ⇒ resume
+    /// sweeping from it. IDLE: nothing.
+    pub fn tick(&mut self, now: u64) {
+        match self.phase {
+            ParkPhase::Sweeping => {
+                let dwell_done = now.saturating_sub(self.dwell_started_ms) >= PARK_DWELL_MS;
+                if dwell_done && self.bursts_this_dwell >= 1 {
+                    let next = (self.idx + 1) % PARK_CHANNELS.len() as u8;
+                    self.start_sweep(next, now);
+                }
+            }
+            ParkPhase::Parked => {
+                if now.saturating_sub(self.last_feedback_ms) >= PARK_SILENCE_MS {
+                    self.start_sweep(self.idx, now); // re-sweep from the last good channel
+                }
+            }
+            ParkPhase::Idle => {}
+        }
+    }
+
+    /// Should the leaf fire an emission BURST this tick? Only while SWEEPING (the ACK-feedback
+    /// bootstrap): up to [`PARK_BURSTS_PER_DWELL`] per candidate, spaced ≥ [`PARK_BURST_EVERY_MS`]
+    /// (the first of each dwell fires immediately). PARKED/IDLE ⇒ `false` (normal telemetry cadence
+    /// carries the held channel). MUTATES the burst counters — call at most once per tick.
+    pub fn should_burst(&mut self, now: u64) -> bool {
+        if self.phase != ParkPhase::Sweeping {
+            return false;
+        }
+        if self.bursts_this_dwell >= PARK_BURSTS_PER_DWELL {
+            return false;
+        }
+        if self.bursts_this_dwell > 0
+            && now.saturating_sub(self.last_burst_ms) < PARK_BURST_EVERY_MS
+        {
+            return false; // not yet time for the next burst of this dwell
+        }
+        self.bursts_this_dwell = self.bursts_this_dwell.saturating_add(1);
+        self.last_burst_ms = now;
+        true
+    }
+
+    /// A forward/ACK signal — a RELAYACK2 addressed to us, or a relay re-broadcasting OUR origin —
+    /// arrived while on the current channel ⇒ that channel WORKS. SWEEPING ⇒ PARK here. PARKED ⇒
+    /// refresh freshness so the silence timer doesn't abandon a live channel. IDLE ⇒ ignore
+    /// (a non-stranded leaf's ACKs are normal single-hop traffic, not park feedback).
+    pub fn on_feedback(&mut self, now: u64) {
+        match self.phase {
+            ParkPhase::Sweeping => {
+                self.phase = ParkPhase::Parked;
+                self.last_feedback_ms = now;
+            }
+            ParkPhase::Parked => {
+                self.last_feedback_ms = now;
+            }
+            ParkPhase::Idle => {}
+        }
+    }
+}
+
+impl Default for ChannelPark {
     fn default() -> Self {
         Self::new()
     }
