@@ -504,14 +504,20 @@ struct DiagCounters {
     /// (OTA verify ok/fail is read live from `OtaLeafSession`, not mirrored here.)
     flush_ok: u32,
     flush_fail: u32,
-    /// #13 multi-hop mesh counters (surfaced as `fwd=`/`dedup=`/`ttl=` in the DIAG record; the
-    /// rig scores P2/P3 off them, and the C0 byte-identical canary is exactly `fwd == 0` on every
-    /// node across a normal all-hear window). `fwd` = inbound `RELAY2` frames this node re-broadcast;
-    /// `dedup` = `RELAY2` frames dropped as already-seen `(origin,msgid,frag)`; `ttl` = `RELAY2`
-    /// frames dropped for an exhausted hop budget. All stay 0 in the single-hop / all-hear case.
+    /// #13 multi-hop mesh counters (surfaced in the DIAG record; the rig scores P2/P3 off them).
+    /// `fwd` = inbound UPLINK `RELAY2` frames this node re-broadcast — this is the C0 byte-identical
+    /// invariant: `fwd == 0` on every node across a normal all-hear window (a non-stranded leaf never
+    /// emits RELAY2, so nobody forwards). `dedup` = `RELAY2` frames dropped as already-seen
+    /// `(origin,msgid,frag)`; `ttl` = `RELAY2` frames dropped for an exhausted hop budget. All stay 0
+    /// in the single-hop / all-hear case.
+    ///
+    /// `dfwd` (SEPARATE) = DOWNLINK `BATT2`/`GRID2` re-floods — nonzero BY DESIGN (Stage B's
+    /// strictly-newer downlink flood re-broadcasts each new value once, like `TIME`). Kept distinct
+    /// from `fwd` so the uplink invariant stays machine-checkable — do NOT fold it into `fwd`.
     fwd: u32,
     dedup: u32,
     ttl: u32,
+    dfwd: u32,
     /// #13 MESH-TEST rig ONLY: count of inbound frames dropped by the deaf-list (surfaced as
     /// `ddrops=` in DIAG). A production build has no deaf-list, so this field doesn't exist.
     #[cfg(feature = "mesh-test")]
@@ -529,6 +535,7 @@ impl DiagCounters {
             fwd: 0,
             dedup: 0,
             ttl: 0,
+            dfwd: 0,
             #[cfg(feature = "mesh-test")]
             ddrops: 0,
         }
@@ -2644,7 +2651,7 @@ impl RadioManager {
         // score P2/P3; `fwd == 0` fleet-wide is the C0 all-hear byte-identical canary).
         let mesh_hop = if self.relay.latch.latched() { crate::net::flood::MAX_HOP } else { 1 };
         let mut rec = alloc::format!(
-            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}|brk={}|otah={}|fwd={}|dedup={}|ttl={}|hop={}|dlseq={}",
+            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}|brk={}|otah={}|fwd={}|dedup={}|ttl={}|hop={}|dlseq={}|dfwd={}",
             d.boot_slot,
             d.reset_reason,
             d.boot_count,
@@ -2678,6 +2685,7 @@ impl RadioManager {
             // stay unchanged when an older/replayed dl_seq is dropped). 0 on a gateway (source) or
             // a v1-only leaf. Representative of the downlink channel; GRID2 uses the same mechanism.
             self.batt.dl_seq,
+            self.diag.dfwd,
         );
         // #74 item 3 (stage-2): fold in the APPLIED-config string for HA config-drift, ONLY when
         // `main` populated it (espnow build). ASCII by construction (as_wire/to_wire/hex/F24). HA
@@ -4407,7 +4415,10 @@ impl RadioManager {
                         let mut fb = [0u8; DL_FRAME_MAX];
                         let len = encode_dl(BATT2_PREFIX, seq, payload, &mut fb);
                         self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
-                        log::info!("smol: BATT2 seq {} adopted + reflooded", seq);
+                        // DOWNLINK re-flood (Stage B, nonzero by design) — counted SEPARATELY from the
+                        // uplink `fwd` invariant so C0's `fwd==0` stays machine-checkable.
+                        self.diag.dfwd = self.diag.dfwd.saturating_add(1);
+                        log::info!("smol: BATT2 seq {} adopted + reflooded (dfwd)", seq);
                     }
                     label = Some(alloc::format!("batt2 {}", seq));
                 }
@@ -4423,7 +4434,8 @@ impl RadioManager {
                         let mut fb = [0u8; DL_FRAME_MAX];
                         let len = encode_dl(GRID2_PREFIX, seq, payload, &mut fb);
                         self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
-                        log::info!("smol: GRID2 seq {} adopted + reflooded", seq);
+                        self.diag.dfwd = self.diag.dfwd.saturating_add(1); // downlink re-flood (see BATT2)
+                        log::info!("smol: GRID2 seq {} adopted + reflooded (dfwd)", seq);
                     }
                     label = Some(alloc::format!("grid2 {}", seq));
                 }
