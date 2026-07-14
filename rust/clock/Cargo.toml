@@ -180,6 +180,14 @@ cast = ["espnow"]
 # serial. Builds on espnow. Everything it changes is `cfg(feature = "coexist-soak")`.
 coexist-soak = ["espnow"]
 
+# #13 MESH-TEST rig (NOT for production). A debug-only MAC deaf-list: a node silently
+# drops inbound frames whose source MAC is in the per-board `board::DEAF_MACS`, so the
+# 3-board fleet can be forced into a 2-hop topology (G→R→F) to validate routed multi-hop
+# (scratch/smol-dreamteam/13-rig-design.md). Builds on espnow. Default-OFF so a production
+# build is BYTE-FREE of it AND structurally CANNOT be made deaf (no field, no hook) — the
+# strongest guard against a "won't-rejoin" leftover-deaf ghost. DIAG surfaces deaf=/ddrops=.
+mesh-test = ["espnow"]
+
 [profile.release]
 # esp-wifi strongly recommends opt-level "s"/2/3 and LTO; the radio blobs are
 # timing-sensitive and misbehave when built at opt-level 0.

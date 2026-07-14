@@ -17,6 +17,19 @@ mod mqtt;
 #[cfg(feature = "espnow")]
 pub mod mode;
 
+// #13 routed multi-hop mesh: the PURE managed-flood decision core (SeenSet + forward
+// decision + HopLatch escalation state machine), host-testable, no HAL deps. Driven by
+// the relay path in `mode`, so espnow-gated.
+#[cfg(feature = "espnow")]
+pub mod flood;
+
+// #13: the PURE SMOLv1 relay-family wire codec (RELAY/RELAYACK/RELAY2/RELAYACK2/BATT2/GRID2 +
+// the fixed-width ASCII field helpers), extracted from `mode` so the frame formats are
+// host-unit-testable off-target (see `experiments/relay_compat`) — the mixed-fleet / #124
+// byte-compat guard. `mode` re-exports it via `use crate::net::wire::*`.
+#[cfg(feature = "espnow")]
+pub mod wire;
+
 // #25 WLED WiZmote-emit (smol as a WLED "linked remote"). `wled = ["espnow"]`, so
 // this is present only in a wled build; the default/wifi/espnow builds are byte-free
 // of it (the module is `#![cfg(feature = "wled")]`). Referenced by `app` (the

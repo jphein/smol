@@ -55,6 +55,11 @@ use esp_wifi::{
 
 use crate::led::LedState;
 use crate::net::WifiPeripherals;
+// #13: the relay-family wire codec + ASCII field helpers live in the PURE, host-testable
+// `net::wire` module (extracted from here, byte-identical). Glob-imported so every call site
+// below (encode_relay, parse_relay[2], *relayack*, encode_dl, write_u5/u10, parse_id/u5/u10,
+// the *_PREFIX / RELAY_CHUNK / BATT_PAYLOAD_MAX consts, …) stays unqualified.
+use crate::net::wire::*;
 
 /// Fixed ESP-NOW channel used in TIME-SHARE mode. All smol units must agree on
 /// this value (1..=13). 6 is a common, low-congestion default.
@@ -123,14 +128,18 @@ const BEACON_PREFIX: &[u8] = b"SMOLv1 BEACON "; // + "NNN SSSSS EEEEE"
 /// on a private fixed channel; harden with a signed payload or an ESP-NOW LMK
 /// if it ever matters. Documented, not defended.
 const TIME_PREFIX: &[u8] = b"SMOLv1 TIME "; // + "NNN UUUUUUUUUU SSSSSSSSSS"
-/// Relay-bridge tags (see the "Relay bridge" section below). RELAY carries a
-/// fragment of a leaf's telemetry uplink; RELAYACK is the gateway's per-message
-/// received-fragment bitmap so the leaf can retransmit gaps. Distinct tags to
-/// keep the SMOLv1 namespace clean for the in-flight MMO-snake frames (issue #5).
-/// The trailing space on RELAY disambiguates it from RELAYACK at parse time
-/// (`"SMOLv1 RELAY "[12]` is ' ' where RELAYACK has 'A'), so match order is moot.
-const RELAY_PREFIX: &[u8] = b"SMOLv1 RELAY "; // + "NNN MMMMM F C " + chunk
-const RELAYACK_PREFIX: &[u8] = b"SMOLv1 RELAYACK "; // + "MMMMM BBB"
+// #13: the RELAY / RELAYACK / RELAY2 / RELAYACK2 wire TAGS + their whole codec live in the
+// pure, host-testable `net::wire` module (glob-imported above — RELAY carries a leaf-telemetry
+// fragment; RELAYACK the gateway's fragment-bitmap; RELAY2/RELAYACK2 the #13 multi-hop variants,
+// NEW tags an old firmware classifies to None → no flag-day). The `*_FRAME_MAX` buffer-size
+// consts stay here — they size call-site stack buffers in this module, not the codec.
+/// Max RELAY2 frame length on the wire (30-byte header + full chunk); sizes stack buffers.
+/// Header = 14-byte prefix + "OOO MMMMM H F C " (16) = 30, vs RELAY's 27 (the extra 3 =
+/// the origin↔src split's `H ` hop field; `OOO` is the ORIGIN id, distinct from the
+/// re-broadcasting relay's own src MAC).
+const RELAY2_FRAME_MAX: usize = 30 + RELAY_CHUNK;
+/// Max RELAYACK2 frame length ("SMOLv1 RELAYACK2 " + "TTT MMMMM BBB H" = 32); rounded up.
+const RELAYACK2_FRAME_MAX: usize = 40;
 /// Battery-downlink tag: the 12-B `"SMOLv1 BATT "` (trailing space, mirroring TIME)
 /// then the VERBATIM `smol/display/batt` payload INCLUDING its `BATT|` marker
 /// (e.g. `SMOLv1 BATT BATT|48V 52.8V|HV 391.9V|d 43mV`). NO length byte — the
@@ -143,8 +152,8 @@ const RELAYACK_PREFIX: &[u8] = b"SMOLv1 RELAYACK "; // + "MMMMM BBB"
 /// propagate a stale payload or loop; single-hop gateway → neighbour leaves is
 /// the safe, intended shape. Same threat model as every SMOLv1 frame (unauthed).
 const BATT_PREFIX: &[u8] = b"SMOLv1 BATT "; // + verbatim "BATT|l1|l2|l3"
-/// Max BATT payload retained/echoed — matches `BattCache` (LOCKED ≤ 96 B).
-const BATT_PAYLOAD_MAX: usize = 96;
+// `BATT_PAYLOAD_MAX` (≤ 96 B, matches BattCache/GridCache) lives in `net::wire` (glob-imported) —
+// the codec's `encode_dl` truncates to it, and this module's trackers/buffers size to it.
 
 /// Grid-downlink tag (issue #16): the exact TWIN of [`BATT_PREFIX`] — the 12-B
 /// `"SMOLv1 GRID "` (trailing space) then the VERBATIM `smol/display/grid` payload
@@ -155,6 +164,15 @@ const BATT_PAYLOAD_MAX: usize = 96;
 const GRID_PREFIX: &[u8] = b"SMOLv1 GRID "; // + verbatim "GRID|l1|l2|l3"
 /// Max GRID payload retained/echoed — matches `GridCache` (LOCKED ≤ 96 B).
 const GRID_PAYLOAD_MAX: usize = 96;
+
+// #13 Stage B: the BATT2 / GRID2 downlink-freshness TAGS + their `encode_dl`/`parse_dl` codec
+// live in `net::wire` (glob-imported) — a 10-digit monotonic `dl_seq` (gateway unix-of-last-
+// value-change, TIME `synced_at`-style strict-newer) prepended to the verbatim BATT|/GRID|
+// payload so a relay re-floods only strictly-newer data. v1 `BATT`/`GRID` (above) stay here for
+// the back-compat receive path. `DL_FRAME_MAX` (this module's emit-buffer size) stays here.
+/// Max BATT2/GRID2 frame on the wire: 13-B prefix + 10-digit `dl_seq` + space + ≤96-B payload
+/// = ≤120; 128 leaves headroom. Sizes the emit stack buffer.
+const DL_FRAME_MAX: usize = 128;
 
 /// #21/#56 leaf-relay config-downlink tag: `"SMOLv1 CFG "` (11 B, trailing space) then
 /// `"NNN"` (3-ASCII zero-padded TARGET leaf id), then a 1-byte config `KEY` (#56), then
@@ -417,12 +435,36 @@ enum Frame<'a> {
     /// A gateway's acknowledgement of a relay message: the `msgid` and the u8
     /// bitmap of fragments received so far, so the leaf resends only the gaps.
     RelayAck { msgid: u16, bitmap: u8 },
+    /// #13 multi-hop: one fragment of a STRANDED leaf's telemetry uplink, carrying the
+    /// true `origin` id (stamped by the source, survives forwarding — unlike `src_mac`,
+    /// which is the last relay) and a hop-limit `hop` (decremented at each forward,
+    /// dropped at ≤ 1 by a non-gateway). Otherwise identical to `Relay`. `chunk` borrows
+    /// the RX buffer. Emitted only by an escalated leaf + re-broadcast by relays.
+    Relay2 {
+        origin: u8,
+        msgid: u16,
+        hop: u8,
+        frag: u8,
+        count: u8,
+        chunk: &'a [u8],
+    },
+    /// #13 multi-hop: the gateway's flooded-back ACK for a `Relay2` message (R1,
+    /// table-free) — `target` = the origin leaf to ACK, `msgid` + `bitmap` as `RelayAck`,
+    /// plus a `hop` limit so relays flood it back the same 2-hop distance. Loop-safety
+    /// rides the hop decrement (MAX_HOP=2), not a seen-set.
+    RelayAck2 { target: u8, msgid: u16, bitmap: u8, hop: u8 },
     /// A battery-downlink payload from a gateway: the verbatim `BATT|…` bytes
     /// (`payload` borrows the RX buffer; copied into `BattTracker` in `service`).
     Batt(&'a [u8]),
     /// A grid-downlink payload from a gateway (issue #16): the verbatim `GRID|…`
     /// bytes (twin of `Batt`; copied into `GridTracker` in `service`).
     Grid(&'a [u8]),
+    /// #13 Stage B: a battery downlink carrying a monotonic freshness `seq` (the gateway's
+    /// unix-second of the last value change). A node adopts + re-floods only a STRICTLY-NEWER
+    /// `seq`; `payload` is the verbatim `BATT|…` bytes (borrows the RX buffer).
+    Batt2 { seq: u32, payload: &'a [u8] },
+    /// #13 Stage B: the grid twin of [`Frame::Batt2`].
+    Grid2 { seq: u32, payload: &'a [u8] },
     /// #21/#56 leaf-relay: a gateway's keyed CONFIG downlink — `target` leaf id, the config
     /// channel `key` (`S`=screen/…), + the verbatim `value` bytes (`value` borrows the RX
     /// buffer; the leaf buffers it per-key in `CfgTracker` in `service` IFF `target ==
@@ -462,6 +504,24 @@ struct DiagCounters {
     /// (OTA verify ok/fail is read live from `OtaLeafSession`, not mirrored here.)
     flush_ok: u32,
     flush_fail: u32,
+    /// #13 multi-hop mesh counters (surfaced in the DIAG record; the rig scores P2/P3 off them).
+    /// `fwd` = inbound UPLINK `RELAY2` frames this node re-broadcast — this is the C0 byte-identical
+    /// invariant: `fwd == 0` on every node across a normal all-hear window (a non-stranded leaf never
+    /// emits RELAY2, so nobody forwards). `dedup` = `RELAY2` frames dropped as already-seen
+    /// `(origin,msgid,frag)`; `ttl` = `RELAY2` frames dropped for an exhausted hop budget. All stay 0
+    /// in the single-hop / all-hear case.
+    ///
+    /// `dfwd` (SEPARATE) = DOWNLINK `BATT2`/`GRID2` re-floods — nonzero BY DESIGN (Stage B's
+    /// strictly-newer downlink flood re-broadcasts each new value once, like `TIME`). Kept distinct
+    /// from `fwd` so the uplink invariant stays machine-checkable — do NOT fold it into `fwd`.
+    fwd: u32,
+    dedup: u32,
+    ttl: u32,
+    dfwd: u32,
+    /// #13 MESH-TEST rig ONLY: count of inbound frames dropped by the deaf-list (surfaced as
+    /// `ddrops=` in DIAG). A production build has no deaf-list, so this field doesn't exist.
+    #[cfg(feature = "mesh-test")]
+    ddrops: u32,
 }
 
 impl DiagCounters {
@@ -472,6 +532,12 @@ impl DiagCounters {
             btnl: 0,
             flush_ok: 0,
             flush_fail: 0,
+            fwd: 0,
+            dedup: 0,
+            ttl: 0,
+            dfwd: 0,
+            #[cfg(feature = "mesh-test")]
+            ddrops: 0,
         }
     }
 }
@@ -615,11 +681,14 @@ struct BattTracker {
     buf: [u8; BATT_PAYLOAD_MAX],
     len: usize,
     have: bool,
+    /// #13 Stage B: the freshness `seq` of the last-adopted BATT2 (0 = none / v1 BATT only). A
+    /// higher `seq` is strictly newer; drives the strict-newer adopt + relay re-flood decision.
+    dl_seq: u32,
 }
 
 impl BattTracker {
     const fn new() -> Self {
-        Self { buf: [0; BATT_PAYLOAD_MAX], len: 0, have: false }
+        Self { buf: [0; BATT_PAYLOAD_MAX], len: 0, have: false, dl_seq: 0 }
     }
 
     /// Buffer a freshly-received payload (truncated to capacity; ≤ 96 B by spec).
@@ -628,6 +697,19 @@ impl BattTracker {
         self.buf[..n].copy_from_slice(&payload[..n]);
         self.len = n;
         self.have = true;
+    }
+
+    /// #13 Stage B: adopt a BATT2 payload IFF its `seq` is STRICTLY NEWER than the last adopted
+    /// (the `TIME` strict-newer template). Returns true if adopted → the caller re-floods it.
+    /// A first sight always adopts (so a stranded leaf catches up); a same/older `seq` is a
+    /// replay/echo → dropped (bounds the flood, no loop).
+    fn set_fresh(&mut self, payload: &[u8], seq: u32) -> bool {
+        if self.have && seq <= self.dl_seq {
+            return false;
+        }
+        self.set(payload);
+        self.dl_seq = seq;
+        true
     }
 }
 
@@ -647,11 +729,13 @@ struct GridTracker {
     buf: [u8; GRID_PAYLOAD_MAX],
     len: usize,
     have: bool,
+    /// #13 Stage B: freshness `seq` of the last-adopted GRID2 (twin of `BattTracker::dl_seq`).
+    dl_seq: u32,
 }
 
 impl GridTracker {
     const fn new() -> Self {
-        Self { buf: [0; GRID_PAYLOAD_MAX], len: 0, have: false }
+        Self { buf: [0; GRID_PAYLOAD_MAX], len: 0, have: false, dl_seq: 0 }
     }
 
     /// Buffer a freshly-received payload (truncated to capacity; ≤ 96 B by spec).
@@ -661,6 +745,16 @@ impl GridTracker {
         self.len = n;
         self.have = true;
     }
+
+    /// #13 Stage B: strict-newer adopt + re-flood decision (twin of `BattTracker::set_fresh`).
+    fn set_fresh(&mut self, payload: &[u8], seq: u32) -> bool {
+        if self.have && seq <= self.dl_seq {
+            return false;
+        }
+        self.set(payload);
+        self.dl_seq = seq;
+        true
+    }
 }
 
 /// A `Copy` snapshot of a buffered GRID payload handed to `main` by
@@ -669,6 +763,38 @@ impl GridTracker {
 pub struct GridOffer {
     pub buf: [u8; GRID_PAYLOAD_MAX],
     pub len: usize,
+}
+
+/// #13 Stage B GATEWAY-origin state for ONE downlink channel (BATT2 or GRID2): the last payload
+/// broadcast + the freshness `seq` assigned to it. `broadcast_batt`/`broadcast_grid` bump `seq`
+/// to the gateway's current unix-second ONLY when the payload CHANGES, so an unchanged periodic
+/// re-broadcast keeps the same `seq` (relays don't re-flood it) while a genuine new value floods
+/// once. Fixed `.bss`, no heap. Only a gateway writes it (a leaf never originates downlink).
+struct DlOrigin {
+    seq: u32,
+    last: [u8; BATT_PAYLOAD_MAX], // BATT_PAYLOAD_MAX == GRID_PAYLOAD_MAX (96); reused for both
+    len: usize,
+}
+
+impl DlOrigin {
+    const fn new() -> Self {
+        Self { seq: 0, last: [0; BATT_PAYLOAD_MAX], len: 0 }
+    }
+
+    /// The freshness `seq` to stamp on `payload`. On a CHANGE, bump to `now_unix` but never below
+    /// `seq+1` — so the seq is strictly monotonic across changes even if the clock is unsynced
+    /// (small `now_unix`) or two changes land in the same second, yet tracks wall-time so it
+    /// survives a gateway reboot (a post-reboot `now_unix` outranks any pre-reboot seq a leaf holds).
+    fn seq_for(&mut self, payload: &[u8], now_unix: u32) -> u32 {
+        let n = payload.len().min(BATT_PAYLOAD_MAX);
+        let changed = n != self.len || self.last[..n] != payload[..n];
+        if changed {
+            self.seq = now_unix.max(self.seq.saturating_add(1));
+            self.last[..n].copy_from_slice(&payload[..n]);
+            self.len = n;
+        }
+        self.seq
+    }
 }
 
 /// #21/#56 leaf-relay: buffers the most-recent inbound `SMOLv1 CFG` value that targeted
@@ -1149,17 +1275,14 @@ pub struct BenchStats {
 //     header + a loop-prevention seen-set + a shared-channel invariant across
 //     every node (+200-400 LOC). This is single-hop uplink only.
 
-/// Max telemetry payload per RELAY fragment (bytes). On the wire a frame is the
-/// fixed 27-byte ASCII header + this, comfortably under the 250 B ESP-NOW limit.
-const RELAY_CHUNK: usize = 64;
+// `RELAY_CHUNK` (64 B max telemetry payload per fragment) lives in `net::wire` (glob-imported) —
+// the codec truncates chunks to it, and this module's reassembly/tx offsets index by it.
 /// Max fragments per message. Kept <= 8 so the received-fragment bitmap is a
 /// single `u8`; => max reassembled telemetry = CHUNK * FRAGS bytes.
 const RELAY_MAX_FRAGS: usize = 4;
 /// Max reassembled message length (bytes) = 256. A leaf truncates telemetry to
 /// this (documented) — this is SHORT-telemetry relay, not bulk transfer.
 const RELAY_MAX_MSG: usize = RELAY_CHUNK * RELAY_MAX_FRAGS;
-/// Max RELAY frame length on the wire (header + full chunk); sizes stack buffers.
-const RELAY_FRAME_MAX: usize = 27 + RELAY_CHUNK;
 /// Max RELAYACK frame length ("SMOLv1 RELAYACK " + "MMMMM BBB" = 25); rounded up.
 const RELAYACK_FRAME_MAX: usize = 32;
 /// Concurrent (src_mac, msgid) reassemblies a gateway tracks. Bounded table.
@@ -1174,6 +1297,11 @@ const RELAY_STALE_MS: u64 = 10_000;
 const RELAY_EMIT_INTERVAL_MS: u64 = 15_000;
 /// Leaf waits this long for a fuller RELAYACK before retransmitting the gaps.
 const RELAY_RETX_MS: u64 = 2_000;
+/// #13 un-latch Gate A: a latched (stranded) leaf only fires an `H=1` direct probe while
+/// the elected owner's HELLO is being heard THIS recently — proof the downlink is back.
+/// ~3× the ~2 s HELLO cadence, so one dropped HELLO doesn't falsely read as "still
+/// stranded", but a genuinely deaf leaf never wastes probe airtime.
+const RELAY_DOWNLINK_FRESH_MS: u64 = 6_000;
 /// Gateway flushes its queue this often (if non-empty), or at once when full.
 const RELAY_FLUSH_INTERVAL_MS: u64 = 30_000;
 /// After this many CONSECUTIVE failed flushes, shed the OLDEST queued message on
@@ -1273,10 +1401,15 @@ struct RelayTx {
     active: bool,
     msgid: u16,
     count: u8,
-    acked: u8, // fragments the gateway has confirmed (from RELAYACK)
+    acked: u8, // fragments the gateway has confirmed (from RELAYACK / RELAYACK2)
     tries: u8,
     total_len: usize,
     last_ms: u64,
+    /// #13: the hop-limit this message was ORIGINATED at (chosen once per emit from the
+    /// `HopLatch`): `1` ⇒ plain `RELAY` (the byte-identical single-hop / probe case),
+    /// `MAX_HOP` ⇒ `RELAY2`. Retransmits re-encode with the SAME framing so a message's
+    /// gaps stay on the wire form it started on.
+    hop: u8,
     buf: [u8; RELAY_MAX_MSG],
 }
 
@@ -1290,6 +1423,7 @@ impl RelayTx {
             tries: 0,
             total_len: 0,
             last_ms: 0,
+            hop: 1,
             buf: [0; RELAY_MAX_MSG],
         }
     }
@@ -1315,6 +1449,16 @@ struct Relay {
     /// retransmits so a message is never enqueued (UDP-delivered) twice (finding 3).
     done: [Option<([u8; 6], u16)>; DONE_RING],
     done_cursor: usize,
+    /// #13 relay-role: the `(origin, msgid, frag)` loop/dup guard for FORWARDING inbound
+    /// `RELAY2` frames. Only a NON-gateway consults it (the gateway reassembles + dedups
+    /// via its own `reasm`/`done`, so it never marks a frame "seen" — else a lost-ACK
+    /// retransmit would be dropped before it could be re-ACKed). See `net/flood.rs`.
+    seen: crate::net::flood::SeenSet,
+    /// #13 leaf-role: the single-hop⇄multi-hop escalation state machine. Stays inert
+    /// (single-hop, byte-identical) until this leaf's telemetry goes fully un-ACKed
+    /// (`relay_retransmit` exhaust) — then it latches `RELAY2` at `MAX_HOP` and probes
+    /// its way back down. See `net/flood.rs`.
+    latch: crate::net::flood::HopLatch,
 }
 
 impl Relay {
@@ -1330,6 +1474,8 @@ impl Relay {
             flush_fails: 0,
             done: [None; DONE_RING],
             done_cursor: 0,
+            seen: crate::net::flood::SeenSet::new(),
+            latch: crate::net::flood::HopLatch::new(),
         }
     }
 
@@ -1553,6 +1699,11 @@ pub struct RadioManager {
     /// Twin of `batt` (issue #16): most-recent inbound SMOLv1 GRID payload, buffered
     /// for `main` to store into its `GridCache`.
     grid: GridTracker,
+    /// #13 Stage B: GATEWAY-origin freshness state for the BATT2/GRID2 downlink — assigns the
+    /// monotonic `dl_seq` (bumped only on a value change) so relays re-flood strictly-newer data.
+    /// Inert on a leaf (a leaf never originates downlink; it adopts via the trackers above).
+    dl_batt: DlOrigin,
+    dl_grid: DlOrigin,
     /// #21/#56 leaf-relay (LEAF side): most-recent inbound `SMOLv1 CFG` value PER config
     /// key that targeted THIS leaf, buffered for `main` to apply via `take_cfg_offer(key)`.
     cfg: CfgTracker,
@@ -1625,6 +1776,13 @@ pub struct RadioManager {
     /// still HELLO-scans when it is 0/stale/absent (the proven fallback). Sourced from `rx_control`,
     /// NOT the deliberately-sidestepped `esp_wifi_get_channel`.
     learned_channel: u8,
+    /// #13 MESH-TEST rig ONLY: MACs this board pretends it cannot hear. `service()` drops any
+    /// inbound frame from a listed source before it touches the roster/parse — a deterministic,
+    /// reproducible stand-in for physical RF attenuation that forces a 2-hop topology. Seeded
+    /// once from the per-board `board::DEAF_MACS`. Empty = normal. A production build has neither
+    /// this field nor the hook, so it can never be made deaf. See the `mesh-test` cargo feature.
+    #[cfg(feature = "mesh-test")]
+    deaf: [Option<[u8; 6]>; 4],
     /// #23 fix (oracle #1/#2): persistent staleness observation of the retained `MC`
     /// record — the last owner id + seq seen and when that pair was FIRST seen. A seq
     /// frozen past `MC_STALE_MS` marks the owner DEAD (takeover-able). Seeded into the
@@ -1758,6 +1916,8 @@ impl RadioManager {
             roster: Roster::new(),
             batt: BattTracker::new(),
             grid: GridTracker::new(),
+            dl_batt: DlOrigin::new(),
+            dl_grid: DlOrigin::new(),
             cfg: CfgTracker::new(),
             cfg_cache: crate::net::wifi::CfgCache::new(),
             stat_cache: crate::net::wifi::CfgCache::new(),
@@ -1777,6 +1937,8 @@ impl RadioManager {
             scan_locked: false,
             scan_idx: 0,
             learned_channel: 0, // #29: unknown until the first frame is heard
+            #[cfg(feature = "mesh-test")]
+            deaf: crate::board::DEAF_MACS, // #13 rig: baked per-board deaf-list (empty in prod)
 
             last_scan_hop_ms: 0,
             last_owner_heard_ms: 0,
@@ -2193,18 +2355,18 @@ impl RadioManager {
 
     // --- Battery downlink relay (see the BATT_PREFIX + BattTracker sections) ---
 
-    /// Broadcast one SMOLv1 BATT frame: the 12-B tag + the verbatim `BATT|…`
-    /// `payload` (byte-for-byte the gateway's `BattCache`). GATEWAY-ONLY by
-    /// convention — `main` calls this on a slow cadence while `is_gateway` and the
-    /// cache is non-empty, so neighbour leaves fill their own cache. No length byte
-    /// (payload is the rest of the frame); safe in either radio mode.
-    pub fn broadcast_batt(&mut self, payload: &[u8]) {
-        // 12-B tag + ≤ 96-B payload = ≤ 108 B, well under the 250-B ESP-NOW limit.
-        let mut msg = [0u8; BATT_PREFIX.len() + BATT_PAYLOAD_MAX];
-        msg[..BATT_PREFIX.len()].copy_from_slice(BATT_PREFIX);
-        let n = payload.len().min(BATT_PAYLOAD_MAX);
-        msg[BATT_PREFIX.len()..BATT_PREFIX.len() + n].copy_from_slice(&payload[..n]);
-        self.send_to(&BROADCAST_ADDRESS, &msg[..BATT_PREFIX.len() + n]);
+    /// #13 Stage B: broadcast the battery downlink as a `SMOLv1 BATT2` frame — the tag + a
+    /// 10-digit freshness `dl_seq` + the verbatim `BATT|…` `payload` (byte-for-byte the gateway's
+    /// `BattCache`). GATEWAY-ONLY — `main` calls this on a slow cadence while `is_gateway` + the
+    /// cache is non-empty, passing the gateway's current `now_unix`. The `dl_seq` is bumped only
+    /// when the payload CHANGES (see [`DlOrigin::seq_for`]), so an unchanged periodic re-broadcast
+    /// isn't re-flooded by relays while a genuine new value floods to stranded leaves once.
+    /// (Supersedes the v1 single-hop `BATT` send; leaves still PARSE v1 `BATT` from an old gateway.)
+    pub fn broadcast_batt(&mut self, payload: &[u8], now_unix: u32) {
+        let seq = self.dl_batt.seq_for(payload, now_unix);
+        let mut msg = [0u8; DL_FRAME_MAX];
+        let len = encode_dl(BATT2_PREFIX, seq, payload, &mut msg);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
     }
 
     /// Take the buffered inbound BATT payload (if any), clearing it. `main` stores
@@ -2220,17 +2382,16 @@ impl RadioManager {
         }
     }
 
-    /// Broadcast one SMOLv1 GRID frame — the exact TWIN of [`broadcast_batt`]
-    /// (issue #16). GATEWAY-ONLY by convention (`main` gates on `is_gateway` + a
-    /// non-empty cache); 12-B tag + verbatim `GRID|…` payload, no length byte.
+    /// #13 Stage B: broadcast the grid downlink as a `SMOLv1 GRID2` frame — the exact TWIN of
+    /// [`broadcast_batt`] (issue #16): tag + 10-digit `dl_seq` + verbatim `GRID|…` payload, seq
+    /// bumped only on a value change. GATEWAY-ONLY.
     ///
     /// [`broadcast_batt`]: RadioManager::broadcast_batt
-    pub fn broadcast_grid(&mut self, payload: &[u8]) {
-        let mut msg = [0u8; GRID_PREFIX.len() + GRID_PAYLOAD_MAX];
-        msg[..GRID_PREFIX.len()].copy_from_slice(GRID_PREFIX);
-        let n = payload.len().min(GRID_PAYLOAD_MAX);
-        msg[GRID_PREFIX.len()..GRID_PREFIX.len() + n].copy_from_slice(&payload[..n]);
-        self.send_to(&BROADCAST_ADDRESS, &msg[..GRID_PREFIX.len() + n]);
+    pub fn broadcast_grid(&mut self, payload: &[u8], now_unix: u32) {
+        let seq = self.dl_grid.seq_for(payload, now_unix);
+        let mut msg = [0u8; DL_FRAME_MAX];
+        let len = encode_dl(GRID2_PREFIX, seq, payload, &mut msg);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
     }
 
     /// Take the buffered inbound GRID payload (if any), clearing it. Twin of
@@ -2484,8 +2645,13 @@ impl RadioManager {
             _ => "baked",
         };
         let otah = if net.ota_host.is_some() { "ovr" } else { "slot" };
+        // #13: this leaf's CURRENT origin hop — 1 = single-hop (normal / byte-identical),
+        // MAX_HOP = escalated (stranded, emitting RELAY2). A gateway never originates, so it
+        // reads 1. Surfaced so the rig sees a leaf latch/un-latch (and `fwd`/`dedup`/`ttl`
+        // score P2/P3; `fwd == 0` fleet-wide is the C0 all-hear byte-identical canary).
+        let mesh_hop = if self.relay.latch.latched() { crate::net::flood::MAX_HOP } else { 1 };
         let mut rec = alloc::format!(
-            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}|brk={}|otah={}",
+            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}|brk={}|otah={}|fwd={}|dedup={}|ttl={}|hop={}|dlseq={}|dfwd={}",
             d.boot_slot,
             d.reset_reason,
             d.boot_count,
@@ -2511,6 +2677,15 @@ impl RadioManager {
             net_fb,
             brk,
             otah,
+            self.diag.fwd,
+            self.diag.dedup,
+            self.diag.ttl,
+            mesh_hop,
+            // #13 Stage B: the leaf's last-adopted BATT2 downlink freshness (rig P4 watches this
+            // stay unchanged when an older/replayed dl_seq is dropped). 0 on a gateway (source) or
+            // a v1-only leaf. Representative of the downlink channel; GRID2 uses the same mechanism.
+            self.batt.dl_seq,
+            self.diag.dfwd,
         );
         // #74 item 3 (stage-2): fold in the APPLIED-config string for HA config-drift, ONLY when
         // `main` populated it (espnow build). ASCII by construction (as_wire/to_wire/hex/F24). HA
@@ -2530,6 +2705,14 @@ impl RadioManager {
                 rec.push_str("|io=");
                 rec.push_str(io);
             }
+        }
+        // #13 MESH-TEST rig: surface the deaf-list state so a leftover entry is visible in HA at a
+        // glance (the anti-"won't-rejoin-ghost" guard) — `deaf` = active entries, `ddrops` = frames
+        // dropped by it. `mesh-test`-gated → the DIAG string is byte-identical on a production build.
+        #[cfg(feature = "mesh-test")]
+        {
+            let deaf_n = self.deaf.iter().flatten().count();
+            rec.push_str(&alloc::format!("|deaf={}|ddrops={}", deaf_n, self.diag.ddrops));
         }
         rec
     }
@@ -2770,29 +2953,83 @@ impl RadioManager {
                 || now.saturating_sub(self.relay.last_emit_ms) >= RELAY_EMIT_INTERVAL_MS)
     }
 
+    /// #13: emit ONE fragment of OUR OWN uplink at the message's chosen framing.
+    /// `hop <= 1` → plain `RELAY` (the byte-identical single-hop case AND the `H=1`
+    /// un-latch probe); `hop > 1` → `RELAY2` (origin-stamped, hop-limited, forwarded by
+    /// relays). The chunk is copied into a LOCAL frame buffer BEFORE `send_to`, so no
+    /// borrow of `self.relay` is held across the `&mut self` send.
+    fn relay_send_frag(&mut self, msgid: u16, hop: u8, frag: u8, count: u8, off: usize, end: usize) {
+        let mut fb = [0u8; RELAY2_FRAME_MAX];
+        let len = if hop <= 1 {
+            encode_relay(self.id, msgid, frag, count, &self.relay.tx.buf[off..end], &mut fb)
+        } else {
+            encode_relay2(self.id, msgid, hop, frag, count, &self.relay.tx.buf[off..end], &mut fb)
+        };
+        self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+    }
+
+    /// #13 gateway: flood a RELAYACK2 back toward the stranded `target` origin (R1,
+    /// table-free) at `MAX_HOP`, so a relay carries it the same distance the RELAY2 came.
+    /// Broadcast (the origin isn't directly reachable — that's why it's stranded).
+    fn flood_relayack2(&mut self, target: u8, msgid: u16, bitmap: u8) {
+        let mut fb = [0u8; RELAYACK2_FRAME_MAX];
+        let len = encode_relayack2(target, msgid, bitmap, crate::net::flood::MAX_HOP, &mut fb);
+        self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+    }
+
     /// Leaf only: fragment `telemetry` into RELAY frames and BROADCAST them all,
     /// staging the message for bounded retransmit. No-op on a gateway.
     pub fn relay_emit(&mut self, telemetry: &[u8], now: u64) {
         if self.relay.is_gateway {
             return;
         }
+        // #13 P1 fix (deaf-list rig): the escalation streak must NOT depend solely on the
+        // retry-exhaustion path. A totally-deaf gateway yields ZERO ACKs, and the retransmit loop
+        // that feeds `on_relay_exhausted` can be starved — a stranded leaf is pinned in blocking
+        // WiFi recovery bursts, and the 15 s emit re-stages `tries=1` before `relay_retransmit`
+        // accumulates to `RELAY_MAX_TRIES` — so a fully-out-of-earshot leaf (the flagship case!)
+        // never latched. Feed the streak at SUPERSESSION too: the message we're about to replace,
+        // if still active with ZERO acks, went fully un-ACKed. Mutually exclusive with the
+        // retry-exhaustion feed (which clears `active`), so no double-count; a totally-silent
+        // gateway now latches in ESCALATE_STREAK emit cycles (~45 s) regardless of retransmit timing.
+        let was_latched = self.relay.latch.latched();
+        if self.relay.tx.active && self.relay.tx.acked == 0 {
+            self.relay.latch.on_relay_exhausted(false);
+        }
+        if !was_latched && self.relay.latch.latched() {
+            log::info!(
+                "smol #13: leaf escalated to multi-hop (RELAY2) — gateway unreachable, {} un-ACKed msgs",
+                crate::net::flood::ESCALATE_STREAK
+            );
+        }
         let count = self.relay.stage_tx(telemetry, now);
         if count == 0 {
             return;
         }
         self.relay.last_emit_ms = now;
+        // #13: pick this message's framing from the escalation latch. `downlink_up` = the
+        // elected owner's HELLO is being heard DIRECTLY + fresh (Gate A: only probe back
+        // toward single-hop when the downlink is demonstrably alive — else we KNOW we're
+        // still stranded, so don't waste probe airtime). `should_probe` is a no-op unless
+        // latched, so the non-escalated path emits plain `RELAY` (hop 1) = byte-identical.
+        let downlink_up = self.owner_hello_seen
+            && now.saturating_sub(self.last_owner_heard_ms) < RELAY_DOWNLINK_FRESH_MS;
+        let is_probe = self.relay.latch.should_probe(downlink_up);
+        let hop = self.relay.latch.origin_hop(is_probe);
+        self.relay.tx.hop = hop;
         let (msgid, total_len) = (self.relay.tx.msgid, self.relay.tx.total_len);
         for frag in 0..count {
             let off = frag as usize * RELAY_CHUNK;
             let end = (off + RELAY_CHUNK).min(total_len);
-            // Encode into a LOCAL frame buffer (copying the chunk out of tx.buf)
-            // BEFORE send_to, so no borrow of self.relay is held across the
-            // &mut-self send call.
-            let mut fb = [0u8; RELAY_FRAME_MAX];
-            let len = encode_relay(self.id, msgid, frag, count, &self.relay.tx.buf[off..end], &mut fb);
-            self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+            self.relay_send_frag(msgid, hop, frag, count, off, end);
         }
-        log::info!("smol: relay emit msgid {} ({} frag)", msgid, count);
+        log::info!(
+            "smol: relay emit msgid {} ({} frag) hop {}{}",
+            msgid,
+            count,
+            hop,
+            if is_probe { " probe" } else { "" }
+        );
     }
 
     /// Leaf only: retransmit the fragments still unacked, bounded to
@@ -2807,17 +3044,31 @@ impl RadioManager {
             return;
         }
         if self.relay.tx.tries >= RELAY_MAX_TRIES {
+            // #13 escalation / un-latch hook: this message is out of tries.
+            if self.relay.latch.latched() && self.relay.tx.hop <= 1 {
+                // A latched leaf emitting at hop 1 was firing an un-latch PROBE — its failure
+                // means the direct uplink is still down, so RESET the un-latch streak but stay
+                // latched (multi-hop keeps carrying telemetry). Distinct from escalation.
+                self.relay.latch.on_probe_miss();
+            } else {
+                // A normal emit out of tries: if the gateway ACKed NOTHING (acked == 0) it heard
+                // nothing from us directly → latch multi-hop (`RELAY2` next emit). If it ACKed ≥ 1
+                // frag (direct, or via the flooded RELAYACK2 once already multi-hop) we're heard,
+                // just lossy → no escalation.
+                self.relay.latch.on_relay_exhausted(self.relay.tx.acked != 0);
+            }
             self.relay.tx.active = false; // give up — telemetry is loss-tolerant
             return;
         }
         if now.saturating_sub(self.relay.tx.last_ms) < RELAY_RETX_MS {
             return; // give the gateway time to ACK before resending
         }
-        let (msgid, count, acked, total_len) = (
+        let (msgid, count, acked, total_len, hop) = (
             self.relay.tx.msgid,
             self.relay.tx.count,
             self.relay.tx.acked,
             self.relay.tx.total_len,
+            self.relay.tx.hop,
         );
         for frag in 0..count {
             if acked & (1u8 << frag) != 0 {
@@ -2825,9 +3076,8 @@ impl RadioManager {
             }
             let off = frag as usize * RELAY_CHUNK;
             let end = (off + RELAY_CHUNK).min(total_len);
-            let mut fb = [0u8; RELAY_FRAME_MAX];
-            let len = encode_relay(self.id, msgid, frag, count, &self.relay.tx.buf[off..end], &mut fb);
-            self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+            // Retransmit on the SAME framing the message was originated with (`tx.hop`).
+            self.relay_send_frag(msgid, hop, frag, count, off, end);
         }
         self.relay.tx.tries += 1;
         self.relay.tx.last_ms = now;
@@ -3835,6 +4085,15 @@ impl RadioManager {
             if src == self.self_mac {
                 continue;
             }
+            // #13 MESH-TEST rig: drop frames from a deaf-listed source BEFORE any handler
+            // (OTA dispatch, roster, parse) — a deterministic stand-in for "out of RF range"
+            // that forces a 2-hop topology. `ddrops` counts these so a leftover entry is
+            // visible in DIAG. Compiled out entirely in a production build (no `mesh-test`).
+            #[cfg(feature = "mesh-test")]
+            if self.deaf.iter().flatten().any(|m| *m == src) {
+                self.diag.ddrops = self.diag.ddrops.saturating_add(1);
+                continue;
+            }
             // RSSI of this frame (dBm) from the ESP-NOW RX control info; used by
             // BENCH. Captured up front so each arm can record it if relevant.
             let rssi = recv.info.rx_control.rssi;
@@ -4023,7 +4282,109 @@ impl RadioManager {
                     // Leaf: the gateway confirmed these fragments — stop resending
                     // them. On a gateway (no outstanding tx) this is a no-op.
                     self.relay.apply_ack(msgid, bitmap);
+                    // #13: the gateway ACKed a fragment directly → it hears us → reset the
+                    // escalation streak so a LATER transient full-loss starts counting fresh
+                    // (escalation is CONSECUTIVE-only; this is what keeps fwd=0 under normal loss).
+                    if bitmap != 0 {
+                        self.relay.latch.on_uplink_progress();
+                    }
+                    // #13: a DIRECT (unicast) RELAYACK also proves the gateway heard an H=1 frame
+                    // from us directly → the uplink is back. While latched, count it toward
+                    // un-latching (UNLATCH_STREAK consecutive drops the latch back to single-hop).
+                    // A no-op when not latched. NOTE: the flooded RELAYACK2 does NOT call this —
+                    // it proves only the multi-hop path, not direct reach.
+                    self.relay.latch.on_direct_ack();
                     label = Some(alloc::format!("ack {:05}", msgid));
+                }
+                Some(Frame::Relay2 { origin, msgid, hop, frag, count, chunk }) => {
+                    // #13 multi-hop uplink fragment. Proves the SENDER (the last relay, or the
+                    // origin itself) is audible (LED detected + roster, attributed to `origin`).
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, Some(origin), rssi, now);
+                    if origin == self.id {
+                        // Our OWN frame echoed back by a relay — never re-forward or reassemble it
+                        // (that would count as a bogus fwd + could loop). Just drop it.
+                        label = Some(alloc::format!("relay2 self {:03}", origin));
+                    } else if self.relay.is_gateway {
+                        // GATEWAY = the flood's sink. Reassemble keyed by ORIGIN (a synthetic MAC
+                        // `00:00:00:00:00:<origin>`), NOT `src` — `src` is the last relay's MAC, but
+                        // reassembly + late-retransmit dedup must key on the true source. We do NOT
+                        // consult the seen-set here: `accept()` + `DONE_RING` already dedup
+                        // fragments/retransmits, and a seen-set drop would kill a lost-RELAYACK2
+                        // retransmit's re-ACK (the single-hop path's finding 3, one hop out). On each
+                        // accepted fragment, FLOOD a RELAYACK2 back toward the origin (R1, table-free)
+                        // carrying the cumulative bitmap so the stranded leaf learns completion.
+                        let synth = synth_origin_mac(origin);
+                        let (bitmap, complete) =
+                            self.relay.accept(synth, (origin, msgid, frag, count), chunk, now);
+                        self.flood_relayack2(origin, msgid, bitmap);
+                        label = Some(if complete {
+                            alloc::format!("relay2 {:03} ok", origin)
+                        } else {
+                            alloc::format!("relay2 {:03} {}/{}", origin, bitmap.count_ones(), count)
+                        });
+                    } else {
+                        // RELAY role: the seen-set-gated forward. `forward_decision` (pure) picks
+                        // the fate from (is_gateway=false, hop, already-seen `(origin,msgid,frag)`).
+                        let seen = self.relay.seen.seen_or_insert(origin, msgid, frag);
+                        match crate::net::flood::forward_decision(false, hop, seen) {
+                            crate::net::flood::ForwardAction::Forward { hop: next_hop } => {
+                                self.diag.fwd = self.diag.fwd.saturating_add(1);
+                                // Re-broadcast at the decremented hop. `chunk` borrows the RX buffer;
+                                // it's copied into the local frame buffer before the `&mut self` send.
+                                let mut fb = [0u8; RELAY2_FRAME_MAX];
+                                let len =
+                                    encode_relay2(origin, msgid, next_hop, frag, count, chunk, &mut fb);
+                                self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+                                // Rate-limited serial trace (the forward path was previously OLED-only —
+                                // a rig watching serial saw the fwd counter climb with no log). Every 8th.
+                                if self.diag.fwd.is_multiple_of(8) {
+                                    log::info!(
+                                        "smol #13: fwd {} (origin {:03} msgid {} frag {} -> h{})",
+                                        self.diag.fwd, origin, msgid, frag, next_hop
+                                    );
+                                }
+                                label = Some(alloc::format!("fwd {:03} h{} f{}", origin, next_hop, frag));
+                            }
+                            crate::net::flood::ForwardAction::DedupDrop => {
+                                self.diag.dedup = self.diag.dedup.saturating_add(1);
+                                label = Some(alloc::format!("dedup {:03}", origin));
+                            }
+                            crate::net::flood::ForwardAction::TtlDrop => {
+                                self.diag.ttl = self.diag.ttl.saturating_add(1);
+                                label = Some(alloc::format!("ttl {:03}", origin));
+                            }
+                            // Reassemble is only returned for is_gateway=true (handled above).
+                            crate::net::flood::ForwardAction::Reassemble => {}
+                        }
+                    }
+                }
+                Some(Frame::RelayAck2 { target, msgid, bitmap, hop }) => {
+                    // #13 multi-hop ACK. Proves the SENDER is audible.
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, None, rssi, now);
+                    if target == self.id {
+                        // We're the stranded origin being ACKed — fold in the bitmap (stop resending
+                        // the confirmed frags), exactly like a direct RELAYACK. We do NOT call
+                        // `on_direct_ack`: this arrived via the flood, so it proves the multi-hop path
+                        // works, NOT that the gateway can hear us DIRECTLY (only an H=1 probe drawing a
+                        // direct RELAYACK un-latches us). Never re-forward an ACK addressed to us.
+                        self.relay.apply_ack(msgid, bitmap);
+                        // Multi-hop delivery worked → the gateway hears us (via the relay) → reset
+                        // the escalation streak (does NOT un-latch — that still needs a direct probe).
+                        if bitmap != 0 {
+                            self.relay.latch.on_uplink_progress();
+                        }
+                        label = Some(alloc::format!("ack2 {:05}", msgid));
+                    } else if hop > 1 {
+                        // Not for us + hops left: flood it one hop further toward the target. Loop
+                        // safety rides the hop decrement (MAX_HOP=2 ⇒ at most one forward), so this
+                        // needs no seen-set. A 3-hop future would add a RELAYACK2 seen-set.
+                        let mut fb = [0u8; RELAYACK2_FRAME_MAX];
+                        let len = encode_relayack2(target, msgid, bitmap, hop - 1, &mut fb);
+                        self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+                        label = Some(alloc::format!("fwdack {:03} h{}", target, hop - 1));
+                    }
                 }
                 Some(Frame::Batt(payload)) => {
                     // A gateway's battery downlink. Buffer the verbatim payload for
@@ -4053,6 +4414,49 @@ impl RadioManager {
                     self.peers.last_hello_ms = now;
                     self.roster.heard(src, None, rssi, now);
                     label = Some(alloc::string::String::from("grid"));
+                }
+                Some(Frame::Batt2 { seq, payload }) => {
+                    // #13 Stage B: a freshness-stamped battery downlink. A LEAF adopts + RE-FLOODS
+                    // it ONLY when strictly newer than what it holds (the TIME strict-newer template)
+                    // — that both bounds the flood (a replay/echo is dropped, no loop) and carries a
+                    // genuinely-new value one hop further toward a stranded leaf. A GATEWAY ignores
+                    // inbound downlink entirely: it IS the source (its `BattCache` comes from HA), so
+                    // it must never adopt a mesh value back into its own cache. Only a well-formed
+                    // `BATT|` is kept (a stray frame can't wipe a good reading).
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, None, rssi, now);
+                    if !self.relay.is_gateway
+                        && payload.starts_with(b"BATT|")
+                        && self.batt.set_fresh(payload, seq)
+                    {
+                        // Re-broadcast the SAME frame verbatim (payload + seq). `payload` borrows the
+                        // RX buffer; it's copied into the local frame buffer before the &mut-self send.
+                        let mut fb = [0u8; DL_FRAME_MAX];
+                        let len = encode_dl(BATT2_PREFIX, seq, payload, &mut fb);
+                        self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+                        // DOWNLINK re-flood (Stage B, nonzero by design) — counted SEPARATELY from the
+                        // uplink `fwd` invariant so C0's `fwd==0` stays machine-checkable.
+                        self.diag.dfwd = self.diag.dfwd.saturating_add(1);
+                        log::info!("smol: BATT2 seq {} adopted + reflooded (dfwd)", seq);
+                    }
+                    label = Some(alloc::format!("batt2 {}", seq));
+                }
+                Some(Frame::Grid2 { seq, payload }) => {
+                    // #13 Stage B: the grid twin of the Batt2 arm — leaf adopts + re-floods strictly
+                    // newer; gateway ignores (it's the source).
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, None, rssi, now);
+                    if !self.relay.is_gateway
+                        && payload.starts_with(b"GRID|")
+                        && self.grid.set_fresh(payload, seq)
+                    {
+                        let mut fb = [0u8; DL_FRAME_MAX];
+                        let len = encode_dl(GRID2_PREFIX, seq, payload, &mut fb);
+                        self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+                        self.diag.dfwd = self.diag.dfwd.saturating_add(1); // downlink re-flood (see BATT2)
+                        log::info!("smol: GRID2 seq {} adopted + reflooded (dfwd)", seq);
+                    }
+                    label = Some(alloc::format!("grid2 {}", seq));
                 }
                 Some(Frame::Cfg { target, key, value }) => {
                     // #21/#56 leaf-relay: a gateway's keyed CONFIG downlink. Target-filter
@@ -4378,15 +4782,7 @@ fn encode_beacon(id: u8, seq: u32, echo: u32, out: &mut [u8]) -> usize {
     n
 }
 
-/// Write a 5-digit zero-padded decimal (value mod 100000) into `out[..5]`.
-fn write_u5(v: u32, out: &mut [u8]) {
-    let v = v % 100_000;
-    out[0] = b'0' + ((v / 10_000) % 10) as u8;
-    out[1] = b'0' + ((v / 1_000) % 10) as u8;
-    out[2] = b'0' + ((v / 100) % 10) as u8;
-    out[3] = b'0' + ((v / 10) % 10) as u8;
-    out[4] = b'0' + (v % 10) as u8;
-}
+// (write_u5 / write_u10 / parse_id / parse_u5 / parse_u10 moved to `net::wire`, glob-imported.)
 
 /// Encode a TIME frame `"SMOLv1 TIME NNN UUUUUUUUUU SSSSSSSSSS"` into `out`;
 /// returns length (37). `unix`/`synced_at` are 10-digit zero-padded decimals —
@@ -4410,16 +4806,6 @@ fn encode_time(id: u8, unix: u32, synced_at: u32, out: &mut [u8]) -> usize {
     write_u10(synced_at, &mut out[n..]);
     n += 10;
     n
-}
-
-/// Write a 10-digit zero-padded decimal into `out[..10]`. 10 digits holds every
-/// u32 (max 4_294_967_295), so no clamp is needed — the full value round-trips
-/// through [`parse_u10`]. Filled least-significant-digit first.
-fn write_u10(mut v: u32, out: &mut [u8]) {
-    for i in (0..10).rev() {
-        out[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
 }
 
 /// Parse an inbound payload into a [`Frame`], or `None` if it isn't ours.
@@ -4469,6 +4855,16 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
     if let Some((msgid, bitmap)) = parse_relayack(data) {
         return Some(Frame::RelayAck { msgid, bitmap });
     }
+    // #13 multi-hop variants. Order vs RELAY/RELAYACK is moot — `strip_prefix` is exact and
+    // the `2` at the disambiguating byte makes base + variant mutually exclusive — but keep
+    // them adjacent to their base tag. A plain-RELAY frame never matches RELAY2 (byte 12 is
+    // ' ' not '2') and vice-versa, so a non-escalated leaf's frames stay byte-identical.
+    if let Some((origin, msgid, hop, frag, count, chunk)) = parse_relay2(data) {
+        return Some(Frame::Relay2 { origin, msgid, hop, frag, count, chunk });
+    }
+    if let Some((target, msgid, bitmap, hop)) = parse_relayack2(data) {
+        return Some(Frame::RelayAck2 { target, msgid, bitmap, hop });
+    }
     if let Some(rest) = data.strip_prefix(BATT_PREFIX) {
         // The rest is the verbatim `BATT|…` payload (no length byte).
         return Some(Frame::Batt(rest));
@@ -4476,6 +4872,14 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
     if let Some(rest) = data.strip_prefix(GRID_PREFIX) {
         // Twin of BATT (issue #16): the rest is the verbatim `GRID|…` payload.
         return Some(Frame::Grid(rest));
+    }
+    // #13 Stage B freshness variants. Exclusive from BATT/GRID (the `2` at byte 11 vs the
+    // trailing space), so order is moot; kept adjacent to their base tag.
+    if let Some((seq, payload)) = parse_dl(BATT2_PREFIX, data) {
+        return Some(Frame::Batt2 { seq, payload });
+    }
+    if let Some((seq, payload)) = parse_dl(GRID2_PREFIX, data) {
+        return Some(Frame::Grid2 { seq, payload });
     }
     if let Some(rest) = data.strip_prefix(CFG_PREFIX) {
         // #21/#56 leaf-relay: "NNN<KEY><value>" — 3-ASCII target id, a 1-byte config KEY,
@@ -4512,135 +4916,6 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
         return Some(Frame::Scan { src, value: &rest[3..] });
     }
     None
-}
-
-/// Parse a 3-digit ASCII id (`b"007"` -> 7). Rejects non-digits / short input.
-fn parse_id(rest: &[u8]) -> Option<u8> {
-    if rest.len() < 3 {
-        return None;
-    }
-    let mut val: u16 = 0;
-    for &b in &rest[..3] {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        val = val * 10 + (b - b'0') as u16;
-    }
-    (val <= 255).then_some(val as u8)
-}
-
-/// Parse exactly 5 ASCII digits into a u32. Rejects short/non-digit input.
-fn parse_u5(rest: &[u8]) -> Option<u32> {
-    if rest.len() < 5 {
-        return None;
-    }
-    let mut val: u32 = 0;
-    for &b in &rest[..5] {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        val = val * 10 + (b - b'0') as u32;
-    }
-    Some(val)
-}
-
-/// Parse exactly 10 ASCII digits into a u32. Accumulates in u64 and range-checks
-/// on the way out, so a garbled/hostile 10-digit field that exceeds u32::MAX
-/// (e.g. "9999999999") is rejected as `None` rather than silently wrapping —
-/// stricter than [`parse_u5`], where 5 digits always fit in u32.
-fn parse_u10(rest: &[u8]) -> Option<u32> {
-    if rest.len() < 10 {
-        return None;
-    }
-    let mut val: u64 = 0;
-    for &b in &rest[..10] {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        val = val * 10 + (b - b'0') as u64;
-    }
-    u32::try_from(val).ok()
-}
-
-// --- Relay wire codec (pure + fixed-width; host-unit-testable) --------------
-
-/// Encode a RELAY fragment `"SMOLv1 RELAY NNN MMMMM F C " + <chunk>` into `out`;
-/// returns total length (27-byte header + chunk). `NNN` = src id, `MMMMM` = msgid
-/// (5-digit u16), `F`/`C` = single-digit frag index / count (count <=
-/// RELAY_MAX_FRAGS <= 9). `chunk` is truncated to `RELAY_CHUNK`. Mirrors
-/// [`encode_beacon`]'s discipline.
-fn encode_relay(src_id: u8, msgid: u16, frag: u8, count: u8, chunk: &[u8], out: &mut [u8]) -> usize {
-    let mut n = 0;
-    out[..RELAY_PREFIX.len()].copy_from_slice(RELAY_PREFIX);
-    n += RELAY_PREFIX.len();
-    out[n] = b'0' + (src_id / 100) % 10;
-    out[n + 1] = b'0' + (src_id / 10) % 10;
-    out[n + 2] = b'0' + src_id % 10;
-    n += 3;
-    out[n] = b' ';
-    n += 1;
-    write_u5(msgid as u32, &mut out[n..]);
-    n += 5;
-    out[n] = b' ';
-    n += 1;
-    out[n] = b'0' + frag;
-    n += 1;
-    out[n] = b' ';
-    n += 1;
-    out[n] = b'0' + count;
-    n += 1;
-    out[n] = b' ';
-    n += 1;
-    let len = chunk.len().min(RELAY_CHUNK);
-    out[n..n + len].copy_from_slice(&chunk[..len]);
-    n + len
-}
-
-/// Parse a RELAY frame into `(src_id, msgid, frag, count, chunk)`, or `None` if it
-/// isn't a well-formed RELAY. `chunk` borrows `data`. The caller
-/// ([`Relay::accept`]) re-validates `count`/`frag`/`chunk.len()` against its caps.
-fn parse_relay(data: &[u8]) -> Option<(u8, u16, u8, u8, &[u8])> {
-    let rest = data.strip_prefix(RELAY_PREFIX)?;
-    if rest.len() < 14 {
-        return None;
-    }
-    let src_id = parse_id(&rest[0..3])?;
-    let msgid = u16::try_from(parse_u5(&rest[4..9])?).ok()?;
-    if !rest[10].is_ascii_digit() || !rest[12].is_ascii_digit() {
-        return None;
-    }
-    let frag = rest[10] - b'0';
-    let count = rest[12] - b'0';
-    Some((src_id, msgid, frag, count, &rest[14..]))
-}
-
-/// Encode a `"SMOLv1 RELAYACK MMMMM BBB"` frame into `out`; returns length (25).
-/// `MMMMM` = msgid (5-digit), `BBB` = the 3-digit received-fragment bitmap (0..255).
-fn encode_relayack(msgid: u16, bitmap: u8, out: &mut [u8]) -> usize {
-    let mut n = 0;
-    out[..RELAYACK_PREFIX.len()].copy_from_slice(RELAYACK_PREFIX);
-    n += RELAYACK_PREFIX.len();
-    write_u5(msgid as u32, &mut out[n..]);
-    n += 5;
-    out[n] = b' ';
-    n += 1;
-    out[n] = b'0' + (bitmap / 100) % 10;
-    out[n + 1] = b'0' + (bitmap / 10) % 10;
-    out[n + 2] = b'0' + bitmap % 10;
-    n += 3;
-    n
-}
-
-/// Parse a RELAYACK frame into `(msgid, bitmap)`, or `None`. The 3-digit bitmap
-/// reuses [`parse_id`] (both are a 3-ASCII-digit `u8` in 0..=255).
-fn parse_relayack(data: &[u8]) -> Option<(u16, u8)> {
-    let rest = data.strip_prefix(RELAYACK_PREFIX)?;
-    if rest.len() < 9 {
-        return None;
-    }
-    let msgid = u16::try_from(parse_u5(&rest[0..5])?).ok()?;
-    let bitmap = parse_id(&rest[6..9])?;
-    Some((msgid, bitmap))
 }
 
 // -------------------------------------------------------------------------

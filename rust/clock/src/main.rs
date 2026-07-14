@@ -906,7 +906,10 @@ fn main() -> ! {
                 && !batt_cache.is_empty()
                 && (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000)
             {
-                r.broadcast_batt(batt_cache.bytes());
+                // #13 Stage B: pass the gateway's current unix so BATT2 stamps a freshness dl_seq
+                // (bumped only on a value change) — relays re-flood strictly-newer to stranded leaves.
+                let unix_now = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
+                r.broadcast_batt(batt_cache.bytes(), unix_now);
             }
             // Twin GRID re-broadcast (issue #16): same ~10 s gateway-only cadence
             // and single-hop rationale as BATT (grid power also moves slowly).
@@ -914,7 +917,8 @@ fn main() -> ! {
                 && !grid_cache.is_empty()
                 && (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000)
             {
-                r.broadcast_grid(grid_cache.bytes());
+                let unix_now = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
+                r.broadcast_grid(grid_cache.bytes(), unix_now);
             }
             // #21 leaf-relay: a GATEWAY re-broadcasts each cached leaf's dashboard-set
             // default screen as a SMOLv1 CFG frame on the SAME ~10 s cadence as
