@@ -1818,11 +1818,12 @@ pub struct RadioManager {
     /// (#134) is the current consecutive-failure count for this outcome class — surfaced in the
     /// retained payload (`fetch-failed retry=3`) so a stuck fetch is visible headlessly.
     leaf_ota_diag: Option<(u8, &'static str, bool, u8)>,
-    /// #139-followup: on a failed SELF-fetch, `(chunk_k, chunk_n, retries, stalls)` buffered by
-    /// `run_ota_update` → formatted + published retained to `smol/<id>/ota/diag` on the next gateway
-    /// flush (fleet-visible failure diag; release images are serial-silent). Consumed once (set to
-    /// `None` after publish), mirroring `leaf_ota_diag`.
-    ota_self_fail: Option<(u32, u32, u32, u32)>,
+    /// #139-followup/#147: on a failed SELF-fetch, `(chunk_k, chunk_n, retries, stalls, where)`
+    /// buffered by `run_ota_update` → formatted + published retained to `smol/<id>/ota/diag` on the
+    /// next gateway flush (fleet-visible failure diag; release images are serial-silent). `where` is
+    /// the `wifi::ota_fail::*` code for the exact stage that died. Consumed once (set to `None` after
+    /// publish), mirroring `leaf_ota_diag`.
+    ota_self_fail: Option<(u32, u32, u32, u32, u32)>,
     /// #40 #1 DECOUPLE: true while a leaf-OTA relay is pending/in-flight (armed until its
     /// outcome is terminal or the retry cap is hit). While set, the gateway SUPPRESSES its own
     /// self-OTA (`do_install`) so a relay is never interrupted by the gateway rebooting into a
@@ -3258,7 +3259,7 @@ impl RadioManager {
         log::info!("smol OTA: opening update burst (mesh deaf for the whole download)");
         let _ = self.switch(Mode::WifiSta);
         let rng = self.rng;
-        let mut fail: Option<(u32, u32, u32, u32)> = None;
+        let mut fail: Option<(u32, u32, u32, u32, u32)> = None;
         let ok = match self.sta.as_mut() {
             None => false,
             Some(sta) => {
