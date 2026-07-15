@@ -368,7 +368,7 @@ firmware predates is DROPPED (forward-compat, #46). Parse is panic-free/heap-fre
 | `U` | #43 | **display units** — °F/°C + 12/24h (fleet-global via `CFG_TARGET_ALL`) | yes | live |
 | `P` | #55 | **plugin visibility** bitmask per node | yes | live |
 | `Y` | #45 | **Custom screen** layout (the largest value → drives `CFG_VALUE_MAX = 64`) | yes | live |
-| `N` | #100 S1b | active **WiFi slot** index (`fd3b439`) | yes | **edge-triggered reboot** |
+| ~~`N`~~ | #100 S1b → **#142** | **RETIRED** — WiFi-slot switch removed (single-network). A received `N` is drained + ignored | (n/a) | none |
 | `B` | #100 S2 | **broker** leg override (IPv4 + port) (`b08204d`, #110) | yes | **edge-triggered reboot** |
 | `O` | #100 S3 | **OTA-host** override — one RFC1918 host appended to the fetch allowlist (`b08204d`, #110) | yes | live, **no reboot** |
 | `R` | #52 | **remote reboot** | **NO** — transient, never cached/retained | reboots (that is its function) |
@@ -376,15 +376,16 @@ firmware predates is DROPPED (forward-compat, #46). Parse is panic-free/heap-fre
 | `G` | #72 | **IO pin-map** — the whole per-node driver map (see below) (`5689b1b`, #113) | yes | live, **no reboot** (edge-triggered re-bind) |
 | `g` | #72 | **IO output states** — commanded output levels (see below) (`5689b1b`, #113) | yes | live, no reboot |
 
-- **Reboot vs live.** Live-apply (no reboot): `S L U P Y O W G g`. Reboot on apply: `N` (WiFi-slot
-  switch), `B` (broker-leg change) — both **edge-triggered** (only when the value changes, so
-  the ~10 s re-arm never reboot-loops); `R` reboots by design. `O` takes effect on the next OTA
-  fetch without a reboot.
-- **Cached + re-armed vs transient.** `S L U P Y N B O G g` live in the gateway's `cfg_cache` and are
+- **Reboot vs live.** Live-apply (no reboot): `S L U P Y O W G g`. Reboot on apply: `B` (broker-leg
+  change) — **edge-triggered** (only when the value changes, so the ~10 s re-arm never
+  reboot-loops); `R` reboots by design. `O` takes effect on the next OTA fetch without a reboot.
+  (`N` was reboot-on-apply pre-#142; retired.)
+- **Cached + re-armed vs transient.** `S L U P Y B O G g` live in the gateway's `cfg_cache` and are
   **re-broadcast every ~10 s** (`broadcast_cached_configs`), so a rebooted leaf re-arms within ~10 s
-  with **no leaf-side NVS** — except the network state (`N`/`B`/`O`), which *also* persists in the
-  NVS net record below (needed to reach the broker at all before the first relay). `R`/`W` are
-  one-shot and never cached (an anti-reboot-loop / anti-off-channel invariant).
+  with **no leaf-side NVS** — except the network overrides (`B`/`O`), which *also* persist in the
+  NVS net record below (needed to reach the broker at all before the first relay). A retained `N` is
+  still relayed but **inert** (drained + ignored, #142). `R`/`W` are one-shot and never cached (an
+  anti-reboot-loop / anti-off-channel invariant).
 - **`S` default-screen value.** `<AppKind>:<page>` — `AppKind` is the exact `app.rs` spelling
   (`Menu Clock Batt Grid Snake Bench MeshSnake About`; wire `Snake` → MeshSnake on espnow); `page`
   is one digit, out-of-range clamps to 0; empty value clears → compile-time `board.rs`
@@ -420,34 +421,39 @@ cleanly, those don't). Source: `io.rs` (`PinMap`/`apply_wire`/`apply_set`), `wif
 - This is the **dollhouse per-room lamp + button foundation** (#75): a room LED on `7L`, a doll's
   button on `10B`, driven/observed entirely from HA.
 
-### The NVS net record — 28-byte v2 (#100)
+### The NVS net record — 28-byte v3 (#100 → #142)
 
-The network state set by `CFG-N/B/O` also persists in NVS **sector 5** (`0x5000`), so a leaf can
+The network override state set by `CFG-B/O` persists in NVS **sector 5** (`0x5000`), so a leaf can
 reach the broker before the first relay arrives. Brick-safe: any read failure/corruption → `None` →
-the caller defaults to slot 0 (the boot-default network).
+the caller defaults to the single baked network, no overrides. #142 retired the slot machinery;
+bytes 5–7 are now reserved-zero (same layout, so a pre-#142 v2 record still parses — see compat).
 
 | Bytes | Field | Notes |
 |---|---|---|
 | 0–3 | magic `"SMn1"` | `NET_MAGIC` |
-| 4 | version | v1 = 10-B core (slot only); **v2 = 28 B** (written today), adds the ext |
-| 5 | `active` | WiFi slot associated NOW (`<2`) |
-| 6 | `commanded` | last slot CFG-`N` asked for (differs from `active` iff auto-reverted) |
-| 7 | `fallback` | the un-brick WiFi fallback fired → DIAG `net=<slot>:fb` |
-| 8 | `active ^ 0xFF` | core complement guard |
-| 9 | `(active^commanded^fb)+0x5A` | core checksum guard *(v1 core ends here — 10 B)* |
-| 10 | broker present (1/0) | v2 ext (Stage 2) |
+| 4 | version | v1 = 10-B core; v2 = 28 B (#100 slot+overrides); **v3 = 28 B** (#142, written today) |
+| 5 | ~~`active`~~ reserved (0) | was WiFi slot; **#142: reserved-zero** (nonzero in a legacy v2 record) |
+| 6 | ~~`commanded`~~ reserved (0) | was last CFG-`N` slot; **#142: reserved-zero** |
+| 7 | ~~`fallback`~~ reserved (0) | was the un-brick fallback flag; **#142: reserved-zero** |
+| 8 | `b5 ^ 0xFF` | core complement guard (over byte 5) |
+| 9 | `(b5^b6^b7)+0x5A` | core checksum guard *(v1 core ends here — 10 B)* |
+| 10 | broker present (1/0) | ext (Stage 2) |
 | 11 | `broker_fallback` | override auto-disabled after repeated CONNACK fails → `brk=fb` |
 | 12–15 | broker IPv4 octets | RFC1918, gated at CFG apply |
 | 16–17 | broker port | u16 LE |
-| 18 | ota_host present (1/0) | v2 ext (Stage 3) |
+| 18 | ota_host present (1/0) | ext (Stage 3) |
 | 19–22 | ota_host IPv4 octets | RFC1918 |
 | 23 | ext checksum | `sum(rec[10..23]) + 0x5A` |
 | 24 | ext checksum `^ 0xFF` | ext complement guard |
 | 25–27 | zero pad | word-alignment only — esp-storage `WRITE_SIZE = 4`, so 25→**28** (`1b52456`); outside the checksum |
 
-- **v1 ↔ v2 compat.** A v2 firmware reading a v1 record treats it as "no overrides"; a v1 firmware
-  reading a v2 record rejects it (version mismatch) → slot 0 (a **safe** rollback). No forced
-  migration — the first v2 write (a CFG-`N`/`B`/`O` apply, or a fallback) upgrades the record in place.
+- **Migration (v1/v2/v3).** #142 fw reading a **v2** record MIGRATES it: keep the broker/OTA-host
+  override fields, discard the (now-meaningless) slot bytes — so a deployed board that was never
+  flash-erased keeps its overrides across the OTA. A **v1** record → no overrides. **v3** → native.
+  Unknown version / bad checksum / erased → `None` → safe defaults. No forced boot-time rewrite
+  (flash wear): the first genuine CFG-`B`/`O` change upgrades the record to v3 in place
+  (verify-after-write gated). A pre-#142 (v2-reader) fw reading a v3 record rejects it → safe default
+  (same one-way rollback posture as v1↔v2).
 - **Why 28, not 25.** A non-word-aligned write returns `NotAligned`; the swallowed error had made the
   record silently never persist (HW-canary find 2026-07-12 — the edge-trigger fired, then
   verify-after-write aborted every apply). Source: `ota.rs` `NetCfg`/`encode_net_cfg`/`parse_net_cfg`.
@@ -465,7 +471,7 @@ caches it (`diag_cache`) and republishes it retained to `smol/<id>/diag`.
 DIAG|slot=<bootslot>|rst=<reset-reason>|boot=<bootcount>|ota=<outcome>|up=<sec>|heap=<free>
     |hmin=<heap-min>|btn=<short>|btnl=<long>|fok=<flush-ok>|ffl=<flush-fail>|vok=<verify-ok>
     |vfl=<verify-fail>|loss=<pct>|rtt=<ms>|rx=<n>|tx=<n>|led=<mode>:<on|off>|tage=<sec-since-sync>
-    |tsrc=<ntp|mesh|none>|net=<slot>:<ok|fb>|brk=<baked|ovr|fb>|otah=<slot|ovr>
+    |tsrc=<ntp|mesh|none>|net=0:ok|brk=<baked|ovr|fb>|otah=<slot|ovr>
     |fwd=<uplink-fwds>|dedup=<dup-drops>|ttl=<ttl-drops>|hop=<1|2>|dlseq=<last-adopted>|dfwd=<downlink-refloods>
     [|cfg=<applied-config>][|io=<pin>:<count>,…][|deaf=<n>|ddrops=<n>]
 ```
@@ -481,7 +487,7 @@ DIAG|slot=<bootslot>|rst=<reset-reason>|boot=<bootcount>|ota=<outcome>|up=<sec>|
 | `vok`/`vfl` | OTA image verify ok/fail | #49 |
 | `loss`/`rtt`/`rx`/`tx` | mesh link-quality set (packet-loss % · RTT ms · rx/tx counts) | #49/#74 |
 | `led`/`tage`/`tsrc` | commanded LED mode:lit-state · seconds since sync · time source | #74 |
-| `net=<slot>:<ok\|fb>` | active WiFi slot + whether the un-brick fallback fired | #100 S1b (`fd3b439`) |
+| `net=0:ok` | **FROZEN** constant (#142 single-network — no slot/fallback; `0` = the historical primary baseline). Kept only so the dashboard's positional DIAG parse stays stable; a dashboard follow-up repurposes/drops it | #100 S1b → #142 |
 | `brk=<baked\|ovr\|fb>` | broker: baked-in · override active · override auto-disabled | #100 S2 (#110) |
 | `otah=<slot\|ovr>` | OTA host: slot allowlist · runtime override appended | #100 S3 (#110) |
 | `fwd` | **uplink** RELAY2 re-broadcasts forwarded by this node — the C0 byte-identical invariant: **must be 0 fleet-wide in all-hear** (increments at exactly one site, the RELAY2 forward arm) | #13 |

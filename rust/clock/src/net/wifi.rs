@@ -48,8 +48,8 @@ use smoltcp::{
 // Configuration (compile-time placeholders — set before flashing).
 // -------------------------------------------------------------------------
 
-// #100 Stage 1b: WiFi creds are read PER-SLOT at runtime (`WIFI_NETWORKS[active].ssid/pass`) inside
-// `associate_slot`, selected by the NVS net-record + the un-brickable fallback — no fixed SSID const.
+// #142: WiFi creds are read at runtime from the single baked `WIFI_NETWORK` (ssid/pass) inside
+// `associate` — no fixed SSID const, and (post-#142) no slot selection or un-brickable fallback.
 
 /// NTP server IPv4. We hardcode an anycast IP so we need no DNS resolver in
 /// the smoltcp build. time.cloudflare.com's NTP anycast address:
@@ -426,17 +426,16 @@ enum AssocResult {
     Aborted,
 }
 
-/// #100: one association attempt on `WIFI_NETWORKS[slot]`. Disconnect-then-(re)configure so a
-/// slot SWITCH (different SSID) re-associates cleanly, then wait for `is_connected` within
-/// `SYNC_BUDGET`. Extracted from `run_ntp_burst` so the fallback loop can retry PER-SLOT and
-/// revert on `TimedOut` ONLY (never on a long-press abort or a later DHCP/SNTP failure).
+/// #142: one association attempt on the single baked `WIFI_NETWORK`. Disconnect-then-(re)configure
+/// so a re-association is clean, then wait for `is_connected` within `SYNC_BUDGET`. `TimedOut` just
+/// means retry next burst (never a network switch — #100's slot revert is retired); a `#20 long-press
+/// Aborted` unwinds the burst.
 #[cfg(feature = "wifi")]
-fn associate_slot(
+fn associate(
     controller: &mut esp_wifi::wifi::WifiController<'static>,
-    slot: u8,
     tick: &mut dyn FnMut() -> bool,
 ) -> AssocResult {
-    let net = &crate::secrets::WIFI_NETWORKS[slot as usize];
+    let net = &crate::secrets::WIFI_NETWORK;
     // Drop any prior association before reconfiguring (harmless if not connected) so switching
     // SSIDs between slots doesn't leave a stale config. Errors are non-fatal → treated as a miss.
     let _ = controller.disconnect();
@@ -465,11 +464,11 @@ fn associate_slot(
             return AssocResult::Aborted; // #20 long-press mid-sync
         }
         if Instant::now() > deadline {
-            log::warn!("smol #100: assoc timed out on slot {} ('{}')", slot, net.ssid);
+            log::warn!("smol #142: assoc timed out on '{}' — retry next burst (mesh-only leaf)", net.ssid);
             return AssocResult::TimedOut;
         }
     }
-    log::info!("smol #100: associated to slot {} ('{}')", slot, net.ssid);
+    log::info!("smol #142: associated to '{}'", net.ssid);
     AssocResult::Associated
 }
 
@@ -486,8 +485,7 @@ fn active_broker() -> (Ipv4Addr, u16) {
     if let Some((ip, port)) = cfg.and_then(|c| c.broker.filter(|_| !c.broker_fallback)) {
         return (Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]), port);
     }
-    let active = cfg.map_or(0usize, |c| c.active as usize);
-    let net = &crate::secrets::WIFI_NETWORKS[active.min(crate::secrets::WIFI_NETWORKS.len() - 1)];
+    let net = &crate::secrets::WIFI_NETWORK;
     (
         Ipv4Addr::new(net.broker_ip[0], net.broker_ip[1], net.broker_ip[2], net.broker_ip[3]),
         net.broker_port,
@@ -623,50 +621,28 @@ pub fn run_ntp_burst(
     );
     let tcp_handle = sockets.add(tcp_socket);
 
-    // --- #100 WiFi connect with the UN-BRICKABLE slot fallback -----------
-    // Associate on the NVS-selected slot (default 0 if the record is erased/corrupt). A wrong or
-    // unreachable selection SELF-HEALS without USB: up to ASSOC_ATTEMPTS × SYNC_BUDGET on the
-    // active slot; all TimedOut → the ONE revert to the other slot (write NVS {active=other,
-    // fallback=1}) → retry it. BOTH slots fail → STAY PUT (return None; the boot free-runs and the
-    // next burst/boot retries). The NVS `fallback` flag GATES the cross-reboot revert: an
-    // already-reverted boot never reverts again → provably ONE revert-write per commanded
-    // selection, ZERO flash wear during a sustained total outage. Only a `TimedOut` counts toward a
-    // revert — a `#20 long-press Aborted` unwinds without ever touching NVS.
+    // --- #142 WiFi connect: single network, retry-primary-forever ---------
+    // Associate on the ONE baked network (`crate::secrets::WIFI_NETWORK`). Up to ASSOC_ATTEMPTS ×
+    // SYNC_BUDGET; all TimedOut → return None and let THIS burst end — the board free-runs as a
+    // fully-functional ESP-NOW mesh-only leaf (mesh membership + relayed telemetry + mesh time, no
+    // WiFi bursts) and the next burst/boot simply retries the primary. #142 retired #100's dual-slot
+    // revert: a board is NEVER switched onto the secondary/roam SSID (which caused AP-table
+    // pathologies) — a persistent primary-assoc failure is a placement/per-board TX issue (#141),
+    // not a reason to leave the intended network. No NVS write on failure (zero flash wear).
     const ASSOC_ATTEMPTS: u8 = 3;
-    let mut sel = crate::ota::read_net_cfg().unwrap_or(crate::ota::NetCfg {
-        active: 0,
-        commanded: 0,
-        fallback: false,
-        broker: None,
-        broker_fallback: false,
-        ota_host: None,
-    });
-    'assoc: loop {
-        let mut attempt = 0u8;
-        loop {
-            match associate_slot(controller, sel.active, tick) {
-                AssocResult::Associated => break 'assoc,
-                AssocResult::Aborted => return None, // long-press → never a revert
-                AssocResult::TimedOut => {
-                    attempt += 1;
-                    if attempt >= ASSOC_ATTEMPTS {
-                        break; // active slot exhausted → revert or stay-put
-                    }
+    let mut attempt = 0u8;
+    loop {
+        match associate(controller, tick) {
+            AssocResult::Associated => break,
+            AssocResult::Aborted => return None, // #20 long-press → unwind the burst
+            AssocResult::TimedOut => {
+                attempt += 1;
+                if attempt >= ASSOC_ATTEMPTS {
+                    log::warn!("smol #142: primary assoc unreachable — mesh-only this burst, retry next");
+                    return None; // mesh-only leaf; next burst retries the primary (never switch)
                 }
             }
         }
-        if sel.fallback {
-            // Already reverted (this boot, or a prior one — the NVS flag) and the fallback slot ALSO
-            // failed → STAY PUT. No revert, no NVS write (the anti-ping-pong / zero-wear guarantee).
-            log::warn!("smol #100: both slots unreachable (fallback latched) — staying put, no NVS write");
-            return None;
-        }
-        let other = 1 - sel.active;
-        // Preserve commanded + the broker/OTA overrides (`..sel`) — the WiFi revert only flips the
-        // active slot; a broker/OTA override survives a slot fallback (and CFG-`N` clears them).
-        sel = crate::ota::NetCfg { active: other, fallback: true, ..sel };
-        crate::ota::write_net_cfg(sel); // the ONE revert-write
-        log::warn!("smol #100: selected slot unreachable — reverted to slot {} (fallback), retrying", other);
     }
 
     // Poll the stack until DHCP yields an address. The DHCP `Event` borrows
