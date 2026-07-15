@@ -50,3 +50,6 @@ rust/clock/src/**/*.bak
 # tools/ota_publish.sh. Git-ignored (repo is public); the tracked template is
 # tools/ota_publish.env.example (cp it → tools/ota_publish.env, edit). No password here.
 tools/ota_publish.env
+
+# brainstorm visual-companion sessions (local mockups)
+.superpowers/
