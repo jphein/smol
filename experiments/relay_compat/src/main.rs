@@ -84,18 +84,8 @@ fn main() {
     let an = wire::encode_relayack(12345, 3, &mut ab);
     assert_eq!(&ab[..an], old_ack, "encode_relayack golden wire bytes");
 
-    // #13 tag round-trips + DISAMBIGUATION (the no-flag-day guarantee) ------------------------
-    // A RELAY2 frame must NEVER classify as a plain RELAY (old fw would mis-read it), and a plain
-    // RELAY must never classify as RELAY2. Same for RELAYACK/RELAYACK2.
-    let mut r2 = [0u8; 128];
-    let r2n = wire::encode_relay2(9, 42, 2, 1, 2, b"hi", &mut r2);
-    assert!(wire::parse_relay(&r2[..r2n]).is_none(), "RELAY2 must NOT parse as plain RELAY");
-    assert_eq!(
-        wire::parse_relay2(&r2[..r2n]).unwrap(),
-        (9, 42, 2, 1, 2, &b"hi"[..]),
-        "RELAY2 round-trip"
-    );
-    assert!(wire::parse_relay2(&fb[..n2]).is_none(), "plain RELAY must NOT parse as RELAY2");
+    // #13/#124 RELAYACK2 round-trip + DISAMBIGUATION (the no-flag-day guarantee) --------------
+    // (RELAY2 is retired — replaced by UP2 below; RELAYACK2 stays as the flooded ACK.)
     // the gateway's origin-keyed reassembly MAC (never aliases a real Espressif MAC).
     assert_eq!(wire::synth_origin_mac(9), [0, 0, 0, 0, 0, 9], "synth_origin_mac layout");
 
@@ -114,5 +104,65 @@ fn main() {
     // a BATT2 frame must not parse under the GRID2 prefix (tag isolation).
     assert!(wire::parse_dl(wire::GRID2_PREFIX, &dl[..dln]).is_none(), "BATT2 is not a GRID2");
 
-    println!("relay_compat: ALL CHECKS PASSED (bidirectional byte-compat + golden bytes + #13 tag round-trips + disambiguation)");
+    // #124 UP2 envelope — golden bytes + wrap→unwrap→re-parse-inner both directions + disambiguation.
+    // Wrap a plain RELAY (the RELAY2-subsuming case): the gateway unwraps → the inner is a verbatim
+    // RELAY that re-parses under the SAME parse_relay used for a single-hop leaf.
+    let inner_relay = {
+        let mut ib = [0u8; 128];
+        let iln = wire::encode_relay(7, 100, 0, 1, b"cpu=42", &mut ib);
+        ib[..iln].to_vec()
+    };
+    let mut up = [0u8; 256];
+    let upn = wire::encode_up2(7, 5, 2, &inner_relay, &mut up);
+    // GOLDEN: "SMOLv1 UP2 007 00005 2 " + <the verbatim RELAY frame>.
+    let mut golden_up = b"SMOLv1 UP2 007 00005 2 ".to_vec();
+    golden_up.extend_from_slice(&inner_relay);
+    assert_eq!(&up[..upn], &golden_up[..], "encode_up2 golden wire bytes");
+    let (o, em, h, inner) = wire::parse_up2(&up[..upn]).expect("parse_up2");
+    assert_eq!((o, em, h), (7, 5, 2), "UP2 header: origin / envelope-msgid / hop");
+    // the unwrapped inner is a verbatim RELAY → re-parses under the ordinary parser (gateway dispatch).
+    let (rid, rmid, rfrag, rcnt, rchunk) = wire::parse_relay(inner).expect("inner is a verbatim RELAY");
+    assert_eq!((rid, rmid, rfrag, rcnt, rchunk), (7, 100, 0, 1, &b"cpu=42"[..]), "inner RELAY round-trip");
+    // envelope msgid (5) is DISTINCT from the inner RELAY msgid (100) — the two-layer contract.
+    assert_ne!(em, rmid, "envelope msgid != inner RELAY msgid (flood-dedup vs reassembly layers)");
+    // disambiguation: UP2 must NOT classify as a plain RELAY, and vice-versa.
+    assert!(wire::parse_relay(&up[..upn]).is_none(), "UP2 must NOT parse as plain RELAY");
+    assert!(wire::parse_up2(&fb[..n]).is_none(), "a plain RELAY must NOT parse as UP2");
+    // CONSTRAINT 1: a max inner is clamped so the envelope never exceeds ESP_NOW_MTU.
+    let big_inner = [b'z'; 240];
+    let cn = wire::encode_up2(9, 1, 2, &big_inner, &mut up);
+    assert!(cn <= wire::ESP_NOW_MTU, "UP2 clamps inner → frame never exceeds ESP_NOW_MTU");
+    let (_, _, _, clamped) = wire::parse_up2(&up[..cn]).unwrap();
+    assert_eq!(clamped.len(), wire::UP2_INNER_MAX, "inner clamped to UP2_INNER_MAX");
+
+    // #124 Stage 2 — field-boundary clamp (a wrapped DIAG/SCAN never truncates mid `key=val`).
+    // Fits: returns the full length, no clamp.
+    assert_eq!(wire::clamp_inner_field_boundary(b"aa|bb|cc", 100), 8, "clamp: fits => full len");
+    // Over budget: truncate at the LAST `|` at or before max, dropping the straddling tail field.
+    assert_eq!(wire::clamp_inner_field_boundary(b"aa|bb|cc", 5), 5, "clamp: cut at `|` index 5 => aa|bb");
+    assert_eq!(wire::clamp_inner_field_boundary(b"aa|bb|cc", 4), 2, "clamp: cut at `|` index 2 => aa");
+    // No `|` inside max (a single oversized field): raw fallback to max.
+    assert_eq!(wire::clamp_inner_field_boundary(b"aaaaaa", 3), 3, "clamp: no separator => raw max");
+
+    // A realistic over-budget DIAG frame: "SMOLv1 DIAG 007" + a long `|`-joined record (> MTU). The
+    // wrapped envelope must (a) fit ESP_NOW_MTU, (b) cut at a field boundary (the cut index is a `|`,
+    // and the surviving slice does NOT end mid-field), (c) keep the SMOLv1 DIAG prefix intact so the
+    // gateway still classifies + caches it.
+    let mut diag = b"SMOLv1 DIAG 007".to_vec();
+    for i in 0..40u32 {
+        diag.push(b'|');
+        diag.extend_from_slice(format!("k{i:02}=vvvvv").as_bytes());
+    }
+    assert!(diag.len() > wire::ESP_NOW_MTU, "test DIAG must exceed the MTU to exercise the clamp");
+    let cut = wire::clamp_inner_field_boundary(&diag, wire::UP2_INNER_MAX);
+    assert!(cut <= wire::UP2_INNER_MAX, "clamp <= UP2_INNER_MAX");
+    assert_eq!(diag[cut], b'|', "clamp lands ON a `|` separator (dropped tail field starts here)");
+    assert_ne!(diag[cut - 1], b'|', "surviving slice ends on a complete field, not a bare `|`");
+    let dn = wire::encode_up2(7, 3, 2, &diag[..cut], &mut up);
+    assert!(dn <= wire::ESP_NOW_MTU, "wrapped over-budget DIAG still fits the MTU");
+    let (_, _, _, dinner) = wire::parse_up2(&up[..dn]).expect("parse wrapped DIAG");
+    assert_eq!(dinner, &diag[..cut], "unwrapped inner == the field-boundary-clamped DIAG verbatim");
+    assert!(dinner.starts_with(b"SMOLv1 DIAG 007"), "clamped DIAG keeps its classify-able prefix");
+
+    println!("relay_compat: ALL CHECKS PASSED (bidirectional byte-compat + golden bytes + #13/#124 tag round-trips + disambiguation + UP2 clamp + field-boundary DIAG clamp)");
 }
