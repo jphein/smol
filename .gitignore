@@ -34,6 +34,18 @@ wifi_secrets.*
 board.rs
 **/board.rs
 
+# #147 hardening: also ignore BACKUP / VARIANT siblings of the secret files — a loose
+# `secrets.rs.pre142.bak` (real creds, NOT matched by `**/secrets.rs`) nearly rode a
+# commit, and the repo is PUBLIC. The `.example` TEMPLATES must stay TRACKED, so they
+# are re-included via explicit negation (order matters: exclude then negate).
+**/secrets.rs.*
+!**/secrets.rs.example
+**/board.rs.*
+!**/board.rs.example
+# Editor/tooling backups under the firmware crate src (belt-and-suspenders).
+rust/clock/src/*.bak
+rust/clock/src/**/*.bak
+
 # OTA publish infra config (issue #6) — real host/broker/addon values for
 # tools/ota_publish.sh. Git-ignored (repo is public); the tracked template is
 # tools/ota_publish.env.example (cp it → tools/ota_publish.env, edit). No password here.
