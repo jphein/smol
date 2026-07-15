@@ -251,3 +251,115 @@ impl Default for HopLatch {
         Self::new()
     }
 }
+
+// ---- #126 latched-leaf channel parking (multi-hop throughput) ---------------
+
+/// Bootstrap dwell per candidate while HUNTING for the relay's channel (matches `mode.rs`'s scan
+/// dwell). A leaf that can't hear its owner blind-hops the candidate channels, so an uplink lands
+/// on the relay's channel only ~1/N of the time (#123's ~1/3 finding).
+pub const PARK_DWELL_MS: u64 = 1500;
+
+/// No park signal (a relay echoing our UP2, or a RELAYACK2 for us) on the parked channel for this
+/// long ⇒ the relay moved or died; forget the park and resume the hunt. A few dwell cycles — long
+/// enough to ride a lossy gap, short enough to re-discover promptly. Self-healing.
+pub const PARK_STALE_MS: u64 = 12_000;
+
+/// #126: a LATCHED leaf's channel-selection state machine (pure). A stranded leaf never locks a
+/// channel (it can't hear its owner's HELLO), so #13 v1 left it blind-hopping the candidates — its
+/// uplink coincides with the relay's channel only ~1/N of the time, and the `RELAYACK2` flood-back
+/// hits the same ~1/N in reverse. This PARKS the leaf on the channel that last drew a park signal
+/// (a relay re-broadcasting our own UP2 — the early "forwarded" proof — or a `RELAYACK2` addressed
+/// to us — the end-to-end proof), so subsequent emits AND ACKs ride the channel that demonstrably
+/// works. Self-healing: a park that stops drawing signals ([`PARK_STALE_MS`]) is dropped and the
+/// round-robin hunt resumes (rides relay roam / re-election for free).
+///
+/// It owns the ENTIRE latched-leaf channel decision so the firmware wiring is trivial: apply
+/// [`ChannelPark::poll`]'s result via `set_channel`, feed [`ChannelPark::on_signal`] when a relay
+/// echoes our UP2 or a `RELAYACK2` for us arrives, and [`ChannelPark::reset`] when the leaf
+/// un-latches. Host tests over these methods therefore ARE the trigger-wiring coverage — the #123
+/// lesson: last campaign only the [`HopLatch`] MATH was host-tested, NOT the wiring that drives it,
+/// so an on-air trigger bug slipped past green builds. Here the wiring is reduced to "apply + feed".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelPark {
+    /// The channel that last drew a park signal while latched — the park target. `None` ⇒ hunting.
+    parked: Option<u8>,
+    /// When `parked` last drew a signal (freshness anchor for [`PARK_STALE_MS`]).
+    last_signal_ms: u64,
+    /// Round-robin cursor into the candidate list during the bootstrap / re-hunt.
+    scan_idx: usize,
+    /// When the bootstrap cursor last advanced (the dwell gate).
+    last_hop_ms: u64,
+    /// The channel [`poll`] last selected — what the leaf is physically tuned to; a signal parks here.
+    ///
+    /// [`poll`]: ChannelPark::poll
+    current: u8,
+}
+
+impl ChannelPark {
+    pub const fn new() -> Self {
+        Self { parked: None, last_signal_ms: 0, scan_idx: 0, last_hop_ms: 0, current: 0 }
+    }
+
+    /// Decide the channel to be on NOW; return `Some(ch)` IFF it changed since the last selection
+    /// (so the caller re-tunes only on a real hop or park-switch, never mid-dwell). Parks on the
+    /// signalling channel while fresh; else round-robins `candidates` every [`PARK_DWELL_MS`] (the
+    /// #126 "dwell-per-channel" hunt). Lazily forgets a stale park. `candidates` must be non-empty
+    /// (empty ⇒ keep the current channel, defensively).
+    pub fn poll(&mut self, now: u64, candidates: &[u8]) -> Option<u8> {
+        let next = self.decide(now, candidates);
+        if next != self.current {
+            self.current = next;
+            Some(next)
+        } else {
+            None
+        }
+    }
+
+    fn decide(&mut self, now: u64, candidates: &[u8]) -> u8 {
+        if let Some(ch) = self.parked {
+            if now.saturating_sub(self.last_signal_ms) < PARK_STALE_MS {
+                return ch; // fresh park — dwell here, do not hop
+            }
+            self.parked = None; // stale → resume the hunt
+        }
+        if candidates.is_empty() {
+            return self.current; // defensive: never index an empty candidate list
+        }
+        if now.saturating_sub(self.last_hop_ms) >= PARK_DWELL_MS {
+            self.scan_idx = (self.scan_idx + 1) % candidates.len();
+            self.last_hop_ms = now;
+        }
+        candidates[self.scan_idx % candidates.len()]
+    }
+
+    /// A park signal arrived on the channel we're physically on (a relay echoed our UP2, or a
+    /// `RELAYACK2` addressed to us) — proof the relay path works HERE. Park on it. Called only while
+    /// latched, after [`poll`] has selected a real candidate, so `current` is non-zero by then; the
+    /// zero-guard is belt-and-suspenders (never park on the sentinel "unset" channel).
+    ///
+    /// [`poll`]: ChannelPark::poll
+    pub fn on_signal(&mut self, now: u64) {
+        if self.current != 0 {
+            self.parked = Some(self.current);
+            self.last_signal_ms = now;
+        }
+    }
+
+    /// The leaf un-latched (re-acquired its owner / re-elected) — forget the park so a future latch
+    /// re-bootstraps from a clean hunt. Leaves the round-robin cursor (start index is immaterial).
+    pub fn reset(&mut self) {
+        self.parked = None;
+        self.current = 0;
+    }
+
+    /// The channel the leaf is currently parked on, or `None` while hunting. Observability / tests.
+    pub fn parked(&self) -> Option<u8> {
+        self.parked
+    }
+}
+
+impl Default for ChannelPark {
+    fn default() -> Self {
+        Self::new()
+    }
+}

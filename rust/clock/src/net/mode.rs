@@ -128,16 +128,12 @@ const BEACON_PREFIX: &[u8] = b"SMOLv1 BEACON "; // + "NNN SSSSS EEEEE"
 /// on a private fixed channel; harden with a signed payload or an ESP-NOW LMK
 /// if it ever matters. Documented, not defended.
 const TIME_PREFIX: &[u8] = b"SMOLv1 TIME "; // + "NNN UUUUUUUUUU SSSSSSSSSS"
-// #13: the RELAY / RELAYACK / RELAY2 / RELAYACK2 wire TAGS + their whole codec live in the
+// #13/#124: the RELAY / RELAYACK / UP2 / RELAYACK2 wire TAGS + their whole codec live in the
 // pure, host-testable `net::wire` module (glob-imported above — RELAY carries a leaf-telemetry
-// fragment; RELAYACK the gateway's fragment-bitmap; RELAY2/RELAYACK2 the #13 multi-hop variants,
-// NEW tags an old firmware classifies to None → no flag-day). The `*_FRAME_MAX` buffer-size
-// consts stay here — they size call-site stack buffers in this module, not the codec.
-/// Max RELAY2 frame length on the wire (30-byte header + full chunk); sizes stack buffers.
-/// Header = 14-byte prefix + "OOO MMMMM H F C " (16) = 30, vs RELAY's 27 (the extra 3 =
-/// the origin↔src split's `H ` hop field; `OOO` is the ORIGIN id, distinct from the
-/// re-broadcasting relay's own src MAC).
-const RELAY2_FRAME_MAX: usize = 30 + RELAY_CHUNK;
+// fragment; RELAYACK the gateway's fragment-bitmap; UP2 the #124 generic uplink ENVELOPE that
+// wraps ANY inner frame from a stranded leaf (subsumes the retired RELAY2), RELAYACK2 the
+// flooded-back ACK — NEW tags an old firmware classifies to None → no flag-day). The
+// `*_FRAME_MAX`/`ESP_NOW_MTU` buffer-size consts size call-site stack buffers in this module.
 /// Max RELAYACK2 frame length ("SMOLv1 RELAYACK2 " + "TTT MMMMM BBB H" = 32); rounded up.
 const RELAYACK2_FRAME_MAX: usize = 40;
 /// Battery-downlink tag: the 12-B `"SMOLv1 BATT "` (trailing space, mirroring TIME)
@@ -435,18 +431,17 @@ enum Frame<'a> {
     /// A gateway's acknowledgement of a relay message: the `msgid` and the u8
     /// bitmap of fragments received so far, so the leaf resends only the gaps.
     RelayAck { msgid: u16, bitmap: u8 },
-    /// #13 multi-hop: one fragment of a STRANDED leaf's telemetry uplink, carrying the
-    /// true `origin` id (stamped by the source, survives forwarding — unlike `src_mac`,
-    /// which is the last relay) and a hop-limit `hop` (decremented at each forward,
-    /// dropped at ≤ 1 by a non-gateway). Otherwise identical to `Relay`. `chunk` borrows
-    /// the RX buffer. Emitted only by an escalated leaf + re-broadcast by relays.
-    Relay2 {
+    /// #124 UP2 generic uplink envelope from a STRANDED leaf: the true `origin` id (stamped by the
+    /// source, survives forwarding — unlike `src_mac`, the last relay), the envelope's own
+    /// `env_msgid` (per-origin rolling — the FLOOD-DEDUP key, distinct from any inner RELAY msgid),
+    /// a hop-limit `hop` (decremented per forward, dropped at ≤ 1 by a non-gateway), and the verbatim
+    /// `inner` SMOLv1 frame (RELAY/STAT/DIAG/SCAN — `inner` borrows the RX buffer). The gateway
+    /// unwraps + re-dispatches `inner`. Emitted only by an escalated leaf + re-broadcast by relays.
+    Up2 {
         origin: u8,
-        msgid: u16,
+        env_msgid: u16,
         hop: u8,
-        frag: u8,
-        count: u8,
-        chunk: &'a [u8],
+        inner: &'a [u8],
     },
     /// #13 multi-hop: the gateway's flooded-back ACK for a `Relay2` message (R1,
     /// table-free) — `target` = the origin leaf to ACK, `msgid` + `bitmap` as `RelayAck`,
@@ -1449,16 +1444,25 @@ struct Relay {
     /// retransmits so a message is never enqueued (UDP-delivered) twice (finding 3).
     done: [Option<([u8; 6], u16)>; DONE_RING],
     done_cursor: usize,
-    /// #13 relay-role: the `(origin, msgid, frag)` loop/dup guard for FORWARDING inbound
-    /// `RELAY2` frames. Only a NON-gateway consults it (the gateway reassembles + dedups
-    /// via its own `reasm`/`done`, so it never marks a frame "seen" — else a lost-ACK
-    /// retransmit would be dropped before it could be re-ACKed). See `net/flood.rs`.
+    /// #13 relay-role: the `(origin, env_msgid, 0)` loop/dup guard for FORWARDING inbound `UP2`
+    /// envelopes (#124: keyed on the envelope msgid; each UP2 is one atomic frame so `frag`=0). Only
+    /// a NON-gateway consults it (the gateway reassembles + dedups via its own `reasm`/`done`, so it
+    /// never marks a frame "seen" — else a lost-ACK retransmit would be dropped before it could be
+    /// re-ACKed). See `net/flood.rs`.
     seen: crate::net::flood::SeenSet,
     /// #13 leaf-role: the single-hop⇄multi-hop escalation state machine. Stays inert
     /// (single-hop, byte-identical) until this leaf's telemetry goes fully un-ACKed
-    /// (`relay_retransmit` exhaust) — then it latches `RELAY2` at `MAX_HOP` and probes
+    /// (`relay_retransmit` exhaust / supersession) — then it latches `UP2` at `MAX_HOP` and probes
     /// its way back down. See `net/flood.rs`.
     latch: crate::net::flood::HopLatch,
+    /// #124 leaf-role: the envelope's own per-origin rolling msgid — bumped once per `UP2` emitted
+    /// (each inner frame / RELAY fragment gets a unique one), the FLOOD-DEDUP key. DISTINCT from the
+    /// inner RELAY `msgid` (`tx.msgid`), which stays the reassembly/RELAYACK2 key. Wraps like `next_msgid`.
+    up_env_msgid: u16,
+    /// #126 leaf-role: the latched-leaf channel-parking state machine. Inert until the leaf latches
+    /// multi-hop; then it parks on the channel that drew a relay-echo/`RELAYACK2` instead of blind-
+    /// hopping (raising the ~1/3 channel-coincidence throughput). See `net/flood.rs`.
+    park: crate::net::flood::ChannelPark,
 }
 
 impl Relay {
@@ -1476,6 +1480,8 @@ impl Relay {
             done_cursor: 0,
             seen: crate::net::flood::SeenSet::new(),
             latch: crate::net::flood::HopLatch::new(),
+            up_env_msgid: 0,
+            park: crate::net::flood::ChannelPark::new(),
         }
     }
 
@@ -1804,12 +1810,19 @@ pub struct RadioManager {
     /// independent drain timing). Persists the current staged image for every leaf relay.
     staged_raw: Option<crate::ota::Announce>,
     /// #40 headless observability + clear/retry: the LAST leaf-OTA attempt's `(leaf_id,
-    /// phase, clear_install)`, set by `main` after `run_leaf_ota_relay`, PUBLISHED to
+    /// phase, clear_install, retry_n)`, set by `main` after `run_leaf_ota_relay`, PUBLISHED to
     /// `smol/<leaf>/ota/diag` on the gateway's next burst and used to drive the install
     /// clear (terminal/exhausted) vs retry (transient). `None` when nothing is pending.
     /// The phase is stored as the rendered `&'static str` (not the espnow-only enum) so the
-    /// shared `wifi::mqtt_session` signature stays buildable in the wifi-only profile.
-    leaf_ota_diag: Option<(u8, &'static str, bool)>,
+    /// shared `wifi::mqtt_session` signature stays buildable in the wifi-only profile. `retry_n`
+    /// (#134) is the current consecutive-failure count for this outcome class — surfaced in the
+    /// retained payload (`fetch-failed retry=3`) so a stuck fetch is visible headlessly.
+    leaf_ota_diag: Option<(u8, &'static str, bool, u8)>,
+    /// #139-followup: on a failed SELF-fetch, `(chunk_k, chunk_n, retries, stalls)` buffered by
+    /// `run_ota_update` → formatted + published retained to `smol/<id>/ota/diag` on the next gateway
+    /// flush (fleet-visible failure diag; release images are serial-silent). Consumed once (set to
+    /// `None` after publish), mirroring `leaf_ota_diag`.
+    ota_self_fail: Option<(u32, u32, u32, u32)>,
     /// #40 #1 DECOUPLE: true while a leaf-OTA relay is pending/in-flight (armed until its
     /// outcome is terminal or the retry cap is hit). While set, the gateway SUPPRESSES its own
     /// self-OTA (`do_install`) so a relay is never interrupted by the gateway rebooting into a
@@ -1837,9 +1850,15 @@ pub struct RadioManager {
     /// chunk-loss stall. `last_wb` is in chunk units (matches `total = om::total_chunks`).
     /// Carries the leaf's `LDBG` self-report too (captured during the relay) — see `RelayDiag`.
     leaf_relay_rx: Option<crate::net::wifi::RelayDiag>,
-    /// #40: consecutive non-terminal (transient) relay attempts for the current install —
-    /// caps the auto-retry so a persistently-failing leaf can't loop the mesh-deaf relay.
+    /// #40: consecutive POST-HANDOFF transient relay attempts (`RelayFailed`/`Timeout`/`Aborted`)
+    /// for the current install — caps the auto-retry so a persistently-failing (doomed) IMAGE can't
+    /// loop the mesh-deaf relay. Does NOT count pre-relay failures (see `leaf_ota_fetch_retries`).
     leaf_ota_retries: u8,
+    /// #134: consecutive PRE-RELAY failures (`FetchFailed`/`MacUnknown` — the feed never handed off
+    /// to the leaf) for the current install. Counted for the retained `ota/diag` retry number ONLY —
+    /// it NEVER burns the order (a gateway-local fetch failure says nothing about the leaf/image, so
+    /// the install survives for the next attempt / the next crown). Reset on a terminal outcome.
+    leaf_ota_fetch_retries: u8,
     /// #21 node-manager: the parsed default-screen command surfaced by a burst,
     /// pending `main`'s `take_config_offer` → apply. `None` when nothing is pending.
     config_offer: Option<crate::app::DefaultScreen>,
@@ -1892,6 +1911,15 @@ impl RadioManager {
         let (mut controller, interfaces) = esp_wifi::wifi::new(ctrl, p.wifi).ok()?;
         controller.set_mode(WifiMode::Sta).ok()?;
         controller.start().ok()?;
+        // #139: assert PowerSaveMode::None at RADIO INIT — the esp-wifi/IDF default is
+        // WIFI_PS_MIN_MODEM (the STA sleeps between DTIMs; the AP then buffers UNICAST at DTIM and
+        // drops it on marginal links → the re-ARP-after-reply / forwarded-NTP-never-arrives /
+        // TX-fine-RX-deaf class). This is the baseline; `switch()` re-asserts after each connect()
+        // (which resets ps to the default), and the post-is_connected() sites stay belt-and-
+        // suspenders. Shared by every espnow association (NTP/MQTT/OTA/re-election). See nebula
+        // finding 2 (scratch/smol-ha-batt/nebula-c3-wifi-research.md).
+        let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
+        crate::net::assert_max_tx_power(); // #141: 8.5 dBm clamp, right after driver start
 
         // #68/#76 SELF-MAC: capture our STA MAC (ESP-NOW rides the STA interface) so service()
         // can DROP frames from our own address. The esp-wifi RX queue can deliver our own
@@ -1950,7 +1978,9 @@ impl RadioManager {
             ota_offer: None,
             staged_raw: None,
             leaf_ota_diag: None,
+            ota_self_fail: None,
             leaf_ota_retries: 0,
+            leaf_ota_fetch_retries: 0,
             leaf_ota_pending: false,
             leaf_installs_outstanding: false,
             leaf_ota_mac: None,
@@ -2001,6 +2031,26 @@ impl RadioManager {
         if self.scan_locked {
             return;
         }
+        // #126 channel parking: a LATCHED leaf (stranded — never locked an owner) delegates its
+        // channel choice to ChannelPark, which parks on the channel that drew a relay-echo/RELAYACK2
+        // instead of blind-hopping (raising the ~1/3 channel-coincidence throughput). It hunts the
+        // SAME candidates when bootstrapping / after a park goes stale, so a not-yet-signalled latched
+        // leaf behaves like today's blind scan. `poll` returns Some only on an actual change, so we
+        // re-tune the radio exactly as sparsely as the round-robin did (never mid-dwell).
+        if self.relay.latch.latched() {
+            if let Some(ch) = self.relay.park.poll(now, &CANDIDATES) {
+                let _ = self.esp_now.set_channel(ch);
+                log::info!(
+                    "smol #126: latched-leaf channel {} ({})",
+                    ch,
+                    if self.relay.park.parked() == Some(ch) { "parked" } else { "hunting" }
+                );
+            }
+            return;
+        }
+        // NOT latched → the ordinary blind scan for our owner. Forget any stale park so a future
+        // latch re-bootstraps from a clean hunt.
+        self.relay.park.reset();
         if now.saturating_sub(self.last_scan_hop_ms) >= DWELL_MS {
             self.scan_idx = (self.scan_idx + 1) % CANDIDATES.len();
             let ch = CANDIDATES[self.scan_idx];
@@ -2077,6 +2127,15 @@ impl RadioManager {
         // never heard (a forged/phantom retained MC — the standoff) is taken over promptly instead
         // of waiting the RSSI backoff (which exists to stagger takeover of a possibly-live owner).
         elect.owner_never_heard = !self.owner_hello_seen;
+        // #136: seed the heard-path takeover floor = the worst-case gap between a LIVE owner's
+        // OBSERVED MC seq advances (one flush interval + a slow/failed flush bounded by the flush
+        // budget). Computed here (espnow tier, where both constants live) so the wifi-tier resolver
+        // honors it without a cross-cfg dependency. Keeps a budget-edge re-assoc flush from being
+        // mistaken for a dead owner (issue #136); tracks #122 B1's flush interval automatically.
+        // `as_secs()*1000` (not `as_millis() as u64`): as_secs() is u64-native (no cast) and the
+        // budget is defined in whole seconds, so it's exact — and clippy-clean under -D warnings.
+        elect.recovery_stale_floor_ms =
+            RELAY_FLUSH_INTERVAL_MS + crate::net::wifi::RELAY_FLUSH_BUDGET.as_secs() * 1000;
         // #6 OTA / #21 config / #33 install: a leaf's recovery burst can also surface these.
         let mut ota_offer: Option<crate::ota::Announce> = None;
         let mut config_offer: Option<crate::app::DefaultScreen> = None;
@@ -2117,6 +2176,7 @@ impl RadioManager {
                     &mut None, // #40: recovery burst carries no persistent staged
                     &mut None, // #40: recovery burst publishes no relay diag
                     &mut None, // #3: recovery burst publishes no relay RX-diag
+                    &mut None, // #139-followup: a leaf recovery burst is never a self-OTA fetch
                     tick,
                 )
             }
@@ -2268,6 +2328,14 @@ impl RadioManager {
                 // to the AP's channel automatically; ESP-NOW then coexists on
                 // that channel. (Caller must have valid credentials set.)
                 let _ = self.controller.connect();
+                // #139: connect() resets power-save to the WIFI_PS_MIN_MODEM default, so the
+                // association/auth handshake that follows would otherwise run under modem-sleep
+                // (unicast-deaf window). Re-assert None NOW — before the handshake completes — not
+                // only after the downstream is_connected() gates (MQTT flush / OTA fetch).
+                let _ = self
+                    .controller
+                    .set_power_saving(esp_wifi::config::PowerSaveMode::None);
+                crate::net::assert_max_tx_power(); // #141
                 log::info!("smol: radio -> WiFi STA (coexist)");
             }
         }
@@ -2448,6 +2516,7 @@ impl RadioManager {
         let n = value.len().min(crate::net::wifi::CFG_VALUE_MAX);
         msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
+        self.relay_wrap_observability(&msg[..base + 3 + n]);
     }
 
     /// #70/#49: broadcast this node's compact key=val DIAG record as a `SMOLv1 DIAG` frame —
@@ -2467,6 +2536,7 @@ impl RadioManager {
         let n = value.len().min(crate::net::wifi::RELAY_VALUE_MAX);
         msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
+        self.relay_wrap_observability(&msg[..base + 3 + n]);
     }
 
     /// #71: broadcast this node's one-shot WiFi-scan record as a `SMOLv1 SCAN` frame — twin of
@@ -2485,6 +2555,29 @@ impl RadioManager {
         let n = value.len().min(crate::net::wifi::RELAY_VALUE_MAX);
         msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
+        self.relay_wrap_observability(&msg[..base + 3 + n]);
+    }
+
+    /// #124 Stage 2 (observability closure) — when this leaf is LATCHED (multi-hop, gateway out of
+    /// direct earshot), ALSO emit `frame` (a fully-built plain STAT/DIAG/SCAN) wrapped in a UP2
+    /// envelope so a relay floods our /stat /diag /scan to the gateway. Closes the P1 gap: a
+    /// stranded leaf that can't RELAY-uplink was previously observability-DARK (STAT/DIAG/SCAN are
+    /// plain broadcasts, never forwarded). No-op on a gateway or when NOT latched — so a healthy
+    /// leaf's on-air behaviour is BYTE-IDENTICAL (only the plain broadcast, no UP2). The inner is
+    /// clamped at a FIELD BOUNDARY (last `|` ≤ [`UP2_INNER_MAX`]) so an over-budget DIAG/SCAN record
+    /// truncates its tail cleanly (never mid `key=val`); STAT (≤ 79 B) never clamps. Each wrap gets a
+    /// fresh envelope msgid (the flood-dedup key; fire-and-forget — no inner ACK). `frame` is a local
+    /// buffer in the caller, so no borrow of `self` is held across the `&mut self` send.
+    fn relay_wrap_observability(&mut self, frame: &[u8]) {
+        if self.relay.is_gateway || !self.relay.latch.latched() {
+            return;
+        }
+        let env_msgid = self.relay.up_env_msgid;
+        self.relay.up_env_msgid = self.relay.up_env_msgid.wrapping_add(1);
+        let ilen = clamp_inner_field_boundary(frame, UP2_INNER_MAX);
+        let mut fb = [0u8; ESP_NOW_MTU];
+        let len = encode_up2(self.id, env_msgid, crate::net::flood::MAX_HOP, &frame[..ilen], &mut fb);
+        self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
     }
 
     /// #71: run ONE on-demand WiFi AP scan (triggered by applying the `W` command) → publish the
@@ -2625,20 +2718,14 @@ impl RadioManager {
         let tx = self.bench.tx_count;
         let e = self.diag_extra;
         let led_state = if e.led_on { "on" } else { "off" };
-        // #100: active WiFi slot + fallback state (net=<slot>:<ok|fb>). `fb` = we auto-reverted off
-        // the commanded slot (the un-brick fallback fired) — HA surfaces "the network switch failed".
-        // Stage 2/3: brk=<baked|ovr|fb> (broker override state — `fb` = the override was auto-disabled
-        // after repeated CONNACK failures, running the baked broker) + otah=<slot|ovr> (an OTA-host
-        // override is appended to the allowlist). All read live from the one NVS net-record.
-        let net = crate::ota::read_net_cfg().unwrap_or(crate::ota::NetCfg {
-            active: 0,
-            commanded: 0,
-            fallback: false,
-            broker: None,
-            broker_fallback: false,
-            ota_host: None,
-        });
-        let net_fb = if net.fallback { "fb" } else { "ok" };
+        // #142: single-network operation — the #100 slot/fallback state is retired, so `net=` is
+        // FROZEN to the constant `0:ok` (slot 0 was always the primary — every healthy board's
+        // historical baseline is net=0:ok; the removed roam network was slot 1). Kept (not dropped) ONLY to preserve the HA dashboard's
+        // POSITIONAL DIAG parse; a dashboard follow-up repurposes or drops it. Stage 2/3 override
+        // state is still LIVE from the NVS net-record: brk=<baked|ovr|fb> (broker override — `fb` =
+        // auto-disabled after repeated CONNACK failures, running the baked broker) + otah=<slot|ovr>.
+        let net = crate::ota::read_net_cfg().unwrap_or_default();
+        let net_fb = "ok"; // #142: frozen (no slot fallback in single-network mode)
         let brk = match (net.broker.is_some(), net.broker_fallback) {
             (true, false) => "ovr",
             (true, true) => "fb",
@@ -2673,7 +2760,7 @@ impl RadioManager {
             led_state,
             e.tage_s,
             e.tsrc,
-            net.active,
+            0, // #142: net= frozen to slot 0 (the historical primary baseline); dashboard parse stays positional
             net_fb,
             brk,
             otah,
@@ -2953,17 +3040,27 @@ impl RadioManager {
                 || now.saturating_sub(self.relay.last_emit_ms) >= RELAY_EMIT_INTERVAL_MS)
     }
 
-    /// #13: emit ONE fragment of OUR OWN uplink at the message's chosen framing.
-    /// `hop <= 1` → plain `RELAY` (the byte-identical single-hop case AND the `H=1`
-    /// un-latch probe); `hop > 1` → `RELAY2` (origin-stamped, hop-limited, forwarded by
-    /// relays). The chunk is copied into a LOCAL frame buffer BEFORE `send_to`, so no
-    /// borrow of `self.relay` is held across the `&mut self` send.
+    /// #124: emit ONE fragment of OUR OWN uplink at the message's chosen framing.
+    /// `hop <= 1` → plain `RELAY` (the byte-identical single-hop case AND the `H=1` un-latch probe);
+    /// `hop > 1` → the fragment's plain `RELAY` frame WRAPPED in a `UP2` envelope (origin-stamped,
+    /// hop-limited, forwarded by relays). Each wrapped fragment gets a FRESH per-origin envelope
+    /// msgid (the flood-dedup key — distinct from the inner RELAY `msgid`, which stays the gateway's
+    /// reassembly/RELAYACK2 key); a fresh env_msgid per (re)send means a retransmit is re-forwarded
+    /// (the relay's seen-set doesn't suppress it — closing #13's single-relay retransmit gap). The
+    /// inner + frame are built into LOCAL buffers before `send_to`, so no borrow of `self.relay` is
+    /// held across the `&mut self` send.
     fn relay_send_frag(&mut self, msgid: u16, hop: u8, frag: u8, count: u8, off: usize, end: usize) {
-        let mut fb = [0u8; RELAY2_FRAME_MAX];
+        let mut fb = [0u8; ESP_NOW_MTU];
         let len = if hop <= 1 {
             encode_relay(self.id, msgid, frag, count, &self.relay.tx.buf[off..end], &mut fb)
         } else {
-            encode_relay2(self.id, msgid, hop, frag, count, &self.relay.tx.buf[off..end], &mut fb)
+            // Build the inner plain RELAY, then wrap it in UP2 with a fresh envelope msgid.
+            let mut inner = [0u8; 96]; // RELAY frame ≤ 27-byte header + RELAY_CHUNK(64) = 91
+            let ilen =
+                encode_relay(self.id, msgid, frag, count, &self.relay.tx.buf[off..end], &mut inner);
+            let env_msgid = self.relay.up_env_msgid;
+            self.relay.up_env_msgid = self.relay.up_env_msgid.wrapping_add(1);
+            encode_up2(self.id, env_msgid, hop, &inner[..ilen], &mut fb)
         };
         self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
     }
@@ -3161,16 +3258,29 @@ impl RadioManager {
         log::info!("smol OTA: opening update burst (mesh deaf for the whole download)");
         let _ = self.switch(Mode::WifiSta);
         let rng = self.rng;
-        match self.sta.as_mut() {
+        let mut fail: Option<(u32, u32, u32, u32)> = None;
+        let ok = match self.sta.as_mut() {
             None => false,
             Some(sta) => {
                 // Self-OTA: activate-on-success (relay_mode = false; the slot out-param is
                 // unused since a successful self-fetch reboots inside `activate`).
                 crate::net::wifi::run_ota_fetch(
-                    &mut self.controller, sta, rng, announce, tick, false, &mut None,
+                    &mut self.controller, sta, rng, announce, tick, false, &mut None, &mut fail,
                 )
             }
+        };
+        // #139-followup: a SUCCESS reboots INSIDE the fetch (never returns here), so reaching this
+        // with ok==false is a genuine self-fetch failure — buffer the (chunk_k, chunk_n, retries,
+        // stalls) snapshot so the next gateway flush publishes it retained to smol/<id>/ota/diag.
+        // Release images are serial-silent, so this retained record is the ONLY fleet-visible signal
+        // of WHY a self-fetch died (the blindness that turned tonight's mid-body deaths into a
+        // three-hour diagnosis). `id` avoids borrowing self across the field set.
+        if !ok {
+            if let Some(rec) = fail {
+                self.ota_self_fail = Some(rec);
+            }
         }
+        ok
     }
 
     /// #40: record a leaf-OTA attempt's outcome (called by `main` after `run_leaf_ota_relay`,
@@ -3179,22 +3289,39 @@ impl RadioManager {
     /// cap is hit) vs LEAVE it retained to retry (mac-unknown / fetch / relay / timeout). The
     /// phase is published to `smol/<leaf>/ota/diag` on the next burst (headless observability).
     pub fn record_leaf_ota(&mut self, leaf_id: u8, outcome: crate::ota_mesh::LeafOtaOutcome) {
-        let clear = if outcome.is_terminal() {
+        // #134 clear/retry policy — THREE cases, not two:
+        //  1. terminal (leaf DEFINITIVELY acted: installed / rolled-back / id-mismatch) → CLEAR,
+        //     reset both counters.
+        //  2. PRE-RELAY transient (`FetchFailed`/`MacUnknown` — `!reached_leaf()`): the feed NEVER
+        //     handed off to the leaf, so this is GATEWAY-LOCAL and says nothing about the leaf/image.
+        //     NEVER clear — the retained install must survive for the next attempt or the NEXT CROWN
+        //     (crown-portable per #111). Only count it, for the ota/diag retry number. THIS is the
+        //     #134 fix: previously a fetch-broken crown (e.g. unicast-deaf) burned the order after
+        //     LEAF_OTA_MAX_RETRIES fetch-fails, destroying an install a healthy successor would finish.
+        //  3. POST-HANDOFF transient (`RelayFailed`/`Timeout`/`Aborted` — the image DID reach the
+        //     leaf): the DOOMED-image backstop → bounded retries, then CLEAR so a bad image can't
+        //     re-arm forever.
+        let (clear, retry_n) = if outcome.is_terminal() {
             self.leaf_ota_retries = 0;
-            true
+            self.leaf_ota_fetch_retries = 0;
+            (true, 0)
+        } else if !outcome.reached_leaf() {
+            self.leaf_ota_fetch_retries = self.leaf_ota_fetch_retries.saturating_add(1);
+            (false, self.leaf_ota_fetch_retries)
         } else {
             self.leaf_ota_retries = self.leaf_ota_retries.saturating_add(1);
+            let n = self.leaf_ota_retries;
             let exhausted = self.leaf_ota_retries >= LEAF_OTA_MAX_RETRIES;
             if exhausted {
                 self.leaf_ota_retries = 0;
             }
-            exhausted
+            (exhausted, n)
         };
         log::info!(
-            "smol #40: leaf id{} OTA phase={} (clear_install={}, retries={})",
-            leaf_id, outcome.as_str(), clear, self.leaf_ota_retries
+            "smol #40/#134: leaf id{} OTA phase={} (clear_install={}, reached_leaf={}, retry={})",
+            leaf_id, outcome.as_str(), clear, outcome.reached_leaf(), retry_n
         );
-        self.leaf_ota_diag = Some((leaf_id, outcome.as_str(), clear));
+        self.leaf_ota_diag = Some((leaf_id, outcome.as_str(), clear, retry_n));
         // #1 DECOUPLE: the relay session is done for this install iff we're clearing it
         // (terminal outcome or retry cap). While NOT cleared (transient retry) it stays
         // pending so the gateway keeps suppressing its own self-OTA until the leaf resolves.
@@ -3344,7 +3471,7 @@ impl RadioManager {
         let mut staged: Option<Slot> = None;
         let fetched = match self.sta.as_mut() {
             Some(sta) => crate::net::wifi::run_ota_fetch(
-                &mut self.controller, sta, rng, announce, tick, true, &mut staged,
+                &mut self.controller, sta, rng, announce, tick, true, &mut staged, &mut None,
             ),
             None => false,
         };
@@ -3838,6 +3965,7 @@ impl RadioManager {
                     &mut self.staged_raw, // #40: persist the staged across flushes (pair-safe)
                     &mut self.leaf_ota_diag, // #40: publish smol/<leaf>/ota/diag + clear/retry
                     &mut self.leaf_relay_rx, // #3: publish smol/<leaf>/ota/relaydiag (RX evidence)
+                    &mut self.ota_self_fail, // #139-followup: publish own smol/<id>/ota/diag on self-fetch fail
                     tick,
                 )
             }
@@ -4296,55 +4424,83 @@ impl RadioManager {
                     self.relay.latch.on_direct_ack();
                     label = Some(alloc::format!("ack {:05}", msgid));
                 }
-                Some(Frame::Relay2 { origin, msgid, hop, frag, count, chunk }) => {
-                    // #13 multi-hop uplink fragment. Proves the SENDER (the last relay, or the
-                    // origin itself) is audible (LED detected + roster, attributed to `origin`).
+                Some(Frame::Up2 { origin, env_msgid, hop, inner }) => {
+                    // #124 multi-hop uplink ENVELOPE. Proves the SENDER (last relay, or the origin)
+                    // is audible (LED detected + roster, attributed to `origin`).
                     self.peers.last_hello_ms = now;
                     self.roster.heard(src, Some(origin), rssi, now);
                     if origin == self.id {
-                        // Our OWN frame echoed back by a relay — never re-forward or reassemble it
-                        // (that would count as a bogus fwd + could loop). Just drop it.
-                        label = Some(alloc::format!("relay2 self {:03}", origin));
+                        // Our OWN envelope echoed back by a relay — never re-forward/reassemble it
+                        // (bogus fwd + could loop). But the echo PROVES a relay heard + forwarded us
+                        // on the channel we're physically on → the #126 early park signal (arrives a
+                        // hop sooner than the gateway's RELAYACK2). Feed it while latched.
+                        if self.relay.latch.latched() {
+                            self.relay.park.on_signal(now);
+                        }
+                        label = Some(alloc::format!("up2 self {:03}", origin));
                     } else if self.relay.is_gateway {
-                        // GATEWAY = the flood's sink. Reassemble keyed by ORIGIN (a synthetic MAC
-                        // `00:00:00:00:00:<origin>`), NOT `src` — `src` is the last relay's MAC, but
-                        // reassembly + late-retransmit dedup must key on the true source. We do NOT
-                        // consult the seen-set here: `accept()` + `DONE_RING` already dedup
-                        // fragments/retransmits, and a seen-set drop would kill a lost-RELAYACK2
-                        // retransmit's re-ACK (the single-hop path's finding 3, one hop out). On each
-                        // accepted fragment, FLOOD a RELAYACK2 back toward the origin (R1, table-free)
-                        // carrying the cumulative bitmap so the stranded leaf learns completion.
+                        // GATEWAY SINK: dispatch by the INNER frame type (#124 Stage 2). Everything is
+                        // keyed by the envelope `origin` (the stranded leaf), NOT `src` (the last relay):
+                        //   • RELAY → reassemble (synthetic origin MAC) + flood a RELAYACK2 back toward
+                        //     the origin. `imsgid` is the INNER RELAY msgid = reassembly/ACK key (distinct
+                        //     from env_msgid). accept()+DONE_RING dedup fragments/retransmits, so we do
+                        //     NOT consult the seen-set here (a seen-set drop would kill a lost-ACK
+                        //     retransmit's re-ACK).
+                        //   • STAT/DIAG/SCAN → the same gateway caches the DIRECT arms feed (the P1
+                        //     observability closure): a stranded leaf's /stat /diag /scan now reach HA.
+                        //     STAT stamps the synthetic origin MAC so the leaf stays mac-resolvable
+                        //     (mirror of the direct STAT arm, which stamps the real `src`).
                         let synth = synth_origin_mac(origin);
-                        let (bitmap, complete) =
-                            self.relay.accept(synth, (origin, msgid, frag, count), chunk, now);
-                        self.flood_relayack2(origin, msgid, bitmap);
-                        label = Some(if complete {
-                            alloc::format!("relay2 {:03} ok", origin)
-                        } else {
-                            alloc::format!("relay2 {:03} {}/{}", origin, bitmap.count_ones(), count)
-                        });
+                        match parse_frame(inner) {
+                            Some(Frame::Relay { msgid: imsgid, frag, count, chunk, .. }) => {
+                                let (bitmap, complete) =
+                                    self.relay.accept(synth, (origin, imsgid, frag, count), chunk, now);
+                                self.flood_relayack2(origin, imsgid, bitmap);
+                                label = Some(if complete {
+                                    alloc::format!("up2 {:03} ok", origin)
+                                } else {
+                                    alloc::format!("up2 {:03} {}/{}", origin, bitmap.count_ones(), count)
+                                });
+                            }
+                            Some(Frame::Stat { value, .. }) => {
+                                self.stat_cache.set(
+                                    origin, crate::net::wifi::CFG_KEY_SCREEN, value, synth, now,
+                                );
+                                label = Some(alloc::format!("up2 {:03} stat", origin));
+                            }
+                            Some(Frame::Diag { value, .. }) => {
+                                self.diag_cache.set(origin, value, now);
+                                label = Some(alloc::format!("up2 {:03} diag", origin));
+                            }
+                            Some(Frame::Scan { value, .. }) => {
+                                self.scan_cache.set(origin, value, now);
+                                label = Some(alloc::format!("up2 {:03} scan", origin));
+                            }
+                            // An inner we don't sink (nested/unknown) — drop, never re-wrap.
+                            _ => label = Some(alloc::format!("up2 {:03} ?inner", origin)),
+                        }
                     } else {
-                        // RELAY role: the seen-set-gated forward. `forward_decision` (pure) picks
-                        // the fate from (is_gateway=false, hop, already-seen `(origin,msgid,frag)`).
-                        let seen = self.relay.seen.seen_or_insert(origin, msgid, frag);
+                        // RELAY role: envelope-only, inner-AGNOSTIC flood — forwards RELAY and
+                        // STAT/DIAG/SCAN alike (the relay never parses the inner). Seen-set-gated on
+                        // the ENVELOPE msgid `(origin, env_msgid, 0)` — each UP2 is one atomic frame
+                        // (the frag dimension is absorbed into env_msgid, unique per emitted/
+                        // retransmitted UP2).
+                        let seen = self.relay.seen.seen_or_insert(origin, env_msgid, 0);
                         match crate::net::flood::forward_decision(false, hop, seen) {
                             crate::net::flood::ForwardAction::Forward { hop: next_hop } => {
                                 self.diag.fwd = self.diag.fwd.saturating_add(1);
-                                // Re-broadcast at the decremented hop. `chunk` borrows the RX buffer;
-                                // it's copied into the local frame buffer before the `&mut self` send.
-                                let mut fb = [0u8; RELAY2_FRAME_MAX];
-                                let len =
-                                    encode_relay2(origin, msgid, next_hop, frag, count, chunk, &mut fb);
+                                // Re-wrap the SAME inner verbatim at hop-1 (env_msgid preserved).
+                                // `inner` borrows the RX buffer; copied into `fb` before the send.
+                                let mut fb = [0u8; ESP_NOW_MTU];
+                                let len = encode_up2(origin, env_msgid, next_hop, inner, &mut fb);
                                 self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
-                                // Rate-limited serial trace (the forward path was previously OLED-only —
-                                // a rig watching serial saw the fwd counter climb with no log). Every 8th.
                                 if self.diag.fwd.is_multiple_of(8) {
                                     log::info!(
-                                        "smol #13: fwd {} (origin {:03} msgid {} frag {} -> h{})",
-                                        self.diag.fwd, origin, msgid, frag, next_hop
+                                        "smol #124: fwd {} (origin {:03} env_msgid {} -> h{})",
+                                        self.diag.fwd, origin, env_msgid, next_hop
                                     );
                                 }
-                                label = Some(alloc::format!("fwd {:03} h{} f{}", origin, next_hop, frag));
+                                label = Some(alloc::format!("fwd {:03} h{}", origin, next_hop));
                             }
                             crate::net::flood::ForwardAction::DedupDrop => {
                                 self.diag.dedup = self.diag.dedup.saturating_add(1);
@@ -4374,6 +4530,11 @@ impl RadioManager {
                         // the escalation streak (does NOT un-latch — that still needs a direct probe).
                         if bitmap != 0 {
                             self.relay.latch.on_uplink_progress();
+                        }
+                        // #126: the ACK reached us on the channel we're physically on → the round-trip
+                        // works HERE. Park on it (confirming signal; complements the earlier UP2-echo).
+                        if self.relay.latch.latched() {
+                            self.relay.park.on_signal(now);
                         }
                         label = Some(alloc::format!("ack2 {:05}", msgid));
                     } else if hop > 1 {
@@ -4855,12 +5016,11 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
     if let Some((msgid, bitmap)) = parse_relayack(data) {
         return Some(Frame::RelayAck { msgid, bitmap });
     }
-    // #13 multi-hop variants. Order vs RELAY/RELAYACK is moot — `strip_prefix` is exact and
-    // the `2` at the disambiguating byte makes base + variant mutually exclusive — but keep
-    // them adjacent to their base tag. A plain-RELAY frame never matches RELAY2 (byte 12 is
-    // ' ' not '2') and vice-versa, so a non-escalated leaf's frames stay byte-identical.
-    if let Some((origin, msgid, hop, frag, count, chunk)) = parse_relay2(data) {
-        return Some(Frame::Relay2 { origin, msgid, hop, frag, count, chunk });
+    // #124 multi-hop variants. Order vs RELAY/RELAYACK is moot — `strip_prefix` is exact and UP2
+    // diverges from RELAY at byte 7 (`'U'` vs `'R'`), RELAYACK2 from RELAYACK at byte 15 — so a
+    // non-escalated leaf's plain frames never mis-classify (byte-identical) and vice-versa.
+    if let Some((origin, env_msgid, hop, inner)) = parse_up2(data) {
+        return Some(Frame::Up2 { origin, env_msgid, hop, inner });
     }
     if let Some((target, msgid, bitmap, hop)) = parse_relayack2(data) {
         return Some(Frame::RelayAck2 { target, msgid, bitmap, hop });

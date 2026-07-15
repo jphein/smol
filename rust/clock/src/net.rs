@@ -9,6 +9,22 @@
 #[cfg(feature = "wifi")]
 mod wifi;
 
+/// #141: clamp the radio's max TX power. Cheap C3-supermini boards distort their own TX at
+/// full power (worse on marginal USB supplies) — the AP receives corrupted auth/ACK frames
+/// (the "auth expired at strong signal" / silent-hostapd / mid-transfer-stall class). Units
+/// are 0.25 dBm steps (the IDF `esp_wifi_set_max_tx_power` contract, valid range 8..=84);
+/// 34 = 8.5 dBm, the sibling-project-proven value for this board class. Requires a STARTED
+/// WiFi driver — called at radio init and re-asserted beside every #139 `PowerSaveMode::None`
+/// assert (a driver stop/start resets it; connect() does not).
+#[cfg(feature = "wifi")]
+pub(crate) fn assert_max_tx_power() {
+    const MAX_TX_POWER_QDBM: i8 = 34; // 8.5 dBm x 4 (quarter-dBm units)
+    let err = unsafe { esp_wifi_sys::include::esp_wifi_set_max_tx_power(MAX_TX_POWER_QDBM) };
+    if err != 0 {
+        log::debug!("smol #141: esp_wifi_set_max_tx_power -> {err}");
+    }
+}
+
 // Hand-rolled MQTT 3.1.1 (QoS0) codec for the HA batt/telemetry bridge (v2). Pure
 // encode/decode; the socket poll-loop that drives it lives in `wifi.rs`.
 #[cfg(feature = "wifi")]

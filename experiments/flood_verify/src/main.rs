@@ -6,8 +6,8 @@
 mod flood;
 
 use flood::{
-    forward_decision, ForwardAction, HopLatch, SeenSet, ESCALATE_STREAK, MAX_HOP, PROBE_EVERY,
-    SEEN_RING, UNLATCH_STREAK,
+    forward_decision, ChannelPark, ForwardAction, HopLatch, SeenSet, ESCALATE_STREAK, MAX_HOP,
+    PARK_DWELL_MS, PARK_STALE_MS, PROBE_EVERY, SEEN_RING, UNLATCH_STREAK,
 };
 
 /// Drive a fresh latch into multi-hop the way a genuinely-stranded leaf does: ESCALATE_STREAK
@@ -120,5 +120,57 @@ fn main() {
     l3.on_direct_ack();
     assert!(!l3.latched());
 
-    println!("flood_verify: ALL CHECKS PASSED (SeenSet + forward_decision + HopLatch)");
+    // --- #126 ChannelPark: latched-leaf channel parking ------------------
+    // The #123 LESSON: last campaign only the HopLatch MATH was host-tested, not the trigger WIRING,
+    // so an on-air bug slipped past green builds. ChannelPark owns the ENTIRE latched-leaf channel
+    // decision (poll = the channel to be on; on_signal = a relay-echo/RELAYACK2 arrived; reset =
+    // un-latched), so exercising these here IS the wiring coverage — mode.rs only applies + feeds.
+    const C: [u8; 3] = [1, 6, 11]; // must match mode.rs's CANDIDATES
+
+    // (a) BOOTSTRAP HUNT: with no signal yet, round-robin the candidates every PARK_DWELL_MS. poll
+    //     returns Some only on an actual change (so the radio re-tunes exactly as sparsely as the
+    //     round-robin), None mid-dwell.
+    let mut p = ChannelPark::new();
+    assert_eq!(p.poll(0, &C), Some(1), "first selection tunes to candidate 0");
+    assert_eq!(p.poll(500, &C), None, "mid-dwell: no re-tune");
+    assert_eq!(p.poll(PARK_DWELL_MS, &C), Some(6), "dwell elapsed ⇒ hop to candidate 1");
+    assert_eq!(p.poll(2 * PARK_DWELL_MS, &C), Some(11), "hop to candidate 2");
+    assert_eq!(p.poll(3 * PARK_DWELL_MS, &C), Some(1), "round-robin wraps to candidate 0");
+    assert_eq!(p.parked(), None, "no signal yet ⇒ not parked (still hunting)");
+
+    // (b) PARK ON SIGNAL: a relay echoed our UP2 (or a RELAYACK2 for us arrived) while on candidate 0
+    //     ⇒ park there. Subsequent polls DWELL on it (no hop) for the whole freshness window.
+    p.on_signal(3 * PARK_DWELL_MS); // signalled while current == candidate 0 (from the poll above)
+    assert_eq!(p.parked(), Some(1), "signal ⇒ parked on the channel we're physically on");
+    assert_eq!(p.poll(4 * PARK_DWELL_MS, &C), None, "parked+fresh ⇒ dwell, do NOT hop");
+    assert_eq!(p.poll(3 * PARK_DWELL_MS + PARK_STALE_MS - 1, &C), None, "still parked just under stale");
+    assert_eq!(p.parked(), Some(1), "park held across the fresh window");
+
+    // (c) FRESHNESS REFRESH: another signal while parked extends the window (a leaf that keeps
+    //     drawing ACKs stays parked indefinitely).
+    let t_refresh = 4 * PARK_DWELL_MS;
+    p.on_signal(t_refresh);
+    assert_eq!(p.poll(t_refresh + PARK_STALE_MS - 1, &C), None, "refreshed park still fresh");
+    assert_eq!(p.parked(), Some(1), "refresh held the park");
+
+    // (d) STALENESS RECOVERY: no signal for PARK_STALE_MS ⇒ forget the park and resume the hunt
+    //     (self-healing when the relay roams / dies).
+    let after_stale = t_refresh + PARK_STALE_MS;
+    let ch = p.poll(after_stale, &C).expect("stale park ⇒ re-tune (resume hunt)");
+    assert_ne!(ch, 1, "resumed hunt moves off the stale parked channel");
+    assert_eq!(p.parked(), None, "stale park cleared");
+
+    // (e) RESET (un-latch): forget the park immediately; the next poll re-bootstraps from ch 0.
+    p.on_signal(after_stale); // re-park first
+    assert!(p.parked().is_some(), "re-parked");
+    p.reset();
+    assert_eq!(p.parked(), None, "reset (un-latch) clears the park");
+    assert!(p.poll(after_stale + 10 * PARK_DWELL_MS, &C).is_some(), "post-reset re-tune (re-bootstrap)");
+
+    // (f) DEFENSIVE: a signal before any poll (current == unset sentinel) must NOT park on 0.
+    let mut q = ChannelPark::new();
+    q.on_signal(100);
+    assert_eq!(q.parked(), None, "no park on the unset-channel sentinel");
+
+    println!("flood_verify: ALL CHECKS PASSED (SeenSet + forward_decision + HopLatch + ChannelPark)");
 }

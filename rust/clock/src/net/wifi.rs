@@ -48,8 +48,8 @@ use smoltcp::{
 // Configuration (compile-time placeholders — set before flashing).
 // -------------------------------------------------------------------------
 
-// #100 Stage 1b: WiFi creds are read PER-SLOT at runtime (`WIFI_NETWORKS[active].ssid/pass`) inside
-// `associate_slot`, selected by the NVS net-record + the un-brickable fallback — no fixed SSID const.
+// #142: WiFi creds are read at runtime from the single baked `WIFI_NETWORK` (ssid/pass) inside
+// `associate` — no fixed SSID const, and (post-#142) no slot selection or un-brickable fallback.
 
 /// NTP server IPv4. We hardcode an anycast IP so we need no DNS resolver in
 /// the smoltcp build. time.cloudflare.com's NTP anycast address:
@@ -121,6 +121,16 @@ pub struct MeshElect {
     /// overrides the FROZEN-seq safety gate: an owner whose seq still advances is alive and is never
     /// taken over regardless of this flag (RF-dead-zone protection intact).
     pub owner_never_heard: bool,
+    /// #136: (recovery only) a floor for the HEARD-path takeover window = the worst-case gap
+    /// between a LIVE owner's *observed* MC seq advances (`RELAY_FLUSH_INTERVAL_MS` + a slow/failed
+    /// flush bounded by `RELAY_FLUSH_BUDGET`). The caller (espnow tier) computes it from those two
+    /// constants and seeds it here so the wifi-tier resolver can honor it without a cross-cfg
+    /// dependency. The resolver takes over a heard-then-lost owner only past
+    /// `max(RECOVERY_STALE_MS, recovery_stale_floor_ms)`, so a gateway that republishes within a
+    /// flush-interval-plus-budget always advances its seq before the window completes → adopted,
+    /// never taken over (even at a budget-edge re-assoc flush). 0 on boot/gateway-flush/wifi-only
+    /// (those use the single-signal `MC_STALE_MS` path anyway) → `max(35s, 0)` = unchanged.
+    pub recovery_stale_floor_ms: u64,
     /// #51 return-flap fix: true ONLY on the one-shot BOOT election. A freshly-booted board
     /// must NEVER claim over a DIFFERENT owner already present in the retained MC — it comes
     /// up as a leaf and lets leaf-scan (fast HELLO lock) + the recovery election decide (live
@@ -152,6 +162,7 @@ impl MeshElect {
             my_channel: 0, // #29: advisory 0 until a frame's rx_control is learned
             recovery: false,
             owner_never_heard: false,
+            recovery_stale_floor_ms: 0, // #136: seeded by the caller on a recovery election
             boot: false,
             i_am_owner: false,
             owner_id: my_id,
@@ -320,7 +331,7 @@ const SYNC_BUDGET: Duration = Duration::from_secs(30);
 /// below the old 30 s spin. Tradeoff unchanged: longer budget = longer worst-case
 /// display/input freeze per attempt during an outage.
 #[cfg(feature = "espnow")]
-const RELAY_FLUSH_BUDGET: Duration = Duration::from_secs(15);
+pub(crate) const RELAY_FLUSH_BUDGET: Duration = Duration::from_secs(15); // #136: read by the leaf-reelect floor
 
 // -------------------------------------------------------------------------
 // Peripheral bundle handed over from `main` (single esp_hal::init()).
@@ -415,17 +426,16 @@ enum AssocResult {
     Aborted,
 }
 
-/// #100: one association attempt on `WIFI_NETWORKS[slot]`. Disconnect-then-(re)configure so a
-/// slot SWITCH (different SSID) re-associates cleanly, then wait for `is_connected` within
-/// `SYNC_BUDGET`. Extracted from `run_ntp_burst` so the fallback loop can retry PER-SLOT and
-/// revert on `TimedOut` ONLY (never on a long-press abort or a later DHCP/SNTP failure).
+/// #142: one association attempt on the single baked `WIFI_NETWORK`. Disconnect-then-(re)configure
+/// so a re-association is clean, then wait for `is_connected` within `SYNC_BUDGET`. `TimedOut` just
+/// means retry next burst (never a network switch — #100's slot revert is retired); a `#20 long-press
+/// Aborted` unwinds the burst.
 #[cfg(feature = "wifi")]
-fn associate_slot(
+fn associate(
     controller: &mut esp_wifi::wifi::WifiController<'static>,
-    slot: u8,
     tick: &mut dyn FnMut() -> bool,
 ) -> AssocResult {
-    let net = &crate::secrets::WIFI_NETWORKS[slot as usize];
+    let net = &crate::secrets::WIFI_NETWORK;
     // Drop any prior association before reconfiguring (harmless if not connected) so switching
     // SSIDs between slots doesn't leave a stale config. Errors are non-fatal → treated as a miss.
     let _ = controller.disconnect();
@@ -454,11 +464,11 @@ fn associate_slot(
             return AssocResult::Aborted; // #20 long-press mid-sync
         }
         if Instant::now() > deadline {
-            log::warn!("smol #100: assoc timed out on slot {} ('{}')", slot, net.ssid);
+            log::warn!("smol #142: assoc timed out on '{}' — retry next burst (mesh-only leaf)", net.ssid);
             return AssocResult::TimedOut;
         }
     }
-    log::info!("smol #100: associated to slot {} ('{}')", slot, net.ssid);
+    log::info!("smol #142: associated to '{}'", net.ssid);
     AssocResult::Associated
 }
 
@@ -475,8 +485,7 @@ fn active_broker() -> (Ipv4Addr, u16) {
     if let Some((ip, port)) = cfg.and_then(|c| c.broker.filter(|_| !c.broker_fallback)) {
         return (Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]), port);
     }
-    let active = cfg.map_or(0usize, |c| c.active as usize);
-    let net = &crate::secrets::WIFI_NETWORKS[active.min(crate::secrets::WIFI_NETWORKS.len() - 1)];
+    let net = &crate::secrets::WIFI_NETWORK;
     (
         Ipv4Addr::new(net.broker_ip[0], net.broker_ip[1], net.broker_ip[2], net.broker_ip[3]),
         net.broker_port,
@@ -612,50 +621,28 @@ pub fn run_ntp_burst(
     );
     let tcp_handle = sockets.add(tcp_socket);
 
-    // --- #100 WiFi connect with the UN-BRICKABLE slot fallback -----------
-    // Associate on the NVS-selected slot (default 0 if the record is erased/corrupt). A wrong or
-    // unreachable selection SELF-HEALS without USB: up to ASSOC_ATTEMPTS × SYNC_BUDGET on the
-    // active slot; all TimedOut → the ONE revert to the other slot (write NVS {active=other,
-    // fallback=1}) → retry it. BOTH slots fail → STAY PUT (return None; the boot free-runs and the
-    // next burst/boot retries). The NVS `fallback` flag GATES the cross-reboot revert: an
-    // already-reverted boot never reverts again → provably ONE revert-write per commanded
-    // selection, ZERO flash wear during a sustained total outage. Only a `TimedOut` counts toward a
-    // revert — a `#20 long-press Aborted` unwinds without ever touching NVS.
+    // --- #142 WiFi connect: single network, retry-primary-forever ---------
+    // Associate on the ONE baked network (`crate::secrets::WIFI_NETWORK`). Up to ASSOC_ATTEMPTS ×
+    // SYNC_BUDGET; all TimedOut → return None and let THIS burst end — the board free-runs as a
+    // fully-functional ESP-NOW mesh-only leaf (mesh membership + relayed telemetry + mesh time, no
+    // WiFi bursts) and the next burst/boot simply retries the primary. #142 retired #100's dual-slot
+    // revert: a board is NEVER switched onto the secondary/roam SSID (which caused AP-table
+    // pathologies) — a persistent primary-assoc failure is a placement/per-board TX issue (#141),
+    // not a reason to leave the intended network. No NVS write on failure (zero flash wear).
     const ASSOC_ATTEMPTS: u8 = 3;
-    let mut sel = crate::ota::read_net_cfg().unwrap_or(crate::ota::NetCfg {
-        active: 0,
-        commanded: 0,
-        fallback: false,
-        broker: None,
-        broker_fallback: false,
-        ota_host: None,
-    });
-    'assoc: loop {
-        let mut attempt = 0u8;
-        loop {
-            match associate_slot(controller, sel.active, tick) {
-                AssocResult::Associated => break 'assoc,
-                AssocResult::Aborted => return None, // long-press → never a revert
-                AssocResult::TimedOut => {
-                    attempt += 1;
-                    if attempt >= ASSOC_ATTEMPTS {
-                        break; // active slot exhausted → revert or stay-put
-                    }
+    let mut attempt = 0u8;
+    loop {
+        match associate(controller, tick) {
+            AssocResult::Associated => break,
+            AssocResult::Aborted => return None, // #20 long-press → unwind the burst
+            AssocResult::TimedOut => {
+                attempt += 1;
+                if attempt >= ASSOC_ATTEMPTS {
+                    log::warn!("smol #142: primary assoc unreachable — mesh-only this burst, retry next");
+                    return None; // mesh-only leaf; next burst retries the primary (never switch)
                 }
             }
         }
-        if sel.fallback {
-            // Already reverted (this boot, or a prior one — the NVS flag) and the fallback slot ALSO
-            // failed → STAY PUT. No revert, no NVS write (the anti-ping-pong / zero-wear guarantee).
-            log::warn!("smol #100: both slots unreachable (fallback latched) — staying put, no NVS write");
-            return None;
-        }
-        let other = 1 - sel.active;
-        // Preserve commanded + the broker/OTA overrides (`..sel`) — the WiFi revert only flips the
-        // active slot; a broker/OTA override survives a slot fallback (and CFG-`N` clears them).
-        sel = crate::ota::NetCfg { active: other, fallback: true, ..sel };
-        crate::ota::write_net_cfg(sel); // the ONE revert-write
-        log::warn!("smol #100: selected slot unreachable — reverted to slot {} (fallback), retrying", other);
     }
 
     // Poll the stack until DHCP yields an address. The DHCP `Event` borrows
@@ -752,6 +739,7 @@ pub fn run_ntp_burst(
         &mut None, // #40: boot burst has no persistent staged to carry
         &mut None, // #40: boot burst has no relay diag to publish
         &mut None, // #3: boot burst has no relay RX-diag to publish
+        &mut None, // #139-followup: boot/NTP burst is never a self-OTA fetch
         mqtt_deadline,
         tick,
     );
@@ -1640,10 +1628,13 @@ fn mqtt_session(
     // PUBLISHED to `smol/<leaf>/ota/diag` here, and drives the retained-install clear (on a
     // terminal/exhausted phase) vs retry (transient). Consumed (set None) after publish.
     // `&mut None` off-gateway.
-    leaf_diag: &mut Option<(u8, &'static str, bool)>,
+    leaf_diag: &mut Option<(u8, &'static str, bool, u8)>,
     // #3 RELAY RX-DIAG: the last relay's `(leaf_id, rx_any, otan_valid, last_wb, total)`.
     // PUBLISHED to retained `smol/<leaf>/ota/relaydiag` here, consumed after. `&mut None` off-gw.
     leaf_relay_rx: &mut Option<RelayDiag>,
+    // #139-followup: on a failed SELF-fetch, `(chunk_k, chunk_n, retries, stalls)` → formatted +
+    // published retained to `smol/<id>/ota/diag` (gateway-only; consumed once). `&mut None` otherwise.
+    ota_self_fail: &mut Option<(u32, u32, u32, u32)>,
     deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
@@ -2612,15 +2603,24 @@ fn mqtt_session(
     // = the leaf installed/rolled-back, or the transient-retry cap was hit) or LEAVE it
     // retained to retry. On a clear, also null `pending_leaf` for THIS flush so we don't
     // re-arm a just-finished leaf. Runs BEFORE the arm below. Consumed after publish.
-    if let Some((lid, phase, clear)) = *leaf_diag {
+    if let Some((lid, phase, clear, retry)) = *leaf_diag {
         let mut dtopic = MqttScratch::new();
         let _ = write!(dtopic, "smol/{}/ota/diag", lid);
+        // #134: surface the consecutive-failure count in the retained payload ("fetch-failed
+        // retry=3") so a stuck fetch is VISIBLE headlessly instead of silently burning the order.
+        // retry == 0 (a terminal / first attempt) → just the bare phase, unchanged from before.
+        let mut dpayload = MqttScratch::new();
+        if retry > 0 {
+            let _ = write!(dpayload, "{} retry={}", phase, retry);
+        } else {
+            let _ = write!(dpayload, "{}", phase);
+        }
         if let Some(n) =
-            crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), phase.as_bytes(), true)
+            crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), dpayload.as_bytes(), true)
         {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
-        log::info!("smol #40: published smol/{}/ota/diag = {} (clear={})", lid, phase, clear);
+        log::info!("smol #40: published smol/{}/ota/diag = {} retry={} (clear={})", lid, phase, retry, clear);
         if clear {
             let mut itopic = MqttScratch::new();
             let _ = write!(itopic, "smol/{}/ota/install", lid);
@@ -2632,6 +2632,29 @@ fn mqtt_session(
             }
         }
         *leaf_diag = None; // consumed — published once
+    }
+
+    // #139-followup: publish this node's OWN failed-self-fetch record to retained
+    // `smol/<id>/ota/diag` (#135 armdiag pattern). Release images are serial-silent, so a self-OTA
+    // that dies mid-download is otherwise INVISIBLE on the fleet — the blindness that turned
+    // tonight's mid-body deaths into a three-hour diagnosis. `chunk=k/n` = how far the download got
+    // (0/0 ⇒ died before the download: assoc/DHCP/slot); `retry`/`stall` = transfer trouble.
+    // Consumed after publish (set None) so it isn't re-emitted every flush.
+    if let Some((k, n, r, s)) = *ota_self_fail {
+        let mut dtopic = MqttScratch::new();
+        let _ = write!(dtopic, "smol/{}/ota/diag", node_id);
+        let mut dval = MqttScratch::new();
+        let _ = write!(dval, "self-fetch-failed chunk={}/{} retry={} stall={}", k, n, r, s);
+        if let Some(np) =
+            crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), dval.as_bytes(), true)
+        {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..np], deadline, tick);
+        }
+        log::info!(
+            "smol #139: published smol/{}/ota/diag = self-fetch-failed chunk={}/{} retry={} stall={}",
+            node_id, k, n, r, s
+        );
+        *ota_self_fail = None; // consumed — published once
     }
 
     // #111: CROWN-PORTABLE install cleanup — clear a leaf's retained `ota/install` once its FRESH
@@ -2807,8 +2830,20 @@ fn mqtt_session(
             // just at 90s instead of 35s — election stability > speed). A HEARD-then-lost owner keeps
             // the fast RECOVERY_STALE_MS (35s): the owner-HELLO silence that opened this recovery is
             // independent corroboration of death, so no live board can be misjudged there.
+            // #136: the HEARD-then-lost window is floored at the worst-case gap between a LIVE
+            // owner's OBSERVED seq advances (`recovery_stale_floor_ms` = flush interval + a slow
+            // flush bounded by RELAY_FLUSH_BUDGET, seeded by the caller). At today's 30 s flush that
+            // lifts the effective window 35→45 s so a budget-edge re-assoc flush (seq merely delayed,
+            // not frozen) can't cross it — the owner advances its seq and is adopted, never taken
+            // over (#136 canary 1). A genuinely-dead owner's seq is frozen forever, so it is still
+            // taken over at the window (#136 canary 2). Tracks #122 B1 automatically (at F=20 the
+            // floor is 20+15=35, already covered). NEVER-heard keeps MC_STALE_MS (3×F, ≥ the floor).
             let stale_limit = if elect.recovery {
-                if elect.owner_never_heard { MC_STALE_MS } else { RECOVERY_STALE_MS }
+                if elect.owner_never_heard {
+                    MC_STALE_MS
+                } else {
+                    RECOVERY_STALE_MS.max(elect.recovery_stale_floor_ms)
+                }
             } else {
                 MC_STALE_MS
             };
@@ -3229,10 +3264,13 @@ pub fn run_mqtt_burst(
     staged_raw: &mut Option<crate::ota::Announce>,
     // #40: last relay attempt's `(leaf_id, phase, clear)` → published to `smol/<leaf>/ota/diag`
     // (see `mqtt_session`). `&mut None` on boot/leaf bursts.
-    leaf_diag: &mut Option<(u8, &'static str, bool)>,
+    leaf_diag: &mut Option<(u8, &'static str, bool, u8)>,
     // #3: last relay attempt's RX evidence → published to `smol/<leaf>/ota/relaydiag` (see
     // `mqtt_session`). `&mut None` on boot/leaf bursts.
     leaf_relay_rx: &mut Option<RelayDiag>,
+    // #139-followup: on a failed SELF-fetch, `(chunk_k, chunk_n, retries, stalls)` → formatted +
+    // published retained to `smol/<id>/ota/diag` (see `mqtt_session`). `&mut None` otherwise.
+    ota_self_fail: &mut Option<(u32, u32, u32, u32)>,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
@@ -3328,6 +3366,7 @@ pub fn run_mqtt_burst(
     // MQTT stream (the old UDP path only needed the ARP reply). Same reasoning,
     // same placement (must be AFTER the reconnect). Tradeoff: higher idle draw.
     let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
+    crate::net::assert_max_tx_power(); // #141
 
     // #64: capture the WiFi-uplink RSSI HERE — the STA is confirmed connected (the loop
     // above waited for is_connected()==Ok(true)), so esp_wifi_sta_get_rssi has a live
@@ -3422,6 +3461,7 @@ pub fn run_mqtt_burst(
         staged_raw, // #40: forward the persistent staged announce (or &mut None)
         leaf_diag, // #40: forward the diag/clear state (or &mut None)
         leaf_relay_rx, // #3: forward the relay RX-diag (or &mut None)
+        ota_self_fail, // #139-followup: forward the self-fetch-fail snapshot (or &mut None)
         deadline,
         tick,
     );
@@ -3590,6 +3630,7 @@ fn parse_ipv4(host: &str) -> Option<smoltcp::wire::Ipv4Address> {
 /// (failure/abort, good slot untouched); on SUCCESS it reboots inside `ota::activate`
 /// and never returns.
 #[cfg(feature = "espnow")]
+#[allow(clippy::too_many_arguments)] // +fail diag (#139-followup) tips this to 8 params
 pub fn run_ota_fetch(
     controller: &mut esp_wifi::wifi::WifiController<'static>,
     device: &mut esp_wifi::wifi::WifiDevice<'static>,
@@ -3602,6 +3643,12 @@ pub fn run_ota_fetch(
     // body is byte-identical, only the terminal action differs (activate-reboot vs return).
     relay_mode: bool,
     staged_slot: &mut Option<esp_bootloader_esp_idf::ota::Slot>,
+    // #139-followup observability: on a genuine self-fetch FAILURE (not a user abort), set to
+    // `(chunk_k, chunk_n, retries, stalls)` — how far the download got + the transfer-trouble
+    // counters. The self-OTA caller (`run_ota_update`) formats + publishes it retained to
+    // `smol/<id>/ota/diag` (#135 armdiag pattern); release images are serial-silent, so this is
+    // the ONLY fleet-visible signal of WHY a self-fetch failed.
+    fail: &mut Option<(u32, u32, u32, u32)>,
 ) -> bool {
     let Some((host, port, path)) = crate::ota::split_url(announce.url()) else {
         log::error!("smol OTA: malformed announce URL — aborting fetch");
@@ -3656,11 +3703,13 @@ pub fn run_ota_fetch(
             return false;
         }
         if Instant::now() > deadline {
+            *fail = Some((0, 0, 0, 0)); // #139-followup: died before the download (association)
             log::warn!("smol OTA: WiFi association timed out");
             return false;
         }
     }
     let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
+    crate::net::assert_max_tx_power(); // #141
 
     // Fresh DHCP lease (interface just rebuilt).
     loop {
@@ -3680,130 +3729,267 @@ pub fn run_ota_fetch(
             break;
         }
         if Instant::now() > deadline {
+            *fail = Some((0, 0, 0, 0)); // #139-followup: died before the download (DHCP)
             log::warn!("smol OTA: DHCP timed out");
             return false;
         }
     }
 
-    // TCP connect to the (allowlisted) image host.
-    let src_port = 49152 + (rng.random() % 16384) as u16;
-    {
-        let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
-        if s.connect(iface.context(), (IpAddress::Ipv4(ip), port), src_port)
-            .is_err()
-        {
-            log::error!("smol OTA: TCP connect failed");
-            return false;
-        }
-    }
-    loop {
-        iface.poll(smoltcp_now(), device, &mut sockets);
-        if sockets.get_mut::<tcp::Socket>(tcp_handle).may_send() {
-            break;
-        }
-        if tick() {
-            return false;
-        }
-        if Instant::now() > deadline {
-            log::warn!("smol OTA: TCP connect timed out");
-            return false;
-        }
-    }
-
-    // Send the request in pieces (no format buffer; total « the 512 B tx ring).
-    {
-        let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
-        let ok = s.send_slice(b"GET ").is_ok()
-            && s.send_slice(path.as_bytes()).is_ok()
-            && s.send_slice(b" HTTP/1.0\r\nHost: ").is_ok()
-            && s.send_slice(host.as_bytes()).is_ok()
-            && s.send_slice(b"\r\nConnection: close\r\n\r\n").is_ok();
-        if !ok {
-            log::error!("smol OTA: failed to send HTTP request");
-            return false;
-        }
-    }
-
-    // Open the inactive-slot writer (image is streamed here, never buffered whole).
+    // Open the inactive-slot writer ONCE (image is streamed here across chunks, never buffered
+    // whole). `writer.written()` doubles as the RESUME cursor and the running-SHA position.
     let Some(mut writer) = crate::ota::ImageWriter::begin() else {
+        *fail = Some((0, 0, 0, 0)); // #139-followup: died before the download (slot open)
         log::error!("smol OTA: cannot open inactive slot (no OTA partition table?)");
         return false;
     };
     let target = writer.target();
 
-    // Receive: accumulate the HTTP headers (validate 200 + Content-Length == size),
-    // then STREAM every body byte straight into the flash writer.
-    let mut header_buf = [0u8; 512];
-    let mut header_len = 0usize;
-    let mut headers_done = false;
-    loop {
+    // #138: fetch the image as sequential HTTP Range chunks instead of one fragile minutes-long
+    // GET. Each chunk is its own short HTTP/1.0 GET+`Range` on a FRESH connection (Connection:
+    // close) — many reliable short transfers inside the socket window that demonstrably works
+    // (seconds-long MQTT/DHCP on the same association are rock-solid; only the single long GET
+    // died mid-body — nebula finding 1b / IDF esp_https_ota partial_http_download). The running
+    // SHA-256 composes across chunks (the writer accumulates), so the verify gate below is
+    // UNCHANGED. A broken chunk resumes from `writer.written()` rather than restarting the whole
+    // image; `OTA_FETCH_BUDGET` stays the overall cap. `chunk_retries` is surfaced to serial
+    // (the fetch reboots on success, so an in-RAM diag counter wouldn't survive — serial is the
+    // rig's forensic sink).
+    const OTA_CHUNK: u32 = 48 * 1024;
+    /// Consecutive zero-progress attempts before giving up (livelock guard inside the budget).
+    const OTA_MAX_STALL: u32 = 6;
+
+    // Variable-width decimal into `out` (Range byte-positions must NOT be zero-padded for all
+    // servers); returns the digit count. `v` is a u32 → at most 10 digits.
+    fn write_dec(mut v: u32, out: &mut [u8]) -> usize {
+        if v == 0 {
+            out[0] = b'0';
+            return 1;
+        }
+        let mut tmp = [0u8; 10];
+        let mut i = 0;
+        while v > 0 {
+            tmp[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            i += 1;
+        }
+        for j in 0..i {
+            out[j] = tmp[i - 1 - j];
+        }
+        i
+    }
+
+    let mut range_ok = true; // flips false if chunk 0 returns 200 (server ignored Range)
+    let mut chunk_retries: u32 = 0; // re-requests forced by a short/failed chunk
+    let mut stall: u32 = 0; // consecutive zero-progress attempts
+    let chunk_n = announce.size.div_ceil(OTA_CHUNK); // total chunks (for the #139-followup fail diag)
+
+    while writer.written() < announce.size {
+        // #139-followup: keep the fail-diag snapshot current so ANY failure return below carries
+        // how far the download got + the trouble counters (the self-OTA caller publishes it retained
+        // to smol/<id>/ota/diag — release images are serial-silent, so this is the fleet-visible why).
+        *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall));
         if tick() {
             log::warn!("smol OTA: aborted by long-press (slot untouched)");
             return false;
-        }
-        iface.poll(smoltcp_now(), device, &mut sockets);
-        let mut closed = false;
-        {
-            let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
-            if s.can_recv() {
-                let outcome = s.recv(|data| {
-                    if !headers_done {
-                        let take = core::cmp::min(header_buf.len() - header_len, data.len());
-                        if take == 0 {
-                            return (0, false); // headers exceed the buffer → give up
-                        }
-                        header_buf[header_len..header_len + take]
-                            .copy_from_slice(&data[..take]);
-                        header_len += take;
-                        if let Some(bstart) = crate::ota::header_end(&header_buf[..header_len]) {
-                            if crate::ota::status_code(&header_buf[..header_len]) != Some(200) {
-                                return (take, false); // non-200 → abort
-                            }
-                            if let Some(cl) = crate::ota::content_length(&header_buf[..header_len])
-                            {
-                                if cl != announce.size {
-                                    return (take, false); // length mismatch → abort
-                                }
-                            }
-                            headers_done = true;
-                            // feed body bytes already captured past the header terminator
-                            let fed = writer.feed(&header_buf[bstart..header_len]);
-                            return (take, fed);
-                        }
-                        (take, true) // headers still arriving
-                    } else {
-                        let fed = writer.feed(data);
-                        (data.len(), fed)
-                    }
-                });
-                match outcome {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        log::error!("smol OTA: bad HTTP response or flash write error");
-                        return false;
-                    }
-                    Err(_) => closed = true,
-                }
-            } else if !s.may_recv() {
-                closed = true; // peer closed (Connection: close) + rx drained
-            }
-        }
-        // OTA throughput fix: poll AGAIN right after draining the rx ring so the
-        // reopened window (and its ACK) hits the wire this iteration instead of
-        // waiting for the next loop's top-of-loop poll — halves the window-closed gap
-        // that made the transfer round-trip-bound.
-        iface.poll(smoltcp_now(), device, &mut sockets);
-        if headers_done && writer.written() >= announce.size {
-            break;
-        }
-        if closed {
-            break;
         }
         if Instant::now() > deadline {
             log::warn!("smol OTA: download timed out (slot untouched)");
             return false;
         }
+        let off = writer.written();
+        let end = core::cmp::min(off + OTA_CHUNK, announce.size) - 1; // inclusive last byte
+
+        // Fresh connection for this chunk: abort any prior (closed) socket, then reconnect on a
+        // new ephemeral port (avoids TIME_WAIT collisions).
+        {
+            let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
+            s.abort();
+        }
+        iface.poll(smoltcp_now(), device, &mut sockets);
+        let src_port = 49152 + (rng.random() % 16384) as u16;
+        {
+            let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
+            if s.connect(iface.context(), (IpAddress::Ipv4(ip), port), src_port)
+                .is_err()
+            {
+                chunk_retries += 1;
+                stall += 1;
+                if stall >= OTA_MAX_STALL {
+                    log::error!("smol OTA: repeated TCP connect failures — aborting (slot untouched)");
+                    return false;
+                }
+                continue;
+            }
+        }
+        {
+            let mut connected = false;
+            while !connected {
+                iface.poll(smoltcp_now(), device, &mut sockets);
+                if sockets.get_mut::<tcp::Socket>(tcp_handle).may_send() {
+                    connected = true;
+                } else if tick() {
+                    return false;
+                } else if Instant::now() > deadline {
+                    log::warn!("smol OTA: TCP connect timed out (slot untouched)");
+                    return false;
+                }
+            }
+        }
+
+        // Request the byte range [off, end]. Sent in pieces (no format buffer; « the 512 B tx ring).
+        // `Range: bytes=<off>-<end>` — a 206-capable server returns exactly that slice; a server
+        // that ignores Range answers 200 with the whole body (handled as a fallback on chunk 0).
+        let mut rbuf = [0u8; 32];
+        let mut rl = 6;
+        rbuf[..6].copy_from_slice(b"bytes=");
+        rl += write_dec(off, &mut rbuf[rl..]);
+        rbuf[rl] = b'-';
+        rl += 1;
+        rl += write_dec(end, &mut rbuf[rl..]);
+        {
+            let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
+            let ok = s.send_slice(b"GET ").is_ok()
+                && s.send_slice(path.as_bytes()).is_ok()
+                && s.send_slice(b" HTTP/1.0\r\nHost: ").is_ok()
+                && s.send_slice(host.as_bytes()).is_ok()
+                && s.send_slice(b"\r\nRange: ").is_ok()
+                && s.send_slice(&rbuf[..rl]).is_ok()
+                && s.send_slice(b"\r\nConnection: close\r\n\r\n").is_ok();
+            if !ok {
+                chunk_retries += 1;
+                stall += 1;
+                if stall >= OTA_MAX_STALL {
+                    log::error!("smol OTA: repeated request-send failures — aborting (slot untouched)");
+                    return false;
+                }
+                continue;
+            }
+        }
+
+        // Drain this chunk's response into the writer (streaming; headers validated once/chunk).
+        let chunk_start = writer.written();
+        let mut header_buf = [0u8; 512];
+        let mut header_len = 0usize;
+        let mut headers_done = false;
+        let mut bad = false;
+        loop {
+            if tick() {
+                log::warn!("smol OTA: aborted by long-press (slot untouched)");
+                return false;
+            }
+            iface.poll(smoltcp_now(), device, &mut sockets);
+            let mut closed = false;
+            {
+                let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
+                if s.can_recv() {
+                    let outcome = s.recv(|data| {
+                        if !headers_done {
+                            let take = core::cmp::min(header_buf.len() - header_len, data.len());
+                            if take == 0 {
+                                bad = true;
+                                return (0, false); // headers exceed the buffer → give up
+                            }
+                            header_buf[header_len..header_len + take]
+                                .copy_from_slice(&data[..take]);
+                            header_len += take;
+                            if let Some(bstart) = crate::ota::header_end(&header_buf[..header_len]) {
+                                match crate::ota::status_code(&header_buf[..header_len]) {
+                                    Some(206) => {} // Partial Content — Range honoured
+                                    Some(200) if off == 0 => {
+                                        // Server ignored Range → full-body fallback (the old
+                                        // single-GET path). Validate Content-Length == size as
+                                        // before; this GET is NOT resumable (checked after drain).
+                                        range_ok = false;
+                                        if let Some(cl) =
+                                            crate::ota::content_length(&header_buf[..header_len])
+                                        {
+                                            if cl != announce.size {
+                                                bad = true;
+                                                return (take, false); // length mismatch → abort
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        bad = true; // non-206 range reply (or 200 mid-stream)
+                                        return (take, false);
+                                    }
+                                }
+                                headers_done = true;
+                                let fed = writer.feed(&header_buf[bstart..header_len]);
+                                if !fed {
+                                    bad = true; // flash write error
+                                }
+                                return (take, fed);
+                            }
+                            (take, true) // headers still arriving
+                        } else {
+                            let fed = writer.feed(data);
+                            if !fed {
+                                bad = true; // flash write error
+                            }
+                            (data.len(), fed)
+                        }
+                    });
+                    match outcome {
+                        Ok(true) => {}
+                        Ok(false) => closed = true, // bad header / flash error → end this chunk
+                        Err(_) => closed = true,
+                    }
+                } else if !s.may_recv() {
+                    closed = true; // peer closed (Connection: close) + rx drained → chunk complete
+                }
+            }
+            // Poll AGAIN right after draining so the reopened window (+ its ACK) hits the wire
+            // this iteration — halves the window-closed gap that made the transfer RTT-bound.
+            iface.poll(smoltcp_now(), device, &mut sockets);
+            if writer.written() >= announce.size {
+                break; // whole image done
+            }
+            if closed {
+                break; // this chunk's connection ended → outer loop resumes from written()
+            }
+            if Instant::now() > deadline {
+                log::warn!("smol OTA: download timed out (slot untouched)");
+                return false;
+            }
+        }
+
+        if bad {
+            log::error!("smol OTA: bad HTTP status/length on range {off}-{end} (slot untouched)");
+            return false;
+        }
+        if !range_ok && writer.written() < announce.size {
+            // A 200 server re-sends from 0, so an incomplete full-body GET can't be resumed
+            // (that's the OLD failure mode). Fail cleanly rather than double-write.
+            log::error!(
+                "smol OTA: server ignored Range (200) and the single GET died mid-body — not resumable"
+            );
+            return false;
+        }
+        // Progress accounting: a chunk that advanced resets the stall guard; a chunk that
+        // delivered fewer bytes than requested (broke early) forces re-requesting the remainder.
+        if writer.written() > chunk_start {
+            stall = 0;
+            if range_ok && writer.written() <= end && writer.written() < announce.size {
+                chunk_retries += 1; // short chunk → remainder re-requested next iteration
+            }
+        } else {
+            chunk_retries += 1;
+            stall += 1;
+            if stall >= OTA_MAX_STALL {
+                log::error!(
+                    "smol OTA: {OTA_MAX_STALL} zero-progress attempts at offset {off} — aborting (slot untouched)"
+                );
+                return false;
+            }
+        }
     }
+
+    log::info!(
+        "smol OTA: image received — {} B over Range chunks ({} chunk retries)",
+        writer.written(),
+        chunk_retries
+    );
 
     // Integrity gate (exact size + SHA-256) AND #32 authenticity gate (Ed25519 over the
     // signed manifest "build|size|sha256hex"). BOTH must pass before otadata is touched;
@@ -3831,6 +4017,10 @@ pub fn run_ota_fetch(
         crate::ota::activate(target, announce.build, false); // self-OTA → confirm via DHCP
         false // reached only if the otadata write failed
     } else {
+        // #139-followup: the download COMPLETED but the integrity/authenticity gate rejected it
+        // (corrupt/truncated/bad-sig). Record K=N (all chunks fetched) so the fleet diag
+        // distinguishes a verify failure from a mid-download death.
+        *fail = Some((chunk_n, chunk_n, chunk_retries, stall));
         log::error!("smol OTA: verify FAILED (size/SHA-256 or ed25519 signature) — discarded (good slot intact)");
         false
     }
