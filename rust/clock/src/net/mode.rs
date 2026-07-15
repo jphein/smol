@@ -1303,7 +1303,13 @@ const RELAY_RETX_MS: u64 = 2_000;
 /// stranded", but a genuinely deaf leaf never wastes probe airtime.
 const RELAY_DOWNLINK_FRESH_MS: u64 = 6_000;
 /// Gateway flushes its queue this often (if non-empty), or at once when full.
-const RELAY_FLUSH_INTERVAL_MS: u64 = 30_000;
+/// #122 B1 (SOAK-GATED): 30_000 → 20_000 — this is the master clock every HA-visible latency is
+/// quantized by (#117 decomposition). Election co-derivation in scratch/smol-ha-batt/122-b1-derivation.md:
+/// the recovery windows do NOT shrink with it — RECOVERY_STALE_MS/REELECT_SILENCE_MS gain margin at a
+/// shorter flush (inv #3/#4) and are KEPT; only MC_STALE_MS scales (3×F → 60s). Binding soak risk:
+/// RELAY_FLUSH_BUDGET (15s) == REELECT_SILENCE_MS (15s) — a worst-case re-assoc flush can be
+/// HELLO-silent up to the re-elect threshold → crown churn; more frequent flushes raise the exposure.
+const RELAY_FLUSH_INTERVAL_MS: u64 = 20_000;
 /// After this many CONSECUTIVE failed flushes, shed the OLDEST queued message on
 /// every further failure. Bounds queue staleness AND lets a gateway stuck against
 /// a dead AP drain to empty → `relay_ready_to_flush` goes false → the blocking
@@ -1314,9 +1320,10 @@ const FLUSH_FAILS_BEFORE_DROP: u8 = 2;
 /// gateway relinquishes ownership — `is_gateway=false` + drop to leaf-scan — and (with the
 /// #51 A1 silence gate) stops HELLOing, letting a reachable board take over. Set above
 /// `FLUSH_FAILS_BEFORE_DROP` so a transient broker blip never flap-demotes.
-/// #51 speed-up: 3 (≈`FLUSH_FAILS_BEFORE_DEMOTE` × RELAY_FLUSH_INTERVAL_MS ≈ 90 s of
-/// sustained no-AP) — still safely past a transient blip / roam (R-CONNECT recovers those in
-/// seconds), but ~60 s snappier than the prior 5 for the powered-uplink-loss (R4) failover.
+/// #51 speed-up: 3 (≈`FLUSH_FAILS_BEFORE_DEMOTE` × RELAY_FLUSH_INTERVAL_MS) — still safely past a
+/// transient blip / roam (R-CONNECT recovers those in seconds). This is a COUNT, so it auto-scales
+/// with #122 B1's shorter flush: ≈90 s at the old 30 s interval → ≈60 s at 20 s. A snappier
+/// powered-uplink-loss (R4) demote; acceptable (3 consecutive fails still isn't a transient).
 const FLUSH_FAILS_BEFORE_DEMOTE: u8 = 3;
 /// Recently-completed `(src_mac, msgid)` memory. A lost RELAYACK makes a leaf
 /// retransmit an ALREADY-complete message; we must re-ACK it but NOT re-enqueue

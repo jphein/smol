@@ -207,22 +207,29 @@ const RSSI_BUCKET_STEP_MS: u64 = 15_000;
 const OTA_STAGED_TOPIC: &[u8] = b"smol/ota/staged";
 
 /// A retained owner whose `seq` has not advanced for this long is presumed DEAD and
-/// may be taken over. The owner re-publishes `MC` (seq++) every gateway flush (~30 s),
-/// so 3 missed refreshes with a frozen seq is a safe "owner gone" threshold. Consumed
-/// by the [`mqtt_session`] adopt decision (a leaf re-election is what re-reads `MC`
-/// after a prolonged HELLO silence, giving the stale check a second sample to fire on).
+/// may be taken over. The owner re-publishes `MC` (seq++) every gateway flush, so 3 missed
+/// refreshes with a frozen seq is a safe "owner gone" threshold. Consumed by the
+/// [`mqtt_session`] adopt decision on the SINGLE-SIGNAL paths (boot / gateway-flush) AND, since
+/// #121, the NEVER-heard recovery takeover (a leaf that hasn't corroborated the owner by HELLO).
+/// #122 B1: scales with the flush interval as 3×`RELAY_FLUSH_INTERVAL_MS` — 90_000 (3×30 s) →
+/// 60_000 (3×20 s). Keeps the "3 missed flushes" margin AND speeds the #121 never-heard heal
+/// (~90 s → ~60 s), the exact latency seen in the crown-churn / channel-drift event.
 #[cfg(feature = "wifi")]
-const MC_STALE_MS: u64 = 90_000;
+const MC_STALE_MS: u64 = 60_000;
 
 /// #51 speed-up: the dead-owner window used ONLY on a LEAF RECOVERY election. It can be far
 /// shorter than `MC_STALE_MS` because recovery carries INDEPENDENT corroboration — the leaf
 /// only re-elects after `REELECT_SILENCE_MS` of owner-HELLO silence (a live gateway HELLOs
 /// every 2 s, so an audible one never reaches here). A takeover thus means the owner is quiet
 /// on BOTH the mesh (HELLO) AND the broker (MC seq frozen this long).
-/// LOWER BOUND: it MUST stay above the gateway's MC-republish cadence (`RELAY_FLUSH_INTERVAL_MS`
-/// ≈ 30 s) — a genuinely-alive gateway's seq is frozen up to one flush interval between flushes,
-/// and the seq-advance-resets-`alive` guard only protects us if our window spans a full flush.
-/// 35 s = one flush + margin → confidently dead, ~half the old MC_STALE_MS latency. Boot/
+/// LOWER BOUND: it MUST stay above the gateway's MC-republish cadence (`RELAY_FLUSH_INTERVAL_MS`)
+/// — a genuinely-alive gateway's seq is frozen up to one flush interval between flushes, and the
+/// seq-advance-resets-`alive` guard only protects us if our window spans a full flush.
+/// #122 B1: DELIBERATELY NOT SCALED WITH THE FLUSH INTERVAL. At the old 30 s flush this was
+/// F + 5 s (tight — the corner the #121 never-heard path had to cover); at B1's 20 s flush the
+/// SAME 35 s is F + 15 s, so it now also clears F + `REELECT_RETRY_MS` (20+10=30) — the true
+/// no-false-takeover bound — with margin to spare. Shrinking it toward the shorter F would
+/// re-erode the H1/H2/H3 takeover safety and invite crown churn, so it is HELD at 35 s. Boot/
 /// gateway-flush keep `MC_STALE_MS` (single-signal, no HELLO corroboration → keep the 3× margin).
 #[cfg(feature = "wifi")]
 const RECOVERY_STALE_MS: u64 = 35_000;
