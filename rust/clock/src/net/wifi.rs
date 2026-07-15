@@ -752,6 +752,7 @@ pub fn run_ntp_burst(
         &mut None, // #40: boot burst has no persistent staged to carry
         &mut None, // #40: boot burst has no relay diag to publish
         &mut None, // #3: boot burst has no relay RX-diag to publish
+        &mut None, // #139-followup: boot/NTP burst is never a self-OTA fetch
         mqtt_deadline,
         tick,
     );
@@ -1644,6 +1645,9 @@ fn mqtt_session(
     // #3 RELAY RX-DIAG: the last relay's `(leaf_id, rx_any, otan_valid, last_wb, total)`.
     // PUBLISHED to retained `smol/<leaf>/ota/relaydiag` here, consumed after. `&mut None` off-gw.
     leaf_relay_rx: &mut Option<RelayDiag>,
+    // #139-followup: on a failed SELF-fetch, `(chunk_k, chunk_n, retries, stalls)` → formatted +
+    // published retained to `smol/<id>/ota/diag` (gateway-only; consumed once). `&mut None` otherwise.
+    ota_self_fail: &mut Option<(u32, u32, u32, u32)>,
     deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
@@ -2634,6 +2638,29 @@ fn mqtt_session(
         *leaf_diag = None; // consumed — published once
     }
 
+    // #139-followup: publish this node's OWN failed-self-fetch record to retained
+    // `smol/<id>/ota/diag` (#135 armdiag pattern). Release images are serial-silent, so a self-OTA
+    // that dies mid-download is otherwise INVISIBLE on the fleet — the blindness that turned
+    // tonight's mid-body deaths into a three-hour diagnosis. `chunk=k/n` = how far the download got
+    // (0/0 ⇒ died before the download: assoc/DHCP/slot); `retry`/`stall` = transfer trouble.
+    // Consumed after publish (set None) so it isn't re-emitted every flush.
+    if let Some((k, n, r, s)) = *ota_self_fail {
+        let mut dtopic = MqttScratch::new();
+        let _ = write!(dtopic, "smol/{}/ota/diag", node_id);
+        let mut dval = MqttScratch::new();
+        let _ = write!(dval, "self-fetch-failed chunk={}/{} retry={} stall={}", k, n, r, s);
+        if let Some(np) =
+            crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), dval.as_bytes(), true)
+        {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..np], deadline, tick);
+        }
+        log::info!(
+            "smol #139: published smol/{}/ota/diag = self-fetch-failed chunk={}/{} retry={} stall={}",
+            node_id, k, n, r, s
+        );
+        *ota_self_fail = None; // consumed — published once
+    }
+
     // #111: CROWN-PORTABLE install cleanup — clear a leaf's retained `ota/install` once its FRESH
     // STAT confirms the version-flip (reported build >= the staged build). This is the SUCCESS
     // clear that survives a crown handover: the old design cleared only on the RELAY outcome
@@ -3233,6 +3260,9 @@ pub fn run_mqtt_burst(
     // #3: last relay attempt's RX evidence → published to `smol/<leaf>/ota/relaydiag` (see
     // `mqtt_session`). `&mut None` on boot/leaf bursts.
     leaf_relay_rx: &mut Option<RelayDiag>,
+    // #139-followup: on a failed SELF-fetch, `(chunk_k, chunk_n, retries, stalls)` → formatted +
+    // published retained to `smol/<id>/ota/diag` (see `mqtt_session`). `&mut None` otherwise.
+    ota_self_fail: &mut Option<(u32, u32, u32, u32)>,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
@@ -3422,6 +3452,7 @@ pub fn run_mqtt_burst(
         staged_raw, // #40: forward the persistent staged announce (or &mut None)
         leaf_diag, // #40: forward the diag/clear state (or &mut None)
         leaf_relay_rx, // #3: forward the relay RX-diag (or &mut None)
+        ota_self_fail, // #139-followup: forward the self-fetch-fail snapshot (or &mut None)
         deadline,
         tick,
     );
@@ -3590,6 +3621,7 @@ fn parse_ipv4(host: &str) -> Option<smoltcp::wire::Ipv4Address> {
 /// (failure/abort, good slot untouched); on SUCCESS it reboots inside `ota::activate`
 /// and never returns.
 #[cfg(feature = "espnow")]
+#[allow(clippy::too_many_arguments)] // +fail diag (#139-followup) tips this to 8 params
 pub fn run_ota_fetch(
     controller: &mut esp_wifi::wifi::WifiController<'static>,
     device: &mut esp_wifi::wifi::WifiDevice<'static>,
@@ -3602,6 +3634,12 @@ pub fn run_ota_fetch(
     // body is byte-identical, only the terminal action differs (activate-reboot vs return).
     relay_mode: bool,
     staged_slot: &mut Option<esp_bootloader_esp_idf::ota::Slot>,
+    // #139-followup observability: on a genuine self-fetch FAILURE (not a user abort), set to
+    // `(chunk_k, chunk_n, retries, stalls)` — how far the download got + the transfer-trouble
+    // counters. The self-OTA caller (`run_ota_update`) formats + publishes it retained to
+    // `smol/<id>/ota/diag` (#135 armdiag pattern); release images are serial-silent, so this is
+    // the ONLY fleet-visible signal of WHY a self-fetch failed.
+    fail: &mut Option<(u32, u32, u32, u32)>,
 ) -> bool {
     let Some((host, port, path)) = crate::ota::split_url(announce.url()) else {
         log::error!("smol OTA: malformed announce URL — aborting fetch");
@@ -3656,6 +3694,7 @@ pub fn run_ota_fetch(
             return false;
         }
         if Instant::now() > deadline {
+            *fail = Some((0, 0, 0, 0)); // #139-followup: died before the download (association)
             log::warn!("smol OTA: WiFi association timed out");
             return false;
         }
@@ -3680,6 +3719,7 @@ pub fn run_ota_fetch(
             break;
         }
         if Instant::now() > deadline {
+            *fail = Some((0, 0, 0, 0)); // #139-followup: died before the download (DHCP)
             log::warn!("smol OTA: DHCP timed out");
             return false;
         }
@@ -3688,6 +3728,7 @@ pub fn run_ota_fetch(
     // Open the inactive-slot writer ONCE (image is streamed here across chunks, never buffered
     // whole). `writer.written()` doubles as the RESUME cursor and the running-SHA position.
     let Some(mut writer) = crate::ota::ImageWriter::begin() else {
+        *fail = Some((0, 0, 0, 0)); // #139-followup: died before the download (slot open)
         log::error!("smol OTA: cannot open inactive slot (no OTA partition table?)");
         return false;
     };
@@ -3730,8 +3771,13 @@ pub fn run_ota_fetch(
     let mut range_ok = true; // flips false if chunk 0 returns 200 (server ignored Range)
     let mut chunk_retries: u32 = 0; // re-requests forced by a short/failed chunk
     let mut stall: u32 = 0; // consecutive zero-progress attempts
+    let chunk_n = announce.size.div_ceil(OTA_CHUNK); // total chunks (for the #139-followup fail diag)
 
     while writer.written() < announce.size {
+        // #139-followup: keep the fail-diag snapshot current so ANY failure return below carries
+        // how far the download got + the trouble counters (the self-OTA caller publishes it retained
+        // to smol/<id>/ota/diag — release images are serial-silent, so this is the fleet-visible why).
+        *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall));
         if tick() {
             log::warn!("smol OTA: aborted by long-press (slot untouched)");
             return false;
@@ -3961,6 +4007,10 @@ pub fn run_ota_fetch(
         crate::ota::activate(target, announce.build, false); // self-OTA → confirm via DHCP
         false // reached only if the otadata write failed
     } else {
+        // #139-followup: the download COMPLETED but the integrity/authenticity gate rejected it
+        // (corrupt/truncated/bad-sig). Record K=N (all chunks fetched) so the fleet diag
+        // distinguishes a verify failure from a mid-download death.
+        *fail = Some((chunk_n, chunk_n, chunk_retries, stall));
         log::error!("smol OTA: verify FAILED (size/SHA-256 or ed25519 signature) — discarded (good slot intact)");
         false
     }
