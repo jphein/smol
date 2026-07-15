@@ -117,13 +117,20 @@ pub use wifi::CFG_KEY_SCAN;
 pub use wifi::try_time_sync;
 
 /// Install esp-wifi's heap ONCE. esp-alloc declares the `#[global_allocator]`
-/// inside its own crate; this macro just adds a 72 KiB internal-RAM region to
-/// it (the size the esp-wifi C3 examples use). Defined here so both the Phase 2
-/// (`wifi`) and Phase 3 (`espnow`) code paths share a single heap region rather
-/// than each reserving their own.
+/// inside its own crate; this macro just adds an internal-RAM region to it.
+/// Defined here so both the Phase 2 (`wifi`) and Phase 3 (`espnow`) code paths
+/// share a single heap region rather than each reserving their own.
+///
+/// #140: grown 72 → 128 KiB. The gateway free-heap low-watermark bottomed at ~5.9 KB during crown
+/// duty (esp-wifi's static RX pool ≈16 KB + dynamic RX churn draw from THIS region), leaving no room
+/// to raise the RX buffers that fix the sustained-fetch stalls. The heap audit
+/// (scratch/smol-ha-batt/140-heap-audit.md) showed ~120 KB of the C3's 313 KiB DRAM window unused —
+/// so growing the heap is the safe unlock: it lifts the low-watermark to ~52 KB even after the
+/// #140 static-RX bump (.cargo/config.toml [env]). The region is uninit `.bss` in DMA-capable
+/// internal SRAM; 128 KiB keeps `.data`+`.bss` (~191 KB) well under the DRAM window before stack.
 #[cfg(feature = "wifi")]
 pub fn init_heap() {
-    esp_alloc::heap_allocator!(size: 72 * 1024);
+    esp_alloc::heap_allocator!(size: 128 * 1024);
 }
 
 /// Phase-1 (default) placeholder used when no radio features are enabled: the
