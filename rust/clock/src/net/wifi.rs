@@ -1536,6 +1536,50 @@ fn recv_into(
     }
 }
 
+/// #147 self-fetch failure POINT — the exact stage a failed `run_ota_fetch` died at, carried as
+/// the 5th field of the `(chunk_k, chunk_n, retries, stalls, where)` self-fail record and rendered
+/// into the retained `smol/<id>/ota/diag` payload (`… at=<label>`). Release images are serial-
+/// silent, so this is the ONLY fleet-visible signal of WHERE a self-fetch died: the #139 record
+/// showed how FAR the download got but not WHICH stage wedged (a chunk-2 handshake wedge and a
+/// mid-body stall both surfaced as `chunk=1/N retry=0 stall=0`). Defined once here so the espnow
+/// fetch loop and the wifi diag formatter agree on the codes.
+#[cfg(feature = "wifi")]
+mod ota_fail {
+    pub const NONE: u32 = 0; // no point recorded (should not surface on a real failure)
+    pub const ASSOC: u32 = 1; // WiFi association timed out (pre-download)
+    pub const DHCP: u32 = 2; // DHCP lease timed out (pre-download)
+    pub const SLOT: u32 = 3; // inactive OTA slot would not open (pre-download)
+    pub const CONNECT: u32 = 4; // smoltcp connect() returned Err on the (reused) socket
+    pub const HANDSHAKE: u32 = 5; // connect() ok but the TCP handshake never completed in-window
+    pub const SEND: u32 = 6; // the HTTP GET/Range request could not be enqueued
+    pub const STATUS: u32 = 7; // bad HTTP status / Content-Length on a chunk
+    pub const FALLBACK: u32 = 8; // 200 full-body fallback died mid-stream (non-resumable)
+    pub const STALL: u32 = 9; // consecutive zero-progress attempts exhausted
+    pub const DEADLINE: u32 = 10; // global OTA_FETCH_BUDGET elapsed mid-download
+    pub const VERIFY: u32 = 11; // download completed but the size/SHA-256/ed25519 gate rejected it
+    pub const RECYCLE: u32 = 12; // the socket never returned to a connectable state between chunks
+
+    /// Short, stable label for the retained diag payload (kept terse — the MQTT packet is capped).
+    pub fn label(fp: u32) -> &'static str {
+        match fp {
+            ASSOC => "assoc",
+            DHCP => "dhcp",
+            SLOT => "slot",
+            CONNECT => "connect",
+            HANDSHAKE => "handshake",
+            SEND => "send",
+            STATUS => "status",
+            FALLBACK => "fallback-trunc",
+            STALL => "stall",
+            DEADLINE => "deadline",
+            VERIFY => "verify",
+            RECYCLE => "recycle",
+            NONE => "none",
+            _ => "?",
+        }
+    }
+}
+
 /// One short MQTT 3.1.1 QoS0 session over a fresh TCP socket to the HA broker:
 /// TCP connect → CONNECT (client-id `smol-<node_id>`, username+password) → CONNACK
 /// → SUBSCRIBE `smol/display/batt` (downlink FIRST — the retained payload every node
@@ -1632,9 +1676,10 @@ fn mqtt_session(
     // #3 RELAY RX-DIAG: the last relay's `(leaf_id, rx_any, otan_valid, last_wb, total)`.
     // PUBLISHED to retained `smol/<leaf>/ota/relaydiag` here, consumed after. `&mut None` off-gw.
     leaf_relay_rx: &mut Option<RelayDiag>,
-    // #139-followup: on a failed SELF-fetch, `(chunk_k, chunk_n, retries, stalls)` → formatted +
+    // #139-followup: on a failed SELF-fetch, `(chunk_k, chunk_n, retries, stalls, where)` → formatted +
     // published retained to `smol/<id>/ota/diag` (gateway-only; consumed once). `&mut None` otherwise.
-    ota_self_fail: &mut Option<(u32, u32, u32, u32)>,
+    // #147: `where` = the `ota_fail::*` code for the exact stage that died (self-describing diag).
+    ota_self_fail: &mut Option<(u32, u32, u32, u32, u32)>,
     deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
@@ -2640,19 +2685,25 @@ fn mqtt_session(
     // tonight's mid-body deaths into a three-hour diagnosis. `chunk=k/n` = how far the download got
     // (0/0 ⇒ died before the download: assoc/DHCP/slot); `retry`/`stall` = transfer trouble.
     // Consumed after publish (set None) so it isn't re-emitted every flush.
-    if let Some((k, n, r, s)) = *ota_self_fail {
+    if let Some((k, n, r, s, w)) = *ota_self_fail {
         let mut dtopic = MqttScratch::new();
         let _ = write!(dtopic, "smol/{}/ota/diag", node_id);
         let mut dval = MqttScratch::new();
-        let _ = write!(dval, "self-fetch-failed chunk={}/{} retry={} stall={}", k, n, r, s);
+        // #147: `at=<label>` names the exact stage that died (handshake / recv / verify / …) so a
+        // failure is self-describing on the wire — release images are serial-silent.
+        let _ = write!(
+            dval,
+            "self-fetch-failed chunk={}/{} retry={} stall={} at={}",
+            k, n, r, s, ota_fail::label(w)
+        );
         if let Some(np) =
             crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), dval.as_bytes(), true)
         {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..np], deadline, tick);
         }
         log::info!(
-            "smol #139: published smol/{}/ota/diag = self-fetch-failed chunk={}/{} retry={} stall={}",
-            node_id, k, n, r, s
+            "smol #139/#147: published smol/{}/ota/diag = self-fetch-failed chunk={}/{} retry={} stall={} at={}",
+            node_id, k, n, r, s, ota_fail::label(w)
         );
         *ota_self_fail = None; // consumed — published once
     }
@@ -3114,14 +3165,20 @@ fn mqtt_session(
         // session) — not merely because we caught the INSTALL. The old eager clear-on-catch lost the
         // order in the boot-race: a rebooting board caught its own retained INSTALL BEFORE it had
         // drained `ota/staged`, so `staged_raw` was None, `main` had nothing to fetch, yet the order
-        // was cleared anyway (id7, 13:56). Gating on `staged_raw.is_some()` leaves the order retained
-        // until a staged image is actually in hand → it survives the racing boot and installs on the
-        // burst that parses staged. This stays a ONE-SHOT clear (fires at the install, not after a
-        // version-flip), which is deliberate: the OWN self-OTA gate is `build > BUILD_NUMBER` only
-        // (NOT floor-gated, unlike the leaf mesh path), so a version-flip-clear would re-fetch a
-        // rolled-back image forever — clearing at install-time is what keeps a bad self-image
-        // one-shot. `staged_raw` (the persisted raw announce) is Some iff we've parsed a staged line.
-        if *install_requested && staged_raw.is_some() {
+        // was cleared anyway (id7, 13:56). This stays a ONE-SHOT clear (fires at the install, not
+        // after a version-flip), which is deliberate: the OWN self-OTA gate is `build > BUILD_NUMBER`
+        // only (NOT floor-gated, unlike the leaf mesh path), so a version-flip-clear would re-fetch a
+        // rolled-back image forever — clearing at install-time is what keeps a bad self-image one-shot.
+        //
+        // #147: gate the clear on `ota_offer.is_some()` (a GATE-PASSING staged target — the thing
+        // `main` actually fetches via `take_ota_offer`), NOT `staged_raw.is_some()` (any staged line
+        // that merely PARSED). A record that parsed but the gate REFUSED (monotonicity / host-
+        // allowlist / bad size — `ota_offer` stays None) previously burned the paired install order
+        // WITHOUT any fetch (an operator's bad-recovery staging killed the order). A pre-fetch refusal
+        // must PRESERVE the order — the same never-clear semantics #135/#134 give pre-relay failures
+        // (`reached_leaf()==false`) — so the next good staging (or the next crown) still installs.
+        // `ota_offer.is_some()` ⟹ `staged_raw.is_some()`, so the boot-race guard above is unchanged.
+        if *install_requested && ota_offer.is_some() {
             if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, cmd_topic.as_bytes(), &[], true) {
                 let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
             }
@@ -3268,9 +3325,10 @@ pub fn run_mqtt_burst(
     // #3: last relay attempt's RX evidence → published to `smol/<leaf>/ota/relaydiag` (see
     // `mqtt_session`). `&mut None` on boot/leaf bursts.
     leaf_relay_rx: &mut Option<RelayDiag>,
-    // #139-followup: on a failed SELF-fetch, `(chunk_k, chunk_n, retries, stalls)` → formatted +
+    // #139-followup: on a failed SELF-fetch, `(chunk_k, chunk_n, retries, stalls, where)` → formatted +
     // published retained to `smol/<id>/ota/diag` (see `mqtt_session`). `&mut None` otherwise.
-    ota_self_fail: &mut Option<(u32, u32, u32, u32)>,
+    // #147: 5th field = the `ota_fail::*` code for the stage that died.
+    ota_self_fail: &mut Option<(u32, u32, u32, u32, u32)>,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
@@ -3648,7 +3706,8 @@ pub fn run_ota_fetch(
     // counters. The self-OTA caller (`run_ota_update`) formats + publishes it retained to
     // `smol/<id>/ota/diag` (#135 armdiag pattern); release images are serial-silent, so this is
     // the ONLY fleet-visible signal of WHY a self-fetch failed.
-    fail: &mut Option<(u32, u32, u32, u32)>,
+    // #147: 5th field = the `ota_fail::*` code pinning the exact stage that died.
+    fail: &mut Option<(u32, u32, u32, u32, u32)>,
 ) -> bool {
     let Some((host, port, path)) = crate::ota::split_url(announce.url()) else {
         log::error!("smol OTA: malformed announce URL — aborting fetch");
@@ -3703,7 +3762,7 @@ pub fn run_ota_fetch(
             return false;
         }
         if Instant::now() > deadline {
-            *fail = Some((0, 0, 0, 0)); // #139-followup: died before the download (association)
+            *fail = Some((0, 0, 0, 0, ota_fail::ASSOC)); // #139/#147: died before the download (association)
             log::warn!("smol OTA: WiFi association timed out");
             return false;
         }
@@ -3729,7 +3788,7 @@ pub fn run_ota_fetch(
             break;
         }
         if Instant::now() > deadline {
-            *fail = Some((0, 0, 0, 0)); // #139-followup: died before the download (DHCP)
+            *fail = Some((0, 0, 0, 0, ota_fail::DHCP)); // #139/#147: died before the download (DHCP)
             log::warn!("smol OTA: DHCP timed out");
             return false;
         }
@@ -3738,7 +3797,7 @@ pub fn run_ota_fetch(
     // Open the inactive-slot writer ONCE (image is streamed here across chunks, never buffered
     // whole). `writer.written()` doubles as the RESUME cursor and the running-SHA position.
     let Some(mut writer) = crate::ota::ImageWriter::begin() else {
-        *fail = Some((0, 0, 0, 0)); // #139-followup: died before the download (slot open)
+        *fail = Some((0, 0, 0, 0, ota_fail::SLOT)); // #139/#147: died before the download (slot open)
         log::error!("smol OTA: cannot open inactive slot (no OTA partition table?)");
         return false;
     };
@@ -3757,6 +3816,13 @@ pub fn run_ota_fetch(
     const OTA_CHUNK: u32 = 48 * 1024;
     /// Consecutive zero-progress attempts before giving up (livelock guard inside the budget).
     const OTA_MAX_STALL: u32 = 6;
+    /// #147: bounded per-chunk connect+handshake window. Chunk N+1 reuses the smoltcp socket right
+    /// after chunk N's `Connection: close`; if that reconnect wedges (SYN dropped / server still
+    /// holding the old half-open / stack mid-recycle) the handshake wait must fail FAST into the
+    /// stall guard and retry on a FRESH ephemeral port — NOT spin against the 300 s global budget.
+    /// That was the #147 bug: one wedged chunk 2 ate the whole fetch (11 attempts, each 206-served
+    /// chunk 1 then a budget death). 8 s ≫ a healthy LAN handshake, so a real slow assoc still wins.
+    const OTA_CHUNK_CONNECT: Duration = Duration::from_secs(8);
 
     // Variable-width decimal into `out` (Range byte-positions must NOT be zero-padded for all
     // servers); returns the digit count. `v` is a u32 → at most 10 digits.
@@ -3782,31 +3848,70 @@ pub fn run_ota_fetch(
     let mut chunk_retries: u32 = 0; // re-requests forced by a short/failed chunk
     let mut stall: u32 = 0; // consecutive zero-progress attempts
     let chunk_n = announce.size.div_ceil(OTA_CHUNK); // total chunks (for the #139-followup fail diag)
+    // #147: the stage the CURRENT chunk attempt is in — advanced as we pass connect → handshake →
+    // send → recv, so whatever return fires below carries the precise failure point in the diag.
+    let mut fail_point: u32 = ota_fail::NONE;
 
     while writer.written() < announce.size {
-        // #139-followup: keep the fail-diag snapshot current so ANY failure return below carries
-        // how far the download got + the trouble counters (the self-OTA caller publishes it retained
-        // to smol/<id>/ota/diag — release images are serial-silent, so this is the fleet-visible why).
-        *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall));
+        // #139-followup/#147: keep the fail-diag snapshot current so ANY failure return below carries
+        // how far the download got + the trouble counters + the stage it died in (the self-OTA
+        // caller publishes it retained to smol/<id>/ota/diag — release images are serial-silent, so
+        // this is the fleet-visible why).
+        *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, fail_point));
         if tick() {
             log::warn!("smol OTA: aborted by long-press (slot untouched)");
             return false;
         }
         if Instant::now() > deadline {
+            *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::DEADLINE));
             log::warn!("smol OTA: download timed out (slot untouched)");
             return false;
         }
         let off = writer.written();
         let end = core::cmp::min(off + OTA_CHUNK, announce.size) - 1; // inclusive last byte
 
-        // Fresh connection for this chunk: abort any prior (closed) socket, then reconnect on a
-        // new ephemeral port (avoids TIME_WAIT collisions).
+        // #147: recycle the socket to a genuinely connectable state before this chunk. smoltcp's
+        // `abort()` sets CLOSED *synchronously* but leaves the RST queued (it egresses only on a
+        // later poll) and the stale 4-tuple/buffers in place until `connect()`'s `reset()` wipes
+        // them. On-air the single post-abort poll wasn't reliably draining that, so chunk 2+
+        // reconnected on a half-recycled handle and wedged. Pump the interface until the socket
+        // reports CLOSED (RST flushed) with a bounded wait; if it never does, count a stall and
+        // retry the whole chunk (fresh abort + new port) rather than reconnect on a dirty handle.
+        fail_point = ota_fail::RECYCLE;
         {
             let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
             s.abort();
         }
-        iface.poll(smoltcp_now(), device, &mut sockets);
+        {
+            let recycle_deadline = Instant::now() + OTA_CHUNK_CONNECT;
+            let mut recycled = false;
+            loop {
+                iface.poll(smoltcp_now(), device, &mut sockets);
+                if sockets.get_mut::<tcp::Socket>(tcp_handle).state() == tcp::State::Closed {
+                    recycled = true;
+                    break; // connectable
+                }
+                if tick() {
+                    return false;
+                }
+                if Instant::now() > recycle_deadline || Instant::now() > deadline {
+                    break; // couldn't fully recycle in-window
+                }
+            }
+            if !recycled {
+                chunk_retries += 1;
+                stall += 1;
+                if stall >= OTA_MAX_STALL {
+                    *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::RECYCLE));
+                    log::error!("smol OTA: socket would not recycle to a connectable state — aborting (slot untouched)");
+                    return false;
+                }
+                continue; // fail_point=RECYCLE rides the loop-top snapshot on the retry
+            }
+        }
+        // Fresh ephemeral port each chunk (avoids TIME_WAIT / server half-open collisions on reuse).
         let src_port = 49152 + (rng.random() % 16384) as u16;
+        fail_point = ota_fail::CONNECT;
         {
             let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
             if s.connect(iface.context(), (IpAddress::Ipv4(ip), port), src_port)
@@ -3815,14 +3920,23 @@ pub fn run_ota_fetch(
                 chunk_retries += 1;
                 stall += 1;
                 if stall >= OTA_MAX_STALL {
+                    *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::CONNECT));
                     log::error!("smol OTA: repeated TCP connect failures — aborting (slot untouched)");
                     return false;
                 }
                 continue;
             }
         }
+        // #147: BOUNDED handshake. A reused socket that wedges HERE (connect ok, may_send never
+        // true) must retry on a fresh port via the stall guard instead of spinning to the 300 s
+        // global budget — that unbounded wait was the #147 whole-fetch death (one wedged chunk 2
+        // ate the entire budget, 11×). Only the GLOBAL deadline or the stall cap is terminal; the
+        // per-chunk window just recycles.
+        fail_point = ota_fail::HANDSHAKE;
         {
+            let chunk_connect_deadline = core::cmp::min(Instant::now() + OTA_CHUNK_CONNECT, deadline);
             let mut connected = false;
+            let mut window_elapsed = false;
             while !connected {
                 iface.poll(smoltcp_now(), device, &mut sockets);
                 if sockets.get_mut::<tcp::Socket>(tcp_handle).may_send() {
@@ -3830,9 +3944,23 @@ pub fn run_ota_fetch(
                 } else if tick() {
                     return false;
                 } else if Instant::now() > deadline {
+                    *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::HANDSHAKE));
                     log::warn!("smol OTA: TCP connect timed out (slot untouched)");
                     return false;
+                } else if Instant::now() > chunk_connect_deadline {
+                    window_elapsed = true;
+                    break; // per-chunk handshake window elapsed → retry on a fresh port
                 }
+            }
+            if window_elapsed {
+                chunk_retries += 1;
+                stall += 1;
+                if stall >= OTA_MAX_STALL {
+                    *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::HANDSHAKE));
+                    log::error!("smol OTA: repeated TCP handshake wedges — aborting (slot untouched)");
+                    return false;
+                }
+                continue;
             }
         }
 
@@ -3847,6 +3975,7 @@ pub fn run_ota_fetch(
         rl += 1;
         rl += write_dec(end, &mut rbuf[rl..]);
         {
+            fail_point = ota_fail::SEND;
             let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
             let ok = s.send_slice(b"GET ").is_ok()
                 && s.send_slice(path.as_bytes()).is_ok()
@@ -3859,6 +3988,7 @@ pub fn run_ota_fetch(
                 chunk_retries += 1;
                 stall += 1;
                 if stall >= OTA_MAX_STALL {
+                    *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::SEND));
                     log::error!("smol OTA: repeated request-send failures — aborting (slot untouched)");
                     return false;
                 }
@@ -3949,18 +4079,21 @@ pub fn run_ota_fetch(
                 break; // this chunk's connection ended → outer loop resumes from written()
             }
             if Instant::now() > deadline {
+                *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::DEADLINE));
                 log::warn!("smol OTA: download timed out (slot untouched)");
                 return false;
             }
         }
 
         if bad {
+            *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::STATUS));
             log::error!("smol OTA: bad HTTP status/length on range {off}-{end} (slot untouched)");
             return false;
         }
         if !range_ok && writer.written() < announce.size {
             // A 200 server re-sends from 0, so an incomplete full-body GET can't be resumed
             // (that's the OLD failure mode). Fail cleanly rather than double-write.
+            *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::FALLBACK));
             log::error!(
                 "smol OTA: server ignored Range (200) and the single GET died mid-body — not resumable"
             );
@@ -3977,6 +4110,7 @@ pub fn run_ota_fetch(
             chunk_retries += 1;
             stall += 1;
             if stall >= OTA_MAX_STALL {
+                *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::STALL));
                 log::error!(
                     "smol OTA: {OTA_MAX_STALL} zero-progress attempts at offset {off} — aborting (slot untouched)"
                 );
@@ -4018,9 +4152,9 @@ pub fn run_ota_fetch(
         false // reached only if the otadata write failed
     } else {
         // #139-followup: the download COMPLETED but the integrity/authenticity gate rejected it
-        // (corrupt/truncated/bad-sig). Record K=N (all chunks fetched) so the fleet diag
+        // (corrupt/truncated/bad-sig). Record K=N (all chunks fetched) + at=verify so the fleet diag
         // distinguishes a verify failure from a mid-download death.
-        *fail = Some((chunk_n, chunk_n, chunk_retries, stall));
+        *fail = Some((chunk_n, chunk_n, chunk_retries, stall, ota_fail::VERIFY));
         log::error!("smol OTA: verify FAILED (size/SHA-256 or ed25519 signature) — discarded (good slot intact)");
         false
     }
