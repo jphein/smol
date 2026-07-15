@@ -1810,12 +1810,14 @@ pub struct RadioManager {
     /// independent drain timing). Persists the current staged image for every leaf relay.
     staged_raw: Option<crate::ota::Announce>,
     /// #40 headless observability + clear/retry: the LAST leaf-OTA attempt's `(leaf_id,
-    /// phase, clear_install)`, set by `main` after `run_leaf_ota_relay`, PUBLISHED to
+    /// phase, clear_install, retry_n)`, set by `main` after `run_leaf_ota_relay`, PUBLISHED to
     /// `smol/<leaf>/ota/diag` on the gateway's next burst and used to drive the install
     /// clear (terminal/exhausted) vs retry (transient). `None` when nothing is pending.
     /// The phase is stored as the rendered `&'static str` (not the espnow-only enum) so the
-    /// shared `wifi::mqtt_session` signature stays buildable in the wifi-only profile.
-    leaf_ota_diag: Option<(u8, &'static str, bool)>,
+    /// shared `wifi::mqtt_session` signature stays buildable in the wifi-only profile. `retry_n`
+    /// (#134) is the current consecutive-failure count for this outcome class — surfaced in the
+    /// retained payload (`fetch-failed retry=3`) so a stuck fetch is visible headlessly.
+    leaf_ota_diag: Option<(u8, &'static str, bool, u8)>,
     /// #40 #1 DECOUPLE: true while a leaf-OTA relay is pending/in-flight (armed until its
     /// outcome is terminal or the retry cap is hit). While set, the gateway SUPPRESSES its own
     /// self-OTA (`do_install`) so a relay is never interrupted by the gateway rebooting into a
@@ -1843,9 +1845,15 @@ pub struct RadioManager {
     /// chunk-loss stall. `last_wb` is in chunk units (matches `total = om::total_chunks`).
     /// Carries the leaf's `LDBG` self-report too (captured during the relay) — see `RelayDiag`.
     leaf_relay_rx: Option<crate::net::wifi::RelayDiag>,
-    /// #40: consecutive non-terminal (transient) relay attempts for the current install —
-    /// caps the auto-retry so a persistently-failing leaf can't loop the mesh-deaf relay.
+    /// #40: consecutive POST-HANDOFF transient relay attempts (`RelayFailed`/`Timeout`/`Aborted`)
+    /// for the current install — caps the auto-retry so a persistently-failing (doomed) IMAGE can't
+    /// loop the mesh-deaf relay. Does NOT count pre-relay failures (see `leaf_ota_fetch_retries`).
     leaf_ota_retries: u8,
+    /// #134: consecutive PRE-RELAY failures (`FetchFailed`/`MacUnknown` — the feed never handed off
+    /// to the leaf) for the current install. Counted for the retained `ota/diag` retry number ONLY —
+    /// it NEVER burns the order (a gateway-local fetch failure says nothing about the leaf/image, so
+    /// the install survives for the next attempt / the next crown). Reset on a terminal outcome.
+    leaf_ota_fetch_retries: u8,
     /// #21 node-manager: the parsed default-screen command surfaced by a burst,
     /// pending `main`'s `take_config_offer` → apply. `None` when nothing is pending.
     config_offer: Option<crate::app::DefaultScreen>,
@@ -1957,6 +1965,7 @@ impl RadioManager {
             staged_raw: None,
             leaf_ota_diag: None,
             leaf_ota_retries: 0,
+            leaf_ota_fetch_retries: 0,
             leaf_ota_pending: false,
             leaf_installs_outstanding: false,
             leaf_ota_mac: None,
@@ -3240,22 +3249,39 @@ impl RadioManager {
     /// cap is hit) vs LEAVE it retained to retry (mac-unknown / fetch / relay / timeout). The
     /// phase is published to `smol/<leaf>/ota/diag` on the next burst (headless observability).
     pub fn record_leaf_ota(&mut self, leaf_id: u8, outcome: crate::ota_mesh::LeafOtaOutcome) {
-        let clear = if outcome.is_terminal() {
+        // #134 clear/retry policy — THREE cases, not two:
+        //  1. terminal (leaf DEFINITIVELY acted: installed / rolled-back / id-mismatch) → CLEAR,
+        //     reset both counters.
+        //  2. PRE-RELAY transient (`FetchFailed`/`MacUnknown` — `!reached_leaf()`): the feed NEVER
+        //     handed off to the leaf, so this is GATEWAY-LOCAL and says nothing about the leaf/image.
+        //     NEVER clear — the retained install must survive for the next attempt or the NEXT CROWN
+        //     (crown-portable per #111). Only count it, for the ota/diag retry number. THIS is the
+        //     #134 fix: previously a fetch-broken crown (e.g. unicast-deaf) burned the order after
+        //     LEAF_OTA_MAX_RETRIES fetch-fails, destroying an install a healthy successor would finish.
+        //  3. POST-HANDOFF transient (`RelayFailed`/`Timeout`/`Aborted` — the image DID reach the
+        //     leaf): the DOOMED-image backstop → bounded retries, then CLEAR so a bad image can't
+        //     re-arm forever.
+        let (clear, retry_n) = if outcome.is_terminal() {
             self.leaf_ota_retries = 0;
-            true
+            self.leaf_ota_fetch_retries = 0;
+            (true, 0)
+        } else if !outcome.reached_leaf() {
+            self.leaf_ota_fetch_retries = self.leaf_ota_fetch_retries.saturating_add(1);
+            (false, self.leaf_ota_fetch_retries)
         } else {
             self.leaf_ota_retries = self.leaf_ota_retries.saturating_add(1);
+            let n = self.leaf_ota_retries;
             let exhausted = self.leaf_ota_retries >= LEAF_OTA_MAX_RETRIES;
             if exhausted {
                 self.leaf_ota_retries = 0;
             }
-            exhausted
+            (exhausted, n)
         };
         log::info!(
-            "smol #40: leaf id{} OTA phase={} (clear_install={}, retries={})",
-            leaf_id, outcome.as_str(), clear, self.leaf_ota_retries
+            "smol #40/#134: leaf id{} OTA phase={} (clear_install={}, reached_leaf={}, retry={})",
+            leaf_id, outcome.as_str(), clear, outcome.reached_leaf(), retry_n
         );
-        self.leaf_ota_diag = Some((leaf_id, outcome.as_str(), clear));
+        self.leaf_ota_diag = Some((leaf_id, outcome.as_str(), clear, retry_n));
         // #1 DECOUPLE: the relay session is done for this install iff we're clearing it
         // (terminal outcome or retry cap). While NOT cleared (transient retry) it stays
         // pending so the gateway keeps suppressing its own self-OTA until the leaf resolves.
