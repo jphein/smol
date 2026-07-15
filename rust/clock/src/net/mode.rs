@@ -1919,6 +1919,7 @@ impl RadioManager {
         // suspenders. Shared by every espnow association (NTP/MQTT/OTA/re-election). See nebula
         // finding 2 (scratch/smol-ha-batt/nebula-c3-wifi-research.md).
         let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
+        crate::net::assert_max_tx_power(); // #141: 8.5 dBm clamp, right after driver start
 
         // #68/#76 SELF-MAC: capture our STA MAC (ESP-NOW rides the STA interface) so service()
         // can DROP frames from our own address. The esp-wifi RX queue can deliver our own
@@ -2334,6 +2335,7 @@ impl RadioManager {
                 let _ = self
                     .controller
                     .set_power_saving(esp_wifi::config::PowerSaveMode::None);
+                crate::net::assert_max_tx_power(); // #141
                 log::info!("smol: radio -> WiFi STA (coexist)");
             }
         }

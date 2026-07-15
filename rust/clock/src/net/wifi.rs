@@ -3366,6 +3366,7 @@ pub fn run_mqtt_burst(
     // MQTT stream (the old UDP path only needed the ARP reply). Same reasoning,
     // same placement (must be AFTER the reconnect). Tradeoff: higher idle draw.
     let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
+    crate::net::assert_max_tx_power(); // #141
 
     // #64: capture the WiFi-uplink RSSI HERE — the STA is confirmed connected (the loop
     // above waited for is_connected()==Ok(true)), so esp_wifi_sta_get_rssi has a live
@@ -3708,6 +3709,7 @@ pub fn run_ota_fetch(
         }
     }
     let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
+    crate::net::assert_max_tx_power(); // #141
 
     // Fresh DHCP lease (interface just rebuilt).
     loop {
