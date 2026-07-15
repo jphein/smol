@@ -15,7 +15,8 @@ SSLCTX=ssl.create_default_context()  # verifies by default
 if os.environ.get("HA_WS_INSECURE"):  # explicit opt-out for a LAN self-signed HA cert (like curl -k)
     SSLCTX.check_hostname=False; SSLCTX.verify_mode=ssl.CERT_NONE
 HA=os.environ.get("HA_SSH","user@homeassistant.local"); WWW="/config/www/luna-cards"; LOCAL="/local/luna-cards"
-KNOWN={7:{"name":"Draconic Dominion","role":"the Seat","gate":True},
+KNOWN={5:{"name":"Silent Aegis","role":"leaf","headless":True},  # headless board (no OLED — #headless); telemetry-only card
+       7:{"name":"Draconic Dominion","role":"the Seat","gate":True},
        8:{"name":"Eldritch Nexus","role":"leaf"},
        9:{"name":"Jade Herald","role":"leaf"}}
 ACCENT="var(--accent-color)"; PHOS="var(--primary-color)"; VT="'VT323','IBM Plex Mono',monospace"
@@ -100,8 +101,8 @@ def plugin_chips(nid, present):
                         "background:var(--card-background-color);}"}}
 
 # ---------- node box = mushroom header + mushroom OLED + entities; span-4 in the VIEW grid ----------
-def node_card(nid, meta, present):
-    gate=meta["gate"]; I=str(nid); on=f"is_state('binary_sensor.smol_{I}_online','on')"
+def node_card(nid, meta, present, span=4):
+    gate=meta["gate"]; headless=meta.get("headless",False); I=str(nid); on=f"is_state('binary_sensor.smol_{I}_online','on')"
     # #64: the gateway's WiFi-uplink RSSI entity is device-name-derived (HA discovery names
     # it sensor.smol_<id>_<noun>_uplink, where <noun> is the fantasy noun = last name word).
     up=f"sensor.smol_{nid}_{meta['name'].split()[-1].lower()}_uplink"
@@ -194,13 +195,39 @@ def node_card(nid, meta, present):
     if inst in present: bot.append({"entity":inst,"name":"Install staged (gateway consumes)","icon":"mdi:rocket-launch"})
     ctrl_bottom={"type":"entities","show_header_toggle":False,"entities":bot,
                  "card_mod":{"style":"ha-card{border-radius:0 0 10px 10px;border-top:none;margin-top:-1px;"+OP+"}"}}
+    # ---- #vitals ALWAYS-ON telemetry (heap / uptime / boot / slot / reset + mesh counters).
+    #      These rich diag sensors existed but only surfaced in the fault-only device_card
+    #      (self-hides when clean) → invisible in normal operation (JP: "not dynamic enough
+    #      with data"). Now live on every box; prow() skips whatever a given node lacks. ----
+    vit=[{"type":"section","label":"telemetry · live"}]
+    prow(vit,f"sensor.smol_{nid}_heap_free","heap free","mdi:memory")
+    prow(vit,f"sensor.smol_{nid}_heap_min","heap min (worst)","mdi:memory-arrow-down")
+    prow(vit,f"sensor.smol_{nid}_uptime","uptime","mdi:timer-outline")
+    prow(vit,f"sensor.smol_{nid}_boot_count","boot count","mdi:counter")
+    prow(vit,f"sensor.smol_{nid}_boot_slot","OTA slot (running)","mdi:swap-horizontal-bold")
+    prow(vit,f"sensor.smol_{nid}_reset_reason","last reset","mdi:restart-alert")
+    for e,nm,ic in [("mesh_rx","mesh rx","mdi:arrow-down-bold-box"),("mesh_tx","mesh tx","mdi:arrow-up-bold-box"),
+                    ("mesh_loss","mesh loss","mdi:alert-circle-outline")]:
+        prow(vit,f"sensor.smol_{nid}_{e}",nm,ic)
+    telemetry={"type":"entities","show_header_toggle":False,"entities":vit,"card_mod":{"style":JOIN}}
+    # per-node heap history (24h) — the live trend, seamless in the stack (#dynamic-data + history).
+    heap_hist=None
+    if f"sensor.smol_{nid}_heap_free" in present:
+        heap_hist={"type":"history-graph","hours_to_show":24,
+                   "entities":[{"entity":f"sensor.smol_{nid}_heap_free","name":"heap free"}]
+                              +([{"entity":f"sensor.smol_{nid}_heap_min","name":"heap min"}] if f"sensor.smol_{nid}_heap_min" in present else []),
+                   "card_mod":{"style":"ha-card{border-radius:0;border-top:none;border-bottom:none;margin-top:-1px;"+OP+"}"}}
     ota=ota_progress_card(nid)   # #40 relay progress bar + phase chip — self-hides (display:none) when idle
     dev=device_card(nid)         # #70/#74 rollback / abnormal-reset alarm — self-hides when clean
     plug=plugin_chips(nid,present)  # #55 plugin-visibility toggle chips
-    seq=[header,oled,ctrl_top,cond_leaf,cond_gw,ota,dev]
-    if plug: seq.append(plug)
-    seq.append(ctrl_bottom)
-    return {"type":"vertical-stack","view_layout":{"grid-column":"span 4"},"cards":seq}
+    if headless:
+        # #headless board: no OLED / screen-mode / plugin controls to show — telemetry-first box.
+        seq=[header,telemetry]+([heap_hist] if heap_hist else [])+[ota,dev,ctrl_bottom]
+    else:
+        seq=[header,oled,ctrl_top,cond_leaf,cond_gw,telemetry]+([heap_hist] if heap_hist else [])+[ota,dev]
+        if plug: seq.append(plug)
+        seq.append(ctrl_bottom)
+    return {"type":"vertical-stack","view_layout":{"grid-column":f"span {span}"},"cards":seq}
 
 def legend_card(nodes, present):
     ents=[{"type":"section","label":"the mesh"}]
@@ -246,6 +273,44 @@ def forge_install_rows(nodes, present):
             rows.append({"entity":inst,"name":f"Install → id{I} {n['name'].split()[-1]}"+(" · canary / the Seat" if n["gate"] else ""),
                          "icon":"mdi:rocket-launch" if n["gate"] else "mdi:rocket-launch-outline"})
     return rows
+
+# ---------- mesh-overview matrix — crown/channel + per-node build / slot / reset / OTA state ----------
+# The "whole fleet at one glance" table JP asked for. Every cell is templated so it re-evaluates
+# live (crown moves on #51 takeover; build flips as OTA converges). Build shows run →staged when behind.
+def mesh_overview_md(nodes, present):
+    na=NAJ
+    head=("{% set na="+na+" %}{% set owner=state_attr('sensor.smol_mesh_channel','owner') %}"
+          "{% set ch=states('sensor.smol_mesh_channel') %}{% set seq=state_attr('sensor.smol_mesh_channel','seq') %}"
+          "{% set re=is_state('binary_sensor.smol_mesh_reelecting','on') %}"
+          "**the mesh** · {% if re %}⚠️ **RE-ELECTING** — choosing a gateway…{% else %}"
+          "👑 the Seat **id{{ owner if owner not in na else '?' }}** · ch **{{ ch if ch not in na else '—' }}** · "
+          "seq **{{ seq if seq not in na else '—' }}** _(advancing = alive)_{% endif %}")
+    rows=["", "| sigil | link | build | slot | last reset | OTA |", "|:--|:--:|:--:|:--:|:--:|:--:|"]
+    for n in nodes:
+        I=str(n["id"]); tag="♛ " if n["gate"] else ""
+        rows.append(
+            "{% set on=is_state('binary_sensor.smol_"+I+"_online','on') %}"
+            "{% set b=states('sensor.smol_"+I+"_build') %}{% set sl=states('sensor.smol_"+I+"_boot_slot') %}"
+            "{% set rr=states('sensor.smol_"+I+"_reset_reason') %}{% set oo=states('sensor.smol_"+I+"_ota_outcome') %}"
+            "{% set st=states('sensor.smol_ota_staged') %}"
+            "| "+tag+esc(n["name"])+" · id"+I+" "
+            "| {{ '🟢' if on else '⛔' }} "
+            "| {{ b if b not in na else '—' }}{% if b not in na and st not in na and st!='none' and b!=st %} →{{ st }}{% endif %} "
+            "| {{ sl|replace('ota_','slot ') if sl not in na else '—' }} "
+            "| {{ rr if rr not in na else '—' }} "
+            "| {{ oo if oo not in na else '—' }} |")
+    return head+"\n"+"\n".join(rows)
+
+# ---------- vitals history — heap-free + uptime across the WHOLE fleet, 24h (JP: history graphs) ----------
+def vitals_history_cards(nodes, present):
+    def graph(field, title, accent):
+        ents=[{"entity":f"sensor.smol_{n['id']}_{field}","name":f"id{n['id']}"}
+              for n in nodes if f"sensor.smol_{n['id']}_{field}" in present]
+        if not ents: return None
+        return {"type":"history-graph","title":title,"hours_to_show":24,"entities":ents,
+                "view_layout":{"grid-column":"span 6"},"card_mod":{"style":accent_top(accent)}}
+    return [c for c in (graph("heap_free","heap free · 24h · all sigils",PHOS),
+                        graph("uptime","uptime · 24h · reboots = sawtooth",ACCENT)) if c]
 
 def gen_topology(nodes, seat):
     W,H=680,300; cx,cy=W/2,H*0.40; F="ui-monospace,'DejaVu Sans Mono',monospace"
@@ -299,15 +364,22 @@ async def main():
         nodes.sort(key=lambda n:(not n["gate"],not n["on"],n["id"]))
         seat=next(n for n in nodes if n["id"]==seat_id)
         topo_url=serve("smol-topology.svg", gen_topology(nodes,seat))
-        node_cards=[node_card(n["id"],n,present) for n in nodes]
+        # adaptive fleet tiling: 4 sigils → 2×2 (span 6), 3 → 3-up (span 4), 2 → span 6, 1 → full width.
+        per_row={1:1,2:2,4:2}.get(len(nodes),3); NODE_SPAN=12//per_row
+        node_cards=[node_card(n["id"],n,present,NODE_SPAN) for n in nodes]
         legend=legend_card(nodes,present)
-        cards=view["cards"]; out=[]; done={"topo":0,"legend":0,"fleet":0,"forge":0,"install":0}
+        mesh_ovw=mesh_overview_md(nodes,present); vitals=vitals_history_cards(nodes,present)
+        cards=view["cards"]; out=[]; done={"topo":0,"legend":0,"meshovw":0,"fleet":0,"vitals":0,"forge":0,"install":0}
         for c in cards:
             if c.get("type")=="picture" and c.get("image")=="TOPO": c["image"]=topo_url; done["topo"]+=1; out.append(c)
             elif c.get("type")=="markdown" and c.get("content")=="LEGEND":
                 lc=dict(legend); lc["view_layout"]=c.get("view_layout") or lc.get("view_layout"); done["legend"]+=1; out.append(lc)
+            elif c.get("type")=="markdown" and c.get("content")=="MESHOVW":
+                mc=dict(c); mc["content"]=mesh_ovw; done["meshovw"]+=1; out.append(mc)
             elif c.get("type")=="markdown" and c.get("content")=="FLEET":
                 out.extend(node_cards); done["fleet"]+=1
+            elif c.get("type")=="markdown" and c.get("content")=="VITALS":
+                out.extend(vitals); done["vitals"]+=1
             else: out.append(c)
         view["cards"]=out
         def fill_forge(cs):                                   # FORGE_OTA + FORGE_INSTALL nested in the forge vertical-stack
@@ -325,9 +397,9 @@ async def main():
         if not s.get("success"): print("!! SAVE FAILED",s); return
         r2=(await rpc(ws,{"type":"lovelace/config","url_path":DASH}))["result"]
         vv=next(x for x in r2["views"] if x.get("path")=="smol-control")
-        span4=[c for c in vv["cards"] if (c.get("view_layout") or {}).get("grid-column")=="span 4" and c.get("type")=="vertical-stack"]
-        print("SAVE ok · nodes:",ids,"Seat id",seat_id,"online",sorted(online))
-        print("  node boxes spliced into view grid (span-4 vertical-stacks):",len(span4),"· done:",done)
-        print("  each box:",[c.get("type") for c in span4[0]["cards"]] if span4 else "NONE")
+        nb=[c for c in vv["cards"] if (c.get("view_layout") or {}).get("grid-column")==f"span {NODE_SPAN}" and c.get("type")=="vertical-stack"]
+        print("SAVE ok · nodes:",ids,"Seat id",seat_id,"online",sorted(online),"· node span",NODE_SPAN)
+        print("  node boxes spliced into view grid:",len(nb),"· done:",done)
+        print("  each box:",[c.get("type") for c in nb[0]["cards"]] if nb else "NONE")
 if __name__=="__main__":
     asyncio.run(main())

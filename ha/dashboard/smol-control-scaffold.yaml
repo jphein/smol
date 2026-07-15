@@ -74,6 +74,24 @@ cards:
     content: "LEGEND"    # ← build script replaces this card with a generated entities legend (span 5)
     view_layout: {grid-column: "span 5"}
 
+  # ---- mesh-overview matrix: crown/channel + per-node build / slot / reset / OTA (span 12) ----
+  - type: markdown
+    content: "MESHOVW"   # ← build script fills the live fleet status matrix
+    view_layout: {grid-column: "span 12"}
+    card_mod:
+      style:
+        .: |
+          ha-card { position:relative; overflow:hidden; }
+          ha-card:before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,transparent,var(--accent-color),transparent); opacity:.55; }
+        ha-markdown$: |
+          table { width:100%; border-collapse:collapse; font-family:'VT323','IBM Plex Mono',monospace; }
+          th { text-align:left; font-size:11px; letter-spacing:2px; text-transform:uppercase; color:var(--secondary-text-color); border-bottom:1px solid var(--ha-card-border-color); padding:5px 10px; }
+          td { font-size:16px; color:var(--primary-text-color); border-bottom:1px solid rgba(127,127,127,.12); padding:3px 10px; }
+          td:first-child { color:var(--primary-color); }
+          p { margin:2px 0 10px; font-size:13px; color:var(--secondary-text-color); }
+          strong { color:var(--primary-color); }
+          em { color:var(--secondary-text-color); font-style:normal; opacity:.7; font-size:11px; }
+
   # ---- 02 · THE FLEET ----
   - type: markdown
     view_layout: {grid-column: "span 12"}
@@ -137,7 +155,15 @@ cards:
 
   - type: markdown
     content: "FLEET"   # ← build script REPLACES this with N node cards spliced DIRECTLY into the view grid
-                       #    (each view_layout: span 4). Nested grid-layout rendered EMPTY (JP screenshot) — avoided.
+                       #    (each view_layout: span = adaptive; 4 sigils → 2×2). Nested grid-layout renders EMPTY — avoided.
+
+  # ---- vitals · history (heap + uptime across the whole fleet, 24h) ----
+  - type: markdown
+    view_layout: {grid-column: "span 12"}
+    content: "**02·b**&nbsp;&nbsp;vitals · heap &amp; uptime · 24h history"
+    card_mod: *kick
+  - type: markdown
+    content: "VITALS"  # ← build script REPLACES this with heap + uptime history-graph cards (span 6 each)
 
   # ---- 03 · GLASS · POWER · FORGE ----
   - type: markdown
