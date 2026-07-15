@@ -2077,6 +2077,15 @@ impl RadioManager {
         // never heard (a forged/phantom retained MC — the standoff) is taken over promptly instead
         // of waiting the RSSI backoff (which exists to stagger takeover of a possibly-live owner).
         elect.owner_never_heard = !self.owner_hello_seen;
+        // #136: seed the heard-path takeover floor = the worst-case gap between a LIVE owner's
+        // OBSERVED MC seq advances (one flush interval + a slow/failed flush bounded by the flush
+        // budget). Computed here (espnow tier, where both constants live) so the wifi-tier resolver
+        // honors it without a cross-cfg dependency. Keeps a budget-edge re-assoc flush from being
+        // mistaken for a dead owner (issue #136); tracks #122 B1's flush interval automatically.
+        // `as_secs()*1000` (not `as_millis() as u64`): as_secs() is u64-native (no cast) and the
+        // budget is defined in whole seconds, so it's exact — and clippy-clean under -D warnings.
+        elect.recovery_stale_floor_ms =
+            RELAY_FLUSH_INTERVAL_MS + crate::net::wifi::RELAY_FLUSH_BUDGET.as_secs() * 1000;
         // #6 OTA / #21 config / #33 install: a leaf's recovery burst can also surface these.
         let mut ota_offer: Option<crate::ota::Announce> = None;
         let mut config_offer: Option<crate::app::DefaultScreen> = None;
