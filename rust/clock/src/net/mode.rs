@@ -1818,6 +1818,11 @@ pub struct RadioManager {
     /// (#134) is the current consecutive-failure count for this outcome class — surfaced in the
     /// retained payload (`fetch-failed retry=3`) so a stuck fetch is visible headlessly.
     leaf_ota_diag: Option<(u8, &'static str, bool, u8)>,
+    /// #139-followup: on a failed SELF-fetch, `(chunk_k, chunk_n, retries, stalls)` buffered by
+    /// `run_ota_update` → formatted + published retained to `smol/<id>/ota/diag` on the next gateway
+    /// flush (fleet-visible failure diag; release images are serial-silent). Consumed once (set to
+    /// `None` after publish), mirroring `leaf_ota_diag`.
+    ota_self_fail: Option<(u32, u32, u32, u32)>,
     /// #40 #1 DECOUPLE: true while a leaf-OTA relay is pending/in-flight (armed until its
     /// outcome is terminal or the retry cap is hit). While set, the gateway SUPPRESSES its own
     /// self-OTA (`do_install`) so a relay is never interrupted by the gateway rebooting into a
@@ -1906,6 +1911,14 @@ impl RadioManager {
         let (mut controller, interfaces) = esp_wifi::wifi::new(ctrl, p.wifi).ok()?;
         controller.set_mode(WifiMode::Sta).ok()?;
         controller.start().ok()?;
+        // #139: assert PowerSaveMode::None at RADIO INIT — the esp-wifi/IDF default is
+        // WIFI_PS_MIN_MODEM (the STA sleeps between DTIMs; the AP then buffers UNICAST at DTIM and
+        // drops it on marginal links → the re-ARP-after-reply / forwarded-NTP-never-arrives /
+        // TX-fine-RX-deaf class). This is the baseline; `switch()` re-asserts after each connect()
+        // (which resets ps to the default), and the post-is_connected() sites stay belt-and-
+        // suspenders. Shared by every espnow association (NTP/MQTT/OTA/re-election). See nebula
+        // finding 2 (scratch/smol-ha-batt/nebula-c3-wifi-research.md).
+        let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
 
         // #68/#76 SELF-MAC: capture our STA MAC (ESP-NOW rides the STA interface) so service()
         // can DROP frames from our own address. The esp-wifi RX queue can deliver our own
@@ -1964,6 +1977,7 @@ impl RadioManager {
             ota_offer: None,
             staged_raw: None,
             leaf_ota_diag: None,
+            ota_self_fail: None,
             leaf_ota_retries: 0,
             leaf_ota_fetch_retries: 0,
             leaf_ota_pending: false,
@@ -2161,6 +2175,7 @@ impl RadioManager {
                     &mut None, // #40: recovery burst carries no persistent staged
                     &mut None, // #40: recovery burst publishes no relay diag
                     &mut None, // #3: recovery burst publishes no relay RX-diag
+                    &mut None, // #139-followup: a leaf recovery burst is never a self-OTA fetch
                     tick,
                 )
             }
@@ -2312,6 +2327,13 @@ impl RadioManager {
                 // to the AP's channel automatically; ESP-NOW then coexists on
                 // that channel. (Caller must have valid credentials set.)
                 let _ = self.controller.connect();
+                // #139: connect() resets power-save to the WIFI_PS_MIN_MODEM default, so the
+                // association/auth handshake that follows would otherwise run under modem-sleep
+                // (unicast-deaf window). Re-assert None NOW — before the handshake completes — not
+                // only after the downstream is_connected() gates (MQTT flush / OTA fetch).
+                let _ = self
+                    .controller
+                    .set_power_saving(esp_wifi::config::PowerSaveMode::None);
                 log::info!("smol: radio -> WiFi STA (coexist)");
             }
         }
@@ -3234,16 +3256,29 @@ impl RadioManager {
         log::info!("smol OTA: opening update burst (mesh deaf for the whole download)");
         let _ = self.switch(Mode::WifiSta);
         let rng = self.rng;
-        match self.sta.as_mut() {
+        let mut fail: Option<(u32, u32, u32, u32)> = None;
+        let ok = match self.sta.as_mut() {
             None => false,
             Some(sta) => {
                 // Self-OTA: activate-on-success (relay_mode = false; the slot out-param is
                 // unused since a successful self-fetch reboots inside `activate`).
                 crate::net::wifi::run_ota_fetch(
-                    &mut self.controller, sta, rng, announce, tick, false, &mut None,
+                    &mut self.controller, sta, rng, announce, tick, false, &mut None, &mut fail,
                 )
             }
+        };
+        // #139-followup: a SUCCESS reboots INSIDE the fetch (never returns here), so reaching this
+        // with ok==false is a genuine self-fetch failure — buffer the (chunk_k, chunk_n, retries,
+        // stalls) snapshot so the next gateway flush publishes it retained to smol/<id>/ota/diag.
+        // Release images are serial-silent, so this retained record is the ONLY fleet-visible signal
+        // of WHY a self-fetch died (the blindness that turned tonight's mid-body deaths into a
+        // three-hour diagnosis). `id` avoids borrowing self across the field set.
+        if !ok {
+            if let Some(rec) = fail {
+                self.ota_self_fail = Some(rec);
+            }
         }
+        ok
     }
 
     /// #40: record a leaf-OTA attempt's outcome (called by `main` after `run_leaf_ota_relay`,
@@ -3434,7 +3469,7 @@ impl RadioManager {
         let mut staged: Option<Slot> = None;
         let fetched = match self.sta.as_mut() {
             Some(sta) => crate::net::wifi::run_ota_fetch(
-                &mut self.controller, sta, rng, announce, tick, true, &mut staged,
+                &mut self.controller, sta, rng, announce, tick, true, &mut staged, &mut None,
             ),
             None => false,
         };
@@ -3928,6 +3963,7 @@ impl RadioManager {
                     &mut self.staged_raw, // #40: persist the staged across flushes (pair-safe)
                     &mut self.leaf_ota_diag, // #40: publish smol/<leaf>/ota/diag + clear/retry
                     &mut self.leaf_relay_rx, // #3: publish smol/<leaf>/ota/relaydiag (RX evidence)
+                    &mut self.ota_self_fail, // #139-followup: publish own smol/<id>/ota/diag on self-fetch fail
                     tick,
                 )
             }
