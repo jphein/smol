@@ -1892,6 +1892,14 @@ impl RadioManager {
         let (mut controller, interfaces) = esp_wifi::wifi::new(ctrl, p.wifi).ok()?;
         controller.set_mode(WifiMode::Sta).ok()?;
         controller.start().ok()?;
+        // #139: assert PowerSaveMode::None at RADIO INIT — the esp-wifi/IDF default is
+        // WIFI_PS_MIN_MODEM (the STA sleeps between DTIMs; the AP then buffers UNICAST at DTIM and
+        // drops it on marginal links → the re-ARP-after-reply / forwarded-NTP-never-arrives /
+        // TX-fine-RX-deaf class). This is the baseline; `switch()` re-asserts after each connect()
+        // (which resets ps to the default), and the post-is_connected() sites stay belt-and-
+        // suspenders. Shared by every espnow association (NTP/MQTT/OTA/re-election). See nebula
+        // finding 2 (scratch/smol-ha-batt/nebula-c3-wifi-research.md).
+        let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
 
         // #68/#76 SELF-MAC: capture our STA MAC (ESP-NOW rides the STA interface) so service()
         // can DROP frames from our own address. The esp-wifi RX queue can deliver our own
@@ -2268,6 +2276,13 @@ impl RadioManager {
                 // to the AP's channel automatically; ESP-NOW then coexists on
                 // that channel. (Caller must have valid credentials set.)
                 let _ = self.controller.connect();
+                // #139: connect() resets power-save to the WIFI_PS_MIN_MODEM default, so the
+                // association/auth handshake that follows would otherwise run under modem-sleep
+                // (unicast-deaf window). Re-assert None NOW — before the handshake completes — not
+                // only after the downstream is_connected() gates (MQTT flush / OTA fetch).
+                let _ = self
+                    .controller
+                    .set_power_saving(esp_wifi::config::PowerSaveMode::None);
                 log::info!("smol: radio -> WiFi STA (coexist)");
             }
         }
