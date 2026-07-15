@@ -511,25 +511,18 @@ fn main() -> ! {
 
     #[cfg(feature = "espnow")]
     let (mut radio, synced) = {
-        // #20 (1b): responsive BOOT tick — runs inside every busy-wait loop of the
-        // NTP/MQTT burst. LED fast-blink (as before) + a throttled "Syncing…"
-        // spinner (only AFTER the splash minimum, so the identity splash still
-        // shows) + a LONG-PRESS abort that LATCHES (once `boot_abort` is set the
-        // closure returns true forever, so the burst unwinds fast and boot proceeds
-        // straight to the Menu). Built here so the radio module stays UI-agnostic.
-        let mut boot_draw_ms = 0u64;
+        // #20 (1b) / #153: responsive BOOT tick — runs inside every busy-wait loop of the
+        // NTP/MQTT burst. LED fast-blink (as before) + a LONG-PRESS abort that LATCHES (once
+        // `boot_abort` is set the closure returns true forever, so the burst unwinds fast and
+        // boot proceeds straight to the Menu). #153 retired the "Syncing…" spinner: at boot
+        // there is no app frame yet, so the identity SPLASH simply persists on the glass for
+        // the burst (nothing overdraws it). Built here so the radio module stays UI-agnostic.
         let mut boot_abort = false;
         let mut boot_tick = || {
             let now = millis();
             led.apply(led::LedState::WifiSync, now);
             if matches!(button.poll(now), Some(input::Press::Long)) {
                 boot_abort = true;
-            }
-            if now.saturating_sub(splash_start) >= SPLASH_MIN_MS
-                && now.saturating_sub(boot_draw_ms) >= SYNC_REDRAW_MS
-            {
-                boot_draw_ms = now;
-                draw_syncing(&mut display, (now / SYNC_REDRAW_MS) as u8);
             }
             boot_abort
         };
@@ -760,17 +753,14 @@ fn main() -> ! {
             // blocks for the association, so it drives the SAME responsive tick as a
             // flush (LED + throttled spinner + latching long-press abort).
             {
-                let mut reelect_draw_ms = 0u64;
                 let mut reelect_abort = false;
+                // #153: re-election is a routine burst → draw NOTHING; the last app frame
+                // stays frozen on the glass (a still clock beats a spinner). LED + abort only.
                 if r.maybe_leaf_reelect(&mut batt_cache, &mut grid_cache, now, &mut || {
                     let t = millis();
                     led.apply(led::LedState::WifiSync, t);
                     if matches!(button.poll(t), Some(input::Press::Long)) {
                         reelect_abort = true;
-                    }
-                    if t.saturating_sub(reelect_draw_ms) >= SYNC_REDRAW_MS {
-                        reelect_draw_ms = t;
-                        draw_syncing(&mut display, (t / SYNC_REDRAW_MS) as u8);
                     }
                     reelect_abort
                 }) {
@@ -802,6 +792,10 @@ fn main() -> ! {
                 if let Some(announce) = r.take_ota_offer() {
                     let mut ota_draw_ms = 0u64;
                     let mut ota_abort = false;
+                    // #153: OTA self-install is minutes-scale → keep the frozen app frame and
+                    // paint only a 1-px bottom progress edge from the live byte counts the
+                    // fetch writes into `ota_prog` (throttled to SYNC_REDRAW_MS like the old spinner).
+                    let ota_prog = core::cell::Cell::new(ota::OtaProgress::default());
                     r.run_ota_update(&announce, &mut || {
                         let t = millis();
                         led.apply(led::LedState::WifiSync, t);
@@ -810,10 +804,11 @@ fn main() -> ! {
                         }
                         if t.saturating_sub(ota_draw_ms) >= SYNC_REDRAW_MS {
                             ota_draw_ms = t;
-                            draw_syncing(&mut display, (t / SYNC_REDRAW_MS) as u8);
+                            let p = ota_prog.get();
+                            draw_ota_edge(&mut display, p.done, p.total);
                         }
                         ota_abort
-                    });
+                    }, &ota_prog);
                     redraw = true;
                 }
             }
@@ -1113,18 +1108,12 @@ fn main() -> ! {
                     #[cfg(feature = "coexist-soak")]
                     let (_, soak_rx0, soak_lost0, _) = r.soak_counts();
                     let mut flush_abort = false;
-                    let mut flush_draw_ms = 0u64;
-                    // #30: draw the sync spinner ONLY on the idle Clock face. The flush is
-                    // sub-second and already deferred until >= FLUSH_IDLE_MS of no input (the #20
-                    // idle-defer above), so the user is never mid-navigation when it fires — the
-                    // one residual is the overlay flashing over whatever screen was LEFT on display
-                    // (e.g. a static Home menu). Suppressing it everywhere but the Clock lets that
-                    // frame simply hold for the sub-second flush (the render loop repaints after),
-                    // while the Clock — the ambient idle face — keeps its expected brief sync glyph.
-                    // The LED WifiSync cue below still fires on every screen (non-disruptive). This
-                    // retires the visible #20/#30 residual WITHOUT touching the HW-proven flush poll
-                    // (the cooperative/non-blocking-poll rewrite is filed separately, HW-canary-gated).
-                    let show_sync = matches!(app, App::Clock(_));
+                    // #153: telemetry flush is a routine sub-second burst → draw NOTHING; the
+                    // last app frame (any screen) simply holds for its duration and the render
+                    // loop repaints after. Retires the #20/#30 residual overlay entirely (the
+                    // old Clock-only `show_sync` heuristic is gone). LED WifiSync cue + latching
+                    // long-press abort below are unchanged. The HW-proven flush poll is untouched
+                    // (the cooperative/non-blocking-poll rewrite stays filed separately, #89).
                     // #40: a flush that hears a leaf's retained OTA install surfaces
                     // `(leaf_id, staged announce)` here → relayed below.
                     let mut leaf_ota: Option<(u8, ota::Announce)> = None;
@@ -1133,10 +1122,6 @@ fn main() -> ! {
                         led.apply(led::LedState::WifiSync, t);
                         if matches!(button.poll(t), Some(input::Press::Long)) {
                             flush_abort = true;
-                        }
-                        if show_sync && t.saturating_sub(flush_draw_ms) >= SYNC_REDRAW_MS {
-                            flush_draw_ms = t;
-                            draw_syncing(&mut display, (t / SYNC_REDRAW_MS) as u8);
                         }
                         flush_abort
                     });
@@ -1164,6 +1149,10 @@ fn main() -> ! {
                         if let Some(mac) = r.mac_for_id_sticky(leaf_id) {
                             let mut relay_draw_ms = 0u64;
                             let mut relay_abort = false;
+                            // #153: leaf-feed relay is minutes-scale → keep the frozen app frame
+                            // and paint the 1-px bottom progress edge (fetch bytes then ESP-NOW
+                            // chunk windows, both written into `relay_prog` by run_leaf_ota_relay).
+                            let relay_prog = core::cell::Cell::new(ota::OtaProgress::default());
                             let outcome = r.run_leaf_ota_relay(leaf_id, mac, &ann, &mut || {
                                 let t = millis();
                                 led.apply(led::LedState::WifiSync, t);
@@ -1172,10 +1161,11 @@ fn main() -> ! {
                                 }
                                 if t.saturating_sub(relay_draw_ms) >= SYNC_REDRAW_MS {
                                     relay_draw_ms = t;
-                                    draw_syncing(&mut display, (t / SYNC_REDRAW_MS) as u8);
+                                    let p = relay_prog.get();
+                                    draw_ota_edge(&mut display, p.done, p.total);
                                 }
                                 relay_abort
-                            });
+                            }, &relay_prog);
                             // #40: record the phase → published to smol/<leaf>/ota/diag on the
                             // next burst + drives the install clear/retry policy.
                             r.record_leaf_ota(leaf_id, outcome);
@@ -1629,40 +1619,36 @@ where
 }
 
 /// #20: the "Syncing WiFi" indicator shown while a WiFi burst blocks the loop
-/// (boot NTP burst + gateway flush). An animated spinner (`|/-\`) so the freeze
-/// reads as intentional progress, plus a `hold=menu` hint for the long-press
-/// abort. Takes the concrete [`app::Oled`] and flushes itself (unlike
-/// `draw_splash`). espnow-only — the only builds with the blocking flush + abort
-/// path, so default/wifi stay untouched.
+/// #153: the 1-px OTA progress edge along the display's BOTTOM row — the minimal feedback
+/// that replaced the retired full-screen `draw_syncing` spinner. Unlike the spinner it does
+/// NOT clear the framebuffer: the frozen last app frame stays visible above, and only row
+/// `y = H-1` is repainted (Off across the full width, then On for the completed fraction)
+/// before flushing. `done`/`total` are the transfer counts the fetch/relay writes into the
+/// shared [`ota::OtaProgress`] cell — bytes for a self-fetch, chunks for a leaf relay; only
+/// the ratio is rendered. `total == 0` (op just armed) → an empty edge. The long-press abort
+/// is unadvertised now (issue #153) but still live. espnow-only, matching the blocking OTA
+/// path, so default/wifi builds stay untouched.
 #[cfg(feature = "espnow")]
-fn draw_syncing(display: &mut app::Oled, frame: u8) {
-    let big = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(BinaryColor::On)
-        .build();
-    let small = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
-        .text_color(BinaryColor::On)
-        .build();
-    display.clear(BinaryColor::Off).ok();
-    // "Sync <spinner>" — motion is visible even while the single radio is busy and
-    // the rest of the UI can't advance.
-    let spin = [b'|', b'/', b'-', b'\\'][(frame & 3) as usize];
-    let head = [b'S', b'y', b'n', b'c', b' ', spin];
-    Text::with_baseline(
-        core::str::from_utf8(&head).unwrap_or("Sync"),
-        Point::new(2, 3),
-        big,
-        Baseline::Top,
-    )
-    .draw(display)
-    .ok();
-    Text::with_baseline("WiFi...", Point::new(2, 16), big, Baseline::Top)
+fn draw_ota_edge(display: &mut app::Oled, done: u32, total: u32) {
+    use embedded_graphics::primitives::{Line, PrimitiveStyle};
+    let bb = display.bounding_box();
+    let w = bb.size.width as i32;
+    let y = bb.size.height as i32 - 1;
+    // Erase the bottom row only (the app frame above is left intact), then paint the
+    // completed fraction. The erase keeps it correct even if a resume lowers the count.
+    Line::new(Point::new(0, y), Point::new(w - 1, y))
+        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::Off, 1))
         .draw(display)
         .ok();
-    Text::with_baseline("hold=menu", Point::new(2, 31), small, Baseline::Top)
-        .draw(display)
-        .ok();
+    if total > 0 && done > 0 {
+        let filled = ((done.min(total) as u64 * w as u64) / total as u64) as i32;
+        if filled > 0 {
+            Line::new(Point::new(0, y), Point::new(filled - 1, y))
+                .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+                .draw(display)
+                .ok();
+        }
+    }
     display.flush().ok();
 }
 

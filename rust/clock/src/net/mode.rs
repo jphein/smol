@@ -3283,6 +3283,8 @@ impl RadioManager {
         &mut self,
         announce: &crate::ota::Announce,
         tick: &mut dyn FnMut() -> bool,
+        // #153: forwarded to the fetch so `main`'s tick can paint the OTA progress edge.
+        progress: &core::cell::Cell<crate::ota::OtaProgress>,
     ) -> bool {
         log::info!("smol OTA: opening update burst (mesh deaf for the whole download)");
         let _ = self.switch(Mode::WifiSta);
@@ -3295,6 +3297,7 @@ impl RadioManager {
                 // unused since a successful self-fetch reboots inside `activate`).
                 crate::net::wifi::run_ota_fetch(
                     &mut self.controller, sta, rng, announce, tick, false, &mut None, &mut fail,
+                    progress,
                 )
             }
         };
@@ -3397,6 +3400,9 @@ impl RadioManager {
         leaf_mac: [u8; 6],
         announce: &crate::ota::Announce,
         tick: &mut dyn FnMut() -> bool,
+        // #153: written during the fetch (bytes) then the ESP-NOW push (chunks) so `main`'s
+        // relay tick can paint the 1-px bottom progress edge over the frozen app frame.
+        progress: &core::cell::Cell<crate::ota::OtaProgress>,
     ) -> crate::ota_mesh::LeafOtaOutcome {
         use crate::ota_mesh::{
             self as om, LeafOtaOutcome, CHUNK_PAYLOAD, WINDOW_BYTES, WINDOW_CHUNKS,
@@ -3501,6 +3507,7 @@ impl RadioManager {
         let fetched = match self.sta.as_mut() {
             Some(sta) => crate::net::wifi::run_ota_fetch(
                 &mut self.controller, sta, rng, announce, tick, true, &mut staged, &mut None,
+                progress,
             ),
             None => false,
         };
@@ -3636,6 +3643,8 @@ impl RadioManager {
             if tick() {
                 return LeafOtaOutcome::Aborted;
             }
+            // #153: surface leaf-feed chunk progress for the UI tick's bottom edge.
+            progress.set(crate::ota::OtaProgress { done: wb, total });
             let wlen_chunks = core::cmp::min(WINDOW_CHUNKS as u32, total - wb);
             let window_off = wb * CHUNK_PAYLOAD as u32;
             let window_bytes = core::cmp::min(WINDOW_BYTES as u32, size - window_off) as usize;
