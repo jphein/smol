@@ -53,17 +53,15 @@ pub const OTA_AUTO_INSTALL: bool = false;
 
 /// Image-host allowlist test (spec §4b-5): an announce whose URL host is not allowed is refused
 /// BEFORE any socket opens. The real LAN host(s) live in the GIT-IGNORED `crate::secrets` (this repo
-/// is PUBLIC — never commit a LAN IP). #100 Stage 3: the base allowlist is the RUNTIME-active slot's
-/// baked `ota_hosts` (was a slot-0 const), PLUS the NVS CFG-`O` override (one extra RFC1918 host,
-/// dashboard-set). Read at gate time — no reboot. A bad override can only ever REFUSE a fetch (it is
-/// merely an additional allowed host); the image itself stays monotonicity-gated, so this is
+/// is PUBLIC — never commit a LAN IP). #142: the base allowlist is the single baked network's
+/// `ota_hosts` (`crate::secrets::WIFI_NETWORK`), PLUS the NVS CFG-`O` override (one extra RFC1918
+/// host, dashboard-set). Read at gate time — no reboot. A bad override can only ever REFUSE a fetch
+/// (it is merely an additional allowed host); the image itself stays monotonicity-gated, so this is
 /// defense-in-depth, never a brick surface.
 #[cfg(feature = "wifi")]
 fn host_allowed(host: &str) -> bool {
     let cfg = read_net_cfg();
-    let active = cfg.map_or(0usize, |c| c.active as usize);
-    let slot = &crate::secrets::WIFI_NETWORKS[active.min(crate::secrets::WIFI_NETWORKS.len() - 1)];
-    if slot.ota_hosts.contains(&host) {
+    if crate::secrets::WIFI_NETWORK.ota_hosts.contains(&host) {
         return true;
     }
     // Stage 3: the CFG-`O` override — one extra RFC1918 host, matched by parsing the URL host.
@@ -1514,12 +1512,19 @@ pub fn reset_reason_token() -> &'static str {
 #[cfg(feature = "wifi")]
 const NET_MAGIC: [u8; 4] = *b"SMn1";
 /// Record version WRITTEN by this firmware. v1 (Stage 1) = the 10-byte core (slot selection only);
-/// v2 (Stage 2/3) appends the broker + OTA-host overrides. `parse_net_cfg` accepts BOTH: a v2 fw
-/// reading a Stage-1 v1 record treats it as "no overrides"; a v1 fw reading a v2 record rejects it
-/// (version mismatch) → slot 0 (a SAFE rollback default). No forced migration — the first v2 write
-/// (CFG-`N`/`B`/`O` apply or a fallback) upgrades the record in place.
-#[cfg(feature = "wifi")]
-const NET_VERSION: u8 = 2;
+/// v2 (#100 Stage 2/3) added the broker + OTA-host overrides alongside the slot bytes; v3 (#142)
+/// RETIRES the slot machinery — same on-flash layout, but the former slot bytes [5..8] are
+/// reserved-zero and carry no meaning. `parse_net_cfg` MIGRATES on read: v2 → keep the override
+/// fields, discard the slot bytes; v1 → no overrides; v3 → native. An unknown version / bad checksum
+/// / erased flash → `None` → safe defaults (single baked network, no overrides). Deployed boards that
+/// were never flash-erased carry a v2 record, so this migration is REQUIRED — it preserves their
+/// broker/OTA-host overrides across the #142 OTA. No forced boot-time rewrite (flash wear): the first
+/// genuine CFG-`B`/`O` change upgrades the record to v3 in place, verify-after-write gated. A pre-#142
+/// (v2-reader) fw reading a v3 record rejects it → slot 0 (a SAFE rollback default), same as v1↔v2.
+// #142: written only by the CFG-`B`/`O` apply (espnow tier) — the wifi-tier writer (the retired
+// slot-fallback revert) is gone, so gate to `espnow` to stay dead-code-clean in a wifi-only build.
+#[cfg(feature = "espnow")]
+const NET_VERSION: u8 = 3;
 /// nvs sector 5 = 0x5000 = 20480 (the one free sector; see the segregation note above).
 #[cfg(feature = "wifi")]
 const NET_REC_OFF: u32 = 5 * 4096;
@@ -1535,20 +1540,20 @@ const NET_REC_OFF: u32 = 5 * 4096;
 #[cfg(feature = "wifi")]
 const NET_REC_LEN: usize = 28;
 
-/// The persisted network identity. `active` = the WiFi slot we associate on NOW; `commanded` = the
-/// last slot HA asked for via CFG-`N` (differs from `active` iff we auto-reverted); `fallback` = the
-/// WiFi assoc fallback fired (surfaced as `net=<slot>:fb`). #100 Stage 2/3 overrides (all runtime,
-/// NVS-persisted, RFC1918-gated at the CFG apply): `broker` = the COMMANDED broker leg override (the
-/// slot's baked broker is used when `None`); `broker_fallback` = the override was auto-disabled after
-/// repeated CONNACK failures — `broker` is KEPT (for DIAG + the edge-trigger) but ignored at runtime,
-/// mirroring the WiFi `fallback`; `ota_host` = one extra RFC1918 host appended to the OTA allowlist.
+/// The persisted network overrides. #142: the #100 dual-slot fields (`active`/`commanded`/`fallback`)
+/// are RETIRED — boards run the single baked network (`crate::secrets::WIFI_NETWORK`), so there is no
+/// slot to select or revert. The on-flash record FORMAT is unchanged (see `encode_net_cfg`): the
+/// former slot bytes `[5..10]` are reserved-zero, so a pre-#142 record still parses and its overrides
+/// (below) SURVIVE the OTA — the migration is brick-safe with no version bump. #100 Stage 2/3 overrides
+/// (all runtime, NVS-persisted, RFC1918-gated at the CFG apply; independent of the slot machinery and
+/// load-bearing per #116): `broker` = the COMMANDED broker leg override (the baked broker is used when
+/// `None`); `broker_fallback` = the override was auto-disabled after repeated CONNACK failures —
+/// `broker` is KEPT (for DIAG + the edge-trigger) but ignored at runtime; `ota_host` = one extra
+/// RFC1918 host appended to the OTA allowlist.
 #[cfg(feature = "wifi")]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 pub struct NetCfg {
-    pub active: u8,
-    pub commanded: u8,
-    pub fallback: bool,
-    /// Stage 2: broker leg override (IPv4 octets + port). `None` = use the active slot's baked broker.
+    /// Stage 2: broker leg override (IPv4 octets + port). `None` = use the baked network's broker.
     pub broker: Option<([u8; 4], u16)>,
     /// Stage 2: the `broker` override was auto-disabled (N failed CONNACKs). Runtime uses the baked
     /// broker; `broker` is retained so DIAG shows `brk=fb` and CFG-`B` edge-triggers correctly.
@@ -1577,30 +1582,26 @@ fn parse_net_cfg(rec: &[u8]) -> Option<NetCfg> {
         return None;
     }
     let ver = rec[4];
-    if ver != 1 && ver != 2 {
+    // #142: accept v1 (Stage-1 core), v2 (#100 slot+overrides — MIGRATED), and v3 (#142 native).
+    // Anything else (or a rollback-written future version) → None → safe defaults.
+    if ver != 1 && ver != 2 && ver != 3 {
         return None;
     }
-    let (active, commanded, fb) = (rec[5], rec[6], rec[7]);
-    // Core complement + checksum guards (mirror the identity record) — present in v1 AND v2.
-    if rec[8] != active ^ 0xFF || rec[9] != (active ^ commanded ^ fb).wrapping_add(0x5A) {
+    // rec[5..8]: the slot bytes (active/commanded/fallback) in v1/v2, reserved-zero in v3. Read only
+    // to validate the core redundancy guards — this is what lets a PRE-#142 v2 record (nonzero slot
+    // bytes, valid checksum) still parse so its overrides survive the OTA. The values are DISCARDED
+    // (there is no slot concept any more): v2 is thereby migrated to the v3 in-RAM shape on read.
+    let (b5, b6, b7) = (rec[5], rec[6], rec[7]);
+    // Core complement + checksum guards (mirror the identity record) — present in v1, v2 AND v3.
+    if rec[8] != b5 ^ 0xFF || rec[9] != (b5 ^ b6 ^ b7).wrapping_add(0x5A) {
         return None;
     }
-    // Slot indices MUST be valid (< 2) and fallback a clean bool — else treat as corrupt.
-    if active > 1 || commanded > 1 || fb > 1 {
-        return None;
-    }
-    let core = NetCfg {
-        active,
-        commanded,
-        fallback: fb != 0,
-        broker: None,
-        broker_fallback: false,
-        ota_host: None,
-    };
     if ver == 1 {
-        return Some(core); // Stage-1 record: no overrides.
+        return Some(NetCfg::default()); // Stage-1 record: no overrides.
     }
-    // v2 ext: require the full record + a matching checksum/complement before trusting the overrides.
+    // v2/v3 ext: require the full record + a matching checksum/complement before trusting the
+    // overrides. (Identical ext layout in v2 and v3 — only the version byte + zeroed slots differ,
+    // so the same extraction migrates a v2 record and reads a v3 one.)
     if rec.len() < NET_REC_LEN || rec[23] != net_ext_checksum(rec) || rec[24] != rec[23] ^ 0xFF {
         return None;
     }
@@ -1615,22 +1616,27 @@ fn parse_net_cfg(rec: &[u8]) -> Option<NetCfg> {
         broker,
         broker_fallback: rec[11] == 1,
         ota_host,
-        ..core
     })
 }
 
-/// Encode the v2 net record (always written at [`NET_VERSION`] = 2). Absent overrides zero their
-/// present-flag + bytes so the record is deterministic; the ext checksum + complement close it.
-#[cfg(feature = "wifi")]
+/// Encode the v3 net record (#142 — always written at [`NET_VERSION`] = 3; slot bytes reserved-zero).
+/// Absent overrides zero their present-flag + bytes so the record is deterministic; the ext checksum
+/// + complement close it. Length stays 28 B (word-aligned; [25..28] pad outside the checksum).
+///
+/// #142: espnow-gated — only the CFG-`B`/`O` apply (mesh tier) writes the record now.
+#[cfg(feature = "espnow")]
 fn encode_net_cfg(c: NetCfg) -> [u8; NET_REC_LEN] {
     let mut r = [0u8; NET_REC_LEN];
     r[0..4].copy_from_slice(&NET_MAGIC);
     r[4] = NET_VERSION;
-    r[5] = c.active;
-    r[6] = c.commanded;
-    r[7] = c.fallback as u8;
-    r[8] = c.active ^ 0xFF;
-    r[9] = (c.active ^ c.commanded ^ c.fallback as u8).wrapping_add(0x5A);
+    // #142: the retired slot bytes [5..8] are reserved-zero; the core guards still checksum over
+    // them (0^0xFF at [8], (0^0^0)+0x5A at [9]) so the on-flash format is byte-identical to a
+    // pre-#142 record and `parse_net_cfg` accepts both without a version bump.
+    r[5] = 0;
+    r[6] = 0;
+    r[7] = 0;
+    r[8] = 0xFF;
+    r[9] = 0x5A;
     if let Some((ip, port)) = c.broker {
         r[10] = 1;
         r[12..16].copy_from_slice(&ip);
@@ -1663,12 +1669,15 @@ pub fn read_net_cfg() -> Option<NetCfg> {
     parse_net_cfg(&rec)
 }
 
-/// Persist the net selection (erase + write nvs sector 5). Best-effort — any error is swallowed
-/// (the in-RAM selection still governs THIS boot; the next boot retries). Sector 5 is the net
-/// record's OWN sector (segregated), so the erase+write can never touch identity/floor/boot-count.
-/// Called ONLY on a genuine change (CFG-`N` apply, or the ONE-per-boot fallback revert) — never in
-/// a retry loop, so no flash wear / NVS ping-pong even during a total-outage stay-put.
-#[cfg(feature = "wifi")]
+/// Persist the net overrides (erase + write nvs sector 5). Best-effort — any error is swallowed
+/// (the in-RAM value still governs THIS boot; the next boot retries). Sector 5 is the net record's
+/// OWN sector (segregated), so the erase+write can never touch identity/floor/boot-count. #142:
+/// called ONLY on a genuine CFG-`B`/`O` override change (the slot-switch + un-brick-fallback callers
+/// are retired) — never in a retry loop, so no flash wear / NVS ping-pong. This is also what upgrades
+/// a legacy v2 record to v3 in place, on the first real override change.
+/// #142: espnow-gated — only the CFG-`B`/`O` apply (mesh tier) writes; the wifi-tier writer (the
+/// retired #100 slot-fallback revert) is gone, so a wifi-only build carries no writer (dead-code-clean).
+#[cfg(feature = "espnow")]
 pub fn write_net_cfg(c: NetCfg) {
     use embedded_storage::nor_flash::NorFlash;
     let mut flash = FlashStorage::new();

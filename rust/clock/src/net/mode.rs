@@ -2625,20 +2625,14 @@ impl RadioManager {
         let tx = self.bench.tx_count;
         let e = self.diag_extra;
         let led_state = if e.led_on { "on" } else { "off" };
-        // #100: active WiFi slot + fallback state (net=<slot>:<ok|fb>). `fb` = we auto-reverted off
-        // the commanded slot (the un-brick fallback fired) — HA surfaces "the network switch failed".
-        // Stage 2/3: brk=<baked|ovr|fb> (broker override state — `fb` = the override was auto-disabled
-        // after repeated CONNACK failures, running the baked broker) + otah=<slot|ovr> (an OTA-host
-        // override is appended to the allowlist). All read live from the one NVS net-record.
-        let net = crate::ota::read_net_cfg().unwrap_or(crate::ota::NetCfg {
-            active: 0,
-            commanded: 0,
-            fallback: false,
-            broker: None,
-            broker_fallback: false,
-            ota_host: None,
-        });
-        let net_fb = if net.fallback { "fb" } else { "ok" };
+        // #142: single-network operation — the #100 slot/fallback state is retired, so `net=` is
+        // FROZEN to the constant `0:ok` (slot 0 was always the primary — every healthy board's
+        // historical baseline is net=0:ok; the removed roam network was slot 1). Kept (not dropped) ONLY to preserve the HA dashboard's
+        // POSITIONAL DIAG parse; a dashboard follow-up repurposes or drops it. Stage 2/3 override
+        // state is still LIVE from the NVS net-record: brk=<baked|ovr|fb> (broker override — `fb` =
+        // auto-disabled after repeated CONNACK failures, running the baked broker) + otah=<slot|ovr>.
+        let net = crate::ota::read_net_cfg().unwrap_or_default();
+        let net_fb = "ok"; // #142: frozen (no slot fallback in single-network mode)
         let brk = match (net.broker.is_some(), net.broker_fallback) {
             (true, false) => "ovr",
             (true, true) => "fb",
@@ -2673,7 +2667,7 @@ impl RadioManager {
             led_state,
             e.tage_s,
             e.tsrc,
-            net.active,
+            0, // #142: net= frozen to slot 0 (the historical primary baseline); dashboard parse stays positional
             net_fb,
             brk,
             otah,

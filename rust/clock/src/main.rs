@@ -1268,53 +1268,12 @@ fn main() -> ! {
                 log::info!("smol #45: custom screen layout updated ({} B)", n);
             }
 
-            // #100: a network-switch config (key `N`) = the active WiFi-slot index. CONFIG/CACHED
-            // (retained), so it re-delivers every burst → EDGE-TRIGGERED on a change of the COMMANDED
-            // slot (NOT the active slot): a re-read of the same value is a no-op ⇒ never a reboot-loop
-            // (compare-to-commanded also means a latched fallback stays put — re-command to escape).
-            // A genuine change → persist {active=slot, commanded=slot, fallback=false} + reboot into
-            // the slot (the boot fallback then associates on it, self-healing if it's unreachable).
-            // Out-of-range / unparseable → ignored (keep current). software_reset() never returns.
-            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_NET) {
-                if let Some(slot) = core::str::from_utf8(&o.buf[..o.len])
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u8>().ok())
-                {
-                    if (slot as usize) < crate::secrets::WIFI_NETWORKS.len() {
-                        let cur = crate::ota::read_net_cfg().map_or(0, |c| c.commanded);
-                        if slot != cur {
-                            log::warn!("smol #100: network slot -> {} (was commanded {}) — reboot", slot, cur);
-                            // A WiFi-slot switch resets to the new network's BAKED identity: the
-                            // broker + OTA-host overrides are cleared (they were set for the OLD
-                            // network's VLAN and would drop CONNACK cross-VLAN / point OTA off-net).
-                            // The slot IS the full network identity — re-apply an override after the
-                            // switch if still wanted.
-                            crate::ota::write_net_cfg(crate::ota::NetCfg {
-                                active: slot,
-                                commanded: slot,
-                                fallback: false,
-                                broker: None,
-                                broker_fallback: false,
-                                ota_host: None,
-                            });
-                            // #100 canary lesson: VERIFY-AFTER-WRITE before the reset. If the
-                            // record didn't persist (any flash error — all swallowed above), a
-                            // reset would boot back on the old slot, re-receive the retained
-                            // command, and loop forever (~20 s reset cycle, observed on HW).
-                            // A failed readback = abort the switch this cycle; the retained
-                            // command retries next cycle, and the failure stays VISIBLE
-                            // (commanded stays != slot) instead of becoming a reboot loop.
-                            let persisted = crate::ota::read_net_cfg()
-                                .is_some_and(|c| c.commanded == slot);
-                            if persisted {
-                                esp_hal::system::software_reset();
-                            } else {
-                                log::warn!("smol #100: net record did NOT persist — switch aborted (no reset)");
-                            }
-                        }
-                    }
-                }
-            }
+            // #142: the CFG-`N` network-slot command is RETIRED (single-network operation — no slot
+            // to select). Drain any stale/retained `N` offer so it can't linger in the tracker, but
+            // take NO action — a board never switches networks (a primary-assoc failure is a
+            // mesh-only leaf that keeps retrying the primary, not a reason to switch). The broker
+            // (`B`) and OTA-host (`O`) overrides below are independent and remain. See docs/protocol.md.
+            let _ = r.take_cfg_offer(crate::net::CFG_KEY_NET);
 
             // #100 Stage 2: a broker-override config (key `B`) = the MQTT broker leg (`ip` or
             // `ip:port`). CONFIG/CACHED (retained) — EDGE-TRIGGERED on a change of the COMMANDED
