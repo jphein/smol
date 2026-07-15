@@ -1640,7 +1640,7 @@ fn mqtt_session(
     // PUBLISHED to `smol/<leaf>/ota/diag` here, and drives the retained-install clear (on a
     // terminal/exhausted phase) vs retry (transient). Consumed (set None) after publish.
     // `&mut None` off-gateway.
-    leaf_diag: &mut Option<(u8, &'static str, bool)>,
+    leaf_diag: &mut Option<(u8, &'static str, bool, u8)>,
     // #3 RELAY RX-DIAG: the last relay's `(leaf_id, rx_any, otan_valid, last_wb, total)`.
     // PUBLISHED to retained `smol/<leaf>/ota/relaydiag` here, consumed after. `&mut None` off-gw.
     leaf_relay_rx: &mut Option<RelayDiag>,
@@ -2612,15 +2612,24 @@ fn mqtt_session(
     // = the leaf installed/rolled-back, or the transient-retry cap was hit) or LEAVE it
     // retained to retry. On a clear, also null `pending_leaf` for THIS flush so we don't
     // re-arm a just-finished leaf. Runs BEFORE the arm below. Consumed after publish.
-    if let Some((lid, phase, clear)) = *leaf_diag {
+    if let Some((lid, phase, clear, retry)) = *leaf_diag {
         let mut dtopic = MqttScratch::new();
         let _ = write!(dtopic, "smol/{}/ota/diag", lid);
+        // #134: surface the consecutive-failure count in the retained payload ("fetch-failed
+        // retry=3") so a stuck fetch is VISIBLE headlessly instead of silently burning the order.
+        // retry == 0 (a terminal / first attempt) → just the bare phase, unchanged from before.
+        let mut dpayload = MqttScratch::new();
+        if retry > 0 {
+            let _ = write!(dpayload, "{} retry={}", phase, retry);
+        } else {
+            let _ = write!(dpayload, "{}", phase);
+        }
         if let Some(n) =
-            crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), phase.as_bytes(), true)
+            crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), dpayload.as_bytes(), true)
         {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
-        log::info!("smol #40: published smol/{}/ota/diag = {} (clear={})", lid, phase, clear);
+        log::info!("smol #40: published smol/{}/ota/diag = {} retry={} (clear={})", lid, phase, retry, clear);
         if clear {
             let mut itopic = MqttScratch::new();
             let _ = write!(itopic, "smol/{}/ota/install", lid);
@@ -3229,7 +3238,7 @@ pub fn run_mqtt_burst(
     staged_raw: &mut Option<crate::ota::Announce>,
     // #40: last relay attempt's `(leaf_id, phase, clear)` → published to `smol/<leaf>/ota/diag`
     // (see `mqtt_session`). `&mut None` on boot/leaf bursts.
-    leaf_diag: &mut Option<(u8, &'static str, bool)>,
+    leaf_diag: &mut Option<(u8, &'static str, bool, u8)>,
     // #3: last relay attempt's RX evidence → published to `smol/<leaf>/ota/relaydiag` (see
     // `mqtt_session`). `&mut None` on boot/leaf bursts.
     leaf_relay_rx: &mut Option<RelayDiag>,

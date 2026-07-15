@@ -396,6 +396,18 @@ impl LeafOtaOutcome {
             LeafOtaOutcome::Confirmed | LeafOtaOutcome::RolledBack | LeafOtaOutcome::IdMismatch
         )
     }
+
+    /// #134: did the image feed actually HAND OFF to the leaf (relay bytes started flowing)?
+    /// `false` for the GATEWAY-LOCAL pre-relay failures — `FetchFailed` (couldn't stage the image
+    /// from the OTA host) and `MacUnknown` (never learned the target MAC) — where the feed never
+    /// reached the leaf. Such a failure says nothing about the leaf or the image, so the retained
+    /// `smol/<leaf>/ota/install` must SURVIVE it (for the next attempt / the next crown — orders are
+    /// crown-portable per #111) instead of counting toward the doomed-image retry cap. `true` for the
+    /// terminals and the post-handoff transients (`RelayFailed`/`Timeout` — bytes were flowing — and
+    /// `Aborted`), which keep the bounded-retry-then-clear backstop.
+    pub fn reached_leaf(&self) -> bool {
+        !matches!(self, LeafOtaOutcome::FetchFailed | LeafOtaOutcome::MacUnknown)
+    }
 }
 
 /// What `service()` must do after handing a frame / a tick to the leaf session.
