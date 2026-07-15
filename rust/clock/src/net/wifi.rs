@@ -138,6 +138,14 @@ pub struct MeshElect {
     /// boot when the MC is empty or already names THIS board. Gateway-flush keeps `boot=false`
     /// so a running gateway's lowest-id split-brain resolution (#2) is unchanged.
     pub boot: bool,
+    /// #146 CLAIM guard: true iff the caller has LATCHED this board out of ownership because it
+    /// abdicated on sustained flush failure (`mode.rs` `flush_fail_latch`). When set, the resolver
+    /// refuses to (re)claim the crown in ANY arm — including re-grabbing this board's own stale
+    /// retained `MC` (the `owner == node_id` self-reclaim that defeated R-DEMOTE in issue #146) —
+    /// and leaves the record to freeze so a flush-capable board takes over. Leaf adoption of a live
+    /// owner is unaffected. Always false on boot/gateway-flush and for a healthy fleet (a board that
+    /// can flush is never latched), so this is a no-op on every path except a proven-incapable owner.
+    pub flush_incapable: bool,
     // --- outputs (applied to the live role by the caller) ---
     /// True iff I claimed / hold ownership (I am the coexist gateway).
     pub i_am_owner: bool,
@@ -164,6 +172,7 @@ impl MeshElect {
             owner_never_heard: false,
             recovery_stale_floor_ms: 0, // #136: seeded by the caller on a recovery election
             boot: false,
+            flush_incapable: false, // #146: seeded by the caller from the flush-fail abdication latch
             i_am_owner: false,
             owner_id: my_id,
             owner_alive: false,
@@ -2951,6 +2960,25 @@ fn mqtt_session(
             elect.owner_id = node_id;
             Some(1)
         }
+    };
+    // #146 CLAIM guard: a board that abdicated on sustained flush failure (its WiFi uplink is
+    // PROVEN unable to complete a broker flush) must participate as LEAF ONLY — it may adopt an
+    // owner but must never (re)claim the crown, not even its own stale retained `MC`. Suppress the
+    // claim HERE, before any MC publish, so the retained record is left to FREEZE and the H1/H2
+    // takeover machinery elects a flush-capable board off that frozen seq. `i_am_owner == true`
+    // iff `claim_seq.is_some()` on every arm above, so clearing it here is exactly the claim set.
+    // Composes with #137: a live, actively-FLUSHING owner is never latched (its flushes succeed →
+    // the latch is clear), so this is a no-op for a healthy fleet — zero behavior change.
+    let claim_seq = if elect.flush_incapable {
+        if claim_seq.is_some() {
+            elect.i_am_owner = false;
+            log::warn!(
+                "smol: #146 election — flush-incapable, refusing to claim (leaf-only until a flush succeeds)"
+            );
+        }
+        None
+    } else {
+        claim_seq
     };
     if let Some(newseq) = claim_seq {
         // Record my own ownership locally so my seq counts as "fresh" next read, then

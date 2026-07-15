@@ -1440,6 +1440,17 @@ struct Relay {
     /// Consecutive failed flushes; past `FLUSH_FAILS_BEFORE_DROP` we shed the
     /// queue's oldest each failure so a dead-AP gateway drains + stops re-bursting.
     flush_fails: u8,
+    /// #146 CLAIM guard (abdicate-on-flush-fail latch): set when this board R-DEMOTES on
+    /// sustained flush failure (its WiFi uplink is PROVEN unable to complete a broker flush),
+    /// cleared only when a flush actually SUCCEEDS or this board adopts a live FOREIGN owner
+    /// (the mesh is healthy again). While set, the election resolver refuses to (re)claim the
+    /// crown — even this board's own stale retained `MC` record — so a marginal/RF-impaired
+    /// owner that can squeak a tiny election-burst CONNACK through (but never a full flush)
+    /// can NO LONGER perpetually re-grab its frozen `MC` after every R-DEMOTE (which reset
+    /// `flush_fails` and dragged the mesh across channels — issue #146). Leaf participation
+    /// stays fully intact; only the CLAIM is suppressed, so the H1/H2 machinery elects a
+    /// flush-capable board off the abdicated owner's frozen seq.
+    flush_fail_latch: bool,
     /// Recently-completed `(src_mac, msgid)` ring — dedup post-completion
     /// retransmits so a message is never enqueued (UDP-delivered) twice (finding 3).
     done: [Option<([u8; 6], u16)>; DONE_RING],
@@ -1476,6 +1487,7 @@ impl Relay {
             queue: [GwMsg::new(); GATEWAY_QUEUE],
             last_flush_ms: 0,
             flush_fails: 0,
+            flush_fail_latch: false, // #146: no abdication yet
             done: [None; DONE_RING],
             done_cursor: 0,
             seen: crate::net::flood::SeenSet::new(),
@@ -2136,6 +2148,12 @@ impl RadioManager {
         // budget is defined in whole seconds, so it's exact — and clippy-clean under -D warnings.
         elect.recovery_stale_floor_ms =
             RELAY_FLUSH_INTERVAL_MS + crate::net::wifi::RELAY_FLUSH_BUDGET.as_secs() * 1000;
+        // #146 CLAIM guard: if we abdicated on sustained flush failure, tell the resolver to
+        // participate as LEAF ONLY — never (re)claim the crown, not even our own stale retained
+        // `MC`. This is what makes R-DEMOTE STICK: without it, this very recovery burst would
+        // re-read `MC|<self>|…` (frozen seq) and re-grab ownership on a CONNACK that a tiny
+        // election publish can pass but a full flush cannot — the #146 churn/channel-drag loop.
+        elect.flush_incapable = self.relay.flush_fail_latch;
         // #6 OTA / #21 config / #33 install: a leaf's recovery burst can also surface these.
         let mut ota_offer: Option<crate::ota::Announce> = None;
         let mut config_offer: Option<crate::app::DefaultScreen> = None;
@@ -2225,6 +2243,16 @@ impl RadioManager {
         } else {
             // A LIVE owner holds the mesh (possibly a new lower id): stay leaf, re-scan.
             self.relay.is_gateway = false;
+            // #146 CLAIM guard clear: adopting a LIVE FOREIGN owner means the mesh is healthy
+            // again under a flush-capable board (it proved its uplink by publishing a fresh MC).
+            // Lift the abdication latch so we may compete normally if that owner later dies —
+            // the RSSI-weighted recovery stagger then de-prioritizes a weak-uplink survivor, and
+            // if we win again but still can't flush, R-DEMOTE simply re-latches us. Guarded on a
+            // DIFFERENT, ALIVE owner so our own suppressed self-record (owner_id == id) never
+            // clears the latch (that would re-open the loop).
+            if elect.owner_id != id && elect.owner_alive {
+                self.relay.flush_fail_latch = false;
+            }
             // #51 speed-up: grace-reset the owner-silence clock ONLY for a GENUINELY LIVE
             // owner (give the scan time to re-lock it). A dead-but-inside-our-backoff owner
             // (owner_alive == false) gets NO reset, so the next recovery burst fires on
@@ -4115,6 +4143,10 @@ impl RadioManager {
                 q.used = false;
             }
             self.relay.flush_fails = 0;
+            // #146 CLAIM guard: a flush SUCCEEDED → our uplink is proven able to reach the
+            // broker, so lift the abdication latch. Ownership is claimable again (this is the
+            // literal "no re-claim until a flush succeeds" clear).
+            self.relay.flush_fail_latch = false;
             log::info!("smol: relay flush done");
         } else {
             self.relay.flush_fails = self.relay.flush_fails.saturating_add(1);
@@ -4138,6 +4170,14 @@ impl RadioManager {
                 // HELLO-silent until we re-lock a new owner — otherwise our stale HELLO
                 // keeps the leaves pinned to us and no successor can ever be elected.
                 self.silent_until_relock = true;
+                // #146 CLAIM guard: LATCH the abdication. Going HELLO-silent alone was NOT
+                // enough — the next leaf recovery burst re-read our OWN stale retained `MC`
+                // (owner == node_id) and RE-CLAIMED the crown (resetting flush_fails, resuming
+                // HELLO, dragging the mesh across channels). The latch makes the election
+                // resolver refuse that self-reclaim until a flush actually succeeds or we adopt
+                // a live foreign owner — so a flush-incapable board stays leaf-only and the
+                // H1/H2 machinery elects a capable owner off our now-frozen `MC` seq.
+                self.relay.flush_fail_latch = true;
                 let _ = self.switch(Mode::EspNow);
                 log::warn!(
                     "smol: gateway DEMOTED after {} failed flushes — AP unreachable, HELLO-silent + leaf-scanning",
