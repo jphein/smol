@@ -121,6 +121,16 @@ pub struct MeshElect {
     /// overrides the FROZEN-seq safety gate: an owner whose seq still advances is alive and is never
     /// taken over regardless of this flag (RF-dead-zone protection intact).
     pub owner_never_heard: bool,
+    /// #136: (recovery only) a floor for the HEARD-path takeover window = the worst-case gap
+    /// between a LIVE owner's *observed* MC seq advances (`RELAY_FLUSH_INTERVAL_MS` + a slow/failed
+    /// flush bounded by `RELAY_FLUSH_BUDGET`). The caller (espnow tier) computes it from those two
+    /// constants and seeds it here so the wifi-tier resolver can honor it without a cross-cfg
+    /// dependency. The resolver takes over a heard-then-lost owner only past
+    /// `max(RECOVERY_STALE_MS, recovery_stale_floor_ms)`, so a gateway that republishes within a
+    /// flush-interval-plus-budget always advances its seq before the window completes → adopted,
+    /// never taken over (even at a budget-edge re-assoc flush). 0 on boot/gateway-flush/wifi-only
+    /// (those use the single-signal `MC_STALE_MS` path anyway) → `max(35s, 0)` = unchanged.
+    pub recovery_stale_floor_ms: u64,
     /// #51 return-flap fix: true ONLY on the one-shot BOOT election. A freshly-booted board
     /// must NEVER claim over a DIFFERENT owner already present in the retained MC — it comes
     /// up as a leaf and lets leaf-scan (fast HELLO lock) + the recovery election decide (live
@@ -152,6 +162,7 @@ impl MeshElect {
             my_channel: 0, // #29: advisory 0 until a frame's rx_control is learned
             recovery: false,
             owner_never_heard: false,
+            recovery_stale_floor_ms: 0, // #136: seeded by the caller on a recovery election
             boot: false,
             i_am_owner: false,
             owner_id: my_id,
@@ -320,7 +331,7 @@ const SYNC_BUDGET: Duration = Duration::from_secs(30);
 /// below the old 30 s spin. Tradeoff unchanged: longer budget = longer worst-case
 /// display/input freeze per attempt during an outage.
 #[cfg(feature = "espnow")]
-const RELAY_FLUSH_BUDGET: Duration = Duration::from_secs(15);
+pub(crate) const RELAY_FLUSH_BUDGET: Duration = Duration::from_secs(15); // #136: read by the leaf-reelect floor
 
 // -------------------------------------------------------------------------
 // Peripheral bundle handed over from `main` (single esp_hal::init()).
@@ -2816,8 +2827,20 @@ fn mqtt_session(
             // just at 90s instead of 35s — election stability > speed). A HEARD-then-lost owner keeps
             // the fast RECOVERY_STALE_MS (35s): the owner-HELLO silence that opened this recovery is
             // independent corroboration of death, so no live board can be misjudged there.
+            // #136: the HEARD-then-lost window is floored at the worst-case gap between a LIVE
+            // owner's OBSERVED seq advances (`recovery_stale_floor_ms` = flush interval + a slow
+            // flush bounded by RELAY_FLUSH_BUDGET, seeded by the caller). At today's 30 s flush that
+            // lifts the effective window 35→45 s so a budget-edge re-assoc flush (seq merely delayed,
+            // not frozen) can't cross it — the owner advances its seq and is adopted, never taken
+            // over (#136 canary 1). A genuinely-dead owner's seq is frozen forever, so it is still
+            // taken over at the window (#136 canary 2). Tracks #122 B1 automatically (at F=20 the
+            // floor is 20+15=35, already covered). NEVER-heard keeps MC_STALE_MS (3×F, ≥ the floor).
             let stale_limit = if elect.recovery {
-                if elect.owner_never_heard { MC_STALE_MS } else { RECOVERY_STALE_MS }
+                if elect.owner_never_heard {
+                    MC_STALE_MS
+                } else {
+                    RECOVERY_STALE_MS.max(elect.recovery_stale_floor_ms)
+                }
             } else {
                 MC_STALE_MS
             };
