@@ -3685,125 +3685,255 @@ pub fn run_ota_fetch(
         }
     }
 
-    // TCP connect to the (allowlisted) image host.
-    let src_port = 49152 + (rng.random() % 16384) as u16;
-    {
-        let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
-        if s.connect(iface.context(), (IpAddress::Ipv4(ip), port), src_port)
-            .is_err()
-        {
-            log::error!("smol OTA: TCP connect failed");
-            return false;
-        }
-    }
-    loop {
-        iface.poll(smoltcp_now(), device, &mut sockets);
-        if sockets.get_mut::<tcp::Socket>(tcp_handle).may_send() {
-            break;
-        }
-        if tick() {
-            return false;
-        }
-        if Instant::now() > deadline {
-            log::warn!("smol OTA: TCP connect timed out");
-            return false;
-        }
-    }
-
-    // Send the request in pieces (no format buffer; total « the 512 B tx ring).
-    {
-        let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
-        let ok = s.send_slice(b"GET ").is_ok()
-            && s.send_slice(path.as_bytes()).is_ok()
-            && s.send_slice(b" HTTP/1.0\r\nHost: ").is_ok()
-            && s.send_slice(host.as_bytes()).is_ok()
-            && s.send_slice(b"\r\nConnection: close\r\n\r\n").is_ok();
-        if !ok {
-            log::error!("smol OTA: failed to send HTTP request");
-            return false;
-        }
-    }
-
-    // Open the inactive-slot writer (image is streamed here, never buffered whole).
+    // Open the inactive-slot writer ONCE (image is streamed here across chunks, never buffered
+    // whole). `writer.written()` doubles as the RESUME cursor and the running-SHA position.
     let Some(mut writer) = crate::ota::ImageWriter::begin() else {
         log::error!("smol OTA: cannot open inactive slot (no OTA partition table?)");
         return false;
     };
     let target = writer.target();
 
-    // Receive: accumulate the HTTP headers (validate 200 + Content-Length == size),
-    // then STREAM every body byte straight into the flash writer.
-    let mut header_buf = [0u8; 512];
-    let mut header_len = 0usize;
-    let mut headers_done = false;
-    loop {
+    // #138: fetch the image as sequential HTTP Range chunks instead of one fragile minutes-long
+    // GET. Each chunk is its own short HTTP/1.0 GET+`Range` on a FRESH connection (Connection:
+    // close) — many reliable short transfers inside the socket window that demonstrably works
+    // (seconds-long MQTT/DHCP on the same association are rock-solid; only the single long GET
+    // died mid-body — nebula finding 1b / IDF esp_https_ota partial_http_download). The running
+    // SHA-256 composes across chunks (the writer accumulates), so the verify gate below is
+    // UNCHANGED. A broken chunk resumes from `writer.written()` rather than restarting the whole
+    // image; `OTA_FETCH_BUDGET` stays the overall cap. `chunk_retries` is surfaced to serial
+    // (the fetch reboots on success, so an in-RAM diag counter wouldn't survive — serial is the
+    // rig's forensic sink).
+    const OTA_CHUNK: u32 = 48 * 1024;
+    /// Consecutive zero-progress attempts before giving up (livelock guard inside the budget).
+    const OTA_MAX_STALL: u32 = 6;
+
+    // Variable-width decimal into `out` (Range byte-positions must NOT be zero-padded for all
+    // servers); returns the digit count. `v` is a u32 → at most 10 digits.
+    fn write_dec(mut v: u32, out: &mut [u8]) -> usize {
+        if v == 0 {
+            out[0] = b'0';
+            return 1;
+        }
+        let mut tmp = [0u8; 10];
+        let mut i = 0;
+        while v > 0 {
+            tmp[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            i += 1;
+        }
+        for j in 0..i {
+            out[j] = tmp[i - 1 - j];
+        }
+        i
+    }
+
+    let mut range_ok = true; // flips false if chunk 0 returns 200 (server ignored Range)
+    let mut chunk_retries: u32 = 0; // re-requests forced by a short/failed chunk
+    let mut stall: u32 = 0; // consecutive zero-progress attempts
+
+    while writer.written() < announce.size {
         if tick() {
             log::warn!("smol OTA: aborted by long-press (slot untouched)");
             return false;
-        }
-        iface.poll(smoltcp_now(), device, &mut sockets);
-        let mut closed = false;
-        {
-            let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
-            if s.can_recv() {
-                let outcome = s.recv(|data| {
-                    if !headers_done {
-                        let take = core::cmp::min(header_buf.len() - header_len, data.len());
-                        if take == 0 {
-                            return (0, false); // headers exceed the buffer → give up
-                        }
-                        header_buf[header_len..header_len + take]
-                            .copy_from_slice(&data[..take]);
-                        header_len += take;
-                        if let Some(bstart) = crate::ota::header_end(&header_buf[..header_len]) {
-                            if crate::ota::status_code(&header_buf[..header_len]) != Some(200) {
-                                return (take, false); // non-200 → abort
-                            }
-                            if let Some(cl) = crate::ota::content_length(&header_buf[..header_len])
-                            {
-                                if cl != announce.size {
-                                    return (take, false); // length mismatch → abort
-                                }
-                            }
-                            headers_done = true;
-                            // feed body bytes already captured past the header terminator
-                            let fed = writer.feed(&header_buf[bstart..header_len]);
-                            return (take, fed);
-                        }
-                        (take, true) // headers still arriving
-                    } else {
-                        let fed = writer.feed(data);
-                        (data.len(), fed)
-                    }
-                });
-                match outcome {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        log::error!("smol OTA: bad HTTP response or flash write error");
-                        return false;
-                    }
-                    Err(_) => closed = true,
-                }
-            } else if !s.may_recv() {
-                closed = true; // peer closed (Connection: close) + rx drained
-            }
-        }
-        // OTA throughput fix: poll AGAIN right after draining the rx ring so the
-        // reopened window (and its ACK) hits the wire this iteration instead of
-        // waiting for the next loop's top-of-loop poll — halves the window-closed gap
-        // that made the transfer round-trip-bound.
-        iface.poll(smoltcp_now(), device, &mut sockets);
-        if headers_done && writer.written() >= announce.size {
-            break;
-        }
-        if closed {
-            break;
         }
         if Instant::now() > deadline {
             log::warn!("smol OTA: download timed out (slot untouched)");
             return false;
         }
+        let off = writer.written();
+        let end = core::cmp::min(off + OTA_CHUNK, announce.size) - 1; // inclusive last byte
+
+        // Fresh connection for this chunk: abort any prior (closed) socket, then reconnect on a
+        // new ephemeral port (avoids TIME_WAIT collisions).
+        {
+            let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
+            s.abort();
+        }
+        iface.poll(smoltcp_now(), device, &mut sockets);
+        let src_port = 49152 + (rng.random() % 16384) as u16;
+        {
+            let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
+            if s.connect(iface.context(), (IpAddress::Ipv4(ip), port), src_port)
+                .is_err()
+            {
+                chunk_retries += 1;
+                stall += 1;
+                if stall >= OTA_MAX_STALL {
+                    log::error!("smol OTA: repeated TCP connect failures — aborting (slot untouched)");
+                    return false;
+                }
+                continue;
+            }
+        }
+        {
+            let mut connected = false;
+            while !connected {
+                iface.poll(smoltcp_now(), device, &mut sockets);
+                if sockets.get_mut::<tcp::Socket>(tcp_handle).may_send() {
+                    connected = true;
+                } else if tick() {
+                    return false;
+                } else if Instant::now() > deadline {
+                    log::warn!("smol OTA: TCP connect timed out (slot untouched)");
+                    return false;
+                }
+            }
+        }
+
+        // Request the byte range [off, end]. Sent in pieces (no format buffer; « the 512 B tx ring).
+        // `Range: bytes=<off>-<end>` — a 206-capable server returns exactly that slice; a server
+        // that ignores Range answers 200 with the whole body (handled as a fallback on chunk 0).
+        let mut rbuf = [0u8; 32];
+        let mut rl = 6;
+        rbuf[..6].copy_from_slice(b"bytes=");
+        rl += write_dec(off, &mut rbuf[rl..]);
+        rbuf[rl] = b'-';
+        rl += 1;
+        rl += write_dec(end, &mut rbuf[rl..]);
+        {
+            let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
+            let ok = s.send_slice(b"GET ").is_ok()
+                && s.send_slice(path.as_bytes()).is_ok()
+                && s.send_slice(b" HTTP/1.0\r\nHost: ").is_ok()
+                && s.send_slice(host.as_bytes()).is_ok()
+                && s.send_slice(b"\r\nRange: ").is_ok()
+                && s.send_slice(&rbuf[..rl]).is_ok()
+                && s.send_slice(b"\r\nConnection: close\r\n\r\n").is_ok();
+            if !ok {
+                chunk_retries += 1;
+                stall += 1;
+                if stall >= OTA_MAX_STALL {
+                    log::error!("smol OTA: repeated request-send failures — aborting (slot untouched)");
+                    return false;
+                }
+                continue;
+            }
+        }
+
+        // Drain this chunk's response into the writer (streaming; headers validated once/chunk).
+        let chunk_start = writer.written();
+        let mut header_buf = [0u8; 512];
+        let mut header_len = 0usize;
+        let mut headers_done = false;
+        let mut bad = false;
+        loop {
+            if tick() {
+                log::warn!("smol OTA: aborted by long-press (slot untouched)");
+                return false;
+            }
+            iface.poll(smoltcp_now(), device, &mut sockets);
+            let mut closed = false;
+            {
+                let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
+                if s.can_recv() {
+                    let outcome = s.recv(|data| {
+                        if !headers_done {
+                            let take = core::cmp::min(header_buf.len() - header_len, data.len());
+                            if take == 0 {
+                                bad = true;
+                                return (0, false); // headers exceed the buffer → give up
+                            }
+                            header_buf[header_len..header_len + take]
+                                .copy_from_slice(&data[..take]);
+                            header_len += take;
+                            if let Some(bstart) = crate::ota::header_end(&header_buf[..header_len]) {
+                                match crate::ota::status_code(&header_buf[..header_len]) {
+                                    Some(206) => {} // Partial Content — Range honoured
+                                    Some(200) if off == 0 => {
+                                        // Server ignored Range → full-body fallback (the old
+                                        // single-GET path). Validate Content-Length == size as
+                                        // before; this GET is NOT resumable (checked after drain).
+                                        range_ok = false;
+                                        if let Some(cl) =
+                                            crate::ota::content_length(&header_buf[..header_len])
+                                        {
+                                            if cl != announce.size {
+                                                bad = true;
+                                                return (take, false); // length mismatch → abort
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        bad = true; // non-206 range reply (or 200 mid-stream)
+                                        return (take, false);
+                                    }
+                                }
+                                headers_done = true;
+                                let fed = writer.feed(&header_buf[bstart..header_len]);
+                                if !fed {
+                                    bad = true; // flash write error
+                                }
+                                return (take, fed);
+                            }
+                            (take, true) // headers still arriving
+                        } else {
+                            let fed = writer.feed(data);
+                            if !fed {
+                                bad = true; // flash write error
+                            }
+                            (data.len(), fed)
+                        }
+                    });
+                    match outcome {
+                        Ok(true) => {}
+                        Ok(false) => closed = true, // bad header / flash error → end this chunk
+                        Err(_) => closed = true,
+                    }
+                } else if !s.may_recv() {
+                    closed = true; // peer closed (Connection: close) + rx drained → chunk complete
+                }
+            }
+            // Poll AGAIN right after draining so the reopened window (+ its ACK) hits the wire
+            // this iteration — halves the window-closed gap that made the transfer RTT-bound.
+            iface.poll(smoltcp_now(), device, &mut sockets);
+            if writer.written() >= announce.size {
+                break; // whole image done
+            }
+            if closed {
+                break; // this chunk's connection ended → outer loop resumes from written()
+            }
+            if Instant::now() > deadline {
+                log::warn!("smol OTA: download timed out (slot untouched)");
+                return false;
+            }
+        }
+
+        if bad {
+            log::error!("smol OTA: bad HTTP status/length on range {off}-{end} (slot untouched)");
+            return false;
+        }
+        if !range_ok && writer.written() < announce.size {
+            // A 200 server re-sends from 0, so an incomplete full-body GET can't be resumed
+            // (that's the OLD failure mode). Fail cleanly rather than double-write.
+            log::error!(
+                "smol OTA: server ignored Range (200) and the single GET died mid-body — not resumable"
+            );
+            return false;
+        }
+        // Progress accounting: a chunk that advanced resets the stall guard; a chunk that
+        // delivered fewer bytes than requested (broke early) forces re-requesting the remainder.
+        if writer.written() > chunk_start {
+            stall = 0;
+            if range_ok && writer.written() <= end && writer.written() < announce.size {
+                chunk_retries += 1; // short chunk → remainder re-requested next iteration
+            }
+        } else {
+            chunk_retries += 1;
+            stall += 1;
+            if stall >= OTA_MAX_STALL {
+                log::error!(
+                    "smol OTA: {OTA_MAX_STALL} zero-progress attempts at offset {off} — aborting (slot untouched)"
+                );
+                return false;
+            }
+        }
     }
+
+    log::info!(
+        "smol OTA: image received — {} B over Range chunks ({} chunk retries)",
+        writer.written(),
+        chunk_retries
+    );
 
     // Integrity gate (exact size + SHA-256) AND #32 authenticity gate (Ed25519 over the
     // signed manifest "build|size|sha256hex"). BOTH must pass before otadata is touched;
