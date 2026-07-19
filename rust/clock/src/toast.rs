@@ -29,15 +29,22 @@ const LINE_H: i32 = 10; // FONT_5X8 is 8 px tall; 10 px baseline pitch leaves a 
 const PANEL_W: i32 = 72;
 const PANEL_H: i32 = 40;
 
+// #197: the notify PRODUCER API (`set` + its wire parser + timing consts) is fed only by the
+// espnow CFG-`M` apply (main's take_cfg_offer(M)); a no-radio (default/wifi) build has no feed, so
+// it reads as dead there — `allow(dead_code)`, same rationale as the CFG_KEY_* consts. The overlay
+// CONSUMER (`draw`/`is_active`, called every render tick) stays always-live in every build.
 /// Default on-glass duration when the wire carries no `~<dur>` prefix.
+#[allow(dead_code)]
 pub const TOAST_DEFAULT_S: u16 = 5;
 /// Clamp a wire-supplied duration so a bad value can't pin a toast on glass forever.
+#[allow(dead_code)]
 const TOAST_MAX_S: u16 = 60;
 
 /// Parse the notify wire value `[~<dur>]<msg>` → `(dur_seconds, msg_bytes)`. A leading
 /// `~<digits>` sets the TTL (clamped to `TOAST_MAX_S`); absent → `TOAST_DEFAULT_S`. Panic-free,
 /// bounded (untrusted relayed value — the #46 clamp discipline). The returned slice borrows
 /// the input.
+#[allow(dead_code)] // espnow-fed producer API (see the note above the timing consts)
 pub fn parse_wire(v: &[u8]) -> (u16, &[u8]) {
     if v.first() == Some(&b'~') {
         let mut i = 1;
@@ -72,6 +79,7 @@ fn active() -> &'static mut Toast {
 
 /// Show `msg` for `dur_ms` from `now_ms` (replace-on-new). `msg` is truncated to
 /// `TOAST_MAX`; non-UTF8 is stored verbatim (draw sanitizes). Empty `msg` clears.
+#[allow(dead_code)] // espnow-fed producer API (see the note above the timing consts)
 pub fn set(msg: &[u8], now_ms: u64, dur_ms: u64) {
     let t = active();
     if msg.is_empty() {

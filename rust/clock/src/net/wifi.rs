@@ -1007,6 +1007,7 @@ pub fn run_ntp_burst(
     let mut _ntp_gw_own = GwOwnCfg::new(); // #48: boot/NTP burst never captures gateway-own cfg (cfg_cache=None)
     let mut _ntp_reset_req = ResetReq::new(); // #52: boot/NTP burst subscribes no cmd/reset (cfg_cache=None)
     let mut _ntp_scan_req = ScanReq::new(); // #71: boot/NTP burst subscribes no cmd/scan (cfg_cache=None)
+    let mut _ntp_notify_req = NotifyReq::new(); // #197: boot/NTP burst subscribes no notify (cfg_cache=None)
     // #89 Stage 1: hand the machine's LIVE stack to the UNCHANGED blocking session —
     // the boot screen freezes for this ≤ MQTT_SESSION_BUDGET tail exactly as before
     // (making the tail cooperative is #89 Stage 2). `tick` still runs (LED + abort),
@@ -1037,6 +1038,7 @@ pub fn run_ntp_burst(
         &[], // #71: boot burst publishes no own scan
         None, // #71: boot burst republishes no cached scan
         &mut _ntp_scan_req, // #71: boot burst subscribes no cmd/scan (cfg_cache=None)
+        &mut _ntp_notify_req, // #197: boot burst subscribes no notify (cfg_cache=None)
         &mut None, // #40: boot burst never relays a leaf OTA
         &mut None, // #40: boot burst has no persistent staged to carry
         &mut None, // #40: boot burst has no relay diag to publish
@@ -1453,6 +1455,60 @@ impl ScanReq {
     /// The queued leaf scan targets (to relay one-shot; NEVER cached).
     pub fn targets(&self) -> &[u8] {
         &self.targets[..self.n]
+    }
+}
+
+/// #197 herald NOTIFY capture — a transient toast COMMAND seen on `smol/+/notify` this burst.
+/// Like [`ResetReq`]/[`ScanReq`] it is NEVER cached (a cached toast re-shows on every boot), but it
+/// CARRIES the message (unlike the value-less R/W). One notify per burst (last-wins): the operator
+/// sends one message to one target (or `CFG_TARGET_ALL` = 255 for the whole fleet). After the burst
+/// `service()` fires a ONE-SHOT `broadcast_config(target, M, msg)` relay + injects `M` into its OWN
+/// `CfgTracker` if `own`, so `main`'s `take_cfg_offer(M)` toasts a leaf or the gateway on one path.
+#[cfg(feature = "wifi")]
+#[allow(dead_code)]
+pub struct NotifyReq {
+    msg: [u8; CFG_VALUE_MAX],
+    len: usize,
+    relay_to: Option<u8>, // Some(leaf | 255) to relay; None = own-only (target was our id)
+    own: bool,
+    have: bool,
+}
+
+#[cfg(feature = "wifi")]
+#[allow(dead_code)]
+impl NotifyReq {
+    pub const fn new() -> Self {
+        Self { msg: [0; CFG_VALUE_MAX], len: 0, relay_to: None, own: false, have: false }
+    }
+    /// Capture a notify for `target` (the `<id>` from `smol/<id>/notify`, may be `CFG_TARGET_ALL`),
+    /// given our own id. Bounded copy (untrusted relayed value → the #46 clamp discipline).
+    pub fn set(&mut self, target: u8, own_id: u8, payload: &[u8]) {
+        let n = payload.len().min(CFG_VALUE_MAX);
+        self.msg[..n].copy_from_slice(&payload[..n]);
+        self.len = n;
+        self.have = true;
+        if target == CFG_TARGET_ALL {
+            self.own = true; // fleet: toast us too
+            self.relay_to = Some(CFG_TARGET_ALL); // ...and relay to every leaf
+        } else if target == own_id {
+            self.own = true; // just us — no relay
+        } else {
+            self.relay_to = Some(target); // a specific leaf
+        }
+    }
+    pub fn have(&self) -> bool {
+        self.have
+    }
+    pub fn own(&self) -> bool {
+        self.own
+    }
+    /// The leaf/fleet id to one-shot relay the toast to, if any.
+    pub fn relay(&self) -> Option<u8> {
+        self.relay_to
+    }
+    /// The captured `[~<dur>]<msg>` wire.
+    pub fn msg(&self) -> &[u8] {
+        &self.msg[..self.len]
     }
 }
 
@@ -1928,6 +1984,10 @@ fn mqtt_session(
     // #71: filled with the scan COMMANDS seen on the transient `smol/+/cmd/scan` topics this burst
     // (leaf targets to one-shot-relay `<id>W` + own flag). Twin of `reset_req`; NEVER cached.
     scan_req: &mut ScanReq,
+    // #197 herald: filled with the notify COMMAND (target + message) seen on the transient
+    // `smol/+/notify` topics this burst → a one-shot `<id>M` relay + own self-toast after the
+    // burst. Twin of `scan_req` (carries a message value); NEVER cached.
+    notify_req: &mut NotifyReq,
     // #40 leaf-mesh-OTA: on a GATEWAY flush, filled with `(leaf_id, raw staged announce)`
     // when a retained `smol/<leaf>/ota/install = INSTALL` is present for a leaf id ≠ self
     // AND a staged image is available — the caller then relays it over ESP-NOW. The retained
@@ -2183,6 +2243,12 @@ fn mqtt_session(
         // #72 IO output control (pid 23): every node's retained output-states topic (key `g`).
         #[cfg(feature = "io")]
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 23, b"smol/+/io/set") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        // #197 herald: wildcard-subscribe the TRANSIENT `smol/+/notify` toast command (pid 24, QoS 1
+        // like cmd/reset|scan — a transient command must not be silently dropped). The gateway relays
+        // a captured toast to the target leaf (one-shot `<id>M`) after the burst; 255 = fleet.
+        if let Some(n) = crate::net::mqtt::encode_subscribe_qos1(&mut pkt, 24, b"smol/+/notify") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
     }
@@ -2857,6 +2923,15 @@ fn mqtt_session(
                             scan_req.push_leaf(leaf_id);
                             log::info!("smol #71: leaf id{} scan command — one-shot relay queued", leaf_id);
                         }
+                    } else if let Some(target) = parse_leaf_config_topic(topic, b"/notify") {
+                        // #197 herald toast — a COMMAND on a TRANSIENT topic (retain:false), twin of
+                        // reset/scan but the PAYLOAD IS the message (`[~<dur>]<msg>`). NEVER cached (a
+                        // cached toast re-shows on every boot). Capture into `notify_req` for a
+                        // one-shot `<id>M` relay after the burst. `target` may be our own id (self-
+                        // toast) or `CFG_TARGET_ALL`=255 (fleet: self + relay to all leaves); the
+                        // own/leaf routing is decided in `NotifyReq::set`.
+                        notify_req.set(target, node_id, payload);
+                        log::info!("smol #197: notify target{} captured ({} B)", target, payload.len());
                     } else if let Some(leaf_id) = parse_leaf_install_topic(topic) {
                         // #40 (§B3): a wildcard-delivered leaf OTA install command. On a
                         // GATEWAY flush (cfg_cache = Some), an `INSTALL` for a leaf id ≠ self
@@ -3650,6 +3725,8 @@ pub fn run_mqtt_burst(
     scan_cache: Option<&RelayCache>,
     // #71: filled with the scan commands seen on `smol/+/cmd/scan` this burst (one-shot relay below).
     scan_req: &mut ScanReq,
+    // #197: filled with the notify command seen on `smol/+/notify` this burst (one-shot relay below).
+    notify_req: &mut NotifyReq,
     // #40: on a gateway flush, filled with `(leaf_id, staged announce)` when a leaf install
     // is pending → the caller relays it over ESP-NOW. `&mut None` on boot/leaf bursts.
     leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
@@ -3852,6 +3929,7 @@ pub fn run_mqtt_burst(
         scan, // #71: forward this node's own scan record (or empty)
         scan_cache, // #71: forward the gateway's cached relayed scans (or None)
         scan_req, // #71: forward the scan-command capture (one-shot relay)
+        notify_req, // #197: forward the notify-command capture (one-shot relay)
         leaf_ota, // #40: forward the leaf-OTA install pairing (or &mut None)
         staged_raw, // #40: forward the persistent staged announce (or &mut None)
         leaf_diag, // #40: forward the diag/clear state (or &mut None)
