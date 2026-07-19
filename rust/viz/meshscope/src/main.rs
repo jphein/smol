@@ -135,8 +135,9 @@ fn seed_demo(m: &mut Model) {
         let heap8 = 39_500 - (k as i64 * 12);
         let heap9 = 38_200 + ((k % 7) as i64 * 25);
         m.ingest(t, "smol/7/diag", format!("DIAG|slot=0|rst=POWERON|boot=4|ota=ok|up={}|heap={heap7}|hmin=37200|loss=1|rtt=12|rx={}|tx={}|led=status:on|tage=30|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=0|dedup=0|ttl=0|hop=1|dlseq=0|dfwd=0", 100 + t as u64, 200 + k, 190 + k).as_bytes());
-        m.ingest(t, "smol/8/diag", format!("DIAG|slot=1|rst=SW|boot=7|ota=ok|up={}|heap={heap8}|hmin=36900|loss=3|rtt=18|rx={}|tx={}|led=status:on|tage=45|tsrc=mesh|net=0:ok|brk=baked|otah=slot|fwd=0|dedup=2|ttl=0|hop=1|dlseq=1783|dfwd=1", 90 + t as u64, 150 + k, 140 + k).as_bytes());
-        m.ingest(t, "smol/9/diag", format!("DIAG|slot=0|rst=POWERON|boot=2|ota=ok|up={}|heap={heap9}|hmin=37600|loss=22|rtt=40|rx={}|tx={}|led=status:on|tage=120|tsrc=mesh|net=0:ok|brk=baked|otah=slot|fwd=0|dedup=0|ttl=1|hop=2|dlseq=1783|dfwd=0", 60 + t as u64, 40 + k, 30 + k).as_bytes());
+        m.ingest(t, "smol/8/diag", format!("DIAG|slot=1|rst=SW|boot=7|ota=ok|up={}|heap={heap8}|hmin=36900|loss=3|rtt=18|rx={}|tx={}|led=status:on|tage=820|tsrc=mesh|net=0:ok|brk=baked|otah=slot|fwd=0|dedup=2|ttl=0|hop=1|dlseq=1783|dfwd=1|cfg=Batt:2", 90 + t as u64, 150 + k, 140 + k).as_bytes());
+        // id9: NTP-stale (~70 min since sync) — the case JP wants visible.
+        m.ingest(t, "smol/9/diag", format!("DIAG|slot=0|rst=POWERON|boot=2|ota=ok|up={}|heap={heap9}|hmin=37600|loss=22|rtt=40|rx={}|tx={}|led=status:on|tage=4200|tsrc=mesh|net=0:ok|brk=baked|otah=slot|fwd=0|dedup=0|ttl=1|hop=2|dlseq=1783|dfwd=0", 60 + t as u64, 40 + k, 30 + k).as_bytes());
         m.ingest(t, "smol/7/uplink", format!("{}", -54 - (k % 6) as i32).as_bytes());
     }
     let t = 320.0;
@@ -146,13 +147,14 @@ fn seed_demo(m: &mut Model) {
     m.ingest(t, "smol/9/peers", b"PEERS|L|6|7,-80,25,6,1");
     // Election / crown.
     m.ingest(t, "smol/mesh/channel", b"MC|7|6|41");
-    // OTA state (id8 a build behind → "latest available").
+    // OTA state: id8 is mid-update (45 → 48) so meshscope shows the live badge; id7/id9 settled.
     m.ingest(t, "smol/7/ota/state", br#"{"installed_version":"48","latest_version":"48","in_progress":false,"title":"v48 Molten Crucible"}"#);
-    m.ingest(t, "smol/8/ota/state", br#"{"installed_version":"45","latest_version":"48","in_progress":false,"title":"v45 Pressed Oven"}"#);
+    m.ingest(t, "smol/8/ota/state", br#"{"installed_version":"45","latest_version":"48","in_progress":true,"title":"v48 Molten Crucible"}"#);
+    m.ingest(t, "smol/8/ota/diag", b"relaying block 22/40 retry=0");
     m.ingest(t, "smol/9/ota/state", br#"{"installed_version":"48","latest_version":"48","in_progress":false,"title":"v48 Molten Crucible"}"#);
-    // Status (live screen:page).
-    m.ingest(t, "smol/7/status", b"STAT|Clock:0");
-    m.ingest(t, "smol/8/status", b"STAT|Batt:1");
+    // Status (live screen:page) — id7 shows the Familiar; id8's OTA screen has taken over.
+    m.ingest(t, "smol/7/status", b"STAT|Familiar:0");
+    m.ingest(t, "smol/8/status", b"STAT|OTA:0");
     m.ingest(t, "smol/9/status", b"STAT|About:0");
     // Telemetry lines.
     m.ingest(t, "smol/7/telemetry", b"23C 3.98V Nexus");
@@ -163,6 +165,7 @@ fn seed_demo(m: &mut Model) {
     // A few live events for the ticker.
     m.ingest(t + 5.0, "smol/9/ota/install", b"INSTALL");
     m.ingest(t + 8.0, "smol/9/ota/diag", b"fetch retry 1/3 (window 12)");
-    m.ingest(t + 14.0, "smol/8/ota/state", br#"{"installed_version":"48","latest_version":"48","in_progress":false,"title":"v48 Molten Crucible"}"#);
+    // (id8 stays mid-update — leave its in_progress ota/state as the final demo state so
+    // the live OTA badge is visible.)
     m.ingest(t + 20.0, "smol/mesh/channel", b"MC|7|6|42");
 }

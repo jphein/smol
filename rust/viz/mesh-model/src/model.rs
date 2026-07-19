@@ -25,6 +25,10 @@ pub const STALE_S: f64 = 45.0;
 pub const WEAK_LINK_DBM: i32 = -80;
 /// Free heap at or below this many bytes is "low heap" (flagged).
 pub const LOW_HEAP_B: u64 = 20_000;
+/// Time-sync (DIAG `tage`) is FRESH under this many seconds since last sync (green).
+pub const SYNC_FRESH_S: u64 = 300;
+/// ... AGING up to here (amber); STALE beyond (red) — an NTP-stale board wants to show.
+pub const SYNC_STALE_S: u64 = 3600;
 
 const HIST_CAP: usize = 240; // ~ retained cadence * this = tens of minutes of trail
 const EVENT_CAP: usize = 300;
@@ -42,6 +46,16 @@ pub enum EventKind {
     Version, // installed build flip
     Ota,     // ota progress / fetch retries / diag
     Join,    // node first seen
+}
+
+/// A node's clock-sync freshness, derived from DIAG `tage`/`tsrc`. Both frontends
+/// colour this identically (green/amber/red/grey) — one derivation, two faces.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SyncFreshness {
+    Fresh,    // synced within SYNC_FRESH_S
+    Aging,    // synced, but SYNC_FRESH_S..SYNC_STALE_S ago
+    Stale,    // synced longer ago than SYNC_STALE_S
+    Unsynced, // tsrc=none, or no tage reported
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +78,7 @@ pub struct Node {
     pub diag: Option<Diag>,
     pub ota: Option<OtaState>,
     pub ota_armed: bool,
+    pub ota_phase: Option<String>, // latest smol/<id>/ota/diag phase (e.g. "fetch-failed retry=3")
     pub links: Vec<PeerLink>, // peers this node hears (edges out)
     pub heap_hist: VecDeque<[f64; 2]>,
     pub rssi_hist: VecDeque<[f64; 2]>,
@@ -84,6 +99,7 @@ impl Node {
             diag: None,
             ota: None,
             ota_armed: false,
+            ota_phase: None,
             links: Vec::new(),
             heap_hist: VecDeque::new(),
             rssi_hist: VecDeque::new(),
@@ -104,6 +120,45 @@ impl Node {
 
     pub fn is_stale(&self, now_s: f64) -> bool {
         now_s - self.last_seen_s > STALE_S
+    }
+
+    /// The node's LIVE screen — the "familiar"/app it is showing. The AppKind from the
+    /// STAT topic (`<AppKind>:<page>`), falling back to the DIAG `cfg=` default-screen
+    /// echo (`cfg=<AppKind>:<page>,…`). `None` until either is seen.
+    pub fn screen(&self) -> Option<String> {
+        if let Some(s) = &self.status {
+            let name = s.split(':').next().unwrap_or(s).trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+        self.diag.as_ref().and_then(|d| d.get("cfg")).and_then(|cfg| {
+            let name = cfg.split(',').next().unwrap_or(cfg).split(':').next().unwrap_or(cfg).trim();
+            (!name.is_empty()).then(|| name.to_string())
+        })
+    }
+
+    /// Seconds since this node last synced its clock (DIAG `tage`).
+    pub fn time_age(&self) -> Option<u64> {
+        self.diag.as_ref().and_then(|d| d.u64("tage"))
+    }
+
+    /// This node's time source (DIAG `tsrc`: `ntp` / `mesh` / `none`).
+    pub fn time_src(&self) -> Option<&str> {
+        self.diag.as_ref().and_then(|d| d.get("tsrc"))
+    }
+
+    /// Classify clock-sync freshness from `tage`/`tsrc` (shared by both frontends).
+    pub fn sync_freshness(&self) -> SyncFreshness {
+        if self.time_src() == Some("none") {
+            return SyncFreshness::Unsynced;
+        }
+        match self.time_age() {
+            None => SyncFreshness::Unsynced,
+            Some(a) if a < SYNC_FRESH_S => SyncFreshness::Fresh,
+            Some(a) if a < SYNC_STALE_S => SyncFreshness::Aging,
+            Some(_) => SyncFreshness::Stale,
+        }
     }
 }
 
@@ -294,7 +349,12 @@ impl Model {
             "ota/diag" | "ota/relaydiag" | "ota/armdiag" => {
                 if !text.is_empty() {
                     let short: String = text.chars().take(80).collect();
-                    self.node_mut(id, now_s);
+                    let n = self.node_mut(id, now_s);
+                    // The transfer PHASE ("fetch-failed retry=3", terminal outcomes) lands on
+                    // ota/diag — keep the latest for the inspector; the others stay ticker-only.
+                    if suffix == "ota/diag" {
+                        n.ota_phase = Some(short.clone());
+                    }
                     self.event(now_s, EventKind::Ota, format!("id{id} {suffix}: {short}"));
                 }
             }
@@ -352,6 +412,42 @@ mod tests {
 
     fn m() -> Model {
         Model::new("test".into())
+    }
+
+    #[test]
+    fn screen_from_status_then_cfg_fallback() {
+        let mut model = m();
+        // Live STAT wins: "<AppKind>:<page>" -> AppKind.
+        model.ingest(1.0, "smol/7/status", b"STAT|Familiar:0");
+        assert_eq!(model.nodes[&7].screen().as_deref(), Some("Familiar"));
+        // With no STAT, fall back to the DIAG cfg= default-screen echo.
+        model.ingest(1.0, "smol/8/diag", b"DIAG|boot=1|heap=40000|cfg=Clock:1,status,00FF");
+        assert_eq!(model.nodes[&8].screen().as_deref(), Some("Clock"));
+    }
+
+    #[test]
+    fn sync_freshness_from_tage_tsrc() {
+        let mut model = m();
+        model.ingest(1.0, "smol/1/diag", b"DIAG|boot=1|heap=40000|tage=30|tsrc=ntp");
+        model.ingest(1.0, "smol/2/diag", b"DIAG|boot=1|heap=40000|tage=820|tsrc=mesh");
+        model.ingest(1.0, "smol/3/diag", b"DIAG|boot=1|heap=40000|tage=4200|tsrc=mesh");
+        model.ingest(1.0, "smol/4/diag", b"DIAG|boot=1|heap=40000|tsrc=none");
+        assert_eq!(model.nodes[&1].sync_freshness(), SyncFreshness::Fresh);
+        assert_eq!(model.nodes[&2].sync_freshness(), SyncFreshness::Aging);
+        assert_eq!(model.nodes[&3].sync_freshness(), SyncFreshness::Stale);
+        assert_eq!(model.nodes[&4].sync_freshness(), SyncFreshness::Unsynced);
+        assert_eq!(model.nodes[&1].time_age(), Some(30));
+        assert_eq!(model.nodes[&1].time_src(), Some("ntp"));
+    }
+
+    #[test]
+    fn ota_diag_phase_stored_on_node() {
+        let mut model = m();
+        model.ingest(1.0, "smol/8/ota/diag", b"fetch-failed retry=3");
+        assert_eq!(model.nodes[&8].ota_phase.as_deref(), Some("fetch-failed retry=3"));
+        // relaydiag stays ticker-only (not the transfer phase).
+        model.ingest(2.0, "smol/8/ota/relaydiag", b"leaf=H2V1N0");
+        assert_eq!(model.nodes[&8].ota_phase.as_deref(), Some("fetch-failed retry=3"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
-use mesh_model::model::{Model, WEAK_LINK_DBM};
+use mesh_model::model::{Model, SyncFreshness, WEAK_LINK_DBM};
 
 const GOLDEN_ANGLE: f32 = 2.399_963_2; // radians, spreads initial placement
 const K_REP: f32 = 90_000.0; // repulsion strength
@@ -172,7 +172,7 @@ impl GraphLayout {
                 Align2::CENTER_CENTER,
                 format!("{}", e.rssi),
                 FontId::proportional(9.0),
-                col.gamma_multiply(1.4),
+                col, // (was gamma_multiply(1.4) — factor>1 panics ecolor's debug assert)
             );
         }
 
@@ -234,8 +234,43 @@ impl GraphLayout {
                 if stale { Color32::GRAY } else { Color32::from_rgb(222, 226, 236) },
             );
 
-            // Tiny heap sparkline beneath the label.
-            draw_sparkline(&painter, sp + Vec2::new(-24.0, r + 22.0), Vec2::new(48.0, 12.0), &node.heap_hist, Color32::from_rgb(120, 200, 150));
+            // #159 — live screen ("the familiar") under the label.
+            if let Some(screen) = node.screen() {
+                painter.text(
+                    sp + Vec2::new(0.0, r + 22.0),
+                    Align2::CENTER_CENTER,
+                    screen,
+                    FontId::proportional(10.5),
+                    if stale { Color32::from_gray(120) } else { Color32::from_rgb(150, 200, 235) },
+                );
+            }
+
+            // #159 — NTP-sync freshness dot at the top-right of the disc.
+            let ndot = sp + Vec2::new(r * 0.72, -r * 0.72);
+            painter.circle_filled(ndot, 4.0, sync_color(node.sync_freshness()));
+            painter.circle_stroke(ndot, 4.0, Stroke::new(1.0_f32, Color32::from_black_alpha(130)));
+
+            // #159 — OTA in progress: a pulsing ring + "OTA→vLATEST". (No live transfer %
+            // is published to MQTT — ota/state carries only in_progress + installed/latest —
+            // so this is an honest indeterminate indicator, not a fake bar.)
+            if let Some(o) = &node.ota {
+                if o.in_progress && !stale {
+                    let pulse = (0.5 + 0.4 * ((now_s * 4.0).sin() as f32 * 0.5 + 0.5)).clamp(0.2, 1.0);
+                    painter.circle_stroke(sp, r + 5.0, Stroke::new(2.5_f32, Color32::from_rgb(210, 120, 235).gamma_multiply(pulse)));
+                    if Some(id) != crown {
+                        painter.text(
+                            sp + Vec2::new(0.0, -r - 11.0),
+                            Align2::CENTER_CENTER,
+                            format!("OTA →v{}", o.latest),
+                            FontId::proportional(10.5),
+                            Color32::from_rgb(222, 150, 240),
+                        );
+                    }
+                }
+            }
+
+            // Tiny heap sparkline beneath the screen line.
+            draw_sparkline(&painter, sp + Vec2::new(-24.0, r + 33.0), Vec2::new(48.0, 12.0), &node.heap_hist, Color32::from_rgb(120, 200, 150));
 
             if hovered && response.clicked() {
                 clicked = Some(id);
@@ -273,6 +308,17 @@ pub fn rssi_color(rssi: i32) -> Color32 {
         lerp3((210, 80, 80), (230, 200, 70), u)
     };
     Color32::from_rgb(r, g, b)
+}
+
+/// NTP-sync freshness colour (shared with the detail panel): green fresh → amber aging
+/// → red stale → grey unsynced.
+pub fn sync_color(f: SyncFreshness) -> Color32 {
+    match f {
+        SyncFreshness::Fresh => Color32::from_rgb(90, 210, 120),
+        SyncFreshness::Aging => Color32::from_rgb(230, 200, 70),
+        SyncFreshness::Stale => Color32::from_rgb(224, 100, 90),
+        SyncFreshness::Unsynced => Color32::from_rgb(130, 130, 142),
+    }
 }
 
 fn lerp3(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {

@@ -4,10 +4,10 @@
 use egui::{Color32, RichText};
 use egui_plot::{Line, Plot, PlotPoints};
 
-use mesh_model::model::{Model, Node, LOW_HEAP_B};
+use mesh_model::model::{Model, Node, SyncFreshness, LOW_HEAP_B};
 
 pub fn show(ui: &mut egui::Ui, model: &Model, selected: Option<u8>, now_s: f64) {
-    let Some(id) = selected.and_then(|i| if model.nodes.contains_key(&i) { Some(i) } else { None }) else {
+    let Some(id) = selected.filter(|i| model.nodes.contains_key(i)) else {
         ui.add_space(8.0);
         ui.label(RichText::new("Select a node").weak());
         ui.label(RichText::new("Click a disc in the graph to inspect its health, OTA state and links.").weak().small());
@@ -27,6 +27,33 @@ pub fn show(ui: &mut egui::Ui, model: &Model, selected: Option<u8>, now_s: f64) 
         age as u64
     ));
 
+    // #159 — the live screen ("the familiar") + NTP-sync freshness, up front.
+    if let Some(screen) = node.screen() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("screen").weak());
+            ui.label(RichText::new(screen).strong().color(Color32::from_rgb(150, 200, 235)));
+        });
+    }
+    {
+        let fresh = node.sync_freshness();
+        let word = match fresh {
+            SyncFreshness::Fresh => "fresh",
+            SyncFreshness::Aging => "aging",
+            SyncFreshness::Stale => "STALE",
+            SyncFreshness::Unsynced => "unsynced",
+        };
+        let detail = match (node.time_src(), node.time_age()) {
+            (Some(src), Some(age)) => format!("{src} · {} ago", fmt_dur(age)),
+            (Some(src), None) => src.to_string(),
+            (None, Some(age)) => format!("{} ago", fmt_dur(age)),
+            (None, None) => "—".into(),
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("time sync").weak());
+            ui.label(RichText::new(format!("{detail}  ({word})")).color(super::graph::sync_color(fresh)));
+        });
+    }
+
     if let Some(t) = &node.telemetry {
         ui.add_space(2.0);
         ui.label(RichText::new(t).monospace().small());
@@ -42,10 +69,20 @@ pub fn show(ui: &mut egui::Ui, model: &Model, selected: Option<u8>, now_s: f64) 
             kv(ui, "latest", &format!("v{} available", o.latest));
         }
         if o.in_progress {
-            ui.label(RichText::new("⏳ install in progress").color(Color32::from_rgb(210, 120, 235)));
+            ui.label(
+                RichText::new(format!("⟳ updating  v{} → v{}", o.installed, o.latest))
+                    .strong()
+                    .color(Color32::from_rgb(220, 140, 240)),
+            );
         }
         if node.ota_armed {
             ui.label(RichText::new("🎯 install armed").color(Color32::from_rgb(210, 120, 235)));
+        }
+        // Latest transfer phase from smol/<id>/ota/diag ("fetch-failed retry=3", terminal
+        // outcomes). No live % is published to MQTT, so this phase + the version flip on
+        // completion are the honest "watch it happen" signals.
+        if let Some(phase) = &node.ota_phase {
+            ui.label(RichText::new(format!("phase: {phase}")).small().monospace().color(Color32::from_rgb(190, 165, 220)));
         }
         ui.separator();
     }
@@ -61,7 +98,7 @@ pub fn show(ui: &mut egui::Ui, model: &Model, selected: Option<u8>, now_s: f64) 
                     ui.end_row();
                 }
             };
-            row(ui, "uptime", d.u64("up").map(|s| fmt_dur(s)));
+            row(ui, "uptime", d.u64("up").map(fmt_dur));
             row(ui, "boot #", d.u64("boot").map(|b| b.to_string()));
             row(ui, "reset", d.get("rst").map(|s| s.to_string()));
             row(ui, "heap free", d.u64("heap").map(fmt_bytes));
