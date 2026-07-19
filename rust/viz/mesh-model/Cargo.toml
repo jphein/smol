@@ -1,0 +1,23 @@
+# mesh-model — the shared ingest + world-model core for the smol mesh visualizers.
+#
+# Pure library: connects to the broker, parses the smol MQTT wire formats, folds
+# them into a `Model` (nodes/edges/crown/events with freshness aging). NO UI, no
+# rendering. meshscope (#158, egui) and observatory (#159, Bevy) are thin render
+# frontends over identical state — "one model, two faces".
+#
+# Provenance: lifted VERBATIM from rust/meshscope @ 81ebb14 (its model.rs/parse.rs/
+# names.rs/mqtt.rs were already UI-free and unit-tested). The ONE change vs that
+# source is a per-connection MQTT client-id (see mqtt.rs) so meshscope + observatory
+# can listen simultaneously without the broker kicking a duplicate client-id.
+[package]
+name = "mesh-model"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Shared MQTT ingest + world-model for the smol mesh visualizers (meshscope / observatory)"
+
+[dependencies]
+rumqttc.workspace = true
+serde_json.workspace = true
+dotenvy.workspace = true

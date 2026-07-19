@@ -1,0 +1,5 @@
+/target
+# Local broker creds — NEVER commit (public repo). See .env.example.
+.env
+# Ad-hoc render captures are build artifacts; the committed hero frames live in media/.
+/captures
