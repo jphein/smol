@@ -46,8 +46,10 @@ in your hand — and it's the emotional hook that makes the technical story land
 
 ## Why it's not a toy — the technical spine
 
-Under the whimsy is a real distributed system, every piece hardware-proven on the id7/id8/id9
-bench fleet:
+Under the whimsy is a real distributed system. The data path is the whole trick on one radio:
+**ESP-NOW mesh → an elected "crown" gateway → a brief WiFi burst → MQTT → Home Assistant**,
+and back down the same chain as retained downlink re-broadcast to the WiFi-less leaves. Every
+piece below is hardware-proven on the id7/id8/id9 bench fleet:
 
 - **Signed leaf-mesh-OTA** ([#40](https://github.com/jphein/smol/issues/40)). WiFi-less leaves
   update **over the mesh**: an elected gateway fetches an **ed25519-signed** ~1 MB image,
@@ -75,7 +77,38 @@ bench fleet:
 And the games are real: **World Snake**, a shared 256×256 toroidal MMO world over the mesh with
 a scrolling viewport, peers drawn by name, a mesh leaderboard, and treasure-powers
 ([#5](https://github.com/jphein/smol/issues/5)); plus a one-button arcade pack, an RSSI
-treasure hunt, and a Bluetooth-controller Minecraft-ish digger.
+treasure hunt, and a Bluetooth-controller Minecraft-ish digger. Next up is the **mesh RPG** — a
+spec'd isometric 1-bit LitRPG whose shared world runs *across* the fleet, with the tamper-evident
+ledger (below) as its world-state substrate.
+
+---
+
+## A war story: the mesh that diagnosed its own disease
+
+The best evidence a system is *real* is what breaks and how it's fixed. Here's the one to tell.
+
+A crown — the board that's briefly on WiFi to reach Home Assistant — would go **downstream-deaf
+within minutes of taking the crown.** Its transmit path kept working, it kept publishing
+telemetry, it held its DHCP lease — but sustained *inbound* unicast quietly died, so anything
+that depends on *receiving* (OTA image fetch, time sync, the MQTT downlink) failed. The tell
+that made it maddening: **the disease followed the role, not the board.** Across two boards and
+three incidents, whichever board wore the crown went deaf; the leaves stayed healthy. Rebooting
+didn't cure it — the board just re-claimed the crown and re-deafened.
+
+It was **root-caused live** ([#204](https://github.com/jphein/smol/issues/204)): the deafness
+correlated with the crown operating **off the mesh's ch6** (a crown that associated to a ch1 AP
+matched a single-radio coexist airtime-starvation mechanism exactly). Then a *partial-heal*
+observation sharpened it further — after the channel realigned, unicast ARP started answering
+but bulk transfer still died, proving the detector must key on **sustained inbound success**,
+never a single small frame that would false-GREEN the exact half-healed state. The fix that
+shipped is a **self-heal ladder**: detect the deafness, reassoc toward a ch6 AP, and if that's
+not enough, **shed the crown** so a healthier board takes over — and it was **hardened across
+three review passes** before landing. A follow-up ([#217](https://github.com/jphein/smol/issues/217))
+adds a *proactive* guard: don't even take a crown onto a hopeless AP in the first place.
+
+**A hobby mesh on dollar boards that diagnosed its own coexist-starvation disease from its own
+telemetry, live, and grew a self-healing recovery ladder** — that's the beat that turns "cute"
+into "credible."
 
 ---
 
@@ -105,21 +138,29 @@ A distinguishing feature for a hobby project: a **research shelf** in-repo. Befo
 heavyweight ideas, smol studied them and wrote down *why* it did or didn't borrow — the
 recurring verdict being **"borrow the primitive, admire the protocol."**
 
-- **[Althea / Babel (RFC 8966)](superpowers/research/althea-babel-study.md)** → borrow the ETX
-  link metric, admire the routing protocol (a single-sink 2-hop mesh doesn't need any-to-any
-  distance-vector).
-- **[A mesh ledger](superpowers/research/mesh-ledger-study.md)** → adopt a hash-chained
-  append-only log (tamper-evident fleet provenance); skip BFT — the elected crown is a free
-  sequencer.
-- **[RIOT OS's ESP-NOW netdev](superpowers/research/riot-espnow-study.md)** → validation by
-  contrast: RIOT *forbids* the broadcast-flood-plus-WiFi combo smol is built on, confirming
-  smol's flood-first design is genuine novelty.
-- **[Inspirations coverage audit](superpowers/research/inspirations-coverage.md)** → of ~33
-  borrows across 18 projects, ~79% shipped — a durable "did we build what we learned?" ledger.
-- Plus design specs for the mesh-RPG, the visualizers, and mesh authentication.
+1. **[Althea / Babel (RFC 8966)](superpowers/research/althea-babel-study.md)** → borrow the ETX
+   link metric, admire the routing protocol (a single-sink 2-hop mesh doesn't need any-to-any
+   distance-vector).
+2. **[A mesh ledger](superpowers/research/mesh-ledger-study.md)** → adopt a hash-chained
+   append-only log (tamper-evident fleet provenance); skip BFT — the elected crown is a free
+   sequencer. *(Now built: the L1 core is host-tested + merged.)*
+3. **[RIOT OS's ESP-NOW netdev](superpowers/research/riot-espnow-study.md)** → validation by
+   contrast: RIOT *forbids* the broadcast-flood-plus-WiFi combo smol is built on, confirming
+   smol's flood-first design is genuine novelty.
+4. **NuttX on a bench C3** → the road-not-taken RTOS: a real `nuttx.bin` **built** for the
+   $1 board (a ~237 KB POSIX shell in ~200 KB of RAM) to scope what a full RTOS would cost vs
+   smol's `no_std` bare-metal.
+5. **[Inspirations coverage audit](superpowers/research/inspirations-coverage.md)** → of ~33
+   borrows across 18 projects, ~79% shipped — a durable "did we build what we learned?" ledger.
+6. **The PMK-broadcast source-dive** → research that *changed the build*: it proved ESP-NOW
+   **cannot encrypt broadcast**, which killed an impossible mesh-auth design and reshaped it into
+   a group-HMAC — a decision made from source, not a guess.
 
-That shelf is the "credible, not just cute" evidence a Hackaday or conference audience respects:
-the project knows the literature and made deliberate calls.
+Plus design specs for the mesh-RPG, the mesh visualizers, and mesh authentication. That shelf is
+the "credible, not just cute" evidence a Hackaday or conference audience respects: the project
+knows the literature and made deliberate, cited calls — sometimes borrowing a primitive,
+sometimes admiring and walking away, and at least once **letting a source-dive kill a design
+before a line of it was written.**
 
 ---
 
