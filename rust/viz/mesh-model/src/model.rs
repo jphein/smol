@@ -497,17 +497,20 @@ mod tests {
     fn ap_and_cdeaf_parse_from_diag() {
         let mut model = m();
         // #204 optional DIAG appends: ap=<ch>:<rssi>:<bssid(12hex)>, cdeaf=<streak>:<cycles>:<shed>.
-        model.ingest(1.0, "smol/7/diag", b"DIAG|boot=1|heap=40000|ap=6:-52:a1b2c3d4e5f6|cdeaf=4:2:1");
+        // F2 (155's 2a review): `cdeaf` CONTAINS `deaf` (the mesh-test deaf-LIST count) and
+        // `ap=` is a substring of `heap=` — this fixture packs heap= + deaf= + ap= + cdeaf=
+        // TOGETHER so a substring-matching regression fails loudly. (We match EXACT map keys.)
+        model.ingest(1.0, "smol/7/diag", b"DIAG|boot=1|heap=40000|deaf=7,8|ap=6:-52:a1b2c3d4e5f6|cdeaf=4:2:1");
         let ap = model.nodes[&7].ap().unwrap();
-        assert_eq!(ap.channel, 6);
+        assert_eq!(ap.channel, 6); // 6, NOT heap's 40000 → ap= is not matched from heap=
         assert_eq!(ap.rssi, -52); // signed dBm — NOT normalized
         assert_eq!(ap.bssid, [0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6]);
         let cd = model.nodes[&7].crown_deaf().unwrap();
-        assert_eq!(cd.streak, 4);
+        assert_eq!(cd.streak, 4); // 4 from cdeaf=, NOT 7 from deaf= → cdeaf is not matched from deaf
         assert_eq!(cd.reassoc_cycles, 2);
         assert!(cd.shed);
-        // Absent on a node without the fields.
-        model.ingest(1.0, "smol/8/diag", b"DIAG|boot=1|heap=40000");
+        // A node with ONLY the confusable stems (heap=, deaf=) must yield neither.
+        model.ingest(1.0, "smol/8/diag", b"DIAG|boot=1|heap=40000|deaf=1,2,3");
         assert!(model.nodes[&8].ap().is_none());
         assert!(model.nodes[&8].crown_deaf().is_none());
     }
