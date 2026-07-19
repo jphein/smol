@@ -1818,20 +1818,21 @@ mod ota_fail {
     }
 }
 
-/// #204 2b/F1: is a self-fetch failure stage a DOWNSTREAM-RECEIVE (bulk-deaf) signature — did the
-/// fetch get far enough to be RECEIVING the response/body but fail to complete it? These gate the
+/// #204 2b/F1: is a self-fetch failure stage a BODY-RECEPTION (bulk-deaf) signature — did the fetch
+/// reach the point of receiving the 206 response/body and then fail to complete it? These gate the
 /// aggressive crown SHED (the small-frame `got_mc` streak can false-green on a partial-heal, so the
-/// shed needs bulk-inbound proof). TRUE: handshake (no SYN-ACK) / status (bad response header) /
-/// fallback (200 body died mid-stream) / stall (zero-progress exhausted) / deadline (mid-download) /
-/// recycle (chunk never drained). FALSE: the pre-receive stages (assoc/dhcp/slot = pre-net,
-/// connect = never established, send = TX-side which is HEALTHY in the disease) and verify (body was
-/// fully RECEIVED, only the size/SHA/sig gate rejected it → downstream itself worked).
+/// shed needs bulk-inbound proof). TRUE (post-206, body-reception): status (bad 206 header /
+/// Content-Length on a chunk) / fallback (200 body died mid-stream) / stall (zero-progress exhausted
+/// = the #26 "ACKs zero downstream") / deadline (elapsed mid-download) / recycle (chunk never
+/// drained). FALSE — the PRE-206 / non-RX stages (155 crux 3): assoc/dhcp/slot (pre-net), connect
+/// (never established), handshake (TCP SYN-ACK — pre-206, and an upstream/AP blip could cause it, the
+/// R-DEMOTE lane), send (TX-side, HEALTHY in the disease), verify (body FULLY received, only the
+/// size/SHA/sig gate rejected it → downstream worked).
 #[cfg(feature = "espnow")]
 pub(crate) fn ota_fail_is_bulk_deaf(w: u32) -> bool {
     matches!(
         w,
-        ota_fail::HANDSHAKE
-            | ota_fail::STATUS
+        ota_fail::STATUS
             | ota_fail::FALLBACK
             | ota_fail::STALL
             | ota_fail::DEADLINE

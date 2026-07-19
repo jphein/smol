@@ -4212,58 +4212,67 @@ impl RadioManager {
         // downstream-dry. Streak (not one-shot): small retained frames sneak through intermittently
         // (#204 partial-heal), so a run of dry flushes is required before 2b escalates.
         if ok {
-            // #204 2b/F1: a "deaf tick" = missed our own small retained downstream (got_mc etc.) OR a
-            // recent SELF-fetch died at a bulk-RECEIVE stage. The bulk arm catches the PARTIAL-HEAL
-            // (small frames sneak through → downstream_seen=true → a got_mc-only streak would never
-            // accrue, yet the bulk download still fails — the #26 handshake-passes / body-dies split).
-            let deaf_tick = !elect.downstream_seen || bulk_fetch_deaf;
-            if deaf_tick {
-                self.relay.crown_deaf_streak = self.relay.crown_deaf_streak.saturating_add(1);
-                if bulk_fetch_deaf {
-                    self.relay.deaf_bulk_seen = true; // latch explicit bulk-inbound proof for the shed gate
-                }
-                // Self-heal ladder (GATEWAY-only — flush_telemetry is is_gateway-guarded; `ok`-gating
-                // keeps this disjoint from the !ok flush-fail / R-DEMOTE path). The reassoc rung fires
-                // on the streak (cheap); the aggressive SHED requires BULK proof (an explicit bulk-
-                // fetch failure) OR a DEEP streak — F1: never shed a partial-heal on small-frame alone.
-                if self.relay.crown_deaf_streak >= DEAF_REASSOC_N {
-                    let shed_justified = self.relay.deaf_bulk_seen
-                        || self.relay.crown_deaf_streak >= DEAF_SHED_DEEP_STREAK;
-                    if self.relay.reassoc_cycles >= DEAF_SHED_M && shed_justified {
-                        // SHED / abdicate. Mirrors the #155 channel-yield abdication shape (leaf-scan
-                        // + HELLO-silent) but tags `deaf_shed` — NOT flush_fail_latch: our UPLINK is
-                        // fine (we just flushed `ok`); we're RX-deaf, not flush-incapable. The frozen
-                        // MC lets the H1/H2 machinery elect a healthy crown; the deaf_shed backoff
-                        // (foreign-MC OR 5-min floor) damps the shed→heal-as-leaf→reclaim→re-deafen
-                        // ping-pong (the #26 loop: id9 rebooted 71→74 and re-deafened each time).
-                        self.relay.is_gateway = false;
-                        self.scan_locked = false;
-                        self.last_owner_heard_ms = now;
-                        self.silent_until_relock = true;
-                        self.relay.deaf_shed = true;
-                        self.relay.deaf_shed_ms = now;
-                        self.relay.crown_deaf_streak = 0;
-                        self.relay.reassoc_cycles = 0;
-                        self.relay.deaf_bulk_seen = false;
-                        let _ = self.switch(Mode::EspNow);
-                        log::warn!(
-                            "smol #204: crown SHED — {} ch6-reassocs still downstream-deaf; HELLO-silent + leaf-scanning",
-                            DEAF_SHED_M
-                        );
-                    } else if self.relay.reassoc_cycles < DEAF_SHED_M {
-                        // Rung 1: ch6-preferred reassociate; keep the crown, re-measure next flush.
-                        self.reassoc_ch6_prefer();
-                        self.relay.reassoc_cycles = self.relay.reassoc_cycles.saturating_add(1);
-                        self.relay.crown_deaf_streak = 0;
-                    }
-                    // else (reassoc rung exhausted but not yet shed-justified): HOLD — keep flushing;
-                    // the got_mc streak climbs toward DEEP, or a bulk-fetch failure arrives, then shed.
-                }
-            } else {
-                // FULL heal: received our own small downstream AND no bulk-fetch failure → reset all.
+            // #204 2b/F1 (155 cruxes 2+3): TWO independent deaf signals.
+            //  (a) crown_deaf_streak — the got_mc small-frame streak = the FULLY-deaf detector (small
+            //      unicast dead). Resets on ANY small downstream received.
+            //  (b) deaf_bulk_seen — a LATCHED bulk-inbound failure (a self-fetch that died RECEIVING
+            //      the body). This is the PARTIAL-HEAL signal, and the measured steady state: small
+            //      frames pass cycle after cycle (so the streak NEVER accrues) while every bulk
+            //      transfer dies. It MUST NOT be cleared by a small-frame pass (that pass IS the
+            //      partial-heal — clearing on it re-buries F1); cleared ONLY on a reassoc re-prove
+            //      (fresh evidence after a realign, bounds staleness to one cycle) or on a shed.
+            if elect.downstream_seen {
                 self.relay.crown_deaf_streak = 0;
-                self.relay.reassoc_cycles = 0;
-                self.relay.deaf_bulk_seen = false;
+            } else {
+                self.relay.crown_deaf_streak = self.relay.crown_deaf_streak.saturating_add(1);
+            }
+            if bulk_fetch_deaf {
+                self.relay.deaf_bulk_seen = true;
+            }
+            // Self-heal ladder (GATEWAY-only — flush_telemetry is is_gateway-guarded; `ok`-gating keeps
+            // it disjoint from the !ok flush-fail / R-DEMOTE path). ESCALATE on EITHER a got_mc streak
+            // (fully-deaf) OR a latched bulk failure (partial-heal — where the streak never accrues, so
+            // the bulk latch is the only driver). reassoc rung first (heal in place); SHED requires
+            // BULK proof (deaf_bulk_seen) OR a DEEP got_mc streak (the fully-deaf backstop — never
+            // fires in a small-passes partial-heal, 155 crux 4).
+            let escalate =
+                self.relay.crown_deaf_streak >= DEAF_REASSOC_N || self.relay.deaf_bulk_seen;
+            if escalate {
+                let shed_justified = self.relay.deaf_bulk_seen
+                    || self.relay.crown_deaf_streak >= DEAF_SHED_DEEP_STREAK;
+                if self.relay.reassoc_cycles >= DEAF_SHED_M && shed_justified {
+                    // SHED / abdicate. Mirrors the #155 channel-yield abdication shape (leaf-scan +
+                    // HELLO-silent) but tags `deaf_shed` — NOT flush_fail_latch: our UPLINK is fine (we
+                    // just flushed `ok`); we're RX-deaf, not flush-incapable. The frozen MC lets the
+                    // H1/H2 machinery elect a healthy crown; the deaf_shed backoff (foreign-MC OR 5-min
+                    // floor) damps the shed→heal-as-leaf→reclaim→re-deafen ping-pong (the #26 loop).
+                    self.relay.is_gateway = false;
+                    self.scan_locked = false;
+                    self.last_owner_heard_ms = now;
+                    self.silent_until_relock = true;
+                    self.relay.deaf_shed = true;
+                    self.relay.deaf_shed_ms = now;
+                    self.relay.crown_deaf_streak = 0;
+                    self.relay.reassoc_cycles = 0;
+                    self.relay.deaf_bulk_seen = false;
+                    let _ = self.switch(Mode::EspNow);
+                    log::warn!(
+                        "smol #204: crown SHED — {} ch6-reassocs still downstream-deaf; HELLO-silent + leaf-scanning",
+                        DEAF_SHED_M
+                    );
+                } else if self.relay.reassoc_cycles < DEAF_SHED_M {
+                    // Rung 1: ch6-preferred reassociate; keep the crown, re-measure next flush. RE-ARM
+                    // the bulk latch + streak so the next shed decision re-proves deafness FRESH after
+                    // the realign (155 crux 2 — never shed on pre-reassoc evidence).
+                    self.reassoc_ch6_prefer();
+                    self.relay.reassoc_cycles = self.relay.reassoc_cycles.saturating_add(1);
+                    self.relay.crown_deaf_streak = 0;
+                    self.relay.deaf_bulk_seen = false;
+                }
+                // else (reassoc rung exhausted, not yet shed-justified): HOLD — a fresh bulk failure or
+                // a DEEP got_mc streak will arrive and shed. reassoc_cycles resets only on a shed, so a
+                // repeat-offender crown (healed then deaf again in-tenure) sheds one reassoc sooner —
+                // acceptable (demonstrated deafness ⇒ hand off faster).
             }
         }
         // #6 OTA: stash any announce this flush surfaced for `main` to act on.
