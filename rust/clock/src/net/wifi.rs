@@ -77,6 +77,20 @@ const GRID_TOPIC: &[u8] = b"smol/display/grid";
 #[cfg(feature = "wifi")]
 const MESH_CHANNEL_TOPIC: &[u8] = b"smol/mesh/channel";
 
+/// #155 channel-drag OPERATOR LEVER: a retained hint the crown HONORS at claim time.
+/// Payload = a decimal 2.4 GHz channel (the fleet uses `1`/`6`/`11`); an EMPTY payload (the
+/// retain-clear) restores un-hinted behavior. The mesh channel is PHYSICALLY the crown's AP
+/// channel (coexist single-radio: while associated the PHY sits on the AP's channel), so a hint
+/// can only steer WHICH board holds the crown — a candidate whose LEARNED channel != the hint
+/// refuses to claim (see the claim gate in `mqtt_session`), so the (re)election converges onto a
+/// board already on the hinted channel and the fleet stops being dragged onto a weak AP. This
+/// replaces JP's manual seq-forged `MC` plant with a first-class, documented control. Absent/empty
+/// ⇒ the election is byte-identical to pre-#155. See issue #155 (option 3). SAFETY: an
+/// unsatisfiable hint (no capable board on that channel) leaves the mesh crownless until the
+/// operator clears the topic — the lever is deliberate, not automatic.
+#[cfg(feature = "wifi")]
+const MESH_CHANNEL_HINT_TOPIC: &[u8] = b"smol/mesh/channel_hint";
+
 /// #23 stage 3-4 boot ELECTION result, filled by [`mqtt_session`] from the retained
 /// `smol/mesh/channel`. A board that reached DHCP is a candidate; the lowest-id
 /// candidate is the OWNER (coexist gateway). Non-owners demote to leaf + scan for the
@@ -146,6 +160,15 @@ pub struct MeshElect {
     /// owner is unaffected. Always false on boot/gateway-flush and for a healthy fleet (a board that
     /// can flush is never latched), so this is a no-op on every path except a proven-incapable owner.
     pub flush_incapable: bool,
+    /// #155 channel-drag operator lever: the retained `smol/mesh/channel_hint` value (a decimal
+    /// 2.4 GHz channel), or `None` when the topic is absent/empty/garbage. Seeded by
+    /// [`mqtt_session`] from the broker each burst. When `Some(h)`, this board's own channel
+    /// (`my_channel`) is KNOWN (non-zero) and != `h`, the claim gate refuses to (re)claim the crown
+    /// — so the mesh converges onto a crown actually on the hinted channel and the drag heals.
+    /// FAIL-OPEN on an unknown own-channel (`my_channel == 0`): a not-yet-learned board claims as
+    /// before, so a mesh is never left crownless while a channel is still being learned. `None` ⇒
+    /// no gate ⇒ election unchanged. Same claim-guard shape as `flush_incapable` (#146).
+    pub channel_hint: Option<u8>,
     // --- outputs (applied to the live role by the caller) ---
     /// True iff I claimed / hold ownership (I am the coexist gateway).
     pub i_am_owner: bool,
@@ -156,6 +179,12 @@ pub struct MeshElect {
     /// its owner-silence clock ONLY for a genuinely-live owner — a dead-deferred owner
     /// gets no reset, so the next recovery burst fires on cadence (faster failover).
     pub owner_alive: bool,
+    /// #155: true iff the CHANNEL-HINT claim gate fired this burst — i.e. we would have claimed /
+    /// held the crown but our channel != the operator's `channel_hint`, so we yielded. The caller
+    /// uses this on the gateway-flush path to go HELLO-silent on a hint-driven demote (like an
+    /// R-DEMOTE abdication), so a sitting crown vacates promptly and leaves re-elect a
+    /// hinted-channel board instead of staying pinned to our now-wrong-channel HELLO.
+    pub hint_blocked: bool,
 }
 
 #[cfg(feature = "wifi")]
@@ -173,9 +202,11 @@ impl MeshElect {
             recovery_stale_floor_ms: 0, // #136: seeded by the caller on a recovery election
             boot: false,
             flush_incapable: false, // #146: seeded by the caller from the flush-fail abdication latch
+            channel_hint: None, // #155: seeded by the caller from the retained smol/mesh/channel_hint
             i_am_owner: false,
             owner_id: my_id,
             owner_alive: false,
+            hint_blocked: false, // #155: set by the claim gate on a channel-hint yield
         }
     }
 }
@@ -258,6 +289,22 @@ fn parse_mesh_channel(payload: &[u8]) -> Option<(u8, u8, u32)> {
     let ch: u8 = it.next()?.parse().ok()?;
     let seq: u32 = it.next()?.parse().ok()?;
     Some((owner, ch, seq))
+}
+
+/// #155: parse a retained `smol/mesh/channel_hint` payload → the hinted 2.4 GHz channel.
+/// A single decimal `u8` (the operator publishes `1`/`6`/`11`); surrounding ASCII whitespace is
+/// tolerated. An EMPTY payload (the retain-clear) or any malformed / out-of-range value → `None`
+/// (no hint) — so clearing the topic restores the un-hinted election, and a typo (e.g. `99`) can
+/// never wedge the mesh onto a channel no board can be on (fail-open). Panic-free (checked parse,
+/// no indexing). Accepts only 1..=13 (real 2.4 GHz channels); 0 is the advisory sentinel elsewhere.
+#[cfg(feature = "wifi")]
+fn parse_channel_hint(payload: &[u8]) -> Option<u8> {
+    let ch: u8 = core::str::from_utf8(payload).ok()?.trim().parse().ok()?;
+    if (1..=13).contains(&ch) {
+        Some(ch)
+    } else {
+        None
+    }
 }
 
 /// #21/#48/#55 leaf-relay: extract the leaf id `N` from a `smol/<N><suffix>` topic (the shape
@@ -2118,6 +2165,13 @@ fn mqtt_session(
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 3, MESH_CHANNEL_TOPIC) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
     }
+    // #155 channel-drag operator lever: subscribe the retained channel-hint (packet-id 13 — the
+    // first free id; 9 is `smol/+/ota/install`). Sent right after the election topic so its retained
+    // value rides the SAME broker burst as `MC` and is captured before the resolver runs (the settle
+    // window after the primary downlinks catches it, exactly like the OTA/config retained topics).
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 13, MESH_CHANNEL_HINT_TOPIC) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
 
     // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
     for &(id, line) in telemetry {
@@ -2432,6 +2486,14 @@ fn mqtt_session(
                     } else if topic == MESH_CHANNEL_TOPIC {
                         mc = parse_mesh_channel(payload); // #23 election record
                         got_mc = true; // present (unparseable → treated as claimable below)
+                    } else if topic == MESH_CHANNEL_HINT_TOPIC {
+                        // #155: capture the operator's retained channel hint into the election
+                        // record; the claim gate (below, next to the #146 guard) honors it. An
+                        // empty/garbage payload parses to None → no hint → unchanged election.
+                        elect.channel_hint = parse_channel_hint(payload);
+                        if let Some(h) = elect.channel_hint {
+                            log::info!("smol: #155 channel_hint = ch{} (retained)", h);
+                        }
                     } else if topic == OTA_STAGED_TOPIC {
                         // #33 Model-A: parse + GATE the retained STAGED line (monotonicity +
                         // host allowlist + size). A gate-passing staged build becomes the
@@ -3205,6 +3267,29 @@ fn mqtt_session(
         None
     } else {
         claim_seq
+    };
+    // #155 channel-drag OPERATOR LEVER: honor the retained `smol/mesh/channel_hint`. The mesh
+    // channel is PHYSICALLY the crown's AP channel (coexist single-radio), so a hint can only steer
+    // WHICH board holds the crown: a candidate whose OWN channel is KNOWN (non-zero) and != the
+    // hint must not claim, so the (re)election converges onto a board already on the hinted channel
+    // and the fleet stops being dragged onto a weak AP. Same claim-guard SHAPE as #146 above —
+    // suppress the claim HERE, before the MC publish, so the retained record is left to freeze and
+    // a hinted-channel board takes over off that frozen seq. `hint_blocked` tells the caller
+    // (mode.rs flush) to go HELLO-silent on a hint-driven yield so a SITTING crown vacates promptly.
+    // FAIL-OPEN on an unknown own-channel (`my_channel == 0`): a not-yet-learned board claims as
+    // before (never a crownless mesh while a channel is still being learned). No hint ⇒ no-op.
+    let claim_seq = match (claim_seq, elect.channel_hint) {
+        (Some(_), Some(h)) if elect.my_channel != 0 && elect.my_channel != h => {
+            elect.i_am_owner = false;
+            elect.hint_blocked = true;
+            log::info!(
+                "smol: #155 channel_hint ch{} != my ch{} — yielding crown (leaf until on-hint)",
+                h,
+                elect.my_channel
+            );
+            None
+        }
+        (cs, _) => cs,
     };
     if let Some(newseq) = claim_seq {
         // Record my own ownership locally so my seq counts as "fresh" next read, then

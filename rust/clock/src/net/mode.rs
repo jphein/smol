@@ -4166,10 +4166,22 @@ impl RadioManager {
                 self.relay.is_gateway = false;
                 self.scan_locked = false;
                 self.last_owner_heard_ms = now;
+                // #155: a HINT-DRIVEN yield (our channel != the operator's channel_hint) is an
+                // abdication, not an adopt-a-live-owner demote — go HELLO-silent like an R-DEMOTE
+                // so leaves stop following us on the wrong channel and re-elect a hinted-channel
+                // crown promptly. We DON'T latch flush_fail_latch: our uplink is fine (we flush),
+                // we're merely on the wrong channel — so we may reclaim once on a hinted-channel AP.
+                if elect.hint_blocked {
+                    self.silent_until_relock = true;
+                }
                 let _ = self.switch(Mode::EspNow);
                 log::info!(
-                    "smol: gateway DEMOTED — live owner id{} holds the mesh; leaf-scanning",
-                    self.elected_owner
+                    "smol: gateway DEMOTED — {} (leaf-scanning)",
+                    if elect.hint_blocked {
+                        "yielded on channel_hint, HELLO-silent"
+                    } else {
+                        "live owner holds the mesh"
+                    }
                 );
             }
         }
