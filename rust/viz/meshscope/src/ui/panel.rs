@@ -127,6 +127,27 @@ pub fn show(ui: &mut egui::Ui, model: &Model, selected: Option<u8>, now_s: f64) 
         if d.u64("heap").is_some_and(|h| h <= LOW_HEAP_B) {
             ui.label(RichText::new("⚠ low heap").color(Color32::from_rgb(230, 120, 90)));
         }
+        // #204: the crown's associated AP (which AP/channel/RSSI a deaf crown is on — the
+        // forensics gap that cost hours of pcap), and crown dead-downstream health.
+        if let Some(ap) = node.ap() {
+            kv(ui, "AP", &format!("ch{} · {} dBm · {}", ap.channel, ap.rssi, fmt_bssid(ap.bssid)));
+        }
+        if let Some(cd) = node.crown_deaf() {
+            let col = if cd.shed {
+                Color32::from_rgb(224, 90, 90)
+            } else if cd.streak > 0 {
+                Color32::from_rgb(230, 190, 70)
+            } else {
+                Color32::from_rgb(120, 200, 150)
+            };
+            ui.label(
+                RichText::new(format!(
+                    "crown-deaf: streak {} · reassoc {} · shed {}",
+                    cd.streak, cd.reassoc_cycles, if cd.shed { "yes" } else { "no" }
+                ))
+                .color(col),
+            );
+        }
         ui.separator();
     }
 
@@ -187,6 +208,10 @@ fn sparkline_plot(ui: &mut egui::Ui, name: &str, hist: &std::collections::VecDeq
         .show(ui, |plot_ui| {
             plot_ui.line(Line::new(pts).color(color).width(1.5_f32));
         });
+}
+
+fn fmt_bssid(b: [u8; 6]) -> String {
+    format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", b[0], b[1], b[2], b[3], b[4], b[5])
 }
 
 fn fmt_bytes(b: u64) -> String {

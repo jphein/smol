@@ -209,14 +209,29 @@ pub fn demo_driver(mesh: Res<MeshHandle>, mut script: ResMut<DemoScript>) {
         script.last_live_s = now;
         script.tick += 1;
         let tick = script.tick;
+        let crown = m.crown.map(|c| c.owner);
         for (slot, &id) in DEMO_FLEET.iter().enumerate() {
             let heap = 40_000 + (jitter(id as u64, tick) * 900.0) as i64;
             let up = 100 + now as u64;
             let boot = 4 + (id as u64 % 3);
-            let diag = format!(
-                "DIAG|slot={}|rst=POWERON|boot={boot}|ota=ok|up={up}|heap={heap}|hmin=37200|led=status:on|tage=30|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=0|dedup=0|hop=1",
+            // Vary NTP freshness across the fleet so the aura shows every state.
+            let (tage, tsrc): (u64, &str) = match id {
+                9 => (4200, "mesh"), // stale (red)
+                8 => (820, "mesh"),  // aging (amber)
+                11 => (0, "none"),   // unsynced (grey)
+                _ => (30, "ntp"),    // fresh (green)
+            };
+            let mut diag = format!(
+                "DIAG|slot={}|rst=POWERON|boot={boot}|ota=ok|up={up}|heap={heap}|hmin=37200|led=status:on|tage={tage}|tsrc={tsrc}|net=0:ok|brk=baked|otah=slot|fwd=0|dedup=0|hop=1",
                 slot % 2
             );
+            // The reigning crown reports its AP association + a climbing dead-downstream
+            // streak (#204) — the crown visibly sickens/reddens/flickers, then sheds and
+            // recovers, so the coexist disease is drama on the wall display.
+            if Some(id) == crown {
+                let streak = ((tick / 2) % 10) as u8; // 0..9, climbs then resets
+                diag.push_str(&format!("|ap=6:-58:a1b2c3d4e5f6|cdeaf={streak}:{}:{}", streak / 3, u8::from(streak >= 8)));
+            }
             m.ingest(now, &format!("smol/{id}/diag"), diag.as_bytes());
             let rssi = -52 + (jitter(tick, id as u64) * 6.0) as i32;
             m.ingest(now, &format!("smol/{id}/uplink"), rssi.to_string().as_bytes());

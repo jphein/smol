@@ -148,7 +148,7 @@ fn seed_demo(m: &mut Model) {
         let heap7 = 41_000 - (k as i64 * 30) + ((k % 5) as i64 * 40);
         let heap8 = 39_500 - (k as i64 * 12);
         let heap9 = 38_200 + ((k % 7) as i64 * 25);
-        m.ingest(t, "smol/7/diag", format!("DIAG|slot=0|rst=POWERON|boot=4|ota=ok|up={}|heap={heap7}|hmin=37200|loss=1|rtt=12|rx={}|tx={}|led=status:on|tage=30|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=0|dedup=0|ttl=0|hop=1|dlseq=0|dfwd=0", 100 + t as u64, 200 + k, 190 + k).as_bytes());
+        m.ingest(t, "smol/7/diag", format!("DIAG|slot=0|rst=POWERON|boot=4|ota=ok|up={}|heap={heap7}|hmin=37200|loss=1|rtt=12|rx={}|tx={}|led=status:on|tage=30|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=0|dedup=0|ttl=0|hop=1|dlseq=0|dfwd=0|ap=6:-58:a1b2c3d4e5f6|cdeaf=3:1:0", 100 + t as u64, 200 + k, 190 + k).as_bytes());
         m.ingest(t, "smol/8/diag", format!("DIAG|slot=1|rst=SW|boot=7|ota=ok|up={}|heap={heap8}|hmin=36900|loss=3|rtt=18|rx={}|tx={}|led=status:on|tage=820|tsrc=mesh|net=0:ok|brk=baked|otah=slot|fwd=0|dedup=2|ttl=0|hop=1|dlseq=1783|dfwd=1|cfg=Batt:2", 90 + t as u64, 150 + k, 140 + k).as_bytes());
         // id9: NTP-stale (~70 min since sync) — the case JP wants visible.
         m.ingest(t, "smol/9/diag", format!("DIAG|slot=0|rst=POWERON|boot=2|ota=ok|up={}|heap={heap9}|hmin=37600|loss=22|rtt=40|rx={}|tx={}|led=status:on|tage=4200|tsrc=mesh|net=0:ok|brk=baked|otah=slot|fwd=0|dedup=0|ttl=1|hop=2|dlseq=1783|dfwd=0", 60 + t as u64, 40 + k, 30 + k).as_bytes());

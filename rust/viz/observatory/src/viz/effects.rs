@@ -8,6 +8,8 @@ use std::f32::consts::TAU;
 
 use bevy::prelude::*;
 
+use mesh_model::model::{CrownDeaf, SyncFreshness};
+
 use crate::mesh::MeshHandle;
 use crate::palette;
 use crate::viz::{Comet, NodeId, Stream, VizState};
@@ -20,7 +22,8 @@ const BURST_DUR: f64 = 0.7;
 /// caused by the mesh, never faked.
 pub fn detect_transitions(mesh: Res<MeshHandle>, mut state: ResMut<VizState>) {
     let now = mesh.now();
-    let (owner, channel, ota): (Option<u8>, Option<u8>, Vec<(u8, bool)>) = {
+    #[allow(clippy::type_complexity)]
+    let (owner, channel, ota, crown_deaf): (Option<u8>, Option<u8>, Vec<(u8, bool)>, Option<CrownDeaf>) = {
         let Ok(m) = mesh.model.lock() else { return };
         let owner = m.crown.map(|c| c.owner);
         let channel = m.crown.map(|c| c.channel);
@@ -29,8 +32,12 @@ pub fn detect_transitions(mesh: Res<MeshHandle>, mut state: ResMut<VizState>) {
             .iter()
             .map(|(id, n)| (*id, n.ota.as_ref().map(|o| o.in_progress).unwrap_or(false)))
             .collect();
-        (owner, channel, ota)
+        // #204: the reigning crown's dead-downstream health.
+        let crown_deaf = owner.and_then(|o| m.nodes.get(&o)).and_then(|n| n.crown_deaf());
+        (owner, channel, ota, crown_deaf)
     };
+    state.crown_deaf_streak = crown_deaf.map(|c| c.streak).unwrap_or(0);
+    state.crown_shed = crown_deaf.map(|c| c.shed).unwrap_or(false);
 
     // Crown moved → launch a comet from old → new.
     if owner != state.crown_owner {
@@ -89,10 +96,24 @@ pub fn draw_crown(
 
     if let Some(owner) = state.crown_owner {
         if let Some(&c) = pos.get(&owner) {
-            gizmos.circle_2d(c, 34.0, palette::crown_gold());
+            // #204 crown-health: healthy = steady gold; as the dead-downstream streak
+            // climbs the crown reddens, dims and flickers; a SHED crown flickers violently
+            // — tonight's coexist disease made visible as drama on the wall display.
+            let sick = (state.crown_deaf_streak as f32 / 8.0).clamp(0.0, 1.0);
+            let brightness = if state.crown_shed {
+                0.2 + 0.4 * ((elapsed * 24.0).sin() * 0.5 + 0.5)
+            } else if sick > 0.05 {
+                let dim = 1.0 - 0.6 * sick;
+                let flick = 0.6 + 0.4 * (0.5 + 0.5 * (elapsed * (5.0 + sick * 14.0)).sin());
+                (dim * flick).clamp(0.15, 1.0)
+            } else {
+                1.0
+            };
+            let crown_col = palette::crown_health(sick, brightness);
+            gizmos.circle_2d(c, 34.0, crown_col);
             for i in 0..6 {
                 let a = elapsed * 0.6 + i as f32 * TAU / 6.0;
-                gizmos.circle_2d(c + Vec2::new(a.cos(), a.sin()) * 40.0, 2.6, palette::crown_gold());
+                gizmos.circle_2d(c + Vec2::new(a.cos(), a.sin()) * 40.0, 2.6, crown_col);
             }
         }
     }
@@ -144,6 +165,27 @@ pub fn draw_streams(mesh: Res<MeshHandle>, state: Res<VizState>, orbs: Query<(&N
                 gizmos.circle_2d(to, 4.0 + bf * 22.0, palette::ota_burst());
             }
         }
+    }
+}
+
+/// NTP-sync freshness aura ringing each orb (parity with meshscope's dots, #187): jade
+/// fresh · amber aging · red stale · grey unsynced — same 300/3600 thresholds. Stale and
+/// unsynced pulse to catch the eye; fresh/aging sit steady.
+pub fn draw_ntp_aura(time: Res<Time>, mesh: Res<MeshHandle>, orbs: Query<(&NodeId, &Transform)>, mut gizmos: Gizmos) {
+    let fresh: HashMap<u8, SyncFreshness> = {
+        let Ok(m) = mesh.model.lock() else { return };
+        m.nodes.iter().map(|(id, n)| (*id, n.sync_freshness())).collect()
+    };
+    let elapsed = time.elapsed_seconds();
+    for (n, t) in &orbs {
+        let Some(f) = fresh.get(&n.0) else { continue };
+        let pulse = match f {
+            SyncFreshness::Stale | SyncFreshness::Unsynced => 0.45 + 0.55 * (0.5 + 0.5 * (elapsed * 3.0).sin()),
+            _ => 0.7,
+        };
+        let base = palette::sync_color(*f).to_linear();
+        let col = Color::linear_rgb(base.red * pulse, base.green * pulse, base.blue * pulse);
+        gizmos.circle_2d(t.translation.truncate(), t.scale.x + 7.0, col);
     }
 }
 

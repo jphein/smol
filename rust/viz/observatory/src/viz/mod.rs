@@ -79,6 +79,9 @@ pub struct VizState {
     pub ota_active: HashMap<u8, bool>,
     pub comet: Option<Comet>,
     pub streams: Vec<Stream>,
+    /// #204 crown dead-downstream streak (cdeaf) — drives the crown's sick flicker.
+    pub crown_deaf_streak: u8,
+    pub crown_shed: bool,
 }
 
 pub struct VizPlugin;
@@ -100,6 +103,7 @@ impl Plugin for VizPlugin {
                     effects::detect_transitions,
                     effects::draw_crown,
                     effects::draw_streams,
+                    effects::draw_ntp_aura,
                     effects::channel_shift,
                     hud::update_hud,
                 )
