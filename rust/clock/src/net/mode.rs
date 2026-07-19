@@ -1052,19 +1052,27 @@ impl Roster {
         }
     }
 
-    /// #164: the best (lowest) link cost among fresh peers — this node's headline uplink-quality
-    /// signal for the DIAG record. `INFINITY` when no fresh peer exists (isolated / all links
-    /// silent). Reads the per-peer `etx` off the same [`RosterView`] that #155/#165 (and Bench)
-    /// consume via [`RadioManager::roster`], so the per-peer surface has a live reader.
-    fn best_link_cost(&self, now: u64) -> u8 {
+    /// #164: the WORST (highest) link cost among fresh peers — this node's headline drag signal
+    /// for the DIAG record. `INFINITY` when no fresh peer exists (isolated). **worst, not best,
+    /// by design** (morpheus-155's #155 review): the channel-drag disease is *asymmetric* — a
+    /// dragged leaf can still have one good peer, so a `min` (best-link) aggregate would report a
+    /// healthy number and HIDE the drag. `max` surfaces "some link of mine is bad." It reads the
+    /// per-peer `etx` off the same [`RosterView`] that #155/#165 (and Bench) consume via
+    /// [`RadioManager::roster`] — and that per-peer surface is the PRECISE path: an options-1/2
+    /// channel policy should read the leaf→crown link specifically (peer id == the elected owner),
+    /// which `max` only approximates. Keeping the per-peer field the load-bearing primitive.
+    fn worst_link_cost(&self, now: u64) -> u8 {
         let view = self.view(now);
-        let mut best = crate::net::etx::INFINITY;
+        if view.count == 0 {
+            return crate::net::etx::INFINITY; // isolated: no fresh peer heard
+        }
+        let mut worst = 0u8;
         for n in &view.nodes[..view.count] {
-            if n.etx < best {
-                best = n.etx;
+            if n.etx > worst {
+                worst = n.etx;
             }
         }
-        best
+        worst
     }
 
     /// Snapshot the fresh peers (heard within `ROSTER_STALE_MS`), strongest-RSSI
@@ -2833,10 +2841,11 @@ impl RadioManager {
         // reads 1. Surfaced so the rig sees a leaf latch/un-latch (and `fwd`/`dedup`/`ttl`
         // score P2/P3; `fwd == 0` fleet-wide is the C0 all-hear byte-identical canary).
         let mesh_hop = if self.relay.latch.latched() { crate::net::flood::MAX_HOP } else { 1 };
-        // #164: this node's best (lowest) per-peer link cost — 0 = a perfect link exists, 255 =
-        // no fresh id-known peer heard (isolated). Complements the `loss`/`rtt` set with a
-        // HELLO-reception-derived quality signal #155 (channel choice) can aggregate fleet-wide.
-        let etx_best = self.roster.best_link_cost(now_ms());
+        // #164: this node's WORST per-peer link cost — 0 = every fresh link perfect, 253 = a
+        // link is dragging, 255 = no fresh peer (isolated). `worst` not `min` on purpose (#155
+        // review): min would hide an asymmetric drag. The per-peer roster surface is the precise
+        // path for an options-1/2 policy (leaf→crown link); this DIAG field is the coarse beacon.
+        let etx_worst = self.roster.worst_link_cost(now_ms());
         let mut rec = alloc::format!(
             "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}|brk={}|otah={}|fwd={}|dedup={}|ttl={}|hop={}|dlseq={}|dfwd={}|etx={}",
             d.boot_slot,
@@ -2873,7 +2882,7 @@ impl RadioManager {
             // a v1-only leaf. Representative of the downlink channel; GRID2 uses the same mechanism.
             self.batt.dl_seq,
             self.diag.dfwd,
-            etx_best, // #164 best per-peer link cost (0 = perfect … 255 = no fresh peer)
+            etx_worst, // #164 worst per-peer link cost (0 = all perfect … 253 = dragging … 255 = isolated)
         );
         // #74 item 3 (stage-2): fold in the APPLIED-config string for HA config-drift, ONLY when
         // `main` populated it (espnow build). ASCII by construction (as_wire/to_wire/hex/F24). HA
