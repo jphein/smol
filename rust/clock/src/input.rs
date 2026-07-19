@@ -29,16 +29,22 @@
 //! importantly, needs no blocking delay — everything is derived from the
 //! timestamps handed in by the caller, so the OLED/LED keep updating.
 
+// #152: the physical BOOT-button HAL (GPIO9 debounce) rides `hw`; the host emulator
+// (`hostsim`) synthesizes `Press` from keyboard/tap directly, so it needs only the
+// `Press` contract below — not the GPIO plumbing.
+#[cfg(feature = "hw")]
 use esp_hal::gpio::{Input, InputConfig, Pull};
 
 /// A raw level must be stable this long (ms) before we accept it as a real
 /// edge. 25 ms comfortably rejects the few-ms mechanical bounce of a tact switch
 /// without adding perceptible latency.
+#[cfg(feature = "hw")]
 const DEBOUNCE_MS: u64 = 25;
 
 /// Press duration (ms) at/above which a press is a **long** press rather than a
 /// short tap. ~700 ms per the spec: long enough that a normal "click" never
 /// trips it, short enough that "hold to enter/back" doesn't feel sticky.
+#[cfg(feature = "hw")]
 const LONG_PRESS_MS: u64 = 700;
 
 /// The gesture a completed (or crossing-threshold) button interaction produced.
@@ -53,6 +59,7 @@ pub enum Press {
 }
 
 /// Internal debounce/gesture phase.
+#[cfg(feature = "hw")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// Button released and stable.
@@ -65,11 +72,13 @@ enum Phase {
 }
 
 /// Debounced BOOT button with short-tap / long-press classification.
+#[cfg(feature = "hw")]
 pub struct Button {
     pin: Input<'static>,
     phase: Phase,
 }
 
+#[cfg(feature = "hw")]
 impl Button {
     /// Wrap GPIO9 as a pulled-up active-low input. `main` owns `esp_hal::init()`
     /// and the pin singleton and passes it in, so the HAL is initialised once.

@@ -19,6 +19,10 @@
 //! takes its own reference-counted peripheral guard from esp-hal, so they
 //! coexist without fighting over the peripheral.
 
+// #152: the physical die-temp + battery-ADC reads are HAL (`hw`). The host emulator
+// (`hostsim`) provides a stub `Sensors` further down that returns a canned `Reading`, so
+// `draw_clock` (which takes `&mut Sensors` + calls `.read()`) compiles + renders unchanged.
+#[cfg(feature = "hw")]
 use esp_hal::{
     analog::adc::{Adc, AdcConfig, AdcPin, Attenuation},
     peripherals::{ADC1, GPIO4, TSENS},
@@ -74,12 +78,14 @@ pub struct Reading {
 
 /// Owns the temperature sensor + a configured ADC1 channel and produces a
 /// [`Reading`] on demand.
+#[cfg(feature = "hw")]
 pub struct Sensors<'d> {
     tsens: TemperatureSensor<'d>,
     adc: Adc<'d, ADC1<'d>, esp_hal::Blocking>,
     batt_pin: AdcPin<GPIO4<'d>, ADC1<'d>>,
 }
 
+#[cfg(feature = "hw")]
 impl<'d> Sensors<'d> {
     /// Bring up the chip temperature sensor and ADC1 on [`BATT_ADC_GPIO`].
     ///
@@ -122,6 +128,34 @@ impl<'d> Sensors<'d> {
             chip_c,
             batt_v,
             batt_pct,
+        }
+    }
+}
+
+/// #152 host emulator stub: a `Sensors` with the SAME `read()` surface but no HAL — it
+/// returns a fixed, plausible `Reading` (mild die temp, ~full 1S cell) so the Clock's
+/// sensor line renders in the browser. Keeps the `'d` lifetime so `Ctx`'s
+/// `&'a mut Sensors<'static>` field type is unchanged. `Default` = `new()`.
+#[cfg(not(feature = "hw"))]
+#[derive(Default)]
+pub struct Sensors<'d> {
+    _marker: core::marker::PhantomData<&'d ()>,
+}
+
+#[cfg(not(feature = "hw"))]
+impl<'d> Sensors<'d> {
+    pub fn new() -> Self {
+        Self {
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    /// A canned sample (24.0 °C die, 4.05 V ≈ 92 % 1S) — the emulator has no hardware.
+    pub fn read(&mut self) -> Reading {
+        Reading {
+            chip_c: 24.0,
+            batt_v: 4.05,
+            batt_pct: batt_percent(4.05),
         }
     }
 }
