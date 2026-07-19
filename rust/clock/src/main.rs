@@ -173,6 +173,13 @@ mod ota;
 #[cfg(feature = "espnow")]
 mod ota_mesh;
 
+// #161 the dedicated on-board OTA screen (receiving / feeding / self-fetch): a full-glass
+// progress display that auto-takes over while an update is in flight. Supersedes #153's 1-px
+// edge. Pure presentation over the OtaProgress cell + the leaf receive session — no radio
+// traffic, no wire change. espnow-only (the OTA-display path is likewise espnow-gated).
+#[cfg(feature = "espnow")]
+mod ota_screen;
+
 // LOCAL git-ignored WiFi credentials, used by the `wifi`/`espnow` radio bring-up.
 #[cfg(feature = "wifi")]
 mod secrets;
@@ -741,6 +748,15 @@ fn main() -> ! {
     // the plugins. Cleared at the end of every tick.
     let mut redraw = true;
 
+    // #161: state for the RECEIVING-leaf OTA takeover — an inbound mesh-OTA paints the
+    // dedicated OTA screen OVER the app frame each tick while the leaf session is live.
+    // `ota_rx_eta` estimates the ETA from block-rate; `was_ota_rx` is the edge latch that
+    // forces the app to repaint once the transfer ends (it resumes over our screen).
+    #[cfg(feature = "espnow")]
+    let mut ota_rx_eta = ota_screen::OtaEta::new();
+    #[cfg(feature = "espnow")]
+    let mut was_ota_rx = false;
+
     // Hold the boot splash for at least SPLASH_MIN_MS total. The espnow/wifi NTP
     // burst above usually already blew past this (the splash was up throughout);
     // this only adds real wait in the default build, where bring-up is instant.
@@ -830,10 +846,14 @@ fn main() -> ! {
                 if let Some(announce) = r.take_ota_offer() {
                     let mut ota_draw_ms = 0u64;
                     let mut ota_abort = false;
-                    // #153: OTA self-install is minutes-scale → keep the frozen app frame and
-                    // paint only a 1-px bottom progress edge from the live byte counts the
-                    // fetch writes into `ota_prog` (throttled to SYNC_REDRAW_MS like the old spinner).
+                    // #161: OTA self-install is minutes-scale → paint the dedicated full-glass OTA
+                    // screen (source host + big block bar + %/ETA + the incoming build's codename)
+                    // from the live byte counts the fetch writes into `ota_prog`, throttled to
+                    // SYNC_REDRAW_MS. Supersedes #153's 1-px edge for the self-fetch path.
                     let ota_prog = core::cell::Cell::new(ota::OtaProgress::default());
+                    let ota_host = ota::split_url(announce.url()).map(|(h, _, _)| h).unwrap_or("net");
+                    let ota_build = announce.build;
+                    let mut ota_eta = ota_screen::OtaEta::new();
                     r.run_ota_update(&announce, &mut || {
                         let t = millis();
                         led.apply(led::LedState::WifiSync, t);
@@ -843,7 +863,14 @@ fn main() -> ! {
                         if t.saturating_sub(ota_draw_ms) >= SYNC_REDRAW_MS {
                             ota_draw_ms = t;
                             let p = ota_prog.get();
-                            draw_ota_edge(&mut display, p.done, p.total);
+                            ota_screen::draw(&mut display, &ota_screen::OtaView {
+                                kind: ota_screen::OtaKind::SelfFetch { host: ota_host },
+                                build: ota_build,
+                                done: p.done,
+                                total: p.total,
+                                eta_s: ota_eta.sample(p.done, p.total, t),
+                                unit: ota_screen::OtaUnit::Bytes,
+                            });
                         }
                         ota_abort
                     }, &ota_prog);
@@ -1187,10 +1214,16 @@ fn main() -> ! {
                         if let Some(mac) = r.mac_for_id_sticky(leaf_id) {
                             let mut relay_draw_ms = 0u64;
                             let mut relay_abort = false;
-                            // #153: leaf-feed relay is minutes-scale → keep the frozen app frame
-                            // and paint the 1-px bottom progress edge (fetch bytes then ESP-NOW
-                            // chunk windows, both written into `relay_prog` by run_leaf_ota_relay).
+                            // #161: leaf-feed relay is minutes-scale → paint the dedicated OTA
+                            // screen ("feeding <leaf>" + big block bar + %/ETA + the incoming
+                            // build's codename) from the counts run_leaf_ota_relay writes into
+                            // `relay_prog`. That counter is BYTES during the gateway's own fetch
+                            // then BLOCKS during the ESP-NOW relay, so the unit is auto-picked per
+                            // paint (>10k ⇒ bytes) and the ETA re-anchors itself at the phase flip
+                            // (done drops → OtaEta re-seeds), keeping the readout clean throughout.
                             let relay_prog = core::cell::Cell::new(ota::OtaProgress::default());
+                            let relay_build = ann.build;
+                            let mut relay_eta = ota_screen::OtaEta::new();
                             let outcome = r.run_leaf_ota_relay(leaf_id, mac, &ann, &mut || {
                                 let t = millis();
                                 led.apply(led::LedState::WifiSync, t);
@@ -1200,7 +1233,18 @@ fn main() -> ! {
                                 if t.saturating_sub(relay_draw_ms) >= SYNC_REDRAW_MS {
                                     relay_draw_ms = t;
                                     let p = relay_prog.get();
-                                    draw_ota_edge(&mut display, p.done, p.total);
+                                    ota_screen::draw(&mut display, &ota_screen::OtaView {
+                                        kind: ota_screen::OtaKind::Feeding { leaf_id },
+                                        build: relay_build,
+                                        done: p.done,
+                                        total: p.total,
+                                        eta_s: relay_eta.sample(p.done, p.total, t),
+                                        unit: if p.total > 10_000 {
+                                            ota_screen::OtaUnit::Bytes
+                                        } else {
+                                            ota_screen::OtaUnit::Blocks
+                                        },
+                                    });
                                 }
                                 relay_abort
                             }, &relay_prog);
@@ -1592,6 +1636,44 @@ fn main() -> ! {
         // === Advance + render the active screen. Each plugin owns its update
         // cadence + its framebuffer clear/flush — the old per-mode match arms,
         // relocated VERBATIM into each `Plugin::update` (the equivalence proof).
+        // #161: while THIS board is RECEIVING a mesh-OTA, the dedicated OTA screen takes over
+        // the whole glass (auto-activated by `ota_rx_view`, not a menu item) — the app frame is
+        // frozen until the transfer ends, then repainted (forced redraw on the falling edge).
+        // The receive session is serviced in `service()` BEFORE dispatch, so skipping the app
+        // render here only pauses PAINTING, never the mesh/flash logic.
+        #[cfg(feature = "espnow")]
+        {
+            let ota_rx = ctx.radio.as_deref().and_then(|r| r.ota_rx_view());
+            match ota_rx {
+                Some(view) => {
+                    let eta = ota_rx_eta.sample(view.done, view.total, now);
+                    ota_screen::draw(
+                        ctx.display,
+                        &ota_screen::OtaView {
+                            kind: ota_screen::OtaKind::Receiving {
+                                source_id: view.source_id,
+                                hop: view.hop,
+                            },
+                            build: view.build,
+                            done: view.done,
+                            total: view.total,
+                            eta_s: eta,
+                            unit: ota_screen::OtaUnit::Blocks,
+                        },
+                    );
+                    was_ota_rx = true;
+                }
+                None => {
+                    if was_ota_rx {
+                        was_ota_rx = false;
+                        ota_rx_eta.reset();
+                        ctx.redraw = true; // transfer ended → repaint the app over our screen
+                    }
+                    app.update(&mut ctx);
+                }
+            }
+        }
+        #[cfg(not(feature = "espnow"))]
         app.update(&mut ctx);
 
         // #26 cast: snapshot the just-rendered glass image into the shared cast frame
@@ -1654,40 +1736,6 @@ where
         .ok();
     // The caller flushes — `flush` lives on the concrete `Ssd1306`, not the
     // generic `DrawTarget` (same split as `draw_clock`/`draw_snake_death`).
-}
-
-/// #20: the "Syncing WiFi" indicator shown while a WiFi burst blocks the loop
-/// #153: the 1-px OTA progress edge along the display's BOTTOM row — the minimal feedback
-/// that replaced the retired full-screen `draw_syncing` spinner. Unlike the spinner it does
-/// NOT clear the framebuffer: the frozen last app frame stays visible above, and only row
-/// `y = H-1` is repainted (Off across the full width, then On for the completed fraction)
-/// before flushing. `done`/`total` are the transfer counts the fetch/relay writes into the
-/// shared [`ota::OtaProgress`] cell — bytes for a self-fetch, chunks for a leaf relay; only
-/// the ratio is rendered. `total == 0` (op just armed) → an empty edge. The long-press abort
-/// is unadvertised now (issue #153) but still live. espnow-only, matching the blocking OTA
-/// path, so default/wifi builds stay untouched.
-#[cfg(feature = "espnow")]
-fn draw_ota_edge(display: &mut app::Oled, done: u32, total: u32) {
-    use embedded_graphics::primitives::{Line, PrimitiveStyle};
-    let bb = display.bounding_box();
-    let w = bb.size.width as i32;
-    let y = bb.size.height as i32 - 1;
-    // Erase the bottom row only (the app frame above is left intact), then paint the
-    // completed fraction. The erase keeps it correct even if a resume lowers the count.
-    Line::new(Point::new(0, y), Point::new(w - 1, y))
-        .into_styled(PrimitiveStyle::with_stroke(BinaryColor::Off, 1))
-        .draw(display)
-        .ok();
-    if total > 0 && done > 0 {
-        let filled = ((done.min(total) as u64 * w as u64) / total as u64) as i32;
-        if filled > 0 {
-            Line::new(Point::new(0, y), Point::new(filled - 1, y))
-                .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
-                .draw(display)
-                .ok();
-        }
-    }
-    display.flush().ok();
 }
 
 /// Write `"v<build_num> <ver_noun>"` into `out` (heap-free — the splash runs in the

@@ -545,6 +545,19 @@ impl OtaLeafSession {
         self.gateway_mac
     }
 
+    /// #161: a live snapshot for the on-board OTA screen — `(done, total, build, gateway_mac)`
+    /// where `done`/`total` are BLOCKS: fully-committed windows (`window_base`) plus the current
+    /// window's received chunks (`window_recv` popcount), clamped to `total_chunks`. `None` when
+    /// idle. READ-ONLY — touches no flash/otadata and does not perturb the transfer; the caller
+    /// resolves `gateway_mac` → a source id for the "from <noun>" line.
+    pub fn rx_progress(&self) -> Option<(u32, u32, u32, [u8; 6])> {
+        if !self.active {
+            return None;
+        }
+        let done = self.window_base.saturating_add(self.window_recv.count_ones());
+        Some((done.min(self.total_chunks), self.total_chunks, self.build, self.gateway_mac))
+    }
+
     /// Discard the session (drop the writer WITHOUT activating → otadata untouched).
     fn discard(&mut self) {
         self.active = false;

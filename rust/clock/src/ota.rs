@@ -128,6 +128,31 @@ pub struct OtaProgress {
     pub total: u32,
 }
 
+/// #161: a read-only snapshot of the mesh-OTA a RECEIVING leaf is currently taking, for the
+/// dedicated on-board OTA screen (`crate::ota_screen`). `main` reads it each tick via
+/// [`crate::net::mode::RadioManager::ota_rx_view`] and, while it is `Some`, paints the OTA
+/// screen OVER the frozen app frame — auto-activated by an inbound transfer, never a menu
+/// item. Pure PRESENTATION of state the leaf receive session (`OtaLeafSession`) already
+/// tracks: no new telemetry, no wire/format change. Copy + tiny so it crosses the borrow
+/// (read `ctx.radio`, release, then draw with `ctx.display`) as a value. espnow-only — the
+/// leaf receive path only exists in the mesh build.
+#[cfg(feature = "espnow")]
+#[derive(Clone, Copy)]
+pub struct OtaRxView {
+    /// The feeding gateway's logical id when the roster can place its MAC (`None` = a MAC we
+    /// can't name yet → the screen says "from mesh" rather than inventing an id).
+    pub source_id: Option<u8>,
+    /// ESP-NOW hops from the source. Leaf-mesh-OTA is single-hop today (gateway→leaf), so this
+    /// is 1; kept a field so a future multi-hop relay can surface the true distance unchanged.
+    pub hop: u8,
+    /// The incoming image's monotonic build number (from the SIGNED manifest) — drives the
+    /// "→ v<n>" line + its deterministic FORGE codename ("what you're becoming").
+    pub build: u32,
+    /// Image blocks committed so far / total blocks (the `k/n` readout + the bar fill ratio).
+    pub done: u32,
+    pub total: u32,
+}
+
 #[derive(Clone, Copy)]
 pub struct Announce {
     pub build: u32,
