@@ -3639,6 +3639,10 @@ impl RadioManager {
         }
 
         let mut wb: u32 = 0;
+        // #157: set when the LAST window is positively acked by the leaf's finalize-ack (an
+        // all-zero OTAN at the last window base) → delivered-CONFIRMED. Stays false if the last
+        // window only exited via the blind round-exhaustion fallthrough → delivered-UNCONFIRMED.
+        let mut last_win_acked = false;
         'windows: while wb < total {
             if tick() {
                 return LeafOtaOutcome::Aborted;
@@ -3740,6 +3744,12 @@ impl RadioManager {
                     }
                 }
                 if advanced {
+                    // #157: an all-zero OTAN at the LAST window base is the leaf's finalize-ack —
+                    // positive proof it received the whole image + is activating. (For non-last
+                    // windows it's the ordinary advance-ack.)
+                    if wb + WINDOW_CHUNKS as u32 >= total {
+                        last_win_acked = true;
+                    }
                     wb += WINDOW_CHUNKS as u32;
                     break;
                 }
@@ -3856,12 +3866,23 @@ impl RadioManager {
                 log::info!("smol #40: leaf id{} CONFIRMED at build {} — update stuck", leaf_id, b);
                 LeafOtaOutcome::Confirmed
             }
-            Some(b) => {
+            // Settled at an OLD build. #157: distinguish a genuine self-test rollback (the leaf
+            // finalize-acked → it DID complete + activate, then rolled back) from a stranded feed
+            // (NO finalize-ack → it never completed the last window, so it's on the old build
+            // because it never activated — not a rollback). The stranded case must RETRY, not clear.
+            Some(b) if last_win_acked => {
                 log::warn!(
-                    "smol #40: leaf id{} settled at OLD build {} — self-test rolled it back (HA re-offers)",
+                    "smol #40: leaf id{} settled at OLD build {} after finalize-ack — self-test rolled it back (HA re-offers)",
                     leaf_id, b
                 );
                 LeafOtaOutcome::RolledBack
+            }
+            Some(b) => {
+                log::warn!(
+                    "smol #40 #157: leaf id{} on OLD build {} + NO finalize-ack → DELIVERED-UNCONFIRMED (last-window frame lost; retrying)",
+                    leaf_id, b
+                );
+                LeafOtaOutcome::RelayUnconfirmed
             }
             None => {
                 if let Some(wrong) = mac_seen_id {
@@ -3873,12 +3894,23 @@ impl RadioManager {
                         leaf_id, wrong
                     );
                     LeafOtaOutcome::IdMismatch
-                } else {
+                } else if last_win_acked {
+                    // #157: the leaf finalize-acked (completed + activating) but never re-STATed —
+                    // it activated and went silent → a genuine possible brick (unchanged semantics).
                     log::error!(
-                        "smol #40: leaf id{} did not reappear at build {} within the confirm window — possible brick (USB recovery)",
+                        "smol #40: leaf id{} finalize-acked then did not reappear at build {} — possible brick (USB recovery)",
                         leaf_id, announce.build
                     );
                     LeafOtaOutcome::Timeout
+                } else {
+                    // #157: never finalize-acked AND never re-STATed → the feed never completed
+                    // (leaf still on the old image, mesh-silent this window) → delivered-unconfirmed,
+                    // retry rather than mislabel as a brick.
+                    log::warn!(
+                        "smol #40 #157: leaf id{} never finalize-acked + no STAT → DELIVERED-UNCONFIRMED (retrying)",
+                        leaf_id
+                    );
+                    LeafOtaOutcome::RelayUnconfirmed
                 }
             }
         }
@@ -4764,9 +4796,18 @@ impl RadioManager {
         // window; abort on a progress/hard-cap timeout). No-op unless a transfer is live.
         {
             let mut out = [0u8; crate::ota_mesh::OTAN_FRAME_MAX];
-            if let crate::ota_mesh::LeafAction::Nak(n) = self.ota_leaf.tick(self.id, now_ms(), &mut out) {
-                let gw = self.ota_leaf.gateway_mac();
-                self.send_to(&gw, &out[..n]);
+            match self.ota_leaf.tick(self.id, now_ms(), &mut out) {
+                crate::ota_mesh::LeafAction::Nak(n) => {
+                    let gw = self.ota_leaf.gateway_mac();
+                    self.send_to(&gw, &out[..n]);
+                }
+                // #157: the leaf self-activates from the finalize-ack timer (belt-and-braces) —
+                // even if the gateway never acknowledged the finalize-ack, a verified complete
+                // image must not stay stranded. `activate` reboots into the new slot on success.
+                crate::ota_mesh::LeafAction::Complete(slot, build) => {
+                    crate::ota::activate(slot, build, true);
+                }
+                crate::ota_mesh::LeafAction::None | crate::ota_mesh::LeafAction::Abort => {}
             }
         }
         label
