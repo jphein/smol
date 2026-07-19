@@ -281,6 +281,8 @@ A signature is an **appended field**; an old board ignores the extra bytes (or t
 ### 7.3 The composition trap (must verify)
 Signing/encryption must not break the guards I and others just shipped: **#155 channel_hint gate, #146/#136/#137/#150 election guards, #204 self-heal.** A signed MC still has to flow through the same resolver; the group-MAC filter still has to let the #204 detector see "sustained inbound" (a MAC drop must not be mistaken for RF deafness — count MAC-fails separately). **Design so auth is a filter *in front of* the existing logic, never a rewrite of it** — verify-then-parse (the OTAM order), exactly as #184's verify gate already sits before `parse_manifest`.
 
+**How a group-key mishap actually manifests (from morpheus-155's #204 review — shapes the canary).** The group MAC rides **ESP-NOW broadcast** (HELLO / flood / TIME / FAM), but #204's crown-liveness `got_mc` detector keys on the **MQTT retained downlink (TCP, not ESP-NOW)**. So a bad GROUP_KEY / wrong key-epoch does **NOT** trip a crown-deaf-shed — it makes **leaves drop the crown's HELLO → owner-lock lost → recovery-election churn**. Two consequences for the observe→enforce rollout (§7.1): (a) the transition canary must watch **leaf owner-lock stability**, not just crown liveness — HELLO-drop churn is the failure signature here; and (b) **never flip enforce during (or adjacent to) a #204 episode** — a real crown-loss + a MAC-enforce flip would compound into hard-to-diagnose churn. Gate the flip on a quiet fleet.
+
 ---
 
 ## 8. What NOT to sign / encrypt (C3 perf & RAM budget)
@@ -288,7 +290,7 @@ Signing/encryption must not break the guards I and others just shipped: **#155 c
 The C3 is single-core RISC-V @160 MHz, ~400 KB SRAM, no PSRAM. ed25519 verify is ~ms-scale; **signing** is comparable but adds RNG + key handling. Budget rules:
 
 - **DON'T sign** high-rate/nuisance frames: HELLO (2 Hz × N boards), BEACON, RELAY telemetry, DIAG, STAT, SCAN, FAM. Signing these would (a) blow airtime on the deaf-⅓ single radio and (b) burn CPU on a board already CPU-blocking during flush. **The reshaped #190 group MAC covers them for +8 B + one sha256 (not a 64-B sig, not a ~ms verify); that's sufficient for nuisance-tier.** *(Amended: the original said "#190 covers them for free" when #190 = zero-cost hardware AES-CCM; the app-layer MAC is +8 B/frame + cheap sha256 — still far below a signature, but not literally free. Budget it.)*
-- **DON'T MAC** anything if #190 is on — a symmetric MAC duplicates the PMK's protection (§3 tier B).
+- **DON'T add a *second* MAC** — post-reshape, the group MAC (§3 tier B) **IS** #190; every broadcast frame already carries it. Don't layer another symmetric MAC on top. *(Amended: the original bullet said "don't MAC if #190 is on — it duplicates the PMK" — self-contradictory now that the MAC is #190, not AES-CCM.)*
 - **DO sign** only: OTA arm (done), crown MC, remote-reboot/config INTENT — all **low-rate** (per-election / per-command).
 - **RAM:** verify is no-alloc (proven, `ota.rs`); a per-node signing key adds 32 B priv + 32 B pub in NVS — negligible. The 64-B sig buffers are stack, sized like the existing OTAM path.
 - **Airtime is the real budget, not CPU:** the [smol retire-the-burst] deaf window means every extra broadcast byte matters. This is why §3's chain-of-trust (sign the root, not every record) is the scalable answer.
@@ -325,7 +327,7 @@ This auth design and the ledger are the **same coin**: the ledger study's "authe
 
 1. ~~**#190 broadcast encryption** — does `esp-wifi` support PMK-encrypted *broadcast*?~~ **✅ RESOLVED (#36): NO — unicast-LMK only.** #190 is reshaped to the group HMAC (§4); this is no longer an unknown. *The remaining #190 decision for JP is simply: greenlight the group-MAC rung, or defer it — there are no impossible options left in it.*
 2. **On-device key gate (#184 model B)** — is autonomous self-election authenticity worth a per-board private key on physically-accessible hardware? Or is the model-A operator-signed-steer fallback (§5.3) enough for v1?
-3. **Rotation appetite** — flag-day reflash vs the two-release overlap window (§7)? Affects whether #190 is a weekend or a two-wave rollout.
+3. **Initial provisioning** — flag-day reflash vs a two-release dual-listen window (§7) for *first* GROUP_KEY rollout? *(Rotation itself is now OTA-able via the key-epoch overlap — §4.1/§6 — so this question is about first provisioning only, not ongoing rotation.)*
 4. **Enforce threshold** — after the observe phase, what `verify_fail` rate / soak duration gates the flip from soft-accept to hard-reject-unsigned?
 5. **Replay** — is `dl_seq` sufficient anti-replay for signed INTENTs, or does a reboot/command need a nonce + freshness window (a signed reboot captured off the air could be replayed later)?
 
