@@ -17,6 +17,11 @@ pub struct BrokerCfg {
     pub port: u16,
     pub user: String,
     pub pass: String,
+    /// MQTT client id. MUST be unique per concurrent client — two clients sharing an
+    /// id get kicked by the broker into a reconnect war. meshscope defaults to
+    /// "meshscope"; observatory (#159) uses "observatory". (Frozen mesh-model API,
+    /// coordinated with morpheus-159.) Override via SMOL_MQTT_CLIENT_ID.
+    pub client_id: String,
 }
 
 impl BrokerCfg {
@@ -35,6 +40,7 @@ impl BrokerCfg {
             port,
             user: std::env::var("SMOL_MQTT_USER").unwrap_or_default(),
             pass: std::env::var("SMOL_MQTT_PASS").unwrap_or_default(),
+            client_id: std::env::var("SMOL_MQTT_CLIENT_ID").unwrap_or_else(|_| "meshscope".to_string()),
         })
     }
 
@@ -47,7 +53,7 @@ impl BrokerCfg {
 /// for ages) so every timestamp shares one clock.
 pub fn spawn(model: Arc<Mutex<Model>>, cfg: BrokerCfg, start: Instant) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut opts = MqttOptions::new("meshscope", &cfg.host, cfg.port);
+        let mut opts = MqttOptions::new(&cfg.client_id, &cfg.host, cfg.port);
         opts.set_keep_alive(Duration::from_secs(30));
         opts.set_max_packet_size(256 * 1024, 256 * 1024); // screen BMPs + big diag
         if !cfg.user.is_empty() {
