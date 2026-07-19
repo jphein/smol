@@ -1,0 +1,32 @@
+# meshscope — realtime egui mesh instrument for the smol mesh (issue #158).
+#
+# OWN workspace — deliberately isolated from the embedded `rust/clock` crate and
+# its pinned esp-hal toolchain. The empty `[workspace]` table below makes this a
+# self-contained workspace root so it can NEVER be accidentally absorbed into a
+# parent workspace. Builds for the HOST (x86_64-unknown-linux-gnu), not the C3.
+[workspace]
+
+[package]
+name = "meshscope"
+version = "0.1.0"
+edition = "2021"
+description = "Realtime egui instrument for the smol ESP-NOW mesh (MQTT smol/# -> live graph)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# Immediate-mode GUI + native windowing (glow/OpenGL backend, dlopens X11/wayland
+# at runtime — no build-time dev libs required).
+eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.28"
+egui_plot = "0.28"      # sparklines in the detail panel
+# Hand-rolled-free MQTT 3.1.1 client (blocking API in its own thread).
+rumqttc = "0.24"
+# ota/state + HA discovery JSON.
+serde_json = "1"
+# Load a local .env (SMOL_MQTT_HOST/USER/PASS) if present — never committed.
+dotenvy = "0.15"
+
+[profile.release]
+opt-level = 2
+lto = "thin"

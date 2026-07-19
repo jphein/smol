@@ -1,0 +1,96 @@
+//! The eframe `App`: top status bar, central node graph, right detail panel, bottom
+//! event ticker. Reads the shared [`Model`] under its lock once per frame.
+
+pub mod graph;
+mod panel;
+mod ticker;
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use egui::{Color32, RichText};
+
+use crate::model::{ConnState, Model};
+use graph::GraphLayout;
+
+pub struct MeshscopeApp {
+    model: Arc<Mutex<Model>>,
+    layout: GraphLayout,
+    selected: Option<u8>,
+    start: Instant,
+}
+
+impl MeshscopeApp {
+    pub fn new(cc: &eframe::CreationContext<'_>, model: Arc<Mutex<Model>>, start: Instant, selected: Option<u8>) -> Self {
+        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        MeshscopeApp { model, layout: GraphLayout::default(), selected, start }
+    }
+}
+
+impl eframe::App for MeshscopeApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Keep animating the force layout + live data.
+        ctx.request_repaint_after(Duration::from_millis(33));
+        let now_s = self.start.elapsed().as_secs_f64();
+
+        // Decouple the guard from `self` by locking a cloned Arc.
+        let model = self.model.clone();
+        let m = model.lock().unwrap();
+
+        egui::TopBottomPanel::top("top").show(ctx, |ui| top_bar(ui, &m));
+
+        egui::TopBottomPanel::bottom("events")
+            .resizable(true)
+            .default_height(148.0)
+            .min_height(60.0)
+            .show(ctx, |ui| {
+                ui.add_space(2.0);
+                ui.label(RichText::new(format!("event ticker · {} msgs", m.msg_count)).strong().small());
+                ticker::show(ui, &m, now_s);
+            });
+
+        egui::SidePanel::right("detail").resizable(true).default_width(310.0).min_width(240.0).show(ctx, |ui| {
+            panel::show(ui, &m, self.selected, now_s);
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if let Some(clicked) = self.layout.draw(ui, &m, self.selected, now_s) {
+                self.selected = Some(clicked);
+            }
+        });
+    }
+}
+
+fn top_bar(ui: &mut egui::Ui, m: &Model) {
+    ui.add_space(3.0);
+    ui.horizontal(|ui| {
+        ui.heading(RichText::new("meshscope").strong());
+        ui.separator();
+
+        let (dot, label) = match m.conn {
+            ConnState::Connected => (Color32::from_rgb(90, 210, 120), "connected"),
+            ConnState::Connecting => (Color32::from_rgb(230, 200, 70), "connecting"),
+            ConnState::Error => (Color32::from_rgb(220, 90, 90), "disconnected"),
+        };
+        ui.label(RichText::new("●").color(dot));
+        ui.label(RichText::new(format!("{label}  ·  {}", m.broker)).small());
+        ui.separator();
+
+        match m.crown {
+            Some(c) => ui.label(RichText::new(format!("👑 id{} · ch {} · seq {}", c.owner, c.channel, c.seq)).color(Color32::from_rgb(255, 205, 70))),
+            None => ui.label(RichText::new("no crown seen").weak()),
+        };
+        ui.separator();
+
+        let gateways = m.nodes.values().filter(|n| n.gateway).count();
+        ui.label(format!("{} node(s) · {} gateway", m.nodes.len(), gateways));
+
+        // Right-aligned HA battery/grid readout if present.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some(b) = &m.batt {
+                ui.label(RichText::new(b.replace('|', " ")).small().monospace().color(Color32::from_rgb(150, 200, 160)));
+            }
+        });
+    });
+    ui.add_space(3.0);
+}
