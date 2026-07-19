@@ -341,6 +341,16 @@ const LEAF_PROGRESS_STALL_MS: u64 = 30_000;
 const LEAF_FIRST_CHUNK_GRACE_MS: u64 = 330_000;
 /// Hard total-session cap (ms) — a runaway transfer aborts → good slot boots (R1: USB).
 const LEAF_SESSION_MAX_MS: u64 = 600_000;
+/// #157: after the LAST window verifies, broadcast a finalize-ack (an all-zero OTAN at the
+/// last window base = "image complete, activating") up to this many times before
+/// self-activating. Gives the gateway a positive *delivered-confirmed* signal that survives
+/// a lost terminal frame — the crown records confirmed-vs-unconfirmed from hearing it.
+const LEAF_FINALIZE_ACK_MAX: u8 = 4;
+/// #157: max time (ms) to spend emitting finalize-acks before self-activating ANYWAY. The
+/// leaf never *waits* on the gateway — this is a short courtesy window so the ack can be
+/// heard; on expiry the leaf activates regardless (the belt-and-braces that un-strands a
+/// complete-but-unconfirmed image). ~2 OTAN cadences.
+const LEAF_FINALIZE_ACK_WINDOW_MS: u64 = 1_200;
 
 /// Outcome/phase of a GATEWAY → leaf relay attempt — published to `smol/<leaf>/ota/diag`
 /// (headless observability: the mesh-only leaf gives no serial, so the gateway reports the
@@ -355,6 +365,12 @@ pub enum LeafOtaOutcome {
     FetchFailed,
     /// The ESP-NOW relay loop exhausted its retransmit rounds (leaf not NAKing) — never confirmed.
     RelayFailed,
+    /// #157: the feed reached the leaf, but the leaf NEVER confirmed completion — no finalize-ack
+    /// was heard AND it settled on the OLD build / never re-STATed. The last-window terminal frame
+    /// was lost and the leaf stranded on the old image (the two live 07-15/07-18 occurrences).
+    /// Distinct from `RolledBack` (a completed image that self-tested then rolled back) and
+    /// `Timeout` (a completed image that went silent). Transient → the install is RE-OFFERED (retry).
+    RelayUnconfirmed,
     /// No STAT reappearance within the confirm window — possible brick (USB recovery).
     Timeout,
     /// The armed install's target leaf MAC isn't in the roster yet (never heard its HELLO).
@@ -376,6 +392,7 @@ impl LeafOtaOutcome {
             LeafOtaOutcome::RolledBack => "rolled-back",
             LeafOtaOutcome::FetchFailed => "fetch-failed",
             LeafOtaOutcome::RelayFailed => "relay-failed",
+            LeafOtaOutcome::RelayUnconfirmed => "delivered-unconfirmed",
             LeafOtaOutcome::Timeout => "leaf-timeout",
             LeafOtaOutcome::MacUnknown => "mac-unknown",
             LeafOtaOutcome::IdMismatch => "id-mismatch",
@@ -463,6 +480,18 @@ pub struct OtaLeafSession {
     /// gating decisions over an already-valid signature, tracked by `dbg_verdict`/relaydiag.
     verify_ok: u16,
     verify_fail: u16,
+    /// #157 finalize-ack phase. `> 0` while the VERIFIED last window is broadcasting
+    /// finalize-acks before the leaf self-activates; `0` = not finalizing. Set when the last
+    /// window passes readback verify (in `on_data`); cleared when the leaf activates or aborts.
+    /// The verify happens BEFORE this (unchanged brick-safety); this only defers the *reboot*
+    /// by a short courtesy window so the gateway can hear the completion.
+    finalize_since_ms: u64,
+    /// The last window's base seq — the OTAN window_base the finalize-ack carries.
+    finalize_wb: u32,
+    /// The verified target slot to activate (captured before `finalize()` consumed the writer).
+    finalize_slot: Option<Slot>,
+    /// Finalize-acks emitted so far this session (bounded by `LEAF_FINALIZE_ACK_MAX`).
+    finalize_acks_sent: u8,
 }
 
 impl OtaLeafSession {
@@ -486,6 +515,10 @@ impl OtaLeafSession {
             dbg_otan_sent: 0,
             verify_ok: 0,
             verify_fail: 0,
+            finalize_since_ms: 0,
+            finalize_wb: 0,
+            finalize_slot: None,
+            finalize_acks_sent: 0,
         }
     }
 
@@ -517,6 +550,9 @@ impl OtaLeafSession {
         self.active = false;
         self.window_recv = 0;
         self.writer = None;
+        self.finalize_since_ms = 0; // #157: abandon any pending finalize-ack phase
+        self.finalize_slot = None;
+        self.finalize_acks_sent = 0;
     }
 
     /// Handle an `OTAM` (signed announce). VERIFY-SIG-FIRST is the whole point: a frame
@@ -721,24 +757,40 @@ impl OtaLeafSession {
             return LeafAction::Nak(n);
         }
 
-        // ---- LAST window done → FINALIZE (readback verify) → activate. ------------
-        let (size, sha, build) = (self.size, self.sha256, self.build);
-        let writer = self.writer.take();
-        self.active = false;
-        match writer {
+        // ---- LAST window done → readback-VERIFY, then enter the #157 finalize-ack phase. ----
+        // Verify is UNCHANGED (brick-safety: a bad image never activates). On PASS we do NOT
+        // activate immediately — we broadcast a finalize-ack (an all-zero OTAN at the last window
+        // base) so the gateway learns we completed + is activating, and self-activate on a short
+        // timer in `tick()` REGARDLESS of whether the gateway hears it (#157 belt-and-braces:
+        // a lost terminal frame no longer strands a complete image on the old build).
+        let (size, sha) = (self.size, self.sha256);
+        match self.writer.take() {
             Some(w) => {
-                let target_slot = w.target();
+                let target_slot = w.target(); // capture BEFORE finalize() consumes the writer
                 if w.finalize(size, &sha) {
-                    log::info!("smol #40: image VERIFIED (readback SHA-256, ed25519 already ok) — activating build {}", build);
+                    log::info!("smol #40 #157: image VERIFIED — finalize-ack then activate build {}", self.build);
                     self.verify_ok = self.verify_ok.saturating_add(1); // #49: full integrity-verified
-                    LeafAction::Complete(target_slot, build)
+                    // Enter the finalize-ack phase; stay `active` so tick() drives ack + activate.
+                    self.finalize_since_ms = now.max(1); // never 0 (0 == "not finalizing")
+                    self.finalize_wb = wb;
+                    self.finalize_slot = Some(target_slot);
+                    self.finalize_acks_sent = 1;
+                    self.last_nak_ms = now;
+                    let zero = [0u8; OTAN_BITMAP_BYTES];
+                    let n = encode_otan(my_id, self.session_id, wb as u16, &zero, out);
+                    self.dbg_otan_sent = self.dbg_otan_sent.saturating_add(1);
+                    LeafAction::Nak(n) // the finalize-ack (gateway reads it as delivered-confirmed)
                 } else {
                     log::error!("smol #40: readback verify FAILED — discarded (good slot intact)");
                     self.verify_fail = self.verify_fail.saturating_add(1); // #49: readback SHA mismatch
+                    self.discard();
                     LeafAction::Abort
                 }
             }
-            None => LeafAction::Abort,
+            None => {
+                self.discard();
+                LeafAction::Abort
+            }
         }
     }
 
@@ -747,6 +799,39 @@ impl OtaLeafSession {
     pub fn tick(&mut self, my_id: u8, now: u64, out: &mut [u8]) -> LeafAction {
         if !self.active {
             return LeafAction::None;
+        }
+        // #157: finalize-ack phase — the last window is VERIFIED; re-broadcast the finalize-ack a
+        // few times so the gateway records delivered-CONFIRMED, then self-activate REGARDLESS (the
+        // leaf never waits on the gateway). Runs BEFORE the stall/NAK logic below — the transfer is
+        // already complete, so the progress-stall abort must not fire on it.
+        if self.finalize_since_ms != 0 {
+            let window_open =
+                now.saturating_sub(self.finalize_since_ms) < LEAF_FINALIZE_ACK_WINDOW_MS;
+            if window_open && self.finalize_acks_sent < LEAF_FINALIZE_ACK_MAX {
+                if now.saturating_sub(self.last_nak_ms) < LEAF_IDLE_NAK_MS {
+                    return LeafAction::None; // throttle between acks
+                }
+                self.last_nak_ms = now;
+                self.finalize_acks_sent = self.finalize_acks_sent.saturating_add(1);
+                let zero = [0u8; OTAN_BITMAP_BYTES];
+                let n = encode_otan(my_id, self.session_id, self.finalize_wb as u16, &zero, out);
+                self.dbg_otan_sent = self.dbg_otan_sent.saturating_add(1);
+                return LeafAction::Nak(n);
+            }
+            // Courtesy window elapsed or acks maxed → self-activate now (belt-and-braces).
+            let slot = self.finalize_slot.take();
+            self.finalize_since_ms = 0;
+            self.active = false;
+            return match slot {
+                Some(s) => {
+                    log::info!(
+                        "smol #40 #157: finalize-acks done ({}) — self-activating build {}",
+                        self.finalize_acks_sent, self.build
+                    );
+                    LeafAction::Complete(s, self.build)
+                }
+                None => LeafAction::Abort, // unreachable: slot is set whenever finalize_since_ms != 0
+            };
         }
         // #3b: while ARMED but still awaiting the very first chunk (window 0, nothing received),
         // allow the fetch-spanning grace — the gateway is fetching off-ch6, not dead. Once any
