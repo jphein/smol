@@ -1,0 +1,16 @@
+# #183 host-test harness for the PURE mesh-ledger L2 core (net/treehead.rs) — the crown-ordered
+# tree-head / CT-style Merkle anchor over the per-node #182 chain heads. Runs OFF-target (std)
+# via `cargo run`; #[path]-includes the real treehead.rs (no drift). sha256 injected via sha2.
+# Mirrors experiments/flood_verify + etx_verify + ledger_verify.
+[package]
+name = "treehead_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "treehead_verify"
+path = "src/main.rs"
+[dependencies]
+sha2 = "0.10"
+[profile.dev]
+opt-level = 0
