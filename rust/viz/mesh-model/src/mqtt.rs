@@ -54,7 +54,9 @@ impl BrokerCfg {
     /// Set the MQTT client id (chainable). Use a name unique to the frontend so two
     /// listeners can share one broker (`"meshscope"`, `"observatory"`).
     pub fn with_client_id(mut self, id: impl Into<String>) -> Self {
-        self.client_id = id.into();
+        // An explicit SMOL_MQTT_CLIENT_ID always wins (e.g. to run two of the same tool
+        // at once); otherwise the frontend's own name is used.
+        self.client_id = std::env::var("SMOL_MQTT_CLIENT_ID").unwrap_or_else(|_| id.into());
         self
     }
 

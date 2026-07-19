@@ -8,14 +8,12 @@
 #   mesh-model  — shared MQTT ingest + topic→state fold + freshness aging (no UI).
 #   observatory — Bevy "living constellation" showpiece (#159).
 #
-# meshscope (#158) currently lives at ../meshscope with its model INLINED (it merged
-# first, PR #162). It converges into this workspace + depends on mesh-model in a
-# follow-up PR; until then mesh-model here is a verbatim lift of meshscope's core
-# (provenance: rust/meshscope @ 81ebb14) with one addition — a per-client MQTT id
-# (two listeners sharing a client-id get kicked by the broker).
+# meshscope (#158) is now a member here too (converged in #159): it depends on
+# mesh-model and its inlined model copy was deleted, so both frontends fold identical
+# state through one crate — a bug fixed in the model fixes both faces.
 [workspace]
 resolver = "2"
-members = ["mesh-model", "observatory"]
+members = ["mesh-model", "meshscope", "observatory"]
 
 [workspace.package]
 edition = "2021"

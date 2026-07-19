@@ -3,7 +3,7 @@
 
 use egui::{Color32, RichText, ScrollArea};
 
-use crate::model::{EventKind, Model};
+use mesh_model::model::{EventKind, Model};
 
 pub fn show(ui: &mut egui::Ui, model: &Model, now_s: f64) {
     ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
