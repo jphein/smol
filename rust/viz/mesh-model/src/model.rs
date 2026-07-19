@@ -58,6 +58,35 @@ pub enum SyncFreshness {
     Unsynced, // tsrc=none, or no tage reported
 }
 
+/// The crown's associated AP — channel, RSSI (dBm), BSSID — from DIAG `ap=` (#204).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ApInfo {
+    pub channel: u8,
+    pub rssi: i32,
+    pub bssid: [u8; 6],
+}
+
+/// Crown dead-downstream health from DIAG `cdeaf=` (#204). `streak` climbing = the crown
+/// is connected upstream but hearing nothing downstream (the coexist deaf disease).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CrownDeaf {
+    pub streak: u8,
+    pub reassoc_cycles: u32,
+    pub shed: bool,
+}
+
+/// Parse a 12-hex-char BSSID (`aabbccddeeff`, no separators — the DIAG `ap=` wire form).
+fn parse_bssid_hex(s: &str) -> Option<[u8; 6]> {
+    if s.len() != 12 {
+        return None;
+    }
+    let mut out = [0u8; 6];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
 #[derive(Clone, Debug)]
 pub struct Event {
     pub t_s: f64,
@@ -159,6 +188,30 @@ impl Node {
             Some(a) if a < SYNC_STALE_S => SyncFreshness::Aging,
             Some(_) => SyncFreshness::Stale,
         }
+    }
+
+    /// The crown's current AP association (DIAG `ap=<ch>:<rssi>:<bssid>`, #204). `rssi`
+    /// is already signed dBm (from `esp_wifi_sta_get_ap_info`), NOT raw-u8 — the
+    /// `controller.rssi()` rule (see `parse::normalize_rssi`) — so it passes through.
+    pub fn ap(&self) -> Option<ApInfo> {
+        let raw = self.diag.as_ref()?.get("ap")?;
+        let mut it = raw.splitn(3, ':'); // bssid is 12 hex chars, no colons
+        let channel = it.next()?.parse().ok()?;
+        let rssi = it.next()?.parse().ok()?;
+        let bssid = parse_bssid_hex(it.next()?)?;
+        Some(ApInfo { channel, rssi, bssid })
+    }
+
+    /// Crown dead-downstream health (DIAG `cdeaf=<streak>:<reassoc_cycles>:<shed>`, #204).
+    /// A climbing `streak` = the crown is CONNECTED but hearing nothing downstream — the
+    /// disease #204 hunts; `shed` = the crown shed itself. `None` on a non-crown leaf.
+    pub fn crown_deaf(&self) -> Option<CrownDeaf> {
+        let raw = self.diag.as_ref()?.get("cdeaf")?;
+        let mut it = raw.split(':');
+        let streak = it.next()?.parse().ok()?;
+        let reassoc_cycles = it.next()?.parse().ok()?;
+        let shed = it.next()?.parse::<u8>().ok()? != 0;
+        Some(CrownDeaf { streak, reassoc_cycles, shed })
     }
 }
 
@@ -438,6 +491,25 @@ mod tests {
         assert_eq!(model.nodes[&4].sync_freshness(), SyncFreshness::Unsynced);
         assert_eq!(model.nodes[&1].time_age(), Some(30));
         assert_eq!(model.nodes[&1].time_src(), Some("ntp"));
+    }
+
+    #[test]
+    fn ap_and_cdeaf_parse_from_diag() {
+        let mut model = m();
+        // #204 optional DIAG appends: ap=<ch>:<rssi>:<bssid(12hex)>, cdeaf=<streak>:<cycles>:<shed>.
+        model.ingest(1.0, "smol/7/diag", b"DIAG|boot=1|heap=40000|ap=6:-52:a1b2c3d4e5f6|cdeaf=4:2:1");
+        let ap = model.nodes[&7].ap().unwrap();
+        assert_eq!(ap.channel, 6);
+        assert_eq!(ap.rssi, -52); // signed dBm — NOT normalized
+        assert_eq!(ap.bssid, [0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6]);
+        let cd = model.nodes[&7].crown_deaf().unwrap();
+        assert_eq!(cd.streak, 4);
+        assert_eq!(cd.reassoc_cycles, 2);
+        assert!(cd.shed);
+        // Absent on a node without the fields.
+        model.ingest(1.0, "smol/8/diag", b"DIAG|boot=1|heap=40000");
+        assert!(model.nodes[&8].ap().is_none());
+        assert!(model.nodes[&8].crown_deaf().is_none());
     }
 
     #[test]

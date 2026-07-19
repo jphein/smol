@@ -6,6 +6,27 @@
 //! void, dim filaments) sit below 1.0.
 
 use bevy::prelude::*;
+use mesh_model::model::SyncFreshness;
+
+/// NTP-sync freshness aura colour (parity with meshscope's dots): jade fresh → amber
+/// aging → infernal red stale → cold grey unsynced. HDR-bright so it blooms.
+pub fn sync_color(f: SyncFreshness) -> Color {
+    match f {
+        SyncFreshness::Fresh => Color::linear_rgb(0.1, 1.7, 0.5),
+        SyncFreshness::Aging => Color::linear_rgb(2.6, 1.7, 0.2),
+        SyncFreshness::Stale => Color::linear_rgb(3.2, 0.4, 0.3),
+        SyncFreshness::Unsynced => Color::linear_rgb(0.35, 0.38, 0.5),
+    }
+}
+
+/// The crown's ring colour as its dead-downstream health degrades (#204 `cdeaf`):
+/// steady gold when healthy (`sick`=0) → infernal red as the deaf streak climbs
+/// (`sick`→1), the whole thing scaled by `brightness` (the caller flickers/dims it).
+pub fn crown_health(sick: f32, brightness: f32) -> Color {
+    let s = sick.clamp(0.0, 1.0);
+    let b = brightness.clamp(0.0, 1.0);
+    Color::linear_rgb(lerp(6.0, 5.2, s) * b, lerp(3.4, 0.35, s) * b, lerp(0.5, 0.2, s) * b)
+}
 
 /// Deep arcane void — the field the constellation floats in. A near-black indigo so
 /// bloom has darkness to bloom against. This is the base clear colour at channel 6;
