@@ -25,11 +25,21 @@ use std::process::Command;
 fn main() {
     let hash = env_or_git("SMOL_GIT_HASH", &["rev-parse", "--short=7", "HEAD"])
         .unwrap_or_else(|| "dev".to_string());
-    let number = env_or_git("SMOL_BUILD_NUMBER", &["rev-list", "--count", "HEAD"])
-        .unwrap_or_else(|| "0".to_string());
+    // #218: the build NUMBER is a COMMITTED ratchet (`version.txt`), NOT `git rev-list
+    // --count` — the count is BRANCH-relative, so a newer canary off a side branch stamps
+    // a LOWER number than the deployed release and reads as a rollback on every dashboard.
+    // The ratchet is content-ordered + bumped on release. Precedence: env (archive/pipeline)
+    // > version.txt > fallback.
+    let number = env_or_file("SMOL_BUILD_NUMBER", "version.txt").unwrap_or_else(|| "0".to_string());
+    // #218: honest dev marker. A build is a RELEASE only when the ship pipeline says so
+    // (`SMOL_RELEASE=1`); every other build (local / canary) is dev and displays
+    // `v<N>+dev.<hash>` so it can never masquerade as the release. The NUMERIC BUILD_NUMBER
+    // is unchanged, so OTA monotonicity holds and a dev build compares as the floor.
+    let is_release = std::env::var("SMOL_RELEASE").map(|v| v.trim() == "1").unwrap_or(false);
 
     println!("cargo:rustc-env=BUILD_HASH={hash}");
     println!("cargo:rustc-env=BUILD_NUMBER={number}");
+    println!("cargo:rustc-env=BUILD_DEV={}", if is_release { "0" } else { "1" });
 
     // #42: OPTIONAL per-board NODE_ID override. Emitted ONLY when set → a normal build
     // is byte-unchanged; `SMOL_NODE_ID=8 cargo build` overrides board.rs's fallback
@@ -44,9 +54,24 @@ fn main() {
     // Rebuild when the commit moves (real checkout) or an override env changes;
     // all are harmless no-ops in an archive build with none present.
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=version.txt");
     println!("cargo:rerun-if-env-changed=SMOL_GIT_HASH");
     println!("cargo:rerun-if-env-changed=SMOL_BUILD_NUMBER");
+    println!("cargo:rerun-if-env-changed=SMOL_RELEASE");
     println!("cargo:rerun-if-env-changed=SMOL_NODE_ID");
+}
+
+/// Prefer the explicit env override (archive/pipeline), else read `path` (relative to the
+/// crate root — the committed ratchet); `None` if neither yields a non-empty value.
+fn env_or_file(var: &str, path: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(var) {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    let s = std::fs::read_to_string(path).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 /// Prefer the explicit env override (archive builds), else run `git`; `None` if

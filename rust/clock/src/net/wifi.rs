@@ -3419,7 +3419,6 @@ fn mqtt_session(
             Some(a) => a.build,
             None => installed,
         };
-        let noun = crate::net::names::version_name().1;
         // Discovery config (retained) — bound to the SAME device as telemetry via
         // identifiers:["smol<id>"], so Update lands on the existing device card.
         let mut dtopic = MqttScratch::new();
@@ -3437,13 +3436,22 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), djson.as_bytes(), true) {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
-        // State JSON (retained): installed + latest + in_progress + title.
+        // State JSON (retained): installed + latest + in_progress + title. installed/latest
+        // stay NUMERIC (HA's version compare). #218: the title is the human DISPLAY — the
+        // running build's honest stamp (with `+dev.<hash>` for a canary) when up-to-date,
+        // else the update TARGET's sigil name ("v<latest> <Word>").
         let mut sjson = MqttScratch::new();
         let _ = write!(
             sjson,
-            "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":{},\"title\":\"v{} {}\"}}",
-            installed, latest, *install_requested, latest, noun
+            "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":{},\"title\":\"",
+            installed, latest, *install_requested
         );
+        if latest == installed {
+            crate::net::names::write_version(&mut sjson);
+        } else {
+            let _ = write!(sjson, "v{} {}", latest, crate::net::names::version_name_for(latest).1);
+        }
+        let _ = write!(sjson, "\"}}");
         let mut stopic = MqttScratch::new();
         let _ = write!(stopic, "smol/{}/ota/state", node_id);
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, stopic.as_bytes(), sjson.as_bytes(), true) {
@@ -3515,10 +3523,11 @@ fn mqtt_session(
             if let Some(installed) = crate::ota_mesh::stat_build(val) {
                 let latest = latest_staged.unwrap_or(installed);
                 let mut sjson = MqttScratch::new();
+                // #218: carry the sigil forge name in the relayed leaf title too.
                 let _ = write!(
                     sjson,
-                    "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":false,\"title\":\"smol v{}\"}}",
-                    installed, latest, latest
+                    "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":false,\"title\":\"smol v{} {}\"}}",
+                    installed, latest, latest, crate::net::names::version_name_for(latest).1
                 );
                 let mut stopic = MqttScratch::new();
                 let _ = write!(stopic, "smol/{}/ota/state", lid);
