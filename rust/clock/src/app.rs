@@ -191,6 +191,11 @@ pub enum AppKind {
     Watch,
     #[cfg(feature = "espnow")]
     Hunt,
+    // #151 Finder — hands-free auto-nearest placement meter (roster RSSI). LIVE whenever
+    // compiled (REGISTRY row + `enter` + `from_wire` construct it), like Watch/Hunt → no
+    // dead_code allow needed. espnow-only (consumes the mesh roster).
+    #[cfg(feature = "espnow")]
+    Finder,
     // #57 The Mesh Familiar (flagship). LIVE whenever compiled (REGISTRY row + `enter` +
     // `from_wire` construct it), like Batt/Grid → no dead_code allow needed. cfg(espnow)
     // = it needs the radio (the creature lives on the mesh).
@@ -249,6 +254,9 @@ impl AppKind {
             "Watch" => AppKind::Watch,
             #[cfg(feature = "espnow")]
             "Hunt" => AppKind::Hunt,
+            // #151: a node's default screen can be set to the Finder via #21 too.
+            #[cfg(feature = "espnow")]
+            "Finder" => AppKind::Finder,
             // #57: a leaf's default screen can be set to the Familiar via #21 too.
             #[cfg(feature = "espnow")]
             "Familiar" => AppKind::Familiar,
@@ -287,6 +295,8 @@ impl AppKind {
             AppKind::Watch => "Watch",
             #[cfg(feature = "espnow")]
             AppKind::Hunt => "Hunt",
+            #[cfg(feature = "espnow")]
+            AppKind::Finder => "Finder",
             AppKind::Familiar => "Familiar",
             #[cfg(feature = "wled")]
             AppKind::WledRemote => "WledRemote",
@@ -352,6 +362,8 @@ pub enum App {
     #[cfg(feature = "espnow")]
     Hunt(crate::hunt::HuntState),
     #[cfg(feature = "espnow")]
+    Finder(crate::finder::FinderState),
+    #[cfg(feature = "espnow")]
     Familiar(crate::familiar::FamiliarState),
     #[cfg(feature = "wled")]
     WledRemote(crate::net::wled::WledRemoteState),
@@ -382,6 +394,8 @@ impl App {
             AppKind::Watch => App::Watch(crate::watch::WatchState::new()),
             #[cfg(feature = "espnow")]
             AppKind::Hunt => App::Hunt(crate::hunt::HuntState::new()),
+            #[cfg(feature = "espnow")]
+            AppKind::Finder => App::Finder(crate::finder::FinderState::new()),
             #[cfg(feature = "espnow")]
             AppKind::Familiar => App::Familiar(crate::familiar::FamiliarState::new(ctx.node_id)),
             #[cfg(feature = "wled")]
@@ -420,6 +434,8 @@ impl App {
             #[cfg(feature = "espnow")]
             App::Hunt(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "espnow")]
+            App::Finder(s) => Plugin::on_button(s, press, ctx),
+            #[cfg(feature = "espnow")]
             App::Familiar(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "wled")]
             App::WledRemote(s) => Plugin::on_button(s, press, ctx),
@@ -447,6 +463,8 @@ impl App {
             App::Watch(s) => Plugin::update(s, ctx),
             #[cfg(feature = "espnow")]
             App::Hunt(s) => Plugin::update(s, ctx),
+            #[cfg(feature = "espnow")]
+            App::Finder(s) => Plugin::update(s, ctx),
             #[cfg(feature = "espnow")]
             App::Familiar(s) => Plugin::update(s, ctx),
             #[cfg(feature = "wled")]
@@ -495,6 +513,8 @@ impl App {
             App::Watch(_) => (AppKind::Watch, 0),
             #[cfg(feature = "espnow")]
             App::Hunt(_) => (AppKind::Hunt, 0),
+            #[cfg(feature = "espnow")]
+            App::Finder(_) => (AppKind::Finder, 0),
             App::Familiar(_) => (AppKind::Familiar, 0),
             #[cfg(feature = "wled")]
             App::WledRemote(_) => (AppKind::WledRemote, 0),
@@ -536,6 +556,9 @@ pub const REGISTRY: &[AppDesc] = &[
     AppDesc { title: "Watch", kind: AppKind::Watch },
     #[cfg(feature = "espnow")]
     AppDesc { title: "Hunt", kind: AppKind::Hunt },
+    // #151 Finder — hands-free auto-nearest placement/range meter. espnow-only.
+    #[cfg(feature = "espnow")]
+    AppDesc { title: "Finder", kind: AppKind::Finder },
     // #57 The Mesh Familiar (flagship) — the living creature screen. espnow-only.
     #[cfg(feature = "espnow")]
     AppDesc { title: "Familiar", kind: AppKind::Familiar },
@@ -579,6 +602,10 @@ pub const fn plugin_bit(kind: AppKind) -> Option<u8> {
         AppKind::Watch => None,
         #[cfg(feature = "espnow")]
         AppKind::Hunt => None,
+        // #151 Finder — not #55-maskable (like Watch/Hunt); `None` ⇒ always shown. Wiring it
+        // into the plugin mask needs a paired HA bit + toggle, deferred until that lands.
+        #[cfg(feature = "espnow")]
+        AppKind::Finder => None,
         #[cfg(feature = "wifi")]
         AppKind::Batt => Some(3),
         #[cfg(feature = "wifi")]
