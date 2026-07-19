@@ -1202,7 +1202,13 @@ fn main() -> ! {
                     {
                         let unix_now = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
                         let stale_s = unix_now.saturating_sub(my_synced_at);
-                        if stale_s > net::NTP_RESYNC_AGE_S && r.is_gateway() {
+                        // #192 N1 (155 review): ALSO fire when NEVER-synced (my_synced_at == 0).
+                        // 3/4 boards failed boot SNTP (tsrc=mesh) tonight, so post-#204-heal a
+                        // gateway with my_synced_at==0 would otherwise free-run a full
+                        // NTP_RESYNC_AGE_S (~1h) before its FIRST correction. Fires each flush
+                        // until the first successful sync sets my_synced_at nonzero → then the
+                        // normal ~1h staleness cadence resumes (airtime-conscious once synced).
+                        if (my_synced_at == 0 || stale_s > net::NTP_RESYNC_AGE_S) && r.is_gateway() {
                             let mut resync_abort = false;
                             let fresh = r.resync_ntp(&mut || {
                                 let t = millis();
