@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>smol · web emulator</title>
+<!-- Favicon: a tiny green pixel-snake on dark glass (SVG data URI, no external asset). -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23071008'/%3E%3Cg fill='%2300ff88'%3E%3Crect x='3' y='7' width='2' height='2'/%3E%3Crect x='5' y='7' width='2' height='2'/%3E%3Crect x='7' y='7' width='2' height='2'/%3E%3Crect x='9' y='5' width='2' height='2'/%3E%3Crect x='11' y='5' width='2' height='2'/%3E%3C/g%3E%3C/svg%3E">
+<style>
+  :root {
+    /* OLED phosphor — the smol green (matches WLED_CAST_ON [0,255,120]). */
+    --oled-on: #00ff88;
+    --oled-glass: #050a07;
+    /* Page chrome — light/dark via prefers-color-scheme. */
+    --bg: #f3f5f4; --fg: #14201a; --muted: #5c6b63; --card: #ffffff; --line: #d9e0dc; --accent: #0a7f52;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0c0f0e; --fg: #e7efea; --muted: #8fa39a; --card: #141917; --line: #232b28; --accent: #33d999; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 15px/1.5 ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    padding: 2rem 1rem; gap: 1.25rem;
+  }
+  h1 { font-size: 1.1rem; letter-spacing: .06em; margin: 0; font-weight: 600; }
+  h1 .dot { color: var(--accent); }
+  .sub { color: var(--muted); font-size: .82rem; margin: -.6rem 0 .2rem; text-align: center; max-width: 42ch; }
+
+  /* The device: a dark bezel around the glowing 72×40 glass. */
+  .device {
+    background: linear-gradient(160deg, #1a1f1d, #05100b);
+    border-radius: 18px; padding: 26px; box-shadow: 0 18px 50px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.05);
+    border: 1px solid #0c1512;
+  }
+  .glass {
+    background: var(--oled-glass); border-radius: 8px; padding: 12px;
+    box-shadow: inset 0 0 22px rgba(0,0,0,.9), inset 0 0 2px rgba(0,255,136,.15);
+    position: relative;
+  }
+  /* faint scanlines over the glass */
+  .glass::after {
+    content: ""; position: absolute; inset: 12px; border-radius: 4px; pointer-events: none;
+    background: repeating-linear-gradient(0deg, rgba(0,0,0,.16) 0 1px, transparent 1px 3px);
+    mix-blend-mode: multiply;
+  }
+  canvas { display: block; image-rendering: pixelated; border-radius: 3px; }
+
+  .controls { display: flex; gap: .5rem; flex-wrap: wrap; justify-content: center; align-items: center; }
+  button {
+    font: inherit; font-size: .82rem; color: var(--fg); background: var(--card);
+    border: 1px solid var(--line); border-radius: 8px; padding: .5rem .9rem; cursor: pointer;
+    transition: border-color .12s, transform .04s;
+  }
+  button:hover { border-color: var(--accent); }
+  button:active { transform: translateY(1px); }
+  button.on { border-color: var(--accent); color: var(--accent); }
+  .hint { color: var(--muted); font-size: .78rem; text-align: center; max-width: 46ch; }
+  kbd { background: var(--card); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: .05rem .4rem; font-size: .78rem; }
+  footer { color: var(--muted); font-size: .72rem; text-align: center; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+  <h1>smol <span class="dot">·</span> web emulator</h1>
+  <p class="sub">The real firmware <code>snake.rs</code> / <code>clock.rs</code> compiled to WASM, drawing every pixel through the same <code>embedded-graphics</code> path — 72×40, no reimplementation.</p>
+
+  <div class="device">
+    <div class="glass"><canvas id="screen" width="576" height="320"></canvas></div>
+  </div>
+
+  <div class="controls">
+    <button id="btn-snake" class="on">Snake</button>
+    <button id="btn-clock">Clock</button>
+    <span style="width:1px;height:22px;background:var(--line)"></span>
+    <button id="btn-press">Button ▸ tap</button>
+    <button id="btn-long">Long press</button>
+  </div>
+
+  <p class="hint"><kbd>Space</kbd> / tap the glass = the BOOT button · <kbd>L</kbd> = long-press · pick a screen above. In Snake, tap turns; a long-press asks for the menu (no-op here — single-board spike).</p>
+
+  <footer>smol #152 web-emulator spike · game code is the firmware's own, unforked · <span id="fps"></span></footer>
+
+<script>
+(async () => {
+  // --- instantiate the wasm (base64-inlined so this file opens from file:// with no server) ---
+  const WASM_B64 = "__WASM_B64__";
+  const bytes = Uint8Array.from(atob(WASM_B64), c => c.charCodeAt(0));
+  const { instance } = await WebAssembly.instantiate(bytes, {});
+  const ex = instance.exports;
+
+  ex.emu_init();
+  const W = ex.emu_width(), H = ex.emu_height();      // 72 × 40
+  const cvs = document.getElementById("screen");
+  const g = cvs.getContext("2d");
+  const scale = Math.floor(cvs.width / W);            // 576/72 = 8 px per OLED pixel
+  const gap = 1;                                       // 1px grid gap → distinct "pixels"
+  const ON = getComputedStyle(document.documentElement).getPropertyValue("--oled-on").trim() || "#00ff88";
+
+  // --- input: space / tap = short press, L / button = long press ---
+  const press = (long) => ex.emu_button(long ? 1 : 0);
+  document.addEventListener("keydown", (e) => {
+    if (e.code === "Space") { e.preventDefault(); press(false); }
+    else if (e.key === "l" || e.key === "L") { press(true); }
+  });
+  cvs.addEventListener("pointerdown", (e) => { e.preventDefault(); press(false); });
+  document.getElementById("btn-press").onclick = () => press(false);
+  document.getElementById("btn-long").onclick  = () => press(true);
+
+  // --- screen switch ---
+  const bSnake = document.getElementById("btn-snake"), bClock = document.getElementById("btn-clock");
+  const setScreen = (app) => {
+    ex.emu_switch(app);                                // 0 = Snake, 1 = Clock
+    bSnake.classList.toggle("on", app === 0);
+    bClock.classList.toggle("on", app === 1);
+  };
+  bSnake.onclick = () => setScreen(0);
+  bClock.onclick = () => setScreen(1);
+
+  // --- render loop ---
+  const fpsEl = document.getElementById("fps");
+  let last = 0, frames = 0, acc = 0;
+  const draw = (t) => {
+    ex.emu_set_unix(Math.floor(Date.now() / 1000));    // real wall-clock for the Clock screen
+    ex.emu_tick(t >>> 0);                              // advance + render into the wasm framebuffer
+
+    // Fresh view each frame (memory.buffer may reallocate; the ptr is stable but the view isn't).
+    const fb = new Uint8Array(ex.memory.buffer, ex.emu_framebuffer_ptr(), W * H);
+    g.fillStyle = "#050a07";
+    g.fillRect(0, 0, cvs.width, cvs.height);
+    g.fillStyle = ON;
+    g.shadowColor = ON; g.shadowBlur = 6;              // phosphor bloom
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        if (fb[y * W + x]) g.fillRect(x * scale, y * scale, scale - gap, scale - gap);
+      }
+    }
+    g.shadowBlur = 0;
+
+    frames++; acc += t - last; last = t;
+    if (acc >= 500) { fpsEl.textContent = (frames * 1000 / acc).toFixed(0) + " fps"; frames = 0; acc = 0; }
+    requestAnimationFrame(draw);
+  };
+  requestAnimationFrame(draw);
+})();
+</script>
+</body>
+</html>
