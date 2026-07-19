@@ -936,6 +936,19 @@ impl Roster {
         None
     }
 
+    /// #161: the KNOWN logical id last learned for `mac` (inverse of [`mac_for_id`]), for the
+    /// on-board OTA screen's "from <noun>" source line. `None` if that MAC isn't in the roster
+    /// or hasn't announced an id yet — the screen then falls back to "from mesh".
+    #[cfg(feature = "espnow")]
+    fn id_for_mac(&self, mac: [u8; 6]) -> Option<u8> {
+        for n in &self.nodes {
+            if n.used && n.id_known && n.mac == mac {
+                return Some(n.id);
+            }
+        }
+        None
+    }
+
     /// #28: eviction value-key for a MAC — LOWER is LESS valuable (evicted first). Orders by
     /// usability (`id_known` — a MAC we can't place in HA / can't relay to is worthless), then
     /// liveness (`connected` = a fresh ACK within `PEER_STALE_MS`), then signal (`rssi`), then
@@ -4956,6 +4969,24 @@ impl RadioManager {
     #[cfg(feature = "espnow")]
     pub fn ota_leaf_dbg(&self) -> (u16, u8, u16) {
         self.ota_leaf.dbg()
+    }
+
+    /// #161: a read-only snapshot of a mesh-OTA THIS leaf is RECEIVING, for the dedicated
+    /// on-board OTA screen — `main` paints [`crate::ota_screen`] over the frozen app frame while
+    /// this is `Some`, so an inbound transfer AUTO-takes the glass (not a menu item). `None` in
+    /// steady state. Resolves the feeding gateway's MAC → a roster id for the "from <noun>" line.
+    /// READ-ONLY: reads the leaf receive session + roster, mutates neither. `espnow`-scoped like
+    /// `ota_leaf_dbg` (the `ota_leaf` receive session only exists in the mesh build).
+    #[cfg(feature = "espnow")]
+    pub fn ota_rx_view(&self) -> Option<crate::ota::OtaRxView> {
+        let (done, total, build, gw_mac) = self.ota_leaf.rx_progress()?;
+        Some(crate::ota::OtaRxView {
+            source_id: self.roster.id_for_mac(gw_mac),
+            hop: 1, // leaf-mesh-OTA is single-hop (gateway→leaf) today
+            build,
+            done,
+            total,
+        })
     }
 
     /// Current peer-link state as an [`LedState`], evaluated at `now_ms`.
