@@ -112,6 +112,17 @@ const fn parse_u32(s: &str) -> u32 {
 /// A parsed retained OTA announce: `OTA|build|size|sha256hex|url`. OWNED (the URL is
 /// copied into a fixed buffer) so it can be stashed between the burst that READS it
 /// and the burst that FETCHES it, without borrowing the MQTT receive buffer.
+/// #153: OTA transfer progress surfaced to the UI so `main`'s tick can paint the 1-px
+/// bottom progress edge that replaced the retired full-screen syncing overlay. `done`/
+/// `total` are bytes (self-fetch) or chunks (leaf relay) — the renderer only needs the
+/// ratio. Threaded as a `&Cell<OtaProgress>` into the fetch/relay so the UI-agnostic
+/// `net/` layer writes the counts without ever touching the display.
+#[derive(Clone, Copy, Default)]
+pub struct OtaProgress {
+    pub done: u32,
+    pub total: u32,
+}
+
 #[derive(Clone, Copy)]
 pub struct Announce {
     pub build: u32,

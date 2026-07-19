@@ -3736,6 +3736,10 @@ pub fn run_ota_fetch(
     // the ONLY fleet-visible signal of WHY a self-fetch failed.
     // #147: 5th field = the `ota_fail::*` code pinning the exact stage that died.
     fail: &mut Option<(u32, u32, u32, u32, u32)>,
+    // #153: written each chunk so `main`'s OTA tick can paint the 1-px bottom progress
+    // edge (bytes downloaded / image size). UI-agnostic: net/ only sets the counts, the
+    // display lives in `main`. Shared by self-OTA and the gateway's relay-fetch phase.
+    progress: &core::cell::Cell<crate::ota::OtaProgress>,
 ) -> bool {
     let Some((host, port, path)) = crate::ota::split_url(announce.url()) else {
         log::error!("smol OTA: malformed announce URL — aborting fetch");
@@ -3886,6 +3890,8 @@ pub fn run_ota_fetch(
         // caller publishes it retained to smol/<id>/ota/diag — release images are serial-silent, so
         // this is the fleet-visible why).
         *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, fail_point));
+        // #153: surface live byte progress for the UI tick's bottom edge.
+        progress.set(crate::ota::OtaProgress { done: writer.written(), total: announce.size });
         if tick() {
             log::warn!("smol OTA: aborted by long-press (slot untouched)");
             return false;
