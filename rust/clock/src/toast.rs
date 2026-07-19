@@ -105,45 +105,52 @@ pub fn is_active(now_ms: u64) -> bool {
 fn wrap(s: &str) -> ([(usize, usize); ROWS], usize) {
     let mut lines = [(0usize, 0usize); ROWS];
     let mut n = 0;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && n < ROWS {
-        // Skip leading spaces on a new line.
-        while i < bytes.len() && bytes[i] == b' ' {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        let start = i;
-        let mut last_break = 0usize; // byte index of the last space that fits, 0 = none
-        let mut col = 0usize;
-        while i < bytes.len() && bytes[i] != b'\n' {
-            if col == COLS {
-                break; // line full
-            }
-            if bytes[i] == b' ' {
-                last_break = i;
-            }
-            col += 1;
-            i += 1;
-        }
-        // Decide the line end: prefer the last space (word boundary) unless none fits.
-        let end = if i < bytes.len() && bytes[i] != b'\n' && last_break > start {
-            let e = last_break;
-            i = last_break; // resume after the space (skipped next iteration)
-            e
-        } else {
-            if i < bytes.len() && bytes[i] == b'\n' {
-                let e = i;
-                i += 1; // consume the newline
-                e
-            } else {
-                i // hard split / end of string
-            }
+    // Walk by CHAR, not byte: `COLS` counts glyphs (a multibyte char is ONE column, not N),
+    // and every offset stored is a char boundary — so `&s[start..end]` in `draw` can never
+    // panic on a crafted multibyte message arriving over the unauthenticated CFG-`M` frame.
+    let mut cursor = 0usize; // byte offset, always a char boundary
+    while cursor < s.len() && n < ROWS {
+        // Skip leading ASCII spaces to the next real char (char-boundary offset).
+        let start = match s[cursor..].char_indices().find(|&(_, c)| c != ' ') {
+            Some((i, _)) => cursor + i,
+            None => break,
         };
-        lines[n] = (start, end);
+        let mut line_end = start; // char boundary
+        let mut next = s.len();
+        let mut break_at: Option<usize> = None; // last space's byte offset within the window
+        let mut cols = 0usize;
+        for (i, c) in s[start..].char_indices() {
+            let abs = start + i; // this char's byte offset (a char boundary)
+            if c == '\n' {
+                line_end = abs;
+                next = abs + 1; // consume the newline
+                break;
+            }
+            if cols == COLS {
+                line_end = abs; // line full at a char boundary
+                next = abs;
+                break;
+            }
+            if c == ' ' {
+                break_at = Some(abs);
+            }
+            cols += 1;
+            line_end = abs + c.len_utf8(); // one past this char (a char boundary)
+            next = line_end;
+        }
+        // Full line mid-word → prefer the last space (word wrap); no space → hard split (both
+        // at char boundaries).
+        if cols == COLS {
+            if let Some(b) = break_at {
+                if b > start {
+                    line_end = b;
+                    next = b;
+                }
+            }
+        }
+        lines[n] = (start, line_end);
         n += 1;
+        cursor = next;
     }
     (lines, n)
 }
@@ -183,7 +190,10 @@ where
         .text_color(BinaryColor::Off)
         .build();
     for (row, &(a, b)) in lines[..n].iter().enumerate() {
-        let line = &s[a..b];
+        // `wrap` guarantees `a`/`b` are char boundaries, but this value arrives over an
+        // unauthenticated ESP-NOW CFG-`M` frame — `get(..).unwrap_or("")` is belt-and-braces so
+        // no future wrap edit can ever turn a crafted message into a panic→reset.
+        let line = s.get(a..b).unwrap_or("");
         let ly = y + 2 + row as i32 * LINE_H;
         Text::with_baseline(line, Point::new(x + 3, ly), style, Baseline::Top)
             .draw(display)
