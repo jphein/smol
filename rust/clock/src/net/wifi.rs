@@ -1276,6 +1276,18 @@ pub const CFG_KEY_IO: u8 = b'G';
 #[allow(dead_code)]
 pub const CFG_KEY_IO_SET: u8 = b'g';
 
+/// #197 herald NOTIFY (key `M`) = a TRANSIENT on-glass toast message. Verified free against
+/// the full key family (`S L U P R Y W N B O G g`). One-shot like R/W — captured from the
+/// transient `smol/<id>/notify` topic (retain:false), relayed via `broadcast_config` with the
+/// message as the value, and **NEVER cached / re-armed** (a retained or cached notify would
+/// re-toast on every boot — the load-bearing #197 invariant). The leaf applies it by pushing a
+/// `crate::toast` overlay (auto-dismiss), it is NOT in `CFG_APPLY_KEYS`' cached set. Value =
+/// `[~<dur>]<msg>` (optional TTL-seconds prefix, then the message), ≤ `CFG_VALUE_MAX`.
+/// Same wifi-tier / allow(dead_code) rationale as R/W (unused in a wifi-only build).
+#[cfg(feature = "wifi")]
+#[allow(dead_code)]
+pub const CFG_KEY_NOTIFY: u8 = b'M';
+
 /// #48 (GwOwnCfg — approved arch): the GATEWAY's OWN per-node configs read from its own MQTT
 /// topics this burst. A leaf gets these RELAYED (→ its `CfgTracker`); the gateway reads them
 /// DIRECTLY. Bundled into ONE `run_mqtt_burst`/`mqtt_session` out-param (net +1, not +N) — after

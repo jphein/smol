@@ -194,7 +194,7 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 12] = [
+const CFG_APPLY_KEYS: [u8; 13] = [
     crate::net::wifi::CFG_KEY_SCREEN,
     crate::net::wifi::CFG_KEY_LED,
     crate::net::wifi::CFG_KEY_UNITS,
@@ -218,6 +218,9 @@ const CFG_APPLY_KEYS: [u8; 12] = [
     // #72 IO output states: g — same unconditional-slot rationale as G above (the config
     // PLUMBING is `io`-gated; a non-io build's slot is inert). Leaf takes it via take_cfg_offer(g).
     crate::net::wifi::CFG_KEY_IO_SET,
+    // #197 herald NOTIFY: M — a COMMAND like R/W (buffered/applied via take_cfg_offer(M), NEVER
+    // cached: a cached toast would re-show on every boot). One-shot; the leaf toasts + auto-dismisses.
+    crate::net::wifi::CFG_KEY_NOTIFY,
 ];
 /// #50b leaf-status UPLINK tag: `"SMOLv1 STAT "` (12 B, trailing space) then `"NNN"`
 /// (3-ASCII zero-padded SENDER leaf id) then the verbatim live `<AppKind>:<page>` value

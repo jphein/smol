@@ -91,6 +91,9 @@ use ssd1306::mode::DisplayConfig;
 // `AppKind`/`App` enum + centralized dispatch, and the `REGISTRY` that
 // auto-builds the menu. The dispatch keystone every screen plugs into.
 mod app;
+// #197 transient on-glass toast overlay — a general primitive (also the mesh-RPG substrate),
+// composited over the active screen from the render loop; never persisted.
+mod toast;
 // ABOUT screen (identity + provenance + OTA stub) and CLOCK screen — both
 // plugins, compiled in EVERY build (identity/time need no radio).
 mod about;
@@ -756,6 +759,8 @@ fn main() -> ! {
     let mut ota_rx_eta = ota_screen::OtaEta::new();
     #[cfg(feature = "espnow")]
     let mut was_ota_rx = false;
+    // #197: tracks a shown toast so its falling edge forces one repaint to clear the box.
+    let mut was_toast = false;
 
     // Hold the boot splash for at least SPLASH_MIN_MS total. The espnow/wifi NTP
     // burst above usually already blew past this (the splash was up throughout);
@@ -1444,6 +1449,15 @@ fn main() -> ! {
                 }
             }
 
+            // #197: a transient on-glass toast (key `M`) — a COMMAND (cache-bypass, one-shot, NEVER
+            // cached → never re-toasts on reboot). Value = `[~<dur>]<msg>`; `toast::parse_wire` splits
+            // the optional `~<sec>` TTL from the message, then we show it over the active screen.
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_NOTIFY) {
+                let (dur_s, msg) = crate::toast::parse_wire(&o.buf[..o.len]);
+                crate::toast::set(msg, now, dur_s as u64 * 1000);
+                log::info!("smol #197: toast shown ({} B, {}s)", msg.len(), dur_s);
+            }
+
             // #52: a remote reboot command (key `R`) — a COMMAND (cache-bypass, one-shot). Applied
             // once (edge — `take` clears it); the value is empty (the key IS the command). Feeds
             // BOTH a leaf (relayed `<id>R`) and the gateway's OWN reset (injected into `self.cfg`),
@@ -1676,6 +1690,17 @@ fn main() -> ! {
         #[cfg(not(feature = "espnow"))]
         app.update(&mut ctx);
 
+        // #197 toast overlay: composite a transient message over the just-painted screen (before
+        // the cast snapshot, so the WLED mirror includes it). The SSD1306 framebuffer persists
+        // between flushes, so re-compositing each tick keeps the box up even after a plugin
+        // repaint. `display` is free here — the `ctx` borrow ended at `update` above. The
+        // falling-edge repaint is deferred to AFTER the redraw-latch reset below (see there).
+        let toast_now = crate::toast::is_active(now);
+        if toast_now {
+            crate::toast::draw(&mut display, now);
+            display.flush().ok();
+        }
+
         // #26 cast: snapshot the just-rendered glass image into the shared cast frame
         // (the `ctx` borrow of `display` has ended at the `update` call above), so the
         // next gateway flush can stream it to the WLED matrix. No-op unless feature=cast.
@@ -1684,6 +1709,13 @@ fn main() -> ! {
 
         // The redraw latch is single-tick: this tick's `update` consumed it.
         redraw = false;
+
+        // #197: a just-EXPIRED toast forces ONE repaint so the plugin redraws over where the box
+        // was. Set AFTER the latch reset above, so it survives to the next tick's top-of-loop seed.
+        if was_toast && !toast_now {
+            redraw = true;
+        }
+        was_toast = toast_now;
 
         delay.delay_millis(SUBTICK_MS);
     }
