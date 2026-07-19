@@ -1818,6 +1818,27 @@ mod ota_fail {
     }
 }
 
+/// #204 2b/F1: is a self-fetch failure stage a DOWNSTREAM-RECEIVE (bulk-deaf) signature — did the
+/// fetch get far enough to be RECEIVING the response/body but fail to complete it? These gate the
+/// aggressive crown SHED (the small-frame `got_mc` streak can false-green on a partial-heal, so the
+/// shed needs bulk-inbound proof). TRUE: handshake (no SYN-ACK) / status (bad response header) /
+/// fallback (200 body died mid-stream) / stall (zero-progress exhausted) / deadline (mid-download) /
+/// recycle (chunk never drained). FALSE: the pre-receive stages (assoc/dhcp/slot = pre-net,
+/// connect = never established, send = TX-side which is HEALTHY in the disease) and verify (body was
+/// fully RECEIVED, only the size/SHA/sig gate rejected it → downstream itself worked).
+#[cfg(feature = "espnow")]
+pub(crate) fn ota_fail_is_bulk_deaf(w: u32) -> bool {
+    matches!(
+        w,
+        ota_fail::HANDSHAKE
+            | ota_fail::STATUS
+            | ota_fail::FALLBACK
+            | ota_fail::STALL
+            | ota_fail::DEADLINE
+            | ota_fail::RECYCLE
+    )
+}
+
 /// One short MQTT 3.1.1 QoS0 session over a fresh TCP socket to the HA broker:
 /// TCP connect → CONNECT (client-id `smol-<node_id>`, username+password) → CONNACK
 /// → SUBSCRIBE `smol/display/batt` (downlink FIRST — the retained payload every node
