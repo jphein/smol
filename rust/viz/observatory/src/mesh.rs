@@ -78,27 +78,39 @@ fn ev(t: f64, topic: &str, payload: impl AsRef<[u8]>) -> ScriptEvent {
     ScriptEvent { t, topic: topic.to_string(), payload: payload.as_ref().to_vec() }
 }
 
+/// Encode a dBm reading the way the firmware puts it on the wire: ESP-NOW RSSI is a
+/// **raw `u8`**, so a negative dBm ships as its unsigned byte (e.g. -46 dBm -> 210).
+/// mesh-model's `normalize_rssi` decodes it back. Emitting raw here makes the demo a
+/// faithful `smol/<id>/peers` replay and exercises the decode end-to-end.
+fn raw_rssi(dbm: i32) -> i32 {
+    if dbm < 0 {
+        dbm + 256
+    } else {
+        dbm
+    }
+}
+
 /// A star roster centred on `owner` at channel `ch`: owner is gateway 'G' linking to
 /// every leaf; each leaf is 'L' linking back. RSSI falls off by list position so the
-/// filaments vary. Returns the peers events to publish.
+/// filaments vary. Returns the peers events to publish (raw-u8 RSSI, like the fleet).
 fn peers_star(owner: u8, fleet: &[u8], ch: u8, t: f64) -> Vec<ScriptEvent> {
     let leaves: Vec<u8> = fleet.iter().copied().filter(|&i| i != owner).collect();
     let mut out = Vec::new();
     // Owner sees all leaves.
     let mut body = String::new();
     for (k, &l) in leaves.iter().enumerate() {
-        let rssi = -46 - (k as i32) * 9; // -46, -55, -64, -73 ...
+        let rssi = raw_rssi(-46 - (k as i32) * 9); // -46, -55, -64, -73 dBm on the wire
         let age = 1 + k as u32;
         body.push_str(&format!("{l},{rssi},{age},{ch},3;"));
     }
     out.push(ev(t, &format!("smol/{owner}/peers"), format!("PEERS|G|{ch}|{body}")));
     // Each leaf sees the owner (+ a cross-link to its neighbour for a richer graph).
     for (k, &l) in leaves.iter().enumerate() {
-        let rssi = -48 - (k as i32) * 9;
+        let rssi = raw_rssi(-48 - (k as i32) * 9);
         let mut lb = format!("{owner},{rssi},{},{ch},3;", 1 + k as u32);
         if let Some(&nb) = leaves.get((k + 1) % leaves.len()) {
             if nb != l {
-                lb.push_str(&format!("{nb},{},{},{ch},1;", -70 - (k as i32) * 3, 8 + k as u32));
+                lb.push_str(&format!("{nb},{},{},{ch},1;", raw_rssi(-70 - (k as i32) * 3), 8 + k as u32));
             }
         }
         out.push(ev(t, &format!("smol/{l}/peers"), format!("PEERS|L|{ch}|{lb}")));

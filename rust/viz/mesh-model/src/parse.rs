@@ -52,6 +52,20 @@ pub fn split_node_topic(topic: &str) -> Option<(u8, &str)> {
     Some((id, suffix))
 }
 
+/// The firmware serializes a peer's ESP-NOW RSSI as the **raw `u8`** byte from
+/// `rx_control.rssi` (esp-wifi reports it unsigned), so a real `-41 dBm` arrives on
+/// the wire as `215`. Reinterpret any 128..=255 value as the signed byte it is;
+/// genuine negatives / zero / small values pass through. RSSI in dBm is never
+/// positive, so this is lossless for every real reading (-128..-1 ↔ 128..255).
+/// Confirmed against live `smol/5/peers` = `8,215,…` (id8 at -41 dBm).
+pub fn normalize_rssi(v: i32) -> i32 {
+    if (128..=255).contains(&v) {
+        v - 256
+    } else {
+        v
+    }
+}
+
 /// Parse `PEERS|<role>|<ch>|id,rssi,age,ch,flags;...`. An empty payload (retained
 /// clear on demotion) yields `None`; the caller treats that as "drop this node's edges".
 pub fn parse_peers(payload: &str) -> Option<PeersRecord> {
@@ -65,7 +79,7 @@ pub fn parse_peers(payload: &str) -> Option<PeersRecord> {
     for rec in body.split(';').filter(|s| !s.is_empty()) {
         let mut f = rec.split(',');
         let id: u8 = f.next()?.parse().ok()?;
-        let rssi: i32 = f.next()?.parse().ok()?;
+        let rssi: i32 = normalize_rssi(f.next()?.parse().ok()?);
         let age_s: u32 = f.next()?.parse().ok()?;
         let ch: u8 = f.next()?.parse().ok()?;
         let flags: u8 = f.next()?.parse().ok()?;
@@ -180,6 +194,20 @@ mod tests {
         assert_eq!(p.links.len(), 2);
         assert_eq!(p.links[0], PeerLink { id: 8, rssi: -55, age_s: 2, channel: 6, connected: true, has_mesh_time: true });
         assert_eq!(p.links[1], PeerLink { id: 9, rssi: -72, age_s: 14, channel: 6, connected: true, has_mesh_time: false });
+    }
+
+    #[test]
+    fn rssi_raw_u8_is_decoded_to_dbm() {
+        // Live ground truth: smol/5/peers = "PEERS|G|1|8,215,0,1,3;7,214,0,1,3;9,194,0,1,3".
+        assert_eq!(normalize_rssi(215), -41);
+        assert_eq!(normalize_rssi(214), -42);
+        assert_eq!(normalize_rssi(194), -62);
+        assert_eq!(normalize_rssi(-55), -55); // already-signed passes through
+        assert_eq!(normalize_rssi(0), 0);
+        let p = parse_peers("PEERS|G|1|8,215,0,1,3;7,214,0,1,3;9,194,0,1,3").unwrap();
+        assert_eq!(p.channel, 1);
+        assert_eq!(p.links[0].rssi, -41);
+        assert_eq!(p.links[2].rssi, -62);
     }
 
     #[test]
