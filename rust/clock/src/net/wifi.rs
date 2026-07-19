@@ -378,6 +378,9 @@ pub fn try_time_sync(
     p: WifiPeripherals,
     batt: &mut crate::batt::BattCache,
     grid: &mut crate::grid::GridCache,
+    // #89 Stage 1: painted on each prologue yield so the (wifi-only bench) boot screen
+    // shows a LIVE clock through the assoc/DHCP/SNTP sync window instead of a frozen splash.
+    render: &mut dyn FnMut(),
 ) -> Option<u32> {
     super::init_heap();
 
@@ -408,7 +411,8 @@ pub fn try_time_sync(
         &mut controller,
         &mut device,
         rng,
-        &mut || false,
+        &mut || false, // wifi-only bench: no #20 abort button wired
+        render,
         &mut reached_dhcp,
         crate::node_id(),
         batt,
@@ -426,59 +430,354 @@ pub fn try_time_sync(
     synced
 }
 
-/// #100: outcome of ONE association attempt — drives the slot-fallback loop. Only `TimedOut`
-/// counts toward a revert; `Aborted` (a #20 long-press) unwinds the burst without touching NVS.
+// ===========================================================================
+// #89 Stage 1 — non-blocking NTP prologue substrate (assoc / DHCP / SNTP).
+// ===========================================================================
+//
+// The pre-MQTT prologue of `run_ntp_burst` (WiFi association, DHCP, one SNTP
+// exchange) used to be three back-to-back blocking `loop { tick(); iface.poll();
+// … }` spins. Each spin idles waiting on a radio/DHCP/UDP round-trip — wall-clock
+// the UI thread should have spent rendering. `NtpMachine` turns those three waits
+// into ONE resumable state machine polled from the boot path: `poll()` advances
+// the current phase, keeps polling while smoltcp reports forward progress, and
+// returns `Pending` the moment it stalls (or after `BURST_POLL_BUDGET` of
+// continuous progress) so the caller can paint a live clock frame + poll the #20
+// abort button between polls.
+//
+// The MQTT tail (`mqtt_session`) is DELIBERATELY still blocking this stage (that
+// is #89 Stage 2) — the machine hands it the live stack and the screen freezes for
+// the ≤ `MQTT_SESSION_BUDGET` tail exactly as before. Reverting Stage 1 alone
+// restores the old blocking prologue with nothing stranded (no later-stage
+// substrate consumer exists yet).
+//
+// Buffer hoist (F2 precedent — see `OTA_TCP_RX` in `run_ota_fetch`): the smoltcp
+// socket storage + per-socket buffers live in module `static mut` so the machine
+// can hold `SocketSet<'static>` ACROSS polls. Alias-safe for the same reason the
+// OTA fix is: `run_ntp_burst` is boot-only, single-caller, main-thread, and never
+// re-entered (periodic flushes / re-elections use `run_mqtt_burst`, not this
+// path), so the previous borrow always ends when `run_ntp_burst` returns before
+// any next call. `addr_of_mut!` avoids the reference-to-`static mut` lint.
+
+/// #142: association attempts on the single baked `WIFI_NETWORK` before giving up
+/// (mesh-only this burst; retry next boot — never a network switch).
 #[cfg(feature = "wifi")]
-enum AssocResult {
-    Associated,
-    TimedOut,
-    Aborted,
+const ASSOC_ATTEMPTS: u8 = 3;
+
+/// #89 ⚠️ HARDWARE-WATCH tuning knob (sibling to the retired `SYNC_REDRAW_MS`): the
+/// belt-and-suspenders cap on how long `NtpMachine::poll` may keep polling while
+/// smoltcp reports continuous forward progress before it yields a frame anyway. On
+/// the NTP path progress is never continuous beyond one round-trip, so this cap
+/// effectively never trips here — it earns its keep on the Stage 2/3 transfer paths
+/// that reuse this substrate.
+#[cfg(feature = "wifi")]
+const BURST_POLL_BUDGET: Duration = Duration::from_millis(20);
+
+// --- Hoisted smoltcp stack buffers (F2 precedent; boot-only, single-caller) ---
+#[cfg(feature = "wifi")]
+static mut NTP_SOCK_STORAGE: [SocketStorage; 4] = [SocketStorage::EMPTY; 4];
+#[cfg(feature = "wifi")]
+static mut NTP_UDP_RX_META: [udp::PacketMetadata; 4] = [udp::PacketMetadata::EMPTY; 4];
+#[cfg(feature = "wifi")]
+static mut NTP_UDP_RX_DATA: [u8; 512] = [0; 512];
+#[cfg(feature = "wifi")]
+static mut NTP_UDP_TX_META: [udp::PacketMetadata; 4] = [udp::PacketMetadata::EMPTY; 4];
+#[cfg(feature = "wifi")]
+static mut NTP_UDP_TX_DATA: [u8; 512] = [0; 512];
+#[cfg(feature = "wifi")]
+static mut NTP_TCP_RX: [u8; 512] = [0; 512];
+#[cfg(feature = "wifi")]
+static mut NTP_TCP_TX: [u8; 512] = [0; 512];
+/// DHCP hostname option — must be `'static` because `dhcpv4::Socket<'a>` borrows it
+/// for the socket's lifetime and this socket lives `'static` in the hoisted `SocketSet`.
+#[cfg(feature = "wifi")]
+static NTP_DHCP_OPTS: [DhcpOption<'static>; 1] = [DhcpOption { kind: 12, data: b"smol" }];
+
+/// The resumable prologue phase. `Assoc → Dhcp → Sntp → Done | Failed`.
+#[cfg(feature = "wifi")]
+enum NtpPhase {
+    /// WiFi association: run the (blocking, brief) disconnect/configure/start/connect
+    /// FFI once per attempt, then poll `is_connected()` within a per-attempt
+    /// `SYNC_BUDGET`. Up to `ASSOC_ATTEMPTS` (#142). All attempts timing out → `Failed`.
+    Assoc,
+    /// DHCP: poll for a lease within the shared DHCP+SNTP `SYNC_BUDGET`. On a lease,
+    /// qualify the node as gateway (N3c) and advance to `Sntp`; timeout → `Failed`.
+    Dhcp,
+    /// One SNTP exchange within the same shared deadline; a parsed reply → `Done(Some)`,
+    /// deadline → `Done(None)` (DHCP already succeeded, so the MQTT tail still runs).
+    Sntp,
+    /// Prologue complete, DHCP reached: the caller runs the (still-blocking) MQTT tail
+    /// on the live stack, then returns this SNTP result.
+    Done(Option<u32>),
+    /// Assoc or DHCP gave up: the caller returns `None` with NO MQTT tail (mesh-only leaf).
+    Failed,
 }
 
-/// #142: one association attempt on the single baked `WIFI_NETWORK`. Disconnect-then-(re)configure
-/// so a re-association is clean, then wait for `is_connected` within `SYNC_BUDGET`. `TimedOut` just
-/// means retry next burst (never a network switch — #100's slot revert is retired); a `#20 long-press
-/// Aborted` unwinds the burst.
+/// One `NtpMachine::poll` outcome.
 #[cfg(feature = "wifi")]
-fn associate(
-    controller: &mut esp_wifi::wifi::WifiController<'static>,
-    tick: &mut dyn FnMut() -> bool,
-) -> AssocResult {
-    let net = &crate::secrets::WIFI_NETWORK;
-    // Drop any prior association before reconfiguring (harmless if not connected) so switching
-    // SSIDs between slots doesn't leave a stale config. Errors are non-fatal → treated as a miss.
-    let _ = controller.disconnect();
-    if controller
-        .set_configuration(&Configuration::Client(ClientConfiguration {
-            ssid: net.ssid.into(),
-            password: net.pass.into(),
-            // COEXIST SOAK (#23 PART 1): pin association to ch1 (see the pre-#100 note).
-            #[cfg(feature = "coexist-soak")]
-            channel: Some(1),
-            ..Default::default()
-        }))
-        .is_err()
-    {
-        return AssocResult::TimedOut;
-    }
-    if !matches!(controller.is_started(), Ok(true)) && controller.start().is_err() {
-        return AssocResult::TimedOut;
-    }
-    if controller.connect().is_err() {
-        return AssocResult::TimedOut;
-    }
-    let deadline = Instant::now() + SYNC_BUDGET;
-    while !matches!(controller.is_connected(), Ok(true)) {
-        if tick() {
-            return AssocResult::Aborted; // #20 long-press mid-sync
+enum NtpPoll {
+    /// Prologue stalled on a round-trip — paint a frame + poll abort, then poll again.
+    Pending,
+    /// Assoc/DHCP failed: caller returns `None`, skips the MQTT tail (mesh-only leaf).
+    Failed,
+    /// Reached DHCP; carries the SNTP result. Caller runs the (blocking) MQTT tail on the
+    /// machine's live stack, then returns this value.
+    ReachedDhcp(Option<u32>),
+}
+
+/// #89 Stage 1: the resumable assoc/DHCP/SNTP prologue. Holds the (hoisted) smoltcp
+/// stack + phase + timers ACROSS polls; the caller drives `poll()` and renders between
+/// yields. Built once per boot burst, dropped at burst end (per-burst freshness — a
+/// fresh interface each burst keeps the empty-neighbour-cache behaviour identical to
+/// the pre-#89 path).
+#[cfg(feature = "wifi")]
+struct NtpMachine {
+    iface: Interface,
+    sockets: SocketSet<'static>,
+    dhcp_handle: smoltcp::iface::SocketHandle,
+    udp_handle: smoltcp::iface::SocketHandle,
+    tcp_handle: smoltcp::iface::SocketHandle,
+    phase: NtpPhase,
+    /// #142 association attempt counter (0-based).
+    attempt: u8,
+    /// Whether the current attempt's connect FFI bookend has been issued.
+    assoc_configured: bool,
+    /// Per-attempt assoc budget, then the shared DHCP+SNTP budget (set on Assoc→Dhcp).
+    deadline: Instant,
+    /// RNG-seeded ephemeral source port for the SNTP exchange.
+    sntp_src_port: u16,
+    sntp_bound: bool,
+    sntp_sent: bool,
+}
+
+#[cfg(feature = "wifi")]
+impl NtpMachine {
+    /// Build the hoisted smoltcp stack (DHCP + UDP/SNTP + TCP/MQTT sockets over the
+    /// module `static mut` buffers) and start in `Assoc`. `sntp_src_port` is the
+    /// caller's RNG-seeded ephemeral port for the SNTP request.
+    fn new(device: &mut esp_wifi::wifi::WifiDevice, sntp_src_port: u16) -> Self {
+        let iface = create_interface(device);
+
+        // SAFETY: F2 precedent — boot-only, single-caller, main-thread, never re-entered
+        // (see the module note above), so these `static mut` borrows never alias.
+        // Array→slice unsized coercion at the `let` type (NOT `(*ptr)[..]` indexing,
+        // which trips the deny-by-default `dangerous_implicit_autorefs`). The referent
+        // is a `static`, so the borrow is soundly `'static` and the machine holds the
+        // resulting `SocketSet<'static>` across polls.
+        let sock_storage: &'static mut [SocketStorage] =
+            unsafe { &mut *core::ptr::addr_of_mut!(NTP_SOCK_STORAGE) };
+        let udp_rx_meta: &'static mut [udp::PacketMetadata] =
+            unsafe { &mut *core::ptr::addr_of_mut!(NTP_UDP_RX_META) };
+        let udp_rx_data: &'static mut [u8] =
+            unsafe { &mut *core::ptr::addr_of_mut!(NTP_UDP_RX_DATA) };
+        let udp_tx_meta: &'static mut [udp::PacketMetadata] =
+            unsafe { &mut *core::ptr::addr_of_mut!(NTP_UDP_TX_META) };
+        let udp_tx_data: &'static mut [u8] =
+            unsafe { &mut *core::ptr::addr_of_mut!(NTP_UDP_TX_DATA) };
+        let tcp_rx: &'static mut [u8] =
+            unsafe { &mut *core::ptr::addr_of_mut!(NTP_TCP_RX) };
+        let tcp_tx: &'static mut [u8] =
+            unsafe { &mut *core::ptr::addr_of_mut!(NTP_TCP_TX) };
+
+        let mut sockets = SocketSet::new(sock_storage);
+
+        let mut dhcp_socket = dhcpv4::Socket::new();
+        dhcp_socket.set_outgoing_options(&NTP_DHCP_OPTS);
+        let dhcp_handle = sockets.add(dhcp_socket);
+
+        let udp_socket = udp::Socket::new(
+            udp::PacketBuffer::new(udp_rx_meta, udp_rx_data),
+            udp::PacketBuffer::new(udp_tx_meta, udp_tx_data),
+        );
+        let udp_handle = sockets.add(udp_socket);
+
+        let tcp_socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(tcp_rx),
+            tcp::SocketBuffer::new(tcp_tx),
+        );
+        let tcp_handle = sockets.add(tcp_socket);
+
+        Self {
+            iface,
+            sockets,
+            dhcp_handle,
+            udp_handle,
+            tcp_handle,
+            phase: NtpPhase::Assoc,
+            attempt: 0,
+            assoc_configured: false,
+            deadline: Instant::now(), // real deadline set on the first assoc setup
+            sntp_src_port,
+            sntp_bound: false,
+            sntp_sent: false,
         }
-        if Instant::now() > deadline {
-            log::warn!("smol #142: assoc timed out on '{}' — retry next burst (mesh-only leaf)", net.ssid);
-            return AssocResult::TimedOut;
+    }
+
+    /// Advance the prologue. Keeps polling while smoltcp makes forward progress;
+    /// returns `Pending` the instant it stalls (yield to render + poll abort) or after
+    /// `BURST_POLL_BUDGET` of continuous progress.
+    fn poll(
+        &mut self,
+        controller: &mut esp_wifi::wifi::WifiController<'static>,
+        device: &mut esp_wifi::wifi::WifiDevice<'static>,
+    ) -> NtpPoll {
+        let poll_start = Instant::now();
+        loop {
+            let progressed = match self.phase {
+                NtpPhase::Assoc => self.step_assoc(controller),
+                NtpPhase::Dhcp => self.step_dhcp(device),
+                NtpPhase::Sntp => self.step_sntp(device),
+                NtpPhase::Done(_) | NtpPhase::Failed => false,
+            };
+            match self.phase {
+                NtpPhase::Done(t) => return NtpPoll::ReachedDhcp(t),
+                NtpPhase::Failed => return NtpPoll::Failed,
+                _ => {}
+            }
+            if !progressed || Instant::now() >= poll_start + BURST_POLL_BUDGET {
+                return NtpPoll::Pending;
+            }
         }
     }
-    log::info!("smol #142: associated to '{}'", net.ssid);
-    AssocResult::Associated
+
+    /// Association step. The disconnect/configure/start/connect FFI (a brief esp-wifi
+    /// reconfigure, not pumpable — design §2) runs once per attempt; then we poll
+    /// `is_connected()`. Returns whether the phase advanced this step (`false` = still
+    /// waiting → yield).
+    fn step_assoc(&mut self, controller: &mut esp_wifi::wifi::WifiController<'static>) -> bool {
+        let net = &crate::secrets::WIFI_NETWORK;
+        if !self.assoc_configured {
+            // Drop any prior association before reconfiguring (harmless if not connected).
+            let _ = controller.disconnect();
+            let ok = controller
+                .set_configuration(&Configuration::Client(ClientConfiguration {
+                    ssid: net.ssid.into(),
+                    password: net.pass.into(),
+                    // COEXIST SOAK (#23 PART 1): pin association to ch1.
+                    #[cfg(feature = "coexist-soak")]
+                    channel: Some(1),
+                    ..Default::default()
+                }))
+                .is_ok()
+                && (matches!(controller.is_started(), Ok(true)) || controller.start().is_ok())
+                && controller.connect().is_ok();
+            if !ok {
+                return self.assoc_attempt_failed();
+            }
+            self.assoc_configured = true;
+            self.deadline = Instant::now() + SYNC_BUDGET; // per-attempt assoc budget
+            return true;
+        }
+        if matches!(controller.is_connected(), Ok(true)) {
+            log::info!("smol #142: associated to '{}'", net.ssid);
+            // Shared DHCP+SNTP budget starts now (mirrors the pre-#89 `deadline` set at
+            // the top of the DHCP loop).
+            self.deadline = Instant::now() + SYNC_BUDGET;
+            self.phase = NtpPhase::Dhcp;
+            return true;
+        }
+        if Instant::now() > self.deadline {
+            log::warn!(
+                "smol #142: assoc timed out on '{}' — retry next burst (mesh-only leaf)",
+                net.ssid
+            );
+            return self.assoc_attempt_failed();
+        }
+        false // still waiting on association → yield
+    }
+
+    /// Count one failed association attempt; give up (→ `Failed`) after `ASSOC_ATTEMPTS`
+    /// (#142: retry the ONE baked network, never switch SSID, no NVS write on failure).
+    fn assoc_attempt_failed(&mut self) -> bool {
+        self.attempt += 1;
+        self.assoc_configured = false; // re-run the connect bookend next attempt
+        if self.attempt >= ASSOC_ATTEMPTS {
+            log::warn!("smol #142: primary assoc unreachable — mesh-only this burst, retry next");
+            self.phase = NtpPhase::Failed;
+        }
+        true
+    }
+
+    /// DHCP step: one `iface.poll()`, apply a lease if it arrived. On a lease, set the
+    /// gateway qualifier (N3c: `run_ntp_burst` returns `ReachedDhcp`) and advance to SNTP.
+    fn step_dhcp(&mut self, device: &mut esp_wifi::wifi::WifiDevice<'static>) -> bool {
+        let changed = matches!(
+            self.iface.poll(smoltcp_now(), device, &mut self.sockets),
+            smoltcp::iface::PollResult::SocketStateChanged
+        );
+        let configured = {
+            let socket = self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp_handle);
+            match socket.poll() {
+                Some(dhcpv4::Event::Configured(cfg)) => Some((cfg.address, cfg.router)),
+                _ => None,
+            }
+        };
+        if let Some((addr, router)) = configured {
+            apply_dhcp(&mut self.iface, addr, router);
+            log::info!("smol: DHCP address {}", addr);
+            self.phase = NtpPhase::Sntp;
+            return true;
+        }
+        if Instant::now() > self.deadline {
+            log::warn!("smol: DHCP timed out");
+            self.phase = NtpPhase::Failed;
+            return true;
+        }
+        changed // progress iff smoltcp readiness changed this poll; else yield
+    }
+
+    /// SNTP step: bind once, send the NTPv4 request once the socket can send, parse a
+    /// reply into Unix seconds. Deadline → `Done(None)` (DHCP already succeeded → MQTT
+    /// tail still runs, just no time this burst).
+    fn step_sntp(&mut self, device: &mut esp_wifi::wifi::WifiDevice<'static>) -> bool {
+        let changed = matches!(
+            self.iface.poll(smoltcp_now(), device, &mut self.sockets),
+            smoltcp::iface::PollResult::SocketStateChanged
+        );
+        let socket = self.sockets.get_mut::<udp::Socket>(self.udp_handle);
+
+        // Bind the ephemeral source port once (retry next poll if the stack isn't ready).
+        if !self.sntp_bound && socket.bind(self.sntp_src_port).is_ok() {
+            self.sntp_bound = true;
+        }
+
+        let mut progressed = changed;
+
+        // Send the NTPv4 request once (LI=0, VN=4, Mode=3 → first byte 0x23), latched.
+        if self.sntp_bound && !self.sntp_sent && socket.can_send() {
+            let mut request = [0u8; 48];
+            request[0] = 0x23;
+            if socket
+                .send_slice(&request, (IpAddress::Ipv4(NTP_SERVER_IP), NTP_PORT))
+                .is_ok()
+            {
+                self.sntp_sent = true;
+                progressed = true;
+            }
+        }
+
+        if socket.can_recv() {
+            let mut buf = [0u8; 48];
+            if let Ok((len, _from)) = socket.recv_slice(&mut buf) {
+                if len >= 48 {
+                    // Transmit Timestamp seconds field = bytes 40..44, big-endian, from
+                    // the NTP epoch (1900).
+                    let ntp_secs = u32::from_be_bytes([buf[40], buf[41], buf[42], buf[43]]);
+                    if ntp_secs > NTP_TO_UNIX_OFFSET {
+                        self.phase = NtpPhase::Done(Some(ntp_secs - NTP_TO_UNIX_OFFSET));
+                        return true;
+                    }
+                }
+            }
+        }
+
+        if Instant::now() > self.deadline {
+            log::warn!("smol: SNTP timed out");
+            self.phase = NtpPhase::Done(None);
+            return true;
+        }
+
+        progressed
+    }
 }
 
 /// #100: the broker leg (IPv4, port) to connect THIS burst, resolved at RUNTIME from the NVS
@@ -574,6 +873,11 @@ pub fn run_ntp_burst(
     device: &mut esp_wifi::wifi::WifiDevice<'static>,
     mut rng: Rng,
     tick: &mut dyn FnMut() -> bool,
+    // #89 Stage 1: painted on each prologue yield (assoc/DHCP/SNTP stall) so the boot
+    // screen shows a LIVE clock through the sync window. UI-agnostic here — the display
+    // lives in `main`; net/ just calls back. NOT invoked during the (still-blocking)
+    // MQTT tail below, which freezes exactly as before (that is #89 Stage 2).
+    render: &mut dyn FnMut(),
     // N3c: set true once we've ASSOCIATED + got a DHCP lease (before SNTP runs).
     // The caller uses this — NOT the returned NTP Option — to decide gateway role,
     // so an SNTP outage can't demote a node with a working LAN uplink.
@@ -597,106 +901,37 @@ pub fn run_ntp_burst(
     // #33: set true iff a retained OTA `install` command is present for this board.
     install_requested: &mut bool,
 ) -> Option<u32> {
-    // --- smoltcp stack: DHCP + UDP (SNTP) + TCP (MQTT) sockets -----------
-    let mut iface = create_interface(device);
-
-    let mut sockets_storage: [SocketStorage; 4] = Default::default();
-    let mut sockets = SocketSet::new(&mut sockets_storage[..]);
-
-    let mut dhcp_socket = dhcpv4::Socket::new();
-    dhcp_socket.set_outgoing_options(&[DhcpOption {
-        kind: 12, // hostname
-        data: b"smol",
-    }]);
-    let dhcp_handle = sockets.add(dhcp_socket);
-
-    // UDP socket for SNTP.
-    let mut udp_rx_meta = [udp::PacketMetadata::EMPTY; 4];
-    let mut udp_rx_data = [0u8; 512];
-    let mut udp_tx_meta = [udp::PacketMetadata::EMPTY; 4];
-    let mut udp_tx_data = [0u8; 512];
-    let udp_socket = udp::Socket::new(
-        udp::PacketBuffer::new(&mut udp_rx_meta[..], &mut udp_rx_data[..]),
-        udp::PacketBuffer::new(&mut udp_tx_meta[..], &mut udp_tx_data[..]),
-    );
-    let udp_handle = sockets.add(udp_socket);
-
-    // TCP socket for the MQTT downlink (the retained battery payload).
-    let mut tcp_rx = [0u8; 512];
-    let mut tcp_tx = [0u8; 512];
-    let tcp_socket = tcp::Socket::new(
-        tcp::SocketBuffer::new(&mut tcp_rx[..]),
-        tcp::SocketBuffer::new(&mut tcp_tx[..]),
-    );
-    let tcp_handle = sockets.add(tcp_socket);
-
-    // --- #142 WiFi connect: single network, retry-primary-forever ---------
-    // Associate on the ONE baked network (`crate::secrets::WIFI_NETWORK`). Up to ASSOC_ATTEMPTS ×
-    // SYNC_BUDGET; all TimedOut → return None and let THIS burst end — the board free-runs as a
-    // fully-functional ESP-NOW mesh-only leaf (mesh membership + relayed telemetry + mesh time, no
-    // WiFi bursts) and the next burst/boot simply retries the primary. #142 retired #100's dual-slot
-    // revert: a board is NEVER switched onto the secondary/roam SSID (which caused AP-table
-    // pathologies) — a persistent primary-assoc failure is a placement/per-board TX issue (#141),
-    // not a reason to leave the intended network. No NVS write on failure (zero flash wear).
-    const ASSOC_ATTEMPTS: u8 = 3;
-    let mut attempt = 0u8;
-    loop {
-        match associate(controller, tick) {
-            AssocResult::Associated => break,
-            AssocResult::Aborted => return None, // #20 long-press → unwind the burst
-            AssocResult::TimedOut => {
-                attempt += 1;
-                if attempt >= ASSOC_ATTEMPTS {
-                    log::warn!("smol #142: primary assoc unreachable — mesh-only this burst, retry next");
-                    return None; // mesh-only leaf; next burst retries the primary (never switch)
+    // --- #89 Stage 1: resumable assoc → DHCP → SNTP prologue --------------
+    // The three blocking waits (assoc, DHCP, SNTP — up to ASSOC_ATTEMPTS × SYNC_BUDGET
+    // for assoc, then a shared DHCP+SNTP SYNC_BUDGET) are now one `NtpMachine` polled
+    // from here. On each round-trip stall we `render()` a live clock frame + `tick()`
+    // (LED + #20 long-press abort), so the boot screen ticks through the whole sync
+    // window instead of holding a frozen splash. The machine's hoisted `static mut`
+    // stack (F2 precedent) hands off to the still-blocking MQTT tail below.
+    //
+    // #142 (unchanged): assoc retries the ONE baked network forever, never switches
+    // SSID, writes no NVS on failure; all attempts timing out → mesh-only this burst,
+    // retry next boot.
+    let sntp_src_port = 49152 + (rng.random() % 16384) as u16;
+    let mut machine = NtpMachine::new(device, sntp_src_port);
+    let synced = loop {
+        match machine.poll(controller, device) {
+            NtpPoll::Pending => {
+                render(); // paint the live clock frame during the round-trip wait
+                if tick() {
+                    return None; // #20 long-press → unwind the burst (no MQTT tail)
                 }
             }
+            // Assoc or DHCP gave up → mesh-only leaf this burst; NO MQTT tail (matches
+            // the pre-#89 early returns). The next burst/boot retries the primary (#142).
+            NtpPoll::Failed => return None,
+            NtpPoll::ReachedDhcp(t) => break t,
         }
-    }
-
-    // Poll the stack until DHCP yields an address. The DHCP `Event` borrows
-    // the socket, so we extract the plain (Ipv4Cidr, router) data inside a
-    // short scope, then apply it to the interface once the borrow is released.
-    let deadline = Instant::now() + SYNC_BUDGET; // DHCP+SNTP budget (assoc has its own per-slot budget in try_time_sync)
-    loop {
-        if tick() {
-            return None; // #20 abort during DHCP wait
-        }
-        let ts = smoltcp_now();
-        iface.poll(ts, device, &mut sockets);
-
-        let configured = {
-            let socket = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
-            match socket.poll() {
-                Some(dhcpv4::Event::Configured(cfg)) => Some((cfg.address, cfg.router)),
-                _ => None,
-            }
-        };
-
-        if let Some((addr, router)) = configured {
-            apply_dhcp(&mut iface, addr, router);
-            log::info!("smol: DHCP address {}", addr);
-            // N3c: association + DHCP reached — this alone qualifies the node as a
-            // relay GATEWAY (see start()); the SNTP below is best-effort for TIME.
-            *reached_dhcp = true;
-            break;
-        }
-        if Instant::now() > deadline {
-            log::warn!("smol: DHCP timed out");
-            return None;
-        }
-    }
-
-    // --- SNTP exchange ---------------------------------------------------
-    let synced = sntp_query(
-        &mut iface,
-        device,
-        &mut sockets,
-        udp_handle,
-        rng.random(),
-        deadline,
-        tick,
-    );
+    };
+    // N3c: the machine only yields `ReachedDhcp` on an association + DHCP lease — that
+    // alone qualifies the node as a relay GATEWAY (see start()); SNTP is best-effort for
+    // TIME, so an SNTP outage can't demote a node with a working LAN uplink.
+    *reached_dhcp = true;
 
     // --- HA battery downlink (MQTT, on this same open burst) -------------
     // We reached DHCP (the loop above only breaks on a lease), so the LAN + broker
@@ -718,11 +953,15 @@ pub fn run_ntp_burst(
     let mut _ntp_gw_own = GwOwnCfg::new(); // #48: boot/NTP burst never captures gateway-own cfg (cfg_cache=None)
     let mut _ntp_reset_req = ResetReq::new(); // #52: boot/NTP burst subscribes no cmd/reset (cfg_cache=None)
     let mut _ntp_scan_req = ScanReq::new(); // #71: boot/NTP burst subscribes no cmd/scan (cfg_cache=None)
+    // #89 Stage 1: hand the machine's LIVE stack to the UNCHANGED blocking session —
+    // the boot screen freezes for this ≤ MQTT_SESSION_BUDGET tail exactly as before
+    // (making the tail cooperative is #89 Stage 2). `tick` still runs (LED + abort),
+    // but `render` is not called here, so the display holds its last clock frame.
     let _ = mqtt_session(
-        &mut iface,
+        &mut machine.iface,
         device,
-        &mut sockets,
-        tcp_handle,
+        &mut machine.sockets,
+        machine.tcp_handle,
         node_id,
         &[],
         mqtt_port,
@@ -765,70 +1004,6 @@ fn apply_dhcp(iface: &mut Interface, addr: Ipv4Cidr, router: Option<Ipv4Addr>) {
     });
     if let Some(router) = router {
         let _ = iface.routes_mut().add_default_ipv4_route(router);
-    }
-}
-
-/// Send one SNTP request and parse the reply into a Unix timestamp (seconds).
-fn sntp_query(
-    iface: &mut Interface,
-    device: &mut esp_wifi::wifi::WifiDevice,
-    sockets: &mut SocketSet,
-    udp_handle: smoltcp::iface::SocketHandle,
-    ephemeral_port_seed: u32,
-    deadline: Instant,
-    tick: &mut dyn FnMut() -> bool,
-) -> Option<u32> {
-    // Bind a pseudo-random ephemeral source port (49152..=65535).
-    let src_port = 49152 + (ephemeral_port_seed % 16384) as u16;
-
-    // SNTP/NTPv4 client request: LI=0, VN=4, Mode=3 -> first byte 0x23.
-    let mut request = [0u8; 48];
-    request[0] = 0x23;
-
-    let server = (IpAddress::Ipv4(NTP_SERVER_IP), NTP_PORT);
-
-    {
-        let socket = sockets.get_mut::<udp::Socket>(udp_handle);
-        if socket.bind(src_port).is_err() {
-            return None;
-        }
-        if socket.send_slice(&request, server).is_err() {
-            // Not connected yet; the poll loop below will retry the send once.
-        }
-    }
-
-    let mut sent = false;
-    loop {
-        if tick() {
-            return None; // #20 abort during SNTP exchange
-        }
-        let ts = smoltcp_now();
-        iface.poll(ts, device, sockets);
-
-        let socket = sockets.get_mut::<udp::Socket>(udp_handle);
-
-        if !sent && socket.can_send() && socket.send_slice(&request, server).is_ok() {
-            sent = true;
-        }
-
-        if socket.can_recv() {
-            let mut buf = [0u8; 48];
-            if let Ok((len, _from)) = socket.recv_slice(&mut buf) {
-                if len >= 48 {
-                    // Transmit Timestamp seconds field = bytes 40..44, big-endian,
-                    // measured from the NTP epoch (1900).
-                    let ntp_secs = u32::from_be_bytes([buf[40], buf[41], buf[42], buf[43]]);
-                    if ntp_secs > NTP_TO_UNIX_OFFSET {
-                        return Some(ntp_secs - NTP_TO_UNIX_OFFSET);
-                    }
-                }
-            }
-        }
-
-        if Instant::now() > deadline {
-            log::warn!("smol: SNTP timed out");
-            return None;
-        }
     }
 }
 

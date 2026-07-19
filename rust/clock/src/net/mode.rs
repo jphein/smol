@@ -2294,6 +2294,9 @@ impl RadioManager {
         config_offer: &mut Option<crate::app::DefaultScreen>,
         install_requested: &mut bool,
         tick: &mut dyn FnMut() -> bool,
+        // #89 Stage 1: paint the live boot clock on each prologue yield (forwarded to
+        // `run_ntp_burst`; not called during the still-blocking MQTT tail).
+        render: &mut dyn FnMut(),
     ) -> (bool, Option<u32>) {
         // Disjoint field borrows: &mut self.controller, &mut *sta, Copy of rng/id.
         // `batt` is a caller-owned &mut (main's cache), disjoint from every self
@@ -2308,6 +2311,7 @@ impl RadioManager {
             sta,
             self.rng,
             tick,
+            render,
             &mut reached_dhcp,
             id,
             batt,
@@ -5153,6 +5157,10 @@ pub fn start(
     // LED-only closure, keeping this radio module UI-agnostic — it just calls
     // `tick() -> bool`.
     tick: &mut dyn FnMut() -> bool,
+    // #89 Stage 1: painted on each assoc/DHCP/SNTP yield so the boot screen shows a
+    // LIVE clock through the sync window (UI-agnostic — the draw lives in `main`). Not
+    // called during the still-blocking MQTT tail, which freezes as before.
+    render: &mut dyn FnMut(),
     batt: &mut crate::batt::BattCache,
     grid: &mut crate::grid::GridCache,
 ) -> (Option<RadioManager>, Option<u32>) {
@@ -5182,6 +5190,7 @@ pub fn start(
         &mut config_offer,
         &mut install_requested,
         tick,
+        render,
     );
     // #6 OTA: stash any gated boot-time announce for `main` to fetch after boot.
     radio.ota_offer = ota_offer;

@@ -71,7 +71,9 @@ impl Plugin for ClockState {
 /// message under `espnow`, else our own noun) and the compact sensor readout.
 /// Moved out of `main` verbatim; builds its own styles (the loop no longer
 /// passes them). Generic over the draw target so it stays testable in principle.
-fn draw_clock<D>(
+/// `pub(crate)` since #89 Stage 1: `main`'s boot-burst render callback paints a live
+/// clock frame with it through the assoc/DHCP/SNTP sync window.
+pub(crate) fn draw_clock<D>(
     display: &mut D,
     sod: u32,
     sensors: &mut sensors::Sensors,
