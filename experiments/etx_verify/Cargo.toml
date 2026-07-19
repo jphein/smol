@@ -1,0 +1,15 @@
+# #164 host-test harness for the PURE per-peer link-quality (ETX) core (net/etx.rs).
+# Runs OFF-target on the host (std) via `cargo run` — the firmware crate is
+# no_std/riscv32imc and can't host-test, so this #[path]-includes the real etx.rs
+# (no drift) and exercises the reach register + cost mapping + up() heuristic.
+# Mirrors experiments/flood_verify.
+[package]
+name = "etx_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "etx_verify"
+path = "src/main.rs"
+[profile.dev]
+opt-level = 0

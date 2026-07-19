@@ -894,6 +894,11 @@ fn main() -> ! {
             // 2000 ms / SUBTICK_MS aligned via the monotonic clock.
             if (now / 2000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 2000) {
                 r.broadcast_hello();
+                // #164: advance every peer's link-quality (ETX) register one HELLO interval.
+                // UNCONDITIONAL (not inside broadcast_hello) so a HELLO-silent/abdicated board
+                // still scores the peers it hears. Reads+clears each peer's per-interval
+                // "heard a HELLO" latch; math lives in net/etx.rs (host-tested).
+                r.sample_link_quality();
                 // Advertise our current Unix time + the sync it descends from on
                 // the SAME tick, so a peer with an older sync can adopt ours.
                 // (A separate frame from HELLO — the LED handshake wire format is
