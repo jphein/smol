@@ -117,6 +117,11 @@ const fn parse_u32(s: &str) -> u32 {
 /// `total` are bytes (self-fetch) or chunks (leaf relay) — the renderer only needs the
 /// ratio. Threaded as a `&Cell<OtaProgress>` into the fetch/relay so the UI-agnostic
 /// `net/` layer writes the counts without ever touching the display.
+// #172: constructed only on the espnow OTA fetch/relay paths (run_ota_fetch / mode /
+// main's OTA closures — all cfg(espnow)); keep the type in every build but silence
+// dead-code in a wifi-without-espnow build, matching the `Announce` field idiom below.
+// Lets `clippy --features wifi -D warnings` pass on all tiers.
+#[cfg_attr(not(feature = "espnow"), allow(dead_code))]
 #[derive(Clone, Copy, Default)]
 pub struct OtaProgress {
     pub done: u32,

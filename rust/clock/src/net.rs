@@ -17,6 +17,10 @@ mod wifi;
 /// WiFi driver — called at radio init and re-asserted beside every #139 `PowerSaveMode::None`
 /// assert (a driver stop/start resets it; connect() does not).
 #[cfg(feature = "wifi")]
+// #172: a wifi-layer TX-power clamp, but every caller today is on an espnow-gated path
+// (run_mqtt_burst / run_ota_fetch / mode). Keep it available in wifi builds; silence
+// dead-code in a wifi-without-espnow build so `clippy --features wifi -D warnings` passes.
+#[cfg_attr(not(feature = "espnow"), allow(dead_code))]
 pub(crate) fn assert_max_tx_power() {
     const MAX_TX_POWER_QDBM: i8 = 34; // 8.5 dBm x 4 (quarter-dBm units)
     let err = unsafe { esp_wifi_sys::include::esp_wifi_set_max_tx_power(MAX_TX_POWER_QDBM) };
