@@ -128,6 +128,10 @@ mod watch;
 // #60 treasure-hunt — RSSI warmer/colder game over the roster.
 #[cfg(feature = "espnow")]
 mod hunt;
+// #151 Finder — hands-free auto-nearest placement/range meter (roster RSSI). Pure read,
+// no new frames; reuses the #58/#60 rssi.rs smoothing + proximity helpers. espnow-only.
+#[cfg(feature = "espnow")]
+mod finder;
 // #57 The Mesh Familiar (flagship): one living creature that inhabits exactly one
 // board at a time + MIGRATES across the mesh. The FAM frame codec + the always-on
 // holder/arbitration/migration state machine + the procedural renderer. espnow-only
