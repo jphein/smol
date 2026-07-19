@@ -57,4 +57,7 @@ tools/ota_publish.env
 # #152 web emulator build artifacts
 rust/web-emu/target/
 web/emulator/*.wasm
+# #152: the generated (base64-wasm-inlined) page is a build artifact — regenerate via
+# build.sh; source of truth is index.template.html + build.sh (no blob churn in git).
+web/emulator/index.html
 web/emulator/dist/
