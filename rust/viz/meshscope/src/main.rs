@@ -10,16 +10,15 @@
 //!   meshscope --selftest headless: feed sample payloads through the model, print, exit
 //!   meshscope --help / --version
 
-mod model;
-mod mqtt;
-mod names;
-mod parse;
 mod ui;
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use model::{ConnState, Model};
+// The ingest + world model live in the shared `mesh-model` crate (converged #159);
+// observatory folds identical state through the same core.
+use mesh_model::model::{ConnState, Model};
+use mesh_model::mqtt;
 
 const HELP: &str = "\
 meshscope — realtime egui instrument for the smol mesh
@@ -65,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         m.conn = ConnState::Connected;
         Arc::new(Mutex::new(m))
     } else {
-        let cfg = match mqtt::BrokerCfg::from_env() {
+        let cfg = match mqtt::BrokerCfg::from_env().map(|c| c.with_client_id("meshscope")) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("meshscope: {e}");

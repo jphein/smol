@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
-use crate::model::{Model, WEAK_LINK_DBM};
+use mesh_model::model::{Model, WEAK_LINK_DBM};
 
 const GOLDEN_ANGLE: f32 = 2.399_963_2; // radians, spreads initial placement
 const K_REP: f32 = 90_000.0; // repulsion strength

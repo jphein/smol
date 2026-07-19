@@ -4,7 +4,7 @@
 use egui::{Color32, RichText};
 use egui_plot::{Line, Plot, PlotPoints};
 
-use crate::model::{Model, Node, LOW_HEAP_B};
+use mesh_model::model::{Model, Node, LOW_HEAP_B};
 
 pub fn show(ui: &mut egui::Ui, model: &Model, selected: Option<u8>, now_s: f64) {
     let Some(id) = selected.and_then(|i| if model.nodes.contains_key(&i) { Some(i) } else { None }) else {

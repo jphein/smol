@@ -58,6 +58,12 @@ pub fn split_node_topic(topic: &str) -> Option<(u8, &str)> {
 /// genuine negatives / zero / small values pass through. RSSI in dBm is never
 /// positive, so this is lossless for every real reading (-128..-1 ↔ 128..255).
 /// Confirmed against live `smol/5/peers` = `8,215,…` (id8 at -41 dBm).
+///
+/// Apply this ONLY to `rx_control.rssi` values (the `smol/<id>/peers` bytes). The
+/// `smol/<id>/uplink` reading comes from `controller.rssi()` and is already a signed
+/// `i8` on the wire (e.g. `-57`) — do NOT normalize it. Rule of thumb for any future
+/// RSSI-bearing topic: `rx_control.rssi` → normalize; `controller.rssi()` → already
+/// signed. (Verified with morpheus-158 against the firmware, 2026-07-18.)
 pub fn normalize_rssi(v: i32) -> i32 {
     if (128..=255).contains(&v) {
         v - 256
