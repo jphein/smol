@@ -2597,6 +2597,7 @@ dependencies = [
  "egui",
  "egui_plot",
  "mesh-model",
+ "rumqttc",
 ]
 
 [[package]]

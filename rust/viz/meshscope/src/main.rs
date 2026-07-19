@@ -10,6 +10,7 @@
 //!   meshscope --selftest headless: feed sample payloads through the model, print, exit
 //!   meshscope --help / --version
 
+mod operator;
 mod ui;
 
 use std::sync::{Arc, Mutex};
@@ -27,6 +28,9 @@ USAGE:
     meshscope [FLAGS]
 
 FLAGS:
+    --operator    Enable OPERATOR mode: an Operator dock appears and meshscope may PUBLISH
+                  to smol command topics (OTA install, config/*, reboot/scan, channel_hint).
+                  WITHOUT this flag meshscope is a pure listener (default). Live mode only.
     --demo        Launch the UI seeded with synthetic mesh data (no broker needed)
     --selftest    Headless: feed sample payloads through the model, print a summary, exit
     --help        Show this help
@@ -56,13 +60,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let demo = args.iter().any(|a| a == "--demo");
+    let operator_on = args.iter().any(|a| a == "--operator");
     let start = Instant::now();
 
-    let model = if demo {
+    let (model, operator): (Arc<Mutex<Model>>, Option<operator::Publisher>) = if demo {
         let mut m = Model::new("(demo — no broker)".into());
         seed_demo(&mut m);
         m.conn = ConnState::Connected;
-        Arc::new(Mutex::new(m))
+        if operator_on {
+            eprintln!("meshscope: --operator has no effect with --demo (no live broker to publish to)");
+        }
+        (Arc::new(Mutex::new(m)), None)
     } else {
         let cfg = match mqtt::BrokerCfg::from_env().map(|c| c.with_client_id("meshscope")) {
             Ok(c) => c,
@@ -73,8 +81,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         let m = Arc::new(Mutex::new(Model::new(cfg.endpoint())));
-        mqtt::spawn(m.clone(), cfg, start);
-        m
+        mqtt::spawn(m.clone(), cfg.clone(), start);
+        // #23: the operator publisher is a SEPARATE client (distinct `<id>-op` id) so it
+        // can never collide with the listener; constructed ONLY with --operator.
+        let operator = operator_on.then(|| operator::Publisher::new(&cfg));
+        if operator_on {
+            eprintln!("meshscope: ⚡ OPERATOR MODE — publishing to smol/* is ARMED");
+        }
+        (m, operator)
     };
 
     let native_options = eframe::NativeOptions {
@@ -90,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eframe::run_native(
         "meshscope",
         native_options,
-        Box::new(move |cc| Ok(Box::new(ui::MeshscopeApp::new(cc, model_for_app, start, initial_selected)))),
+        Box::new(move |cc| Ok(Box::new(ui::MeshscopeApp::new(cc, model_for_app, start, initial_selected, operator)))),
     )?;
     Ok(())
 }
