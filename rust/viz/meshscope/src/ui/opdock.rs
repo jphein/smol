@@ -15,9 +15,10 @@ use mesh_model::model::Node;
 const APPKINDS: &[&str] =
     &["Menu", "Clock", "Batt", "Grid", "Snake", "Bench", "MeshSnake", "About", "Custom", "Familiar"];
 const LED_MODES: &[&str] = &["status", "on", "off"];
-/// (display label, wire token) — token is the compact `F24`/`C12` form (DIAG cfg echo).
-/// Labels align to the HA dashboard vocabulary (parity — reconciling with #24).
-const UNITS: &[(&str, &str)] = &[("°C 24h", "C24"), ("°C 12h", "C12"), ("°F 24h", "F24"), ("°F 12h", "F12")];
+/// (display label, wire token). The wire token is PIPE-separated `<F|C>|<24|12>` — the fw's
+/// `units::from_wire` splits on `|` and matches the halves exactly, so a joined `F24` parses
+/// to None and the board silently keeps its units (#46 clamp). Mirrors the HA payload (#25).
+const UNITS: &[(&str, &str)] = &[("°C 24h", "C|24"), ("°C 12h", "C|12"), ("°F 24h", "F|24"), ("°F 12h", "F|12")];
 
 /// Operator UI input state (text buffers + the pending confirmation + last-published).
 #[derive(Default)]

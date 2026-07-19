@@ -185,7 +185,7 @@ mod tests {
             io_set(7, "0=1"),
             broker(7, "192.0.2.10:1883"),
             ota_host(7, "192.0.2.11"),
-            units("°C 24h"),
+            units("C|24"),
             channel_hint(Some(6)),
             channel_hint(None),
         ] {
@@ -199,7 +199,7 @@ mod tests {
         assert!(reboot(7).destructive);
         assert!(broker(7, "192.0.2.10:1883").destructive);
         assert!(ota_host(7, "192.0.2.11").destructive);
-        assert!(units("°C 24h").destructive);
+        assert!(units("C|24").destructive);
         assert!(channel_hint(Some(6)).destructive);
         // Not confirm-gated: install (idempotent), led, screen, scan.
         assert!(!install(7).destructive);
@@ -219,7 +219,10 @@ mod tests {
         assert_eq!(scan(9).topic, "smol/9/cmd/scan");
         assert_eq!(install(9).topic, "smol/9/ota/install");
         assert_eq!(led(9, "off").topic, "smol/9/config/led");
-        assert_eq!(units("°C 24h").topic, "smol/config/units");
+        assert_eq!(units("C|24").topic, "smol/config/units");
+        // #25: the units wire token is PIPE-separated (fw `from_wire` split('|')) — a joined
+        // "C24" would silently no-op on the board. Lock the pipe form against regression.
+        assert_eq!(units("F|24").payload, b"F|24");
         assert_eq!(channel_hint(Some(6)).topic, "smol/mesh/channel_hint");
     }
 }
