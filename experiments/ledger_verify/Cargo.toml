@@ -1,0 +1,17 @@
+# #182 host-test harness for the PURE mesh-ledger L1 core (net/ledger.rs). Runs OFF-target
+# on the host (std) via `cargo run` — the firmware crate is no_std/riscv32imc and can't
+# host-test, so this #[path]-includes the real ledger.rs (no drift) and exercises the
+# hash-chain append/verify/prune. Mirrors experiments/flood_verify + etx_verify.
+# sha2 supplies the injected hasher (the ledger core is hasher-agnostic / dependency-free).
+[package]
+name = "ledger_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "ledger_verify"
+path = "src/main.rs"
+[dependencies]
+sha2 = "0.10"
+[profile.dev]
+opt-level = 0
