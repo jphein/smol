@@ -3554,6 +3554,107 @@ fn mqtt_session(
 /// mesh is deaf on the ESP-NOW channel for its duration — the documented cost,
 /// bounded by `RELAY_FLUSH_BUDGET` (the MQTT session is a sub-bound within it, so
 /// it does not extend the deaf window beyond the flush the mesh already pays for).
+/// #89 Stage 2 (Inc 2): the flush smoltcp stack, held so a later poll-from-main driver can
+/// keep it ACROSS render polls. `SocketSet<'static>` over fn-level `static mut` buffers (the
+/// F2 / `run_ota_fetch` precedent, Inc 1) — alias-safe because the flush is single-caller,
+/// main-thread, never re-entered. The WiFi device is NOT held here: smoltcp's `iface.poll`
+/// takes `device` per-call, so between polls `radio` is free for `main` to build + render the
+/// app `Ctx`. `new()` centralizes the build so both the (current) blocking `run_mqtt_burst`
+/// and the (Inc 3) main-driven loop construct the identical stack.
+#[cfg(feature = "espnow")]
+struct FlushStack {
+    iface: Interface,
+    sockets: SocketSet<'static>,
+    dhcp_handle: smoltcp::iface::SocketHandle,
+    tcp_handle: smoltcp::iface::SocketHandle,
+    /// #9 next-hop ARP pre-warm socket.
+    warm_handle: smoltcp::iface::SocketHandle,
+    /// #26 WLED pixel-stream socket (cast builds only).
+    #[cfg(feature = "cast")]
+    cast_handle: smoltcp::iface::SocketHandle,
+}
+
+#[cfg(feature = "espnow")]
+impl FlushStack {
+    /// Build the flush stack (DHCP + TCP/MQTT + warm-ARP [+ cast] sockets) over the hoisted
+    /// `static mut` buffers. See the struct doc for the alias-safety argument.
+    fn new(device: &mut esp_wifi::wifi::WifiDevice) -> Self {
+        let iface = create_interface(device);
+        // SAFETY (F2 precedent): flush is single-caller/main-thread/non-reentrant, so these
+        // `static mut` borrows never alias. `addr_of_mut!` + array→slice coercion at the
+        // slice-typed `let` (NOT `(*ptr)[..]` — trips `dangerous_implicit_autorefs`).
+        // #26 cast adds one UDP socket (the WLED pixel-stream) to the set.
+        #[cfg(not(feature = "cast"))]
+        static mut MQTTF_SOCK_STORAGE: [SocketStorage; 3] = [SocketStorage::EMPTY; 3];
+        #[cfg(feature = "cast")]
+        static mut MQTTF_SOCK_STORAGE: [SocketStorage; 4] = [SocketStorage::EMPTY; 4];
+        let sock_storage: &'static mut [SocketStorage] =
+            unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_SOCK_STORAGE) };
+        let mut sockets = SocketSet::new(sock_storage);
+
+        let mut dhcp_socket = dhcpv4::Socket::new();
+        // Reuse the module `static` DHCP hostname option (Stage 1): a `'static` slice is
+        // required for the (now `'static`) socket's lifetime.
+        dhcp_socket.set_outgoing_options(&NTP_DHCP_OPTS);
+        let dhcp_handle = sockets.add(dhcp_socket);
+
+        static mut MQTTF_TCP_RX: [u8; 512] = [0; 512];
+        static mut MQTTF_TCP_TX: [u8; 512] = [0; 512];
+        let tcp_rx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_TCP_RX) };
+        let tcp_tx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_TCP_TX) };
+        let tcp_socket =
+            tcp::Socket::new(tcp::SocketBuffer::new(tcp_rx), tcp::SocketBuffer::new(tcp_tx));
+        let tcp_handle = sockets.add(tcp_socket);
+
+        // #9 item-1: throwaway UDP socket used ONLY to pre-warm the next-hop (router) ARP.
+        static mut MQTTF_WARM_RX_META: [udp::PacketMetadata; 1] = [udp::PacketMetadata::EMPTY; 1];
+        static mut MQTTF_WARM_TX_META: [udp::PacketMetadata; 1] = [udp::PacketMetadata::EMPTY; 1];
+        static mut MQTTF_WARM_RX: [u8; 1] = [0; 1];
+        static mut MQTTF_WARM_TX: [u8; 4] = [0; 4];
+        let warm_rx_meta: &'static mut [udp::PacketMetadata] =
+            unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_WARM_RX_META) };
+        let warm_tx_meta: &'static mut [udp::PacketMetadata] =
+            unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_WARM_TX_META) };
+        let warm_rx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_WARM_RX) };
+        let warm_tx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_WARM_TX) };
+        let warm_socket = udp::Socket::new(
+            udp::PacketBuffer::new(warm_rx_meta, warm_rx),
+            udp::PacketBuffer::new(warm_tx_meta, warm_tx),
+        );
+        let warm_handle = sockets.add(warm_socket);
+
+        // #26 cast: a real UDP socket for the WLED DNRGB pixel-stream (cast builds only).
+        #[cfg(feature = "cast")]
+        let cast_handle = {
+            static mut MQTTF_CAST_RX_META: [udp::PacketMetadata; 1] = [udp::PacketMetadata::EMPTY; 1];
+            static mut MQTTF_CAST_TX_META: [udp::PacketMetadata; 4] = [udp::PacketMetadata::EMPTY; 4];
+            static mut MQTTF_CAST_RX: [u8; 4] = [0; 4];
+            static mut MQTTF_CAST_TX: [u8; 512] = [0; 512];
+            let cast_rx_meta: &'static mut [udp::PacketMetadata] =
+                unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_CAST_RX_META) };
+            let cast_tx_meta: &'static mut [udp::PacketMetadata] =
+                unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_CAST_TX_META) };
+            let cast_rx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_CAST_RX) };
+            let cast_tx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_CAST_TX) };
+            let s = udp::Socket::new(
+                udp::PacketBuffer::new(cast_rx_meta, cast_rx),
+                udp::PacketBuffer::new(cast_tx_meta, cast_tx),
+            );
+            sockets.add(s)
+        };
+
+        Self {
+            iface,
+            sockets,
+            dhcp_handle,
+            tcp_handle,
+            warm_handle,
+            #[cfg(feature = "cast")]
+            cast_handle,
+        }
+    }
+}
+
 #[cfg(feature = "espnow")]
 #[allow(clippy::too_many_arguments)] // +grid (issue #16) tips this to 8 params
 pub fn run_mqtt_burst(
@@ -3619,82 +3720,19 @@ pub fn run_mqtt_burst(
     ota_self_fail: &mut Option<(u32, u32, u32, u32, u32)>,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
-    let mut iface = create_interface(device);
-    // #89 Stage 2 (Inc 1): the flush stack buffers are hoisted to fn-level `static mut`
-    // (the F2 / `run_ota_fetch` precedent) so a later poll-from-main FlushMachine can hold
-    // `SocketSet<'static>` ACROSS render polls. Alias-safe for the identical reason: the
-    // flush is single-caller, main-thread, and never re-entered (flushes/re-elections run
-    // sequentially, never concurrently). Behaviour-identical to the old stack locals — only
-    // the storage location moved. `addr_of_mut!` + array→slice coercion at the slice-typed
-    // `let` (NOT `(*ptr)[..]` — that trips `dangerous_implicit_autorefs`).
-    // #26 cast adds one UDP socket (the WLED pixel-stream) to the set.
-    #[cfg(not(feature = "cast"))]
-    static mut MQTTF_SOCK_STORAGE: [SocketStorage; 3] = [SocketStorage::EMPTY; 3];
-    #[cfg(feature = "cast")]
-    static mut MQTTF_SOCK_STORAGE: [SocketStorage; 4] = [SocketStorage::EMPTY; 4];
-    let sock_storage: &'static mut [SocketStorage] =
-        unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_SOCK_STORAGE) };
-    let mut sockets = SocketSet::new(sock_storage);
-
-    let mut dhcp_socket = dhcpv4::Socket::new();
-    // Reuse the module `static` DHCP hostname option (Stage 1) — a `'static` slice is required
-    // because `dhcpv4::Socket<'a>` borrows it for the (now `'static`) socket's lifetime.
-    dhcp_socket.set_outgoing_options(&NTP_DHCP_OPTS);
-    let dhcp_handle = sockets.add(dhcp_socket);
-
-    // TCP socket for the MQTT session (the UDP collector datagram is retired).
-    static mut MQTTF_TCP_RX: [u8; 512] = [0; 512];
-    static mut MQTTF_TCP_TX: [u8; 512] = [0; 512];
-    let tcp_rx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_TCP_RX) };
-    let tcp_tx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_TCP_TX) };
-    let tcp_socket = tcp::Socket::new(
-        tcp::SocketBuffer::new(tcp_rx),
-        tcp::SocketBuffer::new(tcp_tx),
-    );
-    let tcp_handle = sockets.add(tcp_socket);
-
-    // #9 item-1: throwaway UDP socket used ONLY to pre-warm the next-hop (router) ARP
-    // right after DHCP (see the warm-up below). Tiny buffers — stack-negligible next to
-    // the 512 B TCP buffers above, so the F1/F2 frame headroom is preserved. mqtt_session
-    // never touches it.
-    static mut MQTTF_WARM_RX_META: [udp::PacketMetadata; 1] = [udp::PacketMetadata::EMPTY; 1];
-    static mut MQTTF_WARM_TX_META: [udp::PacketMetadata; 1] = [udp::PacketMetadata::EMPTY; 1];
-    static mut MQTTF_WARM_RX: [u8; 1] = [0; 1];
-    static mut MQTTF_WARM_TX: [u8; 4] = [0; 4];
-    let warm_rx_meta: &'static mut [udp::PacketMetadata] =
-        unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_WARM_RX_META) };
-    let warm_tx_meta: &'static mut [udp::PacketMetadata] =
-        unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_WARM_TX_META) };
-    let warm_rx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_WARM_RX) };
-    let warm_tx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_WARM_TX) };
-    let warm_socket = udp::Socket::new(
-        udp::PacketBuffer::new(warm_rx_meta, warm_rx),
-        udp::PacketBuffer::new(warm_tx_meta, warm_tx),
-    );
-    let warm_handle = sockets.add(warm_socket);
-
-    // #26 cast: a real UDP socket for the WLED DNRGB pixel-stream (present only in a
-    // cast build). TX sized for one full DNRGB chunk (4 + 3*128 = 388 B ⇒ 512 with
-    // margin); RX tiny (WLED never replies to realtime frames). Streamed AFTER the
-    // MQTT session below, reusing this still-associated interface.
-    #[cfg(feature = "cast")]
-    let cast_handle = {
-        static mut MQTTF_CAST_RX_META: [udp::PacketMetadata; 1] = [udp::PacketMetadata::EMPTY; 1];
-        static mut MQTTF_CAST_TX_META: [udp::PacketMetadata; 4] = [udp::PacketMetadata::EMPTY; 4];
-        static mut MQTTF_CAST_RX: [u8; 4] = [0; 4];
-        static mut MQTTF_CAST_TX: [u8; 512] = [0; 512];
-        let cast_rx_meta: &'static mut [udp::PacketMetadata] =
-            unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_CAST_RX_META) };
-        let cast_tx_meta: &'static mut [udp::PacketMetadata] =
-            unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_CAST_TX_META) };
-        let cast_rx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_CAST_RX) };
-        let cast_tx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(MQTTF_CAST_TX) };
-        let s = udp::Socket::new(
-            udp::PacketBuffer::new(cast_rx_meta, cast_rx),
-            udp::PacketBuffer::new(cast_tx_meta, cast_tx),
-        );
-        sockets.add(s)
-    };
+    // #89 Stage 2 (Inc 2): the flush stack (iface + SocketSet<'static> over static-mut
+    // buffers + dhcp/tcp/warm[/cast] handles) is built by `FlushStack::new` — centralized so
+    // the (Inc 3) main-driven poll loop constructs the identical stack. Destructured into
+    // locals here so `run_mqtt_burst`'s body below stays byte-identical (behaviour-preserving).
+    let FlushStack {
+        mut iface,
+        mut sockets,
+        dhcp_handle,
+        tcp_handle,
+        warm_handle,
+        #[cfg(feature = "cast")]
+        cast_handle,
+    } = FlushStack::new(device);
 
     // FINDING 1b (retained): bound the ENTIRE flush by the short RELAY_FLUSH_BUDGET,
     // not the 30 s NTP budget — a dead AP fails fast so the loop isn't frozen 30 s.
