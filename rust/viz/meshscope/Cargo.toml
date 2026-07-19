@@ -19,5 +19,8 @@ mesh-model.workspace = true
 eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.28"
 egui_plot = "0.28" # sparklines in the detail panel
+# #23 operator mode: the publish path (a separate client, distinct id). The listener
+# lives in mesh-model; this is meshscope's OWN client for --operator publishing.
+rumqttc.workspace = true
 # Load a local .env (SMOL_MQTT_HOST/USER/PASS) if present — never committed.
 dotenvy.workspace = true

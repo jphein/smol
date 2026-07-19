@@ -2,6 +2,7 @@
 //! event ticker. Reads the shared [`Model`] under its lock once per frame.
 
 pub mod graph;
+mod opdock;
 mod panel;
 mod ticker;
 
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
 
+use crate::operator::Publisher;
 use mesh_model::model::{ConnState, Model, SyncFreshness};
 use graph::GraphLayout;
 
@@ -18,12 +20,22 @@ pub struct MeshscopeApp {
     layout: GraphLayout,
     selected: Option<u8>,
     start: Instant,
+    /// `Some` ONLY in `--operator` mode — the publish path. `None` = pure listener
+    /// (default), and the operator dock is never shown.
+    operator: Option<Publisher>,
+    op_state: opdock::OperatorState,
 }
 
 impl MeshscopeApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, model: Arc<Mutex<Model>>, start: Instant, selected: Option<u8>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        model: Arc<Mutex<Model>>,
+        start: Instant,
+        selected: Option<u8>,
+        operator: Option<Publisher>,
+    ) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        MeshscopeApp { model, layout: GraphLayout::default(), selected, start }
+        MeshscopeApp { model, layout: GraphLayout::default(), selected, start, operator, op_state: opdock::OperatorState::default() }
     }
 }
 
@@ -59,6 +71,16 @@ impl eframe::App for MeshscopeApp {
         egui::SidePanel::right("detail").resizable(true).default_width(310.0).min_width(240.0).show(ctx, |ui| {
             panel::show(ui, &m, self.selected, now_s);
         });
+
+        // Operator dock (left) — ONLY in --operator mode. The command surface + the
+        // confirmation modal for destructive/fleet actions. Default builds never see it.
+        if let Some(publisher) = self.operator.as_ref() {
+            egui::SidePanel::left("operator").resizable(true).default_width(290.0).min_width(250.0).show(ctx, |ui| {
+                let sel_node = self.selected.and_then(|id| m.nodes.get(&id));
+                opdock::show(ui, sel_node, publisher, &mut self.op_state);
+            });
+            opdock::confirm_modal(ctx, publisher, &mut self.op_state);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(clicked) = self.layout.draw(ui, &m, self.selected, now_s) {
