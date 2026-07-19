@@ -67,6 +67,14 @@ CONFIG topic). Operator guide: **[`docs/relay.md`](docs/relay.md)**.
   the broker** — a retained `smol/mesh/channel` = `MC|owner|channel|seq` record — so it can't
   fragment (gateways on different channels still share one broker). The `seq`/liveness field is
   load-bearing: a stale record → the next-best board takes over.
+- **Operator channel lever** (#155): publish a **retained** `smol/mesh/channel_hint` = a decimal
+  channel (e.g. `6`) and the crown **honors it at claim time** — a board whose AP channel ≠ the
+  hint refuses the crown, so the mesh converges onto a board already on that channel (the coexist
+  radio can only park the mesh on the crown's *own* AP channel, so the lever steers *which* board
+  is crown). A sitting crown on the wrong channel yields (goes HELLO-silent) so a hinted-channel
+  board takes over. **Clear it** by publishing an empty retained payload → normal election resumes.
+  This replaces the old manual seq-forged `MC` plant. ⚠️ A hint no board can satisfy leaves the
+  mesh crownless until you clear it — it's a deliberate operator control, not automatic.
 - **No-burst coexist** (#23): the gateway stays associated and runs ESP-NOW + WiFi concurrently on
   one channel, so a telemetry flush no longer tears the radio down (no multi-second mesh-deaf
   window). Leaves scan 1/6/11 to find the gateway's channel + re-lock on silence.
