@@ -8,9 +8,12 @@ use egui::{Color32, RichText};
 use crate::operator::{self, PublishReq, Publisher};
 use mesh_model::model::Node;
 
-/// Screen names = the exact `app.rs` `AppKind` wire spellings (parity). `Snake` maps to
-/// `MeshSnake` on the espnow fleet, so we list the wire form.
-const APPKINDS: &[&str] = &["Menu", "Clock", "Batt", "Grid", "Bench", "MeshSnake", "About", "Familiar"];
+/// Screen names = the exact `app.rs` `AppKind` wire spellings (single-source parity). Matches
+/// the #24 HA dashboard select (Menu·Clock·Batt·Grid·Snake·Bench·MeshSnake·About·Custom) plus
+/// `Familiar` (a screen boards report but the HA select currently lags — flagged to #25).
+/// app.rs also has Watch/Hunt/Finder; omitted here until confirmed settable-as-default.
+const APPKINDS: &[&str] =
+    &["Menu", "Clock", "Batt", "Grid", "Snake", "Bench", "MeshSnake", "About", "Custom", "Familiar"];
 const LED_MODES: &[&str] = &["status", "on", "off"];
 /// (display label, wire token) — token is the compact `F24`/`C12` form (DIAG cfg echo).
 /// Labels align to the HA dashboard vocabulary (parity — reconciling with #24).
