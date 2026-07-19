@@ -1464,6 +1464,14 @@ struct Relay {
     /// stays fully intact; only the CLAIM is suppressed, so the H1/H2 machinery elects a
     /// flush-capable board off the abdicated owner's frozen seq.
     flush_fail_latch: bool,
+    /// #204 2a: consecutive gateway flushes that CONNECTED (`ok`) but received NONE of this crown's
+    /// own retained downstream (MC/batt/grid) — the crown dead-unicast-RX signal (distinct from
+    /// `flush_fails`, which counts flushes that never CONNECTED). ++ on a connected downstream-dry
+    /// flush, reset to 0 on any downstream received. Rung-1 2b escalates (reassoc → shed) on a streak.
+    crown_deaf_streak: u8,
+    /// #204 2b: ch6-preferred reassociation cycles attempted for the current deaf episode (bounded;
+    /// past M the crown is shed). Reset alongside `crown_deaf_streak` on recovery. 0 in 2a (no actions).
+    reassoc_cycles: u8,
     /// Recently-completed `(src_mac, msgid)` ring — dedup post-completion
     /// retransmits so a message is never enqueued (UDP-delivered) twice (finding 3).
     done: [Option<([u8; 6], u16)>; DONE_RING],
@@ -1501,6 +1509,8 @@ impl Relay {
             last_flush_ms: 0,
             flush_fails: 0,
             flush_fail_latch: false, // #146: no abdication yet
+            crown_deaf_streak: 0, // #204 2a: crown dead-downstream detector
+            reassoc_cycles: 0, // #204 2a/2b: reassoc attempts for the current deaf episode
             done: [None; DONE_RING],
             done_cursor: 0,
             seen: crate::net::flood::SeenSet::new(),
@@ -2858,6 +2868,15 @@ impl RadioManager {
                 ap_ch, ap_rssi, b[0], b[1], b[2], b[3], b[4], b[5]
             ));
         }
+        // #204 2a: crown dead-downstream telemetry — <deaf-streak>:<reassoc-cycles>:<shed 0/1>.
+        // Named `cdeaf` (crown-deaf) to NOT collide with the mesh-test-only `deaf=` (an ESP-NOW
+        // deaf-LIST count). Reads 0:0:0 on a healthy crown or any leaf. The shed flag is 0 in 2a
+        // (no actions yet); rung-1 2b wires the real `deaf_shed`. Appended LAST — positional parse
+        // of the fixed DIAG fields stays intact.
+        rec.push_str(&alloc::format!(
+            "|cdeaf={}:{}:0",
+            self.relay.crown_deaf_streak, self.relay.reassoc_cycles
+        ));
         rec
     }
 
@@ -4072,6 +4091,21 @@ impl RadioManager {
         // flush-success rate is the on-device #9 flush-win proof (was UART0-only). Bumped here so
         // it rides the NEXT diag record.
         self.note_flush(ok);
+        // #204 2a: crown dead-downstream detector (MEASUREMENT ONLY — no election change; 2b adds
+        // the reassoc/shed actions). Only a CONNECTED flush (`ok`) is a valid downstream probe — a
+        // flush that never reached CONNACK (`!ok`) is an uplink/AP failure (already handled by
+        // `flush_fails`/R-DEMOTE), NOT crown-RX deafness. On a connected flush, `elect.downstream_seen`
+        // (got_mc||batt||grid, set in the drain) separates healthy (received its own retained MC) from
+        // downstream-dry. Streak (not one-shot): small retained frames sneak through intermittently
+        // (#204 partial-heal), so a run of dry flushes is required before 2b escalates.
+        if ok {
+            if elect.downstream_seen {
+                self.relay.crown_deaf_streak = 0;
+                self.relay.reassoc_cycles = 0;
+            } else {
+                self.relay.crown_deaf_streak = self.relay.crown_deaf_streak.saturating_add(1);
+            }
+        }
         // #6 OTA: stash any announce this flush surfaced for `main` to act on.
         if ota_offer.is_some() {
             self.ota_offer = ota_offer;
