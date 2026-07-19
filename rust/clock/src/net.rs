@@ -29,6 +29,24 @@ pub(crate) fn assert_max_tx_power() {
     }
 }
 
+/// #204: the crown's CURRENT AP association — `(channel, RSSI dBm, BSSID)` — via the IDF
+/// `esp_wifi_sta_get_ap_info` FFI. `None` if not associated or the call errors. Published in the
+/// crown's DIAG so the #204 coexist-starvation hypothesis (crown deaf when its roam AP is NOT
+/// co-channel with the mesh ch6) is TESTABLE from telemetry — the forensics gap that cost ~3h of
+/// pcap tonight (the fw could not report which AP/channel/RSSI a deaf crown was on).
+#[cfg(feature = "espnow")]
+pub(crate) fn current_ap_info() -> Option<(u8, i8, [u8; 6])> {
+    // SAFETY: `esp_wifi_sta_get_ap_info` fills a caller-owned POD record (all-zero is a valid
+    // initial state); it reads current-association state only, no aliasing. Same FFI idiom as
+    // `assert_max_tx_power` above.
+    let mut rec: esp_wifi_sys::include::wifi_ap_record_t = unsafe { core::mem::zeroed() };
+    let err = unsafe { esp_wifi_sys::include::esp_wifi_sta_get_ap_info(&mut rec) };
+    if err != 0 {
+        return None;
+    }
+    Some((rec.primary, rec.rssi, rec.bssid))
+}
+
 // Hand-rolled MQTT 3.1.1 (QoS0) codec for the HA batt/telemetry bridge (v2). Pure
 // encode/decode; the socket poll-loop that drives it lives in `wifi.rs`.
 #[cfg(feature = "wifi")]

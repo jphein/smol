@@ -2847,6 +2847,17 @@ impl RadioManager {
             let deaf_n = self.deaf.iter().flatten().count();
             rec.push_str(&alloc::format!("|deaf={}|ddrops={}", deaf_n, self.diag.ddrops));
         }
+        // #204: the crown's CURRENT AP association (channel:rssi:bssid). Makes the coexist
+        // off-ch6-starvation hypothesis testable from telemetry — the forensics gap that cost ~3h
+        // of pcap. Only meaningful while associated (a leaf isn't) → `current_ap_info` returns None
+        // off-association and the field is skipped, keeping the DIAG string byte-identical for a
+        // non-associated board. Appended LAST → positional DIAG parse of the fixed fields is intact.
+        if let Some((ap_ch, ap_rssi, b)) = crate::net::current_ap_info() {
+            rec.push_str(&alloc::format!(
+                "|ap={}:{}:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                ap_ch, ap_rssi, b[0], b[1], b[2], b[3], b[4], b[5]
+            ));
+        }
         rec
     }
 
