@@ -37,7 +37,14 @@ impl eframe::App for MeshscopeApp {
         let model = self.model.clone();
         let m = model.lock().unwrap();
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| top_bar(ui, &m));
+        // Default the inspector to the crown once data arrives (user clicks override).
+        if self.selected.is_none() {
+            if let Some(c) = m.crown {
+                self.selected = Some(c.owner);
+            }
+        }
+
+        egui::TopBottomPanel::top("top").show(ctx, |ui| top_bar(ui, &m, now_s));
 
         egui::TopBottomPanel::bottom("events")
             .resizable(true)
@@ -61,7 +68,7 @@ impl eframe::App for MeshscopeApp {
     }
 }
 
-fn top_bar(ui: &mut egui::Ui, m: &Model) {
+fn top_bar(ui: &mut egui::Ui, m: &Model, now_s: f64) {
     ui.add_space(3.0);
     ui.horizontal(|ui| {
         ui.heading(RichText::new("meshscope").strong());
@@ -84,6 +91,26 @@ fn top_bar(ui: &mut egui::Ui, m: &Model) {
 
         let gateways = m.nodes.values().filter(|n| n.gateway).count();
         ui.label(format!("{} node(s) · {} gateway", m.nodes.len(), gateways));
+
+        // Fleet build-uniformity + stale count (derived signals — HA parity).
+        let builds: std::collections::BTreeSet<&str> = m.nodes.values().filter_map(|n| n.build()).collect();
+        match builds.len() {
+            0 => {}
+            1 => {
+                ui.separator();
+                ui.label(RichText::new(format!("all v{}", builds.iter().next().unwrap())).color(Color32::from_rgb(120, 200, 150)));
+            }
+            _ => {
+                ui.separator();
+                let list = builds.iter().map(|b| format!("v{b}")).collect::<Vec<_>>().join("/");
+                ui.label(RichText::new(format!("mixed: {list}")).color(Color32::from_rgb(230, 200, 70)));
+            }
+        }
+        let stale = m.nodes.values().filter(|n| n.is_stale(now_s)).count();
+        if stale > 0 {
+            ui.separator();
+            ui.label(RichText::new(format!("{stale} stale")).color(Color32::from_rgb(220, 130, 90)));
+        }
 
         // Right-aligned HA battery/grid readout if present.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

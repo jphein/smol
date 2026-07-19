@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
-use crate::model::Model;
+use crate::model::{Model, WEAK_LINK_DBM};
 
 const GOLDEN_ANGLE: f32 = 2.399_963_2; // radians, spreads initial placement
 const K_REP: f32 = 90_000.0; // repulsion strength
@@ -159,7 +159,12 @@ impl GraphLayout {
                 col = col.gamma_multiply(0.45);
             }
             let w = 1.0 + ((e.rssi + 90) as f32 / 60.0).clamp(0.0, 1.0) * 3.0;
-            painter.line_segment([sa, sb], Stroke::new(w, col));
+            // Weak links are dashed (a derived "weak link" signal — HA parity).
+            if e.rssi <= WEAK_LINK_DBM {
+                painter.extend(egui::Shape::dashed_line(&[sa, sb], Stroke::new(w, col), 7.0, 5.0));
+            } else {
+                painter.line_segment([sa, sb], Stroke::new(w, col));
+            }
             // RSSI label at midpoint.
             let mid = sa + (sb - sa) * 0.5;
             painter.text(

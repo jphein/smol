@@ -1,15 +1,31 @@
-//! The shared world model. The MQTT thread folds every retained/live `smol/#`
-//! payload into this via [`Model::ingest`]; the egui frame reads it under the lock.
-//! `ingest` is pure w.r.t. the clock — it takes `now_s` — so it is unit-testable and
-//! demo-seedable with synthetic timelines.
+//! The shared world model — the **liftable `mesh-model` core**. Together with
+//! `parse.rs` + `names.rs` this is a closed, UI-free / MQTT-free module set (it
+//! references only `crate::parse` / `crate::names`, and no eframe/rumqttc type
+//! crosses this boundary), so it lifts VERBATIM into a standalone `mesh-model` lib
+//! crate that #159 (observatory) can also depend on — per
+//! docs/superpowers/specs/2026-07-18-mesh-visualizers-design.md ("one model, two
+//! faces"). Inlined here per team-lead direction; structured to lift.
+//!
+//! The MQTT thread folds every retained/live `smol/#` payload in via
+//! [`Model::ingest`]; a frontend reads the state each frame. `ingest` is pure w.r.t.
+//! the clock (takes `now_s`), so it is unit-testable and demo-seedable.
 
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::names;
 use crate::parse::{self, Diag, OtaState, PeerLink};
 
-/// Node considered stale (dimmed) after this many seconds without any message.
-pub const STALE_S: f64 = 90.0;
+// --- Semantic thresholds — the SINGLE SOURCE OF DERIVATION TRUTH (HA parity) ---
+// Every derived signal is defined ONCE here; the HA dashboard mirrors these (and
+// vice-versa) — the bidirectional-parity rule in the spec. Change a threshold here
+// → update HA to match.
+/// A node fades to "stale" after this long without any message (~1.5 flush cycles).
+pub const STALE_S: f64 = 45.0;
+/// A link at or weaker than this dBm is a "weak link" (dashed in the graph).
+pub const WEAK_LINK_DBM: i32 = -80;
+/// Free heap at or below this many bytes is "low heap" (flagged).
+pub const LOW_HEAP_B: u64 = 20_000;
+
 const HIST_CAP: usize = 240; // ~ retained cadence * this = tens of minutes of trail
 const EVENT_CAP: usize = 300;
 
