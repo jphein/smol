@@ -1,0 +1,8 @@
+# Toolchain-pin EXPERIMENT (a #198 deliverable): mirror the firmware's 1.96.1 pin and
+# see whether the Embassy stack (esp-hal-embassy 0.9 + embassy-executor 0.7 + esp-wifi
+# 0.15) builds on it. If it does, the migration forces NO rustc bump (pin delta = 0) —
+# a real finding. If a dep's MSRV demands newer, bump this and record the delta.
+[toolchain]
+channel = "1.96.1"
+targets = ["riscv32imc-unknown-none-elf"]
+components = ["rust-src", "rustfmt", "clippy"]

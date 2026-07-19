@@ -1,0 +1,56 @@
+# spike-embassy — Embassy async executor spike for smol (#198).
+#
+# ISOLATED workspace: OWN Cargo.lock + rust-toolchain.toml, deliberately NOT part of
+# the rust/clock firmware build (its 1.96.1 pin + lockfile must stay untouched) nor the
+# rust/viz host-tool workspace. Same isolation pattern as rust/viz.
+#
+# Vertical slice ONLY (issue #198): esp-hal-embassy boot + three CONCURRENT tasks —
+# a clock tick, an ESP-NOW RX -> peers table, and a WiFi assoc + SNTP burst. The thesis
+# is that the clock keeps ticking and ESP-NOW keeps hearing DURING the WiFi burst,
+# because the compiler writes the state machines. NO FLASHING (HW-held).
+#
+# Versions mirror rust/clock's documented mutually-compatible quartet (esp-hal 1.0.0-rc.0
+# / esp-wifi 0.15 / esp-hal-embassy 0.9 / esp-alloc 0.8) so the spike proves the SAME
+# radio stack ports to async.
+[package]
+name = "spike-embassy"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Embassy async executor spike for the smol ESP32-C3 firmware (#198, HW-held)"
+
+[dependencies]
+esp-hal = { version = "=1.0.0-rc.0", features = ["esp32c3", "unstable"] }
+esp-hal-embassy = { version = "=0.9.0", features = ["esp32c3"] }
+esp-wifi = { version = "=0.15.0", default-features = false, features = [
+    "esp32c3",
+    "wifi",
+    "esp-now",
+    "esp-alloc",
+    "smoltcp",
+    "builtin-scheduler",
+] }
+esp-alloc = "=0.8.0"
+# The ESP-IDF 2nd-stage bootloader validates an app descriptor; the esp_app_desc!() macro
+# emits it so espflash produces a bootable image (same crate the firmware uses).
+esp-bootloader-esp-idf = { version = "=0.2.0", features = ["esp32c3"] }
+# NOTE: no `exception-handler` here — esp-hal's default features already install it
+# (duplicate-symbol link error otherwise; same lesson as rust/clock).
+esp-backtrace = { version = "=0.17.0", features = ["esp32c3", "panic-handler", "println"] }
+esp-println = { version = "=0.15.0", default-features = false, features = ["esp32c3", "jtag-serial"] }
+
+# Embassy: let cargo resolve the exact patch versions esp-hal-embassy 0.9 constrains.
+embassy-executor = { version = "0.7", features = ["task-arena-size-20480"] }
+embassy-time = "0.4"
+embassy-net = { version = "0.6", features = ["dhcpv4", "udp", "medium-ethernet", "proto-ipv4"] }
+
+static_cell = "2"
+heapless = "0.8"
+
+# Size-optimised so the image-size metric vs the ~1 MB superloop baseline is meaningful.
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+overflow-checks = false
