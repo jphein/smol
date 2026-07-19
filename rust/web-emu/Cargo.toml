@@ -1,0 +1,26 @@
+# #152 web emulator — a tiny wasm shim that runs smol's REAL game/render cores in a
+# browser. It depends on the `clock` firmware crate's LIBRARY target built with the
+# `hostsim` feature (no bare-metal `hw` crates) and exposes a raw C ABI over wasm linear
+# memory — NO wasm-bindgen (unavailable + version-brittle here); the JS shell reads the
+# framebuffer straight out of `memory.buffer`. Build:
+#   cargo build -p web-emu --release --target wasm32-unknown-unknown
+[package]
+name = "web-emu"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The REAL cores (snake.rs / clock.rs / app.rs / …), no fork. default-features=false so
+# NONE of the esp-hal `hw` stack is pulled; `hostsim` swaps in the canvas display + stubs.
+clock = { path = "../clock", default-features = false, features = ["hostsim"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+# Panics just trap in the browser; abort keeps the .wasm small (no unwinding tables).
+panic = "abort"

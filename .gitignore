@@ -53,3 +53,8 @@ tools/ota_publish.env
 
 # brainstorm visual-companion sessions (local mockups)
 .superpowers/
+
+# #152 web emulator build artifacts
+rust/web-emu/target/
+web/emulator/*.wasm
+web/emulator/dist/
