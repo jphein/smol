@@ -13,15 +13,16 @@
 //! NOT a plugin) + a ~12-line dispatch core.
 
 use crate::input::Press;
-// Only the plain (non-cast) `Oled` alias below names these; under `feature = "cast"`
-// the alias is `CastOled` and these imports would be unused.
-#[cfg(not(feature = "cast"))]
+// Only the plain (hw, non-cast) `Oled` alias below names these; under `feature = "cast"`
+// the alias is `CastOled`, and under `feature = "hostsim"` (#152) it is the canvas
+// display, so these ssd1306 imports would be unused / unavailable there.
+#[cfg(all(feature = "hw", not(feature = "cast")))]
 use ssd1306::mode::BufferedGraphicsMode;
-#[cfg(not(feature = "cast"))]
+#[cfg(all(feature = "hw", not(feature = "cast")))]
 use ssd1306::prelude::I2CInterface;
-#[cfg(not(feature = "cast"))]
+#[cfg(all(feature = "hw", not(feature = "cast")))]
 use ssd1306::size::DisplaySize72x40;
-#[cfg(not(feature = "cast"))]
+#[cfg(all(feature = "hw", not(feature = "cast")))]
 use ssd1306::Ssd1306;
 
 /// The one concrete OLED type in the firmware. `Ctx` holds this CONCRETELY (not a
@@ -29,12 +30,19 @@ use ssd1306::Ssd1306;
 /// and `flush` lives on `Ssd1306`, not the `DrawTarget` trait. The generic draw
 /// helpers (`draw_clock`, …) still take `&mut impl DrawTarget`; a plugin passes
 /// `ctx.display` (which coerces) and flushes it itself.
-#[cfg(not(feature = "cast"))]
+#[cfg(all(feature = "hw", not(feature = "cast")))]
 pub type Oled = Ssd1306<
     I2CInterface<esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>>,
     DisplaySize72x40,
     BufferedGraphicsMode<DisplaySize72x40>,
 >;
+
+/// #152 host emulator: under `feature = "hostsim"` the one concrete `Oled` becomes a
+/// canvas-backed 72×40 framebuffer that impls the SAME `DrawTarget<Color = BinaryColor>`
+/// + inherent `clear()`/`flush()`/`init()` the plugins already call — so `snake.rs` /
+/// `clock.rs` draw through it UNCHANGED (zero forked render code, the #152 gate).
+#[cfg(feature = "hostsim")]
+pub type Oled = crate::hostsim::CanvasOled;
 
 /// #26 cast: under `feature = "cast"` the one concrete OLED becomes the tee-wrapper
 /// [`crate::net::cast_oled::CastOled`], which mirrors every draw into a shadow
@@ -340,6 +348,11 @@ pub fn parse_default_screen(payload: &[u8]) -> Option<DefaultScreen> {
 /// we must NOT do (no allocator on the game path; §2/§5). The union is still
 /// LESS RAM than the old parallel `Option<Snake>` + `Option<MeshSnake>` (sum),
 /// and only one screen is ever live.
+// #152: the dispatch UNION references every plugin module (menu/batt/bench/…), none of
+// which the hostsim lib re-exports — the emulator drives the pure `Plugin`s (Snake/Clock)
+// DIRECTLY, not via `App`. Gate the union + its impl out of hostsim; the firmware (hw) is
+// unchanged.
+#[cfg(not(feature = "hostsim"))]
 #[allow(clippy::large_enum_variant)]
 pub enum App {
     Menu(crate::menu::Menu),
@@ -371,6 +384,7 @@ pub enum App {
     Custom(crate::custom::CustomState),
 }
 
+#[cfg(not(feature = "hostsim"))] // #152: dispatch union impl — firmware-only (see the enum)
 impl App {
     /// Lazy init: construct fresh state for `kind` on entry (the one place each
     /// screen is created, with the args it needs).

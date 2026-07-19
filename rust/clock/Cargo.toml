@@ -36,19 +36,19 @@ license = "MIT OR Apache-2.0"
 # `unstable` is required for I2C/SPI/RNG and is also a hard requirement of
 # esp-wifi. `esp32c3` selects the chip. `rt` + `exception-handler` come from
 # the default features (runtime + fault handler).
-esp-hal = { version = "=1.0.0-rc.0", features = ["esp32c3", "unstable"] }
+esp-hal = { version = "=1.0.0-rc.0", features = ["esp32c3", "unstable"], optional = true }
 # NOTE: esp-hal's default features already install the exception handler, so
 # esp-backtrace only provides the panic handler + backtrace printing here.
 # Enabling esp-backtrace's `exception-handler` too causes a duplicate
 # `ExceptionHandler` symbol and an LTO bitcode-load failure at link time.
-esp-backtrace = { version = "=0.17.0", features = ["esp32c3", "panic-handler", "println"] }
+esp-backtrace = { version = "=0.17.0", features = ["esp32c3", "panic-handler", "println"], optional = true }
 # Force the USB Serial/JTAG backend explicitly. This board's console is the
 # native USB Serial/JTAG link (/dev/ttyACM0); esp-println's default `auto`
 # backend only routes to USB-JTAG when it detects host SOF packets at the
 # instant it writes, which proved unreliable during the busy WiFi burst and
 # left app logs going to the (unwired) UART0. `jtag-serial` pins the output to
 # USB-JTAG so boot/WiFi/NTP/ESP-NOW logs always appear on /dev/ttyACM0.
-esp-println = { version = "=0.15.0", default-features = false, features = [
+esp-println = { version = "=0.15.0", default-features = false, optional = true, features = [
     "esp32c3",
     "log-04",
     "jtag-serial",
@@ -61,8 +61,11 @@ log = "0.4"
 # the 1.1.0 already in the tree (embedded-hal etc. depend on it) — no lock churn.
 nb = "1"
 
-# --- Display stack (Phase 1, always on) ----------------------------------
-ssd1306 = "=0.10.0"
+# --- Display stack (Phase 1) ---------------------------------------------
+# ssd1306 is the concrete panel driver — HAL-facing (I2C), so it rides `hw`.
+# embedded-graphics is pure (target-agnostic) and stays ALWAYS-on: both the
+# firmware AND the #152 host/wasm emulator draw through it.
+ssd1306 = { version = "=0.10.0", optional = true }
 embedded-graphics = "=0.8.1"
 
 # --- WiFi / NTP (Phase 2, feature = "wifi") ------------------------------
@@ -120,9 +123,25 @@ ed25519-compact = { version = "2", default-features = false, optional = true }
 # (No extra top-level crate; the feature is toggled on esp-wifi below.)
 
 [features]
-# Phase 1 only: clock on the OLED. This is the default so `cargo build
-# --release` with no flags exercises the guaranteed-green baseline.
-default = []
+# Phase 1 only: clock on the OLED. `default` = `hw` so `cargo build --release` with no
+# flags is the guaranteed-green firmware baseline — BYTE-IDENTICAL to before the #152
+# split (the bare-metal crates were non-optional before; now they ride `hw`, which
+# `default` and every firmware tier pull, so the same deps + code compile).
+default = ["hw"]
+
+# #152 host-emulator boundary. The bare-metal crates (esp-hal / esp-backtrace /
+# esp-println / ssd1306) are `optional` so a NON-hardware target (the `hostsim` wasm lib)
+# builds the pure game/render cores without them. `hw` re-bundles them; it is implied by
+# `default` + `wifi` (⊃ espnow/io/cast/wled), so no firmware build changes.
+hw = ["dep:esp-hal", "dep:esp-backtrace", "dep:esp-println", "dep:ssd1306"]
+
+# #152 web emulator: compile the crate's LIBRARY (src/lib.rs) exposing ONLY the pure
+# plugin/render cores (app contract + snake + clock + input Press + sensors/units host
+# stubs) for a host/wasm target — NO `hw` crates, NO radio. Used solely by the `web-emu`
+# cdylib; the firmware BIN (src/main.rs) is never compiled under this feature. Every
+# hostsim change in the shared source is `#[cfg(feature="hostsim")]`/`#[cfg(not)]`, so the
+# firmware (hw) path is untouched. See src/lib.rs.
+hostsim = []
 
 # #72 IO/component registry (ESPHome inverted, "fat image / thin runtime config").
 # Compiles the digital-`Flex` driver menu into ONE image; a runtime pin-map relayed
@@ -141,6 +160,7 @@ io = ["espnow"]
 # esp-backtrace dep, so the `default` build's panic behavior stays the stock
 # loop{} (OTA rollback semantics only matter once there's a radio to fetch over).
 wifi = [
+    "hw", # #152: every firmware tier carries the bare-metal crates (byte-identical to before)
     "dep:esp-alloc",
     "dep:esp-wifi",
     "dep:esp-wifi-sys",
