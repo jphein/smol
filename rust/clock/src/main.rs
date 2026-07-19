@@ -1191,6 +1191,41 @@ fn main() -> ! {
                         flush_abort
                     });
                     flush_defer_since_ms = 0;
+                    // #192: opportunistic NTP RE-SYNC riding the flush cadence. `try_time_sync`
+                    // runs ONLY at boot, so without this the wall-clock free-runs on the C3
+                    // oscillator forever (tage climbs unbounded → fleet drift). The gateway is
+                    // WiFi-active here (just flushed); if our last true sync is stale
+                    // (> NTP_RESYNC_AGE_S ≈ 1 h), run a lightweight SNTP-only burst (reuses the
+                    // #89 NtpMachine; NO MQTT tail; does NOT tear coexist — step_assoc skips the
+                    // reconnect when already associated) and re-anchor the clock. Leaves refresh
+                    // via mesh time adoption once the crown re-broadcasts the fresh time.
+                    {
+                        let unix_now = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
+                        let stale_s = unix_now.saturating_sub(my_synced_at);
+                        if stale_s > net::NTP_RESYNC_AGE_S && r.is_gateway() {
+                            let mut resync_abort = false;
+                            let fresh = r.resync_ntp(&mut || {
+                                let t = millis();
+                                led.apply(led::LedState::WifiSync, t);
+                                if matches!(button.poll(t), Some(input::Press::Long)) {
+                                    resync_abort = true;
+                                }
+                                resync_abort
+                            });
+                            if let Some(unix) = fresh {
+                                // Re-anchor the free-running clock to the fresh SNTP time. The next
+                                // broadcast_time carries the new my_synced_at → leaves adopt it.
+                                base_unix = unix;
+                                anchor_ms = millis();
+                                my_synced_at = unix;
+                                time_source = app::TimeSource::NtpRoot;
+                                log::info!(
+                                    "smol #192: NTP re-synced -> Unix {} (was {}s stale)",
+                                    unix, stale_s
+                                );
+                            }
+                        }
+                    }
                     // #40 leaf-mesh-OTA orchestration: the flush surfaced a leaf install →
                     // relay the staged image to that leaf over ESP-NOW (canary-one-leaf; the
                     // relay does its own WiFi fetch then an ESP-NOW relay, minutes-scale +
