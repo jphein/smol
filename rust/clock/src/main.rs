@@ -494,15 +494,32 @@ fn main() -> ! {
     let synced = net::try_time_sync();
 
     #[cfg(all(feature = "wifi", not(feature = "espnow")))]
-    let synced = net::try_time_sync(
-        net::WifiPeripherals {
-            timg0: peripherals.TIMG0,
-            rng: peripherals.RNG,
-            wifi: peripherals.WIFI,
-        },
-        &mut batt_cache,
-        &mut grid_cache,
-    );
+    let synced = {
+        // #89 Stage 1: paint a LIVE clock through the sync window (wifi-only bench). The
+        // clock free-runs from the compile-time START_SECONDS_OF_DAY (no NTP yet) and
+        // redraws once per second, so the boot screen ticks instead of holding the splash.
+        // No abort button is wired on the bench (try_time_sync passes a no-op tick).
+        let mut boot_clock_sod: Option<u32> = None;
+        let mut boot_render = || {
+            let sod = ((START_SECONDS_OF_DAY as u64 + millis() / 1000) % 86_400) as u32;
+            if boot_clock_sod != Some(sod) {
+                boot_clock_sod = Some(sod);
+                display.clear(BinaryColor::Off).ok();
+                clock::draw_clock(&mut display, sod, &mut sensors, units::Units::default());
+                display.flush().ok();
+            }
+        };
+        net::try_time_sync(
+            net::WifiPeripherals {
+                timg0: peripherals.TIMG0,
+                rng: peripherals.RNG,
+                wifi: peripherals.WIFI,
+            },
+            &mut batt_cache,
+            &mut grid_cache,
+            &mut boot_render,
+        )
+    };
 
     // Phase 3: blue status LED on GPIO8, created at logical-OFF (GPIO8 is a
     // strapping pin) then fast-blinked during the WiFi/NTP burst inside start().
@@ -530,6 +547,22 @@ fn main() -> ! {
             }
             boot_abort
         };
+        // #89 Stage 1: paint a LIVE clock frame on each prologue yield (assoc/DHCP/SNTP)
+        // so the boot screen ticks through the sync window instead of holding the frozen
+        // #153 splash. Free-runs from the compile-time START_SECONDS_OF_DAY (no NTP yet),
+        // 1 redraw/sec. The still-blocking MQTT tail (Stage 2) is NOT painted → it freezes
+        // exactly as before. Disjoint captures from `boot_tick` (display+sensors vs
+        // led+button), so both close over `main`'s locals cleanly.
+        let mut boot_clock_sod: Option<u32> = None;
+        let mut boot_render = || {
+            let sod = ((START_SECONDS_OF_DAY as u64 + millis() / 1000) % 86_400) as u32;
+            if boot_clock_sod != Some(sod) {
+                boot_clock_sod = Some(sod);
+                display.clear(BinaryColor::Off).ok();
+                clock::draw_clock(&mut display, sod, &mut sensors, units::Units::default(), my_noun);
+                display.flush().ok();
+            }
+        };
         net::mode::start(
             net::WifiPeripherals {
                 timg0: peripherals.TIMG0,
@@ -542,6 +575,7 @@ fn main() -> ! {
             // steals the default id (#40 identity fix).
             node_id(),
             &mut boot_tick,
+            &mut boot_render,
             &mut batt_cache,
             &mut grid_cache,
         )
