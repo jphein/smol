@@ -29,7 +29,27 @@ mesh (issue #158). A pure MQTT listener — **no firmware changes** — that sub
 | `homeassistant/+/smol<id>/+/config` | discovery JSON | realm noun (fallback: vendored `names`) |
 
 Wire shapes pinned in [`docs/protocol.md`](../../docs/protocol.md) and
-`rust/clock/src/net/wifi.rs` (the code is authoritative).
+`rust/clock/src/net/wifi.rs` (the code is authoritative). **RSSI note:** the firmware
+serializes a peer's RSSI as the raw `u8` byte from `rx_control.rssi` (so `-41 dBm`
+arrives as `215`); `parse::normalize_rssi` decodes `128..=255 → v-256`, verified
+against live `smol/5/peers`.
+
+## Derived signals & HA-dashboard parity
+
+Per the mesh-visualizers spec, every derived signal here must be **mirrored in the HA
+dashboard** (bidirectional parity). All thresholds are defined **once** in `model.rs`
+(the single source of derivation truth) — change them there and update HA to match:
+
+| Signal | Where derived | HA should mirror |
+|---|---|---|
+| **crown / channel / election** | `MC` owner + seq jumps | crown owner sensor + channel + election log |
+| **RSSI edge (per link)** | `peers`, u8-decoded, symmetric-merged | needs a *graph*; HA has no native edge view → future `mesh-model --publish` bridge republishes derived edges to MQTT |
+| **stale** (`STALE_S = 45s`) | `last_seen` age | per-node `available`/stale binary_sensor |
+| **weak link** (`WEAK_LINK_DBM = -80`) | edge rssi | attribute on the link/peer |
+| **low heap** (`LOW_HEAP_B = 20 KB`) | DIAG `heap` | heap sensor + low-heap binary_sensor |
+| **build-uniformity** (all-vN / mixed) | `ota/state` installed set | fleet-uniform template sensor |
+| **OTA in-progress / armed / fetch retries** | `ota/state`, `ota/{install,diag,relaydiag}` | Update entity + progress (chunk `last_wb=k/n` from relaydiag) |
+| **version flip / reboot** (boot++) | `ota/state` installed change, DIAG `boot` | logbook events |
 
 ## Run
 
