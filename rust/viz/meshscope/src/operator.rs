@@ -45,7 +45,12 @@ impl Retain {
 pub struct PublishReq {
     pub topic: String,
     pub payload: Vec<u8>,
-    pub retain: Retain,
+    /// #201: PRIVATE — the safety-critical field. Set ONLY by the builders below
+    /// (`retained`/`transient`), never by a caller. Because this field is private, external code
+    /// CANNOT construct a `PublishReq` via a struct literal at all (rustc E0451), so there is no
+    /// way to hand-forge a retained `cmd/reset` (a reboot-loop soft-brick) that bypasses the typed
+    /// builders — the guarantee is now the type system's, not just the builders' + a unit test.
+    retain: Retain,
     /// Human summary shown in the confirmation modal + the "last published" line.
     pub label: String,
     /// Requires a confirmation modal before it goes out (reboot / broker / ota_host /
@@ -68,6 +73,15 @@ impl PublishReq {
         let val = String::from_utf8_lossy(&self.payload);
         let r = if self.retain.as_bool() { "retained" } else { "transient" };
         format!("{}  →  {} = \"{}\"  [{}]", self.label, self.topic, val, r)
+    }
+
+    /// #201 soft-brick guard: a command topic (`.../cmd/*` — `cmd/reset`, `cmd/scan`, any future
+    /// one) must NEVER be retained; a retained reset re-fires every ~10 s → permanent reboot loop.
+    /// The builders already guarantee it (cmd/* is only built via `transient`) and the private
+    /// `retain` field blocks external struct-literal forgery — this is the wire-level backstop that
+    /// also catches a future in-module builder that regresses. Enforced in [`Publisher::send`].
+    fn retain_is_safe(&self) -> bool {
+        !(self.retain.as_bool() && self.topic.contains("/cmd/"))
     }
 }
 
@@ -159,6 +173,15 @@ impl Publisher {
     /// Publish a request. Retain comes from the typed request — transient commands are
     /// structurally retain=false. Errors are swallowed (rumqttc requeues/reconnects).
     pub fn send(&self, req: &PublishReq) {
+        // #201 soft-brick backstop: a retained cmd/* is a reboot-loop brick. Structurally
+        // unreachable (cmd/* is only built via `transient`; the private `retain` field blocks
+        // struct-literal forgery), but guard the wire anyway — debug builds ASSERT (loud in
+        // tests/CI if a future builder regresses), release builds REFUSE the publish (never brick
+        // a board). A refused publish is strictly safer than a retained reset.
+        if !req.retain_is_safe() {
+            debug_assert!(false, "refusing to publish a RETAINED command topic (soft-brick): {}", req.topic);
+            return;
+        }
         let _ = self
             .client
             .publish(&req.topic, QoS::AtMostOnce, req.retain.as_bool(), req.payload.clone());
@@ -224,5 +247,48 @@ mod tests {
         // "C24" would silently no-op on the board. Lock the pipe form against regression.
         assert_eq!(units("F|24").payload, b"F|24");
         assert_eq!(channel_hint(Some(6)).topic, "smol/mesh/channel_hint");
+    }
+
+    #[test]
+    fn retained_command_is_structurally_impossible_and_backstopped() {
+        // #201: the struct-literal bypass is closed to EXTERNAL code by the PRIVATE `retain` field
+        // — outside this module `PublishReq { .., retain: Retain::Retained, .. }` fails to compile
+        // (E0451), so `retain` can only be set by the `retained`/`transient` builders. That
+        // compile-time guarantee can't be a runtime test in a bin crate; instead we prove the
+        // wire-level BACKSTOP (`retain_is_safe`, enforced in `send`) that catches a hypothetical
+        // future in-module regression. This test is IN-module, so it CAN forge the literal — and
+        // uses that to show the backstop rejects it.
+        let forged = PublishReq {
+            topic: "smol/7/cmd/reset".to_string(),
+            payload: b"1".to_vec(),
+            retain: Retain::Retained, // the soft-brick no caller must ever be able to set
+            label: "forged".to_string(),
+            destructive: true,
+        };
+        assert!(!forged.retain_is_safe(), "a retained cmd/* MUST be refused by send()'s backstop");
+        // A retained cmd/scan is equally unsafe.
+        let forged_scan = PublishReq {
+            topic: "smol/7/cmd/scan".to_string(),
+            payload: b"1".to_vec(),
+            retain: Retain::Retained,
+            label: "forged".to_string(),
+            destructive: false,
+        };
+        assert!(!forged_scan.retain_is_safe());
+        // Every real (builder-made) request is safe — commands are transient, config/* retained.
+        for r in [
+            reboot(7),
+            scan(7),
+            install(7),
+            led(7, "on"),
+            default_screen(7, "Clock", 0),
+            units("C|24"),
+            channel_hint(Some(6)),
+            channel_hint(None),
+            broker(7, "192.0.2.10:1883"),
+            ota_host(7, "192.0.2.11"),
+        ] {
+            assert!(r.retain_is_safe(), "{} must be safe to publish", r.topic);
+        }
     }
 }
