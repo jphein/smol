@@ -42,7 +42,12 @@ pub fn sync_nodes(
             .iter()
             .map(|(id, n)| {
                 let (color, r) = role_visual(n.gateway, owner == Some(*id), n.is_stale(now));
-                (*id, color, r, n.label().to_string())
+                // Parity with meshscope: the live screen ("the familiar") under the noun.
+                let label = match n.screen() {
+                    Some(s) => format!("{}\n{}", n.label(), s),
+                    None => n.label().to_string(),
+                };
+                (*id, color, r, label)
             })
             .collect()
     };

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
 
-use mesh_model::model::{ConnState, Model};
+use mesh_model::model::{ConnState, Model, SyncFreshness};
 use graph::GraphLayout;
 
 pub struct MeshscopeApp {
@@ -110,6 +110,16 @@ fn top_bar(ui: &mut egui::Ui, m: &Model, now_s: f64) {
         if stale > 0 {
             ui.separator();
             ui.label(RichText::new(format!("{stale} stale")).color(Color32::from_rgb(220, 130, 90)));
+        }
+        // Fleet NTP health (derived signal — HA parity): boards whose clock is stale/unsynced.
+        let ntp_stale = m
+            .nodes
+            .values()
+            .filter(|n| matches!(n.sync_freshness(), SyncFreshness::Stale | SyncFreshness::Unsynced))
+            .count();
+        if ntp_stale > 0 {
+            ui.separator();
+            ui.label(RichText::new(format!("{ntp_stale} NTP-stale")).color(Color32::from_rgb(224, 100, 90)));
         }
 
         // Right-aligned HA battery/grid readout if present.
