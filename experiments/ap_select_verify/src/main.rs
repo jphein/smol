@@ -28,6 +28,20 @@ fn main() {
         CrownApDecision::CoChannel { bssid: [4; 6], ch: 6 },
         "best-rssi co-channel"
     );
+    // 2b. STABLE tie-break: equal-RSSI co-channel APs → the SAME (lowest-bssid) pick regardless of
+    // scan order, so two crown candidates never diverge/oscillate (nebula-ota review item).
+    let tie_a = [ap(2, 6, -60), ap(5, 6, -60)];
+    let tie_b = [ap(5, 6, -60), ap(2, 6, -60)]; // reversed scan order
+    assert_eq!(
+        select_crown_ap(&tie_a, MESH, None),
+        select_crown_ap(&tie_b, MESH, None),
+        "tie-break is order-independent"
+    );
+    assert_eq!(
+        select_crown_ap(&tie_a, MESH, None),
+        CrownApDecision::CoChannel { bssid: [2; 6], ch: 6 },
+        "tie → deterministic lowest bssid"
+    );
     // 3. only off-channel → OffChannelFallback (strand signal), best rssi.
     let scan3 = [ap(1, 1, -67), ap(2, 11, -55)];
     assert_eq!(

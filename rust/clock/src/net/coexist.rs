@@ -49,7 +49,7 @@ pub fn select_crown_ap(aps: &[ApView], mesh_ch: u8, current: Option<ApView>) -> 
     let best_co = aps
         .iter()
         .filter(|a| a.channel == mesh_ch && a.rssi >= AP_USABLE_MIN)
-        .max_by_key(|a| a.rssi);
+        .max_by_key(|a| (a.rssi, core::cmp::Reverse(a.bssid)));
     if let Some(co) = best_co {
         if let Some(cur) = current {
             if cur.channel == mesh_ch && cur.rssi >= AP_USABLE_MIN {
@@ -66,8 +66,8 @@ pub fn select_crown_ap(aps: &[ApView], mesh_ch: u8, current: Option<ApView>) -> 
     let best_any = aps
         .iter()
         .filter(|a| a.rssi >= AP_USABLE_MIN)
-        .max_by_key(|a| a.rssi)
-        .or_else(|| aps.iter().max_by_key(|a| a.rssi));
+        .max_by_key(|a| (a.rssi, core::cmp::Reverse(a.bssid)))
+        .or_else(|| aps.iter().max_by_key(|a| (a.rssi, core::cmp::Reverse(a.bssid))));
     match best_any {
         Some(a) => CrownApDecision::OffChannelFallback { bssid: a.bssid, ch: a.channel },
         None => CrownApDecision::NoAp,
