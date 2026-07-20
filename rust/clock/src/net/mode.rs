@@ -492,6 +492,10 @@ enum Frame<'a> {
     Batt2 { seq: u32, payload: &'a [u8] },
     /// #13 Stage B: the grid twin of [`Frame::Batt2`].
     Grid2 { seq: u32, payload: &'a [u8] },
+    /// #227: the weather downlink — the third freshness-flooded channel (payload is the
+    /// verbatim `WX|<tempF>|<code>` bytes from the gateway's Open-Meteo fetch, borrows the
+    /// RX buffer). Same strict-newer adopt + re-flood mechanics as [`Frame::Batt2`].
+    Wx2 { seq: u32, payload: &'a [u8] },
     /// #21/#56 leaf-relay: a gateway's keyed CONFIG downlink — `target` leaf id, the config
     /// channel `key` (`S`=screen/…), + the verbatim `value` bytes (`value` borrows the RX
     /// buffer; the leaf buffers it per-key in `CfgTracker` in `service` IFF `target ==
@@ -799,6 +803,49 @@ impl GridTracker {
 #[derive(Clone, Copy)]
 pub struct GridOffer {
     pub buf: [u8; GRID_PAYLOAD_MAX],
+    pub len: usize,
+}
+
+/// #227: buffers the most-recent inbound WX2 weather payload — the third
+/// [`BattTracker`]/[`GridTracker`] twin. `service()` only BUFFERS; `main` takes it via
+/// [`RadioManager::take_wx_offer`] and writes its `WxCache`. Fixed `.bss`, no heap.
+struct WxTracker {
+    buf: [u8; crate::net::wx::WX_PAYLOAD_MAX],
+    len: usize,
+    have: bool,
+    /// Freshness `seq` of the last-adopted WX2 (twin of `BattTracker::dl_seq`).
+    dl_seq: u32,
+}
+
+impl WxTracker {
+    const fn new() -> Self {
+        Self { buf: [0; crate::net::wx::WX_PAYLOAD_MAX], len: 0, have: false, dl_seq: 0 }
+    }
+
+    /// Buffer a freshly-received payload (truncated to capacity; ≤ 32 B by spec).
+    fn set(&mut self, payload: &[u8]) {
+        let n = payload.len().min(crate::net::wx::WX_PAYLOAD_MAX);
+        self.buf[..n].copy_from_slice(&payload[..n]);
+        self.len = n;
+        self.have = true;
+    }
+
+    /// Strict-newer adopt + re-flood decision (twin of `BattTracker::set_fresh`).
+    fn set_fresh(&mut self, payload: &[u8], seq: u32) -> bool {
+        if self.have && seq <= self.dl_seq {
+            return false;
+        }
+        self.set(payload);
+        self.dl_seq = seq;
+        true
+    }
+}
+
+/// A `Copy` snapshot of a buffered WX2 payload handed to `main` by
+/// [`RadioManager::take_wx_offer`]. `buf[..len]` is the verbatim `WX|…` bytes.
+#[derive(Clone, Copy)]
+pub struct WxOffer {
+    pub buf: [u8; crate::net::wx::WX_PAYLOAD_MAX],
     pub len: usize,
 }
 
@@ -1886,11 +1933,16 @@ pub struct RadioManager {
     /// Twin of `batt` (issue #16): most-recent inbound SMOLv1 GRID payload, buffered
     /// for `main` to store into its `GridCache`.
     grid: GridTracker,
+    /// #227: third tracker twin — most-recent inbound SMOLv1 WX2 weather payload, buffered
+    /// for `main` to store into its `WxCache`.
+    wx: WxTracker,
     /// #13 Stage B: GATEWAY-origin freshness state for the BATT2/GRID2 downlink — assigns the
     /// monotonic `dl_seq` (bumped only on a value change) so relays re-flood strictly-newer data.
     /// Inert on a leaf (a leaf never originates downlink; it adopts via the trackers above).
     dl_batt: DlOrigin,
     dl_grid: DlOrigin,
+    /// #227: the WX2 origin twin (seq bumps only when the fetched reading changes).
+    dl_wx: DlOrigin,
     /// #21/#56 leaf-relay (LEAF side): most-recent inbound `SMOLv1 CFG` value PER config
     /// key that targeted THIS leaf, buffered for `main` to apply via `take_cfg_offer(key)`.
     cfg: CfgTracker,
@@ -2152,8 +2204,10 @@ impl RadioManager {
             roster: Roster::new(),
             batt: BattTracker::new(),
             grid: GridTracker::new(),
+            wx: WxTracker::new(),
             dl_batt: DlOrigin::new(),
             dl_grid: DlOrigin::new(),
+            dl_wx: DlOrigin::new(),
             cfg: CfgTracker::new(),
             cfg_cache: crate::net::wifi::CfgCache::new(),
             stat_cache: crate::net::wifi::CfgCache::new(),
@@ -2395,6 +2449,7 @@ impl RadioManager {
                     &empty,
                     batt,
                     grid,
+                    None, // #227: a leaf recovery burst never fetches weather (gateway-only)
                     &mut elect,
                     &mut ota_offer,
                     &mut config_offer,
@@ -2749,6 +2804,32 @@ impl RadioManager {
         if self.grid.have {
             self.grid.have = false;
             Some(GridOffer { buf: self.grid.buf, len: self.grid.len })
+        } else {
+            None
+        }
+    }
+
+    /// #227: broadcast the weather downlink as a `SMOLv1 WX2` frame — the third
+    /// [`broadcast_batt`] twin: tag + 10-digit `dl_seq` + the verbatim `WX|…` payload, seq
+    /// bumped only when the READING changes (a 30-min re-fetch returning the same temp/code
+    /// doesn't re-flood the mesh). GATEWAY-ONLY, same ~10 s `main` cadence as BATT/GRID.
+    ///
+    /// [`broadcast_batt`]: RadioManager::broadcast_batt
+    pub fn broadcast_wx(&mut self, payload: &[u8], now_unix: u32) {
+        let seq = self.dl_wx.seq_for(payload, now_unix);
+        let mut msg = [0u8; DL_FRAME_MAX];
+        let len = encode_dl(WX2_PREFIX, seq, payload, &mut msg);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
+    }
+
+    /// Take the buffered inbound WX2 payload (if any), clearing it. Third twin of
+    /// [`take_batt_offer`]; `main` stores the bytes into its `WxCache`.
+    ///
+    /// [`take_batt_offer`]: RadioManager::take_batt_offer
+    pub fn take_wx_offer(&mut self) -> Option<WxOffer> {
+        if self.wx.have {
+            self.wx.have = false;
+            Some(WxOffer { buf: self.wx.buf, len: self.wx.len })
         } else {
             None
         }
@@ -4537,6 +4618,7 @@ impl RadioManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // #227's wx cache tips this to 8 params (like run_mqtt_burst)
     pub fn flush_telemetry(
         &mut self,
         own_telemetry: &[u8],
@@ -4545,6 +4627,9 @@ impl RadioManager {
         status: &[u8],
         batt: &mut crate::batt::BattCache,
         grid: &mut crate::grid::GridCache,
+        // #227: the weather cache — the burst's post-session slot re-fetches Open-Meteo into it
+        // when stale (gateway flush only; the leaf recovery burst passes None downstream).
+        wx: &mut crate::weather::WxCache,
         // #40: filled with `(leaf_id, staged announce)` if this flush surfaced a leaf OTA
         // install → `main` then calls `run_leaf_ota_relay` for that leaf. `None` otherwise.
         leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
@@ -4648,6 +4733,7 @@ impl RadioManager {
                     &items[..n],
                     batt,
                     grid,
+                    Some(wx), // #227: gateway flush — refresh the weather in the post-session slot
                     &mut elect,
                     &mut ota_offer,
                     &mut config_offer,
@@ -5497,6 +5583,24 @@ impl RadioManager {
                     }
                     label = Some(alloc::format!("grid2 {}", seq));
                 }
+                Some(Frame::Wx2 { seq, payload }) => {
+                    // #227: the weather twin of the Batt2/Grid2 arms — leaf adopts + re-floods
+                    // strictly newer; gateway ignores (it's the source — its cache comes from the
+                    // Open-Meteo fetch). Only a well-formed `WX|` payload is kept.
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, None, rssi, now);
+                    if !self.relay.is_gateway
+                        && payload.starts_with(b"WX|")
+                        && self.wx.set_fresh(payload, seq)
+                    {
+                        let mut fb = [0u8; DL_FRAME_MAX];
+                        let len = encode_dl(WX2_PREFIX, seq, payload, &mut fb);
+                        self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+                        self.diag.dfwd = self.diag.dfwd.saturating_add(1); // downlink re-flood (see BATT2)
+                        log::info!("smol: WX2 seq {} adopted + reflooded (dfwd)", seq);
+                    }
+                    label = Some(alloc::format!("wx2 {}", seq));
+                }
                 Some(Frame::Cfg { target, key, value }) => {
                     // #21/#56 leaf-relay: a gateway's keyed CONFIG downlink. Target-filter
                     // FIRST — buffer if addressed to US (`self.id`) OR to the #43 broadcast
@@ -5983,6 +6087,11 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
     }
     if let Some((seq, payload)) = parse_dl(GRID2_PREFIX, data) {
         return Some(Frame::Grid2 { seq, payload });
+    }
+    // #227: the weather freshness channel — same `parse_dl` machinery, distinct tag (byte 7
+    // `'W'` — no other SMOLv1 tag starts with W, so order here is moot).
+    if let Some((seq, payload)) = parse_dl(WX2_PREFIX, data) {
+        return Some(Frame::Wx2 { seq, payload });
     }
     if let Some(rest) = data.strip_prefix(CFG_PREFIX) {
         // #21/#56 leaf-relay: "NNN<KEY><value>" — 3-ASCII target id, a 1-byte config KEY,

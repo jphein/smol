@@ -52,7 +52,7 @@ const fn parse_node_id(s: &str) -> u8 {
 /// The screen this board enters at BOOT instead of the Home menu (issue #18).
 /// Valid values, by the feature tier the firmware is built with:
 ///   * always:              `AppKind::Menu` · `AppKind::Clock` · `AppKind::Snake` · `AppKind::About`
-///   * `--features wifi`:   + `AppKind::Batt` · `AppKind::Grid`
+///   * `--features wifi`:   + `AppKind::Batt` · `AppKind::Grid` · `AppKind::Weather`
 ///   * `--features espnow`: + `AppKind::Bench` · `AppKind::MeshSnake`
 ///
 /// `AppKind::Menu` (the default) boots straight to the Home menu — the historical
@@ -91,3 +91,25 @@ pub const DEFAULT_PAGE: u8 = 0;
 /// ```
 #[cfg(feature = "mesh-test")]
 pub const DEAF_MACS: [Option<[u8; 6]>; 4] = [None; 4];
+
+// --- #227 weather-on-glass (espnow builds only) --------------------------------
+// The GATEWAY fetches current weather from Open-Meteo during its WiFi flush window
+// and relays `WX|<tempF>|<code>` to the fleet. These are ENVIRONMENT-SPECIFIC
+// (your location + a resolved frontend IP), so — per the public-repo rule — the
+// real values live only in the git-ignored `board.rs`; this template ships neutral
+// placeholders (Seattle, the watch reference's example coordinates).
+
+/// Forecast location, as the decimal-string lat/lon Open-Meteo takes in the URL
+/// (strings so no_std float formatting is never needed). ~1 decimal place is
+/// plenty (11 km) and avoids over-precise home coordinates ON the wire.
+#[cfg(feature = "espnow")]
+pub const WEATHER_LAT: &str = "47.6";
+#[cfg(feature = "espnow")]
+pub const WEATHER_LON: &str = "-122.3";
+
+/// #228 part-2: the DNS-fallback IP for `api.open-meteo.com` — used ONLY when the
+/// one-shot DNS A-query fails (no DHCP resolver / timeout / hostile reply). The
+/// proper `Host:` header is always sent (Open-Meteo is name-routed behind a shared
+/// frontend). Refresh at build-review time: `getent hosts api.open-meteo.com`.
+#[cfg(feature = "espnow")]
+pub const WEATHER_FALLBACK_IP: [u8; 4] = [188, 40, 99, 226];
