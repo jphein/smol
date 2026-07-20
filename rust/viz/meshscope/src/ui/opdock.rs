@@ -32,6 +32,8 @@ pub struct OperatorState {
     broker: String,
     ota_host: String,
     channel_hint: String,
+    notify_msg: String,
+    notify_dur: String,
     pending: Option<PublishReq>,
     last: Option<String>,
 }
@@ -204,6 +206,38 @@ pub fn show(ui: &mut egui::Ui, sel: Option<&Node>, publisher: &Publisher, st: &m
                 action = Some(operator::channel_hint(None));
             }
         });
+
+        // ---- #197 herald: send a transient on-glass toast to one node or the whole fleet ----
+        ui.separator();
+        ui.label(RichText::new("message → glass (toast)").small().weak());
+        ui.add(egui::TextEdit::singleline(&mut st.notify_msg).desired_width(170.0).hint_text("hello mesh"));
+        let have_msg = !st.notify_msg.trim().is_empty();
+        let msg = st.notify_msg.clone();
+        ui.horizontal(|ui| {
+            ui.label("secs");
+            ui.add(egui::TextEdit::singleline(&mut st.notify_dur).desired_width(28.0).hint_text("5"));
+            let dur = st.notify_dur.trim().parse::<u16>().ok();
+            if let Some(n) = sel {
+                if ui.add_enabled(have_msg, egui::Button::new(format!("Send → id{}", n.id))).clicked() {
+                    action = Some(operator::notify(n.id, dur, &msg));
+                }
+            }
+            // Fleet-wide (255) is destructive → routed through the confirm modal.
+            if ui.add_enabled(have_msg, egui::Button::new(RichText::new("Send → ALL").color(Color32::from_rgb(230, 200, 70)))).clicked() {
+                action = Some(operator::notify_fleet(dur, &msg));
+            }
+        });
+        // WYSIWYG preview: exactly how the fw toast will wrap it (12 cols / 3 rows), on the
+        // SANITIZED message that goes on the wire — what-you-type-is-what-renders.
+        if have_msg {
+            let lines = operator::wrap_preview(&msg);
+            ui.label(RichText::new("preview (on glass):").small().weak());
+            egui::Frame::none().fill(Color32::from_rgb(18, 20, 26)).inner_margin(3.0).show(ui, |ui| {
+                for l in &lines {
+                    ui.label(RichText::new(l).monospace().color(Color32::from_rgb(215, 220, 230)));
+                }
+            });
+        }
 
         // ---- Last published ----
         if let Some(last) = &st.last {

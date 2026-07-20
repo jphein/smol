@@ -185,6 +185,12 @@ pub struct MeshElect {
     /// R-DEMOTE abdication), so a sitting crown vacates promptly and leaves re-elect a
     /// hinted-channel board instead of staying pinned to our now-wrong-channel HELLO.
     pub hint_blocked: bool,
+    /// #204 2a: true iff this burst RECEIVED any of its own retained downstream (MC/batt/grid) —
+    /// the crown dead-unicast-RX liveness signal. A gateway flush that CONNECTS (`ok`) but leaves
+    /// this FALSE is a downstream-dry tick (the #204 crown-deafness: TX + broadcast fine, sustained
+    /// inbound unicast starves). Set in [`mqtt_session`]'s drain (`got_mc || got_batt || got_grid`);
+    /// the caller reads it post-burst to drive `crown_deaf_streak`. False until the drain runs.
+    pub downstream_seen: bool,
 }
 
 #[cfg(feature = "wifi")]
@@ -207,6 +213,7 @@ impl MeshElect {
             owner_id: my_id,
             owner_alive: false,
             hint_blocked: false, // #155: set by the claim gate on a channel-hint yield
+            downstream_seen: false, // #204 2a: set true in the drain on any retained downstream
         }
     }
 }
@@ -692,6 +699,17 @@ impl NtpMachine {
     /// waiting → yield).
     fn step_assoc(&mut self, controller: &mut esp_wifi::wifi::WifiController<'static>) -> bool {
         let net = &crate::secrets::WIFI_NETWORK;
+        // #192: an ALREADY-associated caller (the periodic NTP re-sync burst on a coexist
+        // gateway) skips the disconnect/reconfigure/connect FFI — issuing it would TEAR a live
+        // coexist association (mesh-deaf + re-election churn) for no reason. Go straight to DHCP.
+        // Boot is NOT yet connected here, so the boot burst still runs the full setup below →
+        // boot behaviour is byte-identical.
+        if !self.assoc_configured && matches!(controller.is_connected(), Ok(true)) {
+            self.assoc_configured = true;
+            self.deadline = Instant::now() + SYNC_BUDGET; // shared DHCP+SNTP budget
+            self.phase = NtpPhase::Dhcp;
+            return true;
+        }
         if !self.assoc_configured {
             // Drop any prior association before reconfiguring (harmless if not connected).
             let _ = controller.disconnect();
@@ -903,6 +921,50 @@ pub fn note_broker_connect(connected: bool) {
     }
 }
 
+/// #192: re-sync NTP when the last true sync (`my_synced_at`) is older than this. try_time_sync
+/// runs ONLY at boot, so without a periodic re-sync the wall-clock free-runs on the ESP32-C3
+/// oscillator forever (~10–40 ppm drift → seconds/day, unbounded). 1 h caps the accumulated
+/// error before correction while keeping the extra WiFi bursts rare (≈1/120 flushes).
+/// ⚠️ HARDWARE-WATCH tuning knob.
+#[cfg(feature = "espnow")]
+pub(crate) const NTP_RESYNC_AGE_S: u32 = 3600;
+
+/// #192: periodic NTP re-sync — a lightweight SNTP-only burst that reuses the #89 Stage-1
+/// `NtpMachine` substrate. UNLIKE `run_ntp_burst` it runs NO MQTT tail (no election, no downlink,
+/// no discovery): it exists solely to refresh the clock when `my_synced_at` goes stale
+/// (main-loop trigger, GATEWAY only — leaves refresh via mesh time adoption). On an already-
+/// associated coexist gateway, `NtpMachine::step_assoc` skips the disconnect/reconnect, so this
+/// does NOT tear the coexist association — it rebuilds the smoltcp stack (fresh interface) →
+/// DHCP → one SNTP exchange → returns the Unix time (`None` on timeout/abort/assoc-DHCP fail).
+///
+/// Reuses the same module `static mut` NTP buffers as the boot burst — alias-safe for the F2
+/// reason: the boot burst completes BEFORE the main loop, and re-syncs are sequential (only one
+/// flush/burst is ever in flight in the single-threaded main loop), so the borrows never overlap.
+#[cfg(feature = "espnow")]
+pub fn run_ntp_resync(
+    controller: &mut esp_wifi::wifi::WifiController<'static>,
+    device: &mut esp_wifi::wifi::WifiDevice<'static>,
+    mut rng: Rng,
+    tick: &mut dyn FnMut() -> bool,
+) -> Option<u32> {
+    let sntp_src_port = 49152 + (rng.random() % 16384) as u16;
+    let mut machine = NtpMachine::new(device, sntp_src_port);
+    loop {
+        match machine.poll(controller, device) {
+            NtpPoll::Pending => {
+                if tick() {
+                    return None; // #20 long-press abort → give up this re-sync, retry when due again
+                }
+            }
+            // Assoc/DHCP gave up (e.g. AP briefly unreachable) → no fresh time this cycle; the
+            // main-loop trigger re-attempts on the next flush once still stale.
+            NtpPoll::Failed => return None,
+            // Reached DHCP; carry the SNTP result. NO MQTT tail (that is run_ntp_burst / the flush).
+            NtpPoll::ReachedDhcp(t) => return t,
+        }
+    }
+}
+
 /// Shared WiFi -> DHCP -> SNTP burst, reused by both the Phase-2 `wifi`-only
 /// build and the Phase-3 `espnow` build. #100: associates on the NVS-selected slot with the
 /// un-brickable fallback (see the assoc loop below), drives a `smoltcp` DHCP+UDP stack over
@@ -1000,6 +1062,7 @@ pub fn run_ntp_burst(
     let mut _ntp_gw_own = GwOwnCfg::new(); // #48: boot/NTP burst never captures gateway-own cfg (cfg_cache=None)
     let mut _ntp_reset_req = ResetReq::new(); // #52: boot/NTP burst subscribes no cmd/reset (cfg_cache=None)
     let mut _ntp_scan_req = ScanReq::new(); // #71: boot/NTP burst subscribes no cmd/scan (cfg_cache=None)
+    let mut _ntp_notify_req = NotifyReq::new(); // #197: boot/NTP burst subscribes no notify (cfg_cache=None)
     // #89 Stage 1: hand the machine's LIVE stack to the UNCHANGED blocking session —
     // the boot screen freezes for this ≤ MQTT_SESSION_BUDGET tail exactly as before
     // (making the tail cooperative is #89 Stage 2). `tick` still runs (LED + abort),
@@ -1030,6 +1093,7 @@ pub fn run_ntp_burst(
         &[], // #71: boot burst publishes no own scan
         None, // #71: boot burst republishes no cached scan
         &mut _ntp_scan_req, // #71: boot burst subscribes no cmd/scan (cfg_cache=None)
+        &mut _ntp_notify_req, // #197: boot burst subscribes no notify (cfg_cache=None)
         &mut None, // #40: boot burst never relays a leaf OTA
         &mut None, // #40: boot burst has no persistent staged to carry
         &mut None, // #40: boot burst has no relay diag to publish
@@ -1269,6 +1333,18 @@ pub const CFG_KEY_IO: u8 = b'G';
 #[allow(dead_code)]
 pub const CFG_KEY_IO_SET: u8 = b'g';
 
+/// #197 herald NOTIFY (key `M`) = a TRANSIENT on-glass toast message. Verified free against
+/// the full key family (`S L U P R Y W N B O G g`). One-shot like R/W — captured from the
+/// transient `smol/<id>/notify` topic (retain:false), relayed via `broadcast_config` with the
+/// message as the value, and **NEVER cached / re-armed** (a retained or cached notify would
+/// re-toast on every boot — the load-bearing #197 invariant). The leaf applies it by pushing a
+/// `crate::toast` overlay (auto-dismiss), it is NOT in `CFG_APPLY_KEYS`' cached set. Value =
+/// `[~<dur>]<msg>` (optional TTL-seconds prefix, then the message), ≤ `CFG_VALUE_MAX`.
+/// Same wifi-tier / allow(dead_code) rationale as R/W (unused in a wifi-only build).
+#[cfg(feature = "wifi")]
+#[allow(dead_code)]
+pub const CFG_KEY_NOTIFY: u8 = b'M';
+
 /// #48 (GwOwnCfg — approved arch): the GATEWAY's OWN per-node configs read from its own MQTT
 /// topics this burst. A leaf gets these RELAYED (→ its `CfgTracker`); the gateway reads them
 /// DIRECTLY. Bundled into ONE `run_mqtt_burst`/`mqtt_session` out-param (net +1, not +N) — after
@@ -1434,6 +1510,60 @@ impl ScanReq {
     /// The queued leaf scan targets (to relay one-shot; NEVER cached).
     pub fn targets(&self) -> &[u8] {
         &self.targets[..self.n]
+    }
+}
+
+/// #197 herald NOTIFY capture — a transient toast COMMAND seen on `smol/+/notify` this burst.
+/// Like [`ResetReq`]/[`ScanReq`] it is NEVER cached (a cached toast re-shows on every boot), but it
+/// CARRIES the message (unlike the value-less R/W). One notify per burst (last-wins): the operator
+/// sends one message to one target (or `CFG_TARGET_ALL` = 255 for the whole fleet). After the burst
+/// `service()` fires a ONE-SHOT `broadcast_config(target, M, msg)` relay + injects `M` into its OWN
+/// `CfgTracker` if `own`, so `main`'s `take_cfg_offer(M)` toasts a leaf or the gateway on one path.
+#[cfg(feature = "wifi")]
+#[allow(dead_code)]
+pub struct NotifyReq {
+    msg: [u8; CFG_VALUE_MAX],
+    len: usize,
+    relay_to: Option<u8>, // Some(leaf | 255) to relay; None = own-only (target was our id)
+    own: bool,
+    have: bool,
+}
+
+#[cfg(feature = "wifi")]
+#[allow(dead_code)]
+impl NotifyReq {
+    pub const fn new() -> Self {
+        Self { msg: [0; CFG_VALUE_MAX], len: 0, relay_to: None, own: false, have: false }
+    }
+    /// Capture a notify for `target` (the `<id>` from `smol/<id>/notify`, may be `CFG_TARGET_ALL`),
+    /// given our own id. Bounded copy (untrusted relayed value → the #46 clamp discipline).
+    pub fn set(&mut self, target: u8, own_id: u8, payload: &[u8]) {
+        let n = payload.len().min(CFG_VALUE_MAX);
+        self.msg[..n].copy_from_slice(&payload[..n]);
+        self.len = n;
+        self.have = true;
+        if target == CFG_TARGET_ALL {
+            self.own = true; // fleet: toast us too
+            self.relay_to = Some(CFG_TARGET_ALL); // ...and relay to every leaf
+        } else if target == own_id {
+            self.own = true; // just us — no relay
+        } else {
+            self.relay_to = Some(target); // a specific leaf
+        }
+    }
+    pub fn have(&self) -> bool {
+        self.have
+    }
+    pub fn own(&self) -> bool {
+        self.own
+    }
+    /// The leaf/fleet id to one-shot relay the toast to, if any.
+    pub fn relay(&self) -> Option<u8> {
+        self.relay_to
+    }
+    /// The captured `[~<dur>]<msg>` wire.
+    pub fn msg(&self) -> &[u8] {
+        &self.msg[..self.len]
     }
 }
 
@@ -1811,6 +1941,28 @@ mod ota_fail {
     }
 }
 
+/// #204 2b/F1: is a self-fetch failure stage a BODY-RECEPTION (bulk-deaf) signature — did the fetch
+/// reach the point of receiving the 206 response/body and then fail to complete it? These gate the
+/// aggressive crown SHED (the small-frame `got_mc` streak can false-green on a partial-heal, so the
+/// shed needs bulk-inbound proof). TRUE (post-206, body-reception): status (bad 206 header /
+/// Content-Length on a chunk) / fallback (200 body died mid-stream) / stall (zero-progress exhausted
+/// = the #26 "ACKs zero downstream") / deadline (elapsed mid-download) / recycle (chunk never
+/// drained). FALSE — the PRE-206 / non-RX stages (155 crux 3): assoc/dhcp/slot (pre-net), connect
+/// (never established), handshake (TCP SYN-ACK — pre-206, and an upstream/AP blip could cause it, the
+/// R-DEMOTE lane), send (TX-side, HEALTHY in the disease), verify (body FULLY received, only the
+/// size/SHA/sig gate rejected it → downstream worked).
+#[cfg(feature = "espnow")]
+pub(crate) fn ota_fail_is_bulk_deaf(w: u32) -> bool {
+    matches!(
+        w,
+        ota_fail::STATUS
+            | ota_fail::FALLBACK
+            | ota_fail::STALL
+            | ota_fail::DEADLINE
+            | ota_fail::RECYCLE
+    )
+}
+
 /// One short MQTT 3.1.1 QoS0 session over a fresh TCP socket to the HA broker:
 /// TCP connect → CONNECT (client-id `smol-<node_id>`, username+password) → CONNACK
 /// → SUBSCRIBE `smol/display/batt` (downlink FIRST — the retained payload every node
@@ -1888,6 +2040,10 @@ fn mqtt_session(
     // #71: filled with the scan COMMANDS seen on the transient `smol/+/cmd/scan` topics this burst
     // (leaf targets to one-shot-relay `<id>W` + own flag). Twin of `reset_req`; NEVER cached.
     scan_req: &mut ScanReq,
+    // #197 herald: filled with the notify COMMAND (target + message) seen on the transient
+    // `smol/+/notify` topics this burst → a one-shot `<id>M` relay + own self-toast after the
+    // burst. Twin of `scan_req` (carries a message value); NEVER cached.
+    notify_req: &mut NotifyReq,
     // #40 leaf-mesh-OTA: on a GATEWAY flush, filled with `(leaf_id, raw staged announce)`
     // when a retained `smol/<leaf>/ota/install = INSTALL` is present for a leaf id ≠ self
     // AND a staged image is available — the caller then relays it over ESP-NOW. The retained
@@ -2145,6 +2301,12 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 23, b"smol/+/io/set") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
+        // #197 herald: wildcard-subscribe the TRANSIENT `smol/+/notify` toast command (pid 24, QoS 1
+        // like cmd/reset|scan — a transient command must not be silently dropped). The gateway relays
+        // a captured toast to the target leaf (one-shot `<id>M`) after the burst; 255 = fleet.
+        if let Some(n) = crate::net::mqtt::encode_subscribe_qos1(&mut pkt, 24, b"smol/+/notify") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
     }
 
     // #100 DRAIN-ORDER FIX (HW canary #110): the batt/grid/mc primary downlinks are the
@@ -2165,11 +2327,15 @@ fn mqtt_session(
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 3, MESH_CHANNEL_TOPIC) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
     }
-    // #155 channel-drag operator lever: subscribe the retained channel-hint (packet-id 13 — the
-    // first free id; 9 is `smol/+/ota/install`). Sent right after the election topic so its retained
-    // value rides the SAME broker burst as `MC` and is captured before the resolver runs (the settle
-    // window after the primary downlinks catches it, exactly like the OTA/config retained topics).
-    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 13, MESH_CHANNEL_HINT_TOPIC) {
+    // #155 channel-drag operator lever: subscribe the retained channel-hint (packet-id 25). NOTE:
+    // this was originally 13, which COLLIDES with the QoS-1 `smol/+/cmd/reset` subscribe (pids
+    // 13/14 are cmd/reset|cmd/scan via `encode_subscribe_qos1`, missed by #155's original
+    // uniqueness check — that grep only matched `encode_subscribe(`). Two in-flight SUBSCRIBEs
+    // sharing a packet id is an MQTT-3.1.1 violation; moved to 25 (13/14 = cmd/reset|scan, 24 =
+    // #197 herald notify, 25 = first free above that). Sent right after the election topic so its
+    // retained value rides the SAME broker burst as `MC` and is captured before the resolver runs
+    // (the settle window after the primary downlinks catches it, like the OTA/config retained topics).
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 25, MESH_CHANNEL_HINT_TOPIC) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
     }
 
@@ -2817,6 +2983,15 @@ fn mqtt_session(
                             scan_req.push_leaf(leaf_id);
                             log::info!("smol #71: leaf id{} scan command — one-shot relay queued", leaf_id);
                         }
+                    } else if let Some(target) = parse_leaf_config_topic(topic, b"/notify") {
+                        // #197 herald toast — a COMMAND on a TRANSIENT topic (retain:false), twin of
+                        // reset/scan but the PAYLOAD IS the message (`[~<dur>]<msg>`). NEVER cached (a
+                        // cached toast re-shows on every boot). Capture into `notify_req` for a
+                        // one-shot `<id>M` relay after the burst. `target` may be our own id (self-
+                        // toast) or `CFG_TARGET_ALL`=255 (fleet: self + relay to all leaves); the
+                        // own/leaf routing is decided in `NotifyReq::set`.
+                        notify_req.set(target, node_id, payload);
+                        log::info!("smol #197: notify target{} captured ({} B)", target, payload.len());
                     } else if let Some(leaf_id) = parse_leaf_install_topic(topic) {
                         // #40 (§B3): a wildcard-delivered leaf OTA install command. On a
                         // GATEWAY flush (cfg_cache = Some), an `INSTALL` for a leaf id ≠ self
@@ -2882,6 +3057,15 @@ fn mqtt_session(
             break;
         }
     }
+
+    // #204 2a: crown dead-downstream detector (measurement only). Record whether this burst
+    // received ANY of its own retained downstream (MC/batt/grid). got_mc is the primary signal —
+    // the crown always retains its OWN MC, so a healthy crown gets it back on every flush; a
+    // downstream-deaf crown gets nothing. batt/grid strengthen confidence but aren't required. The
+    // caller (flush_telemetry) turns a CONNECTED-but-downstream-dry gateway flush into a
+    // `crown_deaf_streak` tick. ⚠️ #204 partial-heal caveat: these are small retained TCP frames,
+    // so a STREAK (not one-shot) guards a lucky small-frame while bulk stays dead (rung-2 = bulk probe).
+    elect.downstream_seen = got_mc || got_batt || got_grid;
 
     // #40 ARMDIAG: snapshot whether THIS flush caught an install (before the diag block below
     // may null `pending_leaf`) — dumped to `smol/<gw>/ota/armdiag` after the arm, so one
@@ -3419,7 +3603,6 @@ fn mqtt_session(
             Some(a) => a.build,
             None => installed,
         };
-        let noun = crate::net::names::version_name().1;
         // Discovery config (retained) — bound to the SAME device as telemetry via
         // identifiers:["smol<id>"], so Update lands on the existing device card.
         let mut dtopic = MqttScratch::new();
@@ -3437,13 +3620,22 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), djson.as_bytes(), true) {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
-        // State JSON (retained): installed + latest + in_progress + title.
+        // State JSON (retained): installed + latest + in_progress + title. installed/latest
+        // stay NUMERIC (HA's version compare). #218: the title is the human DISPLAY — the
+        // running build's honest stamp (with `+dev.<hash>` for a canary) when up-to-date,
+        // else the update TARGET's sigil name ("v<latest> <Word>").
         let mut sjson = MqttScratch::new();
         let _ = write!(
             sjson,
-            "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":{},\"title\":\"v{} {}\"}}",
-            installed, latest, *install_requested, latest, noun
+            "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":{},\"title\":\"",
+            installed, latest, *install_requested
         );
+        if latest == installed {
+            crate::net::names::write_version(&mut sjson);
+        } else {
+            let _ = write!(sjson, "v{} {}", latest, crate::net::names::version_name_for(latest).1);
+        }
+        let _ = write!(sjson, "\"}}");
         let mut stopic = MqttScratch::new();
         let _ = write!(stopic, "smol/{}/ota/state", node_id);
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, stopic.as_bytes(), sjson.as_bytes(), true) {
@@ -3515,10 +3707,13 @@ fn mqtt_session(
             if let Some(installed) = crate::ota_mesh::stat_build(val) {
                 let latest = latest_staged.unwrap_or(installed);
                 let mut sjson = MqttScratch::new();
+                // #218: carry the sigil forge name in the relayed leaf title too. The title must
+                // match the self-published form ("v<N> <sigil>", NOT "smol v<N>") so a relayed leaf
+                // and a self-publishing board render identically in HA/meshscope (live≠repo fix).
                 let _ = write!(
                     sjson,
-                    "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":false,\"title\":\"smol v{}\"}}",
-                    installed, latest, latest
+                    "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":false,\"title\":\"v{} {}\"}}",
+                    installed, latest, latest, crate::net::names::version_name_for(latest).1
                 );
                 let mut stopic = MqttScratch::new();
                 let _ = write!(stopic, "smol/{}/ota/state", lid);
@@ -3601,6 +3796,8 @@ pub fn run_mqtt_burst(
     scan_cache: Option<&RelayCache>,
     // #71: filled with the scan commands seen on `smol/+/cmd/scan` this burst (one-shot relay below).
     scan_req: &mut ScanReq,
+    // #197: filled with the notify command seen on `smol/+/notify` this burst (one-shot relay below).
+    notify_req: &mut NotifyReq,
     // #40: on a gateway flush, filled with `(leaf_id, staged announce)` when a leaf install
     // is pending → the caller relays it over ESP-NOW. `&mut None` on boot/leaf bursts.
     leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
@@ -3803,6 +4000,7 @@ pub fn run_mqtt_burst(
         scan, // #71: forward this node's own scan record (or empty)
         scan_cache, // #71: forward the gateway's cached relayed scans (or None)
         scan_req, // #71: forward the scan-command capture (one-shot relay)
+        notify_req, // #197: forward the notify-command capture (one-shot relay)
         leaf_ota, // #40: forward the leaf-OTA install pairing (or &mut None)
         staged_raw, // #40: forward the persistent staged announce (or &mut None)
         leaf_diag, // #40: forward the diag/clear state (or &mut None)

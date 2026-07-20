@@ -68,6 +68,12 @@ impl PublishReq {
         // is a clear, non-empty marker.
         PublishReq { topic, payload: b"1".to_vec(), retain: Retain::Transient, label, destructive }
     }
+    /// A value-carrying transient command (#197 notify — the message IS the payload). Like
+    /// `transient` it forces Retain::Transient: a retained notify would re-toast on every boot
+    /// (the fw's never-cached invariant), so there is no builder that can make it retained.
+    fn transient_msg(topic: String, payload: Vec<u8>, label: String, destructive: bool) -> Self {
+        PublishReq { topic, payload, retain: Retain::Transient, label, destructive }
+    }
 
     pub fn summary(&self) -> String {
         let val = String::from_utf8_lossy(&self.payload);
@@ -81,7 +87,10 @@ impl PublishReq {
     /// `retain` field blocks external struct-literal forgery — this is the wire-level backstop that
     /// also catches a future in-module builder that regresses. Enforced in [`Publisher::send`].
     fn retain_is_safe(&self) -> bool {
-        !(self.retain.as_bool() && self.topic.contains("/cmd/"))
+        // `/cmd/*` (reset/scan) AND `/notify` (#197 herald toast) must never be retained — a
+        // retained one re-fires/re-toasts on every board reconnect/boot.
+        let transient_topic = self.topic.contains("/cmd/") || self.topic.ends_with("/notify");
+        !(self.retain.as_bool() && transient_topic)
     }
 }
 
@@ -143,6 +152,91 @@ pub fn channel_hint(ch: Option<u8>) -> PublishReq {
         None => (Vec::new(), "FLEET channel hint → CLEAR".to_string()),
     };
     PublishReq::retained("smol/mesh/channel_hint".to_string(), payload, label, true)
+}
+
+// --- #197 herald: transient on-glass toast ("Send message") ---------------------------
+// Wire matches the fw `toast` module: `[~<dur>]<msg>`, wrapped to a 72 px panel.
+
+/// 72 px / (5 px glyph + 1 px advance) = 12 glyphs per line (FONT_5X8) — the fw `toast::COLS`.
+pub const NOTIFY_COLS: usize = 12;
+/// 40 px panel → 3 lines — the fw `toast::ROWS`.
+pub const NOTIFY_ROWS: usize = 3;
+/// Message chars kept, leaving room for a `~<dur>|` prefix within the fw `CFG_VALUE_MAX = 64`.
+const NOTIFY_MSG_MAX: usize = 48;
+
+/// Strip wire delimiters (`|` `;` newlines → space), collapse whitespace, trim, cap length —
+/// so the message can't corrupt the `~<dur>|<msg>` framing or overflow the CFG value.
+fn sanitize(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut prev_space = false;
+    for c in msg.chars() {
+        let c = if matches!(c, '|' | ';' | '\n' | '\r' | '\t') { ' ' } else { c };
+        if c == ' ' {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    let trimmed = out.trim_end();
+    trimmed.chars().take(NOTIFY_MSG_MAX).collect()
+}
+
+/// Build the `[~<dur>]<msg>` wire the fw `toast::parse_wire` expects.
+fn notify_wire(dur_s: Option<u16>, msg: &str) -> String {
+    let clean = sanitize(msg);
+    match dur_s {
+        Some(d) if d > 0 => format!("~{d}|{clean}"),
+        _ => clean,
+    }
+}
+
+/// A per-node transient toast. Not destructive (a single glass); retain:false (a retained
+/// notify would re-toast every boot — enforced by `transient_msg` + `retain_is_safe`).
+pub fn notify(id: u8, dur_s: Option<u16>, msg: &str) -> PublishReq {
+    let wire = notify_wire(dur_s, msg);
+    PublishReq::transient_msg(format!("smol/{id}/notify"), wire.into_bytes(), format!("Notify id{id}"), false)
+}
+
+/// Fleet-wide toast (`smol/255/notify` → CFG_TARGET_ALL) — a mesh-wide announcement; destructive
+/// (every glass in the house), so it is confirm-gated.
+pub fn notify_fleet(dur_s: Option<u16>, msg: &str) -> PublishReq {
+    let wire = notify_wire(dur_s, msg);
+    PublishReq::transient_msg("smol/255/notify".to_string(), wire.into_bytes(), "FLEET notify → ALL glass".to_string(), true)
+}
+
+/// Greedy word-wrap for the dock PREVIEW — byte-for-byte the fw `toast::wrap` behaviour
+/// (12 cols, 3 rows, hard-split an over-wide word) so what-you-type-is-what-renders. Operates
+/// on the SANITIZED message (what actually goes on the wire).
+pub fn wrap_preview(msg: &str) -> Vec<String> {
+    let s = sanitize(msg);
+    let mut lines: Vec<String> = Vec::new();
+    let mut rest = s.as_str();
+    while !rest.is_empty() && lines.len() < NOTIFY_ROWS {
+        rest = rest.trim_start_matches(' ');
+        if rest.is_empty() {
+            break;
+        }
+        let n = rest.chars().count();
+        if n <= NOTIFY_COLS {
+            lines.push(rest.to_string());
+            break;
+        }
+        // Find the last space within the first COLS chars (word boundary); else hard-split.
+        let window: String = rest.chars().take(NOTIFY_COLS).collect();
+        let cut = window.rfind(' ');
+        let take = match cut {
+            Some(pos) if pos > 0 => pos,          // break at the word boundary
+            _ => NOTIFY_COLS,                      // no space → hard split
+        };
+        let head: String = rest.chars().take(take).collect();
+        lines.push(head.trim_end().to_string());
+        rest = &rest[rest.char_indices().nth(take).map(|(i, _)| i).unwrap_or(rest.len())..];
+    }
+    lines
 }
 
 // --- The publisher (own rumqttc client, distinct id) ----------------------------------
@@ -234,6 +328,26 @@ mod tests {
     fn channel_hint_clear_is_empty() {
         assert!(channel_hint(None).payload.is_empty());
         assert_eq!(channel_hint(Some(11)).payload, b"11");
+    }
+
+    #[test]
+    fn notify_is_transient_and_wire_correct() {
+        // #197: per-node + fleet notify MUST be transient (a retained notify re-toasts every boot).
+        assert!(!notify(7, None, "hi").retain.as_bool());
+        assert!(!notify_fleet(None, "hi").retain.as_bool());
+        assert!(notify(7, None, "hi").retain_is_safe()); // backstop covers /notify too
+        // Topics + the [~<dur>]<msg> wire the fw toast::parse_wire expects.
+        assert_eq!(notify(7, None, "hi").topic, "smol/7/notify");
+        assert_eq!(notify(7, None, "hi").payload, b"hi");
+        assert_eq!(notify(7, Some(5), "hi").payload, b"~5|hi");
+        assert_eq!(notify_fleet(None, "hi").topic, "smol/255/notify");
+        // Fleet is destructive (confirm-gated); per-node is not.
+        assert!(notify_fleet(None, "hi").destructive);
+        assert!(!notify(7, None, "hi").destructive);
+        // Sanitize strips wire delimiters so a message can't corrupt the ~dur|msg framing.
+        assert_eq!(notify(7, None, "a|b;c").payload, b"a b c");
+        // Wrap preview == the 12-col / 3-row fw toast behaviour.
+        assert_eq!(wrap_preview("hello there friend"), ["hello there", "friend"]);
     }
 
     #[test]

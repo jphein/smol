@@ -194,7 +194,7 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 12] = [
+const CFG_APPLY_KEYS: [u8; 13] = [
     crate::net::wifi::CFG_KEY_SCREEN,
     crate::net::wifi::CFG_KEY_LED,
     crate::net::wifi::CFG_KEY_UNITS,
@@ -218,6 +218,9 @@ const CFG_APPLY_KEYS: [u8; 12] = [
     // #72 IO output states: g — same unconditional-slot rationale as G above (the config
     // PLUMBING is `io`-gated; a non-io build's slot is inert). Leaf takes it via take_cfg_offer(g).
     crate::net::wifi::CFG_KEY_IO_SET,
+    // #197 herald NOTIFY: M — a COMMAND like R/W (buffered/applied via take_cfg_offer(M), NEVER
+    // cached: a cached toast would re-show on every boot). One-shot; the leaf toasts + auto-dismisses.
+    crate::net::wifi::CFG_KEY_NOTIFY,
 ];
 /// #50b leaf-status UPLINK tag: `"SMOLv1 STAT "` (12 B, trailing space) then `"NNN"`
 /// (3-ASCII zero-padded SENDER leaf id) then the verbatim live `<AppKind>:<page>` value
@@ -293,6 +296,14 @@ const GW_CONFIRM_TIMEOUT_MS: u64 = 120_000;
 /// for one retained install before the gateway gives up + clears it — bounds the auto-retry
 /// so a persistently-failing leaf can't loop the (mesh-deaf) relay every flush forever.
 const LEAF_OTA_MAX_RETRIES: u8 = 3;
+/// #195: max consecutive failed SELF-fetch bursts for one staged build before `main` STOPS
+/// auto-re-triggering the fetch — bounds the mesh-deaf hammer a broken-downstream crown
+/// otherwise sustains (the #204 blackout: id7's canary hit 24 retries before self-terminating).
+/// Mirrors `LEAF_OTA_MAX_RETRIES` (the relay's post-handoff cap). Unlike a doomed-image relay,
+/// a self-fetch failure is a GATEWAY-LOCAL link problem (#134 class), so hitting this cap
+/// SUPPRESSES the re-trigger but does NOT clear the retained arm — a #204 self-heal, a post-shed
+/// relay via a healthy successor crown, a NEW staged build, or a reboot all resume it.
+const SELF_OTA_MAX_RETRIES: u8 = 3;
 /// One-window relay readback buffer (off the stack, in `.bss`). Alias-safe: a gateway
 /// relays to ONE leaf at a time (serial canary), and never runs a leaf receive session.
 static mut GW_OTA_WINDOW: [u8; crate::ota_mesh::WINDOW_BYTES] =
@@ -899,6 +910,15 @@ struct Node {
     last_ack_ms: u64,
     rssi: i32,
     synced_at: u32,
+    /// #164 per-peer link quality: a reach shift-register of HELLO reception → an ETX-style
+    /// cost (`lq.cost()`, 0 = perfect … 255 = unheard). The RSSI above is signal *strength*;
+    /// this is delivery *quality* — the complementary axis #155/#165 consume. Advanced once per
+    /// HELLO cadence by [`Roster::sample_link_quality`], fed by [`Roster::mark_hello`].
+    lq: crate::net::etx::LinkQuality,
+    /// #164 sampling latch: set true when a HELLO from this peer is heard, read+cleared each
+    /// HELLO interval by [`Roster::sample_link_quality`]. Separates "heard a HELLO since the
+    /// last sample" (the ETX input) from `last_heard_ms` (freshened by ANY frame).
+    hello_seen: bool,
 }
 
 impl Node {
@@ -911,6 +931,8 @@ impl Node {
         last_ack_ms: 0,
         rssi: 0,
         synced_at: 0,
+        lq: crate::net::etx::LinkQuality::new(),
+        hello_seen: false,
     };
 }
 
@@ -1031,6 +1053,52 @@ impl Roster {
         }
     }
 
+    /// #164: note that a HELLO was heard from `mac` this interval (the ETX input). Called from
+    /// the HELLO service arm ONLY — non-HELLO frames freshen `last_heard_ms`/liveness but do NOT
+    /// feed ETX, so the metric measures a peer's periodic-beacon reception ratio (babeld's
+    /// Hello-based rxcost), not traffic volume. The flag is consumed by `sample_link_quality`.
+    fn mark_hello(&mut self, mac: [u8; 6]) {
+        let i = self.slot(mac);
+        self.nodes[i].hello_seen = true;
+    }
+
+    /// #164: advance every peer's link-quality register by one HELLO interval — call once per
+    /// HELLO cadence (~2 s, the `broadcast_hello` tick), regardless of whether WE broadcast (a
+    /// HELLO-silent/abdicated board still hears peers and must keep scoring them). For each live
+    /// peer: `lq.tick(hello_seen)` then clear the latch, so a heard interval shifts a `1` into the
+    /// register and a missed one decays it. Peers not marked this interval decay toward INFINITY.
+    fn sample_link_quality(&mut self) {
+        for n in self.nodes.iter_mut() {
+            if n.used {
+                n.lq.tick(n.hello_seen);
+                n.hello_seen = false;
+            }
+        }
+    }
+
+    /// #164: the WORST (highest) link cost among fresh peers — this node's headline drag signal
+    /// for the DIAG record. `INFINITY` when no fresh peer exists (isolated). **worst, not best,
+    /// by design** (morpheus-155's #155 review): the channel-drag disease is *asymmetric* — a
+    /// dragged leaf can still have one good peer, so a `min` (best-link) aggregate would report a
+    /// healthy number and HIDE the drag. `max` surfaces "some link of mine is bad." It reads the
+    /// per-peer `etx` off the same [`RosterView`] that #155/#165 (and Bench) consume via
+    /// [`RadioManager::roster`] — and that per-peer surface is the PRECISE path: an options-1/2
+    /// channel policy should read the leaf→crown link specifically (peer id == the elected owner),
+    /// which `max` only approximates. Keeping the per-peer field the load-bearing primitive.
+    fn worst_link_cost(&self, now: u64) -> u8 {
+        let view = self.view(now);
+        if view.count == 0 {
+            return crate::net::etx::INFINITY; // isolated: no fresh peer heard
+        }
+        let mut worst = 0u8;
+        for n in &view.nodes[..view.count] {
+            if n.etx > worst {
+                worst = n.etx;
+            }
+        }
+        worst
+    }
+
     /// Snapshot the fresh peers (heard within `ROSTER_STALE_MS`), strongest-RSSI
     /// first, into a `Copy` [`RosterView`] Bench renders with no live radio borrow.
     fn view(&self, now: u64) -> RosterView {
@@ -1047,6 +1115,7 @@ impl Roster {
                 age_s: (now.saturating_sub(n.last_heard_ms) / 1000) as u32,
                 has_mesh_time: n.synced_at != 0,
                 connected: PeerTracker::fresh(n.last_ack_ms, now),
+                etx: n.lq.cost(), // #164 per-peer link cost (0 = perfect … 255 = unheard)
             };
             count += 1;
         }
@@ -1079,6 +1148,9 @@ pub struct NodeView {
     /// True if a fresh ACK addressed to us has been heard from this peer (the
     /// same `PEER_STALE_MS` freshness the LED uses, but per-peer).
     pub connected: bool,
+    /// #164 ETX-style link cost from HELLO-reception history: 0 = perfect, higher = lossier,
+    /// 255 = unheard in the window. Complements `rssi` (strength) with delivery *quality*.
+    pub etx: u8,
 }
 
 impl NodeView {
@@ -1089,6 +1161,7 @@ impl NodeView {
         age_s: 0,
         has_mesh_time: false,
         connected: false,
+        etx: crate::net::etx::INFINITY,
     };
 }
 
@@ -1326,6 +1399,23 @@ const FLUSH_FAILS_BEFORE_DROP: u8 = 2;
 /// sustained no-AP) — still safely past a transient blip / roam (R-CONNECT recovers those in
 /// seconds), but ~60 s snappier than the prior 5 for the powered-uplink-loss (R4) failover.
 const FLUSH_FAILS_BEFORE_DEMOTE: u8 = 3;
+
+/// #204 2b: consecutive downstream-dry gateway flushes (`crown_deaf_streak`) before the crown
+/// self-heal attempts its first ch6-preferred REASSOCIATE. 4 × RELAY_FLUSH_INTERVAL_MS ≈ 2 min — a
+/// confident, not-jumpy signal (a healthy crown gets its own retained MC back every flush, so 4
+/// consecutive misses is real, not a transient blip).
+const DEAF_REASSOC_N: u8 = 4;
+/// #204 2b: ch6-reassoc cycles that fail to restore downstream before the crown SHEDS (abdicates)
+/// so a healthy board takes over. 2 cycles ≈ 4-5 min total — if two ch6-reassocs don't heal it, the
+/// fabric/AP is the problem, not the association, so hand off the crown rather than churn.
+const DEAF_SHED_M: u8 = 2;
+
+/// #204 2b/F1: the got_mc-miss streak at which a crown SHEDS on small-frame evidence ALONE — when no
+/// explicit bulk-fetch corroboration is available (e.g. a relay-only crown with no self-OTA in flight).
+/// ~8 × RELAY_FLUSH_INTERVAL_MS ≈ 4 min of continuous downstream-dry flushes AFTER the reassoc rung is
+/// exhausted. A got_mc miss is itself bulk-dead proof (small unicast dead ⇒ bulk dead), so this is a
+/// valid — if deliberately conservative — shed path; a live bulk-fetch failure sheds sooner.
+const DEAF_SHED_DEEP_STREAK: u8 = 8;
 /// Recently-completed `(src_mac, msgid)` memory. A lost RELAYACK makes a leaf
 /// retransmit an ALREADY-complete message; we must re-ACK it but NOT re-enqueue
 /// (else duplicate UDP delivery — finding 3). Ring of the last few completions.
@@ -1464,6 +1554,29 @@ struct Relay {
     /// stays fully intact; only the CLAIM is suppressed, so the H1/H2 machinery elects a
     /// flush-capable board off the abdicated owner's frozen seq.
     flush_fail_latch: bool,
+    /// #204 2a: consecutive gateway flushes that CONNECTED (`ok`) but received NONE of this crown's
+    /// own retained downstream (MC/batt/grid) — the crown dead-unicast-RX signal (distinct from
+    /// `flush_fails`, which counts flushes that never CONNECTED). ++ on a connected downstream-dry
+    /// flush, reset to 0 on any downstream received. Rung-1 2b escalates (reassoc → shed) on a streak.
+    crown_deaf_streak: u8,
+    /// #204 2b: ch6-preferred reassociation cycles attempted for the current deaf episode (bounded;
+    /// past M the crown is shed). Reset alongside `crown_deaf_streak` on recovery. 0 in 2a (no actions).
+    reassoc_cycles: u8,
+    /// #204 2b: crown-deaf ABDICATION latch — set when this board shed the crown because repeated
+    /// ch6-reassocs failed to restore downstream RX. DISTINCT from `flush_fail_latch`: a deaf crown's
+    /// UPLINK is fine (it flushes), it's RX-deaf, so it is NOT flush-incapable in the R-DEMOTE sense —
+    /// but it must still stop (re)claiming so a healthy board takes over. OR'd into the resolver's
+    /// `flush_incapable` claim-guard input; lifted when a FOREIGN owner crowns OR the 5-min floor
+    /// expires (whichever first — the ping-pong damper, since a shed board heals as a leaf and would
+    /// otherwise re-claim + re-deafen).
+    deaf_shed: bool,
+    /// #204 2b: `now_ms()` at the last deaf-shed — the 5-min re-claim-backoff floor references it.
+    deaf_shed_ms: u64,
+    /// #204 2b/F1: latched TRUE when a SELF-fetch failed at a bulk-RECEIVE stage during the current
+    /// deaf episode (explicit bulk-inbound proof). Gates the aggressive SHED so a partial-heal crown
+    /// (small frames pass, bulk dies) is shed on real bulk evidence, not a lucky small-frame streak.
+    /// Cleared on a full heal or a shed.
+    deaf_bulk_seen: bool,
     /// Recently-completed `(src_mac, msgid)` ring — dedup post-completion
     /// retransmits so a message is never enqueued (UDP-delivered) twice (finding 3).
     done: [Option<([u8; 6], u16)>; DONE_RING],
@@ -1501,6 +1614,11 @@ impl Relay {
             last_flush_ms: 0,
             flush_fails: 0,
             flush_fail_latch: false, // #146: no abdication yet
+            crown_deaf_streak: 0, // #204 2a: crown dead-downstream detector
+            reassoc_cycles: 0, // #204 2a/2b: reassoc attempts for the current deaf episode
+            deaf_shed: false, // #204 2b: crown-deaf abdication latch
+            deaf_shed_ms: 0, // #204 2b: timestamp of the last deaf-shed (5-min backoff floor)
+            deaf_bulk_seen: false, // #204 2b/F1: explicit bulk-inbound-failure proof for the shed gate
             done: [None; DONE_RING],
             done_cursor: 0,
             seen: crate::net::flood::SeenSet::new(),
@@ -1885,6 +2003,13 @@ pub struct RadioManager {
     /// it NEVER burns the order (a gateway-local fetch failure says nothing about the leaf/image, so
     /// the install survives for the next attempt / the next crown). Reset on a terminal outcome.
     leaf_ota_fetch_retries: u8,
+    /// #195: consecutive failed SELF-fetch bursts for `self_ota_fail_build`. Build-scoped so a NEW
+    /// staged target starts fresh; `main` skips the re-trigger once it reaches `SELF_OTA_MAX_RETRIES`
+    /// (see `self_ota_fetch_capped`). RAM-only → a reboot clears it. Mirrors `leaf_ota_retries`.
+    self_ota_fail_streak: u8,
+    /// #195: the build number `self_ota_fail_streak` is counted against. A `note_self_ota_failed`
+    /// for a DIFFERENT build resets the streak to 1 (a new target deserves its own N attempts).
+    self_ota_fail_build: u32,
     /// #21 node-manager: the parsed default-screen command surfaced by a burst,
     /// pending `main`'s `take_config_offer` → apply. `None` when nothing is pending.
     config_offer: Option<crate::app::DefaultScreen>,
@@ -2007,6 +2132,8 @@ impl RadioManager {
             ota_self_fail: None,
             leaf_ota_retries: 0,
             leaf_ota_fetch_retries: 0,
+            self_ota_fail_streak: 0,
+            self_ota_fail_build: 0,
             leaf_ota_pending: false,
             leaf_installs_outstanding: false,
             leaf_ota_mac: None,
@@ -2137,6 +2264,13 @@ impl RadioManager {
         // Re-associate + run an election-ONLY burst (empty telemetry list).
         let _ = self.switch(Mode::WifiSta);
         let id = self.id;
+        // #204 2b: 5-min floor lift of the deaf-shed backoff (KNOB3 second arm). A board shed for
+        // crown deafness stays leaf-only (deaf_shed OR'd into the resolver's flush_incapable below)
+        // until EITHER a foreign owner crowns (lifted at the adopt-live-owner site) OR this floor
+        // expires — so a fleet with no other capable gateway is never permanently stranded crownless.
+        if self.relay.deaf_shed && now.saturating_sub(self.relay.deaf_shed_ms) > 300_000 {
+            self.relay.deaf_shed = false;
+        }
         let mut elect = crate::net::wifi::MeshElect::new(id);
         elect.now_ms = now;
         // #51: this is a LEAF RECOVERY election → select the WiFi-strength rule (sticky live
@@ -2167,13 +2301,18 @@ impl RadioManager {
         // `MC`. This is what makes R-DEMOTE STICK: without it, this very recovery burst would
         // re-read `MC|<self>|…` (frozen seq) and re-grab ownership on a CONNACK that a tiny
         // election publish can pass but a full flush cannot — the #146 churn/channel-drag loop.
-        elect.flush_incapable = self.relay.flush_fail_latch;
+        // #204 2b: OR-in the crown-deaf abdication — a board shed for downstream deafness (now a
+        // leaf, re-competing via THIS recovery burst) must also refuse to re-claim until it heals or
+        // hands off. Two independent latches (flush_fail_latch, deaf_shed) → two independent lift
+        // conditions → ONE resolver effect (claim suppressed).
+        elect.flush_incapable = self.relay.flush_fail_latch || self.relay.deaf_shed;
         // #6 OTA / #21 config / #33 install: a leaf's recovery burst can also surface these.
         let mut ota_offer: Option<crate::ota::Announce> = None;
         let mut config_offer: Option<crate::app::DefaultScreen> = None;
         let mut _gw_own = crate::net::wifi::GwOwnCfg::new(); // #48: recovery burst never captures gateway-own cfg
         let mut _reset_req = crate::net::wifi::ResetReq::new(); // #52: recovery burst issues no reboots
         let mut _scan_req = crate::net::wifi::ScanReq::new(); // #71: recovery burst issues no scans
+        let mut _notify_req = crate::net::wifi::NotifyReq::new(); // #197: recovery burst issues no toasts
         let mut install_requested = false;
         let mut _leaf_install_seen = false; // #40 #1: a leaf's recovery burst is not a gateway relay
         let reached = match self.sta.as_mut() {
@@ -2204,6 +2343,7 @@ impl RadioManager {
                     &[], // #71: recovery burst publishes no own scan
                     None, // #71: recovery burst republishes no cached scan
                     &mut _scan_req, // #71: recovery burst subscribes no cmd/scan (cfg_cache=None)
+                    &mut _notify_req, // #197: recovery burst subscribes no notify (cfg_cache=None)
                     &mut None, // #40: a leaf's recovery burst never relays a leaf OTA
                     &mut None, // #40: recovery burst carries no persistent staged
                     &mut None, // #40: recovery burst publishes no relay diag
@@ -2266,6 +2406,11 @@ impl RadioManager {
             // clears the latch (that would re-open the loop).
             if elect.owner_id != id && elect.owner_alive {
                 self.relay.flush_fail_latch = false;
+                // #204 2b KNOB3 (first arm): a FOREIGN owner crowned = the goal state after a deaf-
+                // shed → lift the deaf-shed backoff so we compete normally again. Independent bool
+                // from flush_fail_latch; this is the fast lift, the 5-min floor is the no-other-
+                // gateway fallback.
+                self.relay.deaf_shed = false;
             }
             // #51 speed-up: grace-reset the owner-silence clock ONLY for a GENUINELY LIVE
             // owner (give the scan time to re-lock it). A dead-but-inside-our-backoff owner
@@ -2337,6 +2482,17 @@ impl RadioManager {
         (reached_dhcp, synced)
     }
 
+    /// #192: run a periodic NTP RE-SYNC burst (SNTP-only, NO MQTT tail) on the STA device,
+    /// reusing the boot `NtpMachine` substrate. Called from the main loop on the GATEWAY when
+    /// `my_synced_at` goes stale (> `NTP_RESYNC_AGE_S`). Returns the fresh Unix time, or `None`
+    /// on failure/abort. Does NOT tear the coexist association (`NtpMachine::step_assoc` skips
+    /// the reconnect when already connected). `rng` is `Copy`; `sta` borrows disjoint from
+    /// `self.controller`. Leaves never call this (mesh time adoption refreshes their freshness).
+    pub fn resync_ntp(&mut self, tick: &mut dyn FnMut() -> bool) -> Option<u32> {
+        let sta = self.sta.as_mut()?;
+        crate::net::wifi::run_ntp_resync(&mut self.controller, sta, self.rng, tick)
+    }
+
     /// Current radio mode. Part of the public API (a caller may inspect which
     /// stack is live before choosing to broadcast); not used by `main` today.
     #[allow(dead_code)]
@@ -2405,6 +2561,15 @@ impl RadioManager {
         let mut msg = [0u8; 16];
         let len = encode_id_frame(HELLO_PREFIX, self.id, &mut msg);
         self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
+    }
+
+    /// #164: advance every peer's link-quality (ETX) register by one HELLO interval. Call once
+    /// per HELLO tick from `main` (alongside `broadcast_hello`), UNCONDITIONALLY — a HELLO-silent
+    /// board (abdicated) still hears peers and must keep scoring them, so this is deliberately
+    /// separate from `broadcast_hello`'s `silent_until_relock` early-return. Delegates to the
+    /// pure `Roster` sampler; the metric math lives in `net/etx.rs` (host-tested).
+    pub fn sample_link_quality(&mut self) {
+        self.roster.sample_link_quality();
     }
 
     /// Broadcast one BENCH BEACON carrying our id, our next seq, and the highest
@@ -2669,6 +2834,58 @@ impl RadioManager {
         }
     }
 
+    /// #204 2b rung-1: crown dead-downstream self-heal — REASSOCIATE, ch6-preferred. The crown-role
+    /// coexist unicast-RX deafness (#26/#204) is chronic when the crown's AP is not co-channel with
+    /// the ESP-NOW mesh (ch6). A full-band scan picks the strongest ch6 BSSID and pins the STA to it
+    /// (the known-good co-channel coexist config — retire-the-burst-coexist); with no ch6 AP in range
+    /// it falls back to the strongest overall, else a plain reconnect on the baked creds — never a
+    /// hard ch6 pin that could leave the board with NO association (worse than deaf). GATEWAY-only +
+    /// rare (deaf-streak ≥ DEAF_REASSOC_N), disruptive (the scan hops the PHY off-mesh briefly) but
+    /// bounded. Stays in WifiSta (does NOT tear down to ESP-NOW): the crown keeps its role and
+    /// re-measures downstream on the next flush; #155 channel-follow re-advertises the new channel.
+    /// ⚠️ HW-CANARY-GATED: the scan + reassociate radio path — and whether ESP-NOW coexist follows
+    /// the new STA channel — cannot be verified without hardware (same discipline as `run_scan`/OTA).
+    fn reassoc_ch6_prefer(&mut self) {
+        // COEXIST hard gate: never leave the mesh channel mid mesh-OTA transfer (mirrors run_scan).
+        if self.ota_leaf.is_active() {
+            return;
+        }
+        let net = &crate::secrets::WIFI_NETWORK;
+        // Strongest ch6 BSSID if any; else strongest overall; else None (plain reconnect on creds).
+        let (bssid, pin_ch6): (Option<[u8; 6]>, bool) = match self.controller.scan_n(16) {
+            Ok(aps) => {
+                if let Some(a) = aps
+                    .iter()
+                    .filter(|a| a.channel == 6)
+                    .max_by_key(|a| a.signal_strength)
+                {
+                    (Some(a.bssid), true)
+                } else {
+                    (aps.iter().max_by_key(|a| a.signal_strength).map(|a| a.bssid), false)
+                }
+            }
+            Err(_) => (None, false),
+        };
+        let _ = self.controller.disconnect();
+        let _ = self
+            .controller
+            .set_configuration(&esp_wifi::wifi::Configuration::Client(
+                esp_wifi::wifi::ClientConfiguration {
+                    ssid: net.ssid.into(),
+                    password: net.pass.into(),
+                    bssid,
+                    channel: if pin_ch6 { Some(6) } else { None },
+                    ..Default::default()
+                },
+            ));
+        let _ = self.controller.connect();
+        log::warn!(
+            "smol #204: crown deaf → ch6-prefer reassoc (ch6_found={}, bssid_set={})",
+            pin_ch6,
+            bssid.is_some()
+        );
+    }
+
     /// #70: sample the live free-heap and lower the min-heap watermark. Cheap (one `HEAP.free()`);
     /// `main` calls it on the ~10 s tick so the watermark tracks leak/pressure at finer resolution
     /// than the slow diag publish cadence.
@@ -2783,8 +3000,13 @@ impl RadioManager {
         // reads 1. Surfaced so the rig sees a leaf latch/un-latch (and `fwd`/`dedup`/`ttl`
         // score P2/P3; `fwd == 0` fleet-wide is the C0 all-hear byte-identical canary).
         let mesh_hop = if self.relay.latch.latched() { crate::net::flood::MAX_HOP } else { 1 };
+        // #164: this node's WORST per-peer link cost — 0 = every fresh link perfect, 253 = a
+        // link is dragging, 255 = no fresh peer (isolated). `worst` not `min` on purpose (#155
+        // review): min would hide an asymmetric drag. The per-peer roster surface is the precise
+        // path for an options-1/2 policy (leaf→crown link); this DIAG field is the coarse beacon.
+        let etx_worst = self.roster.worst_link_cost(now_ms());
         let mut rec = alloc::format!(
-            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}|brk={}|otah={}|fwd={}|dedup={}|ttl={}|hop={}|dlseq={}|dfwd={}",
+            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}|brk={}|otah={}|fwd={}|dedup={}|ttl={}|hop={}|dlseq={}|dfwd={}|etx={}",
             d.boot_slot,
             d.reset_reason,
             d.boot_count,
@@ -2819,6 +3041,7 @@ impl RadioManager {
             // a v1-only leaf. Representative of the downlink channel; GRID2 uses the same mechanism.
             self.batt.dl_seq,
             self.diag.dfwd,
+            etx_worst, // #164 worst per-peer link cost (0 = all perfect … 253 = dragging … 255 = isolated)
         );
         // #74 item 3 (stage-2): fold in the APPLIED-config string for HA config-drift, ONLY when
         // `main` populated it (espnow build). ASCII by construction (as_wire/to_wire/hex/F24). HA
@@ -2847,6 +3070,27 @@ impl RadioManager {
             let deaf_n = self.deaf.iter().flatten().count();
             rec.push_str(&alloc::format!("|deaf={}|ddrops={}", deaf_n, self.diag.ddrops));
         }
+        // #204: the crown's CURRENT AP association (channel:rssi:bssid). Makes the coexist
+        // off-ch6-starvation hypothesis testable from telemetry — the forensics gap that cost ~3h
+        // of pcap. Only meaningful while associated (a leaf isn't) → `current_ap_info` returns None
+        // off-association and the field is skipped, keeping the DIAG string byte-identical for a
+        // non-associated board. Appended LAST → positional DIAG parse of the fixed fields is intact.
+        if let Some((ap_ch, ap_rssi, b)) = crate::net::current_ap_info() {
+            rec.push_str(&alloc::format!(
+                "|ap={}:{}:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                ap_ch, ap_rssi, b[0], b[1], b[2], b[3], b[4], b[5]
+            ));
+        }
+        // #204: crown dead-downstream telemetry — <deaf-streak>:<reassoc-cycles>:<deaf_shed 0/1>.
+        // Named `cdeaf` (crown-deaf) to NOT collide with the mesh-test-only `deaf=` (an ESP-NOW
+        // deaf-LIST count). Reads 0:0:0 on a healthy crown or any leaf; the shed flag latches 1 after
+        // a 2b deaf-shed until re-lock. Appended LAST — positional parse of the fixed DIAG fields intact.
+        rec.push_str(&alloc::format!(
+            "|cdeaf={}:{}:{}",
+            self.relay.crown_deaf_streak,
+            self.relay.reassoc_cycles,
+            self.relay.deaf_shed as u8
+        ));
         rec
     }
 
@@ -3330,6 +3574,32 @@ impl RadioManager {
             }
         }
         ok
+    }
+
+    /// #195: record a FAILED self-fetch of `build` (called by `main` after `run_ota_update`
+    /// returns `false` — a success reboots inside the fetch and never returns here). Build-scoped,
+    /// saturating streak, mirroring the relay's `leaf_ota_retries` counting: a DIFFERENT build
+    /// starts a fresh count (a new target deserves its own N attempts). RAM-only (reboot clears).
+    pub fn note_self_ota_failed(&mut self, build: u32) {
+        if build != self.self_ota_fail_build {
+            self.self_ota_fail_build = build;
+            self.self_ota_fail_streak = 1;
+        } else {
+            self.self_ota_fail_streak = self.self_ota_fail_streak.saturating_add(1);
+        }
+        log::info!(
+            "smol #195: self-fetch fail streak {}/{} for build {}",
+            self.self_ota_fail_streak, SELF_OTA_MAX_RETRIES, build
+        );
+    }
+
+    /// #195: has the self-fetch of `build` hit its consecutive-failure cap? `main` skips the
+    /// re-trigger while true, bounding the mesh-deaf hammer a broken-downstream crown otherwise
+    /// sustains (#204). Build-scoped, so a NEW staged build (or a reboot) resumes it automatically.
+    /// Deliberately does NOT clear the retained arm (#134: a gateway-local fetch failure says
+    /// nothing about the image — a self-heal / post-shed relay / successor crown can still finish it).
+    pub fn self_ota_fetch_capped(&self, build: u32) -> bool {
+        build == self.self_ota_fail_build && self.self_ota_fail_streak >= SELF_OTA_MAX_RETRIES
     }
 
     /// #40: record a leaf-OTA attempt's outcome (called by `main` after `run_leaf_ota_relay`,
@@ -3955,6 +4225,15 @@ impl RadioManager {
         let _ = self.switch(Mode::WifiSta);
         let id = self.id;
         let now = now_ms();
+        // #204 2b/F1: snapshot a recent SELF-fetch's bulk-RECEIVE-stage failure BEFORE the burst
+        // consumes self.ota_self_fail (mqtt_session publishes + clears it this flush). A fetch that
+        // reached the response/body receive but couldn't complete it is the #26 downstream-bulk-deaf
+        // signature — the bulk-inbound proof that gates the crown SHED (a small-frame got_mc streak
+        // alone can't distinguish a partial-heal where small frames pass but the bulk download dies).
+        let bulk_fetch_deaf = matches!(
+            self.ota_self_fail,
+            Some((_, _, _, _, w)) if crate::net::wifi::ota_fail_is_bulk_deaf(w)
+        );
         // #27: serialize the roster into a stack buffer BEFORE the mutable-borrow burst
         // — the resulting slice is disjoint from `self` (same disjoint-borrow discipline
         // as `own_telemetry`), so it threads through with no borrow conflict. Worst case
@@ -3989,6 +4268,9 @@ impl RadioManager {
         // #71: capture any on-demand WiFi-scan COMMANDS this flush surfaces (transient cmd/scan).
         // Drained below like reset_req: ONE-SHOT `<id>W` relay per leaf target + a self-scan inject.
         let mut scan_req = crate::net::wifi::ScanReq::new();
+        // #197 herald: capture any transient on-glass toast commands (smol/+/notify); one-shot
+        // relayed / self-toasted below like reset/scan.
+        let mut notify_req = crate::net::wifi::NotifyReq::new();
         // #33: capture any OTA install command this flush surfaces.
         let mut install_requested = false;
         // #40 #1: set iff this flush SEES a retained leaf install (pre-arm) → latch pending below.
@@ -4048,6 +4330,7 @@ impl RadioManager {
                     scan_bytes, // #71: gateway publishes its own smol/<id>/scan (empty unless it self-scanned)
                     Some(&self.scan_cache), // #71: republish cached relayed-node scans
                     &mut scan_req, // #71: capture on-demand scan commands (one-shot relay below)
+                    &mut notify_req, // #197: capture on-glass toast commands (one-shot relay below)
                     leaf_ota, // #40: surface a pending leaf-OTA install for main to relay
                     &mut self.staged_raw, // #40: persist the staged across flushes (pair-safe)
                     &mut self.leaf_ota_diag, // #40: publish smol/<leaf>/ota/diag + clear/retry
@@ -4061,6 +4344,77 @@ impl RadioManager {
         // flush-success rate is the on-device #9 flush-win proof (was UART0-only). Bumped here so
         // it rides the NEXT diag record.
         self.note_flush(ok);
+        // #204 2a: crown dead-downstream detector (MEASUREMENT ONLY — no election change; 2b adds
+        // the reassoc/shed actions). Only a CONNECTED flush (`ok`) is a valid downstream probe — a
+        // flush that never reached CONNACK (`!ok`) is an uplink/AP failure (already handled by
+        // `flush_fails`/R-DEMOTE), NOT crown-RX deafness. On a connected flush, `elect.downstream_seen`
+        // (got_mc||batt||grid, set in the drain) separates healthy (received its own retained MC) from
+        // downstream-dry. Streak (not one-shot): small retained frames sneak through intermittently
+        // (#204 partial-heal), so a run of dry flushes is required before 2b escalates.
+        if ok {
+            // #204 2b/F1 (155 cruxes 2+3): TWO independent deaf signals.
+            //  (a) crown_deaf_streak — the got_mc small-frame streak = the FULLY-deaf detector (small
+            //      unicast dead). Resets on ANY small downstream received.
+            //  (b) deaf_bulk_seen — a LATCHED bulk-inbound failure (a self-fetch that died RECEIVING
+            //      the body). This is the PARTIAL-HEAL signal, and the measured steady state: small
+            //      frames pass cycle after cycle (so the streak NEVER accrues) while every bulk
+            //      transfer dies. It MUST NOT be cleared by a small-frame pass (that pass IS the
+            //      partial-heal — clearing on it re-buries F1); cleared ONLY on a reassoc re-prove
+            //      (fresh evidence after a realign, bounds staleness to one cycle) or on a shed.
+            if elect.downstream_seen {
+                self.relay.crown_deaf_streak = 0;
+            } else {
+                self.relay.crown_deaf_streak = self.relay.crown_deaf_streak.saturating_add(1);
+            }
+            if bulk_fetch_deaf {
+                self.relay.deaf_bulk_seen = true;
+            }
+            // Self-heal ladder (GATEWAY-only — flush_telemetry is is_gateway-guarded; `ok`-gating keeps
+            // it disjoint from the !ok flush-fail / R-DEMOTE path). ESCALATE on EITHER a got_mc streak
+            // (fully-deaf) OR a latched bulk failure (partial-heal — where the streak never accrues, so
+            // the bulk latch is the only driver). reassoc rung first (heal in place); SHED requires
+            // BULK proof (deaf_bulk_seen) OR a DEEP got_mc streak (the fully-deaf backstop — never
+            // fires in a small-passes partial-heal, 155 crux 4).
+            let escalate =
+                self.relay.crown_deaf_streak >= DEAF_REASSOC_N || self.relay.deaf_bulk_seen;
+            if escalate {
+                let shed_justified = self.relay.deaf_bulk_seen
+                    || self.relay.crown_deaf_streak >= DEAF_SHED_DEEP_STREAK;
+                if self.relay.reassoc_cycles >= DEAF_SHED_M && shed_justified {
+                    // SHED / abdicate. Mirrors the #155 channel-yield abdication shape (leaf-scan +
+                    // HELLO-silent) but tags `deaf_shed` — NOT flush_fail_latch: our UPLINK is fine (we
+                    // just flushed `ok`); we're RX-deaf, not flush-incapable. The frozen MC lets the
+                    // H1/H2 machinery elect a healthy crown; the deaf_shed backoff (foreign-MC OR 5-min
+                    // floor) damps the shed→heal-as-leaf→reclaim→re-deafen ping-pong (the #26 loop).
+                    self.relay.is_gateway = false;
+                    self.scan_locked = false;
+                    self.last_owner_heard_ms = now;
+                    self.silent_until_relock = true;
+                    self.relay.deaf_shed = true;
+                    self.relay.deaf_shed_ms = now;
+                    self.relay.crown_deaf_streak = 0;
+                    self.relay.reassoc_cycles = 0;
+                    self.relay.deaf_bulk_seen = false;
+                    let _ = self.switch(Mode::EspNow);
+                    log::warn!(
+                        "smol #204: crown SHED — {} ch6-reassocs still downstream-deaf; HELLO-silent + leaf-scanning",
+                        DEAF_SHED_M
+                    );
+                } else if self.relay.reassoc_cycles < DEAF_SHED_M {
+                    // Rung 1: ch6-preferred reassociate; keep the crown, re-measure next flush. RE-ARM
+                    // the bulk latch + streak so the next shed decision re-proves deafness FRESH after
+                    // the realign (155 crux 2 — never shed on pre-reassoc evidence).
+                    self.reassoc_ch6_prefer();
+                    self.relay.reassoc_cycles = self.relay.reassoc_cycles.saturating_add(1);
+                    self.relay.crown_deaf_streak = 0;
+                    self.relay.deaf_bulk_seen = false;
+                }
+                // else (reassoc rung exhausted, not yet shed-justified): HOLD — a fresh bulk failure or
+                // a DEEP got_mc streak will arrive and shed. reassoc_cycles resets only on a shed, so a
+                // repeat-offender crown (healed then deaf again in-tenure) sheds one reassoc sooner —
+                // acceptable (demonstrated deafness ⇒ hand off faster).
+            }
+        }
         // #6 OTA: stash any announce this flush surfaced for `main` to act on.
         if ota_offer.is_some() {
             self.ota_offer = ota_offer;
@@ -4130,6 +4484,18 @@ impl RadioManager {
         }
         if scan_req.own() {
             self.cfg.set(crate::net::wifi::CFG_KEY_SCAN, b"");
+        }
+        // #197 herald toast — twin of the reset/scan drain: a ONE-SHOT `<id>M` frame CARRYING the
+        // message to the target leaf (direct `broadcast_config`, NEVER cached — a cached toast
+        // re-shows on every boot). Own id / fleet-255 → inject `M` into our OWN CfgTracker so
+        // `main`'s take_cfg_offer(M) toasts us on the SAME path as a leaf. Value = the wire message.
+        if notify_req.have() {
+            if let Some(t) = notify_req.relay() {
+                self.broadcast_config(t, crate::net::wifi::CFG_KEY_NOTIFY, notify_req.msg());
+            }
+            if notify_req.own() {
+                self.cfg.set(crate::net::wifi::CFG_KEY_NOTIFY, notify_req.msg());
+            }
         }
         // #33: OR-in an install command (one-shot; `main`'s take clears it).
         if install_requested {
@@ -4384,6 +4750,10 @@ impl RadioManager {
                     // Roster (additive): HELLO carries the sender's id — the
                     // primary place peer ids are learned (every node HELLOs 2 Hz).
                     self.roster.heard(src, Some(peer_id), rssi, now);
+                    // #164: this is a HELLO specifically → feed the ETX register. Non-HELLO
+                    // frames call `heard` (liveness) but NOT `mark_hello`, so the metric tracks
+                    // the periodic-beacon reception ratio, not traffic volume.
+                    self.roster.mark_hello(src);
 
                     // #23 leaf channel-lock: a leaf that hears the ELECTED OWNER's
                     // HELLO has found the mesh channel — lock (stop scanning) + stamp

@@ -107,30 +107,50 @@ pub static FORGE: Realm = Realm {
     ],
 };
 
-/// Parse leading hex digits of `s` into a `u32` seed (sigil's native version path:
-/// the git short hash IS the seed). Non-hex terminates parsing, so a non-hex build
-/// tag like `"dev"` seeds deterministically off its leading hex (`"dev"` → `0xDE`)
-/// — every dev build then shares one forge name, which is the honest signal.
-fn parse_hex_seed(s: &str) -> u32 {
-    let mut seed: u32 = 0;
-    for &b in s.as_bytes() {
-        let d = match b {
-            b'0'..=b'9' => b - b'0',
-            b'a'..=b'f' => b - b'a' + 10,
-            b'A'..=b'F' => b - b'A' + 10,
-            _ => break, // non-hex char ends the seed (e.g. the 'v' in "dev")
-        };
-        seed = seed.wrapping_mul(16).wrapping_add(d as u32);
-    }
-    seed
+/// #218: the FORGE version name for a build NUMBER — the sigil word for `n`. Uses direct
+/// modulo (NOT sigil's `name_for_seed` `>>8` formula): build numbers are small + sequential
+/// (256..=511 all shift to one noun under `>>8`), so we index the corpus directly so every
+/// build gets its OWN word and consecutive builds differ — 341 = Bellows, 342 = Crucible.
+/// The adjective advances once per full noun cycle (a slow "generation" marker). `.0` =
+/// adjective, `.1` = noun. Names ANY build (e.g. an OTA announce target), not just our own.
+// Fed by the wifi/espnow ota-state title path; dead in a no-radio default build (same
+// rationale as the toast producer API + the CFG_KEY_* consts).
+#[allow(dead_code)]
+pub fn version_name_for(n: u32) -> (&'static str, &'static str) {
+    let nouns = FORGE.nouns;
+    let adjs = FORGE.adjectives;
+    let noun = nouns[(n as usize) % nouns.len()];
+    let adj = adjs[((n / nouns.len() as u32) as usize) % adjs.len()];
+    (adj, noun)
 }
 
-/// The firmware's magical VERSION name — sigil's native path: seed from the git
-/// short hash (`BUILD_HASH`, from `build.rs`), rendered in the FORGE realm. Both
-/// the seed and the corpus are compile-time, so this const-folds to two
-/// `&'static str` exactly like `name_for_id(NODE_ID)` (the seed here is an `env!`
-/// literal). `.0` = adjective, `.1` = noun. Full name in the boot log; the OLED
-/// shows the noun handle, matching the rest of the UI.
+/// The RUNNING firmware's build number — the committed ratchet (`BUILD_NUMBER`, build.rs).
+pub fn build_number() -> u32 {
+    env!("BUILD_NUMBER").parse().unwrap_or(0)
+}
+
+/// True for a dev/canary build (build.rs sets `BUILD_DEV=1` unless the ship pipeline
+/// declared a release via `SMOL_RELEASE=1`).
+#[allow(dead_code)] // consumed by `write_version` (wifi/espnow ota-title path)
+pub fn version_is_dev() -> bool {
+    env!("BUILD_DEV") == "1"
+}
+
+/// The RUNNING firmware's magical VERSION name (FORGE realm), sigil-mapped from the build
+/// NUMBER. `.0` = adjective, `.1` = noun; the OLED/UI shows the noun handle.
 pub fn version_name() -> (&'static str, &'static str) {
-    name_for_seed(parse_hex_seed(env!("BUILD_HASH")), &FORGE)
+    version_name_for(build_number())
+}
+
+/// Write the running version DISPLAY into `w`: `v342 Bellows` (release) or
+/// `v342+dev.25f756a Bellows` (dev/canary — honest, can't masquerade as the release).
+/// Display only — version *comparisons* stay numeric via [`build_number`].
+// Fed by the wifi/espnow ota-state title path; dead in a no-radio default build.
+#[allow(dead_code)]
+pub fn write_version(w: &mut impl core::fmt::Write) {
+    let _ = write!(w, "v{}", env!("BUILD_NUMBER"));
+    if version_is_dev() {
+        let _ = write!(w, "+dev.{}", env!("BUILD_HASH"));
+    }
+    let _ = write!(w, " {}", version_name().1);
 }

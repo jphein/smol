@@ -1,0 +1,19 @@
+# #184 host-test harness for the PURE mesh-ledger L3 core (net/sth.rs) — the ed25519
+# Signed-Tree-Head over the L2 (#183) CT-Merkle anchor. Runs OFF-target (std) via `cargo run`;
+# #[path]-includes the real sth.rs + treehead.rs (no drift) and tests the genuine
+# sign-anchor → verify-STH + verify-inclusion composition. Mirrors flood_verify/etx_verify/
+# ledger_verify/treehead_verify. ed25519-compact (the OTA verifier, here also signing via a
+# fixed seed) + sha2 (for the treehead anchor) supply the injected crypto — the core is agnostic.
+[package]
+name = "sth_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "sth_verify"
+path = "src/main.rs"
+[dependencies]
+sha2 = "0.10"
+ed25519-compact = "2"
+[profile.dev]
+opt-level = 0

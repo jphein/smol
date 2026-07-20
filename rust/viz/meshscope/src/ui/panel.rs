@@ -64,7 +64,14 @@ pub fn show(ui: &mut egui::Ui, model: &Model, selected: Option<u8>, now_s: f64) 
     // --- OTA ---
     if let Some(o) = &node.ota {
         ui.label(RichText::new("OTA").strong());
-        kv(ui, "installed", &format!("v{}", o.installed));
+        // Show the firmware's own version title (carries the sigil word, e.g. "v342 Jig") when the
+        // board publishes one; fall back to the bare number for pre-sigil builds / empty titles.
+        let installed_disp = if o.title.trim().is_empty() {
+            format!("v{}", o.installed)
+        } else {
+            o.title.clone()
+        };
+        kv(ui, "installed", &installed_disp);
         if o.latest != o.installed {
             kv(ui, "latest", &format!("v{} available", o.latest));
         }

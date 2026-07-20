@@ -91,6 +91,9 @@ use ssd1306::mode::DisplayConfig;
 // `AppKind`/`App` enum + centralized dispatch, and the `REGISTRY` that
 // auto-builds the menu. The dispatch keystone every screen plugs into.
 mod app;
+// #197 transient on-glass toast overlay — a general primitive (also the mesh-RPG substrate),
+// composited over the active screen from the render loop; never persisted.
+mod toast;
 // ABOUT screen (identity + provenance + OTA stub) and CLOCK screen — both
 // plugins, compiled in EVERY build (identity/time need no radio).
 mod about;
@@ -756,6 +759,8 @@ fn main() -> ! {
     let mut ota_rx_eta = ota_screen::OtaEta::new();
     #[cfg(feature = "espnow")]
     let mut was_ota_rx = false;
+    // #197: tracks a shown toast so its falling edge forces one repaint to clear the box.
+    let mut was_toast = false;
 
     // Hold the boot splash for at least SPLASH_MIN_MS total. The espnow/wifi NTP
     // burst above usually already blew past this (the splash was up throughout);
@@ -844,37 +849,56 @@ fn main() -> ! {
                 && (crate::ota::OTA_AUTO_INSTALL || r.take_install_request());
             if do_install {
                 if let Some(announce) = r.take_ota_offer() {
-                    let mut ota_draw_ms = 0u64;
-                    let mut ota_abort = false;
-                    // #161: OTA self-install is minutes-scale → paint the dedicated full-glass OTA
-                    // screen (source host + big block bar + %/ETA + the incoming build's codename)
-                    // from the live byte counts the fetch writes into `ota_prog`, throttled to
-                    // SYNC_REDRAW_MS. Supersedes #153's 1-px edge for the self-fetch path.
-                    let ota_prog = core::cell::Cell::new(ota::OtaProgress::default());
-                    let ota_host = ota::split_url(announce.url()).map(|(h, _, _)| h).unwrap_or("net");
-                    let ota_build = announce.build;
-                    let mut ota_eta = ota_screen::OtaEta::new();
-                    r.run_ota_update(&announce, &mut || {
-                        let t = millis();
-                        led.apply(led::LedState::WifiSync, t);
-                        if matches!(button.poll(t), Some(input::Press::Long)) {
-                            ota_abort = true;
+                    // #195: bound the mesh-deaf hammer — if THIS build's self-fetch has already
+                    // failed SELF_OTA_MAX_RETRIES times in a row (e.g. a #204 broken-downstream
+                    // crown), STOP re-triggering. The retained arm is deliberately kept (#134: a
+                    // gateway-local fetch failure says nothing about the image — a #204 self-heal,
+                    // a post-shed relay via a healthy successor crown, a new staged build, or a
+                    // reboot all resume it). This is the #195 self-fetch cap (mirrors the relay's
+                    // leaf_ota_retries; the arm-clear path was proven unreachable on a deaf crown).
+                    if r.self_ota_fetch_capped(announce.build) {
+                        log::info!(
+                            "smol #195: self-fetch capped for build {} — suppressing re-trigger (arm kept)",
+                            announce.build
+                        );
+                    } else {
+                        let mut ota_draw_ms = 0u64;
+                        let mut ota_abort = false;
+                        // #161: OTA self-install is minutes-scale → paint the dedicated full-glass OTA
+                        // screen (source host + big block bar + %/ETA + the incoming build's codename)
+                        // from the live byte counts the fetch writes into `ota_prog`, throttled to
+                        // SYNC_REDRAW_MS. Supersedes #153's 1-px edge for the self-fetch path.
+                        let ota_prog = core::cell::Cell::new(ota::OtaProgress::default());
+                        let ota_host = ota::split_url(announce.url()).map(|(h, _, _)| h).unwrap_or("net");
+                        let ota_build = announce.build;
+                        let mut ota_eta = ota_screen::OtaEta::new();
+                        // #195: a SUCCESS reboots inside the fetch (never returns); a `false` return is
+                        // a genuine self-fetch failure → count it toward the cap above.
+                        let ok = r.run_ota_update(&announce, &mut || {
+                            let t = millis();
+                            led.apply(led::LedState::WifiSync, t);
+                            if matches!(button.poll(t), Some(input::Press::Long)) {
+                                ota_abort = true;
+                            }
+                            if t.saturating_sub(ota_draw_ms) >= SYNC_REDRAW_MS {
+                                ota_draw_ms = t;
+                                let p = ota_prog.get();
+                                ota_screen::draw(&mut display, &ota_screen::OtaView {
+                                    kind: ota_screen::OtaKind::SelfFetch { host: ota_host },
+                                    build: ota_build,
+                                    done: p.done,
+                                    total: p.total,
+                                    eta_s: ota_eta.sample(p.done, p.total, t),
+                                    unit: ota_screen::OtaUnit::Bytes,
+                                });
+                            }
+                            ota_abort
+                        }, &ota_prog);
+                        if !ok {
+                            r.note_self_ota_failed(announce.build);
                         }
-                        if t.saturating_sub(ota_draw_ms) >= SYNC_REDRAW_MS {
-                            ota_draw_ms = t;
-                            let p = ota_prog.get();
-                            ota_screen::draw(&mut display, &ota_screen::OtaView {
-                                kind: ota_screen::OtaKind::SelfFetch { host: ota_host },
-                                build: ota_build,
-                                done: p.done,
-                                total: p.total,
-                                eta_s: ota_eta.sample(p.done, p.total, t),
-                                unit: ota_screen::OtaUnit::Bytes,
-                            });
-                        }
-                        ota_abort
-                    }, &ota_prog);
-                    redraw = true;
+                        redraw = true;
+                    }
                 }
             }
             // A gateway's SMOLv1 BATT downlink (buffered in `service`) → store it in
@@ -921,6 +945,11 @@ fn main() -> ! {
             // 2000 ms / SUBTICK_MS aligned via the monotonic clock.
             if (now / 2000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 2000) {
                 r.broadcast_hello();
+                // #164: advance every peer's link-quality (ETX) register one HELLO interval.
+                // UNCONDITIONAL (not inside broadcast_hello) so a HELLO-silent/abdicated board
+                // still scores the peers it hears. Reads+clears each peer's per-interval
+                // "heard a HELLO" latch; math lives in net/etx.rs (host-tested).
+                r.sample_link_quality();
                 // Advertise our current Unix time + the sync it descends from on
                 // the SAME tick, so a peer with an older sync can adopt ours.
                 // (A separate frame from HELLO — the LED handshake wire format is
@@ -1191,6 +1220,47 @@ fn main() -> ! {
                         flush_abort
                     });
                     flush_defer_since_ms = 0;
+                    // #192: opportunistic NTP RE-SYNC riding the flush cadence. `try_time_sync`
+                    // runs ONLY at boot, so without this the wall-clock free-runs on the C3
+                    // oscillator forever (tage climbs unbounded → fleet drift). The gateway is
+                    // WiFi-active here (just flushed); if our last true sync is stale
+                    // (> NTP_RESYNC_AGE_S ≈ 1 h), run a lightweight SNTP-only burst (reuses the
+                    // #89 NtpMachine; NO MQTT tail; does NOT tear coexist — step_assoc skips the
+                    // reconnect when already associated) and re-anchor the clock. Leaves refresh
+                    // via mesh time adoption once the crown re-broadcasts the fresh time.
+                    {
+                        let unix_now = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
+                        let stale_s = unix_now.saturating_sub(my_synced_at);
+                        // #192 N1 (155 review): ALSO fire when NEVER-synced (my_synced_at == 0).
+                        // 3/4 boards failed boot SNTP (tsrc=mesh) tonight, so post-#204-heal a
+                        // gateway with my_synced_at==0 would otherwise free-run a full
+                        // NTP_RESYNC_AGE_S (~1h) before its FIRST correction. Fires each flush
+                        // until the first successful sync sets my_synced_at nonzero → then the
+                        // normal ~1h staleness cadence resumes (airtime-conscious once synced).
+                        if (my_synced_at == 0 || stale_s > net::NTP_RESYNC_AGE_S) && r.is_gateway() {
+                            let mut resync_abort = false;
+                            let fresh = r.resync_ntp(&mut || {
+                                let t = millis();
+                                led.apply(led::LedState::WifiSync, t);
+                                if matches!(button.poll(t), Some(input::Press::Long)) {
+                                    resync_abort = true;
+                                }
+                                resync_abort
+                            });
+                            if let Some(unix) = fresh {
+                                // Re-anchor the free-running clock to the fresh SNTP time. The next
+                                // broadcast_time carries the new my_synced_at → leaves adopt it.
+                                base_unix = unix;
+                                anchor_ms = millis();
+                                my_synced_at = unix;
+                                time_source = app::TimeSource::NtpRoot;
+                                log::info!(
+                                    "smol #192: NTP re-synced -> Unix {} (was {}s stale)",
+                                    unix, stale_s
+                                );
+                            }
+                        }
+                    }
                     // #40 leaf-mesh-OTA orchestration: the flush surfaced a leaf install →
                     // relay the staged image to that leaf over ESP-NOW (canary-one-leaf; the
                     // relay does its own WiFi fetch then an ESP-NOW relay, minutes-scale +
@@ -1444,6 +1514,15 @@ fn main() -> ! {
                 }
             }
 
+            // #197: a transient on-glass toast (key `M`) — a COMMAND (cache-bypass, one-shot, NEVER
+            // cached → never re-toasts on reboot). Value = `[~<dur>]<msg>`; `toast::parse_wire` splits
+            // the optional `~<sec>` TTL from the message, then we show it over the active screen.
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_NOTIFY) {
+                let (dur_s, msg) = crate::toast::parse_wire(&o.buf[..o.len]);
+                crate::toast::set(msg, now, dur_s as u64 * 1000);
+                log::info!("smol #197: toast shown ({} B, {}s)", msg.len(), dur_s);
+            }
+
             // #52: a remote reboot command (key `R`) — a COMMAND (cache-bypass, one-shot). Applied
             // once (edge — `take` clears it); the value is empty (the key IS the command). Feeds
             // BOTH a leaf (relayed `<id>R`) and the gateway's OWN reset (injected into `self.cfg`),
@@ -1676,6 +1755,17 @@ fn main() -> ! {
         #[cfg(not(feature = "espnow"))]
         app.update(&mut ctx);
 
+        // #197 toast overlay: composite a transient message over the just-painted screen (before
+        // the cast snapshot, so the WLED mirror includes it). The SSD1306 framebuffer persists
+        // between flushes, so re-compositing each tick keeps the box up even after a plugin
+        // repaint. `display` is free here — the `ctx` borrow ended at `update` above. The
+        // falling-edge repaint is deferred to AFTER the redraw-latch reset below (see there).
+        let toast_now = crate::toast::is_active(now);
+        if toast_now {
+            crate::toast::draw(&mut display, now);
+            display.flush().ok();
+        }
+
         // #26 cast: snapshot the just-rendered glass image into the shared cast frame
         // (the `ctx` borrow of `display` has ended at the `update` call above), so the
         // next gateway flush can stream it to the WLED matrix. No-op unless feature=cast.
@@ -1684,6 +1774,13 @@ fn main() -> ! {
 
         // The redraw latch is single-tick: this tick's `update` consumed it.
         redraw = false;
+
+        // #197: a just-EXPIRED toast forces ONE repaint so the plugin redraws over where the box
+        // was. Set AFTER the latch reset above, so it survives to the next tick's top-of-loop seed.
+        if was_toast && !toast_now {
+            redraw = true;
+        }
+        was_toast = toast_now;
 
         delay.delay_millis(SUBTICK_MS);
     }

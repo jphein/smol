@@ -29,6 +29,24 @@ pub(crate) fn assert_max_tx_power() {
     }
 }
 
+/// #204: the crown's CURRENT AP association — `(channel, RSSI dBm, BSSID)` — via the IDF
+/// `esp_wifi_sta_get_ap_info` FFI. `None` if not associated or the call errors. Published in the
+/// crown's DIAG so the #204 coexist-starvation hypothesis (crown deaf when its roam AP is NOT
+/// co-channel with the mesh ch6) is TESTABLE from telemetry — the forensics gap that cost ~3h of
+/// pcap tonight (the fw could not report which AP/channel/RSSI a deaf crown was on).
+#[cfg(feature = "espnow")]
+pub(crate) fn current_ap_info() -> Option<(u8, i8, [u8; 6])> {
+    // SAFETY: `esp_wifi_sta_get_ap_info` fills a caller-owned POD record (all-zero is a valid
+    // initial state); it reads current-association state only, no aliasing. Same FFI idiom as
+    // `assert_max_tx_power` above.
+    let mut rec: esp_wifi_sys::include::wifi_ap_record_t = unsafe { core::mem::zeroed() };
+    let err = unsafe { esp_wifi_sys::include::esp_wifi_sta_get_ap_info(&mut rec) };
+    if err != 0 {
+        return None;
+    }
+    Some((rec.primary, rec.rssi, rec.bssid))
+}
+
 // Hand-rolled MQTT 3.1.1 (QoS0) codec for the HA batt/telemetry bridge (v2). Pure
 // encode/decode; the socket poll-loop that drives it lives in `wifi.rs`.
 #[cfg(feature = "wifi")]
@@ -36,6 +54,14 @@ mod mqtt;
 
 #[cfg(feature = "espnow")]
 pub mod mode;
+
+// #164 per-peer link-quality (ETX) metric: the PURE reach-register + cost mapping, ported
+// from babeld's neighbour.c (see docs/superpowers/research/althea-babel-study.md, #163).
+// Host-testable (experiments/etx_verify), no HAL deps. espnow-gated to match its sole
+// consumer `mode::Roster` (its `LinkQuality`-per-peer holder) — so the default/wifi Phase-1/2
+// builds stay byte-free of it, exactly like `flood`/`wire`.
+#[cfg(feature = "espnow")]
+pub mod etx;
 
 // #13 routed multi-hop mesh: the PURE managed-flood decision core (SeenSet + forward
 // decision + HopLatch escalation state machine), host-testable, no HAL deps. Driven by
@@ -113,6 +139,9 @@ pub use wifi::CFG_KEY_NET;
 pub use wifi::CFG_KEY_BROKER;
 #[cfg(feature = "espnow")]
 pub use wifi::CFG_KEY_OTA;
+// #197 herald NOTIFY key — espnow leaf-apply path (take_cfg_offer(M) → crate::toast::set).
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_KEY_NOTIFY;
 // #72 IO-registry key — the leaf/own apply path (take_cfg_offer(G) → io::apply_wire re-binds
 // the free GPIOs). `io`-gated (⊃ espnow): only the io apply path names it here.
 #[cfg(feature = "io")]
@@ -135,6 +164,11 @@ pub use wifi::CFG_KEY_SCAN;
 // `mode::start` instead, so only re-export it when espnow is NOT enabled.
 #[cfg(all(feature = "wifi", not(feature = "espnow")))]
 pub use wifi::try_time_sync;
+
+// #192: the NTP re-sync staleness threshold — read by `main`'s flush-cadence re-sync trigger.
+// `wifi` is a private submodule, so main reaches the const only via this re-export.
+#[cfg(feature = "espnow")]
+pub(crate) use wifi::NTP_RESYNC_AGE_S;
 
 /// Install esp-wifi's heap ONCE. esp-alloc declares the `#[global_allocator]`
 /// inside its own crate; this macro just adds an internal-RAM region to it.
