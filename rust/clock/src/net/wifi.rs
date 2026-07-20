@@ -185,6 +185,12 @@ pub struct MeshElect {
     /// R-DEMOTE abdication), so a sitting crown vacates promptly and leaves re-elect a
     /// hinted-channel board instead of staying pinned to our now-wrong-channel HELLO.
     pub hint_blocked: bool,
+    /// #204 2a: true iff this burst RECEIVED any of its own retained downstream (MC/batt/grid) —
+    /// the crown dead-unicast-RX liveness signal. A gateway flush that CONNECTS (`ok`) but leaves
+    /// this FALSE is a downstream-dry tick (the #204 crown-deafness: TX + broadcast fine, sustained
+    /// inbound unicast starves). Set in [`mqtt_session`]'s drain (`got_mc || got_batt || got_grid`);
+    /// the caller reads it post-burst to drive `crown_deaf_streak`. False until the drain runs.
+    pub downstream_seen: bool,
 }
 
 #[cfg(feature = "wifi")]
@@ -207,6 +213,7 @@ impl MeshElect {
             owner_id: my_id,
             owner_alive: false,
             hint_blocked: false, // #155: set by the claim gate on a channel-hint yield
+            downstream_seen: false, // #204 2a: set true in the drain on any retained downstream
         }
     }
 }
@@ -1811,6 +1818,28 @@ mod ota_fail {
     }
 }
 
+/// #204 2b/F1: is a self-fetch failure stage a BODY-RECEPTION (bulk-deaf) signature — did the fetch
+/// reach the point of receiving the 206 response/body and then fail to complete it? These gate the
+/// aggressive crown SHED (the small-frame `got_mc` streak can false-green on a partial-heal, so the
+/// shed needs bulk-inbound proof). TRUE (post-206, body-reception): status (bad 206 header /
+/// Content-Length on a chunk) / fallback (200 body died mid-stream) / stall (zero-progress exhausted
+/// = the #26 "ACKs zero downstream") / deadline (elapsed mid-download) / recycle (chunk never
+/// drained). FALSE — the PRE-206 / non-RX stages (155 crux 3): assoc/dhcp/slot (pre-net), connect
+/// (never established), handshake (TCP SYN-ACK — pre-206, and an upstream/AP blip could cause it, the
+/// R-DEMOTE lane), send (TX-side, HEALTHY in the disease), verify (body FULLY received, only the
+/// size/SHA/sig gate rejected it → downstream worked).
+#[cfg(feature = "espnow")]
+pub(crate) fn ota_fail_is_bulk_deaf(w: u32) -> bool {
+    matches!(
+        w,
+        ota_fail::STATUS
+            | ota_fail::FALLBACK
+            | ota_fail::STALL
+            | ota_fail::DEADLINE
+            | ota_fail::RECYCLE
+    )
+}
+
 /// One short MQTT 3.1.1 QoS0 session over a fresh TCP socket to the HA broker:
 /// TCP connect → CONNECT (client-id `smol-<node_id>`, username+password) → CONNACK
 /// → SUBSCRIBE `smol/display/batt` (downlink FIRST — the retained payload every node
@@ -2882,6 +2911,15 @@ fn mqtt_session(
             break;
         }
     }
+
+    // #204 2a: crown dead-downstream detector (measurement only). Record whether this burst
+    // received ANY of its own retained downstream (MC/batt/grid). got_mc is the primary signal —
+    // the crown always retains its OWN MC, so a healthy crown gets it back on every flush; a
+    // downstream-deaf crown gets nothing. batt/grid strengthen confidence but aren't required. The
+    // caller (flush_telemetry) turns a CONNECTED-but-downstream-dry gateway flush into a
+    // `crown_deaf_streak` tick. ⚠️ #204 partial-heal caveat: these are small retained TCP frames,
+    // so a STREAK (not one-shot) guards a lucky small-frame while bulk stays dead (rung-2 = bulk probe).
+    elect.downstream_seen = got_mc || got_batt || got_grid;
 
     // #40 ARMDIAG: snapshot whether THIS flush caught an install (before the diag block below
     // may null `pending_leaf`) — dumped to `smol/<gw>/ota/armdiag` after the arm, so one
