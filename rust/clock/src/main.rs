@@ -354,6 +354,16 @@ fn main() -> ! {
         env!("BUILD_HASH"),
     );
 
+    // --- #226 FIRST-BOOT OTADATA INIT (before diag + #40 bookkeeping) ---------
+    // A freshly USB-flashed board has BLANK otadata; the ROM boots ota_0 (no factory
+    // partition) but leaves the ota-select record absent → boot_slot() reports 255 and a
+    // later OTA would show luna a spurious 255→N "rollback". Write a valid record for the
+    // running slot (Slot0) ONCE so otadata is always well-formed. Runs BEFORE capture_boot_diag
+    // so the diag reads the initialized slot; the inactive_slot() None=>Slot1 net still
+    // protects OTA targeting if this write ever fails. (#226; boot-critical → HW-canary.)
+    #[cfg(feature = "espnow")]
+    ota::init_otadata_if_blank();
+
     // --- #40 leaf-mesh-OTA: EARLIEST-boot self-test bookkeeping ---------------
     // Runs BEFORE any subsystem that can panic (I2C/display/radio) so an early-init
     // crash still trips the crash-loop bound. Only fires when otadata is New/Pending
