@@ -8,10 +8,10 @@
 > JP chose "wait for #237 peer-sourcing" over plugging boards / RF changes: the fleet stays mixed
 > (343/342) until this ships, so **implementability-now beats completeness.** The receiver is
 > untouched, so the smallest *source-side* handoff that safely ships wins. This spec is therefore
-> split into a **v1-minimal slice** ([§10](#10-first-implementation-slice-v1-minimal--smallest-safe-pr)) — the smallest PR that lets a
-> holder serve the fleet — and **v2 deferrals** (flagged inline as `▷ v2` and listed in §10.3).
+> split into a **v1-minimal slice** ([§8](#8-first-implementation-slice-v1-minimal--smallest-safe-pr-slice-1--65)) — the smallest PR that lets a
+> holder serve the fleet — and **v2 deferrals** (flagged inline as `▷ v2` and listed in §8.3).
 > The safety floor is constant across v1/v2: **fallback to the #40 gateway fetch means worst-case
-> v1 is exactly today's behavior.** See [§11](#11-bootstrap-sequencing--the-one-more-roll-irony) for the one-more-gateway-roll bootstrap reality.
+> v1 is exactly today's behavior.** See [§9](#9-bootstrap-sequencing--the-one-more-roll-irony) for the one-more-gateway-roll bootstrap reality.
 
 ---
 
@@ -66,9 +66,10 @@ The very first node of any new build has no holder → the crown seeds it by fet
 
 **`SMOLv1 ODEL `** — crown→holder **delegate-to-serve** (the only thing that authorizes a serve):
 ```
-tag[12] "SMOLv1 ODEL " · target[3] (leaf T) · build[u32 LE] · session[2] · term[u16 LE] · crown_sig-or-tokenTBD[…]
+tag[12] "SMOLv1 ODEL " · target[3] (leaf T) · build[u32 LE] · session[2] · term[u16 LE] · M_len[1] · M[M_len] · sig[64]
 ```
 - `session` is minted by the crown (globally the one in-flight session — §4), so the holder serves under the crown's session, and T binds to it (§5.3).
+- **`M` + `sig` ride the ODEL** (the crown staged the build, so it has them): ≈174 B total, under the 250 B MTU. This is what lets the holder serve with **zero persisted manifest** — it pairs the crown-supplied `(M, sig)` with image bytes from its own slot and emits a byte-identical `OTAM` (§8.1). The sig is still the offline-signed one, so the holder cannot forge.
 - `term` = the crown's election term/epoch (see §5.3 split-brain). A holder rejects an ODEL whose `term` is older than the highest term it has seen → a dethroned crown cannot delegate.
 - **Auth of ODEL:** ODEL only *starts a serve of an already-signed image*; it cannot cause a flash (the leaf still verifies the image sig). So ODEL needs only **replay/stale protection** (`term` + `session`), not a signature. (If group-HMAC #190 lands, ODEL rides it for free; noted, not required.)
 
@@ -164,7 +165,58 @@ Everything below rides existing retained topics (gateway-flushed) + the DIAG/LDB
 
 ---
 
-## 8. Wire-frame appendix (grounded in `ota_mesh.rs`)
+## 8. First implementation slice (v1-minimal) — smallest safe PR (slice-1 / #65)
+
+**Goal of the slice:** the smallest PR that lets **Nexus (id8), already on the target build with a verified image, serve the remaining leaves (Herald / Aegis / Dominion) over ESP-NOW with zero gateway bulk-fetch for those three** — degrading to exactly #40 on any hiccup. Everything not on this list is deferred (§8.3). This section is the contract for task **#65**.
+
+### 8.1 What slice-1 MUST include (and nothing more)
+1. **Two frames only: `ODEL` + `ODON`** (§10 appendix). **Skip `HOLD` entirely.**
+2. **Source-selection = "delegate to the node the crown just finished serving" (the baton) — no HOLD, no DIAG scan.** The crown is already walking a canary sequence; the node it *just* confirmed healthy on build N is, by definition, a valid source for the *next* target. So the crown keeps one variable — `last_confirmed_holder` — and delegates to it. The first target has no prior holder → the crown **seeds** it the #40 way (fetch-and-serve, or an operator `install` to a chosen seed like id8). After that, the baton passes down the sequence. *(This is even smaller than the DIAG-running-build heuristic in §1.2 — it needs no inventory at all, just the crown's own memory of who it last updated.)*
+3. **Minimum holder persistence: ZERO — the `ODEL` carries `(M, sig)`.** A holder becomes a source only *after* it activates and **reboots** into build N, which clears `.bss` — so holder-side retention would have to be durable NVS. Avoid it: the **crown already holds the signed manifest** (it staged the build), so grow `ODEL` to carry `M`(≤86 B) + `sig`(64 B) (total frame ≈174 B, under the 250 B MTU — §10). The holder pairs the crown-supplied `(M, sig)` with **image bytes read back from its own active slot** and emits a byte-identical `OTAM`. The holder persists **nothing new**; the sig is still the offline-signed one (crown→holder→leaf), so the trust chain is intact and the holder still cannot forge. *(If you ever want a holder to self-serve without a live crown handoff — a v2 case — then persist the 64-byte sig in NVS and reconstruct `M` from `build`+`size`+readback-sha; but slice-1 does not need this.)*
+4. **Serve reads back the ACTIVE slot** — extend the #40 gateway relay read-back (today: inactive slot) to also read the **running/active** slot. Flash reads only; safe.
+5. **`ODEL` replay guard** — a minimal `term`+`session`: the holder rejects an ODEL whose `term` is stale (dethroned crown), and the target binds to one `(source, session)` (§5.3). Cheap; keep it in slice-1 (it's the split-brain floor).
+6. **Fallback to #40 gateway fetch** on `ODON != OK` / serve-deadline timeout. **This is the safety floor — with it, worst-case slice-1 == today's #40.** A serve-time readback-sha self-check at the holder (`ODON=self-slot-verify-failed` on mismatch) triggers the fallback early.
+7. **Canary inherited** — reuse the existing single-session #40 scheduler (one target in flight); the only change is `source = baton-holder | self`.
+8. **Minimal observability** — add the `source id` to the existing `smol/<leaf>/ota/diag`; nothing more.
+
+### 8.2 The concrete slice-1 PR — id8 serves three leaves (baton)
+Assuming the peer-sourcing fw is fleet-wide (§9 bootstrap), a uniformity roll to build N:
+1. Operator stages N (`ota_publish.sh stage`) and `install`s the **seed** = **id8** (Nexus). id8 self-fetches its one seed image (or is already on N). The crown sets `last_confirmed_holder = id8` once id8 is confirmed healthy.
+2. Crown updates **Herald**: it sends `ODEL{target=Herald, build=N, session, term, M, sig}` to **id8** (the baton holder). No fetch.
+3. id8 readback-sha-verifies its active slot, then runs the **existing #40 relay** (`OTAM/OTAD/OTAN`) to Herald — using the crown-supplied `(M, sig)`. Herald verifies sig → HOLE-3 → finalize-sha → activates → self-tests (hear-a-mesh-frame).
+4. id8 → `ODON{OK}`; crown confirms Herald healthy → `last_confirmed_holder = Herald` (baton passes) → delegates **Herald** to serve **Aegis**, then Aegis to serve **Dominion** — one at a time. *(Or keep id8 as the sole source for all three — both are valid; the baton spreads serve load, a single source is even simpler. Slice-1 may hard-code either.)*
+5. Any failure at any step → crown falls back to a #40 gateway fetch-and-serve for that one leaf, then resumes the baton.
+
+That is the whole slice-1: three followers updated with **zero gateway bulk-fetch**, on the real fleet, with a hard floor of "no worse than #40," and **no new persistent state or broadcast frame** — just `ODEL`/`ODON` + active-slot read-back + the baton variable.
+
+### 8.3 Explicitly deferred to v2 (cut corners, flagged)
+- **`HOLD` broadcast + crown source-table auto-inventory + load-spread** (§1.2) — slice-1 uses the baton. Add HOLD when the fleet is large enough that auto-selecting *among many* holders (and spreading serve load beyond a linear baton) matters.
+- **Holder-persisted `(M,sig)` / crownless self-serve** — slice-1 carries `(M,sig)` in `ODEL`; persist-and-reconstruct is only needed if a holder must serve without a live crown handoff.
+- **Full split-brain hardening** beyond the minimal term/session guard (transient two-crown windows during a contested election) — harden with the #76 election lineage if contested-crown rolls become real.
+- **Rich observability** — the `…/ota/holds` inventory topic, `LDBG` source attribution, and the `served-by-peer` vs `fell-back` dashboard metric (§7) — slice-1 ships only the source id on `ota/diag`.
+- **Optional ODEL auth via group-HMAC #190** — slice-1 relies on term/session replay-guards (ODEL can't cause a flash, only start a serve of an already-signed image), so a signature is not required; fold in if #190 lands (v345 train).
+- **True multi-hop / epidemic spread** — permanent non-goal (incompatible with structural canary), *not* a v2 item; noted only to keep it off the table.
+
+None of the deferrals weaken the trust model — every one sits *above* the receiver's verify-before-flash floor.
+
+---
+
+## 9. Bootstrap sequencing — the "one more roll" irony
+
+Peer-sourcing is the cure for gateway-fetch-per-follower, but the peer-sourcing **code** can only reach a fleet that doesn't yet have it via… gateway-fetch-per-follower. A node running v343 has no `ODEL`/serve path, so it can only *receive* the next build the #40 way.
+
+**So there is exactly ONE more old-style roll, and it's unavoidable** (build numbers below are illustrative — the exact one is whichever train slice-1 / #65 rides; #190 + ledger are on the v345 train, so peer-sourcing lands on that train or the next):
+1. Build **v_PS = current + peer-sourcing (§8 slice-1)** (≈ v344/v345). Roll it fleet-wide via the **existing #40 gateway path** — the *last* roll where the gateway bulk-fetches (or relays) for every follower. (This is the roll JP is waiting on for uniformity; it doubles as the bootstrap.)
+2. Once v_PS is fleet-wide, **every** node has the serve path. The **next** roll (v_PS+1) seeds **one** node by gateway fetch, then peers serve the rest over ESP-NOW.
+3. **After v_PS, the gateway never bulk-fetches for a follower again** — each new build costs exactly one seed fetch (hardened by #217) + N coexist-safe ESP-NOW serves.
+
+This is a general property of self-improving delivery: the improvement ships one generation behind itself. Plan the v_PS roll as a normal canary-sequenced #40 roll (id-by-id, confirm-healthy-then-next); the payoff lands on the roll after.
+
+> **Operator's-eye success signal** (ties to [ota.md §Ground truth during a roll](../../ota.md)): on the v_PS+1 roll, the image-host pcap shows fetch traffic for the **seed only** and **silence** for every follower — that absence, cross-checked against `ODON served-by-peer` counts, is the proof peer-sourcing is live.
+
+---
+
+## 10. Wire-frame appendix (grounded in `ota_mesh.rs`)
 
 **Unchanged #40 frames (receiver path — do not touch):**
 | Frame | Dir | Layout |
@@ -177,72 +229,27 @@ Everything below rides existing retained topics (gateway-flushed) + the DIAG/LDB
 Constants (from `ota_mesh.rs`): `CHUNK_PAYLOAD=231`, `WINDOW_CHUNKS=64`, `WINDOW_BYTES=14784`, `OTAN_BITMAP_BYTES=8`.
 
 **New #237 frames (arbitration only):**
-| Frame | Dir | Layout |
-|---|---|---|
-| `HOLD` | holder→bcast | `tag[12] id[3] build[u32 LE] flags[1]` (bit0 verified, bit1 on-ch6) |
-| `ODEL` | crown→holder (unicast) | `tag[12] target[3] build[u32 LE] session[2] term[u16 LE]` — delegate-to-serve |
-| `ODON` | holder→crown (unicast) | `tag[12] target[3] build[u32 LE] session[2] result[1]` — serve outcome |
+| Frame | Dir | Layout | Slice |
+|---|---|---|---|
+| `ODEL` | crown→holder (unicast) | `tag[12] target[3] build[u32 LE] session[2] term[u16 LE] M_len[1] M[M_len] sig[64]` — delegate-to-serve **+ the signed manifest** (≈174 B, < 250 MTU); the holder needs no persisted `(M,sig)` | **v1** |
+| `ODON` | holder→crown (unicast) | `tag[12] target[3] build[u32 LE] session[2] result[1]` — serve outcome (0=OK · 1=target-unreachable · 2=aborted · 3=self-slot-verify-failed) | **v1** |
+| `HOLD` | holder→bcast | `tag[12] id[3] build[u32 LE] flags[1]` (bit0 verified, bit1 on-ch6) — source inventory | ▷ v2 |
+
+> **Slice-1 note:** `ODEL` carries `M`+`sig` so a holder that rebooted into build N (clearing RAM) needs **zero durable OTA-manifest state** — the crown, which staged the build, supplies the signed manifest and the holder supplies the image bytes from its active slot. The v2 `HOLD`-inventory path (holder self-advertises) is the only case that needs holder-persisted `(M,sig)`.
 
 ---
 
-## 9. Implementation checklist (for the fw agent — spec hands off here)
+## 11. Implementation checklist (for the fw agent — spec hands off here)
 
-1. `(M, sig)` retention record in `.bss` (150 B), populated on self-fetch + on relay-receive, cleared on a newer stage; a `holds_build() -> Option<(u32, bool)>` self-verify (readback-sha) gate.
-2. `HOLD` encode/parse + crown-side source-table accumulation on the DIAG drain path.
-3. `ODEL`/`ODON` encode/parse (pure, host-testable — the flood/etx/ledger pattern) + `term`/`session` replay guards.
-4. Crown source-selection + single-session arbiter (extend the existing #40 relay scheduler: source = holder|self).
-5. Holder serve path = the existing gateway relay driver, but **reading back the ACTIVE slot** (running build) as well as the inactive slot, and sourced by ODEL instead of `install`.
-6. Fallback-to-gateway-fetch on ODON!=OK / timeout.
-7. Observability (§7) topics + LDBG source id.
-8. Host tests: source-selection preference, split-brain term/session rejection, corrupt-holder → receiver-sha-reject → fallback.
+**Slice-1 (#65) — the v1 subset (§8):**
+1. `ODEL`/`ODON` encode/parse (pure, host-testable — the flood/etx/ledger pattern); `ODEL` carries `M`+`sig`; `term`/`session` replay guards.
+2. Crown baton: track `last_confirmed_holder`; `source = baton-holder | self`; seed the first target the #40 way.
+3. Holder serve path = the existing gateway relay driver, but **reading back the ACTIVE slot** (running build) and sourced by `ODEL` (with crown-supplied `M`+`sig`) instead of `install`; serve-time readback-sha self-check.
+4. Fallback-to-#40-gateway-fetch on `ODON != OK` / timeout.
+5. Single-session arbiter reused from #40 (one target in flight).
+6. Observability: `source id` on `smol/<leaf>/ota/diag`.
+7. Host tests: baton selection, split-brain term/session rejection, corrupt-holder → receiver-sha-reject → gateway fallback.
 
-**Receiver path, HOLE-3, freshness floor, A/B engine: untouched.**
+**v2 (§8.3):** `HOLD` broadcast + crown source-table + load-spread; holder-persisted `(M,sig)`/crownless serve; rich observability; optional #190 ODEL auth.
 
----
-
-## 10. First implementation slice (v1-minimal) — smallest safe PR
-
-**Goal of the slice:** the smallest PR that lets **Nexus (id8), already on the target build, serve the remaining leaves (Herald / Aegis / Dominion) over ESP-NOW with zero gateway bulk-fetch for those three** — degrading to exactly #40 on any hiccup. Everything not on this list is deferred (§10.3).
-
-### 10.1 What v1 MUST include (and nothing more)
-1. **`(M, sig)` retention** — a 150 B `.bss` record (`M` ≤86 B + 64 B sig), populated when a node self-fetches *or* relay-receives a build, cleared on a newer stage. Without this a holder can't reproduce the signed `OTAM`. *(The only genuinely new persistent state.)*
-2. **Serve reads back the ACTIVE slot** — extend the #40 gateway relay read-back (today: inactive slot) to also read the **running/active** slot, so a node serves the build it is *running*. Flash reads only; safe.
-3. **`ODEL` / `ODON`** — the two crown↔holder unicast frames (§2.1), with a **minimal** `term`+`session` replay guard (reject an ODEL with a stale term; target binds to one `(source, session)`).
-4. **v1 source-selection = DIAG-running-build + serve-time self-verify** (§1.2 `▷ v2` note) — no HOLD frame. The crown picks a node DIAG shows running build N; that node readback-sha-checks its own slot on ODEL receipt and `ODON=self-slot-verify-failed` if it can't (→ fallback).
-5. **Fallback to #40 gateway fetch** on `ODON != OK` or serve-deadline timeout. **This is the safety floor — with it, worst-case v1 == today.**
-6. **Canary inherited** — reuse the existing single-session #40 scheduler (one target in flight); the only change is `source = holder | self`.
-7. **Minimal observability** — add the `source id` to the existing `smol/<leaf>/ota/diag` so a peer-served roll is legible; nothing more.
-
-### 10.2 The concrete first PR — id8 serves three leaves
-Assuming v344 (the peer-sourcing fw) is fleet-wide (§11), a uniformity roll to build N:
-1. Operator stages N (`ota_publish.sh stage`) and installs to **id8** (Nexus) — id8 self-fetches (its one seed fetch) or is already on N; it retains `(M, sig)`.
-2. Crown, updating **Herald**, sees id8 DIAG-running N → mints `session`, sends `ODEL{target=Herald, build=N, session, term}` to id8.
-3. id8 readback-sha-verifies its active slot, then runs the **existing #40 relay** (`OTAM/OTAD/OTAN`) to Herald. Herald verifies sig → HOLE-3 → finalize-sha → activates → self-tests (hear-a-mesh-frame). **No gateway fetch.**
-4. id8 → `ODON{result=OK}`; crown advances to **Aegis**, then **Dominion**, one at a time.
-5. Any failure at any step → crown falls back to a #40 gateway fetch-and-serve for that one leaf, then continues.
-
-That is the whole v1. It exercises the full value (three followers updated with zero gateway bulk-fetch) on the real fleet, with a hard floor of "no worse than #40."
-
-### 10.3 Explicitly deferred to v2 (cut corners, flagged)
-- **`HOLD` broadcast + crown source-table auto-inventory + load-spread** (§1.2) — v1 uses DIAG + serve-time self-verify. Add HOLD when the fleet is large enough that auto-selecting *among many* holders and spreading serve load matters.
-- **Full split-brain hardening** beyond the minimal term/session guard (transient two-crown windows during a contested election) — v1's single stable crown + term-stamp covers the common case; harden with the #76 election lineage if contested-crown rolls become real.
-- **Rich observability** — the `…/ota/holds` inventory topic, `LDBG` source attribution, and the `served-by-peer` vs `fell-back` dashboard metric (§7) — v1 ships only the source id on `ota/diag`.
-- **Optional ODEL auth via group-HMAC #190** — v1 relies on term/session replay-guards (ODEL can't cause a flash, only start a serve of an already-signed image), so a signature is not required; fold in if #190 lands.
-- **True multi-hop / epidemic spread** — permanent non-goal (incompatible with structural canary), *not* a v2 item; noted only to keep it off the table.
-
-None of the deferrals weaken the trust model — every one of them sits *above* the receiver's verify-before-flash floor.
-
----
-
-## 11. Bootstrap sequencing — the "one more roll" irony
-
-Peer-sourcing is the cure for gateway-fetch-per-follower, but the peer-sourcing **code** can only reach a fleet that doesn't yet have it via… gateway-fetch-per-follower. A node running v343 has no `ODEL`/serve path, so it can only *receive* the next build the #40 way.
-
-**So there is exactly ONE more old-style roll, and it's unavoidable** (build numbers below are illustrative — the exact one is whichever train slice-1 / #65 rides; #190 + ledger are on the v345 train, so peer-sourcing lands on that train or the next):
-1. Build **v_PS = current + peer-sourcing (§10 v1)** (≈ v344/v345). Roll it fleet-wide via the **existing #40 gateway path** — the *last* roll where the gateway bulk-fetches (or relays) for every follower. (This is the roll JP is waiting on for uniformity; it doubles as the bootstrap.)
-2. Once v_PS is fleet-wide, **every** node has the serve path. The **next** roll (v_PS+1) seeds **one** node by gateway fetch, then peers serve the rest over ESP-NOW.
-3. **After v_PS, the gateway never bulk-fetches for a follower again** — each new build costs exactly one seed fetch (hardened by #217) + N coexist-safe ESP-NOW serves.
-
-This is a general property of self-improving delivery: the improvement ships one generation behind itself. Plan the v_PS roll as a normal canary-sequenced #40 roll (id-by-id, confirm-healthy-then-next); the payoff lands on the roll after.
-
-> **Operator's-eye success signal** (ties to [ota.md §Ground truth during a roll](../../ota.md)): on the v345 roll, the image-host pcap shows fetch traffic for the **seed only** and **silence** for every follower — that absence, cross-checked against `ODON served-by-peer` counts, is the proof peer-sourcing is live.
+**Receiver path, HOLE-3, freshness floor, A/B engine: untouched, both slices.**
