@@ -679,7 +679,26 @@ fn inactive_slot() -> Option<Slot> {
         .ok()??;
     let mut region = od.as_embedded_storage(&mut flash);
     let mut ota = Ota::new(&mut region).ok()?;
-    Some(ota.current_slot().ok()?.next())
+    // #226 SELF-OVERWRITE FIX: on a BLANK/uninitialized otadata, `current_slot()` returns
+    // `Slot::None`, and `Slot::None.next()` folds to `Slot::Slot0` (esp-bootloader 0.2.0
+    // ota.rs:64) — i.e. the RUNNING slot, so an OTA would overwrite the LIVE image (a boot-
+    // critical self-overwrite / brick class). A blank otadata always ROM-falls-back to ota_0
+    // (there is no factory partition in partitions-ota.csv), so the running slot is provably
+    // ota_0 and the true inactive write-target is ota_1. Explicit match instead of the blind
+    // `.next()`. Validated against JP's ESP32-C6 watch (esp-bootloader 0.5), which avoids this
+    // exact bug the same way — the `.next()` footgun SURVIVES into 0.5 (current_slot() still
+    // returns None on blank), so the crate bump does NOT auto-fix it; the explicit mapping does
+    // (watch study: scratch/watch-backport/226-comment.md, task #49).
+    //
+    // No first-boot otadata write is needed (supersedes the original init sketch): a boot-time
+    // flash write to boot-critical partition state would be an unnecessary risk, and `activate()`
+    // already makes otadata valid (set_current_slot + New) on the first real OTA. So the blank
+    // state self-heals on the first successful update, with zero boot-path flash mutation.
+    let target = match ota.current_slot().ok()? {
+        Slot::None => Slot::Slot1,
+        other => other.next(),
+    };
+    Some(target)
 }
 
 /// Point `otadata` at the freshly-written `target` slot + arm the state machine
@@ -717,6 +736,62 @@ fn set_slot_new(target: Slot) -> Option<()> {
     ota.set_current_slot(target).ok()?;
     ota.set_current_ota_state(OtaImageState::New).ok()?;
     Some(())
+}
+
+/// #226 FIRST-BOOT OTADATA INIT: a freshly USB-flashed board has BLANK `otadata` (both
+/// select-entries erased → `current_slot()` == `Slot::None`). The ESP-IDF ROM then boots
+/// `ota_0` (there is no factory partition in `partitions-ota.csv`), but the ota-select record
+/// stays absent, so `boot_slot()` reports 255 ("unprovisioned") and luna's rollback automation
+/// would see a spurious 255→N jump on the first real OTA. This writes a VALID select record for
+/// the running slot exactly once, so otadata is always well-formed.
+///
+/// Provably correct + safe:
+/// - A blank otadata ALWAYS ROM-falls-back to `ota_0` (no factory partition), so the running
+///   slot is `Slot0` — we merely formalize a state that is already physically true (no slot
+///   change, no reboot).
+/// - `Valid` (not `New`) so `otadata_unconfirmed()` stays false — a USB flash is not an OTA under
+///   self-test, so it must not arm the #40 K-counter / leaf self-test.
+/// - ONE-TIME: only fires while `current_slot()` is blank; the write makes it non-blank, so every
+///   later boot is a no-op (no repeated flash wear).
+/// - VERIFY-AFTER-WRITE + FAIL-SAFE: any partition/flash error → no-op, and the `inactive_slot()`
+///   `Slot::None => Slot1` net still targets a subsequent OTA correctly even if this never ran.
+///
+/// Call ONCE at earliest boot, BEFORE `capture_boot_diag` (so `boot_slot` reads 0, not 255) and
+/// BEFORE the #40 unconfirmed-boot block. Boot-critical partition write → HW-canary gated.
+#[cfg(feature = "espnow")]
+pub fn init_otadata_if_blank() {
+    let mut flash = FlashStorage::new();
+    let mut buf = [0u8; PT_SCRATCH];
+    let Ok(pt) = read_partition_table(&mut flash, &mut buf) else {
+        return;
+    };
+    let Ok(Some(od)) = pt.find_partition(PartitionType::Data(DataPartitionSubType::Ota)) else {
+        return; // no otadata partition (non-OTA board) → nothing to init
+    };
+    let mut region = od.as_embedded_storage(&mut flash);
+    let Ok(mut ota) = Ota::new(&mut region) else {
+        return;
+    };
+    // Only touch a genuinely BLANK otadata — never perturb a provisioned record.
+    if !matches!(ota.current_slot(), Ok(Slot::None)) {
+        return;
+    }
+    // Blank ⟹ ROM booted ota_0 ⟹ formalize Slot0 as the valid boot selection.
+    if ota.set_current_slot(Slot::Slot0).is_err()
+        || ota.set_current_ota_state(OtaImageState::Valid).is_err()
+    {
+        log::error!(
+            "smol #226: otadata first-boot init write failed — staying blank (inactive_slot None=>Slot1 net still protects OTA)"
+        );
+        return;
+    }
+    // Verify-after-write (boot-critical): confirm the record now resolves to Slot0.
+    match ota.current_slot() {
+        Ok(Slot::Slot0) => log::info!("smol #226: otadata first-boot init — blank → Slot0/Valid"),
+        other => log::error!(
+            "smol #226: otadata init verify FAILED (got {other:?}) — inactive_slot net still protects OTA"
+        ),
+    }
 }
 
 /// #40 BRICK-SAFETY: does `slot` hold a bootable app image? Reads the slot's first word
