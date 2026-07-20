@@ -1,0 +1,17 @@
+# #227/#228 host-test harness for the PURE minimal DNS A-query codec (net/dns.rs). Runs OFF-target
+# on the host (std) via `cargo run` — the firmware crate is no_std/riscv32imc and can't host-test,
+# so this #[path]-includes the REAL dns.rs (no drift) and asserts golden query bytes, a synthetic
+# CNAME-chain + compression-pointer response, and malformed/tampered rejection (every parse failure
+# must degrade to the baked fallback IP, never panic). Mirrors experiments/relay_compat.
+[package]
+name = "dns_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "dns_verify"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 0
