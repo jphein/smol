@@ -753,11 +753,10 @@ impl FamState {
             return None;
         }
         // Honour a bias (call / greet) when that peer is still present.
-        if let Some(b) = self.bias_to {
-            if cand[..n].contains(&b) {
+        if let Some(b) = self.bias_to
+            && cand[..n].contains(&b) {
                 return Some(b);
             }
-        }
         // Otherwise pick among the nearer half, rotated by seq so it varies (it
         // "wanders" rather than pinning to the single strongest peer).
         let strong = n.div_ceil(2);

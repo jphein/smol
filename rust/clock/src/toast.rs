@@ -140,14 +140,12 @@ fn wrap(s: &str) -> ([(usize, usize); ROWS], usize) {
         }
         // Full line mid-word → prefer the last space (word wrap); no space → hard split (both
         // at char boundaries).
-        if cols == COLS {
-            if let Some(b) = break_at {
-                if b > start {
+        if cols == COLS
+            && let Some(b) = break_at
+                && b > start {
                     line_end = b;
                     next = b;
                 }
-            }
-        }
         lines[n] = (start, line_end);
         n += 1;
         cursor = next;

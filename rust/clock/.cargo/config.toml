@@ -40,20 +40,15 @@ build-std = ["core", "alloc"]
 [registries.crates-io]
 protocol = "sparse"
 
-# #140 esp-wifi RX-buffer tuning (heap-gated — see scratch/smol-ha-batt/140-heap-audit.md).
-# We ran esp-wifi 0.15's stock-low defaults (rx_queue 5 / static_rx 10 / dynamic_rx 32 / rx_ba_win 6),
+# #140 RX-buffer tuning (heap-gated — see scratch/smol-ha-batt/140-heap-audit.md).
+# We ran the stock-low defaults (rx_queue 5 / static_rx 10 / dynamic_rx 32 / rx_ba_win 6),
 # which starve sustained RX and were a co-cause of the mid-body OTA-fetch stalls (nebula finding 3 /
 # esp-hosted #184). The bump is UNLOCKED by growing the heap 72→128 KiB (net::init_heap) — the audit
 # showed ~120 KB of DRAM free and only ~5.9 KB heap headroom at the old size, so tuning buffers on the
-# 72 KiB heap would OOM. Keys/ranges verified against esp-wifi 0.15's generated config table; each
-# static RX buffer ≈ 1.6 KB, allocated at esp_wifi::init from the (now-grown) esp-alloc heap.
+# 72 KiB heap would OOM. Each static RX buffer ≈ 1.6 KB, allocated at radio init from the esp-alloc heap.
 # HW-GATE-HELD: throughput/stability win only provable on the deaf-list/fetch rig (pairs with #143).
-[env]
-# 10→16: more 802.11 RX headroom (IDF throughput profile uses 16–25). +~9.6 KB permanent at init.
-ESP_WIFI_CONFIG_STATIC_RX_BUF_NUM = "16"
-# 32→40: on-demand ceiling; must be ≥ static_rx_buf_num. Freed as the TCP stack drains each frame.
-ESP_WIFI_CONFIG_DYNAMIC_RX_BUF_NUM = "40"
-# 5→8: deeper RX frame queue to ride short bursts without drop.
-ESP_WIFI_CONFIG_RX_QUEUE_SIZE = "8"
-# 6→12: bigger Block-Ack RX window for AMPDU throughput. MUST stay ≤ static_rx_buf_num (16). iperf 9–12.
-ESP_WIFI_CONFIG_RX_BA_WIN = "12"
+#
+# #233: esp-radio 0.18 moved ALL of these RX knobs out of build-env into the runtime
+# `ControllerConfig` — static_rx 16 / dynamic_rx 40 / rx_queue 8 / rx_ba_win 12 are now applied
+# in net::radio_controller_config() (threaded into wifi::new). esp-config HARD-ERRORS on unknown
+# ESP_RADIO_CONFIG_* env keys, and RX_QUEUE_SIZE is no longer one, so there is no [env] block.

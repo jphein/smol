@@ -43,18 +43,19 @@
 extern crate alloc;
 
 use esp_hal::{
+    interrupt::software::SoftwareInterruptControl,
     rng::Rng,
     time::Instant,
     timer::timg::TimerGroup,
 };
-use esp_wifi::{
+use embassy_futures::block_on;
+use esp_radio::{
     esp_now::{EspNow, EspNowWifiInterface, PeerInfo, BROADCAST_ADDRESS},
-    wifi::{WifiController, WifiMode},
-    EspWifiController,
+    wifi::{scan::ScanConfig, sta::StationConfig, Config, WifiController},
 };
 
 use crate::led::LedState;
-use crate::net::WifiPeripherals;
+use crate::net::{SmolWifiDevice, WifiPeripherals};
 // #13: the relay-family wire codec + ASCII field helpers live in the PURE, host-testable
 // `net::wire` module (extracted from here, byte-identical). Glob-imported so every call site
 // below (encode_relay, parse_relay[2], *relayack*, encode_dl, write_u5/u10, parse_id/u5/u10,
@@ -261,12 +262,12 @@ const SCAN_SSID_MAX: usize = 12;
 /// stripped (they're free-form → keep the record parseable); BSSIDs are truncated to 3 octets
 /// (PUBLIC-repo topic — a full BSSID is a privacy leak). `|none` when the scan found nothing.
 /// Panic-free (heap `String`); the caller bounds it to `RELAY_VALUE_MAX` at broadcast/publish.
-fn format_scan_record(aps: &[esp_wifi::wifi::AccessPointInfo]) -> alloc::string::String {
+fn format_scan_record(aps: &[esp_radio::wifi::ap::AccessPointInfo]) -> alloc::string::String {
     use core::fmt::Write;
     let mut s = alloc::string::String::from("SCAN");
     for ap in aps.iter().take(SCAN_MAX_APS) {
         let mut ssid = alloc::string::String::new();
-        for c in ap.ssid.chars().take(SCAN_SSID_MAX) {
+        for c in ap.ssid.as_str().chars().take(SCAN_SSID_MAX) {
             ssid.push(if c == '|' || c == ',' { '_' } else { c });
         }
         let b = ap.bssid;
@@ -1808,7 +1809,7 @@ pub enum Mode {
 ///
 /// The `EspWifiController` and `WifiController` are kept alive for `'static`
 /// (leaked once at construction) so the radio stays initialised for the life
-/// of the program — we never re-run `esp_wifi::init`, which is both expensive
+/// of the program — we never re-run `esp_radio::init`, which is both expensive
 /// and, per esp-wifi's docs, must happen exactly once.
 pub struct RadioManager {
     controller: WifiController<'static>,
@@ -1822,7 +1823,7 @@ pub struct RadioManager {
     /// and is available again for periodic relay flushes (`flush_telemetry`). The
     /// smoltcp stack is built/dropped inside each burst, so between bursts this is
     /// just an idle handle that doesn't contend with ESP-NOW on ch6.
-    sta: Option<esp_wifi::wifi::WifiDevice<'static>>,
+    sta: Option<SmolWifiDevice>,
     /// Kept for the SNTP ephemeral-port seed during the burst.
     rng: Rng,
     mode: Mode,
@@ -2051,17 +2052,24 @@ impl RadioManager {
         super::init_heap();
 
         let timg0 = TimerGroup::new(p.timg0);
-        let rng = Rng::new(p.rng);
-        // esp-wifi's `init` takes the RNG by value; `Rng` is a `Copy` handle
-        // (not the entropy itself), so we keep our own copy for the SNTP
-        // ephemeral-port seed while also handing one to `init`.
-        let ctrl: EspWifiController<'static> = esp_wifi::init(timg0.timer0, rng).ok()?;
-        let ctrl: &'static EspWifiController<'static> =
-            alloc::boxed::Box::leak(alloc::boxed::Box::new(ctrl));
-
-        let (mut controller, interfaces) = esp_wifi::wifi::new(ctrl, p.wifi).ok()?;
-        controller.set_mode(WifiMode::Sta).ok()?;
-        controller.start().ok()?;
+        let sw = SoftwareInterruptControl::new(p.sw_int);
+        // #233: start the esp-rtos scheduler that backs esp-radio's os-adapter BEFORE
+        // wifi::new (NON-embassy: start() pins THIS context as the main task and returns).
+        esp_rtos::start(timg0.timer0, sw.software_interrupt0);
+        // `Rng` is a `Copy` handle (not entropy itself); kept for the SNTP ephemeral-port seed.
+        let rng = Rng::new();
+        // 0.18: WIFI is 'static → wifi::new returns an owned 'static controller + interfaces
+        // (no EspWifiController Box::leak). STA mode derives from the Config::Station set in
+        // associate(); the old explicit set_mode(WifiMode::Sta) is gone in 0.18.
+        let (mut controller, interfaces) =
+            esp_radio::wifi::new(p.wifi, super::radio_controller_config()).ok()?;
+        // #233: esp-radio 0.18 has no controller.start(); `set_config` is what STARTS the
+        // WiFi driver. ESP-NOW rides the STA interface and needs the driver started even on a
+        // leaf that never associates, so start it here in STA mode with an empty config.
+        // associate() later re-configs with real creds + connect_async().
+        controller
+            .set_config(&Config::Station(StationConfig::default()))
+            .ok()?;
         // #139: assert PowerSaveMode::None at RADIO INIT — the esp-wifi/IDF default is
         // WIFI_PS_MIN_MODEM (the STA sleeps between DTIMs; the AP then buffers UNICAST at DTIM and
         // drops it on marginal links → the re-ARP-after-reply / forwarded-NTP-never-arrives /
@@ -2069,21 +2077,22 @@ impl RadioManager {
         // (which resets ps to the default), and the post-is_connected() sites stay belt-and-
         // suspenders. Shared by every espnow association (NTP/MQTT/OTA/re-election). See nebula
         // finding 2 (scratch/smol-ha-batt/nebula-c3-wifi-research.md).
-        let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
+        let _ = controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
         crate::net::assert_max_tx_power(); // #141: 8.5 dBm clamp, right after driver start
 
         // #68/#76 SELF-MAC: capture our STA MAC (ESP-NOW rides the STA interface) so service()
         // can DROP frames from our own address. The esp-wifi RX queue can deliver our own
         // broadcasts back to us; with no self-filter the gateway rosters ITSELF (constant-RSSI,
         // age-0, flags-3 self-entry — roster anomaly #1) and wastes an eviction-immune slot.
-        let self_mac = interfaces.sta.mac_address();
+        let self_mac = interfaces.station.mac_address();
 
         Some(Self {
             controller,
             self_mac,
             esp_now: interfaces.esp_now,
             // Keep the STA device alive for the NTP burst; dropped afterward.
-            sta: Some(interfaces.sta),
+            // #233: wrapped in the smoltcp phy::Device shim (net::radio_dev).
+            sta: Some(SmolWifiDevice::new(interfaces.station)),
             rng,
             mode: Mode::WifiSta,
             id,
@@ -2514,7 +2523,7 @@ impl RadioManager {
             Mode::EspNow => {
                 // TIME-SHARE: relinquish the AP association so nothing else
                 // steers the channel, then pin the fixed ESP-NOW channel.
-                let _ = self.controller.disconnect();
+                let _ = block_on(self.controller.disconnect_async());
                 // Keep the MAC/PHY powered (do NOT stop the controller) so the
                 // esp_now handle stays valid; just retune the channel.
                 self.esp_now
@@ -2529,14 +2538,14 @@ impl RadioManager {
                 // COEXIST: come back to the AP. Re-associating retunes the PHY
                 // to the AP's channel automatically; ESP-NOW then coexists on
                 // that channel. (Caller must have valid credentials set.)
-                let _ = self.controller.connect();
+                let _ = block_on(self.controller.connect_async());
                 // #139: connect() resets power-save to the WIFI_PS_MIN_MODEM default, so the
                 // association/auth handshake that follows would otherwise run under modem-sleep
                 // (unicast-deaf window). Re-assert None NOW — before the handshake completes — not
                 // only after the downstream is_connected() gates (MQTT flush / OTA fetch).
                 let _ = self
                     .controller
-                    .set_power_saving(esp_wifi::config::PowerSaveMode::None);
+                    .set_power_saving(esp_radio::wifi::PowerSaveMode::None);
                 crate::net::assert_max_tx_power(); // #141
                 log::info!("smol: radio -> WiFi STA (coexist)");
             }
@@ -2815,7 +2824,7 @@ impl RadioManager {
         // scan_n = scan_with_config_sync_max(Default, N): a synchronous full-band scan capped at N
         // results. We cap generously then keep the strongest few, so a busy band still yields the
         // most-relevant APs.
-        let record = match self.controller.scan_n(16) {
+        let record = match block_on(self.controller.scan_async(&ScanConfig::default())) {
             Ok(mut aps) => {
                 // Strongest RSSI first (descending → Reverse of the ascending key).
                 aps.sort_by_key(|a| core::cmp::Reverse(a.signal_strength));
@@ -2852,7 +2861,7 @@ impl RadioManager {
         }
         let net = &crate::secrets::WIFI_NETWORK;
         // Strongest ch6 BSSID if any; else strongest overall; else None (plain reconnect on creds).
-        let (bssid, pin_ch6): (Option<[u8; 6]>, bool) = match self.controller.scan_n(16) {
+        let (bssid, pin_ch6): (Option<[u8; 6]>, bool) = match block_on(self.controller.scan_async(&ScanConfig::default())) {
             Ok(aps) => {
                 if let Some(a) = aps
                     .iter()
@@ -2866,19 +2875,22 @@ impl RadioManager {
             }
             Err(_) => (None, false),
         };
-        let _ = self.controller.disconnect();
-        let _ = self
-            .controller
-            .set_configuration(&esp_wifi::wifi::Configuration::Client(
-                esp_wifi::wifi::ClientConfiguration {
-                    ssid: net.ssid.into(),
-                    password: net.pass.into(),
-                    bssid,
-                    channel: if pin_ch6 { Some(6) } else { None },
-                    ..Default::default()
-                },
-            ));
-        let _ = self.controller.connect();
+        let _ = block_on(self.controller.disconnect_async());
+        // #233: StationConfig has private fields — build via BuilderLite setters.
+        // #233: 0.18 with_bssid/with_channel take the INNER value (wrapping in Some), so only
+        // call them when we actually have a bssid / a pinned channel; otherwise leave the
+        // StationConfig defaults (None).
+        let mut sta_cfg = StationConfig::default()
+            .with_ssid(net.ssid)
+            .with_password(net.pass.into());
+        if let Some(b) = bssid {
+            sta_cfg = sta_cfg.with_bssid(b);
+        }
+        if pin_ch6 {
+            sta_cfg = sta_cfg.with_channel(6);
+        }
+        let _ = self.controller.set_config(&Config::Station(sta_cfg));
+        let _ = block_on(self.controller.connect_async());
         log::warn!(
             "smol #204: crown deaf → ch6-prefer reassoc (ch6_found={}, bssid_set={})",
             pin_ch6,
@@ -3047,21 +3059,19 @@ impl RadioManager {
         // `main` populated it (espnow build). ASCII by construction (as_wire/to_wire/hex/F24). HA
         // reconstructs the same string from its command topics + plain-string-compares (luna's
         // `sensor.smol_<id>_config_applied` + drift binary_sensor) — no hash primitive needed.
-        if e.cfg_len > 0 {
-            if let Ok(cfg) = core::str::from_utf8(&e.cfg[..e.cfg_len as usize]) {
+        if e.cfg_len > 0
+            && let Ok(cfg) = core::str::from_utf8(&e.cfg[..e.cfg_len as usize]) {
                 rec.push_str("|cfg=");
                 rec.push_str(cfg);
             }
-        }
         // #72: append the io registry's bound-input press counters (io=<pin>:<count>,…) AFTER cfg=.
         // `io`-gated + only when populated → the DIAG string is byte-identical on a non-io build.
         #[cfg(feature = "io")]
-        if self.diag_io_len > 0 {
-            if let Ok(io) = core::str::from_utf8(&self.diag_io[..self.diag_io_len]) {
+        if self.diag_io_len > 0
+            && let Ok(io) = core::str::from_utf8(&self.diag_io[..self.diag_io_len]) {
                 rec.push_str("|io=");
                 rec.push_str(io);
             }
-        }
         // #13 MESH-TEST rig: surface the deaf-list state so a leftover entry is visible in HA at a
         // glance (the anti-"won't-rejoin-ghost" guard) — `deaf` = active entries, `ddrops` = frames
         // dropped by it. `mesh-test`-gated → the DIAG string is byte-identical on a production build.
@@ -3569,11 +3579,10 @@ impl RadioManager {
         // Release images are serial-silent, so this retained record is the ONLY fleet-visible signal
         // of WHY a self-fetch died (the blindness that turned tonight's mid-body deaths into a
         // three-hour diagnosis). `id` avoids borrowing self across the field set.
-        if !ok {
-            if let Some(rec) = fail {
+        if !ok
+            && let Some(rec) = fail {
                 self.ota_self_fail = Some(rec);
             }
-        }
         ok
     }
 
@@ -3695,7 +3704,7 @@ impl RadioManager {
         use crate::ota_mesh::{
             self as om, LeafOtaOutcome, CHUNK_PAYLOAD, WINDOW_BYTES, WINDOW_CHUNKS,
         };
-        use esp_bootloader_esp_idf::ota::Slot;
+        use esp_bootloader_esp_idf::partitions::AppPartitionSubType;
         if !self.relay.is_gateway {
             return LeafOtaOutcome::RelayFailed;
         }
@@ -3723,10 +3732,10 @@ impl RadioManager {
             let _ = self.switch(Mode::EspNow); // ch6 (the flush left us in WifiSta)
             let mut s = 0u16;
             while s < 40 {
-                if !matches!(self.controller.is_connected(), Ok(true)) {
+                if !self.controller.is_connected() {
                     break;
                 }
-                let _ = self.controller.disconnect();
+                let _ = block_on(self.controller.disconnect_async());
                 s = s.saturating_add(1);
                 if tick() {
                     return LeafOtaOutcome::Aborted;
@@ -3735,7 +3744,7 @@ impl RadioManager {
             let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
             if !self.esp_now.peer_exists(&BROADCAST_ADDRESS) {
                 let _ = self.esp_now.add_peer(PeerInfo {
-                    interface: EspNowWifiInterface::Sta,
+                    interface: EspNowWifiInterface::Station,
                     peer_address: BROADCAST_ADDRESS,
                     lmk: None,
                     channel: None,
@@ -3760,8 +3769,8 @@ impl RadioManager {
                         let _ = self.esp_now.send(&BROADCAST_ADDRESS, &otam_pre[..pre_len]);
                         last = t;
                     }
-                    if let Some(recv) = self.esp_now.receive() {
-                        if recv.info.src_address == leaf_mac {
+                    if let Some(recv) = self.esp_now.receive()
+                        && recv.info.src_address == leaf_mac {
                             let armed = matches!(
                                 om::parse_ldbg(recv.data(), leaf_id),
                                 Some((_, 1, _, _))
@@ -3773,7 +3782,6 @@ impl RadioManager {
                                 break; // leaf armed pre-fetch → its is_active hold now carries ch6
                             }
                         }
-                    }
                 }
                 log::info!("smol #3b: pre-fetch arm burst done (leaf id{})", leaf_id);
             }
@@ -3791,7 +3799,7 @@ impl RadioManager {
         let _ = self.switch(Mode::EspNow);
         let _ = self.switch(Mode::WifiSta);
         let rng = self.rng;
-        let mut staged: Option<Slot> = None;
+        let mut staged: Option<AppPartitionSubType> = None;
         let fetched = match self.sta.as_mut() {
             Some(sta) => crate::net::wifi::run_ota_fetch(
                 &mut self.controller, sta, rng, announce, tick, true, &mut staged, &mut None,
@@ -3826,7 +3834,7 @@ impl RadioManager {
         // below proves whether the send now succeeds.
         if !self.esp_now.peer_exists(&BROADCAST_ADDRESS) {
             let _ = self.esp_now.add_peer(PeerInfo {
-                interface: EspNowWifiInterface::Sta,
+                interface: EspNowWifiInterface::Station,
                 peer_address: BROADCAST_ADDRESS,
                 lmk: None,
                 channel: None,
@@ -3842,10 +3850,10 @@ impl RadioManager {
         // the STA held on — settle>0 confirms this WAS the off-channel egress.
         let mut settle: u16 = 0;
         while settle < 40 {
-            if !matches!(self.controller.is_connected(), Ok(true)) {
+            if !self.controller.is_connected() {
                 break;
             }
-            let _ = self.controller.disconnect();
+            let _ = block_on(self.controller.disconnect_async());
             settle = settle.saturating_add(1);
             if tick() {
                 return LeafOtaOutcome::Aborted;
@@ -3901,15 +3909,14 @@ impl RadioManager {
             if t.saturating_sub(last_wake_ms) >= WAKE_GAP_MS {
                 let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
                 otam_tx = otam_tx.saturating_add(1);
-                if let Ok(waiter) = self.esp_now.send(&BROADCAST_ADDRESS, &otam[..otam_len]) {
-                    if waiter.wait().is_ok() {
+                if let Ok(waiter) = self.esp_now.send(&BROADCAST_ADDRESS, &otam[..otam_len])
+                    && waiter.wait().is_ok() {
                         otam_ok = otam_ok.saturating_add(1);
                     }
-                }
                 last_wake_ms = t;
             }
-            if let Some(recv) = self.esp_now.receive() {
-                if recv.info.src_address == leaf_mac {
+            if let Some(recv) = self.esp_now.receive()
+                && recv.info.src_address == leaf_mac {
                     rx_any = rx_any.saturating_add(1);
                     if let Some((h, v, n, c)) = om::parse_ldbg(recv.data(), leaf_id) {
                         ldbg_heard = h;
@@ -3924,7 +3931,6 @@ impl RadioManager {
                         break; // leaf armed + NAKing → proceed to the windowed transfer
                     }
                 }
-            }
         }
 
         let mut wb: u32 = 0;
@@ -3981,11 +3987,10 @@ impl RadioManager {
                     // (send_to swallows it) to prove egress.
                     let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
                     otam_tx = otam_tx.saturating_add(1);
-                    if let Ok(waiter) = self.esp_now.send(&BROADCAST_ADDRESS, &otam[..otam_len]) {
-                        if waiter.wait().is_ok() {
+                    if let Ok(waiter) = self.esp_now.send(&BROADCAST_ADDRESS, &otam[..otam_len])
+                        && waiter.wait().is_ok() {
                             otam_ok = otam_ok.saturating_add(1);
                         }
-                    }
                 }
                 for i in 0..wlen_chunks as usize {
                     if (missing >> i) & 1 == 1 {
@@ -4003,8 +4008,8 @@ impl RadioManager {
                 let mut advanced = false;
                 let mut got_nak = false;
                 while now_ms() < deadline {
-                    if let Some(recv) = self.esp_now.receive() {
-                        if recv.info.src_address == leaf_mac {
+                    if let Some(recv) = self.esp_now.receive()
+                        && recv.info.src_address == leaf_mac {
                             rx_any = rx_any.saturating_add(1); // #3: heard SOMETHING from the leaf
                             // #3: capture the leaf's LDBG self-report (latest wins) — names WHY
                             // otan=0 without needing the leaf back online post-relay.
@@ -4016,8 +4021,7 @@ impl RadioManager {
                             }
                             if let Some(om::OtaFrame::Nak { origin, session: s, window_base, bitmap }) =
                                 om::parse_ota_frame(recv.data())
-                            {
-                                if origin == leaf_id && s == session && window_base as u32 == wb {
+                                && origin == leaf_id && s == session && window_base as u32 == wb {
                                     otan_valid = otan_valid.saturating_add(1); // #3: valid OTAN
                                     let miss = om::bitmap_to_u64(bitmap) & full;
                                     if miss == 0 {
@@ -4028,9 +4032,7 @@ impl RadioManager {
                                     }
                                     break;
                                 }
-                            }
                         }
-                    }
                 }
                 if advanced {
                     // #157: an all-zero OTAN at the LAST window base is the leaf's finalize-ack —
@@ -4820,14 +4822,13 @@ impl RadioManager {
                     // seq is more than +1 beyond the last, the in-between seqs
                     // were lost. (Only counts forward jumps; reordering/wrap is
                     // treated as no loss to avoid huge spurious counts.)
-                    if let Some(prev) = self.bench.peer_last_seq {
-                        if seq > prev {
+                    if let Some(prev) = self.bench.peer_last_seq
+                        && seq > prev {
                             self.bench.lost_count = self
                                 .bench
                                 .lost_count
                                 .wrapping_add(seq - prev - 1);
                         }
-                    }
                     // Track the highest peer seq (what our own beacons echo).
                     if self.bench.peer_last_seq.is_none_or(|p| seq > p) {
                         self.bench.peer_last_seq = Some(seq);
@@ -5301,11 +5302,10 @@ impl RadioManager {
             self.leaf_ota_mac = Some((id, mac)); // freshest wins; refresh the session cache
             return Some(mac);
         }
-        if let Some((cid, mac)) = self.leaf_ota_mac {
-            if cid == id {
+        if let Some((cid, mac)) = self.leaf_ota_mac
+            && cid == id {
                 return Some(mac); // roster evicted it mid-session → use the session cache
             }
-        }
         // #68 roster-admission robustness: the roster (a 16-slot LRU with no staleness reaping)
         // can EVICT a leaf that HELLOs sparsely while a chatty peer stays resident — so a leaf the
         // gateway currently RELAYS/STATs (id8, live) can be absent from `mac_for_id`, silently
@@ -5343,7 +5343,7 @@ impl RadioManager {
             }
         }
         let _ = self.esp_now.add_peer(PeerInfo {
-            interface: EspNowWifiInterface::Sta,
+            interface: EspNowWifiInterface::Station,
             peer_address: mac,
             lmk: None,
             channel: None,
@@ -5676,11 +5676,10 @@ pub fn start(
     radio.elected_owner = elect.owner_id;
     // #51 B: if we associated, seed the initial RSSI-to-AP so the first recovery
     // election already has a real signal-strength reading to compare on.
-    if reached_dhcp {
-        if let Ok(r) = radio.controller.rssi() {
+    if reached_dhcp
+        && let Ok(r) = radio.controller.rssi() {
             radio.my_rssi_to_ap = r.clamp(-127, 0) as i8;
         }
-    }
     // #23 fix: persist the boot election's staleness observation → a leaf's later
     // recovery re-election measures the owner's seq freshness FROM this first sample.
     radio.mc_seen_owner = elect.seen_owner;

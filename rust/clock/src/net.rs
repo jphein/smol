@@ -9,6 +9,13 @@
 #[cfg(feature = "wifi")]
 mod wifi;
 
+// #233: smoltcp `phy::Device` shim over esp-radio 0.18's raw rx/tx tokens (esp-radio
+// dropped esp-wifi's `smoltcp` feature). Transitional — deleted when #198 lands embassy-net.
+#[cfg(feature = "wifi")]
+mod radio_dev;
+#[cfg(feature = "wifi")]
+pub use radio_dev::SmolWifiDevice;
+
 /// #141: clamp the radio's max TX power. Cheap C3-supermini boards distort their own TX at
 /// full power (worse on marginal USB supplies) — the AP receives corrupted auth/ACK frames
 /// (the "auth expired at strong signal" / silent-hostapd / mid-transfer-stall class). Units
@@ -185,6 +192,21 @@ pub(crate) use wifi::NTP_RESYNC_AGE_S;
 #[cfg(feature = "wifi")]
 pub fn init_heap() {
     esp_alloc::heap_allocator!(size: 128 * 1024);
+}
+
+/// #233/#140: the esp-radio 0.18 controller config. In the old esp-wifi 0.15 stack the
+/// RX-buffer counts were compile-time `ESP_WIFI_CONFIG_*` env knobs (.cargo/config.toml);
+/// in 0.18 they are runtime `ControllerConfig` fields threaded into `wifi::new`. The
+/// #140 tuning (static_rx 16 / dynamic_rx 40 / rx_ba_win 12, unlocked by the 128 KiB heap
+/// above) is re-applied here; `ESP_RADIO_CONFIG_RX_QUEUE_SIZE` stays the env knob. Shared
+/// by both radio-init paths (`wifi::try_time_sync` and `mode::RadioManager::new`).
+#[cfg(feature = "wifi")]
+pub(crate) fn radio_controller_config() -> esp_radio::wifi::ControllerConfig {
+    esp_radio::wifi::ControllerConfig::default()
+        .with_static_rx_buf_num(16)
+        .with_dynamic_rx_buf_num(40)
+        .with_rx_queue_size(8)
+        .with_rx_ba_win(12)
 }
 
 /// Phase-1 (default) placeholder used when no radio features are enabled: the

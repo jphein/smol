@@ -326,7 +326,7 @@ pub fn stat_build(value: &[u8]) -> Option<u32> {
 // with otadata untouched (the good slot boots; a hard brick ⇒ USB recovery, §4).
 // ===========================================================================
 
-use esp_bootloader_esp_idf::ota::Slot;
+use esp_bootloader_esp_idf::partitions::AppPartitionSubType;
 
 /// Emit a gap-NAK if a window stays incomplete this long since the last NAK (ms).
 const LEAF_IDLE_NAK_MS: u64 = 500;
@@ -436,7 +436,7 @@ pub enum LeafAction {
     /// The image is fully received AND verified (sig + size + readback sha). Activate
     /// this slot with the manifest build# — [`crate::ota::activate`] reboots into it
     /// (never returns on success); the build# tags the self-test exemption marker.
-    Complete(Slot, u32),
+    Complete(AppPartitionSubType, u32),
     /// The session aborted (bad frame class handled internally) — discard; nothing to send.
     Abort,
 }
@@ -489,7 +489,7 @@ pub struct OtaLeafSession {
     /// The last window's base seq — the OTAN window_base the finalize-ack carries.
     finalize_wb: u32,
     /// The verified target slot to activate (captured before `finalize()` consumed the writer).
-    finalize_slot: Option<Slot>,
+    finalize_slot: Option<AppPartitionSubType>,
     /// Finalize-acks emitted so far this session (bounded by `LEAF_FINALIZE_ACK_MAX`).
     finalize_acks_sent: u8,
 }

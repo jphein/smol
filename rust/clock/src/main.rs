@@ -62,7 +62,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 // bootloader auto-reverts too, if it was built with rollback enabled). rc.0 puts
 // `software_reset` in `esp_hal::system`, NOT `esp_hal::reset` (spike-verified).
 #[cfg(feature = "wifi")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "Rust" fn custom_halt() -> ! {
     // #70 observability: record that THIS reset was a PANIC before we reboot. A panic halts
     // here → software_reset, which the SoC logs as a plain `CoreSw` (same as an intentional
@@ -532,7 +532,7 @@ fn main() -> ! {
         net::try_time_sync(
             net::WifiPeripherals {
                 timg0: peripherals.TIMG0,
-                rng: peripherals.RNG,
+                sw_int: peripherals.SW_INTERRUPT,
                 wifi: peripherals.WIFI,
             },
             &mut batt_cache,
@@ -586,7 +586,7 @@ fn main() -> ! {
         net::mode::start(
             net::WifiPeripherals {
                 timg0: peripherals.TIMG0,
-                rng: peripherals.RNG,
+                sw_int: peripherals.SW_INTERRUPT,
                 wifi: peripherals.WIFI,
             },
             // This unit's short id (see NODE_ID) — embedded in HELLO/ACK/BEACON/TIME
@@ -857,8 +857,8 @@ fn main() -> ! {
             let do_install = !r.leaf_ota_pending()
                 && !r.leaf_installs_outstanding()
                 && (crate::ota::OTA_AUTO_INSTALL || r.take_install_request());
-            if do_install {
-                if let Some(announce) = r.take_ota_offer() {
+            if do_install
+                && let Some(announce) = r.take_ota_offer() {
                     // #195: bound the mesh-deaf hammer — if THIS build's self-fetch has already
                     // failed SELF_OTA_MAX_RETRIES times in a row (e.g. a #204 broken-downstream
                     // crown), STOP re-triggering. The retained arm is deliberately kept (#134: a
@@ -910,7 +910,6 @@ fn main() -> ! {
                         redraw = true;
                     }
                 }
-            }
             // A gateway's SMOLv1 BATT downlink (buffered in `service`) → store it in
             // our cache so LEAVES render HA battery voltages too. `store` validates
             // the `BATT|` marker; a repaint shows fresh data at once. (A gateway
@@ -934,8 +933,8 @@ fn main() -> ! {
             // past the origin NTP node's, so the mesh converges and stops
             // swapping (loop-free — see net::mode's TimeTracker + should_adopt).
             // Checked every subtick so a never-synced board picks up time fast.
-            if let Some((punix, psynced, pid)) = r.take_time_offer() {
-                if should_adopt(my_synced_at, psynced) {
+            if let Some((punix, psynced, pid)) = r.take_time_offer()
+                && should_adopt(my_synced_at, psynced) {
                     let old = my_synced_at;
                     base_unix = punix;
                     anchor_ms = now;
@@ -950,7 +949,6 @@ fn main() -> ! {
                     bottom_line = alloc::string::String::from("mesh");
                     log::info!("smol: adopted mesh time (synced_at {} -> {})", old, psynced);
                 }
-            }
             // ~every 2 s advertise ourselves (HELLO drives the LED handshake).
             // 2000 ms / SUBTICK_MS aligned via the monotonic clock.
             if (now / 2000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 2000) {
@@ -1368,8 +1366,8 @@ fn main() -> ! {
             // #48: pull the relayed LED-mode config (leaf) and update the held mode. Edge-safe:
             // a garbage/unknown value parses to None → keep the current mode (never a bad LED).
             // On the gateway, its OWN led config is applied via the gateway-own path (deferred).
-            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_LED) {
-                if let Some(m) = led::LedMode::from_wire(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_LED)
+                && let Some(m) = led::LedMode::from_wire(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
                     if m != led_mode {
                         log::info!("smol #48: LED mode -> {:?}", m);
                         // #114 U2: an APPLIED config change rides the DIAG record's cfg= field —
@@ -1379,35 +1377,32 @@ fn main() -> ! {
                     }
                     led_mode = m;
                 }
-            }
 
             // #43: pull the relayed/gateway-own display-units config (key `U`, fleet-global via
             // broadcast target 255) and update the held `Units`. Edge-safe: a garbage/partial
             // value parses to None → keep the current units (never a half-applied unit). Same
             // unified path as LED: a leaf gets it relayed, the gateway injects its own (GwOwnCfg).
-            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_UNITS) {
-                if let Some(u) = units::Units::from_wire(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_UNITS)
+                && let Some(u) = units::Units::from_wire(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
                     if u != units {
                         log::info!("smol #43: display units -> {:?}", u);
                         diag_dirty = true; // #114 U2: expedite DIAG (units ride cfg=) — see LED above
                     }
                     units = u;
                 }
-            }
 
             // #55: pull the relayed/gateway-own plugin-visibility mask (key `P`) and update it.
             // Edge-safe: garbage/partial hex parses to None → keep the current mask (never blanks
             // the menu). The mask filters Home-menu rows; a masked-off LIVE screen is caught after
             // `ctx` is built (below) and falls back to the board default.
-            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_PLUGINS) {
-                if let Some(m) = menu::parse_plugin_mask(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_PLUGINS)
+                && let Some(m) = menu::parse_plugin_mask(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
                     if m != plugin_mask {
                         log::info!("smol #55: plugin mask -> {:#06x}", m);
                         diag_dirty = true; // #114 U2: expedite DIAG (mask rides cfg=) — see LED above
                     }
                     plugin_mask = m;
                 }
-            }
 
             // #45: pull the relayed / gateway-own Custom-screen layout (key `Y`) and store the raw
             // RESOLVED wire (entities already substituted HA-side) for the Custom plugin to render.
@@ -1498,8 +1493,8 @@ fn main() -> ! {
             // reset outputs). On change: re-bind the free GPIOs via io::apply_wire (validates +
             // rejects reserved/unknown pins). No NVS — survives reboot via the gateway's re-relay.
             #[cfg(feature = "io")]
-            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_IO) {
-                if o.len != io_wire_len || io_wire[..o.len] != o.buf[..o.len] {
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_IO)
+                && (o.len != io_wire_len || io_wire[..o.len] != o.buf[..o.len]) {
                     io_wire[..o.len].copy_from_slice(&o.buf[..o.len]);
                     io_wire_len = o.len;
                     let n = io::apply_wire(&mut io_pins, &o.buf[..o.len]);
@@ -1510,19 +1505,17 @@ fn main() -> ! {
                     }
                     log::info!("smol #72 io: pin-map applied ({} B, {} pins bound)", o.len, n);
                 }
-            }
             // #72: the relayed / gateway-own output states (key `g`). EDGE-triggered on a CHANGE;
             // drives each bound OUTPUT to its commanded level (io::apply_set no-ops on unbound /
             // input slots). Held in io_set_wire so a later `G` re-bind re-asserts it.
             #[cfg(feature = "io")]
-            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_IO_SET) {
-                if o.len != io_set_len || io_set_wire[..o.len] != o.buf[..o.len] {
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_IO_SET)
+                && (o.len != io_set_len || io_set_wire[..o.len] != o.buf[..o.len]) {
                     io_set_wire[..o.len].copy_from_slice(&o.buf[..o.len]);
                     io_set_len = o.len;
                     let n = io::apply_set(&mut io_pins, &o.buf[..o.len]);
                     log::info!("smol #72 io: output states set ({} B, {} driven)", o.len, n);
                 }
-            }
 
             // #197: a transient on-glass toast (key `M`) — a COMMAND (cache-bypass, one-shot, NEVER
             // cached → never re-toasts on reboot). Value = `[~<dur>]<msg>`; `toast::parse_wire` splits
