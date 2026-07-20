@@ -249,6 +249,21 @@ const DIAG_PREFIX: &[u8] = b"SMOLv1 DIAG "; // + "NNN" + verbatim "up=.. bt=.. r
 /// never confuses them. Value bounded by `RELAY_VALUE_MAX`.
 const SCAN_PREFIX: &[u8] = b"SMOLv1 SCAN "; // + "NNN" + verbatim "<ssid>,<bssid3>,<ch>,<rssi>|…"
 
+/// #190: enforce policy for the group-MAC (Fork B / B1). `false` = OBSERVE release: append the MAC
+/// on TX, verify on RX, count `mac_ok`/`mac_fail`, but SOFT-ACCEPT un-MAC'd / bad-MAC frames so a
+/// mixed fleet never partitions (design §7.1). Flip to `true` in a later ENFORCE release once the
+/// observe soak shows `mac_fail≈0` steady-state on a quiet fleet — then a frame that fails the MAC
+/// is DROPPED before the parser. The failure mode of enforce is "drops some frames," never a
+/// hardware-layer deafness (the MAC is an appended field, not ESP-NOW encryption). HW-held into v345.
+const MAC_ENFORCE: bool = false;
+
+/// #190: max observability-record value (`DIAG`/`SCAN`) that fits a plain single-hop frame ONCE the
+/// group-MAC trailer is appended at `send_to`: `MTU − MAC_TRAILER_LEN − prefix(12) − id(3)`. Below
+/// the pre-auth `RELAY_VALUE_MAX` (232) by exactly `MAC_TRAILER_LEN`, so `frame + trailer ≤ ESP_NOW_MTU`
+/// (design §4.1 budget). `DIAG_PREFIX.len() == SCAN_PREFIX.len() == 12`. The record tail (cfg=/io=,
+/// appended last) is what truncates — key-parsed by HA, so a lost tail field degrades gracefully.
+const OBS_VALUE_MAX: usize = ESP_NOW_MTU - MAC_TRAILER_LEN - DIAG_PREFIX.len() - 3;
+
 /// #71: max APs in one scan record (strongest-RSSI first) — bounds the record under
 /// `RELAY_VALUE_MAX` and keeps the mesh frame small.
 const SCAN_MAX_APS: usize = 5;
@@ -530,6 +545,14 @@ struct DiagCounters {
     dedup: u32,
     ttl: u32,
     dfwd: u32,
+    /// #190 group-MAC (Fork B / B1) observe counters, mirroring ota_mesh's `verify_ok`/`verify_fail`.
+    /// `mac_ok` = inbound frames whose truncated HMAC-SHA256 verified against the group key; `mac_fail`
+    /// = frames with no valid MAC (legacy un-MAC'd during the observe rollout, wrong key/epoch, or a
+    /// forgery). Surfaced as `mo=`/`mf=` in DIAG. The observe-phase watch: `mac_ok` should climb
+    /// fleet-wide and `mac_fail` fall to ≈0 once every board is MAC'ing — the gate for the enforce flip
+    /// (design §7.1). Bumped BOTH on a leaf and a gateway (every node verifies what it hears).
+    mac_ok: u32,
+    mac_fail: u32,
     /// #13 MESH-TEST rig ONLY: count of inbound frames dropped by the deaf-list (surfaced as
     /// `ddrops=` in DIAG). A production build has no deaf-list, so this field doesn't exist.
     #[cfg(feature = "mesh-test")]
@@ -548,6 +571,8 @@ impl DiagCounters {
             dedup: 0,
             ttl: 0,
             dfwd: 0,
+            mac_ok: 0,
+            mac_fail: 0,
             #[cfg(feature = "mesh-test")]
             ddrops: 0,
         }
@@ -2775,7 +2800,9 @@ impl RadioManager {
         msg[base] = b'0' + own / 100;
         msg[base + 1] = b'0' + (own / 10) % 10;
         msg[base + 2] = b'0' + own % 10;
-        let n = value.len().min(crate::net::wifi::RELAY_VALUE_MAX);
+        // #190: clamp to OBS_VALUE_MAX (< RELAY_VALUE_MAX by MAC_TRAILER_LEN) so this plain single-hop
+        // frame + the group-MAC trailer `send_to` appends stays ≤ ESP_NOW_MTU.
+        let n = value.len().min(OBS_VALUE_MAX);
         msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
         self.relay_wrap_observability(&msg[..base + 3 + n]);
@@ -2794,7 +2821,8 @@ impl RadioManager {
         msg[base] = b'0' + own / 100;
         msg[base + 1] = b'0' + (own / 10) % 10;
         msg[base + 2] = b'0' + own % 10;
-        let n = value.len().min(crate::net::wifi::RELAY_VALUE_MAX);
+        // #190: clamp to OBS_VALUE_MAX (see broadcast_diag) so frame + group-MAC trailer ≤ ESP_NOW_MTU.
+        let n = value.len().min(OBS_VALUE_MAX);
         msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
         self.relay_wrap_observability(&msg[..base + 3 + n]);
@@ -3074,6 +3102,10 @@ impl RadioManager {
             self.diag.dfwd,
             etx_worst, // #164 worst per-peer link cost (0 = all perfect … 253 = dragging … 255 = isolated)
         );
+        // #190 group-MAC (Fork B / B1) observe counters. Appended AFTER the fixed positional fields
+        // (like cfg=/io=) so the deployed dashboard's positional parse of the fixed set is intact;
+        // HA picks these by key. `mo`/`mf` = frames whose group HMAC verified / failed (design §7.1).
+        rec.push_str(&alloc::format!("|mo={}|mf={}", self.diag.mac_ok, self.diag.mac_fail));
         // #74 item 3 (stage-2): fold in the APPLIED-config string for HA config-drift, ONLY when
         // `main` populated it (espnow build). ASCII by construction (as_wire/to_wire/hex/F24). HA
         // reconstructs the same string from its command topics + plain-string-compares (luna's
@@ -4386,7 +4418,20 @@ impl RadioManager {
                 // Copy the source MAC out FIRST (Copy) so the `recv.data()` borrow in the
                 // parse below doesn't collide with the identity-guard MAC compare.
                 let src_mac = recv.info.src_address;
-                if let Some(Frame::Stat { src, value }) = parse_frame(recv.data()) {
+                // #190: strip the group-MAC trailer before parsing — a v345 leaf's STAT now carries
+                // it, and `om::stat_build` would choke on the 9-byte tail. This confirm loop is a
+                // local PROGRESSION gate (a mis-verdict at worst mis-labels the HA card, never bricks
+                // — see the window comment above), so it soft-accepts un-MAC'd/bad frames regardless
+                // of MAC_ENFORCE; the main `service` path owns the enforce policy + the mo=/mf= counters.
+                let cdata = recv.data();
+                let cframe = match verify_group_mac(
+                    cdata,
+                    &[(crate::secrets::GROUP_KEY_EPOCH, &crate::secrets::GROUP_KEY)],
+                ) {
+                    MacVerdict::Ok { payload_len } => &cdata[..payload_len],
+                    MacVerdict::Fail => cdata,
+                };
+                if let Some(Frame::Stat { src, value }) = parse_frame(cframe) {
                     if src == leaf_id {
                         if let Some(b) = om::stat_build(value) {
                             last_build = Some(b); // keep the latest — the settled state wins
@@ -4898,8 +4943,36 @@ impl RadioManager {
 
     /// Low-level send helper: fire one frame and wait for the TX callback so we
     /// don't overrun the single in-flight ESP-NOW send slot.
+    ///
+    /// #190 (Fork B / B1): this is the SINGLE TX choke every `broadcast_*`/relay helper funnels
+    /// through, so the group-MAC auth trailer is appended HERE — once — for every SMOLv1 frame.
+    /// The gate `starts_with(b"SMOLv1 ")` is load-bearing: `send_to` ALSO carries the #25 WLED
+    /// WiZmote frame to a THIRD-PARTY WLED controller, which must NOT receive a trailer. The frame
+    /// builders reserve `MAC_TRAILER_LEN` out of the MTU (`UP2_INNER_MAX`, `OBS_VALUE_MAX`), so the
+    /// fit check never fails for a real frame; if it ever did, we send raw rather than exceed the
+    /// MTU. The OTA-mesh sends (OTAM/OTAD/OTAN) bypass `send_to` entirely and carry their own
+    /// ed25519 signature, so they are (intentionally) untouched by the group MAC.
     fn send_to(&mut self, dst: &[u8; 6], data: &[u8]) {
-        match self.esp_now.send(dst, data) {
+        let mut buf = [0u8; ESP_NOW_MTU];
+        // #190: append the group-MAC trailer only when `should_group_mac` says so — a pure decision
+        // (host-tested) that EXCLUDES the OTA family (OTAM/OTAD/OTAN/LDBG). Those frames are
+        // consumed by `parse_ota_frame`/`parse_ldbg` BEFORE the RX verify-then-strip, so a trailer
+        // would never be removed → a MAC'd OTAN is dropped (bitmap over-cap) and a MAC'd partial
+        // OTAD chunk corrupts the image (finalize-SHA mismatch). Non-SMOLv1 (WLED) + over-MTU
+        // frames are likewise sent verbatim.
+        let out: &[u8] = if should_group_mac(data) {
+            buf[..data.len()].copy_from_slice(data);
+            let n = append_group_mac(
+                &mut buf,
+                data.len(),
+                &crate::secrets::GROUP_KEY,
+                crate::secrets::GROUP_KEY_EPOCH,
+            );
+            &buf[..n]
+        } else {
+            data
+        };
+        match self.esp_now.send(dst, out) {
             Ok(waiter) => {
                 let _ = waiter.wait();
             }
@@ -4973,7 +5046,35 @@ impl RadioManager {
                 continue;
             }
 
-            match parse_frame(recv.data()) {
+            // #190 (Fork B / B1) VERIFY-THEN-PARSE: check the group-MAC and STRIP its trailer before
+            // the parser runs. OTA frames were consumed above (their own ed25519 gate) and our own
+            // frames were dropped at the self-MAC filter, so everything here is a peer SMOLv1 frame.
+            // OBSERVE (MAC_ENFORCE=false): SOFT-ACCEPT — parse regardless, but count ok/fail so the
+            // rollout is measurable (design §7.1). ENFORCE: DROP a frame that fails the MAC before it
+            // reaches the parser. A group-key/epoch mishap manifests as leaf HELLO-drop → owner-churn,
+            // NOT a crown-deaf-shed (design §7.3) — `mac_fail` is the telemetry that tells the two
+            // apart, so it must be counted SEPARATELY from RF-deafness signals.
+            let raw = recv.data();
+            let payload: &[u8] = match verify_group_mac(
+                raw,
+                // Accepted (epoch, key) set. Rotation: add `(GROUP_KEY_EPOCH + 1, &GROUP_KEY_NEXT)`
+                // as a second pair for the one-release overlap window (design §4.1), then drop the old.
+                &[(crate::secrets::GROUP_KEY_EPOCH, &crate::secrets::GROUP_KEY)],
+            ) {
+                MacVerdict::Ok { payload_len } => {
+                    self.diag.mac_ok = self.diag.mac_ok.saturating_add(1);
+                    &raw[..payload_len]
+                }
+                MacVerdict::Fail => {
+                    self.diag.mac_fail = self.diag.mac_fail.saturating_add(1);
+                    if MAC_ENFORCE {
+                        continue; // enforce: an un-MAC'd / bad-MAC frame never reaches the parser
+                    }
+                    raw // observe: soft-accept — a legacy un-MAC'd frame parses verbatim (no trailer)
+                }
+            };
+
+            match parse_frame(payload) {
                 Some(Frame::Snk(f)) => {
                     // An MMO-snake frame proves the peer is audible → counts
                     // toward the LED "detected" state exactly like HELLO/BEACON.

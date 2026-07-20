@@ -1,0 +1,22 @@
+# #190 host-test harness for the PURE group-HMAC-SHA256 transport-auth codec (net/wire.rs, Fork B / B1).
+# Runs OFF-target on the host (std) via `cargo run` — the firmware crate is no_std/riscv32imc and can't
+# host-test, so this #[path]-includes the REAL wire.rs (no drift) and exercises hmac_sha256 /
+# append_group_mac / verify_group_mac: RFC 4231 known-answer vectors (the correctness proof for the
+# hand-rolled HMAC), append→verify round-trip, tamper/wrong-key/wrong-epoch rejection, epoch-rotation
+# dual-accept, and the MTU/trailer budget invariants. Mirrors experiments/relay_compat + etx_verify.
+# `sha2` supplies the SHA-256 the HMAC is built on (same crate the firmware uses under `espnow`).
+[package]
+name = "mac_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "mac_verify"
+path = "src/main.rs"
+
+[dependencies]
+sha2 = "0.10"
+
+[profile.dev]
+opt-level = 0
