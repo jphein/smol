@@ -164,6 +164,13 @@ mod batt;
 #[cfg(feature = "wifi")]
 mod grid;
 
+// #227 weather screen (Weather): the display-only Plugin + its `WxCache` — the Batt/Grid
+// display-case shape with the SOURCE being the gateway's Open-Meteo HTTP fetch during the
+// flush window (net/wifi.rs::fetch_weather) instead of an HA retained topic; leaves fill
+// the cache from the WX2 freshness flood.
+#[cfg(feature = "wifi")]
+mod weather;
+
 // OTA self-update engine (issue #6): announce parse/gate, streaming image writer
 // (HTTP body → flash + HW-SHA), otadata slot activate, and the first-boot
 // self-test/rollback (MF-1). Needs radio + flash-from-running-fw → wifi-only.
@@ -506,6 +513,17 @@ fn main() -> ! {
     // from the gateway's SMOLv1 GRID frame (`take_grid_offer`). cfg(wifi).
     #[cfg(feature = "wifi")]
     let mut grid_cache = grid::GridCache::new();
+
+    // --- #227 weather cache (Weather screen) ---------------------------------
+    // The Batt/Grid twin with an HTTP source: owned by `main`, borrowed read-only via
+    // `Ctx::wx`, filled on the GATEWAY by the Open-Meteo fetch riding the flush window
+    // (threaded &mut into `flush_telemetry` → `run_mqtt_burst` → `fetch_weather`) and,
+    // on a leaf, from the gateway's SMOLv1 WX2 flood (`take_wx_offer`). cfg(wifi).
+    // (cfg_attr: both fill paths — the gateway fetch and the WX2 offer — are espnow-only, so
+    // on plain wifi the cache is never mutated; the Weather screen renders its empty state.)
+    #[cfg(feature = "wifi")]
+    #[cfg_attr(not(feature = "espnow"), allow(unused_mut))]
+    let mut wx_cache = weather::WxCache::new();
 
     // --- Radio bring-up (feature-dependent) ----------------------------------
     // Each branch yields `synced` (Option<u32> Unix time at boot). Phase 3 also
@@ -927,6 +945,13 @@ fn main() -> ! {
                 grid_cache.store(&o.buf[..o.len], now);
                 redraw = true;
             }
+            // #227: the gateway's SMOLv1 WX2 weather flood, buffered in `service`,
+            // stored so leaves render the weather too. `store` validates the `WX|`
+            // marker + a full parse (mirror of BATT/GRID, plus the parse gate).
+            if let Some(o) = r.take_wx_offer() {
+                wx_cache.store(&o.buf[..o.len], now);
+                redraw = true;
+            }
             // Mesh time adoption: if a peer's clock descends from a STRICTLY
             // newer authoritative sync than ours, re-anchor onto its estimate
             // NOW and INHERIT its `synced_at` (not `now`). Because freshness
@@ -1027,6 +1052,16 @@ fn main() -> ! {
             {
                 let unix_now = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
                 r.broadcast_grid(grid_cache.bytes(), unix_now);
+            }
+            // #227 WX2 re-broadcast: same ~10 s gateway-only cadence as BATT/GRID
+            // (weather moves even slower; the DlOrigin seq bumps only on a CHANGED
+            // reading, so relays re-flood a new fetch once and stay quiet otherwise).
+            if r.is_gateway()
+                && !wx_cache.is_empty()
+                && (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000)
+            {
+                let unix_now = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
+                r.broadcast_wx(wx_cache.bytes(), unix_now);
             }
             // #21 leaf-relay: a GATEWAY re-broadcasts each cached leaf's dashboard-set
             // default screen as a SMOLv1 CFG frame on the SAME ~10 s cadence as
@@ -1221,7 +1256,7 @@ fn main() -> ! {
                     // #40: a flush that hears a leaf's retained OTA install surfaces
                     // `(leaf_id, staged announce)` here → relayed below.
                     let mut leaf_ota: Option<(u8, ota::Announce)> = None;
-                    r.flush_telemetry(own.as_bytes(), stat.as_bytes(), &mut batt_cache, &mut grid_cache, &mut leaf_ota, &mut || {
+                    r.flush_telemetry(own.as_bytes(), stat.as_bytes(), &mut batt_cache, &mut grid_cache, &mut wx_cache, &mut leaf_ota, &mut || {
                         let t = millis();
                         led.apply(led::LedState::WifiSync, t);
                         if matches!(button.poll(t), Some(input::Press::Long)) {
@@ -1619,6 +1654,9 @@ fn main() -> ! {
             batt: &batt_cache,
             #[cfg(feature = "wifi")]
             grid: &grid_cache,
+            // #227 weather cache — read by the Weather plugin (the Batt/Grid twin).
+            #[cfg(feature = "wifi")]
+            wx: &wx_cache,
             #[cfg(feature = "espnow")]
             label: bottom_line.as_str(),
             #[cfg(feature = "espnow")]

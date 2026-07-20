@@ -3736,6 +3736,182 @@ fn mqtt_session(
     connected
 }
 
+// ---------------------------------------------------------------------------
+// #227 weather-on-glass — one-shot Open-Meteo fetch riding the flush window
+// ---------------------------------------------------------------------------
+
+/// #227: re-fetch cadence — the gateway refreshes its weather at most once per 30 minutes
+/// (weather moves slowly; Open-Meteo asks for ≤ 1 req/min courtesy — this is 2/hour).
+#[cfg(feature = "espnow")]
+const WX_REFRESH_MS: u64 = 30 * 60 * 1000;
+/// #227: whole-fetch budget (DNS + TCP + HTTP + parse) — the watch reference's 8 s bound.
+#[cfg(feature = "espnow")]
+const WX_FETCH_BUDGET: Duration = Duration::from_secs(8);
+/// The ONE real hostname smol resolves (#228 part-2 — everything else is IP-only by design).
+/// The URL path is built from the git-ignored `board.rs` lat/lon consts; the `Host:` header
+/// is always this name (Open-Meteo is name-routed behind a shared frontend, so the header
+/// matters even when connecting to the fallback IP).
+#[cfg(feature = "espnow")]
+const WEATHER_HOST: &str = "api.open-meteo.com";
+
+/// #227: fetch current weather `(temp_f, wmo_code)` from Open-Meteo over the STILL-LIVE
+/// flush association. One-shot, bounded by [`WX_FETCH_BUDGET`], `tick`-abortable, and
+/// fail-soft (`None` — the caller keeps the previous reading; boot/flush never block on it).
+///
+/// Resolve order (the #228 part-2 decision, documented in `net/dns.rs`): a single DNS
+/// A-query via the DHCP-provided resolver (`dns_ip`, captured this burst) → on ANY failure
+/// (no resolver / timeout / hostile reply) the baked `board::WEATHER_FALLBACK_IP`. The HTTP
+/// exchange reuses the burst's TCP socket via the `publish_ota_progress` recycle idiom
+/// (abort → wait-Closed → connect → wait-Established), HTTP/1.0 + `Connection: close` ⇒
+/// read-until-EOF framing — the exact shape of the esp32c6-watch reference `weather.rs`.
+#[cfg(feature = "espnow")]
+#[allow(clippy::too_many_arguments)]
+fn fetch_weather(
+    iface: &mut Interface,
+    device: &mut esp_wifi::wifi::WifiDevice,
+    sockets: &mut SocketSet,
+    tcp_handle: smoltcp::iface::SocketHandle,
+    dns_handle: smoltcp::iface::SocketHandle,
+    rng: &mut Rng,
+    dns_ip: Option<core::net::Ipv4Addr>,
+    tick: &mut dyn FnMut() -> bool,
+) -> Option<(i16, u8)> {
+    let deadline = Instant::now() + WX_FETCH_BUDGET;
+
+    // --- resolve: one-shot A-query (≤ 2 s sub-bound) → fallback IP ---------------------
+    let mut host_ip: Option<[u8; 4]> = None;
+    if let Some(dns) = dns_ip {
+        let txid = (rng.random() & 0xFFFF) as u16;
+        let mut q = [0u8; crate::net::dns::DNS_QUERY_MAX];
+        if let Some(qn) = crate::net::dns::encode_a_query(txid, WEATHER_HOST, &mut q) {
+            {
+                let s = sockets.get_mut::<udp::Socket>(dns_handle);
+                let _ = s.bind(49152 + (rng.random() % 16384) as u16);
+                let _ = s.send_slice(&q[..qn], (IpAddress::Ipv4(dns), crate::net::dns::DNS_PORT));
+            }
+            let dns_cap = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < dns_cap && Instant::now() < deadline {
+                if tick() {
+                    return None;
+                }
+                iface.poll(smoltcp_now(), device, sockets);
+                let s = sockets.get_mut::<udp::Socket>(dns_handle);
+                if s.can_recv() {
+                    let mut rb = [0u8; crate::net::dns::DNS_RESPONSE_MAX];
+                    if let Ok((n, _meta)) = s.recv_slice(&mut rb) {
+                        host_ip = crate::net::dns::parse_a_response(txid, &rb[..n]);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    // The fallback keeps the failure mode identical to smol's IP-only norm. (Deliberately
+    // not logging the IP or the board.rs lat/lon — environment-private values.)
+    let ip = match host_ip {
+        Some(a) => {
+            log::info!("smol #227: {} resolved via DNS", WEATHER_HOST);
+            a
+        }
+        None => {
+            log::info!("smol #227: DNS unavailable/failed — using the baked fallback IP");
+            crate::board::WEATHER_FALLBACK_IP
+        }
+    };
+
+    // --- HTTP/1.0 GET over the burst's TCP socket (the publish_ota_progress recycle) ----
+    sockets.get_mut::<tcp::Socket>(tcp_handle).abort();
+    loop {
+        iface.poll(smoltcp_now(), device, sockets);
+        if sockets.get_mut::<tcp::Socket>(tcp_handle).state() == tcp::State::Closed {
+            break;
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+    }
+    let src_port = 49152 + (rng.random() % 16384) as u16;
+    let remote = (
+        IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(ip[0], ip[1], ip[2], ip[3])),
+        80u16,
+    );
+    if sockets
+        .get_mut::<tcp::Socket>(tcp_handle)
+        .connect(iface.context(), remote, src_port)
+        .is_err()
+    {
+        return None;
+    }
+    loop {
+        if tick() {
+            return None;
+        }
+        iface.poll(smoltcp_now(), device, sockets);
+        match sockets.get_mut::<tcp::Socket>(tcp_handle).state() {
+            tcp::State::Established => break,
+            tcp::State::Closed => return None,
+            _ => {}
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+    }
+    // Build + send the request. Piecewise into a stack buffer (≤ ~190 B with sane lat/lon);
+    // an over-long board const refuses rather than sending a truncated URL.
+    let mut req = [0u8; 256];
+    let mut rl = 0usize;
+    for part in [
+        &b"GET /v1/forecast?latitude="[..],
+        crate::board::WEATHER_LAT.as_bytes(),
+        b"&longitude=",
+        crate::board::WEATHER_LON.as_bytes(),
+        b"&current=temperature_2m,weather_code&temperature_unit=fahrenheit HTTP/1.0\r\nHost: ",
+        WEATHER_HOST.as_bytes(),
+        b"\r\nConnection: close\r\n\r\n",
+    ] {
+        if rl + part.len() > req.len() {
+            return None;
+        }
+        req[rl..rl + part.len()].copy_from_slice(part);
+        rl += part.len();
+    }
+    if !tcp_send(iface, device, sockets, tcp_handle, &req[..rl], deadline, tick) {
+        return None;
+    }
+    // Read until EOF (peer FIN + drained — the `Connection: close` framing) or buffer/budget
+    // exhaustion. Headers + JSON fit well under 1.5 KB and both keys appear early, so a
+    // truncated tail still parses (the watch's "parse what we have" behavior).
+    let mut resp = [0u8; 1536];
+    let mut filled = 0usize;
+    loop {
+        if tick() {
+            return None;
+        }
+        iface.poll(smoltcp_now(), device, sockets);
+        {
+            let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
+            if s.can_recv() {
+                if let Ok(n) = s.recv_slice(&mut resp[filled..]) {
+                    filled += n;
+                }
+            }
+            if filled == resp.len() || !s.may_recv() {
+                break;
+            }
+        }
+        if Instant::now() > deadline {
+            break;
+        }
+    }
+    sockets.get_mut::<tcp::Socket>(tcp_handle).abort(); // leave the shared socket clean
+
+    let resp = &resp[..filled];
+    if !(resp.starts_with(b"HTTP/1.0 200") || resp.starts_with(b"HTTP/1.1 200")) {
+        return None;
+    }
+    crate::net::wx::parse_open_meteo(resp)
+}
+
 /// Gateway flush → **MQTT burst** (`espnow` gateway only; v2 — this REPLACES the
 /// retired UDP-to-collector egress). The caller has ALREADY triggered re-association
 /// via `RadioManager::switch(Mode::WifiSta)`; here we build a fresh smoltcp stack on
@@ -3762,6 +3938,10 @@ pub fn run_mqtt_burst(
     messages: &[(u8, &[u8])],
     batt: &mut crate::batt::BattCache,
     grid: &mut crate::grid::GridCache,
+    // #227: `Some` on a gateway flush → the post-session slot re-fetches Open-Meteo into the
+    // cache when it's stale (≥ WX_REFRESH_MS). `None` on leaf/recovery bursts (gateway-only,
+    // like `cfg_cache`).
+    wx: Option<&mut crate::weather::WxCache>,
     // #23 fix: caller-OWNED election state (seeded from the live RadioManager role +
     // its persistent staleness observation), filled by `mqtt_session` and read BACK
     // by the caller so the role re-decides at runtime — not just at boot.
@@ -3820,11 +4000,12 @@ pub fn run_mqtt_burst(
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
     let mut iface = create_interface(device);
-    // #26 cast adds one UDP socket (the WLED pixel-stream) to the set.
+    // #26 cast adds one UDP socket (the WLED pixel-stream) to the set; #227 adds one more
+    // (the one-shot DNS A-query for the weather fetch) — hence 4/5.
     #[cfg(not(feature = "cast"))]
-    let mut sockets_storage: [SocketStorage; 3] = Default::default();
-    #[cfg(feature = "cast")]
     let mut sockets_storage: [SocketStorage; 4] = Default::default();
+    #[cfg(feature = "cast")]
+    let mut sockets_storage: [SocketStorage; 5] = Default::default();
     let mut sockets = SocketSet::new(&mut sockets_storage[..]);
 
     let mut dhcp_socket = dhcpv4::Socket::new();
@@ -3856,6 +4037,22 @@ pub fn run_mqtt_burst(
         udp::PacketBuffer::new(&mut warm_tx_meta[..], &mut warm_tx[..]),
     );
     let warm_handle = sockets.add(warm_socket);
+
+    // #227: a small UDP socket for the weather fetch's one-shot DNS A-query (the #228 part-2
+    // resolve-with-fallback). TX sized for the ~36 B query; RX for a realistic answer (CNAME
+    // chain + a few A records ≤ 512 B — an over-long reply is truncated → parse fails → the
+    // baked fallback IP takes over). Touched ONLY by `fetch_weather` in the post-session slot.
+    let mut dns_rx_meta = [udp::PacketMetadata::EMPTY; 1];
+    let mut dns_tx_meta = [udp::PacketMetadata::EMPTY; 1];
+    let mut dns_rx = [0u8; crate::net::dns::DNS_RESPONSE_MAX];
+    let mut dns_tx = [0u8; 64];
+    let dns_handle = {
+        let s = udp::Socket::new(
+            udp::PacketBuffer::new(&mut dns_rx_meta[..], &mut dns_rx[..]),
+            udp::PacketBuffer::new(&mut dns_tx_meta[..], &mut dns_tx[..]),
+        );
+        sockets.add(s)
+    };
 
     // #26 cast: a real UDP socket for the WLED DNRGB pixel-stream (present only in a
     // cast build). TX sized for one full DNRGB chunk (4 + 3*128 = 388 B ⇒ 512 with
@@ -3925,6 +4122,10 @@ pub fn run_mqtt_burst(
     }
 
     // Fresh DHCP lease each burst (the interface was just rebuilt).
+    // #227: also capture the DHCP-provided DNS resolver (previously discarded — smol is
+    // IP-only everywhere else). Used ONLY by the weather fetch's one-shot A-query; absent
+    // (or failing) → the fetch goes straight to the baked fallback IP.
+    let mut dns_ip: Option<core::net::Ipv4Addr> = None;
     loop {
         if tick() {
             return false; // #20 abort during flush DHCP wait
@@ -3933,7 +4134,10 @@ pub fn run_mqtt_burst(
         let configured = {
             let socket = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
             match socket.poll() {
-                Some(dhcpv4::Event::Configured(cfg)) => Some((cfg.address, cfg.router)),
+                Some(dhcpv4::Event::Configured(cfg)) => {
+                    dns_ip = cfg.dns_servers.first().copied();
+                    Some((cfg.address, cfg.router))
+                }
                 _ => None,
             }
         };
@@ -4034,6 +4238,42 @@ pub fn run_mqtt_burst(
             deadline,
             tick,
         );
+    }
+
+    // #227 weather-on-glass: refresh the weather over the STILL-LIVE association (the cast
+    // slot precedent above — the MQTT DISCONNECT only closed the TCP socket, not the STA
+    // link). Gateway flushes only (`wx` = Some), at most once per WX_REFRESH_MS. It runs on
+    // its OWN small budget (WX_FETCH_BUDGET, watch-parity 8 s) rather than the flush
+    // `deadline`: the fetch fires ≤ 2×/hour, so an extra bounded WiFi-committed window twice
+    // an hour is negligible next to cast's per-flush hold — and a session that consumed the
+    // 15 s flush budget must not starve a 30-minute-cadence fetch indefinitely. `tick()`
+    // still aborts it. Fire-and-forget: any failure logs and leaves the cache untouched (the
+    // fleet keeps rendering the previous reading + its age).
+    if let Some(wx) = wx {
+        let now = Instant::now().duration_since_epoch().as_millis();
+        let stale = match wx.fetched_at() {
+            None => true,
+            Some(t) => now.saturating_sub(t) >= WX_REFRESH_MS,
+        };
+        if stale && session_ok {
+            if let Some((temp_f, code)) = fetch_weather(
+                &mut iface,
+                device,
+                &mut sockets,
+                tcp_handle,
+                dns_handle,
+                &mut rng,
+                dns_ip,
+                tick,
+            ) {
+                let mut pl = [0u8; crate::net::wx::WX_PAYLOAD_MAX];
+                let n = crate::net::wx::encode_wx(temp_f, code, &mut pl);
+                wx.store(&pl[..n], Instant::now().duration_since_epoch().as_millis());
+                log::info!("smol #227: weather {} F, WMO {} — cached", temp_f, code);
+            } else {
+                log::info!("smol #227: weather fetch failed — keeping previous reading");
+            }
+        }
     }
 
     session_ok

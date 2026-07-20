@@ -93,6 +93,23 @@ pub mod cast;
 #[cfg(feature = "cast")]
 pub mod cast_oled;
 
+// #227 weather-on-glass: the PURE weather codec (no-serde Open-Meteo JSON scrape, the
+// `WX|<tempF>|<code>` mesh-payload codec, the WMO→label table). Host-tested in
+// experiments/wx_verify, no HAL deps — the `wire`/`flood` pattern. wifi-gated: the Weather
+// screen (wifi, like Batt) parses the payload; the fetch/scrape half (parse_open_meteo /
+// encode_wx) is espnow-only, so the wifi-without-espnow profile allows dead-code on the module
+// (the same shape as net.rs's assert_max_tx_power cfg_attr).
+#[cfg(feature = "wifi")]
+#[cfg_attr(not(feature = "espnow"), allow(dead_code))]
+pub mod wx;
+
+// #227/#228: the PURE minimal DNS A-query codec (one-shot resolve of api.open-meteo.com over
+// the already-enabled smoltcp `socket-udp`; fallback = the git-ignored board.rs IP). Host-tested
+// in experiments/dns_verify. espnow-gated: its only driver is the weather fetch inside
+// `run_mqtt_burst` (espnow), exactly like `etx`/`flood`.
+#[cfg(feature = "espnow")]
+pub mod dns;
+
 // Deterministic magical node names (realm-sigil port). Needs no radio — a node
 // derives its OWN name and any peer's name from the logical id alone — so it is
 // compiled in ALL builds (peer names are only *displayed* under espnow, but our

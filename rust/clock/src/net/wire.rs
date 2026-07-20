@@ -23,6 +23,11 @@ pub const RELAYACK2_PREFIX: &[u8] = b"SMOLv1 RELAYACK2 "; // + "TTT MMMMM BBB H"
 /// #13 Stage B downlink freshness tags (10-digit `dl_seq` + verbatim `BATT|`/`GRID|` payload).
 pub const BATT2_PREFIX: &[u8] = b"SMOLv1 BATT2 ";
 pub const GRID2_PREFIX: &[u8] = b"SMOLv1 GRID2 ";
+/// #227 weather downlink tag — the third `encode_dl`/`parse_dl` freshness channel (payload
+/// `WX|<tempF>|<code>`, gateway-sourced from the Open-Meteo fetch). Diverges from every other
+/// tag at byte 7 (`'W'` — no other SMOLv1 tag starts with W), so `strip_prefix` never confuses
+/// it; an old firmware `classify()`s it to `None` (harmless — the #100 additive rule).
+pub const WX2_PREFIX: &[u8] = b"SMOLv1 WX2 ";
 /// #124 generic uplink envelope tag (see the UP2 section below). Diverges from `RELAY` at byte 7
 /// (`'U'` vs `'R'`), so `strip_prefix` never confuses it.
 pub const UP2_PREFIX: &[u8] = b"SMOLv1 UP2 "; // + "OOO MMMMM H " + <inner frame>
