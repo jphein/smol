@@ -292,6 +292,12 @@ const GW_WINDOW_ROUNDS_MAX: u32 = 16;
 /// WINDOW_MS` ≈ 60 s) + a STAT cadence (~10 s) so a late self-test rollback is observed
 /// before the gateway declares Confirmed.
 const GW_CONFIRM_TIMEOUT_MS: u64 = 120_000;
+/// #237 crown-delegate serve deadline: a holder's full serve (pre-arm + wake + windowed relay +
+/// Tier-2 confirm) can run several minutes and ALWAYS ends with an `ODON` (OK or a failure code);
+/// this backstops the ONLY no-ODON case — holder death mid-serve → the crown falls back to the #40
+/// gateway fetch. Set WELL ABOVE the holder's worst-case serve (≈8 min) so a live serve is never
+/// pre-empted into a double-source (§5.3). Normal path returns on the ODON long before this.
+const CROWN_DELEGATE_DEADLINE_MS: u64 = 12 * 60_000;
 /// #40: max consecutive TRANSIENT (mac-unknown / fetch / relay / timeout) relay attempts
 /// for one retained install before the gateway gives up + clears it — bounds the auto-retry
 /// so a persistently-failing leaf can't loop the (mesh-deaf) relay every flush forever.
@@ -1966,8 +1972,10 @@ pub struct RadioManager {
     /// The phase is stored as the rendered `&'static str` (not the espnow-only enum) so the
     /// shared `wifi::mqtt_session` signature stays buildable in the wifi-only profile. `retry_n`
     /// (#134) is the current consecutive-failure count for this outcome class — surfaced in the
-    /// retained payload (`fetch-failed retry=3`) so a stuck fetch is visible headlessly.
-    leaf_ota_diag: Option<(u8, &'static str, bool, u8)>,
+    /// retained payload (`fetch-failed retry=3`) so a stuck fetch is visible headlessly. #237: the
+    /// trailing `u8` is the serve SOURCE id — 0 = the gateway/crown (a #40 seed fetch or a
+    /// fallback), else the peer HOLDER that served it — surfaced as `src=` (spec §8.1 item 8).
+    leaf_ota_diag: Option<(u8, &'static str, bool, u8, u8)>,
     /// #139-followup/#147: on a failed SELF-fetch, `(chunk_k, chunk_n, retries, stalls, where)`
     /// buffered by `run_ota_update` → formatted + published retained to `smol/<id>/ota/diag` on the
     /// next gateway flush (fleet-visible failure diag; release images are serial-silent). `where` is
@@ -1987,6 +1995,19 @@ pub struct RadioManager {
     /// gateway can't self-OTA (rebooting) in that gap — starving a second leaf + inverting the order.
     /// The gateway updates itself LAST, only once every leaf's install has cleared.
     leaf_installs_outstanding: bool,
+    /// #237 peer-relay HOLDER state: a crown-delegated serve accepted via ODEL, recorded in the RX
+    /// drain (`handle_arb_frame`) and consumed by main.rs (the serve blocks, so it can't run in the
+    /// drain). One at a time — a second ODEL while set is ignored (holder single-session).
+    pending_serve: Option<crate::ota_mesh::PendingServe>,
+    /// #237: highest ODEL `term` (= the crown's MC seq) ever seen — reject a stale/dethroned crown's
+    /// ODEL (term < this), the §5.3 split-brain guard.
+    highest_arb_term: u16,
+    /// #237 CROWN baton (§8.2): `(leaf_id, build)` of the leaf this crown LAST confirmed healthy on
+    /// a serve. It is, by definition, a valid SOURCE for the next target on the same build → the
+    /// crown delegates the next serve to it (`baton_holder_for`) instead of a WiFi bulk fetch. The
+    /// FIRST target of a build has no baton → the crown seeds it the #40 way, then the baton passes
+    /// down the canary sequence. Reset implicitly by a build change (`baton_holder_for` build match).
+    last_confirmed_holder: Option<(u8, u32)>,
     /// #40 #3 STICKY MAC: `(leaf_id, mac)` captured the moment an armed leaf became addressable,
     /// held for the whole install session (cleared on a terminal `record_leaf_ota`). The roster
     /// is a bounded 16-slot LRU that EVICTS this leaf while the mesh-deaf relay stops hearing it
@@ -2143,6 +2164,9 @@ impl RadioManager {
             self_ota_fail_build: 0,
             leaf_ota_pending: false,
             leaf_installs_outstanding: false,
+            pending_serve: None,
+            highest_arb_term: 0,
+            last_confirmed_holder: None,
             leaf_ota_mac: None,
             leaf_relay_rx: None,
             config_offer: None,
@@ -3642,7 +3666,14 @@ impl RadioManager {
     /// retained install (terminal — the leaf installed or rolled back — or the transient-retry
     /// cap is hit) vs LEAVE it retained to retry (mac-unknown / fetch / relay / timeout). The
     /// phase is published to `smol/<leaf>/ota/diag` on the next burst (headless observability).
-    pub fn record_leaf_ota(&mut self, leaf_id: u8, outcome: crate::ota_mesh::LeafOtaOutcome) {
+    /// #237: `source_id` is the serve SOURCE — 0 = the gateway/crown (a #40 seed fetch or a
+    /// fallback), else the peer HOLDER id that served this leaf — surfaced on `ota/diag` as `src=`.
+    pub fn record_leaf_ota(
+        &mut self,
+        leaf_id: u8,
+        outcome: crate::ota_mesh::LeafOtaOutcome,
+        source_id: u8,
+    ) {
         // #134 clear/retry policy — THREE cases, not two:
         //  1. terminal (leaf DEFINITIVELY acted: installed / rolled-back / id-mismatch) → CLEAR,
         //     reset both counters.
@@ -3675,7 +3706,7 @@ impl RadioManager {
             "smol #40/#134: leaf id{} OTA phase={} (clear_install={}, reached_leaf={}, retry={})",
             leaf_id, outcome.as_str(), clear, outcome.reached_leaf(), retry_n
         );
-        self.leaf_ota_diag = Some((leaf_id, outcome.as_str(), clear, retry_n));
+        self.leaf_ota_diag = Some((leaf_id, outcome.as_str(), clear, retry_n, source_id));
         // #1 DECOUPLE: the relay session is done for this install iff we're clearing it
         // (terminal outcome or retry cap). While NOT cleared (transient retry) it stays
         // pending so the gateway keeps suppressing its own self-OTA until the leaf resolves.
@@ -3709,6 +3740,174 @@ impl RadioManager {
         self.leaf_installs_outstanding
     }
 
+    /// #237: take the crown-delegated serve accepted in the RX drain (if any). main.rs drives the
+    /// blocking `run_leaf_ota_relay(HolderActiveSlot, …)` + emits the ODON. One-shot (cleared on take).
+    #[cfg(feature = "espnow")]
+    pub fn take_pending_serve(&mut self) -> Option<crate::ota_mesh::PendingServe> {
+        self.pending_serve.take()
+    }
+
+    /// #237: send one crown↔holder ARBITRATION frame (`ODEL`/`ODON`) as a RAW ESP-NOW unicast.
+    /// Deliberately NOT routed through [`Self::send_to`]: once #248 (v346) lands, `send_to` appends a
+    /// 9-B group-MAC trailer on TX, but the OTA family (incl. these arbitration frames) is consumed
+    /// by the parser BEFORE any RX verify-then-strip, so a trailer would corrupt the frame (190L
+    /// review item 1). Registers the peer first (bounded-LRU evict if the HW table is full), then
+    /// fires + waits for the TX callback so we don't overrun the single in-flight send slot.
+    #[cfg(feature = "espnow")]
+    pub fn send_arb_raw(&mut self, dst: [u8; 6], frame: &[u8]) {
+        self.ensure_peer(dst, now_ms());
+        match self.esp_now.send(&dst, frame) {
+            Ok(waiter) => {
+                let _ = waiter.wait();
+            }
+            Err(e) => log::warn!("smol #237: arb-frame raw send failed: {:?}", e),
+        }
+    }
+
+    /// #237 CROWN baton term (§5.3 split-brain): the crown stamps every `ODEL` with its election
+    /// generation so a dethroned crown's stale delegation is refused at the holder (it rejects a
+    /// `term` older than the highest it has seen). Sourced from the MC election seq (`mc_seen_seq`),
+    /// which advances each election → a newly-elected crown out-terms the old one. Low 16 bits (the
+    /// wire `term` is `u16`; the guard needs only relative ordering within a roll).
+    pub fn crown_term(&self) -> u16 {
+        (self.mc_seen_seq & 0xFFFF) as u16
+    }
+
+    /// #237 CROWN baton source-pick (§8.2): the holder to DELEGATE the next serve to — the leaf this
+    /// crown last confirmed healthy, IFF it is running the exact `want_build`, is not the `target`
+    /// itself, and its MAC is resolvable (sticky). `None` ⇒ no baton (first target of a build, a
+    /// build change, or the holder's MAC is unknown) ⇒ the caller SEEDS via the #40 gateway fetch.
+    /// Reading the sticky MAC keeps the holder addressable across the minutes-long serve.
+    pub fn baton_holder_for(&mut self, want_build: u32, target: u8) -> Option<(u8, [u8; 6])> {
+        let (hid, hbuild) = self.last_confirmed_holder?;
+        if hbuild != want_build || hid == target {
+            return None;
+        }
+        let mac = self.mac_for_id_sticky(hid)?;
+        Some((hid, mac))
+    }
+
+    /// #237 CROWN baton advance (§8.2): record `leaf_id` (now confirmed on `build`) as the source for
+    /// the NEXT target. Called after a CONFIRMED serve — delegated OR seeded.
+    pub fn note_confirmed_holder(&mut self, leaf_id: u8, build: u32) {
+        self.last_confirmed_holder = Some((leaf_id, build));
+    }
+
+    /// #237 CROWN delegate-and-await (§8.2): delegate the serve of `leaf_id` to peer `holder`
+    /// (confirmed running the target build) instead of a gateway WiFi bulk-fetch. Fires the `ODEL`
+    /// — carrying the crown-staged `(M, sig)` — via RAW esp_now (NOT `send_to`: the #248 group-MAC
+    /// trailer would corrupt the OTA family, 190L item 1), then AWAITS the holder's matching `ODON`
+    /// within the serve deadline, keeping the UI + mesh alive (~1 Hz HELLO) throughout. Returns the
+    /// reported `ServeResult` on a matching ODON, `Some(Aborted)` on a long-press, or `None` on a
+    /// serve-deadline timeout / un-encodable manifest. THE CALLER FALLS BACK to the #40 gateway
+    /// fetch on `None` OR any non-`Ok` — the UNCONDITIONAL safety floor. BLOCKS for minutes like
+    /// `run_leaf_ota_relay`, so it runs from main.rs's loop, never the RX drain.
+    pub fn run_crown_delegate(
+        &mut self,
+        holder_id: u8,
+        holder_mac: [u8; 6],
+        leaf_id: u8,
+        announce: &crate::ota::Announce,
+        term: u16,
+        tick: &mut dyn FnMut() -> bool,
+    ) -> Option<crate::ota_mesh::ServeResult> {
+        use crate::ota_mesh as om;
+        // session mirrors the OTAM discriminator the holder emits (build & 0xFFFF), so the crown↔
+        // holder ODON correlates 1:1 with the leaf-facing session.
+        let session: u16 = (announce.build & 0xFFFF) as u16;
+        let mut odel = [0u8; om::ODEL_FRAME_MAX];
+        let Some(n) = om::encode_odel(
+            leaf_id,
+            announce.build,
+            session,
+            term,
+            announce.signed_msg(),
+            announce.sig(),
+            &mut odel,
+        ) else {
+            log::error!(
+                "smol #237: crown could not encode ODEL for build {} (M too large?) — falling back",
+                announce.build
+            );
+            return None;
+        };
+        let _ = self.switch(Mode::EspNow);
+        self.ensure_peer(holder_mac, now_ms());
+        // Opening BURST: fire a few ODELs so the holder catches one before it goes serve-busy
+        // (mesh-deaf). Once accepted it single-sessions + ignores dups; a fast failure ODON
+        // short-circuits the burst.
+        const ODEL_BURST: u8 = 6;
+        const ODEL_GAP_MS: u64 = 200;
+        for _ in 0..ODEL_BURST {
+            if tick() {
+                return Some(om::ServeResult::Aborted);
+            }
+            let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+            self.send_arb_raw(holder_mac, &odel[..n]);
+            let gap = now_ms() + ODEL_GAP_MS;
+            while now_ms() < gap {
+                if let Some(res) = self.poll_odon(holder_mac, leaf_id, session) {
+                    return Some(res);
+                }
+            }
+        }
+        // AWAIT the ODON. The holder's serve ALWAYS ends with an ODON (OK or a failure code); the
+        // only no-ODON case is holder death → the deadline backstops it → fall back. Keep a ~1 Hz
+        // HELLO so leaves don't re-elect while the crown waits (same posture as the #40 confirm).
+        let deadline = now_ms() + CROWN_DELEGATE_DEADLINE_MS;
+        let mut last_hello_ms = 0u64;
+        while now_ms() < deadline {
+            if tick() {
+                return Some(om::ServeResult::Aborted);
+            }
+            let t = now_ms();
+            if t.saturating_sub(last_hello_ms) >= 1000 {
+                let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+                self.broadcast_hello();
+                last_hello_ms = t;
+            }
+            if let Some(res) = self.poll_odon(holder_mac, leaf_id, session) {
+                log::info!(
+                    "smol #237: crown got ODON id{} build {} → {:?}",
+                    leaf_id, announce.build, res
+                );
+                return Some(res);
+            }
+        }
+        log::warn!(
+            "smol #237: crown DELEGATE serve-deadline elapsed (no ODON from holder id{}) — falling back to #40",
+            holder_id
+        );
+        None
+    }
+
+    /// #237: one bounded RX drain step for [`Self::run_crown_delegate`] — return a `ServeResult`
+    /// iff a matching `ODON` (from `holder_mac`, for `(leaf_id, session)`) is queued. Non-matching
+    /// frames are discarded (same direct-drain posture as the #40 relay). Bounded so it never
+    /// stalls the caller's tick.
+    fn poll_odon(
+        &mut self,
+        holder_mac: [u8; 6],
+        leaf_id: u8,
+        session: u16,
+    ) -> Option<crate::ota_mesh::ServeResult> {
+        use crate::ota_mesh as om;
+        for _ in 0..8 {
+            let recv = self.esp_now.receive()?;
+            if recv.info.src_address != holder_mac {
+                continue;
+            }
+            if let Some(om::ArbFrame::Odon { target, session: s, result, .. }) =
+                om::parse_arb_frame(recv.data())
+            {
+                if target == leaf_id && s == session {
+                    return Some(result);
+                }
+            }
+        }
+        None
+    }
+
     /// #40 GATEWAY leaf-mesh-OTA orchestration (§B4). Fetch the staged image (WiFi) into
     /// THIS gateway's inactive slot → relay it over ESP-NOW to ONE leaf (windowed-NAK) →
     /// watch for the leaf's Tier-2 STAT reappearance at the NEW build. CANARY-ONE-LEAF:
@@ -3718,6 +3917,7 @@ impl RadioManager {
     /// outcome for the HA `smol/<leaf>/ota/state` publish. No-op on a non-gateway.
     pub fn run_leaf_ota_relay(
         &mut self,
+        source: crate::ota_mesh::ServeSource,
         leaf_id: u8,
         leaf_mac: [u8; 6],
         announce: &crate::ota::Announce,
@@ -3730,7 +3930,10 @@ impl RadioManager {
             self as om, LeafOtaOutcome, CHUNK_PAYLOAD, WINDOW_BYTES, WINDOW_CHUNKS,
         };
         use esp_bootloader_esp_idf::ota::Slot;
-        if !self.relay.is_gateway {
+        // #237: a GATEWAY-fetch serve needs the crown role (it does the WiFi fetch); a HOLDER
+        // active-slot serve is authorized by the crown's ODEL (term/session + serve-time
+        // readback-sha verified by the caller), so it does NOT require is_gateway.
+        if matches!(source, om::ServeSource::GatewayFetch) && !self.relay.is_gateway {
             return LeafOtaOutcome::RelayFailed;
         }
         let size = announce.size;
@@ -3813,30 +4016,41 @@ impl RadioManager {
             }
         }
 
-        // --- FETCH (WiFi) → stage+verify into THIS gateway's inactive slot (no activate).
-        // CRITICAL: `run_leaf_ota_relay` is called IMMEDIATELY after `flush_telemetry`, which
-        // leaves the radio in WifiSta. `switch()` is a NO-OP when already in-mode → it would
-        // NOT issue a fresh `connect()`, but `run_ota_fetch` ASSUMES the caller's switch just
-        // connect()'d (its own contract). If the flush's association has gone stale, the fetch
-        // then spins its whole 5-min budget waiting for `is_connected` (no SYN, mesh-deaf) —
-        // exactly the observed "no fetch + long offline". Self-OTA avoids this because it runs
-        // from EspNow mode (its switch DOES connect). So force a fresh association here:
-        // EspNow (drop the stale link) → WifiSta (issue a real connect), mirroring self-OTA.
-        let _ = self.switch(Mode::EspNow);
-        let _ = self.switch(Mode::WifiSta);
-        let rng = self.rng;
-        let mut staged: Option<Slot> = None;
-        let fetched = match self.sta.as_mut() {
-            Some(sta) => crate::net::wifi::run_ota_fetch(
-                &mut self.controller, sta, rng, announce, tick, true, &mut staged, &mut None,
-                progress,
-                Some(leaf_id), // #188: live progress → smol/<leaf>/ota/progress (crown relay-fetch)
-            ),
-            None => false,
+        // --- SOURCE the image slot: #40 gateway FETCH (WiFi → inactive slot) OR #237 peer-serve
+        // (read the build this holder is RUNNING from its ACTIVE slot — no WiFi, coexist-safe).
+        // The RELAY machinery below is source-AGNOSTIC (it reads via `reader`), so peer-sourcing
+        // only changes where these bytes come from.
+        let slot = match source {
+            om::ServeSource::GatewayFetch => {
+                // CRITICAL: run_leaf_ota_relay is called IMMEDIATELY after flush_telemetry, which
+                // leaves the radio in WifiSta. switch() is a NO-OP when already in-mode → it would
+                // NOT issue a fresh connect(), but run_ota_fetch ASSUMES the caller's switch just
+                // connect()'d (its contract). If the flush's association went stale, the fetch spins
+                // its whole budget waiting for is_connected. So force a fresh association here:
+                // EspNow (drop the stale link) → WifiSta (real connect), mirroring self-OTA.
+                let _ = self.switch(Mode::EspNow);
+                let _ = self.switch(Mode::WifiSta);
+                let rng = self.rng;
+                let mut staged: Option<Slot> = None;
+                let fetched = match self.sta.as_mut() {
+                    Some(sta) => crate::net::wifi::run_ota_fetch(
+                        &mut self.controller, sta, rng, announce, tick, true, &mut staged, &mut None,
+                        progress,
+                        Some(leaf_id), // #188: live progress → smol/<leaf>/ota/progress (relay-fetch)
+                    ),
+                    None => false,
+                };
+                if fetched { staged } else { None }
+            }
+            om::ServeSource::HolderActiveSlot => {
+                // #237: no WiFi fetch — the holder serves its RUNNING build from the ACTIVE slot.
+                // The ODEL handler (caller) already verified term/session + ran verify_active_slot
+                // against the manifest sha, so these bytes are the signed image the crown named.
+                crate::ota::active_slot()
+            }
         };
-        let staged = if fetched { staged } else { None };
-        let Some(slot) = staged else {
-            log::error!("smol #40: relay FETCH/stage failed — aborting (leaf untouched)");
+        let Some(slot) = slot else {
+            log::error!("smol #237/#40: relay source slot unavailable — aborting (leaf untouched)");
             let _ = self.switch(Mode::EspNow);
             return LeafOtaOutcome::FetchFailed;
         };
@@ -4751,6 +4965,13 @@ impl RadioManager {
                 self.handle_ota_frame(otaf, src, rssi, now);
                 continue;
             }
+            // #237 peer-relay ARBITRATION (ODEL/ODON) — crown↔holder unicast, dispatched like the
+            // OTA frames above. handle_arb_frame is FAST (records the delegation into pending_serve);
+            // the blocking serve runs from main.rs, never in this drain.
+            if let Some(arb) = crate::ota_mesh::parse_arb_frame(recv.data()) {
+                self.handle_arb_frame(arb, src, now);
+                continue;
+            }
 
             match parse_frame(recv.data()) {
                 Some(Frame::Snk(f)) => {
@@ -5253,6 +5474,44 @@ impl RadioManager {
     /// valid SMOLv1 frame"), registers the sender for the unicast NAK back-channel, then
     /// drives the receive session. On `Complete` [`crate::ota::activate`] reboots into the
     /// new slot; on `Nak` we unicast the OTAN to the gateway; `Abort`/`None` do nothing.
+    /// #237 peer-relay ARBITRATION dispatch (crown↔holder ODEL/ODON). Runs in the RX drain, so it
+    /// MUST be fast: it validates + RECORDS the delegation into `pending_serve`; the actual serve
+    /// (minutes) runs later from main.rs. Never blocks, never serves here.
+    #[cfg(feature = "espnow")]
+    fn handle_arb_frame(&mut self, arb: crate::ota_mesh::ArbFrame<'_>, src: [u8; 6], _now: u64) {
+        use crate::ota_mesh::ArbFrame;
+        match arb {
+            ArbFrame::Odel { target, build: _, session, term, m, sig } => {
+                // §5.3 replay/stale guard: reject a dethroned crown's older-term delegation.
+                if term < self.highest_arb_term {
+                    return;
+                }
+                self.highest_arb_term = term;
+                // Holder single-session: don't clobber a serve already accepted / in flight.
+                if self.pending_serve.is_some() {
+                    return;
+                }
+                // Rebuild the signed Announce from the ODEL's (M,sig); malformed → ignore (the crown
+                // times out → falls back to the #40 gateway fetch, the safety floor). main.rs
+                // resolves target's MAC + runs verify_active_slot + the serve + the ODON.
+                if let Some(ann) = crate::ota::Announce::from_signed(m, sig) {
+                    self.pending_serve = Some(crate::ota_mesh::PendingServe {
+                        target,
+                        session,
+                        ann,
+                        crown_mac: src,
+                    });
+                }
+            }
+            ArbFrame::Odon { .. } => {
+                // Crown-side ODON is consumed DIRECTLY by `run_crown_delegate` (it drains the RX
+                // queue itself while awaiting the serve outcome, like `run_leaf_ota_relay` drains
+                // OTANs) — never through this async drain. A stray/late ODON reaching here (outside
+                // a delegate wait) has no session to advance, so ignoring it is correct.
+            }
+        }
+    }
+
     fn handle_ota_frame(&mut self, f: crate::ota_mesh::OtaFrame<'_>, src: [u8; 6], rssi: i32, now: u64) {
         use crate::ota_mesh::{LeafAction, OtaFrame};
         // Benign "heard a frame" liveness — safe to record for ANY decoded OTA-shaped frame:

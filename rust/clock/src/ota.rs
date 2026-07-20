@@ -189,6 +189,39 @@ impl Announce {
     pub fn sig(&self) -> &[u8; 64] {
         &self.sig
     }
+
+    /// #237: reconstruct an `Announce` from a signed manifest `m` = `"build|size|sha256hex"` + its
+    /// 64-byte ed25519 `sig`, WITHOUT the MQTT `OTA|…|url` wrapper. A peer-relay HOLDER receives
+    /// `(M, sig)` in the crown's ODEL (not from `smol/ota/staged`), so it rebuilds the `Announce`
+    /// here to drive `run_leaf_ota_relay(HolderActiveSlot, …)`. `url` is empty — a holder never
+    /// fetches. `signed_msg` is set to the EXACT `m` bytes so the leaf's sig-over-M verify stays
+    /// byte-identical to a gateway-sourced OTAM. Panic-free — `None` on any malformed field or
+    /// `m` > `SIGNED_MSG_MAX`. (`splitn(3)` fail-closes a 4th field: trailing bytes land in the sha
+    /// slot and fail the 64-hex parse.)
+    #[cfg(feature = "espnow")]
+    #[allow(dead_code)] // #237: wired by the ODEL-receipt handler (next dispatch increment)
+    pub fn from_signed(m: &[u8], sig: &[u8; 64]) -> Option<Announce> {
+        if m.is_empty() || m.len() > SIGNED_MSG_MAX {
+            return None;
+        }
+        let s = core::str::from_utf8(m).ok()?;
+        let mut it = s.splitn(3, '|');
+        let build: u32 = it.next()?.parse().ok()?;
+        let size: u32 = it.next()?.parse().ok()?;
+        let sha256 = parse_hex_n::<32>(it.next()?)?;
+        let mut signed_msg = [0u8; SIGNED_MSG_MAX];
+        signed_msg[..m.len()].copy_from_slice(m);
+        Some(Announce {
+            build,
+            size,
+            sha256,
+            sig: *sig,
+            signed_msg,
+            signed_len: m.len(),
+            url: [0u8; URL_MAX],
+            url_len: 0,
+        })
+    }
 }
 
 /// Parse `OTA|build|size|sha256hex|sighex|url` (#32: `sighex` = 128-hex Ed25519 sig; url
@@ -1161,6 +1194,73 @@ impl SlotReader {
         let mut region = app.as_embedded_storage(&mut flash);
         region.read(off, out).is_ok()
     }
+}
+
+/// #237 slice-1 (serve-reads-active-slot): the ACTIVE/running slot — the build this node is
+/// executing, and a peer-relay holder's serve SOURCE. `SlotReader::open` already reads any slot;
+/// the #40 gateway relay passes the just-staged INACTIVE slot, whereas a holder serves the build it
+/// is RUNNING, so it needs the active one. Mirrors `inactive_slot` but returns `current_slot`
+/// directly. Blank otadata ⇒ the ROM booted `ota_0` (no factory partition in partitions-ota.csv)
+/// ⇒ `Slot0` — the same mapping as #226's inactive_slot fix. `None` on any partition/flash error.
+#[cfg(feature = "espnow")]
+#[allow(dead_code)] // #237: wired by the crown/holder serve arbiter (later slice-1 increment)
+pub fn active_slot() -> Option<Slot> {
+    let mut flash = FlashStorage::new();
+    let mut buf = [0u8; PT_SCRATCH];
+    let pt = read_partition_table(&mut flash, &mut buf).ok()?;
+    let od = pt
+        .find_partition(PartitionType::Data(DataPartitionSubType::Ota))
+        .ok()??;
+    let mut region = od.as_embedded_storage(&mut flash);
+    let mut ota = Ota::new(&mut region).ok()?;
+    Some(match ota.current_slot().ok()? {
+        Slot::None => Slot::Slot0, // blank ⇒ ROM booted ota_0 (mirrors inactive_slot, #226)
+        s => s,
+    })
+}
+
+/// #237 slice-1 serve-time SELF-VERIFY (spec §10.1 item 4 / §5.2 pre-flight): read the ACTIVE slot's
+/// first `size` bytes and confirm their SHA-256 == `sha256` (the manifest sha the crown supplied in
+/// the ODEL). A peer-relay holder MUST pass this before serving — on mismatch it replies
+/// `ODON = self-slot-verify-failed` and the crown falls back to the #40 gateway fetch (§5.2). A
+/// source must never offer a copy it cannot itself reproduce. Read-only, fail-closed (ANY
+/// partition/flash/slot error ⇒ `false`).
+///
+/// The read buffer lives in a `static` (NOT the stack — the serve task budget is tight; same F2
+/// discipline as #217's OTA_STAGE) and reads in `CHUNK` spans so `SlotReader::read`'s per-call
+/// partition-table reparse amortizes over few calls. Single-caller + one-shot per ODEL (a serve is
+/// never re-entrant), so the `&'static mut` borrow is alias-safe; `addr_of_mut!` avoids the
+/// ref-to-`static mut` lint. Word-alignment: `off` steps by `CHUNK` (aligned) except the final
+/// partial (which ends the loop); the tail read length is rounded up to a word and only the real
+/// `size` bytes are hashed (the slot beyond `size` is inert 0xFF pad).
+#[cfg(feature = "espnow")]
+#[allow(dead_code)] // #237: wired by the ODEL-receipt handler (INC4 dispatch)
+pub fn verify_active_slot(size: u32, sha256: &[u8; 32]) -> bool {
+    use sha2::{Digest, Sha256};
+    static mut VERIFY_BUF: [u8; CHUNK] = [0u8; CHUNK];
+    let slot = match active_slot() {
+        Some(s) => s,
+        None => return false,
+    };
+    let reader = match SlotReader::open(slot) {
+        Some(r) => r,
+        None => return false,
+    };
+    // Alias-safe: one-shot, single-caller, non-re-entrant (see doc).
+    let buf: &mut [u8; CHUNK] = unsafe { &mut *core::ptr::addr_of_mut!(VERIFY_BUF) };
+    let mut hasher = Sha256::new();
+    let mut off: u32 = 0;
+    while off < size {
+        let take = core::cmp::min(CHUNK as u32, size - off) as usize;
+        let read_len = take.next_multiple_of(4); // SlotReader wants a word-aligned len (≤ CHUNK)
+        if !reader.read(off, &mut buf[..read_len]) {
+            return false;
+        }
+        hasher.update(&buf[..take]);
+        off += take as u32;
+    }
+    let digest = hasher.finalize();
+    digest[..] == sha256[..]
 }
 
 // ---------------------------------------------------------------------------
