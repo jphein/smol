@@ -2327,11 +2327,15 @@ fn mqtt_session(
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 3, MESH_CHANNEL_TOPIC) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
     }
-    // #155 channel-drag operator lever: subscribe the retained channel-hint (packet-id 13 — the
-    // first free id; 9 is `smol/+/ota/install`). Sent right after the election topic so its retained
-    // value rides the SAME broker burst as `MC` and is captured before the resolver runs (the settle
-    // window after the primary downlinks catches it, exactly like the OTA/config retained topics).
-    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 13, MESH_CHANNEL_HINT_TOPIC) {
+    // #155 channel-drag operator lever: subscribe the retained channel-hint (packet-id 25). NOTE:
+    // this was originally 13, which COLLIDES with the QoS-1 `smol/+/cmd/reset` subscribe (pids
+    // 13/14 are cmd/reset|cmd/scan via `encode_subscribe_qos1`, missed by #155's original
+    // uniqueness check — that grep only matched `encode_subscribe(`). Two in-flight SUBSCRIBEs
+    // sharing a packet id is an MQTT-3.1.1 violation; moved to 25 (13/14 = cmd/reset|scan, 24 =
+    // #197 herald notify, 25 = first free above that). Sent right after the election topic so its
+    // retained value rides the SAME broker burst as `MC` and is captured before the resolver runs
+    // (the settle window after the primary downlinks catches it, like the OTA/config retained topics).
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 25, MESH_CHANNEL_HINT_TOPIC) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
     }
 
