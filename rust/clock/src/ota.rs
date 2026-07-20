@@ -428,6 +428,59 @@ pub fn content_length(headers: &[u8]) -> Option<u32> {
 #[cfg(feature = "espnow")]
 static mut OTA_STAGE: [u8; CHUNK] = [0xFF; CHUNK];
 
+// #267: cross-burst OTA-fetch resume cursor. SAME-BOOT, resets on reboot (the #100 in-RAM idiom) —
+// the #195 OTA retry is per-burst WITHIN one boot, so NO NVS is needed (this deliberately sidesteps
+// the near-full `nvs` partition; a reboot legitimately restarts the fetch from byte 0). Without it,
+// each burst's `ImageWriter::begin` reset the write cursor to 0 and the fetch re-`Range`d from byte
+// 0; under the coexist bulk-RX disease (≈1 chunk/burst) a multi-chunk image never accumulated
+// (#267). The PURE keying (does a saved cursor match this staged image + slot?) lives in
+// `crate::net::ota_resume` (host-tested); this holds only the `.bss` cursor + thin accessors.
+#[cfg(feature = "espnow")]
+struct OtaResumeState {
+    saved: Option<(crate::net::ota_resume::ResumeKey, u32)>,
+}
+#[cfg(feature = "espnow")]
+static mut OTA_RESUME: OtaResumeState = OtaResumeState { saved: None };
+
+/// Target-slot discriminator for the resume key (`0` = Slot0, `1` = Slot1).
+#[cfg(feature = "espnow")]
+fn slot_key(s: Slot) -> u8 {
+    if s == Slot::Slot1 {
+        1
+    } else {
+        0
+    }
+}
+
+/// The resume offset for a fresh fetch of `(build, sha)` into `slot` — `0` if none matches (a fresh
+/// fetch from byte 0). Delegates the match to the pure `net::ota_resume::resume_offset`.
+#[cfg(feature = "espnow")]
+fn ota_resume_lookup(build: u32, sha: &[u8; 32], slot: Slot, size: u32) -> u32 {
+    let want = crate::net::ota_resume::ResumeKey {
+        build,
+        sha_key: crate::net::ota_resume::sha_key16(sha),
+        slot: slot_key(slot),
+    };
+    let saved = unsafe { (*core::ptr::addr_of!(OTA_RESUME)).saved };
+    crate::net::ota_resume::resume_offset(saved, &want, size)
+}
+
+/// Record the on-flash (flushed, sector-aligned) committed offset for the in-progress fetch, so the
+/// next burst's `begin` resumes here instead of restarting from 0.
+#[cfg(feature = "espnow")]
+fn ota_resume_save(key: crate::net::ota_resume::ResumeKey, committed: u32) {
+    let r = unsafe { &mut *core::ptr::addr_of_mut!(OTA_RESUME) };
+    r.saved = Some((key, committed));
+}
+
+/// Drop the resume cursor (a fetch is terminal: finalize success OR failure → a fresh attempt
+/// starts from byte 0). A newer/ different staged image is handled by keying, not this.
+#[cfg(feature = "espnow")]
+pub fn ota_resume_clear() {
+    let r = unsafe { &mut *core::ptr::addr_of_mut!(OTA_RESUME) };
+    r.saved = None;
+}
+
 #[cfg(feature = "espnow")]
 pub struct ImageWriter {
     flash: FlashStorage,
@@ -448,7 +501,9 @@ pub struct ImageWriter {
     /// the array did). Alias-safe: one OTA at a time (`begin` is single-caller, one-shot).
     stage: &'static mut [u8; CHUNK],
     stage_len: usize,
-    hasher: sha2::Sha256,
+    /// #267: identifies the staged image + slot this fetch belongs to, so each sector flush can
+    /// persist the resume cursor keyed to it (a re-stage / slot flip then can't resume onto it).
+    resume_key: crate::net::ota_resume::ResumeKey,
     target: Slot,
 }
 
@@ -456,8 +511,7 @@ pub struct ImageWriter {
 impl ImageWriter {
     /// Open a writer for the inactive slot (the one `otadata`'s current slot is NOT).
     /// `None` on any partition/flash error (e.g. a board without the OTA table).
-    pub fn begin() -> Option<ImageWriter> {
-        use sha2::Digest;
+    pub fn begin(build: u32, expected_sha: &[u8; 32]) -> Option<ImageWriter> {
         let target = inactive_slot()?;
         let sub = if target == Slot::Slot1 {
             AppPartitionSubType::Ota1
@@ -473,20 +527,31 @@ impl ImageWriter {
             let app = pt.find_partition(PartitionType::App(sub)).ok()??;
             (app.offset(), app.len())
         };
+        // #267: resume from a same-boot prior burst's committed (flushed, sector-aligned) offset iff
+        // this staged image + slot match the saved cursor; else 0 (fresh fetch). Bytes [0..resume)
+        // are already on flash from earlier bursts, so `erased_upto = base + resume` — begin never
+        // re-erases the committed prefix; the resumed feed erases-ahead only past it. Integrity is a
+        // finalize READBACK-SHA over `slot[..size]` (below), which is burst-count invariant — no
+        // streaming hasher to restore, so resume needs only the offset.
+        let resume = ota_resume_lookup(build, expected_sha, target, size);
         Some(ImageWriter {
             flash,
             base,
             size,
-            written: 0,
-            flushed: 0,
-            erased_upto: base,
+            written: resume,
+            flushed: resume,
+            erased_upto: base + resume,
             // F2: borrow the static stage buffer (off the stack). Alias-safe — one OTA
             // at a time. No stale-data risk: `flush_stage` re-pads `[len..padded]` to
             // 0xFF and writes only `stage[..padded]`, so a reused buffer never leaks
             // prior bytes to flash. `stage_len: 0` starts the accumulation fresh.
             stage: unsafe { &mut *core::ptr::addr_of_mut!(OTA_STAGE) },
             stage_len: 0,
-            hasher: sha2::Sha256::new(),
+            resume_key: crate::net::ota_resume::ResumeKey {
+                build,
+                sha_key: crate::net::ota_resume::sha_key16(expected_sha),
+                slot: slot_key(target),
+            },
             target,
         })
     }
@@ -505,11 +570,11 @@ impl ImageWriter {
     /// Returns `false` on overflow past the slot or any flash error (caller aborts;
     /// otadata untouched → good slot stays active).
     pub fn feed(&mut self, bytes: &[u8]) -> bool {
-        use sha2::Digest;
+        // #267: no streaming hash here anymore — integrity is a finalize READBACK-SHA over the slot
+        // (burst-count invariant), so a resumed multi-burst fetch verifies like a one-shot fetch.
         if self.written.saturating_add(bytes.len() as u32) > self.size {
             return false; // image claims more than a slot — refuse
         }
-        self.hasher.update(bytes);
         self.written += bytes.len() as u32;
         let mut off = 0;
         while off < bytes.len() {
@@ -552,6 +617,10 @@ impl ImageWriter {
             return false;
         }
         self.flushed += len as u32;
+        // #267: persist the on-flash cursor so the next burst's `begin` resumes here (not from 0).
+        // Fetch-loop flushes are full sectors (aligned); the finalize tail flush is non-aligned but
+        // finalize clears the cursor immediately after, so a non-aligned value never persists.
+        ota_resume_save(self.resume_key, self.flushed);
         self.stage_len = 0;
         true
     }
@@ -560,14 +629,37 @@ impl ImageWriter {
     /// AND running SHA-256 == announced hash. `true` ⇒ the whole image landed intact
     /// and [`activate`] is safe. otadata is still untouched here.
     pub fn finalize(mut self, expected_size: u32, expected_sha: &[u8; 32]) -> bool {
+        use embedded_storage::nor_flash::ReadNorFlash;
         use sha2::Digest;
         if !self.flush_stage() {
+            ota_resume_clear();
             return false;
         }
         if self.written != expected_size {
+            ota_resume_clear();
             return false;
         }
-        self.hasher.finalize().as_slice() == &expected_sha[..]
+        // #267/#40: READBACK-SHA over `slot[..size]` — the exact bytes that will boot — instead of a
+        // streaming hash. Burst-count invariant, so a fetch resumed across N bursts verifies
+        // identically to a one-shot fetch. Uses OTA_READBACK (a distinct static from `self.stage` →
+        // no aliasing). Reads absolute flash at `base + off` (length word-rounded; extra tail bytes
+        // are read legally but not hashed), mirroring `LeafImageWriter::finalize`.
+        let buf = unsafe { &mut *core::ptr::addr_of_mut!(OTA_READBACK) };
+        let mut hasher = sha2::Sha256::new();
+        let mut off = 0u32;
+        let mut read_ok = true;
+        while off < expected_size {
+            let want = core::cmp::min(buf.len() as u32, expected_size - off);
+            let read_len = (want.div_ceil(4) * 4) as usize;
+            if self.flash.read(self.base + off, &mut buf[..read_len]).is_err() {
+                read_ok = false;
+                break;
+            }
+            hasher.update(&buf[..want as usize]);
+            off += want;
+        }
+        ota_resume_clear(); // fetch terminal (success OR fail) → a fresh attempt starts from 0
+        read_ok && hasher.finalize().as_slice() == &expected_sha[..]
     }
 }
 

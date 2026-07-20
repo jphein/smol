@@ -1,0 +1,19 @@
+# #267 host-test harness for the PURE cross-burst OTA-resume key logic (net/ota_resume.rs).
+# Runs OFF-target (std) via `cargo run` AND `cargo test`; #[path]-includes the real
+# ota_resume.rs (no drift). Proves the resume keying (match → offset, any mismatch → 0) and the
+# segmentation-invariance property the fix rests on: an image written in one shot vs resumed in
+# N segments (boundaries driven by the real `resume_offset`) yields byte-identical flash → an
+# identical finalize readback-SHA. Mirrors etx_verify/ledger_verify/crdt_verify. sha2 supplies
+# the readback hash — the core is dependency-free.
+[package]
+name = "resume_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "resume_verify"
+path = "src/main.rs"
+[dependencies]
+sha2 = "0.10"
+[profile.dev]
+opt-level = 0

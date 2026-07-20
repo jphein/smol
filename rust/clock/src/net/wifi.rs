@@ -4423,7 +4423,9 @@ pub fn run_ota_fetch(
 
     // Open the inactive-slot writer ONCE (image is streamed here across chunks, never buffered
     // whole). `writer.written()` doubles as the RESUME cursor and the running-SHA position.
-    let Some(mut writer) = crate::ota::ImageWriter::begin() else {
+    // #267: pass (build, sha) so the writer can resume a same-boot prior burst's committed offset
+    // instead of restarting the Range from byte 0 (see ImageWriter::begin / net::ota_resume).
+    let Some(mut writer) = crate::ota::ImageWriter::begin(announce.build, &announce.sha256) else {
         *fail = Some((0, 0, 0, 0, ota_fail::SLOT)); // #139/#147: died before the download (slot open)
         log::error!("smol OTA: cannot open inactive slot (no OTA partition table?)");
         return false;
