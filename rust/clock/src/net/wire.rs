@@ -462,3 +462,28 @@ pub fn verify_group_mac(data: &[u8], keys: &[(u8, &[u8; 32])]) -> MacVerdict {
     }
     MacVerdict::Fail
 }
+
+/// True iff `frame` is an **OTA-family** frame — one the receiver consumes at the `parse_ota_frame`
+/// dispatch (OTAM/OTAD/OTAN) or the relay-drain `parse_ldbg` capture (LDBG), BOTH of which run
+/// BEFORE the group-MAC [`verify_group_mac`]-then-strip in `service()`. Such a frame must therefore
+/// NEVER carry the trailer: it would arrive at those parsers with 9 un-strippable trailing bytes
+/// (a MAC'd OTAN's bitmap overflows its cap → dropped → the OTA window never advances; a MAC'd
+/// partial-chunk OTAD corrupts the reassembled image → finalize-SHA mismatch). `SMOLv1 OTA*` covers
+/// OTAM/OTAD/OTAN (and any future `OTAx`) structurally; `LDBG ` is the receive-diagnostic beacon.
+/// (The #237 arbitration frames `ODEL`/`ODON` are exempt by construction — they send via
+/// `send_arb_raw`, never `send_to` — so they need no entry here.)
+pub fn is_ota_family(frame: &[u8]) -> bool {
+    frame.starts_with(b"SMOLv1 OTA") || frame.starts_with(b"SMOLv1 LDBG ")
+}
+
+/// The send-choke TX decision: `true` ⇒ append the group-MAC trailer, `false` ⇒ send `frame`
+/// verbatim. Verbatim when the frame is (a) not a SMOLv1 frame (e.g. the #25 WLED WiZmote emit —
+/// a trailer would corrupt a third-party receiver), (b) an [`is_ota_family`] frame (bypasses the
+/// verify-then-strip by design), or (c) too large to fit the trailer under [`ESP_NOW_MTU`] (never
+/// emit > MTU). Pure so the exact `send_to` decision is host-tested (`experiments/mac_verify`) and
+/// the OTA-exemption cannot silently regress.
+pub fn should_group_mac(frame: &[u8]) -> bool {
+    frame.starts_with(b"SMOLv1 ")
+        && !is_ota_family(frame)
+        && frame.len() + MAC_TRAILER_LEN <= ESP_NOW_MTU
+}
