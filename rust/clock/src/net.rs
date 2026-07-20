@@ -76,6 +76,13 @@ pub mod flood;
 #[cfg(feature = "espnow")]
 pub mod wire;
 
+// #217 rung-3: co-channel-preferred crown AP selection + the never-crownless strand-guard state
+// machine. PURE (no esp-hal/esp-wifi, no alloc) so it's host-tested verbatim by
+// `experiments/ap_select_verify` (#[path]-include, like `wire`); `wifi`/`mode` build ApViews from
+// scan results + drive the WiFi association + crown state from its decisions.
+#[cfg(feature = "espnow")]
+pub mod coexist;
+
 // #25 WLED WiZmote-emit (smol as a WLED "linked remote"). `wled = ["espnow"]`, so
 // this is present only in a wled build; the default/wifi/espnow builds are byte-free
 // of it (the module is `#![cfg(feature = "wled")]`). Referenced by `app` (the
