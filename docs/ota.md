@@ -153,6 +153,16 @@ Diagnostics ride retained topics — `smol/<leaf>/ota/diag` (relay phase) and
 **without** an advance-ack (the leaf finalizes and reboots), so the gateway treats last-window
 exhaustion as a **confirm**, not a failure.
 
+> **Why relay over ESP-NOW and not an off-the-shelf mesh framework?** The reference
+> architectures (Espressif's WiFi-tree esp-mesh-lite, the `esp-now` OTA example, and
+> Thread/Matter OTA on the C6) were surveyed against smol's flood+crown model in
+> [reliable-mesh-ota-architectures.md](superpowers/research/reliable-mesh-ota-architectures.md)
+> (#54). Verdict: smol's leaf relay **is** the ESP-NOW-native pattern; esp-mesh-lite would force
+> every headless leaf onto WiFi, and Thread needs an 802.15.4 radio the C3 doesn't have. The one
+> worthwhile extension — an already-updated node sourcing the next over ESP-NOW to retire the
+> gateway's WiFi-fetch window — is tracked separately (gated on the esp-radio-0.18 coex
+> root-cause finding, #198/#204).
+
 ## Reproducible builds — verify image ↔ commit before/after a flash (#44)
 
 The release image is **byte-reproducible for a fixed commit**: build it on any machine and
