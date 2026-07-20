@@ -203,6 +203,19 @@ pub enum ServeSource {
     HolderActiveSlot,
 }
 
+/// #237: a crown-delegated serve a HOLDER accepted via ODEL and will run from main.rs — the serve
+/// blocks for minutes, so it must NOT run in the mesh RX drain (it'd stall HELLO/MC/etc.). Recorded
+/// by `handle_arb_frame` in the drain; consumed by main.rs, which resolves `target`'s MAC
+/// (mac_for_id_sticky), runs `verify_active_slot`, drives `run_leaf_ota_relay(HolderActiveSlot,…)`,
+/// and emits the ODON (target/build/session/result) back to `crown_mac`.
+#[allow(dead_code)] // fields read by main.rs's serve-driver (next dispatch increment)
+pub struct PendingServe {
+    pub target: u8,
+    pub session: u16,
+    pub ann: crate::ota::Announce,
+    pub crown_mac: [u8; 6],
+}
+
 /// Parse one #40 OTA frame. Returns `None` on ANY malformed input (never panics,
 /// never indexes past the slice) — the caller treats `None` as "not an OTA frame".
 // #69 IRAM: on the per-chunk RX hot path (parsed for every OTAD during a leaf mesh-OTA). Placed in
