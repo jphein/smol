@@ -10,5 +10,9 @@ publish = false
 [[bin]]
 name = "relay_compat"
 path = "src/main.rs"
+# #190: wire.rs gained the group-HMAC codec (hmac_sha256 over sha2). This harness `#[path]`-includes
+# wire.rs, so it needs sha2 on the host too (the codec itself is exercised by experiments/mac_verify).
+[dependencies]
+sha2 = "0.10"
 [profile.dev]
 opt-level = 0
