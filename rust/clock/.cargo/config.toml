@@ -33,9 +33,17 @@ rustflags = [
     "-C", "force-frame-pointers",
 ]
 
-[unstable]
-# esp-hal / esp-wifi build core+alloc from source for the exact target.
-build-std = ["core", "alloc"]
+# build-std REMOVED (2026-07-20, morpheus): riscv32imc-unknown-none-elf is a TIER-2 target with a
+# prebuilt core/alloc, so `-Zbuild-std` was unnecessary here. It was also actively HARMFUL: build-std
+# forces resolver-1-style feature unification across the host/target boundary, which leaked esp-hal's
+# `portable-atomic/unsafe-assume-single-core` (a riscv-only cfg) into the HOST (x86_64) proc-macro/
+# build compile of portable-atomic — where portable-atomic's arch guard rejects it with a
+# `compile_error!`. That broke EVERY fresh (cold-cache) fw build; v345's ELF only linked because its
+# target/ was warm. Dropping build-std = prebuilt core (no host portable-atomic recompile) → fixed.
+# Verified: cold build of espnow,cast,io + default + wifi all green. REVISIT if a future esp-hal/
+# esp-wifi requires a from-source core (xtensa-only concern; N/A for the riscv C3).
+# [unstable]
+# build-std = ["core", "alloc"]
 
 [registries.crates-io]
 protocol = "sparse"
