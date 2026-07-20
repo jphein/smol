@@ -76,6 +76,26 @@ pub mod flood;
 #[cfg(feature = "espnow")]
 pub mod wire;
 
+// #181 mesh-ledger cores — the PURE, host-tested L1/L2/L3 primitives (sha256 + ed25519 injected),
+// wired into the firmware by `ledger_link` (#182 hash-chain, #183 CT-Merkle anchor, #184 signed
+// tree-head; landed inert via PRs #220/#223/#224). Each is a frozen library-of-primitives with a
+// full host-test suite (`experiments/{ledger,treehead,sth}_verify`); `ledger_link` wires a
+// meaningful SUBSET now (own-chain append + crown anchor/sign + verify-what-you-sign self-check),
+// with peer-STH gossip/acceptance the HW-gated L2-coordination follow-up. `#[allow(dead_code)]` on
+// the CORE modules (this is a binary crate, so a not-yet-wired pub primitive would trip `-D
+// warnings`) — the integration `ledger_link` below carries NO allow, so its own quality is enforced.
+#[cfg(feature = "espnow")]
+#[allow(dead_code)]
+pub mod ledger;
+#[cfg(feature = "espnow")]
+#[allow(dead_code)]
+pub mod treehead;
+#[cfg(feature = "espnow")]
+#[allow(dead_code)]
+pub mod sth;
+#[cfg(feature = "espnow")]
+pub mod ledger_link;
+
 // #25 WLED WiZmote-emit (smol as a WLED "linked remote"). `wled = ["espnow"]`, so
 // this is present only in a wled build; the default/wifi/espnow builds are byte-free
 // of it (the module is `#![cfg(feature = "wled")]`). Referenced by `app` (the

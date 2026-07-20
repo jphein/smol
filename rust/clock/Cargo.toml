@@ -176,6 +176,12 @@ wifi = [
 # Builds on `wifi` (shares the radio init path) and turns on esp-wifi/esp-now.
 espnow = ["wifi", "esp-wifi/esp-now", "dep:ed25519-compact"]
 
+# #181/#184 mesh-ledger key PROVISIONING (a JP-supervised USB-touch build, NOT for the fleet OTA
+# image). Enables the one-shot NVS seeding of the ed25519 signing key from a build-time
+# `SMOL_LEDGER_SEED` (hex, supplied out-of-band, NEVER committed). The default / OTA image omits this
+# feature → it only ever READS an already-provisioned key. NO key generation in the firmware or CI.
+ledger-provision = ["espnow"]
+
 # #25 WLED WiZmote-emit: smol impersonates a WLED "linked remote" (13-B WiZmote
 # ESP-NOW broadcast). Needs the ESP-NOW broadcast path + RadioManager, so it builds
 # on `espnow`. Nothing new links — pure encode + the existing `esp_now.send`. The
