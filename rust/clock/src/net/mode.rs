@@ -3559,6 +3559,7 @@ impl RadioManager {
                 crate::net::wifi::run_ota_fetch(
                     &mut self.controller, sta, rng, announce, tick, false, &mut None, &mut fail,
                     progress,
+                    Some(self.id), // #188: live progress → smol/<self>/ota/progress (self-OTA)
                 )
             }
         };
@@ -3795,6 +3796,7 @@ impl RadioManager {
             Some(sta) => crate::net::wifi::run_ota_fetch(
                 &mut self.controller, sta, rng, announce, tick, true, &mut staged, &mut None,
                 progress,
+                Some(leaf_id), // #188: live progress → smol/<leaf>/ota/progress (crown relay-fetch)
             ),
             None => false,
         };
