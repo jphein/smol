@@ -1,0 +1,18 @@
+# #185 host-test harness for the PURE mesh-ledger L4 core (net/crdt.rs) — the delta-state
+# OR-Set / G-Set CRDT for multi-writer RPG shared state (loot / gravestone). Runs OFF-target
+# (std) via `cargo run`; #[path]-includes the real crdt.rs (no drift) and exercises the CvRDT
+# laws (convergence, commutativity, idempotence, delta-merge, add-wins) + the injected-sha256
+# order-independent set digest. Mirrors flood_verify/etx_verify/ledger_verify/treehead_verify/
+# sth_verify. sha2 supplies the injected hash — the core is dependency-free.
+[package]
+name = "crdt_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "crdt_verify"
+path = "src/main.rs"
+[dependencies]
+sha2 = "0.10"
+[profile.dev]
+opt-level = 0
