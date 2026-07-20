@@ -3721,9 +3721,25 @@ impl RadioManager {
     /// #237: take the crown-delegated serve accepted in the RX drain (if any). main.rs drives the
     /// blocking `run_leaf_ota_relay(HolderActiveSlot, …)` + emits the ODON. One-shot (cleared on take).
     #[cfg(feature = "espnow")]
-    #[allow(dead_code)] // consumed by main.rs's serve-driver (next dispatch increment)
     pub fn take_pending_serve(&mut self) -> Option<crate::ota_mesh::PendingServe> {
         self.pending_serve.take()
+    }
+
+    /// #237: send one crown↔holder ARBITRATION frame (`ODEL`/`ODON`) as a RAW ESP-NOW unicast.
+    /// Deliberately NOT routed through [`Self::send_to`]: once #248 (v346) lands, `send_to` appends a
+    /// 9-B group-MAC trailer on TX, but the OTA family (incl. these arbitration frames) is consumed
+    /// by the parser BEFORE any RX verify-then-strip, so a trailer would corrupt the frame (190L
+    /// review item 1). Registers the peer first (bounded-LRU evict if the HW table is full), then
+    /// fires + waits for the TX callback so we don't overrun the single in-flight send slot.
+    #[cfg(feature = "espnow")]
+    pub fn send_arb_raw(&mut self, dst: [u8; 6], frame: &[u8]) {
+        self.ensure_peer(dst, now_ms());
+        match self.esp_now.send(&dst, frame) {
+            Ok(waiter) => {
+                let _ = waiter.wait();
+            }
+            Err(e) => log::warn!("smol #237: arb-frame raw send failed: {:?}", e),
+        }
     }
 
     /// #40 GATEWAY leaf-mesh-OTA orchestration (§B4). Fetch the staged image (WiFi) into

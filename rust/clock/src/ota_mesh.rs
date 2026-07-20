@@ -93,6 +93,12 @@ pub const OTAM_FRAME_MAX: usize = 12 + 3 + 2 + 1 + ota::SIGNED_MSG_MAX + 64;
 pub const OTAD_FRAME_MAX: usize = 12 + 3 + 2 + 2 + CHUNK_PAYLOAD;
 /// Max `OTAN` frame: 12 + 3 + 2 + 2 + 8.
 pub const OTAN_FRAME_MAX: usize = 12 + 3 + 2 + 2 + OTAN_BITMAP_BYTES;
+/// #237 max `ODEL` frame: 12 + 3 (target) + 4 (build) + 2 (session) + 2 (term) + 1 (M_len) +
+/// `SIGNED_MSG_MAX` (M) + 64 (sig) = 184 B — < the 250 B ESP-NOW MTU (spec §8/§10, real M ≤86).
+#[allow(dead_code)] // #237: wired by the crown baton (Piece 2, next commit)
+pub const ODEL_FRAME_MAX: usize = 12 + 3 + 4 + 2 + 2 + 1 + ota::SIGNED_MSG_MAX + 64;
+/// #237 max `ODON` frame: 12 + 3 (target) + 4 (build) + 2 (session) + 1 (result) = 22 B.
+pub const ODON_FRAME_MAX: usize = 12 + 3 + 4 + 2 + 1;
 
 // ---------------------------------------------------------------------------
 // Parsed frames (borrow the RX buffer; used immediately in `service()`)
@@ -158,6 +164,25 @@ impl ServeResult {
             2 => Some(ServeResult::Aborted),
             3 => Some(ServeResult::SelfSlotVerifyFailed),
             _ => None,
+        }
+    }
+    /// #237: map a #40 [`LeafOtaOutcome`] (what a HOLDER's `run_leaf_ota_relay` returns) → the
+    /// `ODON` result it reports to the crown. FAIL-CLOSED: **only** a build-matched `Confirmed` is
+    /// `Ok`; EVERY other outcome — including any future variant (the `_` arm) — is a non-`Ok` the
+    /// crown treats as "fall back to the #40 gateway fetch" (the safety floor) and must NEVER
+    /// advance the baton onto. `FetchFailed` on a holder means its own active-slot source was
+    /// unavailable → `SelfSlotVerifyFailed`; a leaf that never answered → `TargetUnreachable`;
+    /// delivered-but-unconfirmed / rolled-back / id-mismatch / operator-abort → `Aborted`. The
+    /// precise non-`Ok` code is observability only — the crown falls back on all of them.
+    #[allow(dead_code)] // #237: wired by the holder serve-driver (main.rs)
+    pub fn from_leaf_outcome(o: LeafOtaOutcome) -> Self {
+        match o {
+            LeafOtaOutcome::Confirmed => ServeResult::Ok,
+            LeafOtaOutcome::MacUnknown | LeafOtaOutcome::RelayFailed => {
+                ServeResult::TargetUnreachable
+            }
+            LeafOtaOutcome::FetchFailed => ServeResult::SelfSlotVerifyFailed,
+            _ => ServeResult::Aborted,
         }
     }
 }

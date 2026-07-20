@@ -836,6 +836,91 @@ fn main() -> ! {
                     redraw = true; // a recovery burst ran → role may have changed; repaint
                 }
             }
+            // === #237 peer-relay HOLDER serve-driver =========================================
+            // A crown `ODEL` (validated + recorded as `pending_serve` in the RX drain,
+            // `handle_arb_frame`) delegates THIS node to serve leaf `ps.target` the byte-identical
+            // signed image FROM ITS OWN ACTIVE SLOT over ESP-NOW — no WiFi fetch (coexist-safe).
+            // The serve BLOCKS for minutes, so it runs HERE from the main loop (NEVER the RX drain,
+            // which would stall HELLO/MC/time). Placed BEFORE the self-OTA `do_install` below so a
+            // holder finishes serving the fleet before it updates ITSELF (the #40 leaves-first,
+            // gateway/self-last ordering). SAFETY FLOOR: every branch reports an `ODON` result (or
+            // the crown times out) → on any non-OK the crown falls back to the #40 gateway fetch, so
+            // worst-case == today's behavior.
+            if let Some(ps) = r.take_pending_serve() {
+                let result = match r.mac_for_id_sticky(ps.target) {
+                    // Never learned the target's MAC (no HELLO heard) → report unreachable; the
+                    // crown re-seeds this leaf via the trusted #40 gateway fetch (the safety floor).
+                    None => crate::ota_mesh::ServeResult::TargetUnreachable,
+                    Some(mac) => {
+                        // §5.2 pre-flight: readback-sha-verify OUR OWN active slot against the
+                        // ODEL's manifest sha BEFORE serving. A source must never offer a copy it
+                        // cannot itself reproduce → mismatch = self-slot-verify-failed → the crown
+                        // falls back to the trusted gateway fetch.
+                        if !crate::ota::verify_active_slot(ps.ann.size, &ps.ann.sha256) {
+                            log::warn!(
+                                "smol #237: holder active-slot verify FAILED for build {} — declining serve (crown falls back)",
+                                ps.ann.build
+                            );
+                            crate::ota_mesh::ServeResult::SelfSlotVerifyFailed
+                        } else {
+                            // Drive the existing #40 relay from the ACTIVE slot (byte-identical
+                            // OTAM from the crown-supplied M+sig). UI-alive tick + long-press abort,
+                            // same "feeding <leaf>" screen as the gateway relay.
+                            let mut relay_draw_ms = 0u64;
+                            let mut relay_abort = false;
+                            let relay_prog = core::cell::Cell::new(ota::OtaProgress::default());
+                            let relay_build = ps.ann.build;
+                            let serve_target = ps.target;
+                            let mut relay_eta = ota_screen::OtaEta::new();
+                            let outcome = r.run_leaf_ota_relay(
+                                crate::ota_mesh::ServeSource::HolderActiveSlot,
+                                ps.target,
+                                mac,
+                                &ps.ann,
+                                &mut || {
+                                    let t = millis();
+                                    led.apply(led::LedState::WifiSync, t);
+                                    if matches!(button.poll(t), Some(input::Press::Long)) {
+                                        relay_abort = true;
+                                    }
+                                    if t.saturating_sub(relay_draw_ms) >= SYNC_REDRAW_MS {
+                                        relay_draw_ms = t;
+                                        let p = relay_prog.get();
+                                        ota_screen::draw(&mut display, &ota_screen::OtaView {
+                                            kind: ota_screen::OtaKind::Feeding { leaf_id: serve_target },
+                                            build: relay_build,
+                                            done: p.done,
+                                            total: p.total,
+                                            eta_s: relay_eta.sample(p.done, p.total, t),
+                                            unit: if p.total > 10_000 {
+                                                ota_screen::OtaUnit::Bytes
+                                            } else {
+                                                ota_screen::OtaUnit::Blocks
+                                            },
+                                        });
+                                    }
+                                    relay_abort
+                                },
+                                &relay_prog,
+                            );
+                            redraw = true;
+                            crate::ota_mesh::ServeResult::from_leaf_outcome(outcome)
+                        }
+                    }
+                };
+                // ODON → crown: RAW esp_now unicast (NOT send_to — 190L item 1: the OTA family is
+                // parsed before the #248 group-MAC verify-then-strip, so a trailer would corrupt it).
+                let mut odon = [0u8; crate::ota_mesh::ODON_FRAME_MAX];
+                if let Some(n) =
+                    crate::ota_mesh::encode_odon(ps.target, ps.ann.build, ps.session, result, &mut odon)
+                {
+                    r.send_arb_raw(ps.crown_mac, &odon[..n]);
+                }
+                log::info!(
+                    "smol #237: holder served id{} build {} → ODON {:?}",
+                    ps.target, ps.ann.build, result
+                );
+            }
             // #6/#33 OTA: a burst (boot or gateway flush) surfaces a gated announce as the
             // "latest available" TARGET (its state is published to the HA Update entity by
             // the burst). Fetch it ONLY when an install was COMMANDED — the native HA
