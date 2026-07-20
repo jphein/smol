@@ -357,6 +357,11 @@ and #45/#48/#43/#55/#52/#71/#100 hung the rest of the family off the same wire.
 | `key` | 1 | ASCII | which knob (table below) |
 | `value` | ≤64 | bytes | key-specific payload, `CFG_VALUE_MAX = 64` |
 
+**Key-less (legacy) frame.** A frame carrying only `target` with an **empty tail** (no `key` byte)
+is read as an **empty-value clear on the `S` (screen) key** — the pre-#56 wire shape, kept for
+back-compat (`mode.rs` `classify`). A conformant parser MUST treat "no key byte" as `key = 'S'`,
+`value = ""` (screen → board default), **not** as a malformed frame.
+
 **The key family (`CFG_APPLY_KEYS`, merged main @ `95747b1` — 12 keys).** A key a leaf's
 firmware predates is DROPPED (forward-compat, #46). Parse is panic-free/heap-free/bounded
 (a LAN-writable broker + a payload that panicked would re-deliver every boot → boot-loop brick).
@@ -389,7 +394,11 @@ firmware predates is DROPPED (forward-compat, #46). Parse is panic-free/heap-fre
 - **`S` default-screen value.** `<AppKind>:<page>` — `AppKind` is the exact `app.rs` spelling
   (`Menu Clock Batt Grid Snake Bench MeshSnake About`; wire `Snake` → MeshSnake on espnow); `page`
   is one digit, out-of-range clamps to 0; empty value clears → compile-time `board.rs`
-  `DEFAULT_APP`/`DEFAULT_PAGE` (#18/#19).
+  `DEFAULT_APP`/`DEFAULT_PAGE` (#18/#19). **Foreign devices** — a non-fleet-app implementation that
+  doesn't share this `AppKind` enum (e.g. the esp32c6-watch) — should take the **`page` digit after
+  the last `:`** (clamped to their own range) and **ignore the `AppKind` token**: `page` is the
+  portable part of the value, so an `S` config authored for the fleet still selects a sensible
+  screen on a foreign node rather than being rejected.
 - **Retained MQTT feed.** Each key is fed by a retained per-node topic (`smol/<id>/config/…`); the
   gateway self-applies its own id via the credentialed MQTT path and relays the rest single-hop
   (leaves never re-broadcast → no flood/loop).
@@ -810,6 +819,15 @@ snake** and broadcasts an **absolute, stateless** head snapshot; peers
 | `head_x` | 1 | u8 | world cell X (toroidal) |
 | `head_y` | 1 | u8 | world cell Y (toroidal) |
 | `length` | 1 | u8 | segment count; **body dead-reckoned, not sent** |
+
+**Versioning (`ver`) + forward-compat.** The parser is **length-tolerant**: a frame with the `SNK`
+prefix and **≥ 18 B** decodes the stable 18 B v1 core regardless of any trailing bytes. A **v2 = 19 B**
+frame appends a `score` byte at `[18]` (`SNK_FRAME_LEN_V2`, defined on **both** the C3 fleet and the
+esp32c6-watch); **`ver = 1` implies `score == length`**, so a v1 receiver loses nothing. As of this
+writing **no board emits `ver = 2`** — the v2 slot is *reserved-but-inactive*. Who bumps `ver` to 2
+(and thus what a `score` that diverges from `length` means), or whether to drop the dead definition,
+is the open decision in **#232**. A conformant parser reads `[0..18)` unconditionally and reads
+`[18]` **only** when `ver ≥ 2` **and** the frame is ≥ 19 B.
 
 **World / coords.** `u8` per axis → up to **256×256 toroidal** world (design may
 mask to 128/axis via `x & 0x7F`); world size is a game knob. `MAX_PEERS = 16`.
