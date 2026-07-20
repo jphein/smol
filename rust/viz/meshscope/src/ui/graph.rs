@@ -250,10 +250,49 @@ impl GraphLayout {
             painter.circle_filled(ndot, 4.0, sync_color(node.sync_freshness()));
             painter.circle_stroke(ndot, 4.0, Stroke::new(1.0_f32, Color32::from_black_alpha(130)));
 
-            // #159 — OTA in progress: a pulsing ring + "OTA→vLATEST". (No live transfer %
-            // is published to MQTT — ota/state carries only in_progress + installed/latest —
-            // so this is an honest indeterminate indicator, not a fake bar.)
-            if let Some(o) = &node.ota {
+            // #188 — LIVE OTA transfer. A real progress ARC (%+phase) now that the firmware publishes
+            // smol/<id>/ota/progress, OR a LOUD death-point when that record goes stale mid-flight
+            // (the transfer stopped AT `done` bytes — exactly the diagnostic we lacked). Falls back to
+            // the old indeterminate pulse only when a node reports in_progress with no live progress
+            // record yet (pre-first-publish / older firmware).
+            if let Some((frac, dead, prog)) = node.ota_progress_view(now_s) {
+                let ring_r = r + 5.0;
+                if dead {
+                    // Death-point: a loud red pulsing full ring + the exact byte count it died at.
+                    let pulse = (0.55 + 0.45 * (now_s * 6.0).sin() as f32).clamp(0.15, 1.0);
+                    painter.circle_stroke(sp, ring_r, Stroke::new(3.5_f32, Color32::from_rgb(240, 60, 60).gamma_multiply(pulse)));
+                    painter.text(
+                        sp + Vec2::new(0.0, -r - 12.0),
+                        Align2::CENTER_CENTER,
+                        format!("✖ DIED {}k/{}k", prog.done / 1024, prog.total / 1024),
+                        FontId::proportional(11.0),
+                        Color32::from_rgb(255, 120, 120),
+                    );
+                } else if !stale {
+                    // Live: a cyan-green arc sweeping `frac` of the ring, clockwise from the top.
+                    let segs = 40usize;
+                    let sweep = frac.max(0.02) * std::f32::consts::TAU;
+                    let col = Color32::from_rgb(70, 210, 170);
+                    let mut prev: Option<Pos2> = None;
+                    for i in 0..=segs {
+                        let a = -std::f32::consts::FRAC_PI_2 + sweep * (i as f32 / segs as f32);
+                        let pt = sp + Vec2::new(a.cos() * ring_r, a.sin() * ring_r);
+                        if let Some(pv) = prev {
+                            painter.line_segment([pv, pt], Stroke::new(3.0_f32, col));
+                        }
+                        prev = Some(pt);
+                    }
+                    if Some(id) != crown {
+                        painter.text(
+                            sp + Vec2::new(0.0, -r - 12.0),
+                            Align2::CENTER_CENTER,
+                            format!("OTA {}% {}", (frac * 100.0) as u32, prog.phase),
+                            FontId::proportional(10.5),
+                            Color32::from_rgb(120, 230, 200),
+                        );
+                    }
+                }
+            } else if let Some(o) = &node.ota {
                 if o.in_progress && !stale {
                     let pulse = (0.5 + 0.4 * ((now_s * 4.0).sin() as f32 * 0.5 + 0.5)).clamp(0.2, 1.0);
                     painter.circle_stroke(sp, r + 5.0, Stroke::new(2.5_f32, Color32::from_rgb(210, 120, 235).gamma_multiply(pulse)));
