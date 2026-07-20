@@ -111,6 +111,21 @@ fn top_bar(ui: &mut egui::Ui, m: &Model, now_s: f64) {
         };
         ui.separator();
 
+        // #204/#217 coexist-channel-health — the fleet-critical at-a-glance chip: the crown's
+        // uplink AP channel MUST equal the mesh channel or the crown goes bulk-RX-deaf and OTA
+        // dies. Mirrors luna-notify's HA coexist tile (green ==, red !=, amber weak-uplink).
+        let cx = graph::crown_coexist(m);
+        let cx_chip = match cx {
+            graph::Coexist::Healthy { ch } => Some(format!("✓ coexist ch{ch}")),
+            graph::Coexist::Weak { ch, rssi } => Some(format!("⚠ coexist ch{ch} · uplink {rssi} dBm")),
+            graph::Coexist::Violated { ap_ch, mesh_ch } => Some(format!("✖ OFF-CHANNEL · AP ch{ap_ch} ≠ mesh ch{mesh_ch}")),
+            graph::Coexist::Unknown => None,
+        };
+        if let Some(text) = cx_chip {
+            ui.label(RichText::new(text).strong().color(graph::coexist_color(cx)));
+            ui.separator();
+        }
+
         let gateways = m.nodes.values().filter(|n| n.gateway).count();
         ui.label(format!("{} node(s) · {} gateway", m.nodes.len(), gateways));
 
