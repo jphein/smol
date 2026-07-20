@@ -42,6 +42,18 @@ pub struct OtaState {
     pub title: String,
 }
 
+/// #188 live transfer progress from `smol/<id>/ota/progress` = `<done>|<total>|<phase>` (bytes;
+/// phase `self` | `relayfetch` | `relaychunks`). Retained by the firmware, so the LAST value pins
+/// exactly WHERE a transfer got to — the meshscope death-point render keys off it going stale while
+/// `done < total` (the transfer stopped AT `done` bytes). This is the live % the old ota/state
+/// consumer explicitly could NOT show ("no live transfer % is published").
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OtaProgress {
+    pub done: u32,
+    pub total: u32,
+    pub phase: String,
+}
+
 /// Split `smol/<id>/<suffix...>` into `(id, suffix)`. Non-numeric second segment
 /// (e.g. `smol/mesh/channel`, `smol/display/batt`) returns `None` — those are
 /// handled by exact-topic match, not as per-node topics.
@@ -127,6 +139,16 @@ pub fn parse_ota_state(payload: &str) -> Option<OtaState> {
         in_progress: v.get("in_progress").and_then(|x| x.as_bool()).unwrap_or(false),
         title: s("title"),
     })
+}
+
+/// #188: parse `smol/<id>/ota/progress` = `done|total|phase` (pipe-delimited, not JSON). Panic-free;
+/// `None` on a malformed line. `phase` defaults to "" if the third field is absent.
+pub fn parse_ota_progress(payload: &str) -> Option<OtaProgress> {
+    let mut f = payload.splitn(3, '|');
+    let done: u32 = f.next()?.trim().parse().ok()?;
+    let total: u32 = f.next()?.trim().parse().ok()?;
+    let phase = f.next().unwrap_or("").trim().to_string();
+    Some(OtaProgress { done, total, phase })
 }
 
 /// Extract the device noun from an HA discovery config JSON, e.g. device.name
@@ -250,6 +272,18 @@ mod tests {
         assert_eq!(o.latest, "48");
         assert!(o.in_progress);
         assert_eq!(o.title, "v48 Molten Crucible");
+    }
+
+    #[test]
+    fn ota_progress() {
+        let p = parse_ota_progress("393216|1006688|relayfetch").unwrap();
+        assert_eq!(p.done, 393216);
+        assert_eq!(p.total, 1006688);
+        assert_eq!(p.phase, "relayfetch");
+        // phase optional; garbage rejected.
+        assert_eq!(parse_ota_progress("0|1006688").unwrap().phase, "");
+        assert!(parse_ota_progress("").is_none());
+        assert!(parse_ota_progress("abc|1|self").is_none());
     }
 
     #[test]

@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::names;
-use crate::parse::{self, Diag, OtaState, PeerLink};
+use crate::parse::{self, Diag, OtaProgress, OtaState, PeerLink};
 
 // --- Semantic thresholds — the SINGLE SOURCE OF DERIVATION TRUTH (HA parity) ---
 // Every derived signal is defined ONCE here; the HA dashboard mirrors these (and
@@ -21,6 +21,10 @@ use crate::parse::{self, Diag, OtaState, PeerLink};
 // → update HA to match.
 /// A node fades to "stale" after this long without any message (~1.5 flush cycles).
 pub const STALE_S: f64 = 45.0;
+/// #188: an ota/progress record with no update for this long, while `done < total`, is a DEAD
+/// transfer — it stopped AT `done` bytes (the death-point). ~30 s ≫ the fw's ~5 s publish cadence,
+/// so a live transfer never trips it, but a stalled/blackholed one goes loud within one window.
+pub const OTA_PROGRESS_STALE_S: f64 = 30.0;
 /// A link at or weaker than this dBm is a "weak link" (dashed in the graph).
 pub const WEAK_LINK_DBM: i32 = -80;
 /// Free heap at or below this many bytes is "low heap" (flagged).
@@ -108,6 +112,11 @@ pub struct Node {
     pub ota: Option<OtaState>,
     pub ota_armed: bool,
     pub ota_phase: Option<String>, // latest smol/<id>/ota/diag phase (e.g. "fetch-failed retry=3")
+    /// #188 live transfer progress (smol/<id>/ota/progress) + the frame-time it last updated. A
+    /// stale record with done<total is the DEATH-POINT — the transfer stopped AT `done` bytes. See
+    /// [`Node::ota_progress_view`].
+    pub ota_progress: Option<OtaProgress>,
+    pub ota_progress_at: f64,
     pub links: Vec<PeerLink>, // peers this node hears (edges out)
     pub heap_hist: VecDeque<[f64; 2]>,
     pub rssi_hist: VecDeque<[f64; 2]>,
@@ -129,6 +138,8 @@ impl Node {
             ota: None,
             ota_armed: false,
             ota_phase: None,
+            ota_progress: None,
+            ota_progress_at: 0.0,
             links: Vec::new(),
             heap_hist: VecDeque::new(),
             rssi_hist: VecDeque::new(),
@@ -149,6 +160,21 @@ impl Node {
 
     pub fn is_stale(&self, now_s: f64) -> bool {
         now_s - self.last_seen_s > STALE_S
+    }
+
+    /// #188: OTA transfer view for meshscope — `(fraction 0..=1, dead, &OtaProgress)`, or `None`
+    /// if the node published no ota/progress. `dead` = the retained progress went STALE
+    /// (`now_s - ota_progress_at > OTA_PROGRESS_STALE_S`) while `done < total` — i.e. the transfer
+    /// stopped AT `done` bytes (the death-point). `now_s` is the render frame time.
+    pub fn ota_progress_view(&self, now_s: f64) -> Option<(f32, bool, &OtaProgress)> {
+        let p = self.ota_progress.as_ref()?;
+        let frac = if p.total > 0 {
+            (p.done as f32 / p.total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let dead = p.done < p.total && (now_s - self.ota_progress_at) > OTA_PROGRESS_STALE_S;
+        Some((frac, dead, p))
     }
 
     /// The node's LIVE screen — the "familiar"/app it is showing. The AppKind from the
@@ -389,6 +415,15 @@ impl Model {
                         self.event(now_s, EventKind::Ota, format!("⏳ id{id} installing v{}", o.latest));
                     }
                     self.node_mut(id, now_s).ota = Some(o);
+                }
+            }
+            // #188 live transfer progress (bytes). Stamp the frame-time so the render can detect a
+            // STALE record (the death-point). Render-only — no per-update ticker event (too chatty).
+            "ota/progress" => {
+                if let Some(p) = parse::parse_ota_progress(text) {
+                    let n = self.node_mut(id, now_s);
+                    n.ota_progress = Some(p);
+                    n.ota_progress_at = now_s;
                 }
             }
             "ota/install" => {

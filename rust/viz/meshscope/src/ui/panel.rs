@@ -82,6 +82,31 @@ pub fn show(ui: &mut egui::Ui, model: &Model, selected: Option<u8>, now_s: f64) 
                     .color(Color32::from_rgb(220, 140, 240)),
             );
         }
+        // #188 live transfer progress + death-point (smol/<id>/ota/progress). The bytes/% is the
+        // live "watch it happen" signal the old inspector couldn't show; a DIED line pins exactly
+        // where a stalled transfer stopped.
+        if let Some((frac, dead, prog)) = node.ota_progress_view(now_s) {
+            let line = format!(
+                "{} / {} KB  ({}%, {})",
+                prog.done / 1024,
+                prog.total / 1024,
+                (frac * 100.0) as u32,
+                prog.phase
+            );
+            if dead {
+                ui.label(
+                    RichText::new(format!("✖ transfer DIED @ {line}"))
+                        .strong()
+                        .color(Color32::from_rgb(255, 110, 110)),
+                );
+            } else {
+                ui.label(
+                    RichText::new(format!("↓ {line}"))
+                        .monospace()
+                        .color(Color32::from_rgb(120, 230, 200)),
+                );
+            }
+        }
         if node.ota_armed {
             ui.label(RichText::new("🎯 install armed").color(Color32::from_rgb(210, 120, 235)));
         }
