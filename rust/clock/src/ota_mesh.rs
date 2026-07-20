@@ -167,12 +167,23 @@ impl ServeResult {
 /// crown handles `Odon`. Parsed by [`parse_arb_frame`], off the per-chunk hot path.
 #[allow(dead_code)] // #237 INC1: wired by the crown/holder dispatch in a later slice-1 increment
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArbFrame {
+pub enum ArbFrame<'a> {
     /// crown→holder: serve `build` to leaf `target` under `session`, gated by `term` (a holder
     /// rejects a `term` older than the highest it has seen → a dethroned crown cannot delegate).
-    /// ODEL only STARTS a serve of an already-signed image — it cannot cause a flash (the leaf still
-    /// verifies the image sig) — so it needs replay/stale protection, not a signature.
-    Odel { target: u8, build: u32, session: u16, term: u16 },
+    /// Carries the signed manifest `m` + 64-byte ed25519 `sig` (spec §8 final): the crown staged the
+    /// build, so it ships (M,sig) HERE and the holder pairs them with image bytes read from its own
+    /// ACTIVE slot to emit a byte-identical OTAM — ZERO persisted manifest, and the offline sig
+    /// travels crown→holder→leaf so the holder cannot forge. ODEL only STARTS a serve of an
+    /// already-signed image (cannot cause a flash — the leaf still verifies sig), so it needs only
+    /// replay/stale protection (`term`+`session`), not its own signature.
+    Odel {
+        target: u8,
+        build: u32,
+        session: u16,
+        term: u16,
+        m: &'a [u8],
+        sig: &'a [u8; 64],
+    },
     /// holder→crown: outcome of the delegated serve (so the crown advances or falls back).
     Odon { target: u8, build: u32, session: u16, result: ServeResult },
 }
@@ -320,17 +331,30 @@ pub fn encode_otan(origin_id: u8, session: u16, window_base: u16, bitmap: &[u8],
 /// `#[esp_hal::ram]`: arbitration is rare and off the receiver's per-chunk hot path, so it must not
 /// spend `parse_ota_frame`'s IRAM budget.
 #[allow(dead_code)] // #237 INC1: wired by the crown/holder dispatch in a later slice-1 increment
-pub fn parse_arb_frame(data: &[u8]) -> Option<ArbFrame> {
+pub fn parse_arb_frame(data: &[u8]) -> Option<ArbFrame<'_>> {
     if let Some(rest) = data.strip_prefix(ODEL_PREFIX) {
-        // target[3] build[u32 LE] session[2] term[u16 LE]
-        if rest.len() < 3 + 4 + 2 + 2 {
+        // target[3] build[u32 LE] session[2] term[u16 LE] M_len[1] M[M_len] sig[64]
+        if rest.len() < 3 + 4 + 2 + 2 + 1 {
             return None;
         }
         let target = parse_id3(&rest[0..3])?;
         let build = u32::from_le_bytes([rest[3], rest[4], rest[5], rest[6]]);
         let session = u16::from_le_bytes([rest[7], rest[8]]);
         let term = u16::from_le_bytes([rest[9], rest[10]]);
-        return Some(ArbFrame::Odel { target, build, session, term });
+        let m_len = rest[11] as usize;
+        // Bound M by the shared cap so a hostile M_len can't over-read or blow buffers (mirrors OTAM).
+        if m_len == 0 || m_len > ota::SIGNED_MSG_MAX {
+            return None;
+        }
+        let m_start = 12;
+        let sig_start = m_start + m_len;
+        let end = sig_start + 64;
+        if rest.len() < end {
+            return None;
+        }
+        let m = &rest[m_start..sig_start];
+        let sig: &[u8; 64] = rest[sig_start..end].try_into().ok()?;
+        return Some(ArbFrame::Odel { target, build, session, term, m, sig });
     }
     if let Some(rest) = data.strip_prefix(ODON_PREFIX) {
         // target[3] build[u32 LE] session[2] result[1]
@@ -349,8 +373,19 @@ pub fn parse_arb_frame(data: &[u8]) -> Option<ArbFrame> {
 /// Encode an `ODEL` (crown→holder delegate-to-serve). Fixed-width (no manifest) → always fits one
 /// ESP-NOW frame. Returns the byte length written, or `None` if `out` is too small.
 #[allow(dead_code)] // #237 INC1: wired later
-pub fn encode_odel(target_id: u8, build: u32, session: u16, term: u16, out: &mut [u8]) -> Option<usize> {
-    let total = ODEL_PREFIX.len() + 3 + 4 + 2 + 2;
+pub fn encode_odel(
+    target_id: u8,
+    build: u32,
+    session: u16,
+    term: u16,
+    m: &[u8],
+    sig: &[u8; 64],
+    out: &mut [u8],
+) -> Option<usize> {
+    if m.is_empty() || m.len() > ota::SIGNED_MSG_MAX {
+        return None;
+    }
+    let total = ODEL_PREFIX.len() + 3 + 4 + 2 + 2 + 1 + m.len() + 64;
     if out.len() < total {
         return None;
     }
@@ -365,6 +400,12 @@ pub fn encode_odel(target_id: u8, build: u32, session: u16, term: u16, out: &mut
     n += 2;
     out[n..n + 2].copy_from_slice(&term.to_le_bytes());
     n += 2;
+    out[n] = m.len() as u8;
+    n += 1;
+    out[n..n + m.len()].copy_from_slice(m);
+    n += m.len();
+    out[n..n + 64].copy_from_slice(sig);
+    n += 64;
     Some(n)
 }
 
