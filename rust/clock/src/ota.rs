@@ -36,15 +36,29 @@ use esp_bootloader_esp_idf::partitions::{
 };
 use esp_storage::FlashStorage;
 
-/// #233: esp-storage 0.9's `FlashStorage` is a once-only singleton that CONSUMES the FLASH
-/// peripheral (`FlashStorage::new(FLASH)`; panics if constructed twice). smol's OTA is strictly
-/// SERIAL — one `ImageWriter`/`LeafImageWriter` at a time, and the otadata/identity helpers run
-/// before begin / after finalize, never concurrently with the writer or each other — and only
-/// ever reads a CONSTANT flash capacity, so a freshly-stolen per-op handle reproduces the exact
-/// (safe) semantics of the old 0.7 throwaway `flash()`. This avoids threading the
-/// FLASH peripheral through the whole radio stack (main → mode → RadioManager → run_ota_fetch)
-/// and dodges introducing a `&mut FlashStorage` borrow held across the streaming write.
-/// SAFETY: no two `FlashStorage` handles are live-and-in-use at the same instant on this chip.
+/// #233: esp-storage 0.9's `FlashStorage::new` CONSUMES the FLASH peripheral. Its
+/// "Panics if called more than once" doc is the *compile-time move contract* on the
+/// esp-hal peripheral singleton, NOT a runtime check — two independent source-reads
+/// (scratch/233-upgrade/flashstorage-steal-verdict.md) confirmed there is NO once-guard
+/// anywhere in esp-storage 0.9 (the lone `.unwrap()` is capacity-detect), and esp-hal
+/// 1.1.1's `FLASH::steal()` fabricates the zero-state token unconditionally. So a
+/// freshly-stolen per-op handle reproduces the exact semantics of the old 0.7 throwaway
+/// `FlashStorage::new()` — each call just re-reads the constant flash-size header. This
+/// avoids threading the FLASH peripheral through the whole radio stack
+/// (main → mode → RadioManager → run_ota_fetch) and dodges a `&mut FlashStorage` borrow
+/// held across the streaming write.
+///
+/// ⚠️ HUMAN-AUDITED INVARIANT (steal() moves the exclusivity guarantee from the compiler
+/// to us — the risk class is a torn write from a concurrent flash user overlapping an
+/// in-flight OTA op):
+/// - Callers must NEVER hold two `FlashStorage` instances live-and-in-use at once.
+/// - ALL flash access stays on the main loop: OTA is strictly serial (one
+///   `ImageWriter`/`LeafImageWriter` at a time; the otadata/identity helpers run before
+///   begin / after finalize, never concurrently), and no ISR touches flash.
+/// This holds STRUCTURALLY in the non-embassy superloop. #198 (embassy-net migration):
+/// re-evaluate this deliberately — once flash users can interleave at await points, move
+/// to a single owned instance (StaticCell/once-init here in `ota::`) instead of per-op
+/// steal. Do not carry this helper into an async world unexamined.
 #[cfg(feature = "wifi")]
 fn flash() -> FlashStorage<'static> {
     FlashStorage::new(unsafe { esp_hal::peripherals::FLASH::steal() })
