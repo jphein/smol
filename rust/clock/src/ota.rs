@@ -189,6 +189,39 @@ impl Announce {
     pub fn sig(&self) -> &[u8; 64] {
         &self.sig
     }
+
+    /// #237: reconstruct an `Announce` from a signed manifest `m` = `"build|size|sha256hex"` + its
+    /// 64-byte ed25519 `sig`, WITHOUT the MQTT `OTA|…|url` wrapper. A peer-relay HOLDER receives
+    /// `(M, sig)` in the crown's ODEL (not from `smol/ota/staged`), so it rebuilds the `Announce`
+    /// here to drive `run_leaf_ota_relay(HolderActiveSlot, …)`. `url` is empty — a holder never
+    /// fetches. `signed_msg` is set to the EXACT `m` bytes so the leaf's sig-over-M verify stays
+    /// byte-identical to a gateway-sourced OTAM. Panic-free — `None` on any malformed field or
+    /// `m` > `SIGNED_MSG_MAX`. (`splitn(3)` fail-closes a 4th field: trailing bytes land in the sha
+    /// slot and fail the 64-hex parse.)
+    #[cfg(feature = "espnow")]
+    #[allow(dead_code)] // #237: wired by the ODEL-receipt handler (next dispatch increment)
+    pub fn from_signed(m: &[u8], sig: &[u8; 64]) -> Option<Announce> {
+        if m.is_empty() || m.len() > SIGNED_MSG_MAX {
+            return None;
+        }
+        let s = core::str::from_utf8(m).ok()?;
+        let mut it = s.splitn(3, '|');
+        let build: u32 = it.next()?.parse().ok()?;
+        let size: u32 = it.next()?.parse().ok()?;
+        let sha256 = parse_hex_n::<32>(it.next()?)?;
+        let mut signed_msg = [0u8; SIGNED_MSG_MAX];
+        signed_msg[..m.len()].copy_from_slice(m);
+        Some(Announce {
+            build,
+            size,
+            sha256,
+            sig: *sig,
+            signed_msg,
+            signed_len: m.len(),
+            url: [0u8; URL_MAX],
+            url_len: 0,
+        })
+    }
 }
 
 /// Parse `OTA|build|size|sha256hex|sighex|url` (#32: `sighex` = 128-hex Ed25519 sig; url
