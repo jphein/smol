@@ -5,6 +5,7 @@ use egui::{Color32, RichText};
 use egui_plot::{Line, Plot, PlotPoints};
 
 use mesh_model::model::{Model, Node, SyncFreshness, LOW_HEAP_B};
+use mesh_model::parse::OtaSource;
 
 pub fn show(ui: &mut egui::Ui, model: &Model, selected: Option<u8>, now_s: f64) {
     let Some(id) = selected.filter(|i| model.nodes.contains_key(i)) else {
@@ -115,6 +116,27 @@ pub fn show(ui: &mut egui::Ui, model: &Model, selected: Option<u8>, now_s: f64) 
         // completion are the honest "watch it happen" signals.
         if let Some(phase) = &node.ota_phase {
             ui.label(RichText::new(format!("phase: {phase}")).small().monospace().color(Color32::from_rgb(190, 165, 220)));
+        }
+        // #237 peer-sourcing — WHO served this node's last OTA. `gateway` is the normal WiFi
+        // fetch; a peer `id<n>` means a HOLDER served it over ESP-NOW (the baton — the visible
+        // outcome of the crown's ODEL delegation + the holder's ODON), a fetch the gateway never
+        // had to make. The distinction is the metric that proves peer-sourcing saved a fetch.
+        match node.ota_src {
+            Some(OtaSource::Gateway) => {
+                ui.label(
+                    RichText::new("source: gateway fetch")
+                        .small()
+                        .color(Color32::from_rgb(150, 170, 195)),
+                );
+            }
+            Some(OtaSource::Peer(pid)) => {
+                ui.label(
+                    RichText::new(format!("source: ⇄ peer id{pid}  (baton · ESP-NOW serve)"))
+                        .strong()
+                        .color(Color32::from_rgb(170, 220, 120)),
+                );
+            }
+            None => {}
         }
         ui.separator();
     }
