@@ -301,4 +301,37 @@ mod tests {
         assert_eq!(d.led(), Some(("status".to_string(), true)));
         assert_eq!(d.u64("fwd"), Some(0));
     }
+
+    #[test]
+    fn diag_v345_hmac_and_ledger() {
+        // #190 HMAC health + #181/#249 ledger head, exactly as the v345 fw appends them (leaf:
+        // all-node keys; crown: + folded L2 anchor / L3 signed-tree-head). Pins the wire keys the
+        // meshscope panel/graph render against so a fw rename can't silently blank the tiles.
+        let leaf = parse_diag(
+            "DIAG|slot=0|boot=3|up=99|heap=41000|mo=1500|mf=0|lgt=a1b2c3d4|lgn=42|lgok=1|lgk=1",
+        )
+        .unwrap();
+        assert_eq!(leaf.u64("mo"), Some(1500)); // frames authenticated
+        assert_eq!(leaf.u64("mf"), Some(0)); // forgeries rejected
+        assert_eq!(leaf.get("lgt"), Some("a1b2c3d4")); // chain tip (tamper canary)
+        assert_eq!(leaf.u64("lgn"), Some(42)); // chain length
+        assert_eq!(leaf.u64("lgok"), Some(1)); // self-verify OK
+        assert_eq!(leaf.u64("lgk"), Some(1)); // signing key held
+        assert_eq!(leaf.get("lgan"), None); // anchor is crown-only
+
+        // Crown with a signed L3 tree-head (lgsg=1).
+        let crown = parse_diag(
+            "DIAG|slot=0|mo=9|mf=0|lgt=aa|lgn=5|lgok=1|lgk=1|lgan=deadbeef|lgep=7|lgsz=233|lgsg=1",
+        )
+        .unwrap();
+        assert_eq!(crown.get("lgan"), Some("deadbeef"));
+        assert_eq!(crown.u64("lgep"), Some(7));
+        assert_eq!(crown.u64("lgsz"), Some(233));
+        assert_eq!(crown.u64("lgsg"), Some(1));
+
+        // The two alert conditions the render keys on: tamper canary (lgok=0) + HMAC forgeries.
+        let bad = parse_diag("DIAG|slot=0|mo=10|mf=4|lgt=ff|lgn=1|lgok=0|lgk=0").unwrap();
+        assert_eq!(bad.u64("lgok"), Some(0)); // → "✖ ledger self-verify FAILED"
+        assert!(bad.u64("mf").is_some_and(|f| f > 0)); // → "⚠ N HMAC failures"
+    }
 }

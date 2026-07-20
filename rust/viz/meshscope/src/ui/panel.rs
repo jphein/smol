@@ -155,9 +155,67 @@ pub fn show(ui: &mut egui::Ui, model: &Model, selected: Option<u8>, now_s: f64) 
                 _ => None,
             });
             row(ui, "cfg echo", d.get("cfg").map(|s| s.to_string()));
+            // #190 group-HMAC transport auth (v345 train): mo = frames authenticated, mf =
+            // frames rejected as forgeries / wrong group key. Absent on pre-v345 fw → row skipped.
+            row(ui, "HMAC ok/fail", match (d.u64("mo"), d.u64("mf")) {
+                (Some(ok), Some(fail)) => Some(format!("{ok} / {fail}")),
+                _ => None,
+            });
         });
         if d.u64("heap").is_some_and(|h| h <= LOW_HEAP_B) {
             ui.label(RichText::new("⚠ low heap").color(Color32::from_rgb(230, 120, 90)));
+        }
+        // #190: any nonzero HMAC-fail count is worth a look — a rejected forgery, or a board
+        // running the wrong group key. The counter is monotonic, so it's a cumulative tally.
+        if let Some(mf) = d.u64("mf").filter(|f| *f > 0) {
+            ui.label(
+                RichText::new(format!("⚠ {mf} HMAC failures — rejected forgeries / key mismatch"))
+                    .color(Color32::from_rgb(230, 160, 90)),
+            );
+        }
+        // #181/#249 mesh-ledger head (v345): the chain tip is a tamper canary; lgok=0 means this
+        // node's own provenance chain failed self-verify. The crown additionally folds in the L2
+        // anchor / L3 signed-tree-head (lgan present only on the gateway). Defensive: the whole
+        // block is skipped on pre-v345 fw that doesn't publish `lgt`.
+        if let Some(tip) = d.get("lgt") {
+            let recs = d.u64("lgn").unwrap_or(0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("ledger").weak());
+                ui.label(
+                    RichText::new(format!("{tip} · {recs} rec{}", if recs == 1 { "" } else { "s" }))
+                        .monospace()
+                        .color(Color32::from_rgb(150, 200, 235)),
+                );
+                if d.u64("lgk") == Some(1) {
+                    ui.label(RichText::new("· 🔑 key").small().weak());
+                }
+            });
+            if d.u64("lgok") == Some(0) {
+                ui.label(
+                    RichText::new("✖ ledger self-verify FAILED — tamper canary tripped")
+                        .strong()
+                        .color(Color32::from_rgb(255, 110, 110)),
+                );
+            }
+            if let Some(anchor) = d.get("lgan") {
+                let signed = d.u64("lgsg") == Some(1);
+                let (detail, col) = if signed {
+                    (
+                        format!(
+                            "anchor {anchor} · epoch {} · {} leaves · ✍ signed",
+                            d.u64("lgep").unwrap_or(0),
+                            d.u64("lgsz").unwrap_or(0),
+                        ),
+                        Color32::from_rgb(150, 200, 150),
+                    )
+                } else {
+                    (format!("anchor {anchor} · unsigned (L2)"), Color32::from_rgb(205, 190, 140))
+                };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("↳ crown STH").weak().small());
+                    ui.label(RichText::new(detail).small().color(col));
+                });
+            }
         }
         // #204: the crown's associated AP (which AP/channel/RSSI a deaf crown is on — the
         // forensics gap that cost hours of pcap), and crown dead-downstream health.

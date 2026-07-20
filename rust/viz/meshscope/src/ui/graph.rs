@@ -250,6 +250,29 @@ impl GraphLayout {
             painter.circle_filled(ndot, 4.0, sync_color(node.sync_freshness()));
             painter.circle_stroke(ndot, 4.0, Stroke::new(1.0_f32, Color32::from_black_alpha(130)));
 
+            // #190/#249 — fleet-visible security alert at the top-LEFT (mirrors the sync dot).
+            // Red = ledger tamper canary tripped (lgok=0); amber = HMAC forgeries rejected (mf>0).
+            // Pulses so it reads across the whole graph without opening the inspector; tamper wins.
+            if let Some(d) = &node.diag {
+                let tamper = d.u64("lgok") == Some(0);
+                let forgery = d.u64("mf").is_some_and(|f| f > 0);
+                if tamper || forgery {
+                    let pulse = (0.5 + 0.5 * (now_s * 5.0).sin() as f32).clamp(0.3, 1.0);
+                    let col = if tamper {
+                        Color32::from_rgb(240, 70, 70)
+                    } else {
+                        Color32::from_rgb(235, 175, 80)
+                    };
+                    painter.text(
+                        sp + Vec2::new(-r * 0.72, -r * 0.72),
+                        Align2::CENTER_CENTER,
+                        "⚠",
+                        FontId::proportional(13.0),
+                        col.gamma_multiply(if stale { 0.45 } else { pulse }),
+                    );
+                }
+            }
+
             // #188 — LIVE OTA transfer. A real progress ARC (%+phase) now that the firmware publishes
             // smol/<id>/ota/progress, OR a LOUD death-point when that record goes stale mid-flight
             // (the transfer stopped AT `done` bytes — exactly the diagnostic we lacked). Falls back to
