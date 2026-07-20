@@ -1923,6 +1923,10 @@ pub struct RadioManager {
     diag: DiagCounters,
     /// #74 obs wave-2: node state mirrored from `main` (LED mode + time-sync) for the DIAG record.
     diag_extra: DiagExtra,
+    /// #181 mesh-ledger: this node's L1 hash-chain (own provenance) + the crown's L2 head-set for the
+    /// signed tree-head (L3). The on-device ed25519 signing key (if any) is loaded from NVS at
+    /// construction — see [`crate::ota::resolve_ledger_key`]. Surfaced in the DIAG record each cadence.
+    ledger: crate::net::ledger_link::LedgerLink,
     /// #72 io registry: this node's compact `io=<pin>:<count>,…` DIAG field (bound-input press
     /// counters), pushed from `main` via `set_diag_io` each diag-sample tick. Fixed buffer, no heap.
     #[cfg(feature = "io")]
@@ -2158,6 +2162,14 @@ impl RadioManager {
             own_scan: None,
             diag: DiagCounters::new(),
             diag_extra: DiagExtra::new(),
+            // #181: load the on-device ed25519 signing key from NVS (None ⇒ verify-only / unsigned
+            // anchor). resolve_ledger_key NEVER generates a key — provisioning is a deliberate
+            // USB-touch act (feature `ledger-provision`); the OTA image only ever reads.
+            ledger: {
+                let mut l = crate::net::ledger_link::LedgerLink::new();
+                l.set_signing_key(crate::ota::resolve_ledger_key());
+                l
+            },
             #[cfg(feature = "io")]
             diag_io: [0u8; IO_DIAG_MAX],
             #[cfg(feature = "io")]
@@ -3106,6 +3118,33 @@ impl RadioManager {
         // (like cfg=/io=) so the deployed dashboard's positional parse of the fixed set is intact;
         // HA picks these by key. `mo`/`mf` = frames whose group HMAC verified / failed (design §7.1).
         rec.push_str(&alloc::format!("|mo={}|mf={}", self.diag.mac_ok, self.diag.mac_fail));
+        // #181 mesh-ledger: L1 — append a compact provenance record for THIS cadence, then surface
+        // the chain tip (a tamper canary), retained len, self-verify result, and whether a signing
+        // key is held. On the CROWN, also fold in the L2 anchor + (if provisioned) the L3 signed
+        // tree-head epoch — the "publish path" rides the already-retained DIAG topic (peer-STH gossip
+        // is the HW-gated follow-up). Appended LAST → positional parse of the fixed fields intact.
+        let prov = alloc::format!("u{}b{}s{}o{}", up_s, d.boot_count, d.boot_slot, ota);
+        self.ledger.append(prov.as_bytes());
+        let (tip, clen, lok) = self.ledger.chain_summary();
+        rec.push_str(&alloc::format!(
+            "|lgt={:02x}{:02x}{:02x}{:02x}|lgn={}|lgok={}|lgk={}",
+            tip[0], tip[1], tip[2], tip[3], clen, lok as u8, self.ledger.can_sign() as u8
+        ));
+        if self.relay.is_gateway {
+            if let Some(sth) = self.ledger.sign_and_selfcheck(self.id) {
+                let r = sth.root();
+                rec.push_str(&alloc::format!(
+                    "|lgan={:02x}{:02x}{:02x}{:02x}|lgep={}|lgsz={}|lgsg=1",
+                    r[0], r[1], r[2], r[3], sth.epoch(), sth.size()
+                ));
+            } else {
+                let a = self.ledger.anchor(self.id);
+                rec.push_str(&alloc::format!(
+                    "|lgan={:02x}{:02x}{:02x}{:02x}|lgsg=0",
+                    a[0], a[1], a[2], a[3]
+                ));
+            }
+        }
         // #74 item 3 (stage-2): fold in the APPLIED-config string for HA config-drift, ONLY when
         // `main` populated it (espnow build). ASCII by construction (as_wire/to_wire/hex/F24). HA
         // reconstructs the same string from its command topics + plain-string-compares (luna's
