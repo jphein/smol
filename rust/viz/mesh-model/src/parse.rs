@@ -151,6 +151,29 @@ pub fn parse_ota_progress(payload: &str) -> Option<OtaProgress> {
     Some(OtaProgress { done, total, phase })
 }
 
+/// #237 peer-sourcing: WHO served a leaf's last OTA, parsed from the ` src=` suffix the fw
+/// appends to the retained `smol/<id>/ota/diag` payload (`<phase>[ retry=N] src=gw|src=id<n>`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OtaSource {
+    /// `src=gw` — the crown WiFi-fetched it (or fell back to a gateway fetch).
+    Gateway,
+    /// `src=id<n>` — a peer HOLDER served it over ESP-NOW (zero bulk fetch): the #237 baton,
+    /// i.e. the visible outcome of the crown's `ODEL` delegation + the holder's `ODON` result.
+    Peer(u8),
+}
+
+/// Parse the trailing ` src=` attribution off an `ota/diag` payload. `None` when the field is
+/// absent (pre-#237 fw / older records). Tolerant of trailing tokens — takes the first word.
+pub fn parse_ota_src(payload: &str) -> Option<OtaSource> {
+    let (_, tail) = payload.rsplit_once(" src=")?;
+    let tok = tail.split_whitespace().next()?;
+    if tok == "gw" {
+        Some(OtaSource::Gateway)
+    } else {
+        tok.strip_prefix("id")?.parse().ok().map(OtaSource::Peer)
+    }
+}
+
 /// Extract the device noun from an HA discovery config JSON, e.g. device.name
 /// `"smol 7 Draconic"` -> `"Draconic"`. Belt-and-suspenders next to the vendored
 /// `names` table (works even if the firmware corpus ever drifts).
@@ -333,5 +356,17 @@ mod tests {
         let bad = parse_diag("DIAG|slot=0|mo=10|mf=4|lgt=ff|lgn=1|lgok=0|lgk=0").unwrap();
         assert_eq!(bad.u64("lgok"), Some(0)); // → "✖ ledger self-verify FAILED"
         assert!(bad.u64("mf").is_some_and(|f| f > 0)); // → "⚠ N HMAC failures"
+    }
+
+    #[test]
+    fn ota_src_237() {
+        // #237 src= attribution, exactly as the fw appends it to ota/diag.
+        assert_eq!(parse_ota_src("done src=gw"), Some(OtaSource::Gateway));
+        assert_eq!(parse_ota_src("self-fetch-failed retry=3 src=id7"), Some(OtaSource::Peer(7)));
+        assert_eq!(parse_ota_src("installed src=id12"), Some(OtaSource::Peer(12)));
+        // Pre-#237 records (no src=) → None, so the tile simply doesn't render.
+        assert_eq!(parse_ota_src("fetch-failed retry=3"), None);
+        // Malformed source token → None, never a panic.
+        assert_eq!(parse_ota_src("done src=bogus"), None);
     }
 }

@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::names;
-use crate::parse::{self, Diag, OtaProgress, OtaState, PeerLink};
+use crate::parse::{self, Diag, OtaProgress, OtaSource, OtaState, PeerLink};
 
 // --- Semantic thresholds — the SINGLE SOURCE OF DERIVATION TRUTH (HA parity) ---
 // Every derived signal is defined ONCE here; the HA dashboard mirrors these (and
@@ -112,6 +112,9 @@ pub struct Node {
     pub ota: Option<OtaState>,
     pub ota_armed: bool,
     pub ota_phase: Option<String>, // latest smol/<id>/ota/diag phase (e.g. "fetch-failed retry=3")
+    /// #237 peer-sourcing: WHO served the last OTA — `gw` (gateway fetch) vs a peer HOLDER that
+    /// served it over ESP-NOW (the baton). Parsed from the ` src=` suffix on `ota/diag`.
+    pub ota_src: Option<OtaSource>,
     /// #188 live transfer progress (smol/<id>/ota/progress) + the frame-time it last updated. A
     /// stale record with done<total is the DEATH-POINT — the transfer stopped AT `done` bytes. See
     /// [`Node::ota_progress_view`].
@@ -138,6 +141,7 @@ impl Node {
             ota: None,
             ota_armed: false,
             ota_phase: None,
+            ota_src: None,
             ota_progress: None,
             ota_progress_at: 0.0,
             links: Vec::new(),
@@ -441,7 +445,11 @@ impl Model {
                     // The transfer PHASE ("fetch-failed retry=3", terminal outcomes) lands on
                     // ota/diag — keep the latest for the inspector; the others stay ticker-only.
                     if suffix == "ota/diag" {
-                        n.ota_phase = Some(short.clone());
+                        // #237: split the ` src=` attribution out into its own field so the phase
+                        // line stays clean; the source renders as a distinct peer-source/baton tile.
+                        n.ota_src = parse::parse_ota_src(&short);
+                        let phase = short.split(" src=").next().unwrap_or_default().trim_end();
+                        n.ota_phase = Some(phase.to_string());
                     }
                     self.event(now_s, EventKind::Ota, format!("id{id} {suffix}: {short}"));
                 }
@@ -555,9 +563,24 @@ mod tests {
         let mut model = m();
         model.ingest(1.0, "smol/8/ota/diag", b"fetch-failed retry=3");
         assert_eq!(model.nodes[&8].ota_phase.as_deref(), Some("fetch-failed retry=3"));
+        assert_eq!(model.nodes[&8].ota_src, None); // no src= on this record
         // relaydiag stays ticker-only (not the transfer phase).
         model.ingest(2.0, "smol/8/ota/relaydiag", b"leaf=H2V1N0");
         assert_eq!(model.nodes[&8].ota_phase.as_deref(), Some("fetch-failed retry=3"));
+    }
+
+    #[test]
+    fn ota_diag_src_attribution_237() {
+        use crate::parse::OtaSource;
+        let mut model = m();
+        // Peer-sourced: the ` src=id7` splits out into ota_src; the phase line stays clean.
+        model.ingest(1.0, "smol/9/ota/diag", b"installed src=id7");
+        assert_eq!(model.nodes[&9].ota_src, Some(OtaSource::Peer(7)));
+        assert_eq!(model.nodes[&9].ota_phase.as_deref(), Some("installed"));
+        // Gateway fetch attribution.
+        model.ingest(2.0, "smol/9/ota/diag", b"self-fetch-failed retry=2 src=gw");
+        assert_eq!(model.nodes[&9].ota_src, Some(OtaSource::Gateway));
+        assert_eq!(model.nodes[&9].ota_phase.as_deref(), Some("self-fetch-failed retry=2"));
     }
 
     #[test]

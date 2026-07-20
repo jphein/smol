@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
 use mesh_model::model::{Model, SyncFreshness, WEAK_LINK_DBM};
+use mesh_model::parse::OtaSource;
 
 const GOLDEN_ANGLE: f32 = 2.399_963_2; // radians, spreads initial placement
 const K_REP: f32 = 90_000.0; // repulsion strength
@@ -329,6 +330,20 @@ impl GraphLayout {
                         );
                     }
                 }
+            }
+
+            // #237 peer-source baton: tag a node whose last OTA was served by a peer HOLDER
+            // (src=id<n>) over ESP-NOW — a small "⇄id<n>" to the right of the disc so a
+            // peer-sourced board reads as visually distinct from a plain gateway fetch (which is
+            // the default and stays untagged). The visible outcome of the ODEL→serve→ODON baton.
+            if let Some(OtaSource::Peer(pid)) = node.ota_src {
+                painter.text(
+                    sp + Vec2::new(r + 6.0, r * 0.55),
+                    Align2::LEFT_CENTER,
+                    format!("⇄id{pid}"),
+                    FontId::proportional(10.5),
+                    if stale { Color32::from_gray(120) } else { Color32::from_rgb(170, 220, 120) },
+                );
             }
 
             // Tiny heap sparkline beneath the screen line.
