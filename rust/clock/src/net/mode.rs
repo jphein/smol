@@ -296,6 +296,14 @@ const GW_CONFIRM_TIMEOUT_MS: u64 = 120_000;
 /// for one retained install before the gateway gives up + clears it — bounds the auto-retry
 /// so a persistently-failing leaf can't loop the (mesh-deaf) relay every flush forever.
 const LEAF_OTA_MAX_RETRIES: u8 = 3;
+/// #195: max consecutive failed SELF-fetch bursts for one staged build before `main` STOPS
+/// auto-re-triggering the fetch — bounds the mesh-deaf hammer a broken-downstream crown
+/// otherwise sustains (the #204 blackout: id7's canary hit 24 retries before self-terminating).
+/// Mirrors `LEAF_OTA_MAX_RETRIES` (the relay's post-handoff cap). Unlike a doomed-image relay,
+/// a self-fetch failure is a GATEWAY-LOCAL link problem (#134 class), so hitting this cap
+/// SUPPRESSES the re-trigger but does NOT clear the retained arm — a #204 self-heal, a post-shed
+/// relay via a healthy successor crown, a NEW staged build, or a reboot all resume it.
+const SELF_OTA_MAX_RETRIES: u8 = 3;
 /// One-window relay readback buffer (off the stack, in `.bss`). Alias-safe: a gateway
 /// relays to ONE leaf at a time (serial canary), and never runs a leaf receive session.
 static mut GW_OTA_WINDOW: [u8; crate::ota_mesh::WINDOW_BYTES] =
@@ -1933,6 +1941,13 @@ pub struct RadioManager {
     /// it NEVER burns the order (a gateway-local fetch failure says nothing about the leaf/image, so
     /// the install survives for the next attempt / the next crown). Reset on a terminal outcome.
     leaf_ota_fetch_retries: u8,
+    /// #195: consecutive failed SELF-fetch bursts for `self_ota_fail_build`. Build-scoped so a NEW
+    /// staged target starts fresh; `main` skips the re-trigger once it reaches `SELF_OTA_MAX_RETRIES`
+    /// (see `self_ota_fetch_capped`). RAM-only → a reboot clears it. Mirrors `leaf_ota_retries`.
+    self_ota_fail_streak: u8,
+    /// #195: the build number `self_ota_fail_streak` is counted against. A `note_self_ota_failed`
+    /// for a DIFFERENT build resets the streak to 1 (a new target deserves its own N attempts).
+    self_ota_fail_build: u32,
     /// #21 node-manager: the parsed default-screen command surfaced by a burst,
     /// pending `main`'s `take_config_offer` → apply. `None` when nothing is pending.
     config_offer: Option<crate::app::DefaultScreen>,
@@ -2055,6 +2070,8 @@ impl RadioManager {
             ota_self_fail: None,
             leaf_ota_retries: 0,
             leaf_ota_fetch_retries: 0,
+            self_ota_fail_streak: 0,
+            self_ota_fail_build: 0,
             leaf_ota_pending: false,
             leaf_installs_outstanding: false,
             leaf_ota_mac: None,
@@ -3469,6 +3486,32 @@ impl RadioManager {
             }
         }
         ok
+    }
+
+    /// #195: record a FAILED self-fetch of `build` (called by `main` after `run_ota_update`
+    /// returns `false` — a success reboots inside the fetch and never returns here). Build-scoped,
+    /// saturating streak, mirroring the relay's `leaf_ota_retries` counting: a DIFFERENT build
+    /// starts a fresh count (a new target deserves its own N attempts). RAM-only (reboot clears).
+    pub fn note_self_ota_failed(&mut self, build: u32) {
+        if build != self.self_ota_fail_build {
+            self.self_ota_fail_build = build;
+            self.self_ota_fail_streak = 1;
+        } else {
+            self.self_ota_fail_streak = self.self_ota_fail_streak.saturating_add(1);
+        }
+        log::info!(
+            "smol #195: self-fetch fail streak {}/{} for build {}",
+            self.self_ota_fail_streak, SELF_OTA_MAX_RETRIES, build
+        );
+    }
+
+    /// #195: has the self-fetch of `build` hit its consecutive-failure cap? `main` skips the
+    /// re-trigger while true, bounding the mesh-deaf hammer a broken-downstream crown otherwise
+    /// sustains (#204). Build-scoped, so a NEW staged build (or a reboot) resumes it automatically.
+    /// Deliberately does NOT clear the retained arm (#134: a gateway-local fetch failure says
+    /// nothing about the image — a self-heal / post-shed relay / successor crown can still finish it).
+    pub fn self_ota_fetch_capped(&self, build: u32) -> bool {
+        build == self.self_ota_fail_build && self.self_ota_fail_streak >= SELF_OTA_MAX_RETRIES
     }
 
     /// #40: record a leaf-OTA attempt's outcome (called by `main` after `run_leaf_ota_relay`,

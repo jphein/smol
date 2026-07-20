@@ -849,37 +849,56 @@ fn main() -> ! {
                 && (crate::ota::OTA_AUTO_INSTALL || r.take_install_request());
             if do_install {
                 if let Some(announce) = r.take_ota_offer() {
-                    let mut ota_draw_ms = 0u64;
-                    let mut ota_abort = false;
-                    // #161: OTA self-install is minutes-scale → paint the dedicated full-glass OTA
-                    // screen (source host + big block bar + %/ETA + the incoming build's codename)
-                    // from the live byte counts the fetch writes into `ota_prog`, throttled to
-                    // SYNC_REDRAW_MS. Supersedes #153's 1-px edge for the self-fetch path.
-                    let ota_prog = core::cell::Cell::new(ota::OtaProgress::default());
-                    let ota_host = ota::split_url(announce.url()).map(|(h, _, _)| h).unwrap_or("net");
-                    let ota_build = announce.build;
-                    let mut ota_eta = ota_screen::OtaEta::new();
-                    r.run_ota_update(&announce, &mut || {
-                        let t = millis();
-                        led.apply(led::LedState::WifiSync, t);
-                        if matches!(button.poll(t), Some(input::Press::Long)) {
-                            ota_abort = true;
+                    // #195: bound the mesh-deaf hammer — if THIS build's self-fetch has already
+                    // failed SELF_OTA_MAX_RETRIES times in a row (e.g. a #204 broken-downstream
+                    // crown), STOP re-triggering. The retained arm is deliberately kept (#134: a
+                    // gateway-local fetch failure says nothing about the image — a #204 self-heal,
+                    // a post-shed relay via a healthy successor crown, a new staged build, or a
+                    // reboot all resume it). This is the #195 self-fetch cap (mirrors the relay's
+                    // leaf_ota_retries; the arm-clear path was proven unreachable on a deaf crown).
+                    if r.self_ota_fetch_capped(announce.build) {
+                        log::info!(
+                            "smol #195: self-fetch capped for build {} — suppressing re-trigger (arm kept)",
+                            announce.build
+                        );
+                    } else {
+                        let mut ota_draw_ms = 0u64;
+                        let mut ota_abort = false;
+                        // #161: OTA self-install is minutes-scale → paint the dedicated full-glass OTA
+                        // screen (source host + big block bar + %/ETA + the incoming build's codename)
+                        // from the live byte counts the fetch writes into `ota_prog`, throttled to
+                        // SYNC_REDRAW_MS. Supersedes #153's 1-px edge for the self-fetch path.
+                        let ota_prog = core::cell::Cell::new(ota::OtaProgress::default());
+                        let ota_host = ota::split_url(announce.url()).map(|(h, _, _)| h).unwrap_or("net");
+                        let ota_build = announce.build;
+                        let mut ota_eta = ota_screen::OtaEta::new();
+                        // #195: a SUCCESS reboots inside the fetch (never returns); a `false` return is
+                        // a genuine self-fetch failure → count it toward the cap above.
+                        let ok = r.run_ota_update(&announce, &mut || {
+                            let t = millis();
+                            led.apply(led::LedState::WifiSync, t);
+                            if matches!(button.poll(t), Some(input::Press::Long)) {
+                                ota_abort = true;
+                            }
+                            if t.saturating_sub(ota_draw_ms) >= SYNC_REDRAW_MS {
+                                ota_draw_ms = t;
+                                let p = ota_prog.get();
+                                ota_screen::draw(&mut display, &ota_screen::OtaView {
+                                    kind: ota_screen::OtaKind::SelfFetch { host: ota_host },
+                                    build: ota_build,
+                                    done: p.done,
+                                    total: p.total,
+                                    eta_s: ota_eta.sample(p.done, p.total, t),
+                                    unit: ota_screen::OtaUnit::Bytes,
+                                });
+                            }
+                            ota_abort
+                        }, &ota_prog);
+                        if !ok {
+                            r.note_self_ota_failed(announce.build);
                         }
-                        if t.saturating_sub(ota_draw_ms) >= SYNC_REDRAW_MS {
-                            ota_draw_ms = t;
-                            let p = ota_prog.get();
-                            ota_screen::draw(&mut display, &ota_screen::OtaView {
-                                kind: ota_screen::OtaKind::SelfFetch { host: ota_host },
-                                build: ota_build,
-                                done: p.done,
-                                total: p.total,
-                                eta_s: ota_eta.sample(p.done, p.total, t),
-                                unit: ota_screen::OtaUnit::Bytes,
-                            });
-                        }
-                        ota_abort
-                    }, &ota_prog);
-                    redraw = true;
+                        redraw = true;
+                    }
                 }
             }
             // A gateway's SMOLv1 BATT downlink (buffered in `service`) → store it in
