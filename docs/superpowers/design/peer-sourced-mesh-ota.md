@@ -9,7 +9,7 @@
 > (343/342) until this ships, so **implementability-now beats completeness.** The receiver is
 > untouched, so the smallest *source-side* handoff that safely ships wins. This spec is therefore
 > split into a **v1-minimal slice** ([§8](#8-first-implementation-slice-v1-minimal--smallest-safe-pr-slice-1--65)) — the smallest PR that lets a
-> holder serve the fleet — and **v2 deferrals** (flagged inline as `▷ v2` and listed in §8.3).
+> holder serve the fleet — and **v2 deferrals** (flagged inline as `▷ v2`, listed in §8.3, **fully specced in [§12](#12-v2-design--hold-source-inventory-crownless-self-serve-hands-off-rolls)**).
 > The safety floor is constant across v1/v2: **fallback to the #40 gateway fetch means worst-case
 > v1 is exactly today's behavior.** See [§9](#9-bootstrap-sequencing--the-one-more-roll-irony) for the one-more-gateway-roll bootstrap reality.
 
@@ -257,3 +257,70 @@ Constants (from `ota_mesh.rs`): `CHUNK_PAYLOAD=231`, `WINDOW_CHUNKS=64`, `WINDOW
 **v2 (§8.3):** `HOLD` broadcast + crown source-table + load-spread; holder-persisted `(M,sig)`/crownless serve; rich observability; optional #190 ODEL auth.
 
 **Receiver path, HOLE-3, freshness floor, A/B engine: untouched, both slices.**
+
+---
+
+## 12. v2 design — HOLD source-inventory, crownless self-serve, hands-off rolls
+
+Slice-1 (§8) ships peer-sourcing with the **baton** (`last_confirmed_holder`) + crown-carried `(M,sig)`. Correct and minimal, but linear and crown-driven: the crown can only delegate to the node it *just* served, can't load-spread, can't pick the best-positioned source, and every roll needs the crown to seed and walk the chain. v2 removes those limits. It is **additive** — v1 stays the fallback, and every v2 mechanism sits above the unchanged verify-before-flash floor. Ship it **after** slice-1 has HW-proven the serve path (§6/#65).
+
+### 12.1 HOLD source-inventory (replaces the baton)
+Promote the `HOLD` broadcast (§10) from reserved to active. Each node that can serve a build broadcasts `HOLD{id, build, flags}` (~10 s, piggybacked on the DIAG tick); the crown accumulates a **source table** `{id → (build, verified, on_ch6, last_seen)}` on the same drain path as DIAG. Source-selection becomes: **any** qualified holder of build N, not just the last one served. Over the baton:
+- **Load-spread** — distribute serve duty across all holders (§12.4), not one linear chain.
+- **Churn-robust** — a holder that reboots/leaves ages out via `last_seen` staleness; the crown picks another. The baton *stalls* if `last_confirmed_holder` dies mid-roll; the inventory doesn't.
+- **Hands-off** — the crown *discovers* sources rather than the operator/crown seeding each chain (§12.6).
+Bounded table (evict stalest); a `HOLD` for a build older than the roll target is ignored.
+
+### 12.2 Holder-persisted (M,sig) in NVS
+To advertise `HOLD` and serve **without** the crown re-supplying the manifest, a holder must retain `(M, sig)` across its own activate-**reboot** (which clears `.bss` — the slice-1 reason the crown carries it, §8.1). v2 persists it in **NVS**: minimum the **64-byte `sig`** (`M` is reconstructable post-reboot from `build` + slot `size` + a readback-sha), or the full `M`+`sig` (≤150 B) to skip reconstruction. Cleared on a newer stage. A holder sets `HOLD.flags.verified` **only after** its own `slot[..size]` readback-sha matches the manifest — so it never advertises a copy it can't reproduce.
+
+### 12.3 Crownless self-serve (lean ODEL) — and where the canary line stays
+With persisted `(M,sig)` the `ODEL` no longer needs to carry the manifest: **`M_len = 0` ⇒ "holder, serve from your persisted `(M,sig)`"**; `M_len > 0` is the slice-1 crown-supplied form (clean mixed v1/v2 interop). This is "crownless" in that *serving* no longer depends on the crown holding the manifest — which matters when the elected crown is **not the gateway/stager** (a lowest-id leaf crown that never saw the MQTT manifest can still direct a holder that did).
+**The canary line does not move:** the crown stays the **sole sequencer** — one target in flight, no fleet push. Persisted `(M,sig)` changes *what the ODEL carries*, never *how many update at once*.
+> **Explicitly NOT v2 (flagged):** a *fully* crown-independent **pull** (a leaf requests and multiple holders serve different targets with no arbiter) would break structural canary — concurrent un-sequenced updates re-introduce the mass-brick risk while bootloader auto-revert is unproven. That needs a distributed one-at-a-time lock **or** proven bootloader rollback first. It is a **v3** with that caveat, not v2.
+
+### 12.4 Source-preference order (promotes §1.3)
+For target T on build N, the crown picks the first holder that qualifies:
+1. **verified + on ch6** (serve-ready; can't push co-channel otherwise),
+2. **fewest in-flight serve obligations** (load-spread),
+3. **best link to T if known** (ETX/#164 — a holder one good hop from T beats a distant one),
+4. **prefer a non-crown holder** (keep the crown free to flush/arbitrate),
+5. **freshest `HOLD`** (most-recently-alive) as a tiebreak,
+6. else **self** via the #40 gateway fetch (seed / fallback — always available, §5.5).
+
+### 12.5 The natural-crown bootstrap gate (live-run reality)
+Election is **lowest-id** (`mode.rs`: a "dead **lowest-id** owner" is the takeover trigger; a live owner "possibly a new **lower id**" wins). So the **durable crown is the lowest-id node — id5/Aegis in the current fleet.** Peer-sourcing is crown-driven, so it **activates only once the natural crown is on a peer-capable build (v345+)**:
+- **The bootstrap must get v345 onto id5** (the natural crown) — the v345 wave, via the last #40-style roll or USB. Until id5 is v345+, it remains crown (lowest id) but **cannot delegate** → the fleet falls back to #40 gateway fetch. *Getting the feature fleet-wide is not enough; the crown ROLE must sit on a peer-capable build.*
+- **A transient higher-id crown** (during id5 downtime) peer-sources only if it too is v345+; else #40 fallback. Steady state re-converges to id5, so this is a brief window.
+- **Once id5 is v345+, v346+ rolls are hands-off** (§12.6).
+
+### 12.6 Hands-off v346+ rolls (the payoff)
+With HOLD inventory + a v345-capable natural crown, an operator roll is:
+1. `ota_publish.sh stage <build>` — publish the signed manifest. **That is the entire operator action.**
+2. The crown (id5) fetches the seed **once** (its unavoidable WiFi fetch, hardened by #217), activates, and begins advertising `HOLD`.
+3. As each node updates it advertises `HOLD`; the crown auto-delegates the next target to the best-positioned holder (§12.4), **canary-sequenced + load-spread**, with #40 fallback on any `ODON != OK`.
+4. The roll walks the fleet with **no per-target operator action and zero gateway bulk-fetch after the seed** — visible via the `served-by-peer` vs `fell-back` metric (§7) and the image-host pcap showing silence for followers ([ota.md ground-truth](../../ota.md)).
+
+Contrast: **v1** (§8.2) — operator seeds + the crown batons one chain; **v2** — operator stages and the crown self-organizes the whole roll.
+
+### 12.7 v2 wire delta (all additive, mixed-fleet safe)
+- `HOLD` (§10) promoted reserved → **active**.
+- `ODEL` gains the **`M_len = 0`** lean form (holder uses persisted `(M,sig)`); the M+sig-carrying form (slice-1) stays for holders without persistence → clean mixed v1/v2 interop.
+- New NVS record: `(M,sig)` for the current build (≤150 B; 64 B minimum), cleared on a newer stage.
+- **No receiver change; no new trust** (verify-before-flash / HOLE-3 / freshness-floor unchanged).
+
+### 12.8 v2 failure modes (delta over §5)
+- **Stale HOLD** (advertised build N but rebooted/lost it) → serve-time readback-sha self-check fails → `ODON=self-slot-verify-failed` → crown re-picks from the table (or #40 fallback). `verified` + `last_seen` staleness minimize it.
+- **HOLD-table overflow** → bounded, evict stalest; a missed holder simply isn't picked → fallback. Correctness unaffected.
+- **Natural crown not yet v345** → §12.5; the fleet degrades to exactly #40 (no worse than today).
+- **Persisted-`(M,sig)` drift** (NVS corrupt / build mismatch) → readback-sha guard rejects → self-verify-failed → fallback.
+
+### 12.9 Implementation order (v2, after slice-1 ships)
+1. NVS `(M,sig)` record + `HOLD.flags.verified` self-check (§12.2).
+2. `HOLD` encode/parse + crown source-table on the DIAG drain (§12.1).
+3. Lean `ODEL` (`M_len=0`) + holder-serve-from-NVS (§12.3).
+4. Source-preference order + load-spread accounting (§12.4).
+5. Observability: `…/ota/holds` inventory topic + served-by-peer/fell-back metric (§7).
+6. Host tests (the flood/etx/ledger pattern): source-table selection + churn (holder ages out), lean-ODEL serve-from-NVS, stale-HOLD → self-verify-fail → re-pick, natural-crown-gate (crown-not-peer-capable → #40 fallback).
+
+**Receiver path, HOLE-3, freshness floor, canary-one-at-a-time: unchanged.**
