@@ -679,7 +679,26 @@ fn inactive_slot() -> Option<Slot> {
         .ok()??;
     let mut region = od.as_embedded_storage(&mut flash);
     let mut ota = Ota::new(&mut region).ok()?;
-    Some(ota.current_slot().ok()?.next())
+    // #226 SELF-OVERWRITE FIX: on a BLANK/uninitialized otadata, `current_slot()` returns
+    // `Slot::None`, and `Slot::None.next()` folds to `Slot::Slot0` (esp-bootloader 0.2.0
+    // ota.rs:64) — i.e. the RUNNING slot, so an OTA would overwrite the LIVE image (a boot-
+    // critical self-overwrite / brick class). A blank otadata always ROM-falls-back to ota_0
+    // (there is no factory partition in partitions-ota.csv), so the running slot is provably
+    // ota_0 and the true inactive write-target is ota_1. Explicit match instead of the blind
+    // `.next()`. Validated against JP's ESP32-C6 watch (esp-bootloader 0.5), which avoids this
+    // exact bug the same way — the `.next()` footgun SURVIVES into 0.5 (current_slot() still
+    // returns None on blank), so the crate bump does NOT auto-fix it; the explicit mapping does
+    // (watch study: scratch/watch-backport/226-comment.md, task #49).
+    //
+    // No first-boot otadata write is needed (supersedes the original init sketch): a boot-time
+    // flash write to boot-critical partition state would be an unnecessary risk, and `activate()`
+    // already makes otadata valid (set_current_slot + New) on the first real OTA. So the blank
+    // state self-heals on the first successful update, with zero boot-path flash mutation.
+    let target = match ota.current_slot().ok()? {
+        Slot::None => Slot::Slot1,
+        other => other.next(),
+    };
+    Some(target)
 }
 
 /// Point `otadata` at the freshly-written `target` slot + arm the state machine
