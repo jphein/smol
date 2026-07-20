@@ -4717,14 +4717,18 @@ impl RadioManager {
             if escalate {
                 let shed_justified = self.relay.deaf_bulk_seen
                     || self.relay.crown_deaf_streak >= DEAF_SHED_DEEP_STREAK;
-                // #217 rung-3 STRAND-GUARD: never shed into a crownless gap. If the co-channel
-                // selector has LATCHED `Degraded` (M reclaims proved NO co-channel AP is reachable),
-                // a successor would be off-channel too → shedding only starts crownless churn. Stay
-                // crown, degraded (MQTT/mesh alive, OTA off). A ch6-heal → `Normal` clears the latch
-                // and normal #204 shedding resumes. (Deafness on a ch6 AP keeps crown_state=Normal,
-                // so this never suppresses a legitimate #204 self-heal shed.)
+                // #217 rung-3 STRAND-GUARD: never shed into a crownless gap. Suppress the deaf-shed
+                // abdication whenever the crown is NOT co-channel (state != Normal = Shed OR Degraded).
+                // Gating on `!= Normal` (not `== Degraded`) closes a RACE: DEAF_SHED_M fires the
+                // abdication at reassoc_cycles>=2, but the Degraded latch needs shed_reclaims>=3 — so
+                // `== Degraded` left a shed_reclaims=1,2 window (state=Shed) where a sole off-channel
+                // crown could abdicate ~1 cycle BEFORE latching → a bounded crownless gap. `!= Normal`
+                // engages the instant the co-channel selector confirms no co-channel AP (Shed), so the
+                // never-crownless invariant holds BY CONSTRUCTION, not by a timing race. SAFE for #204:
+                // a co-channel decision resets crown_state to Normal, so a legitimate ch6-AP deaf-shed
+                // (deaf for non-channel reasons) stays Normal → NOT suppressed.
                 let strand_latched =
-                    self.crown_state == crate::net::coexist::CrownState::Degraded;
+                    self.crown_state != crate::net::coexist::CrownState::Normal;
                 if strand_latched {
                     log::warn!(
                         "smol #217r3: deaf-shed SUPPRESSED — strand-latched (no co-channel AP); staying crown (never crownless)"
