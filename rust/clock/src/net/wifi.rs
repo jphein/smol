@@ -3968,6 +3968,128 @@ fn parse_ipv4(host: &str) -> Option<smoltcp::wire::Ipv4Address> {
     Some(smoltcp::wire::Ipv4Address::new(a, b, c, d))
 }
 
+/// #188: best-effort publish of ONE retained `smol/<id>/ota/progress` = `<done>|<total>|<phase>`
+/// mid-fetch, so the visualizers animate live progress AND — the diagnostic we lacked all night —
+/// the LAST retained value pins exactly WHERE a transfer died (vs hand-correlating server GET logs).
+/// REUSES the fetch's tcp socket in its between-chunks idle window: abort → connect broker →
+/// CONNECT/CONNACK → PUBLISH(retain) → close; the loop's #147 per-chunk recycle then re-cleans +
+/// reconnects to the HTTP host (state-agnostic, so this can't corrupt the download). A short internal
+/// deadline bounds a broker hiccup so telemetry NEVER stalls the fetch; ANY failure is swallowed
+/// (progress is best-effort). Shares the fetch's `tick` so a long-press still aborts. Broker leg =
+/// `active_broker()` (#100). espnow-only (the OTA fetch is).
+#[cfg(feature = "espnow")]
+#[allow(clippy::too_many_arguments)]
+fn publish_ota_progress(
+    iface: &mut Interface,
+    device: &mut esp_wifi::wifi::WifiDevice,
+    sockets: &mut SocketSet,
+    tcp_handle: smoltcp::iface::SocketHandle,
+    src_port: u16,
+    node_id: u8,
+    done: u32,
+    total: u32,
+    phase: &str,
+    tick: &mut dyn FnMut() -> bool,
+) {
+    let (bip, bport) = active_broker();
+    let o = bip.octets();
+    let broker = (IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(o[0], o[1], o[2], o[3])), bport);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    // Force the (possibly lingering) socket to CLOSED, then open a fresh broker connection. The
+    // fetch loop's per-chunk recycle re-cleans + reconnects to the HTTP host after we return.
+    sockets.get_mut::<tcp::Socket>(tcp_handle).abort();
+    loop {
+        iface.poll(smoltcp_now(), device, sockets);
+        if sockets.get_mut::<tcp::Socket>(tcp_handle).state() == tcp::State::Closed {
+            break;
+        }
+        if Instant::now() > deadline {
+            return;
+        }
+    }
+    if sockets
+        .get_mut::<tcp::Socket>(tcp_handle)
+        .connect(iface.context(), broker, src_port)
+        .is_err()
+    {
+        return;
+    }
+    loop {
+        if tick() {
+            return;
+        }
+        iface.poll(smoltcp_now(), device, sockets);
+        match sockets.get_mut::<tcp::Socket>(tcp_handle).state() {
+            tcp::State::Established => break,
+            tcp::State::Closed => return,
+            _ => {}
+        }
+        if Instant::now() > deadline {
+            return;
+        }
+    }
+    let mut pkt = [0u8; 128];
+    // CONNECT (client id distinct from the flush session's `smol-<id>` so the broker doesn't
+    // take-over that session's connection).
+    let mut cid = MqttScratch::new();
+    let _ = write!(cid, "smol-{}op", node_id);
+    match crate::net::mqtt::encode_connect(
+        &mut pkt,
+        cid.as_bytes(),
+        crate::secrets::MQTT_USER.as_bytes(),
+        crate::secrets::MQTT_PASS.as_bytes(),
+    ) {
+        Some(n) if tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick) => {}
+        _ => return,
+    }
+    // CONNACK (require rc=0) — small local accumulator. Copy scalars out of the match BEFORE the
+    // `copy_within` compaction so the `acc` borrow (via the parsed packet) is released first.
+    let mut acc = [0u8; 64];
+    let mut acc_len = 0usize;
+    let mut connected = false;
+    while !connected {
+        if tick() {
+            return;
+        }
+        iface.poll(smoltcp_now(), device, sockets);
+        recv_into(sockets, tcp_handle, &mut acc, &mut acc_len);
+        loop {
+            let (consumed, ok, bad) = match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
+                None => break,
+                Some((crate::net::mqtt::Incoming::ConnAck { return_code }, consumed)) => {
+                    (consumed, return_code == 0, return_code != 0)
+                }
+                Some((_, consumed)) => (consumed, false, false),
+            };
+            acc.copy_within(consumed..acc_len, 0);
+            acc_len -= consumed;
+            if bad {
+                return;
+            }
+            if ok {
+                connected = true;
+                break;
+            }
+        }
+        if Instant::now() > deadline {
+            return;
+        }
+    }
+    // PUBLISH the retained progress line.
+    let mut topic = MqttScratch::new();
+    let _ = write!(topic, "smol/{}/ota/progress", node_id);
+    let mut payload = MqttScratch::new();
+    let _ = write!(payload, "{}|{}|{}", done, total, phase);
+    if let Some(n) =
+        crate::net::mqtt::encode_publish(&mut pkt, topic.as_bytes(), payload.as_bytes(), true)
+    {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
+    // Close cleanly; the loop's recycle will re-establish the HTTP connection for the next chunk.
+    sockets.get_mut::<tcp::Socket>(tcp_handle).close();
+    iface.poll(smoltcp_now(), device, sockets);
+}
+
 /// #6 OTA FETCH burst (`espnow` gateway, triggered by a gated announce): stream the
 /// announced image over plain HTTP/1.0 into the INACTIVE slot, hashing on the fly,
 /// verify SHA-256 + size, then activate + reboot. The caller has ALREADY
@@ -4000,6 +4122,10 @@ pub fn run_ota_fetch(
     // edge (bytes downloaded / image size). UI-agnostic: net/ only sets the counts, the
     // display lives in `main`. Shared by self-OTA and the gateway's relay-fetch phase.
     progress: &core::cell::Cell<crate::ota::OtaProgress>,
+    // #188: Some(target_id) → publish a throttled retained `smol/<target_id>/ota/progress` during the
+    // fetch (self id for a self-OTA; the LEAF id for a crown relay-fetch). None → no publish and the
+    // fetch path is byte-identical to before (relay-unchanged / default-build invariant).
+    progress_id: Option<u8>,
 ) -> bool {
     let Some((host, port, path)) = crate::ota::split_url(announce.url()) else {
         log::error!("smol OTA: malformed announce URL — aborting fetch");
@@ -4139,6 +4265,10 @@ pub fn run_ota_fetch(
     let mut range_ok = true; // flips false if chunk 0 returns 200 (server ignored Range)
     let mut chunk_retries: u32 = 0; // re-requests forced by a short/failed chunk
     let mut stall: u32 = 0; // consecutive zero-progress attempts
+    // #188: throttle for the live MQTT progress publish. Seeded to NOW so the first loop fires it
+    // immediately (a fetch that dies fast still leaves a death-point); ~5 s cadence after that so the
+    // telemetry never dominates the download's airtime.
+    let mut next_progress_pub = Instant::now();
     let chunk_n = announce.size.div_ceil(OTA_CHUNK); // total chunks (for the #139-followup fail diag)
     // #147: the stage the CURRENT chunk attempt is in — advanced as we pass connect → handshake →
     // send → recv, so whatever return fires below carries the precise failure point in the diag.
@@ -4152,6 +4282,20 @@ pub fn run_ota_fetch(
         *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, fail_point));
         // #153: surface live byte progress for the UI tick's bottom edge.
         progress.set(crate::ota::OtaProgress { done: writer.written(), total: announce.size });
+        // #188: throttled live progress → retained MQTT (viz + the death-point diagnostic). Best-effort;
+        // reuses the tcp socket in this between-chunks idle window (the per-chunk recycle below re-cleans
+        // + reconnects to the HTTP host). None ⇒ skipped entirely (byte-identical to the pre-#188 path).
+        if let Some(pid) = progress_id {
+            if Instant::now() >= next_progress_pub {
+                next_progress_pub = Instant::now() + Duration::from_secs(5);
+                let src_port = 49152 + (rng.random() % 16384) as u16;
+                let phase = if relay_mode { "relayfetch" } else { "self" };
+                publish_ota_progress(
+                    &mut iface, device, &mut sockets, tcp_handle, src_port, pid,
+                    writer.written(), announce.size, phase, tick,
+                );
+            }
+        }
         if tick() {
             log::warn!("smol OTA: aborted by long-press (slot untouched)");
             return false;
