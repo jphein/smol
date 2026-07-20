@@ -1186,6 +1186,50 @@ pub fn active_slot() -> Option<Slot> {
     })
 }
 
+/// #237 slice-1 serve-time SELF-VERIFY (spec §10.1 item 4 / §5.2 pre-flight): read the ACTIVE slot's
+/// first `size` bytes and confirm their SHA-256 == `sha256` (the manifest sha the crown supplied in
+/// the ODEL). A peer-relay holder MUST pass this before serving — on mismatch it replies
+/// `ODON = self-slot-verify-failed` and the crown falls back to the #40 gateway fetch (§5.2). A
+/// source must never offer a copy it cannot itself reproduce. Read-only, fail-closed (ANY
+/// partition/flash/slot error ⇒ `false`).
+///
+/// The read buffer lives in a `static` (NOT the stack — the serve task budget is tight; same F2
+/// discipline as #217's OTA_STAGE) and reads in `CHUNK` spans so `SlotReader::read`'s per-call
+/// partition-table reparse amortizes over few calls. Single-caller + one-shot per ODEL (a serve is
+/// never re-entrant), so the `&'static mut` borrow is alias-safe; `addr_of_mut!` avoids the
+/// ref-to-`static mut` lint. Word-alignment: `off` steps by `CHUNK` (aligned) except the final
+/// partial (which ends the loop); the tail read length is rounded up to a word and only the real
+/// `size` bytes are hashed (the slot beyond `size` is inert 0xFF pad).
+#[cfg(feature = "espnow")]
+#[allow(dead_code)] // #237: wired by the ODEL-receipt handler (INC4 dispatch)
+pub fn verify_active_slot(size: u32, sha256: &[u8; 32]) -> bool {
+    use sha2::{Digest, Sha256};
+    static mut VERIFY_BUF: [u8; CHUNK] = [0u8; CHUNK];
+    let slot = match active_slot() {
+        Some(s) => s,
+        None => return false,
+    };
+    let reader = match SlotReader::open(slot) {
+        Some(r) => r,
+        None => return false,
+    };
+    // Alias-safe: one-shot, single-caller, non-re-entrant (see doc).
+    let buf: &mut [u8; CHUNK] = unsafe { &mut *core::ptr::addr_of_mut!(VERIFY_BUF) };
+    let mut hasher = Sha256::new();
+    let mut off: u32 = 0;
+    while off < size {
+        let take = core::cmp::min(CHUNK as u32, size - off) as usize;
+        let read_len = take.next_multiple_of(4); // SlotReader wants a word-aligned len (≤ CHUNK)
+        if !reader.read(off, &mut buf[..read_len]) {
+            return false;
+        }
+        hasher.update(&buf[..take]);
+        off += take as u32;
+    }
+    let digest = hasher.finalize();
+    digest[..] == sha256[..]
+}
+
 // ---------------------------------------------------------------------------
 // #40 §3C — the persistent signed-freshness FLOOR (NVS-backed).
 //
