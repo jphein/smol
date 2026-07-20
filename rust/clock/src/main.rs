@@ -1304,7 +1304,7 @@ fn main() -> ! {
                             let relay_prog = core::cell::Cell::new(ota::OtaProgress::default());
                             let relay_build = ann.build;
                             let mut relay_eta = ota_screen::OtaEta::new();
-                            let outcome = r.run_leaf_ota_relay(leaf_id, mac, &ann, &mut || {
+                            let outcome = r.run_leaf_ota_relay(crate::ota_mesh::ServeSource::GatewayFetch, leaf_id, mac, &ann, &mut || {
                                 let t = millis();
                                 led.apply(led::LedState::WifiSync, t);
                                 if matches!(button.poll(t), Some(input::Press::Long)) {

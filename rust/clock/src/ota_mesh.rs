@@ -188,6 +188,21 @@ pub enum ArbFrame<'a> {
     Odon { target: u8, build: u32, session: u16, result: ServeResult },
 }
 
+/// #237 slice-1: where a leaf-OTA serve sources its image bytes (selects the source arm inside
+/// `run_leaf_ota_relay`). `GatewayFetch` = the #40 path (the crown WiFi-fetches into its inactive
+/// slot then serves) — the seed + the fallback floor. `HolderActiveSlot` = peer-sourcing: a holder
+/// serves the build it is RUNNING from its ACTIVE slot over ESP-NOW with NO WiFi fetch
+/// (coexist-safe), authorized by the crown's ODEL (term/session + serve-time readback-sha verified
+/// by the caller before it invokes the serve).
+// HolderActiveSlot is constructed by the ODEL-receipt handler (next #237 increment); GatewayFetch
+// is live now (the #40 caller). Allow until that handler wires the holder-serve path.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeSource {
+    GatewayFetch,
+    HolderActiveSlot,
+}
+
 /// Parse one #40 OTA frame. Returns `None` on ANY malformed input (never panics,
 /// never indexes past the slice) — the caller treats `None` as "not an OTA frame".
 // #69 IRAM: on the per-chunk RX hot path (parsed for every OTAD during a leaf mesh-OTA). Placed in

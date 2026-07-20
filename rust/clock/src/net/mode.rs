@@ -3718,6 +3718,7 @@ impl RadioManager {
     /// outcome for the HA `smol/<leaf>/ota/state` publish. No-op on a non-gateway.
     pub fn run_leaf_ota_relay(
         &mut self,
+        source: crate::ota_mesh::ServeSource,
         leaf_id: u8,
         leaf_mac: [u8; 6],
         announce: &crate::ota::Announce,
@@ -3730,7 +3731,10 @@ impl RadioManager {
             self as om, LeafOtaOutcome, CHUNK_PAYLOAD, WINDOW_BYTES, WINDOW_CHUNKS,
         };
         use esp_bootloader_esp_idf::ota::Slot;
-        if !self.relay.is_gateway {
+        // #237: a GATEWAY-fetch serve needs the crown role (it does the WiFi fetch); a HOLDER
+        // active-slot serve is authorized by the crown's ODEL (term/session + serve-time
+        // readback-sha verified by the caller), so it does NOT require is_gateway.
+        if matches!(source, om::ServeSource::GatewayFetch) && !self.relay.is_gateway {
             return LeafOtaOutcome::RelayFailed;
         }
         let size = announce.size;
@@ -3813,30 +3817,41 @@ impl RadioManager {
             }
         }
 
-        // --- FETCH (WiFi) → stage+verify into THIS gateway's inactive slot (no activate).
-        // CRITICAL: `run_leaf_ota_relay` is called IMMEDIATELY after `flush_telemetry`, which
-        // leaves the radio in WifiSta. `switch()` is a NO-OP when already in-mode → it would
-        // NOT issue a fresh `connect()`, but `run_ota_fetch` ASSUMES the caller's switch just
-        // connect()'d (its own contract). If the flush's association has gone stale, the fetch
-        // then spins its whole 5-min budget waiting for `is_connected` (no SYN, mesh-deaf) —
-        // exactly the observed "no fetch + long offline". Self-OTA avoids this because it runs
-        // from EspNow mode (its switch DOES connect). So force a fresh association here:
-        // EspNow (drop the stale link) → WifiSta (issue a real connect), mirroring self-OTA.
-        let _ = self.switch(Mode::EspNow);
-        let _ = self.switch(Mode::WifiSta);
-        let rng = self.rng;
-        let mut staged: Option<Slot> = None;
-        let fetched = match self.sta.as_mut() {
-            Some(sta) => crate::net::wifi::run_ota_fetch(
-                &mut self.controller, sta, rng, announce, tick, true, &mut staged, &mut None,
-                progress,
-                Some(leaf_id), // #188: live progress → smol/<leaf>/ota/progress (crown relay-fetch)
-            ),
-            None => false,
+        // --- SOURCE the image slot: #40 gateway FETCH (WiFi → inactive slot) OR #237 peer-serve
+        // (read the build this holder is RUNNING from its ACTIVE slot — no WiFi, coexist-safe).
+        // The RELAY machinery below is source-AGNOSTIC (it reads via `reader`), so peer-sourcing
+        // only changes where these bytes come from.
+        let slot = match source {
+            om::ServeSource::GatewayFetch => {
+                // CRITICAL: run_leaf_ota_relay is called IMMEDIATELY after flush_telemetry, which
+                // leaves the radio in WifiSta. switch() is a NO-OP when already in-mode → it would
+                // NOT issue a fresh connect(), but run_ota_fetch ASSUMES the caller's switch just
+                // connect()'d (its contract). If the flush's association went stale, the fetch spins
+                // its whole budget waiting for is_connected. So force a fresh association here:
+                // EspNow (drop the stale link) → WifiSta (real connect), mirroring self-OTA.
+                let _ = self.switch(Mode::EspNow);
+                let _ = self.switch(Mode::WifiSta);
+                let rng = self.rng;
+                let mut staged: Option<Slot> = None;
+                let fetched = match self.sta.as_mut() {
+                    Some(sta) => crate::net::wifi::run_ota_fetch(
+                        &mut self.controller, sta, rng, announce, tick, true, &mut staged, &mut None,
+                        progress,
+                        Some(leaf_id), // #188: live progress → smol/<leaf>/ota/progress (relay-fetch)
+                    ),
+                    None => false,
+                };
+                if fetched { staged } else { None }
+            }
+            om::ServeSource::HolderActiveSlot => {
+                // #237: no WiFi fetch — the holder serves its RUNNING build from the ACTIVE slot.
+                // The ODEL handler (caller) already verified term/session + ran verify_active_slot
+                // against the manifest sha, so these bytes are the signed image the crown named.
+                crate::ota::active_slot()
+            }
         };
-        let staged = if fetched { staged } else { None };
-        let Some(slot) = staged else {
-            log::error!("smol #40: relay FETCH/stage failed — aborting (leaf untouched)");
+        let Some(slot) = slot else {
+            log::error!("smol #237/#40: relay source slot unavailable — aborting (leaf untouched)");
             let _ = self.switch(Mode::EspNow);
             return LeafOtaOutcome::FetchFailed;
         };
