@@ -4442,6 +4442,13 @@ pub fn run_ota_fetch(
     /// That was the #147 bug: one wedged chunk 2 ate the whole fetch (11 attempts, each 206-served
     /// chunk 1 then a budget death). 8 s ≫ a healthy LAN handshake, so a real slow assoc still wins.
     const OTA_CHUNK_CONNECT: Duration = Duration::from_secs(8);
+    /// #217: per-body-progress stall window. On an RX-deaf fetch leg the connection never delivers
+    /// bytes AND never RECEIVES the server's FIN/RST (RX is dead), so the body read would otherwise
+    /// spin to the 300 s global budget. If zero body bytes advance for this window, break the chunk
+    /// into the existing stall guard (→ `STALL` after `OTA_MAX_STALL`), so a byte-0 / mid-body hang
+    /// classifies in ~seconds not minutes, and #217 rung-2C reassocs before the retry. 8 s ≫ any
+    /// healthy inter-packet gap, so a slow-but-alive link (which keeps advancing) never false-trips.
+    const OTA_BODY_STALL: Duration = Duration::from_secs(8);
 
     // Variable-width decimal into `out` (Range byte-positions must NOT be zero-padded for all
     // servers); returns the digit count. `v` is a u32 → at most 10 digits.
@@ -4641,6 +4648,11 @@ pub fn run_ota_fetch(
         let mut header_len = 0usize;
         let mut headers_done = false;
         let mut bad = false;
+        // #217: per-body-progress stall timer (see OTA_BODY_STALL). Tracks body advance so a byte-0
+        // hang on an RX-deaf, never-closing connection falls through to the outer stall guard FAST
+        // instead of spinning to the global DEADLINE.
+        let mut last_body_advance = Instant::now();
+        let mut body_seen = writer.written();
         loop {
             if tick() {
                 log::warn!("smol OTA: aborted by long-press (slot untouched)");
@@ -4711,6 +4723,15 @@ pub fn run_ota_fetch(
             // Poll AGAIN right after draining so the reopened window (+ its ACK) hits the wire
             // this iteration — halves the window-closed gap that made the transfer RTT-bound.
             iface.poll(smoltcp_now(), device, &mut sockets);
+            // #217: fetch-leg stall detection (see OTA_BODY_STALL init above). Body advanced → reset
+            // the timer; else if it has been silent for OTA_BODY_STALL, break the chunk so the outer
+            // stall guard counts a zero-progress attempt → STALL fast (not a 300 s DEADLINE spin).
+            if writer.written() > body_seen {
+                body_seen = writer.written();
+                last_body_advance = Instant::now();
+            } else if Instant::now() > last_body_advance + OTA_BODY_STALL {
+                break;
+            }
             if writer.written() >= announce.size {
                 break; // whole image done
             }
