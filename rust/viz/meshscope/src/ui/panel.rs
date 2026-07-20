@@ -244,6 +244,29 @@ pub fn show(ui: &mut egui::Ui, model: &Model, selected: Option<u8>, now_s: f64) 
         if let Some(ap) = node.ap() {
             kv(ui, "AP", &format!("ch{} · {} dBm · {}", ap.channel, ap.rssi, fmt_bssid(ap.bssid)));
         }
+        // #204/#217 coexist verdict for the crown: its uplink AP channel vs the elected mesh
+        // channel. A mismatch is the bulk-RX-deaf OTA-death bug (ch1-AP vs ch6-mesh); a weak
+        // uplink is the stacked factor. Only meaningful on the crown (the WiFi-fetching node).
+        if Some(node.id) == model.crown.map(|c| c.owner) {
+            let cx = super::graph::crown_coexist(model);
+            let verdict = match cx {
+                super::graph::Coexist::Healthy { ch } => {
+                    Some((format!("✓ coexist healthy — AP & mesh both on ch{ch}"), false))
+                }
+                super::graph::Coexist::Weak { ch, rssi } => {
+                    Some((format!("⚠ coexist ch{ch} — uplink weak ({rssi} dBm), degraded not dead"), true))
+                }
+                super::graph::Coexist::Violated { ap_ch, mesh_ch } => Some((
+                    format!("✖ COEXIST BROKEN — AP ch{ap_ch} ≠ mesh ch{mesh_ch} · crown off-channel → OTA-dead"),
+                    true,
+                )),
+                super::graph::Coexist::Unknown => None,
+            };
+            if let Some((text, strong)) = verdict {
+                let t = RichText::new(text).color(super::graph::coexist_color(cx));
+                ui.label(if strong { t.strong() } else { t });
+            }
+        }
         if let Some(cd) = node.crown_deaf() {
             let col = if cd.shed {
                 Color32::from_rgb(224, 90, 90)

@@ -375,6 +375,50 @@ fn rssi_rest_len(rssi: i32) -> f32 {
 }
 
 /// Green (strong) -> amber -> red (weak).
+/// Coexist-channel-health (#204/#217): the crown's WiFi-uplink AP channel MUST equal the
+/// elected ESP-NOW mesh channel, or the crown goes bulk-RX-deaf mid-fetch and OTA dies (the
+/// ch1-AP-vs-ch6-mesh bug that cost a night of pcap). `Weak` = channels match but the uplink
+/// is at/under `WEAK_LINK_DBM` (−80 dBm), the stacked factor seen in the disease. `Unknown` =
+/// no crown seen yet, or the crown hasn't published its `ap=` association. Shared by the
+/// top-bar chip and the crown detail line so both read identically — and by design matched to
+/// the HA coexist tile (luna-notify): green ==, red !=, amber weak.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Coexist {
+    Healthy { ch: u8 },
+    Weak { ch: u8, rssi: i32 },
+    Violated { ap_ch: u8, mesh_ch: u8 },
+    Unknown,
+}
+
+/// Classify the CURRENT crown's coexist health. The crown is the MC `owner`; we read that
+/// node's DIAG `ap=` and compare its channel to the elected mesh channel. (A future fw `cc=`
+/// flag — morpheus — could override this as the board's own verdict; the computed comparison
+/// is the ground truth available today.)
+pub fn crown_coexist(m: &Model) -> Coexist {
+    let Some(crown) = m.crown else {
+        return Coexist::Unknown;
+    };
+    let Some(ap) = m.nodes.get(&crown.owner).and_then(|n| n.ap()) else {
+        return Coexist::Unknown;
+    };
+    if ap.channel != crown.channel {
+        Coexist::Violated { ap_ch: ap.channel, mesh_ch: crown.channel }
+    } else if ap.rssi <= WEAK_LINK_DBM {
+        Coexist::Weak { ch: ap.channel, rssi: ap.rssi }
+    } else {
+        Coexist::Healthy { ch: ap.channel }
+    }
+}
+
+pub fn coexist_color(c: Coexist) -> Color32 {
+    match c {
+        Coexist::Healthy { .. } => Color32::from_rgb(90, 210, 120),
+        Coexist::Weak { .. } => Color32::from_rgb(230, 200, 70),
+        Coexist::Violated { .. } => Color32::from_rgb(224, 90, 90),
+        Coexist::Unknown => Color32::from_rgb(130, 130, 140),
+    }
+}
+
 pub fn rssi_color(rssi: i32) -> Color32 {
     let t = ((rssi + 90) as f32 / 60.0).clamp(0.0, 1.0);
     let (r, g, b) = if t > 0.5 {
@@ -425,4 +469,48 @@ pub fn draw_sparkline(painter: &egui::Painter, origin: Pos2, size: Vec2, hist: &
         })
         .collect();
     painter.add(egui::Shape::line(pts, Stroke::new(1.2_f32, color)));
+}
+
+#[cfg(test)]
+mod coexist_tests {
+    use super::*;
+    use mesh_model::model::Model;
+
+    fn crown_model(mc: &str, crown_diag: &str) -> Model {
+        let mut m = Model::new("test".into());
+        m.ingest(1.0, "smol/mesh/channel", mc.as_bytes());
+        m.ingest(1.0, "smol/7/diag", crown_diag.as_bytes());
+        m
+    }
+
+    #[test]
+    fn healthy_when_ap_channel_matches_mesh() {
+        let m = crown_model("MC|7|6|10", "DIAG|boot=1|heap=40000|ap=6:-58:a1b2c3d4e5f6");
+        assert_eq!(crown_coexist(&m), Coexist::Healthy { ch: 6 });
+    }
+
+    #[test]
+    fn violated_on_channel_mismatch() {
+        // The exact ch1-AP-vs-ch6-mesh bug that made the crown bulk-RX-deaf → OTA-dead.
+        let m = crown_model("MC|7|6|10", "DIAG|boot=1|heap=40000|ap=1:-58:a1b2c3d4e5f6");
+        assert_eq!(crown_coexist(&m), Coexist::Violated { ap_ch: 1, mesh_ch: 6 });
+    }
+
+    #[test]
+    fn weak_when_matched_but_faint_uplink() {
+        // Channels agree but the uplink is at/under WEAK_LINK_DBM (−80) — the stacked factor.
+        let m = crown_model("MC|7|6|10", "DIAG|boot=1|heap=40000|ap=6:-82:a1b2c3d4e5f6");
+        assert_eq!(crown_coexist(&m), Coexist::Weak { ch: 6, rssi: -82 });
+    }
+
+    #[test]
+    fn unknown_without_crown_or_ap() {
+        // No crown record → unknown.
+        let mut m = Model::new("test".into());
+        m.ingest(1.0, "smol/7/diag", b"DIAG|boot=1|heap=40000|ap=6:-58:a1b2c3d4e5f6");
+        assert_eq!(crown_coexist(&m), Coexist::Unknown);
+        // Crown known but the crown node hasn't published an ap= yet → unknown, not a false green.
+        let m2 = crown_model("MC|7|6|10", "DIAG|boot=1|heap=40000");
+        assert_eq!(crown_coexist(&m2), Coexist::Unknown);
+    }
 }
