@@ -18,7 +18,7 @@ mod wire;
 
 use wire::{
     append_group_mac, hmac_sha256, verify_group_mac, MacVerdict, ESP_NOW_MTU, MAC_TAG_LEN,
-    MAC_TRAILER_LEN, UP2_INNER_MAX, UP2_OVERHEAD,
+    MAC_TRAILER_LEN, UP2_INNER_MAX, UP2_OVERHEAD, is_ota_family, should_group_mac,
 };
 
 /// Decode a lowercase hex string into a `[u8; 32]` (panics on wrong length / non-hex).
@@ -124,5 +124,34 @@ fn main() {
     assert_eq!(bn, ESP_NOW_MTU, "a ceiling-sized frame + trailer is exactly ESP_NOW_MTU");
     assert!(matches!(verify_group_mac(&big[..bn], &[(epoch, &key)]), MacVerdict::Ok { .. }), "ceiling frame verifies");
 
-    println!("mac_verify: ALL CHECKS PASSED (RFC 4231 KATs + round-trip + tamper/key/epoch rejection + epoch-rotation dual-accept + MTU budget)");
+    // --- 7. OTA-family EXEMPTION (the v346 correctness gate) --------------------------------
+    // The receiver consumes OTAM/OTAD/OTAN (parse_ota_frame) + LDBG (parse_ldbg relay drain)
+    // BEFORE the group-MAC verify-then-strip, so `send_to` MUST send them verbatim — a trailer
+    // would never be stripped (MAC'd OTAN → bitmap over-cap → dropped → no window advances;
+    // MAC'd partial OTAD → image corrupt → finalize-SHA fail). `should_group_mac` is the exact
+    // pure `send_to` decision; assert it exempts the OTA family and MAC's the ordinary frames.
+    for tag in [
+        &b"SMOLv1 OTAM "[..], b"SMOLv1 OTAD ", b"SMOLv1 OTAN ", b"SMOLv1 LDBG ",
+    ] {
+        assert!(is_ota_family(tag), "OTA-family classified: {:?}", core::str::from_utf8(tag));
+        assert!(!should_group_mac(tag), "send_to must NOT MAC an OTA-family frame: {:?}", core::str::from_utf8(tag));
+    }
+    // A realistic OTAD/OTAN wire frame (prefix + body) round-trips UN-TRAILERED through the
+    // send_to decision — the regression the whole patch exists to prevent.
+    let otad_frame = { let mut f = Vec::from(&b"SMOLv1 OTAD "[..]); f.extend_from_slice(&[0u8; 200]); f };
+    let otan_frame = { let mut f = Vec::from(&b"SMOLv1 OTAN "[..]); f.extend_from_slice(&[0u8; 15]); f };
+    assert!(!should_group_mac(&otad_frame), "OTAD frame sent verbatim (no trailer)");
+    assert!(!should_group_mac(&otan_frame), "OTAN frame sent verbatim (no trailer)");
+    // Ordinary SMOLv1 frames ARE MAC'd (the exemption didn't over-reach); non-SMOLv1 (WLED) is not.
+    for tag in [&b"SMOLv1 HELLO 007"[..], b"SMOLv1 TIME 007 ...", b"SMOLv1 BATT2 ...", b"SMOLv1 DIAG 007", b"SMOLv1 SNK ..", b"SMOLv1 WX2 .."] {
+        assert!(!is_ota_family(tag), "not OTA-family: {:?}", core::str::from_utf8(tag));
+        assert!(should_group_mac(tag), "ordinary SMOLv1 frame IS MAC'd: {:?}", core::str::from_utf8(tag));
+    }
+    assert!(!should_group_mac(b"\x91\x0b\x00..wled-wizmote.."), "non-SMOLv1 (WLED) sent verbatim");
+    // An over-MTU SMOLv1 frame is sent verbatim (never emit > MTU): ceiling+1 with a real prefix.
+    let mut over = Vec::from(&b"SMOLv1 DIAG 007"[..]);
+    over.resize(ESP_NOW_MTU - MAC_TRAILER_LEN + 1, b'x');
+    assert!(!should_group_mac(&over), "an over-budget frame is sent verbatim (never > MTU)");
+
+    println!("mac_verify: ALL CHECKS PASSED (RFC 4231 KATs + round-trip + tamper/key/epoch rejection + epoch-rotation dual-accept + MTU budget + OTA-family exemption)");
 }

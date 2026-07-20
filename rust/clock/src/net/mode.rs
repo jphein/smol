@@ -4706,9 +4706,13 @@ impl RadioManager {
     /// ed25519 signature, so they are (intentionally) untouched by the group MAC.
     fn send_to(&mut self, dst: &[u8; 6], data: &[u8]) {
         let mut buf = [0u8; ESP_NOW_MTU];
-        let out: &[u8] = if data.starts_with(b"SMOLv1 ")
-            && data.len() + MAC_TRAILER_LEN <= ESP_NOW_MTU
-        {
+        // #190: append the group-MAC trailer only when `should_group_mac` says so — a pure decision
+        // (host-tested) that EXCLUDES the OTA family (OTAM/OTAD/OTAN/LDBG). Those frames are
+        // consumed by `parse_ota_frame`/`parse_ldbg` BEFORE the RX verify-then-strip, so a trailer
+        // would never be removed → a MAC'd OTAN is dropped (bitmap over-cap) and a MAC'd partial
+        // OTAD chunk corrupts the image (finalize-SHA mismatch). Non-SMOLv1 (WLED) + over-MTU
+        // frames are likewise sent verbatim.
+        let out: &[u8] = if should_group_mac(data) {
             buf[..data.len()].copy_from_slice(data);
             let n = append_group_mac(
                 &mut buf,
