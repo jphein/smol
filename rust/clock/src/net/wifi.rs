@@ -2059,7 +2059,7 @@ fn mqtt_session(
     // PUBLISHED to `smol/<leaf>/ota/diag` here, and drives the retained-install clear (on a
     // terminal/exhausted phase) vs retry (transient). Consumed (set None) after publish.
     // `&mut None` off-gateway.
-    leaf_diag: &mut Option<(u8, &'static str, bool, u8)>,
+    leaf_diag: &mut Option<(u8, &'static str, bool, u8, u8)>,
     // #3 RELAY RX-DIAG: the last relay's `(leaf_id, rx_any, otan_valid, last_wb, total)`.
     // PUBLISHED to retained `smol/<leaf>/ota/relaydiag` here, consumed after. `&mut None` off-gw.
     leaf_relay_rx: &mut Option<RelayDiag>,
@@ -3081,7 +3081,7 @@ fn mqtt_session(
     // = the leaf installed/rolled-back, or the transient-retry cap was hit) or LEAVE it
     // retained to retry. On a clear, also null `pending_leaf` for THIS flush so we don't
     // re-arm a just-finished leaf. Runs BEFORE the arm below. Consumed after publish.
-    if let Some((lid, phase, clear, retry)) = *leaf_diag {
+    if let Some((lid, phase, clear, retry, src)) = *leaf_diag {
         let mut dtopic = MqttScratch::new();
         let _ = write!(dtopic, "smol/{}/ota/diag", lid);
         // #134: surface the consecutive-failure count in the retained payload ("fetch-failed
@@ -3092,6 +3092,14 @@ fn mqtt_session(
             let _ = write!(dpayload, "{} retry={}", phase, retry);
         } else {
             let _ = write!(dpayload, "{}", phase);
+        }
+        // #237 (spec §8.1 item 8): append the serve SOURCE — `src=gw` (the crown WiFi-fetched or
+        // fell back to it) vs `src=id<n>` (a peer HOLDER served it over ESP-NOW, zero bulk fetch).
+        // That distinction is the metric proving peer-sourcing actually saved a fetch.
+        if src == 0 {
+            let _ = write!(dpayload, " src=gw");
+        } else {
+            let _ = write!(dpayload, " src=id{}", src);
         }
         if let Some(n) =
             crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), dpayload.as_bytes(), true)
@@ -3809,7 +3817,7 @@ pub fn run_mqtt_burst(
     staged_raw: &mut Option<crate::ota::Announce>,
     // #40: last relay attempt's `(leaf_id, phase, clear)` → published to `smol/<leaf>/ota/diag`
     // (see `mqtt_session`). `&mut None` on boot/leaf bursts.
-    leaf_diag: &mut Option<(u8, &'static str, bool, u8)>,
+    leaf_diag: &mut Option<(u8, &'static str, bool, u8, u8)>,
     // #3: last relay attempt's RX evidence → published to `smol/<leaf>/ota/relaydiag` (see
     // `mqtt_session`). `&mut None` on boot/leaf bursts.
     leaf_relay_rx: &mut Option<RelayDiag>,

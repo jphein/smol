@@ -1972,8 +1972,10 @@ pub struct RadioManager {
     /// The phase is stored as the rendered `&'static str` (not the espnow-only enum) so the
     /// shared `wifi::mqtt_session` signature stays buildable in the wifi-only profile. `retry_n`
     /// (#134) is the current consecutive-failure count for this outcome class — surfaced in the
-    /// retained payload (`fetch-failed retry=3`) so a stuck fetch is visible headlessly.
-    leaf_ota_diag: Option<(u8, &'static str, bool, u8)>,
+    /// retained payload (`fetch-failed retry=3`) so a stuck fetch is visible headlessly. #237: the
+    /// trailing `u8` is the serve SOURCE id — 0 = the gateway/crown (a #40 seed fetch or a
+    /// fallback), else the peer HOLDER that served it — surfaced as `src=` (spec §8.1 item 8).
+    leaf_ota_diag: Option<(u8, &'static str, bool, u8, u8)>,
     /// #139-followup/#147: on a failed SELF-fetch, `(chunk_k, chunk_n, retries, stalls, where)`
     /// buffered by `run_ota_update` → formatted + published retained to `smol/<id>/ota/diag` on the
     /// next gateway flush (fleet-visible failure diag; release images are serial-silent). `where` is
@@ -3664,7 +3666,14 @@ impl RadioManager {
     /// retained install (terminal — the leaf installed or rolled back — or the transient-retry
     /// cap is hit) vs LEAVE it retained to retry (mac-unknown / fetch / relay / timeout). The
     /// phase is published to `smol/<leaf>/ota/diag` on the next burst (headless observability).
-    pub fn record_leaf_ota(&mut self, leaf_id: u8, outcome: crate::ota_mesh::LeafOtaOutcome) {
+    /// #237: `source_id` is the serve SOURCE — 0 = the gateway/crown (a #40 seed fetch or a
+    /// fallback), else the peer HOLDER id that served this leaf — surfaced on `ota/diag` as `src=`.
+    pub fn record_leaf_ota(
+        &mut self,
+        leaf_id: u8,
+        outcome: crate::ota_mesh::LeafOtaOutcome,
+        source_id: u8,
+    ) {
         // #134 clear/retry policy — THREE cases, not two:
         //  1. terminal (leaf DEFINITIVELY acted: installed / rolled-back / id-mismatch) → CLEAR,
         //     reset both counters.
@@ -3697,7 +3706,7 @@ impl RadioManager {
             "smol #40/#134: leaf id{} OTA phase={} (clear_install={}, reached_leaf={}, retry={})",
             leaf_id, outcome.as_str(), clear, outcome.reached_leaf(), retry_n
         );
-        self.leaf_ota_diag = Some((leaf_id, outcome.as_str(), clear, retry_n));
+        self.leaf_ota_diag = Some((leaf_id, outcome.as_str(), clear, retry_n, source_id));
         // #1 DECOUPLE: the relay session is done for this install iff we're clearing it
         // (terminal outcome or retry cap). While NOT cleared (transient retry) it stays
         // pending so the gateway keeps suppressing its own self-OTA until the leaf resolves.

@@ -1423,7 +1423,11 @@ fn main() -> ! {
                             // election seq, §5.3 replay guard) and awaits the holder's ODON.
                             let term = r.crown_term();
                             let holder = r.baton_holder_for(ann.build, leaf_id);
+                            // #237 INC5 observability: the serve SOURCE for ota/diag — 0 = the
+                            // gateway/crown (a #40 seed fetch or a fallback), else the peer holder id.
+                            let mut serve_src = 0u8;
                             let delegated = if let Some((hid, hmac)) = holder {
+                                serve_src = hid;
                                 log::info!(
                                     "smol #237: crown DELEGATE serve of id{} build {} → holder id{}",
                                     leaf_id, ann.build, hid
@@ -1446,6 +1450,8 @@ fn main() -> ! {
                                             leaf_id, res
                                         );
                                     }
+                                    // The gateway sourced this serve (seed or fallback), not a peer.
+                                    serve_src = 0;
                                     r.run_leaf_ota_relay(
                                         crate::ota_mesh::ServeSource::GatewayFetch,
                                         leaf_id,
@@ -1457,8 +1463,8 @@ fn main() -> ! {
                                 }
                             };
                             // #40: record the phase → published to smol/<leaf>/ota/diag on the
-                            // next burst + drives the install clear/retry policy.
-                            r.record_leaf_ota(leaf_id, outcome);
+                            // next burst + drives the install clear/retry policy. #237: + serve src.
+                            r.record_leaf_ota(leaf_id, outcome, serve_src);
                             // #237 baton advance: a CONFIRMED serve (delegated OR seeded) makes this
                             // just-served leaf the SOURCE for the next target of this build.
                             if matches!(outcome, crate::ota_mesh::LeafOtaOutcome::Confirmed) {
@@ -1469,7 +1475,7 @@ fn main() -> ! {
                             // MAC not learned yet (no HELLO heard) → record MacUnknown; the
                             // install is LEFT retained (not cleared) → retried on a later flush
                             // once the leaf HELLOs. Diag published so it's visible headless.
-                            r.record_leaf_ota(leaf_id, crate::ota_mesh::LeafOtaOutcome::MacUnknown);
+                            r.record_leaf_ota(leaf_id, crate::ota_mesh::LeafOtaOutcome::MacUnknown, 0);
                         }
                     }
                     // Coexist soak (#23 PART 1): the during-window RX loss — how many

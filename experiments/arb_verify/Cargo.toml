@@ -1,0 +1,18 @@
+# #237 host-test harness for the peer-sourced-relay ARBITRATION contract (ODEL/ODON codec +
+# the baton / split-brain-term / outcome-mapping decision logic). Runs OFF-target on the host
+# (std) via `cargo run` — the firmware crate is no_std/riscv32imc AND `ota_mesh.rs` can't be
+# `#[path]`-included on host (it carries `#[esp_hal::ram]` attrs + `crate::ota::{LeafImageWriter,
+# Announce,verify_signature}` HAL deps), so this VENDORS the pure arb codec verbatim (relay_compat
+# pattern) and pins the exact §8/§10 WIRE layout with GOLDEN-BYTE assertions — a real encoder drift
+# then diverges from these goldens (and the firmware↔leaf OTAM) at the next canary/review.
+# Mirrors experiments/relay_compat. Run: `cargo run` — panics on any mismatch.
+[package]
+name = "arb_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "arb_verify"
+path = "src/main.rs"
+[profile.dev]
+opt-level = 0
