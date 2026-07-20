@@ -249,6 +249,21 @@ const DIAG_PREFIX: &[u8] = b"SMOLv1 DIAG "; // + "NNN" + verbatim "up=.. bt=.. r
 /// never confuses them. Value bounded by `RELAY_VALUE_MAX`.
 const SCAN_PREFIX: &[u8] = b"SMOLv1 SCAN "; // + "NNN" + verbatim "<ssid>,<bssid3>,<ch>,<rssi>|…"
 
+/// #190: enforce policy for the group-MAC (Fork B / B1). `false` = OBSERVE release: append the MAC
+/// on TX, verify on RX, count `mac_ok`/`mac_fail`, but SOFT-ACCEPT un-MAC'd / bad-MAC frames so a
+/// mixed fleet never partitions (design §7.1). Flip to `true` in a later ENFORCE release once the
+/// observe soak shows `mac_fail≈0` steady-state on a quiet fleet — then a frame that fails the MAC
+/// is DROPPED before the parser. The failure mode of enforce is "drops some frames," never a
+/// hardware-layer deafness (the MAC is an appended field, not ESP-NOW encryption). HW-held into v345.
+const MAC_ENFORCE: bool = false;
+
+/// #190: max observability-record value (`DIAG`/`SCAN`) that fits a plain single-hop frame ONCE the
+/// group-MAC trailer is appended at `send_to`: `MTU − MAC_TRAILER_LEN − prefix(12) − id(3)`. Below
+/// the pre-auth `RELAY_VALUE_MAX` (232) by exactly `MAC_TRAILER_LEN`, so `frame + trailer ≤ ESP_NOW_MTU`
+/// (design §4.1 budget). `DIAG_PREFIX.len() == SCAN_PREFIX.len() == 12`. The record tail (cfg=/io=,
+/// appended last) is what truncates — key-parsed by HA, so a lost tail field degrades gracefully.
+const OBS_VALUE_MAX: usize = ESP_NOW_MTU - MAC_TRAILER_LEN - DIAG_PREFIX.len() - 3;
+
 /// #71: max APs in one scan record (strongest-RSSI first) — bounds the record under
 /// `RELAY_VALUE_MAX` and keeps the mesh frame small.
 const SCAN_MAX_APS: usize = 5;
@@ -477,6 +492,10 @@ enum Frame<'a> {
     Batt2 { seq: u32, payload: &'a [u8] },
     /// #13 Stage B: the grid twin of [`Frame::Batt2`].
     Grid2 { seq: u32, payload: &'a [u8] },
+    /// #227: the weather downlink — the third freshness-flooded channel (payload is the
+    /// verbatim `WX|<tempF>|<code>` bytes from the gateway's Open-Meteo fetch, borrows the
+    /// RX buffer). Same strict-newer adopt + re-flood mechanics as [`Frame::Batt2`].
+    Wx2 { seq: u32, payload: &'a [u8] },
     /// #21/#56 leaf-relay: a gateway's keyed CONFIG downlink — `target` leaf id, the config
     /// channel `key` (`S`=screen/…), + the verbatim `value` bytes (`value` borrows the RX
     /// buffer; the leaf buffers it per-key in `CfgTracker` in `service` IFF `target ==
@@ -530,6 +549,14 @@ struct DiagCounters {
     dedup: u32,
     ttl: u32,
     dfwd: u32,
+    /// #190 group-MAC (Fork B / B1) observe counters, mirroring ota_mesh's `verify_ok`/`verify_fail`.
+    /// `mac_ok` = inbound frames whose truncated HMAC-SHA256 verified against the group key; `mac_fail`
+    /// = frames with no valid MAC (legacy un-MAC'd during the observe rollout, wrong key/epoch, or a
+    /// forgery). Surfaced as `mo=`/`mf=` in DIAG. The observe-phase watch: `mac_ok` should climb
+    /// fleet-wide and `mac_fail` fall to ≈0 once every board is MAC'ing — the gate for the enforce flip
+    /// (design §7.1). Bumped BOTH on a leaf and a gateway (every node verifies what it hears).
+    mac_ok: u32,
+    mac_fail: u32,
     /// #13 MESH-TEST rig ONLY: count of inbound frames dropped by the deaf-list (surfaced as
     /// `ddrops=` in DIAG). A production build has no deaf-list, so this field doesn't exist.
     #[cfg(feature = "mesh-test")]
@@ -548,6 +575,8 @@ impl DiagCounters {
             dedup: 0,
             ttl: 0,
             dfwd: 0,
+            mac_ok: 0,
+            mac_fail: 0,
             #[cfg(feature = "mesh-test")]
             ddrops: 0,
         }
@@ -774,6 +803,49 @@ impl GridTracker {
 #[derive(Clone, Copy)]
 pub struct GridOffer {
     pub buf: [u8; GRID_PAYLOAD_MAX],
+    pub len: usize,
+}
+
+/// #227: buffers the most-recent inbound WX2 weather payload — the third
+/// [`BattTracker`]/[`GridTracker`] twin. `service()` only BUFFERS; `main` takes it via
+/// [`RadioManager::take_wx_offer`] and writes its `WxCache`. Fixed `.bss`, no heap.
+struct WxTracker {
+    buf: [u8; crate::net::wx::WX_PAYLOAD_MAX],
+    len: usize,
+    have: bool,
+    /// Freshness `seq` of the last-adopted WX2 (twin of `BattTracker::dl_seq`).
+    dl_seq: u32,
+}
+
+impl WxTracker {
+    const fn new() -> Self {
+        Self { buf: [0; crate::net::wx::WX_PAYLOAD_MAX], len: 0, have: false, dl_seq: 0 }
+    }
+
+    /// Buffer a freshly-received payload (truncated to capacity; ≤ 32 B by spec).
+    fn set(&mut self, payload: &[u8]) {
+        let n = payload.len().min(crate::net::wx::WX_PAYLOAD_MAX);
+        self.buf[..n].copy_from_slice(&payload[..n]);
+        self.len = n;
+        self.have = true;
+    }
+
+    /// Strict-newer adopt + re-flood decision (twin of `BattTracker::set_fresh`).
+    fn set_fresh(&mut self, payload: &[u8], seq: u32) -> bool {
+        if self.have && seq <= self.dl_seq {
+            return false;
+        }
+        self.set(payload);
+        self.dl_seq = seq;
+        true
+    }
+}
+
+/// A `Copy` snapshot of a buffered WX2 payload handed to `main` by
+/// [`RadioManager::take_wx_offer`]. `buf[..len]` is the verbatim `WX|…` bytes.
+#[derive(Clone, Copy)]
+pub struct WxOffer {
+    pub buf: [u8; crate::net::wx::WX_PAYLOAD_MAX],
     pub len: usize,
 }
 
@@ -1861,11 +1933,16 @@ pub struct RadioManager {
     /// Twin of `batt` (issue #16): most-recent inbound SMOLv1 GRID payload, buffered
     /// for `main` to store into its `GridCache`.
     grid: GridTracker,
+    /// #227: third tracker twin — most-recent inbound SMOLv1 WX2 weather payload, buffered
+    /// for `main` to store into its `WxCache`.
+    wx: WxTracker,
     /// #13 Stage B: GATEWAY-origin freshness state for the BATT2/GRID2 downlink — assigns the
     /// monotonic `dl_seq` (bumped only on a value change) so relays re-flood strictly-newer data.
     /// Inert on a leaf (a leaf never originates downlink; it adopts via the trackers above).
     dl_batt: DlOrigin,
     dl_grid: DlOrigin,
+    /// #227: the WX2 origin twin (seq bumps only when the fetched reading changes).
+    dl_wx: DlOrigin,
     /// #21/#56 leaf-relay (LEAF side): most-recent inbound `SMOLv1 CFG` value PER config
     /// key that targeted THIS leaf, buffered for `main` to apply via `take_cfg_offer(key)`.
     cfg: CfgTracker,
@@ -1898,6 +1975,10 @@ pub struct RadioManager {
     diag: DiagCounters,
     /// #74 obs wave-2: node state mirrored from `main` (LED mode + time-sync) for the DIAG record.
     diag_extra: DiagExtra,
+    /// #181 mesh-ledger: this node's L1 hash-chain (own provenance) + the crown's L2 head-set for the
+    /// signed tree-head (L3). The on-device ed25519 signing key (if any) is loaded from NVS at
+    /// construction — see [`crate::ota::resolve_ledger_key`]. Surfaced in the DIAG record each cadence.
+    ledger: crate::net::ledger_link::LedgerLink,
     /// #72 io registry: this node's compact `io=<pin>:<count>,…` DIAG field (bound-input press
     /// counters), pushed from `main` via `set_diag_io` each diag-sample tick. Fixed buffer, no heap.
     #[cfg(feature = "io")]
@@ -2123,8 +2204,10 @@ impl RadioManager {
             roster: Roster::new(),
             batt: BattTracker::new(),
             grid: GridTracker::new(),
+            wx: WxTracker::new(),
             dl_batt: DlOrigin::new(),
             dl_grid: DlOrigin::new(),
+            dl_wx: DlOrigin::new(),
             cfg: CfgTracker::new(),
             cfg_cache: crate::net::wifi::CfgCache::new(),
             stat_cache: crate::net::wifi::CfgCache::new(),
@@ -2133,6 +2216,14 @@ impl RadioManager {
             own_scan: None,
             diag: DiagCounters::new(),
             diag_extra: DiagExtra::new(),
+            // #181: load the on-device ed25519 signing key from NVS (None ⇒ verify-only / unsigned
+            // anchor). resolve_ledger_key NEVER generates a key — provisioning is a deliberate
+            // USB-touch act (feature `ledger-provision`); the OTA image only ever reads.
+            ledger: {
+                let mut l = crate::net::ledger_link::LedgerLink::new();
+                l.set_signing_key(crate::ota::resolve_ledger_key());
+                l
+            },
             #[cfg(feature = "io")]
             diag_io: [0u8; IO_DIAG_MAX],
             #[cfg(feature = "io")]
@@ -2358,6 +2449,7 @@ impl RadioManager {
                     &empty,
                     batt,
                     grid,
+                    None, // #227: a leaf recovery burst never fetches weather (gateway-only)
                     &mut elect,
                     &mut ota_offer,
                     &mut config_offer,
@@ -2717,6 +2809,32 @@ impl RadioManager {
         }
     }
 
+    /// #227: broadcast the weather downlink as a `SMOLv1 WX2` frame — the third
+    /// [`broadcast_batt`] twin: tag + 10-digit `dl_seq` + the verbatim `WX|…` payload, seq
+    /// bumped only when the READING changes (a 30-min re-fetch returning the same temp/code
+    /// doesn't re-flood the mesh). GATEWAY-ONLY, same ~10 s `main` cadence as BATT/GRID.
+    ///
+    /// [`broadcast_batt`]: RadioManager::broadcast_batt
+    pub fn broadcast_wx(&mut self, payload: &[u8], now_unix: u32) {
+        let seq = self.dl_wx.seq_for(payload, now_unix);
+        let mut msg = [0u8; DL_FRAME_MAX];
+        let len = encode_dl(WX2_PREFIX, seq, payload, &mut msg);
+        self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
+    }
+
+    /// Take the buffered inbound WX2 payload (if any), clearing it. Third twin of
+    /// [`take_batt_offer`]; `main` stores the bytes into its `WxCache`.
+    ///
+    /// [`take_batt_offer`]: RadioManager::take_batt_offer
+    pub fn take_wx_offer(&mut self) -> Option<WxOffer> {
+        if self.wx.have {
+            self.wx.have = false;
+            Some(WxOffer { buf: self.wx.buf, len: self.wx.len })
+        } else {
+            None
+        }
+    }
+
     /// #21/#56 leaf-relay: broadcast one targeted keyed `SMOLv1 CFG` frame — tag + 3-ASCII
     /// zero-padded `target_id` + the 1-byte config `key` (#56) + the verbatim `value`.
     /// Mirror of [`broadcast_batt`]: fixed frame → `send_to(&BROADCAST_ADDRESS, ..)`
@@ -2775,7 +2893,9 @@ impl RadioManager {
         msg[base] = b'0' + own / 100;
         msg[base + 1] = b'0' + (own / 10) % 10;
         msg[base + 2] = b'0' + own % 10;
-        let n = value.len().min(crate::net::wifi::RELAY_VALUE_MAX);
+        // #190: clamp to OBS_VALUE_MAX (< RELAY_VALUE_MAX by MAC_TRAILER_LEN) so this plain single-hop
+        // frame + the group-MAC trailer `send_to` appends stays ≤ ESP_NOW_MTU.
+        let n = value.len().min(OBS_VALUE_MAX);
         msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
         self.relay_wrap_observability(&msg[..base + 3 + n]);
@@ -2794,7 +2914,8 @@ impl RadioManager {
         msg[base] = b'0' + own / 100;
         msg[base + 1] = b'0' + (own / 10) % 10;
         msg[base + 2] = b'0' + own % 10;
-        let n = value.len().min(crate::net::wifi::RELAY_VALUE_MAX);
+        // #190: clamp to OBS_VALUE_MAX (see broadcast_diag) so frame + group-MAC trailer ≤ ESP_NOW_MTU.
+        let n = value.len().min(OBS_VALUE_MAX);
         msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
         self.relay_wrap_observability(&msg[..base + 3 + n]);
@@ -3074,6 +3195,37 @@ impl RadioManager {
             self.diag.dfwd,
             etx_worst, // #164 worst per-peer link cost (0 = all perfect … 253 = dragging … 255 = isolated)
         );
+        // #190 group-MAC (Fork B / B1) observe counters. Appended AFTER the fixed positional fields
+        // (like cfg=/io=) so the deployed dashboard's positional parse of the fixed set is intact;
+        // HA picks these by key. `mo`/`mf` = frames whose group HMAC verified / failed (design §7.1).
+        rec.push_str(&alloc::format!("|mo={}|mf={}", self.diag.mac_ok, self.diag.mac_fail));
+        // #181 mesh-ledger: L1 — append a compact provenance record for THIS cadence, then surface
+        // the chain tip (a tamper canary), retained len, self-verify result, and whether a signing
+        // key is held. On the CROWN, also fold in the L2 anchor + (if provisioned) the L3 signed
+        // tree-head epoch — the "publish path" rides the already-retained DIAG topic (peer-STH gossip
+        // is the HW-gated follow-up). Appended LAST → positional parse of the fixed fields intact.
+        let prov = alloc::format!("u{}b{}s{}o{}", up_s, d.boot_count, d.boot_slot, ota);
+        self.ledger.append(prov.as_bytes());
+        let (tip, clen, lok) = self.ledger.chain_summary();
+        rec.push_str(&alloc::format!(
+            "|lgt={:02x}{:02x}{:02x}{:02x}|lgn={}|lgok={}|lgk={}",
+            tip[0], tip[1], tip[2], tip[3], clen, lok as u8, self.ledger.can_sign() as u8
+        ));
+        if self.relay.is_gateway {
+            if let Some(sth) = self.ledger.sign_and_selfcheck(self.id) {
+                let r = sth.root();
+                rec.push_str(&alloc::format!(
+                    "|lgan={:02x}{:02x}{:02x}{:02x}|lgep={}|lgsz={}|lgsg=1",
+                    r[0], r[1], r[2], r[3], sth.epoch(), sth.size()
+                ));
+            } else {
+                let a = self.ledger.anchor(self.id);
+                rec.push_str(&alloc::format!(
+                    "|lgan={:02x}{:02x}{:02x}{:02x}|lgsg=0",
+                    a[0], a[1], a[2], a[3]
+                ));
+            }
+        }
         // #74 item 3 (stage-2): fold in the APPLIED-config string for HA config-drift, ONLY when
         // `main` populated it (espnow build). ASCII by construction (as_wire/to_wire/hex/F24). HA
         // reconstructs the same string from its command topics + plain-string-compares (luna's
@@ -4386,7 +4538,20 @@ impl RadioManager {
                 // Copy the source MAC out FIRST (Copy) so the `recv.data()` borrow in the
                 // parse below doesn't collide with the identity-guard MAC compare.
                 let src_mac = recv.info.src_address;
-                if let Some(Frame::Stat { src, value }) = parse_frame(recv.data()) {
+                // #190: strip the group-MAC trailer before parsing — a v345 leaf's STAT now carries
+                // it, and `om::stat_build` would choke on the 9-byte tail. This confirm loop is a
+                // local PROGRESSION gate (a mis-verdict at worst mis-labels the HA card, never bricks
+                // — see the window comment above), so it soft-accepts un-MAC'd/bad frames regardless
+                // of MAC_ENFORCE; the main `service` path owns the enforce policy + the mo=/mf= counters.
+                let cdata = recv.data();
+                let cframe = match verify_group_mac(
+                    cdata,
+                    &[(crate::secrets::GROUP_KEY_EPOCH, &crate::secrets::GROUP_KEY)],
+                ) {
+                    MacVerdict::Ok { payload_len } => &cdata[..payload_len],
+                    MacVerdict::Fail => cdata,
+                };
+                if let Some(Frame::Stat { src, value }) = parse_frame(cframe) {
                     if src == leaf_id {
                         if let Some(b) = om::stat_build(value) {
                             last_build = Some(b); // keep the latest — the settled state wins
@@ -4453,6 +4618,7 @@ impl RadioManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // #227's wx cache tips this to 8 params (like run_mqtt_burst)
     pub fn flush_telemetry(
         &mut self,
         own_telemetry: &[u8],
@@ -4461,6 +4627,9 @@ impl RadioManager {
         status: &[u8],
         batt: &mut crate::batt::BattCache,
         grid: &mut crate::grid::GridCache,
+        // #227: the weather cache — the burst's post-session slot re-fetches Open-Meteo into it
+        // when stale (gateway flush only; the leaf recovery burst passes None downstream).
+        wx: &mut crate::weather::WxCache,
         // #40: filled with `(leaf_id, staged announce)` if this flush surfaced a leaf OTA
         // install → `main` then calls `run_leaf_ota_relay` for that leaf. `None` otherwise.
         leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
@@ -4564,6 +4733,7 @@ impl RadioManager {
                     &items[..n],
                     batt,
                     grid,
+                    Some(wx), // #227: gateway flush — refresh the weather in the post-session slot
                     &mut elect,
                     &mut ota_offer,
                     &mut config_offer,
@@ -4898,8 +5068,36 @@ impl RadioManager {
 
     /// Low-level send helper: fire one frame and wait for the TX callback so we
     /// don't overrun the single in-flight ESP-NOW send slot.
+    ///
+    /// #190 (Fork B / B1): this is the SINGLE TX choke every `broadcast_*`/relay helper funnels
+    /// through, so the group-MAC auth trailer is appended HERE — once — for every SMOLv1 frame.
+    /// The gate `starts_with(b"SMOLv1 ")` is load-bearing: `send_to` ALSO carries the #25 WLED
+    /// WiZmote frame to a THIRD-PARTY WLED controller, which must NOT receive a trailer. The frame
+    /// builders reserve `MAC_TRAILER_LEN` out of the MTU (`UP2_INNER_MAX`, `OBS_VALUE_MAX`), so the
+    /// fit check never fails for a real frame; if it ever did, we send raw rather than exceed the
+    /// MTU. The OTA-mesh sends (OTAM/OTAD/OTAN) bypass `send_to` entirely and carry their own
+    /// ed25519 signature, so they are (intentionally) untouched by the group MAC.
     fn send_to(&mut self, dst: &[u8; 6], data: &[u8]) {
-        match self.esp_now.send(dst, data) {
+        let mut buf = [0u8; ESP_NOW_MTU];
+        // #190: append the group-MAC trailer only when `should_group_mac` says so — a pure decision
+        // (host-tested) that EXCLUDES the OTA family (OTAM/OTAD/OTAN/LDBG). Those frames are
+        // consumed by `parse_ota_frame`/`parse_ldbg` BEFORE the RX verify-then-strip, so a trailer
+        // would never be removed → a MAC'd OTAN is dropped (bitmap over-cap) and a MAC'd partial
+        // OTAD chunk corrupts the image (finalize-SHA mismatch). Non-SMOLv1 (WLED) + over-MTU
+        // frames are likewise sent verbatim.
+        let out: &[u8] = if should_group_mac(data) {
+            buf[..data.len()].copy_from_slice(data);
+            let n = append_group_mac(
+                &mut buf,
+                data.len(),
+                &crate::secrets::GROUP_KEY,
+                crate::secrets::GROUP_KEY_EPOCH,
+            );
+            &buf[..n]
+        } else {
+            data
+        };
+        match self.esp_now.send(dst, out) {
             Ok(waiter) => {
                 let _ = waiter.wait();
             }
@@ -4973,7 +5171,35 @@ impl RadioManager {
                 continue;
             }
 
-            match parse_frame(recv.data()) {
+            // #190 (Fork B / B1) VERIFY-THEN-PARSE: check the group-MAC and STRIP its trailer before
+            // the parser runs. OTA frames were consumed above (their own ed25519 gate) and our own
+            // frames were dropped at the self-MAC filter, so everything here is a peer SMOLv1 frame.
+            // OBSERVE (MAC_ENFORCE=false): SOFT-ACCEPT — parse regardless, but count ok/fail so the
+            // rollout is measurable (design §7.1). ENFORCE: DROP a frame that fails the MAC before it
+            // reaches the parser. A group-key/epoch mishap manifests as leaf HELLO-drop → owner-churn,
+            // NOT a crown-deaf-shed (design §7.3) — `mac_fail` is the telemetry that tells the two
+            // apart, so it must be counted SEPARATELY from RF-deafness signals.
+            let raw = recv.data();
+            let payload: &[u8] = match verify_group_mac(
+                raw,
+                // Accepted (epoch, key) set. Rotation: add `(GROUP_KEY_EPOCH + 1, &GROUP_KEY_NEXT)`
+                // as a second pair for the one-release overlap window (design §4.1), then drop the old.
+                &[(crate::secrets::GROUP_KEY_EPOCH, &crate::secrets::GROUP_KEY)],
+            ) {
+                MacVerdict::Ok { payload_len } => {
+                    self.diag.mac_ok = self.diag.mac_ok.saturating_add(1);
+                    &raw[..payload_len]
+                }
+                MacVerdict::Fail => {
+                    self.diag.mac_fail = self.diag.mac_fail.saturating_add(1);
+                    if MAC_ENFORCE {
+                        continue; // enforce: an un-MAC'd / bad-MAC frame never reaches the parser
+                    }
+                    raw // observe: soft-accept — a legacy un-MAC'd frame parses verbatim (no trailer)
+                }
+            };
+
+            match parse_frame(payload) {
                 Some(Frame::Snk(f)) => {
                     // An MMO-snake frame proves the peer is audible → counts
                     // toward the LED "detected" state exactly like HELLO/BEACON.
@@ -5356,6 +5582,24 @@ impl RadioManager {
                         log::info!("smol: GRID2 seq {} adopted + reflooded (dfwd)", seq);
                     }
                     label = Some(alloc::format!("grid2 {}", seq));
+                }
+                Some(Frame::Wx2 { seq, payload }) => {
+                    // #227: the weather twin of the Batt2/Grid2 arms — leaf adopts + re-floods
+                    // strictly newer; gateway ignores (it's the source — its cache comes from the
+                    // Open-Meteo fetch). Only a well-formed `WX|` payload is kept.
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, None, rssi, now);
+                    if !self.relay.is_gateway
+                        && payload.starts_with(b"WX|")
+                        && self.wx.set_fresh(payload, seq)
+                    {
+                        let mut fb = [0u8; DL_FRAME_MAX];
+                        let len = encode_dl(WX2_PREFIX, seq, payload, &mut fb);
+                        self.send_to(&BROADCAST_ADDRESS, &fb[..len]);
+                        self.diag.dfwd = self.diag.dfwd.saturating_add(1); // downlink re-flood (see BATT2)
+                        log::info!("smol: WX2 seq {} adopted + reflooded (dfwd)", seq);
+                    }
+                    label = Some(alloc::format!("wx2 {}", seq));
                 }
                 Some(Frame::Cfg { target, key, value }) => {
                     // #21/#56 leaf-relay: a gateway's keyed CONFIG downlink. Target-filter
@@ -5843,6 +6087,11 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
     }
     if let Some((seq, payload)) = parse_dl(GRID2_PREFIX, data) {
         return Some(Frame::Grid2 { seq, payload });
+    }
+    // #227: the weather freshness channel — same `parse_dl` machinery, distinct tag (byte 7
+    // `'W'` — no other SMOLv1 tag starts with W, so order here is moot).
+    if let Some((seq, payload)) = parse_dl(WX2_PREFIX, data) {
+        return Some(Frame::Wx2 { seq, payload });
     }
     if let Some(rest) = data.strip_prefix(CFG_PREFIX) {
         // #21/#56 leaf-relay: "NNN<KEY><value>" — 3-ASCII target id, a 1-byte config KEY,

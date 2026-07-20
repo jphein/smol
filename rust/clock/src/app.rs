@@ -121,6 +121,12 @@ pub struct Ctx<'a> {
     /// while this screen is inactive, so the plugin only reads it. cfg(wifi).
     #[cfg(feature = "wifi")]
     pub grid: &'a crate::grid::GridCache,
+    /// #227 weather cache (the Weather screen), borrowed read-only. Owned by `main`,
+    /// filled by the gateway's Open-Meteo fetch (`net/wifi.rs::fetch_weather`) or an
+    /// inbound WX2 frame — either can happen while this screen is inactive, so the
+    /// plugin only reads it. cfg(wifi), the Batt/Grid twin.
+    #[cfg(feature = "wifi")]
+    pub wx: &'a crate::weather::WxCache,
     // --- espnow-only ---
     /// The Clock bottom-line label under espnow: the radio service's most-recent
     /// peer/mesh message (`bottom_line`, owned by `main`). Non-espnow builds derive
@@ -189,6 +195,11 @@ pub enum AppKind {
     // is wifi-only (espnow ⊃ wifi).
     #[cfg(feature = "wifi")]
     Grid,
+    // #227 Weather — Open-Meteo current conditions, gateway-fetched + WX2-relayed. LIVE
+    // whenever compiled (REGISTRY row + `enter` construct it), like Batt/Grid. cfg(wifi):
+    // the screen tier matches Batt (the fetch/relay half is espnow, ⊃ wifi).
+    #[cfg(feature = "wifi")]
+    Weather,
     #[cfg(feature = "espnow")]
     Bench,
     #[cfg(feature = "espnow")]
@@ -254,6 +265,8 @@ impl AppKind {
             "About" => AppKind::About,
             "Batt" => AppKind::Batt,
             "Grid" => AppKind::Grid,
+            // #227: a node's default screen can be set to Weather via #21 too.
+            "Weather" => AppKind::Weather,
             #[cfg(feature = "espnow")]
             "Bench" => AppKind::Bench,
             #[cfg(feature = "espnow")]
@@ -295,6 +308,8 @@ impl AppKind {
             AppKind::Batt => "Batt",
             #[cfg(feature = "wifi")]
             AppKind::Grid => "Grid",
+            #[cfg(feature = "wifi")]
+            AppKind::Weather => "Weather",
             #[cfg(feature = "espnow")]
             AppKind::Bench => "Bench",
             #[cfg(feature = "espnow")]
@@ -366,6 +381,8 @@ pub enum App {
     Batt(crate::batt::BattState),
     #[cfg(feature = "wifi")]
     Grid(crate::grid::GridState),
+    #[cfg(feature = "wifi")]
+    Weather(crate::weather::WxState),
     #[cfg(feature = "espnow")]
     Bench(crate::bench::BenchState),
     #[cfg(feature = "espnow")]
@@ -398,6 +415,8 @@ impl App {
             AppKind::Batt => App::Batt(crate::batt::BattState::new()),
             #[cfg(feature = "wifi")]
             AppKind::Grid => App::Grid(crate::grid::GridState::new()),
+            #[cfg(feature = "wifi")]
+            AppKind::Weather => App::Weather(crate::weather::WxState::new()),
             #[cfg(feature = "espnow")]
             AppKind::Bench => App::Bench(crate::bench::BenchState::new()),
             #[cfg(feature = "espnow")]
@@ -439,6 +458,8 @@ impl App {
             App::Batt(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "wifi")]
             App::Grid(s) => Plugin::on_button(s, press, ctx),
+            #[cfg(feature = "wifi")]
+            App::Weather(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "espnow")]
             App::Bench(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "espnow")]
@@ -469,6 +490,8 @@ impl App {
             App::Batt(s) => Plugin::update(s, ctx),
             #[cfg(feature = "wifi")]
             App::Grid(s) => Plugin::update(s, ctx),
+            #[cfg(feature = "wifi")]
+            App::Weather(s) => Plugin::update(s, ctx),
             #[cfg(feature = "espnow")]
             App::Bench(s) => Plugin::update(s, ctx),
             #[cfg(feature = "espnow")]
@@ -519,6 +542,8 @@ impl App {
             App::Batt(s) => (AppKind::Batt, s.page()),
             #[cfg(feature = "wifi")]
             App::Grid(s) => (AppKind::Grid, s.page()),
+            #[cfg(feature = "wifi")]
+            App::Weather(_) => (AppKind::Weather, 0),
             #[cfg(feature = "espnow")]
             App::Bench(_) => (AppKind::Bench, 0),
             #[cfg(feature = "espnow")]
@@ -580,6 +605,9 @@ pub const REGISTRY: &[AppDesc] = &[
     AppDesc { title: "Batt", kind: AppKind::Batt },
     #[cfg(feature = "wifi")]
     AppDesc { title: "Grid", kind: AppKind::Grid },
+    // #227 Weather — gateway Open-Meteo fetch relayed fleet-wide. wifi tier, like Batt/Grid.
+    #[cfg(feature = "wifi")]
+    AppDesc { title: "Weather", kind: AppKind::Weather },
     // #25 WLED remote — only in a wled build (menu grows by one row; the scrolling
     // window math in menu.rs is length-relative, so it just works).
     #[cfg(feature = "wled")]
@@ -624,6 +652,11 @@ pub const fn plugin_bit(kind: AppKind) -> Option<u8> {
         AppKind::Batt => Some(3),
         #[cfg(feature = "wifi")]
         AppKind::Grid => Some(4),
+        // #227 Weather is NON-maskable (like Custom/Watch/Hunt/Finder): luna's live #55 mask
+        // is the original 7 bits (all-on 007F) — giving Weather a new bit would let a legacy
+        // mask permanently hide it. `None` ⇒ always shown; revisit with a paired HA mask change.
+        #[cfg(feature = "wifi")]
+        AppKind::Weather => None,
         #[cfg(feature = "wled")]
         AppKind::WledRemote => Some(5),
         AppKind::About => Some(6),

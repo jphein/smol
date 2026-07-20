@@ -1,0 +1,16 @@
+# #227 host-test harness for the PURE weather codec (net/wx.rs): the no-serde Open-Meteo JSON
+# scrape (with the current_units string-value skip), the WX|<tempF>|<code> mesh-payload codec
+# round-trip, and the WMO label table bounds. #[path]-includes the REAL wx.rs (no drift).
+# Mirrors experiments/relay_compat + dns_verify. Run: `cargo run` — panics on failure.
+[package]
+name = "wx_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "wx_verify"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 0

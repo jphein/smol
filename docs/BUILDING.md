@@ -66,6 +66,9 @@ Block Digger needs the Bluepad32 core: `esp32-bluepad32:esp32:esp32c3:CDCOnBoot=
 cd rust/clock
 cp src/board.rs.example   src/board.rs        # then set NODE_ID + DEFAULT_APP/DEFAULT_PAGE (per board) — git-ignored, ALL builds (#18/#19)
 cp src/secrets.rs.example src/secrets.rs      # then edit WIFI_SSID / WIFI_PASS — git-ignored, wifi/espnow only
+# For an --features espnow build, also set GROUP_KEY (32 bytes) in secrets.rs — the shared #190
+# mesh-auth key. Generate one with `openssl rand -hex 32` and give the WHOLE FLEET the same key
+# (+ same GROUP_KEY_EPOCH). It's authenticity, not confidentiality; NEVER commit it (repo is public).
 ESP_LOG=info cargo build --release --features espnow   # full build: Clock + Snake + Bench
 espflash flash --port /dev/ttyACM0 target/riscv32imc-unknown-none-elf/release/clock
 ```
@@ -83,7 +86,7 @@ Feature tiers: default = Clock + Snake · `--features wifi` = + NTP · `--featur
 - **`CDCOnBoot=cdc`** is required in the Arduino FQBN for Serial over USB-Serial/JTAG.
 - **Bluepad32 package is `esp32-bluepad32`** (hyphen), not `esp32_bluepad32`.
 - **Display 180°:** the pocket-watch case hangs from the USB-C end, so the firmware sets `DisplayRotation::Rotate180`. On a bare board with USB-C down it reads upside-down — flip it USB-up (or set `Rotate0` for bench use).
-- **Secrets:** real WiFi creds live only in git-ignored `rust/clock/src/secrets.rs` (the repo is public).
+- **Secrets:** real WiFi creds **and the #190 `GROUP_KEY`** (the fleet-shared mesh-auth HMAC key, `espnow` builds) live only in git-ignored `rust/clock/src/secrets.rs` (the repo is public). Every board must share one `GROUP_KEY` + `GROUP_KEY_EPOCH`, or a MAC-mismatch drops its frames (in observe it just bumps `mf=` in DIAG; in a future enforce release it partitions).
 
 ## Multi-board / ESP-NOW mesh
 Give each board a **distinct peer id** (`rust/clock/src/main.rs`, the `mode::start(..., N, ...)` arg — we flashed 7 / 8 / 9). Distinct ids let the blue-LED handshake and the Bench link stats work between boards (same id can be filtered as self-echo). Boards auto-pair over ESP-NOW on the AP's channel; watch the blue LED go slow-blink (detected) → solid (connected).

@@ -697,6 +697,152 @@ pub fn resolve_node_id() -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// #181/#184 mesh-ledger signing key — a per-node ed25519 SEED persisted in `nvs`
+// ---------------------------------------------------------------------------
+// The L3 Signed-Tree-Head (net/sth.rs) needs an on-device ed25519 key on the crown. Same NVS
+// discipline as identity, with three HARD rules the #184 gate demands:
+//   1. NO KEY GENERATION anywhere in the firmware or CI. The seed is supplied out-of-band by JP at
+//      a SUPERVISED USB touch; `resolve_ledger_key` only ever READS it, and `provision_*` only
+//      writes a seed it was HANDED. A node with no key runs verify-only / publishes an UNSIGNED
+//      anchor — it NEVER fabricates one (contrast `resolve_node_id`, which auto-seeds from a baked
+//      const; a signing key must be a deliberate act).
+//   2. The seed NEVER leaves the device — never committed, never in a log line, never over MQTT.
+//   3. It lives in `nvs` SECTOR 3 (offset 0x3000) — distinct from identity (sector 0) and the
+//      freshness-floor cells (sectors 1-2), so no operation on those touches it, and (like identity)
+//      it survives every OTA (the image write never touches `nvs`).
+// Provisioning is gated behind the `ledger-provision` feature + a JP-supplied `SMOL_LEDGER_SEED`
+// (hex): the default / OTA image carries neither, so it is read-only and seed-free.
+
+/// Ledger signing-key record magic ("smol ledger key, v1").
+#[cfg(feature = "espnow")]
+const LEDGER_KEY_MAGIC: [u8; 4] = *b"SMlk";
+#[cfg(feature = "espnow")]
+const LEDGER_KEY_VERSION: u8 = 1;
+/// `nvs` byte offset of the ledger-key record — SECTOR 3 (0x3000), clear of identity + floor cells.
+#[cfg(feature = "espnow")]
+const LEDGER_KEY_OFFSET: u32 = 0x3000;
+/// Record length: magic(4) + version(1) + seed(32) + checksum(1) = 38, padded to a WRITE_SIZE(4)
+/// multiple (40) so the raw `write` never NotAligned-fails (the [[smol-flash-write-word-align]] trap).
+#[cfg(feature = "espnow")]
+const LEDGER_KEY_REC_LEN: usize = 40;
+
+/// Decode a stored ledger-key record. `Some(seed)` iff magic + version + the seed checksum all
+/// check out. Erased flash (all 0xFF) and any corruption fail — never misread as a key.
+#[cfg(feature = "espnow")]
+fn parse_ledger_key(rec: &[u8]) -> Option<[u8; 32]> {
+    if rec.len() < 38 || rec[0..4] != LEDGER_KEY_MAGIC || rec[4] != LEDGER_KEY_VERSION {
+        return None;
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&rec[5..37]);
+    let sum = seed.iter().fold(0u8, |a, &b| a ^ b).wrapping_add(0x5A);
+    if rec[37] != sum {
+        return None; // checksum guard
+    }
+    Some(seed)
+}
+
+/// Encode the 40-byte ledger-key record for `seed`.
+#[cfg(feature = "ledger-provision")]
+fn encode_ledger_key(seed: &[u8; 32]) -> [u8; LEDGER_KEY_REC_LEN] {
+    let mut r = [0u8; LEDGER_KEY_REC_LEN];
+    r[0..4].copy_from_slice(&LEDGER_KEY_MAGIC);
+    r[4] = LEDGER_KEY_VERSION;
+    r[5..37].copy_from_slice(seed);
+    r[37] = seed.iter().fold(0u8, |a, &b| a ^ b).wrapping_add(0x5A);
+    r
+}
+
+/// Read the ledger signing seed from `nvs` sector 3. `None` on any flash error or when no valid
+/// record is present (unprovisioned) — the caller then runs verify-only / publishes unsigned.
+#[cfg(feature = "espnow")]
+fn read_ledger_key_nvs() -> Option<[u8; 32]> {
+    use embedded_storage::nor_flash::ReadNorFlash;
+    let mut flash = FlashStorage::new();
+    let mut buf = [0u8; PT_SCRATCH];
+    let pt = read_partition_table(&mut flash, &mut buf).ok()?;
+    let nvs = pt
+        .find_partition(PartitionType::Data(DataPartitionSubType::Nvs))
+        .ok()??;
+    let mut region = nvs.as_embedded_storage(&mut flash);
+    let mut rec = [0u8; LEDGER_KEY_REC_LEN];
+    region.read(LEDGER_KEY_OFFSET, &mut rec).ok()?;
+    parse_ledger_key(&rec)
+}
+
+/// Persist `seed` as the ledger signing key — the JP-supervised USB-touch primitive. Writes ONLY
+/// when sector 3 is fully erased (all 0xFF), so it never clobbers an existing key or foreign data;
+/// re-provisioning requires an explicit `espflash erase-region` of the sector first (deliberate).
+/// Best-effort: returns whether the write landed. Never logs the seed.
+#[cfg(feature = "ledger-provision")]
+fn provision_ledger_key_nvs(seed: &[u8; 32]) -> bool {
+    use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
+    let mut flash = FlashStorage::new();
+    let mut buf = [0u8; PT_SCRATCH];
+    let Ok(pt) = read_partition_table(&mut flash, &mut buf) else {
+        return false;
+    };
+    let Ok(Some(nvs)) = pt.find_partition(PartitionType::Data(DataPartitionSubType::Nvs)) else {
+        return false;
+    };
+    let mut region = nvs.as_embedded_storage(&mut flash);
+    let sector = <FlashStorage as NorFlash>::ERASE_SIZE as u32;
+    // Refuse unless the WHOLE target sector is erased — never overwrite an existing key.
+    let mut chunk = [0u8; 64];
+    let mut off = LEDGER_KEY_OFFSET;
+    let end = LEDGER_KEY_OFFSET + sector;
+    while off < end {
+        if region.read(off, &mut chunk).is_err() {
+            return false;
+        }
+        if chunk.iter().any(|&b| b != 0xFF) {
+            return false; // not erased → don't touch
+        }
+        off += chunk.len() as u32;
+    }
+    if region.erase(LEDGER_KEY_OFFSET, end).is_err() {
+        return false;
+    }
+    region.write(LEDGER_KEY_OFFSET, &encode_ledger_key(seed)).is_ok()
+}
+
+/// Parse the JP-supplied `SMOL_LEDGER_SEED` (64 lowercase/upper hex chars) into a 32-byte seed.
+/// Compile-time env, read at runtime; absent/malformed → `None` (no provisioning). Never logged.
+#[cfg(feature = "ledger-provision")]
+fn ledger_seed_from_env() -> Option<[u8; 32]> {
+    let s = option_env!("SMOL_LEDGER_SEED")?;
+    if s.len() != 64 {
+        return None;
+    }
+    let b = s.as_bytes();
+    let mut seed = [0u8; 32];
+    for (i, out) in seed.iter_mut().enumerate() {
+        let hi = (b[i * 2] as char).to_digit(16)?;
+        let lo = (b[i * 2 + 1] as char).to_digit(16)?;
+        *out = ((hi << 4) | lo) as u8;
+    }
+    Some(seed)
+}
+
+/// The node's ledger signing key: the NVS record if provisioned, else `None`. Called once at boot.
+/// Provisioning is a DELIBERATE act, never automatic — only a `ledger-provision` build with a
+/// JP-supplied `SMOL_LEDGER_SEED` seeds NVS (once, if the sector is erased). The default / OTA image
+/// has neither → it only ever reads an already-provisioned key. NO key generation, NO key in the
+/// repo / MQTT / logs (the #184 on-device-key gate). BRICK-SAFE — never panics.
+#[cfg(feature = "espnow")]
+pub fn resolve_ledger_key() -> Option<[u8; 32]> {
+    #[cfg(feature = "ledger-provision")]
+    if read_ledger_key_nvs().is_none() {
+        if let Some(seed) = ledger_seed_from_env() {
+            if provision_ledger_key_nvs(&seed) {
+                log::info!("smol #181: ledger signing key provisioned into NVS (seed not logged)");
+            }
+        }
+    }
+    read_ledger_key_nvs()
+}
+
+// ---------------------------------------------------------------------------
 // otadata operations: inactive-slot lookup, activation, first-boot confirm
 // ---------------------------------------------------------------------------
 
