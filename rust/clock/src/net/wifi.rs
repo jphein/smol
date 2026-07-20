@@ -2226,8 +2226,11 @@ fn mqtt_session(
             json.clear();
             let _ = write!(
                 json,
-                "{{\"unique_id\":\"smol{}_{}\",\"object_id\":\"smol_{}_{}\",\"has_entity_name\":true,\"name\":\"{}\",\"state_topic\":\"smol/{}/telemetry\",\"value_template\":\"{}\"{},\"expire_after\":300,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {}\"}}}}",
-                id, field, id, field, name, id, tmpl, extra, id, id, noun
+                // #228: device block enriched with model/manufacturer/sw_version so HA groups
+                // every entity under one device card with the running sigil version shown.
+                // sw_version = "v<build#> <forge-noun>" (e.g. "v342 Jig"); none of these are secret.
+                "{{\"unique_id\":\"smol{}_{}\",\"object_id\":\"smol_{}_{}\",\"has_entity_name\":true,\"name\":\"{}\",\"state_topic\":\"smol/{}/telemetry\",\"value_template\":\"{}\"{},\"expire_after\":300,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {}\",\"model\":\"smol ESP32-C3\",\"manufacturer\":\"jphein\",\"sw_version\":\"v{} {}\"}}}}",
+                id, field, id, field, name, id, tmpl, extra, id, id, noun, env!("BUILD_NUMBER"), crate::net::names::version_name().1
             );
             if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), json.as_bytes(), true) {
                 let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
@@ -2264,8 +2267,8 @@ fn mqtt_session(
             // entity_category) so HA derives the clean entity_id `sensor.smol_<id>_uplink`
             // from object_id instead of the device-name-concatenated form. unique_id bumped
             // (_uplk) to force HA to re-derive the entity_id for the corrected config.
-            "{{\"unique_id\":\"smol{}_uplk\",\"object_id\":\"smol_{}_uplink\",\"has_entity_name\":true,\"name\":\"Uplink\",\"state_topic\":\"smol/{}/uplink\",\"unit_of_measurement\":\"dBm\",\"device_class\":\"signal_strength\",\"expire_after\":120,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {}\"}}}}",
-            node_id, node_id, node_id, node_id, node_id, unoun
+            "{{\"unique_id\":\"smol{}_uplk\",\"object_id\":\"smol_{}_uplink\",\"has_entity_name\":true,\"name\":\"Uplink\",\"state_topic\":\"smol/{}/uplink\",\"unit_of_measurement\":\"dBm\",\"device_class\":\"signal_strength\",\"expire_after\":120,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {}\",\"model\":\"smol ESP32-C3\",\"manufacturer\":\"jphein\",\"sw_version\":\"v{} {}\"}}}}",
+            node_id, node_id, node_id, node_id, node_id, unoun, env!("BUILD_NUMBER"), crate::net::names::version_name().1
         );
         if let Some(n) =
             crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), json.as_bytes(), true)
