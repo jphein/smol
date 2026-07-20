@@ -699,6 +699,17 @@ impl NtpMachine {
     /// waiting → yield).
     fn step_assoc(&mut self, controller: &mut esp_wifi::wifi::WifiController<'static>) -> bool {
         let net = &crate::secrets::WIFI_NETWORK;
+        // #192: an ALREADY-associated caller (the periodic NTP re-sync burst on a coexist
+        // gateway) skips the disconnect/reconfigure/connect FFI — issuing it would TEAR a live
+        // coexist association (mesh-deaf + re-election churn) for no reason. Go straight to DHCP.
+        // Boot is NOT yet connected here, so the boot burst still runs the full setup below →
+        // boot behaviour is byte-identical.
+        if !self.assoc_configured && matches!(controller.is_connected(), Ok(true)) {
+            self.assoc_configured = true;
+            self.deadline = Instant::now() + SYNC_BUDGET; // shared DHCP+SNTP budget
+            self.phase = NtpPhase::Dhcp;
+            return true;
+        }
         if !self.assoc_configured {
             // Drop any prior association before reconfiguring (harmless if not connected).
             let _ = controller.disconnect();
@@ -907,6 +918,50 @@ pub fn note_broker_connect(connected: bool) {
             "smol #100: broker override unreachable x{} — disabled, reverting to the slot's baked broker",
             streak
         );
+    }
+}
+
+/// #192: re-sync NTP when the last true sync (`my_synced_at`) is older than this. try_time_sync
+/// runs ONLY at boot, so without a periodic re-sync the wall-clock free-runs on the ESP32-C3
+/// oscillator forever (~10–40 ppm drift → seconds/day, unbounded). 1 h caps the accumulated
+/// error before correction while keeping the extra WiFi bursts rare (≈1/120 flushes).
+/// ⚠️ HARDWARE-WATCH tuning knob.
+#[cfg(feature = "espnow")]
+pub(crate) const NTP_RESYNC_AGE_S: u32 = 3600;
+
+/// #192: periodic NTP re-sync — a lightweight SNTP-only burst that reuses the #89 Stage-1
+/// `NtpMachine` substrate. UNLIKE `run_ntp_burst` it runs NO MQTT tail (no election, no downlink,
+/// no discovery): it exists solely to refresh the clock when `my_synced_at` goes stale
+/// (main-loop trigger, GATEWAY only — leaves refresh via mesh time adoption). On an already-
+/// associated coexist gateway, `NtpMachine::step_assoc` skips the disconnect/reconnect, so this
+/// does NOT tear the coexist association — it rebuilds the smoltcp stack (fresh interface) →
+/// DHCP → one SNTP exchange → returns the Unix time (`None` on timeout/abort/assoc-DHCP fail).
+///
+/// Reuses the same module `static mut` NTP buffers as the boot burst — alias-safe for the F2
+/// reason: the boot burst completes BEFORE the main loop, and re-syncs are sequential (only one
+/// flush/burst is ever in flight in the single-threaded main loop), so the borrows never overlap.
+#[cfg(feature = "espnow")]
+pub fn run_ntp_resync(
+    controller: &mut esp_wifi::wifi::WifiController<'static>,
+    device: &mut esp_wifi::wifi::WifiDevice<'static>,
+    mut rng: Rng,
+    tick: &mut dyn FnMut() -> bool,
+) -> Option<u32> {
+    let sntp_src_port = 49152 + (rng.random() % 16384) as u16;
+    let mut machine = NtpMachine::new(device, sntp_src_port);
+    loop {
+        match machine.poll(controller, device) {
+            NtpPoll::Pending => {
+                if tick() {
+                    return None; // #20 long-press abort → give up this re-sync, retry when due again
+                }
+            }
+            // Assoc/DHCP gave up (e.g. AP briefly unreachable) → no fresh time this cycle; the
+            // main-loop trigger re-attempts on the next flush once still stale.
+            NtpPoll::Failed => return None,
+            // Reached DHCP; carry the SNTP result. NO MQTT tail (that is run_ntp_burst / the flush).
+            NtpPoll::ReachedDhcp(t) => return t,
+        }
     }
 }
 

@@ -157,6 +157,11 @@ pub use wifi::CFG_KEY_SCAN;
 #[cfg(all(feature = "wifi", not(feature = "espnow")))]
 pub use wifi::try_time_sync;
 
+// #192: the NTP re-sync staleness threshold — read by `main`'s flush-cadence re-sync trigger.
+// `wifi` is a private submodule, so main reaches the const only via this re-export.
+#[cfg(feature = "espnow")]
+pub(crate) use wifi::NTP_RESYNC_AGE_S;
+
 /// Install esp-wifi's heap ONCE. esp-alloc declares the `#[global_allocator]`
 /// inside its own crate; this macro just adds an internal-RAM region to it.
 /// Defined here so both the Phase 2 (`wifi`) and Phase 3 (`espnow`) code paths

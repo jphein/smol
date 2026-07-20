@@ -2420,6 +2420,17 @@ impl RadioManager {
         (reached_dhcp, synced)
     }
 
+    /// #192: run a periodic NTP RE-SYNC burst (SNTP-only, NO MQTT tail) on the STA device,
+    /// reusing the boot `NtpMachine` substrate. Called from the main loop on the GATEWAY when
+    /// `my_synced_at` goes stale (> `NTP_RESYNC_AGE_S`). Returns the fresh Unix time, or `None`
+    /// on failure/abort. Does NOT tear the coexist association (`NtpMachine::step_assoc` skips
+    /// the reconnect when already connected). `rng` is `Copy`; `sta` borrows disjoint from
+    /// `self.controller`. Leaves never call this (mesh time adoption refreshes their freshness).
+    pub fn resync_ntp(&mut self, tick: &mut dyn FnMut() -> bool) -> Option<u32> {
+        let sta = self.sta.as_mut()?;
+        crate::net::wifi::run_ntp_resync(&mut self.controller, sta, self.rng, tick)
+    }
+
     /// Current radio mode. Part of the public API (a caller may inspect which
     /// stack is live before choosing to broadcast); not used by `main` today.
     #[allow(dead_code)]
