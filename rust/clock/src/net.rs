@@ -55,6 +55,14 @@ mod mqtt;
 #[cfg(feature = "espnow")]
 pub mod mode;
 
+// #164 per-peer link-quality (ETX) metric: the PURE reach-register + cost mapping, ported
+// from babeld's neighbour.c (see docs/superpowers/research/althea-babel-study.md, #163).
+// Host-testable (experiments/etx_verify), no HAL deps. espnow-gated to match its sole
+// consumer `mode::Roster` (its `LinkQuality`-per-peer holder) — so the default/wifi Phase-1/2
+// builds stay byte-free of it, exactly like `flood`/`wire`.
+#[cfg(feature = "espnow")]
+pub mod etx;
+
 // #13 routed multi-hop mesh: the PURE managed-flood decision core (SeenSet + forward
 // decision + HopLatch escalation state machine), host-testable, no HAL deps. Driven by
 // the relay path in `mode`, so espnow-gated.

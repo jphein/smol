@@ -910,6 +910,15 @@ struct Node {
     last_ack_ms: u64,
     rssi: i32,
     synced_at: u32,
+    /// #164 per-peer link quality: a reach shift-register of HELLO reception → an ETX-style
+    /// cost (`lq.cost()`, 0 = perfect … 255 = unheard). The RSSI above is signal *strength*;
+    /// this is delivery *quality* — the complementary axis #155/#165 consume. Advanced once per
+    /// HELLO cadence by [`Roster::sample_link_quality`], fed by [`Roster::mark_hello`].
+    lq: crate::net::etx::LinkQuality,
+    /// #164 sampling latch: set true when a HELLO from this peer is heard, read+cleared each
+    /// HELLO interval by [`Roster::sample_link_quality`]. Separates "heard a HELLO since the
+    /// last sample" (the ETX input) from `last_heard_ms` (freshened by ANY frame).
+    hello_seen: bool,
 }
 
 impl Node {
@@ -922,6 +931,8 @@ impl Node {
         last_ack_ms: 0,
         rssi: 0,
         synced_at: 0,
+        lq: crate::net::etx::LinkQuality::new(),
+        hello_seen: false,
     };
 }
 
@@ -1042,6 +1053,52 @@ impl Roster {
         }
     }
 
+    /// #164: note that a HELLO was heard from `mac` this interval (the ETX input). Called from
+    /// the HELLO service arm ONLY — non-HELLO frames freshen `last_heard_ms`/liveness but do NOT
+    /// feed ETX, so the metric measures a peer's periodic-beacon reception ratio (babeld's
+    /// Hello-based rxcost), not traffic volume. The flag is consumed by `sample_link_quality`.
+    fn mark_hello(&mut self, mac: [u8; 6]) {
+        let i = self.slot(mac);
+        self.nodes[i].hello_seen = true;
+    }
+
+    /// #164: advance every peer's link-quality register by one HELLO interval — call once per
+    /// HELLO cadence (~2 s, the `broadcast_hello` tick), regardless of whether WE broadcast (a
+    /// HELLO-silent/abdicated board still hears peers and must keep scoring them). For each live
+    /// peer: `lq.tick(hello_seen)` then clear the latch, so a heard interval shifts a `1` into the
+    /// register and a missed one decays it. Peers not marked this interval decay toward INFINITY.
+    fn sample_link_quality(&mut self) {
+        for n in self.nodes.iter_mut() {
+            if n.used {
+                n.lq.tick(n.hello_seen);
+                n.hello_seen = false;
+            }
+        }
+    }
+
+    /// #164: the WORST (highest) link cost among fresh peers — this node's headline drag signal
+    /// for the DIAG record. `INFINITY` when no fresh peer exists (isolated). **worst, not best,
+    /// by design** (morpheus-155's #155 review): the channel-drag disease is *asymmetric* — a
+    /// dragged leaf can still have one good peer, so a `min` (best-link) aggregate would report a
+    /// healthy number and HIDE the drag. `max` surfaces "some link of mine is bad." It reads the
+    /// per-peer `etx` off the same [`RosterView`] that #155/#165 (and Bench) consume via
+    /// [`RadioManager::roster`] — and that per-peer surface is the PRECISE path: an options-1/2
+    /// channel policy should read the leaf→crown link specifically (peer id == the elected owner),
+    /// which `max` only approximates. Keeping the per-peer field the load-bearing primitive.
+    fn worst_link_cost(&self, now: u64) -> u8 {
+        let view = self.view(now);
+        if view.count == 0 {
+            return crate::net::etx::INFINITY; // isolated: no fresh peer heard
+        }
+        let mut worst = 0u8;
+        for n in &view.nodes[..view.count] {
+            if n.etx > worst {
+                worst = n.etx;
+            }
+        }
+        worst
+    }
+
     /// Snapshot the fresh peers (heard within `ROSTER_STALE_MS`), strongest-RSSI
     /// first, into a `Copy` [`RosterView`] Bench renders with no live radio borrow.
     fn view(&self, now: u64) -> RosterView {
@@ -1058,6 +1115,7 @@ impl Roster {
                 age_s: (now.saturating_sub(n.last_heard_ms) / 1000) as u32,
                 has_mesh_time: n.synced_at != 0,
                 connected: PeerTracker::fresh(n.last_ack_ms, now),
+                etx: n.lq.cost(), // #164 per-peer link cost (0 = perfect … 255 = unheard)
             };
             count += 1;
         }
@@ -1090,6 +1148,9 @@ pub struct NodeView {
     /// True if a fresh ACK addressed to us has been heard from this peer (the
     /// same `PEER_STALE_MS` freshness the LED uses, but per-peer).
     pub connected: bool,
+    /// #164 ETX-style link cost from HELLO-reception history: 0 = perfect, higher = lossier,
+    /// 255 = unheard in the window. Complements `rssi` (strength) with delivery *quality*.
+    pub etx: u8,
 }
 
 impl NodeView {
@@ -1100,6 +1161,7 @@ impl NodeView {
         age_s: 0,
         has_mesh_time: false,
         connected: false,
+        etx: crate::net::etx::INFINITY,
     };
 }
 
@@ -2501,6 +2563,15 @@ impl RadioManager {
         self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
     }
 
+    /// #164: advance every peer's link-quality (ETX) register by one HELLO interval. Call once
+    /// per HELLO tick from `main` (alongside `broadcast_hello`), UNCONDITIONALLY — a HELLO-silent
+    /// board (abdicated) still hears peers and must keep scoring them, so this is deliberately
+    /// separate from `broadcast_hello`'s `silent_until_relock` early-return. Delegates to the
+    /// pure `Roster` sampler; the metric math lives in `net/etx.rs` (host-tested).
+    pub fn sample_link_quality(&mut self) {
+        self.roster.sample_link_quality();
+    }
+
     /// Broadcast one BENCH BEACON carrying our id, our next seq, and the highest
     /// peer seq we've heard (the echo). Called by BENCH mode a few times/sec IN
     /// ADDITION to the normal HELLO; unused in the other modes. Records the send
@@ -2929,8 +3000,13 @@ impl RadioManager {
         // reads 1. Surfaced so the rig sees a leaf latch/un-latch (and `fwd`/`dedup`/`ttl`
         // score P2/P3; `fwd == 0` fleet-wide is the C0 all-hear byte-identical canary).
         let mesh_hop = if self.relay.latch.latched() { crate::net::flood::MAX_HOP } else { 1 };
+        // #164: this node's WORST per-peer link cost — 0 = every fresh link perfect, 253 = a
+        // link is dragging, 255 = no fresh peer (isolated). `worst` not `min` on purpose (#155
+        // review): min would hide an asymmetric drag. The per-peer roster surface is the precise
+        // path for an options-1/2 policy (leaf→crown link); this DIAG field is the coarse beacon.
+        let etx_worst = self.roster.worst_link_cost(now_ms());
         let mut rec = alloc::format!(
-            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}|brk={}|otah={}|fwd={}|dedup={}|ttl={}|hop={}|dlseq={}|dfwd={}",
+            "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}|brk={}|otah={}|fwd={}|dedup={}|ttl={}|hop={}|dlseq={}|dfwd={}|etx={}",
             d.boot_slot,
             d.reset_reason,
             d.boot_count,
@@ -2965,6 +3041,7 @@ impl RadioManager {
             // a v1-only leaf. Representative of the downlink channel; GRID2 uses the same mechanism.
             self.batt.dl_seq,
             self.diag.dfwd,
+            etx_worst, // #164 worst per-peer link cost (0 = all perfect … 253 = dragging … 255 = isolated)
         );
         // #74 item 3 (stage-2): fold in the APPLIED-config string for HA config-drift, ONLY when
         // `main` populated it (espnow build). ASCII by construction (as_wire/to_wire/hex/F24). HA
@@ -4673,6 +4750,10 @@ impl RadioManager {
                     // Roster (additive): HELLO carries the sender's id — the
                     // primary place peer ids are learned (every node HELLOs 2 Hz).
                     self.roster.heard(src, Some(peer_id), rssi, now);
+                    // #164: this is a HELLO specifically → feed the ETX register. Non-HELLO
+                    // frames call `heard` (liveness) but NOT `mark_hello`, so the metric tracks
+                    // the periodic-beacon reception ratio, not traffic volume.
+                    self.roster.mark_hello(src);
 
                     // #23 leaf channel-lock: a leaf that hears the ELECTED OWNER's
                     // HELLO has found the mesh channel — lock (stop scanning) + stamp
