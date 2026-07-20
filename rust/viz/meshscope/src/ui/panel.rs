@@ -251,7 +251,7 @@ pub fn show(ui: &mut egui::Ui, model: &Model, selected: Option<u8>, now_s: f64) 
             let cx = super::graph::crown_coexist(model);
             let verdict = match cx {
                 super::graph::Coexist::Healthy { ch } => {
-                    Some((format!("✓ coexist healthy — AP & mesh both on ch{ch}"), false))
+                    Some((format!("● coexist healthy — AP & mesh both on ch{ch}"), false))
                 }
                 super::graph::Coexist::Weak { ch, rssi } => {
                     Some((format!("⚠ coexist ch{ch} — uplink weak ({rssi} dBm), degraded not dead"), true))

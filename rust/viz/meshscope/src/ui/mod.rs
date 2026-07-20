@@ -116,7 +116,7 @@ fn top_bar(ui: &mut egui::Ui, m: &Model, now_s: f64) {
         // dies. Mirrors luna-notify's HA coexist tile (green ==, red !=, amber weak-uplink).
         let cx = graph::crown_coexist(m);
         let cx_chip = match cx {
-            graph::Coexist::Healthy { ch } => Some(format!("✓ coexist ch{ch}")),
+            graph::Coexist::Healthy { ch } => Some(format!("● coexist ch{ch}")),
             graph::Coexist::Weak { ch, rssi } => Some(format!("⚠ coexist ch{ch} · uplink {rssi} dBm")),
             graph::Coexist::Violated { ap_ch, mesh_ch } => Some(format!("✖ OFF-CHANNEL · AP ch{ap_ch} ≠ mesh ch{mesh_ch}")),
             graph::Coexist::Unknown => None,
