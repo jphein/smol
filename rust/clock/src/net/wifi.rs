@@ -3707,10 +3707,12 @@ fn mqtt_session(
             if let Some(installed) = crate::ota_mesh::stat_build(val) {
                 let latest = latest_staged.unwrap_or(installed);
                 let mut sjson = MqttScratch::new();
-                // #218: carry the sigil forge name in the relayed leaf title too.
+                // #218: carry the sigil forge name in the relayed leaf title too. The title must
+                // match the self-published form ("v<N> <sigil>", NOT "smol v<N>") so a relayed leaf
+                // and a self-publishing board render identically in HA/meshscope (live≠repo fix).
                 let _ = write!(
                     sjson,
-                    "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":false,\"title\":\"smol v{} {}\"}}",
+                    "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":false,\"title\":\"v{} {}\"}}",
                     installed, latest, latest, crate::net::names::version_name_for(latest).1
                 );
                 let mut stopic = MqttScratch::new();
