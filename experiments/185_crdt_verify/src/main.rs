@@ -39,7 +39,7 @@ fn dg(s: &Set) -> [u8; 16] {
     s.digest(sha256)
 }
 
-fn main() {
+fn run() {
     // ---- empty ------------------------------------------------------------
     let e0 = Set::new();
     assert!(e0.is_empty(), "fresh set is empty");
@@ -192,4 +192,19 @@ fn main() {
     const _C: OrSet<8> = OrSet::new();
 
     println!("crdt_verify: all assertions passed");
+}
+
+fn main() {
+    run();
+}
+
+#[cfg(test)]
+mod tests {
+    /// `cargo test` entry — runs the full CvRDT-law suite (identical asserts to `cargo run`), so
+    /// neither invocation is a false-green. (A bin with no `#[test]` reports "0 passed" under
+    /// `cargo test` — this wrapper prevents that.)
+    #[test]
+    fn crdt_laws() {
+        super::run();
+    }
 }
