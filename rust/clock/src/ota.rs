@@ -1163,6 +1163,29 @@ impl SlotReader {
     }
 }
 
+/// #237 slice-1 (serve-reads-active-slot): the ACTIVE/running slot — the build this node is
+/// executing, and a peer-relay holder's serve SOURCE. `SlotReader::open` already reads any slot;
+/// the #40 gateway relay passes the just-staged INACTIVE slot, whereas a holder serves the build it
+/// is RUNNING, so it needs the active one. Mirrors `inactive_slot` but returns `current_slot`
+/// directly. Blank otadata ⇒ the ROM booted `ota_0` (no factory partition in partitions-ota.csv)
+/// ⇒ `Slot0` — the same mapping as #226's inactive_slot fix. `None` on any partition/flash error.
+#[cfg(feature = "espnow")]
+#[allow(dead_code)] // #237: wired by the crown/holder serve arbiter (later slice-1 increment)
+pub fn active_slot() -> Option<Slot> {
+    let mut flash = FlashStorage::new();
+    let mut buf = [0u8; PT_SCRATCH];
+    let pt = read_partition_table(&mut flash, &mut buf).ok()?;
+    let od = pt
+        .find_partition(PartitionType::Data(DataPartitionSubType::Ota))
+        .ok()??;
+    let mut region = od.as_embedded_storage(&mut flash);
+    let mut ota = Ota::new(&mut region).ok()?;
+    Some(match ota.current_slot().ok()? {
+        Slot::None => Slot::Slot0, // blank ⇒ ROM booted ota_0 (mirrors inactive_slot, #226)
+        s => s,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // #40 §3C — the persistent signed-freshness FLOOR (NVS-backed).
 //
