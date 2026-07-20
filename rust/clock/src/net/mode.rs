@@ -1416,6 +1416,13 @@ const DEAF_SHED_M: u8 = 2;
 /// exhausted. A got_mc miss is itself bulk-dead proof (small unicast dead ⇒ bulk dead), so this is a
 /// valid — if deliberately conservative — shed path; a live bulk-fetch failure sheds sooner.
 const DEAF_SHED_DEEP_STREAK: u8 = 8;
+
+/// #217 rung-2: crown-assumption + pre-fetch AP-quality floor. A crown that associates to an AP
+/// weaker than this proactively ch6-reassocs to a stronger one BEFORE committing as gateway and
+/// BEFORE a self-OTA fetch. Evidence: the #204 pcap deaf AP was rssi -82 — the crown went
+/// unicast-RX-deaf within ~1 ms of its own GET TX. -75 leaves headroom above that and sits between
+/// the reelect rssi buckets (-65 / -78). PROACTIVE (preempt) vs rung-1's REACTIVE detect→heal.
+const CROWN_AP_RSSI_MIN: i8 = -75;
 /// Recently-completed `(src_mac, msgid)` memory. A lost RELAYACK makes a leaf
 /// retransmit an ALREADY-complete message; we must re-ACK it but NOT re-enqueue
 /// (else duplicate UDP delivery — finding 3). Ring of the last few completions.
@@ -3549,6 +3556,19 @@ impl RadioManager {
     ) -> bool {
         log::info!("smol OTA: opening update burst (mesh deaf for the whole download)");
         let _ = self.switch(Mode::WifiSta);
+        // #217 rung-2B: pre-fetch AP-quality gate. If the current AP is weak (rssi < -75 — the pcap
+        // deaf-AP class that never ACKs response byte 0), steer to a stronger ch6 AP BEFORE the
+        // fetch (run_ota_fetch's own assoc-wait absorbs the reconnect latency). BEST-EFFORT
+        // reassoc-then-fetch, NOT a defer: run_ota_update's `false` return is a self-fetch FAILURE
+        // that feeds the #195/#225 fail-cap, so a defer-as-failure would poison the cap. Cap-neutral
+        // true-defer = rung-2D follow-up.
+        if self.my_rssi_to_ap < CROWN_AP_RSSI_MIN {
+            log::warn!(
+                "smol #217: pre-fetch AP weak (rssi {}) — ch6-reassoc before fetch",
+                self.my_rssi_to_ap
+            );
+            self.reassoc_ch6_prefer();
+        }
         let rng = self.rng;
         let mut fail: Option<(u32, u32, u32, u32, u32)> = None;
         let ok = match self.sta.as_mut() {
@@ -3572,6 +3592,20 @@ impl RadioManager {
         if !ok {
             if let Some(rec) = fail {
                 self.ota_self_fail = Some(rec);
+                // #217 rung-2C: the fetch SOCKET was RX-deaf (a bulk-deaf ota_fail stage) — a leg the
+                // #204 got_mc detector is BLIND to (cdeaf stayed 0:0:0 through the pcap's fetch death,
+                // so the ladder never escalated). Reassoc to a better AP NOW so the buffered retry
+                // lands on a healthy link instead of re-dying on the same AP. DIRECT fetch-leg
+                // sensing→action, no got_mc/flush dependency. espnow-gated: ota_fail_is_bulk_deaf is
+                // espnow-only, and run_ota_update also compiles on the wifi-only tier.
+                #[cfg(feature = "espnow")]
+                if crate::net::wifi::ota_fail_is_bulk_deaf(rec.4) {
+                    log::warn!(
+                        "smol #217: fetch-leg deaf (ota_fail stage {}) — reassoc before retry",
+                        rec.4
+                    );
+                    self.reassoc_ch6_prefer();
+                }
             }
         }
         ok
@@ -5677,6 +5711,22 @@ pub fn start(
     // #51 B: if we associated, seed the initial RSSI-to-AP so the first recovery
     // election already has a real signal-strength reading to compare on.
     if reached_dhcp {
+        if let Ok(r) = radio.controller.rssi() {
+            radio.my_rssi_to_ap = r.clamp(-127, 0) as i8;
+        }
+    }
+    // #217 rung-2A: PROACTIVE reassoc at CROWN-ASSUMPTION. If this board just won the crown on a
+    // WEAK AP (rssi < -75 — the pcap deaf-AP class), steer to a strong ch6 AP BEFORE the coexist
+    // gateway commits below ("mesh rides my AP channel"). Crowning on a doomed link otherwise
+    // guarantees the #204 bulk-RX-deaf disease. reassoc_ch6_prefer no-ops mid mesh-OTA (ota_leaf).
+    // rssi trigger only this rung; ch-mismatch is a follow-up (no trivial current-AP-channel
+    // accessor at this site yet). Re-capture rssi after so #51 election + coexist use the new value.
+    if radio.relay.is_gateway && radio.my_rssi_to_ap < CROWN_AP_RSSI_MIN {
+        log::warn!(
+            "smol #217: crown-assumption on a weak AP (rssi {}) — proactive ch6-reassoc",
+            radio.my_rssi_to_ap
+        );
+        radio.reassoc_ch6_prefer();
         if let Ok(r) = radio.controller.rssi() {
             radio.my_rssi_to_ap = r.clamp(-127, 0) as i8;
         }
