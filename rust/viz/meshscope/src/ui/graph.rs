@@ -411,11 +411,14 @@ pub fn crown_coexist(m: &Model) -> Coexist {
 }
 
 pub fn coexist_color(c: Coexist) -> Color32 {
+    // Sibling palette to the #204 crown-deaf health callout in panel.rs (same dark-canvas
+    // tuning: bg ≈ rgb 16,18,24) so the coexist indicator reads as a matching health signal
+    // right next to it, not a stranger. Kept in lockstep with that block's red/amber/green.
     match c {
-        Coexist::Healthy { .. } => Color32::from_rgb(90, 210, 120),
-        Coexist::Weak { .. } => Color32::from_rgb(230, 200, 70),
+        Coexist::Healthy { .. } => Color32::from_rgb(120, 200, 150),
+        Coexist::Weak { .. } => Color32::from_rgb(230, 190, 70),
         Coexist::Violated { .. } => Color32::from_rgb(224, 90, 90),
-        Coexist::Unknown => Color32::from_rgb(130, 130, 140),
+        Coexist::Unknown => Color32::from_gray(120),
     }
 }
 
