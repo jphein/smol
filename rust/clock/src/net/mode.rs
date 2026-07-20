@@ -2824,7 +2824,11 @@ impl RadioManager {
         // scan_n = scan_with_config_sync_max(Default, N): a synchronous full-band scan capped at N
         // results. We cap generously then keep the strongest few, so a busy band still yields the
         // most-relevant APs.
-        let record = match block_on(self.controller.scan_async(&ScanConfig::default())) {
+        // #233 REGRESSION FIX: esp-radio 0.18 scan_async(ScanConfig::default()) has max=None and
+        // returns EVERY AP in range as a heap Vec — the old esp-wifi scan_n(16) capped at 16. In a
+        // dense RF environment the unbounded Vec is an OOM-panic risk (alloc failure = rst=panic);
+        // .with_max(16) restores the proven bound.
+        let record = match block_on(self.controller.scan_async(&ScanConfig::default().with_max(16))) {
             Ok(mut aps) => {
                 // Strongest RSSI first (descending → Reverse of the ascending key).
                 aps.sort_by_key(|a| core::cmp::Reverse(a.signal_strength));
@@ -2861,7 +2865,9 @@ impl RadioManager {
         }
         let net = &crate::secrets::WIFI_NETWORK;
         // Strongest ch6 BSSID if any; else strongest overall; else None (plain reconnect on creds).
-        let (bssid, pin_ch6): (Option<[u8; 6]>, bool) = match block_on(self.controller.scan_async(&ScanConfig::default())) {
+        // #233 REGRESSION FIX: bound the scan (see run_scan) — the old scan_n(16) capped results;
+        // scan_async(default) is unbounded (max=None) → OOM-panic risk on the crown-deaf path.
+        let (bssid, pin_ch6): (Option<[u8; 6]>, bool) = match block_on(self.controller.scan_async(&ScanConfig::default().with_max(16))) {
             Ok(aps) => {
                 if let Some(a) = aps
                     .iter()

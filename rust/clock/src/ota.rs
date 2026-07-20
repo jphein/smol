@@ -55,6 +55,7 @@ use esp_storage::FlashStorage;
 /// - ALL flash access stays on the main loop: OTA is strictly serial (one
 ///   `ImageWriter`/`LeafImageWriter` at a time; the otadata/identity helpers run before
 ///   begin / after finalize, never concurrently), and no ISR touches flash.
+///
 /// This holds STRUCTURALLY in the non-embassy superloop. #198 (embassy-net migration):
 /// re-evaluate this deliberately — once flash users can interleave at await points, move
 /// to a single owned instance (StaticCell/once-init here in `ota::`) instead of per-op
