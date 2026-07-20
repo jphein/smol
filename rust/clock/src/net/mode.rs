@@ -194,7 +194,7 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 12] = [
+const CFG_APPLY_KEYS: [u8; 13] = [
     crate::net::wifi::CFG_KEY_SCREEN,
     crate::net::wifi::CFG_KEY_LED,
     crate::net::wifi::CFG_KEY_UNITS,
@@ -218,6 +218,9 @@ const CFG_APPLY_KEYS: [u8; 12] = [
     // #72 IO output states: g — same unconditional-slot rationale as G above (the config
     // PLUMBING is `io`-gated; a non-io build's slot is inert). Leaf takes it via take_cfg_offer(g).
     crate::net::wifi::CFG_KEY_IO_SET,
+    // #197 herald NOTIFY: M — a COMMAND like R/W (buffered/applied via take_cfg_offer(M), NEVER
+    // cached: a cached toast would re-show on every boot). One-shot; the leaf toasts + auto-dismisses.
+    crate::net::wifi::CFG_KEY_NOTIFY,
 ];
 /// #50b leaf-status UPLINK tag: `"SMOLv1 STAT "` (12 B, trailing space) then `"NNN"`
 /// (3-ASCII zero-padded SENDER leaf id) then the verbatim live `<AppKind>:<page>` value
@@ -2230,6 +2233,7 @@ impl RadioManager {
         let mut _gw_own = crate::net::wifi::GwOwnCfg::new(); // #48: recovery burst never captures gateway-own cfg
         let mut _reset_req = crate::net::wifi::ResetReq::new(); // #52: recovery burst issues no reboots
         let mut _scan_req = crate::net::wifi::ScanReq::new(); // #71: recovery burst issues no scans
+        let mut _notify_req = crate::net::wifi::NotifyReq::new(); // #197: recovery burst issues no toasts
         let mut install_requested = false;
         let mut _leaf_install_seen = false; // #40 #1: a leaf's recovery burst is not a gateway relay
         let reached = match self.sta.as_mut() {
@@ -2260,6 +2264,7 @@ impl RadioManager {
                     &[], // #71: recovery burst publishes no own scan
                     None, // #71: recovery burst republishes no cached scan
                     &mut _scan_req, // #71: recovery burst subscribes no cmd/scan (cfg_cache=None)
+                    &mut _notify_req, // #197: recovery burst subscribes no notify (cfg_cache=None)
                     &mut None, // #40: a leaf's recovery burst never relays a leaf OTA
                     &mut None, // #40: recovery burst carries no persistent staged
                     &mut None, // #40: recovery burst publishes no relay diag
@@ -4132,6 +4137,9 @@ impl RadioManager {
         // #71: capture any on-demand WiFi-scan COMMANDS this flush surfaces (transient cmd/scan).
         // Drained below like reset_req: ONE-SHOT `<id>W` relay per leaf target + a self-scan inject.
         let mut scan_req = crate::net::wifi::ScanReq::new();
+        // #197 herald: capture any transient on-glass toast commands (smol/+/notify); one-shot
+        // relayed / self-toasted below like reset/scan.
+        let mut notify_req = crate::net::wifi::NotifyReq::new();
         // #33: capture any OTA install command this flush surfaces.
         let mut install_requested = false;
         // #40 #1: set iff this flush SEES a retained leaf install (pre-arm) → latch pending below.
@@ -4191,6 +4199,7 @@ impl RadioManager {
                     scan_bytes, // #71: gateway publishes its own smol/<id>/scan (empty unless it self-scanned)
                     Some(&self.scan_cache), // #71: republish cached relayed-node scans
                     &mut scan_req, // #71: capture on-demand scan commands (one-shot relay below)
+                    &mut notify_req, // #197: capture on-glass toast commands (one-shot relay below)
                     leaf_ota, // #40: surface a pending leaf-OTA install for main to relay
                     &mut self.staged_raw, // #40: persist the staged across flushes (pair-safe)
                     &mut self.leaf_ota_diag, // #40: publish smol/<leaf>/ota/diag + clear/retry
@@ -4344,6 +4353,18 @@ impl RadioManager {
         }
         if scan_req.own() {
             self.cfg.set(crate::net::wifi::CFG_KEY_SCAN, b"");
+        }
+        // #197 herald toast — twin of the reset/scan drain: a ONE-SHOT `<id>M` frame CARRYING the
+        // message to the target leaf (direct `broadcast_config`, NEVER cached — a cached toast
+        // re-shows on every boot). Own id / fleet-255 → inject `M` into our OWN CfgTracker so
+        // `main`'s take_cfg_offer(M) toasts us on the SAME path as a leaf. Value = the wire message.
+        if notify_req.have() {
+            if let Some(t) = notify_req.relay() {
+                self.broadcast_config(t, crate::net::wifi::CFG_KEY_NOTIFY, notify_req.msg());
+            }
+            if notify_req.own() {
+                self.cfg.set(crate::net::wifi::CFG_KEY_NOTIFY, notify_req.msg());
+            }
         }
         // #33: OR-in an install command (one-shot; `main`'s take clears it).
         if install_requested {
