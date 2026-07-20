@@ -2420,6 +2420,12 @@ impl RadioManager {
         if let Ok(r) = self.controller.rssi() {
             self.my_rssi_to_ap = r.clamp(-127, 0) as i8;
         }
+        // #217 rung-3: refresh the REAL associated AP channel at this stable association point so
+        // `off_channel` (my_ap_channel != mesh) drives the pre-fetch 2B co-channel gate + DIAG
+        // accurately — no boot-time reassoc needed.
+        if let Some((ap_ch, _, _)) = crate::net::current_ap_info() {
+            self.my_ap_channel = ap_ch;
+        }
         // Persist the refreshed staleness observation (so takeover accrues across bursts).
         self.mc_seen_owner = elect.seen_owner;
         self.mc_seen_seq = elect.seen_seq;
@@ -6078,35 +6084,18 @@ pub fn start(
             radio.my_rssi_to_ap = r.clamp(-127, 0) as i8;
         }
     }
-    // #217 rung-2A: PROACTIVE reassoc at CROWN-ASSUMPTION. If this board just won the crown on a
-    // WEAK AP (rssi < -75 — the pcap deaf-AP class), steer to a strong ch6 AP BEFORE the coexist
-    // gateway commits below ("mesh rides my AP channel"). Crowning on a doomed link otherwise
-    // guarantees the #204 bulk-RX-deaf disease. reassoc_ch6_prefer no-ops mid mesh-OTA (ota_leaf).
-    // rssi trigger only this rung; ch-mismatch is a follow-up (no trivial current-AP-channel
-    // accessor at this site yet). Re-capture rssi after so #51 election + coexist use the new value.
-    // #217 rung-3: the ch-mismatch trigger the rung-2 comment deferred ("no trivial current-AP-
-    // channel accessor yet") is now `my_ap_channel`. Off-channel (ap_ch != mesh — RSSI-INDEPENDENT,
-    // the id5 ch1-vs-ch6 bug) OR weak → co-channel-prefer reassoc BEFORE the coexist gateway
-    // commits, then fold into the never-crownless strand-guard. Leaves stay on ESP_NOW_FIXED_CHANNEL.
+    // #217 rung-3 (HW-fix v900): do NOT reassoc at crown-assumption. burst_ntp's boot association
+    // (used for DHCP/NTP/boot-MQTT) must NOT be torn down here — `start()` time-share-switches to
+    // ESP-NOW immediately after, so a disconnect + pinned-reconnect would never complete → the crown
+    // ends un-associated → no telemetry. (v900 regression: `my_ap_channel` defaulted to 0, so the
+    // off_channel gate fired for EVERY crown, not just off-channel ones.) Co-channel is only required
+    // in the OTA/coexist window (crown fetching WHILE serving the mesh) — achieved JUST-IN-TIME at
+    // the pre-fetch 2B gate, where run_ota_fetch's assoc-wait absorbs the reconnect and the
+    // strand-guard gates OTA. Here we ONLY capture the REAL associated channel so off_channel is
+    // accurate for 2B + DIAG; crown stays Normal at boot (not pre-judged).
     if radio.relay.is_gateway {
-        let off_channel = radio.my_ap_channel != ESP_NOW_FIXED_CHANNEL;
-        if off_channel || radio.my_rssi_to_ap < CROWN_AP_RSSI_MIN {
-            log::warn!(
-                "smol #217r3: crown-assumption off_ch={} rssi={} — co-channel-prefer reassoc",
-                off_channel,
-                radio.my_rssi_to_ap
-            );
-            let decision = radio.reassoc_ch6_prefer();
-            radio.note_crown_ap(decision);
-            if let Ok(r) = radio.controller.rssi() {
-                radio.my_rssi_to_ap = r.clamp(-127, 0) as i8;
-            }
-        } else {
-            // Already co-channel + strong → healthy crown; clear any prior strand latch.
-            radio.note_crown_ap(crate::net::coexist::CrownApDecision::CoChannel {
-                bssid: [0; 6],
-                ch: ESP_NOW_FIXED_CHANNEL,
-            });
+        if let Some((ap_ch, _, _)) = crate::net::current_ap_info() {
+            radio.my_ap_channel = ap_ch;
         }
     }
     // #23 fix: persist the boot election's staleness observation → a leaf's later
