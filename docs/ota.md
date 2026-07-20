@@ -106,6 +106,29 @@ tools/ota_publish.sh install <id>                                     # publish 
    `staged.build > running`), so a board never re-installs the build it's already on. To cancel a
    pending rollout, simply don't fire the remaining installs; to supersede, `stage` a newer build.
 
+### Ground truth during a roll — trust sources in this order
+
+When a roll looks stuck, **which signal you believe decides whether you diagnose the real fault
+or chase a phantom.** Trust in this order:
+
+1. **`pcap` on the image host** (`tcpdump` on the HTTP fetch port) — **decisive.** It shows
+   whether bytes actually flowed *and were ACKed*. The coexist-bulk-OTA disease is invisible to
+   every higher-level log because it's an asymmetric RX-deafness: the board's SYN/ACK/GET all
+   reach the server, but the board **never ACKs a single response byte** — only the packet
+   capture reveals "server sending into a void." A pcap is what caught it at the packet level
+   (see [Leaf mesh-OTA](#leaf-mesh-ota--updating-esp-now-only-leaves-40) / #204).
+2. **An MQTT topic flipping to a NEW value** — trustworthy *as a transition*, not as a state.
+   Retained topics are ghosts: a persisted old value proves nothing (it survives reboots and
+   re-subscribes). Clear-then-watch, and believe the **flip** to a fresh value (e.g. a build#
+   or progress% advancing), never the mere presence of a value.
+3. **`rangeserver.log`** (the image host's HTTP access log) — **last, and with suspicion.** It is
+   **block-buffered and manually tailed**, so a served GET may not appear for a while and a
+   stale read can show an old request as if it were current. Reading it as live truth **misled
+   two separate sessions** into misdiagnosing a fetch that the pcap showed was already dead.
+
+Rule of thumb: **packets > transitions > logs.** If the pcap and the log disagree, the pcap is
+right.
+
 ## What's on the wire
 
 Retained MQTT, pipe-delimited (the board reuses its `split('|')` parser):
