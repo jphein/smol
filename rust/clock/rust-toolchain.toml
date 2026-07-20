@@ -1,7 +1,13 @@
-# Pin the toolchain so the RISC-V bare-metal target is always available.
-# The ESP32-C3 core is a RISC-V RV32IMC, so we use the stock rustc target
-# `riscv32imc-unknown-none-elf` (no Xtensa fork of the compiler required).
+# Toolchain policy (#52, JP latest-everything): ride `stable` — do NOT freeze dev on a patch pin.
+# The old `1.96.1` pin was a fossil from ONE familiar-side spurious-lint incident; currency is now
+# guarded by the KATANA 4-tier gate (clippy -D warnings + release across espnow,cast,io / default /
+# wifi) run per change, and the exact resolved toolchain is recorded PER RELEASE (build stamp) for
+# reproducibility — so a green build proves currency without freezing everyone behind a stale patch.
+# Verified 2026-07-20: main is clean under stable 1.97.1 (clippy -D warnings, all tiers, 0 errors).
+# If a future `stable` introduces a -D-warnings regression, the 4-tier gate catches it → fix the lint
+# (don't re-pin); a genuinely-needed freeze must carry a written reason + revisit trigger here.
+# The RISC-V bare-metal target (ESP32-C3 = RV32IMC, stock rustc target, no Xtensa fork) is required.
 [toolchain]
-channel = "1.96.1"
+channel = "stable"
 targets = ["riscv32imc-unknown-none-elf"]
 components = ["rust-src", "rustfmt", "clippy"]
