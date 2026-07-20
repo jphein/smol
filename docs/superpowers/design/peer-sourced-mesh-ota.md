@@ -27,16 +27,18 @@
 
 ## 1. Source-selection — how the crown learns a peer holds verified build N
 
+> **▶ Shipping design is [§8](#8-first-implementation-slice-v1-minimal--smallest-safe-pr-slice-1--65) (slice-1).** This section describes the fuller **v2/general** source model — a `HOLD`-based inventory the crown queries to auto-select and load-spread a source. **Slice-1 uses a strictly simpler subset and supersedes the §1.x parts flagged below:** the crown carries `(M, sig)` in the `ODEL` (holder persists **nothing**) and selects the source by **baton** (the node it just finished serving), *not* by the `HOLD` inventory. Read §1 for the v2 model; read §8 for what ships first. **Where they differ, §8 wins.**
+
 ### 1.1 What "holds" means (precise)
 A node is a **valid source for build N** iff it can reproduce the exact signed image on demand:
 - it has build N in a **readable slot** (its **active** slot if it is running N, or its **inactive** slot if it fetched/received N but hasn't activated), **and**
-- it has **retained** the signed manifest tuple for N: `M = "build|size|sha256hex"` (≤86 B) + the 64-byte ed25519 `sig` (150 B total, one `.bss` record), **and**
-- a **self-readback-sha of `slot[..size]` matches** the manifest sha (cheap pre-flight; a source must never offer a copy it can't itself verify).
+- it has the signed manifest tuple `M = "build|size|sha256hex"` (≤86 B) + the 64-byte ed25519 `sig` — **in slice-1 the crown supplies these in the `ODEL` (§8.1), so the holder retains nothing**; the v2 self-advertise path (§1.2) instead has the holder *retain* `(M, sig)` so it can offer without a live crown handoff, **and**
+- a **self-readback-sha of `slot[..size]` matches** the manifest sha (cheap pre-flight — in slice-1 run at serve time when the `ODEL` arrives; a source must never serve a copy it can't itself verify).
 
-The manifest+sig retention is the one new persistent-ish state a would-be source keeps. A self-fetched node already parsed `(M, sig)` from `smol/ota/staged`; a relay-received node already got `(M, sig)` in its `OTAM`. Both simply **keep** it (in `.bss`, cleared on a newer stage) instead of discarding after activate.
+> **⚠ Superseded for slice-1 by §8:** the "holder **retains `(M, sig)`** in a `.bss` record" model does **not** apply to slice-1 — a holder only becomes a source *after* it activates and **reboots** into build N, which clears `.bss`. Slice-1 therefore has the **crown** carry `(M, sig)` in the `ODEL` (it staged the build, so it has them). Holder-side retention is a **v2** concern and would need **durable NVS** (not `.bss`), only for crownless self-serve.
 
 ### 1.2 The HOLDS signal `▷ v2`
-> **v1 skips the HOLD frame entirely.** The crown already knows every node's **running build** from DIAG, and the target-uniformity job only needs a source *running the target build*. So v1 source-selection = "a node DIAG-reports running build N" + a **serve-time readback-sha self-check** (the source verifies its own slot when it gets the ODEL; on mismatch it returns `ODON=self-slot-verify-failed` and the crown falls back to gateway fetch — §5.2). That is safe (the receiver still verifies the image sig regardless) and needs **zero new broadcast wire**. HOLD is the v2 upgrade: explicit "can-serve" inventory (retains-(M,sig) + on-ch6 + pre-verified) for **auto-selection + load-spread** across many holders once the fleet is large. The rest of §1.2 specs that v2 frame.
+> **Slice-1 skips the HOLD frame entirely (§8).** Its source-selection is the **baton** — the crown delegates to the node it *just finished serving* (one variable, `last_confirmed_holder`), seeding the first target the #40 way. No HOLD inventory, **no DIAG scan** (an earlier draft used DIAG-running-build; §8 supersedes it with the simpler baton). A **serve-time readback-sha self-check** still gates the actual serve (on mismatch → `ODON=self-slot-verify-failed` → crown falls back to gateway fetch, §5.2). `HOLD` is the **v2** upgrade: an explicit "can-serve" broadcast inventory (retains-`(M,sig)` + on-ch6 + pre-verified) for **auto-selection + load-spread** across many holders once the fleet is large. The rest of §1.2 specs that v2 frame.
 
 Add a new broadcast self-report — **`SMOLv1 HOLD `** (holder→broadcast, ~10 s cadence, piggybackable on the existing DIAG tick):
 
@@ -49,12 +51,14 @@ The crown accumulates a **source table** `{node_id → (build, serve_ready)}` fr
 
 > **Why not derive it from DIAG's running-build alone?** DIAG tells the crown a node is *running* N, but not that it *retains (M,sig)* or that its slot readback still verifies. HOLD is the explicit "I can serve N right now" contract; deriving it implicitly would let the crown delegate to a node that has since dropped its manifest or drifted off ch6.
 
-### 1.3 Source preference order (crown-side)
-When the crown needs to update leaf T to build N and T is not the seed, it picks a source in this order:
+### 1.3 Source preference order (crown-side) `▷ v2`
+> **Slice-1 uses the baton (§8), not this order.** The list below is the **v2** preference, once a `HOLD` inventory exists to pick among.
+
+When the crown (v2) needs to update leaf T to build N and T is not the seed, it picks a source in this order:
 1. a **candidate holder** on ch6 with the fewest in-flight obligations (load-spread across holders as the fleet fills in),
 2. else **itself** via the #40 gateway path (fetch-into-inactive → serve) — the **seed** fetch, or the fallback when no holder qualifies.
 
-The very first node of any new build has no holder → the crown seeds it by fetch (§6 explains why #217 must harden exactly this fetch).
+The very first node of any new build has no holder → the crown seeds it by fetch (§6 explains why #217 must harden exactly this fetch). *(Slice-1's baton reduces this to: source = `last_confirmed_holder`, else self-seed.)*
 
 ---
 
@@ -123,7 +127,7 @@ Symptom: the target's `OTAN` NAKs stop being answered; the target session stalls
 
 ### 5.2 Holder's copy corrupt (sha mismatch at the receiver)
 Two catches, in order:
-- **Pre-flight:** a holder must pass its **own** `slot[..size]` readback-sha before it may set HOLD `flags.verified` (§1.1). This keeps most bad copies from ever being offered.
+- **Pre-flight:** a holder readback-sha-verifies its **own** `slot[..size]` before serving — in **slice-1** at `ODEL` receipt (serve-time; fail → `ODON=self-slot-verify-failed`), in **v2** before advertising `HOLD flags.verified` (§1.1). This keeps most bad copies from ever being offered.
 - **Backstop:** if a copy corrupts after the offer, the **receiver's `finalize` readback-sha fails** → the leaf rejects the image (slot untouched-as-bootable) and NAKs/aborts → crown gets `ODON result=aborted` or a timeout → **falls back to the trusted gateway fetch** (re-pulls from the HTTP source of truth). A corrupt holder can never advance a leaf to a bad image; it can only cost one wasted session before fallback.
 
 ### 5.3 Split-brain double-source
@@ -171,7 +175,7 @@ Everything below rides existing retained topics (gateway-flushed) + the DIAG/LDB
 
 ### 8.1 What slice-1 MUST include (and nothing more)
 1. **Two frames only: `ODEL` + `ODON`** (§10 appendix). **Skip `HOLD` entirely.**
-2. **Source-selection = "delegate to the node the crown just finished serving" (the baton) — no HOLD, no DIAG scan.** The crown is already walking a canary sequence; the node it *just* confirmed healthy on build N is, by definition, a valid source for the *next* target. So the crown keeps one variable — `last_confirmed_holder` — and delegates to it. The first target has no prior holder → the crown **seeds** it the #40 way (fetch-and-serve, or an operator `install` to a chosen seed like id8). After that, the baton passes down the sequence. *(This is even smaller than the DIAG-running-build heuristic in §1.2 — it needs no inventory at all, just the crown's own memory of who it last updated.)*
+2. **Source-selection = "delegate to the node the crown just finished serving" (the baton) — no HOLD, no DIAG scan.** The crown is already walking a canary sequence; the node it *just* confirmed healthy on build N is, by definition, a valid source for the *next* target. So the crown keeps one variable — `last_confirmed_holder` — and delegates to it. The first target has no prior holder → the crown **seeds** it the #40 way (fetch-and-serve, or an operator `install` to a chosen seed like id8). After that, the baton passes down the sequence. *(This needs no inventory at all — just the crown's own memory of who it last updated; simpler even than scanning DIAG for a node running build N.)*
 3. **Minimum holder persistence: ZERO — the `ODEL` carries `(M, sig)`.** A holder becomes a source only *after* it activates and **reboots** into build N, which clears `.bss` — so holder-side retention would have to be durable NVS. Avoid it: the **crown already holds the signed manifest** (it staged the build), so grow `ODEL` to carry `M`(≤86 B) + `sig`(64 B) (total frame ≈174 B, under the 250 B MTU — §10). The holder pairs the crown-supplied `(M, sig)` with **image bytes read back from its own active slot** and emits a byte-identical `OTAM`. The holder persists **nothing new**; the sig is still the offline-signed one (crown→holder→leaf), so the trust chain is intact and the holder still cannot forge. *(If you ever want a holder to self-serve without a live crown handoff — a v2 case — then persist the 64-byte sig in NVS and reconstruct `M` from `build`+`size`+readback-sha; but slice-1 does not need this.)*
 4. **Serve reads back the ACTIVE slot** — extend the #40 gateway relay read-back (today: inactive slot) to also read the **running/active** slot. Flash reads only; safe.
 5. **`ODEL` replay guard** — a minimal `term`+`session`: the holder rejects an ODEL whose `term` is stale (dethroned crown), and the target binds to one `(source, session)` (§5.3). Cheap; keep it in slice-1 (it's the split-brain floor).
