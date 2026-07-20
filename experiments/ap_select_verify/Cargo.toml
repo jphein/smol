@@ -1,0 +1,15 @@
+# #217 rung-3 host guard for the co-channel crown-AP selector + strand-guard state machine
+# (net/coexist.rs). The firmware crate is no_std/riscv32imc and can't host-test, so this
+# `#[path]`-includes the REAL coexist.rs (no drift) and asserts: co-channel preference over a
+# stronger off-channel AP (the id5 bug), usable-floor exclusion, hysteresis, off-channel fallback,
+# and the NEVER-CROWNLESS strand-guard transition table. Permanent guard for #217 rung-3.
+[package]
+name = "ap_select_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "ap_select_verify"
+path = "src/main.rs"
+[profile.dev]
+opt-level = 0
