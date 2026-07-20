@@ -63,6 +63,13 @@ pub mod mode;
 #[cfg(feature = "espnow")]
 pub mod etx;
 
+// #267 cross-burst OTA-fetch resume: the PURE resume-key logic (does a saved cursor match this
+// staged image + slot → what offset to resume from). Host-testable (experiments/267_resume_verify),
+// no HAL deps. Consumed by `crate::ota::ImageWriter` (the HW flash writer + the .bss cursor), which
+// is espnow-gated — so gate it the same, byte-free of the default/wifi builds like `etx`/`flood`.
+#[cfg(feature = "espnow")]
+pub mod ota_resume;
+
 // #13 routed multi-hop mesh: the PURE managed-flood decision core (SeenSet + forward
 // decision + HopLatch escalation state machine), host-testable, no HAL deps. Driven by
 // the relay path in `mode`, so espnow-gated.
