@@ -2062,6 +2062,10 @@ pub struct RadioManager {
     diag: DiagCounters,
     /// #74 obs wave-2: node state mirrored from `main` (LED mode + time-sync) for the DIAG record.
     diag_extra: DiagExtra,
+    /// #181 mesh-ledger: this node's L1 hash-chain (own provenance) + the crown's L2 head-set for the
+    /// signed tree-head (L3). The on-device ed25519 signing key (if any) is loaded from NVS at
+    /// construction — see [`crate::ota::resolve_ledger_key`]. Surfaced in the DIAG record each cadence.
+    ledger: crate::net::ledger_link::LedgerLink,
     /// #72 io registry: this node's compact `io=<pin>:<count>,…` DIAG field (bound-input press
     /// counters), pushed from `main` via `set_diag_io` each diag-sample tick. Fixed buffer, no heap.
     #[cfg(feature = "io")]
@@ -2330,6 +2334,14 @@ impl RadioManager {
             own_scan: None,
             diag: DiagCounters::new(),
             diag_extra: DiagExtra::new(),
+            // #181: load the on-device ed25519 signing key from NVS (None ⇒ verify-only / unsigned
+            // anchor). resolve_ledger_key NEVER generates a key — provisioning is a deliberate
+            // USB-touch act (feature `ledger-provision`); the OTA image only ever reads.
+            ledger: {
+                let mut l = crate::net::ledger_link::LedgerLink::new();
+                l.set_signing_key(crate::ota::resolve_ledger_key());
+                l
+            },
             #[cfg(feature = "io")]
             diag_io: [0u8; IO_DIAG_MAX],
             #[cfg(feature = "io")]
@@ -3508,6 +3520,65 @@ impl RadioManager {
             self.diag.brst_clamped = false;
         }
 
+        // #181 mesh-ledger L1/L2/L3. THE WORK IS UNCONDITIONAL; ONLY THE REPORTING SHEDS.
+        //
+        // That split is the whole design of this block. Append the cadence's provenance record to the
+        // L1 chain, and on the crown advance the L2 anchor / L3 signed tree-head, REGARDLESS of how
+        // much DIAG budget is left — a tamper-evident chain whose contents depend on how wide an
+        // unrelated telemetry string happened to be that minute is not tamper-evident at all, and the
+        // STH epoch must advance monotonically or a verifier sees a stalled crown. So the strings are
+        // built here and handed to `room_for` below, where they are the LAST fields offered and thus
+        // the FIRST shed under pressure.
+        //
+        // They are sheddable (not protected like #190's `mo=/mf=`) because they cannot fit as a
+        // guarantee: 33 B on a leaf and a further 53 B on the crown, against the 23 B that remains
+        // after the core. Making them unconditional is precisely the bug the pre-rebase review caught
+        // — bare `push_str` would put a leaf at 505 B and the crown at 558 B against a 495 B cliff,
+        // and `encode_publish` answers an over-budget record by publishing NOTHING, so a healthy board
+        // would simply stop reporting. Shedding a provenance field costs an operator a follow-up
+        // question; shedding the whole record costs them the board.
+        //
+        // CONSEQUENCE, stated here because this is where the strings are born: under budget pressure
+        // these fields DISAPPEAR FROM THE WIRE with no other trace than the record's `|shed=<n>`
+        // counter. They are offered LAST in the sheddable block precisely so they are the first to
+        // go — see the priority rationale at the `room_for` call site below. Absence therefore means
+        // "shed", never "ledger inactive": the chain below is appended on every cadence regardless.
+        let prov = alloc::format!("u{}b{}s{}o{}", up_s, d.boot_count, d.boot_slot, ota);
+        self.ledger.append(prov.as_bytes());
+        let (tip, clen, lok) = self.ledger.chain_summary();
+        let lg_core = alloc::format!(
+            "|lgt={:02x}{:02x}{:02x}{:02x}|lgn={}|lgok={}|lgk={}",
+            tip[0],
+            tip[1],
+            tip[2],
+            tip[3],
+            clen,
+            lok as u8,
+            self.ledger.can_sign() as u8
+        );
+        let lg_crown = if self.relay.is_gateway {
+            if let Some(sth) = self.ledger.sign_and_selfcheck(self.id) {
+                let r = sth.root();
+                Some(alloc::format!(
+                    "|lgan={:02x}{:02x}{:02x}{:02x}|lgep={}|lgsz={}|lgsg=1",
+                    r[0],
+                    r[1],
+                    r[2],
+                    r[3],
+                    sth.epoch(),
+                    sth.size()
+                ))
+            } else {
+                let a = self.ledger.anchor(self.id);
+                Some(alloc::format!(
+                    "|lgan={:02x}{:02x}{:02x}{:02x}|lgsg=0",
+                    a[0], a[1], a[2], a[3]
+                ))
+            }
+        } else {
+            None
+        };
+
         // ── SHEDDABLE tail: appended ONLY while the budget allows ─────────────────────────────
         // An over-budget record is not truncated by the publisher — `encode_publish` refuses it and
         // the board goes SILENT, which is indistinguishable from a dead board on a fleet with no
@@ -3527,12 +3598,18 @@ impl RadioManager {
         // `io`, the reverse of what the prose claims. Reordering the appends is a wire-visible
         // change and belongs in its own commit; #339 holds that argument.
         //
+        // #181 appends the ledger fields (`lg_core`, then `lg`) AFTER `deaf`, so they are the two
+        // cheapest things on the record to lose — deliberate: a missing `lg=` costs an operator a
+        // ledger echo they can re-read from the topics, while a missing `apch=`/`ap=` costs them
+        // the #204/#217 coexist diagnosis. Absence of `lg*` therefore means "the record was full",
+        // not "the ledger is broken".
+        //
         // The line below is the MACHINE-CHECKED truth. `tools/check_shed_order.py` (run by
         // `tools/gate.sh`, so on every PR) parses the `room_for` sequence below and fails the gate
         // unless it equals this list exactly. Change the appends and you must change this line —
         // which is the point: the prose above rotted precisely because nothing could test it.
         //
-        // SHED-ORDER: sog, cfgq, cdeaf, cc, ap, cfg, io, deaf
+        // SHED-ORDER: sog, cfgq, cdeaf, cc, ap, cfg, io, deaf, lg_core, lg
         let mut shed = 0u8;
         {
             let mut room_for = |rec: &mut alloc::string::String, field: alloc::string::String| {
@@ -3672,6 +3749,35 @@ impl RadioManager {
                     &mut rec,
                     alloc::format!("|deaf={}|ddrops={}", deaf_n, self.diag.ddrops),
                 );
+            }
+            // ── #181 ledger readout: OFFERED LAST, therefore SHED FIRST. That ordering is a
+            // deliberate priority call, not an accident of where the code was appended.
+            //
+            // `room_for` appends while the budget lasts, so append position IS shed priority: the
+            // LAST field offered is the FIRST to disappear. The full order in this block is
+            //
+            //     sog → cfgq → cdeaf → cc/degraded → ap → cfg → io → [deaf] → lgt/lgn/lgok/lgk → lgan/…
+            //     └──────────── survives longest ────────────┘        └─ shed first (this) ─┘
+            //
+            // and the ledger sits at the end because everything ahead of it is load-bearing for a
+            // diagnosis that already cost real days: `cdeaf`/`cc`/`ap` are the crown-deaf and
+            // co-channel signals behind the #204/#217 OTA-deafness root cause, and losing those to
+            // make room for provenance would trade a fleet-blocking diagnostic for a nice-to-have.
+            // Mesh-ledger observability is the newest and least operationally urgent field in the
+            // record; if exactly one thing must go, it is this. Anything added later must justify
+            // being shed AFTER the ledger, or be appended before it.
+            //
+            // ⚠️ THESE FIELDS CAN VANISH SILENTLY. A DIAG record with no `lgt=` does NOT mean the
+            // ledger is inactive — the chain is appended unconditionally above, so it is running
+            // whether or not it is reported. Read `|shed=<n>`: present ⇒ n field(s) were dropped for
+            // budget and the ledger was first in line; absent ⇒ nothing was shed and the record is
+            // complete. Do not infer ledger state from the absence of these keys (the same
+            // absence-is-ambiguous trap `cc=` is three-valued to avoid).
+            //
+            // `lgok=0` is the value worth alerting on: this node's own chain failed to self-verify.
+            room_for(&mut rec, lg_core);
+            if let Some(lg) = lg_crown {
+                room_for(&mut rec, lg);
             }
         }
         // Loud, and it costs 6 B of the budget it is reporting on — worth it: a reader that cannot see
