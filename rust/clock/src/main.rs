@@ -1386,10 +1386,13 @@ fn main() -> ! {
                             // then BLOCKS during the ESP-NOW relay, so the unit is auto-picked per
                             // paint (>10k ⇒ bytes) and the ETA re-anchors itself at the phase flip
                             // (done drops → OtaEta re-seeds), keeping the readout clean throughout.
+                            // #237: the SAME tick drives the crown-delegate wait (LED + abort stay
+                            // alive while a peer holder serves; the progress bar holds at the last
+                            // frame since the holder — not the crown — pushes the bytes).
                             let relay_prog = core::cell::Cell::new(ota::OtaProgress::default());
                             let relay_build = ann.build;
                             let mut relay_eta = ota_screen::OtaEta::new();
-                            let outcome = r.run_leaf_ota_relay(crate::ota_mesh::ServeSource::GatewayFetch, leaf_id, mac, &ann, &mut || {
+                            let mut relay_tick = || {
                                 let t = millis();
                                 led.apply(led::LedState::WifiSync, t);
                                 if matches!(button.poll(t), Some(input::Press::Long)) {
@@ -1412,10 +1415,55 @@ fn main() -> ! {
                                     });
                                 }
                                 relay_abort
-                            }, &relay_prog);
+                            };
+                            // === #237 CROWN BATON ==============================================
+                            // If a confirmed holder is running THIS exact build, DELEGATE the serve
+                            // to it (peer-source over ESP-NOW, zero gateway bulk-fetch); otherwise
+                            // SEED via the #40 gateway fetch. The delegate stamps term (= the crown's
+                            // election seq, §5.3 replay guard) and awaits the holder's ODON.
+                            let term = r.crown_term();
+                            let holder = r.baton_holder_for(ann.build, leaf_id);
+                            let delegated = if let Some((hid, hmac)) = holder {
+                                log::info!(
+                                    "smol #237: crown DELEGATE serve of id{} build {} → holder id{}",
+                                    leaf_id, ann.build, hid
+                                );
+                                r.run_crown_delegate(hid, hmac, leaf_id, &ann, term, &mut relay_tick)
+                            } else {
+                                None
+                            };
+                            // UNCONDITIONAL FALLBACK FLOOR: ONLY a holder ODON=OK skips the fetch;
+                            // NO holder, a non-OK ODON, or a serve-deadline timeout ALL fall through
+                            // to the trusted #40 gateway fetch → worst-case == today's behavior.
+                            let outcome = match delegated {
+                                Some(crate::ota_mesh::ServeResult::Ok) => {
+                                    crate::ota_mesh::LeafOtaOutcome::Confirmed
+                                }
+                                other => {
+                                    if let Some(res) = other {
+                                        log::warn!(
+                                            "smol #237: delegate of id{} → {:?} — FALLING BACK to #40 gateway fetch",
+                                            leaf_id, res
+                                        );
+                                    }
+                                    r.run_leaf_ota_relay(
+                                        crate::ota_mesh::ServeSource::GatewayFetch,
+                                        leaf_id,
+                                        mac,
+                                        &ann,
+                                        &mut relay_tick,
+                                        &relay_prog,
+                                    )
+                                }
+                            };
                             // #40: record the phase → published to smol/<leaf>/ota/diag on the
                             // next burst + drives the install clear/retry policy.
                             r.record_leaf_ota(leaf_id, outcome);
+                            // #237 baton advance: a CONFIRMED serve (delegated OR seeded) makes this
+                            // just-served leaf the SOURCE for the next target of this build.
+                            if matches!(outcome, crate::ota_mesh::LeafOtaOutcome::Confirmed) {
+                                r.note_confirmed_holder(leaf_id, ann.build);
+                            }
                             redraw = true;
                         } else {
                             // MAC not learned yet (no HELLO heard) → record MacUnknown; the

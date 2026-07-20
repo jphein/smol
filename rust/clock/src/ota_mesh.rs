@@ -95,7 +95,6 @@ pub const OTAD_FRAME_MAX: usize = 12 + 3 + 2 + 2 + CHUNK_PAYLOAD;
 pub const OTAN_FRAME_MAX: usize = 12 + 3 + 2 + 2 + OTAN_BITMAP_BYTES;
 /// #237 max `ODEL` frame: 12 + 3 (target) + 4 (build) + 2 (session) + 2 (term) + 1 (M_len) +
 /// `SIGNED_MSG_MAX` (M) + 64 (sig) = 184 B — < the 250 B ESP-NOW MTU (spec §8/§10, real M ≤86).
-#[allow(dead_code)] // #237: wired by the crown baton (Piece 2, next commit)
 pub const ODEL_FRAME_MAX: usize = 12 + 3 + 4 + 2 + 2 + 1 + ota::SIGNED_MSG_MAX + 64;
 /// #237 max `ODON` frame: 12 + 3 (target) + 4 (build) + 2 (session) + 1 (result) = 22 B.
 pub const ODON_FRAME_MAX: usize = 12 + 3 + 4 + 2 + 1;
@@ -423,9 +422,9 @@ pub fn parse_arb_frame(data: &[u8]) -> Option<ArbFrame<'_>> {
     None
 }
 
-/// Encode an `ODEL` (crown→holder delegate-to-serve). Fixed-width (no manifest) → always fits one
-/// ESP-NOW frame. Returns the byte length written, or `None` if `out` is too small.
-#[allow(dead_code)] // #237 INC1: wired later
+/// Encode an `ODEL` (crown→holder delegate-to-serve, carrying the signed manifest `m` + `sig`).
+/// REJECTS (not clamps) an empty or oversized `m` (> `SIGNED_MSG_MAX`). Returns the byte length
+/// written, or `None` if `out` is too small.
 pub fn encode_odel(
     target_id: u8,
     build: u32,

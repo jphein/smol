@@ -292,6 +292,12 @@ const GW_WINDOW_ROUNDS_MAX: u32 = 16;
 /// WINDOW_MS` ≈ 60 s) + a STAT cadence (~10 s) so a late self-test rollback is observed
 /// before the gateway declares Confirmed.
 const GW_CONFIRM_TIMEOUT_MS: u64 = 120_000;
+/// #237 crown-delegate serve deadline: a holder's full serve (pre-arm + wake + windowed relay +
+/// Tier-2 confirm) can run several minutes and ALWAYS ends with an `ODON` (OK or a failure code);
+/// this backstops the ONLY no-ODON case — holder death mid-serve → the crown falls back to the #40
+/// gateway fetch. Set WELL ABOVE the holder's worst-case serve (≈8 min) so a live serve is never
+/// pre-empted into a double-source (§5.3). Normal path returns on the ODON long before this.
+const CROWN_DELEGATE_DEADLINE_MS: u64 = 12 * 60_000;
 /// #40: max consecutive TRANSIENT (mac-unknown / fetch / relay / timeout) relay attempts
 /// for one retained install before the gateway gives up + clears it — bounds the auto-retry
 /// so a persistently-failing leaf can't loop the (mesh-deaf) relay every flush forever.
@@ -1994,6 +2000,12 @@ pub struct RadioManager {
     /// #237: highest ODEL `term` (= the crown's MC seq) ever seen — reject a stale/dethroned crown's
     /// ODEL (term < this), the §5.3 split-brain guard.
     highest_arb_term: u16,
+    /// #237 CROWN baton (§8.2): `(leaf_id, build)` of the leaf this crown LAST confirmed healthy on
+    /// a serve. It is, by definition, a valid SOURCE for the next target on the same build → the
+    /// crown delegates the next serve to it (`baton_holder_for`) instead of a WiFi bulk fetch. The
+    /// FIRST target of a build has no baton → the crown seeds it the #40 way, then the baton passes
+    /// down the canary sequence. Reset implicitly by a build change (`baton_holder_for` build match).
+    last_confirmed_holder: Option<(u8, u32)>,
     /// #40 #3 STICKY MAC: `(leaf_id, mac)` captured the moment an armed leaf became addressable,
     /// held for the whole install session (cleared on a terminal `record_leaf_ota`). The roster
     /// is a bounded 16-slot LRU that EVICTS this leaf while the mesh-deaf relay stops hearing it
@@ -2152,6 +2164,7 @@ impl RadioManager {
             leaf_installs_outstanding: false,
             pending_serve: None,
             highest_arb_term: 0,
+            last_confirmed_holder: None,
             leaf_ota_mac: None,
             leaf_relay_rx: None,
             config_offer: None,
@@ -3740,6 +3753,150 @@ impl RadioManager {
             }
             Err(e) => log::warn!("smol #237: arb-frame raw send failed: {:?}", e),
         }
+    }
+
+    /// #237 CROWN baton term (§5.3 split-brain): the crown stamps every `ODEL` with its election
+    /// generation so a dethroned crown's stale delegation is refused at the holder (it rejects a
+    /// `term` older than the highest it has seen). Sourced from the MC election seq (`mc_seen_seq`),
+    /// which advances each election → a newly-elected crown out-terms the old one. Low 16 bits (the
+    /// wire `term` is `u16`; the guard needs only relative ordering within a roll).
+    pub fn crown_term(&self) -> u16 {
+        (self.mc_seen_seq & 0xFFFF) as u16
+    }
+
+    /// #237 CROWN baton source-pick (§8.2): the holder to DELEGATE the next serve to — the leaf this
+    /// crown last confirmed healthy, IFF it is running the exact `want_build`, is not the `target`
+    /// itself, and its MAC is resolvable (sticky). `None` ⇒ no baton (first target of a build, a
+    /// build change, or the holder's MAC is unknown) ⇒ the caller SEEDS via the #40 gateway fetch.
+    /// Reading the sticky MAC keeps the holder addressable across the minutes-long serve.
+    pub fn baton_holder_for(&mut self, want_build: u32, target: u8) -> Option<(u8, [u8; 6])> {
+        let (hid, hbuild) = self.last_confirmed_holder?;
+        if hbuild != want_build || hid == target {
+            return None;
+        }
+        let mac = self.mac_for_id_sticky(hid)?;
+        Some((hid, mac))
+    }
+
+    /// #237 CROWN baton advance (§8.2): record `leaf_id` (now confirmed on `build`) as the source for
+    /// the NEXT target. Called after a CONFIRMED serve — delegated OR seeded.
+    pub fn note_confirmed_holder(&mut self, leaf_id: u8, build: u32) {
+        self.last_confirmed_holder = Some((leaf_id, build));
+    }
+
+    /// #237 CROWN delegate-and-await (§8.2): delegate the serve of `leaf_id` to peer `holder`
+    /// (confirmed running the target build) instead of a gateway WiFi bulk-fetch. Fires the `ODEL`
+    /// — carrying the crown-staged `(M, sig)` — via RAW esp_now (NOT `send_to`: the #248 group-MAC
+    /// trailer would corrupt the OTA family, 190L item 1), then AWAITS the holder's matching `ODON`
+    /// within the serve deadline, keeping the UI + mesh alive (~1 Hz HELLO) throughout. Returns the
+    /// reported `ServeResult` on a matching ODON, `Some(Aborted)` on a long-press, or `None` on a
+    /// serve-deadline timeout / un-encodable manifest. THE CALLER FALLS BACK to the #40 gateway
+    /// fetch on `None` OR any non-`Ok` — the UNCONDITIONAL safety floor. BLOCKS for minutes like
+    /// `run_leaf_ota_relay`, so it runs from main.rs's loop, never the RX drain.
+    pub fn run_crown_delegate(
+        &mut self,
+        holder_id: u8,
+        holder_mac: [u8; 6],
+        leaf_id: u8,
+        announce: &crate::ota::Announce,
+        term: u16,
+        tick: &mut dyn FnMut() -> bool,
+    ) -> Option<crate::ota_mesh::ServeResult> {
+        use crate::ota_mesh as om;
+        // session mirrors the OTAM discriminator the holder emits (build & 0xFFFF), so the crown↔
+        // holder ODON correlates 1:1 with the leaf-facing session.
+        let session: u16 = (announce.build & 0xFFFF) as u16;
+        let mut odel = [0u8; om::ODEL_FRAME_MAX];
+        let Some(n) = om::encode_odel(
+            leaf_id,
+            announce.build,
+            session,
+            term,
+            announce.signed_msg(),
+            announce.sig(),
+            &mut odel,
+        ) else {
+            log::error!(
+                "smol #237: crown could not encode ODEL for build {} (M too large?) — falling back",
+                announce.build
+            );
+            return None;
+        };
+        let _ = self.switch(Mode::EspNow);
+        self.ensure_peer(holder_mac, now_ms());
+        // Opening BURST: fire a few ODELs so the holder catches one before it goes serve-busy
+        // (mesh-deaf). Once accepted it single-sessions + ignores dups; a fast failure ODON
+        // short-circuits the burst.
+        const ODEL_BURST: u8 = 6;
+        const ODEL_GAP_MS: u64 = 200;
+        for _ in 0..ODEL_BURST {
+            if tick() {
+                return Some(om::ServeResult::Aborted);
+            }
+            let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+            self.send_arb_raw(holder_mac, &odel[..n]);
+            let gap = now_ms() + ODEL_GAP_MS;
+            while now_ms() < gap {
+                if let Some(res) = self.poll_odon(holder_mac, leaf_id, session) {
+                    return Some(res);
+                }
+            }
+        }
+        // AWAIT the ODON. The holder's serve ALWAYS ends with an ODON (OK or a failure code); the
+        // only no-ODON case is holder death → the deadline backstops it → fall back. Keep a ~1 Hz
+        // HELLO so leaves don't re-elect while the crown waits (same posture as the #40 confirm).
+        let deadline = now_ms() + CROWN_DELEGATE_DEADLINE_MS;
+        let mut last_hello_ms = 0u64;
+        while now_ms() < deadline {
+            if tick() {
+                return Some(om::ServeResult::Aborted);
+            }
+            let t = now_ms();
+            if t.saturating_sub(last_hello_ms) >= 1000 {
+                let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+                self.broadcast_hello();
+                last_hello_ms = t;
+            }
+            if let Some(res) = self.poll_odon(holder_mac, leaf_id, session) {
+                log::info!(
+                    "smol #237: crown got ODON id{} build {} → {:?}",
+                    leaf_id, announce.build, res
+                );
+                return Some(res);
+            }
+        }
+        log::warn!(
+            "smol #237: crown DELEGATE serve-deadline elapsed (no ODON from holder id{}) — falling back to #40",
+            holder_id
+        );
+        None
+    }
+
+    /// #237: one bounded RX drain step for [`Self::run_crown_delegate`] — return a `ServeResult`
+    /// iff a matching `ODON` (from `holder_mac`, for `(leaf_id, session)`) is queued. Non-matching
+    /// frames are discarded (same direct-drain posture as the #40 relay). Bounded so it never
+    /// stalls the caller's tick.
+    fn poll_odon(
+        &mut self,
+        holder_mac: [u8; 6],
+        leaf_id: u8,
+        session: u16,
+    ) -> Option<crate::ota_mesh::ServeResult> {
+        use crate::ota_mesh as om;
+        for _ in 0..8 {
+            let recv = self.esp_now.receive()?;
+            if recv.info.src_address != holder_mac {
+                continue;
+            }
+            if let Some(om::ArbFrame::Odon { target, session: s, result, .. }) =
+                om::parse_arb_frame(recv.data())
+            {
+                if target == leaf_id && s == session {
+                    return Some(result);
+                }
+            }
+        }
+        None
     }
 
     /// #40 GATEWAY leaf-mesh-OTA orchestration (§B4). Fetch the staged image (WiFi) into
@@ -5338,8 +5495,10 @@ impl RadioManager {
                 }
             }
             ArbFrame::Odon { .. } => {
-                // Crown-side ODON handling (baton advance / fallback-to-#40) lands with the crown
-                // scheduler in the next dispatch increment; ignored here.
+                // Crown-side ODON is consumed DIRECTLY by `run_crown_delegate` (it drains the RX
+                // queue itself while awaiting the serve outcome, like `run_leaf_ota_relay` drains
+                // OTANs) — never through this async drain. A stray/late ODON reaching here (outside
+                // a delegate wait) has no session to advance, so ignoring it is correct.
             }
         }
     }
