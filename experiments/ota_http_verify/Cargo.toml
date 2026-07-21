@@ -1,0 +1,15 @@
+# Host guard for the OTA fetch-leg HTTP/1.x response-head parsers (net/http.rs). The #[path]-include
+# is the SAME source the firmware links (no drift). Pins the #gateway-election byte-0 fetch bug: a
+# valid "HTTP/1.0 206 Partial Content" whose header + start of the BINARY body arrive in one TCP
+# segment MUST still parse st=206 (the old parser fed the whole buffer to from_utf8 → None → died at
+# byte 0). Also covers version-agnostic status, content-length, non-206, and incomplete headers.
+[package]
+name = "ota_http_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "ota_http_verify"
+path = "src/main.rs"
+[profile.dev]
+opt-level = 0

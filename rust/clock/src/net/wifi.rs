@@ -4932,8 +4932,12 @@ pub fn run_ota_fetch(
                             header_buf[header_len..header_len + take]
                                 .copy_from_slice(&data[..take]);
                             header_len += take;
-                            if let Some(bstart) = crate::ota::header_end(&header_buf[..header_len]) {
-                                match crate::ota::status_code(&header_buf[..header_len]) {
+                            if let Some(bstart) = crate::net::http::header_end(&header_buf[..header_len]) {
+                                // #gateway-election byte-0 FIX: parse the HEADER SLICE (`..bstart`),
+                                // NOT the whole buffer — when the header + start of the binary body
+                                // coalesce into one segment, feeding the body to from_utf8 made the
+                                // status parse None → the fetch died at byte 0 on a perfectly good 206.
+                                match crate::net::http::status_code(&header_buf[..bstart]) {
                                     Some(206) => {} // Partial Content — Range honoured
                                     Some(200) if off == 0 => {
                                         // Server ignored Range → full-body fallback (the old
@@ -4941,7 +4945,7 @@ pub fn run_ota_fetch(
                                         // before; this GET is NOT resumable (checked after drain).
                                         range_ok = false;
                                         if let Some(cl) =
-                                            crate::ota::content_length(&header_buf[..header_len])
+                                            crate::net::http::content_length(&header_buf[..bstart])
                                         {
                                             if cl != announce.size {
                                                 bad = true;

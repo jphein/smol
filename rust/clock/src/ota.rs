@@ -382,33 +382,10 @@ pub fn gate(a: &Announce) -> Result<(), Reject> {
 // HTTP response helpers (used by the fetch burst in net/wifi.rs)
 // ---------------------------------------------------------------------------
 
-/// Index one-past the header terminator (`\r\n\r\n`) — the body start. `None` if the
-/// headers are not yet complete in `buf`.
-#[cfg(feature = "espnow")]
-pub fn header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
-/// Status code from an HTTP/1.x status line (`HTTP/1.0 200 OK` → 200).
-#[cfg(feature = "espnow")]
-pub fn status_code(headers: &[u8]) -> Option<u16> {
-    let line = core::str::from_utf8(headers).ok()?.lines().next()?;
-    line.split_whitespace().nth(1)?.parse().ok()
-}
-
-/// `Content-Length` value (case-insensitive header name). `None` if absent/unparseable.
-#[cfg(feature = "espnow")]
-pub fn content_length(headers: &[u8]) -> Option<u32> {
-    let s = core::str::from_utf8(headers).ok()?;
-    for line in s.lines() {
-        if let Some((name, val)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                return val.trim().parse().ok();
-            }
-        }
-    }
-    None
-}
+// #gateway-election: the HTTP/1.x response-head parsers (header_end / status_code / content_length)
+// moved to the PURE, host-tested `net::http` module (a coalesced header+binary-body TCP segment was
+// failing UTF-8 → status parsed None → the fetch died at byte 0). `run_ota_fetch` now calls
+// `crate::net::http::*` directly on the header slice. See src/net/http.rs + experiments/ota_http_verify.
 
 // ---------------------------------------------------------------------------
 // Streaming image writer (HTTP body → inactive slot + running SHA-256)

@@ -97,6 +97,13 @@ pub mod coexist;
 #[cfg(feature = "wifi")]
 pub mod election;
 
+// Minimal HTTP/1.x response-head parsers for the OTA fetch leg — PURE, host-tested verbatim by
+// `experiments/ota_http_verify` (#[path]-include). Extracted from `ota` so the #gateway-election
+// byte-0 fetch bug (a coalesced header+binary-body segment failing UTF-8 → status None) has ONE
+// definition with a regression test. `espnow`-gated (only `run_ota_fetch` uses it).
+#[cfg(feature = "espnow")]
+pub mod http;
+
 // #25 WLED WiZmote-emit (smol as a WLED "linked remote"). `wled = ["espnow"]`, so
 // this is present only in a wled build; the default/wifi/espnow builds are byte-free
 // of it (the module is `#![cfg(feature = "wled")]`). Referenced by `app` (the
