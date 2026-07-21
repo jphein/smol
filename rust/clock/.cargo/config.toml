@@ -20,13 +20,7 @@ linker = "gcc"
 # the first OTA-capable image MUST be USB-flashed WITH this table (§6-R1); after
 # that, updates ride OTA. With 3 boards present espflash prompts for the port, so
 # pass an explicit --port when flashing a specific board (MAC-guard per §6-R2).
-# #198 0c′ inc9 canary: probe-rs runs the ELF + streams defmt over RTT (espflash-monitor
-# STREAMING dies exit-144 in this Bash env → probe-rs/RTT is the confirmed observability path).
-# The team-lead runs the guarded id5 canary with an explicit MAC-pinned invocation:
-#   probe-rs run --chip esp32c3 --probe 303a:1001:<id5-serial> target/riscv32imc-unknown-none-elf/release/clock
-# To (re)flash the OTA partition table via USB instead, restore the espflash flow:
-#   espflash flash --monitor --partition-table partitions-ota.csv
-runner = "probe-rs run --chip esp32c3"
+runner = "espflash flash --monitor --partition-table partitions-ota.csv"
 # Link the firmware with the bundled rust-lld directly (LLD flavor) instead of
 # going through a C compiler driver. This machine's `cc` is a non-compiler
 # shim, so we must not route the target link through it.
@@ -35,9 +29,6 @@ rustflags = [
     "-C", "linker-flavor=ld.lld",
     # Pull in the linker scripts exported by esp-hal's build script.
     "-C", "link-arg=-Tlinkall.x",
-    # #198 inc9: defmt's linker section (interned strings + level filtering) for the
-    # defmt-rtt canary stream. Required whenever `defmt` is linked (the `hw`/bin build).
-    "-C", "link-arg=-Tdefmt.x",
     # Force frame pointers so esp-backtrace can unwind panics.
     "-C", "force-frame-pointers",
 ]
@@ -66,9 +57,6 @@ protocol = "sparse"
 # static RX buffer ≈ 1.6 KB, allocated at esp_wifi::init from the (now-grown) esp-alloc heap.
 # HW-GATE-HELD: throughput/stability win only provable on the deaf-list/fetch rig (pairs with #143).
 [env]
-# #198 inc9: defmt verbosity for the RTT canary stream (compile-time filter). `info` shows the
-# boot banner + the 1 Hz executor/display/mesh heartbeat + any warn/error, without a debug firehose.
-DEFMT_LOG = "info"
 # ALL-CHANNEL SCAN (association-layer fix, 2026-07-20): esp-wifi's default WIFI_FAST_SCAN stops at
 # the FIRST matching-SSID AP it hears, which made nodes associate to a WEAK ch1 AP (2c:56:dc @ -83)
 # over the STRONG ch6 office AP (a62bb0 @ -66) → off-channel → OTA-deaf (the #204/#217 root cause).

@@ -81,14 +81,6 @@ esp-rtos = { version = "0.3", optional = true, features = ["esp32c3", "embassy",
 embassy-executor = { version = "0.10", optional = true }
 embassy-time = { version = "0.5", optional = true, features = ["log"] }
 static_cell = { version = "2.1", optional = true }
-# #198 inc9 canary observability: defmt over RTT, read by `probe-rs run` (WiFi-STA is stubbed in
-# 0c′ → NO MQTT ground-truth, so the id5 canary observes boot/executor/display/mesh over RTT).
-# defmt-rtt provides the #[global_logger]. NOT mirrored from the watch (it uses log+espflash, but
-# espflash-monitor STREAMING dies in this Bash env → probe-rs/RTT is the confirmed path). Bin-only
-# (rides `hw`), kept OFF the #152 hostsim host lib. defmt 1.1.1 co-resolves with the esp-hal 1.1
-# ecosystem (verified vs the watch's lock). TODO(#198 Phase 1+): keep for ongoing RTT diag or retire.
-defmt = { version = "1", optional = true }
-defmt-rtt = { version = "1", optional = true }
 # esp-wifi 0.15 → esp-radio 0.18 (RENAME). Dropped features vs esp-wifi: `smoltcp` (GONE —
 # esp-radio now exposes ONLY an embassy-net-driver Driver, no raw smoltcp Device) and
 # `builtin-scheduler` (moved into esp-rtos). `esp-now` is added by the `espnow` feature group.
@@ -159,8 +151,6 @@ hw = [
     # boundary is PRESERVED: src/lib.rs never uses `main`/esp-rtos, so `hostsim` is untouched.
     "dep:esp-rtos", "dep:esp-alloc",
     "dep:embassy-executor", "dep:embassy-time", "dep:static_cell",
-    # #198 inc9: defmt-rtt canary observability (probe-rs RTT); bin-only, off the hostsim lib.
-    "dep:defmt", "dep:defmt-rtt",
 ]
 
 # #152 web emulator: compile the crate's LIBRARY (src/lib.rs) exposing ONLY the pure
