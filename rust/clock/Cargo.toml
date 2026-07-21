@@ -93,6 +93,16 @@ embassy-net = { version = "0.9.1", optional = true, features = [
     "medium-ethernet",
     "log",
 ] }
+# #198 Phase 1 inc2 (DR-H1 controller-split): the inline election/coexist reads mirror-atomics
+# (LINK_UP/AP_RSSI/WIFI_BUSY) that `wifi_task` writes, and drives `wifi_task` via a fire-and-forget
+# `WIFI_CMD` Channel. embassy-sync = the Channel + CriticalSectionRawMutex (watch pins 0.7).
+embassy-sync = { version = "0.7", optional = true }
+# rv32imc (C3) has NO native atomics (unlike the C6 watch's rv32imac) — portable-atomic provides
+# `AtomicBool`/`AtomicI16`. The project already sets the `portable_atomic_unsafe_assume_single_core`
+# cfg (the C3 IS single-core), which is mutually exclusive with the `critical-section` feature, so we
+# take NO extra feature here and ride that cfg. Gated under `wifi` so the host (`hostsim`) build
+# never pulls it (build-std is OFF — the #52 leak vector). See memory [smol-portable-atomic-riscv-pin].
+portable-atomic = { version = "1", optional = true }
 # esp-wifi 0.15 → esp-radio 0.18 (RENAME). Dropped features vs esp-wifi: `smoltcp` (GONE —
 # esp-radio now exposes ONLY an embassy-net-driver Driver, no raw smoltcp Device) and
 # `builtin-scheduler` (moved into esp-rtos). `esp-now` is added by the `espnow` feature group.
@@ -193,6 +203,9 @@ wifi = [
     "esp-rtos/esp-radio",
     # #198 Phase 1: async TCP/IP stack (replaces the excised hand-driven smoltcp).
     "dep:embassy-net",
+    # #198 Phase 1 inc2: WIFI_CMD channel + the rv32imc atomic shim for the DR-H1 mirror atomics.
+    "dep:embassy-sync",
+    "dep:portable-atomic",
     "dep:esp-storage",
     "dep:esp-bootloader-esp-idf",
     "dep:sha2",

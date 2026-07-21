@@ -61,11 +61,48 @@ use embassy_executor::Spawner;
 
 use crate::led::LedState;
 use crate::net::WifiPeripherals;
+// #198 Phase 1 inc2 (DR-H1 / DR-M4) — cross-task shared state for the WiFi-in-a-task split.
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use portable_atomic::{AtomicBool, AtomicI16, Ordering};
 // #13: the relay-family wire codec + ASCII field helpers live in the PURE, host-testable
 // `net::wire` module (extracted from here, byte-identical). Glob-imported so every call site
 // below (encode_relay, parse_relay[2], *relayack*, encode_dl, write_u5/u10, parse_id/u5/u10,
 // the *_PREFIX / RELAY_CHUNK / BATT_PAYLOAD_MAX consts, …) stays unqualified.
 use crate::net::wire::*;
+
+// =========================================================================
+// #198 Phase 1 (DR-H1 / DR-M4) — WiFi-in-a-task shared state.
+// =========================================================================
+// The single WiFi `controller` lives in `wifi_task` (sole owner). The inline election/coexist
+// logic can no longer call `controller.rssi()` / `.is_connected()` directly, so `wifi_task`
+// MIRRORS those reads into lock-free atomics the inline logic reads SYNCHRONOUSLY (no `.await`,
+// no round-trip — the election stays sync). Controller ACTIONS go inline→wifi_task over the
+// fire-and-forget `WIFI_CMD` channel (`try_send`, never awaits → the ≤20 ms mesh tick is
+// untouched). SINGLE-WRITER discipline (DR-M4): `wifi_task` is the sole writer of every atomic
+// below; the inline logic is strictly read-only.
+
+/// Mirrors `controller.is_connected()` — the coexist mode gate (was mode.rs `self.controller
+/// .is_connected()` at 4158/4287). `wifi_task` writes; the mesh loop reads.
+static LINK_UP: AtomicBool = AtomicBool::new(false);
+/// Mirrors `controller.rssi()` clamped into `i16` (RSSI is ~-100..0 dBm) — the election
+/// strength input (was `self.controller.rssi()` at 2493/2982/6251). `i16::MIN` = no link/unknown.
+static AP_RSSI: AtomicI16 = AtomicI16::new(i16::MIN);
+/// `wifi_task` raises this across an (off-ch6) assoc/scan window; the inline mesh then skips its
+/// `esp_now.set_channel` retunes (the radio is transiently off-channel anyway, DR-M1). Steady
+/// state (ch6-locked assoc) it is false, so the mesh pins ch6 freely.
+static WIFI_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Controller ACTIONS the inline loop asks `wifi_task` to perform, fire-and-forget (DR-H1).
+enum WifiCmd {
+    /// Associate to the ch6 AP (real creds) + hold the link, mirroring AP_RSSI/LINK_UP, until Stop.
+    OpenWindow,
+    /// Tear the association down (TIME-SHARE return to the ESP-NOW mesh channel).
+    Stop,
+}
+/// Bounded fire-and-forget mailbox: the inline loop `try_send`s (never awaits); `wifi_task`
+/// `receive().await`s. Depth 4 absorbs a couple of coalesced open/stop toggles without blocking.
+static WIFI_CMD: Channel<CriticalSectionRawMutex, WifiCmd, 4> = Channel::new();
 
 /// Fixed ESP-NOW channel used in TIME-SHARE mode. All smol units must agree on
 /// this value (1..=13). 6 is a common, low-congestion default.
@@ -1834,7 +1871,10 @@ pub enum Mode {
 /// of the program — we never re-run `esp_wifi::init`, which is both expensive
 /// and, per esp-wifi's docs, must happen exactly once.
 pub struct RadioManager {
-    controller: WifiController<'static>,
+    // #198 Phase 1 inc2 (DR-H1): the WiFi `controller` is NO LONGER a field — it is MOVED into the
+    // spawned `wifi_task` (its sole owner). The inline election/coexist reads it indirectly through
+    // the mirror atomics (`AP_RSSI`/`LINK_UP`) and drives its actions via `WIFI_CMD`. `esp_now`
+    // (below) stays inline with the mesh.
     /// #68/#76 SELF-MAC: our own STA/ESP-NOW MAC, captured once at `new()`. `service()` drops
     /// inbound frames whose `src` equals this — the esp-wifi RX path can loop our own broadcasts
     /// back, which otherwise self-rosters us (roster anomaly #1) and pollutes PEERS.
@@ -2164,12 +2204,13 @@ impl RadioManager {
         // sites — the app now just awaits sockets (Phases 2-5). DR-M3: the stack seed MUST be
         // per-boot entropy from the esp-hal RNG — NOT a shared literal (a shared seed = identical
         // TCP-ISN/ephemeral-ports fleet-wide). StackResources<4> = DHCP + DNS + 1 transient socket
-        // + 1 spare (smol never opens concurrent sockets). The Stack handle (Copy) is discarded in
-        // inc1 — nothing associates yet; inc2 keeps it + hands it to `wifi_task`.
+        // + 1 spare (smol never opens concurrent sockets). `Stack` is Copy + 'static, so `wifi_task`
+        // takes it by value (Phases 2-5 socket callers get it from `wifi_task`'s own copy / a later
+        // shared handle).
         let seed: u64 = ((rng.random() as u64) << 32) | (rng.random() as u64);
         static NET_RESOURCES: static_cell::StaticCell<embassy_net::StackResources<4>> =
             static_cell::StaticCell::new();
-        let (_stack, runner) = embassy_net::new(
+        let (stack, runner) = embassy_net::new(
             interfaces.station,
             embassy_net::Config::dhcpv4(Default::default()),
             NET_RESOURCES.init(embassy_net::StackResources::new()),
@@ -2178,14 +2219,19 @@ impl RadioManager {
         // embassy-executor 0.10: the `#[task]` fn returns `Result<SpawnToken, SpawnError>` (pool
         // capacity). Handle it gracefully rather than `.expect()` — smol's boot path is panic-free
         // by policy (a panic → MF-2 software_reset → boot-loop). A fresh executor always has room
-        // for this single spawn, so the Err arm is defensive only.
+        // for these single spawns, so the Err arms are defensive only.
         match net_task(runner) {
             Ok(token) => spawner.spawn(token),
             Err(_) => log::error!("smol #198: net_task spawn failed (executor pool exhausted)"),
         }
+        // #198 Phase 1 inc2 (DR-H1): MOVE the controller into `wifi_task` (its sole owner). The
+        // inline election/coexist logic reaches it only through the mirror atomics + `WIFI_CMD`.
+        match wifi_task(controller, stack) {
+            Ok(token) => spawner.spawn(token),
+            Err(_) => log::error!("smol #198: wifi_task spawn failed (executor pool exhausted)"),
+        }
 
         Some(Self {
-            controller,
             self_mac,
             esp_now: interfaces.esp_now,
             rng,
@@ -2490,8 +2536,11 @@ impl RadioManager {
         }
         // #51 B: we're still associated here (pre-EspNow-switch) → capture a fresh
         // RSSI-to-AP for the NEXT recovery election's strength comparison.
-        if let Ok(r) = self.controller.rssi() {
-            self.my_rssi_to_ap = r.clamp(-127, 0) as i8;
+        // #198 Phase 1 inc2 (DR-H1): read the mirror atomic `wifi_task` maintains, NOT the
+        // controller directly (which now lives in `wifi_task`). `i16::MIN` = no link (skip).
+        let r = AP_RSSI.load(Ordering::Relaxed);
+        if r != i16::MIN {
+            self.my_rssi_to_ap = (r as i32).clamp(-127, 0) as i8;
         }
         // #217 rung-3: refresh the REAL associated AP channel at this stable association point so
         // `off_channel` (my_ap_channel != mesh) drives the pre-fetch 2B co-channel gate + DIAG
@@ -2635,13 +2684,14 @@ impl RadioManager {
         }
         match mode {
             Mode::EspNow => {
-                // TIME-SHARE: relinquish the AP association so nothing else
-                // steers the channel, then pin the fixed ESP-NOW channel.
-                // 0c′ STUB (#198): AP disconnect is async in esp-radio 0.18 + there is no STA
-                // association in 0c′ (set_config starts the PHY without associating). The ESP-NOW
-                // channel pin below is the live part. TODO(#198 Phase 3): disconnect_async.
-                // Keep the MAC/PHY powered (do NOT stop the controller) so the
-                // esp_now handle stays valid; just retune the channel.
+                // TIME-SHARE: relinquish the AP association so nothing else steers the channel,
+                // then pin the fixed ESP-NOW channel.
+                // #198 Phase 1 inc2 (DR-H1): the AP disconnect is now a fire-and-forget action to
+                // `wifi_task` (it owns the controller) — non-blocking `try_send`, never awaits, so
+                // the ≤20 ms mesh tick is untouched. `wifi_task` does the async `disconnect_async`.
+                // Keep the MAC/PHY powered (do NOT stop the controller) so the esp_now handle stays
+                // valid; just retune the channel.
+                WIFI_CMD.try_send(WifiCmd::Stop).ok();
                 self.esp_now
                     .set_channel(ESP_NOW_FIXED_CHANNEL)
                     .map_err(|_| ())?;
@@ -2651,18 +2701,12 @@ impl RadioManager {
                 );
             }
             Mode::WifiSta => {
-                // COEXIST: come back to the AP. Re-associating retunes the PHY
-                // to the AP's channel automatically; ESP-NOW then coexists on
-                // that channel. (Caller must have valid credentials set.)
-                // 0c′ STUB (#198): STA (re)connect is async in esp-radio 0.18 + there is no
-                // association in 0c′. TODO(#198 Phase 3): connect_async on embassy-net.
-                // #139: connect() resets power-save to the WIFI_PS_MIN_MODEM default, so the
-                // association/auth handshake that follows would otherwise run under modem-sleep
-                // (unicast-deaf window). Re-assert None NOW — before the handshake completes — not
-                // only after the downstream is_connected() gates (MQTT flush / OTA fetch).
-                let _ = self
-                    .controller
-                    .set_power_saving(esp_radio::wifi::PowerSaveMode::None);
+                // COEXIST: come back to the AP. #198 Phase 1 inc2 (DR-H1): ask `wifi_task` to open
+                // a ch6-locked WiFi window (fire-and-forget — never awaits). It handles the async
+                // `connect_async` + re-asserts PS=None before the handshake (#139: connect resets
+                // PS to WIFI_PS_MIN_MODEM, the unicast-deaf window). ch6-lock keeps the radio
+                // co-channel with the mesh, so ESP-NOW coexists (the deaf-window thesis).
+                WIFI_CMD.try_send(WifiCmd::OpenWindow).ok();
                 crate::net::assert_max_tx_power(); // #141
                 log::info!("smol: radio -> WiFi STA (coexist)");
             }
@@ -2978,11 +3022,15 @@ impl RadioManager {
         let net = &crate::secrets::WIFI_NETWORK;
         // #217 rung-3: incumbent view for the ≥6 dB hysteresis (live rssi via `rssi()` — nebula
         // caveat 3 — at the channel we last pinned; bssid is immaterial to the channel+rssi compare).
+        // #198 Phase 1 inc2 (DR-H1): live RSSI via the mirror atomic `wifi_task` maintains (not the
+        // controller directly). `i16::MIN` = no link → no incumbent view.
         let cur = if self.my_ap_channel != 0 {
-            self.controller
-                .rssi()
-                .ok()
-                .map(|r| ApView { bssid: [0; 6], channel: self.my_ap_channel, rssi: r.clamp(-127, 0) as i8 })
+            let r = AP_RSSI.load(Ordering::Relaxed);
+            (r != i16::MIN).then_some(ApView {
+                bssid: [0; 6],
+                channel: self.my_ap_channel,
+                rssi: (r as i32).clamp(-127, 0) as i8,
+            })
         } else {
             None
         };
@@ -4155,10 +4203,11 @@ impl RadioManager {
             let _ = self.switch(Mode::EspNow); // ch6 (the flush left us in WifiSta)
             let mut s = 0u16;
             while s < 40 {
-                if !self.controller.is_connected() {
+                // #198 Phase 1 inc2 (DR-H1): wait for the async disconnect `wifi_task` performs
+                // (the switch(EspNow) above fired WIFI_CMD::Stop) via the LINK_UP mirror.
+                if !LINK_UP.load(Ordering::Relaxed) {
                     break;
                 }
-                // 0c′ STUB (#198): STA disconnect is async now + no association in 0c′. Phase 3.
                 s = s.saturating_add(1);
                 if tick() {
                     return LeafOtaOutcome::Aborted;
@@ -4284,10 +4333,11 @@ impl RadioManager {
         // the STA held on — settle>0 confirms this WAS the off-channel egress.
         let mut settle: u16 = 0;
         while settle < 40 {
-            if !self.controller.is_connected() {
+            // #198 Phase 1 inc2 (DR-H1): wait for the async disconnect `wifi_task` performs (the
+            // switch(EspNow) above fired WIFI_CMD::Stop) via the LINK_UP mirror.
+            if !LINK_UP.load(Ordering::Relaxed) {
                 break;
             }
-            // 0c′ STUB (#198): STA disconnect is async now + no association in 0c′. Phase 3.
             settle = settle.saturating_add(1);
             if tick() {
                 return LeafOtaOutcome::Aborted;
@@ -6155,6 +6205,91 @@ async fn net_task(
     runner.run().await
 }
 
+/// #198 Phase 1 (DR-H1, §2/§3.2) — the WiFi association lifecycle task, SOLE owner of the
+/// `controller`. Driven by `WIFI_CMD` from the inline mesh loop (fire-and-forget); mirrors the
+/// controller's `rssi`/`is_connected` into `AP_RSSI`/`LINK_UP` so the inline election reads them
+/// synchronously (no `.await`, no round-trip). THIS is the deaf-window lever: while this task
+/// awaits `connect_async()` / a `Timer`, the executor runs the inline mesh loop, so the mesh keeps
+/// polling through the WiFi window (§2 async interleave). DR-M1: the assoc is CH6-LOCKED
+/// (`with_channel`) so `connect_async` skips the channel-hopping scan and the radio stays
+/// co-channel with the mesh — minimising the transient deaf window. Credentials come from
+/// `crate::secrets` (git-ignored; repo is public).
+#[embassy_executor::task]
+async fn wifi_task(
+    mut controller: WifiController<'static>,
+    stack: embassy_net::Stack<'static>,
+) -> ! {
+    let net = &crate::secrets::WIFI_NETWORK;
+    // Association config: real creds, ch6-locked (DR-M1), AllChannels scan as the fallback if a
+    // re-scan is ever forced (M5 — associate-to-strongest, the #204/#217 weak-ch1 fix).
+    let assoc_cfg = esp_radio::wifi::Config::Station(
+        esp_radio::wifi::sta::StationConfig::default()
+            .with_ssid(net.ssid)
+            .with_password(net.pass.into())
+            .with_channel(ESP_NOW_FIXED_CHANNEL)
+            .with_scan_method(esp_radio::wifi::sta::ScanMethod::AllChannels),
+    );
+    loop {
+        match WIFI_CMD.receive().await {
+            WifiCmd::OpenWindow => {
+                WIFI_BUSY.store(true, Ordering::Relaxed);
+                let _ = controller.set_config(&assoc_cfg);
+                // #139: re-assert PS=None before the handshake (connect resets it to MIN_MODEM,
+                // the unicast-deaf window).
+                let _ = controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
+                let connected = matches!(
+                    embassy_time::with_timeout(
+                        embassy_time::Duration::from_secs(15),
+                        controller.connect_async(),
+                    )
+                    .await,
+                    Ok(Ok(_))
+                );
+                LINK_UP.store(connected, Ordering::Relaxed);
+                WIFI_BUSY.store(false, Ordering::Relaxed);
+                if connected {
+                    log::info!(
+                        "smol #198 P1: wifi_task associated (ch{ESP_NOW_FIXED_CHANNEL}, ssid {})",
+                        net.ssid
+                    );
+                } else {
+                    log::warn!("smol #198 P1: wifi_task assoc failed/timed out");
+                }
+                // Steady-state: mirror controller state for the inline election/coexist (DR-H1),
+                // refreshed at election granularity (seconds). (Phase 2/3 insert here: once
+                // `stack.config_v4().is_some()` → ntp_sync().await → MQTT open/done → then drop.)
+                let mut logged_dhcp = false;
+                while LINK_UP.load(Ordering::Relaxed) {
+                    let rssi_i16 = match controller.rssi() {
+                        Ok(r) => r.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                        Err(_) => i16::MIN,
+                    };
+                    AP_RSSI.store(rssi_i16, Ordering::Relaxed);
+                    LINK_UP.store(controller.is_connected(), Ordering::Relaxed);
+                    if !logged_dhcp {
+                        if let Some(cfg) = stack.config_v4() {
+                            log::info!("smol #198 P1: DHCP lease {}", cfg.address);
+                            logged_dhcp = true;
+                        }
+                    }
+                    if matches!(WIFI_CMD.try_receive(), Ok(WifiCmd::Stop)) {
+                        break;
+                    }
+                    embassy_time::Timer::after(embassy_time::Duration::from_millis(500)).await;
+                }
+                let _ = controller.disconnect_async().await;
+                LINK_UP.store(false, Ordering::Relaxed);
+                AP_RSSI.store(i16::MIN, Ordering::Relaxed);
+            }
+            WifiCmd::Stop => {
+                let _ = controller.disconnect_async().await;
+                LINK_UP.store(false, Ordering::Relaxed);
+                AP_RSSI.store(i16::MIN, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Bring the radio up, run a REAL WiFi -> DHCP -> SNTP burst (fast-blinking the
 /// blue LED throughout), then TIME-SHARE-switch the single radio to ESP-NOW.
 ///
@@ -6245,11 +6380,13 @@ pub fn start(
     radio.relay.is_gateway = reached_dhcp && elect.i_am_owner;
     radio.elected_owner = elect.owner_id;
     radio.elected_owner_channel = elect.owner_channel; // #gateway-election reliability (leaf-lock guard)
-    // #51 B: if we associated, seed the initial RSSI-to-AP so the first recovery
-    // election already has a real signal-strength reading to compare on.
+    // #51 B: if we associated, seed the initial RSSI-to-AP so the first recovery election already
+    // has a real signal-strength reading to compare on. #198 Phase 1 inc2 (DR-H1): read the mirror
+    // atomic `wifi_task` maintains, not the controller directly.
     if reached_dhcp {
-        if let Ok(r) = radio.controller.rssi() {
-            radio.my_rssi_to_ap = r.clamp(-127, 0) as i8;
+        let r = AP_RSSI.load(Ordering::Relaxed);
+        if r != i16::MIN {
+            radio.my_rssi_to_ap = (r as i32).clamp(-127, 0) as i8;
         }
     }
     // #217 rung-3 (HW-fix v900): do NOT reassoc at crown-assumption. burst_ntp's boot association
@@ -6295,6 +6432,18 @@ pub fn start(
         let _ = radio.switch(Mode::EspNow);
         log::info!("smol: leaf — scanning for gateway id{}", radio.elected_owner);
     }
+
+    // #198 Phase 1 inc2 — canary/deliverable trigger (TEMPORARY, Phase-1 stand-in).
+    // The boot election runs over MQTT (Phase 3), so in Phase 1 NO node is elected gateway
+    // (reached_dhcp is always false — NTP/MQTT are stubbed), and nothing above opens a WiFi window.
+    // To prove the Phase-1 deliverable — a spawned `wifi_task` associates to the ch6 AP + gets a
+    // DHCP lease while the ESP-NOW mesh stays live (the deaf-window kill) — fire ONE OpenWindow
+    // here (fire-and-forget; queued after the leaf's Stop above, so it wins). `wifi_task` then
+    // associates ch6-locked + mirrors AP_RSSI/LINK_UP for the inline election.
+    // TODO(#198 Phase 3): DELETE this unconditional trigger — the MQTT-driven election opens the
+    // window only when ROLE==gateway + it's sync-time (spec §3.2), and switch(WifiSta)/switch(EspNow)
+    // (now wired to WIFI_CMD) drive the window lifecycle from the coexist FSM.
+    WIFI_CMD.try_send(WifiCmd::OpenWindow).ok();
 
     (Some(radio), synced)
 }
