@@ -194,7 +194,7 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 13] = [
+const CFG_APPLY_KEYS: [u8; 14] = [
     crate::net::wifi::CFG_KEY_SCREEN,
     crate::net::wifi::CFG_KEY_LED,
     crate::net::wifi::CFG_KEY_UNITS,
@@ -221,6 +221,10 @@ const CFG_APPLY_KEYS: [u8; 13] = [
     // #197 herald NOTIFY: M — a COMMAND like R/W (buffered/applied via take_cfg_offer(M), NEVER
     // cached: a cached toast would re-show on every boot). One-shot; the leaf toasts + auto-dismisses.
     crate::net::wifi::CFG_KEY_NOTIFY,
+    // #gateway-election all-nodes-WiFi DEBUG flag: A — cached + relayed like U/N (a leaf takes it via
+    // take_cfg_offer(A) → sets debug_wifi_all). Fleet-global; the crown relays the retained value to
+    // every leaf so a node can enable its own WiFi bursts without first reaching the broker.
+    crate::net::wifi::CFG_KEY_WIFI_ALL,
 ];
 /// #50b leaf-status UPLINK tag: `"SMOLv1 STAT "` (12 B, trailing space) then `"NNN"`
 /// (3-ASCII zero-padded SENDER leaf id) then the verbatim live `<AppKind>:<page>` value
@@ -1916,6 +1920,11 @@ pub struct RadioManager {
     /// #23: the elected mesh owner's id (the single coexist gateway). Set at boot from
     /// the broker election; a leaf scans for THIS id's HELLO to find the mesh channel.
     elected_owner: u8,
+    /// #gateway-election reliability: the elected owner's MC channel (`<ch>`; 0 = unknown). Recorded
+    /// from the election each burst. A CO-CHANNEL-capable leaf REFUSES to leaf-lock to an owner whose
+    /// channel is a KNOWN off-channel (!= mesh) — so it keeps re-electing until the co-channel SEIZE
+    /// fires reliably (fixes the racy ~2/3 seize where a happy leaf-lock stopped the recovery bursts).
+    elected_owner_channel: u8,
     /// #23 leaf scan-discovery state (stage 2): locked onto the owner's channel, the
     /// current 1/6/11 scan index, last channel-hop time, last time the owner was heard.
     scan_locked: bool,
@@ -2054,6 +2063,33 @@ pub struct RadioManager {
     /// Seeded into the recovery `MeshElect` so the strongest-uplink survivor wins the
     /// re-election. Weak default until the first burst measures it.
     my_rssi_to_ap: i8,
+    /// #217 rung-3: the channel of the currently-associated AP (the channel the co-channel
+    /// selector last PINNED, or the fallback AP's channel). 0 = unknown (fresh SSID-only assoc that
+    /// esp-wifi chose) → treated as off-channel so the first pre-fetch runs the co-channel scan.
+    /// `off-channel` ⇔ `my_ap_channel != ESP_NOW_FIXED_CHANNEL`.
+    my_ap_channel: u8,
+    /// #gateway-election ALL-NODES-WiFi DEBUG flag (from the retained `smol/config/wifi_all`, key
+    /// `A`, relayed to leaves). When true, THIS node runs its own periodic WiFi telemetry burst even
+    /// as a leaf (`relay_ready_to_flush` ungate — the debug flush claim-SUPPRESSES so it never
+    /// perturbs the crown election) and may self-fetch OTA on its own install command. DEBUG lever,
+    /// default false (normal operation = crown-only WiFi).
+    debug_wifi_all: bool,
+    /// #gateway-election LAYER 3 (fetch-quiet): true while THIS node is running an OTA self-fetch
+    /// (`run_ota_update`). Suppresses this node's own downlink RE-FLOOD so its ESP-NOW TX never
+    /// competes with the co-channel WiFi bulk-RX. NOTE: `run_ota_fetch` itself does ZERO mesh TX and
+    /// the fetch's tick doesn't service the mesh, so a crown is ALREADY TX-silent during its blocking
+    /// fetch — the real RX-starvation is the FLEET's reflood storm from an election split-brain
+    /// (multiple GRID2 origins → climbing seq defeats the strict-newer dedup), which the LAYER 2
+    /// single-stable-co-channel-crown fix removes. This flag is the belt-and-suspenders that also
+    /// covers a debug (all-nodes-WiFi) LEAF self-fetch. Default false → zero behavior change.
+    ota_fetching: bool,
+    /// #217 rung-3: crown coexist state (Normal = co-channel + OTA-enabled; Degraded = off-channel
+    /// but MQTT/mesh KEPT ALIVE + OTA disabled; Shed = abdicated). Drives the OTA-enable gate + the
+    /// never-crownless strand-guard (`net::coexist::crown_next_state`).
+    crown_state: crate::net::coexist::CrownState,
+    /// #217 rung-3 strand-guard: shed→reclaim cycles with no co-channel AP available. At
+    /// `SHED_RECLAIM_MAX` the crown LATCHES `Degraded` rather than shed-loop into a crownless gap.
+    shed_reclaims: u8,
     /// #57 Mesh Familiar: the ALWAYS-ON living-creature state machine (holder /
     /// heartbeat / seq-arbitration / handoff / RSSI-weighted orphan-takeover). Lives
     /// here beside the `roster` it elects from; ticked every main loop by `fam_tick`
@@ -2141,6 +2177,7 @@ impl RadioManager {
             #[cfg(feature = "wled")]
             wled_seq: 0,
             elected_owner: id,
+            elected_owner_channel: 0, // #gateway-election reliability: set from the election each burst
             scan_locked: false,
             scan_idx: 0,
             learned_channel: 0, // #29: unknown until the first frame is heard
@@ -2173,6 +2210,11 @@ impl RadioManager {
             install_requested: false,
             silent_until_relock: false,
             my_rssi_to_ap: -99,
+            my_ap_channel: 0, // #217 rung-3: unknown until a co-channel scan pins it
+            debug_wifi_all: false, // #gateway-election: all-nodes-WiFi debug flag, default OFF
+            ota_fetching: false, // #gateway-election LAYER 3: fetch-quiet flag, default OFF
+            crown_state: crate::net::coexist::CrownState::Normal, // #217 rung-3
+            shed_reclaims: 0, // #217 rung-3 strand-guard
             // #57: seed the familiar with our id (heartbeat phase + arbitration id).
             // No creature exists until one is heard or first-birthed on a cold mesh.
             fam: FamState::new(id),
@@ -2311,6 +2353,14 @@ impl RadioManager {
         elect.recovery = true;
         elect.my_rssi = self.my_rssi_to_ap;
         elect.my_channel = self.learned_channel; // #29: seed the MC record's <ch> (0 until learned)
+        // #gateway-election: seed the best-gateway fitness signals. co_channel (my AP == the fixed
+        // mesh channel) is the DOMINANT default-weighted input; co_channel_known fail-opens the
+        // empty-MC deferral until the channel is learned. ntp_holder is v1-stubbed false (uniform →
+        // zero ordering effect; wire from `my_synced_at` in a follow-up).
+        elect.co_channel = self.my_ap_channel == ESP_NOW_FIXED_CHANNEL;
+        elect.co_channel_known = self.my_ap_channel != 0;
+        elect.mesh_channel = ESP_NOW_FIXED_CHANNEL; // LAYER 2: detect an off-channel owner in the MC
+        elect.ntp_holder = false;
         elect.seen_owner = self.mc_seen_owner;
         elect.seen_seq = self.mc_seen_seq;
         elect.seen_ms = self.mc_seen_ms;
@@ -2405,6 +2455,12 @@ impl RadioManager {
         if let Ok(r) = self.controller.rssi() {
             self.my_rssi_to_ap = r.clamp(-127, 0) as i8;
         }
+        // #217 rung-3: refresh the REAL associated AP channel at this stable association point so
+        // `off_channel` (my_ap_channel != mesh) drives the pre-fetch 2B co-channel gate + DIAG
+        // accurately — no boot-time reassoc needed.
+        if let Some((ap_ch, _, _)) = crate::net::current_ap_info() {
+            self.my_ap_channel = ap_ch;
+        }
         // Persist the refreshed staleness observation (so takeover accrues across bursts).
         self.mc_seen_owner = elect.seen_owner;
         self.mc_seen_seq = elect.seen_seq;
@@ -2414,6 +2470,7 @@ impl RadioManager {
             self.owner_hello_seen = false;
         }
         self.elected_owner = elect.owner_id;
+        self.elected_owner_channel = elect.owner_channel; // #gateway-election reliability (leaf-lock guard)
         self.scan_locked = false;
         if elect.i_am_owner {
             // Took over a dead/stale owner (or empty topic): become the coexist GATEWAY.
@@ -2876,26 +2933,60 @@ impl RadioManager {
     /// re-measures downstream on the next flush; #155 channel-follow re-advertises the new channel.
     /// ⚠️ HW-CANARY-GATED: the scan + reassociate radio path — and whether ESP-NOW coexist follows
     /// the new STA channel — cannot be verified without hardware (same discipline as `run_scan`/OTA).
-    fn reassoc_ch6_prefer(&mut self) {
+    fn reassoc_ch6_prefer(&mut self) -> crate::net::coexist::CrownApDecision {
+        use crate::net::coexist::{select_crown_ap, ApView, CrownApDecision};
         // COEXIST hard gate: never leave the mesh channel mid mesh-OTA transfer (mirrors run_scan).
         if self.ota_leaf.is_active() {
-            return;
+            return CrownApDecision::NoAp;
         }
         let net = &crate::secrets::WIFI_NETWORK;
-        // Strongest ch6 BSSID if any; else strongest overall; else None (plain reconnect on creds).
-        let (bssid, pin_ch6): (Option<[u8; 6]>, bool) = match self.controller.scan_n(16) {
+        // #217 rung-3: incumbent view for the ≥6 dB hysteresis (live rssi via `rssi()` — nebula
+        // caveat 3 — at the channel we last pinned; bssid is immaterial to the channel+rssi compare).
+        let cur = if self.my_ap_channel != 0 {
+            self.controller
+                .rssi()
+                .ok()
+                .map(|r| ApView { bssid: [0; 6], channel: self.my_ap_channel, rssi: r.clamp(-127, 0) as i8 })
+        } else {
+            None
+        };
+        // Full scan (needs co-channel AND off-channel visibility so `select_crown_ap` can decide
+        // co-channel vs the strand fallback in ONE pass). Filter to our SSID; feed the pure selector.
+        let decision = match self.controller.scan_n(16) {
             Ok(aps) => {
-                if let Some(a) = aps
-                    .iter()
-                    .filter(|a| a.channel == 6)
-                    .max_by_key(|a| a.signal_strength)
-                {
-                    (Some(a.bssid), true)
-                } else {
-                    (aps.iter().max_by_key(|a| a.signal_strength).map(|a| a.bssid), false)
+                let mut views: alloc::vec::Vec<ApView> = alloc::vec::Vec::new();
+                for a in aps.iter() {
+                    if a.ssid.as_str() == net.ssid {
+                        views.push(ApView { bssid: a.bssid, channel: a.channel, rssi: a.signal_strength });
+                    }
                 }
+                select_crown_ap(&views, ESP_NOW_FIXED_CHANNEL, cur)
             }
-            Err(_) => (None, false),
+            Err(_) => CrownApDecision::NoAp,
+        };
+        // #gateway-election issue 2: a transient scan that MISSED our co-channel incumbent must NOT
+        // reassociate us to a WORSE off-channel AP. HW bug: after a fetch-leg-deaf fail, this reassoc
+        // jumped id7 from a62bb0 ch6 -63 to a ch11 -78 AP → off-channel → MC|7|11 → retries then
+        // failed OFF-channel. If we are CURRENTLY co-channel and the selector only found an
+        // off-channel fallback / no AP (the co-channel AP just wasn't in THIS scan), STAY PUT: return
+        // a co-channel decision WITHOUT disconnecting, so note_crown_ap keeps us Normal on the good
+        // ch6 AP and the next attempt re-scans + re-picks. A genuine CoChannel decision proceeds below.
+        if self.my_ap_channel == ESP_NOW_FIXED_CHANNEL
+            && !matches!(decision, CrownApDecision::CoChannel { .. })
+        {
+            log::info!(
+                "smol #gateway-election: reassoc scan missed co-channel ({:?}) — STAYING on current ch{} AP (no off-channel downgrade)",
+                decision,
+                self.my_ap_channel
+            );
+            return CrownApDecision::CoChannel { bssid: [0u8; 6], ch: ESP_NOW_FIXED_CHANNEL };
+        }
+        // Pin the chosen AP (bssid + channel). A vanished pinned BSSID is recovered by the #195
+        // retry re-scan (connect is async — no synchronous fail here); select_crown_ap then re-picks.
+        let (bssid, chan): (Option<[u8; 6]>, Option<u8>) = match decision {
+            CrownApDecision::CoChannel { bssid, ch }
+            | CrownApDecision::OffChannelFallback { bssid, ch } => (Some(bssid), Some(ch)),
+            CrownApDecision::NoAp => (None, None),
         };
         let _ = self.controller.disconnect();
         let _ = self
@@ -2905,16 +2996,44 @@ impl RadioManager {
                     ssid: net.ssid.into(),
                     password: net.pass.into(),
                     bssid,
-                    channel: if pin_ch6 { Some(6) } else { None },
+                    channel: chan,
                     ..Default::default()
                 },
             ));
         let _ = self.controller.connect();
+        // Track the resulting channel so `off-channel` (!= ESP_NOW_FIXED_CHANNEL) is detectable
+        // pre-fetch without a live controller query (0 = NoAp → still off-channel → retry next arm).
+        self.my_ap_channel = match decision {
+            CrownApDecision::CoChannel { ch, .. } | CrownApDecision::OffChannelFallback { ch, .. } => ch,
+            CrownApDecision::NoAp => 0,
+        };
         log::warn!(
-            "smol #204: crown deaf → ch6-prefer reassoc (ch6_found={}, bssid_set={})",
-            pin_ch6,
-            bssid.is_some()
+            "smol #217r3: crown reassoc → co_channel={} ap_ch={} mesh_ch={}",
+            matches!(decision, CrownApDecision::CoChannel { .. }),
+            self.my_ap_channel,
+            ESP_NOW_FIXED_CHANNEL
         );
+        decision
+    }
+
+    /// #217 rung-3 strand-guard bookkeeping: folds a `reassoc_ch6_prefer` decision into the crown
+    /// state via the pure `crown_next_state`. Co-channel resets the reclaim counter and marks
+    /// `Normal`; otherwise it increments reclaims and walks the guard from `Shed`, latching
+    /// `Degraded` at `SHED_RECLAIM_MAX` (serve off-channel, OTA off, MQTT/mesh alive, never crownless).
+    fn note_crown_ap(&mut self, decision: crate::net::coexist::CrownApDecision) {
+        use crate::net::coexist::{crown_next_state, CrownApDecision, CrownCtx, CrownState};
+        if matches!(decision, CrownApDecision::CoChannel { .. }) {
+            self.shed_reclaims = 0;
+            self.crown_state = CrownState::Normal;
+        } else {
+            self.shed_reclaims = self.shed_reclaims.saturating_add(1);
+            // The reassoc already TRIED and failed to reach co-channel, so evaluate from `Shed` with
+            // `reassoc_exhausted`. `better_successor_cc` (yield to a cc=1 peer) is a follow-up that
+            // needs the HELLO `cc` bit; Tier-1 stays crown-in-place, which holds the never-crownless
+            // invariant (safety) — yielding is an optimization, not a safety requirement.
+            let ctx = CrownCtx { reassoc_exhausted: true, better_successor_cc: false };
+            self.crown_state = crown_next_state(CrownState::Shed, decision, self.shed_reclaims, ctx);
+        }
     }
 
     /// #70: sample the live free-heap and lower the min-heap watermark. Cheap (one `HEAP.free()`);
@@ -3112,6 +3231,16 @@ impl RadioManager {
                 ap_ch, ap_rssi, b[0], b[1], b[2], b[3], b[4], b[5]
             ));
         }
+        // #217 rung-3 coexist-channel health (luna tile #82). `cc` = crown is CO-CHANNEL (live
+        // associated AP channel == the mesh channel) — the direct OTA-capability + off-ch6-
+        // starvation signal; `degraded` = strand-guard latched off-channel (MQTT alive, OTA off,
+        // never crownless). Both always present (0 on a leaf / non-associated). Appended LAST —
+        // positional parse of the fixed DIAG fields intact.
+        let cc = crate::net::current_ap_info()
+            .map(|(ch, _, _)| u8::from(ch == ESP_NOW_FIXED_CHANNEL))
+            .unwrap_or(0);
+        let degraded = u8::from(self.crown_state == crate::net::coexist::CrownState::Degraded);
+        rec.push_str(&alloc::format!("|cc={}|degraded={}", cc, degraded));
         // #204: crown dead-downstream telemetry — <deaf-streak>:<reassoc-cycles>:<deaf_shed 0/1>.
         // Named `cdeaf` (crown-deaf) to NOT collide with the mesh-test-only `deaf=` (an ESP-NOW
         // deaf-LIST count). Reads 0:0:0 on a healthy crown or any leaf; the shed flag latches 1 after
@@ -3289,6 +3418,17 @@ impl RadioManager {
     /// only, since a peer's role is never on the wire (bench-mesh-view-spec §3).
     pub fn is_gateway(&self) -> bool {
         self.relay.is_gateway
+    }
+
+    /// #gateway-election: set the all-nodes-WiFi DEBUG flag (applied by `main` from the relayed /
+    /// gateway-own `A` config, `take_cfg_offer(CFG_KEY_WIFI_ALL)`). When true, THIS node does its own
+    /// periodic WiFi bursts even as a leaf (`relay_ready_to_flush` / `flush_telemetry` ungate) and may
+    /// self-fetch OTA; the debug flush claim-SUPPRESSES so it never perturbs the crown election.
+    pub fn set_debug_wifi_all(&mut self, on: bool) {
+        if self.debug_wifi_all != on {
+            log::info!("smol #gateway-election: all-nodes-WiFi debug -> {}", on);
+        }
+        self.debug_wifi_all = on;
     }
 
     /// #27/#29: this node's current ESP-NOW channel for the peers + MC publish. Leaf = its
@@ -3504,7 +3644,10 @@ impl RadioManager {
     /// Gateway only: are there buffered messages due for a flush burst (queue full,
     /// or the flush interval has elapsed with a non-empty queue)?
     pub fn relay_ready_to_flush(&self, now: u64) -> bool {
-        if !self.relay.is_gateway {
+        // #gateway-election all-nodes-WiFi DEBUG: normally only the crown flushes. When the debug flag
+        // is set, a NON-gateway node also flushes on the interval (reads the broker + publishes its own
+        // telemetry + can self-fetch OTA) — the debug flush claim-SUPPRESSES so it never claims the crown.
+        if !self.relay.is_gateway && !self.debug_wifi_all {
             return false;
         }
         let pending = self.relay.queue.iter().filter(|q| q.used).count();
@@ -3580,18 +3723,51 @@ impl RadioManager {
     ) -> bool {
         log::info!("smol OTA: opening update burst (mesh deaf for the whole download)");
         let _ = self.switch(Mode::WifiSta);
+        // #gateway-election LAYER 3 (fetch-quiet): mark the self-fetch active so this node's own
+        // downlink re-flood is suppressed (see the Batt2/Grid2 service arms). A SUCCESS reboots inside
+        // the fetch (flag reset by the reboot); both non-activating returns below clear it.
+        self.ota_fetching = true;
         // #217 rung-2B: pre-fetch AP-quality gate. If the current AP is weak (rssi < -75 — the pcap
         // deaf-AP class that never ACKs response byte 0), steer to a stronger ch6 AP BEFORE the
         // fetch (run_ota_fetch's own assoc-wait absorbs the reconnect latency). BEST-EFFORT
         // reassoc-then-fetch, NOT a defer: run_ota_update's `false` return is a self-fetch FAILURE
         // that feeds the #195/#225 fail-cap, so a defer-as-failure would poison the cap. Cap-neutral
         // true-defer = rung-2D follow-up.
-        if self.my_rssi_to_ap < CROWN_AP_RSSI_MIN {
+        // #217 rung-3: co-channel-FIRST pre-fetch gate. Off-channel (ap_ch != mesh — RSSI-
+        // INDEPENDENT, the id5 ch1-vs-ch6 bug the rung-2 rssi gate missed) OR weak → co-channel-
+        // prefer reassoc before the fetch; fold the outcome into the strand-guard.
+        // #gateway-election reliability (issue 2): my_ap_channel can be transiently 0 here — the
+        // switch(WifiSta) above just (re)issued connect() and the association may not have settled, so
+        // a stale/0 channel would read as "off-channel" and trigger a NEEDLESS reassoc that scanned
+        // away from a good AP and came back ap_ch=0 → OTA aborted. Only reassoc when the channel is
+        // KNOWN (nonzero) and genuinely off-channel/weak; a 0 (unknown/settling) SKIPS the reassoc and
+        // lets run_ota_fetch's own assoc-wait establish the strongest AP (SCAN_METHOD=1 → ch6).
+        let ap_known = self.my_ap_channel != 0;
+        let off_channel = ap_known && self.my_ap_channel != ESP_NOW_FIXED_CHANNEL;
+        if ap_known && (off_channel || self.my_rssi_to_ap < CROWN_AP_RSSI_MIN) {
             log::warn!(
-                "smol #217: pre-fetch AP weak (rssi {}) — ch6-reassoc before fetch",
+                "smol #217r3: pre-fetch off_ch={} rssi={} — co-channel-prefer reassoc",
+                off_channel,
                 self.my_rssi_to_ap
             );
-            self.reassoc_ch6_prefer();
+            let decision = self.reassoc_ch6_prefer();
+            self.note_crown_ap(decision);
+        } else if !ap_known {
+            log::info!(
+                "smol #gateway-election: pre-fetch AP channel unknown (transient after switch) — skipping reassoc, letting the fetch's assoc-wait pick the strongest AP"
+            );
+        }
+        // Strand-guard OTA-enable: attempt OTA ONLY as a healthy co-channel (Normal) crown. If no
+        // co-channel AP is reachable (Degraded/Shed), SKIP the fetch CAP-NEUTRALLY (`true` = "not
+        // attempted", NOT a self-fetch failure that would poison the #195/#225 fail-cap) and STAY
+        // crown (never crownless). A fresh announce / arm re-check retries once co-channel returns.
+        if !crate::net::coexist::ota_enabled(self.crown_state) {
+            log::warn!(
+                "smol #217r3: crown off-channel (state={:?}) — OTA skipped cap-neutrally, staying crown",
+                self.crown_state
+            );
+            self.ota_fetching = false; // LAYER 3: fetch not attempted → clear the quiet flag
+            return true;
         }
         let rng = self.rng;
         let mut fail: Option<(u32, u32, u32, u32, u32)> = None;
@@ -3632,6 +3808,7 @@ impl RadioManager {
                 }
             }
         }
+        self.ota_fetching = false; // LAYER 3: self-fetch attempt done → lift the quiet flag
         ok
     }
 
@@ -4466,7 +4643,10 @@ impl RadioManager {
         leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
         tick: &mut dyn FnMut() -> bool,
     ) -> bool {
-        if !self.relay.is_gateway {
+        // #gateway-election all-nodes-WiFi DEBUG: a NON-gateway reaches here only with the debug flag
+        // set (relay_ready_to_flush gates the same way). It bursts telemetry + reads the broker + can
+        // self-fetch, then returns to the mesh below; the election claim is suppressed (see the seed).
+        if !self.relay.is_gateway && !self.debug_wifi_all {
             return false;
         }
         log::info!("smol: relay flush -> MQTT burst (mesh deaf on ch6 during it)");
@@ -4505,6 +4685,21 @@ impl RadioManager {
         // until the first good flush, which mqtt_session's publish guard skips.
         elect.my_rssi = self.my_rssi_to_ap;
         elect.my_channel = self.learned_channel; // #29: seed the MC record's <ch> (0 until learned)
+        // #gateway-election: seed the best-gateway fitness signals (see maybe_leaf_reelect). On the
+        // flush path my_ap_channel is known (a running gateway is associated), so the deferral +
+        // fitness backoff are fully active. ntp_holder v1-stubbed false (follow-up).
+        elect.co_channel = self.my_ap_channel == ESP_NOW_FIXED_CHANNEL;
+        elect.co_channel_known = self.my_ap_channel != 0;
+        elect.mesh_channel = ESP_NOW_FIXED_CHANNEL; // LAYER 2: detect an off-channel owner in the MC
+        elect.ntp_holder = false;
+        // #gateway-election all-nodes-WiFi DEBUG: a NON-gateway node only reaches this flush because
+        // its debug flag is set. It must NEVER claim the crown (that would let every debug node fight
+        // for ownership) — suppress the claim exactly like the #146 flush-incapable guard, so the
+        // debug flush publishes telemetry + reads the broker + can self-fetch, but leaves the real
+        // election untouched. A genuine crown (is_gateway) is unaffected (flush_incapable stays false).
+        if !self.relay.is_gateway {
+            elect.flush_incapable = true;
+        }
         // #6 OTA: capture any gated retained announce this flush surfaces.
         let mut ota_offer: Option<crate::ota::Announce> = None;
         // #21: capture any default-screen config this flush surfaces.
@@ -4630,7 +4825,24 @@ impl RadioManager {
             if escalate {
                 let shed_justified = self.relay.deaf_bulk_seen
                     || self.relay.crown_deaf_streak >= DEAF_SHED_DEEP_STREAK;
-                if self.relay.reassoc_cycles >= DEAF_SHED_M && shed_justified {
+                // #217 rung-3 STRAND-GUARD: never shed into a crownless gap. Suppress the deaf-shed
+                // abdication whenever the crown is NOT co-channel (state != Normal = Shed OR Degraded).
+                // Gating on `!= Normal` (not `== Degraded`) closes a RACE: DEAF_SHED_M fires the
+                // abdication at reassoc_cycles>=2, but the Degraded latch needs shed_reclaims>=3 — so
+                // `== Degraded` left a shed_reclaims=1,2 window (state=Shed) where a sole off-channel
+                // crown could abdicate ~1 cycle BEFORE latching → a bounded crownless gap. `!= Normal`
+                // engages the instant the co-channel selector confirms no co-channel AP (Shed), so the
+                // never-crownless invariant holds BY CONSTRUCTION, not by a timing race. SAFE for #204:
+                // a co-channel decision resets crown_state to Normal, so a legitimate ch6-AP deaf-shed
+                // (deaf for non-channel reasons) stays Normal → NOT suppressed.
+                let strand_latched =
+                    self.crown_state != crate::net::coexist::CrownState::Normal;
+                if strand_latched {
+                    log::warn!(
+                        "smol #217r3: deaf-shed SUPPRESSED — strand-latched (no co-channel AP); staying crown (never crownless)"
+                    );
+                }
+                if self.relay.reassoc_cycles >= DEAF_SHED_M && shed_justified && !strand_latched {
                     // SHED / abdicate. Mirrors the #155 channel-yield abdication shape (leaf-scan +
                     // HELLO-silent) but tags `deaf_shed` — NOT flush_fail_latch: our UPLINK is fine (we
                     // just flushed `ok`); we're RX-deaf, not flush-incapable. The frozen MC lets the
@@ -4702,6 +4914,11 @@ impl RadioManager {
         // #100 Stage 3: the gateway's OWN OTA-host override — same self-apply path (take_cfg_offer(O)).
         if let Some((buf, len)) = gw_own.ota {
             self.cfg.set(crate::net::wifi::CFG_KEY_OTA, &buf[..len]);
+        }
+        // #gateway-election: the crown's OWN all-nodes-WiFi debug flag — same self-apply path
+        // (take_cfg_offer(A) → set debug_wifi_all).
+        if let Some((buf, len)) = gw_own.wifi_all {
+            self.cfg.set(crate::net::wifi::CFG_KEY_WIFI_ALL, &buf[..len]);
         }
         // #72: the gateway's OWN io pin-map — same self-apply path (take_cfg_offer(G)).
         #[cfg(feature = "io")]
@@ -4791,6 +5008,7 @@ impl RadioManager {
                 self.owner_hello_seen = false;
             }
             self.elected_owner = elect.owner_id;
+            self.elected_owner_channel = elect.owner_channel; // #gateway-election reliability (leaf-lock guard)
             if !elect.i_am_owner {
                 self.relay.is_gateway = false;
                 self.scan_locked = false;
@@ -4876,6 +5094,14 @@ impl RadioManager {
                 self.relay.flush_fails,
                 RELAY_FLUSH_INTERVAL_MS
             );
+        }
+        // #gateway-election all-nodes-WiFi DEBUG: a non-gateway debug node bursts then RETURNS to the
+        // mesh (a real crown STAYS associated for coexist). The ok-path above only drops to EspNow when
+        // it adopts a live owner; ensure a debug leaf returns to ch6 after EVERY burst — including a
+        // FAILED one — so it stays a functional mesh member between its periodic debug bursts.
+        // `switch` is a no-op when already in the mode, so this never double-switches.
+        if !self.relay.is_gateway {
+            let _ = self.switch(Mode::EspNow);
         }
         ok
     }
@@ -5015,7 +5241,19 @@ impl RadioManager {
                     // #23 leaf channel-lock: a leaf that hears the ELECTED OWNER's
                     // HELLO has found the mesh channel — lock (stop scanning) + stamp
                     // the time (silence re-scan is driven by `leaf_scan_tick`).
-                    if !self.relay.is_gateway && peer_id == self.elected_owner {
+                    // #gateway-election reliability: a CO-CHANNEL-capable board must NOT settle as a
+                    // happy leaf under a PROVEN OFF-CHANNEL owner. Locking (+ resetting owner-silence)
+                    // would stop the recovery bursts that RE-EVALUATE the co-channel SEIZE — making the
+                    // seize racy (it fired only ~2/3, when co_channel happened to be known before the
+                    // leaf-lock). So for a known-off-channel owner we SKIP the lock/silence-reset: the
+                    // leaf keeps re-electing (each recovery burst re-runs the seize with co_channel
+                    // reliably known from my_ap_channel) until it seizes the off-channel crown for good.
+                    let owner_off_channel = crate::net::election::refuse_leaf_lock_off_channel(
+                        self.my_ap_channel,
+                        ESP_NOW_FIXED_CHANNEL,
+                        self.elected_owner_channel,
+                    );
+                    if !self.relay.is_gateway && peer_id == self.elected_owner && !owner_off_channel {
                         self.scan_locked = true;
                         self.last_owner_heard_ms = now;
                         // #114 H1: our elected owner is provably ALIVE on the mesh (heard its
@@ -5024,6 +5262,12 @@ impl RadioManager {
                         // #51 A1: re-locked a valid owner's HELLO → resume normal HELLO
                         // (we are a healthy leaf again, no longer an abdicated ghost).
                         self.silent_until_relock = false;
+                    } else if !self.relay.is_gateway && peer_id == self.elected_owner && owner_off_channel {
+                        log::info!(
+                            "smol: #gateway-election — heard off-channel owner id{} (ch{}); NOT leaf-locking (co-channel, will re-elect to seize)",
+                            peer_id,
+                            self.elected_owner_channel
+                        );
                     }
 
                     // Register the broadcaster so the ACK below can be unicast (#28: bounded LRU).
@@ -5325,6 +5569,7 @@ impl RadioManager {
                     self.peers.last_hello_ms = now;
                     self.roster.heard(src, None, rssi, now);
                     if !self.relay.is_gateway
+                        && !self.ota_fetching // #gateway-election LAYER 3: fetch-quiet — no reflood TX mid-self-fetch
                         && payload.starts_with(b"BATT|")
                         && self.batt.set_fresh(payload, seq)
                     {
@@ -5346,6 +5591,7 @@ impl RadioManager {
                     self.peers.last_hello_ms = now;
                     self.roster.heard(src, None, rssi, now);
                     if !self.relay.is_gateway
+                        && !self.ota_fetching // #gateway-election LAYER 3: fetch-quiet — no reflood TX mid-self-fetch
                         && payload.starts_with(b"GRID|")
                         && self.grid.set_fresh(payload, seq)
                     {
@@ -5928,6 +6174,10 @@ pub fn start(
     let mut elect = crate::net::wifi::MeshElect::new(id);
     elect.now_ms = now_ms(); // seed the ONE clock the stale-owner timeout runs on
     elect.boot = true; // #51 return-flap: never displace a different owner already in the MC
+    // #gateway-election LAYER 2: seed the mesh channel so the BOOT election can recompute co_channel
+    // from the LIVE AP (mqtt_session reads current_ap_info) — WITHOUT this the boot resolver's
+    // co_channel stayed false and the co-channel seize could never fire at boot (the regression).
+    elect.mesh_channel = ESP_NOW_FIXED_CHANNEL;
     let mut ota_offer: Option<crate::ota::Announce> = None;
     let mut config_offer: Option<crate::app::DefaultScreen> = None;
     let mut install_requested = false;
@@ -5967,6 +6217,7 @@ pub fn start(
     // `synced` stays best-effort for TIME (mesh-time adoption handles an unsynced GW).
     radio.relay.is_gateway = reached_dhcp && elect.i_am_owner;
     radio.elected_owner = elect.owner_id;
+    radio.elected_owner_channel = elect.owner_channel; // #gateway-election reliability (leaf-lock guard)
     // #51 B: if we associated, seed the initial RSSI-to-AP so the first recovery
     // election already has a real signal-strength reading to compare on.
     if reached_dhcp {
@@ -5974,20 +6225,18 @@ pub fn start(
             radio.my_rssi_to_ap = r.clamp(-127, 0) as i8;
         }
     }
-    // #217 rung-2A: PROACTIVE reassoc at CROWN-ASSUMPTION. If this board just won the crown on a
-    // WEAK AP (rssi < -75 — the pcap deaf-AP class), steer to a strong ch6 AP BEFORE the coexist
-    // gateway commits below ("mesh rides my AP channel"). Crowning on a doomed link otherwise
-    // guarantees the #204 bulk-RX-deaf disease. reassoc_ch6_prefer no-ops mid mesh-OTA (ota_leaf).
-    // rssi trigger only this rung; ch-mismatch is a follow-up (no trivial current-AP-channel
-    // accessor at this site yet). Re-capture rssi after so #51 election + coexist use the new value.
-    if radio.relay.is_gateway && radio.my_rssi_to_ap < CROWN_AP_RSSI_MIN {
-        log::warn!(
-            "smol #217: crown-assumption on a weak AP (rssi {}) — proactive ch6-reassoc",
-            radio.my_rssi_to_ap
-        );
-        radio.reassoc_ch6_prefer();
-        if let Ok(r) = radio.controller.rssi() {
-            radio.my_rssi_to_ap = r.clamp(-127, 0) as i8;
+    // #217 rung-3 (HW-fix v900): do NOT reassoc at crown-assumption. burst_ntp's boot association
+    // (used for DHCP/NTP/boot-MQTT) must NOT be torn down here — `start()` time-share-switches to
+    // ESP-NOW immediately after, so a disconnect + pinned-reconnect would never complete → the crown
+    // ends un-associated → no telemetry. (v900 regression: `my_ap_channel` defaulted to 0, so the
+    // off_channel gate fired for EVERY crown, not just off-channel ones.) Co-channel is only required
+    // in the OTA/coexist window (crown fetching WHILE serving the mesh) — achieved JUST-IN-TIME at
+    // the pre-fetch 2B gate, where run_ota_fetch's assoc-wait absorbs the reconnect and the
+    // strand-guard gates OTA. Here we ONLY capture the REAL associated channel so off_channel is
+    // accurate for 2B + DIAG; crown stays Normal at boot (not pre-judged).
+    if radio.relay.is_gateway {
+        if let Some((ap_ch, _, _)) = crate::net::current_ap_info() {
+            radio.my_ap_channel = ap_ch;
         }
     }
     // #23 fix: persist the boot election's staleness observation → a leaf's later

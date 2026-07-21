@@ -1534,6 +1534,17 @@ fn main() -> ! {
                 }
             }
 
+            // #gateway-election: pull the relayed/gateway-own all-nodes-WiFi DEBUG flag (key `A`,
+            // fleet-global via broadcast target 255). `1`/`on`/`true` enables; anything else — incl.
+            // empty (retain-clear) or garbage — DISABLES, so clearing the retained topic turns debug
+            // off fleet-wide. Same unified relay/own path as UNITS (a leaf gets it relayed, the crown
+            // injects its own via GwOwnCfg).
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_WIFI_ALL) {
+                let v = core::str::from_utf8(&o.buf[..o.len]).unwrap_or("").trim();
+                let on = v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true");
+                r.set_debug_wifi_all(on);
+            }
+
             // #55: pull the relayed/gateway-own plugin-visibility mask (key `P`) and update it.
             // Edge-safe: garbage/partial hex parses to None → keep the current mask (never blanks
             // the menu). The mask filters Home-menu rows; a masked-off LIVE screen is caught after

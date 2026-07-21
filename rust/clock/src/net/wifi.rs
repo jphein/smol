@@ -91,6 +91,15 @@ const MESH_CHANNEL_TOPIC: &[u8] = b"smol/mesh/channel";
 #[cfg(feature = "wifi")]
 const MESH_CHANNEL_HINT_TOPIC: &[u8] = b"smol/mesh/channel_hint";
 
+/// #gateway-election OPERATOR LEVER: the retained best-gateway METRIC. Payload = keyed weights
+/// `c<n>r<n>n<n>u<n>` (co-channel / rssi / ntp / uptime), the literal `legacy` (escape hatch → the
+/// historical lowest-id + RSSI election), or empty (retain-clear → the on-by-default co-channel-
+/// dominant metric). Read in-burst by [`mqtt_session`] into `elect.elect_cfg` — the election consumes
+/// it in the SAME burst it claims in, so (unlike the CFG-relay family) no relay round-trip is needed.
+/// Twin transport of `channel_hint`; parsed by `election::parse_elect_config` (panic-free, fail-open).
+#[cfg(feature = "wifi")]
+const MESH_ELECT_TOPIC: &[u8] = b"smol/mesh/elect";
+
 /// #23 stage 3-4 boot ELECTION result, filled by [`mqtt_session`] from the retained
 /// `smol/mesh/channel`. A board that reached DHCP is a candidate; the lowest-id
 /// candidate is the OWNER (coexist gateway). Non-owners demote to leaf + scan for the
@@ -169,11 +178,38 @@ pub struct MeshElect {
     /// before, so a mesh is never left crownless while a channel is still being learned. `None` ⇒
     /// no gate ⇒ election unchanged. Same claim-guard shape as `flush_incapable` (#146).
     pub channel_hint: Option<u8>,
+    /// Best-gateway election (#gateway-election): this board's AP channel == the fixed mesh channel
+    /// (`ESP_NOW_FIXED_CHANNEL`) — the DOMINANT default-weighted fitness signal (an off-channel crown
+    /// is OTA-deaf regardless of RSSI, #217). Seeded by the caller from `self.my_ap_channel`.
+    pub co_channel: bool,
+    /// Best-gateway election: this board holds NTP-authoritative time (`synced_at != 0`) — a better
+    /// gateway can serve TIME frames. Seeded by the caller (0-weight-equivalent while uniformly false).
+    pub ntp_holder: bool,
+    /// #gateway-election LAYER 2: the fixed mesh channel (`ESP_NOW_FIXED_CHANNEL`), seeded by the
+    /// caller. Lets the resolver detect an OFF-channel owner (retained MC `<ch>` known and != this)
+    /// so a CO-CHANNEL board seizes the wrong (off-channel, OTA-deaf) crown IMMEDIATELY instead of
+    /// deferring to it (the dead/ghost or off-channel id5 case). 0 = unknown (unseeded / boot before
+    /// association) → the off-channel override never fires (safe).
+    pub mesh_channel: u8,
+    /// Best-gateway election FAIL-OPEN guard: true iff this board's AP channel is KNOWN (`my_ap_channel
+    /// != 0`), so `co_channel` is trustworthy. The empty-MC claim deferral fires ONLY when this is set —
+    /// a freshly-booted board (pre-scan, channel unknown) claims a vacant crown IMMEDIATELY (fast
+    /// cold-start preserved, mirroring #155's `my_channel == 0` fail-open). Best-gateway preference then
+    /// engages on later bursts once the channel is learned. Seeded by the caller.
+    pub co_channel_known: bool,
+    /// Best-gateway election POLICY from the retained `smol/mesh/elect` topic (twin of `channel_hint`):
+    /// `BestGateway(weights)` (default = on-by-default co-channel-dominant) or `Legacy` (the escape
+    /// hatch → historical lowest-id + RSSI recovery). Seeded in [`mqtt_session`] from the broker.
+    pub elect_cfg: crate::net::election::ElectConfig,
     // --- outputs (applied to the live role by the caller) ---
     /// True iff I claimed / hold ownership (I am the coexist gateway).
     pub i_am_owner: bool,
     /// The elected owner's id (== my_id when I own it).
     pub owner_id: u8,
+    /// #gateway-election reliability: the adopted/deferred owner's MC channel (`<ch>`; 0 = unknown /
+    /// self-claim). The caller records it as `elected_owner_channel` so a co-channel leaf REFUSES to
+    /// leaf-lock to a proven off-channel owner (keeps re-electing until the seize fires reliably).
+    pub owner_channel: u8,
     /// #51: true iff the adopted owner was GENUINELY LIVE (fresh seq), false iff it
     /// was dead-but-inside-our-backoff (a deferred takeover). The caller grace-resets
     /// its owner-silence clock ONLY for a genuinely-live owner — a dead-deferred owner
@@ -209,51 +245,42 @@ impl MeshElect {
             boot: false,
             flush_incapable: false, // #146: seeded by the caller from the flush-fail abdication latch
             channel_hint: None, // #155: seeded by the caller from the retained smol/mesh/channel_hint
+            co_channel: false, // best-gateway: seeded by the caller from my_ap_channel == mesh
+            ntp_holder: false, // best-gateway: seeded by the caller from synced_at != 0
+            mesh_channel: 0, // LAYER 2: seeded by the caller (ESP_NOW_FIXED_CHANNEL); 0 → override off
+            co_channel_known: false, // best-gateway: false at boot (channel unknown) → claim fast
+            // best-gateway is ON by default (team-lead 2026-07-20); the retained smol/mesh/elect topic
+            // re-weights or selects `legacy`. Absent/empty/garbage config keeps THIS default.
+            elect_cfg: crate::net::election::ElectConfig::BestGateway(
+                crate::net::election::MetricWeights::DEFAULT,
+            ),
             i_am_owner: false,
             owner_id: my_id,
+            owner_channel: 0, // #gateway-election reliability: set from the MC <ch> in the resolver
             owner_alive: false,
             hint_blocked: false, // #155: set by the claim gate on a channel-hint yield
             downstream_seen: false, // #204 2a: set true in the drain on any retained downstream
         }
     }
+
+    /// Best-gateway election: build the pure [`election::FitnessInputs`] from this board's seeded
+    /// signals. `uptime_ms` = `now_ms` (the monotonic loop clock IS uptime-since-boot), so the
+    /// empty-MC claim deferral is stateless.
+    fn fitness_inputs(&self) -> crate::net::election::FitnessInputs {
+        crate::net::election::FitnessInputs {
+            co_channel: self.co_channel,
+            ap_rssi: self.my_rssi,
+            ntp_holder: self.ntp_holder,
+            uptime_ms: self.now_ms,
+        }
+    }
 }
 
-/// #51: map a board's RSSI-to-AP (dBm) → how long it must WAIT, beyond `RECOVERY_STALE_MS`,
-/// before it may take over a dead owner. Stronger signal → shorter wait, so the best-uplink
-/// survivor claims the vacated ownership FIRST and publishes a fresh (retained) `MC`; weaker
-/// survivors, still inside their (longer) backoff, then observe that LIVE owner and adopt it
-/// — the WiFi-strength election JP asked for in #51, node-id only breaking exact-bucket ties.
-///
-/// The bucket step (`RSSI_BUCKET_STEP_MS`) is deliberately LARGER than the recovery-burst
-/// cadence (`REELECT_RETRY_MS`), so a weaker board always has a recovery burst BETWEEN the
-/// stronger board's claim and its own claim threshold — it reads the stronger board's retained
-/// MC and adopts it, and thus NEVER claims. That is what keeps the RSSI winner STABLE: with no
-/// competing claim, the gateway-flush path's lowest-id resolver never fires to undo it. (Two
-/// boards in the SAME bucket can still co-claim in one window → resolved deterministically by
-/// that lowest-id flush path = the intended node-id tiebreak for equal signal.)
-/// No new `MC` wire field: a board only ever compares its OWN rssi against this threshold.
-#[cfg(feature = "wifi")]
-fn reelect_backoff_ms(rssi: i8, node_id: u8) -> u64 {
-    // Bucket by signal strength (typical STA range ≈ -30 strong … -90 weak dBm).
-    let bucket: u64 = if rssi >= -65 {
-        0
-    } else if rssi >= -78 {
-        1
-    } else {
-        2
-    };
-    // One bucket step per weaker bucket (> the burst cadence, see above) + a small per-id
-    // term so same-bucket boards prefer the lower id (final tiebreak; sub-cadence, so it
-    // only orders an already-converging same-window co-claim, never separates buckets).
-    bucket * RSSI_BUCKET_STEP_MS + (node_id as u64) * 200
-}
-
-/// #51 recovery: RSSI backoff step. MUST exceed `REELECT_RETRY_MS` (10 s) so a weaker board
-/// gets a recovery burst (→ reads the winner's retained MC → adopts) before its own claim
-/// threshold — that's what keeps the stronger board's win stable (no competing claim, so the
-/// lowest-id flush resolver never fires to undo it).
-#[cfg(feature = "wifi")]
-const RSSI_BUCKET_STEP_MS: u64 = 15_000;
+// #51 → #gateway-election: the RSSI-weighted dead-owner takeover stagger + its `RSSI_BUCKET_STEP_MS`
+// moved into the PURE `net::election` module and were GENERALIZED into the configurable best-gateway
+// fitness backoff (co-channel-dominant by default; `election::elect_backoff_ms`). The historical
+// RSSI-only rule survives byte-faithfully as `election::legacy_recovery_backoff_ms`, selected by the
+// `ElectConfig::Legacy` escape hatch. The recovery resolver below dispatches on `elect.elect_cfg`.
 
 /// OTA (#33 Model-A): the ONE retained fleet STAGING topic (`OTA|build|size|sha256|url`)
 /// published by `ota_publish.sh stage`. Every board subscribes it as its `latest_version`
@@ -1345,6 +1372,21 @@ pub const CFG_KEY_IO_SET: u8 = b'g';
 #[allow(dead_code)]
 pub const CFG_KEY_NOTIFY: u8 = b'M';
 
+/// #gateway-election ALL-NODES-WiFi DEBUG flag (key `A`, verified free against the family
+/// `S L U P R Y W N B O G g M`). Fleet-GLOBAL, retained `smol/config/wifi_all`, value `0`/`1`.
+/// RETAINED/CACHED STATE (relayed like `U`/`N` under [`CFG_TARGET_ALL`]) — normally only the crown
+/// does WiFi bursts; when set, ANY node runs its own periodic telemetry burst (reads the broker +
+/// publishes its own telemetry) AND may self-fetch OTA on its own install command, so JP can verify
+/// each board's association / co-channel / OTA in isolation. Applied by setting
+/// `RadioManager::debug_wifi_all` (ungates `relay_ready_to_flush`; the debug flush claim-SUPPRESSES
+/// so it never perturbs the real crown election). DEBUG lever — default OFF; while ON every node
+/// periodically goes mesh-deaf + associates (the mesh fragments across channels), which is the
+/// intended test condition, not a normal-operation setting. Same wifi-tier/allow(dead_code)
+/// rationale as `R`/`W` (unused in a wifi-only build with no RadioManager).
+#[cfg(feature = "wifi")]
+#[allow(dead_code)]
+pub const CFG_KEY_WIFI_ALL: u8 = b'A';
+
 /// #48 (GwOwnCfg — approved arch): the GATEWAY's OWN per-node configs read from its own MQTT
 /// topics this burst. A leaf gets these RELAYED (→ its `CfgTracker`); the gateway reads them
 /// DIRECTLY. Bundled into ONE `run_mqtt_burst`/`mqtt_session` out-param (net +1, not +N) — after
@@ -1379,6 +1421,10 @@ pub struct GwOwnCfg {
     /// #100 Stage 3 the gateway's own `smol/<id>/config/ota_host` (or global `smol/config/ota_host`)
     /// OTA-host override value `(buf, len)`, or `None` if absent this burst.
     pub ota: Option<([u8; CFG_VALUE_MAX], usize)>,
+    /// #gateway-election the GLOBAL `smol/config/wifi_all` all-nodes-WiFi debug flag `(buf, len)`, or
+    /// `None` if absent this burst. The gateway self-applies it (sets its own `debug_wifi_all`) via
+    /// the CfgTracker inject, and relays it to leaves under `CFG_TARGET_ALL` (key `A`).
+    pub wifi_all: Option<([u8; CFG_VALUE_MAX], usize)>,
     /// #72 the gateway's own `smol/<id>/config/io` pin-map value `(buf, len)`, or `None` if
     /// absent this burst. `io`-gated so a non-io build's struct is byte-unchanged.
     #[cfg(feature = "io")]
@@ -1399,6 +1445,7 @@ impl GwOwnCfg {
             net: None,
             broker: None,
             ota: None,
+            wifi_all: None,
             #[cfg(feature = "io")]
             io: None,
             #[cfg(feature = "io")]
@@ -2237,6 +2284,13 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 11, b"smol/config/units") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
+        // #gateway-election all-nodes-WiFi debug flag (pid 27): the GLOBAL retained
+        // `smol/config/wifi_all` (`0`/`1`, no id). The crown caches it under CFG_TARGET_ALL so ONE
+        // relayed `<255>A<val>` frame reaches every leaf (they enable their own WiFi bursts without
+        // needing to read the broker themselves), and self-applies its own flag (gw_own.wifi_all).
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 27, b"smol/config/wifi_all") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
         // #55 plugin visibility (pid 12): wildcard-subscribe every leaf's retained plugin mask so
         // the gateway caches + relays it (key `P`) over ESP-NOW, twin of the led wildcard.
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 12, b"smol/+/config/plugins") {
@@ -2336,6 +2390,12 @@ fn mqtt_session(
     // retained value rides the SAME broker burst as `MC` and is captured before the resolver runs
     // (the settle window after the primary downlinks catches it, like the OTA/config retained topics).
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 25, MESH_CHANNEL_HINT_TOPIC) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
+    // #gateway-election: subscribe the retained best-gateway metric (packet-id 26 — next free above
+    // #155's 25). Rides the SAME broker burst as MC/channel_hint so the resolver reads the operator's
+    // metric BEFORE it claims (the settle window after the primary downlinks catches it).
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 26, MESH_ELECT_TOPIC) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
     }
 
@@ -2663,6 +2723,24 @@ fn mqtt_session(
                         if let Some(h) = elect.channel_hint {
                             log::info!("smol: #155 channel_hint = ch{} (retained)", h);
                         }
+                    } else if topic == MESH_ELECT_TOPIC {
+                        // #gateway-election: capture the operator's best-gateway metric into the
+                        // election record. Empty/garbage → BestGateway(DEFAULT) (on-by-default);
+                        // `legacy` → the escape hatch. The recovery-backoff + empty-MC-deferral arms
+                        // dispatch on it. Consumed in THIS burst (no CFG-relay round-trip).
+                        elect.elect_cfg = crate::net::election::parse_elect_config(payload);
+                        match elect.elect_cfg {
+                            crate::net::election::ElectConfig::Legacy => {
+                                log::info!("smol: #gateway-election metric = LEGACY (lowest-id, retained)")
+                            }
+                            crate::net::election::ElectConfig::BestGateway(w) => log::info!(
+                                "smol: #gateway-election metric = best-gateway c{} r{} n{} u{} (retained)",
+                                w.co_channel,
+                                w.rssi,
+                                w.ntp,
+                                w.uptime
+                            ),
+                        }
                     } else if topic == OTA_STAGED_TOPIC {
                         // #33 Model-A: parse + GATE the retained STAGED line (monotonicity +
                         // host allowlist + size). A gate-passing staged build becomes the
@@ -2780,6 +2858,20 @@ fn mqtt_session(
                         gw_own.units = Some(GwOwnCfg::val(payload));
                         log::info!(
                             "smol #43: global display units captured ({} B) — cached (255,U) + self",
+                            payload.len()
+                        );
+                    } else if topic == b"smol/config/wifi_all" {
+                        // #gateway-election all-nodes-WiFi DEBUG flag — GLOBAL (no id). Twin of the
+                        // units branch: (1) cache under CFG_TARGET_ALL so ONE relayed `<255>A<val>`
+                        // frame reaches every leaf; (2) capture into gw_own so `service()` self-applies
+                        // the crown's own flag. Value is `0`/`1` (parsed at apply time in main).
+                        if let Some(cache) = cfg_cache.as_deref_mut() {
+                            let now = Instant::now().duration_since_epoch().as_millis();
+                            cache.set(CFG_TARGET_ALL, CFG_KEY_WIFI_ALL, payload, [0u8; 6], now);
+                        }
+                        gw_own.wifi_all = Some(GwOwnCfg::val(payload));
+                        log::info!(
+                            "smol #gateway-election: all-nodes-WiFi flag captured ({} B) — cached (255,A) + self",
                             payload.len()
                         );
                     } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/plugins") {
@@ -3291,8 +3383,53 @@ fn mqtt_session(
     // NB: the "same owner we're waiting out" vs "a live owner to grace" distinction is now made
     // by `reset` (owner-changed OR seq-advanced this burst — see the alive branch + #114 churn
     // residual note), so no separate pre-observation snapshot of `seen_owner` is needed here.
+    // #gateway-election LAYER 2 (regression fix): make `co_channel` AUTHORITATIVE at election time.
+    // The BOOT election runs inside `burst_ntp` BEFORE `my_ap_channel` is refreshed (mode.rs seeds it
+    // AFTER burst_ntp), so the boot resolver saw co_channel=FALSE and could never fire the co-channel
+    // seize — the node deferred to the off-channel owner, then a happy leaf (ESP-NOW-locked to that
+    // owner's channel, hearing its HELLO → owner-silence never accrues) never re-elected, so the
+    // seize never ran again. Fix: we ARE associated in EVERY broker burst (boot/recovery/flush), so
+    // read the LIVE AP channel here (`esp_wifi_sta_get_ap_info`) and recompute co_channel vs the
+    // seeded mesh channel — and LOG it so the co-channel decision is visible on serial. espnow-only
+    // (current_ap_info is espnow-gated); a wifi-only build keeps the caller's seed (no mesh/election).
+    // RELIABILITY: `esp_wifi_sta_get_ap_info` can transiently return None / a 0 primary channel in the
+    // first moments after association (the ~1/3 racy-seize cause). RETRY a bounded number of times
+    // (polling the iface to let the association settle) for a NONZERO channel; and on a persistent
+    // transient DON'T clobber co_channel to false — keep the caller's seed (recovery/flush seed it
+    // accurately from my_ap_channel; boot falls back to the leaf-lock guard, which keeps re-electing).
+    #[cfg(feature = "espnow")]
+    if elect.mesh_channel != 0 {
+        let mut ap_ch = 0u8;
+        let mut ap_rssi = 0i8;
+        for _ in 0..24 {
+            if let Some((c, r, _)) = crate::net::current_ap_info() {
+                if c != 0 {
+                    ap_ch = c;
+                    ap_rssi = r;
+                    break;
+                }
+            }
+            iface.poll(smoltcp_now(), device, sockets); // give the association a beat to settle
+        }
+        if ap_ch != 0 {
+            elect.co_channel = ap_ch == elect.mesh_channel;
+            elect.co_channel_known = true;
+            log::info!(
+                "smol: #gateway-election AP ch={} rssi={} mesh_ch={} -> co_channel={}",
+                ap_ch,
+                ap_rssi,
+                elect.mesh_channel,
+                elect.co_channel
+            );
+        } else {
+            log::info!(
+                "smol: #gateway-election — AP channel unknown after retries (transient) — keeping co_channel={} (leaf-lock guard will re-elect)",
+                elect.co_channel
+            );
+        }
+    }
     let claim_seq: Option<u32> = match mc {
-        Some((owner, _ch, seq)) => {
+        Some((owner, mc_ch, seq)) => {
             // Refresh the staleness observation: a *changed* (owner,seq) resets the first-seen
             // clock. Same rule on BOTH paths — an ADVANCING seq is the authoritative
             // broker-liveness signal (a dead board can't publish), so it MUST reset "alive"
@@ -3306,6 +3443,9 @@ fn mqtt_session(
             }
             elect.seen_owner = owner;
             elect.seen_seq = seq;
+            // #gateway-election reliability: record the owner's MC channel so the caller knows whether
+            // the (adopted/deferred) owner is off-channel — read only when !i_am_owner (leaf).
+            elect.owner_channel = mc_ch;
             // #114 H3 (stale-self-reclaim fix): choose the dead-owner window by CORROBORATION.
             // `owner_never_heard` was introduced by H1 to mean "a forged/phantom retained MC no
             // board ever heard — take it over promptly". But it is ALSO true for EVERY freshly
@@ -3330,8 +3470,14 @@ fn mqtt_session(
             // over (#136 canary 1). A genuinely-dead owner's seq is frozen forever, so it is still
             // taken over at the window (#136 canary 2). Tracks #122 B1 automatically (at F=20 the
             // floor is 20+15=35, already covered). NEVER-heard keeps MC_STALE_MS (3×F, ≥ the floor).
+            // #gateway-election LAYER 2: a never-heard owner is normally taken over only after the
+            // CONSERVATIVE MC_STALE_MS (90 s = 3 missed flushes) so a live-but-unheard owner is never
+            // misjudged. But a CO-CHANNEL board is the legitimate best gateway — when it can't hear
+            // the named owner (ghost / off-channel incumbent it can't reach on ch6), it takes over on
+            // the FASTER RECOVERY_STALE_MS window (still frozen-seq-gated: a live owner's advancing
+            // seq resets `alive` and is adopted). Halves the "scanning for a dead owner" limbo.
             let stale_limit = if elect.recovery {
-                if elect.owner_never_heard {
+                if elect.owner_never_heard && !elect.co_channel {
                     MC_STALE_MS
                 } else {
                     RECOVERY_STALE_MS.max(elect.recovery_stale_floor_ms)
@@ -3340,7 +3486,59 @@ fn mqtt_session(
                 MC_STALE_MS
             };
             let alive = elect.now_ms.saturating_sub(elect.seen_ms) < stale_limit;
-            if elect.boot && owner != node_id {
+            // #gateway-election LAYER 2 OVERRIDE (the crown-migration fix): a CO-CHANNEL board seizes
+            // an owner PROVEN off-channel (its retained MC `<ch>` is KNOWN and != the mesh channel)
+            // IMMEDIATELY — an off-channel crown is the OTA-deaf WRONG gateway (the whole #204/#217
+            // disease), so the better board must win + hold, not defer to it (the id5-was-ch1-crown
+            // ghost). Bypasses the boot-defer + sticky-live-owner arms (it fires even against an
+            // "alive" off-channel owner — that IS the intended preemption). Once it crowns it publishes
+            // `MC|self|<mesh-ch>`, and no OTHER co-channel board preempts a co-channel owner → STABLE,
+            // no flap. Guarded: only a co-channel board (`co_channel`) with a KNOWN mesh channel, only
+            // a KNOWN-off-channel owner, never self. A live co-channel owner (MC `<ch> == mesh`) or an
+            // unknown-channel owner (`mc_ch == 0`) is untouched → resolved by the normal arms below.
+            let owner_off_channel = crate::net::election::seize_off_channel_owner(
+                elect.co_channel,
+                elect.mesh_channel,
+                node_id,
+                owner,
+                mc_ch,
+            );
+            if owner_off_channel {
+                log::info!(
+                    "smol: #gateway-election LAYER 2 — co-channel (ch{}) SEIZING off-channel owner id{} (its ch{}) — crown migration",
+                    elect.mesh_channel,
+                    owner,
+                    mc_ch
+                );
+                elect.owner_alive = false;
+                elect.i_am_owner = true;
+                elect.owner_id = node_id;
+                Some(seq.wrapping_add(1))
+            } else if crate::net::election::yield_to_co_channel_owner(
+                elect.co_channel_known,
+                elect.co_channel,
+                elect.mesh_channel,
+                node_id,
+                owner,
+                mc_ch,
+                alive,
+            ) {
+                // #gateway-election LAYER 2 (symmetric YIELD — makes the seize STICK): an OFF-channel
+                // board ADOPTS a LIVE co-channel owner (MC <ch> == mesh) regardless of id, instead of
+                // re-claiming via the lowest-id rule below. Without this a LOWER-id off-channel crown
+                // (id5) would re-take the crown from the co-channel board (id7) every flush → endless
+                // flap; with it the off-channel crown yields and the co-channel seize converges stable.
+                log::info!(
+                    "smol: #gateway-election LAYER 2 — off-channel YIELDING to co-channel owner id{} (its ch{}, mesh ch{})",
+                    owner,
+                    mc_ch,
+                    elect.mesh_channel
+                );
+                elect.owner_alive = true;
+                elect.i_am_owner = false;
+                elect.owner_id = owner;
+                None
+            } else if elect.boot && owner != node_id {
                 // #51 return-flap fix: a FRESH-booting board never displaces a DIFFERENT owner
                 // already in the retained MC. Come up as a leaf and defer — leaf-scan locks a
                 // LIVE owner's HELLO in seconds (no re-claim bounce), and the recovery election
@@ -3415,7 +3613,19 @@ fn mqtt_session(
                 let backoff = if elect.owner_never_heard {
                     (node_id as u64) * 200
                 } else {
-                    reelect_backoff_ms(elect.my_rssi, node_id)
+                    // #gateway-election: the dead-owner takeover stagger is now the CONFIGURABLE
+                    // best-gateway fitness backoff (co-channel-dominant by default) — so the
+                    // best-gateway survivor (co-channel > strong-RSSI > NTP > uptime) claims the
+                    // vacated crown FIRST and weaker survivors adopt its fresh MC. `Legacy` restores
+                    // the historical RSSI-only stagger byte-for-byte.
+                    match elect.elect_cfg {
+                        crate::net::election::ElectConfig::BestGateway(w) => {
+                            crate::net::election::elect_backoff_ms(&elect.fitness_inputs(), &w, node_id)
+                        }
+                        crate::net::election::ElectConfig::Legacy => {
+                            crate::net::election::legacy_recovery_backoff_ms(elect.my_rssi, node_id)
+                        }
+                    }
                 };
                 // #114 H3: gate on `stale_limit` (not a hardcoded RECOVERY_STALE_MS) so the
                 // never-heard takeover honours the SAME conservative 90s window used for `alive`
@@ -3436,12 +3646,45 @@ fn mqtt_session(
             }
         }
         None => {
-            // Empty/absent/unparseable topic → claim immediately (fast cold-start; a recovery
-            // that finds the record cleared also claims — sticky-adopt converges any race).
+            // Empty/absent/unparseable topic → the crown is VACANT.
             elect.owner_alive = false;
-            elect.i_am_owner = true;
-            elect.owner_id = node_id;
-            Some(1)
+            // #gateway-election: best-gateway DEFERS an empty-slot claim until this board's uptime
+            // clears its fitness backoff, so a co-channel board (short/zero backoff) crowns FIRST at
+            // cold boot and a weaker board re-reads its now-populated MC next burst and ADOPTS it —
+            // no #204/#217 shed cycle needed to migrate off a bad crown. STATELESS (uptime = now_ms);
+            // BOUNDED (MAX_ELECT_TIERS ⇒ ≤30 s) so a SOLE board still claims → never crownless. A
+            // long-lived board (high uptime) has a tiny backoff, so a running gateway re-claims a
+            // freshly-cleared MC without delay (the defer self-limits to boot-fresh boards). `Legacy`
+            // claims immediately (the historical fast cold-start).
+            // FAIL-OPEN: only defer once our AP channel is KNOWN (co_channel is trustworthy) — a
+            // pre-scan boot board claims immediately (fast cold-start, #155-style fail-open).
+            let defer = elect.co_channel_known
+                && match elect.elect_cfg {
+                    crate::net::election::ElectConfig::BestGateway(w) => {
+                        elect.now_ms
+                            < crate::net::election::elect_backoff_ms(
+                                &elect.fitness_inputs(),
+                                &w,
+                                node_id,
+                            )
+                    }
+                    crate::net::election::ElectConfig::Legacy => false,
+                };
+            if defer {
+                // Stay leaf this burst; owner_id == node_id (no foreign owner) → leaf-reelect retries
+                // on cadence until we claim (uptime clears backoff) or adopt a board that crowned.
+                elect.i_am_owner = false;
+                log::info!(
+                    "smol: best-gateway — deferring empty-MC claim (uptime {} ms < backoff, co_channel={})",
+                    elect.now_ms,
+                    elect.co_channel
+                );
+                None
+            } else {
+                elect.i_am_owner = true;
+                elect.owner_id = node_id;
+                Some(1)
+            }
         }
     };
     // #146 CLAIM guard: a board that abdicated on sustained flush failure (its WiFi uplink is
@@ -3492,8 +3735,18 @@ fn mqtt_session(
         elect.seen_owner = node_id;
         elect.seen_seq = newseq;
         elect.seen_ms = elect.now_ms;
+        // #gateway-election LAYER 2: a CO-CHANNEL crown MUST advertise the MESH channel in its MC
+        // <ch> (not the possibly-still-0 learned ESP-NOW channel), so an OFF-channel board recognizes
+        // it as co-channel and YIELDS (yield_to_co_channel_owner) instead of re-claiming via lowest-id
+        // — THAT is what makes the seize STICK (id5 yields to id7 → no flap). A non-co-channel
+        // claimant keeps its real learned channel (#29 unchanged when co_channel is false/unknown).
+        let pub_ch = if elect.co_channel && elect.mesh_channel != 0 {
+            elect.mesh_channel
+        } else {
+            elect.my_channel
+        };
         let mut mcp = MqttScratch::new();
-        let _ = write!(mcp, "MC|{}|{}|{}", node_id, elect.my_channel, newseq); // #29: real ch (0 until learned)
+        let _ = write!(mcp, "MC|{}|{}|{}", node_id, pub_ch, newseq); // #29/#gateway-election: co-channel crown advertises mesh ch
         // #51 A2 — CLAIM-AFTER-PUBLISH: only actually hold ownership if the retained MC
         // write reached the broker (proof our uplink is alive). If the publish fails, we
         // are NOT a valid owner — revert to leaf so ownership can't land on a board whose
@@ -3557,7 +3810,7 @@ fn mqtt_session(
                     // the retained record names us (the lowest); it yields when it re-reads.
                     let reseq = seq2.wrapping_add(1);
                     let mut mcp2 = MqttScratch::new();
-                    let _ = write!(mcp2, "MC|{}|{}|{}", node_id, elect.my_channel, reseq);
+                    let _ = write!(mcp2, "MC|{}|{}|{}", node_id, pub_ch, reseq); // #gateway-election: co-channel crown advertises mesh ch
                     if let Some(n) =
                         crate::net::mqtt::encode_publish(&mut pkt, MESH_CHANNEL_TOPIC, mcp2.as_bytes(), true)
                     {
@@ -4412,6 +4665,16 @@ pub fn run_ota_fetch(
         };
         if let Some((addr, router)) = configured {
             apply_dhcp(&mut iface, addr, router);
+            // #gateway-election fetch-leg diag: our DHCP IP + the server we're about to hit — so serial
+            // confirms id7 landed on the right subnet to REACH the image host (rules out a routing/
+            // firewall/VLAN mismatch as the byte-0 cause vs an on-air RX deafness).
+            log::info!(
+                "smol OTA: DHCP lease {:?} router {:?} — connecting {}:{}",
+                addr,
+                router,
+                host,
+                port
+            );
             break;
         }
         if Instant::now() > deadline {
@@ -4423,7 +4686,9 @@ pub fn run_ota_fetch(
 
     // Open the inactive-slot writer ONCE (image is streamed here across chunks, never buffered
     // whole). `writer.written()` doubles as the RESUME cursor and the running-SHA position.
-    let Some(mut writer) = crate::ota::ImageWriter::begin() else {
+    // #267: pass (build, sha) so the writer can resume a same-boot prior burst's committed offset
+    // instead of restarting the Range from byte 0 (see ImageWriter::begin / net::ota_resume).
+    let Some(mut writer) = crate::ota::ImageWriter::begin(announce.build, &announce.sha256) else {
         *fail = Some((0, 0, 0, 0, ota_fail::SLOT)); // #139/#147: died before the download (slot open)
         log::error!("smol OTA: cannot open inactive slot (no OTA partition table?)");
         return false;
@@ -4650,12 +4915,24 @@ pub fn run_ota_fetch(
             }
         }
 
+        // #gateway-election fetch-leg instrumentation: the handshake COMPLETED (may_send true above),
+        // so a byte-0 failure is post-connect — log that the request went out so serial shows whether
+        // the RESPONSE arrives (rx_total below) vs the handshake (which we already passed).
+        log::info!(
+            "smol OTA: chunk range {}-{} GET sent (TCP up) — awaiting 206",
+            off,
+            end
+        );
         // Drain this chunk's response into the writer (streaming; headers validated once/chunk).
         let chunk_start = writer.written();
         let mut header_buf = [0u8; 512];
         let mut header_len = 0usize;
         let mut headers_done = false;
         let mut bad = false;
+        // #gateway-election fetch-leg RX instrumentation: total bytes the socket delivered this chunk.
+        // 0 at break ⇒ RX-DEAF (handshake ok but no response bytes — the coexist/RF starvation);
+        // >0 with bad ⇒ a NON-206 / garbled response (logged verbatim below). Distinguishes the two.
+        let mut rx_total = 0usize;
         // #217: per-body-progress stall timer (see OTA_BODY_STALL). Tracks body advance so a byte-0
         // hang on an RX-deaf, never-closing connection falls through to the outer stall guard FAST
         // instead of spinning to the global DEADLINE.
@@ -4672,6 +4949,7 @@ pub fn run_ota_fetch(
                 let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
                 if s.can_recv() {
                     let outcome = s.recv(|data| {
+                        rx_total += data.len(); // #gateway-election: count every delivered byte
                         if !headers_done {
                             let take = core::cmp::min(header_buf.len() - header_len, data.len());
                             if take == 0 {
@@ -4681,8 +4959,12 @@ pub fn run_ota_fetch(
                             header_buf[header_len..header_len + take]
                                 .copy_from_slice(&data[..take]);
                             header_len += take;
-                            if let Some(bstart) = crate::ota::header_end(&header_buf[..header_len]) {
-                                match crate::ota::status_code(&header_buf[..header_len]) {
+                            if let Some(bstart) = crate::net::http::header_end(&header_buf[..header_len]) {
+                                // #gateway-election byte-0 FIX: parse the HEADER SLICE (`..bstart`),
+                                // NOT the whole buffer — when the header + start of the binary body
+                                // coalesce into one segment, feeding the body to from_utf8 made the
+                                // status parse None → the fetch died at byte 0 on a perfectly good 206.
+                                match crate::net::http::status_code(&header_buf[..bstart]) {
                                     Some(206) => {} // Partial Content — Range honoured
                                     Some(200) if off == 0 => {
                                         // Server ignored Range → full-body fallback (the old
@@ -4690,7 +4972,7 @@ pub fn run_ota_fetch(
                                         // before; this GET is NOT resumable (checked after drain).
                                         range_ok = false;
                                         if let Some(cl) =
-                                            crate::ota::content_length(&header_buf[..header_len])
+                                            crate::net::http::content_length(&header_buf[..bstart])
                                         {
                                             if cl != announce.size {
                                                 bad = true;
@@ -4698,7 +4980,20 @@ pub fn run_ota_fetch(
                                             }
                                         }
                                     }
-                                    _ => {
+                                    other => {
+                                        // #gateway-election fetch-leg diag: log the ACTUAL status + the
+                                        // raw response head so serial shows whether the server sent a
+                                        // non-206 (404/416/…) or a GARBLED header (partial RX). This is
+                                        // the definitive RX-deaf-vs-parse discriminator team-lead needs.
+                                        let n = header_len.min(96);
+                                        log::error!(
+                                            "smol OTA: NON-206 st={:?} range {}-{} rx={}B — head: {:?}",
+                                            other,
+                                            off,
+                                            end,
+                                            rx_total,
+                                            core::str::from_utf8(&header_buf[..n]).unwrap_or("<non-utf8>")
+                                        );
                                         bad = true; // non-206 range reply (or 200 mid-stream)
                                         return (take, false);
                                     }
@@ -4753,6 +5048,17 @@ pub fn run_ota_fetch(
             }
         }
 
+        // #gateway-election fetch-leg RX instrumentation: the decisive line. rx=0 ⇒ handshake ok but
+        // ZERO response bytes = RX-DEAF (coexist/RF starvation — the fetch-leg deafness). rx>0 + bad ⇒
+        // a real non-206/garbled reply (logged verbatim above). rx>0 + !headers_done ⇒ a truncated
+        // header (partial RX). Lets serial pinpoint the failure without a pcap.
+        log::info!(
+            "smol OTA: chunk drained — rx={}B body={}B headers_done={} bad={}",
+            rx_total,
+            writer.written().saturating_sub(chunk_start),
+            headers_done,
+            bad
+        );
         if bad {
             *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::STATUS));
             log::error!("smol OTA: bad HTTP status/length on range {off}-{end} (slot untouched)");

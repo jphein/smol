@@ -57,6 +57,13 @@ protocol = "sparse"
 # static RX buffer ≈ 1.6 KB, allocated at esp_wifi::init from the (now-grown) esp-alloc heap.
 # HW-GATE-HELD: throughput/stability win only provable on the deaf-list/fetch rig (pairs with #143).
 [env]
+# ALL-CHANNEL SCAN (association-layer fix, 2026-07-20): esp-wifi's default WIFI_FAST_SCAN stops at
+# the FIRST matching-SSID AP it hears, which made nodes associate to a WEAK ch1 AP (2c:56:dc @ -83)
+# over the STRONG ch6 office AP (a62bb0 @ -66) → off-channel → OTA-deaf (the #204/#217 root cause).
+# `1` = WIFI_ALL_CHANNEL_SCAN: scan every channel, then associate to the STRONGEST AP. This is the
+# prerequisite for the best-gateway election — the election's co_channel / ap_rssi inputs are only
+# meaningful once a board reliably associates to the right (strong, ch6) AP first.
+ESP_WIFI_CONFIG_SCAN_METHOD = "1"
 # 10→16: more 802.11 RX headroom (IDF throughput profile uses 16–25). +~9.6 KB permanent at init.
 ESP_WIFI_CONFIG_STATIC_RX_BUF_NUM = "16"
 # 32→40: on-demand ceiling; must be ≥ static_rx_buf_num. Freed as the TCP stack drains each frame.

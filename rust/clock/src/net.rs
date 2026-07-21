@@ -63,6 +63,13 @@ pub mod mode;
 #[cfg(feature = "espnow")]
 pub mod etx;
 
+// #267 cross-burst OTA-fetch resume: the PURE resume-key logic (does a saved cursor match this
+// staged image + slot → what offset to resume from). Host-testable (experiments/267_resume_verify),
+// no HAL deps. Consumed by `crate::ota::ImageWriter` (the HW flash writer + the .bss cursor), which
+// is espnow-gated — so gate it the same, byte-free of the default/wifi builds like `etx`/`flood`.
+#[cfg(feature = "espnow")]
+pub mod ota_resume;
+
 // #13 routed multi-hop mesh: the PURE managed-flood decision core (SeenSet + forward
 // decision + HopLatch escalation state machine), host-testable, no HAL deps. Driven by
 // the relay path in `mode`, so espnow-gated.
@@ -75,6 +82,27 @@ pub mod flood;
 // byte-compat guard. `mode` re-exports it via `use crate::net::wire::*`.
 #[cfg(feature = "espnow")]
 pub mod wire;
+
+// #217 rung-3: co-channel-preferred crown AP selection + the never-crownless strand-guard state
+// machine. PURE (no esp-hal/esp-wifi, no alloc) so it's host-tested verbatim by
+// `experiments/ap_select_verify` (#[path]-include, like `wire`); `wifi`/`mode` build ApViews from
+// scan results + drive the WiFi association + crown state from its decisions.
+#[cfg(feature = "espnow")]
+pub mod coexist;
+
+// Configurable best-gateway election — PURE (no esp-hal/esp-wifi, no alloc), host-tested verbatim by
+// `experiments/election_verify` (#[path]-include, like `coexist`). Seeded by `wifi`'s MeshElect
+// resolver + `mode`'s flush/recovery paths; gated to `wifi` (where MeshElect lives — every election
+// path is built with WiFi present).
+#[cfg(feature = "wifi")]
+pub mod election;
+
+// Minimal HTTP/1.x response-head parsers for the OTA fetch leg — PURE, host-tested verbatim by
+// `experiments/ota_http_verify` (#[path]-include). Extracted from `ota` so the #gateway-election
+// byte-0 fetch bug (a coalesced header+binary-body segment failing UTF-8 → status None) has ONE
+// definition with a regression test. `espnow`-gated (only `run_ota_fetch` uses it).
+#[cfg(feature = "espnow")]
+pub mod http;
 
 // #25 WLED WiZmote-emit (smol as a WLED "linked remote"). `wled = ["espnow"]`, so
 // this is present only in a wled build; the default/wifi/espnow builds are byte-free
@@ -142,6 +170,10 @@ pub use wifi::CFG_KEY_OTA;
 // #197 herald NOTIFY key — espnow leaf-apply path (take_cfg_offer(M) → crate::toast::set).
 #[cfg(feature = "espnow")]
 pub use wifi::CFG_KEY_NOTIFY;
+// #gateway-election all-nodes-WiFi DEBUG key — espnow leaf/own apply path
+// (take_cfg_offer(A) → RadioManager::set_debug_wifi_all).
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_KEY_WIFI_ALL;
 // #72 IO-registry key — the leaf/own apply path (take_cfg_offer(G) → io::apply_wire re-binds
 // the free GPIOs). `io`-gated (⊃ espnow): only the io apply path names it here.
 #[cfg(feature = "io")]
