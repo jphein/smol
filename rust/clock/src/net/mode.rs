@@ -6237,24 +6237,35 @@ async fn wifi_task(
                 // #139: re-assert PS=None before the handshake (connect resets it to MIN_MODEM,
                 // the unicast-deaf window).
                 let _ = controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
-                let connected = matches!(
-                    embassy_time::with_timeout(
-                        embassy_time::Duration::from_secs(15),
-                        controller.connect_async(),
-                    )
-                    .await,
-                    Ok(Ok(_))
-                );
-                LINK_UP.store(connected, Ordering::Relaxed);
+                let result = embassy_time::with_timeout(
+                    embassy_time::Duration::from_secs(15),
+                    controller.connect_async(),
+                )
+                .await;
                 WIFI_BUSY.store(false, Ordering::Relaxed);
-                if connected {
-                    log::info!(
-                        "smol #198 P1: wifi_task associated (ch{ESP_NOW_FIXED_CHANNEL}, ssid {})",
-                        net.ssid
-                    );
-                } else {
-                    log::warn!("smol #198 P1: wifi_task assoc failed/timed out");
-                }
+                // #198 Phase 1 inc4 — canary observation (§6 pts 6-7): log BSSID + channel so the
+                // fleet-observed canary can confirm the assoc landed CO-CHANNEL (ch6, the deaf-window
+                // precondition) and NOT on a weak off-channel AP. `co_channel=false` here predicts a
+                // deaf mesh — the #204/#217 failure signature.
+                let connected = match result {
+                    Ok(Ok(info)) => {
+                        let b = info.bssid;
+                        log::info!(
+                            "smol #198 P1 canary: wifi_task ASSOCIATED ssid={} bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ch={} mesh_ch={} co_channel={}",
+                            net.ssid,
+                            b[0], b[1], b[2], b[3], b[4], b[5],
+                            info.channel,
+                            ESP_NOW_FIXED_CHANNEL,
+                            info.channel == ESP_NOW_FIXED_CHANNEL,
+                        );
+                        true
+                    }
+                    _ => {
+                        log::warn!("smol #198 P1 canary: wifi_task assoc failed/timed out");
+                        false
+                    }
+                };
+                LINK_UP.store(connected, Ordering::Relaxed);
                 // Steady-state: mirror controller state for the inline election/coexist (DR-H1),
                 // refreshed at election granularity (seconds). (Phase 2/3 insert here: once
                 // `stack.config_v4().is_some()` → ntp_sync().await → MQTT open/done → then drop.)
