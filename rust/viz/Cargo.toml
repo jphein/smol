@@ -22,7 +22,12 @@ publish = false
 
 [workspace.dependencies]
 mesh-model = { path = "mesh-model" }
-rumqttc = "0.25"
+# #293: viz talks to the LOCAL broker over plaintext TCP only (MqttOptions::new host:1883 —
+# no Transport::Tls / ClientConfig anywhere), so drop rumqttc's default `use-rustls` feature.
+# That removes the rustls + aws-lc-rs/aws-lc-sys chain, which since rumqttc 0.25 (#288) forced a
+# cmake + C-compiler build dependency on this host workspace. The plaintext Client/EventLoop is
+# in rumqttc's core (not feature-gated), so nothing viz uses is lost.
+rumqttc = { version = "0.25", default-features = false }
 serde_json = "1"
 dotenvy = "0.15"
 
