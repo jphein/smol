@@ -59,3 +59,9 @@ protocol = "sparse"
 # Leaving the dead `[env]` keys here would falsely imply the #140 tuning is applied when it is NOT.
 # The heap-gate reasoning (72→128 KiB, ~1.6 KB/static-buf) still holds; the allocation just happens at
 # runtime `wifi::new()` now. HW-GATE-HELD: throughput win still only provable on the deaf-list/fetch rig.
+
+[env]
+# #198 Phase 1: defmt verbosity for the `--features defmt-canary` RTT stream (compile-time filter,
+# read ONLY by defmt's build script → a no-op for defmt-free release fleet builds). `info` surfaces
+# the boot banner + the bridged wifi_task assoc/DHCP/co_channel log:: lines without a debug firehose.
+DEFMT_LOG = "info"

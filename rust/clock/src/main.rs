@@ -55,6 +55,76 @@
 #[cfg(feature = "espnow")]
 extern crate alloc;
 
+// #198 Phase 1 — OPT-IN canary observability (feature `defmt-canary`). Installs the defmt-rtt
+// #[global_logger] + a `log`→defmt BRIDGE so the crate's EXISTING `log::` lines (boot banner +
+// wifi_task assoc/DHCP/co_channel) stream over RTT to `probe-rs run --chip esp32c3` on JP's canary
+// rig. Additive to any tier; NOT in `hw`/`default`, so the release fleet image is defmt-free +
+// serial-silent. ALLOC-FREE (fixed stack buffer) because `extern crate alloc` is espnow-gated but
+// this feature can ride any tier. build.rs adds `-Tdefmt.x` under this feature.
+#[cfg(feature = "defmt-canary")]
+mod defmt_canary {
+    use core::fmt::Write as _;
+    // `as _` links defmt-rtt's #[global_logger]; probe-rs reads its RTT channel.
+    use defmt_rtt as _;
+
+    // µs-since-boot on every defmt line (millis()' epoch is boot, same base).
+    defmt::timestamp!("{=u64:us}", {
+        esp_hal::time::Instant::now().duration_since_epoch().as_micros()
+    });
+
+    /// Fixed no-heap sink: format one `log` record into a stack buffer (truncating), then emit it
+    /// as a single defmt `{=str}` line. 256 B covers every smol log line with margin.
+    struct FmtBuf {
+        buf: [u8; 256],
+        len: usize,
+    }
+    impl core::fmt::Write for FmtBuf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let b = s.as_bytes();
+            let n = b.len().min(self.buf.len().saturating_sub(self.len));
+            self.buf[self.len..self.len + n].copy_from_slice(&b[..n]);
+            self.len += n;
+            Ok(())
+        }
+    }
+
+    struct Bridge;
+    impl log::Log for Bridge {
+        fn enabled(&self, _m: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            let mut fb = FmtBuf { buf: [0u8; 256], len: 0 };
+            let _ = write!(fb, "{}", record.args());
+            let s = core::str::from_utf8(&fb.buf[..fb.len]).unwrap_or("<non-utf8>");
+            // Map the `log` level to defmt's; DEFMT_LOG=info filters at compile time.
+            match record.level() {
+                log::Level::Error => defmt::error!("{=str}", s),
+                log::Level::Warn => defmt::warn!("{=str}", s),
+                log::Level::Info => defmt::info!("{=str}", s),
+                log::Level::Debug => defmt::debug!("{=str}", s),
+                log::Level::Trace => defmt::trace!("{=str}", s),
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    static BRIDGE: Bridge = Bridge;
+
+    /// Install the bridge as THE `log` logger (in place of esp-println's serial logger). Called
+    /// once at boot under the feature; `set_logger` erroring (already set) is ignored.
+    pub fn init() {
+        // rv32imc has no atomic-ptr, so `log`'s atomic `set_logger`/`set_max_level` are cfg'd out.
+        // Use the `_racy` variants — SAFE here: single-core, called exactly once at boot before any
+        // concurrent `log::` call (same path esp-println's logger takes on this target).
+        unsafe {
+            let _ = log::set_logger_racy(&BRIDGE);
+            log::set_max_level_racy(log::LevelFilter::Info);
+        }
+        defmt::info!("smol #198 P1 canary: defmt-rtt bridge up — log:: lines stream over RTT");
+    }
+}
+
 use embedded_graphics::{
     mono_font::{ascii::FONT_5X8, ascii::FONT_6X10, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
@@ -381,6 +451,11 @@ async fn main(spawner: Spawner) -> ! {
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
+    // #198 Phase 1: under `defmt-canary`, route `log::` → defmt-rtt (probe-rs RTT) via the bridge;
+    // otherwise the stock esp-println serial logger (release fleet: no ESP_LOG → serial-silent).
+    #[cfg(feature = "defmt-canary")]
+    defmt_canary::init();
+    #[cfg(not(feature = "defmt-canary"))]
     esp_println::logger::init_logger_from_env();
     log::info!("smol booting: unified firmware (menu: Clock / Snake / Bench)");
 

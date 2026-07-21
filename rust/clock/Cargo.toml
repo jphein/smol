@@ -103,6 +103,14 @@ embassy-sync = { version = "0.7", optional = true }
 # take NO extra feature here and ride that cfg. Gated under `wifi` so the host (`hostsim`) build
 # never pulls it (build-std is OFF — the #52 leak vector). See memory [smol-portable-atomic-riscv-pin].
 portable-atomic = { version = "1", optional = true }
+# #198 Phase 1 canary observability (defmt over RTT, read by `probe-rs run`) — OPT-IN + cfg-gated.
+# UNLIKE 0c′'s dc3e7b6 (which rode `hw` unconditionally), these ride the dedicated `defmt-canary`
+# feature so RELEASE FLEET builds link ZERO defmt (serial-silent, current behavior). Only a
+# `--features defmt-canary` build gets the RTT stream + the log→defmt bridge (main.rs). defmt 1.x
+# co-resolves with the esp-hal 1.1 ecosystem (verified vs the watch lock). Kept OFF the #152
+# hostsim host lib (defmt-rtt is a bare-metal RTT logger; the feature is never part of hostsim).
+defmt = { version = "1", optional = true }
+defmt-rtt = { version = "1", optional = true }
 # esp-wifi 0.15 → esp-radio 0.18 (RENAME). Dropped features vs esp-wifi: `smoltcp` (GONE —
 # esp-radio now exposes ONLY an embassy-net-driver Driver, no raw smoltcp Device) and
 # `builtin-scheduler` (moved into esp-rtos). `esp-now` is added by the `espnow` feature group.
@@ -177,6 +185,16 @@ hw = [
 # hostsim change in the shared source is `#[cfg(feature="hostsim")]`/`#[cfg(not)]`, so the
 # firmware (hw) path is untouched. See src/lib.rs.
 hostsim = []
+
+# #198 Phase 1 — OPT-IN canary observability. Adds the defmt-rtt #[global_logger] + a log→defmt
+# bridge (src/main.rs) so the EXISTING `log::` lines (boot banner + wifi_task assoc/DHCP/co_channel)
+# stream over RTT to `probe-rs run --chip esp32c3` on JP's canary rig. ADDITIVE to any tier
+# (e.g. `--features espnow,defmt-canary`); deliberately NOT implied by `hw`/`default`, so the
+# release FLEET image links ZERO defmt and stays serial-silent (memory: release logger baked at
+# build). build.rs adds the `-Tdefmt.x` linker section ONLY under this feature. Re-introduced from
+# 0c′ dc3e7b6 (reverted in 277bae6) per team-lead's Phase-1 closeout ruling; Phase 2's deaf-window
+# measurement harness (P2-H1) requires the RTT instrument.
+defmt-canary = ["dep:defmt", "dep:defmt-rtt"]
 
 # #72 IO/component registry (ESPHome inverted, "fat image / thin runtime config").
 # Compiles the digital-`Flex` driver menu into ONE image; a runtime pin-map relayed

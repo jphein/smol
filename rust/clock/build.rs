@@ -59,6 +59,17 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SMOL_BUILD_NUMBER");
     println!("cargo:rerun-if-env-changed=SMOL_RELEASE");
     println!("cargo:rerun-if-env-changed=SMOL_NODE_ID");
+
+    // #198 Phase 1: defmt's linker section (`-Tdefmt.x` — interned strings + level filtering) is
+    // required whenever defmt is LINKED, and MUST be absent otherwise (the section doesn't exist,
+    // so an unconditional `-Tdefmt.x` in `.cargo/config.toml` would break every non-defmt build).
+    // `.cargo/config.toml` rustflags can't be feature-conditional, so emit it HERE, gated on the
+    // `defmt-canary` feature (Cargo sets CARGO_FEATURE_DEFMT_CANARY for the build script when the
+    // feature is on). Release fleet builds (feature off) link no defmt + no defmt.x → serial-silent.
+    if std::env::var_os("CARGO_FEATURE_DEFMT_CANARY").is_some() {
+        println!("cargo:rustc-link-arg=-Tdefmt.x");
+    }
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DEFMT_CANARY");
 }
 
 /// Prefer the explicit env override (archive/pipeline), else read `path` (relative to the
