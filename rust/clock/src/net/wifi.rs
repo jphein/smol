@@ -31,7 +31,7 @@ use core::net::Ipv4Addr;
 use esp_hal::{
     peripherals::WIFI,
     rng::Rng,
-    time::{Duration, Instant},
+    time::Duration,
 };
 // 0c′ (#198): esp-radio 0.18 dropped the smoltcp `Device` (it exposes only an
 // embassy-net-driver `Driver`) and the `EspWifiController` handle. The WiFi-STA TCP/UDP
@@ -439,9 +439,8 @@ pub struct WifiPeripherals {
 /// unchanged and the (stubbed) NTP/MQTT/OTA-fetch signatures stay stable, keeping their
 /// KEEP-LIVE call sites in `net::mode` churn-free.
 /// TODO(#198 Phase 3): hand this to `embassy_net::new(interfaces.station, …)` instead.
-pub struct StaDevice(#[allow(dead_code)] pub esp_radio::wifi::Interface<'static>);
+pub struct StaDevice(pub esp_radio::wifi::Interface<'static>);
 
-/// smoltcp wants a monotonic timestamp; derive it from the HAL's clock.
 // 0c′ (#198): `smoltcp_now()` + `create_interface()` built the hand-driven smoltcp
 // `Interface` over esp-wifi 0.15's `WifiDevice`. esp-radio 0.18 has no smoltcp Device, so
 // both are removed; Phase 3 replaces them with `embassy_net::new(interfaces.station, …)`
@@ -610,20 +609,6 @@ pub fn run_mqtt_burst(
     log::info!("smol 0c\u{2032}: run_mqtt_burst STUBBED (async MQTT flush task in Phase 4)");
     false
 }
-
-
-
-
-
-use core::fmt::Write as _;
-
-
-
-
-
-
-
-
 
 /// #21 leaf-relay: max bytes of a relayed keyed-CFG value. Lives here (not `net::mode`) because
 /// the gateway FILLS the cache from MQTT in `mqtt_session` (compiled under `wifi`), while the

@@ -211,7 +211,7 @@ pub(crate) use wifi::NTP_RESYNC_AGE_S;
 /// so growing the heap is the safe unlock: it lifts the low-watermark to ~52 KB even after the
 /// #140 static-RX bump (.cargo/config.toml [env]). The region is uninit `.bss` in DMA-capable
 /// internal SRAM; 128 KiB keeps `.data`+`.bss` (~191 KB) well under the DRAM window before stack.
-#[cfg(feature = "wifi")]
+#[cfg(feature = "hw")] // #198: called unconditionally from main (D2 — default build allocates)
 pub fn init_heap() {
     esp_alloc::heap_allocator!(size: 128 * 1024);
 }
