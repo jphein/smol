@@ -92,16 +92,25 @@ static AP_RSSI: AtomicI16 = AtomicI16::new(i16::MIN);
 /// `esp_now.set_channel` retunes (the radio is transiently off-channel anyway, DR-M1). Steady
 /// state (ch6-locked assoc) it is false, so the mesh pins ch6 freely.
 static WIFI_BUSY: AtomicBool = AtomicBool::new(false);
+/// #198 Phase 1 (Oracle §2.5 POINT-2 fix): teardown request — an UNDROPPABLE level flag, NOT a
+/// channel message. A teardown routed through `WIFI_CMD` (a bounded `try_send`) could be DROPPED
+/// when the queue is full of redundant OpenWindows under coexist-FSM oscillation → `wifi_task`
+/// never tears down → radio stuck associated → mesh-deaf. A bool can't be queued-out or starved.
+/// One-shot handshake: the inline loop SETS true (`switch(EspNow)`); `wifi_task` CONSUMES it
+/// (`swap(false)`) — checked FIRST each mirror-loop iteration (and before opening). Teardown is
+/// idempotent so the set/clear race is benign (consistent with the DR-M4 request/ack pattern).
+static STOP_REQ: AtomicBool = AtomicBool::new(false);
 
-/// Controller ACTIONS the inline loop asks `wifi_task` to perform, fire-and-forget (DR-H1).
+/// The one action still routed over the channel: an OPEN request (an edge — "bring a window up").
+/// Teardown moved to the undroppable `STOP_REQ` atomic above (Oracle §2.5 POINT-2).
 enum WifiCmd {
-    /// Associate to the ch6 AP (real creds) + hold the link, mirroring AP_RSSI/LINK_UP, until Stop.
+    /// Associate to the ch6 AP (real creds) + hold the link, mirroring AP_RSSI/LINK_UP, until
+    /// `STOP_REQ` or link loss.
     OpenWindow,
-    /// Tear the association down (TIME-SHARE return to the ESP-NOW mesh channel).
-    Stop,
 }
-/// Bounded fire-and-forget mailbox: the inline loop `try_send`s (never awaits); `wifi_task`
-/// `receive().await`s. Depth 4 absorbs a couple of coalesced open/stop toggles without blocking.
+/// Bounded fire-and-forget mailbox for OPEN requests: the inline loop `try_send`s (never awaits);
+/// `wifi_task` `receive().await`s. The inline sender gates on `!LINK_UP && !WIFI_BUSY` so at most
+/// one open is ever in flight — the depth-4 queue can't fill (which was the POINT-2 drop vector).
 static WIFI_CMD: Channel<CriticalSectionRawMutex, WifiCmd, 4> = Channel::new();
 
 /// Fixed ESP-NOW channel used in TIME-SHARE mode. All smol units must agree on
@@ -2699,12 +2708,14 @@ impl RadioManager {
             Mode::EspNow => {
                 // TIME-SHARE: relinquish the AP association so nothing else steers the channel,
                 // then pin the fixed ESP-NOW channel.
-                // #198 Phase 1 inc2 (DR-H1): the AP disconnect is now a fire-and-forget action to
-                // `wifi_task` (it owns the controller) — non-blocking `try_send`, never awaits, so
-                // the ≤20 ms mesh tick is untouched. `wifi_task` does the async `disconnect_async`.
-                // Keep the MAC/PHY powered (do NOT stop the controller) so the esp_now handle stays
-                // valid; just retune the channel.
-                WIFI_CMD.try_send(WifiCmd::Stop).ok();
+                // #198 Phase 1 (DR-H1 + Oracle §2.5 POINT-2): the AP disconnect is a fire-and-forget
+                // teardown request to `wifi_task` (it owns the controller). Routed via the
+                // UNDROPPABLE `STOP_REQ` level flag (NOT the bounded channel) so a teardown can't be
+                // queue-dropped behind redundant opens → stuck-associated → mesh-deaf. Non-blocking
+                // store, never awaits (≤20 ms mesh tick untouched); `wifi_task` does the async
+                // `disconnect_async`. Keep the MAC/PHY powered (do NOT stop the controller) so the
+                // esp_now handle stays valid; just retune the channel.
+                STOP_REQ.store(true, Ordering::Relaxed);
                 self.esp_now
                     .set_channel(ESP_NOW_FIXED_CHANNEL)
                     .map_err(|_| ())?;
@@ -2714,12 +2725,17 @@ impl RadioManager {
                 );
             }
             Mode::WifiSta => {
-                // COEXIST: come back to the AP. #198 Phase 1 inc2 (DR-H1): ask `wifi_task` to open
-                // a ch6-locked WiFi window (fire-and-forget — never awaits). It handles the async
+                // COEXIST: come back to the AP. #198 Phase 1 (DR-H1): ask `wifi_task` to open a
+                // ch6-locked WiFi window (fire-and-forget — never awaits). It handles the async
                 // `connect_async` + re-asserts PS=None before the handshake (#139: connect resets
                 // PS to WIFI_PS_MIN_MODEM, the unicast-deaf window). ch6-lock keeps the radio
                 // co-channel with the mesh, so ESP-NOW coexists (the deaf-window thesis).
-                WIFI_CMD.try_send(WifiCmd::OpenWindow).ok();
+                // Oracle §2.5 POINT-2: only send an open when NO window is already up/coming
+                // (`!LINK_UP && !WIFI_BUSY`) — this keeps at most one open in flight, so the bounded
+                // channel can't fill with redundant opens (the drop vector for the teardown path).
+                if !LINK_UP.load(Ordering::Relaxed) && !WIFI_BUSY.load(Ordering::Relaxed) {
+                    WIFI_CMD.try_send(WifiCmd::OpenWindow).ok();
+                }
                 crate::net::assert_max_tx_power(); // #141
                 log::info!("smol: radio -> WiFi STA (coexist)");
             }
@@ -6243,74 +6259,77 @@ async fn wifi_task(
             .with_scan_method(esp_radio::wifi::sta::ScanMethod::AllChannels),
     );
     loop {
-        match WIFI_CMD.receive().await {
-            WifiCmd::OpenWindow => {
-                WIFI_BUSY.store(true, Ordering::Relaxed);
-                let _ = controller.set_config(&assoc_cfg);
-                // #139: re-assert PS=None before the handshake (connect resets it to MIN_MODEM,
-                // the unicast-deaf window).
-                let _ = controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
-                let result = embassy_time::with_timeout(
-                    embassy_time::Duration::from_secs(15),
-                    controller.connect_async(),
-                )
-                .await;
-                WIFI_BUSY.store(false, Ordering::Relaxed);
-                // #198 Phase 1 inc4 — canary observation (§6 pts 6-7): log BSSID + channel so the
-                // fleet-observed canary can confirm the assoc landed CO-CHANNEL (ch6, the deaf-window
-                // precondition) and NOT on a weak off-channel AP. `co_channel=false` here predicts a
-                // deaf mesh — the #204/#217 failure signature.
-                let connected = match result {
-                    Ok(Ok(info)) => {
-                        let b = info.bssid;
-                        log::info!(
-                            "smol #198 P1 canary: wifi_task ASSOCIATED ssid={} bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ch={} mesh_ch={} co_channel={}",
-                            net.ssid,
-                            b[0], b[1], b[2], b[3], b[4], b[5],
-                            info.channel,
-                            ESP_NOW_FIXED_CHANNEL,
-                            info.channel == ESP_NOW_FIXED_CHANNEL,
-                        );
-                        true
-                    }
-                    _ => {
-                        log::warn!("smol #198 P1 canary: wifi_task assoc failed/timed out");
-                        false
-                    }
-                };
-                LINK_UP.store(connected, Ordering::Relaxed);
-                // Steady-state: mirror controller state for the inline election/coexist (DR-H1),
-                // refreshed at election granularity (seconds). (Phase 2/3 insert here: once
-                // `stack.config_v4().is_some()` → ntp_sync().await → MQTT open/done → then drop.)
-                let mut logged_dhcp = false;
-                while LINK_UP.load(Ordering::Relaxed) {
-                    let rssi_i16 = match controller.rssi() {
-                        Ok(r) => r.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-                        Err(_) => i16::MIN,
-                    };
-                    AP_RSSI.store(rssi_i16, Ordering::Relaxed);
-                    LINK_UP.store(controller.is_connected(), Ordering::Relaxed);
-                    if !logged_dhcp {
-                        if let Some(cfg) = stack.config_v4() {
-                            log::info!("smol #198 P1: DHCP lease {}", cfg.address);
-                            logged_dhcp = true;
-                        }
-                    }
-                    if matches!(WIFI_CMD.try_receive(), Ok(WifiCmd::Stop)) {
-                        break;
-                    }
-                    embassy_time::Timer::after(embassy_time::Duration::from_millis(500)).await;
-                }
-                let _ = controller.disconnect_async().await;
-                LINK_UP.store(false, Ordering::Relaxed);
-                AP_RSSI.store(i16::MIN, Ordering::Relaxed);
-            }
-            WifiCmd::Stop => {
-                let _ = controller.disconnect_async().await;
-                LINK_UP.store(false, Ordering::Relaxed);
-                AP_RSSI.store(i16::MIN, Ordering::Relaxed);
-            }
+        // The only channel message is an OPEN request (edge). Teardown is the undroppable STOP_REQ
+        // level flag, checked below (Oracle §2.5 POINT-2).
+        WIFI_CMD.receive().await;
+        // A teardown may have raced ahead of this open (inline set STOP_REQ after queueing the
+        // open). Honor it — consume + skip opening — so a stale open can't reopen after a Stop.
+        if STOP_REQ.swap(false, Ordering::Relaxed) {
+            continue;
         }
+        WIFI_BUSY.store(true, Ordering::Relaxed);
+        let _ = controller.set_config(&assoc_cfg);
+        // #139: re-assert PS=None before the handshake (connect resets it to MIN_MODEM, the
+        // unicast-deaf window).
+        let _ = controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
+        let result = embassy_time::with_timeout(
+            embassy_time::Duration::from_secs(15),
+            controller.connect_async(),
+        )
+        .await;
+        WIFI_BUSY.store(false, Ordering::Relaxed);
+        // #198 Phase 1 inc4 — canary observation (§6 pts 6-7): log BSSID + channel so the
+        // fleet-observed canary can confirm the assoc landed CO-CHANNEL (ch6, the deaf-window
+        // precondition) and NOT on a weak off-channel AP. `co_channel=false` here predicts a
+        // deaf mesh — the #204/#217 failure signature.
+        let connected = match result {
+            Ok(Ok(info)) => {
+                let b = info.bssid;
+                log::info!(
+                    "smol #198 P1 canary: wifi_task ASSOCIATED ssid={} bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ch={} mesh_ch={} co_channel={}",
+                    net.ssid,
+                    b[0], b[1], b[2], b[3], b[4], b[5],
+                    info.channel,
+                    ESP_NOW_FIXED_CHANNEL,
+                    info.channel == ESP_NOW_FIXED_CHANNEL,
+                );
+                true
+            }
+            _ => {
+                log::warn!("smol #198 P1 canary: wifi_task assoc failed/timed out");
+                false
+            }
+        };
+        LINK_UP.store(connected, Ordering::Relaxed);
+        // Steady-state: mirror controller state for the inline election/coexist (DR-H1), refreshed
+        // at election granularity (seconds). (Phase 2/3 insert here: once
+        // `stack.config_v4().is_some()` → ntp_sync().await → MQTT open/done → then drop.)
+        let mut logged_dhcp = false;
+        while LINK_UP.load(Ordering::Relaxed) {
+            // Oracle §2.5 POINT-2: check the UNDROPPABLE teardown FIRST — consume it (swap) so a
+            // teardown of THIS open window can never be starved behind benign OpenWindows.
+            if STOP_REQ.swap(false, Ordering::Relaxed) {
+                break;
+            }
+            let rssi_i16 = match controller.rssi() {
+                Ok(r) => r.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                Err(_) => i16::MIN,
+            };
+            AP_RSSI.store(rssi_i16, Ordering::Relaxed);
+            LINK_UP.store(controller.is_connected(), Ordering::Relaxed);
+            if !logged_dhcp {
+                if let Some(cfg) = stack.config_v4() {
+                    log::info!("smol #198 P1: DHCP lease {}", cfg.address);
+                    logged_dhcp = true;
+                }
+            }
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(500)).await;
+        }
+        let _ = controller.disconnect_async().await;
+        LINK_UP.store(false, Ordering::Relaxed);
+        AP_RSSI.store(i16::MIN, Ordering::Relaxed);
+        // Teardown complete — clear any Stop that arrived during disconnect (it's satisfied).
+        STOP_REQ.store(false, Ordering::Relaxed);
     }
 }
 
@@ -6457,16 +6476,19 @@ pub fn start(
         log::info!("smol: leaf — scanning for gateway id{}", radio.elected_owner);
     }
 
-    // #198 Phase 1 inc2 — canary/deliverable trigger (TEMPORARY, Phase-1 stand-in).
+    // #198 Phase 1 — canary/deliverable trigger (TEMPORARY, Phase-1 stand-in).
     // The boot election runs over MQTT (Phase 3), so in Phase 1 NO node is elected gateway
     // (reached_dhcp is always false — NTP/MQTT are stubbed), and nothing above opens a WiFi window.
     // To prove the Phase-1 deliverable — a spawned `wifi_task` associates to the ch6 AP + gets a
-    // DHCP lease while the ESP-NOW mesh stays live (the deaf-window kill) — fire ONE OpenWindow
-    // here (fire-and-forget; queued after the leaf's Stop above, so it wins). `wifi_task` then
-    // associates ch6-locked + mirrors AP_RSSI/LINK_UP for the inline election.
-    // TODO(#198 Phase 3): DELETE this unconditional trigger — the MQTT-driven election opens the
-    // window only when ROLE==gateway + it's sync-time (spec §3.2), and switch(WifiSta)/switch(EspNow)
-    // (now wired to WIFI_CMD) drive the window lifecycle from the coexist FSM.
+    // DHCP lease while the ESP-NOW mesh stays live (the deaf-window kill) — request ONE window here.
+    // The leaf branch above ran `switch(EspNow)` which set STOP_REQ; this trigger is the definitive
+    // "open" intent, so clear that stale teardown first (safe: `start()` is synchronous, so
+    // `wifi_task` has not run yet — this is one-time boot setup, not the steady-state handshake),
+    // then queue the open. `wifi_task` associates ch6-locked + mirrors AP_RSSI/LINK_UP.
+    // TODO(#198 Phase 3): DELETE this trigger — the MQTT-driven election opens the window only when
+    // ROLE==gateway + it's sync-time (spec §3.2), and switch(WifiSta)/switch(EspNow) (wired to
+    // WIFI_CMD/STOP_REQ) drive the window lifecycle from the coexist FSM.
+    STOP_REQ.store(false, Ordering::Relaxed);
     WIFI_CMD.try_send(WifiCmd::OpenWindow).ok();
 
     (Some(radio), synced)
