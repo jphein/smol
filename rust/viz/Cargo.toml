@@ -22,7 +22,7 @@ publish = false
 
 [workspace.dependencies]
 mesh-model = { path = "mesh-model" }
-rumqttc = "0.24"
+rumqttc = "0.25"
 serde_json = "1"
 dotenvy = "0.15"
 
