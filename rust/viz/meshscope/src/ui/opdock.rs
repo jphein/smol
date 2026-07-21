@@ -95,7 +95,7 @@ pub fn show(ui: &mut egui::Ui, sel: Option<&Node>, publisher: &Publisher, st: &m
                 // Default screen.
                 ui.label(RichText::new("display").small().weak());
                 ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_source("op_screen")
+                    egui::ComboBox::from_id_salt("op_screen")
                         .selected_text(if st.screen_kind.is_empty() { "screen" } else { st.screen_kind.as_str() })
                         .show_ui(ui, |ui| {
                             for k in APPKINDS {
@@ -232,7 +232,7 @@ pub fn show(ui: &mut egui::Ui, sel: Option<&Node>, publisher: &Publisher, st: &m
         if have_msg {
             let lines = operator::wrap_preview(&msg);
             ui.label(RichText::new("preview (on glass):").small().weak());
-            egui::Frame::none().fill(Color32::from_rgb(18, 20, 26)).inner_margin(3.0).show(ui, |ui| {
+            egui::Frame::NONE.fill(Color32::from_rgb(18, 20, 26)).inner_margin(3).show(ui, |ui| {
                 for l in &lines {
                     ui.label(RichText::new(l).monospace().color(Color32::from_rgb(215, 220, 230)));
                 }
