@@ -2321,6 +2321,19 @@ impl RadioManager {
         if self.relay.is_gateway {
             return; // gateway owns its channel via association; never scans
         }
+        // #198 Phase 1 inc2 (DR-H1): while `wifi_task` holds a WiFi window, do NOT scan-hop — the
+        // STA associates CO-CHANNEL on ch6 (= ESP_NOW_FIXED_CHANNEL); hopping to ch1/11 would yank
+        // the radio off-channel and drop the association (recreating the deaf window). WIFI_BUSY =
+        // the brief assoc transient: the controller owns the channel, so don't touch it at all
+        // (DR-H1 "skip set_channel while WIFI_BUSY"). LINK_UP = the held window after assoc: pin
+        // ch6 for the mesh (it IS the AP channel — co-channel coexist).
+        if WIFI_BUSY.load(Ordering::Relaxed) {
+            return;
+        }
+        if LINK_UP.load(Ordering::Relaxed) {
+            let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+            return;
+        }
         // #3b (regression fix): while ACTIVELY receiving a mesh-OTA, HOLD the channel — do NOT
         // unlock/hop. The transfer runs on ESP_NOW_FIXED_CHANNEL and hopping mid-transfer drops
         // chunks. NARROW + bounded: true only during a live session (`is_active`); with no OTA in
