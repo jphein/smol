@@ -1,0 +1,68 @@
+# Dependabot — automated dependency currency for smol.
+#
+# Policy: JP's "latest-everything" — keep deps current, guard with the KATANA
+# 4-tier build gate (clippy -D warnings + release across espnow,cast,io / default
+# / wifi), NOT with version freezes. See rust/clock/rust-toolchain.toml.
+#
+# ┌─ CRITICAL: the esp-* matched set is IGNORED here ON PURPOSE ────────────────┐
+# │ esp-hal / esp-wifi / esp-backtrace / esp-println / esp-alloc / esp-storage / │
+# │ esp-bootloader-esp-idf / esp-wifi-sys  (+ smoltcp, which esp-wifi links      │
+# │ against) are an INTENTIONALLY version-LOCKED matched set — see the `=x.y.z`  │
+# │ pins + header comment in rust/clock/Cargo.toml. esp-wifi 0.15.x calls        │
+# │ esp-hal INTERNAL APIs (e.g. Rng::new(RNG)) whose signatures changed in       │
+# │ esp-hal 1.0.0-rc.1/1.0.0, so a naive individual bump FAILS to compile even   │
+# │ though Cargo's semver check passes; the same wave triggered the              │
+# │ portable-atomic host-leak build break. Upgrading the whole set is issue      │
+# │ #233's job — a HW-gated matched-set migration. Dependabot must never         │
+# │ auto-PR these, so they are in the `ignore` list below.                       │
+# └─────────────────────────────────────────────────────────────────────────────┘
+
+version: 2
+updates:
+  # ---- Rust / Cargo — host + firmware workspaces --------------------------
+  # experiments/* are deliberately EXCLUDED: throwaway host-test harnesses
+  # (version 0.0.0, publish = false, no Cargo.lock) — zero shipping value,
+  # would only add PR noise.
+  - package-ecosystem: "cargo"
+    directories:
+      - "/rust/clock"    # ESP32-C3 firmware crate (holds the esp-* `=` pins)
+      - "/rust/viz"      # host visualizers workspace (mesh-model/meshscope/observatory)
+      - "/rust/web-emu"  # wasm host emulator (path-deps clock w/ hostsim; no esp-* deps)
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # One consolidated PR per workspace per week for compatible bumps.
+      cargo-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # #233 matched set — do NOT auto-bump; breaks the firmware build.
+      - dependency-name: "esp-*"
+      - dependency-name: "smoltcp"
+
+  # ---- GitHub Actions (.github/workflows) ---------------------------------
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      github-actions-all:
+        applies-to: version-updates
+        patterns:
+          - "*"
