@@ -194,7 +194,7 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 13] = [
+const CFG_APPLY_KEYS: [u8; 14] = [
     crate::net::wifi::CFG_KEY_SCREEN,
     crate::net::wifi::CFG_KEY_LED,
     crate::net::wifi::CFG_KEY_UNITS,
@@ -221,6 +221,10 @@ const CFG_APPLY_KEYS: [u8; 13] = [
     // #197 herald NOTIFY: M — a COMMAND like R/W (buffered/applied via take_cfg_offer(M), NEVER
     // cached: a cached toast would re-show on every boot). One-shot; the leaf toasts + auto-dismisses.
     crate::net::wifi::CFG_KEY_NOTIFY,
+    // #gateway-election all-nodes-WiFi DEBUG flag: A — cached + relayed like U/N (a leaf takes it via
+    // take_cfg_offer(A) → sets debug_wifi_all). Fleet-global; the crown relays the retained value to
+    // every leaf so a node can enable its own WiFi bursts without first reaching the broker.
+    crate::net::wifi::CFG_KEY_WIFI_ALL,
 ];
 /// #50b leaf-status UPLINK tag: `"SMOLv1 STAT "` (12 B, trailing space) then `"NNN"`
 /// (3-ASCII zero-padded SENDER leaf id) then the verbatim live `<AppKind>:<page>` value
@@ -2059,6 +2063,12 @@ pub struct RadioManager {
     /// esp-wifi chose) → treated as off-channel so the first pre-fetch runs the co-channel scan.
     /// `off-channel` ⇔ `my_ap_channel != ESP_NOW_FIXED_CHANNEL`.
     my_ap_channel: u8,
+    /// #gateway-election ALL-NODES-WiFi DEBUG flag (from the retained `smol/config/wifi_all`, key
+    /// `A`, relayed to leaves). When true, THIS node runs its own periodic WiFi telemetry burst even
+    /// as a leaf (`relay_ready_to_flush` ungate — the debug flush claim-SUPPRESSES so it never
+    /// perturbs the crown election) and may self-fetch OTA on its own install command. DEBUG lever,
+    /// default false (normal operation = crown-only WiFi).
+    debug_wifi_all: bool,
     /// #217 rung-3: crown coexist state (Normal = co-channel + OTA-enabled; Degraded = off-channel
     /// but MQTT/mesh KEPT ALIVE + OTA disabled; Shed = abdicated). Drives the OTA-enable gate + the
     /// never-crownless strand-guard (`net::coexist::crown_next_state`).
@@ -2186,6 +2196,7 @@ impl RadioManager {
             silent_until_relock: false,
             my_rssi_to_ap: -99,
             my_ap_channel: 0, // #217 rung-3: unknown until a co-channel scan pins it
+            debug_wifi_all: false, // #gateway-election: all-nodes-WiFi debug flag, default OFF
             crown_state: crate::net::coexist::CrownState::Normal, // #217 rung-3
             shed_reclaims: 0, // #217 rung-3 strand-guard
             // #57: seed the familiar with our id (heartbeat phase + arbitration id).
@@ -3374,6 +3385,17 @@ impl RadioManager {
         self.relay.is_gateway
     }
 
+    /// #gateway-election: set the all-nodes-WiFi DEBUG flag (applied by `main` from the relayed /
+    /// gateway-own `A` config, `take_cfg_offer(CFG_KEY_WIFI_ALL)`). When true, THIS node does its own
+    /// periodic WiFi bursts even as a leaf (`relay_ready_to_flush` / `flush_telemetry` ungate) and may
+    /// self-fetch OTA; the debug flush claim-SUPPRESSES so it never perturbs the crown election.
+    pub fn set_debug_wifi_all(&mut self, on: bool) {
+        if self.debug_wifi_all != on {
+            log::info!("smol #gateway-election: all-nodes-WiFi debug -> {}", on);
+        }
+        self.debug_wifi_all = on;
+    }
+
     /// #27/#29: this node's current ESP-NOW channel for the peers + MC publish. Leaf = its
     /// locked scan channel (`CANDIDATES[scan_idx]` while `scan_locked`), else 0 (scanning);
     /// gateway = its `learned_channel` (#29 — the channel `rx_control` last saw a frame on;
@@ -3587,7 +3609,10 @@ impl RadioManager {
     /// Gateway only: are there buffered messages due for a flush burst (queue full,
     /// or the flush interval has elapsed with a non-empty queue)?
     pub fn relay_ready_to_flush(&self, now: u64) -> bool {
-        if !self.relay.is_gateway {
+        // #gateway-election all-nodes-WiFi DEBUG: normally only the crown flushes. When the debug flag
+        // is set, a NON-gateway node also flushes on the interval (reads the broker + publishes its own
+        // telemetry + can self-fetch OTA) — the debug flush claim-SUPPRESSES so it never claims the crown.
+        if !self.relay.is_gateway && !self.debug_wifi_all {
             return false;
         }
         let pending = self.relay.queue.iter().filter(|q| q.used).count();
@@ -4566,7 +4591,10 @@ impl RadioManager {
         leaf_ota: &mut Option<(u8, crate::ota::Announce)>,
         tick: &mut dyn FnMut() -> bool,
     ) -> bool {
-        if !self.relay.is_gateway {
+        // #gateway-election all-nodes-WiFi DEBUG: a NON-gateway reaches here only with the debug flag
+        // set (relay_ready_to_flush gates the same way). It bursts telemetry + reads the broker + can
+        // self-fetch, then returns to the mesh below; the election claim is suppressed (see the seed).
+        if !self.relay.is_gateway && !self.debug_wifi_all {
             return false;
         }
         log::info!("smol: relay flush -> MQTT burst (mesh deaf on ch6 during it)");
@@ -4611,6 +4639,14 @@ impl RadioManager {
         elect.co_channel = self.my_ap_channel == ESP_NOW_FIXED_CHANNEL;
         elect.co_channel_known = self.my_ap_channel != 0;
         elect.ntp_holder = false;
+        // #gateway-election all-nodes-WiFi DEBUG: a NON-gateway node only reaches this flush because
+        // its debug flag is set. It must NEVER claim the crown (that would let every debug node fight
+        // for ownership) — suppress the claim exactly like the #146 flush-incapable guard, so the
+        // debug flush publishes telemetry + reads the broker + can self-fetch, but leaves the real
+        // election untouched. A genuine crown (is_gateway) is unaffected (flush_incapable stays false).
+        if !self.relay.is_gateway {
+            elect.flush_incapable = true;
+        }
         // #6 OTA: capture any gated retained announce this flush surfaces.
         let mut ota_offer: Option<crate::ota::Announce> = None;
         // #21: capture any default-screen config this flush surfaces.
@@ -4826,6 +4862,11 @@ impl RadioManager {
         if let Some((buf, len)) = gw_own.ota {
             self.cfg.set(crate::net::wifi::CFG_KEY_OTA, &buf[..len]);
         }
+        // #gateway-election: the crown's OWN all-nodes-WiFi debug flag — same self-apply path
+        // (take_cfg_offer(A) → set debug_wifi_all).
+        if let Some((buf, len)) = gw_own.wifi_all {
+            self.cfg.set(crate::net::wifi::CFG_KEY_WIFI_ALL, &buf[..len]);
+        }
         // #72: the gateway's OWN io pin-map — same self-apply path (take_cfg_offer(G)).
         #[cfg(feature = "io")]
         if let Some((buf, len)) = gw_own.io {
@@ -4999,6 +5040,14 @@ impl RadioManager {
                 self.relay.flush_fails,
                 RELAY_FLUSH_INTERVAL_MS
             );
+        }
+        // #gateway-election all-nodes-WiFi DEBUG: a non-gateway debug node bursts then RETURNS to the
+        // mesh (a real crown STAYS associated for coexist). The ok-path above only drops to EspNow when
+        // it adopts a live owner; ensure a debug leaf returns to ch6 after EVERY burst — including a
+        // FAILED one — so it stays a functional mesh member between its periodic debug bursts.
+        // `switch` is a no-op when already in the mode, so this never double-switches.
+        if !self.relay.is_gateway {
+            let _ = self.switch(Mode::EspNow);
         }
         ok
     }

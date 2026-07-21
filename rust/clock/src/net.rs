@@ -163,6 +163,10 @@ pub use wifi::CFG_KEY_OTA;
 // #197 herald NOTIFY key — espnow leaf-apply path (take_cfg_offer(M) → crate::toast::set).
 #[cfg(feature = "espnow")]
 pub use wifi::CFG_KEY_NOTIFY;
+// #gateway-election all-nodes-WiFi DEBUG key — espnow leaf/own apply path
+// (take_cfg_offer(A) → RadioManager::set_debug_wifi_all).
+#[cfg(feature = "espnow")]
+pub use wifi::CFG_KEY_WIFI_ALL;
 // #72 IO-registry key — the leaf/own apply path (take_cfg_offer(G) → io::apply_wire re-binds
 // the free GPIOs). `io`-gated (⊃ espnow): only the io apply path names it here.
 #[cfg(feature = "io")]

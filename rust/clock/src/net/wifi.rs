@@ -1360,6 +1360,21 @@ pub const CFG_KEY_IO_SET: u8 = b'g';
 #[allow(dead_code)]
 pub const CFG_KEY_NOTIFY: u8 = b'M';
 
+/// #gateway-election ALL-NODES-WiFi DEBUG flag (key `A`, verified free against the family
+/// `S L U P R Y W N B O G g M`). Fleet-GLOBAL, retained `smol/config/wifi_all`, value `0`/`1`.
+/// RETAINED/CACHED STATE (relayed like `U`/`N` under [`CFG_TARGET_ALL`]) — normally only the crown
+/// does WiFi bursts; when set, ANY node runs its own periodic telemetry burst (reads the broker +
+/// publishes its own telemetry) AND may self-fetch OTA on its own install command, so JP can verify
+/// each board's association / co-channel / OTA in isolation. Applied by setting
+/// `RadioManager::debug_wifi_all` (ungates `relay_ready_to_flush`; the debug flush claim-SUPPRESSES
+/// so it never perturbs the real crown election). DEBUG lever — default OFF; while ON every node
+/// periodically goes mesh-deaf + associates (the mesh fragments across channels), which is the
+/// intended test condition, not a normal-operation setting. Same wifi-tier/allow(dead_code)
+/// rationale as `R`/`W` (unused in a wifi-only build with no RadioManager).
+#[cfg(feature = "wifi")]
+#[allow(dead_code)]
+pub const CFG_KEY_WIFI_ALL: u8 = b'A';
+
 /// #48 (GwOwnCfg — approved arch): the GATEWAY's OWN per-node configs read from its own MQTT
 /// topics this burst. A leaf gets these RELAYED (→ its `CfgTracker`); the gateway reads them
 /// DIRECTLY. Bundled into ONE `run_mqtt_burst`/`mqtt_session` out-param (net +1, not +N) — after
@@ -1394,6 +1409,10 @@ pub struct GwOwnCfg {
     /// #100 Stage 3 the gateway's own `smol/<id>/config/ota_host` (or global `smol/config/ota_host`)
     /// OTA-host override value `(buf, len)`, or `None` if absent this burst.
     pub ota: Option<([u8; CFG_VALUE_MAX], usize)>,
+    /// #gateway-election the GLOBAL `smol/config/wifi_all` all-nodes-WiFi debug flag `(buf, len)`, or
+    /// `None` if absent this burst. The gateway self-applies it (sets its own `debug_wifi_all`) via
+    /// the CfgTracker inject, and relays it to leaves under `CFG_TARGET_ALL` (key `A`).
+    pub wifi_all: Option<([u8; CFG_VALUE_MAX], usize)>,
     /// #72 the gateway's own `smol/<id>/config/io` pin-map value `(buf, len)`, or `None` if
     /// absent this burst. `io`-gated so a non-io build's struct is byte-unchanged.
     #[cfg(feature = "io")]
@@ -1414,6 +1433,7 @@ impl GwOwnCfg {
             net: None,
             broker: None,
             ota: None,
+            wifi_all: None,
             #[cfg(feature = "io")]
             io: None,
             #[cfg(feature = "io")]
@@ -2252,6 +2272,13 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 11, b"smol/config/units") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
+        // #gateway-election all-nodes-WiFi debug flag (pid 27): the GLOBAL retained
+        // `smol/config/wifi_all` (`0`/`1`, no id). The crown caches it under CFG_TARGET_ALL so ONE
+        // relayed `<255>A<val>` frame reaches every leaf (they enable their own WiFi bursts without
+        // needing to read the broker themselves), and self-applies its own flag (gw_own.wifi_all).
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 27, b"smol/config/wifi_all") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
         // #55 plugin visibility (pid 12): wildcard-subscribe every leaf's retained plugin mask so
         // the gateway caches + relays it (key `P`) over ESP-NOW, twin of the led wildcard.
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 12, b"smol/+/config/plugins") {
@@ -2819,6 +2846,20 @@ fn mqtt_session(
                         gw_own.units = Some(GwOwnCfg::val(payload));
                         log::info!(
                             "smol #43: global display units captured ({} B) — cached (255,U) + self",
+                            payload.len()
+                        );
+                    } else if topic == b"smol/config/wifi_all" {
+                        // #gateway-election all-nodes-WiFi DEBUG flag — GLOBAL (no id). Twin of the
+                        // units branch: (1) cache under CFG_TARGET_ALL so ONE relayed `<255>A<val>`
+                        // frame reaches every leaf; (2) capture into gw_own so `service()` self-applies
+                        // the crown's own flag. Value is `0`/`1` (parsed at apply time in main).
+                        if let Some(cache) = cfg_cache.as_deref_mut() {
+                            let now = Instant::now().duration_since_epoch().as_millis();
+                            cache.set(CFG_TARGET_ALL, CFG_KEY_WIFI_ALL, payload, [0u8; 6], now);
+                        }
+                        gw_own.wifi_all = Some(GwOwnCfg::val(payload));
+                        log::info!(
+                            "smol #gateway-election: all-nodes-WiFi flag captured ({} B) — cached (255,A) + self",
                             payload.len()
                         );
                     } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/plugins") {
