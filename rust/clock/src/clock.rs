@@ -150,6 +150,17 @@ pub(crate) fn draw_clock<D>(
     // Center: "12:34" (5ch/50px) -> x=11; "1:34" (4ch/40px) -> x=16.
     let tx = if two_digit { 11 } else { 16 };
 
+    // #276 persistent identity: the node's OWN fantasy noun, top-left on its own row above the
+    // big digits (y=0, 5x8 — same row the AM/PM tag uses on the RIGHT, so they never collide).
+    // Always painted regardless of what the bottom line carries — under espnow the bottom line is
+    // mesh chatter, so this header is the ONE place an idle Clock always says WHICH node it is.
+    // Nouns are ≤8 chars (≤42 px from x=2) → clear of the AM/PM tag at x=59. Mirrors About's
+    // noun-top-left treatment for a consistent identity read across screens.
+    let my_noun = crate::net::names::name_for_id(crate::node_id()).1;
+    Text::with_baseline(my_noun, Point::new(2, 0), label_style, Baseline::Top)
+        .draw(display)
+        .ok();
+
     // AM/PM small in the top-right (its own row above the big digits — no overlap). 12h ONLY;
     // a 24-hour clock has no AM/PM tag.
     if !units.clk_24h {
