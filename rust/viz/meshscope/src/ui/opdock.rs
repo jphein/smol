@@ -5,7 +5,7 @@
 
 use egui::{Color32, RichText};
 
-use crate::operator::{self, PublishReq, Publisher};
+use crate::operator::{self, HeraldAlign, HeraldSize, PublishReq, Publisher};
 use mesh_model::model::Node;
 
 /// Screen names = the exact `app.rs` `AppKind` wire spellings (single-source parity). Matches
@@ -26,7 +26,12 @@ pub struct OperatorState {
     screen_kind: String,
     screen_page: String,
     plugins_hex: String,
+    /// #197 custom-screen composer: the message text + its size/align/duration/priority.
     custom: String,
+    custom_size: HeraldSize,
+    custom_align: HeraldAlign,
+    custom_dur: String,
+    custom_priority: bool,
     io_map: String,
     io_set: String,
     broker: String,
@@ -131,12 +136,47 @@ pub fn show(ui: &mut egui::Ui, sel: Option<&Node>, publisher: &Publisher, st: &m
                     }
                 });
 
-                // Custom compose string.
+                // #197 Custom-screen composer — mirrors HA's herald composer; emits the fw #45
+                // wire via `compose_custom` so a board renders identically from HA or here.
+                ui.label(RichText::new("custom screen (composed)").small().weak());
+                ui.add(egui::TextEdit::singleline(&mut st.custom).desired_width(170.0).hint_text("message"));
                 ui.horizontal(|ui| {
-                    ui.label("Custom");
-                    ui.add(egui::TextEdit::singleline(&mut st.custom).desired_width(130.0));
-                    if ui.add_enabled(!st.custom.is_empty(), egui::Button::new("Set")).clicked() {
-                        action = Some(operator::custom(id, &st.custom.clone()));
+                    ui.label("size");
+                    ui.selectable_value(&mut st.custom_size, HeraldSize::Small, "S");
+                    ui.selectable_value(&mut st.custom_size, HeraldSize::Medium, "M");
+                    ui.selectable_value(&mut st.custom_size, HeraldSize::Large, "L");
+                    ui.separator();
+                    ui.label("align");
+                    ui.selectable_value(&mut st.custom_align, HeraldAlign::Left, "L");
+                    ui.selectable_value(&mut st.custom_align, HeraldAlign::Center, "C");
+                    ui.selectable_value(&mut st.custom_align, HeraldAlign::Right, "R");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("secs");
+                    ui.add(egui::TextEdit::singleline(&mut st.custom_dur).desired_width(28.0).hint_text("0"));
+                    ui.checkbox(&mut st.custom_priority, "priority");
+                });
+                let cust_msg = st.custom.clone();
+                let have_cust = !cust_msg.trim().is_empty();
+                // WYSIWYG preview: the wrapped rows exactly as the fw renders them at this size.
+                if have_cust {
+                    let rows = operator::compose_rows(&cust_msg, st.custom_size);
+                    ui.label(RichText::new("preview (on glass):").small().weak());
+                    egui::Frame::NONE.fill(Color32::from_rgb(18, 20, 26)).inner_margin(3).show(ui, |ui| {
+                        for r in &rows {
+                            ui.label(RichText::new(r).monospace().color(Color32::from_rgb(215, 220, 230)));
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(have_cust, egui::Button::new("Set custom")).clicked() {
+                        let dur = st.custom_dur.trim().parse::<u16>().ok();
+                        let wire = operator::compose_custom(&cust_msg, st.custom_size, st.custom_align, dur, st.custom_priority);
+                        action = Some(operator::custom(id, &wire));
+                    }
+                    // Empty retained payload clears the custom screen (retain-delete → noun fallback).
+                    if ui.button("Clear").clicked() {
+                        action = Some(operator::custom(id, ""));
                     }
                 });
 
