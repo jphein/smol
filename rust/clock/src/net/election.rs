@@ -144,6 +144,23 @@ pub fn elect_backoff_ms(i: &FitnessInputs, w: &MetricWeights, node_id: u8) -> u6
     tiers.min(MAX_ELECT_TIERS) * ELECT_TIER_STEP_MS + (node_id as u64) * 200
 }
 
+/// LAYER 2 (crown-migration override): should a CO-CHANNEL board SEIZE an owner proven OFF-channel?
+/// True iff we are co-channel with a KNOWN mesh channel, the owner is not us, and its advertised
+/// MC channel is KNOWN (`!= 0`) and != the mesh channel. An off-channel crown is the OTA-deaf WRONG
+/// gateway (the #204/#217 disease), so the better (co-channel) board takes it over IMMEDIATELY rather
+/// than deferring to it (the dead/ghost or off-channel incumbent). A live co-channel owner
+/// (`owner_ch == mesh_ch`) or an unknown-channel owner (`owner_ch == 0`) is NOT seized — those go
+/// through the normal liveness/lowest-id arms. Pure + deterministic.
+pub fn seize_off_channel_owner(
+    co_channel: bool,
+    mesh_ch: u8,
+    node_id: u8,
+    owner_id: u8,
+    owner_ch: u8,
+) -> bool {
+    co_channel && mesh_ch != 0 && owner_id != node_id && owner_ch != 0 && owner_ch != mesh_ch
+}
+
 /// `Legacy` recovery backoff — reproduces the historical `reelect_backoff_ms(rssi, node_id)` EXACTLY
 /// (bucket 0/1/2 × 15 s + id·200 ms), so `ElectConfig::Legacy` is a byte-faithful rollback of the
 /// election timing. Kept here (pure) so the regression is host-pinned alongside best-gateway.

@@ -94,6 +94,21 @@ fn main() {
     // garbage → default (fail toward the intended default behavior).
     assert_eq!(parse_elect_config(b"????"), ElectConfig::BestGateway(MetricWeights::DEFAULT), "garbage → default");
 
+    // ---- LAYER 2: co-channel seizes a proven off-channel owner (crown migration) -----------
+    const MESH: u8 = 6;
+    // co-channel board (mesh 6) vs owner on ch1 (the id5-was-ch1-crown ghost) → SEIZE.
+    assert!(seize_off_channel_owner(true, MESH, 7, 5, 1), "co-channel seizes off-channel owner id5@ch1");
+    // co-channel owner (ch == mesh) → do NOT seize (it's a valid crown).
+    assert!(!seize_off_channel_owner(true, MESH, 7, 5, MESH), "never seize a co-channel owner");
+    // owner channel unknown (0) → do NOT seize (fall through to liveness arms).
+    assert!(!seize_off_channel_owner(true, MESH, 7, 5, 0), "unknown owner channel → no seize");
+    // we are NOT co-channel → never seize (only the better board preempts).
+    assert!(!seize_off_channel_owner(false, MESH, 7, 5, 1), "non-co-channel board never seizes");
+    // our mesh channel unknown → never seize (safe).
+    assert!(!seize_off_channel_owner(true, 0, 7, 5, 1), "unknown mesh channel → no seize");
+    // owner is self → never seize.
+    assert!(!seize_off_channel_owner(true, MESH, 7, 7, 1), "never seize self");
+
     // ---- Legacy backoff is a byte-faithful 1:1 of the historical reelect_backoff_ms ---------
     assert_eq!(legacy_recovery_backoff_ms(-60, 5), 0 * ELECT_TIER_STEP_MS + 5 * 200, "legacy strong bucket 0");
     assert_eq!(legacy_recovery_backoff_ms(-70, 5), 1 * ELECT_TIER_STEP_MS + 5 * 200, "legacy mid bucket 1");

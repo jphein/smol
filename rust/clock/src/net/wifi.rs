@@ -185,6 +185,12 @@ pub struct MeshElect {
     /// Best-gateway election: this board holds NTP-authoritative time (`synced_at != 0`) — a better
     /// gateway can serve TIME frames. Seeded by the caller (0-weight-equivalent while uniformly false).
     pub ntp_holder: bool,
+    /// #gateway-election LAYER 2: the fixed mesh channel (`ESP_NOW_FIXED_CHANNEL`), seeded by the
+    /// caller. Lets the resolver detect an OFF-channel owner (retained MC `<ch>` known and != this)
+    /// so a CO-CHANNEL board seizes the wrong (off-channel, OTA-deaf) crown IMMEDIATELY instead of
+    /// deferring to it (the dead/ghost or off-channel id5 case). 0 = unknown (unseeded / boot before
+    /// association) → the off-channel override never fires (safe).
+    pub mesh_channel: u8,
     /// Best-gateway election FAIL-OPEN guard: true iff this board's AP channel is KNOWN (`my_ap_channel
     /// != 0`), so `co_channel` is trustworthy. The empty-MC claim deferral fires ONLY when this is set —
     /// a freshly-booted board (pre-scan, channel unknown) claims a vacant crown IMMEDIATELY (fast
@@ -237,6 +243,7 @@ impl MeshElect {
             channel_hint: None, // #155: seeded by the caller from the retained smol/mesh/channel_hint
             co_channel: false, // best-gateway: seeded by the caller from my_ap_channel == mesh
             ntp_holder: false, // best-gateway: seeded by the caller from synced_at != 0
+            mesh_channel: 0, // LAYER 2: seeded by the caller (ESP_NOW_FIXED_CHANNEL); 0 → override off
             co_channel_known: false, // best-gateway: false at boot (channel unknown) → claim fast
             // best-gateway is ON by default (team-lead 2026-07-20); the retained smol/mesh/elect topic
             // re-weights or selects `legacy`. Absent/empty/garbage config keeps THIS default.
@@ -3372,7 +3379,7 @@ fn mqtt_session(
     // by `reset` (owner-changed OR seq-advanced this burst — see the alive branch + #114 churn
     // residual note), so no separate pre-observation snapshot of `seen_owner` is needed here.
     let claim_seq: Option<u32> = match mc {
-        Some((owner, _ch, seq)) => {
+        Some((owner, mc_ch, seq)) => {
             // Refresh the staleness observation: a *changed* (owner,seq) resets the first-seen
             // clock. Same rule on BOTH paths — an ADVANCING seq is the authoritative
             // broker-liveness signal (a dead board can't publish), so it MUST reset "alive"
@@ -3410,8 +3417,14 @@ fn mqtt_session(
             // over (#136 canary 1). A genuinely-dead owner's seq is frozen forever, so it is still
             // taken over at the window (#136 canary 2). Tracks #122 B1 automatically (at F=20 the
             // floor is 20+15=35, already covered). NEVER-heard keeps MC_STALE_MS (3×F, ≥ the floor).
+            // #gateway-election LAYER 2: a never-heard owner is normally taken over only after the
+            // CONSERVATIVE MC_STALE_MS (90 s = 3 missed flushes) so a live-but-unheard owner is never
+            // misjudged. But a CO-CHANNEL board is the legitimate best gateway — when it can't hear
+            // the named owner (ghost / off-channel incumbent it can't reach on ch6), it takes over on
+            // the FASTER RECOVERY_STALE_MS window (still frozen-seq-gated: a live owner's advancing
+            // seq resets `alive` and is adopted). Halves the "scanning for a dead owner" limbo.
             let stale_limit = if elect.recovery {
-                if elect.owner_never_heard {
+                if elect.owner_never_heard && !elect.co_channel {
                     MC_STALE_MS
                 } else {
                     RECOVERY_STALE_MS.max(elect.recovery_stale_floor_ms)
@@ -3420,7 +3433,35 @@ fn mqtt_session(
                 MC_STALE_MS
             };
             let alive = elect.now_ms.saturating_sub(elect.seen_ms) < stale_limit;
-            if elect.boot && owner != node_id {
+            // #gateway-election LAYER 2 OVERRIDE (the crown-migration fix): a CO-CHANNEL board seizes
+            // an owner PROVEN off-channel (its retained MC `<ch>` is KNOWN and != the mesh channel)
+            // IMMEDIATELY — an off-channel crown is the OTA-deaf WRONG gateway (the whole #204/#217
+            // disease), so the better board must win + hold, not defer to it (the id5-was-ch1-crown
+            // ghost). Bypasses the boot-defer + sticky-live-owner arms (it fires even against an
+            // "alive" off-channel owner — that IS the intended preemption). Once it crowns it publishes
+            // `MC|self|<mesh-ch>`, and no OTHER co-channel board preempts a co-channel owner → STABLE,
+            // no flap. Guarded: only a co-channel board (`co_channel`) with a KNOWN mesh channel, only
+            // a KNOWN-off-channel owner, never self. A live co-channel owner (MC `<ch> == mesh`) or an
+            // unknown-channel owner (`mc_ch == 0`) is untouched → resolved by the normal arms below.
+            let owner_off_channel = crate::net::election::seize_off_channel_owner(
+                elect.co_channel,
+                elect.mesh_channel,
+                node_id,
+                owner,
+                mc_ch,
+            );
+            if owner_off_channel {
+                log::info!(
+                    "smol: #gateway-election LAYER 2 — co-channel (ch{}) SEIZING off-channel owner id{} (its ch{}) — crown migration",
+                    elect.mesh_channel,
+                    owner,
+                    mc_ch
+                );
+                elect.owner_alive = false;
+                elect.i_am_owner = true;
+                elect.owner_id = node_id;
+                Some(seq.wrapping_add(1))
+            } else if elect.boot && owner != node_id {
                 // #51 return-flap fix: a FRESH-booting board never displaces a DIFFERENT owner
                 // already in the retained MC. Come up as a leaf and defer — leaf-scan locks a
                 // LIVE owner's HELLO in seconds (no re-claim bounce), and the recovery election

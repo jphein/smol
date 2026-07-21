@@ -2069,6 +2069,15 @@ pub struct RadioManager {
     /// perturbs the crown election) and may self-fetch OTA on its own install command. DEBUG lever,
     /// default false (normal operation = crown-only WiFi).
     debug_wifi_all: bool,
+    /// #gateway-election LAYER 3 (fetch-quiet): true while THIS node is running an OTA self-fetch
+    /// (`run_ota_update`). Suppresses this node's own downlink RE-FLOOD so its ESP-NOW TX never
+    /// competes with the co-channel WiFi bulk-RX. NOTE: `run_ota_fetch` itself does ZERO mesh TX and
+    /// the fetch's tick doesn't service the mesh, so a crown is ALREADY TX-silent during its blocking
+    /// fetch — the real RX-starvation is the FLEET's reflood storm from an election split-brain
+    /// (multiple GRID2 origins → climbing seq defeats the strict-newer dedup), which the LAYER 2
+    /// single-stable-co-channel-crown fix removes. This flag is the belt-and-suspenders that also
+    /// covers a debug (all-nodes-WiFi) LEAF self-fetch. Default false → zero behavior change.
+    ota_fetching: bool,
     /// #217 rung-3: crown coexist state (Normal = co-channel + OTA-enabled; Degraded = off-channel
     /// but MQTT/mesh KEPT ALIVE + OTA disabled; Shed = abdicated). Drives the OTA-enable gate + the
     /// never-crownless strand-guard (`net::coexist::crown_next_state`).
@@ -2197,6 +2206,7 @@ impl RadioManager {
             my_rssi_to_ap: -99,
             my_ap_channel: 0, // #217 rung-3: unknown until a co-channel scan pins it
             debug_wifi_all: false, // #gateway-election: all-nodes-WiFi debug flag, default OFF
+            ota_fetching: false, // #gateway-election LAYER 3: fetch-quiet flag, default OFF
             crown_state: crate::net::coexist::CrownState::Normal, // #217 rung-3
             shed_reclaims: 0, // #217 rung-3 strand-guard
             // #57: seed the familiar with our id (heartbeat phase + arbitration id).
@@ -2343,6 +2353,7 @@ impl RadioManager {
         // zero ordering effect; wire from `my_synced_at` in a follow-up).
         elect.co_channel = self.my_ap_channel == ESP_NOW_FIXED_CHANNEL;
         elect.co_channel_known = self.my_ap_channel != 0;
+        elect.mesh_channel = ESP_NOW_FIXED_CHANNEL; // LAYER 2: detect an off-channel owner in the MC
         elect.ntp_holder = false;
         elect.seen_owner = self.mc_seen_owner;
         elect.seen_seq = self.mc_seen_seq;
@@ -3688,6 +3699,10 @@ impl RadioManager {
     ) -> bool {
         log::info!("smol OTA: opening update burst (mesh deaf for the whole download)");
         let _ = self.switch(Mode::WifiSta);
+        // #gateway-election LAYER 3 (fetch-quiet): mark the self-fetch active so this node's own
+        // downlink re-flood is suppressed (see the Batt2/Grid2 service arms). A SUCCESS reboots inside
+        // the fetch (flag reset by the reboot); both non-activating returns below clear it.
+        self.ota_fetching = true;
         // #217 rung-2B: pre-fetch AP-quality gate. If the current AP is weak (rssi < -75 — the pcap
         // deaf-AP class that never ACKs response byte 0), steer to a stronger ch6 AP BEFORE the
         // fetch (run_ota_fetch's own assoc-wait absorbs the reconnect latency). BEST-EFFORT
@@ -3716,6 +3731,7 @@ impl RadioManager {
                 "smol #217r3: crown off-channel (state={:?}) — OTA skipped cap-neutrally, staying crown",
                 self.crown_state
             );
+            self.ota_fetching = false; // LAYER 3: fetch not attempted → clear the quiet flag
             return true;
         }
         let rng = self.rng;
@@ -3757,6 +3773,7 @@ impl RadioManager {
                 }
             }
         }
+        self.ota_fetching = false; // LAYER 3: self-fetch attempt done → lift the quiet flag
         ok
     }
 
@@ -4638,6 +4655,7 @@ impl RadioManager {
         // fitness backoff are fully active. ntp_holder v1-stubbed false (follow-up).
         elect.co_channel = self.my_ap_channel == ESP_NOW_FIXED_CHANNEL;
         elect.co_channel_known = self.my_ap_channel != 0;
+        elect.mesh_channel = ESP_NOW_FIXED_CHANNEL; // LAYER 2: detect an off-channel owner in the MC
         elect.ntp_holder = false;
         // #gateway-election all-nodes-WiFi DEBUG: a NON-gateway node only reaches this flush because
         // its debug flag is set. It must NEVER claim the crown (that would let every debug node fight
@@ -5497,6 +5515,7 @@ impl RadioManager {
                     self.peers.last_hello_ms = now;
                     self.roster.heard(src, None, rssi, now);
                     if !self.relay.is_gateway
+                        && !self.ota_fetching // #gateway-election LAYER 3: fetch-quiet — no reflood TX mid-self-fetch
                         && payload.starts_with(b"BATT|")
                         && self.batt.set_fresh(payload, seq)
                     {
@@ -5518,6 +5537,7 @@ impl RadioManager {
                     self.peers.last_hello_ms = now;
                     self.roster.heard(src, None, rssi, now);
                     if !self.relay.is_gateway
+                        && !self.ota_fetching // #gateway-election LAYER 3: fetch-quiet — no reflood TX mid-self-fetch
                         && payload.starts_with(b"GRID|")
                         && self.grid.set_fresh(payload, seq)
                     {
