@@ -254,10 +254,10 @@ pub fn wrap_preview(msg: &str) -> Vec<String> {
 
 /// Glyph size for a custom row → the fw fonts (`custom.rs`): s=5x8, m=6x10, l=10x20. `width`/
 /// `max_rows` are luna's verified per-size capacities on the 72×40 panel (the #197 contract).
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // constructed by the #197 operator-dock composer UI (deferred — needs a GUI)
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum HeraldSize {
     Small,
+    #[default]
     Medium,
     Large,
 }
@@ -286,10 +286,10 @@ impl HeraldSize {
 }
 
 /// Row alignment within the 72 px panel (`custom.rs`): left / centre / right.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // constructed by the #197 operator-dock composer UI (deferred — needs a GUI)
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum HeraldAlign {
     Left,
+    #[default]
     Center,
     Right,
 }
@@ -303,15 +303,17 @@ impl HeraldAlign {
     }
 }
 
-/// #197: compose the CUSTOM-screen wire from operator inputs — the pure, testable core the dock
-/// UI (deferred) will call before [`custom`]. Sanitises (strip `|`/`;`, collapse, trim, cap),
-/// word-wraps to the size's WIDTH/MAXROWS, and frames the rows as `<count>[!][~dur]|seg;seg…`
-/// where each `seg = <size><align>row`. Empty/blank message → empty wire (which clears the
-/// screen). Pure + panic-free.
-// Consumed by the #197 dock composer UI, which is deferred (a GUI is needed to verify it); the
-// wire logic + its tests land now so that UI is a thin wiring layer. Same `allow` rationale as
-// the fw's "dead in this tier" builders.
-#[allow(dead_code)]
+/// #197: the wrapped on-glass ROWS for `msg` at `size` — sanitised then word-wrapped to the
+/// size's WIDTH/MAXROWS. The dock composer previews these (WYSIWYG, exactly what renders) and
+/// [`compose_custom`] frames them into the wire. Pure + panic-free.
+pub fn compose_rows(msg: &str, size: HeraldSize) -> Vec<String> {
+    wrap_to(&sanitize(msg), size.width(), size.max_rows())
+}
+
+/// #197: compose the CUSTOM-screen wire from operator inputs — the pure core the dock UI calls
+/// before [`custom`]. Word-wraps via [`compose_rows`] and frames the rows as
+/// `<count>[!][~dur]|seg;seg…` where each `seg = <size><align>row`. Empty/blank message → empty
+/// wire (which clears the screen). Pure + panic-free.
 pub fn compose_custom(
     msg: &str,
     size: HeraldSize,
@@ -319,7 +321,7 @@ pub fn compose_custom(
     dur_s: Option<u16>,
     priority: bool,
 ) -> String {
-    let rows = wrap_to(&sanitize(msg), size.width(), size.max_rows());
+    let rows = compose_rows(msg, size);
     if rows.is_empty() {
         return String::new();
     }
