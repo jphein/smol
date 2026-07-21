@@ -208,35 +208,140 @@ pub fn notify_fleet(dur_s: Option<u16>, msg: &str) -> PublishReq {
     PublishReq::transient_msg("smol/255/notify".to_string(), wire.into_bytes(), "FLEET notify → ALL glass".to_string(), true)
 }
 
-/// Greedy word-wrap for the dock PREVIEW — byte-for-byte the fw `toast::wrap` behaviour
-/// (12 cols, 3 rows, hard-split an over-wide word) so what-you-type-is-what-renders. Operates
-/// on the SANITIZED message (what actually goes on the wire).
-pub fn wrap_preview(msg: &str) -> Vec<String> {
-    let s = sanitize(msg);
+/// Greedy word-wrap to `width` cols, capped at `max_rows` rows (hard-split an over-wide word) —
+/// byte-for-byte the fw wrap behaviour. Operates on ALREADY-sanitized text. Shared by the toast
+/// preview (fixed 12×3) and the #197 custom composer (per-size WIDTH/MAXROWS).
+fn wrap_to(s: &str, width: usize, max_rows: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
-    let mut rest = s.as_str();
-    while !rest.is_empty() && lines.len() < NOTIFY_ROWS {
+    let mut rest = s;
+    while !rest.is_empty() && lines.len() < max_rows {
         rest = rest.trim_start_matches(' ');
         if rest.is_empty() {
             break;
         }
         let n = rest.chars().count();
-        if n <= NOTIFY_COLS {
+        if n <= width {
             lines.push(rest.to_string());
             break;
         }
-        // Find the last space within the first COLS chars (word boundary); else hard-split.
-        let window: String = rest.chars().take(NOTIFY_COLS).collect();
+        // Find the last space within the first `width` chars (word boundary); else hard-split.
+        let window: String = rest.chars().take(width).collect();
         let cut = window.rfind(' ');
         let take = match cut {
-            Some(pos) if pos > 0 => pos,          // break at the word boundary
-            _ => NOTIFY_COLS,                      // no space → hard split
+            Some(pos) if pos > 0 => pos, // break at the word boundary
+            _ => width,                  // no space → hard split
         };
         let head: String = rest.chars().take(take).collect();
         lines.push(head.trim_end().to_string());
         rest = &rest[rest.char_indices().nth(take).map(|(i, _)| i).unwrap_or(rest.len())..];
     }
     lines
+}
+
+/// Greedy word-wrap for the transient-toast dock PREVIEW — the fw `toast::wrap` behaviour (12
+/// cols, 3 rows) on the SANITIZED message (what actually goes on the wire).
+pub fn wrap_preview(msg: &str) -> Vec<String> {
+    wrap_to(&sanitize(msg), NOTIFY_COLS, NOTIFY_ROWS)
+}
+
+// --- #197 herald: composed CUSTOM screen (persistent) ----------------------------------
+// Mirrors HA's herald composer so a board renders identically whether driven from HA or the
+// meshscope operator dock. The wire is the fw #45 custom-screen format
+// `<count>|<size><align>row;…` (see fw `custom.rs`), with a `<count>` / `!`(priority) /
+// `~<dur>`(TTL) PREFIX that today's fw treats as advisory — it renders only the `;`-separated
+// segments after the first `|`; #160 fw will parse `!`/`~dur`. Reusing `sanitize`'s 48-char cap
+// is deliberate: it keeps the composed wire inside the fw `CFG_VALUE_MAX = 64` budget.
+
+/// Glyph size for a custom row → the fw fonts (`custom.rs`): s=5x8, m=6x10, l=10x20. `width`/
+/// `max_rows` are luna's verified per-size capacities on the 72×40 panel (the #197 contract).
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // constructed by the #197 operator-dock composer UI (deferred — needs a GUI)
+pub enum HeraldSize {
+    Small,
+    Medium,
+    Large,
+}
+impl HeraldSize {
+    fn wire(self) -> char {
+        match self {
+            Self::Small => 's',
+            Self::Medium => 'm',
+            Self::Large => 'l',
+        }
+    }
+    fn width(self) -> usize {
+        match self {
+            Self::Small => 14,
+            Self::Medium => 12,
+            Self::Large => 7,
+        }
+    }
+    fn max_rows(self) -> usize {
+        match self {
+            Self::Small => 4,
+            Self::Medium => 3,
+            Self::Large => 1,
+        }
+    }
+}
+
+/// Row alignment within the 72 px panel (`custom.rs`): left / centre / right.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // constructed by the #197 operator-dock composer UI (deferred — needs a GUI)
+pub enum HeraldAlign {
+    Left,
+    Center,
+    Right,
+}
+impl HeraldAlign {
+    fn wire(self) -> char {
+        match self {
+            Self::Left => 'l',
+            Self::Center => 'c',
+            Self::Right => 'r',
+        }
+    }
+}
+
+/// #197: compose the CUSTOM-screen wire from operator inputs — the pure, testable core the dock
+/// UI (deferred) will call before [`custom`]. Sanitises (strip `|`/`;`, collapse, trim, cap),
+/// word-wraps to the size's WIDTH/MAXROWS, and frames the rows as `<count>[!][~dur]|seg;seg…`
+/// where each `seg = <size><align>row`. Empty/blank message → empty wire (which clears the
+/// screen). Pure + panic-free.
+// Consumed by the #197 dock composer UI, which is deferred (a GUI is needed to verify it); the
+// wire logic + its tests land now so that UI is a thin wiring layer. Same `allow` rationale as
+// the fw's "dead in this tier" builders.
+#[allow(dead_code)]
+pub fn compose_custom(
+    msg: &str,
+    size: HeraldSize,
+    align: HeraldAlign,
+    dur_s: Option<u16>,
+    priority: bool,
+) -> String {
+    let rows = wrap_to(&sanitize(msg), size.width(), size.max_rows());
+    if rows.is_empty() {
+        return String::new();
+    }
+    // Prefix: <count>[!][~dur]. Advisory to today's fw (it splits on the first `|`).
+    let mut wire = rows.len().to_string();
+    if priority {
+        wire.push('!');
+    }
+    if let Some(d) = dur_s.filter(|&d| d > 0) {
+        wire.push('~');
+        wire.push_str(&d.to_string());
+    }
+    wire.push('|');
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            wire.push(';');
+        }
+        wire.push(size.wire());
+        wire.push(align.wire());
+        wire.push_str(row);
+    }
+    wire
 }
 
 // --- The publisher (own rumqttc client, distinct id) ----------------------------------
@@ -348,6 +453,34 @@ mod tests {
         assert_eq!(notify(7, None, "a|b;c").payload, b"a b c");
         // Wrap preview == the 12-col / 3-row fw toast behaviour.
         assert_eq!(wrap_preview("hello there friend"), ["hello there", "friend"]);
+    }
+
+    #[test]
+    fn compose_custom_wraps_frames_and_caps() {
+        // Medium (12 cols / 3 rows), centre: greedy wrap → `<count>|seg;seg` framing.
+        assert_eq!(
+            compose_custom("hello there friend", HeraldSize::Medium, HeraldAlign::Center, None, false),
+            "2|mchello there;mcfriend"
+        );
+        // Prefix: priority `!` then `~dur`; count reflects the wrapped row count.
+        assert_eq!(compose_custom("hi", HeraldSize::Large, HeraldAlign::Left, Some(5), true), "1!~5|llhi");
+        // dur = 0 means "keep" (no `~` TTL); no priority → a bare `<count>` prefix.
+        assert_eq!(compose_custom("hi", HeraldSize::Small, HeraldAlign::Right, Some(0), false), "1|srhi");
+        // MAXROWS cap: large = 1 row, so trailing words are dropped and the count stays 1.
+        assert_eq!(compose_custom("one two three four", HeraldSize::Large, HeraldAlign::Left, None, false), "1|llone");
+        // Sanitize: wire delimiters (`|`/`;`) become spaces so they can't corrupt the framing.
+        assert_eq!(compose_custom("a|b;c", HeraldSize::Small, HeraldAlign::Left, None, false), "1|sla b c");
+        // Blank message → empty wire (a retain-delete that clears the custom screen).
+        assert_eq!(compose_custom("   ", HeraldSize::Small, HeraldAlign::Left, None, false), "");
+        // Composed wire stays within the fw CFG_VALUE_MAX (64) even at the small-font worst case.
+        let worst = compose_custom(
+            "aaaaaaaaaaaaaa bbbbbbbbbbbbbb cccccccccccccc dddddddddddddd ee",
+            HeraldSize::Small,
+            HeraldAlign::Left,
+            None,
+            false,
+        );
+        assert!(worst.len() <= 64, "wire {} bytes exceeds CFG_VALUE_MAX: {worst}", worst.len());
     }
 
     #[test]
