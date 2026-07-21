@@ -161,6 +161,31 @@ pub fn seize_off_channel_owner(
     co_channel && mesh_ch != 0 && owner_id != node_id && owner_ch != 0 && owner_ch != mesh_ch
 }
 
+/// LAYER 2 (symmetric YIELD — makes the seize STICK): should an OFF-channel board ADOPT a LIVE
+/// co-channel owner regardless of node-id? True iff we are NOT co-channel (and know it), the owner is
+/// not us, its MC channel == the mesh channel (a co-channel crown), and it is alive. Without this the
+/// historical lowest-id rule lets a LOWER-id off-channel crown (id5) re-claim the crown from the
+/// co-channel board (id7) every flush → endless flap; with it the off-channel board yields, so the
+/// co-channel seize converges to a stable co-channel crown. Pure + deterministic. (A co-channel board
+/// never yields — it seizes instead; the two predicates are mutually exclusive on `co_channel`.)
+#[allow(clippy::too_many_arguments)]
+pub fn yield_to_co_channel_owner(
+    co_channel_known: bool,
+    co_channel: bool,
+    mesh_ch: u8,
+    node_id: u8,
+    owner_id: u8,
+    owner_ch: u8,
+    owner_alive: bool,
+) -> bool {
+    co_channel_known
+        && !co_channel
+        && mesh_ch != 0
+        && owner_id != node_id
+        && owner_ch == mesh_ch
+        && owner_alive
+}
+
 /// `Legacy` recovery backoff — reproduces the historical `reelect_backoff_ms(rssi, node_id)` EXACTLY
 /// (bucket 0/1/2 × 15 s + id·200 ms), so `ElectConfig::Legacy` is a byte-faithful rollback of the
 /// election timing. Kept here (pure) so the regression is host-pinned alongside best-gateway.

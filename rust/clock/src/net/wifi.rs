@@ -3378,6 +3378,32 @@ fn mqtt_session(
     // NB: the "same owner we're waiting out" vs "a live owner to grace" distinction is now made
     // by `reset` (owner-changed OR seq-advanced this burst — see the alive branch + #114 churn
     // residual note), so no separate pre-observation snapshot of `seen_owner` is needed here.
+    // #gateway-election LAYER 2 (regression fix): make `co_channel` AUTHORITATIVE at election time.
+    // The BOOT election runs inside `burst_ntp` BEFORE `my_ap_channel` is refreshed (mode.rs seeds it
+    // AFTER burst_ntp), so the boot resolver saw co_channel=FALSE and could never fire the co-channel
+    // seize — the node deferred to the off-channel owner, then a happy leaf (ESP-NOW-locked to that
+    // owner's channel, hearing its HELLO → owner-silence never accrues) never re-elected, so the
+    // seize never ran again. Fix: we ARE associated in EVERY broker burst (boot/recovery/flush), so
+    // read the LIVE AP channel here (`esp_wifi_sta_get_ap_info`) and recompute co_channel vs the
+    // seeded mesh channel — and LOG it so the co-channel decision is visible on serial. espnow-only
+    // (current_ap_info is espnow-gated); a wifi-only build keeps the caller's seed (no mesh/election).
+    #[cfg(feature = "espnow")]
+    if elect.mesh_channel != 0 {
+        match crate::net::current_ap_info() {
+            Some((ap_ch, ap_rssi, _)) => {
+                elect.co_channel = ap_ch == elect.mesh_channel;
+                elect.co_channel_known = true;
+                log::info!(
+                    "smol: #gateway-election AP ch={} rssi={} mesh_ch={} -> co_channel={}",
+                    ap_ch,
+                    ap_rssi,
+                    elect.mesh_channel,
+                    elect.co_channel
+                );
+            }
+            None => log::info!("smol: #gateway-election — current_ap_info None (not associated at election?)"),
+        }
+    }
     let claim_seq: Option<u32> = match mc {
         Some((owner, mc_ch, seq)) => {
             // Refresh the staleness observation: a *changed* (owner,seq) resets the first-seen
@@ -3461,6 +3487,30 @@ fn mqtt_session(
                 elect.i_am_owner = true;
                 elect.owner_id = node_id;
                 Some(seq.wrapping_add(1))
+            } else if crate::net::election::yield_to_co_channel_owner(
+                elect.co_channel_known,
+                elect.co_channel,
+                elect.mesh_channel,
+                node_id,
+                owner,
+                mc_ch,
+                alive,
+            ) {
+                // #gateway-election LAYER 2 (symmetric YIELD — makes the seize STICK): an OFF-channel
+                // board ADOPTS a LIVE co-channel owner (MC <ch> == mesh) regardless of id, instead of
+                // re-claiming via the lowest-id rule below. Without this a LOWER-id off-channel crown
+                // (id5) would re-take the crown from the co-channel board (id7) every flush → endless
+                // flap; with it the off-channel crown yields and the co-channel seize converges stable.
+                log::info!(
+                    "smol: #gateway-election LAYER 2 — off-channel YIELDING to co-channel owner id{} (its ch{}, mesh ch{})",
+                    owner,
+                    mc_ch,
+                    elect.mesh_channel
+                );
+                elect.owner_alive = true;
+                elect.i_am_owner = false;
+                elect.owner_id = owner;
+                None
             } else if elect.boot && owner != node_id {
                 // #51 return-flap fix: a FRESH-booting board never displaces a DIFFERENT owner
                 // already in the retained MC. Come up as a leaf and defer — leaf-scan locks a
@@ -3658,8 +3708,18 @@ fn mqtt_session(
         elect.seen_owner = node_id;
         elect.seen_seq = newseq;
         elect.seen_ms = elect.now_ms;
+        // #gateway-election LAYER 2: a CO-CHANNEL crown MUST advertise the MESH channel in its MC
+        // <ch> (not the possibly-still-0 learned ESP-NOW channel), so an OFF-channel board recognizes
+        // it as co-channel and YIELDS (yield_to_co_channel_owner) instead of re-claiming via lowest-id
+        // — THAT is what makes the seize STICK (id5 yields to id7 → no flap). A non-co-channel
+        // claimant keeps its real learned channel (#29 unchanged when co_channel is false/unknown).
+        let pub_ch = if elect.co_channel && elect.mesh_channel != 0 {
+            elect.mesh_channel
+        } else {
+            elect.my_channel
+        };
         let mut mcp = MqttScratch::new();
-        let _ = write!(mcp, "MC|{}|{}|{}", node_id, elect.my_channel, newseq); // #29: real ch (0 until learned)
+        let _ = write!(mcp, "MC|{}|{}|{}", node_id, pub_ch, newseq); // #29/#gateway-election: co-channel crown advertises mesh ch
         // #51 A2 — CLAIM-AFTER-PUBLISH: only actually hold ownership if the retained MC
         // write reached the broker (proof our uplink is alive). If the publish fails, we
         // are NOT a valid owner — revert to leaf so ownership can't land on a board whose
@@ -3723,7 +3783,7 @@ fn mqtt_session(
                     // the retained record names us (the lowest); it yields when it re-reads.
                     let reseq = seq2.wrapping_add(1);
                     let mut mcp2 = MqttScratch::new();
-                    let _ = write!(mcp2, "MC|{}|{}|{}", node_id, elect.my_channel, reseq);
+                    let _ = write!(mcp2, "MC|{}|{}|{}", node_id, pub_ch, reseq); // #gateway-election: co-channel crown advertises mesh ch
                     if let Some(n) =
                         crate::net::mqtt::encode_publish(&mut pkt, MESH_CHANNEL_TOPIC, mcp2.as_bytes(), true)
                     {

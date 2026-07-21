@@ -109,6 +109,20 @@ fn main() {
     // owner is self → never seize.
     assert!(!seize_off_channel_owner(true, MESH, 7, 7, 1), "never seize self");
 
+    // ---- LAYER 2 symmetric YIELD: off-channel board adopts a live co-channel owner (no flap) ----
+    // id5 (off-channel, ch known) reading MC|7|6 (co-channel owner, alive) → YIELD (adopt id7).
+    assert!(yield_to_co_channel_owner(true, false, MESH, 5, 7, MESH, true), "off-channel yields to live co-channel owner id7");
+    // a CO-channel board never yields (it seizes instead) — mutually exclusive on co_channel.
+    assert!(!yield_to_co_channel_owner(true, true, MESH, 5, 7, MESH, true), "co-channel board never yields");
+    // owner is off-channel (ch1) → do NOT yield (that's a seize case for a co-channel board).
+    assert!(!yield_to_co_channel_owner(true, false, MESH, 5, 7, 1, true), "don't yield to an off-channel owner");
+    // co-channel owner but DEAD → do NOT yield (never follow a dead crown; fall through to takeover).
+    assert!(!yield_to_co_channel_owner(true, false, MESH, 5, 7, MESH, false), "don't yield to a dead co-channel owner");
+    // channel not yet known → do NOT yield (fail-safe until learned).
+    assert!(!yield_to_co_channel_owner(false, false, MESH, 5, 7, MESH, true), "no yield until channel known");
+    // owner is self → never yield.
+    assert!(!yield_to_co_channel_owner(true, false, MESH, 7, 7, MESH, true), "never yield to self");
+
     // ---- Legacy backoff is a byte-faithful 1:1 of the historical reelect_backoff_ms ---------
     assert_eq!(legacy_recovery_backoff_ms(-60, 5), 0 * ELECT_TIER_STEP_MS + 5 * 200, "legacy strong bucket 0");
     assert_eq!(legacy_recovery_backoff_ms(-70, 5), 1 * ELECT_TIER_STEP_MS + 5 * 200, "legacy mid bucket 1");

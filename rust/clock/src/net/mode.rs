@@ -6120,6 +6120,10 @@ pub fn start(
     let mut elect = crate::net::wifi::MeshElect::new(id);
     elect.now_ms = now_ms(); // seed the ONE clock the stale-owner timeout runs on
     elect.boot = true; // #51 return-flap: never displace a different owner already in the MC
+    // #gateway-election LAYER 2: seed the mesh channel so the BOOT election can recompute co_channel
+    // from the LIVE AP (mqtt_session reads current_ap_info) — WITHOUT this the boot resolver's
+    // co_channel stayed false and the co-channel seize could never fire at boot (the regression).
+    elect.mesh_channel = ESP_NOW_FIXED_CHANNEL;
     let mut ota_offer: Option<crate::ota::Announce> = None;
     let mut config_offer: Option<crate::app::DefaultScreen> = None;
     let mut install_requested = false;
