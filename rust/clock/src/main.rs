@@ -91,12 +91,19 @@ use embassy_executor::Spawner;
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
-    i2c::master::{Config as I2cConfig, I2c},
+    i2c::master::{BusTimeout, Config as I2cConfig, I2c, SoftwareTimeout},
     interrupt::software::SoftwareInterruptControl,
+    time::Duration,
     time::Instant,
     time::Rate,
     timer::timg::TimerGroup,
 };
+// #198 inc9 canary: install defmt's RTT #[global_logger] (bin-only; probe-rs reads the RTT
+// stream). Existing `log`/esp-println over USB-JTAG is untouched — defmt is a SEPARATE transport
+// for the id5 probe-rs canary (WiFi stubbed ⇒ no MQTT ground-truth). `as _` = link the logger.
+use defmt_rtt as _;
+// Microsecond timestamps on every defmt line (since-boot; `millis()`'s epoch is boot).
+defmt::timestamp!("{=u64:us}", Instant::now().duration_since_epoch().as_micros());
 use ssd1306::{prelude::*, size::DisplaySize72x40, I2CDisplayInterface, Ssd1306};
 // `DisplayConfig::init` inits the PLAIN Ssd1306 (non-cast builds). Under `feature =
 // "cast"` the display is the `CastOled` tee, whose inherent `init()` forwards to the
@@ -373,6 +380,10 @@ async fn main(_spawner: Spawner) -> ! {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+    // #198 inc9 canary #1/#2: esp_rtos::start returned ⇒ the RTOS runtime + embassy executor are
+    // up on the C3 — THE 0c′ thesis. First defmt line the id5 probe-rs canary should see; the 1 Hz
+    // heartbeat (main loop) then proves the main task keeps ticking under the executor.
+    defmt::info!("smol 0c\u{2032}: esp_rtos::start OK — executor up on esp32c3");
 
     esp_println::logger::init_logger_from_env();
     log::info!("smol booting: unified firmware (menu: Clock / Snake / Bench)");
@@ -440,7 +451,17 @@ async fn main(_spawner: Spawner) -> ! {
     // --- I2C bus to the OLED -------------------------------------------------
     let i2c = I2c::new(
         peripherals.I2C0,
-        I2cConfig::default().with_frequency(Rate::from_khz(400)),
+        // esp-hal rc.0→1.1 semantic drift (migration-hazards #1): the I2C `Config` default
+        // lost its per-byte software SCL timeout (now `SoftwareTimeout::None`). A stuck or
+        // clock-stretched OLED SCL would then wedge the per-tick flush loop → WDT → boot-loop
+        // (a confusing "why did it reset" on the id5 probe-rs canary, not a clean executor
+        // signal). Restore a bounded timeout: a HW bus-cycle cap + a ~1 ms/byte software cap so
+        // the already-`.ok()`-tolerated flush just drops a frame instead of hanging. (Headless
+        // boards NACK the OLED anyway → tolerated; see the run-HEADLESS note below.)
+        I2cConfig::default()
+            .with_frequency(Rate::from_khz(400))
+            .with_timeout(BusTimeout::BusCycles(24))
+            .with_software_timeout(SoftwareTimeout::PerByte(Duration::from_millis(1))),
     )
     .expect("I2C init")
     .with_sda(peripherals.GPIO5)
@@ -815,9 +836,37 @@ async fn main(_spawner: Spawner) -> ! {
 
     log::info!("smol: entering menu");
 
+    // #198 inc9 canary: last 1 Hz defmt heartbeat timestamp (RTT stream throttle).
+    let mut last_canary_ms: u64 = 0;
+
     // --- Unified render/dispatch loop ---------------------------------------
     loop {
         let now = millis();
+
+        // #198 inc9 canary heartbeat (1 Hz, defmt-rtt → probe-rs). Proves: the #[esp_rtos::main]
+        // loop keeps ticking under the executor (#2), the display renders (frames, #3), and the
+        // mesh/election advance (gateway role + the mesh status line, #4/#5). It's a MAIN-LOOP
+        // heartbeat, not a spawned task: the 0c′ superloop is blocking (mesh polled inline, no
+        // `.await` yield), so a spawned task wouldn't be scheduled — the running main task IS the
+        // executor-liveness signal. TODO(#198): sync canary §4 method w/ morpheus-embassy.
+        if now.saturating_sub(last_canary_ms) >= 1000 {
+            last_canary_ms = now;
+            let up_s = (now / 1000) as u32;
+            #[cfg(feature = "espnow")]
+            {
+                let gw = radio.as_ref().map(|r| r.is_gateway()).unwrap_or(false);
+                defmt::info!(
+                    "smol 0c\u{2032} canary: up={=u32}s frames={=u32} gw={=bool} status={=str}",
+                    up_s,
+                    frame_count,
+                    gw,
+                    bottom_line.as_str()
+                );
+            }
+            // (frame_count is espnow-gated; the non-espnow tiers prove executor-liveness via uptime.)
+            #[cfg(not(feature = "espnow"))]
+            defmt::info!("smol 0c\u{2032} canary: up={=u32}s", up_s);
+        }
 
         // === Background (all modes, espnow build): service ESP-NOW + drive LED.
         // This runs REGARDLESS of the active mode so the LED always reflects the
