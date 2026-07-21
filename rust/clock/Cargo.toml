@@ -81,6 +81,18 @@ esp-rtos = { version = "0.3", optional = true, features = ["esp32c3", "embassy",
 embassy-executor = { version = "0.10", optional = true }
 embassy-time = { version = "0.5", optional = true, features = ["log"] }
 static_cell = { version = "2.1", optional = true }
+# #198 Phase 1: the async TCP/IP stack. esp-radio 0.18 exposes ONLY an embassy-net-driver
+# `Driver` (the parked `interfaces.station`), so the hand-driven smoltcp stack 0c′ excised is
+# replaced by `embassy_net::new(station, …) -> (Stack, Runner)` + a `net_task` running
+# `runner.run().await`. Features mirror the watch (esp32c6-watch Cargo.toml:45) minus `dns`
+# (smol keeps a hardcoded broker IP — portmap §8 keep-hardcoded decision). Rides `wifi`.
+embassy-net = { version = "0.9.1", optional = true, features = [
+    "tcp",
+    "udp",
+    "dhcpv4",
+    "medium-ethernet",
+    "log",
+] }
 # esp-wifi 0.15 → esp-radio 0.18 (RENAME). Dropped features vs esp-wifi: `smoltcp` (GONE —
 # esp-radio now exposes ONLY an embassy-net-driver Driver, no raw smoltcp Device) and
 # `builtin-scheduler` (moved into esp-rtos). `esp-now` is added by the `espnow` feature group.
@@ -92,14 +104,9 @@ esp-radio = { version = "0.18", optional = true, default-features = false, featu
     # (build-script panics otherwise) — new vs esp-wifi 0.15.
     "unstable",
 ] }
-smoltcp = { version = "0.13", optional = true, default-features = false, features = [
-    "medium-ethernet",
-    "proto-ipv4",
-    "proto-dhcpv4",
-    "socket-udp",
-    "socket-dhcpv4",
-    "socket-tcp",
-] }
+# #198 Phase 1: the standalone `smoltcp` dep is GONE — 0c′ excised the hand-driven smoltcp
+# transport, and embassy-net now vendors its own smoltcp internally. Keeping a second direct
+# smoltcp would duplicate the crate. All TCP/UDP/DHCP concurrency lives inside `embassy-net`.
 
 # --- OTA (Phase B, issue #6) — HAL-decoupled, folded into `wifi` ----------
 # Spike-proven co-compile with the pinned quartet (WAVE 10). Both are optional
@@ -184,7 +191,8 @@ wifi = [
     "dep:esp-rtos",
     # #198: turn on esp-rtos's esp-radio scheduler (the os-adapter esp-radio 0.18 requires).
     "esp-rtos/esp-radio",
-    "dep:smoltcp",
+    # #198 Phase 1: async TCP/IP stack (replaces the excised hand-driven smoltcp).
+    "dep:embassy-net",
     "dep:esp-storage",
     "dep:esp-bootloader-esp-idf",
     "dep:sha2",

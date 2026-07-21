@@ -48,12 +48,16 @@ use esp_hal::{
 };
 // #198: esp-wifi → esp-radio. TimerGroup/EspWifiController/WifiMode are gone — the timer
 // is consumed at boot by `esp_rtos::start`, and esp-radio 0.18 has no controller handle
-// or `set_mode` (see RadioManager::new). Config/PowerSaveMode/StationConfig/AccessPointInfo
-// are fully-qualified at their use sites to keep this import lean.
+// or `set_mode` (see RadioManager::new). Config/PowerSaveMode/StationConfig/AccessPointInfo/
+// ControllerConfig are fully-qualified at their use sites to keep this import lean.
 use esp_radio::{
     esp_now::{BROADCAST_ADDRESS, EspNow, EspNowWifiInterface, PeerInfo},
     wifi::WifiController,
 };
+// #198 Phase 1: the executor spawner (threaded from `#[esp_rtos::main]` through `start`) so the
+// radio init can spawn the always-on embassy-net driver pump (`net_task`) — and, from inc2, the
+// association-lifecycle `wifi_task`. embassy-net / StaticCell types are fully-qualified at use.
+use embassy_executor::Spawner;
 
 use crate::led::LedState;
 use crate::net::WifiPeripherals;
@@ -1836,13 +1840,11 @@ pub struct RadioManager {
     /// back, which otherwise self-rosters us (roster anomaly #1) and pollutes PEERS.
     self_mac: [u8; 6],
     esp_now: EspNow<'static>,
-    /// The WiFi STA device, handed out once by esp-wifi's `Interfaces`. Held as
-    /// an `Option` and BORROWED (never dropped) so it survives the boot NTP burst
-    /// and is available again for periodic relay flushes (`flush_telemetry`). The
-    /// smoltcp stack is built/dropped inside each burst, so between bursts this is
-    /// just an idle handle that doesn't contend with ESP-NOW on ch6.
-    sta: Option<crate::net::wifi::StaDevice>,
-    /// Kept for the SNTP ephemeral-port seed during the burst.
+    /// #198 Phase 1: the WiFi STA `Interface` is no longer parked here — it is CONSUMED into
+    /// `embassy_net::new()` at boot (see `RadioManager::new`), and the always-on `net_task`
+    /// pumps it. Callers that used to hold `&mut sta` now reach the network via the embassy-net
+    /// `Stack` (Phases 2-5). ESP-NOW rides the same radio init via `esp_now` above.
+    /// Kept for the SNTP ephemeral-port seed during the burst (Phase 2) + the embassy-net seed.
     rng: Rng,
     mode: Mode,
     /// Our short device id, embedded in HELLO beacons and matched against the
@@ -2112,18 +2114,34 @@ pub fn now_ms() -> u64 {
 impl RadioManager {
     /// Initialise the radio once. Starts in `WifiSta` mode so the caller can do
     /// an NTP burst before switching to ESP-NOW.
-    pub fn new(p: WifiPeripherals, id: u8) -> Option<Self> {
+    ///
+    /// #198 Phase 1: `spawner` is threaded from `#[esp_rtos::main]` so this can consume the STA
+    /// interface into embassy-net + spawn the always-on `net_task` driver pump right here (the
+    /// radio's single owner of the interface).
+    pub fn new(p: WifiPeripherals, id: u8, spawner: Spawner) -> Option<Self> {
         // #198 0c′: the esp-alloc heap + the esp-rtos scheduler/executor are brought up in
         // `main` (boot) BEFORE this runs — esp-radio 0.18 REQUIRES esp-rtos, and `wifi::new` no
         // longer takes a timer or RNG (the scheduler already backs it). `Rng::new()` is no-arg
         // in esp-hal 1.1; kept for the (stubbed) SNTP ephemeral-port seed Phase 3 will reuse.
         let rng = Rng::new();
 
-        let (mut controller, interfaces) =
-            esp_radio::wifi::new(p.wifi, Default::default()).ok()?;
+        // #140/#198 M5: the RX-tuning knobs that lived in `.cargo/config.toml [env]` as esp-wifi
+        // 0.15 `ESP_WIFI_CONFIG_*` keys are DEAD under esp-radio 0.18 — they moved to this runtime
+        // `ControllerConfig` (Nebula phase1-m5-rxconfig.md, source-cited). A bare `Default::default()`
+        // here would silently revert to the stock-low 10/32/5/6 the #140 fix cured (RX starvation +
+        // weak-ch1 association) → a live regression. Re-apply the SAME numbers the env keys carried.
+        let (mut controller, interfaces) = esp_radio::wifi::new(
+            p.wifi,
+            esp_radio::wifi::ControllerConfig::default()
+                .with_static_rx_buf_num(16)
+                .with_dynamic_rx_buf_num(40)
+                .with_rx_queue_size(8)
+                .with_rx_ba_win(12),
+        )
+        .ok()?;
         // esp-radio 0.18 dropped `set_mode` + `start()`: `set_config` STARTS the STA PHY, which
         // is exactly what creds-free ESP-NOW needs — we do NOT associate here (connect_async is
-        // the Phase-3 embassy-net path). Watch model (esp32c6-watch main.rs:1122).
+        // the Phase-1 `wifi_task` embassy-net path). Watch model (esp32c6-watch main.rs:1122).
         controller
             .set_config(&esp_radio::wifi::Config::Station(
                 esp_radio::wifi::sta::StationConfig::default(),
@@ -2137,17 +2155,39 @@ impl RadioManager {
         crate::net::assert_max_tx_power(); // #141: 8.5 dBm clamp, right after PHY start
 
         // #68/#76 SELF-MAC: capture our STA/ESP-NOW MAC (ESP-NOW rides the STA interface) so
-        // service() can DROP frames looped back from our own address (roster anomaly #1).
+        // service() can DROP frames looped back from our own address (roster anomaly #1). Read it
+        // BEFORE `interfaces.station` is moved into embassy-net below.
         let self_mac = interfaces.station.mac_address();
+
+        // #198 Phase 1: CONSUME the STA `Interface` into embassy-net + spawn the always-on driver
+        // pump. `net_task`'s `runner.run().await` subsumes 0c′'s excised ~28 iface.poll/dhcp.poll
+        // sites — the app now just awaits sockets (Phases 2-5). DR-M3: the stack seed MUST be
+        // per-boot entropy from the esp-hal RNG — NOT a shared literal (a shared seed = identical
+        // TCP-ISN/ephemeral-ports fleet-wide). StackResources<4> = DHCP + DNS + 1 transient socket
+        // + 1 spare (smol never opens concurrent sockets). The Stack handle (Copy) is discarded in
+        // inc1 — nothing associates yet; inc2 keeps it + hands it to `wifi_task`.
+        let seed: u64 = ((rng.random() as u64) << 32) | (rng.random() as u64);
+        static NET_RESOURCES: static_cell::StaticCell<embassy_net::StackResources<4>> =
+            static_cell::StaticCell::new();
+        let (_stack, runner) = embassy_net::new(
+            interfaces.station,
+            embassy_net::Config::dhcpv4(Default::default()),
+            NET_RESOURCES.init(embassy_net::StackResources::new()),
+            seed,
+        );
+        // embassy-executor 0.10: the `#[task]` fn returns `Result<SpawnToken, SpawnError>` (pool
+        // capacity). Handle it gracefully rather than `.expect()` — smol's boot path is panic-free
+        // by policy (a panic → MF-2 software_reset → boot-loop). A fresh executor always has room
+        // for this single spawn, so the Err arm is defensive only.
+        match net_task(runner) {
+            Ok(token) => spawner.spawn(token),
+            Err(_) => log::error!("smol #198: net_task spawn failed (executor pool exhausted)"),
+        }
 
         Some(Self {
             controller,
             self_mac,
             esp_now: interfaces.esp_now,
-            // 0c′: park the STA `Interface` in `StaDevice` (KEPT alive, exactly as the old code
-            // kept `interfaces.sta`) — Phase 3 hands it to embassy-net. The stubbed
-            // NTP/MQTT/OTA-fetch paths never touch it in 0c′.
-            sta: Some(crate::net::wifi::StaDevice(interfaces.station)),
             rng,
             mode: Mode::WifiSta,
             id,
@@ -2396,43 +2436,41 @@ impl RadioManager {
         let mut _notify_req = crate::net::wifi::NotifyReq::new(); // #197: recovery burst issues no toasts
         let mut install_requested = false;
         let mut _leaf_install_seen = false; // #40 #1: a leaf's recovery burst is not a gateway relay
-        let reached = match self.sta.as_mut() {
-            None => false,
-            Some(sta) => {
-                let empty: [(u8, &[u8]); 0] = [];
-                crate::net::wifi::run_mqtt_burst(
-                    &mut self.controller,
-                    sta,
-                    self.rng,
-                    id,
-                    &empty,
-                    batt,
-                    grid,
-                    &mut elect,
-                    &mut ota_offer,
-                    &mut config_offer,
-                    &mut _gw_own,
-                    &mut _reset_req,
-                    &mut install_requested,
-                    &mut _leaf_install_seen, // #40 #1: leaf recovery burst — never a gateway relay
-                    &[], // #27: election-only recovery burst publishes no peers (leaf/v1)
-            &[], // #50: recovery burst publishes no live-screen status
-                    None, // #21: a leaf's recovery burst is not a gateway relay
-                    None, // #50b: recovery burst republishes no cached leaf status
-                    &[], // #70/#49: recovery burst publishes no own diag
-                    None, // #70/#49: recovery burst republishes no cached diag
-                    &[], // #71: recovery burst publishes no own scan
-                    None, // #71: recovery burst republishes no cached scan
-                    &mut _scan_req, // #71: recovery burst subscribes no cmd/scan (cfg_cache=None)
-                    &mut _notify_req, // #197: recovery burst subscribes no notify (cfg_cache=None)
-                    &mut None, // #40: a leaf's recovery burst never relays a leaf OTA
-                    &mut None, // #40: recovery burst carries no persistent staged
-                    &mut None, // #40: recovery burst publishes no relay diag
-                    &mut None, // #3: recovery burst publishes no relay RX-diag
-                    &mut None, // #139-followup: a leaf recovery burst is never a self-OTA fetch
-                    tick,
-                )
-            }
+        // #198 Phase 1: the STA interface is consumed into embassy-net + the controller lives in
+        // `wifi_task`, so the (stubbed) recovery MQTT burst no longer takes controller/device.
+        // Phase 3 reworks this to a Signal-gated TCP flush on the embassy-net `Stack`.
+        let reached = {
+            let empty: [(u8, &[u8]); 0] = [];
+            crate::net::wifi::run_mqtt_burst(
+                self.rng,
+                id,
+                &empty,
+                batt,
+                grid,
+                &mut elect,
+                &mut ota_offer,
+                &mut config_offer,
+                &mut _gw_own,
+                &mut _reset_req,
+                &mut install_requested,
+                &mut _leaf_install_seen, // #40 #1: leaf recovery burst — never a gateway relay
+                &[], // #27: election-only recovery burst publishes no peers (leaf/v1)
+                &[], // #50: recovery burst publishes no live-screen status
+                None, // #21: a leaf's recovery burst is not a gateway relay
+                None, // #50b: recovery burst republishes no cached leaf status
+                &[], // #70/#49: recovery burst publishes no own diag
+                None, // #70/#49: recovery burst republishes no cached diag
+                &[], // #71: recovery burst publishes no own scan
+                None, // #71: recovery burst republishes no cached scan
+                &mut _scan_req, // #71: recovery burst subscribes no cmd/scan (cfg_cache=None)
+                &mut _notify_req, // #197: recovery burst subscribes no notify (cfg_cache=None)
+                &mut None, // #40: a leaf's recovery burst never relays a leaf OTA
+                &mut None, // #40: recovery burst carries no persistent staged
+                &mut None, // #40: recovery burst publishes no relay diag
+                &mut None, // #3: recovery burst publishes no relay RX-diag
+                &mut None, // #139-followup: a leaf recovery burst is never a self-OTA fetch
+                tick,
+            )
         };
         if ota_offer.is_some() {
             self.ota_offer = ota_offer;
@@ -2544,17 +2582,13 @@ impl RadioManager {
         // `run_ntp_burst`; not called during the still-blocking MQTT tail).
         render: &mut dyn FnMut(),
     ) -> (bool, Option<u32>) {
-        // Disjoint field borrows: &mut self.controller, &mut *sta, Copy of rng/id.
-        // `batt` is a caller-owned &mut (main's cache), disjoint from every self
-        // field — the boot burst's MQTT downlink fills it (see wifi::run_ntp_burst).
+        // `batt` is a caller-owned &mut (main's cache), disjoint from every self field — the boot
+        // burst's MQTT downlink fills it (see wifi::run_ntp_burst). #198 Phase 1: the STA interface
+        // is now in embassy-net + the controller in `wifi_task`, so the (stubbed) boot burst no
+        // longer takes controller/device; Phase 2 drives NTP on a UDP socket over the `Stack`.
         let id = self.id;
-        let Some(sta) = self.sta.as_mut() else {
-            return (false, None);
-        };
         let mut reached_dhcp = false;
         let synced = crate::net::wifi::run_ntp_burst(
-            &mut self.controller,
-            sta,
             self.rng,
             tick,
             render,
@@ -2574,11 +2608,12 @@ impl RadioManager {
     /// reusing the boot `NtpMachine` substrate. Called from the main loop on the GATEWAY when
     /// `my_synced_at` goes stale (> `NTP_RESYNC_AGE_S`). Returns the fresh Unix time, or `None`
     /// on failure/abort. Does NOT tear the coexist association (`NtpMachine::step_assoc` skips
-    /// the reconnect when already connected). `rng` is `Copy`; `sta` borrows disjoint from
-    /// `self.controller`. Leaves never call this (mesh time adoption refreshes their freshness).
+    /// the reconnect when already connected). `rng` is `Copy`. Leaves never call this (mesh time
+    /// adoption refreshes their freshness).
     pub fn resync_ntp(&mut self, tick: &mut dyn FnMut() -> bool) -> Option<u32> {
-        let sta = self.sta.as_mut()?;
-        crate::net::wifi::run_ntp_resync(&mut self.controller, sta, self.rng, tick)
+        // #198 Phase 1: the STA interface lives in embassy-net now; the (stubbed) resync no longer
+        // takes a controller/device — Phase 2 opens a UDP socket on the `Stack` instead.
+        crate::net::wifi::run_ntp_resync(self.rng, tick)
     }
 
     /// Current radio mode. Part of the public API (a caller may inspect which
@@ -3758,18 +3793,14 @@ impl RadioManager {
         }
         let rng = self.rng;
         let mut fail: Option<(u32, u32, u32, u32, u32)> = None;
-        let ok = match self.sta.as_mut() {
-            None => false,
-            Some(sta) => {
-                // Self-OTA: activate-on-success (relay_mode = false; the slot out-param is
-                // unused since a successful self-fetch reboots inside `activate`).
-                crate::net::wifi::run_ota_fetch(
-                    &mut self.controller, sta, rng, announce, tick, false, &mut None, &mut fail,
-                    progress,
-                    Some(self.id), // #188: live progress → smol/<self>/ota/progress (self-OTA)
-                )
-            }
-        };
+        // Self-OTA: activate-on-success (relay_mode = false; the slot out-param is unused since a
+        // successful self-fetch reboots inside `activate`). #198 Phase 1: the (stubbed) fetch no
+        // longer takes a controller/device — Phase 5 drives a TcpSocket on the embassy-net `Stack`.
+        let ok = crate::net::wifi::run_ota_fetch(
+            rng, announce, tick, false, &mut None, &mut fail,
+            progress,
+            Some(self.id), // #188: live progress → smol/<self>/ota/progress (self-OTA)
+        );
         // #139-followup: a SUCCESS reboots INSIDE the fetch (never returns here), so reaching this
         // with ok==false is a genuine self-fetch failure — buffer the (chunk_k, chunk_n, retries,
         // stalls) snapshot so the next gateway flush publishes it retained to smol/<id>/ota/diag.
@@ -4196,14 +4227,13 @@ impl RadioManager {
                 let _ = self.switch(Mode::WifiSta);
                 let rng = self.rng;
                 let mut staged: Option<Slot> = None;
-                let fetched = match self.sta.as_mut() {
-                    Some(sta) => crate::net::wifi::run_ota_fetch(
-                        &mut self.controller, sta, rng, announce, tick, true, &mut staged, &mut None,
-                        progress,
-                        Some(leaf_id), // #188: live progress → smol/<leaf>/ota/progress (relay-fetch)
-                    ),
-                    None => false,
-                };
+                // #198 Phase 1: stubbed relay-fetch — controller/device dropped (embassy-net Stack
+                // in Phase 5).
+                let fetched = crate::net::wifi::run_ota_fetch(
+                    rng, announce, tick, true, &mut staged, &mut None,
+                    progress,
+                    Some(leaf_id), // #188: live progress → smol/<leaf>/ota/progress (relay-fetch)
+                );
                 if fetched { staged } else { None }
             }
             om::ServeSource::HolderActiveSlot => {
@@ -4715,62 +4745,56 @@ impl RadioManager {
         // self-scanned) — one-shot: publish it THIS flush (retained holds it), then it's cleared.
         let own_scan = self.own_scan.take();
         let scan_bytes: &[u8] = own_scan.as_deref().map(|s| s.as_bytes()).unwrap_or(&[]);
-        let sta = self.sta.as_mut();
-        let ok = match sta {
-            None => false,
-            Some(sta) => {
-                // (src_id, &payload) list to PUBLISH: the gateway's OWN telemetry
-                // first (spec: "also PUBLISH its own telemetry"), then each queued
-                // leaf message. Disjoint borrows: `own_telemetry` is the caller's;
-                // the queue slices are `&self.relay`; `&mut self.controller`/`*sta`
-                // are other fields. `+ 1` slot holds the gateway's own line.
-                let empty: &[u8] = &[];
-                let mut items: [(u8, &[u8]); GATEWAY_QUEUE + 1] =
-                    [(0u8, empty); GATEWAY_QUEUE + 1];
-                let mut n = 0;
-                if !own_telemetry.is_empty() {
-                    items[n] = (id, own_telemetry);
+        // #198 Phase 1: STA interface is consumed into embassy-net + the controller lives in
+        // `wifi_task`, so the (stubbed) gateway flush no longer takes controller/device (Phase 3 =
+        // a Signal-gated TCP flush on the `Stack`). The item-list build stays: (src_id, &payload)
+        // — the gateway's OWN telemetry first (spec: "also PUBLISH its own telemetry"), then each
+        // queued leaf message. Disjoint borrows: `own_telemetry` is the caller's; the queue slices
+        // are `&self.relay`. `+ 1` slot holds the gateway's own line.
+        let ok = {
+            let empty: &[u8] = &[];
+            let mut items: [(u8, &[u8]); GATEWAY_QUEUE + 1] = [(0u8, empty); GATEWAY_QUEUE + 1];
+            let mut n = 0;
+            if !own_telemetry.is_empty() {
+                items[n] = (id, own_telemetry);
+                n += 1;
+            }
+            for q in self.relay.queue.iter() {
+                if q.used {
+                    items[n] = (q.src_id, &q.buf[..q.len]);
                     n += 1;
                 }
-                for q in self.relay.queue.iter() {
-                    if q.used {
-                        items[n] = (q.src_id, &q.buf[..q.len]);
-                        n += 1;
-                    }
-                }
-                crate::net::wifi::run_mqtt_burst(
-                    &mut self.controller,
-                    sta,
-                    self.rng,
-                    id,
-                    &items[..n],
-                    batt,
-                    grid,
-                    &mut elect,
-                    &mut ota_offer,
-                    &mut config_offer,
-                    &mut gw_own, // #48: capture the gateway's own keyed configs
-                    &mut reset_req, // #52: capture remote-reboot commands (one-shot relay below)
-                    &mut install_requested,
-                    &mut leaf_install_seen, // #40 #1: latch pending on install-SEEN (below)
-                    peers, // #27: gateway publishes its roster as retained smol/<id>/peers
-                    status, // #50: gateway publishes its live screen as smol/<id>/status
-                    Some(&mut self.cfg_cache), // #21: gateway caches leaf configs to relay
-                    Some(&self.stat_cache), // #50b: gateway republishes cached leaf statuses
-                    diag_rec.as_bytes(), // #70/#49: gateway publishes its own smol/<id>/diag
-                    Some(&self.diag_cache), // #70/#49: republish cached relayed-node diags
-                    scan_bytes, // #71: gateway publishes its own smol/<id>/scan (empty unless it self-scanned)
-                    Some(&self.scan_cache), // #71: republish cached relayed-node scans
-                    &mut scan_req, // #71: capture on-demand scan commands (one-shot relay below)
-                    &mut notify_req, // #197: capture on-glass toast commands (one-shot relay below)
-                    leaf_ota, // #40: surface a pending leaf-OTA install for main to relay
-                    &mut self.staged_raw, // #40: persist the staged across flushes (pair-safe)
-                    &mut self.leaf_ota_diag, // #40: publish smol/<leaf>/ota/diag + clear/retry
-                    &mut self.leaf_relay_rx, // #3: publish smol/<leaf>/ota/relaydiag (RX evidence)
-                    &mut self.ota_self_fail, // #139-followup: publish own smol/<id>/ota/diag on self-fetch fail
-                    tick,
-                )
             }
+            crate::net::wifi::run_mqtt_burst(
+                self.rng,
+                id,
+                &items[..n],
+                batt,
+                grid,
+                &mut elect,
+                &mut ota_offer,
+                &mut config_offer,
+                &mut gw_own, // #48: capture the gateway's own keyed configs
+                &mut reset_req, // #52: capture remote-reboot commands (one-shot relay below)
+                &mut install_requested,
+                &mut leaf_install_seen, // #40 #1: latch pending on install-SEEN (below)
+                peers, // #27: gateway publishes its roster as retained smol/<id>/peers
+                status, // #50: gateway publishes its live screen as smol/<id>/status
+                Some(&mut self.cfg_cache), // #21: gateway caches leaf configs to relay
+                Some(&self.stat_cache), // #50b: gateway republishes cached leaf statuses
+                diag_rec.as_bytes(), // #70/#49: gateway publishes its own smol/<id>/diag
+                Some(&self.diag_cache), // #70/#49: republish cached relayed-node diags
+                scan_bytes, // #71: gateway publishes its own smol/<id>/scan (empty unless it self-scanned)
+                Some(&self.scan_cache), // #71: republish cached relayed-node scans
+                &mut scan_req, // #71: capture on-demand scan commands (one-shot relay below)
+                &mut notify_req, // #197: capture on-glass toast commands (one-shot relay below)
+                leaf_ota, // #40: surface a pending leaf-OTA install for main to relay
+                &mut self.staged_raw, // #40: persist the staged across flushes (pair-safe)
+                &mut self.leaf_ota_diag, // #40: publish smol/<leaf>/ota/diag + clear/retry
+                &mut self.leaf_relay_rx, // #3: publish smol/<leaf>/ota/relaydiag (RX evidence)
+                &mut self.ota_self_fail, // #139-followup: publish own smol/<id>/ota/diag on self-fetch fail
+                tick,
+            )
         };
         // #49: record the flush outcome (`ok` = reached CONNACK) into the diag counters — the
         // flush-success rate is the on-device #9 flush-win proof (was UART0-only). Bumped here so
@@ -6118,6 +6142,19 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
 // Public flow used by `main` under `--features espnow`.
 // -------------------------------------------------------------------------
 
+/// #198 Phase 1: the always-on embassy-net driver pump. `runner.run().await` drives the internal
+/// smoltcp stack's TX/RX/timers + DHCP client — REPLACING 0c′'s excised ~28 hand-driven
+/// `iface.poll()` / `dhcp.poll()` sites (Nebula portmap §1.3). Spawned once from
+/// `RadioManager::new`; it parks awaiting interface RX/TX readiness, so while it awaits the
+/// executor runs the inline ESP-NOW mesh loop — the structural half of the deaf-window kill (§2:
+/// the mesh keeps polling between the WiFi task's `.await`s).
+#[embassy_executor::task]
+async fn net_task(
+    mut runner: embassy_net::Runner<'static, esp_radio::wifi::Interface<'static>>,
+) -> ! {
+    runner.run().await
+}
+
 /// Bring the radio up, run a REAL WiFi -> DHCP -> SNTP burst (fast-blinking the
 /// blue LED throughout), then TIME-SHARE-switch the single radio to ESP-NOW.
 ///
@@ -6133,6 +6170,9 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
 pub fn start(
     p: WifiPeripherals,
     id: u8,
+    // #198 Phase 1: forwarded to `RadioManager::new` so the radio init can spawn `net_task`
+    // (and, from inc2, `wifi_task`). `main`'s `#[esp_rtos::main]` owns the sole `Spawner`.
+    spawner: Spawner,
     // #20: `main` passes the responsive tick (poll button + "Syncing…" redraw +
     // LED fast-blink); returns true to ABORT the boot burst (a long-press → boot
     // ends early and proceeds straight to the Menu). Replaces the old internal
@@ -6146,7 +6186,7 @@ pub fn start(
     batt: &mut crate::batt::BattCache,
     grid: &mut crate::grid::GridCache,
 ) -> (Option<RadioManager>, Option<u32>) {
-    let Some(mut radio) = RadioManager::new(p, id) else {
+    let Some(mut radio) = RadioManager::new(p, id, spawner) else {
         return (None, None);
     };
 

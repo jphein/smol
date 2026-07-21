@@ -48,27 +48,14 @@ rustflags = [
 [registries.crates-io]
 protocol = "sparse"
 
-# #140 esp-wifi RX-buffer tuning (heap-gated — see scratch/smol-ha-batt/140-heap-audit.md).
-# We ran esp-wifi 0.15's stock-low defaults (rx_queue 5 / static_rx 10 / dynamic_rx 32 / rx_ba_win 6),
-# which starve sustained RX and were a co-cause of the mid-body OTA-fetch stalls (nebula finding 3 /
-# esp-hosted #184). The bump is UNLOCKED by growing the heap 72→128 KiB (net::init_heap) — the audit
-# showed ~120 KB of DRAM free and only ~5.9 KB heap headroom at the old size, so tuning buffers on the
-# 72 KiB heap would OOM. Keys/ranges verified against esp-wifi 0.15's generated config table; each
-# static RX buffer ≈ 1.6 KB, allocated at esp_wifi::init from the (now-grown) esp-alloc heap.
-# HW-GATE-HELD: throughput/stability win only provable on the deaf-list/fetch rig (pairs with #143).
-[env]
-# ALL-CHANNEL SCAN (association-layer fix, 2026-07-20): esp-wifi's default WIFI_FAST_SCAN stops at
-# the FIRST matching-SSID AP it hears, which made nodes associate to a WEAK ch1 AP (2c:56:dc @ -83)
-# over the STRONG ch6 office AP (a62bb0 @ -66) → off-channel → OTA-deaf (the #204/#217 root cause).
-# `1` = WIFI_ALL_CHANNEL_SCAN: scan every channel, then associate to the STRONGEST AP. This is the
-# prerequisite for the best-gateway election — the election's co_channel / ap_rssi inputs are only
-# meaningful once a board reliably associates to the right (strong, ch6) AP first.
-ESP_WIFI_CONFIG_SCAN_METHOD = "1"
-# 10→16: more 802.11 RX headroom (IDF throughput profile uses 16–25). +~9.6 KB permanent at init.
-ESP_WIFI_CONFIG_STATIC_RX_BUF_NUM = "16"
-# 32→40: on-demand ceiling; must be ≥ static_rx_buf_num. Freed as the TCP stack drains each frame.
-ESP_WIFI_CONFIG_DYNAMIC_RX_BUF_NUM = "40"
-# 5→8: deeper RX frame queue to ride short bursts without drop.
-ESP_WIFI_CONFIG_RX_QUEUE_SIZE = "8"
-# 6→12: bigger Block-Ack RX window for AMPDU throughput. MUST stay ≤ static_rx_buf_num (16). iperf 9–12.
-ESP_WIFI_CONFIG_RX_BA_WIN = "12"
+# #140/#198 M5 — RX-buffer + scan tuning MOVED OUT of this [env] block (2026-07-21, morpheus Phase 1).
+# esp-wifi 0.15 exposed these as compile-time `ESP_WIFI_CONFIG_*` esp-config env keys; esp-radio 0.18
+# has NO such keys (they are silently ignored — Nebula phase1-m5-rxconfig.md, source-cited). They are
+# now RUNTIME builders, set where the radio is created (src/net/mode.rs RadioManager::new):
+#   • static_rx_buf_num=16 / dynamic_rx_buf_num=40 / rx_queue_size=8 / rx_ba_win=12
+#       → `ControllerConfig::default().with_static_rx_buf_num(16)…` (the 2nd arg to `wifi::new`)
+#   • SCAN_METHOD=1 (WIFI_ALL_CHANNEL_SCAN, associate-to-strongest — the #204/#217 weak-ch1 fix)
+#       → `StationConfig::with_scan_method(ScanMethod::AllChannels)` on the association config (wifi_task).
+# Leaving the dead `[env]` keys here would falsely imply the #140 tuning is applied when it is NOT.
+# The heap-gate reasoning (72→128 KiB, ~1.6 KB/static-buf) still holds; the allocation just happens at
+# runtime `wifi::new()` now. HW-GATE-HELD: throughput win still only provable on the deaf-list/fetch rig.

@@ -432,14 +432,10 @@ pub struct WifiPeripherals {
     pub wifi: WIFI<'static>,
 }
 
-/// 0c′ holder for the STA interface. esp-wifi 0.15 handed out a smoltcp `WifiDevice`;
-/// esp-radio 0.18 hands out an embassy-net-driver `Interface`. The WiFi-STA TCP/UDP path
-/// is stubbed until Phases 3-5, but we KEEP the interface parked here — exactly as the old
-/// code kept `interfaces.sta` alive in `RadioManager.sta` — so radio teardown behaviour is
-/// unchanged and the (stubbed) NTP/MQTT/OTA-fetch signatures stay stable, keeping their
-/// KEEP-LIVE call sites in `net::mode` churn-free.
-/// TODO(#198 Phase 3): hand this to `embassy_net::new(interfaces.station, …)` instead.
-pub struct StaDevice(pub esp_radio::wifi::Interface<'static>);
+// #198 Phase 1: the 0c′ `StaDevice(Interface)` holder is GONE — the STA `interfaces.station` is
+// now CONSUMED into `embassy_net::new()` at boot (`net::mode::RadioManager::new`) and driven by the
+// always-on `net_task`. The stubbed NTP/MQTT/OTA-fetch paths no longer take a parked device; when
+// reimplemented they open sockets on the embassy-net `Stack`. (Phase 2/3/5.)
 
 // 0c′ (#198): `smoltcp_now()` + `create_interface()` built the hand-driven smoltcp
 // `Interface` over esp-wifi 0.15's `WifiDevice`. esp-radio 0.18 has no smoltcp Device, so
@@ -534,8 +530,10 @@ pub(crate) const NTP_RESYNC_AGE_S: u32 = 3600;
     clippy::needless_pass_by_ref_mut
 )]
 pub fn run_ntp_resync(
-    controller: &mut esp_radio::wifi::WifiController<'static>,
-    device: &mut StaDevice,
+    // #198 Phase 1: the `controller` + STA `device` params are GONE — the controller now lives in
+    // `wifi_task` and the STA interface is consumed into embassy-net (`RadioManager::new`). When
+    // these stubs are reimplemented (NTP Phase 2 / MQTT Phase 3 / OTA Phase 5) they take an
+    // `embassy_net::Stack<'static>` instead and open sockets on it. `rng` stays (Phase-2 seed).
     rng: Rng,
     tick: &mut dyn FnMut() -> bool,
 ) -> Option<u32> {
@@ -550,8 +548,10 @@ pub fn run_ntp_resync(
     clippy::needless_pass_by_ref_mut
 )]
 pub fn run_ntp_burst(
-    controller: &mut esp_radio::wifi::WifiController<'static>,
-    device: &mut StaDevice,
+    // #198 Phase 1: the `controller` + STA `device` params are GONE — the controller now lives in
+    // `wifi_task` and the STA interface is consumed into embassy-net (`RadioManager::new`). When
+    // these stubs are reimplemented (NTP Phase 2 / MQTT Phase 3 / OTA Phase 5) they take an
+    // `embassy_net::Stack<'static>` instead and open sockets on it. `rng` stays (Phase-2 seed).
     rng: Rng,
     tick: &mut dyn FnMut() -> bool,
     render: &mut dyn FnMut(),
@@ -575,8 +575,10 @@ pub fn run_ntp_burst(
     clippy::needless_pass_by_ref_mut
 )]
 pub fn run_mqtt_burst(
-    controller: &mut esp_radio::wifi::WifiController<'static>,
-    device: &mut StaDevice,
+    // #198 Phase 1: the `controller` + STA `device` params are GONE — the controller now lives in
+    // `wifi_task` and the STA interface is consumed into embassy-net (`RadioManager::new`). When
+    // these stubs are reimplemented (NTP Phase 2 / MQTT Phase 3 / OTA Phase 5) they take an
+    // `embassy_net::Stack<'static>` instead and open sockets on it. `rng` stays (Phase-2 seed).
     rng: Rng,
     node_id: u8,
     messages: &[(u8, &[u8])],
@@ -1357,8 +1359,10 @@ const OTA_FETCH_BUDGET: Duration = Duration::from_secs(300);
 #[cfg(feature = "espnow")]
 #[allow(clippy::too_many_arguments, unused_variables, unused_mut, clippy::needless_pass_by_ref_mut)]
 pub fn run_ota_fetch(
-    controller: &mut esp_radio::wifi::WifiController<'static>,
-    device: &mut StaDevice,
+    // #198 Phase 1: the `controller` + STA `device` params are GONE — the controller now lives in
+    // `wifi_task` and the STA interface is consumed into embassy-net (`RadioManager::new`). When
+    // these stubs are reimplemented (NTP Phase 2 / MQTT Phase 3 / OTA Phase 5) they take an
+    // `embassy_net::Stack<'static>` instead and open sockets on it. `rng` stays (Phase-2 seed).
     rng: Rng,
     announce: &crate::ota::Announce,
     tick: &mut dyn FnMut() -> bool,

@@ -357,7 +357,14 @@ fn millis() -> u64 {
 // WiFi/NTP/MQTT/OTA-fetch are stubbed in 0c′ and brought up on embassy-net in Phases 3-5.
 // The #152 host/wasm LIB (src/lib.rs) never uses `main`/esp-rtos, so it is untouched.
 #[esp_rtos::main]
-async fn main(_spawner: Spawner) -> ! {
+async fn main(spawner: Spawner) -> ! {
+    // #198 Phase 1: only the `espnow` radio path (`net::mode::start`) consumes the executor
+    // `Spawner` to launch `net_task` (+ inc2 `wifi_task`). The default (no-radio) and wifi-only
+    // bench builds never bring the mesh up, so the spawner is unused there — discard it cleanly
+    // rather than leak an `unused_variables` warning across those tiers.
+    #[cfg(not(feature = "espnow"))]
+    let _ = spawner;
+
     // --- Clocks & peripherals ------------------------------------------------
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
 
@@ -639,6 +646,8 @@ async fn main(_spawner: Spawner) -> ! {
             // `node_id()` (NVS, seeded from the baked const) so a shared OTA image never
             // steals the default id (#40 identity fix).
             node_id(),
+            // #198 Phase 1: the executor spawner → embassy-net `net_task` (+ inc2 `wifi_task`).
+            spawner,
             &mut boot_tick,
             &mut boot_render,
             &mut batt_cache,
