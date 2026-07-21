@@ -90,7 +90,6 @@ extern "Rust" fn custom_halt() -> ! {
 use embassy_executor::Spawner;
 use esp_hal::{
     clock::CpuClock,
-    delay::Delay,
     i2c::master::{BusTimeout, Config as I2cConfig, I2c, SoftwareTimeout},
     interrupt::software::SoftwareInterruptControl,
     time::Duration,
@@ -499,7 +498,12 @@ async fn main(spawner: Spawner) -> ! {
     draw_splash(&mut display, my_noun, env!("BUILD_NUMBER"), v_noun);
     display.flush().ok();
 
-    let delay = Delay::new();
+    // #198 Phase 1 inc3 (DR-H2): the blocking esp-hal `Delay` is retired — the boot-splash wait
+    // and the main loop now pace on `embassy_time::Timer::after().await`, which YIELDS to the
+    // executor so `net_task`/`wifi_task` interleave (§2 the deaf-window kill). A blocking
+    // `delay_millis` would starve them — the executor only runs other tasks when the main task
+    // awaits. Pinned to SUBTICK_MS (≤20 ms) so the HELLO/TIME/beacon 20 ms-look-back detectors
+    // keep firing (NOT the watch's ~400 ms clamp, which would drop ~95% of mesh broadcasts).
 
     // --- BOOT button on GPIO9 (debounced short/long) -------------------------
     let mut button = Button::new(peripherals.GPIO9);
@@ -830,7 +834,7 @@ async fn main(spawner: Spawner) -> ! {
     // burst above usually already blew past this (the splash was up throughout);
     // this only adds real wait in the default build, where bring-up is instant.
     while millis().saturating_sub(splash_start) < SPLASH_MIN_MS {
-        delay.delay_millis(SUBTICK_MS);
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(SUBTICK_MS as u64)).await;
     }
 
     log::info!("smol: entering menu");
@@ -1996,7 +2000,13 @@ async fn main(spawner: Spawner) -> ! {
         }
         was_toast = toast_now;
 
-        delay.delay_millis(SUBTICK_MS);
+        // #198 Phase 1 inc3 (DR-H2): pace the mesh-serving loop on a YIELDING ≤20 ms await (was a
+        // blocking `delay_millis`). The await hands the executor to `net_task`/`wifi_task` between
+        // ticks — the structural half of the deaf-window kill (§2) — then resumes; `button.poll`
+        // at the top of the loop still runs every iteration (≤20 ms input latency, unchanged), so
+        // the 700 ms long-press detection is intact (DR-M2). Pinned to SUBTICK_MS so the 20 ms
+        // look-back HELLO/TIME/beacon/diag detectors keep firing.
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(SUBTICK_MS as u64)).await;
     }
 }
 
