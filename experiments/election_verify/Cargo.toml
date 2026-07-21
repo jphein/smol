@@ -1,0 +1,15 @@
+# Host guard for the configurable best-gateway election core (net/election.rs). The firmware crate
+# is no_std/riscv32imc and can't host-test, so this `#[path]`-includes the REAL election.rs (no
+# drift) and asserts: co-channel dominance over a stronger OFF-channel board (the id5 bug), the
+# weighted fitness, the bounded/monotonic fitness→backoff tiering, the config parser (default /
+# legacy / re-weight / malformed), and the byte-faithful `Legacy` recovery backoff. Permanent guard.
+[package]
+name = "election_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "election_verify"
+path = "src/main.rs"
+[profile.dev]
+opt-level = 0

@@ -91,6 +91,15 @@ const MESH_CHANNEL_TOPIC: &[u8] = b"smol/mesh/channel";
 #[cfg(feature = "wifi")]
 const MESH_CHANNEL_HINT_TOPIC: &[u8] = b"smol/mesh/channel_hint";
 
+/// #gateway-election OPERATOR LEVER: the retained best-gateway METRIC. Payload = keyed weights
+/// `c<n>r<n>n<n>u<n>` (co-channel / rssi / ntp / uptime), the literal `legacy` (escape hatch → the
+/// historical lowest-id + RSSI election), or empty (retain-clear → the on-by-default co-channel-
+/// dominant metric). Read in-burst by [`mqtt_session`] into `elect.elect_cfg` — the election consumes
+/// it in the SAME burst it claims in, so (unlike the CFG-relay family) no relay round-trip is needed.
+/// Twin transport of `channel_hint`; parsed by `election::parse_elect_config` (panic-free, fail-open).
+#[cfg(feature = "wifi")]
+const MESH_ELECT_TOPIC: &[u8] = b"smol/mesh/elect";
+
 /// #23 stage 3-4 boot ELECTION result, filled by [`mqtt_session`] from the retained
 /// `smol/mesh/channel`. A board that reached DHCP is a candidate; the lowest-id
 /// candidate is the OWNER (coexist gateway). Non-owners demote to leaf + scan for the
@@ -169,6 +178,23 @@ pub struct MeshElect {
     /// before, so a mesh is never left crownless while a channel is still being learned. `None` ⇒
     /// no gate ⇒ election unchanged. Same claim-guard shape as `flush_incapable` (#146).
     pub channel_hint: Option<u8>,
+    /// Best-gateway election (#gateway-election): this board's AP channel == the fixed mesh channel
+    /// (`ESP_NOW_FIXED_CHANNEL`) — the DOMINANT default-weighted fitness signal (an off-channel crown
+    /// is OTA-deaf regardless of RSSI, #217). Seeded by the caller from `self.my_ap_channel`.
+    pub co_channel: bool,
+    /// Best-gateway election: this board holds NTP-authoritative time (`synced_at != 0`) — a better
+    /// gateway can serve TIME frames. Seeded by the caller (0-weight-equivalent while uniformly false).
+    pub ntp_holder: bool,
+    /// Best-gateway election FAIL-OPEN guard: true iff this board's AP channel is KNOWN (`my_ap_channel
+    /// != 0`), so `co_channel` is trustworthy. The empty-MC claim deferral fires ONLY when this is set —
+    /// a freshly-booted board (pre-scan, channel unknown) claims a vacant crown IMMEDIATELY (fast
+    /// cold-start preserved, mirroring #155's `my_channel == 0` fail-open). Best-gateway preference then
+    /// engages on later bursts once the channel is learned. Seeded by the caller.
+    pub co_channel_known: bool,
+    /// Best-gateway election POLICY from the retained `smol/mesh/elect` topic (twin of `channel_hint`):
+    /// `BestGateway(weights)` (default = on-by-default co-channel-dominant) or `Legacy` (the escape
+    /// hatch → historical lowest-id + RSSI recovery). Seeded in [`mqtt_session`] from the broker.
+    pub elect_cfg: crate::net::election::ElectConfig,
     // --- outputs (applied to the live role by the caller) ---
     /// True iff I claimed / hold ownership (I am the coexist gateway).
     pub i_am_owner: bool,
@@ -209,6 +235,14 @@ impl MeshElect {
             boot: false,
             flush_incapable: false, // #146: seeded by the caller from the flush-fail abdication latch
             channel_hint: None, // #155: seeded by the caller from the retained smol/mesh/channel_hint
+            co_channel: false, // best-gateway: seeded by the caller from my_ap_channel == mesh
+            ntp_holder: false, // best-gateway: seeded by the caller from synced_at != 0
+            co_channel_known: false, // best-gateway: false at boot (channel unknown) → claim fast
+            // best-gateway is ON by default (team-lead 2026-07-20); the retained smol/mesh/elect topic
+            // re-weights or selects `legacy`. Absent/empty/garbage config keeps THIS default.
+            elect_cfg: crate::net::election::ElectConfig::BestGateway(
+                crate::net::election::MetricWeights::DEFAULT,
+            ),
             i_am_owner: false,
             owner_id: my_id,
             owner_alive: false,
@@ -216,44 +250,25 @@ impl MeshElect {
             downstream_seen: false, // #204 2a: set true in the drain on any retained downstream
         }
     }
+
+    /// Best-gateway election: build the pure [`election::FitnessInputs`] from this board's seeded
+    /// signals. `uptime_ms` = `now_ms` (the monotonic loop clock IS uptime-since-boot), so the
+    /// empty-MC claim deferral is stateless.
+    fn fitness_inputs(&self) -> crate::net::election::FitnessInputs {
+        crate::net::election::FitnessInputs {
+            co_channel: self.co_channel,
+            ap_rssi: self.my_rssi,
+            ntp_holder: self.ntp_holder,
+            uptime_ms: self.now_ms,
+        }
+    }
 }
 
-/// #51: map a board's RSSI-to-AP (dBm) → how long it must WAIT, beyond `RECOVERY_STALE_MS`,
-/// before it may take over a dead owner. Stronger signal → shorter wait, so the best-uplink
-/// survivor claims the vacated ownership FIRST and publishes a fresh (retained) `MC`; weaker
-/// survivors, still inside their (longer) backoff, then observe that LIVE owner and adopt it
-/// — the WiFi-strength election JP asked for in #51, node-id only breaking exact-bucket ties.
-///
-/// The bucket step (`RSSI_BUCKET_STEP_MS`) is deliberately LARGER than the recovery-burst
-/// cadence (`REELECT_RETRY_MS`), so a weaker board always has a recovery burst BETWEEN the
-/// stronger board's claim and its own claim threshold — it reads the stronger board's retained
-/// MC and adopts it, and thus NEVER claims. That is what keeps the RSSI winner STABLE: with no
-/// competing claim, the gateway-flush path's lowest-id resolver never fires to undo it. (Two
-/// boards in the SAME bucket can still co-claim in one window → resolved deterministically by
-/// that lowest-id flush path = the intended node-id tiebreak for equal signal.)
-/// No new `MC` wire field: a board only ever compares its OWN rssi against this threshold.
-#[cfg(feature = "wifi")]
-fn reelect_backoff_ms(rssi: i8, node_id: u8) -> u64 {
-    // Bucket by signal strength (typical STA range ≈ -30 strong … -90 weak dBm).
-    let bucket: u64 = if rssi >= -65 {
-        0
-    } else if rssi >= -78 {
-        1
-    } else {
-        2
-    };
-    // One bucket step per weaker bucket (> the burst cadence, see above) + a small per-id
-    // term so same-bucket boards prefer the lower id (final tiebreak; sub-cadence, so it
-    // only orders an already-converging same-window co-claim, never separates buckets).
-    bucket * RSSI_BUCKET_STEP_MS + (node_id as u64) * 200
-}
-
-/// #51 recovery: RSSI backoff step. MUST exceed `REELECT_RETRY_MS` (10 s) so a weaker board
-/// gets a recovery burst (→ reads the winner's retained MC → adopts) before its own claim
-/// threshold — that's what keeps the stronger board's win stable (no competing claim, so the
-/// lowest-id flush resolver never fires to undo it).
-#[cfg(feature = "wifi")]
-const RSSI_BUCKET_STEP_MS: u64 = 15_000;
+// #51 → #gateway-election: the RSSI-weighted dead-owner takeover stagger + its `RSSI_BUCKET_STEP_MS`
+// moved into the PURE `net::election` module and were GENERALIZED into the configurable best-gateway
+// fitness backoff (co-channel-dominant by default; `election::elect_backoff_ms`). The historical
+// RSSI-only rule survives byte-faithfully as `election::legacy_recovery_backoff_ms`, selected by the
+// `ElectConfig::Legacy` escape hatch. The recovery resolver below dispatches on `elect.elect_cfg`.
 
 /// OTA (#33 Model-A): the ONE retained fleet STAGING topic (`OTA|build|size|sha256|url`)
 /// published by `ota_publish.sh stage`. Every board subscribes it as its `latest_version`
@@ -2338,6 +2353,12 @@ fn mqtt_session(
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 25, MESH_CHANNEL_HINT_TOPIC) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
     }
+    // #gateway-election: subscribe the retained best-gateway metric (packet-id 26 — next free above
+    // #155's 25). Rides the SAME broker burst as MC/channel_hint so the resolver reads the operator's
+    // metric BEFORE it claims (the settle window after the primary downlinks catches it).
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 26, MESH_ELECT_TOPIC) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
 
     // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
     for &(id, line) in telemetry {
@@ -2662,6 +2683,24 @@ fn mqtt_session(
                         elect.channel_hint = parse_channel_hint(payload);
                         if let Some(h) = elect.channel_hint {
                             log::info!("smol: #155 channel_hint = ch{} (retained)", h);
+                        }
+                    } else if topic == MESH_ELECT_TOPIC {
+                        // #gateway-election: capture the operator's best-gateway metric into the
+                        // election record. Empty/garbage → BestGateway(DEFAULT) (on-by-default);
+                        // `legacy` → the escape hatch. The recovery-backoff + empty-MC-deferral arms
+                        // dispatch on it. Consumed in THIS burst (no CFG-relay round-trip).
+                        elect.elect_cfg = crate::net::election::parse_elect_config(payload);
+                        match elect.elect_cfg {
+                            crate::net::election::ElectConfig::Legacy => {
+                                log::info!("smol: #gateway-election metric = LEGACY (lowest-id, retained)")
+                            }
+                            crate::net::election::ElectConfig::BestGateway(w) => log::info!(
+                                "smol: #gateway-election metric = best-gateway c{} r{} n{} u{} (retained)",
+                                w.co_channel,
+                                w.rssi,
+                                w.ntp,
+                                w.uptime
+                            ),
                         }
                     } else if topic == OTA_STAGED_TOPIC {
                         // #33 Model-A: parse + GATE the retained STAGED line (monotonicity +
@@ -3415,7 +3454,19 @@ fn mqtt_session(
                 let backoff = if elect.owner_never_heard {
                     (node_id as u64) * 200
                 } else {
-                    reelect_backoff_ms(elect.my_rssi, node_id)
+                    // #gateway-election: the dead-owner takeover stagger is now the CONFIGURABLE
+                    // best-gateway fitness backoff (co-channel-dominant by default) — so the
+                    // best-gateway survivor (co-channel > strong-RSSI > NTP > uptime) claims the
+                    // vacated crown FIRST and weaker survivors adopt its fresh MC. `Legacy` restores
+                    // the historical RSSI-only stagger byte-for-byte.
+                    match elect.elect_cfg {
+                        crate::net::election::ElectConfig::BestGateway(w) => {
+                            crate::net::election::elect_backoff_ms(&elect.fitness_inputs(), &w, node_id)
+                        }
+                        crate::net::election::ElectConfig::Legacy => {
+                            crate::net::election::legacy_recovery_backoff_ms(elect.my_rssi, node_id)
+                        }
+                    }
                 };
                 // #114 H3: gate on `stale_limit` (not a hardcoded RECOVERY_STALE_MS) so the
                 // never-heard takeover honours the SAME conservative 90s window used for `alive`
@@ -3436,12 +3487,45 @@ fn mqtt_session(
             }
         }
         None => {
-            // Empty/absent/unparseable topic → claim immediately (fast cold-start; a recovery
-            // that finds the record cleared also claims — sticky-adopt converges any race).
+            // Empty/absent/unparseable topic → the crown is VACANT.
             elect.owner_alive = false;
-            elect.i_am_owner = true;
-            elect.owner_id = node_id;
-            Some(1)
+            // #gateway-election: best-gateway DEFERS an empty-slot claim until this board's uptime
+            // clears its fitness backoff, so a co-channel board (short/zero backoff) crowns FIRST at
+            // cold boot and a weaker board re-reads its now-populated MC next burst and ADOPTS it —
+            // no #204/#217 shed cycle needed to migrate off a bad crown. STATELESS (uptime = now_ms);
+            // BOUNDED (MAX_ELECT_TIERS ⇒ ≤30 s) so a SOLE board still claims → never crownless. A
+            // long-lived board (high uptime) has a tiny backoff, so a running gateway re-claims a
+            // freshly-cleared MC without delay (the defer self-limits to boot-fresh boards). `Legacy`
+            // claims immediately (the historical fast cold-start).
+            // FAIL-OPEN: only defer once our AP channel is KNOWN (co_channel is trustworthy) — a
+            // pre-scan boot board claims immediately (fast cold-start, #155-style fail-open).
+            let defer = elect.co_channel_known
+                && match elect.elect_cfg {
+                    crate::net::election::ElectConfig::BestGateway(w) => {
+                        elect.now_ms
+                            < crate::net::election::elect_backoff_ms(
+                                &elect.fitness_inputs(),
+                                &w,
+                                node_id,
+                            )
+                    }
+                    crate::net::election::ElectConfig::Legacy => false,
+                };
+            if defer {
+                // Stay leaf this burst; owner_id == node_id (no foreign owner) → leaf-reelect retries
+                // on cadence until we claim (uptime clears backoff) or adopt a board that crowned.
+                elect.i_am_owner = false;
+                log::info!(
+                    "smol: best-gateway — deferring empty-MC claim (uptime {} ms < backoff, co_channel={})",
+                    elect.now_ms,
+                    elect.co_channel
+                );
+                None
+            } else {
+                elect.i_am_owner = true;
+                elect.owner_id = node_id;
+                Some(1)
+            }
         }
     };
     // #146 CLAIM guard: a board that abdicated on sustained flush failure (its WiFi uplink is

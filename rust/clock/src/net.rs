@@ -90,6 +90,13 @@ pub mod wire;
 #[cfg(feature = "espnow")]
 pub mod coexist;
 
+// Configurable best-gateway election — PURE (no esp-hal/esp-wifi, no alloc), host-tested verbatim by
+// `experiments/election_verify` (#[path]-include, like `coexist`). Seeded by `wifi`'s MeshElect
+// resolver + `mode`'s flush/recovery paths; gated to `wifi` (where MeshElect lives — every election
+// path is built with WiFi present).
+#[cfg(feature = "wifi")]
+pub mod election;
+
 // #25 WLED WiZmote-emit (smol as a WLED "linked remote"). `wled = ["espnow"]`, so
 // this is present only in a wled build; the default/wifi/espnow builds are byte-free
 // of it (the module is `#![cfg(feature = "wled")]`). Referenced by `app` (the
