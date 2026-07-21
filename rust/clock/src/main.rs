@@ -62,7 +62,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 // bootloader auto-reverts too, if it was built with rollback enabled). rc.0 puts
 // `software_reset` in `esp_hal::system`, NOT `esp_hal::reset` (spike-verified).
 #[cfg(feature = "wifi")]
-#[no_mangle]
+// edition 2024: `no_mangle` is now an unsafe attribute (symbol-name control).
+#[unsafe(no_mangle)]
 extern "Rust" fn custom_halt() -> ! {
     // #70 observability: record that THIS reset was a PANIC before we reboot. A panic halts
     // here → software_reset, which the SoC logs as a plain `CoreSw` (same as an intentional

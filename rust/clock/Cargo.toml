@@ -1,8 +1,8 @@
 [package]
 name = "clock"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.96"
+edition = "2024"
+rust-version = "1.88"
 description = "smol: ESP32-C3 SuperMini + 0.42\" SSD1306 OLED clock with WiFi/NTP + ESP-NOW"
 license = "MIT OR Apache-2.0"
 
