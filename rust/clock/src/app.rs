@@ -179,6 +179,9 @@ pub enum AppKind {
     #[allow(dead_code)]
     Snake,
     About,
+    // #282 Sigil — the node's identity nameplate. Its OWN navigable screen (own Plugin + menu
+    // row). Compiled into EVERY build: identity needs no radio (like About/Clock), so no cfg gate.
+    Sigil,
     // Batt is LIVE whenever compiled (constructed by its REGISTRY row + `enter`),
     // so no `dead_code` allow is needed — unlike `Snake` under espnow. cfg(wifi):
     // the fetch path is wifi-only (espnow ⊃ wifi).
@@ -252,6 +255,8 @@ impl AppKind {
             // in the menu. ("MeshSnake" below is the explicit espnow-only alias.)
             "Snake" => SNAKE_KIND,
             "About" => AppKind::About,
+            // #282: a node's default screen can be set to its identity nameplate via #21.
+            "Sigil" => AppKind::Sigil,
             "Batt" => AppKind::Batt,
             "Grid" => AppKind::Grid,
             #[cfg(feature = "espnow")]
@@ -291,6 +296,7 @@ impl AppKind {
             AppKind::Clock => "Clock",
             AppKind::Snake => "Snake",
             AppKind::About => "About",
+            AppKind::Sigil => "Sigil",
             #[cfg(feature = "wifi")]
             AppKind::Batt => "Batt",
             #[cfg(feature = "wifi")]
@@ -362,6 +368,7 @@ pub enum App {
     #[allow(dead_code)]
     Snake(crate::snake::Snake),
     About(crate::about::About),
+    Sigil(crate::sigil::SigilState),
     #[cfg(feature = "wifi")]
     Batt(crate::batt::BattState),
     #[cfg(feature = "wifi")]
@@ -394,6 +401,7 @@ impl App {
             AppKind::Clock => App::Clock(crate::clock::ClockState::new()),
             AppKind::Snake => App::Snake(crate::snake::Snake::new(ctx.now_ms)),
             AppKind::About => App::About(crate::about::About::new(ctx.now_ms)),
+            AppKind::Sigil => App::Sigil(crate::sigil::SigilState::new()),
             #[cfg(feature = "wifi")]
             AppKind::Batt => App::Batt(crate::batt::BattState::new()),
             #[cfg(feature = "wifi")]
@@ -435,6 +443,7 @@ impl App {
             App::Clock(s) => Plugin::on_button(s, press, ctx),
             App::Snake(s) => Plugin::on_button(s, press, ctx),
             App::About(s) => Plugin::on_button(s, press, ctx),
+            App::Sigil(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "wifi")]
             App::Batt(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "wifi")]
@@ -465,6 +474,7 @@ impl App {
             App::Clock(s) => Plugin::update(s, ctx),
             App::Snake(s) => Plugin::update(s, ctx),
             App::About(s) => Plugin::update(s, ctx),
+            App::Sigil(s) => Plugin::update(s, ctx),
             #[cfg(feature = "wifi")]
             App::Batt(s) => Plugin::update(s, ctx),
             #[cfg(feature = "wifi")]
@@ -515,6 +525,7 @@ impl App {
             App::Clock(_) => (AppKind::Clock, 0),
             App::Snake(_) => (AppKind::Snake, 0),
             App::About(_) => (AppKind::About, 0),
+            App::Sigil(_) => (AppKind::Sigil, 0),
             #[cfg(feature = "wifi")]
             App::Batt(s) => (AppKind::Batt, s.page()),
             #[cfg(feature = "wifi")]
@@ -585,6 +596,9 @@ pub const REGISTRY: &[AppDesc] = &[
     #[cfg(feature = "wled")]
     AppDesc { title: "WLED", kind: AppKind::WledRemote },
     AppDesc { title: "About", kind: AppKind::About },
+    // #282 Sigil — the node's identity nameplate. Compiled into every build (identity needs no
+    // radio), so this row is always present; sits by About in the identity/provenance group.
+    AppDesc { title: "Sigil", kind: AppKind::Sigil },
     // #45 Custom — espnow-only (content arrives only over the radio config path). Last menu row,
     // matching luna's #81 screen input_select order (…About, Custom).
     #[cfg(feature = "espnow")]
@@ -627,6 +641,10 @@ pub const fn plugin_bit(kind: AppKind) -> Option<u8> {
         #[cfg(feature = "wled")]
         AppKind::WledRemote => Some(5),
         AppKind::About => Some(6),
+        // #282 Sigil is NON-maskable (like Menu/Custom): the #55 mask is the original 7 plugins
+        // (bits 0..6) and predates it — giving Sigil a bit would let a legacy all-on mask hide the
+        // node's own nameplate. `None` ⇒ always shown, no rework to the live #55 contract.
+        AppKind::Sigil => None,
         // #45 Custom is NON-maskable (like Menu): luna's #55 mask is the original 7 plugins
         // (bits 0..6, all-on 007F) and predates Custom — giving Custom bit 7 would let a 007F
         // mask HIDE it permanently. `None` ⇒ always shown, no rework to the live #55 contract.

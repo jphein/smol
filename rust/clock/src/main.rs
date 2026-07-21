@@ -98,6 +98,9 @@ mod toast;
 // plugins, compiled in EVERY build (identity/time need no radio).
 mod about;
 mod clock;
+// #282 SIGIL screen — the node's identity nameplate (fantasy name + version sigil). Its own
+// navigable plugin + menu row; compiled in EVERY build (identity needs no radio, like About).
+mod sigil;
 // BENCH mode (ESP-NOW link stats + mesh roster). ESP-NOW-only.
 #[cfg(feature = "espnow")]
 mod bench;
