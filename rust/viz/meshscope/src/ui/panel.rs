@@ -341,7 +341,8 @@ fn sparkline_plot(ui: &mut egui::Ui, name: &str, hist: &std::collections::VecDeq
         .allow_drag(false)
         .allow_scroll(false)
         .show(ui, |plot_ui| {
-            plot_ui.line(Line::new(pts).color(color).width(1.5_f32));
+            // egui_plot 0.36: `Line::new` now requires a name (id) as the first arg.
+            plot_ui.line(Line::new(name, pts).color(color).width(1.5_f32));
         });
 }
 

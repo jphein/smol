@@ -48,11 +48,14 @@ updates:
       # #233 matched set — do NOT auto-bump; breaks the firmware build.
       - dependency-name: "esp-*"
       - dependency-name: "smoltcp"
-      # egui family — coordinated migration only (tracked in #292). meshscope
-      # pins eframe+egui+egui_plot at 0.28; eframe hard-pins egui ^0.28, so a
-      # piecemeal bump of any one forces two incompatible egui crates into the
-      # graph and breaks the build (held PRs #287/#291). Bump all three together
-      # in one migration PR, not weekly dependabot lockstep bumps.
+      # egui family — a MATCHED SET, coordinated-migration-only (like esp-* above).
+      # eframe hard-pins egui, and egui_plot tracks egui on its own cadence, so a
+      # piecemeal bump of any one forces two incompatible egui crates into the graph
+      # and breaks meshscope (held PRs #287/#291). Migrated together to eframe/egui
+      # 0.35 + egui_plot 0.36 in #292; any future major must likewise move all three
+      # in ONE coordinated PR — never weekly dependabot lockstep bumps. Kept ignored
+      # (the "bump manually" path #292 chose) so dependabot stops re-opening the
+      # un-mergeable piecemeal PRs; revisit when the next egui major lands.
       - dependency-name: "eframe"
       - dependency-name: "egui*"
 

@@ -16,9 +16,9 @@ description = "Realtime egui instrument for the smol ESP-NOW mesh (MQTT smol/# -
 mesh-model.workspace = true
 # Immediate-mode GUI + native windowing (glow/OpenGL backend, dlopens X11/wayland at
 # runtime — no build-time dev libs required).
-eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-egui = "0.28"
-egui_plot = "0.28" # sparklines in the detail panel
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.35"
+egui_plot = "0.36" # sparklines in the detail panel (0.36 pins egui ^0.35 — coordinated bump #292)
 # #23 operator mode: the publish path (a separate client, distinct id). The listener
 # lives in mesh-model; this is meshscope's OWN client for --operator publishing.
 rumqttc.workspace = true

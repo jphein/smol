@@ -40,7 +40,13 @@ impl MeshscopeApp {
 }
 
 impl eframe::App for MeshscopeApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    // egui/eframe 0.35 split the old `update(ctx)` into an optional `logic(ctx)` (no painting)
+    // plus this required `ui(ui)` paint pass. The root `ui` has no margin/background, so we lay
+    // the panels straight into it — the 0.35 replacement for showing panels on the `Context`.
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // `Context` is a cheap Arc handle — clone it so the ctx-scoped calls (repaint + the modal
+        // Window, both still ctx-based in 0.35) don't tangle with the `&mut ui` the panels borrow.
+        let ctx = ui.ctx().clone();
         // Keep animating the force layout + live data.
         ctx.request_repaint_after(Duration::from_millis(33));
         let now_s = self.start.elapsed().as_secs_f64();
@@ -56,33 +62,36 @@ impl eframe::App for MeshscopeApp {
             }
         }
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| top_bar(ui, &m, now_s));
+        // 0.35: TopBottomPanel/SidePanel merged into `egui::Panel` (top/bottom/left/right), shown
+        // INTO the `&mut Ui` (not the ctx); `default_width/height` + `min_*` unified to `*_size`.
+        egui::Panel::top("top").show(ui, |ui| top_bar(ui, &m, now_s));
 
-        egui::TopBottomPanel::bottom("events")
+        egui::Panel::bottom("events")
             .resizable(true)
-            .default_height(148.0)
-            .min_height(60.0)
-            .show(ctx, |ui| {
+            .default_size(148.0)
+            .min_size(60.0)
+            .show(ui, |ui| {
                 ui.add_space(2.0);
                 ui.label(RichText::new(format!("event ticker · {} msgs", m.msg_count)).strong().small());
                 ticker::show(ui, &m, now_s);
             });
 
-        egui::SidePanel::right("detail").resizable(true).default_width(310.0).min_width(240.0).show(ctx, |ui| {
+        egui::Panel::right("detail").resizable(true).default_size(310.0).min_size(240.0).show(ui, |ui| {
             panel::show(ui, &m, self.selected, now_s);
         });
 
         // Operator dock (left) — ONLY in --operator mode. The command surface + the
         // confirmation modal for destructive/fleet actions. Default builds never see it.
         if let Some(publisher) = self.operator.as_ref() {
-            egui::SidePanel::left("operator").resizable(true).default_width(290.0).min_width(250.0).show(ctx, |ui| {
+            egui::Panel::left("operator").resizable(true).default_size(290.0).min_size(250.0).show(ui, |ui| {
                 let sel_node = self.selected.and_then(|id| m.nodes.get(&id));
                 opdock::show(ui, sel_node, publisher, &mut self.op_state);
             });
-            opdock::confirm_modal(ctx, publisher, &mut self.op_state);
+            // A modal Window still shows on the ctx in 0.35 (floating, viewport-level — unchanged).
+            opdock::confirm_modal(&ctx, publisher, &mut self.op_state);
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             if let Some(clicked) = self.layout.draw(ui, &m, self.selected, now_s) {
                 self.selected = Some(clicked);
             }
