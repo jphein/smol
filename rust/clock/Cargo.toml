@@ -107,7 +107,7 @@ esp-bootloader-esp-idf = { version = "=0.2.0", optional = true, features = ["esp
 # whereas `sha2` is peripheral-free + move-friendly. Cost is ~4 KB flash — negligible
 # at ~30% slot usage (3.3x headroom). Hashing is bound by the ~600 KB HTTP download,
 # not the digest, so there's no throughput reason to prefer HW here. (spec §Stage C-4.)
-sha2 = { version = "0.10", default-features = false, optional = true }
+sha2 = { version = "0.11", default-features = false, optional = true }
 # The `NorFlash` trait (erase/write) whose impl on esp-storage's FlashStorage the OTA
 # ImageWriter drives. Trait-only crate; pin to the 0.3.x esp-storage already links.
 embedded-storage = { version = "0.3", optional = true }
