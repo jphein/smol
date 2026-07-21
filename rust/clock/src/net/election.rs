@@ -186,6 +186,17 @@ pub fn yield_to_co_channel_owner(
         && owner_alive
 }
 
+/// LAYER 2 reliability: should a CO-CHANNEL-capable board REFUSE to leaf-lock to (settle under) an
+/// owner whose MC channel is a KNOWN off-channel? True iff our AP channel == the mesh channel AND the
+/// owner's channel is known (`!= 0`) AND != the mesh channel. Refusing the lock (skip the
+/// scan-lock + owner-silence reset) keeps the leaf RE-ELECTING, so the co-channel SEIZE re-runs each
+/// recovery burst and fires RELIABLY — fixing the racy ~2/3 seize where a happy leaf-lock (co_channel
+/// transiently unknown at the boot tick) stopped the bursts that would have seized. A co-channel owner
+/// (`owner_ch == mesh`) or an unknown owner channel (`0`) → lock normally (false). Pure + deterministic.
+pub fn refuse_leaf_lock_off_channel(my_ap_ch: u8, mesh_ch: u8, owner_ch: u8) -> bool {
+    mesh_ch != 0 && my_ap_ch == mesh_ch && owner_ch != 0 && owner_ch != mesh_ch
+}
+
 /// `Legacy` recovery backoff — reproduces the historical `reelect_backoff_ms(rssi, node_id)` EXACTLY
 /// (bucket 0/1/2 × 15 s + id·200 ms), so `ElectConfig::Legacy` is a byte-faithful rollback of the
 /// election timing. Kept here (pure) so the regression is host-pinned alongside best-gateway.

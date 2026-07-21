@@ -206,6 +206,10 @@ pub struct MeshElect {
     pub i_am_owner: bool,
     /// The elected owner's id (== my_id when I own it).
     pub owner_id: u8,
+    /// #gateway-election reliability: the adopted/deferred owner's MC channel (`<ch>`; 0 = unknown /
+    /// self-claim). The caller records it as `elected_owner_channel` so a co-channel leaf REFUSES to
+    /// leaf-lock to a proven off-channel owner (keeps re-electing until the seize fires reliably).
+    pub owner_channel: u8,
     /// #51: true iff the adopted owner was GENUINELY LIVE (fresh seq), false iff it
     /// was dead-but-inside-our-backoff (a deferred takeover). The caller grace-resets
     /// its owner-silence clock ONLY for a genuinely-live owner — a dead-deferred owner
@@ -252,6 +256,7 @@ impl MeshElect {
             ),
             i_am_owner: false,
             owner_id: my_id,
+            owner_channel: 0, // #gateway-election reliability: set from the MC <ch> in the resolver
             owner_alive: false,
             hint_blocked: false, // #155: set by the claim gate on a channel-hint yield
             downstream_seen: false, // #204 2a: set true in the drain on any retained downstream
@@ -3387,21 +3392,40 @@ fn mqtt_session(
     // read the LIVE AP channel here (`esp_wifi_sta_get_ap_info`) and recompute co_channel vs the
     // seeded mesh channel — and LOG it so the co-channel decision is visible on serial. espnow-only
     // (current_ap_info is espnow-gated); a wifi-only build keeps the caller's seed (no mesh/election).
+    // RELIABILITY: `esp_wifi_sta_get_ap_info` can transiently return None / a 0 primary channel in the
+    // first moments after association (the ~1/3 racy-seize cause). RETRY a bounded number of times
+    // (polling the iface to let the association settle) for a NONZERO channel; and on a persistent
+    // transient DON'T clobber co_channel to false — keep the caller's seed (recovery/flush seed it
+    // accurately from my_ap_channel; boot falls back to the leaf-lock guard, which keeps re-electing).
     #[cfg(feature = "espnow")]
     if elect.mesh_channel != 0 {
-        match crate::net::current_ap_info() {
-            Some((ap_ch, ap_rssi, _)) => {
-                elect.co_channel = ap_ch == elect.mesh_channel;
-                elect.co_channel_known = true;
-                log::info!(
-                    "smol: #gateway-election AP ch={} rssi={} mesh_ch={} -> co_channel={}",
-                    ap_ch,
-                    ap_rssi,
-                    elect.mesh_channel,
-                    elect.co_channel
-                );
+        let mut ap_ch = 0u8;
+        let mut ap_rssi = 0i8;
+        for _ in 0..24 {
+            if let Some((c, r, _)) = crate::net::current_ap_info() {
+                if c != 0 {
+                    ap_ch = c;
+                    ap_rssi = r;
+                    break;
+                }
             }
-            None => log::info!("smol: #gateway-election — current_ap_info None (not associated at election?)"),
+            iface.poll(smoltcp_now(), device, sockets); // give the association a beat to settle
+        }
+        if ap_ch != 0 {
+            elect.co_channel = ap_ch == elect.mesh_channel;
+            elect.co_channel_known = true;
+            log::info!(
+                "smol: #gateway-election AP ch={} rssi={} mesh_ch={} -> co_channel={}",
+                ap_ch,
+                ap_rssi,
+                elect.mesh_channel,
+                elect.co_channel
+            );
+        } else {
+            log::info!(
+                "smol: #gateway-election — AP channel unknown after retries (transient) — keeping co_channel={} (leaf-lock guard will re-elect)",
+                elect.co_channel
+            );
         }
     }
     let claim_seq: Option<u32> = match mc {
@@ -3419,6 +3443,9 @@ fn mqtt_session(
             }
             elect.seen_owner = owner;
             elect.seen_seq = seq;
+            // #gateway-election reliability: record the owner's MC channel so the caller knows whether
+            // the (adopted/deferred) owner is off-channel — read only when !i_am_owner (leaf).
+            elect.owner_channel = mc_ch;
             // #114 H3 (stale-self-reclaim fix): choose the dead-owner window by CORROBORATION.
             // `owner_never_heard` was introduced by H1 to mean "a forged/phantom retained MC no
             // board ever heard — take it over promptly". But it is ALSO true for EVERY freshly

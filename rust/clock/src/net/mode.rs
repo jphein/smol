@@ -1920,6 +1920,11 @@ pub struct RadioManager {
     /// #23: the elected mesh owner's id (the single coexist gateway). Set at boot from
     /// the broker election; a leaf scans for THIS id's HELLO to find the mesh channel.
     elected_owner: u8,
+    /// #gateway-election reliability: the elected owner's MC channel (`<ch>`; 0 = unknown). Recorded
+    /// from the election each burst. A CO-CHANNEL-capable leaf REFUSES to leaf-lock to an owner whose
+    /// channel is a KNOWN off-channel (!= mesh) — so it keeps re-electing until the co-channel SEIZE
+    /// fires reliably (fixes the racy ~2/3 seize where a happy leaf-lock stopped the recovery bursts).
+    elected_owner_channel: u8,
     /// #23 leaf scan-discovery state (stage 2): locked onto the owner's channel, the
     /// current 1/6/11 scan index, last channel-hop time, last time the owner was heard.
     scan_locked: bool,
@@ -2172,6 +2177,7 @@ impl RadioManager {
             #[cfg(feature = "wled")]
             wled_seq: 0,
             elected_owner: id,
+            elected_owner_channel: 0, // #gateway-election reliability: set from the election each burst
             scan_locked: false,
             scan_idx: 0,
             learned_channel: 0, // #29: unknown until the first frame is heard
@@ -2464,6 +2470,7 @@ impl RadioManager {
             self.owner_hello_seen = false;
         }
         self.elected_owner = elect.owner_id;
+        self.elected_owner_channel = elect.owner_channel; // #gateway-election reliability (leaf-lock guard)
         self.scan_locked = false;
         if elect.i_am_owner {
             // Took over a dead/stale owner (or empty topic): become the coexist GATEWAY.
@@ -3729,8 +3736,15 @@ impl RadioManager {
         // #217 rung-3: co-channel-FIRST pre-fetch gate. Off-channel (ap_ch != mesh — RSSI-
         // INDEPENDENT, the id5 ch1-vs-ch6 bug the rung-2 rssi gate missed) OR weak → co-channel-
         // prefer reassoc before the fetch; fold the outcome into the strand-guard.
-        let off_channel = self.my_ap_channel != ESP_NOW_FIXED_CHANNEL;
-        if off_channel || self.my_rssi_to_ap < CROWN_AP_RSSI_MIN {
+        // #gateway-election reliability (issue 2): my_ap_channel can be transiently 0 here — the
+        // switch(WifiSta) above just (re)issued connect() and the association may not have settled, so
+        // a stale/0 channel would read as "off-channel" and trigger a NEEDLESS reassoc that scanned
+        // away from a good AP and came back ap_ch=0 → OTA aborted. Only reassoc when the channel is
+        // KNOWN (nonzero) and genuinely off-channel/weak; a 0 (unknown/settling) SKIPS the reassoc and
+        // lets run_ota_fetch's own assoc-wait establish the strongest AP (SCAN_METHOD=1 → ch6).
+        let ap_known = self.my_ap_channel != 0;
+        let off_channel = ap_known && self.my_ap_channel != ESP_NOW_FIXED_CHANNEL;
+        if ap_known && (off_channel || self.my_rssi_to_ap < CROWN_AP_RSSI_MIN) {
             log::warn!(
                 "smol #217r3: pre-fetch off_ch={} rssi={} — co-channel-prefer reassoc",
                 off_channel,
@@ -3738,6 +3752,10 @@ impl RadioManager {
             );
             let decision = self.reassoc_ch6_prefer();
             self.note_crown_ap(decision);
+        } else if !ap_known {
+            log::info!(
+                "smol #gateway-election: pre-fetch AP channel unknown (transient after switch) — skipping reassoc, letting the fetch's assoc-wait pick the strongest AP"
+            );
         }
         // Strand-guard OTA-enable: attempt OTA ONLY as a healthy co-channel (Normal) crown. If no
         // co-channel AP is reachable (Degraded/Shed), SKIP the fetch CAP-NEUTRALLY (`true` = "not
@@ -4990,6 +5008,7 @@ impl RadioManager {
                 self.owner_hello_seen = false;
             }
             self.elected_owner = elect.owner_id;
+            self.elected_owner_channel = elect.owner_channel; // #gateway-election reliability (leaf-lock guard)
             if !elect.i_am_owner {
                 self.relay.is_gateway = false;
                 self.scan_locked = false;
@@ -5222,7 +5241,19 @@ impl RadioManager {
                     // #23 leaf channel-lock: a leaf that hears the ELECTED OWNER's
                     // HELLO has found the mesh channel — lock (stop scanning) + stamp
                     // the time (silence re-scan is driven by `leaf_scan_tick`).
-                    if !self.relay.is_gateway && peer_id == self.elected_owner {
+                    // #gateway-election reliability: a CO-CHANNEL-capable board must NOT settle as a
+                    // happy leaf under a PROVEN OFF-CHANNEL owner. Locking (+ resetting owner-silence)
+                    // would stop the recovery bursts that RE-EVALUATE the co-channel SEIZE — making the
+                    // seize racy (it fired only ~2/3, when co_channel happened to be known before the
+                    // leaf-lock). So for a known-off-channel owner we SKIP the lock/silence-reset: the
+                    // leaf keeps re-electing (each recovery burst re-runs the seize with co_channel
+                    // reliably known from my_ap_channel) until it seizes the off-channel crown for good.
+                    let owner_off_channel = crate::net::election::refuse_leaf_lock_off_channel(
+                        self.my_ap_channel,
+                        ESP_NOW_FIXED_CHANNEL,
+                        self.elected_owner_channel,
+                    );
+                    if !self.relay.is_gateway && peer_id == self.elected_owner && !owner_off_channel {
                         self.scan_locked = true;
                         self.last_owner_heard_ms = now;
                         // #114 H1: our elected owner is provably ALIVE on the mesh (heard its
@@ -5231,6 +5262,12 @@ impl RadioManager {
                         // #51 A1: re-locked a valid owner's HELLO → resume normal HELLO
                         // (we are a healthy leaf again, no longer an abdicated ghost).
                         self.silent_until_relock = false;
+                    } else if !self.relay.is_gateway && peer_id == self.elected_owner && owner_off_channel {
+                        log::info!(
+                            "smol: #gateway-election — heard off-channel owner id{} (ch{}); NOT leaf-locking (co-channel, will re-elect to seize)",
+                            peer_id,
+                            self.elected_owner_channel
+                        );
                     }
 
                     // Register the broadcaster so the ACK below can be unicast (#28: bounded LRU).
@@ -6180,6 +6217,7 @@ pub fn start(
     // `synced` stays best-effort for TIME (mesh-time adoption handles an unsynced GW).
     radio.relay.is_gateway = reached_dhcp && elect.i_am_owner;
     radio.elected_owner = elect.owner_id;
+    radio.elected_owner_channel = elect.owner_channel; // #gateway-election reliability (leaf-lock guard)
     // #51 B: if we associated, seed the initial RSSI-to-AP so the first recovery
     // election already has a real signal-strength reading to compare on.
     if reached_dhcp {

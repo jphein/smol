@@ -123,6 +123,18 @@ fn main() {
     // owner is self → never yield.
     assert!(!yield_to_co_channel_owner(true, false, MESH, 7, 7, MESH, true), "never yield to self");
 
+    // ---- reliability: refuse leaf-lock to a known off-channel owner (fixes the racy ~2/3 seize) ---
+    // co-channel board (ap ch6) + owner on ch1 → REFUSE the lock (keep re-electing until seize).
+    assert!(refuse_leaf_lock_off_channel(MESH, MESH, 1), "co-channel refuses lock to off-channel owner");
+    // owner is co-channel (ch == mesh) → lock normally.
+    assert!(!refuse_leaf_lock_off_channel(MESH, MESH, MESH), "lock to a co-channel owner");
+    // owner channel unknown (0) → lock normally (fail-safe).
+    assert!(!refuse_leaf_lock_off_channel(MESH, MESH, 0), "unknown owner channel → lock normally");
+    // WE are not co-channel (ap ch1) → lock normally (we're not the better crown; follow the mesh).
+    assert!(!refuse_leaf_lock_off_channel(1, MESH, 1), "non-co-channel board locks normally");
+    // our AP channel unknown (0) → lock normally.
+    assert!(!refuse_leaf_lock_off_channel(0, MESH, 1), "unknown own channel → lock normally");
+
     // ---- Legacy backoff is a byte-faithful 1:1 of the historical reelect_backoff_ms ---------
     assert_eq!(legacy_recovery_backoff_ms(-60, 5), 0 * ELECT_TIER_STEP_MS + 5 * 200, "legacy strong bucket 0");
     assert_eq!(legacy_recovery_backoff_ms(-70, 5), 1 * ELECT_TIER_STEP_MS + 5 * 200, "legacy mid bucket 1");
