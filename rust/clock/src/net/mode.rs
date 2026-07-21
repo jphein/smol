@@ -2957,6 +2957,23 @@ impl RadioManager {
             }
             Err(_) => CrownApDecision::NoAp,
         };
+        // #gateway-election issue 2: a transient scan that MISSED our co-channel incumbent must NOT
+        // reassociate us to a WORSE off-channel AP. HW bug: after a fetch-leg-deaf fail, this reassoc
+        // jumped id7 from a62bb0 ch6 -63 to a ch11 -78 AP → off-channel → MC|7|11 → retries then
+        // failed OFF-channel. If we are CURRENTLY co-channel and the selector only found an
+        // off-channel fallback / no AP (the co-channel AP just wasn't in THIS scan), STAY PUT: return
+        // a co-channel decision WITHOUT disconnecting, so note_crown_ap keeps us Normal on the good
+        // ch6 AP and the next attempt re-scans + re-picks. A genuine CoChannel decision proceeds below.
+        if self.my_ap_channel == ESP_NOW_FIXED_CHANNEL
+            && !matches!(decision, CrownApDecision::CoChannel { .. })
+        {
+            log::info!(
+                "smol #gateway-election: reassoc scan missed co-channel ({:?}) — STAYING on current ch{} AP (no off-channel downgrade)",
+                decision,
+                self.my_ap_channel
+            );
+            return CrownApDecision::CoChannel { bssid: [0u8; 6], ch: ESP_NOW_FIXED_CHANNEL };
+        }
         // Pin the chosen AP (bssid + channel). A vanished pinned BSSID is recovered by the #195
         // retry re-scan (connect is async — no synchronous fail here); select_crown_ap then re-picks.
         let (bssid, chan): (Option<[u8; 6]>, Option<u8>) = match decision {

@@ -4638,6 +4638,16 @@ pub fn run_ota_fetch(
         };
         if let Some((addr, router)) = configured {
             apply_dhcp(&mut iface, addr, router);
+            // #gateway-election fetch-leg diag: our DHCP IP + the server we're about to hit — so serial
+            // confirms id7 landed on the right subnet to REACH the image host (rules out a routing/
+            // firewall/VLAN mismatch as the byte-0 cause vs an on-air RX deafness).
+            log::info!(
+                "smol OTA: DHCP lease {:?} router {:?} — connecting {}:{}",
+                addr,
+                router,
+                host,
+                port
+            );
             break;
         }
         if Instant::now() > deadline {
@@ -4878,12 +4888,24 @@ pub fn run_ota_fetch(
             }
         }
 
+        // #gateway-election fetch-leg instrumentation: the handshake COMPLETED (may_send true above),
+        // so a byte-0 failure is post-connect — log that the request went out so serial shows whether
+        // the RESPONSE arrives (rx_total below) vs the handshake (which we already passed).
+        log::info!(
+            "smol OTA: chunk range {}-{} GET sent (TCP up) — awaiting 206",
+            off,
+            end
+        );
         // Drain this chunk's response into the writer (streaming; headers validated once/chunk).
         let chunk_start = writer.written();
         let mut header_buf = [0u8; 512];
         let mut header_len = 0usize;
         let mut headers_done = false;
         let mut bad = false;
+        // #gateway-election fetch-leg RX instrumentation: total bytes the socket delivered this chunk.
+        // 0 at break ⇒ RX-DEAF (handshake ok but no response bytes — the coexist/RF starvation);
+        // >0 with bad ⇒ a NON-206 / garbled response (logged verbatim below). Distinguishes the two.
+        let mut rx_total = 0usize;
         // #217: per-body-progress stall timer (see OTA_BODY_STALL). Tracks body advance so a byte-0
         // hang on an RX-deaf, never-closing connection falls through to the outer stall guard FAST
         // instead of spinning to the global DEADLINE.
@@ -4900,6 +4922,7 @@ pub fn run_ota_fetch(
                 let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
                 if s.can_recv() {
                     let outcome = s.recv(|data| {
+                        rx_total += data.len(); // #gateway-election: count every delivered byte
                         if !headers_done {
                             let take = core::cmp::min(header_buf.len() - header_len, data.len());
                             if take == 0 {
@@ -4926,7 +4949,20 @@ pub fn run_ota_fetch(
                                             }
                                         }
                                     }
-                                    _ => {
+                                    other => {
+                                        // #gateway-election fetch-leg diag: log the ACTUAL status + the
+                                        // raw response head so serial shows whether the server sent a
+                                        // non-206 (404/416/…) or a GARBLED header (partial RX). This is
+                                        // the definitive RX-deaf-vs-parse discriminator team-lead needs.
+                                        let n = header_len.min(96);
+                                        log::error!(
+                                            "smol OTA: NON-206 st={:?} range {}-{} rx={}B — head: {:?}",
+                                            other,
+                                            off,
+                                            end,
+                                            rx_total,
+                                            core::str::from_utf8(&header_buf[..n]).unwrap_or("<non-utf8>")
+                                        );
                                         bad = true; // non-206 range reply (or 200 mid-stream)
                                         return (take, false);
                                     }
@@ -4981,6 +5017,17 @@ pub fn run_ota_fetch(
             }
         }
 
+        // #gateway-election fetch-leg RX instrumentation: the decisive line. rx=0 ⇒ handshake ok but
+        // ZERO response bytes = RX-DEAF (coexist/RF starvation — the fetch-leg deafness). rx>0 + bad ⇒
+        // a real non-206/garbled reply (logged verbatim above). rx>0 + !headers_done ⇒ a truncated
+        // header (partial RX). Lets serial pinpoint the failure without a pcap.
+        log::info!(
+            "smol OTA: chunk drained — rx={}B body={}B headers_done={} bad={}",
+            rx_total,
+            writer.written().saturating_sub(chunk_start),
+            headers_done,
+            bad
+        );
         if bad {
             *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::STATUS));
             log::error!("smol OTA: bad HTTP status/length on range {off}-{end} (slot untouched)");
