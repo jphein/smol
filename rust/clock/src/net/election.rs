@@ -140,7 +140,7 @@ pub fn elect_backoff_ms(i: &FitnessInputs, w: &MetricWeights, node_id: u8) -> u6
     let fit = gateway_fitness(i, w) as u64;
     let deficit = maxf.saturating_sub(fit);
     // ceil(deficit * MAX_ELECT_TIERS / maxf), clamped — best board (deficit 0) → tier 0 → no wait.
-    let tiers = ((deficit * MAX_ELECT_TIERS) + (maxf - 1)) / maxf;
+    let tiers = (deficit * MAX_ELECT_TIERS).div_ceil(maxf);
     tiers.min(MAX_ELECT_TIERS) * ELECT_TIER_STEP_MS + (node_id as u64) * 200
 }
 
