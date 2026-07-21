@@ -72,13 +72,15 @@ extern "Rust" fn custom_halt() -> ! {
     esp_hal::system::software_reset()
 }
 
+use embassy_executor::Spawner;
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
     i2c::master::{Config as I2cConfig, I2c},
-    main,
+    interrupt::software::SoftwareInterruptControl,
     time::Instant,
     time::Rate,
+    timer::timg::TimerGroup,
 };
 use ssd1306::{prelude::*, size::DisplaySize72x40, I2CDisplayInterface, Ssd1306};
 // `DisplayConfig::init` inits the PLAIN Ssd1306 (non-cast builds). Under `feature =
@@ -334,10 +336,28 @@ fn millis() -> u64 {
     Instant::now().duration_since_epoch().as_millis()
 }
 
-#[main]
-fn main() -> ! {
+// #198 D1 (executor-first): ONE entry shape for the firmware bin — `#[esp_rtos::main]`
+// universally. The superloop body is preserved below (mesh polled inline, watch model);
+// WiFi/NTP/MQTT/OTA-fetch are stubbed in 0c′ and brought up on embassy-net in Phases 3-5.
+// The #152 host/wasm LIB (src/lib.rs) never uses `main`/esp-rtos, so it is untouched.
+#[esp_rtos::main]
+async fn main(_spawner: Spawner) -> ! {
     // --- Clocks & peripherals ------------------------------------------------
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
+
+    // --- #198 executor substrate (Phase 0c′) --------------------------------
+    // D2: init the esp-alloc heap BEFORE the executor — esp-rtos's task arena draws
+    // from it. The default (no-radio) build is now allocating too; this SUPERSEDES the
+    // #44 byte-minimal-default invariant (accepted for the migration). 128 KiB matches
+    // the #140-grown radio heap so espnow/wifi builds keep their RX headroom.
+    esp_alloc::heap_allocator!(size: 128 * 1024);
+    // esp-radio 0.18 REQUIRES esp-rtos as its scheduler; with the `embassy` feature,
+    // esp_rtos::start ALSO wires the embassy time-driver + async executor (watch model):
+    // TIMG0.timer0 = time base, software_interrupt0 = the async-yield IRQ. Started here
+    // so the scheduler backs esp-radio and the executor ticks the whole run.
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
     esp_println::logger::init_logger_from_env();
     log::info!("smol booting: unified firmware (menu: Clock / Snake / Bench)");
@@ -534,8 +554,6 @@ fn main() -> ! {
         };
         net::try_time_sync(
             net::WifiPeripherals {
-                timg0: peripherals.TIMG0,
-                rng: peripherals.RNG,
                 wifi: peripherals.WIFI,
             },
             &mut batt_cache,
@@ -588,8 +606,6 @@ fn main() -> ! {
         };
         net::mode::start(
             net::WifiPeripherals {
-                timg0: peripherals.TIMG0,
-                rng: peripherals.RNG,
                 wifi: peripherals.WIFI,
             },
             // This unit's short id (see NODE_ID) — embedded in HELLO/ACK/BEACON/TIME

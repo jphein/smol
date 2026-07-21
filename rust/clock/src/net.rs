@@ -22,11 +22,11 @@ mod wifi;
 // dead-code in a wifi-without-espnow build so `clippy --features wifi -D warnings` passes.
 #[cfg_attr(not(feature = "espnow"), allow(dead_code))]
 pub(crate) fn assert_max_tx_power() {
-    const MAX_TX_POWER_QDBM: i8 = 34; // 8.5 dBm x 4 (quarter-dBm units)
-    let err = unsafe { esp_wifi_sys::include::esp_wifi_set_max_tx_power(MAX_TX_POWER_QDBM) };
-    if err != 0 {
-        log::debug!("smol #141: esp_wifi_set_max_tx_power -> {err}");
-    }
+    // 0c′ STUB (#198): esp-radio 0.18 keeps its `esp_wifi_sys` FFI in a `pub(crate)` module,
+    // so the #141 8.5 dBm TX-power clamp can't be re-applied via a free fn here. WiFi-STA is
+    // stubbed in 0c′; the bench canary runs at the driver-default TX power (higher, fine for a
+    // brief bench run). TODO(#198 Phase 3): re-apply via the controller's safe set-power API
+    // (esp_radio WifiController exposes esp_wifi_set_max_tx_power internally) from net::mode.
 }
 
 /// #204: the crown's CURRENT AP association — `(channel, RSSI dBm, BSSID)` — via the IDF
@@ -36,15 +36,12 @@ pub(crate) fn assert_max_tx_power() {
 /// pcap tonight (the fw could not report which AP/channel/RSSI a deaf crown was on).
 #[cfg(feature = "espnow")]
 pub(crate) fn current_ap_info() -> Option<(u8, i8, [u8; 6])> {
-    // SAFETY: `esp_wifi_sta_get_ap_info` fills a caller-owned POD record (all-zero is a valid
-    // initial state); it reads current-association state only, no aliasing. Same FFI idiom as
-    // `assert_max_tx_power` above.
-    let mut rec: esp_wifi_sys::include::wifi_ap_record_t = unsafe { core::mem::zeroed() };
-    let err = unsafe { esp_wifi_sys::include::esp_wifi_sta_get_ap_info(&mut rec) };
-    if err != 0 {
-        return None;
-    }
-    Some((rec.primary, rec.rssi, rec.bssid))
+    // 0c′ STUB (#198): the #204 crown-AP-association readback used esp-wifi's
+    // `esp_wifi_sta_get_ap_info` FFI, now behind esp-radio 0.18's `pub(crate)` sys module.
+    // WiFi-STA is stubbed in 0c′ so a node never associates → this always returned `None`
+    // anyway; keep that. TODO(#198 Phase 3): read the AP info from the associated
+    // embassy-net station (controller.ap_info() on the new stack).
+    None
 }
 
 // Hand-rolled MQTT 3.1.1 (QoS0) codec for the HA batt/telemetry bridge (v2). Pure

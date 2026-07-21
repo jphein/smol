@@ -44,7 +44,13 @@ impl About {
     /// boot), so the entry stamp is reserved, not needed.
     pub fn new(_now_ms: u64) -> Self {
         Self {
-            mac: esp_hal::efuse::Efuse::read_base_mac_address(),
+            // esp-hal 1.1: the `Efuse` struct was removed; the base MAC is now a
+            // free fn returning `MacAddress([u8;6])`. `as_bytes()` is the only getter;
+            // the slice is always len 6, so the `try_into` never fails.
+            mac: esp_hal::efuse::base_mac_address()
+                .as_bytes()
+                .try_into()
+                .unwrap(),
             last_s: None,
         }
     }
