@@ -179,11 +179,14 @@ pub(crate) mod phase2 {
         Some(s) => parse_u32(s),
         None => 10,
     };
-    /// `SMOL_P2_HOLD_MS` — how long the DUT holds each window open (default 8 s: room for a real NTP
-    /// exchange + a sustained WiFi burst so `steady_max_gap` reflects genuine associated-state traffic).
+    /// `SMOL_P2_HOLD_MS` — the CONTROLLED sustained-hold duration of each window (default 15 s). This
+    /// is decoupled from NTP timing on purpose (Oracle): a reachable NTP server makes ntp_sync a
+    /// sub-second event, but Lever B is specifically about a SUSTAINED co-channel hold — so the window
+    /// length is deliberate, not a side-effect of NTP. NTP sync is just ONE activity within the hold;
+    /// `steady_max_gap` is measured across the whole controlled window.
     pub const HOLD_MS: u64 = match option_env!("SMOL_P2_HOLD_MS") {
         Some(s) => parse_u64(s),
-        None => 8_000,
+        None => 15_000,
     };
     /// `SMOL_P2_GAP_MS` — quiescent gap between windows (default 3 s; long enough for wifi_task to tear
     /// the prior window down before the next open).
@@ -273,23 +276,41 @@ pub(crate) mod phase2 {
 /// #198 Phase 2 — the DUT's N-window measurement RUNNER (spec §B.5). A `poll(now)` state machine
 /// (NOT an embassy task: the per-window SUMMARY needs `RadioManager`, which `main`'s loop owns). It
 /// fires `WIFI_CMD`/`STOP_REQ` (module statics, reachable inline) + logs the window-lifecycle markers,
-/// and returns `true` the tick a window ENDS so `main` emits that window's `[dut] SUMMARY` + resets the
-/// per-window maxes. Run-0 control (`SMOL_P2_WINDOWS=0`) and the beacon role go straight to `Finished`
-/// (quiescent-only). Window lifecycle: Idle(gap) → OpenWindow → Opening(await LINK_UP=assoc_done) →
-/// Holding(HOLD_MS, steady-state measured) → STOP_REQ(window_end) → Idle(GAP_MS) → … ×N → Finished.
+/// and returns a [`P2Poll`] so `main` can ACT at the two boundaries: at `AssocDone` fold the scan deaf
+/// window into `scan_max_gap`; at `WindowEnd` emit that window's `[dut] SUMMARY` + reset the per-window
+/// maxes. Run-0 control (`SMOL_P2_WINDOWS=0`) and the beacon role go straight to `Finished` (quiescent-
+/// only). Lifecycle: Idle(gap) → OpenWindow → Opening(await LINK_UP=assoc_done EDGE) → Holding(the
+/// CONTROLLED SMOL_P2_HOLD_MS duration — Lever-B needs a SUSTAINED hold, not NTP's accidental fast
+/// window; latches any mid-window link drop) → STOP_REQ(window_end) → Idle(GAP_MS) → … ×N → Finished.
+#[cfg(feature = "phase2-measure")]
+pub enum P2Poll {
+    /// Nothing to act on this tick.
+    Idle,
+    /// assoc_done EDGE (fires once): the scan deaf window (window_start→assoc_done), captured as a
+    /// DURATION because board-B beacons aren't received during SCAN (radio off-ch6). `main` folds it
+    /// into `scan_max_gap` via [`RadioManager::phase2_capture_scan`].
+    AssocDone { scan_gap_ms: u32 },
+    /// A window just ENDED: `main` emits the per-window `[dut] SUMMARY` + resets the per-window maxes.
+    WindowEnd,
+}
+
 #[cfg(feature = "phase2-measure")]
 pub struct Phase2Runner {
     state: P2State,
     done: u32,
+    /// Latched `true` if LINK_UP EVER dropped between assoc_done and window_end (Lever-B: proves the
+    /// co-channel hold was SUSTAINED, not just up at a snapshot instant). Reset at each window's open.
+    link_dropped: bool,
 }
 
 #[cfg(feature = "phase2-measure")]
 enum P2State {
     /// Quiescent gap; open the next window once `now >= until_ms`.
     Idle { until_ms: u64 },
-    /// Window requested; await LINK_UP (assoc) or give up at `deadline_ms`.
-    Opening { deadline_ms: u64 },
-    /// Window held for steady-state measurement until `until_ms` (or an early link drop).
+    /// Window requested; await LINK_UP (assoc). `window_start_ms` = when we opened it (for the scan
+    /// deaf-window duration); give up at `deadline_ms`.
+    Opening { window_start_ms: u64, deadline_ms: u64 },
+    /// Window held for the CONTROLLED steady-state duration until `until_ms`.
     Holding { until_ms: u64 },
     /// All N windows done (or role/Run-0 = no windows): stay quiescent forever.
     Finished,
@@ -305,61 +326,69 @@ impl Phase2Runner {
                 if phase2::ROLE == phase2::Role::Beacon { "beacon" } else { "dut" },
                 phase2::WINDOWS,
             );
-            return Self { state: P2State::Finished, done: 0 };
+            return Self { state: P2State::Finished, done: 0, link_dropped: false };
         }
         log::info!(
             "[dut] run: {} windows, sta_ch={}, hold={}ms, gap={}ms",
             phase2::WINDOWS, phase2::STA_CHANNEL, phase2::HOLD_MS, phase2::GAP_MS,
         );
-        Self { state: P2State::Idle { until_ms: 0 }, done: 0 }
+        Self { state: P2State::Idle { until_ms: 0 }, done: 0, link_dropped: false }
     }
 
-    /// Drive the runner one subtick. `now` = monotonic ms. Returns `true` exactly on the tick a
-    /// window just ENDED (caller emits the per-window SUMMARY + resets the per-window maxes).
-    pub fn poll(&mut self, now: u64) -> bool {
+    /// Drive the runner one subtick. `now` = monotonic ms. See [`P2Poll`] for what the caller must do.
+    pub fn poll(&mut self, now: u64) -> P2Poll {
         match self.state {
             P2State::Idle { until_ms } => {
                 if now >= until_ms {
                     log::info!("[dut] window_start idx={} t_ms={}", self.done, now);
                     STOP_REQ.store(false, Ordering::Relaxed);
                     WIFI_CMD.try_send(WifiCmd::OpenWindow).ok();
-                    self.state = P2State::Opening { deadline_ms: now + 15_000 };
+                    self.link_dropped = false;
+                    self.state = P2State::Opening { window_start_ms: now, deadline_ms: now + 15_000 };
                 }
-                false
+                P2Poll::Idle
             }
-            P2State::Opening { deadline_ms } => {
+            P2State::Opening { window_start_ms, deadline_ms } => {
                 if LINK_UP.load(Ordering::Relaxed) {
+                    // assoc_done EDGE (Opening→Holding, fires once). The scan deaf window = the time the
+                    // radio was off-ch6 (window_start→now); board-B beacons weren't received during it,
+                    // so it's captured HERE as a duration (main folds it into scan_max_gap).
+                    let scan_gap_ms = now.saturating_sub(window_start_ms) as u32;
                     log::info!(
-                        "[dut] assoc_done idx={} t_ms={} ch={}",
-                        self.done, now, phase2::STA_CHANNEL
+                        "[dut] assoc_done idx={} t_ms={} ch={} scan_gap_ms={}",
+                        self.done, now, phase2::STA_CHANNEL, scan_gap_ms
                     );
                     self.state = P2State::Holding { until_ms: now + phase2::HOLD_MS };
-                    false
+                    P2Poll::AssocDone { scan_gap_ms }
                 } else if now >= deadline_ms {
                     log::warn!("[dut] assoc_timeout idx={} t_ms={}", self.done, now);
                     STOP_REQ.store(true, Ordering::Relaxed);
                     self.advance(now);
-                    false // failed window → no SUMMARY (would pollute the per-window stats)
+                    P2Poll::Idle // failed window → no SUMMARY (would pollute the per-window stats)
                 } else {
-                    false
+                    P2Poll::Idle
                 }
             }
             P2State::Holding { until_ms } => {
-                let link_held = LINK_UP.load(Ordering::Relaxed);
-                if now >= until_ms || !link_held {
-                    // link_held is the Lever-B attribution proof: the assoc stayed up across the hold.
+                // Latch a mid-window link drop (Lever-B = SUSTAINED hold). Hold the FULL controlled
+                // duration regardless, so steady_max_gap reflects the whole window; report whether the
+                // assoc was HELD throughout — not the instantaneous snapshot inc2 had.
+                if !LINK_UP.load(Ordering::Relaxed) {
+                    self.link_dropped = true;
+                }
+                if now >= until_ms {
                     log::info!(
                         "[dut] window_end idx={} t_ms={} link_held={}",
-                        self.done, now, link_held
+                        self.done, now, !self.link_dropped
                     );
                     STOP_REQ.store(true, Ordering::Relaxed); // tell wifi_task to tear the window down
                     self.advance(now);
-                    true // completed window → caller emits SUMMARY + resets per-window maxes
+                    P2Poll::WindowEnd
                 } else {
-                    false
+                    P2Poll::Idle
                 }
             }
-            P2State::Finished => false,
+            P2State::Finished => P2Poll::Idle,
         }
     }
 
@@ -1561,6 +1590,14 @@ struct BenchTracker {
     /// #198 Phase 2 — RX time (ms) of the previous board-B beacon, for the since-last gap.
     #[cfg(feature = "phase2-measure")]
     last_beacon_ms: Option<u64>,
+    /// #198 Phase 2 — the PREVIOUS beacon's phase (`Some(true)` = STEADY/LINK_UP, `Some(false)` =
+    /// QUIESCENT, `None` = no beacon yet). A gap is bucketed ONLY when this beacon's phase equals the
+    /// previous beacon's (the gap lies entirely within one phase). A gap that SPANS the assoc_done
+    /// boundary (the huge scan→steady jump — no beacons arrive during SCAN, radio off-ch6) is DISCARDED
+    /// here, NOT bucketed into steady — the Oracle P2-H2 boundary-contamination fix. Edge-safe: resets
+    /// once per transition, not per beacon, so a genuine mid-steady deaf stretch STILL accumulates.
+    #[cfg(feature = "phase2-measure")]
+    last_steady: Option<bool>,
     /// #198 Phase 2 — the PRIMARY deaf-window metric (P2-H3): the longest single inter-beacon gap
     /// (ms), SEGMENTED at assoc_done (P2-H2). `scan` = the WIFI_BUSY scan/assoc transient (a deaf
     /// window NEITHER coexist lever fixes); `steady` = the LINK_UP-held associated state (what the
@@ -1596,6 +1633,8 @@ impl BenchTracker {
             rx_per_s: 0,
             #[cfg(feature = "phase2-measure")]
             last_beacon_ms: None,
+            #[cfg(feature = "phase2-measure")]
+            last_steady: None,
             #[cfg(feature = "phase2-measure")]
             scan_max_gap_ms: 0,
             #[cfg(feature = "phase2-measure")]
@@ -3121,10 +3160,19 @@ impl RadioManager {
         );
     }
 
+    /// #198 Phase 2 — fold the scan deaf window (window_start→assoc_done, runner-supplied duration)
+    /// into `scan_max_gap`. Called by `main` at the [`P2Poll::AssocDone`] edge — scan can't be measured
+    /// from beacon arrivals (radio off-ch6 during SCAN → none received), so its MAX is this duration.
+    #[cfg(feature = "phase2-measure")]
+    pub fn phase2_capture_scan(&mut self, scan_gap_ms: u32) {
+        self.bench.scan_max_gap_ms = self.bench.scan_max_gap_ms.max(scan_gap_ms);
+    }
+
     /// #198 Phase 2 — reset the PER-WINDOW measurement state after a window's SUMMARY is emitted, so
     /// each window reports its OWN scan/steady max_gap + missed (P2-H3 mean/max over N windows).
-    /// `last_beacon_ms` is cleared too, so the quiescent inter-window gap isn't attributed to the next
-    /// window's first beacon. `quiescent_max_gap_ms` is the ambient baseline — NOT reset (accumulates).
+    /// `last_beacon_ms`/`last_steady` are cleared too, so the quiescent inter-window gap isn't
+    /// attributed to the next window's first beacon. `quiescent_max_gap_ms` is the ambient baseline —
+    /// NOT reset (accumulates across the boot; the Run-0 control reads it).
     #[cfg(feature = "phase2-measure")]
     pub fn phase2_reset(&mut self) {
         self.bench.scan_max_gap_ms = 0;
@@ -3132,6 +3180,7 @@ impl RadioManager {
         self.bench.scan_missed = 0;
         self.bench.steady_missed = 0;
         self.bench.last_beacon_ms = None;
+        self.bench.last_steady = None;
     }
 
     // --- Mesh time sync (see the TimeTracker section + main::should_adopt) ---
@@ -5742,13 +5791,18 @@ impl RadioManager {
                                 .wrapping_add(seq - prev - 1);
                         }
                     }
-                    // #198 Phase 2 — segmented deaf-window measurement (P2-H2/H3). Bucket this
-                    // beacon's since-last gap (the PRIMARY max_gap_ms) + missed count at assoc_done:
-                    // WIFI_BUSY = scan/assoc transient, LINK_UP = associated steady-state, neither =
-                    // quiescent (the Run-0 control baseline). Read BEFORE peer_last_seq is advanced
-                    // below so `prev` is still the previous seq. SMOL_P2_BEACON_MAC filters to board-B
-                    // (the controlled-measurement clincher) so stray fleet beacons can't pollute
-                    // max_gap; unset = accept any beacon (strict 2-board bench).
+                    // #198 Phase 2 — segmented deaf-window measurement (P2-H2/H3), EDGE-SAFE against
+                    // boundary contamination (Oracle P2-H2). During SCAN the radio is off-ch6 (03a09c4)
+                    // so board-B beacons are NOT received — the scan deaf window is captured by the
+                    // RUNNER (window_start→assoc_done duration) + the boundary seq-jump below, NOT by
+                    // arrival gaps. The RX arm buckets a gap ONLY when it lies ENTIRELY within one phase
+                    // (this beacon's phase == the previous beacon's): a gap that SPANS the assoc_done
+                    // boundary (the huge scan→steady jump) is DISCARDED, never bucketed into steady (that
+                    // was the inversion that inflated the thesis MAX). Edge-safe: within a phase, gaps
+                    // accumulate via `.max()`, so a genuine mid-steady deaf stretch (LINK_UP held, mesh
+                    // quiet) STILL lands in steady_max_gap. SMOL_P2_BEACON_MAC filters to board-B so stray
+                    // fleet beacons can't pollute max_gap (unset = accept any, strict 2-board bench).
+                    // Read BEFORE peer_last_seq advances below so `prev` is still the previous seq.
                     #[cfg(feature = "phase2-measure")]
                     if phase2::BEACON_MAC.is_none_or(|m| m == src) {
                         let missed = self
@@ -5756,27 +5810,35 @@ impl RadioManager {
                             .peer_last_seq
                             .and_then(|prev| seq.checked_sub(prev))
                             .map_or(0, |d| d.saturating_sub(1));
-                        let gap = self
-                            .bench
-                            .last_beacon_ms
-                            .map(|prev| now.saturating_sub(prev) as u32);
-                        let g = gap.unwrap_or(0);
-                        let phase = if WIFI_BUSY.load(Ordering::Relaxed) {
-                            self.bench.scan_max_gap_ms = self.bench.scan_max_gap_ms.max(g);
-                            self.bench.scan_missed = self.bench.scan_missed.wrapping_add(missed);
-                            "SCAN"
-                        } else if LINK_UP.load(Ordering::Relaxed) {
-                            self.bench.steady_max_gap_ms = self.bench.steady_max_gap_ms.max(g);
-                            self.bench.steady_missed = self.bench.steady_missed.wrapping_add(missed);
-                            "STEADY"
-                        } else {
-                            self.bench.quiescent_max_gap_ms = self.bench.quiescent_max_gap_ms.max(g);
-                            "QUIET"
-                        };
-                        if gap.is_some() {
-                            log::info!("[dut] beacon_rx seq={} gap_ms={} phase={}", seq, g, phase);
+                        let steady = LINK_UP.load(Ordering::Relaxed);
+                        match (self.bench.last_beacon_ms, self.bench.last_steady) {
+                            // Same phase across both endpoints → the gap is genuine; accumulate it.
+                            (Some(prev_ms), Some(was_steady)) if was_steady == steady => {
+                                let g = now.saturating_sub(prev_ms) as u32;
+                                if steady {
+                                    self.bench.steady_max_gap_ms = self.bench.steady_max_gap_ms.max(g);
+                                    self.bench.steady_missed =
+                                        self.bench.steady_missed.wrapping_add(missed);
+                                } else {
+                                    self.bench.quiescent_max_gap_ms =
+                                        self.bench.quiescent_max_gap_ms.max(g);
+                                }
+                                log::info!(
+                                    "[dut] beacon_rx seq={} gap_ms={} phase={}",
+                                    seq, g, if steady { "STEADY" } else { "QUIET" }
+                                );
+                            }
+                            // Phase CHANGED (or first beacon) → the gap spans a boundary; DISCARD it.
+                            // On the transition INTO steady (assoc_done), the seq-jump = beacons lost
+                            // during scan/assoc → attribute to scan_missed (scan's max_gap = runner-owned).
+                            (Some(_), Some(was_steady)) if !was_steady && steady => {
+                                self.bench.scan_missed = self.bench.scan_missed.wrapping_add(missed);
+                                log::info!("[dut] beacon_rx seq={} boundary→STEADY scan_missed+={}", seq, missed);
+                            }
+                            _ => {} // first-ever beacon, or steady→quiet boundary: nothing to bucket.
                         }
                         self.bench.last_beacon_ms = Some(now);
+                        self.bench.last_steady = Some(steady);
                     }
                     // Track the highest peer seq (what our own beacons echo).
                     if self.bench.peer_last_seq.is_none_or(|p| seq > p) {

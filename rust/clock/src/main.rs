@@ -1258,11 +1258,18 @@ async fn main(spawner: Spawner) -> ! {
                 {
                     r.broadcast_beacon();
                 }
-                // (2) DUT window-runner: drives N WiFi windows; on each window_end emit THAT window's
-                // segmented SUMMARY + reset the per-window maxes (P2-H3 mean/max over N windows).
-                if phase2_runner.poll(now) {
-                    r.phase2_report();
-                    r.phase2_reset();
+                // (2) DUT window-runner: drives N WiFi windows. At assoc_done fold the scan deaf window
+                // into scan_max_gap (P2-H2: scan can't be measured from arrivals — radio off-ch6); at
+                // window_end emit THAT window's segmented SUMMARY + reset the per-window maxes (P2-H3).
+                match phase2_runner.poll(now) {
+                    crate::net::mode::P2Poll::AssocDone { scan_gap_ms } => {
+                        r.phase2_capture_scan(scan_gap_ms);
+                    }
+                    crate::net::mode::P2Poll::WindowEnd => {
+                        r.phase2_report();
+                        r.phase2_reset();
+                    }
+                    crate::net::mode::P2Poll::Idle => {}
                 }
                 // (3) 10 s periodic report — the Run-0 quiescent control baseline + between-window
                 // liveness (for a DUT-with-windows this also shows the running/cumulative quiescent gap).
