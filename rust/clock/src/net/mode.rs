@@ -480,8 +480,9 @@ impl Phase2Runner {
         }
     }
 
-    /// #198 Phase 2 Run-3 (Option B, blocking-EMULATION) — is the DUT currently in the DEAF-BURST
-    /// (mesh service suppressed)? True ONLY under SMOL_P2_BLOCKING, while in Holding, in the window
+    /// #198 Phase 2 Run-3 (blocking-EMULATION) — is the DUT currently in the DEAF-BURST? Gates BOTH
+    /// block models: `skip` (B) suppresses r.service() here (mesh RX undrained); `spin` (A) busy-holds
+    /// the executor here. True ONLY under SMOL_P2_BLOCK_MODE≠None, while in Holding, in the window
     /// `[holding_start+SETTLE_MS, burst_end)` where
     /// `burst_end = min(holding_start+SETTLE_MS+BLOCK_MS, until_ms−RECOVER_MIN_MS)`. `main` skips
     /// `r.service()` while this is true → the mesh RX queue isn't drained → mesh deaf; net_task keeps
