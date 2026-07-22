@@ -1209,6 +1209,16 @@ async fn main(spawner: Spawner) -> ! {
             // ~every 2 s advertise ourselves (HELLO drives the LED handshake).
             // 2000 ms / SUBTICK_MS aligned via the monotonic clock.
             if (now / 2000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 2000) {
+                // #198 Phase 2 — measurement boards are ADVERTISEMENT-SILENT into the fleet. The
+                // election is metric-based over HEARD frames, so a bench board's HELLO/TIME would
+                // make the live id7 crown treat it as an election candidate (DUT could be elected →
+                // gateway duties on the live broker; board-B elected → can't uplink → crown flap) —
+                // even though 8f48850 already stops the bench board from CLAIMING owner itself.
+                // Suppressing HELLO + TIME makes them invisible to the fleet election. They still
+                // beacon (board-B), measure (DUT), and SCORE heard peers — only the outbound
+                // advertisement is muted. HELLO-silence doesn't affect the beacon measurement
+                // (board-B's BEACON is a separate frame; the DUT measures those, not HELLOs).
+                #[cfg(not(feature = "phase2-measure"))]
                 r.broadcast_hello();
                 // #164: advance every peer's link-quality (ETX) register one HELLO interval.
                 // UNCONDITIONAL (not inside broadcast_hello) so a HELLO-silent/abdicated board
@@ -1218,9 +1228,13 @@ async fn main(spawner: Spawner) -> ! {
                 // Advertise our current Unix time + the sync it descends from on
                 // the SAME tick, so a peer with an older sync can adopt ours.
                 // (A separate frame from HELLO — the LED handshake wire format is
-                // hardware-verified and must not change.)
-                let unix_now = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
-                r.broadcast_time(unix_now, my_synced_at);
+                // hardware-verified and must not change.) Muted on measurement boards (above):
+                // a bench DUT's fresh NTP would otherwise seize the fleet's time authority from id7.
+                #[cfg(not(feature = "phase2-measure"))]
+                {
+                    let unix_now = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
+                    r.broadcast_time(unix_now, my_synced_at);
+                }
                 // In BENCH mode also emit the stats BEACON (seq + echo) so the
                 // peer can measure RTT/loss. Only bother when Bench is on screen
                 // to keep other modes' airtime minimal. BEACON STAYS here on the
