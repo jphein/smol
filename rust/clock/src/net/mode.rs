@@ -135,6 +135,245 @@ const ESP_NOW_FIXED_CHANNEL: u8 = 6;
 #[cfg(feature = "coexist-soak")]
 const ESP_NOW_FIXED_CHANNEL: u8 = 1;
 
+// ── #198 Phase 2 — DEAF-WINDOW harness run-matrix config (phase2-measure only) ─────────────────────
+// Env-const knobs (the SMOL_NODE_ID idiom), set at flash-build time per board/run by the team-lead.
+// Defined in TRACKED source (NOT board.rs, which is gitignored per-board config) so every image carries
+// them + oracle-p2 can verify them. A bad value FAILS THE BUILD (const assert/panic) rather than
+// silently mis-measuring. The measurement matrix (spec §B.5) is expressed entirely via these:
+//   Run-0 control : SMOL_P2_WINDOWS=0                         (no window; ambient ESP-NOW baseline)
+//   Run-1 co-chan : SMOL_P2_WINDOWS=N  SMOL_P2_STA_CHANNEL=6  (both levers on)
+//   Run-2 off-chan: SMOL_P2_WINDOWS=N  SMOL_P2_STA_CHANNEL=1  (channel lever off; mesh stays ch6)
+//   board-B       : SMOL_P2_ROLE=beacon  SMOL_P2_BEACON_MS=50 (fast ch6 beacon source, no window)
+#[cfg(feature = "phase2-measure")]
+pub(crate) mod phase2 {
+    /// The board's role in the 2-board controlled measurement (`SMOL_P2_ROLE`).
+    #[derive(PartialEq, Eq, Clone, Copy)]
+    pub enum Role {
+        /// The DUT / measurer (dominion): opens N WiFi windows + measures board-B's beacon gaps.
+        Dut,
+        /// The fast beacon EMITTER (board-B): a fixed-cadence ch6 beacon source; never opens a window.
+        Beacon,
+    }
+
+    /// `SMOL_P2_ROLE` = `"dut"` (default) | `"beacon"`.
+    pub const ROLE: Role = match option_env!("SMOL_P2_ROLE") {
+        Some(s) => parse_role(s),
+        None => Role::Dut,
+    };
+    /// `SMOL_P2_BEACON_MS` — board-B beacon period (default 50 ms). P2-H3 wants T ≤ ~50 ms so the DUT's
+    /// `max_gap_ms` resolves to ~50 ms rather than aliasing a sub-500 ms deaf window to 0-1 missed beacons.
+    pub const BEACON_MS: u64 = match option_env!("SMOL_P2_BEACON_MS") {
+        Some(s) => parse_u64(s),
+        None => 50,
+    };
+    /// `SMOL_P2_STA_CHANNEL` — the DUT's WiFi-STA assoc channel. Default = the mesh channel
+    /// (Run-1 co-channel, both levers on). Run-2 sets it OFF-channel (e.g. 1) with the mesh still on
+    /// ch6 to isolate the channel lever (per [[smol-ota-crown-offchannel-blocker]]: channel is dominant).
+    pub const STA_CHANNEL: u8 = match option_env!("SMOL_P2_STA_CHANNEL") {
+        Some(s) => parse_u8(s),
+        None => super::ESP_NOW_FIXED_CHANNEL,
+    };
+    /// `SMOL_P2_WINDOWS` — number of WiFi windows the DUT runs (default 10; N>1 so mean/max isn't
+    /// phase-aliased, P2-H3). `0` = Run-0 QUIESCENT control (no window; ambient loss to subtract).
+    pub const WINDOWS: u32 = match option_env!("SMOL_P2_WINDOWS") {
+        Some(s) => parse_u32(s),
+        None => 10,
+    };
+    /// `SMOL_P2_HOLD_MS` — how long the DUT holds each window open (default 8 s: room for a real NTP
+    /// exchange + a sustained WiFi burst so `steady_max_gap` reflects genuine associated-state traffic).
+    pub const HOLD_MS: u64 = match option_env!("SMOL_P2_HOLD_MS") {
+        Some(s) => parse_u64(s),
+        None => 8_000,
+    };
+    /// `SMOL_P2_GAP_MS` — quiescent gap between windows (default 3 s; long enough for wifi_task to tear
+    /// the prior window down before the next open).
+    pub const GAP_MS: u64 = match option_env!("SMOL_P2_GAP_MS") {
+        Some(s) => parse_u64(s),
+        None => 3_000,
+    };
+    /// `SMOL_P2_BEACON_MAC` — the DUT measures ONLY beacons from this MAC (board-B), so stray fleet
+    /// frames can't pollute `max_gap` (the controlled-measurement clincher). Format `AA:BB:CC:DD:EE:FF`.
+    /// Unset = accept ANY beacon (fine for a strict 2-board bench where only board-B beacons).
+    pub const BEACON_MAC: Option<[u8; 6]> = match option_env!("SMOL_P2_BEACON_MAC") {
+        Some(s) => Some(parse_mac(s)),
+        None => None,
+    };
+
+    const fn parse_role(s: &str) -> Role {
+        if bytes_eq(s.as_bytes(), b"beacon") {
+            Role::Beacon
+        } else if bytes_eq(s.as_bytes(), b"dut") {
+            Role::Dut
+        } else {
+            panic!("SMOL_P2_ROLE must be \"dut\" or \"beacon\"")
+        }
+    }
+    const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    const fn parse_u64(s: &str) -> u64 {
+        let b = s.as_bytes();
+        assert!(!b.is_empty(), "SMOL_P2 numeric env must not be empty");
+        let mut n: u64 = 0;
+        let mut i = 0;
+        while i < b.len() {
+            let d = b[i];
+            assert!(d >= b'0' && d <= b'9', "SMOL_P2 numeric env must be decimal");
+            n = n * 10 + (d - b'0') as u64;
+            i += 1;
+        }
+        n
+    }
+    const fn parse_u32(s: &str) -> u32 {
+        let n = parse_u64(s);
+        assert!(n <= u32::MAX as u64, "SMOL_P2_WINDOWS out of range");
+        n as u32
+    }
+    const fn parse_u8(s: &str) -> u8 {
+        let n = parse_u64(s);
+        assert!(n <= 255, "SMOL_P2 u8 env must be 0..=255");
+        n as u8
+    }
+    /// Const-parse `AA:BB:CC:DD:EE:FF` (case-insensitive hex, colon-separated) → `[u8; 6]`.
+    const fn parse_mac(s: &str) -> [u8; 6] {
+        let b = s.as_bytes();
+        assert!(b.len() == 17, "SMOL_P2_BEACON_MAC must be AA:BB:CC:DD:EE:FF");
+        let mut out = [0u8; 6];
+        let mut i = 0;
+        while i < 6 {
+            let p = i * 3;
+            out[i] = hex_nib(b[p]) * 16 + hex_nib(b[p + 1]);
+            if i < 5 {
+                assert!(b[p + 2] == b':', "SMOL_P2_BEACON_MAC must be colon-separated");
+            }
+            i += 1;
+        }
+        out
+    }
+    const fn hex_nib(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => panic!("SMOL_P2_BEACON_MAC must be hex digits"),
+        }
+    }
+}
+
+/// #198 Phase 2 — the DUT's N-window measurement RUNNER (spec §B.5). A `poll(now)` state machine
+/// (NOT an embassy task: the per-window SUMMARY needs `RadioManager`, which `main`'s loop owns). It
+/// fires `WIFI_CMD`/`STOP_REQ` (module statics, reachable inline) + logs the window-lifecycle markers,
+/// and returns `true` the tick a window ENDS so `main` emits that window's `[dut] SUMMARY` + resets the
+/// per-window maxes. Run-0 control (`SMOL_P2_WINDOWS=0`) and the beacon role go straight to `Finished`
+/// (quiescent-only). Window lifecycle: Idle(gap) → OpenWindow → Opening(await LINK_UP=assoc_done) →
+/// Holding(HOLD_MS, steady-state measured) → STOP_REQ(window_end) → Idle(GAP_MS) → … ×N → Finished.
+#[cfg(feature = "phase2-measure")]
+pub struct Phase2Runner {
+    state: P2State,
+    done: u32,
+}
+
+#[cfg(feature = "phase2-measure")]
+enum P2State {
+    /// Quiescent gap; open the next window once `now >= until_ms`.
+    Idle { until_ms: u64 },
+    /// Window requested; await LINK_UP (assoc) or give up at `deadline_ms`.
+    Opening { deadline_ms: u64 },
+    /// Window held for steady-state measurement until `until_ms` (or an early link drop).
+    Holding { until_ms: u64 },
+    /// All N windows done (or role/Run-0 = no windows): stay quiescent forever.
+    Finished,
+}
+
+#[cfg(feature = "phase2-measure")]
+impl Phase2Runner {
+    pub fn new() -> Self {
+        // Only the DUT with WINDOWS>0 runs windows; the beacon role + Run-0 control measure quiescent.
+        if phase2::ROLE != phase2::Role::Dut || phase2::WINDOWS == 0 {
+            log::info!(
+                "[dut] run: quiescent baseline only (role={}, windows={})",
+                if phase2::ROLE == phase2::Role::Beacon { "beacon" } else { "dut" },
+                phase2::WINDOWS,
+            );
+            return Self { state: P2State::Finished, done: 0 };
+        }
+        log::info!(
+            "[dut] run: {} windows, sta_ch={}, hold={}ms, gap={}ms",
+            phase2::WINDOWS, phase2::STA_CHANNEL, phase2::HOLD_MS, phase2::GAP_MS,
+        );
+        Self { state: P2State::Idle { until_ms: 0 }, done: 0 }
+    }
+
+    /// Drive the runner one subtick. `now` = monotonic ms. Returns `true` exactly on the tick a
+    /// window just ENDED (caller emits the per-window SUMMARY + resets the per-window maxes).
+    pub fn poll(&mut self, now: u64) -> bool {
+        match self.state {
+            P2State::Idle { until_ms } => {
+                if now >= until_ms {
+                    log::info!("[dut] window_start idx={} t_ms={}", self.done, now);
+                    STOP_REQ.store(false, Ordering::Relaxed);
+                    WIFI_CMD.try_send(WifiCmd::OpenWindow).ok();
+                    self.state = P2State::Opening { deadline_ms: now + 15_000 };
+                }
+                false
+            }
+            P2State::Opening { deadline_ms } => {
+                if LINK_UP.load(Ordering::Relaxed) {
+                    log::info!(
+                        "[dut] assoc_done idx={} t_ms={} ch={}",
+                        self.done, now, phase2::STA_CHANNEL
+                    );
+                    self.state = P2State::Holding { until_ms: now + phase2::HOLD_MS };
+                    false
+                } else if now >= deadline_ms {
+                    log::warn!("[dut] assoc_timeout idx={} t_ms={}", self.done, now);
+                    STOP_REQ.store(true, Ordering::Relaxed);
+                    self.advance(now);
+                    false // failed window → no SUMMARY (would pollute the per-window stats)
+                } else {
+                    false
+                }
+            }
+            P2State::Holding { until_ms } => {
+                let link_held = LINK_UP.load(Ordering::Relaxed);
+                if now >= until_ms || !link_held {
+                    // link_held is the Lever-B attribution proof: the assoc stayed up across the hold.
+                    log::info!(
+                        "[dut] window_end idx={} t_ms={} link_held={}",
+                        self.done, now, link_held
+                    );
+                    STOP_REQ.store(true, Ordering::Relaxed); // tell wifi_task to tear the window down
+                    self.advance(now);
+                    true // completed window → caller emits SUMMARY + resets per-window maxes
+                } else {
+                    false
+                }
+            }
+            P2State::Finished => false,
+        }
+    }
+
+    fn advance(&mut self, now: u64) {
+        self.done += 1;
+        if self.done >= phase2::WINDOWS {
+            log::info!("[dut] run_done windows={}", self.done);
+            self.state = P2State::Finished;
+        } else {
+            self.state = P2State::Idle { until_ms: now + phase2::GAP_MS };
+        }
+    }
+}
+
 // =========================================================================
 // Peer handshake protocol (drives the blue status LED).
 // =========================================================================
@@ -2882,6 +3121,19 @@ impl RadioManager {
         );
     }
 
+    /// #198 Phase 2 — reset the PER-WINDOW measurement state after a window's SUMMARY is emitted, so
+    /// each window reports its OWN scan/steady max_gap + missed (P2-H3 mean/max over N windows).
+    /// `last_beacon_ms` is cleared too, so the quiescent inter-window gap isn't attributed to the next
+    /// window's first beacon. `quiescent_max_gap_ms` is the ambient baseline — NOT reset (accumulates).
+    #[cfg(feature = "phase2-measure")]
+    pub fn phase2_reset(&mut self) {
+        self.bench.scan_max_gap_ms = 0;
+        self.bench.steady_max_gap_ms = 0;
+        self.bench.scan_missed = 0;
+        self.bench.steady_missed = 0;
+        self.bench.last_beacon_ms = None;
+    }
+
     // --- Mesh time sync (see the TimeTracker section + main::should_adopt) ---
 
     /// Broadcast one TIME frame: our current Unix-time estimate + the `synced_at`
@@ -5494,10 +5746,11 @@ impl RadioManager {
                     // beacon's since-last gap (the PRIMARY max_gap_ms) + missed count at assoc_done:
                     // WIFI_BUSY = scan/assoc transient, LINK_UP = associated steady-state, neither =
                     // quiescent (the Run-0 control baseline). Read BEFORE peer_last_seq is advanced
-                    // below so `prev` is still the previous seq. (2-board controlled rig: only board-B
-                    // beacons; inc3 adds the SMOL_P2_BEACON_MAC `src` filter for fleet-adjacent runs.)
+                    // below so `prev` is still the previous seq. SMOL_P2_BEACON_MAC filters to board-B
+                    // (the controlled-measurement clincher) so stray fleet beacons can't pollute
+                    // max_gap; unset = accept any beacon (strict 2-board bench).
                     #[cfg(feature = "phase2-measure")]
-                    {
+                    if phase2::BEACON_MAC.is_none_or(|m| m == src) {
                         let missed = self
                             .bench
                             .peer_last_seq
@@ -6359,11 +6612,18 @@ async fn wifi_task(
     let net = &crate::secrets::WIFI_NETWORK;
     // Association config: real creds, ch6-locked (DR-M1), AllChannels scan as the fallback if a
     // re-scan is ever forced (M5 — associate-to-strongest, the #204/#217 weak-ch1 fix).
+    // #198 Phase 2: the harness overrides the assoc channel via SMOL_P2_STA_CHANNEL (default = the
+    // mesh channel = Run-1 co-channel); Run-2 forces it OFF-channel while the mesh stays on ch6, to
+    // isolate the channel lever. The normal fleet always associates ch6-locked (co-channel).
+    #[cfg(feature = "phase2-measure")]
+    let assoc_channel = phase2::STA_CHANNEL;
+    #[cfg(not(feature = "phase2-measure"))]
+    let assoc_channel = ESP_NOW_FIXED_CHANNEL;
     let assoc_cfg = esp_radio::wifi::Config::Station(
         esp_radio::wifi::sta::StationConfig::default()
             .with_ssid(net.ssid)
             .with_password(net.pass.into())
-            .with_channel(ESP_NOW_FIXED_CHANNEL)
+            .with_channel(assoc_channel)
             .with_scan_method(esp_radio::wifi::sta::ScanMethod::AllChannels),
     );
     loop {
@@ -6442,9 +6702,17 @@ async fn wifi_task(
                     match crate::net::wifi::ntp_sync(stack).await {
                         Some(unix) => {
                             NTP_RESULT.signal(unix);
+                            // #198 Phase 2: the harness emits the `[dut] ntp_done` marker JP greps;
+                            // the fleet keeps the plain log (a fleet gateway isn't a "dut").
+                            #[cfg(feature = "phase2-measure")]
+                            log::info!("[dut] ntp_done ok=true unix={}", unix);
+                            #[cfg(not(feature = "phase2-measure"))]
                             log::info!("smol #198 P2: ntp_done ok=true unix={}", unix);
                         }
                         None => {
+                            #[cfg(feature = "phase2-measure")]
+                            log::warn!("[dut] ntp_done ok=false");
+                            #[cfg(not(feature = "phase2-measure"))]
                             log::warn!("smol #198 P2: ntp_done ok=false (timeout/short/garbage)");
                         }
                     }
@@ -6615,8 +6883,14 @@ pub fn start(
     // TODO(#198 Phase 3): DELETE this trigger — the MQTT-driven election opens the window only when
     // ROLE==gateway + it's sync-time (spec §3.2), and switch(WifiSta)/switch(EspNow) (wired to
     // WIFI_CMD/STOP_REQ) drive the window lifecycle from the coexist FSM.
-    STOP_REQ.store(false, Ordering::Relaxed);
-    WIFI_CMD.try_send(WifiCmd::OpenWindow).ok();
+    // #198 Phase 2: under the measurement harness the window lifecycle is driven by the DUT
+    // `Phase2Runner` (main), and the beacon role never opens a window — so SUPPRESS this P1 canary
+    // trigger there (it would double-open against the runner). The normal fleet keeps the P1 boot open.
+    #[cfg(not(feature = "phase2-measure"))]
+    {
+        STOP_REQ.store(false, Ordering::Relaxed);
+        WIFI_CMD.try_send(WifiCmd::OpenWindow).ok();
+    }
 
     (Some(radio), synced)
 }

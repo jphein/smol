@@ -914,6 +914,11 @@ async fn main(spawner: Spawner) -> ! {
 
     log::info!("smol: entering menu");
 
+    // #198 Phase 2 — the DUT window-runner (spec §B.5), persistent across loop iterations. The
+    // beacon role + Run-0 control (SMOL_P2_WINDOWS=0) construct it in the Finished state (no windows).
+    #[cfg(feature = "phase2-measure")]
+    let mut phase2_runner = crate::net::mode::Phase2Runner::new();
+
     // --- Unified render/dispatch loop ---------------------------------------
     loop {
         let now = millis();
@@ -1240,12 +1245,30 @@ async fn main(spawner: Spawner) -> ! {
                 }
             }
 
-            // #198 Phase 2 — DEAF-WINDOW harness: emit the segmented max_gap SUMMARY every 10 s
-            // (read off the DUT's RTT log). inc3 adds the beacon-EMIT role (board-B) + the DUT
-            // N-window runner + Run-0 control + window-lifecycle markers around this baseline report.
+            // #198 Phase 2 — DEAF-WINDOW harness (spec §B). Three cfg-gated pieces:
             #[cfg(feature = "phase2-measure")]
-            if (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000) {
-                r.phase2_report();
+            {
+                use crate::net::mode::phase2;
+                // (1) board-B beacon-EMIT role: a fast fixed-cadence ch6 beacon source (default 50 ms,
+                // P2-H3), no WiFi window. The DUT is measure-only (no self-TX contending its window).
+                // Resolution floor = SUBTICK_MS (~20 ms); BEACON_MS≥50 is comfortably above it.
+                if phase2::ROLE == phase2::Role::Beacon
+                    && (now / phase2::BEACON_MS)
+                        != ((now.saturating_sub(SUBTICK_MS as u64)) / phase2::BEACON_MS)
+                {
+                    r.broadcast_beacon();
+                }
+                // (2) DUT window-runner: drives N WiFi windows; on each window_end emit THAT window's
+                // segmented SUMMARY + reset the per-window maxes (P2-H3 mean/max over N windows).
+                if phase2_runner.poll(now) {
+                    r.phase2_report();
+                    r.phase2_reset();
+                }
+                // (3) 10 s periodic report — the Run-0 quiescent control baseline + between-window
+                // liveness (for a DUT-with-windows this also shows the running/cumulative quiescent gap).
+                if (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000) {
+                    r.phase2_report();
+                }
             }
 
             // ~every 10 s a GATEWAY re-broadcasts its cached HA battery payload as a
