@@ -177,6 +177,36 @@ struct MqttMsg {
     payload: [u8; MQTT_PAYLOAD_MAX],
 }
 
+// ── #198 Phase 3 (p3-inc2) — the OWN-node telemetry snapshot (P3-M2 latest-state path) ──────────
+// The gateway's own publishable state (status / roster / telemetry) is LATEST-STATE (retained /
+// latest-wins), so per P3-M2 it rides a lock-free overwrite-latest Signal — NOT MQTT_TX (which is for
+// discrete events). This keeps P3-H1 dead (no Mutex ever taken across an `.await`) and mirrors the
+// NTP_RESULT producer→consumer pattern: the inline flush (which owns RadioManager + the byte inputs)
+// PRE-SERIALIZES the payloads into fixed buffers and signals; `mqtt_task` (which can't borrow
+// RadioManager) just reads bytes + `encode_publish`es during the window. Relayed-leaf republish +
+// the bidirectional MC/elect publish are inc3.
+/// Max own-node publish payload sizes. All sit under the ~490 B MQTT packet cap INCLUDING the
+/// `smol/<id>/…` topic + fixed header (memory `smol-mqtt-512b-packet-cap`): peers ≈298 B worst case
+/// (ROSTER_CAP=16) + a ~18 B topic + ~5 B header ≈ 321 B ≪ 490.
+const TELEM_MAX: usize = 192; // own telemetry = sensor line + name label (main.rs:1523)
+const STATUS_MAX: usize = 64; // "STAT|<screen>:<page>|<build>" (main.rs:1538)
+const PEERS_MAX: usize = 320; // serialize_peers output (matches the existing peers_buf @flush_telemetry)
+
+/// #198 Phase 3 (p3-inc2) — the gateway's OWN-node publishable state, PRE-SERIALIZED into fixed
+/// buffers by the inline flush (the only holder of the state) for `mqtt_task` to PUBLISH verbatim.
+struct TelemetrySnapshot {
+    status_len: usize,
+    peers_len: usize,
+    telemetry_len: usize,
+    status: [u8; STATUS_MAX],   // → retained smol/<id>/status  (live screen readback)
+    peers: [u8; PEERS_MAX],     // → retained smol/<id>/peers    (#27 roster)
+    telemetry: [u8; TELEM_MAX], // → transient smol/<id>/telemetry (sensor line + label)
+}
+
+/// Latest-wins telemetry hand-off (lock-free, overwrite-latest — mirrors NTP_RESULT). The inline
+/// flush `signal`s the freshest snapshot; `mqtt_burst` `try_take`s + publishes it in the window.
+static TELEMETRY: Signal<CriticalSectionRawMutex, TelemetrySnapshot> = Signal::new();
+
 /// #198 Phase 2 (edge (c) fix) — RUNNER-AUTHORITATIVE measurement phase, set by `Phase2Runner` on
 /// each state transition and read by the beacon RX arm to bucket gaps. Decouples the CONTROLLED phase
 /// (which window-lifecycle state we're in) from the OBSERVED link state (`LINK_UP`): a transient
@@ -5331,6 +5361,25 @@ impl RadioManager {
         let mut peers_buf = [0u8; 320];
         let peers_len = self.serialize_peers(now, &mut peers_buf);
         let peers = &peers_buf[..peers_len];
+        // #198 Phase 3 (p3-inc2): publish this gateway's OWN-node state via the async `mqtt_task`
+        // instead of the (stubbed) blocking burst. The 3 own-node payloads are already at hand —
+        // `own_telemetry`/`status` params + the roster just serialized — so PRE-SERIALIZE them into a
+        // latest-wins `TelemetrySnapshot` and signal it; `mqtt_task` drains + PUBLISHes during the
+        // window `switch(WifiSta)` above just opened (the #89 decoupling — the flush is a task, the
+        // mesh keeps polling through it). Copies are length-CLAMPED (never panic on an over-long
+        // payload). Latest-wins overwrite: only the freshest snapshot matters per window.
+        let mut snap = TelemetrySnapshot {
+            status_len: 0,
+            peers_len: 0,
+            telemetry_len: 0,
+            status: [0u8; STATUS_MAX],
+            peers: [0u8; PEERS_MAX],
+            telemetry: [0u8; TELEM_MAX],
+        };
+        snap.telemetry_len = fill_clamped(&mut snap.telemetry, own_telemetry);
+        snap.status_len = fill_clamped(&mut snap.status, status);
+        snap.peers_len = fill_clamped(&mut snap.peers, peers);
+        TELEMETRY.signal(snap);
         // #23 fix: seed the election from the live role + persistent staleness so THIS
         // flush RE-DECIDES ownership (demote a duplicate gateway that now sees a LIVE
         // lower-id owner — oracle #2). Read back below and applied to the live role.
@@ -7161,6 +7210,23 @@ async fn mqtt_burst(stack: embassy_net::Stack<'static>, id: u8) -> Result<(), ()
         return Ok(());
     }
 
+    // #198 Phase 3 (p3-inc2): PUBLISH the latest OWN-node telemetry snapshot (P3-M2 latest-state,
+    // lock-free via TELEMETRY). status + peers are RETAINED (HA live-screen / #27 roster readback);
+    // telemetry is transient. Confirmed-gateway here (the check above). Topics are built from `id`.
+    if let Some(snap) = TELEMETRY.try_take() {
+        publish_own(&mut sock, &mut pkt, id, "status", &snap.status[..snap.status_len], true).await?;
+        publish_own(&mut sock, &mut pkt, id, "peers", &snap.peers[..snap.peers_len], true).await?;
+        publish_own(
+            &mut sock,
+            &mut pkt,
+            id,
+            "telemetry",
+            &snap.telemetry[..snap.telemetry_len],
+            false,
+        )
+        .await?;
+    }
+
     // DISCONNECT — a clean goodbye so the broker doesn't fire a will / log a drop (spec §2).
     let dn = crate::net::mqtt::encode_disconnect(&mut pkt).ok_or(())?;
     write_all(&mut sock, &pkt[..dn]).await?;
@@ -7181,6 +7247,41 @@ async fn write_all(sock: &mut embassy_net::tcp::TcpSocket<'_>, buf: &[u8]) -> Re
         }
     }
     Ok(())
+}
+
+/// #198 Phase 3 (p3-inc2): encode + write ONE `smol/<id>/<suffix>` PUBLISH (codec correction #1).
+/// The topic is built HERE (mqtt_task holds `id`, not the serialized state). An empty payload is
+/// skipped (nothing to publish this window — e.g. a leaf-empty roster) rather than sending a bare topic.
+async fn publish_own(
+    sock: &mut embassy_net::tcp::TcpSocket<'_>,
+    pkt: &mut [u8],
+    id: u8,
+    suffix: &str,
+    payload: &[u8],
+    retain: bool,
+) -> Result<(), ()> {
+    use core::fmt::Write as _;
+    if payload.is_empty() {
+        return Ok(());
+    }
+    let mut topic = [0u8; 32];
+    let mut w = SliceWriter {
+        buf: &mut topic,
+        len: 0,
+        overflow: false,
+    };
+    let _ = write!(w, "smol/{}/{}", id, suffix);
+    let tlen = w.len;
+    let n = crate::net::mqtt::encode_publish(pkt, &topic[..tlen], payload, retain).ok_or(())?;
+    write_all(sock, &pkt[..n]).await
+}
+
+/// Copy `src` into `dst`, length-CLAMPED to `dst.len()` (never panic-indexes on an over-long
+/// payload — the SliceWriter overflow discipline); returns the bytes written.
+fn fill_clamped(dst: &mut [u8], src: &[u8]) -> usize {
+    let n = src.len().min(dst.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    n
 }
 
 /// Bring the radio up, run a REAL WiFi -> DHCP -> SNTP burst (fast-blinking the
