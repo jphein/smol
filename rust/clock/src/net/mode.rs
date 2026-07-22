@@ -66,6 +66,8 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use portable_atomic::{AtomicBool, AtomicI16, Ordering};
+#[cfg(feature = "phase2-measure")]
+use portable_atomic::AtomicU8;
 // #13: the relay-family wire codec + ASCII field helpers live in the PURE, host-testable
 // `net::wire` module (extracted from here, byte-identical). Glob-imported so every call site
 // below (encode_relay, parse_relay[2], *relayack*, encode_dl, write_u5/u10, parse_id/u5/u10,
@@ -124,6 +126,21 @@ static WIFI_CMD: Channel<CriticalSectionRawMutex, WifiCmd, 4> = Channel::new();
 /// pattern (wifi_task writes, the mesh side reads). One-slot overwrite-latest: only the freshest
 /// sync matters; a stale un-drained epoch is harmlessly replaced.
 static NTP_RESULT: Signal<CriticalSectionRawMutex, u32> = Signal::new();
+
+/// #198 Phase 2 (edge (c) fix) — RUNNER-AUTHORITATIVE measurement phase, set by `Phase2Runner` on
+/// each state transition and read by the beacon RX arm to bucket gaps. Decouples the CONTROLLED phase
+/// (which window-lifecycle state we're in) from the OBSERVED link state (`LINK_UP`): a transient
+/// `is_connected()`=false glitch mid-Holding must NOT reclassify a beacon QUIET (that would discard a
+/// genuine steady deaf-stretch + false-flag the window). `link_dropped` still reads `LINK_UP` for the
+/// Lever-B attribution — phase = controlled state, attribution = observed state.
+#[cfg(feature = "phase2-measure")]
+const P2_QUIESCENT: u8 = 0; // no WiFi window open (Run-0 control + between-window baseline)
+#[cfg(feature = "phase2-measure")]
+const P2_SCAN: u8 = 1; // window opening: scan/assoc transient (radio off-ch6; scan is runner-owned)
+#[cfg(feature = "phase2-measure")]
+const P2_STEADY: u8 = 2; // window held: associated steady-state (the thesis metric)
+#[cfg(feature = "phase2-measure")]
+static P2_PHASE: AtomicU8 = AtomicU8::new(P2_QUIESCENT);
 
 /// Fixed ESP-NOW channel used in TIME-SHARE mode. All smol units must agree on
 /// this value (1..=13). 6 is a common, low-congestion default.
@@ -344,6 +361,7 @@ impl Phase2Runner {
                     STOP_REQ.store(false, Ordering::Relaxed);
                     WIFI_CMD.try_send(WifiCmd::OpenWindow).ok();
                     self.link_dropped = false;
+                    P2_PHASE.store(P2_SCAN, Ordering::Relaxed); // edge (c): phase is runner-authoritative
                     self.state = P2State::Opening { window_start_ms: now, deadline_ms: now + 15_000 };
                 }
                 P2Poll::Idle
@@ -358,6 +376,7 @@ impl Phase2Runner {
                         "[dut] assoc_done idx={} t_ms={} ch={} scan_gap_ms={}",
                         self.done, now, phase2::STA_CHANNEL, scan_gap_ms
                     );
+                    P2_PHASE.store(P2_STEADY, Ordering::Relaxed); // now STEADY regardless of LINK_UP blips
                     self.state = P2State::Holding { until_ms: now + phase2::HOLD_MS };
                     P2Poll::AssocDone { scan_gap_ms }
                 } else if now >= deadline_ms {
@@ -393,6 +412,8 @@ impl Phase2Runner {
     }
 
     fn advance(&mut self, now: u64) {
+        // Both next states (Idle gap / Finished) are non-window → quiescent phase.
+        P2_PHASE.store(P2_QUIESCENT, Ordering::Relaxed);
         self.done += 1;
         if self.done >= phase2::WINDOWS {
             log::info!("[dut] run_done windows={}", self.done);
@@ -1590,14 +1611,16 @@ struct BenchTracker {
     /// #198 Phase 2 — RX time (ms) of the previous board-B beacon, for the since-last gap.
     #[cfg(feature = "phase2-measure")]
     last_beacon_ms: Option<u64>,
-    /// #198 Phase 2 — the PREVIOUS beacon's phase (`Some(true)` = STEADY/LINK_UP, `Some(false)` =
-    /// QUIESCENT, `None` = no beacon yet). A gap is bucketed ONLY when this beacon's phase equals the
-    /// previous beacon's (the gap lies entirely within one phase). A gap that SPANS the assoc_done
-    /// boundary (the huge scan→steady jump — no beacons arrive during SCAN, radio off-ch6) is DISCARDED
-    /// here, NOT bucketed into steady — the Oracle P2-H2 boundary-contamination fix. Edge-safe: resets
-    /// once per transition, not per beacon, so a genuine mid-steady deaf stretch STILL accumulates.
+    /// #198 Phase 2 — the PREVIOUS beacon's `P2_PHASE` (`P2_QUIESCENT`/`P2_SCAN`/`P2_STEADY`; `None` =
+    /// no beacon yet). A gap is bucketed ONLY when this beacon's phase equals the previous beacon's
+    /// (the gap lies entirely within one phase). A gap that SPANS the assoc_done boundary (the huge
+    /// scan→steady jump — no beacons arrive during SCAN, radio off-ch6) is DISCARDED here, NOT bucketed
+    /// into steady — the Oracle P2-H2 boundary-contamination fix. Edge-safe: resets once per transition,
+    /// not per beacon, so a genuine mid-steady deaf stretch STILL accumulates. The phase is
+    /// runner-authoritative (`P2_PHASE`, not instantaneous `LINK_UP`) — edge (c): a transient LINK_UP
+    /// glitch mid-Holding can't reclassify a beacon and discard a real steady gap.
     #[cfg(feature = "phase2-measure")]
-    last_steady: Option<bool>,
+    last_phase: Option<u8>,
     /// #198 Phase 2 — the PRIMARY deaf-window metric (P2-H3): the longest single inter-beacon gap
     /// (ms), SEGMENTED at assoc_done (P2-H2). `scan` = the WIFI_BUSY scan/assoc transient (a deaf
     /// window NEITHER coexist lever fixes); `steady` = the LINK_UP-held associated state (what the
@@ -1634,7 +1657,7 @@ impl BenchTracker {
             #[cfg(feature = "phase2-measure")]
             last_beacon_ms: None,
             #[cfg(feature = "phase2-measure")]
-            last_steady: None,
+            last_phase: None,
             #[cfg(feature = "phase2-measure")]
             scan_max_gap_ms: 0,
             #[cfg(feature = "phase2-measure")]
@@ -2646,12 +2669,17 @@ impl RadioManager {
     /// #198 Phase 2 — a MEASUREMENT board's replacement for `leaf_scan_tick`: HOLD ch6, never
     /// scan-hop. Hopping 1/6/11 to re-find a roamed crown would yank board-B / the DUT off the ch6
     /// measurement channel — board-B (never in a window) would stop emitting on ch6 → the DUT sees
-    /// false deaf-gaps, and the DUT would miss board-B between windows. Skips the set mid-assoc
-    /// (WIFI_BUSY: the controller owns the channel); the DUT's own WiFi window is the ONLY intended
-    /// off-ch6 excursion. Same per-tick set_channel(ch6) discipline as the LINK_UP arm below.
+    /// false deaf-gaps, and the DUT would miss board-B between windows.
+    ///
+    /// Pin ONLY when NO WiFi window is open — `!WIFI_BUSY && !LINK_UP` (Oracle Run-2 watch-item): a
+    /// held window OWNS the radio channel (Run-1 co-channel ch6, OR Run-2 off-channel ch1). Forcing
+    /// ch6 during Run-2's Holding would fight the ch1 assoc (drop LINK_UP → every Run-2 window
+    /// excluded → NO Run-2 data). board-B never has LINK_UP (no window) → still pinned; the DUT
+    /// between windows → still pinned; only a DUT mid-window is left alone — and that off-ch6
+    /// excursion IS the deaf window being measured.
     #[cfg(feature = "phase2-measure")]
     pub fn pin_mesh_channel(&mut self) {
-        if !WIFI_BUSY.load(Ordering::Relaxed) {
+        if !WIFI_BUSY.load(Ordering::Relaxed) && !LINK_UP.load(Ordering::Relaxed) {
             let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
         }
     }
@@ -3185,7 +3213,7 @@ impl RadioManager {
 
     /// #198 Phase 2 — reset the PER-WINDOW measurement state after a window's SUMMARY is emitted, so
     /// each window reports its OWN scan/steady max_gap + missed (P2-H3 mean/max over N windows).
-    /// `last_beacon_ms`/`last_steady` are cleared too, so the quiescent inter-window gap isn't
+    /// `last_beacon_ms`/`last_phase` are cleared too, so the quiescent inter-window gap isn't
     /// attributed to the next window's first beacon. `quiescent_max_gap_ms` is the ambient baseline —
     /// NOT reset (accumulates across the boot; the Run-0 control reads it).
     #[cfg(feature = "phase2-measure")]
@@ -3195,7 +3223,7 @@ impl RadioManager {
         self.bench.scan_missed = 0;
         self.bench.steady_missed = 0;
         self.bench.last_beacon_ms = None;
-        self.bench.last_steady = None;
+        self.bench.last_phase = None;
     }
 
     // --- Mesh time sync (see the TimeTracker section + main::should_adopt) ---
@@ -5825,35 +5853,49 @@ impl RadioManager {
                             .peer_last_seq
                             .and_then(|prev| seq.checked_sub(prev))
                             .map_or(0, |d| d.saturating_sub(1));
-                        let steady = LINK_UP.load(Ordering::Relaxed);
-                        match (self.bench.last_beacon_ms, self.bench.last_steady) {
+                        // Runner-authoritative phase (edge (c)): NOT instantaneous LINK_UP — a transient
+                        // is_connected() glitch mid-Holding must not reclassify a beacon and discard a
+                        // real steady deaf-stretch. P2_PHASE is set by Phase2Runner on each transition.
+                        let phase = P2_PHASE.load(Ordering::Relaxed);
+                        match (self.bench.last_beacon_ms, self.bench.last_phase) {
                             // Same phase across both endpoints → the gap is genuine; accumulate it.
-                            (Some(prev_ms), Some(was_steady)) if was_steady == steady => {
+                            (Some(prev_ms), Some(prev_phase)) if prev_phase == phase => {
                                 let g = now.saturating_sub(prev_ms) as u32;
-                                if steady {
-                                    self.bench.steady_max_gap_ms = self.bench.steady_max_gap_ms.max(g);
-                                    self.bench.steady_missed =
-                                        self.bench.steady_missed.wrapping_add(missed);
-                                } else {
-                                    self.bench.quiescent_max_gap_ms =
-                                        self.bench.quiescent_max_gap_ms.max(g);
+                                match phase {
+                                    P2_STEADY => {
+                                        self.bench.steady_max_gap_ms =
+                                            self.bench.steady_max_gap_ms.max(g);
+                                        self.bench.steady_missed =
+                                            self.bench.steady_missed.wrapping_add(missed);
+                                    }
+                                    P2_QUIESCENT => {
+                                        self.bench.quiescent_max_gap_ms =
+                                            self.bench.quiescent_max_gap_ms.max(g);
+                                    }
+                                    _ => {} // P2_SCAN: runner-owned (no beacons expected off-ch6); ignore.
                                 }
                                 log::info!(
                                     "[dut] beacon_rx seq={} gap_ms={} phase={}",
-                                    seq, g, if steady { "STEADY" } else { "QUIET" }
+                                    seq,
+                                    g,
+                                    match phase {
+                                        P2_STEADY => "STEADY",
+                                        P2_QUIESCENT => "QUIET",
+                                        _ => "SCAN",
+                                    }
                                 );
                             }
                             // Phase CHANGED (or first beacon) → the gap spans a boundary; DISCARD it.
                             // On the transition INTO steady (assoc_done), the seq-jump = beacons lost
                             // during scan/assoc → attribute to scan_missed (scan's max_gap = runner-owned).
-                            (Some(_), Some(was_steady)) if !was_steady && steady => {
+                            (Some(_), Some(prev_phase)) if prev_phase != P2_STEADY && phase == P2_STEADY => {
                                 self.bench.scan_missed = self.bench.scan_missed.wrapping_add(missed);
                                 log::info!("[dut] beacon_rx seq={} boundary→STEADY scan_missed+={}", seq, missed);
                             }
-                            _ => {} // first-ever beacon, or steady→quiet boundary: nothing to bucket.
+                            _ => {} // first-ever beacon, or a non-steady boundary: nothing to bucket.
                         }
                         self.bench.last_beacon_ms = Some(now);
-                        self.bench.last_steady = Some(steady);
+                        self.bench.last_phase = Some(phase);
                     }
                     // Track the highest peer seq (what our own beacons echo).
                     if self.bench.peer_last_seq.is_none_or(|p| seq > p) {
