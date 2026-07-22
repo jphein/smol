@@ -952,13 +952,25 @@ async fn main(spawner: Spawner) -> ! {
             }
             // #23 stage 2: a LEAF scans 1/6/11 for the elected gateway's HELLO and
             // locks onto its channel (a no-op on the gateway, which rides its AP ch).
+            // #198 Phase 2: a measurement board HOLDS ch6 instead of scan-hopping (hopping would
+            // pull board-B/the DUT off the measurement channel — see pin_mesh_channel).
+            #[cfg(not(feature = "phase2-measure"))]
             r.leaf_scan_tick(now);
+            #[cfg(feature = "phase2-measure")]
+            r.pin_mesh_channel();
             // #23 fix (oracle #1): a LEAF whose owner has gone silent for a PROLONGED
             // period re-opens the broker election — the ONLY runtime path that takes
             // over a DEAD lowest-id owner (leaves never flush). Cheap: early-returns
             // unless owner-silent past its threshold + throttled. When it does fire it
             // blocks for the association, so it drives the SAME responsive tick as a
             // flush (LED + throttled spinner + latching long-press abort).
+            // #198 Phase 2: a MEASUREMENT board (beacon/DUT) NEVER contends the fleet crown. A
+            // recovery re-election is the ONLY runtime path to is_gateway=true (the boot path is
+            // stubbed off in phase2-measure), and smol's own deaf-window makes a ≥15 s gap in the live
+            // crown's HELLO plausible — which would otherwise make a bench board grab the ch6 crown mid-
+            // run, destabilizing the fleet AND the measurement. The DUT's WiFi windows are runner-driven
+            // (WIFI_CMD direct), NOT election-driven, so it needs no gateway role. → non-electing.
+            #[cfg(not(feature = "phase2-measure"))]
             {
                 let mut reelect_abort = false;
                 // #153: re-election is a routine burst → draw NOTHING; the last app frame

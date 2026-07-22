@@ -2643,6 +2643,20 @@ impl RadioManager {
     /// `service`) it locks. If the owner then goes silent past `SCAN_SILENCE_MS` (a
     /// roam), it unlocks + resumes scanning. Gateways never scan (they ride their AP
     /// channel via the live association).
+    /// #198 Phase 2 — a MEASUREMENT board's replacement for `leaf_scan_tick`: HOLD ch6, never
+    /// scan-hop. Hopping 1/6/11 to re-find a roamed crown would yank board-B / the DUT off the ch6
+    /// measurement channel — board-B (never in a window) would stop emitting on ch6 → the DUT sees
+    /// false deaf-gaps, and the DUT would miss board-B between windows. Skips the set mid-assoc
+    /// (WIFI_BUSY: the controller owns the channel); the DUT's own WiFi window is the ONLY intended
+    /// off-ch6 excursion. Same per-tick set_channel(ch6) discipline as the LINK_UP arm below.
+    #[cfg(feature = "phase2-measure")]
+    pub fn pin_mesh_channel(&mut self) {
+        if !WIFI_BUSY.load(Ordering::Relaxed) {
+            let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
+        }
+    }
+
+    #[cfg_attr(feature = "phase2-measure", allow(dead_code))] // measurement boards use pin_mesh_channel
     pub fn leaf_scan_tick(&mut self, now: u64) {
         const CANDIDATES: [u8; 3] = [1, 6, 11]; // JP's roam plan
         const DWELL_MS: u64 = 1500; // listen this long per candidate before hopping
@@ -2728,6 +2742,7 @@ impl RadioManager {
     ///     taken over — the takeover fires only on a FROZEN `MC` seq (owner truly dead).
     ///
     /// Returns true iff a re-election burst actually ran.
+    #[cfg_attr(feature = "phase2-measure", allow(dead_code))] // measurement boards are non-electing
     pub fn maybe_leaf_reelect(
         &mut self,
         batt: &mut crate::batt::BattCache,
