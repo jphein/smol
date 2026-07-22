@@ -211,6 +211,30 @@ pub(crate) mod phase2 {
         Some(s) => parse_u64(s),
         None => 3_000,
     };
+    /// `SMOL_P2_BLOCKING` — Run-3 blocking-mode EMULATION. When set, during each Holding window the DUT
+    /// SUPPRESSES mesh service (`r.service()`) for a deaf-burst — the v904 analog (WiFi/assoc stays up via
+    /// net_task; ONLY the mesh goes unserviced = the single variable that differs async↔v904). Run-1
+    /// (default false) services the mesh throughout (async). (Run3−Run1) on steady_max_gap = the async
+    /// lever's worth. Label: "blocking EMULATION (mesh-service-suppressed analog), NOT v904-exact".
+    pub const BLOCKING: bool = match option_env!("SMOL_P2_BLOCKING") {
+        Some(s) => parse_u64(s) != 0,
+        None => false,
+    };
+    /// `SMOL_P2_BLOCK_MS` — the deaf-burst duration (default 15 s = Run-1's HOLD_MS, so the deaf-burst ==
+    /// the Run-1 window → cleanest single-variable). Bracketed inside Holding by SETTLE + RECOVER, so
+    /// HOLD_MS must exceed BLOCK_MS + SETTLE_MS + RECOVER_MIN_MS (Run-3: SMOL_P2_HOLD_MS≈17 s).
+    pub const BLOCK_MS: u64 = match option_env!("SMOL_P2_BLOCK_MS") {
+        Some(s) => parse_u64(s),
+        None => 15_000,
+    };
+    /// Yield-on settle at Holding entry — service runs so ≥1 REAL steady beacon sets last_phase=STEADY +
+    /// last_beacon_ms BEFORE the deaf-burst (so the post-burst gap buckets STEADY, not boundary-discarded
+    /// by df2bcb5). ~500 ms ≫ the 50 ms beacon period.
+    pub const SETTLE_MS: u64 = 500;
+    /// Minimum yield-on RECOVER after the deaf-burst but BEFORE window_end (which flips P2_PHASE→
+    /// QUIESCENT): guarantees ≥1 beacon period of STEADY service so the first post-burst beacon's
+    /// ~BLOCK_MS gap is captured in steady_max_gap. The deaf-burst end is CLAMPED to leave this slack.
+    pub const RECOVER_MIN_MS: u64 = 300;
     /// `SMOL_P2_BEACON_MAC` — the DUT measures ONLY beacons from this MAC (board-B), so stray fleet
     /// frames can't pollute `max_gap` (the controlled-measurement clincher). Format `AA:BB:CC:DD:EE:FF`.
     /// Unset = accept ANY beacon (fine for a strict 2-board bench where only board-B beacons).
@@ -420,6 +444,31 @@ impl Phase2Runner {
             self.state = P2State::Finished;
         } else {
             self.state = P2State::Idle { until_ms: now + phase2::GAP_MS };
+        }
+    }
+
+    /// #198 Phase 2 Run-3 (Option B, blocking-EMULATION) — is the DUT currently in the DEAF-BURST
+    /// (mesh service suppressed)? True ONLY under SMOL_P2_BLOCKING, while in Holding, in the window
+    /// `[holding_start+SETTLE_MS, burst_end)` where
+    /// `burst_end = min(holding_start+SETTLE_MS+BLOCK_MS, until_ms−RECOVER_MIN_MS)`. `main` skips
+    /// `r.service()` while this is true → the mesh RX queue isn't drained → mesh deaf; net_task keeps
+    /// yielding → WiFi/assoc stays up (LINK_UP live-true) = the v904 analog (single variable: mesh-svc).
+    /// The `−RECOVER_MIN_MS` CLAMP guarantees ≥1 beacon period of STEADY service AFTER the burst but
+    /// BEFORE window_end flips P2_PHASE→QUIESCENT, so the first post-burst beacon's ~BLOCK_MS gap buckets
+    /// steady_max_gap (not boundary-discarded by df2bcb5). SETTLE_MS before establishes the real STEADY
+    /// baseline. (Misconfig HOLD_MS < SETTLE+BLOCK+RECOVER_MIN → empty window → degrades to Run-1, safe.)
+    #[cfg(feature = "phase2-measure")]
+    pub fn in_deaf_burst(&self, now: u64) -> bool {
+        if !phase2::BLOCKING {
+            return false;
+        }
+        if let P2State::Holding { until_ms } = self.state {
+            let burst_start = until_ms.saturating_sub(phase2::HOLD_MS) + phase2::SETTLE_MS;
+            let burst_end = (burst_start + phase2::BLOCK_MS)
+                .min(until_ms.saturating_sub(phase2::RECOVER_MIN_MS));
+            now >= burst_start && now < burst_end
+        } else {
+            false
         }
     }
 }
