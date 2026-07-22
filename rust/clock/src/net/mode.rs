@@ -256,6 +256,11 @@ pub enum DownlinkMsg {
     /// `ingest_downlink_cfg` (own/fleet → self-apply through the CfgTracker; leaf/fleet → cfg_cache
     /// relay). `target` = the `<id>` from `smol/<id>/config/…`, or CFG_TARGET_ALL for `smol/config/…`.
     Config { target: u8, key: u8, buf: [u8; crate::net::wifi::CFG_VALUE_MAX], len: usize },
+    /// #198 Phase 3 (p3-inc3b3): a transient COMMAND (reset R / scan W / notify M) from a QoS1 `cmd/*`/
+    /// `notify` topic. Already PUBACK'd on the wire BEFORE this was queued (#101 guard). `main` routes
+    /// via `apply_command` (own/fleet → the TRANSIENT CfgTracker → take_cfg_offer; leaf/fleet → a
+    /// ONE-SHOT `broadcast_config` mesh relay, NEVER cached — the #52 cache-bypass rule).
+    Command { target: u8, key: u8, buf: [u8; crate::net::wifi::CFG_VALUE_MAX], len: usize },
 }
 // Depth 16: a gateway subscribes fleet-wide config (`smol/+/config/+`), so a window can deliver
 // nodes×keys retained configs. `main` drains this each loop tick DURING the window (the #89
@@ -347,6 +352,24 @@ fn parse_config_topic(topic: &[u8]) -> Option<(u8, u8)> {
         .find(|(sfx, _)| *sfx == suffix)
         .map(|(_, k)| *k)?;
     Some((target, key))
+}
+
+/// #198 Phase 3 (p3-inc3b3) — parse a transient COMMAND topic → (key, target). `smol/<id>/cmd/reset`
+/// → R, `.../cmd/scan` → W, `smol/<id>/notify` → M (NOTE: `/notify`, NOT `/cmd/notify` — HA-repo
+/// verified). Fleet = target 255 (`smol/255/notify` etc.). Unknown/malformed → None (defensive parse
+/// of the untrusted broker topic; commands are QoS1 → a wrong parse would leave a delivery un-PUBACK'd).
+fn parse_command_topic(topic: &[u8]) -> Option<(u8, u8)> {
+    let rest = topic.strip_prefix(b"smol/")?;
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let (idb, tail) = rest.split_at(slash);
+    let target = parse_topic_id(idb)?;
+    let key = match tail {
+        b"/cmd/reset" => crate::net::wifi::CFG_KEY_REBOOT,
+        b"/cmd/scan" => crate::net::wifi::CFG_KEY_SCAN,
+        b"/notify" => crate::net::wifi::CFG_KEY_NOTIFY,
+        _ => return None,
+    };
+    Some((key, target))
 }
 
 /// Parse a 1–3 ASCII-digit node id (0..=255) from a topic segment. (`wire::parse_id` requires a
@@ -4163,6 +4186,21 @@ impl RadioManager {
         }
     }
 
+    /// #198 Phase 3 (p3-inc3b3): apply a transient COMMAND (R/W/M) `mqtt_task` received (already
+    /// PUBACK'd on the wire, #101). Twin of `ingest_downlink_cfg` EXCEPT the leaf relay is a ONE-SHOT
+    /// `broadcast_config` (direct mesh CFG frame), NEVER `cfg_cache` — a cached reboot/scan/toast
+    /// would re-fire every boot (the #52 cache-bypass soft-brick rule). own|FLEET → the TRANSIENT
+    /// CfgTracker (`main`'s `take_cfg_offer(key)` self-applies: reboot boot-debounced / scan / toast).
+    pub fn apply_command(&mut self, key: u8, target: u8, value: &[u8]) {
+        let own = self.id;
+        if target == own || target == crate::net::wifi::CFG_TARGET_ALL {
+            self.cfg.set(key, value);
+        }
+        if target != own {
+            self.broadcast_config(target, key, value); // ONE-SHOT relay, cache-bypass (#52)
+        }
+    }
+
     /// #25 WLED: broadcast one WiZmote button over ESP-NOW on the CURRENT channel.
     /// Mirror of [`broadcast_batt`]: build the fixed 13-B frame → `send_to(&
     /// BROADCAST_ADDRESS, ..)` (fire-and-forget, exactly like BATT/TIME; the
@@ -7532,6 +7570,15 @@ async fn downlink_drain(sock: &mut embassy_net::tcp::TcpSocket<'_>, pkt: &mut [u
     // OTA_OFFER (no fetch; #32 discipline: there is NO per-id act-topic that could trigger a fetch).
     let n = crate::net::mqtt::encode_subscribe(pkt, 5, crate::net::wifi::OTA_STAGED_TOPIC).ok_or(())?;
     write_all(sock, &pkt[..n]).await?;
+    // #198 Phase 3 (p3-inc3b3): the transient COMMAND topics — QoS1 so the persistent session QUEUES a
+    // command that missed our window and redelivers it (#101). MANDATORY PUBACK on receipt (below) or
+    // the broker redelivers forever → reboot loop. reset/scan values fw-ignored; notify carries the msg.
+    let n = crate::net::mqtt::encode_subscribe_qos1(pkt, 6, b"smol/+/cmd/reset").ok_or(())?;
+    write_all(sock, &pkt[..n]).await?;
+    let n = crate::net::mqtt::encode_subscribe_qos1(pkt, 7, b"smol/+/cmd/scan").ok_or(())?;
+    write_all(sock, &pkt[..n]).await?;
+    let n = crate::net::mqtt::encode_subscribe_qos1(pkt, 8, b"smol/+/notify").ok_or(())?;
+    write_all(sock, &pkt[..n]).await?;
 
     let mut got_batt = false;
     let mut got_grid = false;
@@ -7557,9 +7604,22 @@ async fn downlink_drain(sock: &mut embassy_net::tcp::TcpSocket<'_>, pkt: &mut [u
         // pull each COMPLETE packet out of the stream accumulator (route confined to the match arm so
         // the `acc` borrow ends before `copy_within` re-borrows it mutably).
         loop {
+            // #198 Phase 3 (p3-inc3b3): a COMMAND (QoS1 cmd/*) is copied out here but its push to main
+            // is DEFERRED until after the PUBACK below (PUBACK-first — main drains DOWNLINK during our
+            // PUBACK `.await`, so pushing first could let a reset fire mid-write → #101 loop). QoS0
+            // topics (batt/grid/config/ota) route inline (no PUBACK). `puback` = any QoS1 delivery.
+            let mut cmd: Option<DownlinkMsg> = None;
+            let mut puback: Option<u16> = None;
             let total = match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
-                Some((crate::net::mqtt::Incoming::Publish { topic, payload, .. }, total)) => {
-                    route_downlink(topic, payload, &mut got_batt, &mut got_grid);
+                Some((crate::net::mqtt::Incoming::Publish { topic, payload, packet_id }, total)) => {
+                    puback = packet_id;
+                    if let Some((key, target)) = parse_command_topic(topic) {
+                        let mut buf = [0u8; crate::net::wifi::CFG_VALUE_MAX];
+                        let len = fill_clamped(&mut buf, payload);
+                        cmd = Some(DownlinkMsg::Command { target, key, buf, len });
+                    } else {
+                        route_downlink(topic, payload, &mut got_batt, &mut got_grid);
+                    }
                     total
                 }
                 Some((_, total)) => total, // SUBACK / other — consume without routing
@@ -7567,6 +7627,16 @@ async fn downlink_drain(sock: &mut embassy_net::tcp::TcpSocket<'_>, pkt: &mut [u
             };
             acc.copy_within(total..acc_len, 0);
             acc_len -= total;
+            // #101 PUBACK-FIRST: write+flush the ACK (on the wire) BEFORE handing the command to main,
+            // so the broker drops it before main can act. The boot-debounce is the backstop for the
+            // on-wire-vs-broker-received gap (bounded to ≤1 extra reboot, then converges).
+            if let Some(pid) = puback {
+                let m = crate::net::mqtt::encode_puback(pkt, pid).ok_or(())?;
+                write_all(sock, &pkt[..m]).await?;
+            }
+            if let Some(cmd) = cmd {
+                push_downlink(cmd);
+            }
         }
         if acc_len == acc.len() {
             acc_len = 0; // oversized/garbled packet guard — never wedge the accumulator

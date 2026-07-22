@@ -1198,6 +1198,13 @@ async fn main(spawner: Spawner) -> ! {
                         r.ingest_downlink_cfg(target, key, &buf[..len]);
                         redraw = true;
                     }
+                    // #198 Phase 3 (p3-inc3b3): a transient COMMAND (R/W/M, already PUBACK'd) → apply.
+                    // own/fleet self-applies via the transient CfgTracker → the take_cfg_offer(R/W/M)
+                    // handlers below (reboot boot-debounced); leaf/fleet → one-shot mesh relay.
+                    net::mode::DownlinkMsg::Command { target, key, buf, len } => {
+                        r.apply_command(key, target, &buf[..len]);
+                        redraw = true;
+                    }
                 }
             }
             // Mesh time adoption: if a peer's clock descends from a STRICTLY
