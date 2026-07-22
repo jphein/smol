@@ -243,8 +243,17 @@ static RELAYED: Signal<CriticalSectionRawMutex, RelayedSnapshot> = Signal::new()
 pub enum DownlinkMsg {
     Batt { buf: [u8; BATT_PAYLOAD_MAX], len: usize },
     Grid { buf: [u8; BATT_PAYLOAD_MAX], len: usize },
+    /// #198 Phase 3 (p3-inc3b2): a keyed CONFIG (target id + CFG key + value). `main` routes it via
+    /// `ingest_downlink_cfg` (own/fleet → self-apply through the CfgTracker; leaf/fleet → cfg_cache
+    /// relay). `target` = the `<id>` from `smol/<id>/config/…`, or CFG_TARGET_ALL for `smol/config/…`.
+    Config { target: u8, key: u8, buf: [u8; crate::net::wifi::CFG_VALUE_MAX], len: usize },
 }
-const DOWNLINK_DEPTH: usize = 4;
+// Depth 16: a gateway subscribes fleet-wide config (`smol/+/config/+`), so a window can deliver
+// nodes×keys retained configs. `main` drains this each loop tick DURING the window (the #89
+// interleave), so the channel only holds one socket-read's fan-out at a time; 16 gives headroom, and
+// drop-oldest + retained-republish (re-subscribed every window) makes any overflow eventually
+// consistent (P3-M2). batt/grid share the channel (low rate).
+const DOWNLINK_DEPTH: usize = 16;
 static DOWNLINK: Channel<CriticalSectionRawMutex, DownlinkMsg, DOWNLINK_DEPTH> = Channel::new();
 /// P3-M4 last-packet quiet-timer: once the broker goes silent this long after SUBSCRIBE, the retained
 /// set is drained. The outer BURST_BUDGET (mqtt_task) is the hard flush deadline.
@@ -276,8 +285,64 @@ fn route_downlink(topic: &[u8], payload: &[u8], got_batt: &mut bool, got_grid: &
         let len = fill_clamped(&mut buf, payload);
         push_downlink(DownlinkMsg::Grid { buf, len });
         *got_grid = true;
+    } else if let Some((target, key)) = parse_config_topic(topic) {
+        // #198 Phase 3 (p3-inc3b2): a keyed CONFIG downlink → hand to main for apply/relay.
+        let mut buf = [0u8; crate::net::wifi::CFG_VALUE_MAX];
+        let len = fill_clamped(&mut buf, payload);
+        push_downlink(DownlinkMsg::Config { target, key, buf, len });
     }
-    // else: not subscribed here (MC → inc3d, config/commands → inc3b2) — ignore.
+    // else: not routed here (MC → inc3d; cmd/reset|scan|notify → inc3b3; io/set → later) — ignore.
+}
+
+/// #198 Phase 3 (p3-inc3b2) — CONFIG topic-suffix → CFG key. The authoritative wire contract (verified
+/// against the HA repo `packages/smol_mesh.yaml` + dashboards). Command keys (R/W/M, transient `cmd/*`)
+/// and `io/set` (`smol/<id>/io/set`, not `/config/`) are NOT here — different namespaces/increments.
+const CFG_SUFFIX_KEYS: [(&[u8], u8); 10] = [
+    (b"default_screen", crate::net::wifi::CFG_KEY_SCREEN),
+    (b"led", crate::net::wifi::CFG_KEY_LED),
+    (b"units", crate::net::wifi::CFG_KEY_UNITS),
+    (b"plugins", crate::net::wifi::CFG_KEY_PLUGINS),
+    (b"custom", crate::net::wifi::CFG_KEY_CUSTOM),
+    (b"net", crate::net::wifi::CFG_KEY_NET),
+    (b"broker", crate::net::wifi::CFG_KEY_BROKER),
+    (b"ota_host", crate::net::wifi::CFG_KEY_OTA),
+    (b"io", crate::net::wifi::CFG_KEY_IO),
+    (b"wifi_all", crate::net::wifi::CFG_KEY_WIFI_ALL),
+];
+
+/// Parse a `smol/<id>/config/<suffix>` (per-node) or `smol/config/<suffix>` (fleet) topic → (target,
+/// key). Fleet → CFG_TARGET_ALL. Unknown suffix / malformed → None (defensive: the broker topic is
+/// untrusted even behind the subscribe filter). Total/panic-free.
+fn parse_config_topic(topic: &[u8]) -> Option<(u8, u8)> {
+    let rest = topic.strip_prefix(b"smol/")?;
+    let (target, suffix): (u8, &[u8]) = if let Some(s) = rest.strip_prefix(b"config/") {
+        (crate::net::wifi::CFG_TARGET_ALL, s) // fleet: smol/config/<suffix>
+    } else {
+        let slash = rest.iter().position(|&b| b == b'/')?;
+        let (idb, tail) = rest.split_at(slash);
+        (parse_topic_id(idb)?, tail.strip_prefix(b"/config/")?) // per-node: smol/<id>/config/<suffix>
+    };
+    let key = CFG_SUFFIX_KEYS
+        .iter()
+        .find(|(sfx, _)| *sfx == suffix)
+        .map(|(_, k)| *k)?;
+    Some((target, key))
+}
+
+/// Parse a 1–3 ASCII-digit node id (0..=255) from a topic segment. (`wire::parse_id` requires a
+/// fixed 3-digit field — topic ids are variable-width, e.g. `smol/7/…`.)
+fn parse_topic_id(idb: &[u8]) -> Option<u8> {
+    if idb.is_empty() || idb.len() > 3 {
+        return None;
+    }
+    let mut v: u16 = 0;
+    for &b in idb {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + (b - b'0') as u16;
+    }
+    (v <= 255).then_some(v as u8)
 }
 
 /// #198 Phase 2 (edge (c) fix) — RUNNER-AUTHORITATIVE measurement phase, set by `Phase2Runner` on
@@ -4061,6 +4126,23 @@ impl RadioManager {
         self.cfg.take(key)
     }
 
+    /// #198 Phase 3 (p3-inc3b2): apply a keyed CONFIG downlink `mqtt_task` received (via the DOWNLINK
+    /// channel → `main`). ONE method holds the own/leaf/fleet routing so `main`'s drain stays a single
+    /// call. own or FLEET → buffer in the CfgTracker (`main`'s `take_cfg_offer(key)` self-applies);
+    /// leaf or FLEET → cache in `cfg_cache` for the ~10 s mesh relay (`broadcast_cached_configs`). The
+    /// CfgTracker/cache key-filter on `CFG_APPLY_KEYS`, so an unknown key is a safe no-op.
+    pub fn ingest_downlink_cfg(&mut self, target: u8, key: u8, value: &[u8]) {
+        let own = self.id;
+        if target == own || target == crate::net::wifi::CFG_TARGET_ALL {
+            self.cfg.set(key, value);
+        }
+        if target != own {
+            // a specific leaf, or FLEET (relay to every leaf) → cache for the mesh rebroadcast.
+            self.cfg_cache
+                .set(target, key, value, [0u8; 6], now_ms());
+        }
+    }
+
     /// #25 WLED: broadcast one WiZmote button over ESP-NOW on the CURRENT channel.
     /// Mirror of [`broadcast_batt`]: build the fixed 13-B frame → `send_to(&
     /// BROADCAST_ADDRESS, ..)` (fire-and-forget, exactly like BATT/TIME; the
@@ -7418,6 +7500,13 @@ async fn downlink_drain(sock: &mut embassy_net::tcp::TcpSocket<'_>, pkt: &mut [u
     let n = crate::net::mqtt::encode_subscribe(pkt, 1, crate::net::wifi::BATT_TOPIC).ok_or(())?;
     write_all(sock, &pkt[..n]).await?;
     let n = crate::net::mqtt::encode_subscribe(pkt, 2, crate::net::wifi::GRID_TOPIC).ok_or(())?;
+    write_all(sock, &pkt[..n]).await?;
+    // #198 Phase 3 (p3-inc3b2): the keyed CONFIG downlink — per-node + fleet wildcards. QoS0 retained;
+    // no PUBACK, no #101 reboot-loop hazard (that is the cmd/* commands → inc3b3). One subscribe each
+    // covers ALL config keys (the suffix→key table routes them).
+    let n = crate::net::mqtt::encode_subscribe(pkt, 3, b"smol/+/config/+").ok_or(())?;
+    write_all(sock, &pkt[..n]).await?;
+    let n = crate::net::mqtt::encode_subscribe(pkt, 4, b"smol/config/+").ok_or(())?;
     write_all(sock, &pkt[..n]).await?;
 
     let mut got_batt = false;

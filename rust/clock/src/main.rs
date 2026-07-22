@@ -1191,6 +1191,13 @@ async fn main(spawner: Spawner) -> ! {
                         grid_cache.store(&buf[..len], now);
                         redraw = true;
                     }
+                    // #198 Phase 3 (p3-inc3b2): keyed CONFIG downlink → RadioManager routes it
+                    // (own/fleet self-apply via CfgTracker → the take_cfg_offer(key) handlers below;
+                    // leaf/fleet → cfg_cache relay). One call keeps this drain surgical.
+                    net::mode::DownlinkMsg::Config { target, key, buf, len } => {
+                        r.ingest_downlink_cfg(target, key, &buf[..len]);
+                        redraw = true;
+                    }
                 }
             }
             // Mesh time adoption: if a peer's clock descends from a STRICTLY
