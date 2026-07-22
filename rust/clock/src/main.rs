@@ -1169,6 +1169,26 @@ async fn main(spawner: Spawner) -> ! {
                     log::info!("smol: adopted mesh time (synced_at {} -> {})", old, psynced);
                 }
             }
+            // #198 Phase 2 — NTP TIME BRIDGE: `wifi_task` publishes a completed SNTP sync via
+            // `NTP_RESULT` (it owns the `Stack`; a spawned task has no return channel to this loop).
+            // Treat a fresh NTP epoch as an AUTHORITATIVE local time offer through the SAME
+            // `should_adopt` gate as mesh time: a real NTP `synced_at` (≈ now) is strictly-newer
+            // than any mesh-inherited/never-synced value, so NTP wins and this node becomes an
+            // NtpRoot time source. This is the async-topology equivalent of the old boot burst's
+            // return value — non-blocking boot: `start()` returns synced=None, the clock free-runs
+            // a few seconds, then re-anchors here on the first sync (or on mesh adoption, whichever
+            // lands first). Drained every subtick so the correction shows fast.
+            if let Some(unix) = r.take_ntp_sync() {
+                if should_adopt(my_synced_at, unix) {
+                    let old = my_synced_at;
+                    base_unix = unix;
+                    anchor_ms = now;
+                    my_synced_at = unix;
+                    time_source = app::TimeSource::NtpRoot;
+                    redraw = true;
+                    log::info!("smol #198 P2: adopted NTP time (synced_at {} -> {})", old, unix);
+                }
+            }
             // ~every 2 s advertise ourselves (HELLO drives the LED handshake).
             // 2000 ms / SUBTICK_MS aligned via the monotonic clock.
             if (now / 2000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 2000) {

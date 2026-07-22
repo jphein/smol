@@ -54,6 +54,14 @@ use esp_hal::{
 const NTP_SERVER_IP: Ipv4Addr = Ipv4Addr::new(162, 159, 200, 123);
 const NTP_PORT: u16 = 123;
 
+/// #198 Phase 2 — the DUT's local UDP source port for the SNTP exchange. A FIXED client port,
+/// deliberately NOT `bind(0)`: smoltcp rejects port 0 as `BindError::Unaddressable`, so the
+/// spec §A `sock.bind(0)` snippet would silently fail the bind (`.ok()?` → `None` → no sync,
+/// clock free-runs). A fixed port also drops smol's old `Rng` source-port dance (spec §A intent)
+/// and matches the HW-proven esp32c6-watch pattern (`main.rs:264` binds a fixed local port).
+#[cfg(feature = "wifi")]
+const NTP_LOCAL_PORT: u16 = 12345;
+
 // #100 HA Mosquitto broker (v2 MQTT-native bridge): the leg is now the ACTIVE slot's own-VLAN
 // broker, resolved at RUNTIME in `mqtt_session` from the NVS net-record (`active_broker()`) — a
 // slot IS a (ssid, broker, ota) tuple, so the broker MUST follow the associated network (the
@@ -512,16 +520,71 @@ pub fn try_time_sync(
 #[cfg(feature = "espnow")]
 pub(crate) const NTP_RESYNC_AGE_S: u32 = 3600;
 
+/// #198 Phase 2 (spec §A) — one async SNTP exchange over embassy-net UDP.
+///
+/// Replaces smol's excised poll-latch `step_sntp`/`NtpMachine` FSM with the esp32c6-watch's
+/// straight-line `.await` shape (watch `main.rs:257-295`). Runs INSIDE `wifi_task` after the
+/// DHCP-ready gate (`stack.config_v4().is_some()`); while this awaits the UDP round-trip the
+/// executor keeps polling the ESP-NOW mesh — that interleave IS the deaf-window lever (decision ①).
+///
+/// Byte logic is smol's, kept VERBATIM: request byte `0x23` (LI=0, VN=4, Mode=3 client), parse the
+/// transmit-timestamp seconds at `resp[40..44]` big-endian, subtract `NTP_TO_UNIX_OFFSET`. The
+/// subtraction is GUARDED (`secs > OFFSET`) — smol's original (git 1c57ad0) — which doubles as a
+/// garbage-response reject: a zero/short/bad packet has `secs <= OFFSET` and would underflow a plain
+/// subtraction, so it returns `None` instead. Returns Unix seconds as `u32` (matches `main`'s
+/// `base_unix`/`my_synced_at`) or `None` on timeout / short packet / garbage.
+///
+/// Socket buffers live on this fn's stack frame (they persist across the awaits) — NOT the old
+/// `&'static mut` scratch (migration-hazard §E3): one caller, no borrow escapes, no aliasing.
+#[cfg(feature = "wifi")]
+pub async fn ntp_sync(stack: embassy_net::Stack<'static>) -> Option<u32> {
+    use embassy_net::udp::{PacketMetadata, UdpSocket};
+    let mut rx_meta = [PacketMetadata::EMPTY; 1];
+    let mut rx_buf = [0u8; 256];
+    let mut tx_meta = [PacketMetadata::EMPTY; 1];
+    let mut tx_buf = [0u8; 256];
+    let mut sock = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
+    sock.bind(NTP_LOCAL_PORT).ok()?; // fixed local port — smoltcp rejects bind(0). See NTP_LOCAL_PORT.
+
+    let mut req = [0u8; 48];
+    req[0] = 0x23; // LI=0, VN=4, Mode=3 (client) — smol's existing SNTP request byte, kept verbatim.
+    sock.send_to(&req, (NTP_SERVER_IP, NTP_PORT)).await.ok()?;
+
+    let mut resp = [0u8; 48];
+    let (n, _) = embassy_time::with_timeout(
+        embassy_time::Duration::from_secs(5),
+        sock.recv_from(&mut resp),
+    )
+    .await
+    .ok()? // outer Result: `Err` = timed out → None.
+    .ok()?; // inner Result: `Err` = recv error → None.
+    if n < 48 {
+        return None; // short/malformed SNTP response — reject (guard #1).
+    }
+    let secs = u32::from_be_bytes([resp[40], resp[41], resp[42], resp[43]]);
+    // smol's ORIGINAL subtraction guard (git 1c57ad0): a valid SNTP transmit timestamp is decades
+    // past the 1900 NTP epoch, so `secs <= OFFSET` means a zero/garbage packet — reject rather than
+    // underflow (guard #2). Oracle pre-code watch: this guard is mandatory.
+    if secs > NTP_TO_UNIX_OFFSET {
+        Some(secs - NTP_TO_UNIX_OFFSET)
+    } else {
+        None
+    }
+}
+
 // ── 0c′ WiFi-STA transport STUBS (#198) ──────────────────────────────────────
 // The NTP/MQTT bursts drove a hand-rolled smoltcp stack over esp-wifi 0.15's
 // `WifiDevice`, which esp-radio 0.18 removed (it exposes only an embassy-net-driver
 // `Driver`). Signatures are preserved VERBATIM — only the types are renamed
 // (`esp_wifi::wifi::WifiController`→`esp_radio::…`, `WifiDevice`→`StaDevice`) — so the
 // KEEP-LIVE callers in `net::mode` (elections/coexist/relay orchestration) don't churn.
-// The bodies are inert until: run_ntp_burst/run_ntp_resync → embassy-net UDP (Phase 3),
-// run_mqtt_burst → the async MQTT flush task (Phase 4).
-// TODO(#198 Phase 3): reimplement run_ntp_burst + run_ntp_resync on embassy-net.
-// TODO(#198 Phase 4): reimplement run_mqtt_burst as the async MQTT flush task.
+// #198 Phase 2: NTP now syncs via the async `ntp_sync` above, called from `net::mode::wifi_task`
+// (the sync moved out of these synchronous bursts). These `run_ntp_*` bodies are now VESTIGIAL
+// scaffolding — kept inert (return None) so the KEEP-LIVE callers don't churn; a dedicated later
+// cleanup increment removes them + their call sites (flagged: bounds Phase-2 blast radius).
+// run_mqtt_burst stays a stub until the async MQTT flush task (Phase 3).
+// TODO(#198 cleanup): delete run_ntp_burst/run_ntp_resync + their burst_ntp/resync_ntp callers.
+// TODO(#198 Phase 3): reimplement run_mqtt_burst as the async MQTT flush task.
 
 #[allow(
     unused_variables,
@@ -537,7 +600,7 @@ pub fn run_ntp_resync(
     rng: Rng,
     tick: &mut dyn FnMut() -> bool,
 ) -> Option<u32> {
-    log::info!("smol 0c\u{2032}: run_ntp_resync STUBBED (WiFi/NTP on embassy-net in Phase 3)");
+    log::info!("smol #198: run_ntp_resync VESTIGIAL (NTP syncs via wifi_task::ntp_sync, Phase 2)");
     None
 }
 
@@ -564,7 +627,7 @@ pub fn run_ntp_burst(
     config_offer: &mut Option<crate::app::DefaultScreen>,
     install_requested: &mut bool,
 ) -> Option<u32> {
-    log::info!("smol 0c\u{2032}: run_ntp_burst STUBBED (WiFi/NTP on embassy-net in Phase 3)");
+    log::info!("smol #198: run_ntp_burst VESTIGIAL (NTP syncs via wifi_task::ntp_sync, Phase 2)");
     None
 }
 
@@ -608,7 +671,7 @@ pub fn run_mqtt_burst(
     ota_self_fail: &mut Option<(u32, u32, u32, u32, u32)>,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
-    log::info!("smol 0c\u{2032}: run_mqtt_burst STUBBED (async MQTT flush task in Phase 4)");
+    log::info!("smol #198: run_mqtt_burst STUBBED (async MQTT flush task in Phase 3)");
     false
 }
 

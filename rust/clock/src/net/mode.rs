@@ -64,6 +64,7 @@ use crate::net::WifiPeripherals;
 // #198 Phase 1 inc2 (DR-H1 / DR-M4) — cross-task shared state for the WiFi-in-a-task split.
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_sync::signal::Signal;
 use portable_atomic::{AtomicBool, AtomicI16, Ordering};
 // #13: the relay-family wire codec + ASCII field helpers live in the PURE, host-testable
 // `net::wire` module (extracted from here, byte-identical). Glob-imported so every call site
@@ -112,6 +113,17 @@ enum WifiCmd {
 /// `wifi_task` `receive().await`s. The inline sender gates on `!LINK_UP && !WIFI_BUSY` so at most
 /// one open is ever in flight — the depth-4 queue can't fill (which was the POINT-2 drop vector).
 static WIFI_CMD: Channel<CriticalSectionRawMutex, WifiCmd, 4> = Channel::new();
+
+/// #198 Phase 2 — the `wifi_task`→`main` TIME BRIDGE. `wifi_task` runs the async SNTP exchange
+/// (`wifi::ntp_sync`) inside the WiFi window (it owns the `Stack`); being a spawned task it has no
+/// return channel to `main`'s clock loop, so a successful sync is published here as the Unix epoch.
+/// `main` drains it each subtick (`RadioManager::take_ntp_sync`) and re-anchors
+/// `base_unix`/`my_synced_at`/`anchor_ms` through the SAME `should_adopt` gate the mesh-time path
+/// uses — a fresh NTP `synced_at` (≈ now) is strictly-newer than any mesh-inherited/never-synced
+/// value, so NTP correctly wins as authoritative. This mirrors the LINK_UP/AP_RSSI producer→consumer
+/// pattern (wifi_task writes, the mesh side reads). One-slot overwrite-latest: only the freshest
+/// sync matters; a stale un-drained epoch is harmlessly replaced.
+static NTP_RESULT: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 
 /// Fixed ESP-NOW channel used in TIME-SHARE mode. All smol units must agree on
 /// this value (1..=13). 6 is a common, low-congestion default.
@@ -3505,6 +3517,15 @@ impl RadioManager {
         }
     }
 
+    /// #198 Phase 2 — drain a freshly-completed NTP sync from `wifi_task` (the TIME BRIDGE, see
+    /// `NTP_RESULT`). Returns the synced Unix epoch once per successful sync, then clears. `main`
+    /// treats it as an authoritative local time offer: re-anchor via `should_adopt` (a real NTP
+    /// `synced_at` outranks any mesh-inherited time), exactly like `take_time_offer` but sourced
+    /// from THIS node's own SNTP rather than a peer. `&self`: the Signal is its own sync.
+    pub fn take_ntp_sync(&self) -> Option<u32> {
+        NTP_RESULT.try_take()
+    }
+
     /// Snapshot the per-peer roster for the Bench mesh-view (issue #8): fresh
     /// peers, strongest-RSSI first, as a `Copy` view (no live borrow). Read-only
     /// w.r.t. the LED (which still reads only `PeerTracker`).
@@ -6302,9 +6323,13 @@ async fn wifi_task(
         };
         LINK_UP.store(connected, Ordering::Relaxed);
         // Steady-state: mirror controller state for the inline election/coexist (DR-H1), refreshed
-        // at election granularity (seconds). (Phase 2/3 insert here: once
-        // `stack.config_v4().is_some()` → ntp_sync().await → MQTT open/done → then drop.)
+        // at election granularity (seconds). #198 Phase 2: once the DHCP lease lands
+        // (`stack.config_v4().is_some()`) we run ONE async SNTP exchange in this WiFi window and
+        // publish a good sync to `main` via the NTP_RESULT bridge. The executor keeps polling the
+        // ESP-NOW mesh while `ntp_sync` awaits the UDP round-trip — that interleave IS the
+        // deaf-window lever (decision ①). (Phase 3 adds the MQTT open/done here, then drop.)
         let mut logged_dhcp = false;
+        let mut ntp_attempted = false; // one SNTP exchange per window (resync = the next window).
         while LINK_UP.load(Ordering::Relaxed) {
             // Oracle §2.5 POINT-2: check the UNDROPPABLE teardown FIRST — consume it (swap) so a
             // teardown of THIS open window can never be starved behind benign OpenWindows.
@@ -6317,10 +6342,25 @@ async fn wifi_task(
             };
             AP_RSSI.store(rssi_i16, Ordering::Relaxed);
             LINK_UP.store(controller.is_connected(), Ordering::Relaxed);
-            if !logged_dhcp {
-                if let Some(cfg) = stack.config_v4() {
-                    log::info!("smol #198 P1: DHCP lease {}", cfg.address);
+            if stack.config_v4().is_some() {
+                if !logged_dhcp {
+                    if let Some(cfg) = stack.config_v4() {
+                        log::info!("smol #198 P1: DHCP lease {}", cfg.address);
+                    }
                     logged_dhcp = true;
+                }
+                // #198 Phase 2 (spec §A) — SNTP now that DHCP is up. Once per window.
+                if !ntp_attempted {
+                    ntp_attempted = true;
+                    match crate::net::wifi::ntp_sync(stack).await {
+                        Some(unix) => {
+                            NTP_RESULT.signal(unix);
+                            log::info!("smol #198 P2: ntp_done ok=true unix={}", unix);
+                        }
+                        None => {
+                            log::warn!("smol #198 P2: ntp_done ok=false (timeout/short/garbage)");
+                        }
+                    }
                 }
             }
             embassy_time::Timer::after(embassy_time::Duration::from_millis(500)).await;
