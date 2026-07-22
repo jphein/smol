@@ -201,6 +201,11 @@ struct TelemetrySnapshot {
     status: [u8; STATUS_MAX],   // → retained smol/<id>/status  (live screen readback)
     peers: [u8; PEERS_MAX],     // → retained smol/<id>/peers    (#27 roster)
     telemetry: [u8; TELEM_MAX], // → transient smol/<id>/telemetry (sensor line + label)
+    // #198 Phase 3 (p3-inc3d-1): the crown's own MC → retained smol/mesh/channel. Populated by
+    // flush_telemetry ONLY when is_gateway (the 🔴 PUBLISH gate — no bogus owner=self claim);
+    // mc_len==0 (non-gateway) → mqtt_burst publishes no MC.
+    mc_len: usize,
+    mc: [u8; MC_MAX],
 }
 
 /// Latest-wins telemetry hand-off (lock-free, overwrite-latest — mirrors NTP_RESULT). The inline
@@ -241,6 +246,27 @@ static RELAYED: Signal<CriticalSectionRawMutex, RelayedSnapshot> = Signal::new()
 /// MUST apply the install-TRIGGER gate (OTA_AUTO_INSTALL vs install-cmd + #195 self-fetch cap) before
 /// a FETCH — `ota::gate()` does NOT cover those (see the inc3c exec-log flag).
 static OTA_OFFER: Signal<CriticalSectionRawMutex, crate::ota::Announce> = Signal::new();
+
+// ── #198 Phase 3 (p3-inc3d-1) — the MC election OBSERVE back-channel (broker-mediated election) ──
+// The crown election reads the retained `smol/mesh/channel` MC (`MC|owner|ch|seq`). inc3d-1 is the
+// PLUMBING ONLY: `mqtt_task` delivers the observed MC here + the crown PUBLISHes its own MC (gated on
+// is_gateway). The RESOLVE + APPLY (updating mc_seen_*, deciding i_am_owner, set_gateway) is inc3d-2 —
+// so in inc3d-1 this observation is UNCONSUMED except by got_mc (own-echo → the settle), which means
+// inc3d-1 changes NO role logic → structurally cannot split-brain.
+/// One observed retained MC (`owner`/`seq`/`ch`). inc3d-1 reads only `owner` (own-echo → got_mc);
+/// `seq`/`ch` are consumed by inc3d-2's resolve (staleness + channel) → allow dead_code until then.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct McObs {
+    owner: u8,
+    seq: u32,
+    ch: u8,
+}
+/// `mqtt_task` → inline election: the latest observed MC (overwrite-latest, mirrors NTP_RESULT). The
+/// inline resolve consumes this in inc3d-2; inc3d-1 leaves it unconsumed (got_mc uses only own-echo).
+static MC_OBSERVED: Signal<CriticalSectionRawMutex, McObs> = Signal::new();
+/// Max serialized MC payload `MC|<255>|<13>|<4294967295>` ≈ 20 B; 32 gives headroom.
+const MC_MAX: usize = 32;
 
 // ── #198 Phase 3 (p3-inc3b1) — non-crown DOWNLINK back-channel (mqtt_task → main) ───────────────
 // `mqtt_task` parses the retained downlink but can't borrow main's batt/grid caches / the mesh
@@ -2701,6 +2727,10 @@ pub struct RadioManager {
     mc_seen_owner: u8,
     mc_seen_seq: u32,
     mc_seen_ms: u64,
+    /// #198 Phase 3 (p3-inc3d-1): the monotonic liveness seq this crown stamps on its published
+    /// `MC|<id>|<ch>|<seq>`. Bumped each gateway flush; leaves watch it advance as the crown-alive
+    /// signal. inc3d-2 (a209858 port) refines it to unix-anchored (survives reboot without going stale).
+    mc_pub_seq: u32,
     /// #23 fix (oracle #1): last time a LEAF opened a recovery re-election burst — the
     /// retry throttle so a partitioned leaf can't thrash the radio re-associating.
     last_reelect_ms: u64,
@@ -2979,6 +3009,7 @@ impl RadioManager {
             mc_seen_owner: 0,
             mc_seen_seq: 0,
             mc_seen_ms: 0,
+            mc_pub_seq: 0,
             last_reelect_ms: 0,
             ota_offer: None,
             staged_raw: None,
@@ -5588,10 +5619,29 @@ impl RadioManager {
             status: [0u8; STATUS_MAX],
             peers: [0u8; PEERS_MAX],
             telemetry: [0u8; TELEM_MAX],
+            mc_len: 0,
+            mc: [0u8; MC_MAX],
         };
         snap.telemetry_len = fill_clamped(&mut snap.telemetry, own_telemetry);
         snap.status_len = fill_clamped(&mut snap.status, status);
         snap.peers_len = fill_clamped(&mut snap.peers, peers);
+        // #198 Phase 3 (p3-inc3d-1): the crown PUBLISHes its own MC (`MC|<id>|<ch>|<seq>`, retained) so
+        // leaves/HA see the elected crown + its liveness seq. 🔴 GATED on the CURRENT role — only a
+        // node that ALREADY believes it's the gateway claims owner=self (no bogus claim). seq =
+        // monotonic liveness bump (inc3d-2's a209858 port refines it to unix-anchored). inc3d-1 only
+        // PUBLISHes + OBSERVEs; it does NOT resolve/apply → no role change.
+        if self.relay.is_gateway {
+            use core::fmt::Write as _;
+            self.mc_pub_seq = self.mc_pub_seq.saturating_add(1);
+            let ch = self.current_channel();
+            let mut w = SliceWriter {
+                buf: &mut snap.mc,
+                len: 0,
+                overflow: false,
+            };
+            let _ = write!(w, "MC|{}|{}|{}", id, ch, self.mc_pub_seq);
+            snap.mc_len = w.len;
+        }
         TELEMETRY.signal(snap);
         // #198 Phase 3 (p3-inc3a): republish the gateway's cached leaf STATUSES as retained
         // smol/<leaf>/status (#50b HA fleet visibility). FRESH-gated (STAT_FRESH_MS #68: a leaf gone
@@ -7477,6 +7527,18 @@ async fn mqtt_burst(stack: embassy_net::Stack<'static>, id: u8) -> Result<(), ()
             false,
         )
         .await?;
+        // #198 Phase 3 (p3-inc3d-1): PUBLISH the crown's MC to retained smol/mesh/channel. Non-empty
+        // ONLY when the inline flush was a gateway (the 🔴 gate) — a non-gateway never claims owner=self.
+        if snap.mc_len > 0 {
+            let n = crate::net::mqtt::encode_publish(
+                &mut pkt,
+                crate::net::wifi::MESH_CHANNEL_TOPIC,
+                &snap.mc[..snap.mc_len],
+                true,
+            )
+            .ok_or(())?;
+            write_all(&mut sock, &pkt[..n]).await?;
+        }
     }
 
     // #198 Phase 3 (p3-inc3a): republish the gateway's cached leaf STATUSES as retained
@@ -7490,7 +7552,7 @@ async fn mqtt_burst(stack: embassy_net::Stack<'static>, id: u8) -> Result<(), ()
 
     // #198 Phase 3 (p3-inc3b1): SUBSCRIBE + drain the non-crown retained downlink (batt/grid) back to
     // main. Per spec §2 ordering: publish → downlink → DISCONNECT. Confirmed-gateway here.
-    downlink_drain(&mut sock, &mut pkt).await?;
+    downlink_drain(&mut sock, &mut pkt, id).await?;
 
     // DISCONNECT — a clean goodbye so the broker doesn't fire a will / log a drop (spec §2).
     let dn = crate::net::mqtt::encode_disconnect(&mut pkt).ok_or(())?;
@@ -7553,7 +7615,11 @@ fn fill_clamped(dst: &mut [u8], src: &[u8]) -> usize {
 /// the P3-M4 settle — the batt/grid data-flags + a last-packet quiet-timer (DOWNLINK_QUIET_MS); the
 /// outer BURST_BUDGET (mqtt_task) is the hard flush deadline. inc3d extends the SAME settle with the
 /// crown `got_mc` flag. Ignores SUBACK/other. CROWN-SAFE: no MC/election subscribe here.
-async fn downlink_drain(sock: &mut embassy_net::tcp::TcpSocket<'_>, pkt: &mut [u8]) -> Result<(), ()> {
+async fn downlink_drain(
+    sock: &mut embassy_net::tcp::TcpSocket<'_>,
+    pkt: &mut [u8],
+    id: u8,
+) -> Result<(), ()> {
     // SUBSCRIBE batt + grid (QoS0; distinct non-zero packet ids). Retained arrives right after SUBACK.
     let n = crate::net::mqtt::encode_subscribe(pkt, 1, crate::net::wifi::BATT_TOPIC).ok_or(())?;
     write_all(sock, &pkt[..n]).await?;
@@ -7579,14 +7645,26 @@ async fn downlink_drain(sock: &mut embassy_net::tcp::TcpSocket<'_>, pkt: &mut [u
     write_all(sock, &pkt[..n]).await?;
     let n = crate::net::mqtt::encode_subscribe_qos1(pkt, 8, b"smol/+/notify").ok_or(())?;
     write_all(sock, &pkt[..n]).await?;
+    // #198 Phase 3 (p3-inc3d-1): the retained MC election topic (QoS0). OBSERVE-only in inc3d-1 —
+    // delivered to MC_OBSERVED (unconsumed until inc3d-2's resolve) + own-echo sets got_mc (settle).
+    let n = crate::net::mqtt::encode_subscribe(pkt, 9, crate::net::wifi::MESH_CHANNEL_TOPIC).ok_or(())?;
+    write_all(sock, &pkt[..n]).await?;
 
     let mut got_batt = false;
     let mut got_grid = false;
+    // #198 Phase 3 (p3-inc3d-1): own-MC echo (crown-RX health, #204 downstream_seen). Only a gateway
+    // publishes its MC, so only a gateway can echo it — the settle waits on it ONLY when we're crown.
+    let mut got_mc = false;
     let mut acc = [0u8; MQTT_RX_BUF];
     let mut acc_len = 0usize;
     loop {
-        if got_batt && got_grid {
-            break; // both retained downlinks seen → settled (P3-M4, the 2 non-crown flags)
+        // P3-M4 settle (early-break): batt + grid + (for a crown) our own MC echo — the "3-flag"
+        // state. A leaf never publishes/echoes MC (need_mc=false) so it breaks on batt+grid; a crown
+        // also waits its own-MC round-trip (the #204 downstream-health confirmation). The quiet-timer
+        // + BURST_BUDGET backstop the case where a retained topic is absent.
+        let need_mc = ROLE_IS_GATEWAY.load(Ordering::Relaxed);
+        if got_batt && got_grid && (!need_mc || got_mc) {
+            break;
         }
         // last-packet quiet-timer: a read that times out means the broker went silent → drained.
         let n = match embassy_time::with_timeout(
@@ -7613,7 +7691,16 @@ async fn downlink_drain(sock: &mut embassy_net::tcp::TcpSocket<'_>, pkt: &mut [u
             let total = match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
                 Some((crate::net::mqtt::Incoming::Publish { topic, payload, packet_id }, total)) => {
                     puback = packet_id;
-                    if let Some((key, target)) = parse_command_topic(topic) {
+                    if topic == crate::net::wifi::MESH_CHANNEL_TOPIC {
+                        // #198 Phase 3 (p3-inc3d-1): OBSERVE the retained MC → hand to the inline
+                        // election (unconsumed until inc3d-2). Own-echo (owner==id) = crown-RX health.
+                        if let Some((owner, ch, seq)) = crate::net::wifi::parse_mesh_channel(payload) {
+                            MC_OBSERVED.signal(McObs { owner, seq, ch });
+                            if owner == id {
+                                got_mc = true;
+                            }
+                        }
+                    } else if let Some((key, target)) = parse_command_topic(topic) {
                         let mut buf = [0u8; crate::net::wifi::CFG_VALUE_MAX];
                         let len = fill_clamped(&mut buf, payload);
                         cmd = Some(DownlinkMsg::Command { target, key, buf, len });

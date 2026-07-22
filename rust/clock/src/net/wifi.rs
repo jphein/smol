@@ -82,8 +82,9 @@ pub(crate) const GRID_TOPIC: &[u8] = b"smol/display/grid";
 /// #23 stage 4: the retained single-gateway ELECTION topic — `MC|<owner_id>|<ch>|<seq>`.
 /// Broker-mediated so it can't fragment (all gateways reach the one broker regardless
 /// of channel); lowest owner_id wins; `seq` is the load-bearing liveness counter.
+// #198 Phase 3 (p3-inc3d-1): pub(crate) so `net::mode` SUBSCRIBEs/PUBLISHes the one MC election topic.
 #[cfg(feature = "wifi")]
-const MESH_CHANNEL_TOPIC: &[u8] = b"smol/mesh/channel";
+pub(crate) const MESH_CHANNEL_TOPIC: &[u8] = b"smol/mesh/channel";
 
 /// #155 channel-drag OPERATOR LEVER: a retained hint the crown HONORS at claim time.
 /// Payload = a decimal 2.4 GHz channel (the fleet uses `1`/`6`/`11`); an EMPTY payload (the
@@ -325,7 +326,7 @@ const RECOVERY_STALE_MS: u64 = 35_000;
 /// Parse a retained `MC|<owner_id>|<channel>|<seq>` election payload → (owner, ch, seq).
 /// ASCII, decimal fields. Returns `None` on any malformed field (panic-free).
 #[cfg(feature = "wifi")]
-fn parse_mesh_channel(payload: &[u8]) -> Option<(u8, u8, u32)> {
+pub(crate) fn parse_mesh_channel(payload: &[u8]) -> Option<(u8, u8, u32)> {
     let s = core::str::from_utf8(payload).ok()?;
     let rest = s.strip_prefix("MC|")?;
     let mut it = rest.split('|');
