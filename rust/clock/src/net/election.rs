@@ -93,8 +93,17 @@ const UPTIME_STEP_MS: u64 = 300_000;
 /// Backoff step per fitness tier. MUST exceed the recovery-burst cadence (`REELECT_RETRY_MS` = 10 s,
 /// in `mode.rs`) so a weaker board always gets an adopt-burst BETWEEN the stronger board's claim and
 /// its own claim threshold — that's what keeps the winner stable (no competing claim; the lowest-id
-/// flush resolver never fires to undo it). Same value + rationale as the historical `RSSI_BUCKET_STEP_MS`.
-pub const ELECT_TIER_STEP_MS: u64 = 15_000;
+/// flush resolver never fires to undo it). Same rationale as the historical `RSSI_BUCKET_STEP_MS`.
+///
+/// #198 Phase 3 (p3-inc3d-2): WIDENED 15 → 25 s for the ASYNC election. The v904 stagger margin was
+/// `ELECT_TIER_STEP_MS(15s) − (REELECT_RETRY_MS 10s + sub-second smoltcp burst RTT)` ≈ 4 s. The embassy
+/// async burst RTT (assoc+DHCP+TCP) is larger (~2-4 s), shrinking the margin to ~1-2 s — and the #114-H2
+/// same-burst claim-race re-read is GONE (the async split can't socket-re-read; #76 now rests on the
+/// stagger + next-window observe-and-adopt). Widening to 25 s restores a comfortable margin so a worse
+/// candidate reliably OBSERVES the better one's MC before its own backoff expires (no dual-claim). Cost:
+/// slower cold-boot takeover, still BOUNDED by `MAX_ELECT_TIERS`. CANARY-TUNED: the simultaneous-boot
+/// canary measures the worst-observed tail-RTT; tighten toward 15 s only if the tail proves it safe.
+pub const ELECT_TIER_STEP_MS: u64 = 25_000;
 
 /// Max backoff tiers — BOUNDS worst-case takeover / cold-boot-crownless latency at
 /// `MAX_ELECT_TIERS × ELECT_TIER_STEP_MS` = 30 s (+ the sub-tier node-id term). Three tiers {0,1,2}

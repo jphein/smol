@@ -283,6 +283,236 @@ impl MeshElect {
             uptime_ms: self.now_ms,
         }
     }
+
+    /// #198 Phase 3 (p3-inc3d-2) — the RESOLVE: the broker-mediated single-gateway election, ported
+    /// FAITHFULLY from a209858's `mqtt_session` election body (#275, the last full-election run pre-0c′).
+    /// Consumes ONE observed retained MC — `mc = Some((owner, ch, seq))` present / `None` = vacant crown,
+    /// drained from `MC_OBSERVED` — plus this board's seeded signals, and sets the verdict on `self`
+    /// (`i_am_owner`/`owner_id`/`owner_alive`/`owner_channel`/`hint_blocked` + the persistent
+    /// `seen_owner`/`seen_seq`/`seen_ms` observation), returning `claim_seq` (`Some(newseq)` iff we claim
+    /// — the seq the caller's next gateway flush stamps on the retained `MC`). PURE: no socket I/O.
+    ///
+    /// FIDELITY vs a209858 (scratch/embassy-migration/phase3-inc3d2-a209858-fidelity-diff.md): the
+    /// `match mc` claim rules + the #146 flush-incapable guard + the #155 channel-hint guard + the
+    /// on-claim local record are byte-faithful. The a209858 SOCKET ops are handled elsewhere by the async
+    /// split: the in-burst co_channel refresh → the CALLER seeds `co_channel`/`co_channel_known`/
+    /// `mesh_channel`; the MC publish → the gated TELEMETRY snapshot (next-gateway-burst); the #51-A2
+    /// publish-fail-revert → the FLUSH_RESULT→`apply_flush_result` hysteresis; the #114-H2 claim-race
+    /// re-read → the fitness STAGGER (`ELECT_TIER_STEP_MS`, widened to 25 s) + next-window observe-and-
+    /// adopt. #76 rests on the stagger; the resolver itself is deterministic.
+    pub fn resolve_election(&mut self, mc: Option<(u8, u8, u32)>, node_id: u8) -> Option<u32> {
+        let claim_seq: Option<u32> = match mc {
+            Some((owner, mc_ch, seq)) => {
+                // Refresh the staleness observation: a *changed* (owner,seq) resets the first-seen clock
+                // (an advancing seq is the authoritative broker-liveness signal — a dead board can't
+                // publish — so it MUST reset "alive" even in recovery: the split-brain guard).
+                let reset = owner != self.seen_owner || seq != self.seen_seq;
+                if reset {
+                    self.seen_ms = self.now_ms;
+                }
+                self.seen_owner = owner;
+                self.seen_seq = seq;
+                self.owner_channel = mc_ch;
+                // #114 H3 / #136 / #gateway-election LAYER 2: the dead-owner window. NEVER-heard keeps the
+                // conservative MC_STALE_MS (90s = 3 missed flushes) so a live-but-unheard owner is never
+                // misjudged — EXCEPT a co-channel board (the legit best gateway) that can't reach a named
+                // owner takes over on the faster RECOVERY_STALE_MS (still frozen-seq-gated). HEARD-then-lost
+                // keeps RECOVERY_STALE_MS floored by #136's recovery_stale_floor_ms.
+                let stale_limit = if self.recovery {
+                    if self.owner_never_heard && !self.co_channel {
+                        MC_STALE_MS
+                    } else {
+                        RECOVERY_STALE_MS.max(self.recovery_stale_floor_ms)
+                    }
+                } else {
+                    MC_STALE_MS
+                };
+                let alive = self.now_ms.saturating_sub(self.seen_ms) < stale_limit;
+                // LAYER 2 OVERRIDE: a co-channel board SEIZES a proven off-channel owner immediately (an
+                // off-channel crown is the OTA-deaf wrong gateway — the whole #204/#217 disease).
+                let owner_off_channel = crate::net::election::seize_off_channel_owner(
+                    self.co_channel,
+                    self.mesh_channel,
+                    node_id,
+                    owner,
+                    mc_ch,
+                );
+                if owner_off_channel {
+                    log::info!(
+                        "smol: #gateway-election LAYER 2 — co-channel (ch{}) SEIZING off-channel owner id{} (its ch{}) — crown migration",
+                        self.mesh_channel,
+                        owner,
+                        mc_ch
+                    );
+                    self.owner_alive = false;
+                    self.i_am_owner = true;
+                    self.owner_id = node_id;
+                    Some(seq.wrapping_add(1))
+                } else if crate::net::election::yield_to_co_channel_owner(
+                    self.co_channel_known,
+                    self.co_channel,
+                    self.mesh_channel,
+                    node_id,
+                    owner,
+                    mc_ch,
+                    alive,
+                ) {
+                    // Symmetric YIELD (makes the seize STICK): an OFF-channel board ADOPTS a LIVE
+                    // co-channel owner regardless of id (else a lower-id off-channel crown re-takes it → flap).
+                    log::info!(
+                        "smol: #gateway-election LAYER 2 — off-channel YIELDING to co-channel owner id{} (its ch{}, mesh ch{})",
+                        owner,
+                        mc_ch,
+                        self.mesh_channel
+                    );
+                    self.owner_alive = true;
+                    self.i_am_owner = false;
+                    self.owner_id = owner;
+                    None
+                } else if self.boot && owner != node_id {
+                    // #51 return-flap: a FRESH-booting board never displaces a DIFFERENT owner already in
+                    // the MC — come up leaf + defer (leaf-scan locks a live owner in seconds; recovery
+                    // takes over a dead one after its window).
+                    self.owner_alive = alive;
+                    self.i_am_owner = false;
+                    self.owner_id = owner;
+                    None
+                } else if !self.recovery {
+                    // BOOT (empty/own MC) / gateway-flush — original lowest-id rule (as verified).
+                    self.owner_alive = alive;
+                    if owner < node_id && alive {
+                        self.i_am_owner = false;
+                        self.owner_id = owner;
+                        None
+                    } else {
+                        // id >= mine, or a STALE (dead) lower-id owner → claim / take over.
+                        self.i_am_owner = true;
+                        self.owner_id = node_id;
+                        Some(seq.wrapping_add(1))
+                    }
+                } else if owner == node_id {
+                    // #51 recovery: our own retained record → hold ownership.
+                    self.owner_alive = false;
+                    self.i_am_owner = true;
+                    self.owner_id = node_id;
+                    Some(seq.wrapping_add(1))
+                } else if alive {
+                    // #51 recovery: a LIVE owner (any id) is sticky — never override it. `owner_alive` =
+                    // `reset` (#114 churn residual #122-2: reset the caller's silence clock only on FRESH
+                    // liveness — a different owner, or the same owner whose seq ADVANCED this burst).
+                    self.owner_alive = reset;
+                    self.i_am_owner = false;
+                    self.owner_id = owner;
+                    None
+                } else {
+                    // #51 recovery: owner is DEAD (seq frozen past `stale_limit`). Take over past that
+                    // window PLUS our stagger backoff — the best survivor crosses first; others adopt its MC.
+                    self.owner_alive = false;
+                    let backoff = if self.owner_never_heard {
+                        // #114 H1: a never-heard dead owner is a forged/phantom MC (no live board to
+                        // RSSI-stagger against) → small id-only tiebreak.
+                        (node_id as u64) * 200
+                    } else {
+                        match self.elect_cfg {
+                            crate::net::election::ElectConfig::BestGateway(w) => {
+                                crate::net::election::elect_backoff_ms(
+                                    &self.fitness_inputs(),
+                                    &w,
+                                    node_id,
+                                )
+                            }
+                            crate::net::election::ElectConfig::Legacy => {
+                                crate::net::election::legacy_recovery_backoff_ms(self.my_rssi, node_id)
+                            }
+                        }
+                    };
+                    // #114 H3: gate on `stale_limit` (not a hardcoded window) so never-heard honours the
+                    // SAME conservative window used for `alive`.
+                    if self.now_ms.saturating_sub(self.seen_ms) >= stale_limit.saturating_add(backoff) {
+                        self.i_am_owner = true;
+                        self.owner_id = node_id;
+                        Some(seq.wrapping_add(1))
+                    } else {
+                        // Dead, but still inside OUR backoff → defer so a stronger board claims first.
+                        self.i_am_owner = false;
+                        self.owner_id = owner;
+                        None
+                    }
+                }
+            }
+            None => {
+                // Empty/absent/unparseable topic → the crown is VACANT.
+                self.owner_alive = false;
+                // #gateway-election: best-gateway DEFERS an empty-slot claim until this board's uptime
+                // clears its fitness backoff (a co-channel board crowns FIRST at cold boot; a weaker board
+                // re-reads the now-populated MC next burst + ADOPTS it). BOUNDED (MAX_ELECT_TIERS ⇒ a SOLE
+                // board still claims → never crownless). FAIL-OPEN: only defer once the AP channel is KNOWN
+                // (co_channel trustworthy) — a pre-scan boot board claims immediately (fast cold-start).
+                let defer = self.co_channel_known
+                    && match self.elect_cfg {
+                        crate::net::election::ElectConfig::BestGateway(w) => {
+                            self.now_ms
+                                < crate::net::election::elect_backoff_ms(
+                                    &self.fitness_inputs(),
+                                    &w,
+                                    node_id,
+                                )
+                        }
+                        crate::net::election::ElectConfig::Legacy => false,
+                    };
+                if defer {
+                    self.i_am_owner = false;
+                    log::info!(
+                        "smol: best-gateway — deferring empty-MC claim (uptime {} ms < backoff, co_channel={})",
+                        self.now_ms,
+                        self.co_channel
+                    );
+                    None
+                } else {
+                    self.i_am_owner = true;
+                    self.owner_id = node_id;
+                    Some(1)
+                }
+            }
+        };
+        // #146 CLAIM guard: a board latched flush-incapable participates as LEAF ONLY — suppress the
+        // claim so the retained record freezes + the H1/H2 machinery elects a flush-capable board.
+        let claim_seq = if self.flush_incapable {
+            if claim_seq.is_some() {
+                self.i_am_owner = false;
+                log::warn!(
+                    "smol: #146 election — flush-incapable, refusing to claim (leaf-only until a flush succeeds)"
+                );
+            }
+            None
+        } else {
+            claim_seq
+        };
+        // #155 channel-drag OPERATOR LEVER: honor the retained hint — a candidate whose OWN channel is
+        // KNOWN and != the hint must not claim, so the (re)election converges onto a hinted-channel board.
+        let claim_seq = match (claim_seq, self.channel_hint) {
+            (Some(_), Some(h)) if self.my_channel != 0 && self.my_channel != h => {
+                self.i_am_owner = false;
+                self.hint_blocked = true;
+                log::info!(
+                    "smol: #155 channel_hint ch{} != my ch{} — yielding crown (leaf until on-hint)",
+                    h,
+                    self.my_channel
+                );
+                None
+            }
+            (cs, _) => cs,
+        };
+        // On-claim local record (a209858 373-378): record our own ownership so our seq counts as "fresh"
+        // next read. The MC PUBLISH itself rides the caller's next gateway flush TELEMETRY snapshot
+        // (gated `is_gateway`; seq = this `seen_seq`) — NOT here (the async publish split; no H2 re-read).
+        if let Some(newseq) = claim_seq {
+            self.seen_owner = node_id;
+            self.seen_seq = newseq;
+            self.seen_ms = self.now_ms;
+        }
+        claim_seq
+    }
 }
 
 // #51 → #gateway-election: the RSSI-weighted dead-owner takeover stagger + its `RSSI_BUCKET_STEP_MS`

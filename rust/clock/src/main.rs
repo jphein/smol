@@ -988,18 +988,13 @@ async fn main(spawner: Spawner) -> ! {
             // (WIFI_CMD direct), NOT election-driven, so it needs no gateway role. → non-electing.
             #[cfg(not(feature = "phase2-measure"))]
             {
-                let mut reelect_abort = false;
-                // #153: re-election is a routine burst → draw NOTHING; the last app frame
-                // stays frozen on the glass (a still clock beats a spinner). LED + abort only.
-                if r.maybe_leaf_reelect(&mut batt_cache, &mut grid_cache, now, &mut || {
-                    let t = millis();
-                    led.apply(led::LedState::WifiSync, t);
-                    if matches!(button.poll(t), Some(input::Press::Long)) {
-                        reelect_abort = true;
-                    }
-                    reelect_abort
-                }) {
-                    redraw = true; // a recovery burst ran → role may have changed; repaint
+                // #198 Phase 3 (p3-inc3d-2): maybe_leaf_reelect is now NON-BLOCKING — it REQUESTS an async
+                // election-OBSERVE window (WANTS_ELECT) + resolves the prior observation INLINE (MC_OBSERVED
+                // → resolve_election → set_gateway). There's no synchronous burst to draw a spinner for or
+                // long-press-abort, so the old responsive-tick closure is gone. Returns true iff it acted
+                // this tick (role may have changed → repaint).
+                if r.maybe_leaf_reelect(now) {
+                    redraw = true;
                 }
             }
             // === #237 peer-relay HOLDER serve-driver =========================================
@@ -1251,6 +1246,11 @@ async fn main(spawner: Spawner) -> ! {
                     log::info!("smol #198 P2: adopted NTP time (synced_at {} -> {})", old, unix);
                 }
             }
+            // #198 Phase 3 (p3-inc3d-2): drain the ASYNC flush result (FLUSH_RESULT, fired by mqtt_task
+            // per gateway Flush burst) + apply the flush-fail/R-DEMOTE hysteresis INLINE. Same
+            // drain-every-subtick pattern as take_ntp_sync (the crown demotes promptly on sustained
+            // flush failure). No-op when no flush completed since the last subtick.
+            r.poll_flush_result(now);
             // ~every 2 s advertise ourselves (HELLO drives the LED handshake).
             // 2000 ms / SUBTICK_MS aligned via the monotonic clock.
             if (now / 2000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 2000) {

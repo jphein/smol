@@ -148,10 +148,13 @@ enum MqttWindow {
 static MQTT_OPEN: Signal<CriticalSectionRawMutex, MqttWindow> = Signal::new();
 /// `mqtt_task` → `wifi_task`: the burst is done — the window may close.
 static MQTT_DONE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-/// P3-H2 (#146 abdicate-on-flush-fail): `mqtt_task` fires this when the burst times out OR errors;
-/// the inline election reads it to relinquish the crown. The primitive + producer land in inc1 so
-/// the flush-fail signal EXISTS; the election-side reader is wired in a later increment (spec §6).
-static ABDICATE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// P3-H2 (#146 abdicate-on-flush-fail) — #198 Phase 3 (p3-inc3d-2): SUPERSEDES inc1's `ABDICATE`.
+/// `mqtt_task` fires the RESULT of every gateway FLUSH burst here (`true` = reached CONNACK+session,
+/// `false` = timed out / transport error); an `ElectObserve` burst fires NOTHING (a leaf holds no crown
+/// to relinquish). The inline `RadioManager::poll_flush_result` drains it → `apply_flush_result(ok)` =
+/// the FLUSH_FAILS_BEFORE_DEMOTE=3 hysteresis (extracted from flush_telemetry): sustained failures
+/// R-DEMOTE the crown to a scanning leaf. Overwrite-latest (only the freshest flush result matters).
+static FLUSH_RESULT: Signal<CriticalSectionRawMutex, bool> = Signal::new();
 /// DISCRETE telemetry events queued by the inline mesh loop for `mqtt_task` to PUBLISH (P3-M2:
 /// latest-state telemetry rides a SHARED snapshot in inc2, NOT this channel). Depth 8; the enqueue
 /// side (explicit drop-oldest) + the producers land in inc2 — inc1 only drains it.
@@ -271,18 +274,23 @@ static OTA_OFFER: Signal<CriticalSectionRawMutex, crate::ota::Announce> = Signal
 // is_gateway). The RESOLVE + APPLY (updating mc_seen_*, deciding i_am_owner, set_gateway) is inc3d-2 —
 // so in inc3d-1 this observation is UNCONSUMED except by got_mc (own-echo → the settle), which means
 // inc3d-1 changes NO role logic → structurally cannot split-brain.
-/// One observed retained MC (`owner`/`seq`/`ch`). inc3d-1 reads only `owner` (own-echo → got_mc);
-/// `seq`/`ch` are consumed by inc3d-2's resolve (staleness + channel) → allow dead_code until then.
+/// One observed retained MC (`owner`/`seq`/`ch`). All fields consumed by inc3d-2's `resolve_election`
+/// (owner/seq = the claim rules + staleness; ch = the off-channel-owner LAYER-2 detect).
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 struct McObs {
     owner: u8,
     seq: u32,
     ch: u8,
 }
-/// `mqtt_task` → inline election: the latest observed MC (overwrite-latest, mirrors NTP_RESULT). The
-/// inline resolve consumes this in inc3d-2; inc3d-1 leaves it unconsumed (got_mc uses only own-echo).
-static MC_OBSERVED: Signal<CriticalSectionRawMutex, McObs> = Signal::new();
+/// `mqtt_task` → inline election: the RESULT of the latest MC-observe (overwrite-latest, mirrors
+/// NTP_RESULT). #198 Phase 3 (p3-inc3d-2): carries `Option<McObs>` — `Some(mc)` = the retained MC was
+/// present; `None` = the observe COMPLETED but the crown is VACANT (topic absent). The inline resolve
+/// (maybe_leaf_reelect/flush_telemetry) `try_take`s it → `Some(Some)` = present-adopt/take-over,
+/// `Some(None)` = vacant-CLAIM (the sole-board bootstrap), `None` (no signal) = no fresh observe → keep
+/// the current role. Signalled ONCE at drain completion by the gateway `downlink_drain` + the leaf
+/// `elect_observe_drain`. No gen counter needed: windows are STRICTLY serialized (MQTT_OPEN→burst→
+/// MQTT_DONE, one in flight) so a prior-window result can never arrive out of order.
+static MC_OBSERVED: Signal<CriticalSectionRawMutex, Option<McObs>> = Signal::new();
 /// Max serialized MC payload `MC|<255>|<13>|<4294967295>` ≈ 20 B; 32 gives headroom.
 const MC_MAX: usize = 32;
 
@@ -2745,10 +2753,9 @@ pub struct RadioManager {
     mc_seen_owner: u8,
     mc_seen_seq: u32,
     mc_seen_ms: u64,
-    /// #198 Phase 3 (p3-inc3d-1): the monotonic liveness seq this crown stamps on its published
-    /// `MC|<id>|<ch>|<seq>`. Bumped each gateway flush; leaves watch it advance as the crown-alive
-    /// signal. inc3d-2 (a209858 port) refines it to unix-anchored (survives reboot without going stale).
-    mc_pub_seq: u32,
+    // #198 Phase 3 (p3-inc3d-2): inc3d-1's placeholder `mc_pub_seq` REMOVED — the published MC seq is now
+    // the RESOLVED `mc_seen_seq` (resolve_election stamps `seen_seq = observed+1` on each claim → a real
+    // liveness counter tied to the retained record, not a free-running local).
     /// #23 fix (oracle #1): last time a LEAF opened a recovery re-election burst — the
     /// retry throttle so a partitioned leaf can't thrash the radio re-associating.
     last_reelect_ms: u64,
@@ -3027,7 +3034,6 @@ impl RadioManager {
             mc_seen_owner: 0,
             mc_seen_seq: 0,
             mc_seen_ms: 0,
-            mc_pub_seq: 0,
             last_reelect_ms: 0,
             ota_offer: None,
             staged_raw: None,
@@ -3171,13 +3177,11 @@ impl RadioManager {
     ///
     /// Returns true iff a re-election burst actually ran.
     #[cfg_attr(feature = "phase2-measure", allow(dead_code))] // measurement boards are non-electing
-    pub fn maybe_leaf_reelect(
-        &mut self,
-        batt: &mut crate::batt::BattCache,
-        grid: &mut crate::grid::GridCache,
-        now: u64,
-        tick: &mut dyn FnMut() -> bool,
-    ) -> bool {
+    // #198 Phase 3 (p3-inc3d-2): `batt`/`grid`/`tick` DROPPED — the leaf recovery no longer runs a
+    // synchronous blocking burst (those fed the old `run_mqtt_burst`). It now REQUESTS an async
+    // election-OBSERVE window (WANTS_ELECT) + resolves the MC_OBSERVED result inline (no blocking → no
+    // responsive-tick abort needed; the observe burst carries no batt/grid downlink — that's gateway-only).
+    pub fn maybe_leaf_reelect(&mut self, now: u64) -> bool {
         // #51 speed-up: owner HELLOs every 2 s, so 15 s silence ≈ 7 missed HELLOs = gone
         // (a live owner that merely roamed is re-locked by leaf_scan_tick's 6 s re-scan long
         // before this). Retry every 10 s — MUST be < RSSI_BUCKET_STEP_MS (15 s) so a weaker
@@ -3269,81 +3273,23 @@ impl RadioManager {
         // hands off. Two independent latches (flush_fail_latch, deaf_shed) → two independent lift
         // conditions → ONE resolver effect (claim suppressed).
         elect.flush_incapable = self.relay.flush_fail_latch || self.relay.deaf_shed;
-        // #6 OTA / #21 config / #33 install: a leaf's recovery burst can also surface these.
-        let mut ota_offer: Option<crate::ota::Announce> = None;
-        let mut config_offer: Option<crate::app::DefaultScreen> = None;
-        let mut _gw_own = crate::net::wifi::GwOwnCfg::new(); // #48: recovery burst never captures gateway-own cfg
-        let mut _reset_req = crate::net::wifi::ResetReq::new(); // #52: recovery burst issues no reboots
-        let mut _scan_req = crate::net::wifi::ScanReq::new(); // #71: recovery burst issues no scans
-        let mut _notify_req = crate::net::wifi::NotifyReq::new(); // #197: recovery burst issues no toasts
-        let mut install_requested = false;
-        let mut _leaf_install_seen = false; // #40 #1: a leaf's recovery burst is not a gateway relay
-        // #198 Phase 1: the STA interface is consumed into embassy-net + the controller lives in
-        // `wifi_task`, so the (stubbed) recovery MQTT burst no longer takes controller/device.
-        // Phase 3 reworks this to a Signal-gated TCP flush on the embassy-net `Stack`.
-        let reached = {
-            let empty: [(u8, &[u8]); 0] = [];
-            crate::net::wifi::run_mqtt_burst(
-                self.rng,
-                id,
-                &empty,
-                batt,
-                grid,
-                &mut elect,
-                &mut ota_offer,
-                &mut config_offer,
-                &mut _gw_own,
-                &mut _reset_req,
-                &mut install_requested,
-                &mut _leaf_install_seen, // #40 #1: leaf recovery burst — never a gateway relay
-                &[], // #27: election-only recovery burst publishes no peers (leaf/v1)
-                &[], // #50: recovery burst publishes no live-screen status
-                None, // #21: a leaf's recovery burst is not a gateway relay
-                None, // #50b: recovery burst republishes no cached leaf status
-                &[], // #70/#49: recovery burst publishes no own diag
-                None, // #70/#49: recovery burst republishes no cached diag
-                &[], // #71: recovery burst publishes no own scan
-                None, // #71: recovery burst republishes no cached scan
-                &mut _scan_req, // #71: recovery burst subscribes no cmd/scan (cfg_cache=None)
-                &mut _notify_req, // #197: recovery burst subscribes no notify (cfg_cache=None)
-                &mut None, // #40: a leaf's recovery burst never relays a leaf OTA
-                &mut None, // #40: recovery burst carries no persistent staged
-                &mut None, // #40: recovery burst publishes no relay diag
-                &mut None, // #3: recovery burst publishes no relay RX-diag
-                &mut None, // #139-followup: a leaf recovery burst is never a self-OTA fetch
-                tick,
-            )
+        // #198 Phase 3 (p3-inc3d-2): CONSUME the observed retained MC → resolve. Replaces the synchronous
+        // recovery burst (the stub is inert; the ELECTION-OBSERVE window requested above delivers the
+        // retained MC to MC_OBSERVED asynchronously). Resolve on a FRESH observation only:
+        //  • Some(Some(mc)) = present → adopt a live owner / take over a dead one (the RSSI-staggered arm),
+        //  • Some(None)     = VACANT → claim the empty crown (the sole/simultaneous cold-boot bootstrap),
+        //  • None (no signal) = the observe hasn't landed this cycle → stay leaf (SAFE), retry next cadence.
+        // Staleness: skip a stale same-owner older-seq (windows serialized → belt-and-suspenders). `elect`
+        // is seeded (recovery ctx) above. NOTE: RSSI/AP-channel freshness for leaves (the LAYER-2
+        // co-channel seize seed) is a follow-up — the resolve fail-opens on unknown co_channel (claims
+        // fast, #155-style), so the primary paths (adopt/take-over/claim) are correct without it.
+        let Some(observed) = MC_OBSERVED.try_take() else {
+            return true; // no fresh observation yet — stay leaf + keep scanning (next cadence resolves it).
         };
-        if ota_offer.is_some() {
-            self.ota_offer = ota_offer;
+        if matches!(observed, Some(m) if m.owner == self.mc_seen_owner && m.seq < self.mc_seen_seq) {
+            return true; // out-of-order older same-owner MC — ignore, keep the current role.
         }
-        if config_offer.is_some() {
-            self.config_offer = config_offer;
-        }
-        if install_requested {
-            self.install_requested = true;
-        }
-        if !reached {
-            // Broker unreachable (AP down / off our scan channel): do NOT claim on a
-            // failed read — fall back to ESP-NOW + keep scanning; retry after the gap.
-            let _ = self.switch(Mode::EspNow);
-            log::info!("smol: leaf re-election — broker unreachable, still scanning");
-            return true;
-        }
-        // #51 B: we're still associated here (pre-EspNow-switch) → capture a fresh
-        // RSSI-to-AP for the NEXT recovery election's strength comparison.
-        // #198 Phase 1 inc2 (DR-H1): read the mirror atomic `wifi_task` maintains, NOT the
-        // controller directly (which now lives in `wifi_task`). `i16::MIN` = no link (skip).
-        let r = AP_RSSI.load(Ordering::Relaxed);
-        if r != i16::MIN {
-            self.my_rssi_to_ap = (r as i32).clamp(-127, 0) as i8;
-        }
-        // #217 rung-3: refresh the REAL associated AP channel at this stable association point so
-        // `off_channel` (my_ap_channel != mesh) drives the pre-fetch 2B co-channel gate + DIAG
-        // accurately — no boot-time reassoc needed.
-        if let Some((ap_ch, _, _)) = crate::net::current_ap_info() {
-            self.my_ap_channel = ap_ch;
-        }
+        elect.resolve_election(observed.map(|m| (m.owner, m.ch, m.seq)), id);
         // Persist the refreshed staleness observation (so takeover accrues across bursts).
         self.mc_seen_owner = elect.seen_owner;
         self.mc_seen_seq = elect.seen_seq;
@@ -5654,21 +5600,21 @@ impl RadioManager {
         snap.telemetry_len = fill_clamped(&mut snap.telemetry, own_telemetry);
         snap.status_len = fill_clamped(&mut snap.status, status);
         snap.peers_len = fill_clamped(&mut snap.peers, peers);
-        // #198 Phase 3 (p3-inc3d-1): the crown PUBLISHes its own MC (`MC|<id>|<ch>|<seq>`, retained) so
-        // leaves/HA see the elected crown + its liveness seq. 🔴 GATED on the CURRENT role — only a
-        // node that ALREADY believes it's the gateway claims owner=self (no bogus claim). seq =
-        // monotonic liveness bump (inc3d-2's a209858 port refines it to unix-anchored). inc3d-1 only
-        // PUBLISHes + OBSERVEs; it does NOT resolve/apply → no role change.
+        // #198 Phase 3 (p3-inc3d-1/2): the crown PUBLISHes its own MC (`MC|<id>|<ch>|<seq>`, retained) so
+        // leaves/HA see the elected crown + its liveness seq. 🔴 GATED on the CURRENT role — only a node
+        // that ALREADY believes it's the gateway claims owner=self (no bogus claim). #198 inc3d-2: seq =
+        // the RESOLVED `mc_seen_seq` (the resolver stamps `seen_seq = observed+1` on each claim → a real
+        // liveness counter tied to the retained record), replacing inc3d-1's placeholder monotonic
+        // `mc_pub_seq`. The resolve (below) advances it each flush via the owner==self re-claim arm.
         if self.relay.is_gateway {
             use core::fmt::Write as _;
-            self.mc_pub_seq = self.mc_pub_seq.saturating_add(1);
             let ch = self.current_channel();
             let mut w = SliceWriter {
                 buf: &mut snap.mc,
                 len: 0,
                 overflow: false,
             };
-            let _ = write!(w, "MC|{}|{}|{}", id, ch, self.mc_pub_seq);
+            let _ = write!(w, "MC|{}|{}|{}", id, ch, self.mc_seen_seq);
             snap.mc_len = w.len;
         }
         TELEMETRY.signal(snap);
@@ -5819,10 +5765,8 @@ impl RadioManager {
                 tick,
             )
         };
-        // #49: record the flush outcome (`ok` = reached CONNACK) into the diag counters — the
-        // flush-success rate is the on-device #9 flush-win proof (was UART0-only). Bumped here so
-        // it rides the NEXT diag record.
-        self.note_flush(ok);
+        // #49: the flush outcome → diag counters MOVED to `apply_flush_result` (#198 inc3d-2) — the REAL
+        // ok/fail is now the async FLUSH_RESULT, not the inert stub `ok` here. `note_flush` fires there.
         // #204 2a: crown dead-downstream detector (MEASUREMENT ONLY — no election change; 2b adds
         // the reassoc/shed actions). Only a CONNECTED flush (`ok`) is a valid downstream probe — a
         // flush that never reached CONNACK (`!ok`) is an uplink/AP failure (already handled by
@@ -6020,50 +5964,50 @@ impl RadioManager {
         if ok {
             self.leaf_installs_outstanding = leaf_install_seen;
         }
-        // #23 fix (oracle #2): APPLY the re-election result to the LIVE role. On a
-        // connected flush, persist the refreshed staleness observation; if a LIVE
-        // lower-id owner now holds the mesh, DEMOTE to a scanning leaf (drop to ESP-NOW)
-        // — the runtime convergence the boot-only election never had. A NON-connected
-        // flush (transient broker outage) is NOT trusted → keep the current role.
-        if ok {
-            // #64 fix: the RSSI-to-AP is now captured DURING the burst (run_mqtt_burst, while
-            // is_connected()==true) into elect.my_rssi — persist it here across bursts for the
-            // leaf-reelect path. The old post-burst self.controller.rssi() ran when the STA
-            // state was unreliable → returned Err → my_rssi_to_ap stuck at -99 (dead #51
-            // tiebreak + no #64 uplink publish).
-            if elect.my_rssi > -99 {
-                self.my_rssi_to_ap = elect.my_rssi;
-            }
-            self.mc_seen_owner = elect.seen_owner;
-            self.mc_seen_seq = elect.seen_seq;
-            self.mc_seen_ms = elect.seen_ms;
-            // #114 H1: a CHANGED owner must re-prove itself by HELLO before we trust it as heard.
-            if elect.owner_id != self.elected_owner {
-                self.owner_hello_seen = false;
-            }
-            self.elected_owner = elect.owner_id;
-            self.elected_owner_channel = elect.owner_channel; // #gateway-election reliability (leaf-lock guard)
-            if !elect.i_am_owner {
-                self.set_gateway(false);
-                self.scan_locked = false;
-                self.last_owner_heard_ms = now;
-                // #155: a HINT-DRIVEN yield (our channel != the operator's channel_hint) is an
-                // abdication, not an adopt-a-live-owner demote — go HELLO-silent like an R-DEMOTE
-                // so leaves stop following us on the wrong channel and re-elect a hinted-channel
-                // crown promptly. We DON'T latch flush_fail_latch: our uplink is fine (we flush),
-                // we're merely on the wrong channel — so we may reclaim once on a hinted-channel AP.
-                if elect.hint_blocked {
-                    self.silent_until_relock = true;
+        // #198 Phase 3 (p3-inc3d-2): CONSUME the observed retained MC → resolve → apply the role. Replaces
+        // the synchronous burst read-back (the stub is inert; the real burst is async). This is the
+        // gateway's runtime re-decision (#23 oracle #2): if a LIVE lower-id / co-channel owner now holds
+        // the mesh, DEMOTE to a scanning leaf. Fires on a FRESH observation only: `Some(Some(mc))` =
+        // present, `Some(None)` = vacant (a rare deaf-crown case → re-claim; #204 handles sustained
+        // deafness). No signal = no fresh observe this cycle → keep the current role (SAFE-during-gap).
+        // `elect` was seeded (flush ctx) above; the inert stub left it untouched. Staleness: skip a stale
+        // same-owner older-seq (windows are serialized → belt-and-suspenders; no gen counter needed).
+        if let Some(observed) = MC_OBSERVED.try_take() {
+            let fresh = match observed {
+                Some(m) => !(m.owner == self.mc_seen_owner && m.seq < self.mc_seen_seq),
+                None => true,
+            };
+            if fresh {
+                elect.resolve_election(observed.map(|m| (m.owner, m.ch, m.seq)), id);
+                self.mc_seen_owner = elect.seen_owner;
+                self.mc_seen_seq = elect.seen_seq;
+                self.mc_seen_ms = elect.seen_ms;
+                // #114 H1: a CHANGED owner must re-prove itself by HELLO before we trust it as heard.
+                if elect.owner_id != self.elected_owner {
+                    self.owner_hello_seen = false;
                 }
-                let _ = self.switch(Mode::EspNow);
-                log::info!(
-                    "smol: gateway DEMOTED — {} (leaf-scanning)",
+                self.elected_owner = elect.owner_id;
+                self.elected_owner_channel = elect.owner_channel; // #gateway-election reliability (leaf-lock guard)
+                if !elect.i_am_owner {
+                    self.set_gateway(false);
+                    self.scan_locked = false;
+                    self.last_owner_heard_ms = now;
+                    // #155: a HINT-DRIVEN yield (our channel != the operator's channel_hint) is an
+                    // abdication, not an adopt-a-live-owner demote — go HELLO-silent like an R-DEMOTE so
+                    // leaves stop following us on the wrong channel and re-elect a hinted-channel crown.
                     if elect.hint_blocked {
-                        "yielded on channel_hint, HELLO-silent"
-                    } else {
-                        "live owner holds the mesh"
+                        self.silent_until_relock = true;
                     }
-                );
+                    let _ = self.switch(Mode::EspNow);
+                    log::info!(
+                        "smol: gateway DEMOTED — {} (leaf-scanning)",
+                        if elect.hint_blocked {
+                            "yielded on channel_hint, HELLO-silent"
+                        } else {
+                            "live owner holds the mesh"
+                        }
+                    );
+                }
             }
         }
         // #23 stage 1 — PRODUCTION COEXIST: STAY WiFi-associated after the flush (NO
@@ -6077,45 +6021,74 @@ impl RadioManager {
         // attempt resets the clock, so a failure backs off a full
         // RELAY_FLUSH_INTERVAL_MS instead of spinning.
         self.relay.last_flush_ms = now_ms();
+        // #198 Phase 3 (p3-inc3d-2): the flush-fail/R-DEMOTE hysteresis (flush_fails count, queue
+        // drop-oldest, FLUSH_FAILS_BEFORE_DEMOTE=3 abdication + latch) + the flush-success queue-clear +
+        // note_flush MOVED to `apply_flush_result`, driven by the ASYNC FLUSH_RESULT (the real ok/fail) —
+        // the inert stub `ok` here can't drive them (it's always false → would wrongly demote every crown
+        // after 3 flushes). `last_flush_ms` stays here (stamped UNCONDITIONALLY per ATTEMPT — FINDING 1a —
+        // to back off `relay_ready_to_flush`; this is attempt-time, not result-time).
+        // #gateway-election all-nodes-WiFi DEBUG: a non-gateway debug node bursts then RETURNS to the
+        // mesh (a real crown STAYS associated for coexist). The ok-path above only drops to EspNow when
+        // it adopts a live owner; ensure a debug leaf returns to ch6 after EVERY burst — including a
+        // FAILED one — so it stays a functional mesh member between its periodic debug bursts.
+        // `switch` is a no-op when already in the mode, so this never double-switches.
+        if !self.relay.is_gateway {
+            let _ = self.switch(Mode::EspNow);
+        }
+        ok
+    }
+
+    /// #198 Phase 3 (p3-inc3d-2) — drain the ASYNC flush result (`FLUSH_RESULT`, fired by `mqtt_task`
+    /// per gateway Flush burst) and apply the flush-fail/R-DEMOTE hysteresis. Called INLINE each main
+    /// subtick (like `take_ntp_sync`). SUPERSEDES inc1's ABDICATE: the gateway flush now runs in
+    /// `mqtt_task`, so its ok/fail can only be applied here, not in `flush_telemetry` (which merely
+    /// TRIGGERS the window). No signal → no-op (no flush completed since last poll).
+    pub fn poll_flush_result(&mut self, now: u64) {
+        if let Some(ok) = FLUSH_RESULT.try_take() {
+            self.apply_flush_result(ok, now);
+        }
+    }
+
+    /// #198 Phase 3 (p3-inc3d-2) — the flush-fail/R-DEMOTE hysteresis, EXTRACTED VERBATIM from the old
+    /// synchronous `flush_telemetry` `if ok {…} else {…}` tail (which the stub made dead) and rehomed
+    /// onto the async `FLUSH_RESULT`. `ok` = the burst reached CONNACK+session. A run of
+    /// `FLUSH_FAILS_BEFORE_DEMOTE` (3 ≈ 90 s) failures R-DEMOTES the crown to a scanning leaf + latches
+    /// #146 (leaf-only until a flush succeeds / a live foreign owner is adopted). This is ALSO the
+    /// deferred-#204's backstop: a deaf crown that can't flush eventually demotes here.
+    fn apply_flush_result(&mut self, ok: bool, now: u64) {
+        // #49: record the outcome → diag (the #9 flush-win proof; rides the next diag record).
+        self.note_flush(ok);
+        // #51 B / #64: refresh the RSSI-to-AP from the window mirror (`wifi_task` writes `AP_RSSI` while
+        // associated) so the election tiebreak has a live reading. Replaces the old in-burst capture.
+        let r = AP_RSSI.load(Ordering::Relaxed);
+        if r != i16::MIN {
+            self.my_rssi_to_ap = (r as i32).clamp(-127, 0) as i8;
+        }
         if ok {
             for q in self.relay.queue.iter_mut() {
                 q.used = false;
             }
             self.relay.flush_fails = 0;
-            // #146 CLAIM guard: a flush SUCCEEDED → our uplink is proven able to reach the
-            // broker, so lift the abdication latch. Ownership is claimable again (this is the
-            // literal "no re-claim until a flush succeeds" clear).
+            // #146 CLAIM guard: a flush SUCCEEDED → uplink proven → lift the abdication latch.
             self.relay.flush_fail_latch = false;
             log::info!("smol: relay flush done");
         } else {
             self.relay.flush_fails = self.relay.flush_fails.saturating_add(1);
-            // FINDING 1c: once failures pile up, shed the OLDEST message each time
-            // so the queue drains to empty (→ relay_ready_to_flush false → the
-            // bursts stop) and never holds arbitrarily-stale telemetry.
+            // FINDING 1c: shed the OLDEST message so the queue drains to empty (→ bursts stop).
             if self.relay.flush_fails >= FLUSH_FAILS_BEFORE_DROP {
                 self.relay.drop_oldest();
             }
-            // R-DEMOTE (oracle audit-#1): sustained failures mean the AP is truly gone
-            // (a mere roam would have self-recovered via R-CONNECT within seconds).
-            // Relinquish ownership so this board's HELLO stops pinning leaves to a
-            // HA-unreachable owner — drop to leaf-scan; the broker election re-promotes
-            // a reachable board (or this one, once an AP returns). Guarded on the demote
-            // threshold (≈2.5 min) so a transient broker blip can't flap the role.
+            // R-DEMOTE (oracle audit-#1): sustained failures = the AP is truly gone. Relinquish
+            // ownership (drop to leaf-scan) so our HELLO stops pinning leaves to a HA-unreachable owner;
+            // the broker election re-promotes a reachable board. Guarded on the demote threshold (≈2.5 min).
             if self.relay.is_gateway && self.relay.flush_fails >= FLUSH_FAILS_BEFORE_DEMOTE {
                 self.set_gateway(false);
                 self.scan_locked = false;
                 self.last_owner_heard_ms = now;
-                // #51 A1: this is an ABDICATION (our uplink is genuinely dead). Go
-                // HELLO-silent until we re-lock a new owner — otherwise our stale HELLO
-                // keeps the leaves pinned to us and no successor can ever be elected.
+                // #51 A1: ABDICATION — go HELLO-silent until we re-lock a new owner (else our stale HELLO
+                // blocks any successor). #146: LATCH so the resolver refuses a self-reclaim until a flush
+                // succeeds or a live foreign owner is adopted (the frozen-MC → H1/H2 takeover path).
                 self.silent_until_relock = true;
-                // #146 CLAIM guard: LATCH the abdication. Going HELLO-silent alone was NOT
-                // enough — the next leaf recovery burst re-read our OWN stale retained `MC`
-                // (owner == node_id) and RE-CLAIMED the crown (resetting flush_fails, resuming
-                // HELLO, dragging the mesh across channels). The latch makes the election
-                // resolver refuse that self-reclaim until a flush actually succeeds or we adopt
-                // a live foreign owner — so a flush-incapable board stays leaf-only and the
-                // H1/H2 machinery elects a capable owner off our now-frozen `MC` seq.
                 self.relay.flush_fail_latch = true;
                 let _ = self.switch(Mode::EspNow);
                 log::warn!(
@@ -6129,15 +6102,6 @@ impl RadioManager {
                 RELAY_FLUSH_INTERVAL_MS
             );
         }
-        // #gateway-election all-nodes-WiFi DEBUG: a non-gateway debug node bursts then RETURNS to the
-        // mesh (a real crown STAYS associated for coexist). The ok-path above only drops to EspNow when
-        // it adopts a live owner; ensure a debug leaf returns to ch6 after EVERY burst — including a
-        // FAILED one — so it stays a functional mesh member between its periodic debug bursts.
-        // `switch` is a no-op when already in the mode, so this never double-switches.
-        if !self.relay.is_gateway {
-            let _ = self.switch(Mode::EspNow);
-        }
-        ok
     }
 
     /// Snapshot the current BENCH link stats for the UI. `fps` is measured by the
@@ -7448,14 +7412,18 @@ async fn mqtt_task(stack: embassy_net::Stack<'static>, id: u8) -> ! {
         )
         .await
         {
-            Ok(Ok(())) => {}
-            // #146 abdicate ONLY on a FLUSH failure — a crown that couldn't flush relinquishes (the
-            // inline election reads it; reader wired in a later inc). An election-OBSERVE failure is
-            // benign (p3-inc3d-1.5): a leaf that couldn't READ the MC holds no crown to give up, so it
-            // must NOT abdicate — it simply retries next window.
+            // #198 Phase 3 (p3-inc3d-2): report the FLUSH RESULT to the inline apply_flush_result
+            // hysteresis. ok=true reached CONNACK+session. An election-OBSERVE burst reports NOTHING —
+            // it's not a flush; a leaf that couldn't READ the MC holds no crown, so it just retries next
+            // window (never a demote). This is the FLUSH_RESULT that supersedes inc1's ABDICATE.
+            Ok(Ok(())) => {
+                if window == MqttWindow::Flush {
+                    FLUSH_RESULT.signal(true);
+                }
+            }
             _ => {
                 if window == MqttWindow::Flush {
-                    ABDICATE.signal(());
+                    FLUSH_RESULT.signal(false);
                 }
             }
         }
@@ -7647,11 +7615,11 @@ async fn elect_observe_drain(
     let n = crate::net::mqtt::encode_subscribe(pkt, 1, crate::net::wifi::MESH_CHANNEL_TOPIC).ok_or(())?;
     write_all(sock, &pkt[..n]).await?;
 
-    let mut got_mc = false;
+    let mut observed: Option<McObs> = None;
     let mut acc = [0u8; MQTT_RX_BUF];
     let mut acc_len = 0usize;
     loop {
-        if got_mc {
+        if observed.is_some() {
             break; // the retained MC was observed → done (a vacant crown falls through to the quiet-timer)
         }
         // last-packet quiet-timer: a read that times out means the broker went silent → drained (or the
@@ -7674,11 +7642,10 @@ async fn elect_observe_drain(
             let total = match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
                 Some((crate::net::mqtt::Incoming::Publish { topic, payload, .. }, total)) => {
                     if topic == crate::net::wifi::MESH_CHANNEL_TOPIC {
-                        // OBSERVE the retained MC → hand to the inline election (unconsumed until
-                        // inc3d-2's resolve). QoS0 → no PUBACK. Any parseable MC settles the burst.
+                        // OBSERVE the retained MC → record it (signalled once at drain completion below).
+                        // QoS0 → no PUBACK. Any parseable MC settles the burst.
                         if let Some((owner, ch, seq)) = crate::net::wifi::parse_mesh_channel(payload) {
-                            MC_OBSERVED.signal(McObs { owner, seq, ch });
-                            got_mc = true;
+                            observed = Some(McObs { owner, seq, ch });
                         }
                     }
                     total
@@ -7693,6 +7660,10 @@ async fn elect_observe_drain(
             acc_len = 0; // oversized/garbled packet guard — never wedge the accumulator
         }
     }
+    // #198 Phase 3 (p3-inc3d-2): report the observe RESULT to the inline resolve — Some(mc)=present,
+    // None=VACANT (topic absent → the quiet-timer settled without an MC). The None arm is what lets a
+    // sole/simultaneous cold-boot node CLAIM an empty crown (resolve_election's vacant branch).
+    MC_OBSERVED.signal(observed);
     Ok(())
 }
 
@@ -7789,6 +7760,9 @@ async fn downlink_drain(
     // #198 Phase 3 (p3-inc3d-1): own-MC echo (crown-RX health, #204 downstream_seen). Only a gateway
     // publishes its MC, so only a gateway can echo it — the settle waits on it ONLY when we're crown.
     let mut got_mc = false;
+    // #198 Phase 3 (p3-inc3d-2): the observed retained MC (Some=present / None=vacant), signalled ONCE
+    // to MC_OBSERVED at drain completion for the gateway's inline resolve (flush_telemetry demote check).
+    let mut observed: Option<McObs> = None;
     let mut acc = [0u8; MQTT_RX_BUF];
     let mut acc_len = 0usize;
     loop {
@@ -7826,10 +7800,11 @@ async fn downlink_drain(
                 Some((crate::net::mqtt::Incoming::Publish { topic, payload, packet_id }, total)) => {
                     puback = packet_id;
                     if topic == crate::net::wifi::MESH_CHANNEL_TOPIC {
-                        // #198 Phase 3 (p3-inc3d-1): OBSERVE the retained MC → hand to the inline
-                        // election (unconsumed until inc3d-2). Own-echo (owner==id) = crown-RX health.
+                        // #198 Phase 3 (p3-inc3d-1/2): OBSERVE the retained MC → record it (signalled to
+                        // MC_OBSERVED at drain completion for the inline resolve). Own-echo (owner==id) =
+                        // crown-RX health (got_mc → the settle + #204 downstream_seen).
                         if let Some((owner, ch, seq)) = crate::net::wifi::parse_mesh_channel(payload) {
-                            MC_OBSERVED.signal(McObs { owner, seq, ch });
+                            observed = Some(McObs { owner, seq, ch });
                             if owner == id {
                                 got_mc = true;
                             }
@@ -7863,6 +7838,11 @@ async fn downlink_drain(
             acc_len = 0; // oversized/garbled packet guard — never wedge the accumulator
         }
     }
+    // #198 Phase 3 (p3-inc3d-2): report the observed retained MC to the gateway's inline resolve
+    // (flush_telemetry demote check) — Some(mc)=present, None=vacant/not-echoed. A healthy crown sees
+    // its own echo (Some(self)); a deaf crown sees None (re-claims — the #204 detector handles sustained
+    // deafness separately). A rival's MC (Some(rival)) → the gateway demotes if the rival out-ranks it.
+    MC_OBSERVED.signal(observed);
     Ok(())
 }
 
