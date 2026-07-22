@@ -211,14 +211,26 @@ pub(crate) mod phase2 {
         Some(s) => parse_u64(s),
         None => 3_000,
     };
-    /// `SMOL_P2_BLOCKING` — Run-3 blocking-mode EMULATION. When set, during each Holding window the DUT
-    /// SUPPRESSES mesh service (`r.service()`) for a deaf-burst — the v904 analog (WiFi/assoc stays up via
-    /// net_task; ONLY the mesh goes unserviced = the single variable that differs async↔v904). Run-1
-    /// (default false) services the mesh throughout (async). (Run3−Run1) on steady_max_gap = the async
-    /// lever's worth. Label: "blocking EMULATION (mesh-service-suppressed analog), NOT v904-exact".
-    pub const BLOCKING: bool = match option_env!("SMOL_P2_BLOCKING") {
-        Some(s) => parse_u64(s) != 0,
-        None => false,
+    /// Run-3 block model (`SMOL_P2_BLOCK_MODE`) — the ROBUSTNESS PAIR. Both emulate v904 blocking during
+    /// each Holding window, honestly labeled, and are METRIC-EQUIVALENT (the timed beacon comes from
+    /// board-B, independent of the DUT's WiFi → the 2nd frozen variable in `spin` can't affect
+    /// steady_max_gap). Measuring BOTH = "mesh deaf ~BLOCK_MS under BOTH models → the 169ms async win is
+    /// invariant to how blocking is modeled" — stronger than either alone.
+    /// • `spin` (A) = executor busy-HOLD through the burst (exec+mesh frozen; net_task frozen → LINK_UP
+    ///   stale-true). The real "no-async/blocking-executor" architecture (smol WITHOUT the migration).
+    /// • `skip` (B) = skip `r.service()` (mesh unserviced; loop keeps yielding → net_task/WiFi alive →
+    ///   LINK_UP live-true). The "WiFi-serviced, mesh-deaf" model.
+    /// Default `None` = Run-1 (async, mesh serviced throughout). (Run3−Run1) on steady_max_gap = the
+    /// async lever's worth. Labels: A="blocking-EMULATION (executor-hold)", B="…(mesh-service-suppressed)".
+    #[derive(PartialEq, Eq, Clone, Copy)]
+    pub enum BlockMode {
+        None,
+        Spin,
+        Skip,
+    }
+    pub const BLOCK_MODE: BlockMode = match option_env!("SMOL_P2_BLOCK_MODE") {
+        Some(s) => parse_block_mode(s),
+        None => BlockMode::None,
     };
     /// `SMOL_P2_BLOCK_MS` — the deaf-burst duration (default 15 s = Run-1's HOLD_MS, so the deaf-burst ==
     /// the Run-1 window → cleanest single-variable). Bracketed inside Holding by SETTLE + RECOVER, so
@@ -250,6 +262,15 @@ pub(crate) mod phase2 {
             Role::Dut
         } else {
             panic!("SMOL_P2_ROLE must be \"dut\" or \"beacon\"")
+        }
+    }
+    const fn parse_block_mode(s: &str) -> BlockMode {
+        if bytes_eq(s.as_bytes(), b"spin") {
+            BlockMode::Spin
+        } else if bytes_eq(s.as_bytes(), b"skip") {
+            BlockMode::Skip
+        } else {
+            panic!("SMOL_P2_BLOCK_MODE must be \"spin\" or \"skip\"")
         }
     }
     const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
@@ -413,6 +434,18 @@ impl Phase2Runner {
                 }
             }
             P2State::Holding { until_ms } => {
+                // #198 Run-3 mode `spin` (A): busy-HOLD the executor through the deaf-burst — exec+mesh
+                // frozen, net_task frozen (WiFi paused; wifi_task can't run to write LINK_UP=false →
+                // mirror stale-TRUE → link_held=TRUE). BOUNDED + self-releasing (in_deaf_burst → false at
+                // burst_end) → poll returns → RECOVER services + window_end fires (no deadlock). No WDT
+                // feed — the #40 minutes-long OTA-relay executor-hold precedent proves no aggressive WDT.
+                // (mode `skip` (B) is handled in main by skipping r.service() — the loop keeps yielding.)
+                #[cfg(feature = "phase2-measure")]
+                if phase2::BLOCK_MODE == phase2::BlockMode::Spin {
+                    while self.in_deaf_burst(now_ms()) {
+                        core::hint::spin_loop();
+                    }
+                }
                 // Latch a mid-window link drop (Lever-B = SUSTAINED hold). Hold the FULL controlled
                 // duration regardless, so steady_max_gap reflects the whole window; report whether the
                 // assoc was HELD throughout — not the instantaneous snapshot inc2 had.
@@ -459,7 +492,7 @@ impl Phase2Runner {
     /// baseline. (Misconfig HOLD_MS < SETTLE+BLOCK+RECOVER_MIN → empty window → degrades to Run-1, safe.)
     #[cfg(feature = "phase2-measure")]
     pub fn in_deaf_burst(&self, now: u64) -> bool {
-        if !phase2::BLOCKING {
+        if phase2::BLOCK_MODE == phase2::BlockMode::None {
             return false;
         }
         if let P2State::Holding { until_ms } = self.state {

@@ -928,14 +928,18 @@ async fn main(spawner: Spawner) -> ! {
         // ESP-NOW link and peers stay tracked even while Snake/Clock is on screen.
         #[cfg(feature = "espnow")]
         if let Some(r) = radio.as_mut() {
-            // #198 Phase 2 Run-3 (blocking EMULATION, Option B): during the deaf-burst SKIP mesh
-            // service — the ESP-NOW RX queue isn't drained → mesh goes deaf, while the loop keeps
-            // yielding (net_task/WiFi/assoc stay up) = the v904 analog (single variable = mesh-svc).
-            // Run-1 (SMOL_P2_BLOCKING unset) services every tick. The suppressed gap surfaces as
-            // steady_max_gap ≈ BLOCK_MS via the first post-burst drained beacon (bracketed by SETTLE +
-            // RECOVER inside STEADY so df2bcb5 doesn't boundary-discard it).
+            // #198 Phase 2 Run-3 (blocking EMULATION). Two block models (ROBUSTNESS pair):
+            //   `skip` (B): during the deaf-burst SKIP mesh service here — the ESP-NOW RX queue isn't
+            //     drained → mesh deaf, while the loop keeps yielding (net_task/WiFi/assoc up). Handled BELOW.
+            //   `spin` (A): the runner busy-HOLDS the executor through the burst → main's loop (incl. this
+            //     service()) is blocked naturally → no explicit skip needed here.
+            // Run-1 (BLOCK_MODE=None) services every tick. Either way the suppressed gap surfaces as
+            // steady_max_gap ≈ BLOCK_MS via the first post-burst drained beacon (SETTLE+RECOVER bracket
+            // inside STEADY so df2bcb5 doesn't boundary-discard it).
             #[cfg(feature = "phase2-measure")]
-            let skip_mesh_service = phase2_runner.in_deaf_burst(now);
+            let skip_mesh_service = crate::net::mode::phase2::BLOCK_MODE
+                == crate::net::mode::phase2::BlockMode::Skip
+                && phase2_runner.in_deaf_burst(now);
             #[cfg(not(feature = "phase2-measure"))]
             let skip_mesh_service = false;
             if !skip_mesh_service {
