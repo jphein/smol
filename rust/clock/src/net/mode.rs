@@ -127,6 +127,56 @@ static WIFI_CMD: Channel<CriticalSectionRawMutex, WifiCmd, 4> = Channel::new();
 /// sync matters; a stale un-drained epoch is harmlessly replaced.
 static NTP_RESULT: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 
+// ── #198 Phase 3 (p3-inc1, spec §6) — MQTT session task wiring ──────────────────────────────────
+// The gateway's per-WiFi-window MQTT flush runs in the spawned `mqtt_task` (below), NOT inline, so
+// the executor keeps ticking the display + ESP-NOW mesh between the socket `.await`s — the #89
+// non-blocking-flush payoff (the sub-second UI freeze is retired by construction). Signal-gated per
+// window (the DR-H1 producer→consumer pattern): `wifi_task` opens (`MQTT_OPEN`) once DHCP+NTP are up,
+// `mqtt_task` runs one burst and signals `MQTT_DONE` so `wifi_task` may drop the assoc.
+/// `wifi_task` → `mqtt_task`: this WiFi window is up (post-NTP) — run the burst.
+static MQTT_OPEN: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// `mqtt_task` → `wifi_task`: the burst is done — the window may close.
+static MQTT_DONE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// P3-H2 (#146 abdicate-on-flush-fail): `mqtt_task` fires this when the burst times out OR errors;
+/// the inline election reads it to relinquish the crown. The primitive + producer land in inc1 so
+/// the flush-fail signal EXISTS; the election-side reader is wired in a later increment (spec §6).
+static ABDICATE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// DISCRETE telemetry events queued by the inline mesh loop for `mqtt_task` to PUBLISH (P3-M2:
+/// latest-state telemetry rides a SHARED snapshot in inc2, NOT this channel). Depth 8; the enqueue
+/// side (explicit drop-oldest) + the producers land in inc2 — inc1 only drains it.
+static MQTT_TX: Channel<CriticalSectionRawMutex, MqttMsg, 8> = Channel::new();
+/// #198 Phase 3 (spec §6, P3-M3) — the gateway-role MIRROR. `mqtt_task`/`wifi_task` are spawned
+/// tasks with no `&RadioManager`, so they cannot call `is_gateway()`; instead the inline election
+/// (the SOLE writer, via `RadioManager::set_gateway`) mirrors the role into this atomic, exactly like
+/// the DR-M4 `LINK_UP`/`AP_RSSI` pattern. The tasks READ it (Relaxed — single-core rv32imc): the
+/// window-open gate (`wifi_task`) + the P3-M3 role-flip-mid-burst clean-abort (`mqtt_burst`).
+static ROLE_IS_GATEWAY: AtomicBool = AtomicBool::new(false);
+
+/// Outer `with_timeout` budget for one burst — the #89 flush deadline (spec §2). A timeout OR an
+/// inner burst `Err` both mean the flush failed → P3-H2 abdicate.
+const MQTT_BURST_BUDGET_S: u64 = 5;
+/// Per-socket + encode-scratch buffers. ≥ the ~490 B MQTT packet cap (memory `smol-mqtt-512b-packet-cap`).
+const MQTT_RX_BUF: usize = 512;
+const MQTT_TX_BUF: usize = 512;
+const MQTT_PKT_BUF: usize = 512;
+/// Bounds for a queued [`MqttMsg`] (kept under the packet cap; the producer in inc2 enforces them).
+const MQTT_TOPIC_MAX: usize = 64;
+const MQTT_PAYLOAD_MAX: usize = 256;
+
+/// A small owned MQTT publish job the inline mesh loop queues on [`MQTT_TX`] for `mqtt_task` to drain
+/// and PUBLISH (P3-M2 discrete events) — heapless (fixed buffers) so the enqueue never blocks on the
+/// socket. TODO(p3-inc2): the telemetry/SHARED-snapshot producers that CONSTRUCT this land in inc2;
+/// until then `mqtt_task` only drains it (received, never constructed here) → allow `dead_code`.
+#[allow(dead_code)]
+struct MqttMsg {
+    /// Retained-PUBLISH flag (discovery configs are retained; telemetry is transient).
+    retain: bool,
+    topic_len: usize,
+    payload_len: usize,
+    topic: [u8; MQTT_TOPIC_MAX],
+    payload: [u8; MQTT_PAYLOAD_MAX],
+}
+
 /// #198 Phase 2 (edge (c) fix) — RUNNER-AUTHORITATIVE measurement phase, set by `Phase2Runner` on
 /// each state transition and read by the beacon RX arm to bucket gaps. Decouples the CONTROLLED phase
 /// (which window-lifecycle state we're in) from the OBSERVED link state (`LINK_UP`): a transient
@@ -2665,6 +2715,13 @@ impl RadioManager {
             Ok(token) => spawner.spawn(token),
             Err(_) => log::error!("smol #198: wifi_task spawn failed (executor pool exhausted)"),
         }
+        // #198 Phase 3 (p3-inc1): the per-window MQTT session task. `stack` is `Copy` (shared with
+        // `wifi_task`); it idles on `MQTT_OPEN.wait()` until `wifi_task` opens a gateway window, so
+        // spawning it unconditionally (leaf/gateway/harness alike) costs only its parked stack.
+        match mqtt_task(stack, id) {
+            Ok(token) => spawner.spawn(token),
+            Err(_) => log::error!("smol #198: mqtt_task spawn failed (executor pool exhausted)"),
+        }
 
         Some(Self {
             self_mac,
@@ -3029,7 +3086,7 @@ impl RadioManager {
         self.scan_locked = false;
         if elect.i_am_owner {
             // Took over a dead/stale owner (or empty topic): become the coexist GATEWAY.
-            self.relay.is_gateway = true;
+            self.set_gateway(true);
             // #51 A1: we own the mesh now → resume HELLO (leaves lock on the owner's HELLO).
             self.silent_until_relock = false;
             // #51 A2: freshly-elected grace — clear the fail counter so a single transient
@@ -3039,7 +3096,7 @@ impl RadioManager {
             // switch() already left us in WifiSta — stay associated (coexist gateway).
         } else {
             // A LIVE owner holds the mesh (possibly a new lower id): stay leaf, re-scan.
-            self.relay.is_gateway = false;
+            self.set_gateway(false);
             // #146 CLAIM guard clear: adopting a LIVE FOREIGN owner means the mesh is healthy
             // again under a flush-capable board (it proved its uplink by publishing a fresh MC).
             // Lift the abdication latch so we may compete normally if that owner later dies —
@@ -4017,6 +4074,15 @@ impl RadioManager {
     /// only, since a peer's role is never on the wire (bench-mesh-view-spec §3).
     pub fn is_gateway(&self) -> bool {
         self.relay.is_gateway
+    }
+
+    /// #198 Phase 3 (spec §6, P3-M3) — the SINGLE writer of the [`ROLE_IS_GATEWAY`] mirror (DR-M4).
+    /// EVERY gateway-role transition goes through here so the mirror the spawned `mqtt_task`/
+    /// `wifi_task` read can never drift from `self.relay.is_gateway`. Mirror store is Relaxed
+    /// (single-core rv32imc — no cross-core ordering to establish).
+    fn set_gateway(&mut self, on: bool) {
+        self.relay.is_gateway = on;
+        ROLE_IS_GATEWAY.store(on, Ordering::Relaxed);
     }
 
     /// #gateway-election: set the all-nodes-WiFi DEBUG flag (applied by `main` from the relayed /
@@ -5436,7 +5502,7 @@ impl RadioManager {
                     // just flushed `ok`); we're RX-deaf, not flush-incapable. The frozen MC lets the
                     // H1/H2 machinery elect a healthy crown; the deaf_shed backoff (foreign-MC OR 5-min
                     // floor) damps the shed→heal-as-leaf→reclaim→re-deafen ping-pong (the #26 loop).
-                    self.relay.is_gateway = false;
+                    self.set_gateway(false);
                     self.scan_locked = false;
                     self.last_owner_heard_ms = now;
                     self.silent_until_relock = true;
@@ -5598,7 +5664,7 @@ impl RadioManager {
             self.elected_owner = elect.owner_id;
             self.elected_owner_channel = elect.owner_channel; // #gateway-election reliability (leaf-lock guard)
             if !elect.i_am_owner {
-                self.relay.is_gateway = false;
+                self.set_gateway(false);
                 self.scan_locked = false;
                 self.last_owner_heard_ms = now;
                 // #155: a HINT-DRIVEN yield (our channel != the operator's channel_hint) is an
@@ -5656,7 +5722,7 @@ impl RadioManager {
             // a reachable board (or this one, once an AP returns). Guarded on the demote
             // threshold (≈2.5 min) so a transient broker blip can't flap the role.
             if self.relay.is_gateway && self.relay.flush_fails >= FLUSH_FAILS_BEFORE_DEMOTE {
-                self.relay.is_gateway = false;
+                self.set_gateway(false);
                 self.scan_locked = false;
                 self.last_owner_heard_ms = now;
                 // #51 A1: this is an ABDICATION (our uplink is genuinely dead). Go
@@ -6902,6 +6968,9 @@ async fn wifi_task(
         // deaf-window lever (decision ①). (Phase 3 adds the MQTT open/done here, then drop.)
         let mut logged_dhcp = false;
         let mut ntp_attempted = false; // one SNTP exchange per window (resync = the next window).
+        // #198 Phase 3 (p3-inc1): true once we've opened the MQTT window this cycle, so the teardown
+        // below waits for `mqtt_task` to finish the burst (MQTT_DONE) before dropping the assoc.
+        let mut mqtt_opened = false;
         while LINK_UP.load(Ordering::Relaxed) {
             // Oracle §2.5 POINT-2: check the UNDROPPABLE teardown FIRST — consume it (swap) so a
             // teardown of THIS open window can never be starved behind benign OpenWindows.
@@ -6941,9 +7010,26 @@ async fn wifi_task(
                             log::warn!("smol #198 P2: ntp_done ok=false (timeout/short/garbage)");
                         }
                     }
+                    // #198 Phase 3 (p3-inc1, spec §7) — DHCP+NTP are up this window; if we're the
+                    // gateway, open the MQTT burst window. `mqtt_task` drains it (the flush runs as
+                    // a task, so the executor keeps polling the mesh/display through it — the #89
+                    // payoff) and signals MQTT_DONE, which the teardown below waits on. Gated on the
+                    // role MIRROR (no `&RadioManager` here). Fires once per window (inside the
+                    // once-per-window `!ntp_attempted` guard), independent of NTP success.
+                    if ROLE_IS_GATEWAY.load(Ordering::Relaxed) {
+                        MQTT_OPEN.signal(());
+                        mqtt_opened = true;
+                    }
                 }
             }
             embassy_time::Timer::after(embassy_time::Duration::from_millis(500)).await;
+        }
+        // #198 Phase 3 (p3-inc1, spec §7): if we opened an MQTT window this cycle, wait for
+        // `mqtt_task` to finish the burst before dropping the assoc — never tear the link down
+        // mid-flush. `mqtt_task` ALWAYS signals MQTT_DONE (its `with_timeout` bounds the burst), so
+        // this can't hang; if the burst already finished, `wait()` returns immediately.
+        if mqtt_opened {
+            MQTT_DONE.wait().await;
         }
         let _ = controller.disconnect_async().await;
         LINK_UP.store(false, Ordering::Relaxed);
@@ -6951,6 +7037,150 @@ async fn wifi_task(
         // Teardown complete — clear any Stop that arrived during disconnect (it's satisfied).
         STOP_REQ.store(false, Ordering::Relaxed);
     }
+}
+
+/// #198 Phase 3 (p3-inc1, spec §2) — the MQTT session task. Runs ONE per-WiFi-window bidirectional
+/// burst (UPLINK-only in inc1), Signal-gated so it does work ONLY while `wifi_task` holds a window.
+/// Because the burst is a spawned task driven by awaited `TcpSocket` ops, the executor ticks the
+/// display + ESP-NOW mesh between every `.await` — the #89 non-blocking-flush payoff (the flush
+/// freeze is retired by construction, not hidden). Role-gated upstream: `wifi_task` signals
+/// `MQTT_OPEN` only when `ROLE_IS_GATEWAY`.
+#[embassy_executor::task]
+async fn mqtt_task(stack: embassy_net::Stack<'static>, id: u8) -> ! {
+    loop {
+        // `wifi_task` signals this once DHCP+NTP are up in a gateway window.
+        MQTT_OPEN.wait().await;
+        // #89 flush deadline + P3-H2 abdicate: `with_timeout` nests two Results — the OUTER is the
+        // timeout, the INNER is `mqtt_burst`'s Err. EITHER means the flush failed → #146 abdicate.
+        match embassy_time::with_timeout(
+            embassy_time::Duration::from_secs(MQTT_BURST_BUDGET_S),
+            mqtt_burst(stack, id),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            _ => ABDICATE.signal(()), // inline election reads it → relinquish the crown (reader: later inc)
+        }
+        // Tell `wifi_task` the burst is finished so it may drop the assoc (the window closes).
+        MQTT_DONE.signal(());
+    }
+}
+
+/// One UPLINK MQTT burst over the embassy-net `TcpSocket` (spec §2). Correction #1: `net/mqtt.rs`'s
+/// codec encodes INTO a caller buffer (`encode_*(&mut buf, ..) -> Option<usize>`), so we encode-then-
+/// write. Flow: CONNECT → CONNACK → drain any queued `MQTT_TX` PUBLISHes → DISCONNECT. P3-M3: if the
+/// role flips gateway→leaf mid-burst, abort CLEANLY (a stale-gateway flush corrupts the crown MC).
+/// DEFERRED to later increments (spec §8): HA-discovery re-publish + SHARED telemetry snapshot (inc2),
+/// SUBSCRIBE + downlink drain + OTA-offer routing (inc3). Returns `Err(())` on any transport failure
+/// (mapped from the socket error types) so the caller abdicates.
+async fn mqtt_burst(stack: embassy_net::Stack<'static>, id: u8) -> Result<(), ()> {
+    use core::fmt::Write as _;
+    let net = &crate::secrets::WIFI_NETWORK;
+    let mut rx = [0u8; MQTT_RX_BUF];
+    let mut tx = [0u8; MQTT_TX_BUF];
+    let mut sock = embassy_net::tcp::TcpSocket::new(stack, &mut rx, &mut tx);
+    sock.set_timeout(Some(embassy_time::Duration::from_secs(4))); // watch mqtt_ha.rs:66
+    let broker = (
+        core::net::Ipv4Addr::new(
+            net.broker_ip[0],
+            net.broker_ip[1],
+            net.broker_ip[2],
+            net.broker_ip[3],
+        ),
+        net.broker_port,
+    );
+    sock.connect(broker).await.map_err(|_| ())?;
+
+    // CONNECT — persistent session (#101 clean_session=false is baked into the codec). client_id =
+    // "smol-<id>" so the broker can distinguish fleet members (a duplicate id kicks the prior conn).
+    let mut cid_buf = [0u8; 16];
+    let cid_len = {
+        let mut w = SliceWriter {
+            buf: &mut cid_buf,
+            len: 0,
+            overflow: false,
+        };
+        let _ = write!(w, "smol-{}", id);
+        w.len
+    };
+    let mut pkt = [0u8; MQTT_PKT_BUF];
+    let n = crate::net::mqtt::encode_connect(
+        &mut pkt,
+        &cid_buf[..cid_len],
+        crate::secrets::MQTT_USER.as_bytes(),
+        crate::secrets::MQTT_PASS.as_bytes(),
+    )
+    .ok_or(())?;
+    write_all(&mut sock, &pkt[..n]).await?;
+
+    // CONNACK — reuse the codec's parser (correction #1). return_code 0 = accepted. Accumulate until
+    // a whole packet parses (a stream read may under-deliver the 4-byte CONNACK).
+    let mut ack = [0u8; 16];
+    let mut have = 0usize;
+    loop {
+        let got = sock.read(&mut ack[have..]).await.map_err(|_| ())?;
+        if got == 0 {
+            return Err(()); // peer closed before CONNACK
+        }
+        have += got;
+        match crate::net::mqtt::parse_packet(&ack[..have]) {
+            Some((crate::net::mqtt::Incoming::ConnAck { return_code: 0 }, _)) => break,
+            Some(_) => return Err(()), // non-zero CONNACK / unexpected packet → flush failed
+            None => {
+                if have >= ack.len() {
+                    return Err(());
+                }
+            }
+        }
+    }
+
+    // Drain any queued DISCRETE PUBLISHes (P3-M2). inc1 has no producer yet, so this is usually empty
+    // (the SHARED-snapshot + telemetry producers land in inc2) — the drain is here for the structure.
+    while let Ok(msg) = MQTT_TX.try_receive() {
+        // P3-M3: role flipped gateway→leaf mid-burst → abort CLEANLY (don't flush as a stale gateway;
+        // that corrupts the crown MC). DISCONNECT + return Ok — a clean abort, not a flush failure.
+        if !ROLE_IS_GATEWAY.load(Ordering::Relaxed) {
+            let _ = write_all(&mut sock, &[0xE0, 0x00]).await;
+            sock.close();
+            return Ok(());
+        }
+        let pn = crate::net::mqtt::encode_publish(
+            &mut pkt,
+            &msg.topic[..msg.topic_len],
+            &msg.payload[..msg.payload_len],
+            msg.retain,
+        )
+        .ok_or(())?;
+        write_all(&mut sock, &pkt[..pn]).await?;
+    }
+
+    // P3-M3 final role check before finishing the session as gateway.
+    if !ROLE_IS_GATEWAY.load(Ordering::Relaxed) {
+        let _ = write_all(&mut sock, &[0xE0, 0x00]).await;
+        sock.close();
+        return Ok(());
+    }
+
+    // DISCONNECT — a clean goodbye so the broker doesn't fire a will / log a drop (spec §2).
+    let dn = crate::net::mqtt::encode_disconnect(&mut pkt).ok_or(())?;
+    write_all(&mut sock, &pkt[..dn]).await?;
+    sock.flush().await.map_err(|_| ())?;
+    sock.close();
+    Ok(())
+}
+
+/// Write the WHOLE buffer to the socket — embassy-net's `write` may do a partial send, so loop until
+/// drained. A `0`-byte write means the peer closed → treat as an error (→ abdicate).
+async fn write_all(sock: &mut embassy_net::tcp::TcpSocket<'_>, buf: &[u8]) -> Result<(), ()> {
+    let mut sent = 0usize;
+    while sent < buf.len() {
+        match sock.write(&buf[sent..]).await {
+            Ok(0) => return Err(()),
+            Ok(k) => sent += k,
+            Err(_) => return Err(()),
+        }
+    }
+    Ok(())
 }
 
 /// Bring the radio up, run a REAL WiFi -> DHCP -> SNTP burst (fast-blinking the
@@ -7040,7 +7270,11 @@ pub fn start(
     // #23: GATEWAY iff we reached DHCP AND won the election (lowest-id owner). A board
     // that reached DHCP but LOST (a lower-id owner already holds it) demotes to leaf.
     // `synced` stays best-effort for TIME (mesh-time adoption handles an unsynced GW).
-    radio.relay.is_gateway = reached_dhcp && elect.i_am_owner;
+    // #198 Phase 3 (p3-inc1, G8): route the BOOT-election result through `set_gateway` too, so
+    // `ROLE_IS_GATEWAY` reflects the crown from boot — otherwise the mirror stays stale-false until
+    // the first RUNTIME re-election and the gateway's FIRST-window MQTT flush (DHCP+NTP+window all
+    // happen at boot) is skipped. set_gateway is the SOLE writer (DR-M4); this was the 6th site.
+    radio.set_gateway(reached_dhcp && elect.i_am_owner);
     radio.elected_owner = elect.owner_id;
     radio.elected_owner_channel = elect.owner_channel; // #gateway-election reliability (leaf-lock guard)
     // #51 B: if we associated, seed the initial RSSI-to-AP so the first recovery election already
