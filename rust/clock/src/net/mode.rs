@@ -233,6 +233,53 @@ struct RelayedSnapshot {
 /// Latest-wins relayed-status hand-off (lock-free, mirrors TELEMETRY). Inline flush signals; mqtt_task drains.
 static RELAYED: Signal<CriticalSectionRawMutex, RelayedSnapshot> = Signal::new();
 
+// ── #198 Phase 3 (p3-inc3b1) — non-crown DOWNLINK back-channel (mqtt_task → main) ───────────────
+// `mqtt_task` parses the retained downlink but can't borrow main's batt/grid caches / the mesh
+// rebroadcast, so it hands results BACK over this Channel — the INBOUND mirror of the uplink
+// TELEMETRY Signal (D4-approved). `main` drains + dispatches each loop tick (surgical). Drop-OLDEST
+// on full (P3-M2). inc3b2 adds Config/Reset/Scan/Notify; the MC/election read stays crown-side (inc3d).
+/// One non-crown downlink payload for `main` to apply. batt/grid → `*_cache.store` + the ~10 s
+/// gateway rebroadcast re-floods it to the mesh (the store/broadcast handlers already exist in main).
+pub enum DownlinkMsg {
+    Batt { buf: [u8; BATT_PAYLOAD_MAX], len: usize },
+    Grid { buf: [u8; BATT_PAYLOAD_MAX], len: usize },
+}
+const DOWNLINK_DEPTH: usize = 4;
+static DOWNLINK: Channel<CriticalSectionRawMutex, DownlinkMsg, DOWNLINK_DEPTH> = Channel::new();
+/// P3-M4 last-packet quiet-timer: once the broker goes silent this long after SUBSCRIBE, the retained
+/// set is drained. The outer BURST_BUDGET (mqtt_task) is the hard flush deadline.
+const DOWNLINK_QUIET_MS: u64 = 500;
+
+/// `main` drains this each loop tick and dispatches (store + rebroadcast). None when empty.
+pub fn take_downlink() -> Option<DownlinkMsg> {
+    DOWNLINK.try_receive().ok()
+}
+
+/// Enqueue a downlink for `main`, DROP-OLDEST on full (P3-M2: embassy `try_send` drops the NEWEST by
+/// default, so on Full pop one then retry — the newest wins, matching the latest-state intent).
+fn push_downlink(msg: DownlinkMsg) {
+    if let Err(embassy_sync::channel::TrySendError::Full(msg)) = DOWNLINK.try_send(msg) {
+        let _ = DOWNLINK.try_receive();
+        let _ = DOWNLINK.try_send(msg);
+    }
+}
+
+/// Route one inbound retained PUBLISH to `main` (batt/grid only in inc3b1) + set its P3-M4 settle flag.
+fn route_downlink(topic: &[u8], payload: &[u8], got_batt: &mut bool, got_grid: &mut bool) {
+    if topic == crate::net::wifi::BATT_TOPIC {
+        let mut buf = [0u8; BATT_PAYLOAD_MAX];
+        let len = fill_clamped(&mut buf, payload);
+        push_downlink(DownlinkMsg::Batt { buf, len });
+        *got_batt = true;
+    } else if topic == crate::net::wifi::GRID_TOPIC {
+        let mut buf = [0u8; BATT_PAYLOAD_MAX];
+        let len = fill_clamped(&mut buf, payload);
+        push_downlink(DownlinkMsg::Grid { buf, len });
+        *got_grid = true;
+    }
+    // else: not subscribed here (MC → inc3d, config/commands → inc3b2) — ignore.
+}
+
 /// #198 Phase 2 (edge (c) fix) — RUNNER-AUTHORITATIVE measurement phase, set by `Phase2Runner` on
 /// each state transition and read by the beacon RX arm to bucket gaps. Decouples the CONTROLLED phase
 /// (which window-lifecycle state we're in) from the OBSERVED link state (`LINK_UP`): a transient
@@ -7301,6 +7348,10 @@ async fn mqtt_burst(stack: embassy_net::Stack<'static>, id: u8) -> Result<(), ()
         }
     }
 
+    // #198 Phase 3 (p3-inc3b1): SUBSCRIBE + drain the non-crown retained downlink (batt/grid) back to
+    // main. Per spec §2 ordering: publish → downlink → DISCONNECT. Confirmed-gateway here.
+    downlink_drain(&mut sock, &mut pkt).await?;
+
     // DISCONNECT — a clean goodbye so the broker doesn't fire a will / log a drop (spec §2).
     let dn = crate::net::mqtt::encode_disconnect(&mut pkt).ok_or(())?;
     write_all(&mut sock, &pkt[..dn]).await?;
@@ -7356,6 +7407,59 @@ fn fill_clamped(dst: &mut [u8], src: &[u8]) -> usize {
     let n = src.len().min(dst.len());
     dst[..n].copy_from_slice(&src[..n]);
     n
+}
+
+/// #198 Phase 3 (p3-inc3b1): SUBSCRIBE the non-crown retained downlink + drain it into DOWNLINK with
+/// the P3-M4 settle — the batt/grid data-flags + a last-packet quiet-timer (DOWNLINK_QUIET_MS); the
+/// outer BURST_BUDGET (mqtt_task) is the hard flush deadline. inc3d extends the SAME settle with the
+/// crown `got_mc` flag. Ignores SUBACK/other. CROWN-SAFE: no MC/election subscribe here.
+async fn downlink_drain(sock: &mut embassy_net::tcp::TcpSocket<'_>, pkt: &mut [u8]) -> Result<(), ()> {
+    // SUBSCRIBE batt + grid (QoS0; distinct non-zero packet ids). Retained arrives right after SUBACK.
+    let n = crate::net::mqtt::encode_subscribe(pkt, 1, crate::net::wifi::BATT_TOPIC).ok_or(())?;
+    write_all(sock, &pkt[..n]).await?;
+    let n = crate::net::mqtt::encode_subscribe(pkt, 2, crate::net::wifi::GRID_TOPIC).ok_or(())?;
+    write_all(sock, &pkt[..n]).await?;
+
+    let mut got_batt = false;
+    let mut got_grid = false;
+    let mut acc = [0u8; MQTT_RX_BUF];
+    let mut acc_len = 0usize;
+    loop {
+        if got_batt && got_grid {
+            break; // both retained downlinks seen → settled (P3-M4, the 2 non-crown flags)
+        }
+        // last-packet quiet-timer: a read that times out means the broker went silent → drained.
+        let n = match embassy_time::with_timeout(
+            embassy_time::Duration::from_millis(DOWNLINK_QUIET_MS),
+            sock.read(&mut acc[acc_len..]),
+        )
+        .await
+        {
+            Ok(Ok(0)) => break,           // peer closed
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => return Err(()), // socket error
+            Err(_) => break,              // quiet → settled
+        };
+        acc_len += n;
+        // pull each COMPLETE packet out of the stream accumulator (route confined to the match arm so
+        // the `acc` borrow ends before `copy_within` re-borrows it mutably).
+        loop {
+            let total = match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
+                Some((crate::net::mqtt::Incoming::Publish { topic, payload, .. }, total)) => {
+                    route_downlink(topic, payload, &mut got_batt, &mut got_grid);
+                    total
+                }
+                Some((_, total)) => total, // SUBACK / other — consume without routing
+                None => break,             // need more bytes
+            };
+            acc.copy_within(total..acc_len, 0);
+            acc_len -= total;
+        }
+        if acc_len == acc.len() {
+            acc_len = 0; // oversized/garbled packet guard — never wedge the accumulator
+        }
+    }
+    Ok(())
 }
 
 /// Bring the radio up, run a REAL WiFi -> DHCP -> SNTP burst (fast-blinking the

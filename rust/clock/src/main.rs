@@ -1178,6 +1178,21 @@ async fn main(spawner: Spawner) -> ! {
                 grid_cache.store(&o.buf[..o.len], now);
                 redraw = true;
             }
+            // #198 Phase 3 (p3-inc3b1): drain the MQTT downlink `mqtt_task` received (batt/grid from
+            // HA) into our caches — `store` validates the marker + truncates. The ~10 s gateway
+            // rebroadcast below re-floods it to the mesh (same path as the mesh-heard offers above).
+            while let Some(msg) = net::mode::take_downlink() {
+                match msg {
+                    net::mode::DownlinkMsg::Batt { buf, len } => {
+                        batt_cache.store(&buf[..len], now);
+                        redraw = true;
+                    }
+                    net::mode::DownlinkMsg::Grid { buf, len } => {
+                        grid_cache.store(&buf[..len], now);
+                        redraw = true;
+                    }
+                }
+            }
             // Mesh time adoption: if a peer's clock descends from a STRICTLY
             // newer authoritative sync than ours, re-anchor onto its estimate
             // NOW and INHERIT its `synced_at` (not `now`). Because freshness

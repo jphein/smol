@@ -69,13 +69,15 @@ const NTP_LOCAL_PORT: u16 = 12345;
 
 /// The retained downlink topic every node subscribes to for battery voltages, and
 /// the uplink topic template `smol/<id>/telemetry` — see `mqtt_session`.
+// #198 Phase 3 (p3-inc3b1): pub(crate) so `net::mode`'s async `downlink_drain` SUBSCRIBEs the same
+// wire topic (one definition — the HA contract must not drift between the codec side and mode).
 #[cfg(feature = "wifi")]
-const BATT_TOPIC: &[u8] = b"smol/display/batt";
+pub(crate) const BATT_TOPIC: &[u8] = b"smol/display/batt";
 
 /// Twin of [`BATT_TOPIC`] (issue #16): the retained grid-power downlink. Subscribed
 /// on the SAME MQTT session — one extra SUBSCRIBE on the already-open connection.
 #[cfg(feature = "wifi")]
-const GRID_TOPIC: &[u8] = b"smol/display/grid";
+pub(crate) const GRID_TOPIC: &[u8] = b"smol/display/grid";
 
 /// #23 stage 4: the retained single-gateway ELECTION topic — `MC|<owner_id>|<ch>|<seq>`.
 /// Broker-mediated so it can't fragment (all gateways reach the one broker regardless
