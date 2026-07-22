@@ -1252,7 +1252,12 @@ async fn main(spawner: Spawner) -> ! {
             // overrun). A standalone, temporally-separated tick lets the radio settle so a relaying
             // gateway reliably captures one → `smol/<leaf>/ota/relaydiag leaf=HxVxNx`. Leaf-only,
             // unconditional (reports the lifetime dbg counters), mesh build.
-            #[cfg(feature = "espnow")]
+            // #198 Phase 2 (Oracle — 3rd leaf-advert leak): LDBG is gated on `!is_gateway()`, and
+            // 8f48850 pins is_gateway=false FOREVER under phase2-measure, so `!is_gateway()` is always
+            // true — this ID-BEARING beacon (node 50/51) would fire every ~2 s, leaking bench ids to
+            // the fleet crown + self-TX contending the DUT window. HELLO+TIME (61e28a2) weren't the
+            // complete advertisement set; mute LDBG too so a measurement board is genuinely fleet-invisible.
+            #[cfg(all(feature = "espnow", not(feature = "phase2-measure")))]
             if !r.is_gateway()
                 && ((now + 1000) / 2000) != ((now.saturating_sub(SUBTICK_MS as u64) + 1000) / 2000)
             {
@@ -1348,6 +1353,10 @@ async fn main(spawner: Spawner) -> ! {
             // the gateway BATT/GRID/CFG re-broadcasts above. Value is the render-state read
             // (App::live_screen — captures manual BOOT-nav); the gateway prepends "STAT|" at
             // publish so every smol/<id>/status is uniform. Single-hop (no re-broadcast).
+            // #198 Phase 2 (4th leaf-advert leak, same `!is_gateway()`-always-true pattern as LDBG):
+            // STAT is an ID-BEARING leaf broadcast the crown relays to smol/<id>/status → a bench
+            // board would leak smol/50|51/status to the fleet/HA. Mute under phase2-measure.
+            #[cfg(not(feature = "phase2-measure"))]
             if !r.is_gateway()
                 && (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000)
             {
@@ -1417,7 +1426,14 @@ async fn main(spawner: Spawner) -> ! {
             // to ≥ DIAG_EXPEDITE_MIN_MS so a mash can't spam the mesh). The gateway caches it and
             // republishes retained smol/<leaf>/diag. Gateway publishes ITS OWN diag via the flush,
             // so this is leaf-only — the exact inverse of the gateway BATT/GRID/CFG re-broadcasts.
-            if !r.is_gateway() {
+            // #198 Phase 2 (5th leaf-advert leak, same `!is_gateway()`-always-true pattern as LDBG/STAT):
+            // DIAG is an ID-BEARING leaf broadcast the crown republishes retained to smol/<leaf>/diag →
+            // a bench board would leak smol/50|51/diag to the fleet. Muted under phase2-measure via a
+            // RUNTIME `cfg!` guard (not `#[cfg]`) — this block reads/writes OUTER loop-locals
+            // (last_diag_ms/diag_dirty, also touched elsewhere), so removing it would orphan them;
+            // `cfg!(not(...))` const-folds to false → the block never runs on a bench board (identical
+            // runtime silence) while staying compiled (no dead-code). Zero runtime cost.
+            if cfg!(not(feature = "phase2-measure")) && !r.is_gateway() {
                 let due = (now / DIAG_CADENCE_MS) != ((now.saturating_sub(SUBTICK_MS as u64)) / DIAG_CADENCE_MS);
                 let expedite = diag_dirty && now.saturating_sub(last_diag_ms) >= DIAG_EXPEDITE_MIN_MS;
                 if due || expedite {
