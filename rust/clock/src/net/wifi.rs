@@ -296,8 +296,10 @@ impl MeshElect {
 /// on its own per-device HA Update `install` command. There is deliberately NO per-id
 /// `smol/ota/announce/<id>` act-topic (that path is dropped) — so no publish can trigger a
 /// fleet fetch. That structural absence is the #32 canary-discipline closure.
+// #198 Phase 3 (p3-inc3c): pub(crate) so `net::mode`'s downlink SUBSCRIBEs the one staged-announce
+// topic (same one-definition rationale as BATT/GRID — the #32 fetch-discipline topic).
 #[cfg(feature = "wifi")]
-const OTA_STAGED_TOPIC: &[u8] = b"smol/ota/staged";
+pub(crate) const OTA_STAGED_TOPIC: &[u8] = b"smol/ota/staged";
 
 /// A retained owner whose `seq` has not advanced for this long is presumed DEAD and
 /// may be taken over. The owner re-publishes `MC` (seq++) every gateway flush (~30 s),

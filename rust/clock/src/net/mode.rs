@@ -233,6 +233,15 @@ struct RelayedSnapshot {
 /// Latest-wins relayed-status hand-off (lock-free, mirrors TELEMETRY). Inline flush signals; mqtt_task drains.
 static RELAYED: Signal<CriticalSectionRawMutex, RelayedSnapshot> = Signal::new();
 
+/// #198 Phase 3 (p3-inc3c, spec §6) — the gate-passed OTA offer handed from the downlink router to
+/// `ota_task` (Phase 4 consumes it — the flash side is already done in 0c′). The HINT is the
+/// gate-passed `Announce` (build/size/url/sha/sig): `mqtt_task` fires it ONLY after `ota::gate()` (the
+/// P3-M1 core: build-monotonicity + host-allowlist + size) AND being a confirmed gateway (#1/#3
+/// leaf-suppression, structural). Fired-but-unread today = a harmless no-op (like ABDICATE). ⚠️ Phase 4
+/// MUST apply the install-TRIGGER gate (OTA_AUTO_INSTALL vs install-cmd + #195 self-fetch cap) before
+/// a FETCH — `ota::gate()` does NOT cover those (see the inc3c exec-log flag).
+static OTA_OFFER: Signal<CriticalSectionRawMutex, crate::ota::Announce> = Signal::new();
+
 // ── #198 Phase 3 (p3-inc3b1) — non-crown DOWNLINK back-channel (mqtt_task → main) ───────────────
 // `mqtt_task` parses the retained downlink but can't borrow main's batt/grid caches / the mesh
 // rebroadcast, so it hands results BACK over this Channel — the INBOUND mirror of the uplink
@@ -285,6 +294,17 @@ fn route_downlink(topic: &[u8], payload: &[u8], got_batt: &mut bool, got_grid: &
         let len = fill_clamped(&mut buf, payload);
         push_downlink(DownlinkMsg::Grid { buf, len });
         *got_grid = true;
+    } else if topic == crate::net::wifi::OTA_STAGED_TOPIC {
+        // #198 Phase 3 (p3-inc3c): a staged OTA announce → the P3-M1 CORE gate → fire OTA_OFFER (a
+        // hint; consumer = Phase 4 ota_task, fired-but-unread is a harmless no-op today). Gateway-gated
+        // by construction (downlink runs only in a confirmed-gateway burst → #1/#3 leaf-suppression).
+        // No fetch here (Phase 4). Phase 4 owns the install-trigger gate (OTA_AUTO_INSTALL/install-cmd/
+        // #195 self-fetch cap) before any fetch — `ota::gate()` covers only build/host/size.
+        if let Some(ann) = crate::ota::parse_announce(payload) {
+            if crate::ota::gate(&ann).is_ok() {
+                OTA_OFFER.signal(ann);
+            }
+        }
     } else if let Some((target, key)) = parse_config_topic(topic) {
         // #198 Phase 3 (p3-inc3b2): a keyed CONFIG downlink → hand to main for apply/relay.
         let mut buf = [0u8; crate::net::wifi::CFG_VALUE_MAX];
@@ -7507,6 +7527,10 @@ async fn downlink_drain(sock: &mut embassy_net::tcp::TcpSocket<'_>, pkt: &mut [u
     let n = crate::net::mqtt::encode_subscribe(pkt, 3, b"smol/+/config/+").ok_or(())?;
     write_all(sock, &pkt[..n]).await?;
     let n = crate::net::mqtt::encode_subscribe(pkt, 4, b"smol/config/+").ok_or(())?;
+    write_all(sock, &pkt[..n]).await?;
+    // #198 Phase 3 (p3-inc3c): the staged OTA-announce topic (retained, QoS0). Routed → ota::gate() →
+    // OTA_OFFER (no fetch; #32 discipline: there is NO per-id act-topic that could trigger a fetch).
+    let n = crate::net::mqtt::encode_subscribe(pkt, 5, crate::net::wifi::OTA_STAGED_TOPIC).ok_or(())?;
     write_all(sock, &pkt[..n]).await?;
 
     let mut got_batt = false;
