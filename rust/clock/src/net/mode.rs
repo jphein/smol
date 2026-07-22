@@ -133,8 +133,19 @@ static NTP_RESULT: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 // non-blocking-flush payoff (the sub-second UI freeze is retired by construction). Signal-gated per
 // window (the DR-H1 producer→consumer pattern): `wifi_task` opens (`MQTT_OPEN`) once DHCP+NTP are up,
 // `mqtt_task` runs one burst and signals `MQTT_DONE` so `wifi_task` may drop the assoc.
-/// `wifi_task` → `mqtt_task`: this WiFi window is up (post-NTP) — run the burst.
-static MQTT_OPEN: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// #198 Phase 3 (p3-inc3d-1.5): the KIND of MQTT window `wifi_task` opened. A gateway runs the full
+/// telemetry `Flush`; a non-gateway that set `WANTS_ELECT` runs a LEAN `ElectObserve` burst (read the
+/// retained MC only → `MC_OBSERVED`). Carried on `MQTT_OPEN` so `mqtt_task`/`mqtt_burst` branch on it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MqttWindow {
+    /// Gateway telemetry flush (publish own/relayed state + the gateway downlink drain). Unchanged.
+    Flush,
+    /// Non-gateway election OBSERVE — SUBSCRIBE `smol/mesh/channel` → `MC_OBSERVED` → DISCONNECT. No
+    /// publish, no resolve, no role change (the election carve-out to the gateway-gated downlink).
+    ElectObserve,
+}
+/// `wifi_task` → `mqtt_task`: this WiFi window is up (post-NTP) — run the burst of this `MqttWindow`.
+static MQTT_OPEN: Signal<CriticalSectionRawMutex, MqttWindow> = Signal::new();
 /// `mqtt_task` → `wifi_task`: the burst is done — the window may close.
 static MQTT_DONE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// P3-H2 (#146 abdicate-on-flush-fail): `mqtt_task` fires this when the burst times out OR errors;
@@ -151,6 +162,13 @@ static MQTT_TX: Channel<CriticalSectionRawMutex, MqttMsg, 8> = Channel::new();
 /// the DR-M4 `LINK_UP`/`AP_RSSI` pattern. The tasks READ it (Relaxed — single-core rv32imc): the
 /// window-open gate (`wifi_task`) + the P3-M3 role-flip-mid-burst clean-abort (`mqtt_burst`).
 static ROLE_IS_GATEWAY: AtomicBool = AtomicBool::new(false);
+/// #198 Phase 3 (p3-inc3d-1.5) — a NON-gateway's request to open an election-OBSERVE window. Set by
+/// the boot trigger + `maybe_leaf_reelect` (a leaf whose owner went silent); `wifi_task` consumes it
+/// (swap→false) when it opens the window, signalling `MQTT_OPEN(ElectObserve)`. This is the bootstrap
+/// path the broker-mediated election needs: a leaf/boot node can't learn the crown over the mesh, so
+/// it must open a broker window purely to READ the retained MC. OBSERVE-ONLY — it drives no role
+/// change (inc3d-2 consumes the resulting `MC_OBSERVED`). Ordering Relaxed (single-core rv32imc).
+static WANTS_ELECT: AtomicBool = AtomicBool::new(false);
 
 /// Outer `with_timeout` budget for one burst — the #89 flush deadline (spec §2). A timeout OR an
 /// inner burst `Err` both mean the flush failed → P3-H2 abdicate.
@@ -3187,8 +3205,19 @@ impl RadioManager {
             self.elected_owner,
             now.saturating_sub(self.last_owner_heard_ms)
         );
-        // Re-associate + run an election-ONLY burst (empty telemetry list).
-        let _ = self.switch(Mode::WifiSta);
+        // #198 Phase 3 (p3-inc3d-1.5): request a NON-gateway election-OBSERVE window (WANTS_ELECT) so
+        // wifi_task/mqtt_task open a LEAN burst that READS the retained MC → MC_OBSERVED. COEXIST — we
+        // stay in ESP-NOW mode (the mesh keeps polling; the ch6-locked window rides alongside), so we
+        // do NOT switch(WifiSta): that avoids the STOP_REQ teardown race (the bail-path switch(EspNow)
+        // below is then a no-op — switch early-returns when already in the mode) that would skip the
+        // window. OBSERVE-ONLY: the observation is unconsumed until inc3d-2 resolves it → NO role
+        // change here (the set_gateway calls below stay dead until inc3d-2 wires the resolve; the stub
+        // call + the still-unreachable apply block are left intact and replaced wholesale in inc3d-2).
+        // Gate the open like switch(WifiSta) (`!LINK_UP && !WIFI_BUSY`) so at most one window is in flight.
+        WANTS_ELECT.store(true, Ordering::Relaxed);
+        if !LINK_UP.load(Ordering::Relaxed) && !WIFI_BUSY.load(Ordering::Relaxed) {
+            WIFI_CMD.try_send(WifiCmd::OpenWindow).ok();
+        }
         let id = self.id;
         // #204 2b: 5-min floor lift of the deaf-shed backoff (KNOB3 second arm). A board shed for
         // crown deafness stays leaf-only (deaf_shed OR'd into the resolver's flush_incapable below)
@@ -7361,14 +7390,23 @@ async fn wifi_task(
                             log::warn!("smol #198 P2: ntp_done ok=false (timeout/short/garbage)");
                         }
                     }
-                    // #198 Phase 3 (p3-inc1, spec §7) — DHCP+NTP are up this window; if we're the
-                    // gateway, open the MQTT burst window. `mqtt_task` drains it (the flush runs as
-                    // a task, so the executor keeps polling the mesh/display through it — the #89
-                    // payoff) and signals MQTT_DONE, which the teardown below waits on. Gated on the
-                    // role MIRROR (no `&RadioManager` here). Fires once per window (inside the
-                    // once-per-window `!ntp_attempted` guard), independent of NTP success.
+                    // #198 Phase 3 (p3-inc1, spec §7) — DHCP+NTP are up this window; open the MQTT
+                    // burst window. `mqtt_task` drains it (the burst runs as a task, so the executor
+                    // keeps polling the mesh/display through it — the #89 payoff) and signals MQTT_DONE,
+                    // which the teardown below waits on. Fires once per window (inside the once-per-
+                    // window `!ntp_attempted` guard), independent of NTP success.
+                    // #198 Phase 3 (p3-inc3d-1.5): TWO window kinds. A GATEWAY runs the full telemetry
+                    // FLUSH (publish + gateway downlink drain — gateway-gated by construction, unchanged).
+                    // A NON-gateway that set WANTS_ELECT runs a LEAN election-OBSERVE burst (SUBSCRIBE
+                    // smol/mesh/channel → MC_OBSERVED → DISCONNECT) — the broker-mediated election is
+                    // invisible to a leaf otherwise (a boot claim / leaf-recovery takeover must READ the
+                    // retained MC). OBSERVE-ONLY: it publishes nothing + changes no role (inc3d-2 resolves
+                    // MC_OBSERVED). WANTS_ELECT is a one-shot (swap) request consumed here per window.
                     if ROLE_IS_GATEWAY.load(Ordering::Relaxed) {
-                        MQTT_OPEN.signal(());
+                        MQTT_OPEN.signal(MqttWindow::Flush);
+                        mqtt_opened = true;
+                    } else if WANTS_ELECT.swap(false, Ordering::Relaxed) {
+                        MQTT_OPEN.signal(MqttWindow::ElectObserve);
                         mqtt_opened = true;
                     }
                 }
@@ -7399,18 +7437,27 @@ async fn wifi_task(
 #[embassy_executor::task]
 async fn mqtt_task(stack: embassy_net::Stack<'static>, id: u8) -> ! {
     loop {
-        // `wifi_task` signals this once DHCP+NTP are up in a gateway window.
-        MQTT_OPEN.wait().await;
+        // `wifi_task` signals this once DHCP+NTP are up: a gateway FLUSH or (p3-inc3d-1.5) a
+        // non-gateway election-OBSERVE window.
+        let window = MQTT_OPEN.wait().await;
         // #89 flush deadline + P3-H2 abdicate: `with_timeout` nests two Results — the OUTER is the
-        // timeout, the INNER is `mqtt_burst`'s Err. EITHER means the flush failed → #146 abdicate.
+        // timeout, the INNER is `mqtt_burst`'s Err. EITHER means the burst failed.
         match embassy_time::with_timeout(
             embassy_time::Duration::from_secs(MQTT_BURST_BUDGET_S),
-            mqtt_burst(stack, id),
+            mqtt_burst(stack, id, window),
         )
         .await
         {
             Ok(Ok(())) => {}
-            _ => ABDICATE.signal(()), // inline election reads it → relinquish the crown (reader: later inc)
+            // #146 abdicate ONLY on a FLUSH failure — a crown that couldn't flush relinquishes (the
+            // inline election reads it; reader wired in a later inc). An election-OBSERVE failure is
+            // benign (p3-inc3d-1.5): a leaf that couldn't READ the MC holds no crown to give up, so it
+            // must NOT abdicate — it simply retries next window.
+            _ => {
+                if window == MqttWindow::Flush {
+                    ABDICATE.signal(());
+                }
+            }
         }
         // Tell `wifi_task` the burst is finished so it may drop the assoc (the window closes).
         MQTT_DONE.signal(());
@@ -7424,7 +7471,11 @@ async fn mqtt_task(stack: embassy_net::Stack<'static>, id: u8) -> ! {
 /// DEFERRED to later increments (spec §8): HA-discovery re-publish + SHARED telemetry snapshot (inc2),
 /// SUBSCRIBE + downlink drain + OTA-offer routing (inc3). Returns `Err(())` on any transport failure
 /// (mapped from the socket error types) so the caller abdicates.
-async fn mqtt_burst(stack: embassy_net::Stack<'static>, id: u8) -> Result<(), ()> {
+async fn mqtt_burst(
+    stack: embassy_net::Stack<'static>,
+    id: u8,
+    window: MqttWindow,
+) -> Result<(), ()> {
     use core::fmt::Write as _;
     let net = &crate::secrets::WIFI_NETWORK;
     let mut rx = [0u8; MQTT_RX_BUF];
@@ -7483,6 +7534,22 @@ async fn mqtt_burst(stack: embassy_net::Stack<'static>, id: u8) -> Result<(), ()
                 }
             }
         }
+    }
+
+    // #198 Phase 3 (p3-inc3d-1.5): a NON-gateway ELECTION-OBSERVE window runs a LEAN burst — it only
+    // READS the retained MC election topic (SUBSCRIBE smol/mesh/channel → MC_OBSERVED → DISCONNECT).
+    // It publishes NOTHING (no telemetry/peers/MC) and drains NO other downlink (batt/grid/config/OTA/
+    // cmd stay gateway-gated by construction) — this is the election CARVE-OUT, not a gate removal.
+    // OBSERVE-ONLY: the observation is unconsumed until inc3d-2's resolve. Branch BEFORE the gateway-
+    // only role checks + publishes below (we are intentionally !ROLE_IS_GATEWAY here). Role-flip-safe
+    // by construction: it never publishes, so a leaf→gateway flip mid-observe is harmless.
+    if window == MqttWindow::ElectObserve {
+        elect_observe_drain(&mut sock, &mut pkt).await?;
+        let dn = crate::net::mqtt::encode_disconnect(&mut pkt).ok_or(())?;
+        write_all(&mut sock, &pkt[..dn]).await?;
+        sock.flush().await.map_err(|_| ())?;
+        sock.close();
+        return Ok(());
     }
 
     // Drain any queued DISCRETE PUBLISHes (P3-M2). inc1 has no producer yet, so this is usually empty
@@ -7559,6 +7626,73 @@ async fn mqtt_burst(stack: embassy_net::Stack<'static>, id: u8) -> Result<(), ()
     write_all(&mut sock, &pkt[..dn]).await?;
     sock.flush().await.map_err(|_| ())?;
     sock.close();
+    Ok(())
+}
+
+/// #198 Phase 3 (p3-inc3d-1.5) — the LEAN non-gateway ELECTION-OBSERVE drain. A boot/leaf node opens
+/// an MQTT window purely to READ the broker-mediated crown election: SUBSCRIBE the retained
+/// `smol/mesh/channel` MC only → deliver each observed `MC|owner|ch|seq` to `MC_OBSERVED` → return
+/// (the caller DISCONNECTs). This is the ELECTION CARVE-OUT to the "downlink runs only in a confirmed-
+/// gateway window" rule (inc3c): the election is 100% broker-mediated, so a leaf can't learn the crown
+/// any other way (no mesh path). CROWN/LEAF-SAFE + OBSERVE-ONLY — it publishes NOTHING and touches NO
+/// role state; `MC_OBSERVED` is unconsumed until inc3d-2's resolve. Bounds: a per-read quiet-timer
+/// (`DOWNLINK_QUIET_MS`) breaks as soon as the retained MC is delivered (or absent — a VACANT crown
+/// means the topic never arrives, so the quiet-timer settles the burst); the outer BURST_BUDGET
+/// (`mqtt_task`) is the hard deadline. Does NOT drain batt/grid/config/OTA/cmd (those stay gateway-only).
+async fn elect_observe_drain(
+    sock: &mut embassy_net::tcp::TcpSocket<'_>,
+    pkt: &mut [u8],
+) -> Result<(), ()> {
+    // SUBSCRIBE only the retained MC election topic (QoS0). Retained arrives right after SUBACK.
+    let n = crate::net::mqtt::encode_subscribe(pkt, 1, crate::net::wifi::MESH_CHANNEL_TOPIC).ok_or(())?;
+    write_all(sock, &pkt[..n]).await?;
+
+    let mut got_mc = false;
+    let mut acc = [0u8; MQTT_RX_BUF];
+    let mut acc_len = 0usize;
+    loop {
+        if got_mc {
+            break; // the retained MC was observed → done (a vacant crown falls through to the quiet-timer)
+        }
+        // last-packet quiet-timer: a read that times out means the broker went silent → drained (or the
+        // MC topic is absent = a VACANT crown, which inc3d-2's resolve reads as "no owner").
+        let n = match embassy_time::with_timeout(
+            embassy_time::Duration::from_millis(DOWNLINK_QUIET_MS),
+            sock.read(&mut acc[acc_len..]),
+        )
+        .await
+        {
+            Ok(Ok(0)) => break,           // peer closed
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => return Err(()), // socket error
+            Err(_) => break,              // quiet → settled (MC delivered, or vacant crown)
+        };
+        acc_len += n;
+        // pull each COMPLETE packet out of the stream accumulator (route confined to the match arm so
+        // the `acc` borrow ends before `copy_within` re-borrows it mutably — same shape as downlink_drain).
+        loop {
+            let total = match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
+                Some((crate::net::mqtt::Incoming::Publish { topic, payload, .. }, total)) => {
+                    if topic == crate::net::wifi::MESH_CHANNEL_TOPIC {
+                        // OBSERVE the retained MC → hand to the inline election (unconsumed until
+                        // inc3d-2's resolve). QoS0 → no PUBACK. Any parseable MC settles the burst.
+                        if let Some((owner, ch, seq)) = crate::net::wifi::parse_mesh_channel(payload) {
+                            MC_OBSERVED.signal(McObs { owner, seq, ch });
+                            got_mc = true;
+                        }
+                    }
+                    total
+                }
+                Some((_, total)) => total, // SUBACK / other — consume without routing
+                None => break,             // need more bytes
+            };
+            acc.copy_within(total..acc_len, 0);
+            acc_len -= total;
+        }
+        if acc_len == acc.len() {
+            acc_len = 0; // oversized/garbled packet guard — never wedge the accumulator
+        }
+    }
     Ok(())
 }
 
@@ -7897,6 +8031,12 @@ pub fn start(
     #[cfg(not(feature = "phase2-measure"))]
     {
         STOP_REQ.store(false, Ordering::Relaxed);
+        // #198 Phase 3 (p3-inc3d-1.5): the boot window doubles as the first election-OBSERVE. A cold-
+        // boot node is a leaf here (no crown yet — reached_dhcp/i_am_owner false) and must READ the
+        // retained MC to later claim a vacant crown / adopt a live owner. WANTS_ELECT makes wifi_task
+        // run the LEAN election burst (MC → MC_OBSERVED) in this boot window. OBSERVE-ONLY: the
+        // observation is unconsumed until inc3d-2 resolves it → no role change (set_gateway above stands).
+        WANTS_ELECT.store(true, Ordering::Relaxed);
         WIFI_CMD.try_send(WifiCmd::OpenWindow).ok();
     }
 
