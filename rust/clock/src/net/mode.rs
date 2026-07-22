@@ -4445,12 +4445,10 @@ impl RadioManager {
     #[cfg(feature = "espnow")]
     pub fn send_arb_raw(&mut self, dst: [u8; 6], frame: &[u8]) {
         self.ensure_peer(dst, now_ms());
-        match self.esp_now.send(&dst, frame) {
-            Ok(waiter) => {
-                let _ = waiter.wait();
-            }
-            Err(e) => log::warn!("smol #237: arb-frame raw send failed: {:?}", e),
-        }
+        // #198 Phase 2: route through the esp_now_tx choke so arb (ODEL/ODON) is TX-silent on a
+        // measurement board too (belt to the dead-by-isolation of the serve path). Not a beacon frame
+        // → dropped under phase2-measure. (ensure_peer above is harmless — it only registers a peer.)
+        self.esp_now_tx(&dst, frame);
     }
 
     /// #237 CROWN baton term (§5.3 split-brain): the crown stamps every `ODEL` with its election
@@ -5629,15 +5627,40 @@ impl RadioManager {
         }
     }
 
-    /// Low-level send helper: fire one frame and wait for the TX callback so we
-    /// don't overrun the single in-flight ESP-NOW send slot.
-    fn send_to(&mut self, dst: &[u8; 6], data: &[u8]) {
+    /// #198 Phase 2 — THE single esp_now TX choke. Every general mesh send funnels here (send_to +
+    /// send_arb_raw). Under `phase2-measure` a measurement board is esp_now-TX-SILENT except board-B's
+    /// beacon: `ROLE==Dut` drops ALL sends (pure-RX measure — ANY self-TX both leaks ids to the fleet
+    /// AND swamps the small deaf-window signal); `ROLE==Beacon` allows ONLY the beacon frame
+    /// (content-checked via `BEACON_PREFIX`). Robust BY CONSTRUCTION — telemetry (`relay_emit`), fam
+    /// (`broadcast_fam`), relay ack/retransmit, arb, hello/time/stat/diag + any FUTURE emitter all die
+    /// HERE, not at N scattered per-site gates. This is the behavioral-completeness lens the earlier
+    /// `broadcast_*` (lexical) audit missed: `relay_emit`/`fam` are `send_`-named, not `broadcast_`.
+    /// The WiFi window (esp-radio/embassy-net) is a SEPARATE TX path — untouched, so assoc still works.
+    /// (The 3 mesh-OTA relay/serve loops call `esp_now.send` directly to track the TX Result for
+    /// `otam_ok`; they are dead-by-isolation on a bench board — no OTA role when advert-silent — so
+    /// they need no choke. `smol/<leaf>/ota/state` is crown-derived, not leaf-emitted, so it dies too.)
+    fn esp_now_tx(&mut self, dst: &[u8; 6], data: &[u8]) {
+        #[cfg(feature = "phase2-measure")]
+        {
+            let allow =
+                phase2::ROLE == phase2::Role::Beacon && data.starts_with(BEACON_PREFIX);
+            if !allow {
+                return; // measurement board: TX-silent (dropped) — DUT=none, Beacon=beacon-only.
+            }
+        }
         match self.esp_now.send(dst, data) {
             Ok(waiter) => {
                 let _ = waiter.wait();
             }
             Err(e) => log::warn!("smol: esp-now send failed: {:?}", e),
         }
+    }
+
+    /// Low-level send helper: fire one frame and wait for the TX callback so we
+    /// don't overrun the single in-flight ESP-NOW send slot. Routes through the
+    /// [`Self::esp_now_tx`] choke (#198 Phase 2 TX-silence).
+    fn send_to(&mut self, dst: &[u8; 6], data: &[u8]) {
+        self.esp_now_tx(dst, data);
     }
 
     /// Service inbound ESP-NOW traffic and advance the handshake.
