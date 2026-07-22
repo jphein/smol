@@ -207,6 +207,32 @@ struct TelemetrySnapshot {
 /// flush `signal`s the freshest snapshot; `mqtt_burst` `try_take`s + publishes it in the window.
 static TELEMETRY: Signal<CriticalSectionRawMutex, TelemetrySnapshot> = Signal::new();
 
+// ── #198 Phase 3 (p3-inc3a) — RELAYED leaf-status republish (#50b HA fleet visibility) ──────────
+// The gateway republishes each cached leaf STATUS as retained `smol/<leaf>/status` so HA sees every
+// mesh node, not just the crown. Same lock-free latest-wins pattern as TELEMETRY (own-node), but
+// N-leaf: the inline flush pre-serializes the FRESH stat_cache entries (mqtt_task can't borrow the
+// cache) and signals; `mqtt_burst` publishes each in the window. Bounded to the stat_cache capacity.
+// DEFERRED (own sub-inc): diag_cache/scan_cache republish — RELAY_VALUE_MAX=232 × CAP-12 ×2 ≈ 5.6 KB
+// static, too heavy to fold in here; stat is the fleet-visibility-critical one (CFG_VALUE_MAX=64).
+const RELAYED_CAP: usize = 16; // = wifi::CFG_CACHE_CAP (stat_cache); clamp + log if a flush exceeds it
+
+/// One cached leaf status, PRE-SERIALIZED by the inline flush for `mqtt_burst` to publish verbatim.
+#[derive(Clone, Copy)]
+struct RelayedEntry {
+    id: u8,
+    len: usize,
+    payload: [u8; crate::net::wifi::CFG_VALUE_MAX],
+}
+
+/// Latest-wins batch of cached leaf statuses (the FRESH `stat_cache` entries this flush).
+struct RelayedSnapshot {
+    count: usize,
+    entries: [RelayedEntry; RELAYED_CAP],
+}
+
+/// Latest-wins relayed-status hand-off (lock-free, mirrors TELEMETRY). Inline flush signals; mqtt_task drains.
+static RELAYED: Signal<CriticalSectionRawMutex, RelayedSnapshot> = Signal::new();
+
 /// #198 Phase 2 (edge (c) fix) — RUNNER-AUTHORITATIVE measurement phase, set by `Phase2Runner` on
 /// each state transition and read by the beacon RX arm to bucket gaps. Decouples the CONTROLLED phase
 /// (which window-lifecycle state we're in) from the OBSERVED link state (`LINK_UP`): a transient
@@ -5380,6 +5406,45 @@ impl RadioManager {
         snap.status_len = fill_clamped(&mut snap.status, status);
         snap.peers_len = fill_clamped(&mut snap.peers, peers);
         TELEMETRY.signal(snap);
+        // #198 Phase 3 (p3-inc3a): republish the gateway's cached leaf STATUSES as retained
+        // smol/<leaf>/status (#50b HA fleet visibility). FRESH-gated (STAT_FRESH_MS #68: a leaf gone
+        // quiet stops republishing → HA sees it go stale, not a perpetual ghost). Own id is skipped
+        // (our own status rides the TELEMETRY snapshot above). Pre-serialize the fresh set into a
+        // latest-wins RelayedSnapshot; mqtt_task publishes each in the window. (diag/scan republish
+        // deferred — see the RELAYED type comment.)
+        let mut relayed = RelayedSnapshot {
+            count: 0,
+            entries: [RelayedEntry {
+                id: 0,
+                len: 0,
+                payload: [0u8; crate::net::wifi::CFG_VALUE_MAX],
+            }; RELAYED_CAP],
+        };
+        let stat_count = self.stat_cache.count();
+        for i in 0..stat_count {
+            if relayed.count >= RELAYED_CAP {
+                // no-silent-cap: a flush with more fresh leaves than the buffer holds → log the drop.
+                log::warn!(
+                    "smol #198 p3-inc3a: stat republish capped at {} ({} cached)",
+                    RELAYED_CAP,
+                    stat_count
+                );
+                break;
+            }
+            if let Some((leaf_id, payload)) =
+                self.stat_cache
+                    .entry_fresh(i, now, crate::net::wifi::STAT_FRESH_MS)
+            {
+                if leaf_id == id {
+                    continue; // our own status rides TELEMETRY, not the relayed set
+                }
+                let slot = &mut relayed.entries[relayed.count];
+                slot.id = leaf_id;
+                slot.len = fill_clamped(&mut slot.payload, payload);
+                relayed.count += 1;
+            }
+        }
+        RELAYED.signal(relayed);
         // #23 fix: seed the election from the live role + persistent staleness so THIS
         // flush RE-DECIDES ownership (demote a duplicate gateway that now sees a LIVE
         // lower-id owner — oracle #2). Read back below and applied to the live role.
@@ -7225,6 +7290,15 @@ async fn mqtt_burst(stack: embassy_net::Stack<'static>, id: u8) -> Result<(), ()
             false,
         )
         .await?;
+    }
+
+    // #198 Phase 3 (p3-inc3a): republish the gateway's cached leaf STATUSES as retained
+    // smol/<leaf>/status (#50b HA fleet visibility). The inline flush signaled the fresh set; each
+    // rides the SAME window as the own-node telemetry.
+    if let Some(relayed) = RELAYED.try_take() {
+        for e in &relayed.entries[..relayed.count] {
+            publish_own(&mut sock, &mut pkt, e.id, "status", &e.payload[..e.len], true).await?;
+        }
     }
 
     // DISCONNECT — a clean goodbye so the broker doesn't fire a will / log a drop (spec §2).
