@@ -1240,6 +1240,14 @@ async fn main(spawner: Spawner) -> ! {
                 }
             }
 
+            // #198 Phase 2 — DEAF-WINDOW harness: emit the segmented max_gap SUMMARY every 10 s
+            // (read off the DUT's RTT log). inc3 adds the beacon-EMIT role (board-B) + the DUT
+            // N-window runner + Run-0 control + window-lifecycle markers around this baseline report.
+            #[cfg(feature = "phase2-measure")]
+            if (now / 10_000) != ((now.saturating_sub(SUBTICK_MS as u64)) / 10_000) {
+                r.phase2_report();
+            }
+
             // ~every 10 s a GATEWAY re-broadcasts its cached HA battery payload as a
             // SMOLv1 BATT frame so neighbour LEAVES keep a fresh copy. The gateway is
             // the single source (fresh from HA over MQTT); leaves never re-broadcast

@@ -261,6 +261,15 @@ cast = ["espnow"]
 # serial. Builds on espnow. Everything it changes is `cfg(feature = "coexist-soak")`.
 coexist-soak = ["espnow"]
 
+# #198 Phase 2 — DEAF-WINDOW MEASUREMENT harness (bench-only, NOT production). Refines the #23
+# coexist-soak beacon instrument for the executor migration: the DUT tracks `max_gap_ms` (the
+# longest single deaf stretch — the PRIMARY metric, P2-H3) and SEGMENTS it at assoc_done (P2-H2)
+# into scan-transient (WIFI_BUSY) vs associated steady-state (LINK_UP) vs quiescent (Run-0 control),
+# so the coexist thesis is judged on `steady_max_gap_ms` alone. Builds on espnow (beacon RX arm +
+# WiFi window). Everything it adds is `cfg(feature = "phase2-measure")`, so the release fleet is
+# byte-free of it (grep gate). inc3 adds the beacon-emit role + N-window runner + run-matrix knobs.
+phase2-measure = ["espnow"]
+
 # #13 MESH-TEST rig (NOT for production). A debug-only MAC deaf-list: a node silently
 # drops inbound frames whose source MAC is in the per-board `board::DEAF_MACS`, so the
 # 3-board fleet can be forced into a 2-hop topology (G→R→F) to validate routed multi-hop

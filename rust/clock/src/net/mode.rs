@@ -1319,6 +1319,24 @@ struct BenchTracker {
     /// Latest computed rates (updated once per rate window).
     tx_per_s: u32,
     rx_per_s: u32,
+    /// #198 Phase 2 — RX time (ms) of the previous board-B beacon, for the since-last gap.
+    #[cfg(feature = "phase2-measure")]
+    last_beacon_ms: Option<u64>,
+    /// #198 Phase 2 — the PRIMARY deaf-window metric (P2-H3): the longest single inter-beacon gap
+    /// (ms), SEGMENTED at assoc_done (P2-H2). `scan` = the WIFI_BUSY scan/assoc transient (a deaf
+    /// window NEITHER coexist lever fixes); `steady` = the LINK_UP-held associated state (what the
+    /// levers target — the thesis is judged on THIS); `quiescent` = no WiFi window (the Run-0
+    /// control baseline, subtracted from runs 1-3). Plus per-segment missed-beacon counts (secondary).
+    #[cfg(feature = "phase2-measure")]
+    scan_max_gap_ms: u32,
+    #[cfg(feature = "phase2-measure")]
+    steady_max_gap_ms: u32,
+    #[cfg(feature = "phase2-measure")]
+    quiescent_max_gap_ms: u32,
+    #[cfg(feature = "phase2-measure")]
+    scan_missed: u32,
+    #[cfg(feature = "phase2-measure")]
+    steady_missed: u32,
 }
 
 impl BenchTracker {
@@ -1337,6 +1355,18 @@ impl BenchTracker {
             rx_at_window: 0,
             tx_per_s: 0,
             rx_per_s: 0,
+            #[cfg(feature = "phase2-measure")]
+            last_beacon_ms: None,
+            #[cfg(feature = "phase2-measure")]
+            scan_max_gap_ms: 0,
+            #[cfg(feature = "phase2-measure")]
+            steady_max_gap_ms: 0,
+            #[cfg(feature = "phase2-measure")]
+            quiescent_max_gap_ms: 0,
+            #[cfg(feature = "phase2-measure")]
+            scan_missed: 0,
+            #[cfg(feature = "phase2-measure")]
+            steady_missed: 0,
         }
     }
 
@@ -2827,6 +2857,28 @@ impl RadioManager {
             self.bench.loss_pct(),
             self.bench.last_rtt_ms,
             self.bench.last_rssi,
+        );
+    }
+
+    /// #198 Phase 2 — the SEGMENTED deaf-window report (P2-H2/H3), read off the DUT's RTT log.
+    /// `steady_max_gap_ms` is the thesis metric (associated steady-state); `scan_max_gap_ms` is the
+    /// scan/assoc transient reported SEPARATELY (a deaf window neither lever fixes, DR-M1); reporting
+    /// a single conflated total would let a scan-dominated run wrongly escalate "async isn't
+    /// delivering." `quiescent_max_gap_ms` is the Run-0 control to subtract. Emitted on a cadence +
+    /// (inc3) at window_end. LINK_UP is included so the Lever-B attribution ("assoc HELD through the
+    /// burst") is visible alongside the gap.
+    #[cfg(feature = "phase2-measure")]
+    pub fn phase2_report(&self) {
+        log::info!(
+            "[dut] SUMMARY scan_max_gap_ms={} scan_missed={} steady_max_gap_ms={} steady_missed={} quiescent_max_gap_ms={} rx={} lost={} link_up={}",
+            self.bench.scan_max_gap_ms,
+            self.bench.scan_missed,
+            self.bench.steady_max_gap_ms,
+            self.bench.steady_missed,
+            self.bench.quiescent_max_gap_ms,
+            self.bench.rx_count,
+            self.bench.lost_count,
+            LINK_UP.load(Ordering::Relaxed),
         );
     }
 
@@ -5437,6 +5489,41 @@ impl RadioManager {
                                 .lost_count
                                 .wrapping_add(seq - prev - 1);
                         }
+                    }
+                    // #198 Phase 2 — segmented deaf-window measurement (P2-H2/H3). Bucket this
+                    // beacon's since-last gap (the PRIMARY max_gap_ms) + missed count at assoc_done:
+                    // WIFI_BUSY = scan/assoc transient, LINK_UP = associated steady-state, neither =
+                    // quiescent (the Run-0 control baseline). Read BEFORE peer_last_seq is advanced
+                    // below so `prev` is still the previous seq. (2-board controlled rig: only board-B
+                    // beacons; inc3 adds the SMOL_P2_BEACON_MAC `src` filter for fleet-adjacent runs.)
+                    #[cfg(feature = "phase2-measure")]
+                    {
+                        let missed = self
+                            .bench
+                            .peer_last_seq
+                            .and_then(|prev| seq.checked_sub(prev))
+                            .map_or(0, |d| d.saturating_sub(1));
+                        let gap = self
+                            .bench
+                            .last_beacon_ms
+                            .map(|prev| now.saturating_sub(prev) as u32);
+                        let g = gap.unwrap_or(0);
+                        let phase = if WIFI_BUSY.load(Ordering::Relaxed) {
+                            self.bench.scan_max_gap_ms = self.bench.scan_max_gap_ms.max(g);
+                            self.bench.scan_missed = self.bench.scan_missed.wrapping_add(missed);
+                            "SCAN"
+                        } else if LINK_UP.load(Ordering::Relaxed) {
+                            self.bench.steady_max_gap_ms = self.bench.steady_max_gap_ms.max(g);
+                            self.bench.steady_missed = self.bench.steady_missed.wrapping_add(missed);
+                            "STEADY"
+                        } else {
+                            self.bench.quiescent_max_gap_ms = self.bench.quiescent_max_gap_ms.max(g);
+                            "QUIET"
+                        };
+                        if gap.is_some() {
+                            log::info!("[dut] beacon_rx seq={} gap_ms={} phase={}", seq, g, phase);
+                        }
+                        self.bench.last_beacon_ms = Some(now);
                     }
                     // Track the highest peer seq (what our own beacons echo).
                     if self.bench.peer_last_seq.is_none_or(|p| seq > p) {
