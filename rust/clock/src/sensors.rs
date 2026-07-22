@@ -184,6 +184,12 @@ pub struct LineBuf {
     len: usize,
 }
 
+impl Default for LineBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LineBuf {
     const CAP: usize = 20;
 

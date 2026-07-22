@@ -39,7 +39,7 @@ pub type Oled = Ssd1306<
 
 /// #152 host emulator: under `feature = "hostsim"` the one concrete `Oled` becomes a
 /// canvas-backed 72×40 framebuffer that impls the SAME `DrawTarget<Color = BinaryColor>`
-/// + inherent `clear()`/`flush()`/`init()` the plugins already call — so `snake.rs` /
+/// and inherent `clear()`/`flush()`/`init()` the plugins already call — so `snake.rs` /
 /// `clock.rs` draw through it UNCHANGED (zero forked render code, the #152 gate).
 #[cfg(feature = "hostsim")]
 pub type Oled = crate::hostsim::CanvasOled;

@@ -24,6 +24,12 @@ pub struct ClockState {
     last_sec: Option<u32>,
 }
 
+impl Default for ClockState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClockState {
     pub fn new() -> Self {
         Self { last_sec: None }
