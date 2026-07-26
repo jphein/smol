@@ -54,6 +54,11 @@ pub mod input;
 #[cfg(feature = "hostsim")]
 #[path = "bard/nano_llm.rs"]
 pub mod nano_llm;
+// Exported as `bard_tokenizer`, not `tokenizer`: the crate root is shared with the firmware
+// bin's flat module namespace, so the bard-specific name keeps it unambiguous there.
+#[cfg(feature = "hostsim")]
+#[path = "bard/tokenizer.rs"]
+pub mod bard_tokenizer;
 #[cfg(feature = "hostsim")]
 pub mod sensors;
 #[cfg(feature = "hostsim")]

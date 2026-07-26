@@ -5,6 +5,7 @@
 //!  --lib --test bard` — the bare `cargo test` form also builds the firmware BIN, which cannot
 //! compile without the `hw` crates.
 #![cfg(feature = "hostsim")]
+use clock::bard_tokenizer::Tokenizer;
 use clock::nano_llm::{Model, ParseErr};
 
 pub const BLOB: &[u8] = include_bytes!("../model/stories260K-q8.bin");
@@ -29,4 +30,21 @@ fn rejects_corruption() {
     bad[mid] ^= 0xFF;
     assert!(matches!(Model::parse(&bad), Err(ParseErr::Crc)));
     assert!(matches!(Model::parse(&BLOB[..40]), Err(ParseErr::Truncated)));
+}
+
+#[test]
+fn tokenizer_roundtrip() {
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+    let mut ids = [0u16; 64];
+    let n = t.encode("Once upon a time, there was a little dragon", &mut ids);
+    assert!(n > 2 && n < 32, "n={n}");
+    let mut out = std::string::String::new();
+    let mut prev = 1u16; // BOS
+    for &id in &ids[1..n] {
+        // ids[0] is BOS itself
+        out.push_str(core::str::from_utf8(t.decode(prev, id)).unwrap());
+        prev = id;
+    }
+    assert_eq!(out.trim_start(), "Once upon a time, there was a little dragon");
 }
