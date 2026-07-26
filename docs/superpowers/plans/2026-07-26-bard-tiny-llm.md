@@ -630,7 +630,7 @@ impl Session {
   - Weights: dequantize NOTHING up front — keep q8 + scales; matmul does the segment walk: for each output row, segments bounded by every weight-group edge (flattened index) and activation-group edge (position index); per segment `int32` dot of i8×i8, then `acc += np.float32(ival) * ws[wg] * xs[ag]` in row-major segment order (same order as Rust).
   - Activation quantization: per position-group of GS with ragged tail; `q = trunc(v/s + (0.5 if v>=0 else -0.5))` clamped to ±127 (mirrors Rust's `as i8` truncation — do NOT use np.round, it's banker's rounding).
   - RMSNorm eps 1e-5; RoPE = llama2.c adjacent-pair rotation with head_dim-relative exponent; softmax in float32; KV cache int8 per-vector scales, same trunc rounding.
-  - Tokenizer: decode from the blob's table (strip one leading space after BOS); greedy BPE encode identical to Task 4's spec (BOS=1, leading-space token, byte fallback, best-score merges).
+  - Tokenizer: decode from the blob's table (strip one leading space after BOS); greedy BPE encode identical to Task 4's AS-FIXED semantics — **per-CODEPOINT seeding** (accumulate UTF-8 continuation bytes, look up the whole piece, byte-fallback per byte only on miss), BOS=1, leading-space token, best-score merges. The table has 14 multi-byte tokens (curly quotes, em-dash) — per-byte seeding shreds them irrecoverably (oracle-confirmed divergence).
   - CLI: `bard_reference.py <blob> --temp 0 --steps 200 -i "<prompt>"` → prints `# reference <blob-sha256-short> temp0` on line 1, then prompt+continuation as one story text; `--tokens-out <path>` writes generated token ids one per line. Termination on token 1 or 2 or step cap.
 - [ ] **Step 6.2:** Write `tools/bard_golden_baseline.sh`:
 
@@ -842,7 +842,7 @@ static MODEL_BLOB: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/
 static mut BUFS: Bufs = Bufs::INIT;
 static mut STORY_TEXT: [u8; 1024] = [0; 1024];
 ```
-Parse once per entry (`Model::parse` is cheap — a CRC walk over flash); on `Err`, set a `mute: true` flag. NOTE: `lib.rs` reaches the same files via `#[path]` (`bard/nano_llm.rs` etc.) while the bin reaches them as `bard::nano_llm` — keep the internal cross-references as `super::` within `src/bard/`, not `crate::bard::`, so both target roots compile the same source unchanged (`snake_core` precedent).
+Parse once per entry (`Model::parse` is cheap — a CRC walk over flash); on `Err`, set a `mute: true` flag. The `Tokenizer` value is **~2.6KB** (offsets + byte_id tables) — it lives in a module-level `static mut` beside BUFS, never on the stack and never in the App union. NOTE: `lib.rs` reaches the same files via `#[path]` (`bard/nano_llm.rs` etc.) while the bin reaches them as `bard::nano_llm` — keep the internal cross-references as `super::` within `src/bard/`, not `crate::bard::`, so both target roots compile the same source unchanged (`snake_core` precedent).
 - [ ] **Step 9.3:** Registration — the six sites plus wire arms, each `#[cfg(feature = "bard")]`, exactly per the Sigil template:
   - `src/main.rs` mod block: `#[cfg(feature = "bard")] mod bard;`
   - `src/app.rs` `AppKind::Bard` (~:184), `App::Bard(crate::bard::BardApp)` (~:371), `enter` arm (~:404), `on_button`/`update` UFCS arms (~:446/:481), REGISTRY row `AppDesc { title: "Bard", kind: AppKind::Bard }` (~:601).
