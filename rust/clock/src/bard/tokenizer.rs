@@ -116,6 +116,12 @@ impl<'a> Tokenizer<'a> {
         if t.max_token_len > CONCAT {
             return None;
         }
+        // Parity with the exporter's `assert p == len(tok)`: the walk must land EXACTLY on the
+        // end. Trailing bytes mean the table and `vocab` disagree about how many entries there
+        // are — refuse rather than run on a table we only partly understand.
+        if p != table.len() {
+            return None;
+        }
         Some(t)
     }
 
@@ -180,19 +186,46 @@ impl<'a> Tokenizer<'a> {
             }
         }
 
-        for &b in text.as_bytes() {
+        // Seed per CODEPOINT, not per byte. The table holds 14 multi-byte UTF-8 tokens
+        // (’ “ ” – — ‘ é … ñ â € ™ and two spaces), and seeding byte-wise would shred each into
+        // three `<0xXX>` fallbacks that can NEVER merge back into the real token. llama2.c
+        // accumulates continuation bytes, looks the whole codepoint up first, and only falls
+        // back per byte on a miss; `chars()` is exactly that segmentation for the valid UTF-8
+        // a `&str` guarantees.
+        let mut cp = [0u8; 4];
+        for ch in text.chars() {
             if n == out.len() {
                 break;
             }
-            let single = self.byte_id[b as usize];
-            out[n] = if single != 0 {
-                single
-            } else if BYTE_BASE + (b as usize) < self.vocab {
-                (BYTE_BASE + b as usize) as u16 // byte fallback: the `<0xXX>` token
+            let piece = ch.encode_utf8(&mut cp).as_bytes();
+            let whole = if piece.len() == 1 {
+                // Fast path: the single-byte index IS a one-byte `lookup`.
+                match self.byte_id[piece[0] as usize] {
+                    0 => None,
+                    id => Some(id),
+                }
             } else {
-                0 // <unk>: no token and no fallback slot
+                self.lookup(piece)
             };
-            n += 1;
+            match whole {
+                Some(id) => {
+                    out[n] = id;
+                    n += 1;
+                }
+                None => {
+                    for &b in piece {
+                        if n == out.len() {
+                            break;
+                        }
+                        out[n] = if BYTE_BASE + (b as usize) < self.vocab {
+                            (BYTE_BASE + b as usize) as u16 // byte fallback: the `<0xXX>` token
+                        } else {
+                            0 // <unk>: no token and no fallback slot
+                        };
+                        n += 1;
+                    }
+                }
+            }
         }
 
         // Merge until no adjacent pair concatenates to a known token.

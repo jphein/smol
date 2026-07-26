@@ -32,21 +32,109 @@ fn rejects_corruption() {
     assert!(matches!(Model::parse(&BLOB[..40]), Err(ParseErr::Truncated)));
 }
 
+/// Re-stamp the trailing crc32 so a mutated blob fails on the field under test rather than
+/// on integrity. Without this every mutant just returns `Crc` and proves nothing.
+fn recrc(mut v: std::vec::Vec<u8>) -> std::vec::Vec<u8> {
+    let n = v.len() - 4;
+    let c = clock::nano_llm::crc32(&v[..n]);
+    v[n..].copy_from_slice(&c.to_le_bytes());
+    v
+}
+
+#[test]
+fn rejects_bad_header_fields() {
+    // Wrong magic.
+    let mut v = BLOB.to_vec();
+    v[0] ^= 0xFF;
+    assert!(matches!(Model::parse(&recrc(v)), Err(ParseErr::Magic)));
+
+    // Unknown format version.
+    let mut v = BLOB.to_vec();
+    v[4..8].copy_from_slice(&2u32.to_le_bytes());
+    assert!(matches!(Model::parse(&recrc(v)), Err(ParseErr::Version)));
+
+    // dim past MAX_DIM (65 > 64).
+    let mut v = BLOB.to_vec();
+    v[8..12].copy_from_slice(&65u32.to_le_bytes());
+    assert!(matches!(Model::parse(&recrc(v)), Err(ParseErr::DimsTooBig)));
+
+    // Header intact, payload 4 bytes short: this is the guard on the EXACT q-section length,
+    // which nothing else covers — a blob whose header disagrees with its payload must not run.
+    let mut v = BLOB[..BLOB.len() - 4].to_vec();
+    v.truncate(v.len() - 4);
+    v.extend_from_slice(&[0; 4]);
+    assert!(matches!(Model::parse(&recrc(v)), Err(ParseErr::Truncated)));
+}
+
+/// Decode `ids[1..n]` exactly as a caller would, WITHOUT any trimming: the BOS-space strip
+/// inside `decode` is what has to produce a clean string, so tolerating a leading space here
+/// would hide a bug in it.
+fn decode_all(t: &Tokenizer, ids: &[u16]) -> std::string::String {
+    let mut out = std::vec::Vec::new();
+    let mut prev = 1u16; // BOS
+    for &id in &ids[1..] {
+        out.extend_from_slice(t.decode(prev, id));
+        prev = id;
+    }
+    std::string::String::from_utf8(out).expect("decoded bytes are valid utf8")
+}
+
 #[test]
 fn tokenizer_roundtrip() {
     let m = Model::parse(BLOB).unwrap();
     let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
     let mut ids = [0u16; 64];
     let n = t.encode("Once upon a time, there was a little dragon", &mut ids);
-    assert!(n > 2 && n < 32, "n={n}");
-    let mut out = std::string::String::new();
-    let mut prev = 1u16; // BOS
-    for &id in &ids[1..n] {
-        // ids[0] is BOS itself
-        out.push_str(core::str::from_utf8(t.decode(prev, id)).unwrap());
-        prev = id;
+    // Exact upstream (llama2.c) tokenization: ' Once' ' upon' ' a' ' time' ',' ' there'
+    // ' was' ' a' ' little' ' d' 'r' 'a' 'g' 'on' — "dragon" has no whole-word token here.
+    assert_eq!(
+        &ids[..n],
+        &[1, 403, 407, 261, 378, 432, 383, 286, 261, 376, 279, 420, 412, 428, 289]
+    );
+    assert_eq!(
+        decode_all(&t, &ids[..n]),
+        "Once upon a time, there was a little dragon"
+    );
+}
+
+#[test]
+fn tokenizer_seeds_whole_codepoints() {
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+    let mut ids = [0u16; 64];
+    // U+2019 RIGHT SINGLE QUOTATION MARK has its OWN token (id 468). Seeding per byte would
+    // shred it into three `<0xXX>` fallbacks (229, 131, 156) that can never merge back.
+    let n = t.encode("Lily’s cat", &mut ids);
+    assert_eq!(&ids[..n], &[1, 317, 468, 419, 280, 294]);
+    assert!(ids[..n].contains(&468), "the ’ token must be used");
+    for bad in [229u16, 131, 156] {
+        assert!(
+            !ids[..n].contains(&bad),
+            "byte-fallback id {bad} leaked: {:?}",
+            &ids[..n]
+        );
     }
-    assert_eq!(out.trim_start(), "Once upon a time, there was a little dragon");
+    assert_eq!(decode_all(&t, &ids[..n]), "Lily’s cat");
+}
+
+#[test]
+fn tokenizer_new_rejects_malformed_table() {
+    let m = Model::parse(BLOB).unwrap();
+    let v = m.cfg.vocab;
+    // Truncated mid-entry: the walk runs past the end. Unreachable through Model::parse (the
+    // CRC would fail first), so it has to be exercised directly.
+    let cut = m.tok_table.len() - 1;
+    assert!(Tokenizer::new(&m.tok_table[..cut], v).is_none());
+    // Shorter than the leading max_token_len word.
+    assert!(Tokenizer::new(&[], v).is_none());
+    assert!(Tokenizer::new(&m.tok_table[..3], v).is_none());
+    // Degenerate / oversized vocab.
+    assert!(Tokenizer::new(m.tok_table, 0).is_none());
+    assert!(Tokenizer::new(m.tok_table, 100_000).is_none());
+    // Trailing junk means the table and the vocab count disagree.
+    let mut padded = m.tok_table.to_vec();
+    padded.push(0);
+    assert!(Tokenizer::new(&padded, v).is_none());
 }
 
 #[test]

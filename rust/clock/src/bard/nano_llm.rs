@@ -558,7 +558,16 @@ impl Session {
         let (d, h, gs) = (c.dim, c.hidden, c.gs);
         let (kvd, hd) = (c.kv_dim(), c.head_dim());
         let kv_mul = c.n_heads / c.n_kv_heads; // query heads per kv head (GQA)
+        // ⚠️ The KV cache is SEQ_CAP deep, NOT `cfg.seq_len`. The blob advertises seq_len=512
+        // (what the checkpoint was TRAINED for) while we allocate 256 slots per layer, so every
+        // cache index below strides by SEQ_CAP. Using cfg.seq_len anywhere here would address a
+        // layer's slots at the wrong stride and silently read another layer's keys.
+        debug_assert!(
+            SEQ_CAP <= c.seq_len,
+            "cache deeper than the trained context — RoPE positions would be extrapolated"
+        );
         let pos = pos.min(SEQ_CAP - 1);
+        debug_assert!(pos < SEQ_CAP);
         self.pos = pos as u16;
 
         // 1. Embed: dequantize the token's row of tok_emb straight into the residual stream.
@@ -605,7 +614,7 @@ impl Session {
 
             // 4. Quantize K/V into this layer's cache slot — ONE scale per vector, which is
             //    what makes a 256-deep cache affordable (int8 + f32 scale ≈ 1/4 of f32).
-            let slot = l * SEQ_CAP + pos;
+            let slot = l * SEQ_CAP + pos; // SEQ_CAP, never cfg.seq_len — see the note above
             for (src, cache, scales) in [
                 (&kt, &mut b.k_cache, &mut b.k_scale),
                 (&vt, &mut b.v_cache, &mut b.v_scale),
