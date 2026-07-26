@@ -22,6 +22,7 @@
 - Hardware steps (Task 14) touch **only** the board on /dev/ttyACM0 ("Nexus") — ACM1/ACM2 are never-flash devices.
 - Fresh worktrees: `cp` the gitignored `src/board.rs` + `src/secrets.rs` from the main checkout (`/home/jp/Projects/smol/rust/clock/src/`) or the bin target won't build (done once in this worktree at Task 0).
 - Never use bare `git stash`/`git stash pop` — the stash stack is shared repo-wide and holds other sessions' crash WIP. A/B a baseline via file-copy to /tmp + `git checkout -- <paths>`.
+- **HOSTTEST is the ONLY compile gate for `src/bard/*` until Task 9** wires `mod bard` into the bin — a green `--features bard` firmware build before T9 does NOT compile that code.
 
 ---
 
@@ -264,7 +265,7 @@ fn rejects_corruption() {
 
 (Check `Cargo.toml` for the lib name — `name = "clock"` under `[lib]` or the package name with `-`→`_`; adjust the `use` accordingly.)
 - [ ] **Step 3.2:** HOSTTEST → expect FAIL: `Model` not found.
-- [ ] **Step 3.3:** Implement in `nano_llm.rs` — config, CRC (the 8-line table-free reflected CRC-32, poly `0xEDB8_8320`), and section offsets:
+- [ ] **Step 3.3:** Implement in `nano_llm.rs` — **replacing** the T0 stub `//!` line with the real module doc below (never leave "(populated by later tasks)" behind) — config, CRC (the 8-line table-free reflected CRC-32, poly `0xEDB8_8320`), and section offsets:
 
 ```rust
 //! bard (#300) — nano_llm: stories260K-class inference core.
@@ -831,6 +832,8 @@ Parse once per entry (`Model::parse` is cheap — a CRC walk over flash); on `Er
   - `src/main.rs` mod block: `#[cfg(feature = "bard")] mod bard;`
   - `src/app.rs` `AppKind::Bard` (~:184), `App::Bard(crate::bard::BardApp)` (~:371), `enter` arm (~:404), `on_button`/`update` UFCS arms (~:446/:481), REGISTRY row `AppDesc { title: "Bard", kind: AppKind::Bard }` (~:601).
   - `plugin_bit` → `None` arm; `from_wire`/`as_wire`/`live_screen`: next unused wire id — read the existing `as_wire` arms and take highest+1; the cfg combination must keep `as_wire` **total** (`#[cfg(all(feature = "espnow", feature = "bard"))]` arm plus the model's existing fallback pattern — copy how another hw-tier-optional app handles it; if none exists, gate Bard's wire arms `espnow+bard` and give `from_wire` a graceful `None`).
+- [ ] **Step 9.3b: Bard joins the canonical fleet image.** `tools/repro_build.sh:109` hardcodes the shipped feature set (`cargo build --release --features espnow,cast,io`) and `ota_publish.sh` builds through it — without this step, T14 would canary a **Bard-less** image. Change the list to `espnow,cast,io,bard` (both the build line and any echo/doc of the list in that script). ⚠️ This forks the #44 reproducible-image sha lineage — say so explicitly in the commit message (`feat(bard): #300 add bard to the canonical fleet image (repro lineage change, #44)`) and flag it in the PR body for JP's visibility.
+- [ ] **Step 9.3c:** Prove libm actually resolves inside the riscv32imc **bin** (T0 only proved it links unused): after `mod bard` is wired, `CARGO_TARGET_DIR=… cargo build --release --features espnow,cast,io,bard` must succeed, and a libm-backed symbol must be reachable — e.g. `nm` the ELF (`riscv32-esp-elf-nm` or llvm-nm) and confirm an `expf`/`sinf` reference resolved (statically inlined is fine — the gate is the successful link of code that calls `libm::expf`).
 - [ ] **Step 9.4:** Build gates:
   - `cargo build --release --features bard` → OK. Record `.bss` delta: `riscv32-esp-elf-size` (or `size` from `~/.cargo` llvm tools) on the ELF **with and without** `--features bard`; expect ≈ +93KB bss, ≈ +310KB flash. **If total `.data`+`.bss` approaches the 313KB DRAM window minus stack (see `src/net.rs:210-216`), drop `SEQ_CAP` to 192 and note it in the spec amendment.**
   - `cargo build --release --no-default-features --features hw` then `cargo clippy` all four KATANA tiers + `--features espnow,bard` → clean.
