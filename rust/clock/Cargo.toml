@@ -31,6 +31,19 @@ license = "MIT OR Apache-2.0"
 # 1.x implements, so the display stack composes cleanly with the HAL.
 # -----------------------------------------------------------------------------
 
+# The firmware BIN needs the bare-metal crates, so it can only be built when `hw` is on.
+# Declaring that to cargo (rather than leaving the target auto-discovered) matters for the
+# #300 host tests: cargo builds a package's BINARIES alongside any INTEGRATION test — they
+# get `CARGO_BIN_EXE_*` — so `cargo test --features hostsim --test bard` would otherwise try
+# to compile `src/main.rs` without esp-hal/ssd1306 and fail with ~14 unresolved imports.
+# With `required-features` the bin is SKIPPED under a hostsim-only build, which also makes
+# "hostsim compiles NO firmware code" an invariant cargo enforces instead of a convention.
+# `default`/`bard`/`wifi`/`espnow`/... all imply `hw`, so every firmware build is unchanged.
+[[bin]]
+name = "clock"
+path = "src/main.rs"
+required-features = ["hw"]
+
 [dependencies]
 # --- Core HAL (Phase 1, always on) ---------------------------------------
 # `unstable` is required for I2C/SPI/RNG and is also a hard requirement of
