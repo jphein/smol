@@ -60,6 +60,8 @@ log = "0.4"
 # a short busy-wait for the battery-voltage read in `src/sensors.rs`. Resolves to
 # the 1.1.0 already in the tree (embedded-hal etc. depend on it) — no lock churn.
 nb = "1"
+# bard (#300): float intrinsics (expf/cosf/sinf) for the no-FPU RV32IMC — pure Rust, no_std
+libm = { version = "0.2", optional = true, default-features = false }
 
 # --- Display stack (Phase 1) ---------------------------------------------
 # ssd1306 is the concrete panel driver — HAL-facing (I2C), so it rides `hw`.
@@ -141,7 +143,7 @@ hw = ["dep:esp-hal", "dep:esp-backtrace", "dep:esp-println", "dep:ssd1306"]
 # cdylib; the firmware BIN (src/main.rs) is never compiled under this feature. Every
 # hostsim change in the shared source is `#[cfg(feature="hostsim")]`/`#[cfg(not)]`, so the
 # firmware (hw) path is untouched. See src/lib.rs.
-hostsim = []
+hostsim = ["dep:libm"]
 
 # #72 IO/component registry (ESPHome inverted, "fat image / thin runtime config").
 # Compiles the digital-`Flex` driver menu into ONE image; a runtime pin-map relayed
@@ -194,6 +196,11 @@ wled = ["espnow"]
 # `#[cfg(feature = "cast")]` and every hook is cfg-gated; the `Oled` type only swaps to
 # the tee under this flag).
 cast = ["espnow"]
+
+# ── bard (#300): on-device tiny-LLM storyteller ─────────────────────────────
+# Radio-free: rides `hw` only, so it can ship in every tier incl. `default`.
+# Pulls no alloc — the core is static-buffer only (spec §5).
+bard = ["hw", "dep:libm"]
 
 # COEXIST SOAK (issue #23 PART 1 — the gating experiment, NOT for production).
 # The gateway stays WiFi-associated after boot (no switch to ESP-NOW time-share),

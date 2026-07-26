@@ -49,6 +49,11 @@ pub mod app;
 pub mod clock;
 #[cfg(feature = "hostsim")]
 pub mod input;
+// #300 The Bard's tiny-LLM core. Lives in `src/bard/` (its own dir, room for the
+// tokenizer/model siblings) but is a plain pure core like the rest — no `hw`, no radio.
+#[cfg(feature = "hostsim")]
+#[path = "bard/nano_llm.rs"]
+pub mod nano_llm;
 #[cfg(feature = "hostsim")]
 pub mod sensors;
 #[cfg(feature = "hostsim")]
