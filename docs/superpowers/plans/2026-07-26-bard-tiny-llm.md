@@ -9,9 +9,10 @@
 **Tech stack:** Rust `no_std` (only new dep: `libm`, optional), embedded-graphics `FONT_5X8`, Python 3 + torch (offline only), reference C `llama2.c` (offline golden baseline only).
 
 **Branch:** `feat/300-bard-tiny-llm` off `main`. Conventional commits. All host tests run as
-`cd rust/clock && cargo test --no-default-features --features hostsim --target x86_64-unknown-linux-gnu --lib --tests`
+`cd rust/clock && cargo test --no-default-features --features hostsim --target x86_64-unknown-linux-gnu --lib --test bard`
 (referred to below as **HOSTTEST**; `.cargo/config.toml` pins the host linker already).
-⚠️ The `--lib --tests` scoping is mandatory — without it cargo also builds the BIN target, which cannot compile under hostsim (pre-existing, verified at Task 0).
+⚠️ Target scoping is mandatory: an unscoped `cargo test` — and also `--tests` — builds the BIN's unit-test target, which cannot compile under hostsim (pre-existing; verified T0 + oracle). Before `tests/bard.rs` exists (Tasks 0-2), use plain `--lib`.
+⚠️ `clippy --features hostsim` has 3 pre-existing lints (app.rs:43, clock.rs:28, sensors.rs:190) — no gate may expect hostsim-clippy green; the KATANA tiers + `--features bard` are the clippy gates.
 
 **Worker constraints (read first):**
 - The `default` tier has **no allocator** — the bard core must be alloc-free (fixed buffers only). Zero `alloc::` anywhere in `src/bard/`.
