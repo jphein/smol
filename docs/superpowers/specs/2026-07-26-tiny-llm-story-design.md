@@ -4,6 +4,10 @@
 **Status:** design approved in-session by JP 2026-07-26 — next step: implementation plan
 **Author:** claude (fable-5, orchestrator) · **Date:** 2026-07-26
 
+> ### ✏️ AMENDMENT — 2026-07-26 (implementation planning, same session)
+> Four refinements settled while writing the plan (`docs/superpowers/plans/2026-07-26-bard-tiny-llm.md`):
+> **§6 RNG** — hardware-TRNG seeding → **xorshift32 seeded from `now_ms` at the button press** (Snake's proven pattern, `src/snake.rs:106`); the TRNG peripheral is owned by the radio layer and unreachable in the `default` tier. **§11 golden test** — "must equal reference output exactly" → **≥120-char temp-0 prefix match vs upstream `runq`** plus a full-story self-golden for regressions: our KV cache is int8 while runq's is f32, so tail divergence is expected; the long shared prefix is what proves the port. **§3 host tests** — ride the existing `hostsim` lib target (#152), no new crate; bard's pure-core modules are exported there. **§4 hidden_dim** — read from the checkpoint at export time (likely 192, not ~172; the export script's printed stats line is the record — never hardcoded).
+
 ---
 
 ## 0. Thesis
