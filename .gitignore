@@ -54,6 +54,11 @@ tools/ota_publish.env
 # brainstorm visual-companion sessions (local mockups)
 .superpowers/
 
+# bard (#300) model artifacts: the upstream stories260K checkpoint + tok512.bin that
+# tools/bard_fetch_model.sh downloads (sha256-pinned). ~1 MB of UPSTREAM bytes — never
+# committed; the tracked deliverable is the exported rust/clock/model/*.bin blob.
+/scratch/bard/
+
 # #152 web emulator build artifacts
 rust/web-emu/target/
 web/emulator/*.wasm
