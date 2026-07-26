@@ -19,7 +19,7 @@
 - Multi-KB buffers go in module-level `static mut … : [u8; N]` reached via `core::ptr::addr_of_mut!` (house idiom, see `src/ota_mesh.rs:676-678`) — **never** fields on the `App` union, **never** big stack locals.
 - Every new registration arm carries `#[cfg(feature = "bard")]`. A `--no-default-features --features hw` build must be byte-identical to before (feature-absence = symbol absence).
 - Do not touch `partitions-ota.csv`, `board.rs`, or anything under `src/net/` except where a task says so.
-- Hardware steps (Task 14) touch **only** the board on /dev/ttyACM0 ("Nexus") — ACM1/ACM2 are never-flash devices.
+- Hardware steps: the première/bench board is **Eldritch Nexus (id8), /dev/ttyACM3, MAC `ac:a7:04:ba:1f:24`** (chip-verified esp32c3/4MB + MAC-matched to the known id8 fleet serial, 2026-07-26; JP plugged it for the first-story demo — show the first on-glass story THERE). **No fallback board without JP's positive confirmation** (ACM0 currently carries id7-as-measurement-DUT — not ours). **Verify identity by MAC before every flash, via `udevadm info --query=property --name=<port> | grep ID_SERIAL_SHORT` (passive — espflash board-info RESETS the target)**; ports float. Allowlist = `ACA704BA1F24` only. Deny always: laundry proxy `E8069065 9FE4`, JP's C6 watch `98A316A72FE4`, Dygma.
 - Fresh worktrees: `cp` the gitignored `src/board.rs` + `src/secrets.rs` from the main checkout (`/home/jp/Projects/smol/rust/clock/src/`) or the bin target won't build (done once in this worktree at Task 0).
 - Never use bare `git stash`/`git stash pop` — the stash stack is shared repo-wide and holds other sessions' crash WIP. A/B a baseline via file-copy to /tmp + `git checkout -- <paths>`.
 - **HOSTTEST is the ONLY compile gate for `src/bard/*` until Task 9** wires `mod bard` into the bin — a green `--features bard` firmware build before T9 does NOT compile that code.
@@ -891,8 +891,9 @@ log::info!("smol #300: bard story done — {} tok, avg {} ms/tok, max {} ms",
 
 ---
 
-### Task 13: Bench-board validation (hardware — Nexus/ACM0 **only**)
+### Task 13: Bench-board validation (hardware — Eldritch Nexus id8, see Worker constraints for port/MAC)
 
+- [ ] **Step 13.0:** `espflash board-info` on the target port — proceed ONLY if the MAC is `ac:a7:04:ba:1f:24` (id8) or `ACM0`'s known Nexus identity. Any other MAC = STOP.
 - [ ] **Step 13.1:** Flash the bench board over USB: `cargo build --release --features espnow,bard` → `espflash flash` per `docs/BUILDING.md`. ⚠️ After ANY prior OTA on this board: `espflash erase-region 0xf000 0x2000` first (otadata → ota_0 trap), then verify the `Loaded app from offset 0x20000` boot line.
 - [ ] **Step 13.2:** With `ESP_LOG=info` build (release images are serial-silent), on-glass run: menu → Bard → short press. Verify: story composes typewriter-style, mesh LED stays in its normal state (peer solid), Familiar/roster unaffected on a second board, long-press exits cleanly mid-compose.
 - [ ] **Step 13.3:** Capture the Task-11 perf line for 3 stories. **Record avg/max ms/token + observed mesh health as an AMENDMENT block in the spec** (house style), including the go/no-go on the §7 per-layer-yield fallback (needed only if max-stall visibly degrades mesh RX — check a leaf's DIAG link-quality while composing).
