@@ -11,7 +11,7 @@
 **Branch:** `feat/300-bard-tiny-llm` off `main`. Conventional commits. All host tests run as
 `cd rust/clock && cargo test --no-default-features --features hostsim --target x86_64-unknown-linux-gnu --lib --test bard`
 (referred to below as **HOSTTEST**; `.cargo/config.toml` pins the host linker already).
-⚠️ Target scoping is mandatory: an unscoped `cargo test` — and also `--tests` — builds the BIN's unit-test target, which cannot compile under hostsim (pre-existing; verified T0 + oracle). Before `tests/bard.rs` exists (Tasks 0-2), use plain `--lib`.
+⚠️ Target scoping works because T3 added `[[bin]] required-features = ["hw"]` to Cargo.toml — cargo skips the firmware bin under hostsim-only builds (integration tests otherwise force-build package binaries). "hostsim compiles NO firmware code" is now cargo-enforced.
 ⚠️ `clippy --features hostsim` has 3 pre-existing lints (app.rs:43, clock.rs:28, sensors.rs:190) — no gate may expect hostsim-clippy green; the KATANA tiers + `--features bard` are the clippy gates.
 
 **Worker constraints (read first):**
@@ -395,7 +395,7 @@ pub struct Tokenizer<'a> { table: &'a [u8], vocab: usize, offsets: [u32; crate::
 
 Methods (all straight ports of llama2.c `tokenizer.c`):
 - `fn entry(&self, id: u16) -> (f32 /*score*/, &'a [u8] /*text*/)`
-- `pub fn decode(&self, prev: u16, id: u16) -> &'a [u8]` — entry text; **if `prev == BOS(1)` strip one leading space**; map raw-byte tokens `<0xXX>` (they are entries whose text is exactly that 6-char pattern) to their single byte via a small internal `[u8;1]`-per-call — for simplicity return the printable text for v1 and skip raw-byte mapping (TinyStories output is plain ASCII; raw-byte tokens effectively never sampled — if one appears, render nothing).
+- `pub fn decode(&self, prev: u16, id: u16) -> &'a [u8]` — entry text; **if `prev == BOS(1)` strip one leading space**; raw-byte tokens `<0xXX>` (ids 3..259) decode to their literal byte via a static 256-entry pieces table (AS BUILT at T4 — matches upstream `decode()`; the model can sample these ids, and dropping them would eat story characters). Consequence for T7/T10: decode may return one byte of a multi-byte UTF-8 sequence — consumers write **bytes**, never assume `&str` per token.
 - `pub fn encode(&self, text: &str, out: &mut [u16]) -> usize` —
   1. `out[0] = 1` (BOS); if text non-empty, push the id of the single-space token (`str_lookup(" ")`).
   2. Per byte of text: find the vocab id whose text equals that single byte (linear scan; build a `[u16; 256]` byte→id map once in `new`).
@@ -437,6 +437,9 @@ fn forward_is_deterministic_and_finite() {
 - [ ] **Step 5.3:** Implement. Tensor accessors over `Model::qdata` first — each tensor is located by a running offset computed from cfg **in the Task-2 order**; write one table-driven fn:
 
 ```rust
+/// One tensor FAMILY: i8 data for ALL layers contiguous, then f32 scales for all layers
+/// (SBRD family-grouped layout — NOT llama2.c's per-layer q/s interleave; oracle-verified).
+/// Flattened family index / GS therefore indexes `s` directly across layer boundaries.
 pub(crate) struct QTensor<'a> { pub q: &'a [i8], pub s: &'a [u8] /* f32 LE scales */ }
 impl<'a> Model<'a> {
     /// idx: 0=emb 1=wq 2=wk 3=wv 4=wo 5=w1 6=w2 7=w3 8=wcls
