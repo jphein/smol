@@ -625,7 +625,7 @@ impl Session {
 
 **Files:** Create `tools/bard_reference.py`, `tools/bard_golden_baseline.sh`, `rust/clock/src/bard/testdata/golden_ref.txt`, `rust/clock/src/bard/testdata/golden_tokens.txt`, Modify `tests/bard.rs`
 
-- [ ] **Step 6.1:** Write `tools/bard_reference.py` (numpy only, from the T2 venv). Contract — every numeric detail must mirror T5's Rust:
+- [ ] **Step 6.1:** Write `tools/bard_reference.py` (numpy only, from the T2 venv). Contract — every numeric detail must mirror T5's Rust **as built** (the exact-form table in the T5 report / `scratch/bard-300/vesper-implementer-t5.md` is normative: SwiGLU as a divide `v/(1+exp(-v))*gate`; score = `dot * k_scale * inv_sqrt_hd` with hoisted inv_sqrt_hd; V-accumulate as `a = att*v_scale` then `+= a*v`; zero rounds +0.5; do not reassociate):
   - Parse SBRD (same layout as T2's writer); all math in **np.float32** (assert dtypes; no float64 accumulators anywhere — `np.float32` scalars, `dtype=np.float32` arrays).
   - Weights: dequantize NOTHING up front — keep q8 + scales; matmul does the segment walk: for each output row, segments bounded by every weight-group edge (flattened index) and activation-group edge (position index); per segment `int32` dot of i8×i8, then `acc += np.float32(ival) * ws[wg] * xs[ag]` in row-major segment order (same order as Rust).
   - Activation quantization: per position-group of GS with ragged tail; `q = trunc(v/s + (0.5 if v>=0 else -0.5))` clamped to ±127 (mirrors Rust's `as i8` truncation — do NOT use np.round, it's banker's rounding).
@@ -683,6 +683,7 @@ fn golden_prefix_matches_reference_runq() {
 }
 ```
 (The reference output includes the prompt text — align both sides before comparing so the prefix starts at the same character; note what you did in the commit.)
+- [ ] **Step 6.3b:** Also add the cheapest regression guard this numeric stack will get (T5 recommendation): a test that greedy-decodes from bare BOS and asserts the text starts with the known deterministic opening (`"Once upon a time, there was a little girl named Lily"` for this blob) — regenerate alongside the golden files on any blob change.
 - [ ] **Step 6.4:** HOSTTEST → this test may FAIL first — that is the point. Debug order: prompt token ids (both sides print them), first divergent token id vs `golden_tokens.txt`, RoPE convention, activation-rounding formula, segment-flush order, BOS-space decode. **Do not weaken the bar below 120 chars without a written analysis in the commit message.** When it passes: PASS.
 - [ ] **Step 6.5:** Commit: `test(bard): #300 golden prefix vs independent Python reference — port proven`
 
