@@ -58,6 +58,9 @@ tools/ota_publish.env
 # tools/bard_fetch_model.sh downloads (sha256-pinned). ~1 MB of UPSTREAM bytes — never
 # committed; the tracked deliverable is the exported rust/clock/model/*.bin blob.
 /scratch/bard/
+# ...but the EXPORTED q8 blob IS a tracked deliverable (~277 KB, MIT-licensed weights),
+# so re-include it past the blanket `*.bin` on line 3 (order matters: exclude then negate).
+!rust/clock/model/*.bin
 
 # #152 web emulator build artifacts
 rust/web-emu/target/
