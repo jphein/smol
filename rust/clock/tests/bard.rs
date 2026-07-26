@@ -6,7 +6,7 @@
 //! compile without the `hw` crates.
 #![cfg(feature = "hostsim")]
 use clock::bard_tokenizer::Tokenizer;
-use clock::nano_llm::{Model, ParseErr};
+use clock::nano_llm::{Bufs, Model, ParseErr, Session};
 
 pub const BLOB: &[u8] = include_bytes!("../model/stories260K-q8.bin");
 
@@ -47,4 +47,23 @@ fn tokenizer_roundtrip() {
         prev = id;
     }
     assert_eq!(out.trim_start(), "Once upon a time, there was a little dragon");
+}
+
+#[test]
+fn forward_is_deterministic_and_finite() {
+    let m = Model::parse(BLOB).unwrap();
+    let mut bufs = std::boxed::Box::new(Bufs::INIT);
+    let logits1 = {
+        let mut s = Session::new();
+        s.forward(&m, &mut bufs, 1, 0).to_vec()
+    };
+    let logits2 = {
+        let mut s = Session::new();
+        s.forward(&m, &mut bufs, 1, 0).to_vec()
+    };
+    assert_eq!(logits1, logits2);
+    assert!(logits1.iter().all(|v| v.is_finite()));
+    let spread = logits1.iter().cloned().fold(f32::MIN, f32::max)
+        - logits1.iter().cloned().fold(f32::MAX, f32::min);
+    assert!(spread > 1.0, "logits look degenerate: spread={spread}");
 }
