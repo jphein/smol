@@ -9,8 +9,9 @@
 **Tech stack:** Rust `no_std` (only new dep: `libm`, optional), embedded-graphics `FONT_5X8`, Python 3 + torch (offline only), reference C `llama2.c` (offline golden baseline only).
 
 **Branch:** `feat/300-bard-tiny-llm` off `main`. Conventional commits. All host tests run as
-`cd rust/clock && cargo test --no-default-features --features hostsim --target x86_64-unknown-linux-gnu`
+`cd rust/clock && cargo test --no-default-features --features hostsim --target x86_64-unknown-linux-gnu --lib --tests`
 (referred to below as **HOSTTEST**; `.cargo/config.toml` pins the host linker already).
+⚠️ The `--lib --tests` scoping is mandatory — without it cargo also builds the BIN target, which cannot compile under hostsim (pre-existing, verified at Task 0).
 
 **Worker constraints (read first):**
 - The `default` tier has **no allocator** — the bard core must be alloc-free (fixed buffers only). Zero `alloc::` anywhere in `src/bard/`.
@@ -18,6 +19,8 @@
 - Every new registration arm carries `#[cfg(feature = "bard")]`. A `--no-default-features --features hw` build must be byte-identical to before (feature-absence = symbol absence).
 - Do not touch `partitions-ota.csv`, `board.rs`, or anything under `src/net/` except where a task says so.
 - Hardware steps (Task 14) touch **only** the board on /dev/ttyACM0 ("Nexus") — ACM1/ACM2 are never-flash devices.
+- Fresh worktrees: `cp` the gitignored `src/board.rs` + `src/secrets.rs` from the main checkout (`/home/jp/Projects/smol/rust/clock/src/`) or the bin target won't build (done once in this worktree at Task 0).
+- Never use bare `git stash`/`git stash pop` — the stash stack is shared repo-wide and holds other sessions' crash WIP. A/B a baseline via file-copy to /tmp + `git checkout -- <paths>`.
 
 ---
 
