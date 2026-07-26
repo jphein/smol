@@ -10,10 +10,10 @@
 //!
 //! Two conventions worth knowing, both inherited from SentencePiece via llama2.c:
 //!   * DUMMY PREFIX — encode prepends the " " token (a lookup of the one-space string, not a
-//!     byte id) before the text, so "Once" tokenizes as " Once". [`decode`] undoes it by
+//!     byte id) before the text, so "Once" tokenizes as " Once". [`Tokenizer::decode`] undoes it by
 //!     stripping ONE leading space when the previous token was BOS.
 //!   * BYTE FALLBACK — ids 3..259 are literal `<0xXX>` STRINGS, not raw bytes. A character
-//!     with no token of its own encodes as `<0xXX>`, and [`decode`] converts it back to the
+//!     with no token of its own encodes as `<0xXX>`, and [`Tokenizer::decode`] converts it back to the
 //!     byte. (For the shipped tok512 all 88 single-char tokens cover plain-ASCII stories, so
 //!     this path is cold — but the model can still SAMPLE such an id, and dropping it would
 //!     silently eat characters.)
@@ -80,7 +80,7 @@ pub struct Tokenizer<'a> {
 
 impl<'a> Tokenizer<'a> {
     /// Index `table` for a `vocab`-entry tokenizer, or `None` if the table is malformed
-    /// (short, inconsistent, or holding a token longer than [`CONCAT`]).
+    /// (short, inconsistent, or holding a token longer than the 16-byte merge scratch).
     pub fn new(table: &'a [u8], vocab: usize) -> Option<Self> {
         if vocab == 0 || vocab > MAX_VOCAB || table.len() < 4 {
             return None;

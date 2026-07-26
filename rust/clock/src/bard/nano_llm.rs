@@ -12,14 +12,28 @@
 //!   8  u32 dim, hidden, n_layers, n_heads, n_kv_heads, vocab, seq_len, gs, shared_cls  (9)
 //!  44  u32 tok_bytes                48  tokenizer section, then 0-pad to 4-byte alignment
 //!      f32 norms: rms_att[L][dim] · rms_ffn[L][dim] · rms_final[dim]
-//!      q8 tensors, each i8 data[n] then f32 scales[n/gs]:
+//!      q8 families, in this order — for EACH family, i8 data for ALL layers contiguously,
+//!      THEN the f32 scales for ALL layers contiguously:
 //!         tok_emb · wq · wk · wv · wo · w1 · w2 · w3 · (wcls only if !shared_cls)
+//!            family i8   = n_total          bytes, n_total = n_layers * (rows * in)
+//!            family f32s = n_total/gs * 4   bytes
 //!      u32 crc32 of every preceding byte
 //! ```
 //!
-//! Quantization groups run over each matrix's FLATTENED data, so a group may straddle row
-//! boundaries (it does here: w2's in-dim is 172, not a multiple of gs=64). Consumers must
-//! index scales by flattened position — see the exporter's docstring for the full rationale.
+//! ⚠️ FAMILY-GROUPED, NOT PER-MATRIX INTERLEAVED. llama2.c's `export.py` writes `q,s` per
+//! MATRIX (q₀ s₀ q₁ s₁ …); SBRD writes one i8 block then one scale block per FAMILY. So a
+//! layer's scales are NOT at `family_start + layer_i8_len` — reading floats just past a
+//! layer's i8 data lands in the NEXT layer's i8 data. Address a weight as
+//! `i8[family_i8 + layer*numel + row*in + k]` and its scale as
+//! `f32[family_scales + (layer*numel + row*in + k)/gs]`, i.e. ONE flattened index per family
+//! that runs across layer boundaries.
+//!
+//! Quantization groups run over that flattened data, so a group may straddle ROW boundaries
+//! (it does here: w2's in-dim is 172, not a multiple of gs=64) — consumers must index scales
+//! by flattened position, never per row. Groups never straddle a LAYER or MATRIX boundary,
+//! because each matrix's numel is a multiple of `gs` (checked by the exporter and re-checked
+//! here), which is also why the per-family flattened index equals
+//! `layer * numel/gs + (row*in + k)/gs`. See the exporter's docstring for the full rationale.
 
 /// Compile-time maxima: the statically-sized buffers the forward pass will use are cut to
 /// these, and [`Model::parse`] refuses any header that would overflow them. They bound
@@ -104,7 +118,8 @@ pub struct Model<'a> {
     pub tok_table: &'a [u8],
     /// f32 RMSNorm weights: `rms_att[L][dim] · rms_ffn[L][dim] · rms_final[dim]`.
     pub norms: &'a [u8],
-    /// The q8 tensor families, in blob order.
+    /// The q8 tensor families, in blob order, each an i8 block for ALL layers followed by the
+    /// f32 scale block for ALL layers (see the module doc — NOT a per-matrix `q,s` interleave).
     pub qdata: &'a [u8],
 }
 
