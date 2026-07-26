@@ -485,14 +485,23 @@ fn quantize(x: &[f32], gs: usize, q: &mut [i8], s: &mut [f32]) {
         }
     }
 }
+/// ⚠️ GS groups run over the FLATTENED weight tensor (T2 export semantics). hidden=172 means
+/// w2's rows straddle weight-group boundaries; activation groups are position-aligned with a
+/// ragged tail. The i32 accumulator therefore flushes at EVERY weight- OR activation-group edge.
+/// For matrices whose in-dim divides GS this degenerates to exactly one flush per GS chunk.
 fn matmul(out: &mut [f32], xq: &[i8], xs: &[f32], w: &QTensor, w_off: usize, n_in: usize, n_out: usize, gs: usize) {
     for i in 0..n_out {
         let row = w_off + i * n_in;
         let mut acc = 0f32;
-        for g in 0..(n_in / gs) {
+        let mut j = 0usize;
+        while j < n_in {
+            let wg = (row + j) / gs;              // weight group (flattened index)
+            let ag = j / gs;                      // activation group (position index)
+            let seg_end = core::cmp::min(core::cmp::min((wg + 1) * gs - row, (ag + 1) * gs), n_in);
             let mut ival: i32 = 0;
-            for j in 0..gs { ival += w.q[row + g * gs + j] as i32 * xq[g * gs + j] as i32; }
-            acc += ival as f32 * rf32(w.s, (row / gs) + g) * xs[g];
+            for k in j..seg_end { ival += w.q[row + k] as i32 * xq[k] as i32; }
+            acc += ival as f32 * rf32(w.s, wg) * xs[ag];
+            j = seg_end;
         }
         out[i] = acc;
     }
@@ -601,41 +610,44 @@ impl Session {
     }
 }
 ```
-⚠️ Two RoPE conventions exist; llama2.c rotates **adjacent pairs with per-head-position frequency** exactly as above (`head_dim`-relative exponent). If the Task-6 golden disagrees, this is the first place to look. ⚠️ `signum()*0.5` rounding: `0f32.signum()` is `1.0` — harmless (value is 0).
+⚠️ Two RoPE conventions exist; llama2.c rotates **adjacent pairs with per-head-position frequency** exactly as above (`head_dim`-relative exponent). If the Task-6 golden disagrees, this is the first place to look. ⚠️ `signum()*0.5` rounding: `0f32.signum()` is `1.0` — harmless (value is 0). ⚠️ `quantize` uses `chunks(gs)` which already yields the ragged 44-element tail for a 172-long vector — iterate `chunk.len()`, never `gs`, inside it; `xs` needs `ceil(n/gs)` valid scales. The activation rounding formula (`trunc(v/sc ± 0.5)` via the `as i8` cast) is part of the golden contract with `bard_reference.py` — change neither side alone.
 - [ ] **Step 5.4:** HOSTTEST → PASS.
 - [ ] **Step 5.5:** Commit: `feat(bard): #300 int8 forward pass with quantized KV cache`
 
 ---
 
-### Task 6: Golden baseline vs reference llama2.c (TDD — the port-correctness gate)
+### Task 6: Golden baseline vs an independent Python reference (TDD — the port-correctness gate)
 
-**Files:** Create `tools/bard_golden_baseline.sh`, `rust/clock/src/bard/testdata/golden_ref.txt`, Modify `tests/bard.rs`
+> **Why not upstream runq.c (T2 finding, verified in source):** `runq.c:332` walks `j <= n - GS` so with n=172/GS=64 it silently drops in-dim elements 128..171 of every w2 row, and `runq.c:146` leaves the activation tail unquantized. A correct implementation MUST disagree with runq on this checkpoint. The reference is therefore an independent Python forward pass over the SAME committed blob, mirroring the T5 integer semantics exactly — a genuine cross-implementation check in a different language.
 
-- [ ] **Step 6.1:** Write `tools/bard_golden_baseline.sh`:
+**Files:** Create `tools/bard_reference.py`, `tools/bard_golden_baseline.sh`, `rust/clock/src/bard/testdata/golden_ref.txt`, `rust/clock/src/bard/testdata/golden_tokens.txt`, Modify `tests/bard.rs`
+
+- [ ] **Step 6.1:** Write `tools/bard_reference.py` (numpy only, from the T2 venv). Contract — every numeric detail must mirror T5's Rust:
+  - Parse SBRD (same layout as T2's writer); all math in **np.float32** (assert dtypes; no float64 accumulators anywhere — `np.float32` scalars, `dtype=np.float32` arrays).
+  - Weights: dequantize NOTHING up front — keep q8 + scales; matmul does the segment walk: for each output row, segments bounded by every weight-group edge (flattened index) and activation-group edge (position index); per segment `int32` dot of i8×i8, then `acc += np.float32(ival) * ws[wg] * xs[ag]` in row-major segment order (same order as Rust).
+  - Activation quantization: per position-group of GS with ragged tail; `q = trunc(v/s + (0.5 if v>=0 else -0.5))` clamped to ±127 (mirrors Rust's `as i8` truncation — do NOT use np.round, it's banker's rounding).
+  - RMSNorm eps 1e-5; RoPE = llama2.c adjacent-pair rotation with head_dim-relative exponent; softmax in float32; KV cache int8 per-vector scales, same trunc rounding.
+  - Tokenizer: decode from the blob's table (strip one leading space after BOS); greedy BPE encode identical to Task 4's spec (BOS=1, leading-space token, byte fallback, best-score merges).
+  - CLI: `bard_reference.py <blob> --temp 0 --steps 200 -i "<prompt>"` → prints `# reference <blob-sha256-short> temp0` on line 1, then prompt+continuation as one story text; `--tokens-out <path>` writes generated token ids one per line. Termination on token 1 or 2 or step cap.
+- [ ] **Step 6.2:** Write `tools/bard_golden_baseline.sh`:
 
 ```bash
 #!/usr/bin/env bash
-# bard (#300): reference temp-0 output from upstream llama2.c runq (int8), for the golden test.
+# bard (#300): golden reference from the independent Python forward pass (see plan Task 6 for
+# why upstream runq.c is disqualified for this checkpoint).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-tools/bard_fetch_model.sh
-D=scratch/bard/llama2.c
-[ -d "$D" ] || git clone --depth 50 https://github.com/karpathy/llama2.c "$D"
-git -C "$D" rev-parse HEAD
-make -C "$D" runq >/dev/null
 PY=scratch/bard/venv/bin/python
-[ -x "$PY" ] || PY=python3
-"$PY" "$D/export.py" scratch/bard/stories260K_q80.bin --version 2 --checkpoint scratch/bard/stories260K.pt
-OUT=rust/clock/src/bard/testdata/golden_ref.txt
-mkdir -p "$(dirname "$OUT")"
-{ echo "# llama2.c $(git -C "$D" rev-parse --short HEAD) runq -t 0 -i 'Once upon a time, there was a little dragon'";
-  "$D/runq" scratch/bard/stories260K_q80.bin -z scratch/bard/tok512.bin -t 0 -n 200 \
-      -i "Once upon a time, there was a little dragon"; } > "$OUT"
-echo "golden written: $OUT"
+OUT=rust/clock/src/bard/testdata
+mkdir -p "$OUT"
+"$PY" tools/bard_reference.py rust/clock/model/stories260K-q8.bin \
+  --temp 0 --steps 200 -i "Once upon a time, there was a little dragon" \
+  --tokens-out "$OUT/golden_tokens.txt" > "$OUT/golden_ref.txt"
+echo "golden written: $OUT/golden_ref.txt"
 ```
 
-- [ ] **Step 6.2:** Run it; eyeball `golden_ref.txt` — expect a coherent-ish toddler story continuing the prompt. Commit the file + script.
-- [ ] **Step 6.3:** Failing test (append to `tests/bard.rs`):
+Run it; eyeball `golden_ref.txt` — expect a coherent-ish toddler story continuing the prompt (the fp32 model is known-good upstream; if the reference emits garbage, the reference or the blob is wrong — STOP and report rather than committing a garbage golden). Commit script + reference + both testdata files.
+- [ ] **Step 6.3:** Failing test (append to `tests/bard.rs`) — note the golden file's line 1 is a `#` comment and the story text includes the prompt; also compare the generated token ids against `golden_tokens.txt` (exact, id-by-id, up to the first 32 — transcendental differences libm-vs-numpy may cause later drift; the 120-char text bar below is the gate, the id comparison is the debugging aid):
 
 ```rust
 #[test]
@@ -667,9 +679,9 @@ fn golden_prefix_matches_reference_runq() {
     assert_eq!(text.trim()[..bar], golden_story.trim()[..bar]);
 }
 ```
-(The runq output includes the prompt text — align both sides before comparing: strip the prompt from whichever side carries it so the compared prefix starts at the same character. Resolve at implementation against the actual file, and note what you did in the commit.)
-- [ ] **Step 6.4:** HOSTTEST → this test may FAIL first — that is the point. Debug order: tokenizer ids (print both sides' encode of the prompt vs `runq -i` behavior), RoPE convention, BOS-space decode, quantize rounding. **Do not weaken the bar below 120 chars without a written analysis in the commit message.** When it passes: PASS.
-- [ ] **Step 6.5:** Commit: `test(bard): #300 golden prefix vs upstream runq — port proven`
+(The reference output includes the prompt text — align both sides before comparing so the prefix starts at the same character; note what you did in the commit.)
+- [ ] **Step 6.4:** HOSTTEST → this test may FAIL first — that is the point. Debug order: prompt token ids (both sides print them), first divergent token id vs `golden_tokens.txt`, RoPE convention, activation-rounding formula, segment-flush order, BOS-space decode. **Do not weaken the bar below 120 chars without a written analysis in the commit message.** When it passes: PASS.
+- [ ] **Step 6.5:** Commit: `test(bard): #300 golden prefix vs independent Python reference — port proven`
 
 ---
 
