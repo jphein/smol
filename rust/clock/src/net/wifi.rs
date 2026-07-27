@@ -1323,6 +1323,15 @@ pub const CFG_KEY_CUSTOM: u8 = b'Y';
 /// like S/L/U/P/Y, applied live (no reboot): the next story uses it.
 pub const CFG_KEY_TALE: u8 = b'T';
 
+/// #302 Bard DELIVERY channel (key `V`). Per-node retained `smol/<id>/config/delivery` =
+/// `<ms_per_char>:<mode>`, e.g. `160:inf` (write forever, continuous scroll) or `80:page` (one
+/// screenful, then wait for a press). EMPTY payload = retain-clear ⇒ back to the built-in defaults
+/// (`160:inf`), the same "empty = default" convention as `S` and `T`. The speed is CLAMPED to
+/// 20..=500 ms/char on the node (a 0 would peg the reveal loop) and a malformed value is REFUSED
+/// with the previous setting kept — see `bard::delivery::Delivery::parse`. Cached + relayed like
+/// S/L/U/P/Y/T, applied live: the next tick uses it, mid-tale, no reboot.
+pub const CFG_KEY_DELIVERY: u8 = b'V';
+
 pub const CFG_KEY_SCAN: u8 = b'W';
 /// #100 network-switch CONFIG (key `N`) = the active WiFi-slot index (`0`/`1`). RETAINED/CACHED
 /// STATE (relayed like S/L/U/P/Y, NOT a one-shot command like R/W) — a node applies it by writing
@@ -1424,6 +1433,10 @@ pub struct GwOwnCfg {
     /// `bard`-gated like the `io` fields below: a build without the Bard carries no field.
     #[cfg(feature = "bard")]
     pub tale: Option<([u8; CFG_VALUE_MAX], usize)>,
+    /// #302 the gateway's own `smol/<id>/config/delivery` value `(buf, len)`, or `None`. Same
+    /// `bard` gate as `tale`.
+    #[cfg(feature = "bard")]
+    pub delivery: Option<([u8; CFG_VALUE_MAX], usize)>,
     /// #45 the gateway's own `smol/<id>/config/custom` value `(buf, len)`, or `None` if absent.
     pub custom: Option<([u8; CFG_VALUE_MAX], usize)>,
     /// #100 the gateway's own `smol/<id>/config/net` (or global `smol/config/net`) active-slot
@@ -1462,6 +1475,8 @@ impl GwOwnCfg {
             wifi_all: None,
             #[cfg(feature = "bard")]
             tale: None,
+            #[cfg(feature = "bard")]
+            delivery: None,
             #[cfg(feature = "io")]
             io: None,
             #[cfg(feature = "io")]
@@ -2337,6 +2352,11 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 28, b"smol/+/config/tale") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
+        // #302 Bard delivery (pid 29): the reveal pace + inf/page mode, same relay path as `tale`.
+        #[cfg(feature = "bard")]
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 29, b"smol/+/config/delivery") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
         // #100 network-switch (pid 16 per-node + pid 17 fleet-wide): the retained active-slot index.
         // CONFIG/CACHED (key `N`, relayed like S/L/U/P/Y). Per-node `smol/<id>/config/net` + the
         // global `smol/config/net` (→ target 255). Applying it writes the NVS net-record + reboots
@@ -2955,6 +2975,31 @@ fn mqtt_session(
                         } else {
                             gw_own.tale = Some(GwOwnCfg::val(payload));
                             log::info!("smol #303: gateway own story prompt captured ({} B)", payload.len());
+                        }
+                        #[cfg(not(feature = "bard"))]
+                        let _ = leaf_id;
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/delivery")
+                    {
+                        // #302 Bard delivery (key `V`): twin of the `tale` arm above. Not parsed
+                        // here either — the node clamps and validates it (`bard::set_delivery`), so
+                        // one implementation of the format lives on the side that has to honour it.
+                        #[cfg(feature = "bard")]
+                        if leaf_id != node_id {
+                            if let Some(cache) = cfg_cache.as_deref_mut() {
+                                let now = Instant::now().duration_since_epoch().as_millis();
+                                cache.set(leaf_id, CFG_KEY_DELIVERY, payload, [0u8; 6], now);
+                                log::info!(
+                                    "smol #302: cached leaf id{} bard delivery for relay ({} B)",
+                                    leaf_id,
+                                    payload.len()
+                                );
+                            }
+                        } else {
+                            gw_own.delivery = Some(GwOwnCfg::val(payload));
+                            log::info!(
+                                "smol #302: gateway own bard delivery captured ({} B)",
+                                payload.len()
+                            );
                         }
                         #[cfg(not(feature = "bard"))]
                         let _ = leaf_id;

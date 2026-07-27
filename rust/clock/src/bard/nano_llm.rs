@@ -1061,12 +1061,20 @@ impl Story {
         }
     }
 
-    /// Whether the story has finished (further steps return [`StepOut::Done`]).
+    /// Whether this tale has finished (further steps return [`StepOut::Done`]).
+    ///
+    /// The firmware does not read this — the screen reacts to [`StepOut`] as it arrives — but the
+    /// host tests assert the state machine's own view of itself, which is exactly the thing a
+    /// `StepOut`-only test could not catch. Hence the allow rather than a deletion.
+    #[allow(dead_code)]
     pub fn is_done(&self) -> bool {
         self.done
     }
 
-    /// Absolute position of the next forward pass — the story's length in tokens, prompt included.
+    /// Absolute position of the next forward pass — this tale's length in tokens, prompt included.
+    /// Host-side only, as [`Self::is_done`]: it is how the tests and the `bard_continue` example
+    /// prove the ring really wrapped rather than trusting the arithmetic.
+    #[allow(dead_code)]
     pub fn pos(&self) -> u16 {
         self.pos
     }

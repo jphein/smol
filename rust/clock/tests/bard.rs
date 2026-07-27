@@ -615,6 +615,94 @@ fn the_position_cursor_cannot_wrap() {
     }
 }
 
+// ── #302 delivery: the CFG `V` value that sets pace and mode ────────────────────────────
+//
+// A parser for bytes that arrive from a broker, so the tests are mostly about REFUSING things. The
+// contract each one pins: a refusal leaves the caller's setting alone, and a clamp says so.
+
+#[test]
+fn delivery_parses_the_documented_forms() {
+    use clock::delivery::{Delivery, Mode};
+    let cur = Delivery::DEFAULT;
+    let ok = |v: &str| Delivery::parse(v.as_bytes(), cur).expect("should parse");
+
+    assert_eq!(ok("160:inf").delivery, Delivery::DEFAULT);
+    assert_eq!(ok("80:page").delivery.ms_per_char, 80);
+    assert_eq!(ok("80:page").delivery.mode, Mode::Page);
+    // Case is forgiven on the mode word (an operator may type it).
+    assert_eq!(ok("80:PAGE").delivery.mode, Mode::Page);
+    assert_eq!(ok("80:Inf").delivery.mode, Mode::Inf);
+    // Empty FIELD = keep that field; empty VALUE = back to the board defaults (retain-clear).
+    let paged = Delivery { ms_per_char: 40, mode: Mode::Page };
+    assert_eq!(Delivery::parse(b":inf", paged).unwrap().delivery.ms_per_char, 40);
+    assert_eq!(Delivery::parse(b"300:", paged).unwrap().delivery.mode, Mode::Page);
+    assert_eq!(Delivery::parse(b"", paged).unwrap().delivery, Delivery::DEFAULT);
+    // Nothing above should report a clamp.
+    for v in ["160:inf", "80:page", "20:inf", "500:page"] {
+        assert!(!ok(v).clamped, "{v} should not clamp");
+    }
+}
+
+#[test]
+fn delivery_clamps_the_speed_instead_of_refusing_it() {
+    use clock::delivery::{Delivery, Mode};
+    let cur = Delivery::DEFAULT;
+    // 0 is the one that matters: an unclamped 0 ms/char makes the reveal loop run the whole buffer
+    // every tick, which is a pegged CPU rather than a fast typewriter.
+    let z = Delivery::parse(b"0:inf", cur).unwrap();
+    assert_eq!(z.delivery.ms_per_char, Delivery::MS_MIN);
+    assert!(z.clamped, "a clamp must be reported so the log can say so");
+
+    let slow = Delivery::parse(b"9999:page", cur).unwrap();
+    assert_eq!(slow.delivery.ms_per_char, Delivery::MS_MAX);
+    assert!(slow.clamped);
+    assert_eq!(slow.delivery.mode, Mode::Page, "clamping the speed must not lose the mode");
+
+    // Absurd input must saturate, not wrap into range: "99999999" as u16 arithmetic could land
+    // anywhere, and landing on 3 ms/char would be a pegged board from a typo.
+    let huge = Delivery::parse(b"99999999:inf", cur).unwrap();
+    assert_eq!(huge.delivery.ms_per_char, Delivery::MS_MAX);
+    assert!(huge.clamped);
+}
+
+#[test]
+fn delivery_refuses_the_rest_and_keeps_the_previous_setting() {
+    use clock::delivery::{Delivery, DeliveryErr, Mode};
+    let cur = Delivery { ms_per_char: 40, mode: Mode::Page };
+
+    // No separator: refused rather than guessed at.
+    assert_eq!(Delivery::parse(b"160", cur), Err(DeliveryErr::Malformed));
+    // Not a number.
+    assert_eq!(Delivery::parse(b"fast:inf", cur), Err(DeliveryErr::BadSpeed));
+    assert_eq!(Delivery::parse(b"16 0:inf", cur), Err(DeliveryErr::BadSpeed));
+    // Arbitrary wire bytes in the speed field (a CFG payload is not necessarily UTF-8).
+    assert_eq!(Delivery::parse(&[0xff, b':', b'i', b'n', b'f'], cur), Err(DeliveryErr::BadSpeed));
+    // Unknown mode word — including a plausible one, which is exactly why guessing is refused.
+    assert_eq!(Delivery::parse(b"160:slow", cur), Err(DeliveryErr::BadMode));
+    assert_eq!(Delivery::parse(b"160:infinite", cur), Err(DeliveryErr::BadMode));
+    // Over the length bound, refused before anything is looked at.
+    let long = "1".repeat(Delivery::MAX_LEN + 1);
+    assert!(matches!(
+        Delivery::parse(long.as_bytes(), cur),
+        Err(DeliveryErr::TooLong { .. })
+    ));
+
+    // A refusal returns Err and NOTHING else — the caller keeps `cur` because there is no other
+    // value to apply. (The firmware's `set_delivery` only writes the static on Ok.)
+    assert_eq!(cur, Delivery { ms_per_char: 40, mode: Mode::Page });
+}
+
+#[test]
+fn delivery_defaults_are_the_shipped_behaviour() {
+    use clock::delivery::{Delivery, Mode};
+    // The default IS the headline feature — a bard that never stops — and the pre-#302 reading pace.
+    assert_eq!(Delivery::DEFAULT.mode, Mode::Inf);
+    assert_eq!(Delivery::DEFAULT.ms_per_char, 160);
+    assert_eq!(Delivery::DEFAULT.reveal_ms(), 160);
+    // The range must bracket the default, or the shipped setting would itself be clamped.
+    assert!(Delivery::MS_MIN <= Delivery::MS_DEFAULT && Delivery::MS_DEFAULT <= Delivery::MS_MAX);
+}
+
 #[test]
 fn persona_prompts_fit_the_vocabulary() {
     let m = Model::parse(BLOB).unwrap();
@@ -780,6 +868,93 @@ fn roll_never_splits_a_character() {
         assert_ne!(dropped, 3, "cut inside the ’ token");
         assert_ne!(dropped, 4, "cut inside the ’ token");
     }
+}
+
+/// The firmware's own scrollback geometry (`bard/mod.rs`), so the simulation below rolls where the
+/// board rolls.
+const BUF: usize = 1024;
+const TEXT_KEEP: usize = 512;
+
+#[test]
+fn endless_narration_never_breaks_the_panel() {
+    // The integration test for #302's rolling scrollback: drive a REAL endless narration through the
+    // REAL append-with-roll policy and the REAL wrapper, one token at a time, revealing as the
+    // typewriter would — then assert the panel invariants at every single step. This is the test
+    // that would catch a roll that splits a character, drops unread text, or leaves the reveal
+    // cursor pointing into the middle of a line.
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+    let mut bufs = std::boxed::Box::new(Bufs::INIT);
+    let mut story = Story::new(&t, GOLDEN_PROMPT, 4);
+
+    let mut buf = std::vec![0u8; BUF];
+    let mut len = 0usize;
+    let mut shown = 0usize;
+    let mut spans = [(0u16, 0u16); 5];
+    let mut rolls = 0u32;
+    let mut tales = 1u32;
+
+    // Enough passes to overflow the 1 KB buffer several times over (~2.7 bytes/token).
+    for _ in 0..1200 {
+        let bytes: std::vec::Vec<u8> = match story.step(&m, &t, &mut bufs) {
+            StepOut::Text(b) => b.to_vec(),
+            StepOut::Working => std::vec::Vec::new(),
+            StepOut::Done { .. } => {
+                // The screen's next-tale path: a paragraph break, then the next opening.
+                tales += 1;
+                story = Story::new(&t, GOLDEN_PROMPT, 4 + tales);
+                std::vec![b'\n']
+            }
+        };
+        if !bytes.is_empty() {
+            let before = len;
+            let (new_len, dropped) =
+                clock::textflow::append_rolling(&mut buf, len, &bytes, TEXT_KEEP, shown);
+            if dropped > 0 {
+                rolls += 1;
+                // Never more than the reader has seen: the cut is bounded by `shown`.
+                assert!(dropped <= before, "rolled {dropped} of a {before}-byte buffer");
+                assert!(dropped <= shown, "rolled past the reveal cursor ({dropped} > {shown})");
+                shown -= dropped;
+            }
+            len = new_len;
+            assert!(len <= BUF, "buffer overran: {len}");
+            // What went in came out the other end (modulo the roll) — no silently lost token.
+            assert_eq!(
+                len,
+                before - dropped + bytes.len(),
+                "append lost bytes: before={before} dropped={dropped} extra={}",
+                bytes.len()
+            );
+        }
+        // Reveal at ~2 chars per token, which is SLOWER than generation — i.e. the backlog the
+        // firmware's backpressure bounds. Rolling under a lagging reveal is the hard case.
+        shown = (shown + 2).min(len);
+
+        // The panel, at this exact instant. Same assertions as the single-story reveal test, now
+        // with the rolling buffer underneath.
+        let visible = &buf[..shown];
+        let n = wrap_tail(visible, 14, 5, &mut spans);
+        assert!(n <= 5, "{n} lines exceeds the panel");
+        for (i, &(a, b)) in spans[..n].iter().enumerate() {
+            assert!(a <= b, "line{i}: inverted span ({a},{b})");
+            assert!((b as usize) <= shown, "line{i}: span past the revealed text");
+            assert!((b - a) as usize <= 14, "line{i}: wider than the panel");
+            // Every line must still decode: a roll that split a character would show up here as a
+            // line the renderer has to skip.
+            assert!(
+                core::str::from_utf8(&visible[a as usize..b as usize]).is_ok(),
+                "line{i} is not valid UTF-8 after a roll: {:?}",
+                &visible[a as usize..b as usize]
+            );
+        }
+        for w in spans[..n].windows(2) {
+            assert!(w[0].1 <= w[1].0, "spans out of order/overlapping");
+        }
+    }
+    // The fixture has to actually exercise the interesting paths, or it proves nothing.
+    assert!(rolls > 0, "the buffer never rolled — fixture too short to test anything");
+    assert!(tales > 1, "no tale boundary in 1200 passes — the next-tale path went untested");
 }
 
 #[test]

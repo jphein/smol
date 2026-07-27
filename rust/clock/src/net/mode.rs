@@ -194,7 +194,7 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 15] = [
+const CFG_APPLY_KEYS: [u8; 16] = [
     crate::net::wifi::CFG_KEY_SCREEN,
     crate::net::wifi::CFG_KEY_LED,
     crate::net::wifi::CFG_KEY_UNITS,
@@ -231,6 +231,11 @@ const CFG_APPLY_KEYS: [u8; 15] = [
     // one inert CfgTracker slot (~66 B .bss) beats splitting this array per-feature; the config
     // PLUMBING (subscribe/fill/apply) is `bard`-gated so a non-bard build never feeds it.
     crate::net::wifi::CFG_KEY_TALE,
+    // #302 Bard delivery: V — the reveal pace + inf/page mode. Cached + relayed exactly like T
+    // above, and present unconditionally for the same reason (one inert CfgTracker slot beats a
+    // per-feature array); a leaf takes it via take_cfg_offer(V) → bard::set_delivery, which clamps
+    // the speed and keeps the previous setting if the value is malformed.
+    crate::net::wifi::CFG_KEY_DELIVERY,
 ];
 /// #50b leaf-status UPLINK tag: `"SMOLv1 STAT "` (12 B, trailing space) then `"NNN"`
 /// (3-ASCII zero-padded SENDER leaf id) then the verbatim live `<AppKind>:<page>` value
@@ -4913,6 +4918,11 @@ impl RadioManager {
         #[cfg(feature = "bard")]
         if let Some((buf, len)) = gw_own.tale {
             self.cfg.set(crate::net::wifi::CFG_KEY_TALE, &buf[..len]);
+        }
+        // #302: the gateway's OWN bard delivery setting — same self-apply path (take_cfg_offer(V)).
+        #[cfg(feature = "bard")]
+        if let Some((buf, len)) = gw_own.delivery {
+            self.cfg.set(crate::net::wifi::CFG_KEY_DELIVERY, &buf[..len]);
         }
         // #100: the gateway's OWN active-slot index — same self-apply path (take_cfg_offer(N)).
         if let Some((buf, len)) = gw_own.net {

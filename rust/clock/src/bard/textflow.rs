@@ -36,6 +36,37 @@ pub fn roll(text: &mut [u8], len: usize, keep: usize, revealed: usize) -> usize 
     cut
 }
 
+/// Append `extra` to `text[..len]`, ROLLING the oldest bytes out when it will not fit, and return
+/// `(new_len, dropped)`.
+///
+/// This is the whole scrollback policy of an endless narrator (#302), in one pure function so the
+/// host tests drive the real thing rather than a copy: the firmware's `push_text` is only the
+/// `static mut` wrapper around it. `dropped` is what the caller must subtract from its reveal
+/// cursor, since that cursor is a byte offset into a buffer that just moved.
+///
+/// A roll frees down to `keep` bytes (not to just-enough), so the memmove happens rarely instead of
+/// once per token. If it cannot free enough — only possible when nothing has been revealed yet, see
+/// [`roll`] — the append is TRUNCATED rather than allowed to overflow: dropping the tail of one
+/// token beats a panic on a board that is otherwise fine.
+pub fn append_rolling(
+    text: &mut [u8],
+    len: usize,
+    extra: &[u8],
+    keep: usize,
+    revealed: usize,
+) -> (usize, usize) {
+    let len = len.min(text.len());
+    let mut dropped = 0usize;
+    let mut len = len;
+    if len + extra.len() > text.len() {
+        dropped = roll(text, len, keep, revealed);
+        len -= dropped;
+    }
+    let n = extra.len().min(text.len() - len);
+    text[len..len + n].copy_from_slice(&extra[..n]);
+    (len + n, dropped)
+}
+
 /// Word-wrap `text` to `cols` columns and write the LAST `rows` line spans into `out`,
 /// returning how many were written.
 ///

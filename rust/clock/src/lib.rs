@@ -67,6 +67,11 @@ pub mod persona;
 #[cfg(feature = "hostsim")]
 #[path = "bard/textflow.rs"]
 pub mod textflow;
+// #302 the delivery setting (reveal pace + inf/page mode) and its strict CFG-`V` parser. Pure, so
+// the parser's refusals are host-tested rather than discovered over the air.
+#[cfg(feature = "hostsim")]
+#[path = "bard/delivery.rs"]
+pub mod delivery;
 // Only the pure sentinel scanner compiles here; the paint itself is device-only (linker symbols).
 #[cfg(feature = "hostsim")]
 #[path = "bard/stack_paint.rs"]

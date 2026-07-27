@@ -12,6 +12,7 @@
 //! This file is the firmware root of the bard tree; `lib.rs` reaches the same three source
 //! files directly via `#[path]` for host tests, so nothing here may be needed by them.
 
+pub mod delivery;
 pub mod nano_llm;
 pub mod persona;
 // Bench-only stack measurement. Gated on the feature in the FIRMWARE tree: with `stack-paint`
@@ -31,6 +32,7 @@ use embedded_graphics::{
 
 use crate::app::{AppKind, Ctx, Plugin, Transition};
 use crate::input::Press;
+use delivery::Delivery;
 use nano_llm::{Bufs, Model, StepOut, Story};
 use tokenizer::Tokenizer;
 
@@ -72,6 +74,36 @@ static mut PROMPT_LEN: usize = 0;
 /// Only the tiers that can RECEIVE a prompt have anything to stage (see `checked_staged_prompt`).
 #[cfg(any(feature = "espnow", feature = "hostsim"))]
 static mut PROMPT_CHECKED: bool = true;
+
+/// #302 how the narration is delivered (CFG key `V`): reveal pace + `inf`/`page` mode. 4 B of
+/// `.bss`. Read live by the screen every tick, so a change lands with no reboot and without
+/// interrupting the tale in progress.
+static mut DELIVERY: Delivery = Delivery::DEFAULT;
+
+/// The live delivery setting.
+///
+/// # Safety
+/// As [`init_statics`].
+unsafe fn delivery() -> Delivery {
+    core::ptr::addr_of!(DELIVERY).read()
+}
+
+/// Offer a delivery setting (CFG `V`), e.g. `160:inf` or `80:page`; empty restores the defaults.
+/// A malformed value is REFUSED and the previous setting kept — the same discipline as `T`, for the
+/// same reason: this is a value from the air, and the failure mode of accepting half of it is a
+/// board that reveals at 0 ms/char or stops narrating.
+///
+/// Returns what was accepted (and whether the speed had to be clamped) so the caller can log
+/// something actionable.
+///
+/// # Safety
+/// As [`init_statics`] — single-threaded; called only from `main`'s config-apply path.
+#[cfg(any(feature = "espnow", feature = "hostsim"))]
+pub unsafe fn set_delivery(value: &[u8]) -> Result<delivery::Accepted, delivery::DeliveryErr> {
+    let accepted = Delivery::parse(value, delivery())?;
+    core::ptr::addr_of_mut!(DELIVERY).write(accepted.delivery);
+    Ok(accepted)
+}
 
 /// Offer a runtime story prompt (CFG `T`). Validated against the MODEL'S OWN vocabulary before
 /// it is stored, so a prompt that would derail generation is refused and the previous value
@@ -171,14 +203,18 @@ unsafe fn init_statics() -> bool {
     true
 }
 
-/// Start (or restart) a story for this node's protagonist, seeded from the clock so a second
-/// telling differs.
+/// Open a tale for this node's protagonist, seeded from the clock so successive tales differ.
+///
+/// `fresh` clears the panel (entering the screen); otherwise the tale is appended to the text
+/// already scrolling — a paragraph break, then its opening line — which is how the endless
+/// narrator crosses a tale boundary (#302). Returns bytes rolled off the HEAD of the buffer, which
+/// the caller must subtract from its reveal cursor.
 ///
 /// # Safety
 /// As [`init_statics`] — single-threaded, called only from the Bard screen's own handlers.
-unsafe fn begin_story(node_id: u8, now_ms: u64) {
+unsafe fn begin_story(node_id: u8, now_ms: u64, fresh: bool, revealed: usize) -> usize {
     let Some(tok) = (*core::ptr::addr_of!(TOKENIZER)).as_ref() else {
-        return;
+        return 0;
     };
     let mut buf = [0u8; 64];
     // #303 the operator's prompt wins when set (it was validated at accept time); otherwise this
@@ -199,162 +235,90 @@ unsafe fn begin_story(node_id: u8, now_ms: u64) {
     let prompt = core::str::from_utf8(&buf[..n]).unwrap_or("Once upon a time");
     let story = Story::new(tok, prompt, now_ms as u32);
     core::ptr::addr_of_mut!(STORY).write(Some(story));
-    core::ptr::addr_of_mut!(STORY_LEN).write(0);
-    // Seed the visible text with the prompt itself, so the screen reads as a story from the
-    // first frame instead of starting mid-sentence.
+    if fresh {
+        core::ptr::addr_of_mut!(STORY_LEN).write(0);
+    }
+    // Seed the visible text with the opening itself, so the screen reads as a story from the first
+    // frame rather than sitting blank through ~15 priming passes (~3 s) — and, mid-scroll, so a new
+    // tale announces itself instead of appearing to resume the old one mid-sentence. A newline is
+    // the break: `textflow::wrap_tail` treats it as a hard break, which costs no glyph row.
+    let mut dropped = 0usize;
+    if !fresh {
+        dropped += push_text(b"\n", revealed);
+    }
+    dropped + push_text(&buf[..n], revealed.saturating_sub(dropped))
+}
+
+/// Bytes of story text kept when the buffer has to roll (#302). The panel renders only the last
+/// four or five wrapped lines (~70 chars), so everything above this is scrollback nobody can scroll
+/// back to; it is generous rather than tight because the buffer is 1 KB either way — this bounds
+/// the CONTENT, not an allocation — and a bigger keep means a rarer memmove.
+const TEXT_KEEP: usize = 512;
+
+/// Append `extra` to the visible story text, ROLLING the oldest text out when the buffer is full
+/// (#302). Returns how many bytes were dropped from the head — the caller's reveal cursor is a byte
+/// offset into this buffer and MUST move back by that much.
+///
+/// An endless narrator overruns any fixed buffer by definition, so "truncate and stop" (the
+/// pre-#302 behaviour) would have ended the story after 1 KB. The policy and its two hazards —
+/// never dropping unrevealed text, never splitting a UTF-8 character — live in
+/// [`textflow::append_rolling`] where the host tests drive the real code.
+///
+/// # Safety
+/// As [`init_statics`].
+unsafe fn push_text(extra: &[u8], revealed: usize) -> usize {
     let text = &mut *core::ptr::addr_of_mut!(STORY_TEXT);
-    let len = n.min(text.len());
-    text[..len].copy_from_slice(&buf[..len]);
+    let len = *core::ptr::addr_of!(STORY_LEN);
+    let (len, dropped) = textflow::append_rolling(text, len, extra, TEXT_KEEP, revealed);
     core::ptr::addr_of_mut!(STORY_LEN).write(len);
+    dropped
 }
 
-/// Bytes of story text a continuation keeps (#302). The panel renders only the last four or five
-/// wrapped lines (~70 chars), so this is several screens of scrollback nobody can scroll back to;
-/// it is deliberately generous so the head-drop is invisible rather than tight to save `.bss`
-/// (the buffer is 1 KB either way — this is a bound on the CONTENT, not an allocation).
-const TEXT_KEEP: usize = 256;
-
-/// Drop the oldest story text to make room for another chapter, returning how many bytes went.
-/// The arithmetic (and its two hazards) lives in [`textflow::roll`], where the host tests can
-/// reach it; this is only the `static mut` plumbing.
-///
-/// The panel shows the TAIL ([`textflow::wrap_tail`]), so losing the head is invisible — but the
-/// caller's reveal cursor is a byte offset into this buffer and MUST be moved back by the return
-/// value.
+/// Length of the visible story text.
 ///
 /// # Safety
 /// As [`init_statics`].
-unsafe fn compact_text(keep: usize, revealed: usize) -> usize {
-    let text = &mut *core::ptr::addr_of_mut!(STORY_TEXT);
-    let len = *core::ptr::addr_of!(STORY_LEN);
-    let cut = textflow::roll(text, len, keep, revealed);
-    core::ptr::addr_of_mut!(STORY_LEN).write(len - cut);
-    cut
-}
-
-/// What a cut chapter appends so the text reads as trailing off rather than as a crash. ASCII
-/// dots, not U+2026: FONT_5X8 is an ASCII font and would draw the ellipsis as a blank, silently
-/// losing the very signal we are adding.
-const CUT_MARK: &[u8] = b"...";
-
-/// Take back the [`CUT_MARK`] a paused chapter left: it says "the story stops here", and it is
-/// about not to. Without this a continued story reads `went insid... e and went`.
-///
-/// # Safety
-/// As [`init_statics`].
-unsafe fn unmark_truncation() {
-    let text = &*core::ptr::addr_of!(STORY_TEXT);
-    let len = *core::ptr::addr_of!(STORY_LEN);
-    let n = CUT_MARK.len();
-    if len >= n && &text[len - n..len] == CUT_MARK {
-        core::ptr::addr_of_mut!(STORY_LEN).write(len - n);
-    }
-}
-
-/// Continue the paused story instead of starting a new one (#302): trim the ellipsis, make room,
-/// and let the generator pick up mid-sentence. Returns the bytes the reveal cursor must move back,
-/// or `None` when the story is genuinely over (the model chose to stop) and the caller should
-/// begin a new one.
-///
-/// # Safety
-/// As [`init_statics`].
-unsafe fn continue_story(revealed: usize) -> Option<usize> {
-    let story = (*core::ptr::addr_of_mut!(STORY)).as_mut()?;
-    if !story.resume() {
-        return None;
-    }
-    unmark_truncation();
-    Some(compact_text(TEXT_KEEP, revealed))
-}
-
-/// Whether a press on the finished screen should CONTINUE this story (see `Story::can_continue`).
-/// Read from the generator rather than mirrored into [`BardApp`], so the marker on the panel and
-/// the behaviour of the button can never disagree.
-///
-/// # Safety
-/// As [`init_statics`].
-unsafe fn story_can_continue() -> bool {
-    (*core::ptr::addr_of!(STORY))
-        .as_ref()
-        .is_some_and(Story::can_continue)
-}
-
-/// Absolute length of the story so far, in tokens (prompt included) — for the per-chapter log.
-///
-/// # Safety
-/// As [`init_statics`].
-unsafe fn story_pos() -> u16 {
-    (*core::ptr::addr_of!(STORY))
-        .as_ref()
-        .map_or(0, Story::pos)
-}
-
-/// Append `extra` to the visible story text, truncating rather than wrapping.
-///
-/// # Safety
-/// As [`init_statics`].
-unsafe fn push_text(extra: &[u8]) -> bool {
-    let text = &mut *core::ptr::addr_of_mut!(STORY_TEXT);
-    let len = *core::ptr::addr_of!(STORY_LEN);
-    let room = text.len().saturating_sub(len);
-    let n = extra.len().min(room);
-    text[len..len + n].copy_from_slice(&extra[..n]);
-    core::ptr::addr_of_mut!(STORY_LEN).write(len + n);
-    // Out of buffer is a stop condition too — never wrap, never truncate mid-token.
-    room > extra.len()
+unsafe fn text_len() -> usize {
+    *core::ptr::addr_of!(STORY_LEN)
 }
 
 /// What one [`step_story`] call did — enough to tell a prompt-priming pass (same cost, but not
-/// a story token) from a generated one, so the perf stats only count what they claim to.
+/// a story token) from a generated one, so the perf stats only count what they claim to, and to
+/// carry the rolling buffer's head-drop back to the caller's reveal cursor.
 enum Advance {
     /// A prompt token was fed; nothing generated yet.
     Primed,
-    /// A generated token's bytes were appended.
-    Wrote,
-    /// The story ended.
-    Ended,
+    /// A generated token's bytes were appended; `dropped` bytes rolled off the head.
+    Wrote { dropped: usize },
+    /// This TALE ended. NOT the end of the narration — the screen opens the next tale (#302).
+    /// `cursor` distinguishes the two causes for the log: the position cursor recycling (essentially
+    /// never) versus the model choosing to finish (the normal case).
+    Ended { cursor: bool },
 }
 
-/// Advance the story by ONE token, appending to [`STORY_TEXT`].
+/// Advance the tale by ONE token, appending to [`STORY_TEXT`].
 ///
 /// # Safety
 /// As [`init_statics`].
-unsafe fn step_story() -> Advance {
+unsafe fn step_story(revealed: usize) -> Advance {
     let (Some(model), Some(tok)) = (
         (*core::ptr::addr_of!(MODEL)).as_ref(),
         (*core::ptr::addr_of!(TOKENIZER)).as_ref(),
     ) else {
-        return Advance::Ended;
+        return Advance::Ended { cursor: false };
     };
     let Some(story) = (*core::ptr::addr_of_mut!(STORY)).as_mut() else {
-        return Advance::Ended;
+        return Advance::Ended { cursor: false };
     };
     let bufs = &mut *core::ptr::addr_of_mut!(BUFS);
-    let advance = match story.step(model, tok, bufs) {
+    match story.step(model, tok, bufs) {
         StepOut::Working => Advance::Primed,
-        StepOut::Text(bytes) => {
-            if push_text(bytes) {
-                Advance::Wrote
-            } else {
-                // The text buffer is full — the last token landed, but this is the end.
-                Advance::Ended
-            }
-        }
-        // A cut is the usual ending at this model size (T8: ~19 of 20 seeds), so mark it —
-        // trailing dots read as tailing off, where a bare mid-sentence stop reads as a crash.
-        // Since #302 a press takes the mark back off again (`unmark_truncation`) and keeps going.
-        StepOut::Done { truncated } => {
-            if truncated {
-                push_text(CUT_MARK);
-            }
-            Advance::Ended
-        }
-    };
-    // Belt and braces: the state machine's own view must agree that there is more to come.
-    if story.is_done() {
-        Advance::Ended
-    } else {
-        advance
+        // The buffer ROLLS now instead of filling up, so a long tale is not an ending — the only
+        // endings left are the model's own and the cursor's, both of which arrive as `Done`.
+        StepOut::Text(bytes) => Advance::Wrote {
+            dropped: push_text(bytes, revealed),
+        },
+        StepOut::Done { truncated } => Advance::Ended { cursor: truncated },
     }
 }
 
@@ -372,8 +336,6 @@ fn now_ms_live() -> u64 {
         .as_millis()
 }
 
-/// Reveal one character per this many ms (~6/s — spec §7's reading pace).
-const REVEAL_MS: u64 = 160;
 /// Quill blink half-period.
 const BLINK_MS: u64 = 400;
 /// FONT_5X8 columns across the 72 px panel (14 × 5 px = 70).
@@ -385,18 +347,39 @@ const GLYPH_W: i32 = 5;
 /// Pixel height of one text row.
 const ROW_H: i32 = 8;
 
-/// Where the screen is in a story's life.
+/// New characters one `page` delivers before waiting for a press: the story rows of a full panel
+/// (the bottom row is the `~ more ~` marker). Counted in BYTES of generated text, so word-wrap
+/// makes it "about a screenful" rather than exactly one — the honest bound for a variable-width
+/// wrap, and a page that came up one word short would read as a bug where a slightly long one
+/// just scrolls.
+const PAGE_BYTES: u16 = (COLS * (ROWS - 1)) as u16;
+
+/// How far generation may run AHEAD of the reveal in `inf` mode before it waits (#302).
 ///
-/// No `Idle`: [`BardApp::new`] either arms a story (`Composing`) or fails the blob (`Mute`), so
-/// an idle variant would be constructed nowhere and read as dead code.
+/// This is the load-bearing number of infinite mode. Generation makes ~13 chars/s on the C3
+/// (202 ms/token, ~2.7 chars/token) while the default reveal consumes 6.25 chars/s, so an
+/// unthrottled narrator outruns its reader forever: the buffer fills with text nobody has seen and
+/// every roll then has to choose between dropping unread words and stalling. Bounding the unrevealed
+/// backlog turns the pair into a producer/consumer with a small queue — the reveal speed becomes
+/// the generation rate, and the board's compute duty cycle follows the setting instead of pinning
+/// the CPU. ~1.5 screenfuls: deep enough that the typewriter never starves waiting for a token
+/// (one token feeds ~430 ms of reading), shallow enough that a speed change is felt at once.
+const BACKLOG_MAX: usize = 96;
+
+/// Marker shown when a `page` is fully revealed and a press will turn it. ASCII only — FONT_5X8
+/// has no glyph beyond it, and a missing glyph draws as a blank.
+const MORE_MARK: &str = "~ more ~";
+
+/// Where the screen is in the narration.
 ///
-/// `Told` covers both endings a story can have (#302). Which one it is lives in the generator, not
-/// here — see [`story_can_continue`].
+/// No `Idle` and no `Told` (#302): [`BardApp::new`] either starts narrating or fails the blob, and
+/// the narration has no end — a tale finishing is answered by opening the next one, so the only
+/// "not generating" state is a `page` mode pause, which a press ends.
 enum Phase {
     /// Generating and typing out.
     Composing,
-    /// Generation finished; may still be revealing the tail.
-    Told,
+    /// `page` mode: this page's text is written; waiting for a press to turn it.
+    Paged,
     /// The blob failed its checks — render nothing but the notice.
     Mute,
 }
@@ -417,78 +400,93 @@ pub struct BardApp {
     quill_on: bool,
     /// `shown` at the last paint (a repaint trigger).
     painted: u16,
-    /// Set by a tap while composing: stop throttling and catch the reveal up (spec §9).
+    /// Set by a tap: stop throttling and catch the reveal up (spec §9). Expires at the next tale
+    /// or page turn, so one impatient tap does not disable the typewriter for ever.
     fast: bool,
-    /// Generated tokens this story (prompt-priming passes excluded — see [`Advance`]).
+    /// New text bytes written into the current `page` (`page` mode only).
+    page_bytes: u16,
+    /// Generated tokens this tale (prompt-priming passes excluded — see [`Advance`]).
     tok_count: u16,
-    /// Total ms spent in those passes. u32 holds ~49 days; a story is seconds.
+    /// Total ms spent in those passes. u32 holds ~49 days; a tale is seconds to minutes.
     tok_ms_sum: u32,
     /// Slowest single pass, ms — the number that decides whether the UI can stay responsive.
     tok_ms_max: u16,
 }
 
 impl BardApp {
-    /// Parse the blob and arm the first story. Called once per entry to the screen.
+    /// Parse the blob and open the first tale. Called once per entry to the screen.
     pub fn new(ctx: &Ctx) -> Self {
         let ok = unsafe { init_statics() };
-        let mut app = BardApp {
+        let app = BardApp {
             phase: if ok { Phase::Composing } else { Phase::Mute },
             shown: 0,
             next_reveal_ms: ctx.now_ms,
             quill_on: false,
             painted: u16::MAX, // force the first paint
             fast: false,
+            page_bytes: 0,
             tok_count: 0,
             tok_ms_sum: 0,
             tok_ms_max: 0,
         };
         if ok {
-            app.restart(ctx.node_id, ctx.now_ms);
+            unsafe { begin_story(ctx.node_id, ctx.now_ms, true, 0) };
         }
         app
     }
 
-    /// Begin a fresh story, seeded from the clock so successive tellings differ.
-    fn restart(&mut self, node_id: u8, now_ms: u64) {
-        unsafe { begin_story(node_id, now_ms) };
-        self.phase = Phase::Composing;
-        self.shown = 0;
-        self.next_reveal_ms = now_ms;
-        self.painted = u16::MAX;
+    /// Open the next tale in the same endless scroll (#302): the old text keeps scrolling up, a
+    /// paragraph break and the new opening are appended, and the reveal carries straight on. Called
+    /// when the MODEL ends a tale — the reader sees the bard finish and start another, not a screen
+    /// that reset.
+    fn next_tale(&mut self, node_id: u8, now_ms: u64) {
+        let before = unsafe { text_len() };
+        let dropped = unsafe { begin_story(node_id, now_ms, false, self.shown as usize) };
+        // The break and the new opening are new text on the panel, so they count against the page
+        // quota like any other — otherwise a page that happens to contain a tale boundary would run
+        // ~40 characters long.
+        let written = unsafe { text_len() } + dropped - before;
+        self.page_bytes = self.page_bytes.saturating_add(written as u16);
+        self.rewind(dropped);
         self.fast = false;
         self.reset_stats();
     }
 
-    /// Keep telling the SAME story (#302): one press buys another chapter, generated from the KV
-    /// state the last one left behind. `false` ⇒ the model ended this story, so the caller should
-    /// start a new one instead.
-    ///
-    /// The reveal is NOT reset — it is re-anchored. `compact_text` may have dropped bytes off the
-    /// head of the buffer, and `shown` is a byte offset into it, so it moves back by exactly as
-    /// many; the reader sees the typewriter carry on mid-sentence, which is the whole point.
-    /// `fast` survives too: a reader who asked for no throttle asked about the story, not the
-    /// chapter.
-    fn keep_going(&mut self, now_ms: u64) -> bool {
-        let continued = unsafe { continue_story(self.shown as usize) };
-        let Some(dropped) = continued else {
-            return false;
-        };
-        let len = unsafe { *core::ptr::addr_of!(STORY_LEN) } as u16;
-        self.shown = self.shown.saturating_sub(dropped as u16).min(len);
+    /// Turn the page in `page` mode: another [`PAGE_BYTES`] of new text, at reading pace again.
+    fn turn_page(&mut self, now_ms: u64) {
         self.phase = Phase::Composing;
+        self.page_bytes = 0;
+        self.fast = false;
         self.next_reveal_ms = now_ms;
-        self.painted = u16::MAX; // the `~ more ~` marker has to come off the panel
-        // Per-CHAPTER timing, so the numbers stay comparable to the T13 bench (which measured
-        // ~65-token runs) instead of averaging a story that may now run for hours.
-        self.reset_stats();
-        true
+        self.painted = u16::MAX; // the marker has to come off the panel
     }
 
-    /// Zero the per-chapter perf counters.
+    /// Re-anchor the reveal cursor after the rolling buffer dropped `dropped` bytes off the head:
+    /// `shown` is a byte offset into a buffer that just moved. Clamped to the new length so a
+    /// tail trim can never leave the cursor past the end.
+    fn rewind(&mut self, dropped: usize) {
+        if dropped == 0 {
+            return;
+        }
+        let len = unsafe { text_len() } as u16;
+        self.shown = self.shown.saturating_sub(dropped as u16).min(len);
+        self.painted = u16::MAX;
+    }
+
+    /// Zero the per-tale perf counters.
     fn reset_stats(&mut self) {
         self.tok_count = 0;
         self.tok_ms_sum = 0;
         self.tok_ms_max = 0;
+    }
+
+    /// Whether to spend this tick on a forward pass.
+    ///
+    /// The narrator is endless, so something has to decide when NOT to generate; this is that
+    /// something. See [`BACKLOG_MAX`] — generation waits for the reader rather than racing ahead,
+    /// which is what makes the speed setting a pacing control rather than a cosmetic one.
+    fn wants_token(&self, len: usize) -> bool {
+        matches!(self.phase, Phase::Composing) && len.saturating_sub(self.shown as usize) < BACKLOG_MAX
     }
 }
 
@@ -499,17 +497,17 @@ impl Plugin for BardApp {
             Press::Long => Transition::Switch(AppKind::Menu),
             Press::Short => {
                 match self.phase {
-                    // Mid-story: skip the typewriter rather than start over — the story you are
-                    // reading is the one you asked for.
+                    // Composing: skip the typewriter. There is nothing to "restart" any more —
+                    // the narration never ended — so the impatient tap is the only meaning left.
                     Phase::Composing => self.fast = true,
-                    // Paused (#302): keep this story going. A press only starts a NEW story when
-                    // the model itself ended this one (`~ fin ~`); the way to ask for a different
-                    // story is the gesture that already exists — long-press out to the menu and
-                    // pick the Bard again, which builds a fresh `BardApp`. That keeps the grammar
-                    // to two gestures and makes the common case (more of this story) the cheap one.
-                    Phase::Told => {
-                        if !self.keep_going(ctx.now_ms) {
-                            self.restart(ctx.node_id, ctx.now_ms);
+                    // Page turn, with the courtesy of finishing THIS page first: a press while the
+                    // typewriter is still catching up means "hurry", a press once it has caught up
+                    // means "next page". Same button, and neither reading is ever surprising.
+                    Phase::Paged => {
+                        if (self.shown as usize) < unsafe { text_len() } {
+                            self.fast = true;
+                        } else {
+                            self.turn_page(ctx.now_ms);
                         }
                     }
                     Phase::Mute => {}
@@ -526,95 +524,114 @@ impl Plugin for BardApp {
             }
             return;
         }
+        // Read the delivery setting LIVE, so a CFG `V` change lands on the next tick with no
+        // reboot and no story restart (#302).
+        let d = unsafe { delivery() };
+        // Switching to `inf` un-pauses immediately; switching to `page` lets the current page
+        // finish, because `page_bytes` is already counted and cutting mid-page would look like a
+        // dropped word.
+        if matches!(self.phase, Phase::Paged) && d.mode == delivery::Mode::Inf {
+            self.turn_page(ctx.now_ms);
+        }
 
-        // Generate: ONE forward pass per tick, free-running. The REVEAL is what is paced — the
-        // model is the slow part, so throttling generation too would only stall the screen.
-        if matches!(self.phase, Phase::Composing) {
+        // Generate: at most ONE forward pass per tick, and only when the reader is not already
+        // behind (see `wants_token`). The REVEAL is what is paced; generation is what is gated.
+        let len = unsafe { text_len() };
+        if self.wants_token(len) {
             let t0 = now_ms_live();
-            let advance = unsafe { step_story() };
-            // Millisecond resolution is plenty at the expected 20-100 ms per pass.
+            let advance = unsafe { step_story(self.shown as usize) };
+            // Millisecond resolution is plenty at the expected 200 ms per pass.
             let dt = now_ms_live().saturating_sub(t0).min(u16::MAX as u64) as u16;
-            if matches!(advance, Advance::Wrote) {
-                self.tok_count = self.tok_count.saturating_add(1);
-                self.tok_ms_sum = self.tok_ms_sum.saturating_add(dt as u32);
-                self.tok_ms_max = self.tok_ms_max.max(dt);
-            }
-            if matches!(advance, Advance::Ended) {
-                self.phase = Phase::Told;
-                // ONE line per story, on the transition only. Serial-only by nature: ESP_LOG is
-                // baked at compile time, so a release image is silent here and an ESP_LOG=info
-                // build is what surfaces it (Task 13's bench run).
-                let avg = if self.tok_count == 0 {
-                    0
-                } else {
-                    self.tok_ms_sum / self.tok_count as u32
-                };
-                // #302: one line per CHAPTER now, with the story's running length and whether a
-                // press will continue it — the two things a bench run needs to interpret the rest.
-                log::info!(
-                    "smol #300: bard chapter done — {} tok, avg {} ms/tok, max {} ms; story {} tok, {}",
-                    self.tok_count,
-                    avg,
-                    self.tok_ms_max,
-                    unsafe { story_pos() },
-                    if unsafe { story_can_continue() } {
-                        "press to continue"
-                    } else {
-                        "the end"
+            match advance {
+                Advance::Wrote { dropped } => {
+                    self.tok_count = self.tok_count.saturating_add(1);
+                    self.tok_ms_sum = self.tok_ms_sum.saturating_add(dt as u32);
+                    self.tok_ms_max = self.tok_ms_max.max(dt);
+                    // Count what the tale actually appended, so a multi-byte token fills the page
+                    // by the width it will occupy.
+                    let written = unsafe { text_len() } + dropped - len;
+                    self.page_bytes = self.page_bytes.saturating_add(written as u16);
+                    self.rewind(dropped);
+                    if d.mode == delivery::Mode::Page && self.page_bytes >= PAGE_BYTES {
+                        self.phase = Phase::Paged;
                     }
-                );
-                // Bench builds only: how much of the (floor-gated) stack the story actually used.
-                #[cfg(feature = "stack-paint")]
-                {
-                    let region = stack_paint::region_bytes();
-                    let used = stack_paint::high_water();
-                    // checked_div, not a zero test: a region of 0 means the linker symbols were
-                    // nonsense, and reporting 0% is the honest answer rather than dividing.
-                    let pct = (used * 100).checked_div(region).unwrap_or(0);
+                }
+                Advance::Primed => {}
+                Advance::Ended { cursor } => {
+                    // ONE line per TALE, on the transition only. Serial-only by nature: ESP_LOG is
+                    // baked at compile time, so a release image is silent here and an ESP_LOG=info
+                    // build is what surfaces it (Task 13's bench run).
+                    let avg = if self.tok_count == 0 {
+                        0
+                    } else {
+                        self.tok_ms_sum / self.tok_count as u32
+                    };
                     log::info!(
-                        "smol #300: stack high-water {} of {} B ({}%)",
-                        used,
-                        region,
-                        pct
+                        "smol #300: bard tale done — {} tok, avg {} ms/tok, max {} ms; {} — opening the next",
+                        self.tok_count,
+                        avg,
+                        self.tok_ms_max,
+                        if cursor { "position cursor recycled" } else { "the model ended it" }
                     );
+                    // Bench builds only: how much of the (floor-gated) stack the story actually used.
+                    #[cfg(feature = "stack-paint")]
+                    {
+                        let region = stack_paint::region_bytes();
+                        let used = stack_paint::high_water();
+                        // checked_div, not a zero test: a region of 0 means the linker symbols were
+                        // nonsense, and reporting 0% is the honest answer rather than dividing.
+                        let pct = (used * 100).checked_div(region).unwrap_or(0);
+                        log::info!(
+                            "smol #300: stack high-water {} of {} B ({}%)",
+                            used,
+                            region,
+                            pct
+                        );
+                    }
+                    self.next_tale(ctx.node_id, ctx.now_ms);
                 }
             }
         }
-        let text_len = unsafe { *core::ptr::addr_of!(STORY_LEN) } as u16;
+        let text_len = unsafe { text_len() } as u16;
 
         // Reveal on a wall-clock schedule (`next_reveal_ms` accumulates rather than resetting to
-        // `now`), so a slow token or a missed tick catches up to ~6 chars/s instead of drifting.
+        // `now`), so a slow token or a missed tick catches up instead of drifting.
         if self.fast {
             self.shown = text_len;
+        } else if self.shown >= text_len {
+            // Caught up: park the schedule at `now`. Without this, any wait — a page turn, the
+            // backpressure gate, a slow token — banks reveal credit and then dumps a burst of
+            // characters the instant text arrives, which in `page` mode would mean every page after
+            // the first appears all at once instead of typing itself out.
+            self.next_reveal_ms = ctx.now_ms;
         } else {
             while self.shown < text_len && ctx.now_ms >= self.next_reveal_ms {
                 self.shown += 1;
-                self.next_reveal_ms = self.next_reveal_ms.saturating_add(REVEAL_MS);
+                self.next_reveal_ms = self.next_reveal_ms.saturating_add(d.reveal_ms());
             }
         }
 
         // Repaint only when something a viewer can see changed.
-        let told = matches!(self.phase, Phase::Told) && self.shown >= text_len;
-        let quill = !told && (ctx.now_ms / BLINK_MS).is_multiple_of(2);
+        let paused = matches!(self.phase, Phase::Paged) && self.shown >= text_len;
+        let quill = !paused && (ctx.now_ms / BLINK_MS).is_multiple_of(2);
         if !(ctx.redraw || self.shown != self.painted || quill != self.quill_on) {
             return;
         }
         self.painted = self.shown;
         self.quill_on = quill;
-        // Ask the generator, not the phase: the marker must say what the button will actually do.
-        draw_story(ctx, self.shown, told, quill, told && unsafe { story_can_continue() });
+        draw_story(ctx, self.shown, quill, paused.then_some(MORE_MARK));
     }
 }
 
-/// Draw the revealed text, word-wrapped, with the quill while composing and an ending marker once
-/// the story is fully told: `~ more ~` when a press will continue it, `~ fin ~` when the model
-/// ended it and a press starts a new one (#302). The marker IS the affordance — the panel has no
-/// room for instructions, so the two endings have to look different.
-fn draw_story(ctx: &mut Ctx, shown: u16, told: bool, quill: bool, more: bool) {
+/// Draw the revealed text, word-wrapped, with the blinking quill while the bard is writing and
+/// `marker` on the bottom row when it is waiting (`page` mode). The marker IS the affordance — the
+/// panel has no room for instructions — so it appears only when a press will actually do something
+/// (#302: there is no story-over marker any more, because a story is never over).
+fn draw_story(ctx: &mut Ctx, shown: u16, quill: bool, marker: Option<&str>) {
     let text = unsafe { &*core::ptr::addr_of!(STORY_TEXT) };
     let visible = &text[..(shown as usize).min(text.len())];
-    // Reserve the bottom row for the ending, so `~ fin ~` never overwrites a line of story.
-    let rows = if told { ROWS - 1 } else { ROWS };
+    // Reserve the bottom row for the marker, so it never overwrites a line of story.
+    let rows = if marker.is_some() { ROWS - 1 } else { ROWS };
     let mut spans = [(0u16, 0u16); ROWS];
     let n = textflow::wrap_tail(visible, COLS, rows, &mut spans[..rows]);
 
@@ -650,9 +667,7 @@ fn draw_story(ctx: &mut Ctx, shown: u16, told: bool, quill: bool, more: bool) {
         .draw(ctx.display)
         .ok();
     }
-    if told {
-        // ASCII only — FONT_5X8 has no glyph beyond it, and a missing glyph draws as a blank.
-        let mark = if more { "~ more ~" } else { "~ fin ~" };
+    if let Some(mark) = marker {
         let x = ((COLS as i32 * GLYPH_W) - mark.len() as i32 * GLYPH_W) / 2;
         Text::with_baseline(
             mark,

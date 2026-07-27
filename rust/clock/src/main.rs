@@ -1611,6 +1611,33 @@ fn main() -> ! {
                 diag_dirty = true;
             }
 
+            // #302 Bard DELIVERY (key `V`): `<ms_per_char>:<mode>` — how fast the typewriter runs
+            // and whether the bard writes forever (`inf`) or a screenful at a time (`page`). Applied
+            // live, mid-tale. The node clamps the speed into 20..=500 ms/char rather than refusing a
+            // well-meant extreme, and REFUSES a malformed value outright (keeping the previous
+            // setting), because the two failure modes differ in kind: a clamp still narrates, a
+            // half-parsed value could stop the narration or peg the reveal loop.
+            #[cfg(feature = "bard")]
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_DELIVERY) {
+                let v = &o.buf[..o.len];
+                match unsafe { crate::bard::set_delivery(v) } {
+                    Ok(a) => log::info!(
+                        "smol #302: bard delivery = {} ms/char, {}{}",
+                        a.delivery.ms_per_char,
+                        match a.delivery.mode {
+                            crate::bard::delivery::Mode::Inf => "inf (endless scroll)",
+                            crate::bard::delivery::Mode::Page => "page (press to turn)",
+                        },
+                        if a.clamped { " [speed CLAMPED into 20..=500]" } else { "" }
+                    ),
+                    Err(e) => log::warn!(
+                        "smol #302: bard delivery REFUSED ({:?}) — keeping the previous setting",
+                        e
+                    ),
+                }
+                diag_dirty = true;
+            }
+
             if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_CUSTOM) {
                 let n = o.len.min(custom_buf.len());
                 custom_buf[..n].copy_from_slice(&o.buf[..n]);
