@@ -23,6 +23,8 @@
 > **§7 cost:** stories are now cache-bound at **~65 generated tokens (~140 chars)** — three or four sentences on the panel — and at 151 ms/token a full story takes ~10 s to generate while the reveal runs at 6 chars/s. Goldens regenerated at 66 tokens with the reference mirrored to 80; the first 66 ids are identical to the 146-token run, confirming a cap change only ever TRUNCATES. Both obvious DRAM levers are now spent: growing stories back needs new memory, not another dial.
 >
 > **T13 CLOSED (final-geometry verification, same bench):** full 67-token story on glass, **202 ms/tok avg / 274 max**, **stack high-water 54,960 of 75,392 B = 72%** — under the 75% roll gate. Remote CFG-S (`Bard:0` via HA `mqtt.publish`) switched the node to the Bard live and every boot now opens composing; mesh crown held throughout. Fleet roll UNBLOCKED.
+>
+> **T14 CANARY SOAK (build 905, production repro image, id8):** boot slot `ota_1` (OTA landed in the inactive slot, brick-safe), stable across a hard power-cycle, and — the last unverified assumption in the campaign — **heap low-watermark 24,136 B free of the reduced 96 KiB** (predicted ~20 KB from #140's audit). The heap-for-stack trade is confirmed on hardware, not just reasoned. Screen config `Bard:0` applied over CFG-S: the node boots straight into composing.
 
 > ### ✏️ AMENDMENT — 2026-07-26 (implementation planning, same session)
 > Four refinements settled while writing the plan (`docs/superpowers/plans/2026-07-26-bard-tiny-llm.md`):
