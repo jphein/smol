@@ -4,38 +4,62 @@
 **Status:** design approved in-session by JP 2026-07-26 — next step: implementation plan
 **Author:** claude (fable-5, orchestrator) · **Date:** 2026-07-26
 
-> ### ✏️ AMENDMENT — 2026-07-27 (#302 — the cache stops being the end of a story)
-> **§6 Termination and §9 UX both change: a press now CONTINUES the story.** The KV cache became a
-> RING (`nano_llm::cache_slot`), so `Session`'s position keeps counting past `SEQ_CAP` and writing
-> position *p* evicts *p − WINDOW*. A story runs for as many chapters as the reader presses for, on
-> the same 12.8 KB of `.bss` — total cost of the feature **8 B** (`Story::limit`, padded): `.bss`
-> 195,296 B unchanged, `.stack` 76,048 B against the 73,728 B floor. Neither half of #302's "reclaim
-> more DRAM" needed doing, because the window did not have to grow.
+> ### ✏️ AMENDMENT — 2026-07-27 (#302 — THE BARD NEVER STOPS)
+> **§6 termination, §7 scheduling and §9 UX all change, and the design got smaller.** JP's framing:
+> only ~5 × 14 characters are on the glass at once, so **the screen is a window, not the story** — a
+> story never has to end. It doesn't. The KV cache became a RING (`nano_llm::cache_slot`): position
+> keeps counting past `SEQ_CAP`, writing position *p* evicts *p − WINDOW*, and generation simply
+> never stops. A tale ends on exactly two things — the MODEL sampling end-of-text (every few hundred
+> tokens at this size; the screen answers by opening the next tale in the same scroll, so it reads as
+> a paragraph break) or the `u16` position cursor at `POS_MAX` (~3.6 h). **There is no story-over
+> state, no `~ fin ~`, no token budget and no cache-depth stop.**
+> *(An intermediate design — chapters, `~ more ~`, press-to-continue-a-finished-story — was built and
+> then retired before it reached hardware; the engine survived it, the gesture did not. Commits
+> `c67402b`, `8802f36`, superseded by `33e6b7e`, `783d255`.)*
 >
-> **RoPE: no re-rotation, and that is exact rather than a shortcut.** A cached key keeps the phase
-> of its own absolute position; RoPE is relative — ⟨R(m·f)q, R(n·f)k⟩ = qᵀR((n−m)·f)k — so a score
+> **RoPE: no re-rotation, and that is exact rather than a shortcut.** A cached key keeps the phase of
+> its own absolute position; RoPE is relative — ⟨R(m·f)q, R(n·f)k⟩ = qᵀR((n−m)·f)k — so a score
 > depends only on the DIFFERENCE of the two positions and the ring preserves the geometry with zero
 > data movement. llama.cpp's context-shift (memmove + re-rotate) would re-quantize every cached
 > vector at every shift and compound int8 error; the ring's only cost is f32 phase precision (~5 mrad
-> at the cursor's limit, an order of magnitude under the int8 KV cache's own ~8e-3). Attention now
+> at the cursor's limit, an order of magnitude under the int8 KV cache's own ~8e-3). Attention
 > iterates SLOTS, not positions — softmax is permutation-invariant, so ring order is exact.
-> **Chapter 1 is bit-for-bit what it was**: `cache_slot` is the identity below `SEQ_CAP` and the new
-> single `limit` folds the old (`MAX_TOKENS`, `SEQ_CAP`) pair into the same stopping token, so the
-> golden test passes untouched (it was NOT regenerated).
+> **A tale's first 80 positions are bit-for-bit what they were**: `cache_slot` is the identity below
+> `SEQ_CAP`, so the golden test passes untouched (it was NOT regenerated).
 >
 > **Attention sink measured, and the measurement is "no signal".** `KEEP` (pinned first-N slots,
-> StreamingLLM's trick) tried at 0/4/16 over 12 seeds × 6 chapters via `examples/bard_continue.rs`:
+> StreamingLLM's trick) tried at 0/4/16 over 12 seeds × 6 windows via `examples/bard_continue.rs`:
 > 84.4 / 81.3 / 85.0 % distinct words — noise. Shipped at **`KEEP = 0`**, which also keeps every
 > relative distance ≤ `SEQ_CAP − 1` forever, i.e. inside the 512 the checkpoint was trained for; a
 > sink's distance to the query grows without bound and would extrapolate. Revisit only if §12's
 > custom model shows sink behaviour — the ring arithmetic already takes any `KEEP`.
 >
-> **§9 UX:** short press on `~ more ~` continues; `~ fin ~` (the ~5% EOS ending) means a press
-> starts a new one; long-press to the menu and back is the always-available "new story" gesture, so
-> no third gesture was invented. `STORY_TEXT` rolls (`textflow::roll`) — oldest bytes dropped per
-> continuation, bounded by the reveal cursor so a lagging typewriter never loses an unread word, and
-> never splitting a UTF-8 token. Host tests 21 → 31. **Not yet on glass** — the bench numbers to
-> confirm are per-chapter ms/tok and stack high-water across ≥4 chapters (`--features stack-paint`).
+> **§7's real discovery — the reader is the slow part, so generation is now BACKPRESSURED.** The C3
+> generates ~13 chars/s (202 ms/token, ~2.7 chars/token) while the default reveal consumes 6.25, so
+> an unthrottled endless narrator outruns its reader for ever: the text buffer fills with unread text
+> and every roll then has to choose between dropping unread words and stalling. Generation now waits
+> whenever the unrevealed backlog reaches ~1.5 screenfuls. That makes the pair a producer/consumer
+> with a small queue, and it means **the reveal speed sets the compute duty cycle** (~46% at the
+> default pace, not 100%). Consequence to keep in mind for any future battery build: `inf` mode is
+> near-continuous compute; `page` mode idles between presses.
+>
+> **§9 UX — two delivery modes and a configurable pace, settable from HA over CFG key `V`**
+> (`smol/<id>/config/delivery`, sub pid 29, `CFG_APPLY_KEYS` 15 → 16, value `<ms_per_char>:<mode>`
+> e.g. `160:inf` / `80:page`; wire reference in `docs/protocol.md`). `inf` scrolls for ever; `page`
+> writes one screenful of new text then waits for a press (`~ more ~`), and a press during the
+> typewriter catches it up first. Pace is clamped on the node to 20..=500 ms/char — a 0 would peg the
+> reveal loop — and a malformed value is refused with the previous setting kept, the `T` discipline.
+> Empty value = defaults (`160:inf`); an empty field keeps that field. Long-press to the menu is
+> untouched; short press means "hurry" or "turn the page" and nothing else.
+> `STORY_TEXT` is now a ROLLING window (`textflow::append_rolling`): oldest text dropped as new
+> arrives, the cut bounded by the reveal cursor so an unread word is never lost, and never splitting
+> a UTF-8 token.
+>
+> **Measured, canonical fleet tier:** `.bss` **195,296 B — byte-identical to pre-#302** · `.stack`
+> **76,008 B** against the 73,728 B floor (gate passes, 2,280 B margin). The whole feature costs
+> **48 B** of `.data`. Host tests **21 → 36**. **Not yet on glass** — the bench numbers to take are
+> per-tale ms/tok in `inf` mode (expect ~10% above T13's 202, since attention now always spans the
+> full window), stack high-water across ≥4 tale boundaries, and that a `V` change lands mid-tale.
 >
 > ### ✏️ AMENDMENT — 2026-07-26 (T9, measured on the canonical image)
 > **§5 RAM budget — the `SEQ_CAP` knob fired.** At `SEQ_CAP=256` the canonical fleet image (`espnow,cast,io,bard`) **fails to link** (`.bss` overflow by 20,704 B in DRAM). Shipped at **`SEQ_CAP=192`**. Measured loadable-section deltas (bard vs no-bard): `.bss` +78,528 B · `.data` +1,184 B · `.rodata` +285,360 B (283,096 = the blob). ~~Remaining DRAM headroom ≈ 2.6 KB~~ **CORRECTED (oracle, same day): that 2,592 B is the entire remaining RUNTIME STACK** — bard's `.bss` consumed the `.stack` region (82,304 → 2,592 B; the linker shrinks `.stack` silently to zero before erroring, so "it links" is NOT a stack guarantee, and `__stack_chk_guard` landed outside the stack region entirely). Overflow corrupts the adjacent `Bufs`/KV cache → garbled stories, not a clean crash. Remedy SHIPPED (f287c26), measured: **`SEQ_CAP=160`** → `.bss` 257,112 B, **`.stack` = 14,240 B, `__stack_chk_guard` back inside the region**; `repro_build.sh` now derives `_stack_start − _stack_end` via readelf and **hard-fails below 12,288 B** (negative-tested against the real 2,592 B ELF); a **stack-paint high-water measurement at T13** still gates the fleet roll. Stories cache-bound ~145 tokens / ~300 chars. The esp-wifi 128 KiB heap (#140) is the follow-up reclaim lever if stories should grow back. Goldens regenerate bit-for-bit at each cap change (146@160 and 178@192 both verified prefix-identical to their predecessors).

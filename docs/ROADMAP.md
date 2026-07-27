@@ -71,11 +71,11 @@ formula are a bug in this document** — check them together.
 > Re-measure with `--features stack-paint` under live radio — idle numbers are meaningless.
 > **#198/#233 (C6, 512 KB SRAM) dissolves the whole problem.**
 >
-> **`SEQ_CAP` is cheaper than it was (#302, 2026-07-27):** it no longer caps a STORY, only the
-> context window and the chapter beat. The KV cache is a ring, so a press continues the same story
-> indefinitely — turning the dial down shortens the model's memory (and the text between pauses),
-> not the tale. The DRAM half of #302 was therefore never needed and the slack is unchanged at
-> ~2,300 B: the whole feature cost 8 B.
+> **`SEQ_CAP` is cheaper than it was (#302, 2026-07-27):** it no longer caps a STORY at all, only
+> how far back the model can remember. The KV cache is a ring and the Bard narrates endlessly, so
+> turning the dial down shortens its MEMORY (prose holds together less well across sentences), never
+> the length of a tale. The DRAM half of #302 was therefore never needed and the slack is unchanged
+> at ~2,280 B: the whole feature cost **48 B** (`.bss` is byte-identical to pre-#302).
 >
 > Practical consequence for the HW-held PRs (#190 HMAC, #181 ledger, #227 weather): each adds
 > static state and will now meet this gate. Budget the `.bss` delta before rebasing, not after.

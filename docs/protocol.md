@@ -381,12 +381,13 @@ firmware predates is DROPPED (forward-compat, #46). Parse is panic-free/heap-fre
 | `G` | #72 | **IO pin-map** — the whole per-node driver map (see below) (`5689b1b`, #113) | yes | live, **no reboot** (edge-triggered re-bind) |
 | `g` | #72 | **IO output states** — commanded output levels (see below) (`5689b1b`, #113) | yes | live, no reboot |
 | `T` | #303 | **Bard story prompt** — the opening the on-device LLM continues; empty = the node's built-in persona. **The LEAF validates** against the model's own 512-token vocabulary (bytes with no token are refused with an offset; merely-unknown ASCII is accepted but fragments) and keeps its previous prompt on refusal — validation cannot live gateway-side because it needs the tokenizer, which lives with the model | yes | live, no reboot (next story uses it) |
+| `V` | #302 | **Bard delivery** — `<ms_per_char>:<mode>`, e.g. `160:inf` or `80:page`. `inf` narrates for ever (continuous scroll); `page` writes one screenful of new text then waits for a button press. Empty = defaults (`160:inf`); an empty FIELD keeps that field (`:page`, `80:`); the colon is required otherwise. **The LEAF clamps** the pace to `20..=500` ms/char (a 0 would peg the reveal loop) and logs that it did; a malformed value is refused with the previous setting kept | yes | live, no reboot — takes effect **mid-tale**, on the next tick |
 
-- **Reboot vs live.** Live-apply (no reboot): `S L U P Y O W G g T`. Reboot on apply: `B` (broker-leg
+- **Reboot vs live.** Live-apply (no reboot): `S L U P Y O W G g T V`. Reboot on apply: `B` (broker-leg
   change) — **edge-triggered** (only when the value changes, so the ~10 s re-arm never
   reboot-loops); `R` reboots by design. `O` takes effect on the next OTA fetch without a reboot.
   (`N` was reboot-on-apply pre-#142; retired.)
-- **Cached + re-armed vs transient.** `S L U P Y B O G g T` live in the gateway's `cfg_cache` and are
+- **Cached + re-armed vs transient.** `S L U P Y B O G g T V` live in the gateway's `cfg_cache` and are
   **re-broadcast every ~10 s** (`broadcast_cached_configs`), so a rebooted leaf re-arms within ~10 s
   with **no leaf-side NVS** — except the network overrides (`B`/`O`), which *also* persist in the
   NVS net record below (needed to reach the broker at all before the first relay). A retained `N` is
