@@ -111,25 +111,42 @@ unsafe fn push_text(extra: &[u8]) -> bool {
     room > extra.len()
 }
 
-/// Advance the story by ONE token, appending to [`STORY_TEXT`]. Returns `true` while more is
-/// coming.
+/// What one [`step_story`] call did — enough to tell a prompt-priming pass (same cost, but not
+/// a story token) from a generated one, so the perf stats only count what they claim to.
+enum Advance {
+    /// A prompt token was fed; nothing generated yet.
+    Primed,
+    /// A generated token's bytes were appended.
+    Wrote,
+    /// The story ended.
+    Ended,
+}
+
+/// Advance the story by ONE token, appending to [`STORY_TEXT`].
 ///
 /// # Safety
 /// As [`init_statics`].
-unsafe fn step_story() -> bool {
+unsafe fn step_story() -> Advance {
     let (Some(model), Some(tok)) = (
         (*core::ptr::addr_of!(MODEL)).as_ref(),
         (*core::ptr::addr_of!(TOKENIZER)).as_ref(),
     ) else {
-        return false;
+        return Advance::Ended;
     };
     let Some(story) = (*core::ptr::addr_of_mut!(STORY)).as_mut() else {
-        return false;
+        return Advance::Ended;
     };
     let bufs = &mut *core::ptr::addr_of_mut!(BUFS);
-    let more = match story.step(model, tok, bufs) {
-        StepOut::Working => true,
-        StepOut::Text(bytes) => push_text(bytes),
+    let advance = match story.step(model, tok, bufs) {
+        StepOut::Working => Advance::Primed,
+        StepOut::Text(bytes) => {
+            if push_text(bytes) {
+                Advance::Wrote
+            } else {
+                // The text buffer is full — the last token landed, but this is the end.
+                Advance::Ended
+            }
+        }
         // A cut is the usual ending at this model size (T8: ~19 of 20 seeds), so mark it —
         // trailing dots read as tailing off, where a bare mid-sentence stop reads as a crash.
         // ASCII dots, not U+2026: FONT_5X8 is an ASCII font and would draw the ellipsis as a
@@ -138,11 +155,29 @@ unsafe fn step_story() -> bool {
             if truncated {
                 push_text(b"...");
             }
-            false
+            Advance::Ended
         }
     };
     // Belt and braces: the state machine's own view must agree that there is more to come.
-    more && !story.is_done()
+    if story.is_done() {
+        Advance::Ended
+    } else {
+        advance
+    }
+}
+
+/// Milliseconds since boot, read LIVE.
+///
+/// `ctx.now_ms` cannot be used to time a forward pass: it is a snapshot `main` takes once per
+/// tick, so before/after readings inside one `update()` are identical and every measurement
+/// would be 0. `main::millis()` is private and `net::mode::now_ms` is radio-gated, so this
+/// takes the same underlying clock directly — the third copy of a one-line call the crate
+/// already keeps two of, by the same reasoning its comment gives.
+#[inline]
+fn now_ms_live() -> u64 {
+    esp_hal::time::Instant::now()
+        .duration_since_epoch()
+        .as_millis()
 }
 
 /// Reveal one character per this many ms (~6/s — spec §7's reading pace).
@@ -189,6 +224,12 @@ pub struct BardApp {
     painted: u16,
     /// Set by a tap while composing: stop throttling and catch the reveal up (spec §9).
     fast: bool,
+    /// Generated tokens this story (prompt-priming passes excluded — see [`Advance`]).
+    tok_count: u16,
+    /// Total ms spent in those passes. u32 holds ~49 days; a story is seconds.
+    tok_ms_sum: u32,
+    /// Slowest single pass, ms — the number that decides whether the UI can stay responsive.
+    tok_ms_max: u16,
 }
 
 impl BardApp {
@@ -202,6 +243,9 @@ impl BardApp {
             quill_on: false,
             painted: u16::MAX, // force the first paint
             fast: false,
+            tok_count: 0,
+            tok_ms_sum: 0,
+            tok_ms_max: 0,
         };
         if ok {
             app.restart(ctx.node_id, ctx.now_ms);
@@ -217,6 +261,9 @@ impl BardApp {
         self.next_reveal_ms = now_ms;
         self.painted = u16::MAX;
         self.fast = false;
+        self.tok_count = 0;
+        self.tok_ms_sum = 0;
+        self.tok_ms_max = 0;
     }
 }
 
@@ -249,8 +296,33 @@ impl Plugin for BardApp {
 
         // Generate: ONE forward pass per tick, free-running. The REVEAL is what is paced — the
         // model is the slow part, so throttling generation too would only stall the screen.
-        if matches!(self.phase, Phase::Composing) && !unsafe { step_story() } {
-            self.phase = Phase::Told;
+        if matches!(self.phase, Phase::Composing) {
+            let t0 = now_ms_live();
+            let advance = unsafe { step_story() };
+            // Millisecond resolution is plenty at the expected 20-100 ms per pass.
+            let dt = now_ms_live().saturating_sub(t0).min(u16::MAX as u64) as u16;
+            if matches!(advance, Advance::Wrote) {
+                self.tok_count = self.tok_count.saturating_add(1);
+                self.tok_ms_sum = self.tok_ms_sum.saturating_add(dt as u32);
+                self.tok_ms_max = self.tok_ms_max.max(dt);
+            }
+            if matches!(advance, Advance::Ended) {
+                self.phase = Phase::Told;
+                // ONE line per story, on the transition only. Serial-only by nature: ESP_LOG is
+                // baked at compile time, so a release image is silent here and an ESP_LOG=info
+                // build is what surfaces it (Task 13's bench run).
+                let avg = if self.tok_count == 0 {
+                    0
+                } else {
+                    self.tok_ms_sum / self.tok_count as u32
+                };
+                log::info!(
+                    "smol #300: bard story done — {} tok, avg {} ms/tok, max {} ms",
+                    self.tok_count,
+                    avg,
+                    self.tok_ms_max
+                );
+            }
         }
         let text_len = unsafe { *core::ptr::addr_of!(STORY_LEN) } as u16;
 
