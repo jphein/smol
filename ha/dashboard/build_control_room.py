@@ -14,7 +14,13 @@ except ImportError:
 # Defaults are THIS homelab's real endpoints. The old placeholders ("homeassistant.local",
 # "user@...") resolved nowhere, so a first run always died halfway — after writing the SVG but
 # before saving the view. Both stay env-overridable.
-URI=os.environ.get("HA_WS_URI","wss://ha.jphe.in/api/websocket"); TOKEN=os.environ["HA_TOKEN"]; DASH="dashboard-dashboard"
+URI=os.environ.get("HA_WS_URI","wss://ha.jphe.in/api/websocket"); TOKEN=os.environ["HA_TOKEN"]
+# The Control Room lives on the dashboard titled "smol" (url_path `smol-mesh`) — that is the one
+# JP opens. It was hardcoded to "dashboard-dashboard" (the general "Dashboard"), so every run
+# rebuilt a COPY nobody looks at while the real one silently went stale: a #303 control added on
+# 2026-07-27 appeared to save fine and was invisible for an hour. Verify with
+# `lovelace/dashboards/list` before changing this. Overridable for testing.
+DASH=os.environ.get("HA_DASH","smol-mesh")
 SSLCTX=ssl.create_default_context()  # verifies by default
 if os.environ.get("HA_WS_INSECURE"):  # explicit opt-out for a LAN self-signed HA cert (like curl -k)
     SSLCTX.check_hostname=False; SSLCTX.verify_mode=ssl.CERT_NONE
@@ -398,7 +404,50 @@ async def main():
         assert all(done.values()), f"placeholders not all filled: {done}"
         cfg=(await rpc(ws,{"type":"lovelace/config","url_path":DASH}))["result"]
         json.dump(cfg,open("lovelace_PRESAVE_backup.json","w"),indent=1)
-        cfg["views"]=[v for v in cfg["views"] if v.get("title")!="smol Nodes" and v.get("path")!="smol-control"]+[view]
+        # --- NON-DESTRUCTIVE SAVE (2026-07-27 incident) --------------------------------------
+        # This line used to be `[...remove smol-control...] + [view]`, which did two harmful
+        # things: it DROPPED any card added to the live view that the scaffold does not know
+        # about, and it APPENDED the rebuilt view, moving the Control Room to the end of the
+        # dashboard. Both fired on 2026-07-27: ten cards vanished (the herald section, the
+        # per-node overrides/IO section, and NTP freshness — all added live, never back-ported
+        # to the scaffold) and the view demoted itself to second. The live dashboard drifts
+        # AHEAD of the generator; a generator that rebuilds from a stale scaffold must merge,
+        # not replace.
+        def _ident(c):
+            """Stable identity for a card, so an UPDATED generator card is recognised as the
+            same card (not preserved as a duplicate) while a genuinely unknown card is kept."""
+            t = c.get("type", "?")
+            lbl = c.get("title") or (c.get("content", "")[:45] if t == "markdown" else "")
+            if not lbl:
+                # A NODE BOX has no title, so identify it by node id — that way an UPDATED box
+                # (e.g. gaining the #303 story-prompt rows) is recognised as the same card.
+                # Detect one the way the verifier below does: vertical-stack at the node span.
+                # EVERYTHING else falls back to a hash of the whole card, NOT a JSON prefix:
+                # prefixes collide (two untitled vertical-stacks share their first 45 chars, and a
+                # fleet-wide card that merely mentions `smol_8_` looked like the id8 box), and a
+                # collision makes a genuinely-new live card look "known" — silently dropping it,
+                # which is precisely the bug this merge exists to prevent.
+                is_node_box = (t == "vertical-stack"
+                               and (c.get("view_layout") or {}).get("grid-column") == f"span {NODE_SPAN}")
+                m = re.search(r"smol_(\d+)_", json.dumps(c)) if is_node_box else None
+                lbl = (f"node{m.group(1)}" if m
+                       else "sha:" + hashlib.sha1(json.dumps(c, sort_keys=True).encode()).hexdigest()[:12])
+            return f"{t}|{lbl[:45]}"
+
+        prev = next((v for v in cfg["views"] if v.get("path") == "smol-control"), None)
+        idx = cfg["views"].index(prev) if prev else len(cfg["views"])
+        if prev:
+            known = {_ident(c) for c in view["cards"]}
+            extras = [c for c in prev.get("cards", []) if _ident(c) not in known]
+            if extras:
+                view["cards"] = view["cards"] + extras
+                print(f"  PRESERVED {len(extras)} live card(s) the scaffold does not define:")
+                for c in extras:
+                    print(f"    · {_ident(c)}")
+                print("    → back-port these into smol-control-scaffold.yaml, or they stay orphaned here.")
+        cfg["views"] = [v for v in cfg["views"]
+                        if v.get("title") != "smol Nodes" and v.get("path") != "smol-control"]
+        cfg["views"].insert(idx, view)        # in place: never reorder the user's dashboard
         s=await rpc(ws,{"type":"lovelace/config/save","url_path":DASH,"config":cfg})
         if not s.get("success"): print("!! SAVE FAILED",s); return
         r2=(await rpc(ws,{"type":"lovelace/config","url_path":DASH}))["result"]
