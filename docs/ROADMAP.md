@@ -30,6 +30,29 @@ in-repo narrative version; the issue is the living checklist).
 
 ## 2. 🟡 IN FLIGHT / NEXT WAVE
 
+> ### ⚠️ DRAM budget — read this before adding any static buffer (post-#300)
+> The Bard put a 260K-param model on the fleet image, and DRAM is now the binding constraint on
+> the canonical tier (`espnow,cast,io,bard`). Current geometry: `.bss` **195,224 B** · `.stack`
+> **76,128 B** · esp-wifi heap **96 KiB** (low-watermark 24,136 B free) · measured stack peak
+> **54,960 B**.
+>
+> **`tools/repro_build.sh` now hard-fails a release build when the stack region drops below
+> 73,728 B** — so there is only **~2,400 B of slack** before a new static allocation *breaks the
+> build*, not the board. This is deliberate: the pre-gate image linked clean with 2,592 B of
+> stack and would have died on hardware (see the #300 spec amendments). Do **not** raise the floor
+> to make a build pass — it is derived from a measurement (peak × 4/3).
+>
+> If a feature needs more than that slack, the levers, cheapest first: **`SEQ_CAP`** in
+> `src/bard/nano_llm.rs` (80→64 frees ~5.8 KB and costs ~15 story tokens; 80→48 frees ~11.5 KB),
+> the **esp-wifi heap** in `net::init_heap` (re-run #140's audit first), the **RX-buffer tuning**
+> in `.cargo/config.toml`. Re-measure with `--features stack-paint` under live radio — idle
+> numbers are meaningless. #302 tracks reclaiming this properly; **#198/#233 (C6, 512 KB SRAM)
+> dissolves the whole problem.**
+>
+> Practical consequence for the HW-held PRs (#190 HMAC, #181 ledger, #227 weather): each adds
+> static state and will now meet this gate. Budget the `.bss` delta before rebasing, not after.
+
+
 - **Node manager — firmware consume half** (#21). The HA half is live; the firmware side is
   three small sub-tasks that ride one wave: (1) SUBSCRIBE `smol/<id>/config/default_screen`
   + a **strict, panic-free** allowlist parse (a garbage retained payload that panics =
