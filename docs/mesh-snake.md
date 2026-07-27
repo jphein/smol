@@ -7,12 +7,15 @@ labelled by its **magical name**. It's a massively-multiplayer snake that runs o
 $3 microcontrollers talking directly to each other over ESP-NOW — no server, no
 internet.
 
-> **Status (2026-07-07):** the world, movement, scrolling viewport, dead-reckoned
-> peers, the leaderboard **and all six treasure-powers** are **landed + committed**
-> (`6baea36`, plus power fix `877b2af`) and **compile-verified** (all 3 builds
-> clean). It is **not yet flashed / hardware-verified** — that lands at the final
-> flash. Powers exist in code (`mesh_snake/snake_core.rs`: `POWER_PHANTOM…PHOENIX`,
-> `POWER_COUNT = 6`); durations are first-pass and tunable.
+> **Status: 🟢 SHIPPED.** #5 closed **2026-07-08** — the world, movement, scrolling viewport,
+> dead-reckoned peers, the leaderboard **and all six treasure-powers** are flashed and running
+> fleet-wide (committed `6baea36`, power fix `877b2af`; power phasing tested 52/52). Powers live in
+> `mesh_snake/snake_core.rs` (`POWER_PHANTOM…PHOENIX`, `POWER_COUNT = 6`); durations are first-pass
+> and tunable.
+>
+> *(This block said "not yet flashed / hardware-verified" until 2026-07-27 — it was written the day
+> before the flash and never revisited. If you are reading a status line with a date on it, check
+> the issue.)*
 
 ## How to play — one button
 
@@ -39,7 +42,7 @@ control, exactly like the classic Snake mode:
   the body between updates. A briefly-missed update self-heals on the next one.
 - Up to **~16 snakes** share a world comfortably (smooth ≤8, good 12–16).
 
-## The six treasure-powers  *(in firmware — compile-verified, HW pending)*
+## The six treasure-powers  *(🟢 flashed and running fleet-wide — #5, phasing tested 52/52)*
 
 Beyond food, **rare treasures** spawn (roughly 1 every 45–60 s, patchy). Grab one
 and you gain **one timed magical power** — only **one at a time** (a new pickup
@@ -102,5 +105,5 @@ body *can't* be sent; broadcasting head+heading+length and reconstructing the re
 is both necessary and naturally loss-tolerant.
 
 ---
-*Player-facing guide. Mechanics + powers from the committed World Snake (`6baea36`,
-power fix `877b2af`); compile-verified, not yet flashed. Honest status at top.*
+*Player-facing guide. Mechanics + powers from the shipped World Snake (`6baea36`, power fix
+`877b2af`) — flashed and running fleet-wide since #5 closed 2026-07-08.*

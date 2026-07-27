@@ -93,10 +93,11 @@ tools/ota_publish.sh install <id>                                     # publish 
    `self-test FAIL — ROLLING BACK to the previous slot` and the board returns to the old
    image on its own. (A USB/JTAG reflash or a plain power-cycle does **not** self-test — the
    marker is build#-tagged, so only a genuine fresh OTA-activate arms it.)
-   > 🟡 **The HA panel's "running build" readout is not live yet.** It needs the firmware to
-   > publish `smol/<id>/status` (design F4), which hasn't shipped — until then the panel shows
-   > **"unknown"** and the "roll out to rest" button stays **inert (safe)**. **Confirm the
-   > canary via serial + the boot-splash version name**, not the panel number, for now.
+   > 🟢 **The HA panel's "running build" readout is live** (design F4 shipped as #50, closed
+   > 2026-07-10). `net/wifi.rs` publishes retained `smol/<id>/status` = `STAT|<screen>:<page>|<build>`
+   > for the gateway *and* on behalf of leaves, so the panel reads the running build number
+   > directly. Serial + the boot-splash version name remain a fine cross-check — and are still the
+   > ground truth if a retained payload is stale — but you no longer have to reach for them.
 
 5. **Roll out to the rest — one at a time.** Only after the canary is confirmed healthy:
    `tools/ota_publish.sh install 8`, then `install 9` (or each board's HA Update button). Do **not**
@@ -269,9 +270,14 @@ ota_0,    app,  ota_0, 0x20000,  0x1F0000   # 1.938 MB slot
 ota_1,    app,  ota_1, 0x210000, 0x1F0000   # 1.938 MB slot
 ```
 
-Two ~1.94 MB slots vs a ~590 KB image = ~3.3× headroom. The bundled espflash ESP-IDF v5.1.2
-bootloader honors otadata slot-select (proven on hardware). `otadata` must be exactly `0x2000`
-or slot-select fails to initialize.
+Two ~1.94 MB slots. **The image is no longer ~590 KB:** the Bard's 283,096 B model blob rides in
+`.rodata`, so the canonical fleet image (`espnow,cast,io,bard`) is **~880 KB — about 45 % of a
+slot, i.e. ~2.3× headroom, not the ~3.3× this doc claimed pre-#300** (source: the #300 design
+spec, `docs/superpowers/specs/2026-07-26-tiny-llm-story-design.md`). That still fits with room to
+spare, but it is the number behind the `size ≤ 0x1F0000` gate — re-derive it, don't inherit it,
+whenever the feature tier changes. The bundled espflash ESP-IDF v5.1.2 bootloader honors otadata
+slot-select (proven on hardware). `otadata` must be exactly `0x2000` or slot-select fails to
+initialize.
 
 ## Security posture (honest)
 
@@ -292,5 +298,6 @@ a canary **self-updated build 58→59 over the air in ~17 s** — fetch → SHA-
 → `Valid`. The first attempt had failed for an **infra** reason (a missing firewall allow-rule to reach the
 image host, since added; [#37](https://github.com/jphein/smol/issues/37) resolved) — **not a firmware bug.**
 **Bootloader revert-on-boot-fail is still unproven → canary-one-board-at-a-time remains the mass-brick
-defense; never install the whole fleet at once.** The HA "running build" / rollout gate awaits the firmware `smol/<id>/status`
-publish (F4) — until then confirm canaries by serial + boot-splash version name. Issue #6 (#37 resolved).
+defense; never install the whole fleet at once.** The HA "running build" / rollout gate is live — the firmware
+`smol/<id>/status` publish (F4) shipped as #50 — though serial + the boot-splash version name stay
+the ground truth when a retained payload looks stale. Issue #6 (#37 resolved).

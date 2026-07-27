@@ -35,12 +35,13 @@ leaves.
 
 ## The flush cycle
 
-> **⚠️ v2 shipped — MQTT-native (hardware-verified, build 40 "Pressed Oven",
+> **⚠️ v2 shipped — MQTT-native (hardware-verified, build 40 "Carbonized Anvil",
 > 2026-07-08).** The gateway's LAN egress is now an **MQTT burst** straight to Home
 > Assistant (step 4), and the **UDP collector is retired** (stopped/disabled, JSONL
 > archived). Steps 1–2 (the ESP-NOW relay/reassembly) are unchanged and current;
 > step 3 describes the **superseded** UDP flush, kept for context. One honest hold-out:
-> leaf-side `SMOLv1 BATT`-frame *receipt* is still inferred (finding #15).
+> leaf-side `SMOLv1 BATT`-frame *receipt* was inferred rather than observed at the time (#15,
+> since closed 2026-07-08).
 
 1. **Leaf emits** fresh telemetry every `RELAY_EMIT_INTERVAL_MS` (**15 s**) as up to
    `RELAY_MAX_FRAGS` (**4**) `SMOLv1 RELAY` fragments of `RELAY_CHUNK` (**64 B**)
@@ -58,7 +59,7 @@ leaves.
    a fixed post-send delay**: a warm interface flushes fast, a slow one still
    completes within the bound.
 4. **v2 — the flush burst is now an MQTT burst** *(hardware-verified since build 40;
-   current fleet build 45 "Oxidized Die" — leaf-BATT receipt inferred, #15)*. Instead of
+   the fleet build of the day, 45 "Carbonized Furnace")*. Instead of
    `run_udp_flush` → the UDP collector, the same WiFi window
    **connects to Home Assistant's Mosquitto broker** (the HA VM's leg on the boards'
    own VLAN — const in the gateway's git-ignored `secrets.rs`, see
@@ -108,7 +109,8 @@ but **don't pair a high-rate game with a busy MQTT gateway** and expect both smo
 *(Hardware-verified on build 40: a wireless gateway CONNACKs and completes the
 [MQTT burst](protocol.md#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)
 at both boot and flush, no panic; exact burst duration wasn't instrumented but it fits
-inside the 15 s budget. Leaf-side `SMOLv1 BATT`-frame receipt remains inferred — #15.)*
+inside the 15 s budget. Leaf-side `SMOLv1 BATT`-frame receipt was inferred at the time — #15,
+since closed.)*
 
 ## ESP-NOW peer table — the ~20-node ceiling + eviction (#28)
 The relay's **unicast** (`RELAYACK`, and the #40 OTA `OTAN`) rides the **ESP-NOW hardware peer
@@ -215,16 +217,23 @@ v2 telemetry now lands in Home Assistant as native MQTT entities — see
   [MQTT burst](protocol.md#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)
   and re-broadcasts as a [`SMOLv1 BATT`](protocol.md#batt--ha-battery-snapshot) frame
   (HA→gateway→cache leg hardware-verified on build 40; the gateway→leaf `SMOLv1 BATT`
-  frame *receipt* is inferred, not observed — finding #15). A *general* command/data downlink (per-leaf
+  frame *receipt* was inferred rather than observed when this was written — #15, since closed). A *general* command/data downlink (per-leaf
   unicast fragmentation back to the leaf MAC) is still deferred.
-- **Multi-hop** (leaf → relay → … → gateway) — needs a next-hop/TTL header + a
-  loop-prevention seen-set + a shared-channel invariant (+200–400 LOC); this is
-  single-hop uplink only.
+- ~~**Multi-hop** (leaf → relay → … → gateway)~~ — **✅ SHIPPED, and this guide used to deny a
+  capability you now have.** #13 landed (PR #123, merged 2026-07-14): a leaf that stops being heard
+  escalates to a **hop-limited managed flood** — a hop-limit plus an `(origin, msgid, frag)`
+  seen-set, deliberately **table-free** so it rides roam and re-election for free. Escalation is
+  hysteretic (3 consecutive un-ACKed messages to latch, 2 direct-ACK probes to un-latch), so the
+  ordinary all-hear case stays **byte-identical** to single-hop — which is why you will normally
+  never see it fire. 🟢 **On 2026-07-14 a gateway-deaf smol delivered telemetry home through a
+  neighbour** — the first routed frame in smol's history. Wire contract: `RELAY2`/`RELAYACK2` +
+  `BATT2`/`GRID2` in [protocol.md](protocol.md). Honest v1 limits: uplink ACK is best-effort and a
+  stranded leaf's channel-scanning caps throughput (both follow-ups, #126 and #124, have closed).
 - **Browsing / general IP** — physically impractical (see the gateway analysis).
 
 ## Status
 **v1 (retired, historical) — was hardware-proven end-to-end + sustained.** On the wave-6
-fleet (build 36 "Oxidized Spark", `bcafa7e`) the full v1 chain ran: leaf id8 emits →
+fleet (build 36 "Bolted Quench", `bcafa7e`) the full v1 chain ran: leaf id8 emits →
 gateway reassembles → WiFi flush → **`node_id 8` telemetry accumulated in
 `<host>:~/smol-collector/collector.jsonl`, sustained ~02:06Z → 02:44Z** across a firmware
 upgrade. Freeze/dup/liveness fixes (`2ea7c4d`, `652155b`, `ca5d985`) all in. The LAN
@@ -232,7 +241,7 @@ collector was committed (19→26 tests, hardened) + deployed — **now retired**
 v2 below). One non-blocking cold-ARP first-round nit carried over (see the flush follow-up).
 Wire frames: [protocol.md](protocol.md#relay--relayack--espnow--internet-telemetry).
 
-**v2 (hardware-verified — build 40 "Pressed Oven", 2026-07-08):** the LAN egress is now
+**v2 (hardware-verified — build 40 "Carbonized Anvil", 2026-07-08):** the LAN egress is now
 an [MQTT burst](protocol.md#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)
 straight to Home Assistant (telemetry as native HA entities via discovery; a retained
 battery downlink cached + re-broadcast as a [`SMOLv1 BATT`](protocol.md#batt--ha-battery-snapshot)
@@ -240,8 +249,9 @@ frame). The ESP-NOW relay/reassembly above is unchanged; only the gateway's inte
 hop moved. Proven on real boards: wireless CONNACK (boot + flush), 31 B byte-exact
 downlink, `sensor.smol_7…`/`sensor.smol_8…` live in HA (incl. a leaf's telemetry
 relayed leaf→gateway→cloud). The **UDP collector is retired** (stopped/disabled, JSONL
-archived). Still open: leaf-side BATT-frame *receipt* is inferred (finding #15), plus
-one SNTP-starved-boot-MQTT edge (#15).
+archived). Both residuals recorded here have since CLOSED: the inferred leaf-side BATT-frame
+*receipt* and
+the SNTP-starved-boot-MQTT edge (#15, closed 2026-07-08).
 
 **v2.1 — runtime-overridable broker + OTA host (#100 Stage 2/3, PR #110).** The MQTT broker leg
 is no longer baked-only: it can be **overridden at runtime from the HA dashboard** via keyed-CFG

@@ -259,17 +259,29 @@ IDF pin config.
 **Add-on BOM total: ~$5–10** with generic parts, **~$15–18** with genuine
 Adafruit-grade parts and a nice speaker.
 
-### Suggested GPIO mapping (avoids I²C 5/6, strapping 2/8/9, UART 20/21)
+### Suggested GPIO mapping
+
+> ⚠️ **The authority for which pins are usable is the firmware, not this table.**
+> `rust/clock/src/io.rs` defines `FREE_PINS = [0, 1, 3, 7, 10]` and
+> `RESERVED_PINS = [2, 4, 5, 6, 8, 9, 20, 21]`, and `PinMap` **refuses to bind a reserved pin at
+> runtime**. Cite those constants rather than copying this table — an earlier version of it put
+> I²S BCLK on **GPIO4**, which is the **battery ADC** (`sensors::BATT_ADC_GPIO`) and on the
+> never-bind list, under a heading that claimed to dodge every reserved pin.
 
 | Signal | C3 GPIO | Wires to |
 |---|---|---|
-| **I²S BCLK** (shared) | **GPIO4** | INMP441 `SCK` **+** MAX98357A `BCLK` |
+| **I²S BCLK** (shared) | **GPIO0** | INMP441 `SCK` **+** MAX98357A `BCLK` |
 | **I²S WS/LRCK** (shared) | **GPIO3** | INMP441 `WS` **+** MAX98357A `LRC` |
 | **I²S DIN** (mic → C3, RX) | **GPIO10** | INMP441 `SD` |
 | **I²S DOUT** (C3 → amp, TX) | **GPIO7** | MAX98357A `DIN` |
-| **PTT button** | **GPIO1** (or GPIO0) | button → GND, `INPUT_PULLUP` |
+| **PTT button** | **GPIO1** | button → GND, `INPUT_PULLUP` |
 
-Leaves GPIO0 spare (ADC-capable), keeps GPIO5/6 for the OLED, never touches strapping
+**The honest cost:** those five signals consume **all five** free GPIOs, so a walkie-talkie build
+leaves **nothing spare** — no runtime IO registry bindings (#72), and GPIO0, the ADC-capable spare,
+is spent on BCLK. Avoiding GPIO4 is not optional (battery sensing dies with it), so the only way to
+free a pin is to give up a signal — e.g. an amp with a hard-wired LRC, or PTT on the BOOT button.
+
+Keeps GPIO5/6 for the OLED, leaves the battery ADC on GPIO4 intact, never touches strapping
 pins (2/8/9), the onboard LED (8), BOOT (9), or the UART console (20/21). GPIO3 is
 also an ADC pin but that's irrelevant here; GPIO10 is the same safe pin the sound
 doc/NES doc favor.
