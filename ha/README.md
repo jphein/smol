@@ -349,6 +349,18 @@ python3 ~/Projects/ha/tools/ha_supervisor.py GET /addons/e4069849_juicepassproxy
 **Never paste the password into committed files, findings, logs, or issue comments.**
 Addon ACL: authed users have readwrite on `#`, so `smol/#` needs no ACL changes.
 
+> ### ⚠️ Package layout on the LIVE instance differs from this repo (found 2026-07-27)
+> The live `/homeassistant/packages/` holds **`smol_notify.yaml`** and **`smol_telemetry.yaml`**
+> (neither is in this repo) and **no `smol_mesh.yaml`** — only five `.bak` generations of it —
+> yet the package-defined helpers (e.g. `input_select.smol_8_screen`) are live and
+> `check_config` passes. So this repo's `smol_mesh.yaml` is **not** the deployed artifact, and
+> `cat smol_mesh.yaml | tee` would be a guess, not an update. Unresolved; JP knows the history.
+>
+> Consequence for new work: ship additive **self-contained** package files (the pattern the two
+> live companions already use — HA merges same-domain keys across files). `smol_bard.yaml`
+> (#303) is done that way and deployed cleanly; do the same rather than editing `smol_mesh.yaml`
+> and hoping.
+
 ## Install / redeploy (DEPLOYED & LIVE 2026-07-08 — this is the update procedure)
 
 `scp` doesn't work on the HAOS SSH add-on (no subsystem), so use the tee pattern:

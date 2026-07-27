@@ -1,0 +1,100 @@
+# smol · Bard story-prompt package (#303) — the runtime story opening, per node.
+# =====================================================================
+# ADDITIVE COMPANION, deployed as its own file. That is deliberate: the live HA carries
+# `smol_notify.yaml` and `smol_telemetry.yaml` as separate additive packages (HA merges
+# same-domain keys across package files), while `smol_mesh.yaml` is NOT currently deployed
+# there — so a self-contained file is the pattern that actually works on this instance and
+# cannot collide with whatever `smol_mesh.yaml` does or does not define. Everything here is
+# NEW (unique_ids and entity names appear nowhere else).
+#
+# WHAT THIS CONTROLS
+# The Bard (#300) is a 260K-param transformer that writes stories ON the board. This package
+# sets the OPENING it continues, per node, at runtime — no reflash:
+#   input_text.smol_<id>_tale  ->  retained  smol/<id>/config/tale  ->  CFG key `T`
+# Empty value = retain-clear => the node falls back to its built-in persona prompt
+# (id7 dragon / id8 owl / id9 bird), the same "empty = default" convention as the `S` key.
+#
+# THE VALIDATION LIVES ON THE NODE, NOT HERE — and that is not laziness. Checking a prompt
+# means encoding it with the model's own 512-token vocabulary, and the model is on the board.
+# The firmware refuses bytes it has no token for (emoji, most non-ASCII) and refuses prompts
+# that would spend too much of the shared 80-token window, KEEPING THE PREVIOUS PROMPT rather
+# than derailing generation. A refusal is logged on the node (`smol #303: ... REFUSED`), not
+# surfaced in HA — so if a prompt seems ignored, read the board's log.
+#
+# GUIDANCE FOR THE FIELD: simple nursery words work ("One day, a little owl found a red ball").
+# Proper nouns are ACCEPTED but fragment into char-level tokens and read worse; that is the
+# documented trade, not a bug. Shorter openings leave more window for the tale.
+#
+# Deploy: cat ha/packages/smol_bard.yaml | ssh jp@10.0.6.108 \
+#           "sudo tee /homeassistant/packages/smol_bard.yaml > /dev/null"
+#         then POST /api/services/homeassistant/reload_all (new input_* helpers AND mqtt
+#         sensors need reload_all; automation.reload alone does not register them).
+
+input_text:
+  # #303 Bard story prompt: the OPENING the on-device LLM continues. Empty = that node's
+  # built-in persona ("Once upon a time, there was a little owl" for id8). The NODE validates
+  # against the model's own 512-token vocabulary and keeps its previous prompt on refusal, so a
+  # bad value here degrades nothing — watch the node's log for "story prompt REFUSED".
+  # Keep the words SIMPLE (TinyStories nursery vocabulary): emoji and most non-ASCII are refused
+  # outright, and unusual names fragment into char-level tokens and read worse. max 64 = the
+  # firmware's CFG_VALUE_MAX and prompt buffer; every prompt token is a story token spent from
+  # the shared 80-token window, so shorter openings leave longer tales.
+  smol_7_tale:
+    name: "smol 7 story prompt (Bard)"
+    max: 64
+    initial: ""
+  smol_8_tale:
+    name: "smol 8 story prompt (Bard)"
+    max: 64
+    initial: ""
+  smol_9_tale:
+    name: "smol 9 story prompt (Bard)"
+    max: 64
+    initial: ""
+
+automation:
+  - id: smol_tale_publish
+    alias: "smol #303: publish per-node Bard story prompt"
+    description: >-
+      On any per-node story-prompt input_text changing, publish retained smol/<id>/config/tale
+      (raw). Empty payload = retain-clear -> the node falls back to its built-in persona prompt.
+      The node validates the value against the model vocabulary; a refusal is logged there and
+      leaves the previous prompt in place.
+    mode: parallel
+    max: 10
+    trigger:
+      - platform: state
+        entity_id:
+          - input_text.smol_7_tale
+          - input_text.smol_8_tale
+          - input_text.smol_9_tale
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/config/tale"
+          retain: true
+          qos: 1
+          payload: "{{ trigger.to_state.state }}"
+
+mqtt:
+  sensor:
+    # #303 Bard story-prompt mirror: read back the retained prompt so the card shows what was
+    # commanded. '(default)' when empty = the node is using its built-in persona.
+    - name: "smol 7 tale"
+      unique_id: smol_7_tale_mirror
+      state_topic: "smol/7/config/tale"
+      icon: "mdi:feather"
+      value_template: "{{ value if value else '(default)' }}"
+    - name: "smol 8 tale"
+      unique_id: smol_8_tale_mirror
+      state_topic: "smol/8/config/tale"
+      icon: "mdi:feather"
+      value_template: "{{ value if value else '(default)' }}"
+    - name: "smol 9 tale"
+      unique_id: smol_9_tale_mirror
+      state_topic: "smol/9/config/tale"
+      icon: "mdi:feather"
+      value_template: "{{ value if value else '(default)' }}"

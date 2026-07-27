@@ -156,26 +156,6 @@ input_text:
     name: "smol 9 broker override (ip[:port])"
     max: 21
     initial: ""
-  # #303 Bard story prompt: the OPENING the on-device LLM continues. Empty = that node's
-  # built-in persona ("Once upon a time, there was a little owl" for id8). The NODE validates
-  # against the model's own 512-token vocabulary and keeps its previous prompt on refusal, so a
-  # bad value here degrades nothing — watch the node's log for "story prompt REFUSED".
-  # Keep the words SIMPLE (TinyStories nursery vocabulary): emoji and most non-ASCII are refused
-  # outright, and unusual names fragment into char-level tokens and read worse. max 64 = the
-  # firmware's CFG_VALUE_MAX and prompt buffer; every prompt token is a story token spent from
-  # the shared 80-token window, so shorter openings leave longer tales.
-  smol_7_tale:
-    name: "smol 7 story prompt (Bard)"
-    max: 64
-    initial: ""
-  smol_8_tale:
-    name: "smol 8 story prompt (Bard)"
-    max: 64
-    initial: ""
-  smol_9_tale:
-    name: "smol 9 story prompt (Bard)"
-    max: 64
-    initial: ""
   smol_7_ota_host:
     name: "smol 7 OTA host override (ip)"
     max: 15
@@ -546,23 +526,6 @@ mqtt:
     # --- #45 Custom-screen mirror: read back the retained wire payload the compose
     # template sensor published (round-trip confirmation + dashboard preview). State =
     # the FIRST line's resolved text (2-char size/align prefix stripped); '(none)' when empty. ---
-    # #303 Bard story-prompt mirror: read back the retained prompt so the card shows what was
-    # commanded. '(default)' when empty = the node is using its built-in persona.
-    - name: "smol 7 tale"
-      unique_id: smol_7_tale_mirror
-      state_topic: "smol/7/config/tale"
-      icon: "mdi:feather"
-      value_template: "{{ value if value else '(default)' }}"
-    - name: "smol 8 tale"
-      unique_id: smol_8_tale_mirror
-      state_topic: "smol/8/config/tale"
-      icon: "mdi:feather"
-      value_template: "{{ value if value else '(default)' }}"
-    - name: "smol 9 tale"
-      unique_id: smol_9_tale_mirror
-      state_topic: "smol/9/config/tale"
-      icon: "mdi:feather"
-      value_template: "{{ value if value else '(default)' }}"
     - name: "smol 7 custom"
       unique_id: smol_7_custom_mirror
       state_topic: "smol/7/config/custom"
@@ -2303,32 +2266,6 @@ automation:
       - service: mqtt.publish
         data:
           topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/config/broker"
-          retain: true
-          qos: 1
-          payload: "{{ trigger.to_state.state }}"
-
-  - id: smol_tale_publish
-    alias: "smol #303: publish per-node Bard story prompt"
-    description: >-
-      On any per-node story-prompt input_text changing, publish retained smol/<id>/config/tale
-      (raw). Empty payload = retain-clear -> the node falls back to its built-in persona prompt.
-      The node validates the value against the model vocabulary; a refusal is logged there and
-      leaves the previous prompt in place.
-    mode: parallel
-    max: 10
-    trigger:
-      - platform: state
-        entity_id:
-          - input_text.smol_7_tale
-          - input_text.smol_8_tale
-          - input_text.smol_9_tale
-    condition:
-      - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
-    action:
-      - service: mqtt.publish
-        data:
-          topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/config/tale"
           retain: true
           qos: 1
           payload: "{{ trigger.to_state.state }}"
