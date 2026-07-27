@@ -49,7 +49,16 @@ pub const MAX_HEADS: usize = 8;
 pub const MAX_VOCAB: usize = 512;
 /// KV-cache depth the firmware allocates, independent of the header's `seq_len` (512): a
 /// story is capped at this many tokens so the cache fits RAM.
-pub const SEQ_CAP: usize = 256;
+///
+/// 192, NOT 256 — a MEASURED constraint, not a guess. At 256 the canonical fleet image
+/// (`espnow,cast,io,bard`) fails to LINK: `.bss will not fit in region DRAM: overflowed by
+/// 20704 bytes`, because esp-wifi's 128 KiB heap (#140) plus the existing ~191 KB of
+/// `.data`+`.bss` leaves under 100 KB of the C3's 313 KiB DRAM window. Dropping to 192 frees
+/// 23296 B (2 caches × 5 layers × 64 slots × 32 + their scales + the score row), which is what
+/// makes the image link. The cost is story length: with a ~15-token prompt the cache, not
+/// [`Story::MAX_TOKENS`], becomes the stopping rule at ~177 generated tokens (~360 chars) —
+/// still comfortably a story. Raising this again requires giving RAM back somewhere else.
+pub const SEQ_CAP: usize = 192;
 /// Row stride of one cached K (or V) vector, in int8 slots. The shipped model's `kv_dim` is
 /// exactly 32; [`Model::parse`] REFUSES anything wider, which is what lets the forward pass
 /// index the cache without a bounds fallback.
@@ -743,13 +752,9 @@ impl Session {
 // Sampling + story state machine
 // ===================================================================================
 
-// The Bard's tokenizer. Under `hostsim` the pure cores are flat crate-root modules; in the
-// firmware they live under `crate::bard::` (Task 9's mod.rs). Both paths are spelled out here
-// so neither world has to patch this file.
-#[cfg(feature = "hostsim")]
-use crate::bard_tokenizer::Tokenizer;
-#[cfg(not(feature = "hostsim"))]
-use crate::bard::tokenizer::Tokenizer;
+// `super::` resolves to `crate::bard` in the firmware and to the crate root in the host lib
+// (where lib.rs exports these files under their plain names) — ONE spelling for both roots.
+use super::tokenizer::{Tokenizer, BOS, EOS};
 
 /// Longest prompt, in tokens. The 16 personas encode to well under this (Task 9 tests it).
 pub const MAX_PROMPT: usize = 48;
@@ -941,13 +946,14 @@ impl Story {
 
     /// Whether the ending was a hard cut rather than the model stopping — the same flag
     /// [`StepOut::Done`] carries, for a renderer that consults state instead of the step result.
+    // Build-conditional dead code, not a leftover: the host tests assert this agrees with the
+    // step result, and Task 10's renderer consults it at draw time, but the Task 9 firmware stub
+    // reads the `StepOut::Done` field directly — so in a BIN build it has no caller yet. `allow`
+    // rather than `expect` because in the hostsim LIB build it is a live pub item and an
+    // expectation would go unfulfilled.
+    #[allow(dead_code)]
     pub fn truncated(&self) -> bool {
         self.truncated
-    }
-
-    /// Tokens generated or fed so far — the tick counter a UI can show progress from.
-    pub fn pos(&self) -> u16 {
-        self.pos
     }
 
     /// Advance by exactly ONE forward pass: either priming the cache with a prompt token
@@ -990,8 +996,8 @@ impl Story {
             &mut self.rng,
             &mut self.idx,
         );
-        // 1 = BOS, 2 = EOS: llama2.c treats either as end-of-story.
-        if next == 1 || next == 2 {
+        // llama2.c treats either sentinel as end-of-story.
+        if next == BOS || next == EOS {
             self.done = true; // the model chose to stop; `truncated` stays false
             return StepOut::Done { truncated: false };
         }

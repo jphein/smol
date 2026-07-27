@@ -54,11 +54,16 @@ pub mod input;
 #[cfg(feature = "hostsim")]
 #[path = "bard/nano_llm.rs"]
 pub mod nano_llm;
-// Exported as `bard_tokenizer`, not `tokenizer`: the crate root is shared with the firmware
-// bin's flat module namespace, so the bard-specific name keeps it unambiguous there.
+// The bard's siblings, exported under their PLAIN names. That is load-bearing: inside
+// `src/bard/` the three files reach each other as `super::nano_llm` / `super::tokenizer`, which
+// resolves to `crate::bard::*` in the firmware and to these crate-root modules here — one
+// spelling that compiles under both roots, with no cfg juggling in the shared source.
 #[cfg(feature = "hostsim")]
 #[path = "bard/tokenizer.rs"]
-pub mod bard_tokenizer;
+pub mod tokenizer;
+#[cfg(feature = "hostsim")]
+#[path = "bard/persona.rs"]
+pub mod persona;
 #[cfg(feature = "hostsim")]
 pub mod sensors;
 #[cfg(feature = "hostsim")]

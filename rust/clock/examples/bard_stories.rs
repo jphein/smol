@@ -8,7 +8,7 @@
 //! This is the same code path the firmware runs — the pure cores compiled for the host — so it
 //! is also where the host-side tokens/sec number comes from. The device will be far slower
 //! (160 MHz, no FPU, flash-resident weights); Task 11 measures that on hardware.
-use clock::bard_tokenizer::Tokenizer;
+use clock::tokenizer::Tokenizer;
 use clock::nano_llm::*;
 use std::time::Instant;
 

@@ -18,7 +18,7 @@
 //!     this path is cold — but the model can still SAMPLE such an id, and dropping it would
 //!     silently eat characters.)
 
-use crate::nano_llm::{rf32, MAX_VOCAB};
+use super::nano_llm::{rf32, MAX_VOCAB};
 
 /// Beginning-of-sequence id (`\n<s>\n` in the table).
 pub const BOS: u16 = 1;

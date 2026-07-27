@@ -91,6 +91,10 @@ use ssd1306::mode::DisplayConfig;
 // `AppKind`/`App` enum + centralized dispatch, and the `REGISTRY` that
 // auto-builds the menu. The dispatch keystone every screen plugs into.
 mod app;
+// #300 The Bard — on-device tiny-LLM storyteller. Radio-free (rides `hw`), so it can ship in
+// every tier; the 277 KB model is `.rodata` (XIP flash) and its scratch is `.bss`.
+#[cfg(feature = "bard")]
+mod bard;
 // #197 transient on-glass toast overlay — a general primitive (also the mesh-RPG substrate),
 // composited over the active screen from the render loop; never persisted.
 mod toast;

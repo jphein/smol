@@ -49,7 +49,10 @@ import numpy as np
 F32 = np.float32
 # Families in blob order; `tensor()` in the Rust uses these same indices.
 FAMILIES = ("emb", "wq", "wk", "wv", "wo", "w1", "w2", "w3", "wcls")
-SEQ_CAP = 256  # mirrors nano_llm::SEQ_CAP — the cache depth, NOT the header's seq_len
+# Mirrors nano_llm::SEQ_CAP — the cache DEPTH, not the header's seq_len (512). 192 because the
+# canonical fleet image will not link at 256 (see the Rust const's comment); generation stops
+# here regardless of --steps, exactly as the firmware's Story does.
+SEQ_CAP = 192
 
 
 def _f32(x):
@@ -375,7 +378,7 @@ def main():
         ref.forward(ids[i], i)
     token = ids[-1]
     generated, out = [], bytearray()
-    for pos in range(len(ids) - 1, args.steps):
+    for pos in range(len(ids) - 1, min(args.steps, SEQ_CAP)):
         logits = ref.forward(token, pos)
         nxt = int(np.argmax(logits))  # first max wins, matching the Rust's `>` comparison
         if nxt == 1 or nxt == 2:  # BOS/EOS terminate

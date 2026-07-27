@@ -5,8 +5,9 @@
 //!  --lib --test bard` — the bare `cargo test` form also builds the firmware BIN, which cannot
 //! compile without the `hw` crates.
 #![cfg(feature = "hostsim")]
-use clock::bard_tokenizer::Tokenizer;
-use clock::nano_llm::{Bufs, Model, ParseErr, Session, StepOut, Story};
+use clock::persona::{prompt, protagonist, PROTAGONISTS};
+use clock::tokenizer::Tokenizer;
+use clock::nano_llm::{Bufs, Model, ParseErr, Session, StepOut, Story, SEQ_CAP};
 
 pub const BLOB: &[u8] = include_bytes!("../model/stories260K-q8.bin");
 
@@ -178,7 +179,9 @@ fn greedy(
     let mut token = ids[n - 1];
     let mut text = std::string::String::new();
     let mut generated = std::vec::Vec::new();
-    for pos in n - 1..steps {
+    // Stop at the KV cache depth as well as the step budget: this helper drives `forward`
+    // directly (it is not a `Story`), so it owes the cache the same discipline `Story` keeps.
+    for pos in n - 1..steps.min(SEQ_CAP) {
         let logits = s.forward(m, bufs, token, pos);
         let mut best = 0usize;
         for (i, &v) in logits.iter().enumerate() {
@@ -371,4 +374,34 @@ fn story_reports_how_it_ended() {
         story.step(&m, &t, &mut bufs),
         StepOut::Done { truncated: true }
     ));
+}
+
+#[test]
+fn persona_prompts_fit_the_vocabulary() {
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+    assert_eq!(PROTAGONISTS.len(), 16);
+    // The three live boards get a creature matching their realm persona (spec §8).
+    assert!(protagonist(7).contains("dragon"), "id7 Draconic Dominion");
+    assert!(protagonist(8).contains("owl"), "id8 Eldritch Nexus");
+    assert!(protagonist(9).contains("bird"), "id9 Jade Herald");
+
+    let mut ids = [0u16; 64];
+    // EVERY node id, not just the 16 table entries: the `% 16` fallback has to hold for an
+    // unprovisioned board too, and a prompt is the one string the model never chose.
+    for id in 0..=255u8 {
+        let mut buf = [0u8; 64];
+        let n = prompt(id, &mut buf);
+        let s = core::str::from_utf8(&buf[..n]).expect("prompt is ASCII");
+        let k = t.encode(s, &mut ids);
+        assert!(k < 32, "prompt for node {id} is {k} tokens: {s:?}");
+        // Spec §8's real requirement: every word must exist in the 512-token vocabulary. Ids
+        // 3..=258 are the `<0xXX>` byte fallbacks — one of those means the prompt SHREDDED,
+        // which is exactly what would happen if we fed the model a realm name.
+        assert!(
+            !ids[..k].iter().any(|i| (3..=258).contains(i)),
+            "node {id} prompt {s:?} hit byte fallback: {:?}",
+            &ids[..k]
+        );
+    }
 }
