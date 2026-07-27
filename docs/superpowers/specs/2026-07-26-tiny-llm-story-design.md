@@ -21,6 +21,8 @@
 > **JP's decision, 2026-07-27 — fleet-wide short stories.** esp-wifi heap **128 → 96 KiB** (`net::init_heap`; safe on #140's own audit, whose low-watermark bottomed at ~52 KB free of 128 KiB, leaving ~20 KB margin) **plus `SEQ_CAP` 160 → 80**. Shipped and measured: `.stack` = **76,128 B** (39% margin over the observed peak, `__stack_chk_guard` inside the region), `.bss` = **195,224 B**, `.rodata` = 349,276 B. The build gate floor rises **12,288 → 73,728 B**, derived as measured 54,856 × 4/3 and commented as such, so the next person inherits the derivation rather than the number.
 >
 > **§7 cost:** stories are now cache-bound at **~65 generated tokens (~140 chars)** — three or four sentences on the panel — and at 151 ms/token a full story takes ~10 s to generate while the reveal runs at 6 chars/s. Goldens regenerated at 66 tokens with the reference mirrored to 80; the first 66 ids are identical to the 146-token run, confirming a cap change only ever TRUNCATES. Both obvious DRAM levers are now spent: growing stories back needs new memory, not another dial.
+>
+> **T13 CLOSED (final-geometry verification, same bench):** full 67-token story on glass, **202 ms/tok avg / 274 max**, **stack high-water 54,960 of 75,392 B = 72%** — under the 75% roll gate. Remote CFG-S (`Bard:0` via HA `mqtt.publish`) switched the node to the Bard live and every boot now opens composing; mesh crown held throughout. Fleet roll UNBLOCKED.
 
 > ### ✏️ AMENDMENT — 2026-07-26 (implementation planning, same session)
 > Four refinements settled while writing the plan (`docs/superpowers/plans/2026-07-26-bard-tiny-llm.md`):
