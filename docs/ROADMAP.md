@@ -6,7 +6,7 @@ GitHub tracking issue [#24](https://github.com/jphein/smol/issues/24) (this is t
 in-repo narrative version; the issue is the living checklist).
 
 **Honesty rule:** *shipped* means hardware-verified on the id7/8/9 fleet (current build
-**45 "Oxidized Die"**); nothing here is overstated. Verification legend: 🟢 hardware-verified
+**905 "Riveted Furnace"**); nothing here is overstated. Verification legend: 🟢 hardware-verified
 · 🟡 compile/spec-verified, not fully exercised on hardware · ⚪ design only.
 
 ---
@@ -23,6 +23,7 @@ in-repo narrative version; the issue is the living checklist).
 | **UI responsive during WiFi sync** — defer-while-interacting + long-press abort + "Syncing…" spinner | #20 | Review CLEAN; six build/clippy gates green; commit `0ce1ce9` |
 | **HA availability** — discovery `expire_after` so a node goes unavailable after several missed bursts | #12 (fw half) | Live in discovery JSON |
 | **Node manager — HA publish/GUI half** — Lovelace + `input_select`/automations publishing retained `smol/<id>/config/default_screen`; mirror sensors | #21 (HA half) | Deployed live to HA (config topics left empty until the firmware consumes them) |
+| **The Bard — on-device tiny-LLM storyteller** — a real 260K-param TinyStories transformer (int8, executed-in-place from flash) writes a fresh story per press, typewriter-style; per-node protagonist (id8 → owl); `Bard:0` settable over CFG-S so a node boots straight into composing | #300 | 🟢 on glass id8: 67-token story, **202 ms/tok**, stack high-water **72%** of region, canary heap low-watermark **24,136 B** free of 96 KiB; port proven **bit-for-bit** vs an independent reference; PR #301, build 905 |
 | **EPEver cloud-logger contained** (homelab infra) — the PE11 DIN converter was a hidden Hi-Flying cloud datalogger acting as a 2nd Modbus master; firewalled at the gateway | — | Bus corruption cut; the Batt SOC is sourced from the BMS, not EPEver |
 
 ---
