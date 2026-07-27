@@ -728,6 +728,63 @@ fn wrap_tail_survives_every_reveal_position_of_a_real_story() {
     assert_eq!(n, ROWS - 1);
 }
 
+// ── #302 rolling scrollback: what a continuation does to the text buffer ────────────────
+
+/// `roll` with the buffer/len bookkeeping the firmware does around it, so the fixtures read like
+/// the panel's state rather than like a slice call.
+fn rolled(text: &str, keep: usize, revealed: usize) -> (std::string::String, usize) {
+    let mut buf = text.as_bytes().to_vec();
+    let dropped = clock::textflow::roll(&mut buf, text.len(), keep, revealed);
+    let kept = std::string::String::from_utf8(buf[..text.len() - dropped].to_vec())
+        .expect("roll must never split a character");
+    (kept, dropped)
+}
+
+#[test]
+fn roll_drops_the_oldest_text_and_says_how_much() {
+    // Under the keep bound: nothing moves (the common case — one chapter does not fill 1 KB).
+    assert_eq!(rolled("a short story", 256, 999), ("a short story".into(), 0));
+
+    // Over it: the OLDEST bytes go and the tail slides to offset 0.
+    let (kept, dropped) = rolled("0123456789", 4, 999);
+    assert_eq!((kept.as_str(), dropped), ("6789", 6));
+
+    // Degenerate bounds must not panic or wrap: keep 0, and an empty buffer.
+    assert_eq!(rolled("abc", 0, 999), ("".into(), 3));
+    assert_eq!(rolled("", 256, 999), ("".into(), 0));
+}
+
+#[test]
+fn roll_never_eats_an_unread_word() {
+    // The typewriter is 4 bytes in, so at most 4 bytes may be dropped even though the keep bound
+    // asks for 6 — the reader has not seen bytes 4.. yet, and losing them would silently skip
+    // text mid-story.
+    let (kept, dropped) = rolled("0123456789", 4, 4);
+    assert_eq!((kept.as_str(), dropped), ("456789", 4));
+    // Nothing revealed at all ⇒ nothing may be dropped, however full the buffer is.
+    assert_eq!(rolled("0123456789", 2, 0), ("0123456789".into(), 0));
+}
+
+#[test]
+fn roll_never_splits_a_character() {
+    // U+2019 (’) is one 3-byte token in this vocabulary. A cut that lands inside it must walk
+    // FORWARD to the next character boundary — a dangling continuation byte would make
+    // `draw_story` skip the entire line it lands on, losing a line of story to a blank.
+    let text = "ab’cd"; // bytes: a b E2 80 99 c d
+    assert_eq!(text.len(), 7);
+    for keep in 0..=text.len() {
+        let (kept, dropped) = rolled(text, keep, 999);
+        assert!(
+            !kept.is_empty() || dropped == text.len(),
+            "keep={keep} produced an empty buffer without dropping everything"
+        );
+        // The invariant: whatever is kept is still decodable (checked inside `rolled`) and the
+        // cut landed on a boundary, never at byte 3 or 4.
+        assert_ne!(dropped, 3, "cut inside the ’ token");
+        assert_ne!(dropped, 4, "cut inside the ’ token");
+    }
+}
+
 #[test]
 fn golden_failure_names_the_divergent_token() {
     // The length-only arm has been exercised for real (planting stale goldens against a changed

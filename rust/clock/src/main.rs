@@ -1594,8 +1594,11 @@ fn main() -> ! {
                         "smol #303: story prompt staged ({} B) — vocabulary check at first story",
                         v.len()
                     ),
+                    // The remainder is what is left of the CONTEXT WINDOW, not of the story: since
+                    // #302 a story continues for as many chapters as the reader presses for, and
+                    // the prompt only competes for room inside the first one.
                     Ok(Some(n)) => log::info!(
-                        "smol #303: story prompt accepted ({} B -> {} tokens, {} left for the story)",
+                        "smol #303: story prompt accepted ({} B -> {} tokens, {} of the window left)",
                         v.len(),
                         n,
                         crate::bard::nano_llm::SEQ_CAP.saturating_sub(n)

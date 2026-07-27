@@ -44,7 +44,10 @@ static MODEL_BLOB: &[u8] = include_bytes!(concat!(
 
 /// The forward pass's scratch — the single big RAM cost (spec §5). `.bss`, so it costs no flash.
 static mut BUFS: Bufs = Bufs::INIT;
-/// The story so far, as decoded bytes. Sized for a full 220-token story of short tokens.
+/// The story so far, as decoded bytes. Sized for a full 220-token story of short tokens — and
+/// since #302 a story can run for as many chapters as the reader presses for, so this is a ROLLING
+/// window: each continuation drops the oldest text ([`compact_text`]) rather than growing the
+/// buffer. The panel only ever renders the tail, so the cap is on scrollback nobody can reach.
 static mut STORY_TEXT: [u8; 1024] = [0; 1024];
 /// Bytes of [`STORY_TEXT`] in use.
 static mut STORY_LEN: usize = 0;
@@ -205,6 +208,87 @@ unsafe fn begin_story(node_id: u8, now_ms: u64) {
     core::ptr::addr_of_mut!(STORY_LEN).write(len);
 }
 
+/// Bytes of story text a continuation keeps (#302). The panel renders only the last four or five
+/// wrapped lines (~70 chars), so this is several screens of scrollback nobody can scroll back to;
+/// it is deliberately generous so the head-drop is invisible rather than tight to save `.bss`
+/// (the buffer is 1 KB either way — this is a bound on the CONTENT, not an allocation).
+const TEXT_KEEP: usize = 256;
+
+/// Drop the oldest story text to make room for another chapter, returning how many bytes went.
+/// The arithmetic (and its two hazards) lives in [`textflow::roll`], where the host tests can
+/// reach it; this is only the `static mut` plumbing.
+///
+/// The panel shows the TAIL ([`textflow::wrap_tail`]), so losing the head is invisible — but the
+/// caller's reveal cursor is a byte offset into this buffer and MUST be moved back by the return
+/// value.
+///
+/// # Safety
+/// As [`init_statics`].
+unsafe fn compact_text(keep: usize, revealed: usize) -> usize {
+    let text = &mut *core::ptr::addr_of_mut!(STORY_TEXT);
+    let len = *core::ptr::addr_of!(STORY_LEN);
+    let cut = textflow::roll(text, len, keep, revealed);
+    core::ptr::addr_of_mut!(STORY_LEN).write(len - cut);
+    cut
+}
+
+/// What a cut chapter appends so the text reads as trailing off rather than as a crash. ASCII
+/// dots, not U+2026: FONT_5X8 is an ASCII font and would draw the ellipsis as a blank, silently
+/// losing the very signal we are adding.
+const CUT_MARK: &[u8] = b"...";
+
+/// Take back the [`CUT_MARK`] a paused chapter left: it says "the story stops here", and it is
+/// about not to. Without this a continued story reads `went insid... e and went`.
+///
+/// # Safety
+/// As [`init_statics`].
+unsafe fn unmark_truncation() {
+    let text = &*core::ptr::addr_of!(STORY_TEXT);
+    let len = *core::ptr::addr_of!(STORY_LEN);
+    let n = CUT_MARK.len();
+    if len >= n && &text[len - n..len] == CUT_MARK {
+        core::ptr::addr_of_mut!(STORY_LEN).write(len - n);
+    }
+}
+
+/// Continue the paused story instead of starting a new one (#302): trim the ellipsis, make room,
+/// and let the generator pick up mid-sentence. Returns the bytes the reveal cursor must move back,
+/// or `None` when the story is genuinely over (the model chose to stop) and the caller should
+/// begin a new one.
+///
+/// # Safety
+/// As [`init_statics`].
+unsafe fn continue_story(revealed: usize) -> Option<usize> {
+    let story = (*core::ptr::addr_of_mut!(STORY)).as_mut()?;
+    if !story.resume() {
+        return None;
+    }
+    unmark_truncation();
+    Some(compact_text(TEXT_KEEP, revealed))
+}
+
+/// Whether a press on the finished screen should CONTINUE this story (see `Story::can_continue`).
+/// Read from the generator rather than mirrored into [`BardApp`], so the marker on the panel and
+/// the behaviour of the button can never disagree.
+///
+/// # Safety
+/// As [`init_statics`].
+unsafe fn story_can_continue() -> bool {
+    (*core::ptr::addr_of!(STORY))
+        .as_ref()
+        .is_some_and(Story::can_continue)
+}
+
+/// Absolute length of the story so far, in tokens (prompt included) — for the per-chapter log.
+///
+/// # Safety
+/// As [`init_statics`].
+unsafe fn story_pos() -> u16 {
+    (*core::ptr::addr_of!(STORY))
+        .as_ref()
+        .map_or(0, Story::pos)
+}
+
 /// Append `extra` to the visible story text, truncating rather than wrapping.
 ///
 /// # Safety
@@ -258,11 +342,10 @@ unsafe fn step_story() -> Advance {
         }
         // A cut is the usual ending at this model size (T8: ~19 of 20 seeds), so mark it —
         // trailing dots read as tailing off, where a bare mid-sentence stop reads as a crash.
-        // ASCII dots, not U+2026: FONT_5X8 is an ASCII font and would draw the ellipsis as a
-        // blank, silently losing the very signal we are adding.
+        // Since #302 a press takes the mark back off again (`unmark_truncation`) and keeps going.
         StepOut::Done { truncated } => {
             if truncated {
-                push_text(b"...");
+                push_text(CUT_MARK);
             }
             Advance::Ended
         }
@@ -306,6 +389,9 @@ const ROW_H: i32 = 8;
 ///
 /// No `Idle`: [`BardApp::new`] either arms a story (`Composing`) or fails the blob (`Mute`), so
 /// an idle variant would be constructed nowhere and read as dead code.
+///
+/// `Told` covers both endings a story can have (#302). Which one it is lives in the generator, not
+/// here — see [`story_can_continue`].
 enum Phase {
     /// Generating and typing out.
     Composing,
@@ -370,6 +456,36 @@ impl BardApp {
         self.next_reveal_ms = now_ms;
         self.painted = u16::MAX;
         self.fast = false;
+        self.reset_stats();
+    }
+
+    /// Keep telling the SAME story (#302): one press buys another chapter, generated from the KV
+    /// state the last one left behind. `false` ⇒ the model ended this story, so the caller should
+    /// start a new one instead.
+    ///
+    /// The reveal is NOT reset — it is re-anchored. `compact_text` may have dropped bytes off the
+    /// head of the buffer, and `shown` is a byte offset into it, so it moves back by exactly as
+    /// many; the reader sees the typewriter carry on mid-sentence, which is the whole point.
+    /// `fast` survives too: a reader who asked for no throttle asked about the story, not the
+    /// chapter.
+    fn keep_going(&mut self, now_ms: u64) -> bool {
+        let continued = unsafe { continue_story(self.shown as usize) };
+        let Some(dropped) = continued else {
+            return false;
+        };
+        let len = unsafe { *core::ptr::addr_of!(STORY_LEN) } as u16;
+        self.shown = self.shown.saturating_sub(dropped as u16).min(len);
+        self.phase = Phase::Composing;
+        self.next_reveal_ms = now_ms;
+        self.painted = u16::MAX; // the `~ more ~` marker has to come off the panel
+        // Per-CHAPTER timing, so the numbers stay comparable to the T13 bench (which measured
+        // ~65-token runs) instead of averaging a story that may now run for hours.
+        self.reset_stats();
+        true
+    }
+
+    /// Zero the per-chapter perf counters.
+    fn reset_stats(&mut self) {
         self.tok_count = 0;
         self.tok_ms_sum = 0;
         self.tok_ms_max = 0;
@@ -386,8 +502,16 @@ impl Plugin for BardApp {
                     // Mid-story: skip the typewriter rather than start over — the story you are
                     // reading is the one you asked for.
                     Phase::Composing => self.fast = true,
-                    // Finished: tell a new one.
-                    Phase::Told => self.restart(ctx.node_id, ctx.now_ms),
+                    // Paused (#302): keep this story going. A press only starts a NEW story when
+                    // the model itself ended this one (`~ fin ~`); the way to ask for a different
+                    // story is the gesture that already exists — long-press out to the menu and
+                    // pick the Bard again, which builds a fresh `BardApp`. That keeps the grammar
+                    // to two gestures and makes the common case (more of this story) the cheap one.
+                    Phase::Told => {
+                        if !self.keep_going(ctx.now_ms) {
+                            self.restart(ctx.node_id, ctx.now_ms);
+                        }
+                    }
                     Phase::Mute => {}
                 }
                 Transition::Stay
@@ -425,11 +549,19 @@ impl Plugin for BardApp {
                 } else {
                     self.tok_ms_sum / self.tok_count as u32
                 };
+                // #302: one line per CHAPTER now, with the story's running length and whether a
+                // press will continue it — the two things a bench run needs to interpret the rest.
                 log::info!(
-                    "smol #300: bard story done — {} tok, avg {} ms/tok, max {} ms",
+                    "smol #300: bard chapter done — {} tok, avg {} ms/tok, max {} ms; story {} tok, {}",
                     self.tok_count,
                     avg,
-                    self.tok_ms_max
+                    self.tok_ms_max,
+                    unsafe { story_pos() },
+                    if unsafe { story_can_continue() } {
+                        "press to continue"
+                    } else {
+                        "the end"
+                    }
                 );
                 // Bench builds only: how much of the (floor-gated) stack the story actually used.
                 #[cfg(feature = "stack-paint")]
@@ -469,13 +601,16 @@ impl Plugin for BardApp {
         }
         self.painted = self.shown;
         self.quill_on = quill;
-        draw_story(ctx, self.shown, told, quill);
+        // Ask the generator, not the phase: the marker must say what the button will actually do.
+        draw_story(ctx, self.shown, told, quill, told && unsafe { story_can_continue() });
     }
 }
 
-/// Draw the revealed text, word-wrapped, with the quill while composing and `~ fin ~` once the
-/// story is fully told.
-fn draw_story(ctx: &mut Ctx, shown: u16, told: bool, quill: bool) {
+/// Draw the revealed text, word-wrapped, with the quill while composing and an ending marker once
+/// the story is fully told: `~ more ~` when a press will continue it, `~ fin ~` when the model
+/// ended it and a press starts a new one (#302). The marker IS the affordance — the panel has no
+/// room for instructions, so the two endings have to look different.
+fn draw_story(ctx: &mut Ctx, shown: u16, told: bool, quill: bool, more: bool) {
     let text = unsafe { &*core::ptr::addr_of!(STORY_TEXT) };
     let visible = &text[..(shown as usize).min(text.len())];
     // Reserve the bottom row for the ending, so `~ fin ~` never overwrites a line of story.
@@ -516,10 +651,11 @@ fn draw_story(ctx: &mut Ctx, shown: u16, told: bool, quill: bool) {
         .ok();
     }
     if told {
-        const FIN: &str = "~ fin ~";
-        let x = ((COLS as i32 * GLYPH_W) - FIN.len() as i32 * GLYPH_W) / 2;
+        // ASCII only — FONT_5X8 has no glyph beyond it, and a missing glyph draws as a blank.
+        let mark = if more { "~ more ~" } else { "~ fin ~" };
+        let x = ((COLS as i32 * GLYPH_W) - mark.len() as i32 * GLYPH_W) / 2;
         Text::with_baseline(
-            FIN,
+            mark,
             Point::new(x.max(0), (ROWS as i32 - 1) * ROW_H),
             style,
             Baseline::Top,

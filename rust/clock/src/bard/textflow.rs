@@ -8,6 +8,34 @@
 //! measured points). `tools/repro_build.sh` refuses to package an image with less than 12288 B,
 //! so a second copy of the story buffer here could turn into a failed release build.
 
+/// Roll the scrollback: drop the oldest bytes of a `len`-byte story so a continuation (#302) has
+/// room, moving the rest down to offset 0 and returning how many bytes went.
+///
+/// Pure, so the two ways this could quietly ruin the panel are host-tested instead of eyeballed:
+///   * **A reader can never lose an unread word.** `revealed` (the typewriter's cursor) bounds the
+///     cut, so a compaction that lands while the reveal is lagging keeps the buffer fuller rather
+///     than eating text nobody has seen. The caller then subtracts the return value from that
+///     cursor — it is a byte offset into the buffer that just moved.
+///   * **A UTF-8 character is never split.** The tokenizer can emit multi-byte tokens (U+2019 has
+///     its own id), and a dangling continuation byte would silently blank the whole line it lands
+///     on, since the renderer skips a line it cannot decode.
+///
+/// Bytes past `len` are untouched garbage from earlier chapters; only `..len` is meaningful, and
+/// only `..len - dropped` is meaningful afterwards.
+pub fn roll(text: &mut [u8], len: usize, keep: usize, revealed: usize) -> usize {
+    let len = len.min(text.len());
+    if len <= keep {
+        return 0;
+    }
+    let mut cut = (len - keep).min(revealed);
+    // 0b10xx_xxxx is a UTF-8 continuation byte: walk forward off the middle of a character.
+    while cut < len && text[cut] & 0xC0 == 0x80 {
+        cut += 1;
+    }
+    text.copy_within(cut..len, 0);
+    cut
+}
+
 /// Word-wrap `text` to `cols` columns and write the LAST `rows` line spans into `out`,
 /// returning how many were written.
 ///
