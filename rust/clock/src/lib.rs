@@ -49,6 +49,28 @@ pub mod app;
 pub mod clock;
 #[cfg(feature = "hostsim")]
 pub mod input;
+// #300 The Bard's tiny-LLM core. Lives in `src/bard/` (its own dir, room for the
+// tokenizer/model siblings) but is a plain pure core like the rest — no `hw`, no radio.
+#[cfg(feature = "hostsim")]
+#[path = "bard/nano_llm.rs"]
+pub mod nano_llm;
+// The bard's siblings, exported under their PLAIN names. That is load-bearing: inside
+// `src/bard/` the three files reach each other as `super::nano_llm` / `super::tokenizer`, which
+// resolves to `crate::bard::*` in the firmware and to these crate-root modules here — one
+// spelling that compiles under both roots, with no cfg juggling in the shared source.
+#[cfg(feature = "hostsim")]
+#[path = "bard/tokenizer.rs"]
+pub mod tokenizer;
+#[cfg(feature = "hostsim")]
+#[path = "bard/persona.rs"]
+pub mod persona;
+#[cfg(feature = "hostsim")]
+#[path = "bard/textflow.rs"]
+pub mod textflow;
+// Only the pure sentinel scanner compiles here; the paint itself is device-only (linker symbols).
+#[cfg(feature = "hostsim")]
+#[path = "bard/stack_paint.rs"]
+pub mod stack_paint;
 #[cfg(feature = "hostsim")]
 pub mod sensors;
 #[cfg(feature = "hostsim")]

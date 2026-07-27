@@ -54,6 +54,14 @@ tools/ota_publish.env
 # brainstorm visual-companion sessions (local mockups)
 .superpowers/
 
+# bard (#300) model artifacts: the upstream stories260K checkpoint + tok512.bin that
+# tools/bard_fetch_model.sh downloads (sha256-pinned). ~1 MB of UPSTREAM bytes — never
+# committed; the tracked deliverable is the exported rust/clock/model/*.bin blob.
+/scratch/bard/
+# ...but the EXPORTED q8 blob IS a tracked deliverable (~277 KB, MIT-licensed weights),
+# so re-include it past the blanket `*.bin` on line 3 (order matters: exclude then negate).
+!rust/clock/model/*.bin
+
 # #152 web emulator build artifacts
 rust/web-emu/target/
 web/emulator/*.wasm
@@ -61,3 +69,5 @@ web/emulator/*.wasm
 # build.sh; source of truth is index.template.html + build.sh (no blob churn in git).
 web/emulator/index.html
 web/emulator/dist/
+# A killed export leaves a 277 KB tmp blob behind; never let it near a commit.
+rust/clock/model/*.tmp

@@ -221,6 +221,11 @@ pub enum AppKind {
     // it — a Custom menu row there would always be blank. LIVE on espnow (REGISTRY row + enter).
     #[cfg(feature = "espnow")]
     Custom,
+    // #300 The Bard — on-device tiny-LLM storyteller. LIVE whenever compiled (REGISTRY row +
+    // `enter` construct it), like Batt/Grid → no dead_code allow needed. cfg(bard) rather than a
+    // radio tier: the model is entirely local, so the screen works on a headless power-only board.
+    #[cfg(feature = "bard")]
+    Bard,
 }
 
 /// #21 node-manager CONSUME — the parsed retained `smol/<id>/config/default_screen`
@@ -280,6 +285,8 @@ impl AppKind {
             // input_select option "Custom"). espnow-only, like the AppKind variant.
             #[cfg(feature = "espnow")]
             "Custom" => AppKind::Custom,
+            #[cfg(feature = "bard")]
+            "Bard" => AppKind::Bard,
             _ => return None,
         })
     }
@@ -316,6 +323,8 @@ impl AppKind {
             AppKind::WledRemote => "WledRemote",
             #[cfg(feature = "espnow")]
             AppKind::Custom => "Custom",
+            #[cfg(feature = "bard")]
+            AppKind::Bard => "Bard",
         }
     }
 }
@@ -389,6 +398,10 @@ pub enum App {
     WledRemote(crate::net::wled::WledRemoteState),
     #[cfg(feature = "espnow")]
     Custom(crate::custom::CustomState),
+    // #300 The Bard. `BardApp` is deliberately TWO BOOLS: this enum is as large as its biggest
+    // variant, so the model scratch lives in `bard`'s module statics, not here.
+    #[cfg(feature = "bard")]
+    Bard(crate::bard::BardApp),
 }
 
 #[cfg(not(feature = "hostsim"))] // #152: dispatch union impl — firmware-only (see the enum)
@@ -426,6 +439,11 @@ impl App {
             }
             #[cfg(feature = "espnow")]
             AppKind::Custom => App::Custom(crate::custom::CustomState::new()),
+            // Parses the blob + builds the tokenizer into `bard`'s statics (a CRC walk over
+            // flash), then arms the first story — hence the `ctx` (node id picks the
+            // protagonist, `now_ms` seeds the sampler).
+            #[cfg(feature = "bard")]
+            AppKind::Bard => App::Bard(crate::bard::BardApp::new(ctx)),
         }
     }
 
@@ -464,6 +482,8 @@ impl App {
             App::WledRemote(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "espnow")]
             App::Custom(s) => Plugin::on_button(s, press, ctx),
+            #[cfg(feature = "bard")]
+            App::Bard(s) => Plugin::on_button(s, press, ctx),
         }
     }
 
@@ -495,6 +515,8 @@ impl App {
             App::WledRemote(s) => Plugin::update(s, ctx),
             #[cfg(feature = "espnow")]
             App::Custom(s) => Plugin::update(s, ctx),
+            #[cfg(feature = "bard")]
+            App::Bard(s) => Plugin::update(s, ctx),
         }
     }
 
@@ -545,6 +567,8 @@ impl App {
             App::WledRemote(_) => (AppKind::WledRemote, 0),
             #[cfg(feature = "espnow")]
             App::Custom(_) => (AppKind::Custom, 0),
+            #[cfg(feature = "bard")]
+            App::Bard(_) => (AppKind::Bard, 0),
         }
     }
 }
@@ -603,6 +627,10 @@ pub const REGISTRY: &[AppDesc] = &[
     // matching luna's #81 screen input_select order (…About, Custom).
     #[cfg(feature = "espnow")]
     AppDesc { title: "Custom", kind: AppKind::Custom },
+    // #300 The Bard — tells a story on the panel. No radio needed, so this row appears in every
+    // tier that compiles the feature.
+    #[cfg(feature = "bard")]
+    AppDesc { title: "Bard", kind: AppKind::Bard },
 ];
 
 /// #55 plugin visibility: the STABLE mask bit for an app kind, INDEPENDENT of the (cfg-gated)
@@ -652,6 +680,11 @@ pub const fn plugin_bit(kind: AppKind) -> Option<u8> {
         AppKind::Custom => None,
         #[cfg(feature = "espnow")]
         AppKind::Familiar => Some(7), // #57 flagship — its own stable mask bit
+        // #300 Bard — NOT #55-maskable (like Sigil/Custom/Watch): luna's mask is the original 7
+        // plugins (bits 0..6, all-on 007F) and predates it, so handing Bard a bit would let a
+        // legacy mask hide it permanently. `None` ⇒ always shown.
+        #[cfg(feature = "bard")]
+        AppKind::Bard => None,
         AppKind::Menu => None,
     }
 }

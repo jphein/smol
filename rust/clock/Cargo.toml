@@ -31,6 +31,27 @@ license = "MIT OR Apache-2.0"
 # 1.x implements, so the display stack composes cleanly with the HAL.
 # -----------------------------------------------------------------------------
 
+# The firmware BIN needs the bare-metal crates, so it can only be built when `hw` is on.
+# Declaring that to cargo (rather than leaving the target auto-discovered) matters for the
+# #300 host tests: cargo builds a package's BINARIES alongside any INTEGRATION test — they
+# get `CARGO_BIN_EXE_*` — so `cargo test --features hostsim --test bard` would otherwise try
+# to compile `src/main.rs` without esp-hal/ssd1306 and fail with ~14 unresolved imports.
+# With `required-features` the bin is SKIPPED under a hostsim-only build, which also makes
+# "hostsim compiles NO firmware code" an invariant cargo enforces instead of a convention.
+# `default`/`bard`/`wifi`/`espnow`/... all imply `hw`, so every firmware build is unchanged.
+[[bin]]
+name = "clock"
+path = "src/main.rs"
+required-features = ["hw"]
+
+# The #300 story batch is a HOST tool: it uses `std` and the hostsim library target, so it can
+# only build for a host triple. Declaring that keeps `--all-targets` honest on the firmware
+# target (it is skipped instead of failing on `use std`).
+[[example]]
+name = "bard_stories"
+path = "examples/bard_stories.rs"
+required-features = ["hostsim"]
+
 [dependencies]
 # --- Core HAL (Phase 1, always on) ---------------------------------------
 # `unstable` is required for I2C/SPI/RNG and is also a hard requirement of
@@ -60,6 +81,10 @@ log = "0.4"
 # a short busy-wait for the battery-voltage read in `src/sensors.rs`. Resolves to
 # the 1.1.0 already in the tree (embedded-hal etc. depend on it) — no lock churn.
 nb = "1"
+# bard (#300): float intrinsics (expf/cosf/sinf) for the no-FPU RV32IMC — pure Rust, no_std.
+# default-features=false is load-bearing: it keeps libm's `arch` feature off so host tests and
+# the device run the SAME soft-float code paths (the T6 golden-baseline comparison depends on it).
+libm = { version = "0.2", optional = true, default-features = false }
 
 # --- Display stack (Phase 1) ---------------------------------------------
 # ssd1306 is the concrete panel driver — HAL-facing (I2C), so it rides `hw`.
@@ -141,7 +166,7 @@ hw = ["dep:esp-hal", "dep:esp-backtrace", "dep:esp-println", "dep:ssd1306"]
 # cdylib; the firmware BIN (src/main.rs) is never compiled under this feature. Every
 # hostsim change in the shared source is `#[cfg(feature="hostsim")]`/`#[cfg(not)]`, so the
 # firmware (hw) path is untouched. See src/lib.rs.
-hostsim = []
+hostsim = ["dep:libm"]
 
 # #72 IO/component registry (ESPHome inverted, "fat image / thin runtime config").
 # Compiles the digital-`Flex` driver menu into ONE image; a runtime pin-map relayed
@@ -194,6 +219,18 @@ wled = ["espnow"]
 # `#[cfg(feature = "cast")]` and every hook is cfg-gated; the `Oled` type only swaps to
 # the tee under this flag).
 cast = ["espnow"]
+
+# ── bard (#300): on-device tiny-LLM storyteller ─────────────────────────────
+# Radio-free: rides `hw` only, so it can ship in every tier incl. `default`.
+# Pulls no alloc — the core is static-buffer only (spec §5).
+bard = ["hw", "dep:libm"]
+
+# #300 BENCH ONLY — stack high-water measurement (src/bard/stack_paint.rs). Paints the unused
+# stack with a sentinel at boot and reports how deep the story actually went, turning "14240 B
+# should be enough" into a measured number. Deliberately NOT in the canonical fleet list in
+# tools/repro_build.sh: it writes the whole free stack at boot, which is a diagnostic cost no
+# shipped image should pay.
+stack-paint = ["bard"]
 
 # COEXIST SOAK (issue #23 PART 1 — the gating experiment, NOT for production).
 # The gateway stays WiFi-associated after boot (no switch to ESP-NOW time-share),

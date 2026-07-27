@@ -207,6 +207,16 @@ pub(crate) use wifi::NTP_RESYNC_AGE_S;
 /// Defined here so both the Phase 2 (`wifi`) and Phase 3 (`espnow`) code paths
 /// share a single heap region rather than each reserving their own.
 ///
+/// #300 (JP's decision, 2026-07-27): 128 → 96 KiB. RADIO-ADJACENT — this is #140's dial, moved
+/// for a non-radio reason, so the reasoning belongs here rather than in the bard. The T13 bench
+/// measured a 54,856 B stack high-water (WiFi burst + crown duty + stories) against the 14,240 B
+/// the bard's `.bss` had left; no `SEQ_CAP` alone closes a 4× gap, so 32 KiB of DRAM comes back
+/// from this heap and the rest from a shallower KV cache (`nano_llm::SEQ_CAP` 160 → 80). The
+/// #140 audit's own figure is what makes this safe: the low-watermark bottomed at ~52 KB FREE of
+/// 128 KiB during crown duty, so 96 KiB still leaves ~20 KB of margin over the measured peak
+/// demand. If a future radio change pushes allocation up, this is the first number to re-audit —
+/// the RX-buffer tuning in .cargo/config.toml [env] draws from HERE.
+///
 /// #140: grown 72 → 128 KiB. The gateway free-heap low-watermark bottomed at ~5.9 KB during crown
 /// duty (esp-wifi's static RX pool ≈16 KB + dynamic RX churn draw from THIS region), leaving no room
 /// to raise the RX buffers that fix the sustained-fetch stalls. The heap audit
@@ -216,7 +226,7 @@ pub(crate) use wifi::NTP_RESYNC_AGE_S;
 /// internal SRAM; 128 KiB keeps `.data`+`.bss` (~191 KB) well under the DRAM window before stack.
 #[cfg(feature = "wifi")]
 pub fn init_heap() {
-    esp_alloc::heap_allocator!(size: 128 * 1024);
+    esp_alloc::heap_allocator!(size: 96 * 1024);
 }
 
 /// Phase-1 (default) placeholder used when no radio features are enabled: the
