@@ -122,7 +122,15 @@ repro_build_bin() {
   # evidence of a runnable image: with SEQ_CAP 192 the bard image linked with 2592 B of stack
   # (82304 B without bard) and put `__stack_chk_guard` outside the stack region, where the canary
   # cannot detect the overflow it exists to catch. Refuse to package an image that thin.
-  local elf="$tdir/${REPRO_TARGET}/release/clock" stack_floor=12288
+  #
+  # The floor is DERIVED, not chosen: the T13 bench measured a 54,856 B high-water with the
+  # stack-paint build (WiFi burst + crown duty + three stories), and 54,856 x 4/3 = 73,141,
+  # rounded up to 72 KiB = 73,728. The 4/3 is a third again on top of the worst path we have
+  # actually observed — enough to absorb a deeper interrupt nesting or a future radio change
+  # without being so generous that the gate stops biting. Re-measure with stack-paint if either
+  # the radio stack or the bard's buffers move; a floor copied forward untested is how the last
+  # one ended up at 12,288.
+  local elf="$tdir/${REPRO_TARGET}/release/clock" stack_floor=73728
   local ss se
   ss=$(readelf -sW "$elf" 2>/dev/null | awk '$8=="_stack_start"{print $2; exit}')
   se=$(readelf -sW "$elf" 2>/dev/null | awk '$8=="_stack_end"{print $2; exit}')

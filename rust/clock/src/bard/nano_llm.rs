@@ -50,22 +50,22 @@ pub const MAX_VOCAB: usize = 512;
 /// KV-cache depth the firmware allocates, independent of the header's `seq_len` (512): a
 /// story is capped at this many tokens so the cache fits RAM.
 ///
-/// 160, and the number is set by the RUNTIME STACK — not by spare DRAM, and not by taste.
-/// `.stack` is placed in whatever DRAM is left after `.bss`, and the linker shrinks it SILENTLY,
-/// so a successful link proves nothing. Measured on the canonical `espnow,cast,io,bard` image:
+/// 80, and every earlier guess about this number was wrong in the same direction. The bench
+/// (T13, stack-paint instrumentation) measured what the firmware ACTUALLY uses:
 ///
-///   SEQ_CAP 256 → does not link at all (`.bss will not fit in region DRAM`, over by 20704 B)
-///   SEQ_CAP 192 → links, but `.stack` is 2592 B (from 82304 B without bard) and
-///                 `__stack_chk_guard` lands OUTSIDE the stack region — the canary cannot even
-///                 detect the overflow it is there to catch. This would have crashed on the
-///                 first deep call.
-///   SEQ_CAP 160 → frees a further 11648 B, restoring ~14 KB of stack, above the 12288 B floor
-///                 `tools/repro_build.sh` now enforces.
+///   stack high-water 54,856 B — WiFi burst + crown duty + three stories
+///   151 ms/token average, 170 ms worst; the mesh held crown throughout
 ///
-/// Cost: with a ~15-token prompt the CACHE, not [`Story::MAX_TOKENS`], is the stopping rule at
-/// ~145 generated tokens (~300 chars) — still a story. Growing it back means giving RAM up
-/// elsewhere; the esp-wifi 128 KiB heap (#140, low-watermark ~52 KB free) is the obvious lever.
-pub const SEQ_CAP: usize = 160;
+/// So ~55 KB of stack is the real requirement, and the 14,240 B that `SEQ_CAP=160` left would
+/// have been overrun by nearly 4×. No cache depth alone fixes that: the DRAM had to come from
+/// the esp-wifi heap as well (128 → 96 KiB, `net::init_heap`, JP's call 2026-07-27 — see the
+/// comment there). Together they buy back ~62 KB of stack against a 73,728 B floor that
+/// `tools/repro_build.sh` now enforces from the measured peak (54,856 × 4/3).
+///
+/// The trade JP chose is FLEET-WIDE SHORT STORIES: with a ~15-token prompt the cache is the
+/// stopping rule at ~65 generated tokens (~140 chars) — three or four sentences on the panel.
+/// Growing it back means finding DRAM somewhere new; both obvious levers are now spent.
+pub const SEQ_CAP: usize = 80;
 /// Row stride of one cached K (or V) vector, in int8 slots. The shipped model's `kv_dim` is
 /// exactly 32; [`Model::parse`] REFUSES anything wider, which is what lets the forward pass
 /// index the cache without a bounds fallback.

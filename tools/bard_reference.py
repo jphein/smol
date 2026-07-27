@@ -52,7 +52,7 @@ FAMILIES = ("emb", "wq", "wk", "wv", "wo", "w1", "w2", "w3", "wcls")
 # Mirrors nano_llm::SEQ_CAP — the cache DEPTH, not the header's seq_len (512). 192 because the
 # canonical fleet image cannot afford a deeper cache (see the Rust const); generation stops
 # here regardless of --steps, exactly as the firmware's Story does.
-SEQ_CAP = 160
+SEQ_CAP = 80
 
 
 def _f32(x):

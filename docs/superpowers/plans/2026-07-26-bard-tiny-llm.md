@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **T13 BENCH RESULT (2026-07-27) — final sizing.** Measured on id8: stack high-water **54,856 B**, **151 ms/token** (170 worst), mesh held crown through three stories. The 14,240 B stack `SEQ_CAP=160` left was ~4× short — it linked and passed the old 12,288 B gate anyway, which is exactly why the floor is now DERIVED from the measurement (54,856 × 4/3 = **73,728 B**). JP's call: esp-wifi heap **96 KiB** + **`SEQ_CAP=80`**, fleet-wide short stories (~65 tokens / ~140 chars). Shipped figures: `.stack` **76,128 B** (39% margin, guard inside the region), `.bss` **195,224 B**. Goldens 66@80, first-66 prefix-identical to 146@160.
+
 **Goal:** A `bard` app on the C3 fleet that generates a TinyStories tale with a real transformer (stories260K, int8, XIP from flash), typewriter-style onto the 72×40 OLED. Issue [#300](https://github.com/jphein/smol/issues/300); approved spec `docs/superpowers/specs/2026-07-26-tiny-llm-story-design.md`.
 
 **Architecture:** A pure-`no_std` inference core (`src/bard/nano_llm.rs` + `tokenizer.rs`) exported through the existing `hostsim` lib target for host `cargo test`; an offline Python export pipeline producing one committed `SBRD` blob (weights+tokenizer+CRC); a `Plugin` app (`src/bard/mod.rs`) registered at the six `app.rs` sites, doing at most one token forward-pass per `update()` call.
