@@ -129,9 +129,13 @@ esp-bootloader-esp-idf = { version = "=0.2.0", optional = true, features = ["esp
 # Software SHA-256 for the OTA image integrity gate. Chosen over the HW `esp_hal::sha`
 # peripheral deliberately: the HW path needs the SHA peripheral threaded through boot
 # into the OTA burst + a self-referential `ShaDigest` (borrows the `Sha` beside it),
-# whereas `sha2` is peripheral-free + move-friendly. Cost is ~4 KB flash — negligible
-# at ~30% slot usage (3.3x headroom). Hashing is bound by the ~600 KB HTTP download,
-# not the digest, so there's no throughput reason to prefer HW here. (spec §Stage C-4.)
+# whereas `sha2` is peripheral-free + move-friendly. Cost is ~4 KB flash — still negligible,
+# but the slot is no longer roomy: the Bard's 277 KB model (#300) took the image from ~590 KB
+# to 1,432,400 B, i.e. 29% -> 70.5% of a 0x1F0000 (2,031,616 B) slot, so headroom fell 3.4x ->
+# 1.42x (599 KB spare). Recompute rather than trusting this line: slot / actual image size;
+# `ota_publish.sh` hard-gates size <= 0x1F0000, so an overflow fails the publish, not a board.
+# Hashing is bound by the ~1.4 MB HTTP download, not the digest, so there is still no
+# throughput reason to prefer the HW peripheral here. (spec §Stage C-4.)
 sha2 = { version = "0.11", default-features = false, optional = true }
 # The `NorFlash` trait (erase/write) whose impl on esp-storage's FlashStorage the OTA
 # ImageWriter drives. Trait-only crate; pin to the 0.3.x esp-storage already links.

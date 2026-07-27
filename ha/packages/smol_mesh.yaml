@@ -619,9 +619,12 @@ mqtt:
         {% set p = value.split('|') %}
         {{ ({'build': p[1], 'size': p[2], 'sha256': p[3], 'url': (p | last), 'sig': (p[4] if p | length >= 6 else '')} if (p | length >= 5 and p[0] == 'OTA') else {}) | tojson }}
       icon: "mdi:package-up"
-    # Per-node LIVE status — NEEDS firmware smol/<id>/status = STAT|<screen>:<page>|<build>
-    # (design F4; unknown until the firmware wave ships it). Feeds the OTA no-downgrade
-    # gate (running build) AND the node-manager live current-screen reflection.
+    # Per-node LIVE status — smol/<id>/status = STAT|<screen>:<page>|<build> (design F4).
+    # SHIPPED in #50 and live: id8 reports `Bard:0` / build 345 today. (This comment said
+    # "NEEDS firmware … unknown until the firmware wave ships it" long after that wave
+    # landed — the retirement/arrival blind spot in docs/DOC-UPKEEP.md, corrected 2026-07-27.)
+    # Feeds the OTA no-downgrade gate (running build) AND the node-manager live
+    # current-screen reflection.
     - name: "smol 7 screen"
       unique_id: smol_7_status_mirror
       state_topic: "smol/7/status"
