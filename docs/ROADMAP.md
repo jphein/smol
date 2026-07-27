@@ -43,11 +43,16 @@ in-repo narrative version; the issue is the living checklist).
 > to make a build pass — it is derived from a measurement (peak × 4/3).
 >
 > If a feature needs more than that slack, the levers, cheapest first: **`SEQ_CAP`** in
-> `src/bard/nano_llm.rs` (80→64 frees ~5.8 KB and costs ~15 story tokens; 80→48 frees ~11.5 KB),
-> the **esp-wifi heap** in `net::init_heap` (re-run #140's audit first), the **RX-buffer tuning**
-> in `.cargo/config.toml`. Re-measure with `--features stack-paint` under live radio — idle
-> numbers are meaningless. #302 tracks reclaiming this properly; **#198/#233 (C6, 512 KB SRAM)
-> dissolves the whole problem.**
+> `src/bard/nano_llm.rs` (80→64 frees ~5.8 KB; 80→48 frees ~11.5 KB), the **esp-wifi heap** in
+> `net::init_heap` (re-run #140's audit first), the **RX-buffer tuning** in `.cargo/config.toml`.
+> Re-measure with `--features stack-paint` under live radio — idle numbers are meaningless.
+> **#198/#233 (C6, 512 KB SRAM) dissolves the whole problem.**
+>
+> **`SEQ_CAP` is cheaper than it was (#302, 2026-07-27):** it no longer caps a STORY, only the
+> context window and the chapter beat. The KV cache is a ring, so a press continues the same story
+> indefinitely — turning the dial down shortens the model's memory (and the text between pauses),
+> not the tale. The DRAM half of #302 was therefore never needed and the slack is unchanged at
+> ~2,300 B: the whole feature cost 8 B.
 >
 > Practical consequence for the HW-held PRs (#190 HMAC, #181 ledger, #227 weather): each adds
 > static state and will now meet this gate. Budget the `.bss` delta before rebasing, not after.

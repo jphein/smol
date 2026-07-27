@@ -4,6 +4,39 @@
 **Status:** design approved in-session by JP 2026-07-26 — next step: implementation plan
 **Author:** claude (fable-5, orchestrator) · **Date:** 2026-07-26
 
+> ### ✏️ AMENDMENT — 2026-07-27 (#302 — the cache stops being the end of a story)
+> **§6 Termination and §9 UX both change: a press now CONTINUES the story.** The KV cache became a
+> RING (`nano_llm::cache_slot`), so `Session`'s position keeps counting past `SEQ_CAP` and writing
+> position *p* evicts *p − WINDOW*. A story runs for as many chapters as the reader presses for, on
+> the same 12.8 KB of `.bss` — total cost of the feature **8 B** (`Story::limit`, padded): `.bss`
+> 195,296 B unchanged, `.stack` 76,048 B against the 73,728 B floor. Neither half of #302's "reclaim
+> more DRAM" needed doing, because the window did not have to grow.
+>
+> **RoPE: no re-rotation, and that is exact rather than a shortcut.** A cached key keeps the phase
+> of its own absolute position; RoPE is relative — ⟨R(m·f)q, R(n·f)k⟩ = qᵀR((n−m)·f)k — so a score
+> depends only on the DIFFERENCE of the two positions and the ring preserves the geometry with zero
+> data movement. llama.cpp's context-shift (memmove + re-rotate) would re-quantize every cached
+> vector at every shift and compound int8 error; the ring's only cost is f32 phase precision (~5 mrad
+> at the cursor's limit, an order of magnitude under the int8 KV cache's own ~8e-3). Attention now
+> iterates SLOTS, not positions — softmax is permutation-invariant, so ring order is exact.
+> **Chapter 1 is bit-for-bit what it was**: `cache_slot` is the identity below `SEQ_CAP` and the new
+> single `limit` folds the old (`MAX_TOKENS`, `SEQ_CAP`) pair into the same stopping token, so the
+> golden test passes untouched (it was NOT regenerated).
+>
+> **Attention sink measured, and the measurement is "no signal".** `KEEP` (pinned first-N slots,
+> StreamingLLM's trick) tried at 0/4/16 over 12 seeds × 6 chapters via `examples/bard_continue.rs`:
+> 84.4 / 81.3 / 85.0 % distinct words — noise. Shipped at **`KEEP = 0`**, which also keeps every
+> relative distance ≤ `SEQ_CAP − 1` forever, i.e. inside the 512 the checkpoint was trained for; a
+> sink's distance to the query grows without bound and would extrapolate. Revisit only if §12's
+> custom model shows sink behaviour — the ring arithmetic already takes any `KEEP`.
+>
+> **§9 UX:** short press on `~ more ~` continues; `~ fin ~` (the ~5% EOS ending) means a press
+> starts a new one; long-press to the menu and back is the always-available "new story" gesture, so
+> no third gesture was invented. `STORY_TEXT` rolls (`textflow::roll`) — oldest bytes dropped per
+> continuation, bounded by the reveal cursor so a lagging typewriter never loses an unread word, and
+> never splitting a UTF-8 token. Host tests 21 → 31. **Not yet on glass** — the bench numbers to
+> confirm are per-chapter ms/tok and stack high-water across ≥4 chapters (`--features stack-paint`).
+>
 > ### ✏️ AMENDMENT — 2026-07-26 (T9, measured on the canonical image)
 > **§5 RAM budget — the `SEQ_CAP` knob fired.** At `SEQ_CAP=256` the canonical fleet image (`espnow,cast,io,bard`) **fails to link** (`.bss` overflow by 20,704 B in DRAM). Shipped at **`SEQ_CAP=192`**. Measured loadable-section deltas (bard vs no-bard): `.bss` +78,528 B · `.data` +1,184 B · `.rodata` +285,360 B (283,096 = the blob). ~~Remaining DRAM headroom ≈ 2.6 KB~~ **CORRECTED (oracle, same day): that 2,592 B is the entire remaining RUNTIME STACK** — bard's `.bss` consumed the `.stack` region (82,304 → 2,592 B; the linker shrinks `.stack` silently to zero before erroring, so "it links" is NOT a stack guarantee, and `__stack_chk_guard` landed outside the stack region entirely). Overflow corrupts the adjacent `Bufs`/KV cache → garbled stories, not a clean crash. Remedy SHIPPED (f287c26), measured: **`SEQ_CAP=160`** → `.bss` 257,112 B, **`.stack` = 14,240 B, `__stack_chk_guard` back inside the region**; `repro_build.sh` now derives `_stack_start − _stack_end` via readelf and **hard-fails below 12,288 B** (negative-tested against the real 2,592 B ELF); a **stack-paint high-water measurement at T13** still gates the fleet roll. Stories cache-bound ~145 tokens / ~300 chars. The esp-wifi 128 KiB heap (#140) is the follow-up reclaim lever if stories should grow back. Goldens regenerate bit-for-bit at each cap change (146@160 and 178@192 both verified prefix-identical to their predecessors).
 >

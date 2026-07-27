@@ -19,7 +19,7 @@ Every board runs the **unified Rust firmware** (`rust/clock/`, `no_std` esp-hal)
 | App | What | Status |
 |---|---|---|
 | **The Mesh Familiar** | a living creature that migrates across the fleet as boards come and go (see above) | 🟢 **on glass** — migration verified (#57) |
-| **The Bard** | a real transformer LLM (260K-param TinyStories, int8, XIP from flash) that **writes a fresh story on demand, fully on-device** — every node has its own protagonist (id8 tells owl tales), typewriter reveal on the 72×40 OLED | 🟢 **on glass** — bench + canary verified, port proven bit-for-bit vs an independent reference (#300) |
+| **The Bard** | a real transformer LLM (260K-param TinyStories, int8, XIP from flash) that **writes a fresh story on demand, fully on-device** — every node has its own protagonist (id8 tells owl tales), typewriter reveal on the 72×40 OLED, and **press again to keep the same story going** (sliding-window KV cache, so a tale has no length limit) | 🟢 **on glass** — bench + canary verified, port proven bit-for-bit vs an independent reference (#300); continuation host-verified, bench pending (#302) |
 | **World Snake (MMO)** | shared 256×256 toroidal world over the mesh, scrolling viewport, peers drawn by name, mesh leaderboard, 6 **treasure-powers** | 🟢 flashed + running fleet-wide (#5) |
 | **Marauder's Watch** | every node shows where every other node is, by **ESP-NOW roster RSSI** (near/far EWMA — no BLE) | ✅ merged (#58) |
 | **Treasure Hunt** | RSSI warmer/colder game over the mesh | ✅ merged (#60) |
