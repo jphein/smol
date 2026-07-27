@@ -787,7 +787,7 @@ fn main() {
             match story.step(&m, &t, &mut bufs) {
                 StepOut::Text(b) => print!("{}", core::str::from_utf8(b).unwrap()),
                 StepOut::Working => {}
-                StepOut::Done => break,
+                StepOut::Done { truncated } => { if truncated { print!("…"); } break; }
             }
         }
         println!();
