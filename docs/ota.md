@@ -270,12 +270,20 @@ ota_0,    app,  ota_0, 0x20000,  0x1F0000   # 1.938 MB slot
 ota_1,    app,  ota_1, 0x210000, 0x1F0000   # 1.938 MB slot
 ```
 
-Two ~1.94 MB slots. **The image is no longer ~590 KB:** the Bard's 283,096 B model blob rides in
-`.rodata`, so the canonical fleet image (`espnow,cast,io,bard`) is **~880 KB — about 45 % of a
-slot, i.e. ~2.3× headroom, not the ~3.3× this doc claimed pre-#300** (source: the #300 design
-spec, `docs/superpowers/specs/2026-07-26-tiny-llm-story-design.md`). That still fits with room to
-spare, but it is the number behind the `size ≤ 0x1F0000` gate — re-derive it, don't inherit it,
-whenever the feature tier changes. The bundled espflash ESP-IDF v5.1.2 bootloader honors otadata
+**The slot is no longer roomy.** The Bard's model blob rides in `.rodata`, taking the canonical
+fleet image (`espnow,cast,io,bard`) from ~590 KB to a **measured 1,432,400 B — 70.5 % of a
+`0x1F0000` (2,031,616 B) slot. Headroom fell from ~3.4× to 1.42×, leaving ~585 KiB spare.**
+
+> ⚠️ Two wrong numbers have lived here. The original **~3.3×** predates #300 entirely. Its first
+> correction — **~880 KB / 45 % / ~2.3×** — was worse in a subtler way: that figure is the
+> #300 spec's *pre-build projection* (`§5`'s estimate table), not a measurement, and the built
+> image came out ~550 KB heavier than projected. **Take this number from the artifact, never from
+> a design estimate:** `slot ÷ actual image size`. `rust/clock/Cargo.toml` carries the same
+> measurement next to the partition rationale.
+
+`ota_publish.sh` hard-gates `size ≤ 0x1F0000`, so an overflow **fails the publish, not a board** —
+but at 1.42× the gate is now a real constraint rather than a formality, so budget flash before
+adding a feature, not after. The bundled espflash ESP-IDF v5.1.2 bootloader honors otadata
 slot-select (proven on hardware). `otadata` must be exactly `0x2000` or slot-select fails to
 initialize.
 

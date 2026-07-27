@@ -21,11 +21,47 @@ Ranked. When two sources disagree, the higher one wins.
 |---|---|---|
 | 1 | **The tree** — `rust/clock/src/**`, `ha/`, `tools/` | What the code actually does. A `const` beats a paragraph. |
 | 2 | **`rust/clock/version.txt`** | The released fleet build number. Nothing else. |
-| 3 | **`docs/superpowers/specs/` + `plans/`** | Measured numbers — RAM geometry, timings, verification outcomes. Amended in place as hardware findings land, so read to the *end* of a section, not the first claim. |
+| 3 | **`docs/superpowers/specs/` + `plans/`** | Measured numbers — RAM geometry, timings, verification outcomes. **But see the projection trap below** — a spec contains both estimates and measurements, and they look identical. |
 | 4 | **`docs/protocol.md`** | The wire. Byte layouts, CFG keys, MQTT topics. The best-maintained doc in the repo — treat a conflict with it as a bug in the *other* doc. |
 | 5 | **Closed issues + merged PRs** (`gh issue view`, `gh pr view`) | Whether something shipped, and when. PR bodies carry the measured tables. |
 | 6 | **`git log`** | Sequencing, and the *reasoning* — commit bodies here are long on purpose. |
 | 7 | `docs/ROADMAP.md`, `README.md`, `site/` | Nothing. These are **derived** — they are the things you are checking. |
+
+### ⚠️ The projection trap — a spec's estimates look exactly like its measurements
+
+A design spec has two kinds of number in it and **the formatting does not distinguish them**:
+
+- The **design body** (`§5 RAM budget`, sizing tables, "image grows X → Y") is **pre-build
+  projection**. It was written before anything was compiled.
+- The **`✏️ AMENDMENT` blocks** are **measurements**, added after the fact, and they routinely
+  *contradict* the body. The body is deliberately left standing as a record of what was expected.
+
+Quoting the body as though it were measured is a real and easy mistake — it happened during the
+2026-07-27 pass, to the person writing this file. `ota.md`'s slot-headroom figure went from a stale
+**~3.3×** to a *worse* **~2.3×**, because ~2.3× came from the spec's estimate table ("image grows
+~590KB → ~880KB — 45% of a slot"). The built image is **1,432,400 B — 70.5 % of the slot, 1.42×
+headroom**: ~550 KB heavier than projected. The estimate was not a lie; it was simply an estimate,
+sitting in a document full of measurements.
+
+**Rule: for any physical number — image size, RAM, timing — prefer the artifact over any prose.**
+Measure the ELF/binary, or take the figure from a source that says it measured one (an amendment,
+a PR's measured table, `Cargo.toml`'s partition rationale). If you cannot tell whether a number was
+projected or measured, treat it as projected.
+
+### ⚠️ The orchestrator's brief is a lead, not a source
+
+Adopted as a standing rule 2026-07-27, at the team lead's own request. **Re-derive any claim handed
+to you — including from whoever assigned the task — by default, not on suspicion.** Two examples
+from a single session, both from the team lead, both *correct when written*:
+
+- "the current build is 905" — the release is **345** (`version.txt`); 905 was an OTA staged/ratchet
+  canary number, and 905 doesn't even satisfy the sigil formula that produced "Riveted Furnace".
+- "#302's mode/speed work is not built yet" — CFG-`V` had landed and been documented between the
+  brief being written and being read. (The *conclusion* survived — still not on glass — but for a
+  different reason than stated.)
+
+Neither was carelessness. On a repo moving this fast, a brief is a snapshot of a tree that has since
+moved. Read the spec/tree, **then** write. This is cheap and it has caught real defects.
 
 ⚠️ **Retirements are the blind spot.** Closed issues tell you what shipped; nothing tells you
 what got *un*-shipped. Grep the tree for the mechanism before describing it as live. Known
