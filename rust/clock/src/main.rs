@@ -1621,21 +1621,30 @@ fn main() -> ! {
             if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_DELIVERY) {
                 let v = &o.buf[..o.len];
                 match unsafe { crate::bard::set_delivery(v) } {
-                    Ok(a) => log::info!(
-                        "smol #302: bard delivery = {} ms/char, {}{}",
-                        a.delivery.ms_per_char,
-                        match a.delivery.mode {
-                            crate::bard::delivery::Mode::Inf => "inf (endless scroll)",
-                            crate::bard::delivery::Mode::Page => "page (press to turn)",
-                        },
-                        if a.clamped { " [speed CLAMPED into 20..=500]" } else { "" }
-                    ),
-                    Err(e) => log::warn!(
-                        "smol #302: bard delivery REFUSED ({:?}) — keeping the previous setting",
-                        e
-                    ),
+                    // The retained value is re-offered on EVERY gateway burst, so an unchanged one
+                    // must be silent — and must not expedite DIAG either. Same edge discipline as
+                    // the LED/units arms above; the bench found eight identical lines without it.
+                    Ok(None) => {}
+                    Ok(Some(a)) => {
+                        log::info!(
+                            "smol #302: bard delivery = {} ms/char, {}{}",
+                            a.delivery.ms_per_char,
+                            match a.delivery.mode {
+                                crate::bard::delivery::Mode::Inf => "inf (endless scroll)",
+                                crate::bard::delivery::Mode::Page => "page (press to turn)",
+                            },
+                            if a.clamped { " [speed CLAMPED into 20..=500]" } else { "" }
+                        );
+                        diag_dirty = true;
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "smol #302: bard delivery REFUSED ({:?}) — keeping the previous setting",
+                            e
+                        );
+                        diag_dirty = true;
+                    }
                 }
-                diag_dirty = true;
             }
 
             if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_CUSTOM) {

@@ -151,3 +151,58 @@ impl Delivery {
     }
 }
 
+
+/// The last `V` value a node acted on, so a RETAINED value — re-offered on every gateway burst — is
+/// applied and logged ONCE rather than six times a minute (the bench found eight identical lines in
+/// one run). The house pattern is to log on change (LED, units); this is that, for a config whose
+/// "change" has to be judged on the OFFERED BYTES: a REFUSED value has no parsed setting to compare
+/// against, and a refusal is precisely the case that must stay visible without drowning a soak.
+///
+/// Pure and host-tested because the two things that could go wrong are quiet ones: the empty offer
+/// (length 0 — a real, meaningful value meaning "restore defaults") must not read as "nothing seen
+/// yet", and an over-long value must not dedupe against a different value with the same prefix in a
+/// way that hides a distinct refusal.
+#[cfg(any(feature = "espnow", feature = "hostsim"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastOffer {
+    buf: [u8; Delivery::MAX_LEN],
+    /// Bytes recorded, or [`LastOffer::NOTHING`] when no value has ever been offered.
+    len: u8,
+    /// True length of the last offer, before the `MAX_LEN` prefix cut — so two over-long values that
+    /// share a prefix but differ in length are still told apart.
+    full_len: u16,
+}
+
+#[cfg(any(feature = "espnow", feature = "hostsim"))]
+impl LastOffer {
+    /// `len` sentinel: no value offered yet. Not 0 — that is the empty (restore-defaults) offer.
+    const NOTHING: u8 = u8::MAX;
+
+    /// Nothing offered yet.
+    pub const NONE: LastOffer = LastOffer {
+        buf: [0; Delivery::MAX_LEN],
+        len: Self::NOTHING,
+        full_len: 0,
+    };
+
+    /// Whether `value` differs from the recorded offer — and RECORD it either way, so the caller's
+    /// only job is to decide whether to act and speak.
+    ///
+    /// Records before the caller parses, deliberately: a refused value is deduplicated too, so a
+    /// retained bad value warns once and a DIFFERENT bad value warns again.
+    pub fn is_new(&mut self, value: &[u8]) -> bool {
+        let n = value.len().min(Delivery::MAX_LEN);
+        let full = value.len().min(u16::MAX as usize) as u16;
+        let same = self.len != Self::NOTHING
+            && self.len as usize == n
+            && self.full_len == full
+            && self.buf[..n] == value[..n];
+        if same {
+            return false;
+        }
+        self.buf[..n].copy_from_slice(&value[..n]);
+        self.len = n as u8;
+        self.full_len = full;
+        true
+    }
+}

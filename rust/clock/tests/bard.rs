@@ -704,6 +704,39 @@ fn delivery_defaults_are_the_shipped_behaviour() {
 }
 
 #[test]
+fn delivery_dedupes_a_retained_re_arm() {
+    use clock::delivery::LastOffer;
+    // The gateway re-offers a RETAINED value on every burst, so "have I seen this?" is what keeps a
+    // soak's log readable (the bench saw 8 identical apply lines before this existed).
+    let mut last = LastOffer::NONE;
+    assert!(last.is_new(b"160:inf"), "the first offer is always new");
+    assert!(!last.is_new(b"160:inf"), "a re-armed identical value must be recognised");
+    assert!(last.is_new(b"80:page"), "a changed value must be new again");
+    assert!(!last.is_new(b"80:page"));
+    // A bad value dedupes exactly the same way — otherwise a retained typo warns for ever — but a
+    // DIFFERENT bad value must still be reported.
+    assert!(last.is_new(b"160:slow"));
+    assert!(!last.is_new(b"160:slow"));
+    assert!(last.is_new(b"160:fast"));
+
+    // The empty offer is a REAL value (restore defaults), not "nothing seen yet": it must be new
+    // once and then dedupe, which is the bug a zero-as-sentinel would have.
+    let mut fresh = LastOffer::NONE;
+    assert!(fresh.is_new(b""), "an empty offer is a meaningful value");
+    assert!(!fresh.is_new(b""));
+    assert!(fresh.is_new(b"160:inf"));
+
+    // Over-long values keep only a prefix, so length has to be part of the identity or two distinct
+    // refusals would collapse into one silent one.
+    let a = "1".repeat(40);
+    let b = "1".repeat(41);
+    let mut long = LastOffer::NONE;
+    assert!(long.is_new(a.as_bytes()));
+    assert!(!long.is_new(a.as_bytes()));
+    assert!(long.is_new(b.as_bytes()), "a different length must not dedupe on a shared prefix");
+}
+
+#[test]
 fn persona_prompts_fit_the_vocabulary() {
     let m = Model::parse(BLOB).unwrap();
     let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();

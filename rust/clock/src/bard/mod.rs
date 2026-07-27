@@ -88,21 +88,34 @@ unsafe fn delivery() -> Delivery {
     core::ptr::addr_of!(DELIVERY).read()
 }
 
+/// The last `V` value this node acted on — see [`delivery::LastOffer`] for why the dedupe is on
+/// bytes and what the two quiet hazards are. 19 B of `.bss`.
+#[cfg(any(feature = "espnow", feature = "hostsim"))]
+static mut LAST_V: delivery::LastOffer = delivery::LastOffer::NONE;
+
 /// Offer a delivery setting (CFG `V`), e.g. `160:inf` or `80:page`; empty restores the defaults.
 /// A malformed value is REFUSED and the previous setting kept — the same discipline as `T`, for the
 /// same reason: this is a value from the air, and the failure mode of accepting half of it is a
 /// board that reveals at 0 ms/char or stops narrating.
 ///
-/// Returns what was accepted (and whether the speed had to be clamped) so the caller can log
-/// something actionable.
+/// `Ok(None)` means this exact value was already handled (a retained re-arm): nothing changed and
+/// the caller should say nothing. `Ok(Some(a))` is a fresh apply, worth a line — including whether
+/// the speed had to be clamped. `Err` is a fresh refusal, worth a warning.
 ///
 /// # Safety
 /// As [`init_statics`] — single-threaded; called only from `main`'s config-apply path.
 #[cfg(any(feature = "espnow", feature = "hostsim"))]
-pub unsafe fn set_delivery(value: &[u8]) -> Result<delivery::Accepted, delivery::DeliveryErr> {
+pub unsafe fn set_delivery(
+    value: &[u8],
+) -> Result<Option<delivery::Accepted>, delivery::DeliveryErr> {
+    // Records the offer as it checks, so a refused value is deduplicated too (a retained bad value
+    // warns once; a DIFFERENT bad value warns again).
+    if !(*core::ptr::addr_of_mut!(LAST_V)).is_new(value) {
+        return Ok(None);
+    }
     let accepted = Delivery::parse(value, delivery())?;
     core::ptr::addr_of_mut!(DELIVERY).write(accepted.delivery);
-    Ok(accepted)
+    Ok(Some(accepted))
 }
 
 /// Offer a runtime story prompt (CFG `T`). Validated against the MODEL'S OWN vocabulary before
@@ -366,6 +379,20 @@ const PAGE_BYTES: u16 = (COLS * (ROWS - 1)) as u16;
 /// (one token feeds ~430 ms of reading), shallow enough that a speed change is felt at once.
 const BACKLOG_MAX: usize = 96;
 
+/// Perf-report cadence, whichever comes first (#302). An endless narrator has no natural moment to
+/// report at: the old "one line per story" fired on a transition that no longer exists, and a tale
+/// boundary is now minutes apart at best (backpressure paces generation to ~2.3 tok/s, so a
+/// ~300-token tale takes >2 min) or never — a tale that does not sample end-of-text runs to the
+/// position cursor, hours away. So the metric is periodic instead, and each line is self-contained
+/// (pace and mode included) because the config can change mid-soak.
+///
+/// 64 tokens is directly comparable to T13's 67-token story measurement, and the 60 s ceiling means
+/// a paused `page` reader still produces a line rather than silence. Serial-only either way: ESP_LOG
+/// is baked at compile time, so a release fleet image prints none of this.
+const REPORT_TOKENS: u16 = 64;
+/// Longest a report may be withheld, even mid-page.
+const REPORT_MS: u64 = 60_000;
+
 /// Marker shown when a `page` is fully revealed and a press will turn it. ASCII only — FONT_5X8
 /// has no glyph beyond it, and a missing glyph draws as a blank.
 const MORE_MARK: &str = "~ more ~";
@@ -411,6 +438,8 @@ pub struct BardApp {
     tok_ms_sum: u32,
     /// Slowest single pass, ms — the number that decides whether the UI can stay responsive.
     tok_ms_max: u16,
+    /// When the next perf report is due (see [`REPORT_MS`]).
+    next_report_ms: u64,
 }
 
 impl BardApp {
@@ -428,6 +457,7 @@ impl BardApp {
             tok_count: 0,
             tok_ms_sum: 0,
             tok_ms_max: 0,
+            next_report_ms: ctx.now_ms.saturating_add(REPORT_MS),
         };
         if ok {
             unsafe { begin_story(ctx.node_id, ctx.now_ms, true, 0) };
@@ -449,7 +479,6 @@ impl BardApp {
         self.page_bytes = self.page_bytes.saturating_add(written as u16);
         self.rewind(dropped);
         self.fast = false;
-        self.reset_stats();
     }
 
     /// Turn the page in `page` mode: another [`PAGE_BYTES`] of new text, at reading pace again.
@@ -473,7 +502,47 @@ impl BardApp {
         self.painted = u16::MAX;
     }
 
-    /// Zero the per-tale perf counters.
+    /// Emit the accumulated generation metrics and start a fresh window. `why` names the occasion
+    /// (periodic, or a tale boundary) so one grep covers both.
+    ///
+    /// This is the ONLY place the numbers are printed, so they can never be double-counted or —
+    /// as they were until the bench caught it — reported at a transition an endless narrator never
+    /// makes. Silent when nothing was generated: a paused `page` reader should produce no line
+    /// rather than a row of zeroes.
+    fn report_perf(&mut self, now_ms: u64, why: &str) {
+        self.next_report_ms = now_ms.saturating_add(REPORT_MS);
+        if self.tok_count == 0 {
+            return;
+        }
+        let d = unsafe { delivery() };
+        log::info!(
+            "smol #300: bard {} — {} tok, avg {} ms/tok, max {} ms @ {} ms/char {}",
+            why,
+            self.tok_count,
+            self.tok_ms_sum / self.tok_count as u32,
+            self.tok_ms_max,
+            d.ms_per_char,
+            match d.mode {
+                delivery::Mode::Inf => "inf",
+                delivery::Mode::Page => "page",
+            }
+        );
+        // Bench builds only: how much of the (floor-gated) stack the narration actually used. In
+        // the periodic line rather than at a tale end, because the question it answers — does the
+        // ring leak stack as it wraps? — is about elapsed narration, not about tales.
+        #[cfg(feature = "stack-paint")]
+        {
+            let region = stack_paint::region_bytes();
+            let used = stack_paint::high_water();
+            // checked_div, not a zero test: a region of 0 means the linker symbols were nonsense,
+            // and reporting 0% is the honest answer rather than dividing.
+            let pct = (used * 100).checked_div(region).unwrap_or(0);
+            log::info!("smol #300: stack high-water {} of {} B ({}%)", used, region, pct);
+        }
+        self.reset_stats();
+    }
+
+    /// Zero the perf counters.
     fn reset_stats(&mut self) {
         self.tok_count = 0;
         self.tok_ms_sum = 0;
@@ -558,39 +627,25 @@ impl Plugin for BardApp {
                 }
                 Advance::Primed => {}
                 Advance::Ended { cursor } => {
-                    // ONE line per TALE, on the transition only. Serial-only by nature: ESP_LOG is
-                    // baked at compile time, so a release image is silent here and an ESP_LOG=info
-                    // build is what surfaces it (Task 13's bench run).
-                    let avg = if self.tok_count == 0 {
-                        0
-                    } else {
-                        self.tok_ms_sum / self.tok_count as u32
-                    };
-                    log::info!(
-                        "smol #300: bard tale done — {} tok, avg {} ms/tok, max {} ms; {} — opening the next",
-                        self.tok_count,
-                        avg,
-                        self.tok_ms_max,
-                        if cursor { "position cursor recycled" } else { "the model ended it" }
+                    // A tale boundary FLUSHES the window rather than owning the metric, so the
+                    // numbers are attributable to a tale when one ends and still arrive when none
+                    // does. `page` mode gets its per-tale line here exactly as before.
+                    self.report_perf(
+                        ctx.now_ms,
+                        if cursor {
+                            "tale done (position cursor recycled), opening the next"
+                        } else {
+                            "tale done (the model ended it), opening the next"
+                        },
                     );
-                    // Bench builds only: how much of the (floor-gated) stack the story actually used.
-                    #[cfg(feature = "stack-paint")]
-                    {
-                        let region = stack_paint::region_bytes();
-                        let used = stack_paint::high_water();
-                        // checked_div, not a zero test: a region of 0 means the linker symbols were
-                        // nonsense, and reporting 0% is the honest answer rather than dividing.
-                        let pct = (used * 100).checked_div(region).unwrap_or(0);
-                        log::info!(
-                            "smol #300: stack high-water {} of {} B ({}%)",
-                            used,
-                            region,
-                            pct
-                        );
-                    }
                     self.next_tale(ctx.node_id, ctx.now_ms);
                 }
             }
+        }
+        // Periodic report: whichever of the two bounds trips first (see REPORT_TOKENS). Outside the
+        // generate block so a `page` pause still closes out its window on the time bound.
+        if self.tok_count >= REPORT_TOKENS || ctx.now_ms >= self.next_report_ms {
+            self.report_perf(ctx.now_ms, "narrating");
         }
         let text_len = unsafe { text_len() } as u16;
 
