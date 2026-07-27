@@ -11,15 +11,22 @@ hardware · ⚪ design.
 
 ## Why MQTT (and not ESPHome / the native API)
 
-smol is a **battery, single-radio, burst** device: its radio sits on the ESP-NOW mesh
-channel and only briefly switches to WiFi (~2 s per burst) to reach the LAN. That rules
-out the two "richer-looking" options:
+smol is a **single-radio** device, and the reasoning below was written when it was also a
+**burst** device — the radio left the mesh for WiFi and the mesh went deaf. ⚠️ **#23 retired that
+burst** (2026-07-12): the radio now stays up through a WiFi sync via co-channel coexist, so the
+~15 s mesh-deaf window is gone. **The conclusion still holds, for a narrower reason** — see the
+ESPHome bullet — so the analysis is kept rather than deleted. What has *not* changed is that a
+single radio cannot be a persistent TCP server and a mesh node at once. That rules out the two
+"richer-looking" options:
 
 - **ESPHome native API** needs the device to be a **persistent TCP server** Home
-  Assistant dials into and holds open — incompatible with a radio that's off-WiFi ~28 s
-  of every 30 s (HA would see it perpetually offline). There is also **no Rust ESPHome
-  firmware** — ESPHome is Python→C++ codegen. (Full analysis:
-  `scratch/smol-ha-batt/rust-esphome-research.md`.)
+  Assistant dials into and holds open. Pre-#23 the killer was that the radio was off-WiFi ~28 s of
+  every 30 s, so HA saw it perpetually offline. Post-#23 the window is gone but the objection
+  survives: a **leaf** never associates at all (only the elected gateway does), so a per-node
+  persistent socket is still not a thing this topology can offer — and MQTT's retained-message
+  cache is what lets a leaf get its data second-hand over the mesh. There is also **no Rust ESPHome
+  firmware** — ESPHome is Python→C++ codegen. (The full analysis was a
+  scratch note that has since been pruned; the conclusion is what survived.)
 - **MQTT discovery + retained messages** fit perfectly: the broker (Mosquitto on the HA
   VM) is the **cache**. The gateway connects for ~2 s, publishes/reads, disconnects; a
   **retained** message survives the gap and is delivered on the next burst. This is the
@@ -31,15 +38,17 @@ out the two "richer-looking" options:
 On each burst the gateway publishes retained **MQTT-discovery** configs, so each node
 appears in HA as a native `sensor.smol_<id>_*` entity with **zero HA-side YAML**. Leaf
 telemetry is relayed leaf→gateway over ESP-NOW ([RELAY](protocol.md#relay--relayack--espnow--internet-telemetry)),
-then the gateway publishes it. 🟢 hardware-verified. **#12 (everything-release):** each node now
-groups under one HA **device** with **typed child entities** (`_voltage`/`_temp`/`_status`, each with
-`object_id` + `expire_after`) replacing the single packed telemetry line — **verified on-wire (id7);
-fleet on build 58**. A one-time HA retained-clear (morpheus-ha, **running now**) removes the legacy
-build-56 config (a stale-retained artifact, not a firmware defect; #36 closed as a no-op).
+then the gateway publishes it. 🟢 hardware-verified. **#12 (everything-release):** each node
+groups under one HA **device** with **typed child entities** (`object_id` + `expire_after`) instead of
+a single packed telemetry line — verified on-wire on id7, **2026-07-12**. ⚠️ **The split is only
+partial:** live discovery on **2026-07-27** carried **3 `_voltage` and 3 `_rssi` entities and zero
+`_soc`**, so SOC (and `_role`) still ride the packed line. Docket item **D11** stays open for that
+reason. A one-time HA retained-clear removed the legacy build-56 config (a stale-retained artifact,
+not a firmware defect; #36 closed as a no-op).
 
 ### Downlink — HA → every display (retained + mesh re-broadcast)
 HA automations publish **retained**, display-ready payloads that the gateway grabs in its
-burst and **re-broadcasts single-hop** over ESP-NOW so leaves render them too:
+burst and **re-broadcasts** over ESP-NOW so leaves render them too — single-hop normally, or through a relay since #13 shipped routed multi-hop (`BATT2`/`GRID2` carry the downlink behind a strictly-newer freshness gate):
 
 | Topic | Screen | Payload | Mesh frame | Status |
 |---|---|---|---|---|
@@ -62,19 +71,30 @@ reachable). "Set all" writes every per-node topic — there is **no broadcast to
 **no ESP-NOW command relay** (the unauthenticated mesh must never become a command
 channel). **Status:** 🟢 **shipped** — gateway-self default-screen **verified on glass** (id7), plus
 **leaf-relay** (a gateway relays a leaf's screen over a SMOLv1 CFG frame; strict, panic-free allowlist
-parse). Protocol: [protocol.md → CONFIG](protocol.md#config--retained-per-node-default-screen-21-specd--firmware-pending);
+parse). Protocol: [protocol.md → CFG](protocol.md#cfg--keyed-per-node-config-channel-56);
 GUI/entities: [`ha/README.md`](../ha/README.md).
 
-## OTA (#6) — retained announce (🟢 PROVEN: canary self-updated 58→59 OTA in ~17 s)
-Firmware updates ride the same MQTT-native pattern: a retained
-`smol/ota/announce` = `OTA|build|size|sha256|url`; the board fetches the image over
-HTTP to its inactive A/B slot, verifies (sha256), and activates it. Recovery is
+## OTA (#6) — stage, then install per node (🟢 hardware-proven)
+Firmware updates ride the same MQTT-native pattern, but **not via an `announce` topic** — that
+act-path was **retired at the Model-A #32 closure** and there is deliberately **no fleet-push
+topic**. Two topics, and only two:
+
+| Topic | Retained | What it does |
+|---|---|---|
+| `smol/ota/staged` | yes | **Arms** every board's HA Update entity. **No board fetches anything.** |
+| `smol/<id>/ota/install` | yes | **Per-node** install order — the wire behind HA's Install button. Idempotent (the gate is `staged.build > running`), so a re-fire never re-installs. |
+
+The payload carries an **ed25519 signature (`sighex`)** alongside build/size/sha256/url, and the
+leaf **verifies that signature before it writes a byte** (#32). sha256 is the image *identity*
+used against reproducible builds (#44) — **never the trust gate**. Recovery is
 **app-side self-rollback + canary-one-board-at-a-time** — the bundled bootloader
 slot-selects, but **revert-on-boot-fail is OFF** (unproven/likely disabled), so a bad
 image is contained by pushing to one board at a time (never fleet-unison), not by an
 automatic bootloader revert. 🟢 engine + publish tooling + HA panel + native HA **Update entity** (#33)
-are landed and **OTA is proven**: a canary **self-updated build 58→59 over the air in ~17 s** (fetch →
-verify → boot `ota_1` → `Valid`). The first attempt had failed for an **infra** reason (a missing firewall
+are landed and **OTA is hardware-proven**: on **2026-07-10** a canary self-updated build 58→59 over
+the air in ~17 s (fetch → verify → boot `ota_1` → `Valid`), and #40 has since delivered full ~1 MB
+images to WiFi-less leaves **over the mesh**. *(Dating the run matters: undated, "58→59" reads as the
+fleet's current build forever — it is a historical measurement, not a status.)* The first attempt had failed for an **infra** reason (a missing firewall
 allow-rule to reach the image host, since added; [#37](https://github.com/jphein/smol/issues/37) resolved)
 — **not a firmware bug**. Rollout stays canary-one-board-at-a-time. See [ota.md](ota.md).
 

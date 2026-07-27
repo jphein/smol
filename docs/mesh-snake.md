@@ -85,8 +85,11 @@ sees the same ranking of magical names**:
 To play together, boards just need to be **near each other** and agree:
 
 1. **Same firmware** — flash the mesh build (`--features espnow`) on each board.
-2. **Same ESP-NOW channel** — the firmware pins a fixed channel (ch 6) in its
-   time-share mode, so boards find each other automatically; no pairing step.
+2. **Same ESP-NOW channel** — boards find each other automatically; no pairing step.
+   *(The old "pins ch 6 in its time-share mode" description is retired: **#23** replaced the
+   time-share with WiFi+ESP-NOW co-channel coexist, and the mesh now parks on the elected crown's
+   own AP channel — steerable with a retained `smol/mesh/channel_hint`, #155. Leaves scan 1/6/11 to
+   find it.)*
 3. **A distinct id per board** — set at flash time (`mode::start(…, id, …)`); each
    id maps to a deterministic **magical name** shown on screen, so you can tell
    who's who. (See [BUILDING.md](BUILDING.md) → *Multi-board / ESP-NOW mesh*.)

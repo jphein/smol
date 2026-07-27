@@ -57,8 +57,9 @@ Adding an app = add an `AppKind` variant + its module + a registry entry.
 ## 2. The ESP-NOW mesh (SMOLv1)
 
 Wire protocol: **[`docs/protocol.md`](docs/protocol.md)** — every frame byte-accurate with honest
-per-frame verification badges (HELLO/ACK, BEACON, TIME, BATT, GRID, RELAY/RELAYACK, SNK, the retained
-CONFIG topic). Operator guide: **[`docs/relay.md`](docs/relay.md)**.
+per-frame verification badges — HELLO/ACK, BEACON, TIME, BATT/GRID, CFG, DIAG, SCAN, RELAY/RELAYACK,
+RELAY2/RELAYACK2 (routed multi-hop), BATT2/GRID2, SNK, FAM and the leaf mesh-OTA frames, plus the MQTT
+topic map. Read the list there rather than here; an enumerated copy goes stale every wave. Operator guide: **[`docs/relay.md`](docs/relay.md)**.
 
 - **Roles decide themselves at boot from DHCP:** a board that associates + gets a lease is a
   **gateway** (bridges to HA); one without creds / out of range is a **leaf** (pure ESP-NOW). Put
@@ -78,9 +79,10 @@ CONFIG topic). Operator guide: **[`docs/relay.md`](docs/relay.md)**.
 - **No-burst coexist** (#23): the gateway stays associated and runs ESP-NOW + WiFi concurrently on
   one channel, so a telemetry flush no longer tears the radio down (no multi-second mesh-deaf
   window). Leaves scan 1/6/11 to find the gateway's channel + re-lock on silence.
-- **Maturity is honest** — coexist + self-heal are HW-verified *same-channel* (cross-channel roam
-  #35 + a broker-dead-HELLOing residual #31 are open); see the wave changelog / ROADMAP before
-  assuming a mesh feature is fully proven.
+- **Maturity is honest** — coexist + self-heal are HW-verified *same-channel*. **#31
+  (broker-dead-HELLOing) closed 2026-07-12; cross-channel roam #35 is still open**, and the live
+  residual to know about is **#204** — a crown under bulk unicast RX goes downstream-deaf. Check the
+  ROADMAP before assuming a mesh feature is fully proven.
 
 ---
 
@@ -130,9 +132,17 @@ Full toolchain + gotchas: **[`docs/BUILDING.md`](docs/BUILDING.md)**. TL;DR for 
    warnings` across **all three** tiers, and the `default` build must stay behaviourally unaffected
    (prove via cfg-gating, **not** ELF byte-equality — `build.rs` stamps a per-commit git hash, so the
    default ELF changes every commit by design).
-3. **Version identity:** `build.rs` embeds `BUILD_HASH` + `BUILD_NUMBER` (git rev-count →
-   `names.rs::version_name()`, a forge-realm sigil name, e.g. build 56 "Hammer"). The number is the
-   OTA monotonicity gate; the name is the boot-splash reveal.
+3. **Version identity:** `build.rs` embeds `BUILD_HASH` + `BUILD_NUMBER` →
+   `names.rs::version_name()`, a forge-realm sigil name. The number is the OTA monotonicity gate;
+   the name is the boot-splash reveal. Two things to get right:
+   * **`BUILD_NUMBER` is the committed ratchet in `rust/clock/version.txt`** (currently `345`), or a
+     `SMOL_BUILD_NUMBER` override. `git rev-list --count HEAD` is only build.rs's *fallback* when
+     neither exists, and it reads much higher.
+   * **The name is computable, so a mismatched pair is a bug:** `noun = FORGE.nouns[n % 20]`,
+     `adj = FORGE.adjectives[(n / 20) % 20]`. So **345 → "Riveted Furnace"** and **56 → "Carbonized
+     Quench"** — *not* "Hammer", which this line said until 2026-07-27, because **#218 replaced the
+     old `>>8` formula with direct modulo.** Any sigil name written before 2026-07-20 needs
+     recomputing.
 4. **Flash (USB):** from `rust/clock/`, `cargo run --release --features espnow` — the runner is
    `espflash flash --monitor --partition-table partitions-ota.csv` (lays down the dual-A/B OTA
    table). Board identity comes from that board's own `board.rs`/`secrets.rs`.

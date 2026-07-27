@@ -24,7 +24,7 @@ Every board runs the **unified Rust firmware** (`rust/clock/`, `no_std` esp-hal)
 | **Marauder's Watch** | every node shows where every other node is, by **ESP-NOW roster RSSI** (near/far EWMA — no BLE) | ✅ merged (#58) |
 | **Treasure Hunt** | RSSI warmer/colder game over the mesh | ✅ merged (#60) |
 | **Custom screen** | per-node user-defined text/entities, authored from the HA dashboard (HA resolves `{entity}` refs to plain text; the leaf just renders bytes) | ✅ merged (#45) |
-| **HA Batt / HA Grid** | live battery **voltages + SOC** (big per-battery pages) and **grid power** on every display, mirrored from Home Assistant over MQTT + re-broadcast to leaves as mesh frames | 🟢 on-glass round-trip verified (#16/#17) |
+| **HA Batt / HA Grid** | live battery **voltages + SOC** (big per-battery pages) and **grid power** on every display, mirrored from Home Assistant over MQTT + re-broadcast to leaves as mesh frames | 🟢 on-glass round-trip verified **on the gateway** (#16/#17) · 🟡 the **leaf** leg is inferred, not observed — protocol.md logs no leaf-side BATT/GRID receipt, and the fleet is all-gateway so the path is unexercised |
 | **smol Cast** | stream a board's display to a network **WLED** matrix as realtime UDP pixels | 🟢 HW-verified (#26) |
 | **Clock · Snake · Mesh Snake · Benchmark · atomic14 pack** | NTP clock, one-button Snake, 2-board head-to-head, a live ESP-NOW link tester, and 5 single-button games | 🟢 flashed |
 | **Block Digger** | Minecraft-ish dig/build with a Bluetooth **Stadia** controller (Bluepad32; the Arduino build) | 🟢 flashed |

@@ -9,7 +9,7 @@ to Home Assistant** (see [home-assistant.md](home-assistant.md)). The old UDP re
 **What it is — and isn't.** Single-hop, **short telemetry only** (the sensor line
 + last peer/label). It is **not** browsing or a general gateway: ESP-NOW's 250 B
 frame limit and one-radio reality make bulk/interactive traffic impractical (the
-full analysis is in `scratch/smol/nebula-espnow-gateway.md`; the wire frames are in
+full analysis was a scratch note since pruned; the wire frames are in
 [protocol.md](protocol.md#relay--relayack--espnow--internet-telemetry)).
 
 ## Roles: leaf vs gateway (creds decide, automatically)
@@ -74,7 +74,7 @@ leaves.
    — its neighbour leaves cache them but never re-broadcast, so both are single-hop) and
    DISCONNECTs back to ch 6. The **UDP collector egress is retired** (as of build 40; the
    <host> service is stopped/disabled and its JSONL archived — rollback = git). *(A pending
-   firmware wave adds a third SUBSCRIBE — `smol/<id>/config/default_screen` for the
+   firmware **has** a third SUBSCRIBE (shipped #21, 2026-07-10) — `smol/<id>/config/default_screen` for the
    [node manager](protocol.md#config--retained-per-node-default-screen-21-specd--firmware-pending),
    #21.)* Full byte contracts:
    [protocol.md → MQTT burst](protocol.md#mqtt-burst--the-lan-transport-that-retires-the-udp-collector).

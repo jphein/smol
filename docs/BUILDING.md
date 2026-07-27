@@ -86,7 +86,7 @@ Feature tiers: default = Clock + Snake · `--features wifi` = + NTP · `--featur
 - **Secrets:** real WiFi creds live only in git-ignored `rust/clock/src/secrets.rs` (the repo is public).
 
 ## Multi-board / ESP-NOW mesh
-Give each board a **distinct peer id** (`rust/clock/src/main.rs`, the `mode::start(..., N, ...)` arg — we flashed 7 / 8 / 9). Distinct ids let the blue-LED handshake and the Bench link stats work between boards (same id can be filtered as self-echo). Boards auto-pair over ESP-NOW on the AP's channel; watch the blue LED go slow-blink (detected) → solid (connected).
+Give each board a **distinct peer id**. ⚠️ **This is no longer a source literal.** It used to be an argument to `mode::start(...)` in `main.rs`; identity now lives in a **runtime NVS record** (`main.rs` passes `node_id()`), which is what lets **one image serve the whole fleet** and is why OTA never touches identity. Set it per board in the git-ignored `src/board.rs` (`cp src/board.rs.example src/board.rs`), or provision it on-device. Distinct ids let the blue-LED handshake and the Bench link stats work between boards (same id can be filtered as self-echo). Boards auto-pair over ESP-NOW on the AP's channel; watch the blue LED go slow-blink (detected) → solid (connected).
 
 Each id maps to a deterministic **magical name** (via realm-sigil) — id 7 = *Draconic Dominion*, id 8 = *Eldritch Nexus*, id 9 = *Jade Herald*. The name is that board's identity in the mesh: it shows on peers' World-Snake screens and in the leaderboard.
 
@@ -96,4 +96,4 @@ With several identical boards on the bench, don't trust the `ttyACMx` number (it
 - **By USB vendor/MAC:** Espressif boards are `303a:…` (`lsusb`); pin the exact unit by MAC (`espflash board-info`, `udevadm info /dev/ttyACM* | grep -i serial`, or the boot log). Keep an id ↔ MAC ↔ name map for your fleet. Verified today: `ac:a7:04:b9:77:14` = id 7 *Draconic Dominion* (the WiFi/NTP root), `ac:a7:04:ba:1f:24` = id 8 *Eldritch Nexus*, `10:00:3b:ce:95:cc` = id 9 *Jade Herald*.
 - **Final-flash flow:** confirm the target unit by MAC/`board-info` first, flash with its intended id (`mode::start(…, <id>, …)`), then watch the boot log echo the expected name — that name+id on the OLED is your confirmation you flashed the right physical board.
 
-The mesh wire protocol (HELLO/ACK, BEACON, TIME, RELAY, and the design-stage SNK) — exact byte layouts, cadence, and per-frame verification status — is documented in **[docs/protocol.md](protocol.md)**.
+The mesh wire protocol — exact byte layouts, cadence and per-frame verification status — is documented in **[docs/protocol.md](protocol.md)**: HELLO/ACK, BEACON, TIME, BATT/GRID, **CFG**, **DIAG**, **SCAN**, RELAY/RELAYACK, **RELAY2/RELAYACK2** (routed multi-hop, #13), **BATT2/GRID2**, SNK (**shipped**, not design-stage — #5 closed 2026-07-08), **FAM** (the Familiar, #57) and the **leaf mesh-OTA** frames (#40). Treat protocol.md as the list; enumerating frames here just goes stale.
