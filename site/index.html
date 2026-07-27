@@ -511,9 +511,10 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
           <span>72×40 · SSD1306</span><span class="bard-quill">✒ composing</span>
         </div>
       </div>
-      <p class="bard-hint">Typing at the board's real pace — <b>202 ms per token</b>, measured on
-        glass. About <b>five lines of fifteen characters</b> fit at once, so the screen is a
-        <b>window the story moves past</b> — not a container for the story.</p>
+      <p class="bard-hint">Typing at the board's real reveal rate — <b>160 ms per character</b>,
+        the firmware's own default. About <b>five lines of fourteen characters</b> fit at once, so
+        the screen is a <b>window the story moves past</b> — not a container for the story. This
+        excerpt loops; <b>the board itself never stops</b>.</p>
     </div>
 
     <div class="bard-story">
@@ -531,15 +532,23 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
         <div><b>260K</b><span>parameters, int8</span></div>
         <div><b>283,096 B</b><span>blob, XIP from flash — 0 B of RAM</span></div>
         <div><b>202 ms</b><span>per token on glass (274 max)</span></div>
-        <div><b>24,136 B</b><span>heap still free of 96 KiB, after</span></div>
+        <div><b>55,440 B</b><span>stack high-water — identical across 5 reports, so the endless window never creeps</span></div>
       </div>
       <p class="bard-status"><b>🟢 On glass</b> — a 67-token story on the bench board, then a
         canary soak that survived a hard power-cycle from the inactive OTA slot. Set
         <code>Bard:0</code> from Home Assistant and a node boots straight into composing.
-        <b>Honest edge:</b> verified on the bench + canary (id8); the fleet-wide roll rides the
-        next release train, and a rewrite that lets a tale run <i>without end</i> — plus
-        HA-settable pace and page-at-a-time delivery — is committed and host-tested but
-        <b>has not been on glass yet</b>. · <a href="https://github.com/jphein/smol/issues/300" target="_blank">issue #300 ↗</a>
+        <b>And it no longer ends.</b> A sliding-window rewrite (#302) removed the terminal state,
+        so a tale runs indefinitely — verified on glass: the pace was changed from 160 to
+        <b>120 ms/char mid-narration</b> from Home Assistant, without a restart, and the stack
+        high-water came back <b>byte-identical at 55,440 B across five consecutive reports</b>
+        spanning many tale boundaries. A window that reused memory imperfectly would creep; this
+        does not move at all.
+        <b>Honest edges:</b> generation in endless mode runs <b>224–274 ms/token</b> (max 281) —
+        10–35% slower than a bounded story, because attention now always spans the full window, and
+        the spread tracks whether the radio is bursting, not the model. Verified on the bench and
+        canary (id8); the fleet-wide roll rides the next release train. Endless mode is
+        <b>near-continuous compute</b>, so it is the fleet's worst-case power draw — no battery-life
+        claim is implied. · <a href="https://github.com/jphein/smol/issues/300" target="_blank">#300 ↗</a>
         · <a href="https://github.com/jphein/smol/pull/301" target="_blank">PR #301 ↗</a>
         · <a href="https://github.com/jphein/smol/issues/302" target="_blank">#302 ↗</a></p>
       <p class="bard-note" data-edit="bard.note">The story on the left is not mock-up text. It is

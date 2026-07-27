@@ -262,11 +262,21 @@
          --temp 0 --steps 52 -i "Once upon a time, there was a little owl"
      and paste the output.                                                     */
   const BARD = {
+    // Verbatim deterministic (temp 0) output of the committed blob. Regenerate with
+    //   python3 tools/bard_reference.py rust/clock/model/stories260K-q8.bin \
+    //     --temp 0 --steps 90 -i "Once upon a time, there was a little owl"
+    // Greedy decoding is the only reproducible mode (the reference refuses temp > 0 —
+    // sampling lives in the firmware's RNG), and a 260K model starts repeating itself
+    // shortly after this, which is why the excerpt ends where it does.
     STORY: 'Once upon a time, there was a little owl named Jack. Jack loved to ' +
-           'play with his toys. One day, Jack saw a big box in the ground.',
-    // 202 ms/token measured on glass (#300 T13); this vocab averages ~3.5 chars
-    // per token, so ~58 ms/char reproduces the real cadence.
-    MS_PER_CHAR: 58,
+           'play with his toys. One day, Jack saw a big box in the ground. He wanted ' +
+           'to play with it, but he was too small.',
+    // The reveal rate is ms per CHARACTER, not per token: it is the firmware's own
+    // CFG-`V` delivery setting, which DEFAULTS TO 160 (#302). An earlier version of
+    // this file typed at 58 ms/char, derived from the 202 ms/token generation figure —
+    // wrong axis. Generation and reveal are separate clocks; the panel is showing the
+    // reveal one.
+    MS_PER_CHAR: 160,
     HOLD_MS: 3400,
   };
 

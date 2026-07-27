@@ -63,6 +63,40 @@ from a single session, both from the team lead, both *correct when written*:
 Neither was carelessness. On a repo moving this fast, a brief is a snapshot of a tree that has since
 moved. Read the spec/tree, **then** write. This is cheap and it has caught real defects.
 
+### ⚠️ Upgrades are as invisible as retirements
+
+The mirror image of the retirement blind spot, and the more dangerous one because it makes docs
+*understate* the system. **Nobody revisits a doc to make a claim stronger.** When a subsystem
+hardens, whoever hardened it updates the spec and the protocol reference — and the guides keep
+describing the weaker version indefinitely.
+
+Evidence: **two independent documents** understated the *same* security model. `ONBOARDING.md` and
+`home-assistant.md` both described the OTA trust gate as **"SHA-256 verify"** long after #32 made it
+**ed25519 signature verification before the leaf writes a single byte** — a far stronger guarantee —
+and both still documented an `announce`/`announce/all` fetch path that #32's closure had *removed*.
+That is not two mistakes; it is one blind spot hit twice.
+
+So when you check a subsystem, ask both questions:
+- *Has anything here been retired?* (the usual sweep)
+- *Has anything here got **stronger** since this was written?* Security gates, verification depth,
+  brick-safety, error handling. An understated guarantee is still a wrong doc, and it costs you the
+  credit for work that was actually done.
+
+### ⚠️ When a premise expires, check the conclusion before deleting
+
+A doc's *reason* can go stale while its *answer* stays right. Deleting the section loses a correct
+argument; leaving it stands on a false premise. Narrow the premise instead.
+
+Worked example: `home-assistant.md`'s whole "why not ESPHome" analysis rested on *"a radio that's
+off-WiFi ~28 s of every 30 s."* **#23 retired that window.** But the conclusion survives on an
+independent leg — **a leaf never associates at all** (only the elected gateway does), so a per-node
+persistent TCP socket is not something this topology can offer, window or no window. The section was
+kept, the premise re-grounded, and the expiry flagged inline.
+
+Ask: *if the stale premise were simply false, would the conclusion still hold for another reason?*
+If yes, re-ground it. If no, the conclusion goes too — and that is a finding worth reporting, not a
+quiet deletion.
+
 ⚠️ **Retirements are the blind spot.** Closed issues tell you what shipped; nothing tells you
 what got *un*-shipped. Grep the tree for the mechanism before describing it as live. Known
 retirements that documentation has gotten wrong: **CFG-`N`** WiFi-slot switch and its

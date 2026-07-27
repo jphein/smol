@@ -41,7 +41,7 @@ formula are a bug in this document** — check them together.
 | **Signed OTA — dual A/B + ed25519, and over the mesh to WiFi-less leaves** — the gateway fetches a signed image and relays it chunk-by-chunk over ESP-NOW (windowed-NAK); the leaf **verifies the signature before it writes a byte**, then flashes its inactive slot. One runtime-NVS-id image serves the whole fleet | #6/#40/#32 | 🟢 full ~1 MB images delivered over the mesh; verify-before-write on glass. **Canary-one-board is still mandatory** — the reason is in §3 |
 | **Routed multi-hop mesh** — a gateway-deaf leaf escalates to a hop-limited managed flood (hop-limit + `(origin, msgid, frag)` seen-set, table-free so it rides re-election for free); the ordinary all-hear case stays byte-identical to single-hop | #13 | 🟢 **first routed frame 2026-07-14** — a gateway-deaf smol delivered telemetry home through a neighbour. PR #123. Honest v1 limits: best-effort uplink ACK, channel-scan throughput cap (#126), observability-via-relay (#124) |
 | **Retire the burst — WiFi + ESP-NOW co-channel coexist** — the radio stays up through a WiFi sync, so the mesh never goes deaf; killed the ~15 s flush window and the boot assoc-freeze | #23 + #14/#76 | 🟢 zero mesh loss across dozens of sync windows on all 3 boards; same-channel reassoc; fully-dark dead-owner takeover + split-brain co-boot; handover-standoff/seq-race heals (#114). **Live residuals:** bulk-unicast RX starvation on a crown (#204/#217, open) and cross-channel roam not yet forced (#35, open) |
-| **Keyed-CFG channel — the whole remote-config family** — one `SMOLv1 CFG <id><KEY><value>` frame carries every per-node knob over the mesh, all editable from the HA dashboard, no reflash: `S` screen · `L` LED · `U` units · `P` plugins · `Y` custom screen · `B` broker leg · `O` OTA-host allowlist · `R` reboot · `W` scan · `G`/`g` IO pin-map · `T` Bard prompt | #56 + #21/#48/#43/#55/#45/#100/#52/#71/#72/#303 | 🟢 byte-accurate wire in [protocol.md](protocol.md#cfg--keyed-per-node-config-channel-56); most keys apply live, `B` edge-triggers a reboot, `R`/`W` are one-shot and never cached. `T` (#303) is merged + hardware-verified but **the fleet is not rolled**. One more key exists on the wire and is deliberately **not** in this list: **`V`** (Bard delivery pace/mode, #302) is documented in protocol.md but has **no bench run** — it belongs to §2, not here. ⚠️ **`N` (WiFi-slot switch) is RETIRED** — #142 moved the fleet to single-network operation and a received `N` is now drained and ignored, so do not describe the slot switch or its "un-brickable auto-revert" as a live feature |
+| **Keyed-CFG channel — the whole remote-config family** — one `SMOLv1 CFG <id><KEY><value>` frame carries every per-node knob over the mesh, all editable from the HA dashboard, no reflash: `S` screen · `L` LED · `U` units · `P` plugins · `Y` custom screen · `B` broker leg · `O` OTA-host allowlist · `R` reboot · `W` scan · `G`/`g` IO pin-map · `T` Bard prompt · `V` Bard delivery pace/mode | #56 + #21/#48/#43/#55/#45/#100/#52/#71/#72/#303/#302 | 🟢 byte-accurate wire in [protocol.md](protocol.md#cfg--keyed-per-node-config-channel-56); most keys apply live, `B` edge-triggers a reboot, `R`/`W` are one-shot and never cached. **`V` now has its bench run** — 160 → 120 ms/char applied *mid-narration* from HA with no restart (#302, §2), so it joins the list; `T` (#303) is merged + hardware-verified. For both, **the fleet is not rolled**. ⚠️ **`N` (WiFi-slot switch) is RETIRED** — #142 moved the fleet to single-network operation and a received `N` is now drained and ignored, so do not describe the slot switch or its "un-brickable auto-revert" as a live feature |
 | **Node manager — firmware consume half** — all three sub-tasks landed: CFG-`S` default-screen consume behind a strict panic-free allowlist parse; the mesh topology/RSSI roster to HA; retained `smol/<id>/status` = `STAT\|<screen>:<page>\|<build>` | #21/#74/#50 | 🟢 `net/wifi.rs` publishes `smol/<id>/status` for itself *and* on behalf of leaves; the dashboard consumes it (`ha/dashboard/README.md`). Unlocks live current-screen reflection **and** the running-build read OTA needs |
 | **The Mesh Familiar** — one creature inhabits the whole fleet and **hops to a neighbour when you unplug its board**; exactly-one-holder arbitration, migration on loss, orphan re-election | #57 | 🟢 human-verified on glass — pull the plug, watch it jump. PR #99 |
 | **World Snake (MMO) · Marauder's Watch · Treasure Hunt · smol Cast** — shared 256×256 toroidal world with treasure-powers; roster-RSSI peer locator; RSSI warmer/colder game; display streamed to a WLED matrix as realtime UDP pixels | #5/#58/#60/#26 | 🟢 flashed and running fleet-wide |
@@ -98,14 +98,25 @@ formula are a bug in this document** — check them together.
     key documented in [protocol.md](protocol.md#cfg--keyed-per-node-config-channel-56)).
     Leaf-side validation against the model's own 512-token vocabulary is the part that *cannot*
     live gateway-side — the tokenizer lives with the model.
-  - 🟡 **#302 — the endless story: committed and host-tested, but NOT on glass.** A rolling KV
-    window removes the terminal state so a tale can run without end, with `inf`/`page` delivery
-    and typewriter pace over the new CFG-`V`. Host tests 21 → 36; `.bss` byte-identical to
-    pre-#302 and the whole feature costs 48 B of `.data` (see the box above). **The design spec
-    still says "not yet on glass"** — the bench numbers owed are per-tale ms/tok in `inf` mode
-    (expect ~10% above T13's 202, since attention now always spans the full window), stack
-    high-water across ≥4 tale boundaries, and that a `V` change lands mid-tale. Do not describe
-    endless narration as a shipped feature until those exist.
+  - 🟢 **#302 — the endless story: ON GLASS.** A rolling KV window removes the terminal state so a
+    tale runs indefinitely, with `inf`/`page` delivery and typewriter pace over CFG-`V`. Measured on
+    id8 in endless mode, JP's own prompt running:
+    | measurement | value |
+    |---|---|
+    | generation, `inf` mode | **224–274 ms/token** avg, max 281 (reported every 64 tokens) |
+    | vs bounded stories (#300 T13) | 202 ms/tok → **10–35% slower**, as predicted: attention now always spans the full window |
+    | stack high-water | **55,440 of 75,248 B = 73%**, *byte-identical across all 5 reports* |
+    | live `V` change mid-tale | 160 → 120 ms/char applied **while narrating**, no restart |
+    | endless-ness | display mirror 75 s apart: 416/2048 px changed, entirely different prose |
+
+    **The leak test is the one that matters, and it is now measured rather than argued:** five
+    consecutive reports spanning many tale boundaries returned the *same* high-water byte for byte. A
+    sliding window that reused memory imperfectly would creep; this does not move at all. Host tests
+    21 → 36; `.bss` byte-identical to pre-#302 and the whole feature costs 48 B of `.data`.
+    ⚠️ **Two honest caveats.** (1) Quote the ms/tok as a **range** — the 224↔274 spread tracks whether
+    the radio is bursting during that window, not the model. (2) `inf` mode is **near-continuous
+    compute**, making it the fleet's **worst-case power draw**; this 🟢 says nothing about battery
+    life, and [power.md](power.md) still owes a measurement for the mode the fleet actually runs in.
   - ⚪ **#304** — a custom-trained, realm-flavored model as a weights-only swap. Design only.
   > **The idea worth keeping in mind when writing about any of this:** only ~5 lines × ~15
   > characters are on the glass at once, so **the screen is a window the story moves past, not a
