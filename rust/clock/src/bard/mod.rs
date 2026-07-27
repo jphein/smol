@@ -66,6 +66,8 @@ static mut PROMPT_LEN: usize = 0;
 /// Whether [`PROMPT`] has been through the vocabulary check. A prompt can arrive before the model
 /// is built (retained config lands on the first gateway burst; the model loads lazily on first
 /// screen entry), so an unchecked prompt is validated at first use instead of being thrown away.
+/// Only the tiers that can RECEIVE a prompt have anything to stage (see `checked_staged_prompt`).
+#[cfg(any(feature = "espnow", feature = "hostsim"))]
 static mut PROMPT_CHECKED: bool = true;
 
 /// Offer a runtime story prompt (CFG `T`). Validated against the MODEL'S OWN vocabulary before
@@ -112,6 +114,40 @@ pub unsafe fn set_prompt(value: &[u8]) -> Result<Option<usize>, persona::PromptE
     Ok(staged)
 }
 
+/// Vocabulary-check a prompt that was STAGED before the model existed, returning the length to
+/// use (0 ⇒ refused, fall back to this node's persona). Split out of [`begin_story`] because
+/// `persona::validate_prompt` only exists on the tiers that can receive a CFG offer — inlined, it
+/// made the `bard`-only tier fail to compile, which is how it shipped in #303.
+#[cfg(any(feature = "espnow", feature = "hostsim"))]
+unsafe fn checked_staged_prompt(tok: &Tokenizer<'_>, over: usize) -> usize {
+    if over == 0 || core::ptr::addr_of!(PROMPT_CHECKED).read() {
+        return over;
+    }
+    let src = &*core::ptr::addr_of!(PROMPT);
+    let kept = match persona::validate_prompt(tok, &src[..over]) {
+        Ok(n) => {
+            log::info!("smol #303: staged story prompt accepted ({} tokens)", n);
+            over
+        }
+        Err(e) => {
+            log::warn!(
+                "smol #303: staged story prompt REFUSED ({:?}) — using this node's default",
+                e
+            );
+            core::ptr::addr_of_mut!(PROMPT_LEN).write(0);
+            0
+        }
+    };
+    core::ptr::addr_of_mut!(PROMPT_CHECKED).write(true);
+    kept
+}
+
+/// No CFG plumbing on this tier, so nothing can ever be staged — the length passes through.
+#[cfg(not(any(feature = "espnow", feature = "hostsim")))]
+unsafe fn checked_staged_prompt(_tok: &Tokenizer<'_>, over: usize) -> usize {
+    over
+}
+
 /// Build the statics from the flash blob. `false` ⇒ the blob failed its integrity or geometry
 /// checks and the screen must stay mute rather than render whatever the bytes happen to say.
 ///
@@ -145,21 +181,9 @@ unsafe fn begin_story(node_id: u8, now_ms: u64) {
     // #303 the operator's prompt wins when set (it was validated at accept time); otherwise this
     // node's built-in persona. Read per story, not cached, so a CFG change takes effect on the
     // very next story with no reboot.
-    let mut over = core::ptr::addr_of!(PROMPT_LEN).read();
     // A prompt staged before the model was up gets its vocabulary check HERE — the one place the
     // tokenizer is guaranteed. Refused ⇒ drop it and fall back to the persona, saying why.
-    if over > 0 && !core::ptr::addr_of!(PROMPT_CHECKED).read() {
-        let src = &*core::ptr::addr_of!(PROMPT);
-        match persona::validate_prompt(tok, &src[..over]) {
-            Ok(n) => log::info!("smol #303: staged story prompt accepted ({} tokens)", n),
-            Err(e) => {
-                log::warn!("smol #303: staged story prompt REFUSED ({:?}) — using this node's default", e);
-                core::ptr::addr_of_mut!(PROMPT_LEN).write(0);
-                over = 0;
-            }
-        }
-        core::ptr::addr_of_mut!(PROMPT_CHECKED).write(true);
-    }
+    let over = checked_staged_prompt(tok, core::ptr::addr_of!(PROMPT_LEN).read());
     let n = if over > 0 {
         let src = &*core::ptr::addr_of!(PROMPT);
         buf[..over].copy_from_slice(&src[..over]);
