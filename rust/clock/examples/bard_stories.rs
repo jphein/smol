@@ -13,6 +13,10 @@ use clock::nano_llm::*;
 use std::time::Instant;
 
 const PROMPT: &str = "Once upon a time, there was a little dragon";
+/// Tokens to take from each seed. Since #302 the engine has no token budget of its own — a tale
+/// ends when the MODEL ends it — so the "20 short stories" shape of this eyeball check needs its
+/// own bound, and this is it (roughly what the pre-#302 cache-bound story was).
+const STEPS: u32 = 65;
 
 fn main() {
     let blob = include_bytes!("../model/stories260K-q8.bin");
@@ -21,7 +25,7 @@ fn main() {
     let mut bufs = Box::new(Bufs::INIT);
     println!(
         "bard #300 — dim={} hidden={} layers={} heads={}/{} vocab={} gs={} \
-         temp={} top_p={} max_tokens={}",
+         temp={} top_p={} steps={}",
         m.cfg.dim,
         m.cfg.hidden,
         m.cfg.n_layers,
@@ -31,7 +35,7 @@ fn main() {
         m.cfg.gs,
         Story::TEMP,
         Story::TOP_P,
-        Story::MAX_TOKENS
+        STEPS
     );
 
     let (mut total_tokens, mut total_secs) = (0u32, 0f64);
@@ -40,16 +44,23 @@ fn main() {
         print!("\n=== seed {seed} ===\n{PROMPT}");
         let start = Instant::now();
         let mut tokens = 0u32;
-        let truncated = loop {
+        // `cut` = we stopped at STEPS with the tale still going (the normal case at this model
+        // size); otherwise the model chose to end it.
+        let mut cut = true;
+        while tokens < STEPS {
             match story.step(&m, &t, &mut bufs) {
                 StepOut::Text(b) => {
                     print!("{}", core::str::from_utf8(b).unwrap());
                     tokens += 1;
                 }
                 StepOut::Working => {}
-                StepOut::Done { truncated } => break truncated,
+                StepOut::Done { .. } => {
+                    cut = false;
+                    break;
+                }
             }
-        };
+        }
+        let truncated = cut;
         let secs = start.elapsed().as_secs_f64();
         total_tokens += tokens;
         total_secs += secs;
@@ -61,7 +72,7 @@ fn main() {
             if truncated { " …" } else { "" },
             secs * 1000.0,
             tokens as f64 / secs,
-            if truncated { "token budget" } else { "end-of-text" }
+            if truncated { "this eyeball's step budget" } else { "end-of-text" }
         );
     }
     println!(

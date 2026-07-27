@@ -381,42 +381,52 @@ fn greedy_from_bos_is_the_known_opening() {
     );
 }
 
-/// Drive a `Story` to completion, returning its text and the number of `step()` calls.
-fn run_story(m: &Model, t: &Tokenizer, bufs: &mut Bufs, seed: u32) -> (std::string::String, u32) {
+/// Drive a `Story` for at most `steps` passes (or until the tale ends), returning its text and
+/// whether the tale ended. A bounded drive, not "to completion": since #302 nothing but the model
+/// itself (or the POS_MAX cursor) ends a tale, so an unbounded loop is no longer a test — it is a
+/// way to hang.
+fn run_story(
+    m: &Model,
+    t: &Tokenizer,
+    bufs: &mut Bufs,
+    seed: u32,
+    steps: u32,
+) -> (std::string::String, bool) {
     let mut story = Story::new(t, GOLDEN_PROMPT, seed);
     let mut text = std::string::String::new();
-    let mut steps = 0u32;
-    loop {
+    for _ in 0..steps {
         match story.step(m, t, bufs) {
             StepOut::Text(bytes) => text.push_str(core::str::from_utf8(bytes).unwrap()),
             StepOut::Working => {}
-            StepOut::Done { .. } => break,
+            StepOut::Done { .. } => return (text, true),
         }
-        steps += 1;
-        assert!(steps < 300, "no termination");
     }
-    (text, steps)
+    (text, false)
 }
 
 #[test]
-fn story_generates_and_terminates() {
+fn story_generates_and_keeps_going_past_the_cache() {
     let m = Model::parse(BLOB).unwrap();
     let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
     let mut bufs = std::boxed::Box::new(Bufs::INIT);
     let mut story = Story::new(&t, "Once upon a time, there was a little dragon", 0xC0FFEE);
     let mut text = std::string::String::new();
-    let mut steps = 0;
-    loop {
+    // Three windows' worth of passes. The pre-#302 engine would have said `Done` at pass ~65; the
+    // ring means the only thing that can stop this seed is the model choosing to.
+    for _ in 0..SEQ_CAP * 3 {
         match story.step(&m, &t, &mut bufs) {
             StepOut::Text(bytes) => text.push_str(core::str::from_utf8(bytes).unwrap()),
             StepOut::Working => {}
-            StepOut::Done { .. } => break,
+            StepOut::Done { truncated } => {
+                // Only ever the model's own ending — the cursor is nowhere near POS_MAX here.
+                assert!(!truncated, "nothing but EOS may end a tale this early");
+                break;
+            }
         }
-        steps += 1;
-        assert!(steps < 300, "no termination");
     }
     assert!(text.len() > 80, "story too short: {text}");
     assert!(text.is_ascii());
+    assert!(story.pos() as usize > SEQ_CAP, "never left the first window");
 }
 
 #[test]
@@ -424,198 +434,185 @@ fn different_seeds_different_stories() {
     let m = Model::parse(BLOB).unwrap();
     let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
     let mut bufs = std::boxed::Box::new(Bufs::INIT);
-    let (a, _) = run_story(&m, &t, &mut bufs, 1);
-    let (b, _) = run_story(&m, &t, &mut bufs, 2);
+    let (a, _) = run_story(&m, &t, &mut bufs, 1, 120);
+    let (b, _) = run_story(&m, &t, &mut bufs, 2, 120);
     assert_ne!(a, b, "two seeds produced the same story");
     // Reusing one Bufs must not couple the runs: the same seed replays identically even after
-    // another story has scribbled all over the KV cache.
-    let (a_again, _) = run_story(&m, &t, &mut bufs, 1);
+    // another story has scribbled all over the KV cache — including past the ring's wrap.
+    let (a_again, _) = run_story(&m, &t, &mut bufs, 1, 120);
     assert_eq!(a, a_again, "story is not reproducible from its seed");
 }
 
 #[test]
-fn story_reports_how_it_ended() {
+fn only_the_model_ends_a_tale() {
     let m = Model::parse(BLOB).unwrap();
     let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
     let mut bufs = std::boxed::Box::new(Bufs::INIT);
     let mut story = Story::new(&t, GOLDEN_PROMPT, 1);
-    let ending = loop {
+    // Long enough to be sure: 8 windows is ~10× what the pre-#302 budget allowed.
+    let mut ended = None;
+    for _ in 0..SEQ_CAP * 8 {
         if let StepOut::Done { truncated } = story.step(&m, &t, &mut bufs) {
-            break truncated;
+            ended = Some(truncated);
+            break;
         }
-    };
-    assert!(story.is_done());
-    // At 260K params EOS is essentially never sampled, so this seed runs to the budget. If this
-    // ever flips to a natural stop, the UI's `…` path stops being the common case — worth knowing.
-    assert!(ending, "expected a budget cut; EOS-terminated instead");
-    // Once done, further steps keep reporting the same ending rather than resuming.
-    assert!(matches!(
-        story.step(&m, &t, &mut bufs),
-        StepOut::Done { truncated: true }
-    ));
+    }
+    // Whatever happened, it was not a budget or a cache depth — those are gone. Either the model
+    // ended the tale (`truncated == false`) or it is still going.
+    match ended {
+        Some(truncated) => {
+            assert!(!truncated, "only POS_MAX may report truncated, and it is 65,023 away");
+            assert!(story.is_done());
+            // Once a tale is done it stays done: the SCREEN opens the next one (a fresh `Story`),
+            // rather than this object resurrecting itself.
+            assert!(matches!(
+                story.step(&m, &t, &mut bufs),
+                StepOut::Done { truncated: false }
+            ));
+        }
+        None => assert!(
+            story.pos() as usize > SEQ_CAP * 7,
+            "a tale that did not end must have kept generating"
+        ),
+    }
 }
 
-// ── #302 continuation: one press keeps the SAME story going ─────────────────────────────
+// ── #302 the endless narrator: generation simply never stops ────────────────────────────
 
-/// Run the current chapter to its end, returning its text and how it ended.
-fn run_chapter(
+/// Drive `steps` passes of an existing `Story`, returning its text and whether the tale ended.
+fn narrate(
     m: &Model,
     t: &Tokenizer,
     bufs: &mut Bufs,
     story: &mut Story,
+    steps: u32,
 ) -> (std::string::String, bool) {
     let mut text = std::string::String::new();
-    let mut steps = 0u32;
-    loop {
+    for _ in 0..steps {
         match story.step(m, t, bufs) {
             StepOut::Text(b) => text.push_str(&std::string::String::from_utf8_lossy(b)),
             StepOut::Working => {}
-            StepOut::Done { truncated } => return (text, truncated),
+            StepOut::Done { .. } => return (text, true),
         }
-        steps += 1;
-        assert!(steps < 400, "chapter did not terminate");
     }
+    (text, false)
 }
 
 #[test]
-fn story_continues_past_the_cache_depth() {
+fn narration_stays_prose_far_past_the_window() {
+    // The reason to test length rather than trust the arithmetic: once the ring wraps, EVERY token
+    // is written from a context that has partly slid away, and the way a 260K model fails is to
+    // collapse into a repeated phrase. So narrate for many windows and check the text still looks
+    // like language. Tales that END are simply followed by the next one, exactly as the screen does.
     let m = Model::parse(BLOB).unwrap();
     let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
     let mut bufs = std::boxed::Box::new(Bufs::INIT);
-    let mut story = Story::new(&t, GOLDEN_PROMPT, 2);
 
-    let (first, truncated) = run_chapter(&m, &t, &mut bufs, &mut story);
-    assert!(truncated, "chapter 1 should be cut, not EOS-ended");
-    assert!(story.is_done() && story.can_continue());
-    // The pre-#302 stopping point, unchanged: the cache depth is still where chapter 1 pauses.
-    assert_eq!(story.pos() as usize, SEQ_CAP - 1);
-
-    // Four more chapters — well past the point where the whole prompt has been evicted.
-    let mut all = first;
-    for ch in 2..=5 {
-        assert!(story.resume(), "chapter {ch} should be resumable");
-        assert!(!story.is_done(), "resume must clear the done flag");
-        let (text, _) = run_chapter(&m, &t, &mut bufs, &mut story);
-        assert!(!text.is_empty(), "chapter {ch} produced no text");
-        assert!(text.is_ascii(), "chapter {ch} is not ASCII: {text:?}");
+    let mut all = std::string::String::new();
+    let mut tales = 0u32;
+    let mut story = Story::new(&t, GOLDEN_PROMPT, 5);
+    let mut passes = 0u32;
+    while passes < SEQ_CAP as u32 * 6 {
+        let (text, ended) = narrate(&m, &t, &mut bufs, &mut story, 40);
+        passes += 40;
         all.push_str(&text);
-        if !story.can_continue() {
-            break; // the model chose to end it — a real ending, tested separately
+        assert!(text.is_ascii(), "non-ASCII narration: {text:?}");
+        if ended {
+            // A tale ending is a paragraph break, not a terminal state — the screen opens the next
+            // one over the same buffers, and so does this test.
+            tales += 1;
+            story = Story::new(&t, GOLDEN_PROMPT, 5 + tales);
         }
     }
-
-    // Positions ran past the cache, which is the whole point: the ring, not a second cache.
-    assert!(
-        story.pos() as usize > SEQ_CAP,
-        "story never left the first window: pos {}",
-        story.pos()
-    );
-    // A continued story is LONGER than a single chapter could ever be, and still prose: the
-    // failure mode to catch is a collapse into one repeated token, which would tank both.
-    assert!(all.len() > 300, "continued story is only {} chars", all.len());
+    // Far more text than any single pre-#302 story could hold (that was ~140 chars).
+    assert!(all.len() > 800, "endless narration produced only {} chars", all.len());
     let words: std::vec::Vec<&str> = all.split_whitespace().collect();
     let uniq: std::collections::BTreeSet<&&str> = words.iter().collect();
     assert!(
         uniq.len() * 3 > words.len(),
-        "continuation collapsed into repetition: {} distinct of {} words\n{all}",
+        "narration collapsed into repetition: {} distinct of {} words\n{all}",
         uniq.len(),
         words.len()
     );
+    // Sentences, not one run-on: the model's punctuation should survive the sliding context.
+    assert!(all.matches('.').count() > 4, "no sentence structure left: {all}");
 }
 
 #[test]
-fn continuation_is_seamless_and_reproducible() {
+fn generation_is_continuous_across_the_wrap() {
+    // Nothing is re-fed, re-primed or re-rotated when the ring wraps, so the token stream either
+    // side of the wrap is ONE stream. The check: a narration is a pure function of its seed even
+    // when it runs long past the wrap, and another story scribbling over the shared cache in
+    // between does not change it (the `Bufs` ownership contract, now with eviction in play).
     let m = Model::parse(BLOB).unwrap();
     let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
     let mut bufs = std::boxed::Box::new(Bufs::INIT);
 
-    // Nothing is re-fed across a chapter boundary, so the continued text must NOT repeat the
-    // tail of the previous chapter — the seam lands mid-word as often as not.
-    let tell = |bufs: &mut Bufs| {
-        let mut story = Story::new(&t, GOLDEN_PROMPT, 7);
-        let (a, _) = run_chapter(&m, &t, bufs, &mut story);
-        assert!(story.resume());
-        let (b, _) = run_chapter(&m, &t, bufs, &mut story);
-        (a, b)
+    let long = |bufs: &mut Bufs| {
+        let mut story = Story::new(&t, GOLDEN_PROMPT, 11);
+        let (text, _) = narrate(&m, &t, bufs, &mut story, SEQ_CAP as u32 * 2);
+        (text, story.pos())
     };
-    let (a, b) = tell(&mut bufs);
-    let tail: std::string::String = a.chars().rev().take(12).collect::<std::string::String>()
-        .chars().rev().collect();
-    assert!(
-        !b.starts_with(&tail),
-        "chapter 2 replayed the tail of chapter 1 — a token was fed twice"
-    );
+    let (a, pos_a) = long(&mut bufs);
+    assert!(pos_a as usize > SEQ_CAP, "fixture never reached the wrap");
 
-    // And the whole continued story is still a pure function of its seed, even after another
-    // story has scribbled over the shared KV cache (the `Bufs` ownership contract).
     let mut other = Story::new(&t, GOLDEN_PROMPT, 99);
-    run_chapter(&m, &t, &mut bufs, &mut other);
-    let (a2, b2) = tell(&mut bufs);
-    assert_eq!((a, b), (a2, b2), "a continued story is not reproducible from its seed");
+    narrate(&m, &t, &mut bufs, &mut other, 120);
+    let (b, pos_b) = long(&mut bufs);
+    assert_eq!((a, pos_a), (b, pos_b), "narration is not reproducible from its seed");
 }
 
 #[test]
-fn a_story_the_model_ended_is_not_continuable() {
+fn an_ended_tale_stays_ended_and_the_next_one_starts_clean() {
+    // The screen's next-tale path: a fresh `Story` over the SAME `Bufs`. The old tale's keys are
+    // still sitting in the cache, so this is the test that a new tale cannot inherit them — a
+    // `Session` at pos 0 attends exactly one slot, the one it just wrote.
     let m = Model::parse(BLOB).unwrap();
     let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
     let mut bufs = std::boxed::Box::new(Bufs::INIT);
 
-    // EOS is ~5% of chapter endings (T8), so hunt for one by continuing seeds — with chapters
-    // available, a natural ending shows up quickly.
-    let mut found = false;
-    'seeds: for seed in 1..=8u32 {
+    // Find a tale the model ends, then confirm it stays ended.
+    let mut ended = None;
+    for seed in 1..=8u32 {
         let mut story = Story::new(&t, GOLDEN_PROMPT, seed);
-        for _ in 0..8 {
-            let (_, truncated) = run_chapter(&m, &t, &mut bufs, &mut story);
-            if !truncated {
-                // The model said the story is over: no continuing, and `resume` must refuse
-                // rather than quietly restart mid-breath.
-                assert!(!story.can_continue(), "seed {seed} ended on EOS but claims continuable");
-                assert!(!story.resume(), "resume must refuse an EOS-ended story");
-                assert!(story.is_done(), "a refused resume must leave the story done");
-                assert!(matches!(
-                    story.step(&m, &t, &mut bufs),
-                    StepOut::Done { truncated: false }
-                ));
-                found = true;
-                break 'seeds;
-            }
-            assert!(story.resume());
-        }
-    }
-    assert!(found, "no seed ended on end-of-text in 8 seeds x 8 chapters — EOS path untested");
-}
-
-#[test]
-fn chapters_are_bounded_and_the_cursor_is_never_exhausted() {
-    let m = Model::parse(BLOB).unwrap();
-    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
-    let mut bufs = std::boxed::Box::new(Bufs::INIT);
-    let mut story = Story::new(&t, GOLDEN_PROMPT, 3);
-
-    // Every chapter must be bounded by CHAPTER_TOKENS — an unbounded chapter would hold the UI
-    // (and, on the board, the mesh's tick) for as long as the model felt like talking.
-    let mut prev = story.pos();
-    for _ in 0..12 {
-        run_chapter(&m, &t, &mut bufs, &mut story);
-        let grown = story.pos() - prev;
-        assert!(
-            grown <= Story::CHAPTER_TOKENS,
-            "a chapter generated {grown} tokens, over the {} budget",
-            Story::CHAPTER_TOKENS
-        );
-        prev = story.pos();
-        if !story.resume() {
+        let (_, done) = narrate(&m, &t, &mut bufs, &mut story, SEQ_CAP as u32 * 8);
+        if done {
+            assert!(story.is_done());
+            assert!(matches!(
+                story.step(&m, &t, &mut bufs),
+                StepOut::Done { truncated: false }
+            ));
+            ended = Some(seed);
             break;
         }
     }
-    // The far end of the cursor: a story parked near POS_MAX must refuse to continue instead of
-    // wrapping `pos` (which would feed every later token into one slot forever).
+    assert!(ended.is_some(), "no seed ended a tale in 8 tries — the EOS path is untested");
+
+    // A brand-new tale over the dirty cache must be identical to one over a pristine cache.
+    let fresh = {
+        let mut clean = std::boxed::Box::new(Bufs::INIT);
+        let mut story = Story::new(&t, GOLDEN_PROMPT, 42);
+        narrate(&m, &t, &mut clean, &mut story, 60).0
+    };
+    let after = {
+        let mut story = Story::new(&t, GOLDEN_PROMPT, 42);
+        narrate(&m, &t, &mut bufs, &mut story, 60).0
+    };
+    assert_eq!(fresh, after, "a new tale inherited the previous tale's keys");
+}
+
+#[test]
+fn the_position_cursor_cannot_wrap() {
+    // POS_MAX is the only limit an endless narrator has left, so the arithmetic around it has to be
+    // provably safe: `Story` stops AT it and `forward` asserts it, both in u16.
     assert!(POS_MAX < u16::MAX as usize, "POS_MAX must leave the u16 cursor room");
-    assert!(
-        POS_MAX + Story::CHAPTER_TOKENS as usize <= u16::MAX as usize,
-        "a final chapter must not be able to overflow the cursor"
-    );
+    assert!(POS_MAX > SEQ_CAP * 100, "POS_MAX should be a runtime bound, not a story bound");
+    // Every position up to and including the bound addresses a real slot — no gap where the ring
+    // arithmetic would land outside the cache just before the cursor recycles.
+    for pos in [POS_MAX - 1, POS_MAX] {
+        assert!(cache_slot(pos) < SEQ_CAP);
+        assert_eq!(live_slots(pos), SEQ_CAP);
+    }
 }
 
 #[test]

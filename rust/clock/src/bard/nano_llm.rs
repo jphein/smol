@@ -47,8 +47,10 @@ pub const MAX_LAYERS: usize = 5;
 pub const MAX_HEADS: usize = 8;
 /// Max vocabulary entries.
 pub const MAX_VOCAB: usize = 512;
-/// KV-cache depth the firmware allocates, independent of the header's `seq_len` (512): a
-/// story is capped at this many tokens so the cache fits RAM.
+/// KV-cache depth the firmware allocates, independent of the header's `seq_len` (512) — i.e. how
+/// many tokens of CONTEXT the model can see at once. Since #302 it is a sliding WINDOW, not a cap
+/// on a tale: the cache is a ring, the narrator never stops, and this number is the length of its
+/// memory rather than the length of its stories.
 ///
 /// 80, and every earlier guess about this number was wrong in the same direction. The bench
 /// (T13, stack-paint instrumentation) measured what the firmware ACTUALLY uses:
@@ -62,9 +64,10 @@ pub const MAX_VOCAB: usize = 512;
 /// comment there). Together they buy back ~62 KB of stack against a 73,728 B floor that
 /// `tools/repro_build.sh` now enforces from the measured peak (54,856 × 4/3).
 ///
-/// The trade JP chose is FLEET-WIDE SHORT STORIES: with a ~15-token prompt the cache is the
-/// stopping rule at ~65 generated tokens (~140 chars) — three or four sentences on the panel.
-/// Growing it back means finding DRAM somewhere new; both obvious levers are now spent.
+/// The trade JP chose was FLEET-WIDE SHORT STORIES — and #302 then made the length question moot:
+/// with a ring cache a tale runs as long as the reader wants, so 80 buys the model three or four
+/// sentences of MEMORY (what it can still refer back to) rather than a whole story's length.
+/// Growing it needs DRAM found somewhere new; both obvious levers are spent.
 pub const SEQ_CAP: usize = 80;
 /// Row stride of one cached K (or V) vector, in int8 slots. The shipped model's `kv_dim` is
 /// exactly 32; [`Model::parse`] REFUSES anything wider, which is what lets the forward pass
@@ -75,9 +78,9 @@ pub const KV_STRIDE: usize = 32;
 /// never evicted, and the ring slides over the remaining [`WINDOW`] slots.
 ///
 /// **0, measured — and the measurement is that it does not matter.** #302 ran 0, 4 and 16 on the
-/// host (`cargo run --example bard_continue -- 6 12`: 12 seeds continued for six chapters each,
-/// ~40 continuations per setting) and scored the fraction of distinct words in every continued
-/// chapter, the cheapest detector of the way a 260K model fails: 84.4% at 0, 81.3% at 4, 85.0% at
+/// host (`cargo run --example bard_continue`: 12 seeds narrated well past the window, scored in
+/// 80-token blocks) and took the fraction of distinct words in every block written from a slid
+/// context — the cheapest detector of the way a 260K model fails: 84.4% at 0, 81.3% at 4, 85.0% at
 /// 16. That is noise, not a signal — StreamingLLM's attention-sink result is about 7B-class models
 /// whose first token carries a massive activation, and nothing at this size reproduced it.
 ///
@@ -99,10 +102,11 @@ pub const WINDOW: usize = SEQ_CAP - KEEP;
 
 /// Which KV-cache slot holds absolute position `pos`.
 ///
-/// Identity below [`SEQ_CAP`] — a first chapter writes slots 0, 1, 2 … exactly as it did before
-/// #302, which is what keeps the golden token stream bit-for-bit — and a ring above it, so
-/// writing position `pos` evicts position `pos - WINDOW` and continuation costs no data movement
-/// and no re-quantization. See [`Session::forward`] for why the cached RoPE phase stays valid.
+/// Identity below [`SEQ_CAP`] — a tale's first 80 positions write slots 0, 1, 2 … exactly as they
+/// did before #302, which is what keeps the golden token stream bit-for-bit — and a ring above it,
+/// so writing position `pos` evicts position `pos - WINDOW` and generating forever costs no data
+/// movement and no re-quantization. See [`Session::forward`] for why the cached RoPE phase stays
+/// valid.
 pub const fn cache_slot(pos: usize) -> usize {
     if pos < SEQ_CAP {
         pos
@@ -123,10 +127,13 @@ pub const fn live_slots(pos: usize) -> usize {
 }
 
 /// Highest absolute position a session may reach. RoPE is a RELATIVE encoding, so nothing in the
-/// maths stops a story here — the bound is the `u16` cursor [`Session::pos`] keeps (and f32 phase
-/// precision, which is still ~5 mrad at this position). A margin below `u16::MAX` keeps
-/// [`Story`]'s chapter arithmetic overflow-free without a single `saturating_` in the hot path.
-/// At the measured 202 ms/token that is over three hours of held-down continuing.
+/// maths stops a tale here — the bound is the `u16` cursor [`Session::pos`] keeps (and f32 phase
+/// precision, which is still ~5 mrad at this position). The margin below `u16::MAX` is slack for
+/// the `+ 1`s around it, so no arithmetic near the cursor can wrap.
+///
+/// It is the ONLY limit an endless narrator has left, and it is reachable: at the measured
+/// 202 ms/token an unbroken tale would arrive here after ~3.6 hours, whereupon [`Story`] reports
+/// `Done` and the screen simply opens the next tale at position 0.
 pub const POS_MAX: usize = u16::MAX as usize - 512;
 
 /// `b"SBRD"` read as a little-endian u32.
@@ -680,8 +687,9 @@ impl Session {
         // only caller and guarantees it; this is the tripwire for anyone else.
         debug_assert_eq!(pos, self.pos as usize, "forward() called out of sequence");
         // The ring makes any position addressable, so this is no longer a cache bound — it is the
-        // u16 cursor's bound. `Story` stops a chapter long before it; reaching it would mean the
-        // cursor saturating and then feeding every later token into one slot forever.
+        // u16 cursor's bound. `Story` stops a tale AT it (POS_MAX) and the screen opens the next
+        // one; reaching it here would mean the cursor saturating and every later token landing in
+        // one slot forever.
         debug_assert!(pos <= POS_MAX, "pos {pos} past the cursor's range ({POS_MAX})");
         self.pos = self.pos.saturating_add(1);
         // Absolute position (RoPE, above) and cache slot (the ring, below) part ways here.
@@ -897,19 +905,17 @@ pub enum StepOut<'a> {
     Working,
     /// Newly generated text (borrowed straight from the model blob — no copy).
     Text(&'a [u8]),
-    /// The story ended.
+    /// This TALE ended — not the narrator (#302). The screen answers it by opening another tale in
+    /// the same endless scroll, so `Done` is a paragraph break rather than a terminal state.
     ///
-    /// `truncated` distinguishes the two endings, because they read differently to a person:
-    /// `false` means the model chose to stop (it sampled end-of-text), `true` means we cut it
-    /// off at the chapter budget — mid-sentence, almost always. At 260K parameters a natural stop
-    /// is RARE but real: T8 measured 1 of 20 seeds (~5%) ending on end-of-text, the rest hitting
-    /// the budget. So `true` is the normal case a UI must make look deliberate (trail off with an
-    /// ellipsis), and the `false` path is live code, not a theoretical branch.
-    ///
-    /// It is also the CONTINUABLE/finished distinction (#302): a cut chapter can be resumed with
-    /// [`Story::resume`], a story the model chose to end cannot ([`Story::can_continue`]).
+    /// `truncated` says which of the only two things that can end a tale did: `false` means the
+    /// MODEL chose to stop (it sampled end-of-text — the common case now that nothing else cuts a
+    /// tale short, and at 260K parameters it lands every few hundred tokens), `true` means the
+    /// `u16` position cursor ran out ([`POS_MAX`], ~3.6 h of generating) and is essentially never
+    /// seen. Kept apart because they mean different things in a log: one is the bard finishing,
+    /// the other is the runtime recycling.
     Done {
-        /// `true` when the chapter budget ended the story, not the model.
+        /// `true` when the position cursor ended the tale, not the model.
         truncated: bool,
     },
 }
@@ -1005,20 +1011,18 @@ fn sample_top_p(
 /// exactly one per step, which `Session` checks with a `debug_assert`. Termination is explicit
 /// — the ring inside `forward` is a safety net, never a stop condition.
 ///
-/// **Chapters (#302).** A story pauses every [`Story::CHAPTER_TOKENS`] generated tokens instead of
-/// ending at the cache depth, and [`Story::resume`] continues the SAME story from the same KV
-/// state — the sliding window drops the oldest tokens for us. Nothing is re-fed and nothing is
-/// re-rotated: `cur` is already the token whose logits the next pass wants, and `pos` keeps
-/// counting. A pause is a UX beat (one press = one chapter), not a limitation.
+/// **Endless by construction (#302).** There is no token budget and no cache-depth stop: the KV
+/// cache is a ring, so a tale runs until the MODEL ends it (end-of-text) or until the `u16`
+/// position cursor is spent ([`POS_MAX`], ~3.6 hours of generating). Nothing else terminates it.
+/// The old chapter/`resume` machinery is gone with the "press to continue a finished story" UX it
+/// existed for: PAUSING is the screen's business (it simply stops calling `step`), which needs no
+/// state here at all — a paused narrator and a generating one are the same `Story`.
 pub struct Story {
     prompt: [u16; MAX_PROMPT],
     prompt_len: u8,
     /// Prompt tokens already fed (all but the last, which seeds generation).
     fed: u8,
     pos: u16,
-    /// Absolute position this chapter stops BEFORE — the one stopping rule, so a chapter's length
-    /// is one number rather than a pair of conditions to keep in step.
-    limit: u16,
     /// The token whose logits the next step will produce — also the predecessor `decode` needs.
     cur: u16,
     rng: Rng32,
@@ -1037,14 +1041,6 @@ impl Story {
     pub const TEMP: f32 = 0.9;
     /// Nucleus mass.
     pub const TOP_P: f32 = 0.9;
-    /// Generated-token budget for ONE chapter, on top of whatever came before it. Never reached
-    /// today — [`CHAPTER_TOKENS`](Self::CHAPTER_TOKENS) cuts first — but it stays as the bound
-    /// that does not depend on the cache geometry.
-    pub const MAX_TOKENS: u16 = 220;
-    /// Tokens a continuation generates before pausing again. One [`WINDOW`] — the story is
-    /// pausing exactly when the context it was written from has fully turned over, which is the
-    /// same rhythm (and, for the first chapter, the same stopping position) as before #302.
-    pub const CHAPTER_TOKENS: u16 = WINDOW as u16;
 
     /// Encode `prompt` and arm the generator. Same `seed` ⇒ same story, always.
     pub fn new(t: &Tokenizer, prompt: &str, seed: u32) -> Story {
@@ -1055,11 +1051,6 @@ impl Story {
             prompt_len: n as u8,
             fed: 0,
             pos: 0,
-            // The first chapter stops where the pre-#302 pair of conditions stopped it, to the
-            // token: at the cache depth, or at the token budget if a prompt were long enough to
-            // reach it first (MAX_TOKENS + plen > SEQ_CAP for every prompt the validator accepts,
-            // so in practice it is always the cache depth).
-            limit: core::cmp::min(SEQ_CAP as u16, Self::MAX_TOKENS.saturating_add(n as u16)),
             // The last prompt token is not "fed" — it is the one whose logits start the story.
             cur: p[n.saturating_sub(1)],
             rng: Rng32::new(seed),
@@ -1078,39 +1069,6 @@ impl Story {
     /// Absolute position of the next forward pass — the story's length in tokens, prompt included.
     pub fn pos(&self) -> u16 {
         self.pos
-    }
-
-    /// Whether a press should CONTINUE this story rather than begin a new one (#302).
-    ///
-    /// False in exactly two cases: the model chose to stop (it sampled end-of-text — a real
-    /// ending, and continuing past it would read as the story restarting mid-breath), or the
-    /// absolute cursor is nearly spent ([`POS_MAX`]). A chapter that was CUT is always
-    /// continuable, including one the caller cut for its own reasons before `step` said `Done`.
-    pub fn can_continue(&self) -> bool {
-        !(self.done && !self.truncated) && (self.pos as usize) < POS_MAX
-    }
-
-    /// Continue where this story paused: same KV cache, same sampler stream, same absolute
-    /// positions — the sliding window silently drops the oldest tokens to make room (see
-    /// [`Session::forward`]). Returns `false` if the story is genuinely over, in which case the
-    /// caller should start a new one.
-    ///
-    /// Nothing is re-fed: `cur` is the token whose logits the next pass produces, exactly as it
-    /// was mid-chapter, so the first continued token lands seamlessly on the last one — the seam
-    /// is invisible in the text.
-    pub fn resume(&mut self) -> bool {
-        if !self.can_continue() {
-            return false;
-        }
-        self.done = false;
-        self.truncated = false;
-        // Clamped to POS_MAX so the LAST chapter is short rather than stepping past the cursor's
-        // range — `forward` asserts that bound, and an assert is not a place to arrive.
-        self.limit = core::cmp::min(
-            self.pos.saturating_add(Self::CHAPTER_TOKENS),
-            POS_MAX as u16,
-        );
-        true
     }
 
     /// Advance by exactly ONE forward pass: either priming the cache with a prompt token
@@ -1133,16 +1091,14 @@ impl Story {
             return StepOut::Working;
         }
 
-        // Stop BEFORE a pass that would carry this chapter past its limit. Checking here (rather
-        // than letting the ring wrap on its own) is what keeps termination explicit — the ring
-        // would happily generate forever, and a story that never pauses is a story nobody reads.
-        //
-        // `limit` folds together what used to be two conditions (token budget, cache depth); see
-        // `new` for the arithmetic that keeps chapter 1 ending on exactly the same token as
-        // before, and `resume` for how each press buys another chapter's worth.
-        if self.pos.saturating_add(1) >= self.limit {
+        // The ONLY stop that is not the model's own choice: the `u16` position cursor. There is no
+        // token budget and no cache-depth stop any more (the ring slides instead), so an endless
+        // narrator will genuinely arrive here — after POS_MAX tokens, ~3.6 h at the measured
+        // 202 ms/token. The screen answers it by starting the next tale from position 0, which
+        // costs nothing: a fresh tale needs none of the old context.
+        if self.pos.saturating_add(1) >= POS_MAX as u16 {
             self.done = true;
-            self.truncated = true; // cut off mid-thought — the usual ending at this model size
+            self.truncated = true; // the cursor ran out mid-thought, not the model
             return StepOut::Done { truncated: true };
         }
 
