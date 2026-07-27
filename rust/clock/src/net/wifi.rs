@@ -1333,22 +1333,31 @@ pub const CFG_KEY_TALE: u8 = b'T';
 pub const CFG_KEY_DELIVERY: u8 = b'V';
 
 pub const CFG_KEY_SCAN: u8 = b'W';
-/// #100 network-switch CONFIG (key `N`) = the active WiFi-slot index (`0`/`1`). RETAINED/CACHED
-/// STATE (relayed like S/L/U/P/Y, NOT a one-shot command like R/W) — a node applies it by writing
-/// the NVS net-record + rebooting into the slot, EDGE-triggered on a change of the commanded slot
-/// (re-reading the same retained value is a no-op → never a reboot-loop). Per-node
-/// `smol/<id>/config/net` or fleet-wide `smol/config/net` (target 255). Value = one ASCII digit.
+/// ~~#100 network-switch CONFIG (key `N`)~~ — **RETIRED by #142.** It used to carry the active
+/// WiFi-slot index (`0`/`1`), applied by writing the NVS net-record and rebooting into the slot.
+/// The fleet is single-network now: there is no slot to select, the net-record's slot bytes are
+/// reserved-zero, and **a received `N` is DRAINED AND IGNORED** (`main.rs`'s bare
+/// `take_cfg_offer(CFG_KEY_NET)`) — nothing writes a slot, nothing reboots, and a board never
+/// switches networks (a failed primary assoc makes a mesh-only leaf that keeps retrying the
+/// primary, which is not a reason to switch).
+///
+/// The constant, the subscribe, the cache slot and the `CFG_APPLY_KEYS` entry all REMAIN on
+/// purpose: a pre-#142 dashboard may still hold a retained `smol/<id>/config/net` (or the
+/// fleet-wide `smol/config/net`), and the value has to be consumed so it cannot sit in the tracker
+/// forever. Do NOT describe this as a live feature — an operator control that silently no-ops is
+/// worse than an absent one. `docs/protocol.md` is the reference (`~~N~~`, "drained + ignored").
+/// The broker (`B`) and OTA-host (`O`) overrides are independent and very much alive.
 #[cfg(feature = "wifi")]
 pub const CFG_KEY_NET: u8 = b'N';
 /// #100 Stage 2 broker-override CONFIG (key `B`) = the MQTT broker leg `"a.b.c.d"` or `"a.b.c.d:port"`
-/// (RFC1918-gated, IP-only v1; empty = clear back to the slot's baked broker). RETAINED/CACHED STATE
-/// (relayed like `N`). A node applies it by writing the NVS net-record + rebooting; EDGE-triggered on
+/// (RFC1918-gated, IP-only v1; empty = clear back to the baked broker). RETAINED/CACHED STATE
+/// (relayed like S/L/U/P/Y). A node applies it by writing the NVS net-record + rebooting; EDGE-triggered on
 /// a change of the COMMANDED broker (a re-read is a no-op → never a reboot-loop, even after the CONNACK
 /// fallback disables the override). Per-node `smol/<id>/config/broker` or fleet-wide `smol/config/broker`.
 #[cfg(feature = "wifi")]
 pub const CFG_KEY_BROKER: u8 = b'B';
 /// #100 Stage 3 OTA-host-override CONFIG (key `O`) = one extra RFC1918 image host `"a.b.c.d"` appended
-/// to the fetch allowlist (empty = clear). RETAINED/CACHED STATE (relayed like `N`). Applied by writing
+/// to the fetch allowlist (empty = clear). RETAINED/CACHED STATE (relayed like S/L/U/P/Y). Applied by writing
 /// the NVS net-record — NO reboot (the allowlist is read at fetch/gate time). EDGE-triggered on a change.
 /// Per-node `smol/<id>/config/ota_host` or fleet-wide `smol/config/ota_host`.
 #[cfg(feature = "wifi")]
@@ -1356,7 +1365,7 @@ pub const CFG_KEY_OTA: u8 = b'O';
 
 /// #72 IO/component registry CONFIG (key `G`) = the node's whole pin-map descriptor:
 /// `;`-separated `<pin><kind>` tokens (e.g. `0L;7B;10R`), ≤ `CFG_VALUE_MAX`. RETAINED /
-/// CACHED (relayed like S/L/U/P/Y/N, not a one-shot command). Per-node
+/// CACHED (relayed like S/L/U/P/Y, not a one-shot command). Per-node
 /// `smol/<id>/config/io`. Applied by (re)binding the free GPIOs via
 /// `crate::io::apply_wire`, EDGE-triggered on a CHANGE of the map (a re-read of the same
 /// retained value is a no-op). Writes NO NVS (zero flash wear / sector risk — the nvs

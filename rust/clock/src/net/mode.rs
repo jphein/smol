@@ -200,7 +200,9 @@ const CFG_APPLY_KEYS: [u8; 16] = [
     crate::net::wifi::CFG_KEY_UNITS,
     crate::net::wifi::CFG_KEY_PLUGINS,
     crate::net::wifi::CFG_KEY_CUSTOM, // #45 custom-screen layout (cached + relayed like S/L/U/P)
-    crate::net::wifi::CFG_KEY_NET, // #100 active WiFi-slot index (cached + relayed; edge-triggered reboot)
+    // #142: RETIRED (no WiFi slot to switch). Kept in the array so a retained pre-#142 value is
+    // still consumed and drained rather than lingering in the tracker — see CFG_KEY_NET's doc.
+    crate::net::wifi::CFG_KEY_NET,
     crate::net::wifi::CFG_KEY_BROKER, // #100 Stage 2 broker-leg override (cached + relayed; edge-triggered reboot)
     crate::net::wifi::CFG_KEY_OTA, // #100 Stage 3 OTA-host override (cached + relayed; applied WITHOUT reboot)
     // #52 remote reboot: R IS a buffered/applied key (a leaf takes it via take_cfg_offer(R)) but
@@ -210,7 +212,7 @@ const CFG_APPLY_KEYS: [u8; 16] = [
     // #71 on-demand WiFi scan: W — same COMMAND discipline as R (buffered/applied via take_cfg_offer(W),
     // NEVER cached — a cached scan = periodic off-channel excursion, the coexist hazard). One-shot relay.
     crate::net::wifi::CFG_KEY_SCAN,
-    // #72 IO registry pin-map: G — cached + relayed like S/L/U/P/Y/N. Present UNCONDITIONALLY (not
+    // #72 IO registry pin-map: G — cached + relayed like S/L/U/P/Y. Present UNCONDITIONALLY (not
     // `io`-gated) so the leaf-apply slot + relay path exist without splitting this array per-feature;
     // the config PLUMBING (subscribe/fill/apply) is `io`-gated, so a non-io build never feeds it →
     // the slot is inert (one CfgTracker slot, ~66 B .bss). A leaf takes it via take_cfg_offer(G).
