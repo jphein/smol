@@ -65,6 +65,9 @@ pub mod tokenizer;
 #[path = "bard/persona.rs"]
 pub mod persona;
 #[cfg(feature = "hostsim")]
+#[path = "bard/textflow.rs"]
+pub mod textflow;
+#[cfg(feature = "hostsim")]
 pub mod sensors;
 #[cfg(feature = "hostsim")]
 pub mod snake;

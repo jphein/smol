@@ -6,6 +6,7 @@
 //! compile without the `hw` crates.
 #![cfg(feature = "hostsim")]
 use clock::persona::{prompt, protagonist, PROTAGONISTS};
+use clock::textflow::wrap_tail;
 use clock::tokenizer::Tokenizer;
 use clock::nano_llm::{Bufs, Model, ParseErr, Session, StepOut, Story, SEQ_CAP};
 
@@ -404,4 +405,84 @@ fn persona_prompts_fit_the_vocabulary() {
             &ids[..k]
         );
     }
+}
+
+/// Render `wrap_tail`'s spans back into visible lines, so the assertions read like the panel.
+fn wrapped(text: &str, cols: usize, rows: usize) -> std::vec::Vec<&str> {
+    let mut spans = [(0u16, 0u16); 8];
+    let n = wrap_tail(text.as_bytes(), cols, rows, &mut spans[..rows]);
+    // The fixtures are ASCII, so the byte spans are also char boundaries and the &str can be
+    // sliced directly (the firmware renderer decodes defensively instead — see draw_story).
+    spans[..n].iter().map(|&(a, b)| &text[a as usize..b as usize]).collect()
+}
+
+#[test]
+fn wrap_tail_lays_out_the_panel() {
+    // Empty text has nothing to show — not one blank line.
+    assert_eq!(wrapped("", 14, 5), std::vec::Vec::<&str>::new());
+
+    // Exactly the column count must NOT spill into a second line.
+    assert_eq!(wrapped("abcdefghijklmn", 14, 5), ["abcdefghijklmn"]);
+    assert_eq!(wrapped("abcdefghijklmno", 14, 5), ["abcdefghijklmn", "o"]);
+
+    // Greedy break at the last space, and the space itself is consumed (not leading the line).
+    assert_eq!(wrapped("the dragon flew away", 14, 5), ["the dragon", "flew away"]);
+
+    // A word longer than the panel is hard-broken rather than lost.
+    assert_eq!(
+        wrapped("supercalifragilistic", 14, 5),
+        ["supercalifragi", "listic"]
+    );
+
+    // Model-emitted newlines are hard breaks.
+    assert_eq!(wrapped("one\ntwo", 14, 5), ["one", "two"]);
+
+    // 6 lines into 5 rows keeps the LAST five — the panel scrolls.
+    let six = "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll";
+    let all = wrapped(six, 7, 8);
+    assert_eq!(all.len(), 6, "fixture should wrap to 6 lines: {all:?}");
+    let tail = wrapped(six, 7, 5);
+    assert_eq!(tail.len(), 5);
+    assert_eq!(tail[..], all[1..], "should drop the OLDEST line");
+}
+
+#[test]
+fn wrap_tail_survives_every_reveal_position_of_a_real_story() {
+    // The typewriter re-wraps a growing prefix every frame, so the invariants have to hold at
+    // EVERY prefix — not just for the tidy synthetic cases above. This walks a real generated
+    // story one revealed character at a time, exactly as the panel does.
+    let golden = include_str!("../src/bard/testdata/golden_ref.txt");
+    let story = golden.lines().skip(1).collect::<std::vec::Vec<_>>().join("\n");
+    let bytes = story.as_bytes();
+    const COLS: usize = 14;
+    const ROWS: usize = 5;
+    let mut spans = [(0u16, 0u16); ROWS];
+    for shown in 0..=bytes.len() {
+        let n = wrap_tail(&bytes[..shown], COLS, ROWS, &mut spans);
+        assert!(n <= ROWS, "shown={shown}: {n} lines exceeds the panel");
+        for (i, &(a, b)) in spans[..n].iter().enumerate() {
+            assert!(a <= b, "shown={shown} line{i}: inverted span ({a},{b})");
+            assert!(
+                (b as usize) <= shown,
+                "shown={shown} line{i}: span end {b} past the revealed text"
+            );
+            let w = (b - a) as usize;
+            assert!(w <= COLS, "shown={shown} line{i}: {w} chars is wider than the panel");
+            // A line must never begin with the space we were supposed to swallow, or the text
+            // would visibly drift right as the story scrolls.
+            if w > 0 && a > 0 {
+                assert_ne!(
+                    bytes[a as usize], b' ',
+                    "shown={shown} line{i}: line starts with a space"
+                );
+            }
+        }
+        // Lines must be in reading order and non-overlapping.
+        for w in spans[..n].windows(2) {
+            assert!(w[0].1 <= w[1].0, "shown={shown}: spans out of order/overlapping");
+        }
+    }
+    // With the bottom row reserved for `~ fin ~`, the story gets 4 rows and still fits.
+    let n = wrap_tail(bytes, COLS, ROWS - 1, &mut spans[..ROWS - 1]);
+    assert_eq!(n, ROWS - 1);
 }

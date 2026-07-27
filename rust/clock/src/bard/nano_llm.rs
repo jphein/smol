@@ -543,7 +543,9 @@ fn softmax(x: &mut [f32]) {
 /// The cache itself lives in [`Bufs`] so one static allocation serves every session; a new
 /// `Session` over the same `Bufs` simply overwrites cache slots from position 0.
 pub struct Session {
-    /// Last position written (informational; `forward` takes `pos` explicitly).
+    /// The NEXT position `forward` expects to be called with — not the last one written.
+    /// Load-bearing, not informational: `forward` asserts the caller's `pos` equals this and
+    /// then increments it, which is what enforces the monotonic-from-zero KV discipline.
     pub pos: u16,
 }
 
@@ -799,9 +801,10 @@ pub enum StepOut<'a> {
     /// `truncated` distinguishes the two endings, because they read differently to a person:
     /// `false` means the model chose to stop (it sampled end-of-text), `true` means we cut it
     /// off at the token budget or the cache depth — mid-sentence, almost always. At 260K
-    /// parameters EOS is essentially never sampled, so `true` is the NORMAL case (measured:
-    /// every seed tried ran to the 220-token budget). A UI should trail off with `…` on a cut
-    /// rather than presenting it as a finished thought.
+    /// parameters a natural stop is RARE but real: T8 measured 1 of 20 seeds (~5%) ending on
+    /// end-of-text, the rest hitting the budget. So `true` is the normal case a UI must make
+    /// look deliberate (trail off with an ellipsis), and the `false` path is live code, not a
+    /// theoretical branch.
     Done {
         /// `true` when the budget or cache depth ended the story, not the model.
         truncated: bool,
@@ -825,6 +828,11 @@ fn sample_top_p(
     idx: &mut [u16; MAX_VOCAB],
 ) -> u16 {
     let n = logits.len();
+    // A zero temperature would divide every logit to ±inf and softmax to NaN, after which the
+    // cutoff filter drops everything and the degenerate fallback lands on arg-max — the right
+    // answer reached by accident. Greedy decoding is a SEPARATE path (see the golden test), so
+    // arriving here with temp 0 is a caller bug worth catching.
+    debug_assert!(temp > 0.0, "sample_top_p needs a positive temperature");
     for v in logits.iter_mut() {
         *v /= temp;
     }
@@ -979,7 +987,14 @@ impl Story {
         // Stop BEFORE a pass that would exceed the token budget or the cache depth. Checking
         // here (rather than reacting to the clamp in `forward`) is what keeps termination
         // explicit — a clamped `pos` would quietly overwrite the last slot forever.
-        if self.pos >= Self::MAX_TOKENS + plen as u16 || (self.pos as usize) + 1 >= SEQ_CAP {
+        //
+        // Generation starts at `pos == plen - 1` (the last prompt token is not "fed"), so the
+        // number of generating passes already run is `pos + 1 - plen`. The earlier form
+        // (`pos >= MAX_TOKENS + plen`) allowed one extra — T8's output said 221 tokens under a
+        // 220 budget. Masked today by the shallower cache cutting first, but a SEQ_CAP bump
+        // would re-expose it.
+        let generated = (self.pos as usize + 1).saturating_sub(plen);
+        if generated >= Self::MAX_TOKENS as usize || (self.pos as usize) + 1 >= SEQ_CAP {
             self.done = true;
             self.truncated = true; // cut off mid-thought — the usual ending at this model size
             return StepOut::Done { truncated: true };

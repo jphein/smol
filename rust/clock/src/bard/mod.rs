@@ -14,6 +14,7 @@
 
 pub mod nano_llm;
 pub mod persona;
+pub mod textflow;
 pub mod tokenizer;
 
 use embedded_graphics::{
@@ -129,11 +130,13 @@ unsafe fn step_story() -> bool {
     let more = match story.step(model, tok, bufs) {
         StepOut::Working => true,
         StepOut::Text(bytes) => push_text(bytes),
-        // A cut is the usual ending at this model size (~19 of 20 seeds), so mark it: an
-        // ellipsis reads as trailing off, where a bare mid-sentence stop reads as a crash.
+        // A cut is the usual ending at this model size (T8: ~19 of 20 seeds), so mark it —
+        // trailing dots read as tailing off, where a bare mid-sentence stop reads as a crash.
+        // ASCII dots, not U+2026: FONT_5X8 is an ASCII font and would draw the ellipsis as a
+        // blank, silently losing the very signal we are adding.
         StepOut::Done { truncated } => {
             if truncated {
-                push_text(b" \xe2\x80\xa6");
+                push_text(b"...");
             }
             false
         }
@@ -142,25 +145,78 @@ unsafe fn step_story() -> bool {
     more && !story.is_done()
 }
 
-/// The Bard screen. Two bools by design: see the module doc on the `App` union's size.
+/// Reveal one character per this many ms (~6/s — spec §7's reading pace).
+const REVEAL_MS: u64 = 160;
+/// Quill blink half-period.
+const BLINK_MS: u64 = 400;
+/// FONT_5X8 columns across the 72 px panel (14 × 5 px = 70).
+const COLS: usize = 14;
+/// FONT_5X8 rows down the 40 px panel (5 × 8 px = 40).
+const ROWS: usize = 5;
+/// Pixel advance of one FONT_5X8 glyph.
+const GLYPH_W: i32 = 5;
+/// Pixel height of one text row.
+const ROW_H: i32 = 8;
+
+/// Where the screen is in a story's life.
+///
+/// No `Idle`: [`BardApp::new`] either arms a story (`Composing`) or fails the blob (`Mute`), so
+/// an idle variant would be constructed nowhere and read as dead code.
+enum Phase {
+    /// Generating and typing out.
+    Composing,
+    /// Generation finished; may still be revealing the tail.
+    Told,
+    /// The blob failed its checks — render nothing but the notice.
+    Mute,
+}
+
+/// The Bard screen. Small by design: `App` is a stack union sized to its largest variant, so the
+/// model scratch, tokenizer, `Story` and text buffer all live in this module's statics.
+///
+/// (The plan sketched a `story: Option<Story>` field here. Deliberately not done: `Story` is
+/// 1136 B — it carries the 1 KB sampler scratch — which would more than double the union, on the
+/// very stack that overflowed when `SEQ_CAP` was 256.)
 pub struct BardApp {
-    /// The blob did not parse — refuse to render anything rather than show garbage.
-    mute: bool,
-    /// More tokens are coming (drives the per-tick step).
-    telling: bool,
+    phase: Phase,
+    /// Bytes of [`STORY_TEXT`] revealed so far.
+    shown: u16,
+    /// When the next character is due.
+    next_reveal_ms: u64,
+    /// Quill state at the last paint (a repaint trigger).
+    quill_on: bool,
+    /// `shown` at the last paint (a repaint trigger).
+    painted: u16,
+    /// Set by a tap while composing: stop throttling and catch the reveal up (spec §9).
+    fast: bool,
 }
 
 impl BardApp {
-    /// Parse the blob and arm the generator. Called once per entry to the screen.
+    /// Parse the blob and arm the first story. Called once per entry to the screen.
     pub fn new(ctx: &Ctx) -> Self {
         let ok = unsafe { init_statics() };
+        let mut app = BardApp {
+            phase: if ok { Phase::Composing } else { Phase::Mute },
+            shown: 0,
+            next_reveal_ms: ctx.now_ms,
+            quill_on: false,
+            painted: u16::MAX, // force the first paint
+            fast: false,
+        };
         if ok {
-            unsafe { begin_story(ctx.node_id, ctx.now_ms) };
+            app.restart(ctx.node_id, ctx.now_ms);
         }
-        BardApp {
-            mute: !ok,
-            telling: ok,
-        }
+        app
+    }
+
+    /// Begin a fresh story, seeded from the clock so successive tellings differ.
+    fn restart(&mut self, node_id: u8, now_ms: u64) {
+        unsafe { begin_story(node_id, now_ms) };
+        self.phase = Phase::Composing;
+        self.shown = 0;
+        self.next_reveal_ms = now_ms;
+        self.painted = u16::MAX;
+        self.fast = false;
     }
 }
 
@@ -169,12 +225,14 @@ impl Plugin for BardApp {
         match press {
             // Uniform grammar across screens: long press leaves to the menu.
             Press::Long => Transition::Switch(AppKind::Menu),
-            // A tap tells a NEW story (a different seed) — the one interaction this screen has.
             Press::Short => {
-                if !self.mute {
-                    unsafe { begin_story(ctx.node_id, ctx.now_ms) };
-                    self.telling = true;
-                    ctx.redraw = true;
+                match self.phase {
+                    // Mid-story: skip the typewriter rather than start over — the story you are
+                    // reading is the one you asked for.
+                    Phase::Composing => self.fast = true,
+                    // Finished: tell a new one.
+                    Phase::Told => self.restart(ctx.node_id, ctx.now_ms),
+                    Phase::Mute => {}
                 }
                 Transition::Stay
             }
@@ -182,60 +240,111 @@ impl Plugin for BardApp {
     }
 
     fn update(&mut self, ctx: &mut Ctx) {
-        if self.mute {
-            // Static content: paint once per entry/redraw.
+        if matches!(self.phase, Phase::Mute) {
             if ctx.redraw {
                 draw_lines(ctx, &["the bard", "is mute"]);
             }
             return;
         }
-        // ONE forward pass per tick — the loop must stay cooperative, so the story advances a
-        // token at a time rather than blocking for seconds.
-        if self.telling {
-            self.telling = unsafe { step_story() };
-        } else if !ctx.redraw {
+
+        // Generate: ONE forward pass per tick, free-running. The REVEAL is what is paced — the
+        // model is the slow part, so throttling generation too would only stall the screen.
+        if matches!(self.phase, Phase::Composing) && !unsafe { step_story() } {
+            self.phase = Phase::Told;
+        }
+        let text_len = unsafe { *core::ptr::addr_of!(STORY_LEN) } as u16;
+
+        // Reveal on a wall-clock schedule (`next_reveal_ms` accumulates rather than resetting to
+        // `now`), so a slow token or a missed tick catches up to ~6 chars/s instead of drifting.
+        if self.fast {
+            self.shown = text_len;
+        } else {
+            while self.shown < text_len && ctx.now_ms >= self.next_reveal_ms {
+                self.shown += 1;
+                self.next_reveal_ms = self.next_reveal_ms.saturating_add(REVEAL_MS);
+            }
+        }
+
+        // Repaint only when something a viewer can see changed.
+        let told = matches!(self.phase, Phase::Told) && self.shown >= text_len;
+        let quill = !told && (ctx.now_ms / BLINK_MS).is_multiple_of(2);
+        if !(ctx.redraw || self.shown != self.painted || quill != self.quill_on) {
             return;
         }
-        draw_story(ctx);
+        self.painted = self.shown;
+        self.quill_on = quill;
+        draw_story(ctx, self.shown, told, quill);
     }
 }
 
-/// Render the tail of the story, unwrapped. Deliberately plain: Task 10 replaces this with the
-/// word-wrapped typewriter, the quill cursor and the `~ fin ~` ending.
-fn draw_story(ctx: &mut Ctx) {
-    let (text, len) = unsafe {
-        (
-            &*core::ptr::addr_of!(STORY_TEXT),
-            *core::ptr::addr_of!(STORY_LEN),
+/// Draw the revealed text, word-wrapped, with the quill while composing and `~ fin ~` once the
+/// story is fully told.
+fn draw_story(ctx: &mut Ctx, shown: u16, told: bool, quill: bool) {
+    let text = unsafe { &*core::ptr::addr_of!(STORY_TEXT) };
+    let visible = &text[..(shown as usize).min(text.len())];
+    // Reserve the bottom row for the ending, so `~ fin ~` never overwrites a line of story.
+    let rows = if told { ROWS - 1 } else { ROWS };
+    let mut spans = [(0u16, 0u16); ROWS];
+    let n = textflow::wrap_tail(visible, COLS, rows, &mut spans[..rows]);
+
+    ctx.display.clear(BinaryColor::Off).ok();
+    let style = MonoTextStyleBuilder::new()
+        .font(&FONT_5X8)
+        .text_color(BinaryColor::On)
+        .build();
+    let mut last_end = 0i32;
+    for (i, &(a, b)) in spans[..n].iter().enumerate() {
+        // A line that is not valid UTF-8 (a raw byte-fallback token) is skipped rather than
+        // panicked on; the rest of the story still reads.
+        let line = core::str::from_utf8(&visible[a as usize..b as usize]).unwrap_or("");
+        Text::with_baseline(
+            line,
+            Point::new(0, i as i32 * ROW_H),
+            style,
+            Baseline::Top,
         )
-    };
-    // 14 columns of FONT_5X8 across 72 px; show the last 4 lines' worth of characters.
-    const COLS: usize = 14;
-    const ROWS: usize = 4;
-    let shown = &text[len.saturating_sub(COLS * ROWS)..len];
-    let mut rows: [&str; ROWS] = [""; ROWS];
-    for (i, row) in rows.iter_mut().enumerate() {
-        let a = (i * COLS).min(shown.len());
-        let b = ((i + 1) * COLS).min(shown.len());
-        // from_utf8 can fail mid-multi-byte-token; skip that row rather than panic.
-        *row = core::str::from_utf8(&shown[a..b]).unwrap_or("");
+        .draw(ctx.display)
+        .ok();
+        last_end = line.chars().count() as i32;
     }
-    draw_lines(ctx, &rows);
+    if quill && n > 0 {
+        // The nib sits after the last revealed character, clamped inside the panel.
+        let x = (last_end * GLYPH_W).min(COLS as i32 * GLYPH_W - GLYPH_W);
+        Text::with_baseline(
+            "|",
+            Point::new(x, (n as i32 - 1) * ROW_H),
+            style,
+            Baseline::Top,
+        )
+        .draw(ctx.display)
+        .ok();
+    }
+    if told {
+        const FIN: &str = "~ fin ~";
+        let x = ((COLS as i32 * GLYPH_W) - FIN.len() as i32 * GLYPH_W) / 2;
+        Text::with_baseline(
+            FIN,
+            Point::new(x.max(0), (ROWS as i32 - 1) * ROW_H),
+            style,
+            Baseline::Top,
+        )
+        .draw(ctx.display)
+        .ok();
+    }
+    ctx.display.flush().ok();
 }
 
-/// Clear and draw up to 5 left-aligned FONT_5X8 lines. Panic-free.
+/// Clear and draw up to [`ROWS`] left-aligned FONT_5X8 lines. Panic-free.
 fn draw_lines(ctx: &mut Ctx, lines: &[&str]) {
     ctx.display.clear(BinaryColor::Off).ok();
     let style = MonoTextStyleBuilder::new()
         .font(&FONT_5X8)
         .text_color(BinaryColor::On)
         .build();
-    let mut y = 0i32;
-    for line in lines.iter().take(5) {
-        Text::with_baseline(line, Point::new(0, y), style, Baseline::Top)
+    for (i, line) in lines.iter().take(ROWS).enumerate() {
+        Text::with_baseline(line, Point::new(0, i as i32 * ROW_H), style, Baseline::Top)
             .draw(ctx.display)
             .ok();
-        y += 8;
     }
     ctx.display.flush().ok();
 }

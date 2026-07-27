@@ -53,8 +53,9 @@ fn main() {
         let secs = start.elapsed().as_secs_f64();
         total_tokens += tokens;
         total_secs += secs;
-        // A cut is the normal ending at 260K params (EOS is essentially never sampled), so say
-        // which one happened rather than letting a mid-sentence stop look like a bug.
+        // A cut is the normal ending at 260K params — T8 measured ~5% (1 of these 20 seeds)
+        // stopping naturally on end-of-text — so say which one happened rather than letting a
+        // mid-sentence stop look like a bug.
         println!(
             "{}\n[seed {seed}: {tokens} tokens in {:.0} ms = {:.0} tok/s, ended by {}]",
             if truncated { " …" } else { "" },
