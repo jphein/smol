@@ -50,9 +50,9 @@ F32 = np.float32
 # Families in blob order; `tensor()` in the Rust uses these same indices.
 FAMILIES = ("emb", "wq", "wk", "wv", "wo", "w1", "w2", "w3", "wcls")
 # Mirrors nano_llm::SEQ_CAP — the cache DEPTH, not the header's seq_len (512). 192 because the
-# canonical fleet image will not link at 256 (see the Rust const's comment); generation stops
+# canonical fleet image cannot afford a deeper cache (see the Rust const); generation stops
 # here regardless of --steps, exactly as the firmware's Story does.
-SEQ_CAP = 192
+SEQ_CAP = 160
 
 
 def _f32(x):

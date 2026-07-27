@@ -107,15 +107,37 @@ repro_build_bin() {
     # dollhouse's dashboard-only pin-binding depends on it being resident). Changing this
     # list changes the reproducible-image definition (#44): a new sha lineage per commit.
     # #300: + bard (The Bard storyteller). It is radio-free and self-contained, but it costs
-    # ~285 KB of flash (the model blob in .rodata) and ~78 KB of .bss — which leaves only about
-    # 2.6 KB of the DRAM window spare on this tier, so anything added here from now on must
-    # check the link, not just the compile. ⚠️ FORKS THE #44 SHA LINEAGE: every image built
-    # from this commit forward differs from the pre-bard lineage by definition.
+    # ~285 KB of flash (the model blob in .rodata) and ~67 KB of .bss. That .bss comes straight
+    # out of the RUNTIME STACK: `.stack` gets whatever DRAM is left over and the linker shrinks
+    # it SILENTLY, so "it links" says nothing about whether the firmware can run — see the
+    # stack-floor gate below. ⚠️ FORKS THE #44 SHA LINEAGE: every image built from this commit
+    # forward differs from the pre-bard lineage by definition.
     cargo build --release --features espnow,cast,io,bard "${REPRO_CARGO_ARGS[@]}"
   ) || return 1
   # Honor CARGO_TARGET_DIR (verify_image.sh --twice points each build at an isolated dir);
   # default to the in-tree target/ (ota_publish.sh's path) when unset.
   local tdir="${CARGO_TARGET_DIR:-$clock/target}"
+  # #300 STACK FLOOR — the gate that was missing. `.stack` is placed in the DRAM left after
+  # `.bss`, and the linker silently shrinks it rather than failing, so a successful link is NOT
+  # evidence of a runnable image: with SEQ_CAP 192 the bard image linked with 2592 B of stack
+  # (82304 B without bard) and put `__stack_chk_guard` outside the stack region, where the canary
+  # cannot detect the overflow it exists to catch. Refuse to package an image that thin.
+  local elf="$tdir/${REPRO_TARGET}/release/clock" stack_floor=12288
+  local ss se
+  ss=$(readelf -sW "$elf" 2>/dev/null | awk '$8=="_stack_start"{print $2; exit}')
+  se=$(readelf -sW "$elf" 2>/dev/null | awk '$8=="_stack_end"{print $2; exit}')
+  if [ -n "$ss" ] && [ -n "$se" ]; then
+    local stack_bytes=$(( 0x$ss - 0x$se ))
+    if [ "$stack_bytes" -lt "$stack_floor" ]; then
+      echo "FATAL: runtime stack is ${stack_bytes} B, below the ${stack_floor} B floor." >&2
+      echo "       Something grew .bss. Shrink it (nano_llm::SEQ_CAP is the bard's lever) or" >&2
+      echo "       reclaim DRAM elsewhere — do NOT ship this image." >&2
+      return 1
+    fi
+    echo "  stack: ${stack_bytes} B (floor ${stack_floor} B)"
+  else
+    echo "WARNING: could not read _stack_start/_stack_end from $elf — stack floor NOT checked" >&2
+  fi
   "$espflash" save-image --chip esp32c3 \
     "$tdir/${REPRO_TARGET}/release/clock" "$out" >/dev/null || return 1
 }

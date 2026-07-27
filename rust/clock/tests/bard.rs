@@ -364,8 +364,6 @@ fn story_reports_how_it_ended() {
             break truncated;
         }
     };
-    // The step result and the getter must agree — a renderer may consult either.
-    assert_eq!(ending, story.truncated());
     assert!(story.is_done());
     // At 260K params EOS is essentially never sampled, so this seed runs to the budget. If this
     // ever flips to a natural stop, the UI's `…` path stops being the common case — worth knowing.

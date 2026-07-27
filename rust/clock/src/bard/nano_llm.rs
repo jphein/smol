@@ -50,15 +50,22 @@ pub const MAX_VOCAB: usize = 512;
 /// KV-cache depth the firmware allocates, independent of the header's `seq_len` (512): a
 /// story is capped at this many tokens so the cache fits RAM.
 ///
-/// 192, NOT 256 — a MEASURED constraint, not a guess. At 256 the canonical fleet image
-/// (`espnow,cast,io,bard`) fails to LINK: `.bss will not fit in region DRAM: overflowed by
-/// 20704 bytes`, because esp-wifi's 128 KiB heap (#140) plus the existing ~191 KB of
-/// `.data`+`.bss` leaves under 100 KB of the C3's 313 KiB DRAM window. Dropping to 192 frees
-/// 23296 B (2 caches × 5 layers × 64 slots × 32 + their scales + the score row), which is what
-/// makes the image link. The cost is story length: with a ~15-token prompt the cache, not
-/// [`Story::MAX_TOKENS`], becomes the stopping rule at ~177 generated tokens (~360 chars) —
-/// still comfortably a story. Raising this again requires giving RAM back somewhere else.
-pub const SEQ_CAP: usize = 192;
+/// 160, and the number is set by the RUNTIME STACK — not by spare DRAM, and not by taste.
+/// `.stack` is placed in whatever DRAM is left after `.bss`, and the linker shrinks it SILENTLY,
+/// so a successful link proves nothing. Measured on the canonical `espnow,cast,io,bard` image:
+///
+///   SEQ_CAP 256 → does not link at all (`.bss will not fit in region DRAM`, over by 20704 B)
+///   SEQ_CAP 192 → links, but `.stack` is 2592 B (from 82304 B without bard) and
+///                 `__stack_chk_guard` lands OUTSIDE the stack region — the canary cannot even
+///                 detect the overflow it is there to catch. This would have crashed on the
+///                 first deep call.
+///   SEQ_CAP 160 → frees a further 11648 B, restoring ~14 KB of stack, above the 12288 B floor
+///                 `tools/repro_build.sh` now enforces.
+///
+/// Cost: with a ~15-token prompt the CACHE, not [`Story::MAX_TOKENS`], is the stopping rule at
+/// ~145 generated tokens (~300 chars) — still a story. Growing it back means giving RAM up
+/// elsewhere; the esp-wifi 128 KiB heap (#140, low-watermark ~52 KB free) is the obvious lever.
+pub const SEQ_CAP: usize = 160;
 /// Row stride of one cached K (or V) vector, in int8 slots. The shipped model's `kv_dim` is
 /// exactly 32; [`Model::parse`] REFUSES anything wider, which is what lets the forward pass
 /// index the cache without a bounds fallback.
@@ -950,18 +957,6 @@ impl Story {
     /// Whether the story has finished (further steps return [`StepOut::Done`]).
     pub fn is_done(&self) -> bool {
         self.done
-    }
-
-    /// Whether the ending was a hard cut rather than the model stopping — the same flag
-    /// [`StepOut::Done`] carries, for a renderer that consults state instead of the step result.
-    // Build-conditional dead code, not a leftover: the host tests assert this agrees with the
-    // step result, and Task 10's renderer consults it at draw time, but the Task 9 firmware stub
-    // reads the `StepOut::Done` field directly — so in a BIN build it has no caller yet. `allow`
-    // rather than `expect` because in the hostsim LIB build it is a live pub item and an
-    // expectation would go unfulfilled.
-    #[allow(dead_code)]
-    pub fn truncated(&self) -> bool {
-        self.truncated
     }
 
     /// Advance by exactly ONE forward pass: either priming the cache with a prompt token

@@ -51,6 +51,13 @@ pub fn protagonist(node_id: u8) -> &'static str {
 pub fn prompt(node_id: u8, buf: &mut [u8; 64]) -> usize {
     let mut n = 0;
     for part in ["Once upon a time, there was ", protagonist(node_id)] {
+        // The 64-byte buffer and the table are coupled only by arithmetic that happens to work
+        // (28 + 15 = 43). Say so out loud, so adding "a very sleepy little dragon" to
+        // PROTAGONISTS trips here in a debug build instead of panicking on the slice below.
+        debug_assert!(
+            n + part.len() <= buf.len(),
+            "prompt buffer too small for this protagonist"
+        );
         buf[n..n + part.len()].copy_from_slice(part.as_bytes());
         n += part.len();
     }
