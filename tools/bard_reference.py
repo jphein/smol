@@ -49,9 +49,14 @@ import numpy as np
 F32 = np.float32
 # Families in blob order; `tensor()` in the Rust uses these same indices.
 FAMILIES = ("emb", "wq", "wk", "wv", "wo", "w1", "w2", "w3", "wcls")
-# Mirrors nano_llm::SEQ_CAP — the cache DEPTH, not the header's seq_len (512). 192 because the
+# Mirrors nano_llm::SEQ_CAP — the cache DEPTH, not the header's seq_len (512). 80 because the
 # canonical fleet image cannot afford a deeper cache (see the Rust const); generation stops
-# here regardless of --steps, exactly as the firmware's Story does.
+# here regardless of --steps, exactly as the firmware's FIRST chapter does.
+#
+# This reference deliberately does NOT model #302's ring buffer. Its job is to pin the golden token
+# stream, and a first chapter never wraps (`nano_llm::cache_slot` is the identity below SEQ_CAP), so
+# a flat cache that stops at the cap is the exact same computation with less to get wrong. If the
+# goldens ever need to cover a CONTINUED story, this is where the ring would have to come too.
 SEQ_CAP = 80
 
 
