@@ -864,6 +864,8 @@ Parse once per entry (`Model::parse` is cheap — a CRC walk over flash); on `Er
 
 ### Task 10: The Bard UI — typewriter, quill, buttons
 
+> **T9 realities:** DRAM headroom on the canonical tier is **~2.6 KB** — T10 adds ZERO new statics (STORY_TEXT etc. already exist from T9) and every build gate checks the LINK of `espnow,cast,io,bard`. Host module paths are now `clock::nano_llm` / `clock::tokenizer` / `clock::persona` (older snippets saying `bard_tokenizer` are stale). Stories are cache-bound ≈177 tokens / ~360 chars.
+
 **Files:** Modify `rust/clock/src/bard/mod.rs`
 
 - [ ] **Step 10.1:** Implement `BardApp` per spec §9. State:
