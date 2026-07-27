@@ -106,7 +106,12 @@ repro_build_bin() {
     # display-mirror) + io (#72 registry — inert until a G config binds pins, and the
     # dollhouse's dashboard-only pin-binding depends on it being resident). Changing this
     # list changes the reproducible-image definition (#44): a new sha lineage per commit.
-    cargo build --release --features espnow,cast,io "${REPRO_CARGO_ARGS[@]}"
+    # #300: + bard (The Bard storyteller). It is radio-free and self-contained, but it costs
+    # ~285 KB of flash (the model blob in .rodata) and ~78 KB of .bss — which leaves only about
+    # 2.6 KB of the DRAM window spare on this tier, so anything added here from now on must
+    # check the link, not just the compile. ⚠️ FORKS THE #44 SHA LINEAGE: every image built
+    # from this commit forward differs from the pre-bard lineage by definition.
+    cargo build --release --features espnow,cast,io,bard "${REPRO_CARGO_ARGS[@]}"
   ) || return 1
   # Honor CARGO_TARGET_DIR (verify_image.sh --twice points each build at an isolated dir);
   # default to the in-tree target/ (ota_publish.sh's path) when unset.
