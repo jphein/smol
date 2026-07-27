@@ -380,12 +380,13 @@ firmware predates is DROPPED (forward-compat, #46). Parse is panic-free/heap-fre
 | `W` | #71 | on-demand **WiFi scan** trigger | **NO** — transient (a *cached* scan = a periodic off-channel excursion, the coexist hazard) | live one-shot, no reboot |
 | `G` | #72 | **IO pin-map** — the whole per-node driver map (see below) (`5689b1b`, #113) | yes | live, **no reboot** (edge-triggered re-bind) |
 | `g` | #72 | **IO output states** — commanded output levels (see below) (`5689b1b`, #113) | yes | live, no reboot |
+| `T` | #303 | **Bard story prompt** — the opening the on-device LLM continues; empty = the node's built-in persona. **The LEAF validates** against the model's own 512-token vocabulary (bytes with no token are refused with an offset; merely-unknown ASCII is accepted but fragments) and keeps its previous prompt on refusal — validation cannot live gateway-side because it needs the tokenizer, which lives with the model | yes | live, no reboot (next story uses it) |
 
-- **Reboot vs live.** Live-apply (no reboot): `S L U P Y O W G g`. Reboot on apply: `B` (broker-leg
+- **Reboot vs live.** Live-apply (no reboot): `S L U P Y O W G g T`. Reboot on apply: `B` (broker-leg
   change) — **edge-triggered** (only when the value changes, so the ~10 s re-arm never
   reboot-loops); `R` reboots by design. `O` takes effect on the next OTA fetch without a reboot.
   (`N` was reboot-on-apply pre-#142; retired.)
-- **Cached + re-armed vs transient.** `S L U P Y B O G g` live in the gateway's `cfg_cache` and are
+- **Cached + re-armed vs transient.** `S L U P Y B O G g T` live in the gateway's `cfg_cache` and are
   **re-broadcast every ~10 s** (`broadcast_cached_configs`), so a rebooted leaf re-arms within ~10 s
   with **no leaf-side NVS** — except the network overrides (`B`/`O`), which *also* persist in the
   NVS net record below (needed to reach the broker at all before the first relay). A retained `N` is
