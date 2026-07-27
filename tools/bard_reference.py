@@ -33,9 +33,10 @@ This file is worthless unless it mirrors the Rust *as built*, including float RO
       SwiGLU    (v / (1 + exp(-v))) * gate      -- a DIVIDE, not v * (1/(1+exp(-v)))
       RoPE      llama2.c adjacent-pair, freq = 1/pow(10000, (i % head_dim)/head_dim)
       matmul    per segment: acc += (int32_dot as f32 * w_scale[wg]) * x_scale[ag]
-  * Residual transcendental drift is expected and accepted: numpy's expf/sinf/cosf/powf need
-    not agree with libm's to the last bit. That is exactly why the test's gate is a long shared
-    PREFIX rather than the whole story.
+  * Transcendental drift (numpy's expf/sinf/cosf/powf vs libm's) is the one thing that could
+    legitimately differ. In practice it does not: the two implementations agree BIT-FOR-BIT
+    over the whole 186-token story, so the Rust test now pins the ENTIRE id sequence and the
+    ENTIRE text. If a libm/numpy update ever perturbs an argmax, that test is where it shows.
 """
 import argparse
 import hashlib
@@ -69,7 +70,10 @@ class Blob:
         raw = pathlib.Path(path).read_bytes()
         self.sha256 = hashlib.sha256(raw).hexdigest()
         stored = struct.unpack_from("<I", raw, len(raw) - 4)[0]
-        if zlib.crc32(raw[:-4]) != stored:
+        # The same value the Rust parser checks. Stamped into the golden header so a
+        # re-exported blob with stale goldens fails as "wrong blob", not as a prose diff.
+        self.crc32 = zlib.crc32(raw[:-4])
+        if self.crc32 != stored:
             raise SystemExit("crc32 mismatch — refusing to run on a corrupt blob")
         (magic, ver, self.dim, self.hidden, self.n_layers, self.n_heads, self.n_kv_heads,
          self.vocab, self.seq_len, self.gs, shared) = struct.unpack_from("<11I", raw, 0)
@@ -145,7 +149,9 @@ class Blob:
             else:
                 ids.extend(3 + b for b in piece)  # ids 3..259 are the `<0xXX>` tokens
         while True:
-            best_score, best_id, best_at = -1e10, -1, -1
+            # -inf, mirroring the Rust's f32::NEG_INFINITY. Unreachable either way (scores are
+            # small negatives), but exactness is this file's entire job.
+            best_score, best_id, best_at = -np.inf, -1, -1
             for i in range(len(ids) - 1):
                 cand = self.texts[ids[i]] + self.texts[ids[i + 1]]
                 if len(cand) > self.max_token_len:
@@ -378,7 +384,7 @@ def main():
         out += b.decode(token, nxt)
         token = nxt
 
-    print(f"# reference {b.sha256[:12]} temp0")
+    print(f"# reference {b.sha256[:12]} temp0 crc32={b.crc32:08x}")
     print(args.prompt + out.decode("utf-8", "replace"))
     if args.tokens_out:
         pathlib.Path(args.tokens_out).write_text("".join(f"{t}\n" for t in generated))

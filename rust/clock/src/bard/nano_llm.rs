@@ -579,9 +579,12 @@ impl Session {
         // this pass reads keys the previous story wrote and calls them context. `Story` is the
         // only caller and guarantees it; this is the tripwire for anyone else.
         debug_assert_eq!(pos, self.pos as usize, "forward() called out of sequence");
+        // Assert the CALLER's position, before the clamp — after it the check is tautological.
+        // `Story` terminates explicitly at the cap, so reaching this means a caller kept going
+        // past the cache and is about to have its last slot silently overwritten forever.
+        debug_assert!(pos < SEQ_CAP, "pos {pos} past the KV cache ({SEQ_CAP} slots)");
         self.pos = self.pos.saturating_add(1);
         let pos = pos.min(SEQ_CAP - 1);
-        debug_assert!(pos < SEQ_CAP);
 
         // 1. Embed: dequantize the token's row of tok_emb straight into the residual stream.
         let emb = m.tensor(0);

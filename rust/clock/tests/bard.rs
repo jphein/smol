@@ -197,15 +197,24 @@ fn greedy(
     (text, generated)
 }
 
-/// Take the first `n` CHARS (not bytes) — the stories are ASCII today, but a byte slice would
-/// panic the day the model emits a multi-byte token.
-fn head(s: &str, n: usize) -> std::string::String {
-    s.chars().take(n).collect()
-}
-
 #[test]
-fn golden_prefix_matches_reference_runq() {
+fn golden_matches_python_reference() {
     let golden = include_str!("../src/bard/testdata/golden_ref.txt");
+    // Bind the golden to the blob it was generated from. Without this, a re-exported model with
+    // stale testdata fails as a mystifying prose diff instead of "you forgot to regenerate".
+    let stamped = golden
+        .lines()
+        .next()
+        .and_then(|l| l.split("crc32=").nth(1))
+        .map(str::trim)
+        .expect("golden header must carry crc32=<hex>; run tools/bard_golden_baseline.sh");
+    let want_crc = clock::nano_llm::crc32(&BLOB[..BLOB.len() - 4]);
+    assert_eq!(
+        stamped,
+        std::format!("{want_crc:08x}"),
+        "golden was built for a DIFFERENT blob — rerun tools/bard_golden_baseline.sh"
+    );
+
     let golden_story = golden.lines().skip(1).collect::<std::vec::Vec<_>>().join("\n");
     // The reference prints prompt+continuation as one story; the Rust below produces only the
     // continuation. Strip the prompt so both sides start at the same character.
@@ -213,36 +222,47 @@ fn golden_prefix_matches_reference_runq() {
         .trim_start()
         .strip_prefix(GOLDEN_PROMPT)
         .expect("golden story must start with the prompt it was generated from");
+    let golden_ids: std::vec::Vec<u16> = include_str!("../src/bard/testdata/golden_tokens.txt")
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.trim().parse().expect("token id"))
+        .collect();
+    // Guard the guard: an empty or truncated testdata file must not pass by comparing nothing.
+    assert!(
+        golden_ids.len() >= 32,
+        "golden_tokens.txt looks empty or truncated: {} ids",
+        golden_ids.len()
+    );
+    assert!(
+        golden_cont.chars().count() >= 120,
+        "golden continuation is too short to judge: {} chars",
+        golden_cont.chars().count()
+    );
 
     let m = Model::parse(BLOB).unwrap();
     let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
     let mut bufs = std::boxed::Box::new(Bufs::INIT);
     let (text, generated) = greedy(&m, &t, &mut bufs, GOLDEN_PROMPT, 200);
 
-    // Debugging aid (plan Step 6.4): the first divergent token id localises a mismatch far
-    // better than a diff of prose. Transcendentals (libm vs numpy expf/sinf/powf) may drift in
-    // the tail, so this compares the first 32 ids only.
-    let golden_ids: std::vec::Vec<u16> = include_str!("../src/bard/testdata/golden_tokens.txt")
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.trim().parse().expect("token id"))
-        .collect();
-    let k = 32.min(golden_ids.len()).min(generated.len());
-    assert_eq!(
-        generated[..k],
-        golden_ids[..k],
-        "first divergence at token {:?}",
-        generated[..k]
+    // FULL equality, no tolerance. T6 measured bit-for-bit agreement across the entire story
+    // (186 ids / 446 chars) between two independent implementations in different languages, so
+    // anything short of exact is a regression and should fail as loudly as possible. The
+    // divergence index is reported first because it localises a numeric bug far better than a
+    // prose diff — see the reference's docstring for the accumulation-order contract.
+    if generated != golden_ids {
+        let at = generated
             .iter()
-            .zip(&golden_ids[..k])
-            .position(|(a, b)| a != b)
-    );
-
-    // Spec §11 (amended): int8 KV rounding may diverge in the tail; the bar is a long shared
-    // prefix. 120 chars is 30+ tokens of exact agreement.
-    let bar = 120.min(golden_cont.chars().count()).min(text.chars().count());
-    assert!(bar >= 120, "continuation too short to judge: {bar} chars");
-    assert_eq!(head(&text, bar), head(golden_cont, bar));
+            .zip(&golden_ids)
+            .position(|(a, b)| a != b);
+        panic!(
+            "token stream diverges at index {at:?} (rust {} ids, golden {} ids)\n  rust:   {:?}\n  golden: {:?}",
+            generated.len(),
+            golden_ids.len(),
+            &generated[at.unwrap_or(0)..generated.len().min(at.unwrap_or(0) + 8)],
+            &golden_ids[at.unwrap_or(0)..golden_ids.len().min(at.unwrap_or(0) + 8)],
+        );
+    }
+    assert_eq!(text, golden_cont, "text differs despite identical token ids");
 }
 
 #[test]
