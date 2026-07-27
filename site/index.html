@@ -115,7 +115,16 @@ nav a:hover::after{right:0}
 /* the OLED */
 .bezel{background:#05090a;border-radius:9px;padding:11px;border:1px solid rgba(0,0,0,.6);box-shadow:inset 0 0 24px rgba(0,0,0,.9)}
 .screen-shell{position:relative;border-radius:4px;overflow:hidden;background:#02100f;box-shadow:0 0 26px -4px var(--glow-soft),inset 0 0 40px rgba(0,0,0,.6)}
-canvas#oled{display:block;width:100%;height:auto;image-rendering:pixelated;aspect-ratio:72/40}
+/* ---- every display on this page is the same physical part ----
+   72x40, 1-bit. Draw at 1:1 (see oled.js) and let the browser scale with NEAREST
+   NEIGHBOUR, so one device pixel stays one hard-edged square. `pixelated` is
+   load-bearing, not decorative: without it the browser smooths the upscale and
+   invents the greys a 1-bit panel cannot emit.
+   The glow is a `filter` on the scaled element — i.e. OUTSIDE the glass, the way
+   real phosphor bleeds into the bezel. Never a text-shadow on pixels inside it. */
+canvas#oled,.oled-px{display:block;width:100%;height:auto;aspect-ratio:72/40;
+  image-rendering:pixelated;image-rendering:crisp-edges;
+  filter:drop-shadow(0 0 3px var(--glow-soft)) drop-shadow(0 0 9px rgba(125,249,255,.22))}
 .scanlines{position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(0,0,0,.28) 0 1px,transparent 1px 3px);mix-blend-mode:multiply;opacity:.5}
 .glassglare{position:absolute;inset:0;pointer-events:none;background:linear-gradient(115deg,rgba(255,255,255,.06),transparent 40%)}
 /* controls on the shell */
@@ -159,14 +168,7 @@ canvas#oled{display:block;width:100%;height:auto;image-rendering:pixelated;aspec
 .bard-bezel{background:#05090a;border-radius:9px;padding:10px;border:1px solid rgba(0,0,0,.6);
   box-shadow:inset 0 0 24px rgba(0,0,0,.9)}
 .bard-screen{position:relative;border-radius:4px;overflow:hidden;background:#02100f;aspect-ratio:72/40;
-  box-shadow:0 0 26px -4px var(--glow-soft),inset 0 0 40px rgba(0,0,0,.6);
-  display:flex;flex-direction:column;justify-content:flex-start;padding:5% 5.5%}
-/* 5 lines of ~15 chars is what 40px of height actually holds */
-.bard-lines{font-family:var(--mono);font-weight:500;color:var(--glow);
-  font-size:clamp(.62rem,1.55vw,.9rem);line-height:1.34;letter-spacing:-.01em;
-  text-shadow:0 0 9px var(--glow-soft);white-space:pre-wrap;word-break:break-word}
-.bard-lines .tok{display:inline-block;width:.5em;height:1em;background:var(--glow);
-  vertical-align:-.14em;box-shadow:0 0 9px var(--glow-soft);animation:blink 1s steps(1) infinite}
+  box-shadow:0 0 26px -4px var(--glow-soft),inset 0 0 40px rgba(0,0,0,.6)}
 .bard-plate{display:flex;justify-content:space-between;align-items:baseline;margin-top:13px;
   font-family:var(--mono);font-size:.62rem;color:var(--faint);letter-spacing:.06em}
 .bard-quill{color:var(--amber)}
@@ -489,7 +491,8 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
     <div class="bard-stage">
       <div class="bard-device">
         <div class="bard-bezel"><div class="bard-screen">
-          <div class="bard-lines" id="bardLines"></div>
+          <canvas id="bardOled" class="oled-px" width="72" height="40"
+                  aria-label="A 72x40 OLED typing a story the board wrote"></canvas>
           <div class="scanlines"></div><div class="glassglare"></div>
         </div></div>
         <div class="bard-plate">
@@ -989,6 +992,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 </div>
 <div class="toast" id="toast"></div>
 
+<script src="oled.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

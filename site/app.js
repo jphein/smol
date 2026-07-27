@@ -130,11 +130,15 @@
 
   const clock = () => { const c = $('#clock'); if (c) c.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); };
 
-  /* ================================ OLED block-digger ================================ */
-  const cv = $('#oled'), ctx = cv.getContext('2d');
-  ctx.imageSmoothingEnabled = false;
-  const TP = 32, COLS = cv.width / TP, ROWS = cv.height / TP;   // 18 × 10 tiles
-  const BG = '#02100f', FG = '#7df9ff';
+  /* ================================ OLED block-digger ================================
+     Rendered at the panel's REAL resolution: 72x40 device pixels, 1-bit, then scaled
+     up by CSS with image-rendering:pixelated. It used to draw into a 576x320 canvas
+     with an 8x coordinate space, which meant tile insets of 1-3 canvas px were EIGHTHS
+     of a device pixel and the HUD used rgba(...,.5) -- a grey. Neither is producible by
+     this part. At TP = 4 device px per tile the 18x10 world lands on 72x40 exactly.   */
+  const cv = $('#oled');
+  const panel = window.OLED.Panel(cv);
+  const TP = 4, COLS = 18, ROWS = 10;                 // 18 x 4 = 72, 10 x 4 = 40
   const AIR = 0, DIRT = 1, STONE = 2, GRASS = 3;
 
   let world = [], P = { x: 0, y: 0, f: 1 }, inv = 0, lastInput = -9999;
@@ -202,31 +206,39 @@
     else move(P.f);
   }
 
-  // render
+  // render — every coordinate below is a DEVICE PIXEL on a 72x40 1-bit panel
   function draw(demo) {
-    ctx.fillStyle = BG; ctx.fillRect(0, 0, cv.width, cv.height);
-    ctx.save(); ctx.shadowColor = FG; ctx.shadowBlur = 6; ctx.fillStyle = FG; ctx.strokeStyle = FG; ctx.lineWidth = 2;
+    panel.clear();
+    // With only 4x4 px per tile and no greys, SOLID fills merge into one bright slab
+    // (the first pixel-true attempt did exactly that). So terrain is drawn as sparse
+    // TEXTURE and only the player is solid — the classic 1-bit trick, and it makes the
+    // player the brightest thing on the glass without needing a second colour.
     for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
       const t = world[r][c]; if (t === AIR) continue;
       const x = c * TP, y = r * TP;
-      if (t === DIRT) ctx.strokeRect(x + 3, y + 3, TP - 6, TP - 6);
-      else ctx.fillRect(x + 1, y + 1, TP - 2, TP - 2);
+      if (t === GRASS) {                     // surface: solid crust + tufts above it
+        panel.hline(x, y + 1, TP);
+        panel.px(x + 1, y); panel.px(x + 3, y);
+      } else if (t === DIRT) {               // loose soil: two sparse grains
+        panel.px(x + 1, y + 1); panel.px(x + 3, y + 2);
+      } else {                               // stone: a 2x2 core, denser than soil
+        panel.rect(x + 1, y + 1, 2, 2);
+      }
     }
-    ctx.fillRect(P.x * TP + 1, P.y * TP + 1, TP - 2, TP - 2);        // player
-    ctx.restore();
-    // detail punches (no glow)
-    ctx.fillStyle = BG;
-    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
-      if (world[r][c] === GRASS) { ctx.fillRect(c * TP + 6, r * TP + 6, 4, 4); ctx.fillRect(c * TP + 18, r * TP + 12, 4, 4); }
-      if (world[r][c] === STONE) { ctx.fillRect(c * TP + 10, r * TP + 8, 5, 5); }
+    panel.rect(P.x * TP, P.y * TP, TP, TP);                          // player: solid
+    panel.px(P.x * TP + (P.f > 0 ? TP - 1 : 0), P.y * TP + 1, 0);    // facing "eye"
+
+    // HUD — FONT_5X8, on a cleared band, exactly as firmware would have to do it
+    const hud = String(inv);
+    panel.rect(0, 0, 5 + hud.length * window.OLED.GLYPH_W, window.OLED.ROW_H, 0);
+    panel.rect(1, 2, 2, 2);                                          // "a block" glyph
+    panel.text(hud, 5, 0);
+    if (demo) {
+      const w = 4 * window.OLED.GLYPH_W;
+      panel.rect(window.OLED.W - w, 0, w, window.OLED.ROW_H, 0);
+      panel.text('auto', window.OLED.W - w, 0);
     }
-    ctx.fillRect(P.x * TP + (P.f > 0 ? TP - 12 : 6), P.y * TP + 8, 5, 5);  // player "eye"
-    // HUD
-    ctx.fillStyle = FG; ctx.shadowColor = FG; ctx.shadowBlur = 8;
-    ctx.font = 'bold 20px "JetBrains Mono", monospace'; ctx.textBaseline = 'top';
-    ctx.fillText('◆ ' + inv, 8, 6);
-    ctx.shadowBlur = 0;
-    if (demo) { ctx.font = '12px "JetBrains Mono", monospace'; ctx.fillStyle = 'rgba(125,249,255,.5)'; ctx.fillText('▸ auto', cv.width - 52, 8); }
+    panel.flush();
   }
 
   let lastFall = 0, lastStep = 0;
@@ -239,8 +251,8 @@
   }
 
   /* ============================== the bard (02) ==============================
-     Types a REAL story onto a simulated 72×40 OLED — word-wrapped and scrolled
-     the way the firmware does it, at the board's measured pace.
+     Types a REAL story onto a pixel-true 72×40 1-bit panel (see oled.js): the
+     firmware's own FONT_5X8 glyphs, its 14-column wrap, its 5-row scroll.
 
      STORY is verbatim the deterministic (temp 0) output of the model blob
      committed at rust/clock/model/stories260K-q8.bin. Do NOT hand-edit it into
@@ -252,8 +264,6 @@
   const BARD = {
     STORY: 'Once upon a time, there was a little owl named Jack. Jack loved to ' +
            'play with his toys. One day, Jack saw a big box in the ground.',
-    COLS: 15,   // characters per line at 72 px wide — what the glass actually holds
-    ROWS: 5,    // lines at 40 px tall
     // 202 ms/token measured on glass (#300 T13); this vocab averages ~3.5 chars
     // per token, so ~58 ms/char reproduces the real cadence.
     MS_PER_CHAR: 58,
@@ -261,40 +271,30 @@
   };
 
   function bardTypewriter() {
-    const box = $('#bardLines');
-    if (!box) return;
-    // Pre-wrap once: greedy word-wrap to COLS, exactly like the firmware's renderer.
-    const lines = [];
-    let cur = '';
-    for (const word of BARD.STORY.split(' ')) {
-      if (!cur.length) cur = word;
-      else if (cur.length + 1 + word.length <= BARD.COLS) cur += ' ' + word;
-      else { lines.push(cur); cur = word; }
-    }
-    if (cur.length) lines.push(cur);
+    const cv = $('#bardOled');
+    if (!cv || !window.OLED) return;
+    const O = window.OLED, panel = O.Panel(cv);
 
-    // Flatten to a cursor over (line, col) so typing can scroll mid-word.
-    const total = lines.reduce((n, l) => n + l.length + 1, 0);
+    // Wrap ONCE with the firmware's own geometry (14 cols) — see oled.js. Wrapping
+    // forward and keeping the tail is what textflow.rs does, so a line never
+    // re-flows once it is on the glass; the text scrolls instead.
+    const all = O.wrapTail(BARD.STORY, O.COLS, 1e9).lines;
+    const total = all.reduce((n, l) => n + l.length + 1, 0);
     let at = 0, holding = 0;
 
-    // Build the glass once: a text node + a persistent caret element. No innerHTML
-    // on a per-frame path — nothing here needs markup, so nothing here parses any.
-    const txt = document.createTextNode('');
-    const caret = document.createElement('span');
-    caret.className = 'tok';
-    box.textContent = '';
-    box.append(txt, caret);
-
     const render = () => {
-      const out = [];
+      const shown = [];
       let seen = 0;
-      for (const l of lines) {
+      for (const l of all) {
         if (seen >= at) break;
-        out.push(l.slice(0, Math.min(l.length, at - seen)));
+        shown.push(l.slice(0, Math.min(l.length, at - seen)));
         seen += l.length + 1;
       }
-      // scroll: keep only the last ROWS lines on the glass
-      txt.nodeValue = out.slice(Math.max(0, out.length - BARD.ROWS)).join('\n');
+      const tail = shown.slice(Math.max(0, shown.length - O.ROWS));
+      panel.clear().rows(tail);
+      // the quill caret, one glyph cell, at the end of the last line
+      if (tail.length) panel.caret(Math.min(tail[tail.length - 1].length, O.COLS - 1), tail.length - 1);
+      panel.flush();
     };
 
     let last = 0;
@@ -303,9 +303,7 @@
       if (holding) {
         if (ts - holding > BARD.HOLD_MS) { at = 0; holding = 0; last = ts; render(); }
       } else if (ts - last >= BARD.MS_PER_CHAR) {
-        last = ts;
-        at += 1;
-        render();
+        last = ts; at += 1; render();
         if (at >= total) holding = ts;
       }
       requestAnimationFrame(tick);
