@@ -71,3 +71,6 @@ web/emulator/index.html
 web/emulator/dist/
 # A killed export leaves a 277 KB tmp blob behind; never let it near a commit.
 rust/clock/model/*.tmp
+
+# Build artifacts from the experiments/ scratch crates (never shipped, churn on every cargo run)
+experiments/*/Cargo.lock
