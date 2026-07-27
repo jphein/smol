@@ -7,6 +7,28 @@
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%23070b0c'/><g fill='%237df9ff'><rect x='3' y='7' width='2' height='2'/><rect x='5' y='7' width='2' height='2'/><rect x='7' y='7' width='2' height='2'/><rect x='7' y='5' width='2' height='2'/><rect x='9' y='5' width='2' height='2'/></g><rect x='11' y='9' width='2' height='2' fill='%23ffb454'/></svg>" />
 <meta name="theme-color" content="#070b0c" media="(prefers-color-scheme: dark)" />
 <meta name="theme-color" content="#e9efee" media="(prefers-color-scheme: light)" />
+<meta name="description" content="A whole game console, a self-updating ESP-NOW mesh, and a 260K-parameter transformer writing children's stories — all on a $3 ESP32-C3 with a 0.42″ OLED. One no_std Rust firmware, signed over-the-air updates that reach even the WiFi-less nodes over the mesh, and a creature that hops from board to board." />
+<!-- Open Graph / Twitter — so a shared link renders as a card, not a bare URL.
+     og:url and og:image MUST stay absolute: crawlers do not resolve relative paths.
+     The card is a real 1200×630 raster (crawlers reject SVG); its source and the
+     regeneration command live in assets/og-card.html. If you change the image,
+     re-check that the declared width/height below still match the file. -->
+<link rel="canonical" href="https://jphein.github.io/smol/" />
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="smol" />
+<meta property="og:url" content="https://jphein.github.io/smol/" />
+<meta property="og:title" content="smol — a $3 chip that writes you a story" />
+<meta property="og:description" content="A fingertip game console, a mesh that updates itself with signed firmware — even the WiFi-less nodes, over the air — and a real 260K-parameter transformer composing children's stories on the chip. No cloud. One no_std Rust binary on a $3 ESP32-C3." />
+<meta property="og:image" content="https://jphein.github.io/smol/assets/og-card.png" />
+<meta property="og:image:secure_url" content="https://jphein.github.io/smol/assets/og-card.png" />
+<meta property="og:image:type" content="image/png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:alt" content="The smol wordmark beside a scaled-up 72×40 OLED showing a story the board wrote itself: “Once upon a time, there was a little owl named Jack. Jack loved to play with his toys.” — at 202 ms per token." />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="smol — a $3 chip that writes you a story" />
+<meta name="twitter:description" content="A real 260K-parameter transformer composing children's stories on a $3 ESP32-C3, on a 72×40 OLED, with no WiFi and no cloud — inside a mesh that updates itself over the air." />
+<meta name="twitter:image" content="https://jphein.github.io/smol/assets/og-card.png" />
 <!-- self-hosted webfonts (no Google-Fonts CDN → no visitor-IP disclosure); see fonts/fonts.css -->
 <link rel="stylesheet" href="fonts/fonts.css" />
 <style>
@@ -111,6 +133,64 @@ canvas#oled{display:block;width:100%;height:auto;image-rendering:pixelated;aspec
 .rbtn:active,.rbtn.hit{background:var(--amber);color:#241400;border-color:var(--amber);box-shadow:0 0 14px -2px var(--amber)}
 .hint{font-family:var(--mono);font-size:.72rem;color:var(--faint);text-align:center}
 .hint b{color:var(--dim)}
+
+/* ---------- share row ---------- */
+.share{display:flex;flex-wrap:wrap;gap:10px;margin-top:4px}
+/* element selectors, so the markup carries no classes; `font:...inherit` is what
+   stops the <button> rendering in the UA font next to the <a>s. */
+.share a,.share button{display:inline-flex;align-items:center;gap:9px;padding:11px 16px;
+  border-radius:11px;border:1px solid var(--line);background:var(--panel);color:var(--ink);
+  font:500 .82rem/1 var(--mono);letter-spacing:.02em;cursor:pointer;transition:.16s}
+.share a:hover,.share button:hover{border-color:var(--glow);color:var(--glow);
+  box-shadow:0 0 18px -6px var(--glow-soft)}
+/* monochrome + currentColor on purpose: brand colours would fight the phosphor palette */
+.share svg{width:16px;height:16px;fill:currentColor;flex:none}
+.share-sub{font-family:var(--mono);font-size:.72rem;line-height:1.6;color:var(--faint);margin-top:16px;max-width:70ch}
+.share-sub em{color:var(--dim);font-style:normal}
+
+/* ---------- the bard (02) ---------- */
+.bard-grid{display:grid;grid-template-columns:minmax(0,.92fr) minmax(0,1.08fr);gap:44px;align-items:start}
+.bard-stage{display:flex;flex-direction:column;gap:14px;position:sticky;top:88px}
+.bard-device{
+  border-radius:20px;background:linear-gradient(160deg,#13232700,#0c181b);background-color:#0e1c1f;
+  border:1px solid rgba(125,249,255,.14);padding:20px 20px 14px;
+  box-shadow:0 40px 90px -34px rgba(0,0,0,.9),inset 0 1px 0 rgba(255,255,255,.05),0 0 60px -22px var(--glow-soft);
+}
+.bard-bezel{background:#05090a;border-radius:9px;padding:10px;border:1px solid rgba(0,0,0,.6);
+  box-shadow:inset 0 0 24px rgba(0,0,0,.9)}
+.bard-screen{position:relative;border-radius:4px;overflow:hidden;background:#02100f;aspect-ratio:72/40;
+  box-shadow:0 0 26px -4px var(--glow-soft),inset 0 0 40px rgba(0,0,0,.6);
+  display:flex;flex-direction:column;justify-content:flex-start;padding:5% 5.5%}
+/* 5 lines of ~15 chars is what 40px of height actually holds */
+.bard-lines{font-family:var(--mono);font-weight:500;color:var(--glow);
+  font-size:clamp(.62rem,1.55vw,.9rem);line-height:1.34;letter-spacing:-.01em;
+  text-shadow:0 0 9px var(--glow-soft);white-space:pre-wrap;word-break:break-word}
+.bard-lines .tok{display:inline-block;width:.5em;height:1em;background:var(--glow);
+  vertical-align:-.14em;box-shadow:0 0 9px var(--glow-soft);animation:blink 1s steps(1) infinite}
+.bard-plate{display:flex;justify-content:space-between;align-items:baseline;margin-top:13px;
+  font-family:var(--mono);font-size:.62rem;color:var(--faint);letter-spacing:.06em}
+.bard-quill{color:var(--amber)}
+.bard-hint{font-family:var(--mono);font-size:.7rem;line-height:1.55;color:var(--faint);text-align:center}
+.bard-hint b{color:var(--dim)}
+.bard-story h3{font-size:clamp(1.15rem,2.1vw,1.5rem);font-weight:700;letter-spacing:-.015em;margin:10px 0 12px}
+.bard-story p{margin-bottom:14px}
+.bard-story code{font-family:var(--mono);font-size:.86em;color:var(--glow);
+  background:rgba(125,249,255,.07);padding:1px 5px;border-radius:4px}
+/* 2×2, not auto-fit: four items in a 3-track grid leaves a visible hole */
+.bard-nums{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;
+  background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin:20px 0}
+.bard-nums div{background:var(--panel);padding:14px 15px;display:flex;flex-direction:column;gap:3px}
+.bard-nums b{font-family:var(--mono);font-size:1.02rem;font-weight:700;color:var(--glow)}
+.bard-nums span{font-size:.72rem;line-height:1.4;color:var(--dim)}
+.bard-status{font-size:.86rem;line-height:1.65;padding:14px 16px;border-radius:12px;
+  background:var(--panel2);border:1px solid var(--line)}
+.bard-status a{color:var(--glow)}
+.bard-note{font-size:.82rem;line-height:1.6;color:var(--dim);border-left:2px solid var(--amber);
+  padding-left:14px;margin-bottom:0}
+@media (max-width:900px){
+  .bard-grid{grid-template-columns:1fr;gap:30px}
+  .bard-stage{position:static;max-width:430px;margin:0 auto}
+}
 
 /* ---------- sections ---------- */
 section{padding:64px 0;border-top:1px solid var(--line2);position:relative}
@@ -329,7 +409,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
   <div class="wrap bar">
     <div class="brand">smol<span class="dot">▚</span><span class="cursor"></span></div>
     <nav>
-      <a href="#vitals">vitals</a><a href="#games">games</a><a href="#builds">apps</a>
+      <a href="#vitals">vitals</a><a href="#bard">the bard</a><a href="#games">games</a><a href="#builds">apps</a>
       <a href="#mission">mission control</a><a href="#roadmap">roadmap</a><a href="#dollhouse">dollhouse</a><a href="#research">research</a><a href="#board">board</a><a href="#influences">influences</a><a href="#pocketwatch">watch</a><a href="#case">case</a>
     </nav>
     <div class="live" id="live"><span class="led"></span><span id="liveTxt">connecting…</span></div>
@@ -390,10 +470,64 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
   </div>
 </div></section>
 
+<!-- THE BARD -->
+<section id="bard"><div class="wrap">
+  <div class="sec-head reveal">
+    <span class="kicker">02 — The Bard</span>
+    <h2>The board writes you a story.</h2>
+    <p data-edit="bard.intro">Press the button and a <b>real transformer</b> starts composing — 260,000 parameters, int8, from the same llama2.c/TinyStories lineage the big toy models come from — on a chip with <b>400 KB of RAM and no floating-point unit</b>. The weights never load: the model is <b>executed in place from flash</b>, memory-mapped, so all 283 KB of it costs zero bytes of RAM. There is <b>no WiFi, no cloud and no gateway</b> in the loop — a board alone in a drawer can tell a tale. Every node gets its own protagonist, so id8 tells owl stories and its neighbour tells dragon ones.</p>
+  </div>
+
+  <div class="bard-grid reveal">
+    <div class="bard-stage">
+      <div class="bard-device">
+        <div class="bard-bezel"><div class="bard-screen">
+          <div class="bard-lines" id="bardLines"></div>
+          <div class="scanlines"></div><div class="glassglare"></div>
+        </div></div>
+        <div class="bard-plate">
+          <span>72×40 · SSD1306</span><span class="bard-quill">✒ composing</span>
+        </div>
+      </div>
+      <p class="bard-hint">Typing at the board's real pace — <b>202 ms per token</b>, measured on
+        glass. Word-wrap and scroll are what the firmware actually does with 40 pixels of height.</p>
+    </div>
+
+    <div class="bard-story">
+      <span class="kicker">Verified, not asserted</span>
+      <h3>It really is a transformer, and we can prove it.</h3>
+      <p>The interesting risk in a port like this is not that it crashes — it's that it runs
+        beautifully and produces subtly wrong arithmetic. So the forward pass was pinned against
+        <b>two independent implementations</b>: an int8-exact reference mirroring the accumulation
+        order, and a from-scratch fp32 one written during review. It agrees
+        <b>token-for-token, 146 of 146 ids, full text</b>. The obvious reference — upstream
+        <code>runq.c</code> — was <b>disqualified</b>: it silently drops in-dimension elements
+        128..171 of every <code>w2</code> row when the row length isn't a multiple of the group
+        size. The golden gate is therefore cross-<i>implementation</i>, not cross-port.</p>
+      <div class="bard-nums">
+        <div><b>260K</b><span>parameters, int8</span></div>
+        <div><b>283,096 B</b><span>blob, XIP from flash — 0 B of RAM</span></div>
+        <div><b>202 ms</b><span>per token on glass (274 max)</span></div>
+        <div><b>24,136 B</b><span>heap still free of 96 KiB, after</span></div>
+      </div>
+      <p class="bard-status"><b>🟢 On glass</b> — a 67-token story on the bench board, then a
+        canary soak that survived a hard power-cycle from the inactive OTA slot. Set
+        <code>Bard:0</code> from Home Assistant and a node boots straight into composing.
+        <b>Honest edge:</b> verified on the bench + canary (id8); the fleet-wide roll rides the
+        next release train. · <a href="https://github.com/jphein/smol/issues/300" target="_blank">issue #300 ↗</a>
+        · <a href="https://github.com/jphein/smol/pull/301" target="_blank">PR #301 ↗</a></p>
+      <p class="bard-note" data-edit="bard.note">The story on the left is not mock-up text. It is
+        the actual deterministic output of the model blob committed to this repo — regenerate it
+        yourself with <code>tools/bard_reference.py</code> and you will get the same owl, the same
+        Jack, the same toys.</p>
+    </div>
+  </div>
+</div></section>
+
 <!-- GAMES -->
 <section id="games"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">02 — Games</span>
+    <span class="kicker">03 — Games</span>
     <h2>A game console you can lose in your pocket.</h2>
     <p class="games-intro" data-edit="games.intro">smol is one <b>no_std</b> Rust binary with a BOOT-button menu — a fistful of games sharing the glass with a clock and live telemetry. The headline act is mesh multiplayer: a shared world every board roams at once, over an ESP-NOW mesh, no server in sight. The Block Digger up top is running its actual render logic in your browser — that's the kind of thing that fits.</p>
   </div>
@@ -544,7 +678,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- APPS / MODES GALLERY -->
 <section id="builds"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">03 — Apps</span>
+    <span class="kicker">04 — Apps</span>
     <h2>Everything else it runs.</h2>
     <p data-edit="apps.intro">The games live in their own section now — this is everything else smol runs, all folded into the same one-binary BOOT-button menu. The ESP-NOW mesh carries the time (boards agree on the clock — newest NTP sync wins) and gives every board a magical realm name; a live benchmark watches the link; and an MQTT-native Home Assistant bridge mirrors battery, state-of-charge and grid readings on the glass. Each card links to its source.</p>
   </div>
@@ -587,7 +721,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- MISSION CONTROL -->
 <section id="mission"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">04 — Mission Control</span>
+    <span class="kicker">05 — Mission Control</span>
     <h2>Live build status.</h2>
     <p data-edit="mission.intro">This board updates itself. Tasks and the agents working them are tracked in real time as smol comes together — flashing firmware, wrangling git, freeing disk, and more.</p>
   </div>
@@ -608,7 +742,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- ROADMAP -->
 <section id="roadmap" class="road"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">05 — Roadmap</span>
+    <span class="kicker">06 — Roadmap</span>
     <h2>Where smol goes next.</h2>
     <p class="body" data-edit="roadmap.intro">Ideas we're kicking around. Edit this list as the project grows — it's your design doc.</p>
   </div>
@@ -647,7 +781,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- RESEARCH -->
 <section id="research"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">06 — Research</span>
+    <span class="kicker">07 — Research</span>
     <h2>What the agents found.</h2>
     <p data-edit="research.intro">Six agents scouted the ESP32-C3 landscape while smol came together. The full reports live in the repo — here's the map.</p>
   </div>
@@ -668,7 +802,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- BUILT FOR THIS BOARD -->
 <section id="board" class="road"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">07 — Built for this board</span>
+    <span class="kicker">08 — Built for this board</span>
     <h2>You're not alone.</h2>
     <p class="body" data-edit="board.intro">Projects that run on this exact ESP32-C3 + 0.42″ OLED (72×40). A couple need their art re-drawn for the tiny screen — noted inline.</p>
   </div>
@@ -696,7 +830,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- INFLUENCES / PRIOR ART -->
 <section id="influences" class="road"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">08 — Influences</span>
+    <span class="kicker">09 — Influences</span>
     <h2>Standing on shoulders.</h2>
     <p class="body" data-edit="influences.intro">smol didn't appear from nowhere. Its ESP-NOW → MQTT → Home Assistant plumbing is <b>commodity</b> — a well-trodden pattern many have built. What's actually novel is the <b>whole</b>: a no_std Rust game-console mesh on $3 boards, a deliberate single-radio burst time-share, and a retained-payload → mesh-rebroadcast downlink to display-only leaves. Below are the projects that shaped it, grouped by the thread each runs in — credited honestly, with what smol borrows and where it diverges. A few handed over portable ideas; most gave lineage, identity and nerve rather than code.</p>
   </div>
@@ -740,7 +874,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- POCKET WATCH -->
 <section id="pocketwatch"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">09 — Pocket Watch</span>
+    <span class="kicker">10 — Pocket Watch</span>
     <h2>We designed smol a pocket watch.</h2>
     <p data-edit="pw.intro">No printable pocket-watch case existed for this board, so an agent generated one from scratch — a parametric round shell in the classic orientation: the chain bail and a removable crown-style USB-C cover stack at the top, with the OLED window, BOOT/RESET plunger bores and two clear-PLA LED light-pipes below. Inside: pockets for the board + a 502030 LiPo, a TP4056 charge slot, and a press-fit back lid. Three printable parts — body, lid, crown — and the OLED is rotated 180° in firmware so it reads upright when hung. These are live renders of the actual STL.</p>
   </div>
@@ -768,7 +902,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- PRINT A CASE -->
 <section id="case" class="road"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">10 — Print a case</span>
+    <span class="kicker">11 — Print a case</span>
     <h2>Give smol a shell.</h2>
     <p class="body" data-edit="case.intro">Exact-fit 3D-printable cases for the 0.42″ OLED SuperMini. No dedicated handheld shell exists yet — so for a pocket player, start from an editable one and add a button perch at GPIO9. Board is ~24.8×20.45 mm, USB-C on the short edge opposite the OLED. Full ranked list in <a href="https://github.com/jphein/smol/blob/main/docs/cases.md" target="_blank" style="color:var(--glow)">docs/cases.md</a>.</p>
   </div>
@@ -780,6 +914,47 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
     <li><b>GRABCAD · EDITABLE CAD</b><a href="https://grabcad.com/library/esp32-c3-42-oled-case-1" target="_blank">Source CAD — the best base to widen the window + add a button for a handheld. ↗</a></li>
     <li><b>JCVG · PARAMETRIC (bare)</b><a href="https://github.com/jeroenvangrondelle/esp32-super-mini-case" target="_blank">OpenSCAD parametric SuperMini case — regenerate with an OLED window + button. ↗</a></li>
   </ul>
+</div></section>
+
+<!-- SHARE -->
+<section id="share" class="road"><div class="wrap">
+  <div class="sec-head reveal" style="max-width:60ch">
+    <span class="kicker">◇ Spread the word</span>
+    <h2>Tell someone a $3 chip wrote a story.</h2>
+    <p data-edit="share.intro">smol is a hobby fleet, not a product — there is nothing to buy here and nothing to sign up for. If it made you want to solder something, that's the whole payoff. Send it on.</p>
+  </div>
+  <!-- Every href is pre-encoded at author time and hardcoded to the deployed Pages
+       URL. If that URL ever changes, these and the og:*/canonical meta in <head>
+       must ALL move together — see docs/DOC-UPKEEP.md. -->
+  <div class="share reveal">
+    <a href="https://news.ycombinator.com/submitlink?u=https%3A%2F%2Fjphein.github.io%2Fsmol%2F&amp;t=Show%20HN%3A%20A%20%243%20ESP32-C3%20that%20writes%20you%20a%20story%20%28260K-param%20transformer%2C%20no_std%20Rust%29"
+       target="_blank" rel="noopener" aria-label="Submit smol to Hacker News">
+      <!-- fill-rule=evenodd, else the Y winds the same way as the square and the
+           whole mark fills solid (the bug in the version this was adapted from) -->
+      <svg viewBox="0 0 24 24" fill-rule="evenodd" aria-hidden="true"><path d="M3 3h18v18H3V3zm8.2 10.4L7.4 6.8h1.9l2.7 4.9 2.7-4.9h1.9l-3.8 6.6v4.6h-1.6v-4.6z"/></svg>
+      Hacker News</a>
+    <a href="https://www.reddit.com/submit?url=https%3A%2F%2Fjphein.github.io%2Fsmol%2F&amp;title=A%20%243%20chip%20that%20writes%20you%20a%20story%20%E2%80%94%20a%20real%20260K-param%20transformer%20on%20an%20ESP32-C3%2C%20inside%20a%20mesh%20that%20updates%20itself%20over%20the%20air"
+       target="_blank" rel="noopener" aria-label="Post smol to Reddit">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 4l1 3.6c1.6.1 3.1.6 4.2 1.4a2 2 0 112.2 3.3c.1.4.1.7.1 1.1 0 3.4-4 6.1-9 6.1s-9-2.7-9-6.1c0-.4 0-.7.1-1.1a2 2 0 112.2-3.3c1.2-.9 2.9-1.4 4.7-1.5l1.2-4.4 3.3.9zM9 12.8a1.3 1.3 0 100 2.6 1.3 1.3 0 000-2.6zm6 0a1.3 1.3 0 100 2.6 1.3 1.3 0 000-2.6zm-6.3 4.5c.9.7 2 1 3.3 1s2.4-.3 3.3-1l.7.8c-1.1.9-2.5 1.3-4 1.3s-2.9-.4-4-1.3l.7-.8z"/></svg>
+      Reddit</a>
+    <a href="https://twitter.com/intent/tweet?url=https%3A%2F%2Fjphein.github.io%2Fsmol%2F&amp;text=A%20%243%20ESP32-C3%20writing%20children%27s%20stories%20on%20a%2072%C3%9740%20OLED%20%E2%80%94%20a%20real%20260K-param%20transformer%2C%20no%20WiFi%2C%20no%20cloud.%20Plus%20a%20self-updating%20ESP-NOW%20mesh%20and%20a%20creature%20that%20hops%20between%20boards."
+       target="_blank" rel="noopener" aria-label="Share smol on X">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.9 2H22l-6.8 7.8L23.3 22h-6.3l-4.9-6.4L6.4 22H3.3l7.3-8.3L1 2h6.5l4.4 5.9L18.9 2zm-1.1 18h1.7L7.4 3.8H5.6L17.8 20z"/></svg>
+      X</a>
+    <a href="https://www.facebook.com/sharer/sharer.php?u=https%3A%2F%2Fjphein.github.io%2Fsmol%2F"
+       target="_blank" rel="noopener" aria-label="Share smol on Facebook">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13.4 21v-8.2h2.7l.4-3.2h-3.1V7.6c0-.9.3-1.6 1.6-1.6h1.7V3.2c-.3 0-1.3-.2-2.5-.2-2.5 0-4.2 1.5-4.2 4.3v2.3H7.3v3.2H10V21h3.4z"/></svg>
+      Facebook</a>
+    <a href="https://hackaday.com/submit-a-tip/" target="_blank" rel="noopener"
+       aria-label="Send smol to the Hackaday tip line">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21.7 6.3l-3.1 3.1-3-.5-.5-3 3.1-3.1a5 5 0 00-6.5 6.5L4 17l-1 4 4-1 7.7-7.7a5 5 0 006.5-6.5l.5.5z"/></svg>
+      Tip Hackaday</a>
+    <button id="native-share" aria-label="Share smol with your apps — Instagram, WhatsApp and friends">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 16a3 3 0 00-2.2 1L8.9 13a3 3 0 000-2l6.9-4a3 3 0 10-1-1.7L7.9 9.2a3 3 0 100 5.6l6.9 3.9A3 3 0 1018 16z"/></svg>
+      <span id="native-share-label">Share… (Instagram &amp; more)</span></button>
+  </div>
+  <p class="share-sub">On a phone, <em>Share…</em> opens your native share sheet — Instagram,
+    WhatsApp, Messenger and friends live in there. On a desktop it copies the link instead.</p>
 </div></section>
 
 <footer class="wrap">

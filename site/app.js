@@ -238,6 +238,112 @@
     requestAnimationFrame(loop);
   }
 
+  /* ============================== the bard (02) ==============================
+     Types a REAL story onto a simulated 72×40 OLED — word-wrapped and scrolled
+     the way the firmware does it, at the board's measured pace.
+
+     STORY is verbatim the deterministic (temp 0) output of the model blob
+     committed at rust/clock/model/stories260K-q8.bin. Do NOT hand-edit it into
+     something nicer — that would make the page a mock-up, which is the one thing
+     this section claims it isn't. To change it, re-run:
+       python3 tools/bard_reference.py rust/clock/model/stories260K-q8.bin \
+         --temp 0 --steps 52 -i "Once upon a time, there was a little owl"
+     and paste the output.                                                     */
+  const BARD = {
+    STORY: 'Once upon a time, there was a little owl named Jack. Jack loved to ' +
+           'play with his toys. One day, Jack saw a big box in the ground.',
+    COLS: 15,   // characters per line at 72 px wide — what the glass actually holds
+    ROWS: 5,    // lines at 40 px tall
+    // 202 ms/token measured on glass (#300 T13); this vocab averages ~3.5 chars
+    // per token, so ~58 ms/char reproduces the real cadence.
+    MS_PER_CHAR: 58,
+    HOLD_MS: 3400,
+  };
+
+  function bardTypewriter() {
+    const box = $('#bardLines');
+    if (!box) return;
+    // Pre-wrap once: greedy word-wrap to COLS, exactly like the firmware's renderer.
+    const lines = [];
+    let cur = '';
+    for (const word of BARD.STORY.split(' ')) {
+      if (!cur.length) cur = word;
+      else if (cur.length + 1 + word.length <= BARD.COLS) cur += ' ' + word;
+      else { lines.push(cur); cur = word; }
+    }
+    if (cur.length) lines.push(cur);
+
+    // Flatten to a cursor over (line, col) so typing can scroll mid-word.
+    const total = lines.reduce((n, l) => n + l.length + 1, 0);
+    let at = 0, holding = 0;
+
+    // Build the glass once: a text node + a persistent caret element. No innerHTML
+    // on a per-frame path — nothing here needs markup, so nothing here parses any.
+    const txt = document.createTextNode('');
+    const caret = document.createElement('span');
+    caret.className = 'tok';
+    box.textContent = '';
+    box.append(txt, caret);
+
+    const render = () => {
+      const out = [];
+      let seen = 0;
+      for (const l of lines) {
+        if (seen >= at) break;
+        out.push(l.slice(0, Math.min(l.length, at - seen)));
+        seen += l.length + 1;
+      }
+      // scroll: keep only the last ROWS lines on the glass
+      txt.nodeValue = out.slice(Math.max(0, out.length - BARD.ROWS)).join('\n');
+    };
+
+    let last = 0;
+    const tick = ts => {
+      if (!last) last = ts;
+      if (holding) {
+        if (ts - holding > BARD.HOLD_MS) { at = 0; holding = 0; last = ts; render(); }
+      } else if (ts - last >= BARD.MS_PER_CHAR) {
+        last = ts;
+        at += 1;
+        render();
+        if (at >= total) holding = ts;
+      }
+      requestAnimationFrame(tick);
+    };
+    render();
+    requestAnimationFrame(tick);
+  }
+
+  /* ================================ share ================================
+     One button, always visible: navigator.share where it exists, clipboard-copy
+     as the desktop fallback. (Hiding it unless navigator.share exists means every
+     desktop visitor sees nothing — the fallback is strictly better.) SHARE_URL is
+     the deployed Pages URL and must stay in step with the canonical + og:url meta. */
+  const SHARE_URL = 'https://jphein.github.io/smol/';
+  const SHARE_TEXT = "A $3 ESP32-C3 writing children's stories on a 72×40 OLED — a real " +
+    '260K-param transformer, no WiFi, no cloud. Plus a self-updating ESP-NOW mesh and a ' +
+    'creature that hops between boards.';
+
+  function initShare() {
+    const btn = $('#native-share'), lbl = $('#native-share-label');
+    if (!btn || !lbl) return;
+    const restore = lbl.textContent;
+    btn.addEventListener('click', () => {
+      if (navigator.share) {
+        navigator.share({ title: 'smol', text: SHARE_TEXT, url: SHARE_URL }).catch(() => {});
+        return;
+      }
+      const done = ok => {
+        lbl.textContent = ok ? 'Link copied ✓' : 'Copy failed — the URL is in the address bar';
+        setTimeout(() => { lbl.textContent = restore; }, 2200);
+      };
+      // clipboard needs a secure context; degrade to a message rather than silence
+      if (navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(SHARE_URL).then(() => done(true), () => done(false));
+      } else done(false);
+    });
+  }
+
   /* ================================ boot ================================ */
   // On the published (GitHub Pages) copy or a file:// open there is no server
   // to POST edits to, so hide the editor dock and run read-only. Editing works
@@ -247,6 +353,8 @@
     const dock = $('.dock'); if (dock) dock.style.display = 'none';
   }
   loadContent();
+  bardTypewriter();
+  initShare();
   poll(); setInterval(poll, 4000);
   clock(); setInterval(clock, 15000);
   genWorld(); requestAnimationFrame(loop);

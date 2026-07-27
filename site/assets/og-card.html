@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>smol — Open Graph card source (1200×630)</title>
+<!--
+  SOURCE for assets/og-card.png. Not linked from the site; kept in-tree so the card
+  is regenerable instead of a mystery binary (the sister-project practice: author the
+  card, rasterise it, point og:image at the raster — crawlers do not accept SVG).
+
+  Regenerate (from the repo root):
+    google-chrome --headless --disable-gpu --hide-scrollbars \
+      --window-size=1200,630 --screenshot=site/assets/og-card.png \
+      --default-background-color=00000000 site/assets/og-card.html
+
+  Then confirm it is still exactly 1200x630 — the og:image:width/height meta in
+  index.html declares those numbers and a mismatch is a silently-bad share preview:
+    python3 -c "from PIL import Image; print(Image.open('site/assets/og-card.png').size)"
+
+  The story text is REAL: the deterministic (temp 0) output of the committed model
+  blob rust/clock/model/stories260K-q8.bin, reproducible with
+    python3 tools/bard_reference.py rust/clock/model/stories260K-q8.bin \
+      --temp 0 --steps 52 -i "Once upon a time, there was a little owl"
+  Do not paraphrase it — if the blob changes, re-run the command and paste the output.
+-->
+<link rel="stylesheet" href="../fonts/fonts.css">
+<style>
+  *{box-sizing:border-box;margin:0}
+  html,body{width:1200px;height:630px;overflow:hidden}
+  body{
+    background:#070b0c; color:#e4f3f4; font-family:"Sora",system-ui,sans-serif; font-weight:300;
+    background-image:
+      radial-gradient(900px 500px at 78% -12%, rgba(125,249,255,.16), transparent 60%),
+      radial-gradient(700px 600px at 2% 112%, rgba(255,180,84,.10), transparent 55%),
+      radial-gradient(circle at center, rgba(125,249,255,.07) 1px, transparent 1.5px);
+    background-size:auto,auto,26px 26px;
+    display:grid; grid-template-columns:1fr 470px; align-items:center; gap:44px;
+    padding:0 62px;
+  }
+  .kicker{font-family:"JetBrains Mono",monospace;font-size:15px;letter-spacing:.26em;
+    text-transform:uppercase;color:#7df9ff;font-weight:500}
+  .brand{font-family:"Silkscreen",monospace;font-size:88px;line-height:1;margin:20px 0 6px;
+    letter-spacing:.01em;display:flex;align-items:flex-end;gap:.1em}
+  /* the site's brand cursor, drawn rather than typed: Silkscreen has no ▚ (U+259A)
+     and the fallback glyph rasterises at full em-box height. */
+  .brand .cursor{width:.42em;height:.72em;background:#7df9ff;
+    box-shadow:0 0 26px rgba(125,249,255,.65)}
+  h1{font-family:"Sora",sans-serif;font-weight:600;font-size:47px;line-height:1.12;
+    letter-spacing:-.015em;margin:10px 0 16px}
+  h1 em{font-style:normal;color:#7df9ff;text-shadow:0 0 22px rgba(125,249,255,.35)}
+  .sub{font-size:20px;line-height:1.45;color:#9db3b7;max-width:31ch}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+  .chip{font-family:"JetBrains Mono",monospace;font-size:13px;letter-spacing:.04em;
+    padding:7px 12px;border:1px solid rgba(125,249,255,.22);border-radius:999px;
+    color:#bfe9ec;background:rgba(13,23,25,.75)}
+  .chip.amber{border-color:rgba(255,180,84,.34);color:#ffcf8a}
+
+  /* the board: a 72x40 OLED, scaled up, with its bezel */
+  .board{background:#0d1719;border:1px solid rgba(125,249,255,.22);border-radius:16px;
+    padding:20px;box-shadow:0 24px 70px rgba(0,0,0,.6), 0 0 0 1px rgba(125,249,255,.05) inset}
+  .oled{background:#04090a;border-radius:5px;padding:16px 15px;
+    box-shadow:0 0 44px rgba(125,249,255,.20) inset, 0 0 20px rgba(125,249,255,.12)}
+  .oled p{font-family:"JetBrains Mono",monospace;font-weight:500;font-size:23px;line-height:1.38;
+    color:#7df9ff;text-shadow:0 0 11px rgba(125,249,255,.55);letter-spacing:-.01em}
+  .caret{display:inline-block;width:.55em;height:1.02em;background:#7df9ff;
+    vertical-align:-.16em;margin-left:.1em;box-shadow:0 0 12px rgba(125,249,255,.8)}
+  .plate{display:flex;justify-content:space-between;align-items:baseline;margin-top:16px;
+    font-family:"JetBrains Mono",monospace;font-size:13px;color:#6f888c;letter-spacing:.05em}
+  .plate b{color:#ffb454;font-weight:500}
+</style>
+</head>
+<body>
+
+<div>
+  <div class="kicker">$3 ESP32-C3 · 72×40 OLED · no_std Rust</div>
+  <div class="brand">smol<span class="cursor"></span></div>
+  <h1>A whole game console on your fingertip — that <em>writes you a story</em>.</h1>
+  <p class="sub">A real 260K-parameter transformer, composing on the chip. No WiFi, no
+    cloud. A board alone in a drawer can tell a tale.</p>
+  <div class="chips">
+    <span class="chip">ESP-NOW mesh</span>
+    <span class="chip amber">a creature that hops boards</span>
+    <span class="chip">signed OTA over the mesh</span>
+    <span class="chip">shared-world MMO</span>
+  </div>
+</div>
+
+<div class="board">
+  <div class="oled">
+    <p>Once upon a time, there was a little owl named Jack. Jack loved to play with his
+      toys.<span class="caret"></span></p>
+  </div>
+  <div class="plate"><span>THE BARD · on-device LLM</span><span><b>202 ms</b>/token</span></div>
+</div>
+
+</body>
+</html>
