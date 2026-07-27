@@ -3555,8 +3555,8 @@ fn mqtt_session(
                 let mut sjson = MqttScratch::new();
                 let _ = write!(
                     sjson,
-                    "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":false,\"title\":\"smol v{}\"}}",
-                    installed, latest, latest
+                    "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":false,\"title\":\"v{} {}\"}}",
+                    installed, latest, latest, crate::net::names::version_name_for(latest as u32).1
                 );
                 let mut stopic = MqttScratch::new();
                 let _ = write!(stopic, "smol/{}/ota/state", lid);

@@ -79,6 +79,11 @@ repro_cargo_args() {
 repro_build_bin() {
   local clock="$1" out="$2" hash="$3" number="$4" node_id="${5:-}"
   local espflash="${ESPFLASH:-$HOME/.cargo/bin/espflash}"
+  # #218: no explicit number ⇒ use the COMMITTED ratchet (version.txt), NOT git-count.
+  # The caller sets SMOL_RELEASE=1 for a real release (clean `vN Word` stamp); otherwise
+  # build.rs marks it dev (`vN+dev.<hash> Word`) so a canary can't masquerade as the release.
+  [ -n "$number" ] || number="$(tr -d '[:space:]' < "$clock/version.txt" 2>/dev/null)"
+  [ -n "$number" ] || number=0
   repro_cargo_args "$clock" || return 1   # resolve the sysroot with the crate's pinned toolchain
   # #44: pin the esp-bootloader-esp-idf app-descriptor build time. Its build.rs fills the
   # esp_app_desc time/date from `Timestamp::now()` (wall clock) UNLESS SOURCE_DATE_EPOCH is
