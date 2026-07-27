@@ -8,7 +8,10 @@
 use clock::persona::{prompt, protagonist, PROTAGONISTS};
 use clock::textflow::wrap_tail;
 use clock::tokenizer::Tokenizer;
-use clock::nano_llm::{Bufs, Model, ParseErr, Session, StepOut, Story, SEQ_CAP};
+use clock::nano_llm::{
+    cache_slot, live_slots, Bufs, Model, ParseErr, Session, StepOut, Story, KEEP, POS_MAX, SEQ_CAP,
+    WINDOW,
+};
 
 pub const BLOB: &[u8] = include_bytes!("../model/stories260K-q8.bin");
 
@@ -156,6 +159,65 @@ fn forward_is_deterministic_and_finite() {
     let spread = logits1.iter().cloned().fold(f32::MIN, f32::max)
         - logits1.iter().cloned().fold(f32::MAX, f32::min);
     assert!(spread > 1.0, "logits look degenerate: spread={spread}");
+}
+
+// ── #302 KV ring buffer: the arithmetic that lets a story continue ──────────────────────
+//
+// This is where the bugs would be, and it is pure — so it is tested exhaustively rather than
+// sampled. Everything below holds for ANY (SEQ_CAP, KEEP) pair, so it keeps holding if the
+// Embassy re-platform (#198) grows the window.
+
+#[test]
+fn cache_slot_is_the_identity_until_the_ring_fills() {
+    // The golden token stream depends on this: a first chapter must write slots 0, 1, 2 … in
+    // order, exactly as the pre-#302 flat cache did.
+    for pos in 0..SEQ_CAP {
+        assert_eq!(cache_slot(pos), pos, "pos {pos} should still be its own slot");
+        assert_eq!(live_slots(pos), pos + 1, "attention should widen by one per token");
+    }
+    // And then the live set stops growing — every slot holds a token of the sliding window.
+    for pos in SEQ_CAP..SEQ_CAP * 4 {
+        assert_eq!(live_slots(pos), SEQ_CAP);
+    }
+}
+
+#[test]
+fn cache_slot_keeps_the_last_window_of_positions_addressable() {
+    // THE load-bearing invariant: at any position, the SEQ_CAP most recent positions must live in
+    // SEQ_CAP DISTINCT slots. If two of them ever collided, attention would read one key twice
+    // and silently lose the other — a corruption that looks like bad prose, not like a crash.
+    for pos in 0..SEQ_CAP * 5 {
+        let live = live_slots(pos);
+        let mut seen = [false; SEQ_CAP];
+        for back in 0..live {
+            let s = cache_slot(pos - back);
+            assert!(s < SEQ_CAP, "slot {s} out of the cache at pos {pos}");
+            assert!(!seen[s], "pos {} and {} collide in slot {s}", pos - back, pos);
+            seen[s] = true;
+        }
+        // Every slot accounted for once the ring is full: no dead slot, no wasted RAM.
+        assert_eq!(seen.iter().filter(|&&v| v).count(), live);
+    }
+}
+
+#[test]
+fn cache_slot_evicts_the_oldest_and_only_the_oldest() {
+    // Writing `pos` must land on the slot holding `pos - WINDOW` (the oldest evictable token) and
+    // on nothing else — that is what makes the window slide by exactly one.
+    for pos in SEQ_CAP..SEQ_CAP * 4 {
+        assert_eq!(
+            cache_slot(pos),
+            cache_slot(pos - WINDOW),
+            "pos {pos} should reuse the slot of pos {}",
+            pos - WINDOW
+        );
+        // The pinned prefix (KEEP) is never a write target once the ring is turning.
+        assert!(cache_slot(pos) >= KEEP, "pos {pos} overwrote a pinned sink slot");
+    }
+    // Nothing addressable is outside the cache, all the way to the cursor's limit.
+    for pos in [POS_MAX - 1, POS_MAX] {
+        assert!(cache_slot(pos) < SEQ_CAP);
+    }
 }
 
 /// The prompt the golden baseline was generated from (`tools/bard_golden_baseline.sh`).
@@ -391,6 +453,169 @@ fn story_reports_how_it_ended() {
         story.step(&m, &t, &mut bufs),
         StepOut::Done { truncated: true }
     ));
+}
+
+// ── #302 continuation: one press keeps the SAME story going ─────────────────────────────
+
+/// Run the current chapter to its end, returning its text and how it ended.
+fn run_chapter(
+    m: &Model,
+    t: &Tokenizer,
+    bufs: &mut Bufs,
+    story: &mut Story,
+) -> (std::string::String, bool) {
+    let mut text = std::string::String::new();
+    let mut steps = 0u32;
+    loop {
+        match story.step(m, t, bufs) {
+            StepOut::Text(b) => text.push_str(&std::string::String::from_utf8_lossy(b)),
+            StepOut::Working => {}
+            StepOut::Done { truncated } => return (text, truncated),
+        }
+        steps += 1;
+        assert!(steps < 400, "chapter did not terminate");
+    }
+}
+
+#[test]
+fn story_continues_past_the_cache_depth() {
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+    let mut bufs = std::boxed::Box::new(Bufs::INIT);
+    let mut story = Story::new(&t, GOLDEN_PROMPT, 2);
+
+    let (first, truncated) = run_chapter(&m, &t, &mut bufs, &mut story);
+    assert!(truncated, "chapter 1 should be cut, not EOS-ended");
+    assert!(story.is_done() && story.can_continue());
+    // The pre-#302 stopping point, unchanged: the cache depth is still where chapter 1 pauses.
+    assert_eq!(story.pos() as usize, SEQ_CAP - 1);
+
+    // Four more chapters — well past the point where the whole prompt has been evicted.
+    let mut all = first;
+    for ch in 2..=5 {
+        assert!(story.resume(), "chapter {ch} should be resumable");
+        assert!(!story.is_done(), "resume must clear the done flag");
+        let (text, _) = run_chapter(&m, &t, &mut bufs, &mut story);
+        assert!(!text.is_empty(), "chapter {ch} produced no text");
+        assert!(text.is_ascii(), "chapter {ch} is not ASCII: {text:?}");
+        all.push_str(&text);
+        if !story.can_continue() {
+            break; // the model chose to end it — a real ending, tested separately
+        }
+    }
+
+    // Positions ran past the cache, which is the whole point: the ring, not a second cache.
+    assert!(
+        story.pos() as usize > SEQ_CAP,
+        "story never left the first window: pos {}",
+        story.pos()
+    );
+    // A continued story is LONGER than a single chapter could ever be, and still prose: the
+    // failure mode to catch is a collapse into one repeated token, which would tank both.
+    assert!(all.len() > 300, "continued story is only {} chars", all.len());
+    let words: std::vec::Vec<&str> = all.split_whitespace().collect();
+    let uniq: std::collections::BTreeSet<&&str> = words.iter().collect();
+    assert!(
+        uniq.len() * 3 > words.len(),
+        "continuation collapsed into repetition: {} distinct of {} words\n{all}",
+        uniq.len(),
+        words.len()
+    );
+}
+
+#[test]
+fn continuation_is_seamless_and_reproducible() {
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+    let mut bufs = std::boxed::Box::new(Bufs::INIT);
+
+    // Nothing is re-fed across a chapter boundary, so the continued text must NOT repeat the
+    // tail of the previous chapter — the seam lands mid-word as often as not.
+    let tell = |bufs: &mut Bufs| {
+        let mut story = Story::new(&t, GOLDEN_PROMPT, 7);
+        let (a, _) = run_chapter(&m, &t, bufs, &mut story);
+        assert!(story.resume());
+        let (b, _) = run_chapter(&m, &t, bufs, &mut story);
+        (a, b)
+    };
+    let (a, b) = tell(&mut bufs);
+    let tail: std::string::String = a.chars().rev().take(12).collect::<std::string::String>()
+        .chars().rev().collect();
+    assert!(
+        !b.starts_with(&tail),
+        "chapter 2 replayed the tail of chapter 1 — a token was fed twice"
+    );
+
+    // And the whole continued story is still a pure function of its seed, even after another
+    // story has scribbled over the shared KV cache (the `Bufs` ownership contract).
+    let mut other = Story::new(&t, GOLDEN_PROMPT, 99);
+    run_chapter(&m, &t, &mut bufs, &mut other);
+    let (a2, b2) = tell(&mut bufs);
+    assert_eq!((a, b), (a2, b2), "a continued story is not reproducible from its seed");
+}
+
+#[test]
+fn a_story_the_model_ended_is_not_continuable() {
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+    let mut bufs = std::boxed::Box::new(Bufs::INIT);
+
+    // EOS is ~5% of chapter endings (T8), so hunt for one by continuing seeds — with chapters
+    // available, a natural ending shows up quickly.
+    let mut found = false;
+    'seeds: for seed in 1..=8u32 {
+        let mut story = Story::new(&t, GOLDEN_PROMPT, seed);
+        for _ in 0..8 {
+            let (_, truncated) = run_chapter(&m, &t, &mut bufs, &mut story);
+            if !truncated {
+                // The model said the story is over: no continuing, and `resume` must refuse
+                // rather than quietly restart mid-breath.
+                assert!(!story.can_continue(), "seed {seed} ended on EOS but claims continuable");
+                assert!(!story.resume(), "resume must refuse an EOS-ended story");
+                assert!(story.is_done(), "a refused resume must leave the story done");
+                assert!(matches!(
+                    story.step(&m, &t, &mut bufs),
+                    StepOut::Done { truncated: false }
+                ));
+                found = true;
+                break 'seeds;
+            }
+            assert!(story.resume());
+        }
+    }
+    assert!(found, "no seed ended on end-of-text in 8 seeds x 8 chapters — EOS path untested");
+}
+
+#[test]
+fn chapters_are_bounded_and_the_cursor_is_never_exhausted() {
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+    let mut bufs = std::boxed::Box::new(Bufs::INIT);
+    let mut story = Story::new(&t, GOLDEN_PROMPT, 3);
+
+    // Every chapter must be bounded by CHAPTER_TOKENS — an unbounded chapter would hold the UI
+    // (and, on the board, the mesh's tick) for as long as the model felt like talking.
+    let mut prev = story.pos();
+    for _ in 0..12 {
+        run_chapter(&m, &t, &mut bufs, &mut story);
+        let grown = story.pos() - prev;
+        assert!(
+            grown <= Story::CHAPTER_TOKENS,
+            "a chapter generated {grown} tokens, over the {} budget",
+            Story::CHAPTER_TOKENS
+        );
+        prev = story.pos();
+        if !story.resume() {
+            break;
+        }
+    }
+    // The far end of the cursor: a story parked near POS_MAX must refuse to continue instead of
+    // wrapping `pos` (which would feed every later token into one slot forever).
+    assert!(POS_MAX < u16::MAX as usize, "POS_MAX must leave the u16 cursor room");
+    assert!(
+        POS_MAX + Story::CHAPTER_TOKENS as usize <= u16::MAX as usize,
+        "a final chapter must not be able to overflow the cursor"
+    );
 }
 
 #[test]
