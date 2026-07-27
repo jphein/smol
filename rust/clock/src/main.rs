@@ -1587,8 +1587,14 @@ fn main() -> ! {
             if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_TALE) {
                 let v = &o.buf[..o.len];
                 match unsafe { crate::bard::set_prompt(v) } {
-                    Ok(0) => log::info!("smol #303: story prompt CLEARED -> per-node default"),
-                    Ok(n) => log::info!(
+                    Ok(Some(0)) => log::info!("smol #303: story prompt CLEARED -> per-node default"),
+                    // The model is not built until the Bard screen is first opened, so a prompt that
+                    // arrives at boot is STAGED and vocabulary-checked at first use (logged there).
+                    Ok(None) => log::info!(
+                        "smol #303: story prompt staged ({} B) — vocabulary check at first story",
+                        v.len()
+                    ),
+                    Ok(Some(n)) => log::info!(
                         "smol #303: story prompt accepted ({} B -> {} tokens, {} left for the story)",
                         v.len(),
                         n,

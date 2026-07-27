@@ -63,6 +63,10 @@ static mut STORY: Option<Story> = None;
 static mut PROMPT: [u8; 64] = [0; 64];
 /// Bytes of [`PROMPT`] in use; 0 ⇒ no override.
 static mut PROMPT_LEN: usize = 0;
+/// Whether [`PROMPT`] has been through the vocabulary check. A prompt can arrive before the model
+/// is built (retained config lands on the first gateway burst; the model loads lazily on first
+/// screen entry), so an unchecked prompt is validated at first use instead of being thrown away.
+static mut PROMPT_CHECKED: bool = true;
 
 /// Offer a runtime story prompt (CFG `T`). Validated against the MODEL'S OWN vocabulary before
 /// it is stored, so a prompt that would derail generation is refused and the previous value
@@ -74,22 +78,38 @@ static mut PROMPT_LEN: usize = 0;
 /// # Safety
 /// As [`init_statics`] — single-threaded; called only from `main`'s config-apply path.
 #[cfg(any(feature = "espnow", feature = "hostsim"))]
-pub unsafe fn set_prompt(value: &[u8]) -> Result<usize, persona::PromptErr> {
+pub unsafe fn set_prompt(value: &[u8]) -> Result<Option<usize>, persona::PromptErr> {
     if value.is_empty() {
         core::ptr::addr_of_mut!(PROMPT_LEN).write(0);
-        return Ok(0);
+        core::ptr::addr_of_mut!(PROMPT_CHECKED).write(true);
+        return Ok(Some(0));
     }
-    // No tokenizer ⇒ the blob failed its checks and the screen is mute anyway. Refusing here
-    // keeps a mute node from silently accepting config it can never honour.
-    let Some(tok) = (*core::ptr::addr_of!(TOKENIZER)).as_ref() else {
+    // Cheap checks first — these need no model, so they give a straight answer even at boot.
+    if value.len() > PROMPT.len() {
+        return Err(persona::PromptErr::TooLong { got: value.len() });
+    }
+    if core::str::from_utf8(value).is_err() {
         return Err(persona::PromptErr::NotUtf8);
+    }
+    // The vocabulary check needs the tokenizer, and the config can arrive BEFORE the Bard screen
+    // has ever been opened (retained MQTT is delivered on the first gateway burst, while the
+    // model is built lazily on first entry — measured on id8: the prompt landed at boot). So
+    // when the model is not up yet, STAGE the bytes and let `begin_story` validate them once the
+    // tokenizer exists. Refusing here instead would drop a perfectly good prompt for good, since
+    // a retained value is only re-offered when it CHANGES.
+    let staged = match (*core::ptr::addr_of!(TOKENIZER)).as_ref() {
+        Some(tok) => {
+            // Model is up: validate BEFORE storing, so a refusal leaves the previous prompt intact.
+            Some(persona::validate_prompt(tok, value)?)
+        }
+        None => None,
     };
-    let n = persona::validate_prompt(tok, value)?;
     let buf = &mut *core::ptr::addr_of_mut!(PROMPT);
     let len = value.len().min(buf.len());
     buf[..len].copy_from_slice(&value[..len]);
     core::ptr::addr_of_mut!(PROMPT_LEN).write(len);
-    Ok(n)
+    core::ptr::addr_of_mut!(PROMPT_CHECKED).write(staged.is_some());
+    Ok(staged)
 }
 
 /// Build the statics from the flash blob. `false` ⇒ the blob failed its integrity or geometry
@@ -125,7 +145,21 @@ unsafe fn begin_story(node_id: u8, now_ms: u64) {
     // #303 the operator's prompt wins when set (it was validated at accept time); otherwise this
     // node's built-in persona. Read per story, not cached, so a CFG change takes effect on the
     // very next story with no reboot.
-    let over = core::ptr::addr_of!(PROMPT_LEN).read();
+    let mut over = core::ptr::addr_of!(PROMPT_LEN).read();
+    // A prompt staged before the model was up gets its vocabulary check HERE — the one place the
+    // tokenizer is guaranteed. Refused ⇒ drop it and fall back to the persona, saying why.
+    if over > 0 && !core::ptr::addr_of!(PROMPT_CHECKED).read() {
+        let src = &*core::ptr::addr_of!(PROMPT);
+        match persona::validate_prompt(tok, &src[..over]) {
+            Ok(n) => log::info!("smol #303: staged story prompt accepted ({} tokens)", n),
+            Err(e) => {
+                log::warn!("smol #303: staged story prompt REFUSED ({:?}) — using this node's default", e);
+                core::ptr::addr_of_mut!(PROMPT_LEN).write(0);
+                over = 0;
+            }
+        }
+        core::ptr::addr_of_mut!(PROMPT_CHECKED).write(true);
+    }
     let n = if over > 0 {
         let src = &*core::ptr::addr_of!(PROMPT);
         buf[..over].copy_from_slice(&src[..over]);
