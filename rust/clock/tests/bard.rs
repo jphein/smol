@@ -571,3 +571,95 @@ fn stack_paint_scanner_finds_the_high_water_mark() {
     assert_eq!(untouched_bytes(&region), 0);
     assert_eq!(untouched_bytes(&[]), 0);
 }
+
+// ── #303 runtime prompt validation ──────────────────────────────────────────────────────
+
+/// The built-in prompts must all pass the validator they gate operator input with — otherwise
+/// the firmware would reject its own defaults.
+#[test]
+fn builtin_prompts_pass_validation() {
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+    for id in 0u8..=255 {
+        let mut buf = [0u8; 64];
+        let n = clock::persona::prompt(id, &mut buf);
+        let got = clock::persona::validate_prompt(&t, &buf[..n]);
+        assert!(got.is_ok(), "node {id} default prompt rejected: {got:?}");
+        assert!(got.unwrap() <= clock::persona::PROMPT_TOKEN_BUDGET);
+    }
+}
+
+#[test]
+fn validation_accepts_plain_tinystories_prose() {
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+    for good in [
+        "Once upon a time, there was a little cat",
+        "One day, a small dog went to the park",
+        "The little bird was very happy",
+    ] {
+        let r = clock::persona::validate_prompt(&t, good.as_bytes());
+        assert!(r.is_ok(), "rejected good prompt {good:?}: {r:?}");
+    }
+}
+
+#[test]
+fn validation_rejects_the_four_failure_modes() {
+    use clock::persona::PromptErr;
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+
+    // 1. over the 64-byte buffer/CFG-value bound
+    let long = "a".repeat(65);
+    assert!(matches!(
+        clock::persona::validate_prompt(&t, long.as_bytes()),
+        Err(PromptErr::TooLong { got: 65 })
+    ));
+
+    // 2. not UTF-8 (a CFG payload is arbitrary wire bytes)
+    assert_eq!(
+        clock::persona::validate_prompt(&t, &[0xff, 0xfe]),
+        Err(PromptErr::NotUtf8)
+    );
+
+    // 3. an emoji has no token at all -> byte fallbacks -> refused, and it says WHERE
+    match clock::persona::validate_prompt(&t, "the cat 🐱 sat".as_bytes()) {
+        Err(PromptErr::UnrepresentableByte { at_byte }) => {
+            assert!(at_byte > 0, "position should locate the emoji, got {at_byte}")
+        }
+        other => panic!("emoji should be refused, got {other:?}"),
+    }
+
+    // 4. fits 64 bytes but spends too much of the shared window. Note WHICH text does this:
+    // ordinary prose is dense (~2.5 B/token, so 58 bytes is only ~23 tokens and passes), so the
+    // budget is reached by FRAGMENTATION — nonsense words encode ~1 token/char. That makes the
+    // budget an automatic backstop on hazard (2): mild fragmentation is accepted and reported,
+    // severe fragmentation refuses itself here.
+    let fragmenting = "Xyzzy Plugh Frobnitz Quux Zork Grue Blorb Vogon";
+    assert!(fragmenting.len() <= 64);
+    match clock::persona::validate_prompt(&t, fragmenting.as_bytes()) {
+        Err(PromptErr::TooManyTokens { got }) => {
+            assert!(got > clock::persona::PROMPT_TOKEN_BUDGET)
+        }
+        other => panic!("a window-hogging prompt should be refused, got {other:?}"),
+    }
+}
+
+/// The honest distinction that the doc comment claims: an ASCII realm name is REPRESENTABLE
+/// (single-char tokens exist) so it is ACCEPTED — but it fragments, and the token count is the
+/// signal. If a future vocabulary changes this, this test says so instead of the comment lying.
+#[test]
+fn ascii_realm_names_are_accepted_but_fragment() {
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+    let odd = "Once upon a time, there was Eldritch";
+    let n = clock::persona::validate_prompt(&t, odd.as_bytes())
+        .expect("ASCII is representable, so this must be accepted, not refused");
+    let plain = "Once upon a time, there was a little owl";
+    let n_plain = clock::persona::validate_prompt(&t, plain.as_bytes()).unwrap();
+    // Same byte-length ballpark, materially more tokens = the fragmentation the operator is warned about.
+    assert!(
+        n > n_plain,
+        "expected 'Eldritch' to fragment into more tokens ({n}) than plain prose ({n_plain})"
+    );
+}

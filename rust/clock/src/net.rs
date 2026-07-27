@@ -157,6 +157,10 @@ pub use wifi::CFG_KEY_REBOOT;
 // take_cfg_offer(Y); the held layout feeds the Custom plugin render).
 #[cfg(feature = "espnow")]
 pub use wifi::CFG_KEY_CUSTOM;
+// #303 Bard story-prompt key — same `main`-bridge rationale (espnow leaf-apply path via
+// take_cfg_offer(T); the apply hands it to bard::set_prompt, which validates it).
+#[cfg(all(feature = "espnow", feature = "bard"))]
+pub use wifi::CFG_KEY_TALE;
 // #100 network-switch key — same `main`-bridge rationale (espnow leaf-apply path via
 // take_cfg_offer(N); the apply writes the NVS net-record + reboots into the slot).
 #[cfg(feature = "espnow")]

@@ -194,7 +194,7 @@ const CFG_PREFIX: &[u8] = b"SMOLv1 CFG "; // + "NNN" + KEY + verbatim "<value>"
 /// (a `take_cfg_offer(key)` + apply) and a gateway fill site in `mqtt_session`. Sized `[_; N]`
 /// (not `&[u8]`) so [`CfgTracker`] can allocate exactly one `.bss` buffer slot per key.
 /// An inbound key not listed is dropped at [`CfgTracker::set`] (never buffered/applied).
-const CFG_APPLY_KEYS: [u8; 14] = [
+const CFG_APPLY_KEYS: [u8; 15] = [
     crate::net::wifi::CFG_KEY_SCREEN,
     crate::net::wifi::CFG_KEY_LED,
     crate::net::wifi::CFG_KEY_UNITS,
@@ -225,6 +225,12 @@ const CFG_APPLY_KEYS: [u8; 14] = [
     // take_cfg_offer(A) → sets debug_wifi_all). Fleet-global; the crown relays the retained value to
     // every leaf so a node can enable its own WiFi bursts without first reaching the broker.
     crate::net::wifi::CFG_KEY_WIFI_ALL,
+    // #303 Bard story prompt: T — cached + relayed like S/L/U/P/Y (a leaf takes it via
+    // take_cfg_offer(T) → bard::set_prompt, which VALIDATES against the model vocabulary and
+    // keeps the old prompt on refusal). Present UNCONDITIONALLY, same rationale as G/g above:
+    // one inert CfgTracker slot (~66 B .bss) beats splitting this array per-feature; the config
+    // PLUMBING (subscribe/fill/apply) is `bard`-gated so a non-bard build never feeds it.
+    crate::net::wifi::CFG_KEY_TALE,
 ];
 /// #50b leaf-status UPLINK tag: `"SMOLv1 STAT "` (12 B, trailing space) then `"NNN"`
 /// (3-ASCII zero-padded SENDER leaf id) then the verbatim live `<AppKind>:<page>` value
@@ -4902,6 +4908,11 @@ impl RadioManager {
         // #45: the gateway's OWN custom-screen layout — same self-apply path (take_cfg_offer(Y)).
         if let Some((buf, len)) = gw_own.custom {
             self.cfg.set(crate::net::wifi::CFG_KEY_CUSTOM, &buf[..len]);
+        }
+        // #303: the gateway's OWN story prompt — same self-apply path (take_cfg_offer(T)).
+        #[cfg(feature = "bard")]
+        if let Some((buf, len)) = gw_own.tale {
+            self.cfg.set(crate::net::wifi::CFG_KEY_TALE, &buf[..len]);
         }
         // #100: the gateway's OWN active-slot index — same self-apply path (take_cfg_offer(N)).
         if let Some((buf, len)) = gw_own.net {

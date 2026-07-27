@@ -1313,6 +1313,16 @@ pub const CFG_KEY_CUSTOM: u8 = b'Y';
 /// are published to `smol/<id>/scan`. Same cache-BYPASS + wifi-tier-family rationale as `R`.
 #[cfg(feature = "wifi")]
 #[allow(dead_code)]
+/// #303 Bard story-prompt channel (key `T`). Per-node retained `smol/<id>/config/tale` = the
+/// story OPENING the Bard continues, e.g. `"Once upon a time, there was a little owl"`. EMPTY
+/// payload = retain-clear ⇒ the node falls back to its built-in per-node persona prompt (same
+/// "empty = default" convention as `S`). The leaf VALIDATES against the model's own 512-token
+/// vocabulary before accepting and keeps the previous prompt on refusal, so a bad value can
+/// never derail generation — the interesting failure is silent (worse prose, screen looks
+/// fine), which is why validation lives on the node and not in the dashboard. Cached + relayed
+/// like S/L/U/P/Y, applied live (no reboot): the next story uses it.
+pub const CFG_KEY_TALE: u8 = b'T';
+
 pub const CFG_KEY_SCAN: u8 = b'W';
 /// #100 network-switch CONFIG (key `N`) = the active WiFi-slot index (`0`/`1`). RETAINED/CACHED
 /// STATE (relayed like S/L/U/P/Y, NOT a one-shot command like R/W) — a node applies it by writing
@@ -1410,6 +1420,10 @@ pub struct GwOwnCfg {
     pub units: Option<([u8; CFG_VALUE_MAX], usize)>,
     /// #55 the gateway's own `smol/<id>/config/plugins` value `(buf, len)`, or `None` if absent.
     pub plugins: Option<([u8; CFG_VALUE_MAX], usize)>,
+    /// #303 the gateway's own `smol/<id>/config/tale` story prompt `(buf, len)`, or `None`.
+    /// `bard`-gated like the `io` fields below: a build without the Bard carries no field.
+    #[cfg(feature = "bard")]
+    pub tale: Option<([u8; CFG_VALUE_MAX], usize)>,
     /// #45 the gateway's own `smol/<id>/config/custom` value `(buf, len)`, or `None` if absent.
     pub custom: Option<([u8; CFG_VALUE_MAX], usize)>,
     /// #100 the gateway's own `smol/<id>/config/net` (or global `smol/config/net`) active-slot
@@ -1446,6 +1460,8 @@ impl GwOwnCfg {
             broker: None,
             ota: None,
             wifi_all: None,
+            #[cfg(feature = "bard")]
+            tale: None,
             #[cfg(feature = "io")]
             io: None,
             #[cfg(feature = "io")]
@@ -2314,6 +2330,13 @@ fn mqtt_session(
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 15, b"smol/+/config/custom") {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
+        // #303 Bard story prompt (pid 28): wildcard-subscribe every leaf's retained story opening
+        // so the crown can relay it over ESP-NOW. `bard`-gated: a build without the Bard has the
+        // CfgTracker slot (see CFG_APPLY_KEYS) but never feeds it, so the slot stays inert.
+        #[cfg(feature = "bard")]
+        if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 28, b"smol/+/config/tale") {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
         // #100 network-switch (pid 16 per-node + pid 17 fleet-wide): the retained active-slot index.
         // CONFIG/CACHED (key `N`, relayed like S/L/U/P/Y). Per-node `smol/<id>/config/net` + the
         // global `smol/config/net` (→ target 255). Applying it writes the NVS net-record + reboots
@@ -2912,6 +2935,29 @@ fn mqtt_session(
                             gw_own.custom = Some(GwOwnCfg::val(payload));
                             log::info!("smol #45: gateway own custom screen captured ({} B)", payload.len());
                         }
+                    } else if let Some(leaf_id) = parse_leaf_config_topic(topic, b"/config/tale") {
+                        // #303 Bard story prompt: twin of the custom-screen arm. OTHER leaf → cache
+                        // under key `T` for the ESP-NOW relay; OUR OWN id → gw_own so `service()`
+                        // self-applies. The bytes are NOT validated here: validation needs the
+                        // model's tokenizer, which lives on the node that will use it, so the leaf
+                        // refuses a bad prompt itself (bard::set_prompt) and keeps its previous one.
+                        #[cfg(feature = "bard")]
+                        if leaf_id != node_id {
+                            if let Some(cache) = cfg_cache.as_deref_mut() {
+                                let now = Instant::now().duration_since_epoch().as_millis();
+                                cache.set(leaf_id, CFG_KEY_TALE, payload, [0u8; 6], now);
+                                log::info!(
+                                    "smol #303: cached leaf id{} story prompt for relay ({} B)",
+                                    leaf_id,
+                                    payload.len()
+                                );
+                            }
+                        } else {
+                            gw_own.tale = Some(GwOwnCfg::val(payload));
+                            log::info!("smol #303: gateway own story prompt captured ({} B)", payload.len());
+                        }
+                        #[cfg(not(feature = "bard"))]
+                        let _ = leaf_id;
                     } else if topic == b"smol/config/net" {
                         // #100 GLOBAL network-switch (no id) → cache under the broadcast target 255
                         // so ONE relayed `<255>N<slot>` frame reaches every leaf, + gw_own.net for the

@@ -1577,6 +1577,31 @@ fn main() -> ! {
             // RESOLVED wire (entities already substituted HA-side) for the Custom plugin to render.
             // Edge-triggered; an empty value clears it (→ placeholder). No parse here — the Custom
             // plugin parses the layout panic-free at render time.
+            // #303 Bard story prompt (key `T`): hand the operator's opening to the Bard, which
+            // VALIDATES it against the model's own 512-token vocabulary before storing it — a
+            // refusal keeps the previous prompt rather than derailing generation. Empty value =
+            // retain-clear ⇒ back to this node's built-in persona. Applied live: the next story
+            // uses it, no reboot. Logged with both token and byte counts because the interesting
+            // failure mode is silent (see persona::validate_prompt hazard 2 — fragmentation).
+            #[cfg(feature = "bard")]
+            if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_TALE) {
+                let v = &o.buf[..o.len];
+                match unsafe { crate::bard::set_prompt(v) } {
+                    Ok(0) => log::info!("smol #303: story prompt CLEARED -> per-node default"),
+                    Ok(n) => log::info!(
+                        "smol #303: story prompt accepted ({} B -> {} tokens, {} left for the story)",
+                        v.len(),
+                        n,
+                        crate::bard::nano_llm::SEQ_CAP.saturating_sub(n)
+                    ),
+                    Err(e) => log::warn!(
+                        "smol #303: story prompt REFUSED ({:?}) — keeping the previous prompt",
+                        e
+                    ),
+                }
+                diag_dirty = true;
+            }
+
             if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_CUSTOM) {
                 let n = o.len.min(custom_buf.len());
                 custom_buf[..n].copy_from_slice(&o.buf[..n]);

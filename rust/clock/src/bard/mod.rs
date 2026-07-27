@@ -56,6 +56,42 @@ static mut TOKENIZER: Option<Tokenizer<'static>> = None;
 /// The generator, including its 1 KB sampler scratch (~1.1 KB total).
 static mut STORY: Option<Story> = None;
 
+/// #303 the operator's story opening, set at runtime over CFG key `T` (no reflash). Empty ⇒ the
+/// node uses its built-in per-node persona prompt, so clearing the retained topic restores the
+/// default — the same "empty = board default" convention as the `S` screen key (#21).
+/// 64 B to match both the prompt buffer and `CFG_VALUE_MAX`; costs no flash (`.bss`).
+static mut PROMPT: [u8; 64] = [0; 64];
+/// Bytes of [`PROMPT`] in use; 0 ⇒ no override.
+static mut PROMPT_LEN: usize = 0;
+
+/// Offer a runtime story prompt (CFG `T`). Validated against the MODEL'S OWN vocabulary before
+/// it is stored, so a prompt that would derail generation is refused and the previous value
+/// kept — see `persona::validate_prompt` for the two hazards and which one is fatal.
+///
+/// An empty value CLEARS the override (back to the per-node default). Returns the accepted
+/// token count, or the reason it was refused, so the caller can log something actionable.
+///
+/// # Safety
+/// As [`init_statics`] — single-threaded; called only from `main`'s config-apply path.
+#[cfg(any(feature = "espnow", feature = "hostsim"))]
+pub unsafe fn set_prompt(value: &[u8]) -> Result<usize, persona::PromptErr> {
+    if value.is_empty() {
+        core::ptr::addr_of_mut!(PROMPT_LEN).write(0);
+        return Ok(0);
+    }
+    // No tokenizer ⇒ the blob failed its checks and the screen is mute anyway. Refusing here
+    // keeps a mute node from silently accepting config it can never honour.
+    let Some(tok) = (*core::ptr::addr_of!(TOKENIZER)).as_ref() else {
+        return Err(persona::PromptErr::NotUtf8);
+    };
+    let n = persona::validate_prompt(tok, value)?;
+    let buf = &mut *core::ptr::addr_of_mut!(PROMPT);
+    let len = value.len().min(buf.len());
+    buf[..len].copy_from_slice(&value[..len]);
+    core::ptr::addr_of_mut!(PROMPT_LEN).write(len);
+    Ok(n)
+}
+
 /// Build the statics from the flash blob. `false` ⇒ the blob failed its integrity or geometry
 /// checks and the screen must stay mute rather than render whatever the bytes happen to say.
 ///
@@ -86,7 +122,17 @@ unsafe fn begin_story(node_id: u8, now_ms: u64) {
         return;
     };
     let mut buf = [0u8; 64];
-    let n = persona::prompt(node_id, &mut buf);
+    // #303 the operator's prompt wins when set (it was validated at accept time); otherwise this
+    // node's built-in persona. Read per story, not cached, so a CFG change takes effect on the
+    // very next story with no reboot.
+    let over = core::ptr::addr_of!(PROMPT_LEN).read();
+    let n = if over > 0 {
+        let src = &*core::ptr::addr_of!(PROMPT);
+        buf[..over].copy_from_slice(&src[..over]);
+        over
+    } else {
+        persona::prompt(node_id, &mut buf)
+    };
     // The prompt is ASCII by construction (persona.rs), so this cannot fail; `unwrap_or` keeps
     // the screen panic-free even if that ever changes.
     let prompt = core::str::from_utf8(&buf[..n]).unwrap_or("Once upon a time");
