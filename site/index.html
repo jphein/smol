@@ -490,7 +490,8 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
         </div>
       </div>
       <p class="bard-hint">Typing at the board's real pace — <b>202 ms per token</b>, measured on
-        glass. Word-wrap and scroll are what the firmware actually does with 40 pixels of height.</p>
+        glass. About <b>five lines of fifteen characters</b> fit at once, so the screen is a
+        <b>window the story moves past</b> — not a container for the story.</p>
     </div>
 
     <div class="bard-story">
@@ -514,8 +515,11 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
         canary soak that survived a hard power-cycle from the inactive OTA slot. Set
         <code>Bard:0</code> from Home Assistant and a node boots straight into composing.
         <b>Honest edge:</b> verified on the bench + canary (id8); the fleet-wide roll rides the
-        next release train. · <a href="https://github.com/jphein/smol/issues/300" target="_blank">issue #300 ↗</a>
-        · <a href="https://github.com/jphein/smol/pull/301" target="_blank">PR #301 ↗</a></p>
+        next release train, and a rewrite that lets a tale run <i>without end</i> — plus
+        HA-settable pace and page-at-a-time delivery — is committed and host-tested but
+        <b>has not been on glass yet</b>. · <a href="https://github.com/jphein/smol/issues/300" target="_blank">issue #300 ↗</a>
+        · <a href="https://github.com/jphein/smol/pull/301" target="_blank">PR #301 ↗</a>
+        · <a href="https://github.com/jphein/smol/issues/302" target="_blank">#302 ↗</a></p>
       <p class="bard-note" data-edit="bard.note">The story on the left is not mock-up text. It is
         the actual deterministic output of the model blob committed to this repo — regenerate it
         yourself with <code>tools/bard_reference.py</code> and you will get the same owl, the same
