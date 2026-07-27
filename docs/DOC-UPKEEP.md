@@ -204,6 +204,35 @@ able to silently falsify one. Change those in `index.html`.
 `href` in the `#share` section; and `SHARE_URL` in `app.js`. If the Pages URL ever changes, grep
 for `jphein.github.io/smol` and fix all of them.
 
+### Display mockups: pixel-true is a constraint, not a design
+
+Every display on the site is the same physical part — **72 × 40, 1-bit, FONT_5X8, 14 × 5 text
+cells** — and `site/oled.js` is the one renderer for it (glyph bitmaps extracted from the exact
+`embedded-graphics` font the firmware uses; public-domain misc-fixed, attributed in the file).
+
+Three things learned the hard way, 2026-07-27:
+
+1. **Pixel-true is a constraint, not a design — and it can look *worse* than the fake.** The first
+   faithful block-digger draw used solid 4 × 4 tiles and the whole ground merged into one bright
+   slab. Fixed by drawing terrain as sparse *texture* and leaving only the player solid. Fidelity
+   and legibility are separate decisions; satisfying the first does not give you the second.
+   **Check at zoom** — screenshot and blow it up 3×. Reasoning about pixels does not work.
+2. **Take the constraint literally and it audits your copy.** Four tile labels turned out wider
+   than 14 columns (worst: 23 chars), so real hardware would have clipped them — the mockups were
+   promising legibility the part does not have. Four glyphs (`◆ · ✓ →`) are outside FONT_5X8's
+   ASCII range and would render as the fallback glyph. Both are content bugs that only surface when
+   you stop faking the panel.
+3. **Distinguish a panel RENDER from a DIAGRAM, and label the diagram.** The World Snake graphic
+   depicts the 256 × 256 world — two peers ~200 cells apart, which 72 × 40 px cannot hold — and it
+   wore scanlines and a bezel with no caption, so it read as a screenshot. A diagram is legitimate
+   and often clearer; it just has to say what it is. It is now labelled *"world map — not what the
+   glass shows"* and paired with an actual 72 × 40 render, which demonstrates the point instead of
+   asserting it.
+
+Practical rule for a new mockup: if it depicts the OLED, draw it through `oled.js` and let CSS scale
+it (`image-rendering: pixelated`, glow as a `filter` **outside** the glass). If it depicts something
+larger than the panel, it is a diagram — label it as one. Never leave a third category.
+
 ### Site checklist
 
 - [ ] Favicon present; **dark *and* light** via `prefers-color-scheme` (JP's standing preference).

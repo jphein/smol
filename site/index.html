@@ -345,6 +345,18 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 .ws-stage{background:#05090a;border-radius:12px;padding:12px;border:1px solid var(--line);box-shadow:inset 0 0 26px rgba(0,0,0,.7),0 0 50px -26px var(--glow-soft)}
 .ws-screen{position:relative;border-radius:5px;overflow:hidden;background:#02100f;box-shadow:inset 0 0 40px rgba(0,0,0,.6)}
 .ws-screen svg{display:block;width:100%;height:auto}
+/* This graphic is a DIAGRAM of the 256² world, not a panel render — it deliberately
+   shows two peers ~200 cells apart, which 72×40 px cannot hold. It used to wear
+   scanlines and a bezel with no label, so it read as a screenshot. Labelled now, and
+   paired with an actual 72×40 render below it so the difference is shown, not claimed. */
+.ws-diagram-tag{font-family:var(--mono);font-size:.66rem;letter-spacing:.06em;color:var(--faint);
+  margin:0 2px 8px;text-transform:uppercase}
+.ws-diagram-tag b{color:var(--amber);font-weight:500}
+.ws-glass{margin-top:14px;padding-top:14px;border-top:1px solid var(--line2);
+  display:flex;flex-direction:column;gap:8px}
+.ws-glass-lbl{font-family:var(--mono);font-size:.66rem;letter-spacing:.06em;color:var(--faint);
+  text-transform:uppercase}
+.ws-glass canvas{max-width:300px}
 .ws-screen::after{content:"";position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(0,0,0,.24) 0 1px,transparent 1px 3px);mix-blend-mode:multiply;opacity:.5}
 .ws-cap{font-family:var(--mono);font-size:.7rem;color:var(--faint);text-align:center;margin-top:2px}
 .ws-treasure{animation:blink 1.15s steps(1) infinite;transform-origin:center}
@@ -550,7 +562,9 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
   <div class="ws reveal">
     <div class="ws-media">
       <div class="ws-tag"><span class="pill">◆ MMO · flagship</span><span class="ws-live"><i></i>running on 3 boards</span></div>
-      <div class="ws-stage"><div class="ws-screen">
+      <div class="ws-stage">
+        <div class="ws-diagram-tag">◇ world map — <b>not</b> what the glass shows</div>
+        <div class="ws-screen">
         <svg viewBox="0 0 260 150" role="img" aria-label="A viewport into World Snake's shared 256 by 256 world: your cyan snake near center, peer snakes Jade Herald and Draconic Dominion roaming in labelled by their magical names, and a treasure glinting.">
           <defs><pattern id="wsg" width="10" height="10" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r=".6" fill="#0e3b39"/></pattern></defs>
           <rect width="260" height="150" fill="#02100f"/><rect width="260" height="150" fill="url(#wsg)"/>
@@ -575,7 +589,13 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
           <text x="250" y="108" text-anchor="end" font-family="monospace" font-size="7" fill="#7df9ff" class="ws-peer b">Draconic Dominion ◈</text>
           <polygon class="ws-treasure" points="182,100 189,107 182,114 175,107" fill="#ffb454"/>
         </svg>
-      </div></div>
+      </div>
+        <div class="ws-glass">
+          <div class="ws-glass-lbl">and this is the glass — 72×40, the window your board sees</div>
+          <canvas id="wsOled" class="oled-px" width="72" height="40"
+                  aria-label="A 72 by 40 OLED showing World Snake: your snake, a treasure, and the length readout"></canvas>
+        </div>
+</div>
       <p class="ws-cap">one board's viewport into the shared 256×256 world — peers dead-reckoned so a dropped frame never ghosts them</p>
       <div class="ws-board" aria-label="Mesh leaderboard, ranked by length">
         <div class="lb-head"><span>◈ mesh leaderboard</span><span class="ws-live"><i></i>live</span></div>

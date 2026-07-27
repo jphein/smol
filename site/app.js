@@ -312,6 +312,45 @@
     requestAnimationFrame(tick);
   }
 
+  /* ======================= world snake, on the actual glass =======================
+     The section's big graphic is a DIAGRAM of the 256x256 world. This is the same game
+     at the resolution the board really has: 18x10 cells of 4 px. It drifts and wraps,
+     because "no walls, the world wraps" is a claim the page makes and a 72x40 panel can
+     actually demonstrate.                                                              */
+  function wsGlass() {
+    const cv = $('#wsOled');
+    if (!cv || !window.OLED) return;
+    const O = window.OLED, panel = O.Panel(cv), C = 4;         // 4 px cells -> 18 x 10
+    const GW = 18, GH = 10;
+    let head = 6, len = 5, food = 13, t = 0;
+
+    const cell = (cx, cy, on = 1) => panel.rect((cx % GW) * C, cy * C, C - 1, C - 1, on);
+
+    // Laid out against BOTH grids at once, which is the fiddly part of a 72x40 panel:
+    // 4 px cells give 18 x 10 cells, FONT_5X8 gives 14 x 5 text rows, and text row r
+    // covers cell rows 2r and 2r+1. Everything below is placed so nothing collides and
+    // nothing runs past column 14 -- the first attempt put a 6-char name at column 11,
+    // which the panel clipped mid-glyph on top of the snake.
+    function frame() {
+      panel.clear();
+      panel.text('you ' + (183 + len), 0, 0);            // text row 0  (cells 0-1)
+      panel.text('Herald', 0, O.ROW_H);                   // text row 1  (cells 2-3)
+      cell(1, 4); cell(2, 4);                             // its snake, cell row 4
+      for (let i = 0; i < len; i++) cell((head - i + GW * 2) % GW, 6);   // you, row 6
+      const fx = food * C, fy = 8 * C;                    // treasure, cell row 8
+      panel.px(fx + 1, fy).px(fx, fy + 1).px(fx + 2, fy + 1).px(fx + 1, fy + 2);
+      panel.flush();
+    }
+
+    frame();
+    setInterval(() => {
+      head = (head + 1) % GW;
+      if (head === food) { len = Math.min(len + 1, 9); food = (food + 7) % GW; }
+      t++;
+      frame();
+    }, 620);
+  }
+
   /* ================================ share ================================
      One button, always visible: navigator.share where it exists, clipboard-copy
      as the desktop fallback. (Hiding it unless navigator.share exists means every
@@ -353,6 +392,7 @@
   loadContent();
   bardTypewriter();
   initShare();
+  wsGlass();
   poll(); setInterval(poll, 4000);
   clock(); setInterval(clock, 15000);
   genWorld(); requestAnimationFrame(loop);
