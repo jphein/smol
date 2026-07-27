@@ -136,7 +136,13 @@ repro_build_bin() {
     fi
     echo "  stack: ${stack_bytes} B (floor ${stack_floor} B)"
   else
-    echo "WARNING: could not read _stack_start/_stack_end from $elf — stack floor NOT checked" >&2
+    # FAIL CLOSED. This gate exists precisely because "it links" was not evidence of a runnable
+    # image; a gate that waves through an unreadable ELF restores that blind spot exactly, and
+    # the one time it matters is the time something is wrong with the build.
+    echo "FATAL: could not read _stack_start/_stack_end from $elf — refusing to package." >&2
+    echo "       Check that the ELF exists and that readelf is available; do NOT ship an" >&2
+    echo "       image whose stack was never measured." >&2
+    return 1
   fi
   "$espflash" save-image --chip esp32c3 \
     "$tdir/${REPRO_TARGET}/release/clock" "$out" >/dev/null || return 1

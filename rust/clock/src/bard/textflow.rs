@@ -2,8 +2,11 @@
 //! so it is host-tested instead of eyeballed on hardware.
 //!
 //! Pure, `no_std`, zero alloc: [`wrap_tail`] returns byte SPANS into the caller's text rather
-//! than copied lines, so the 1 KB story buffer is never duplicated (there is ~2.6 KB of DRAM
-//! left on the fleet tier — see `nano_llm::SEQ_CAP`).
+//! than copied lines, so the 1 KB story buffer is never duplicated. That frugality is not
+//! stylistic — on the canonical fleet tier the bard's `.bss` comes out of the RUNTIME STACK,
+//! which the linker shrinks silently, leaving 14240 B (see `nano_llm::SEQ_CAP` for all three
+//! measured points). `tools/repro_build.sh` refuses to package an image with less than 12288 B,
+//! so a second copy of the story buffer here could turn into a failed release build.
 
 /// Word-wrap `text` to `cols` columns and write the LAST `rows` line spans into `out`,
 /// returning how many were written.

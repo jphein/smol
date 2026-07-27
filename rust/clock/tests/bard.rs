@@ -201,6 +201,36 @@ fn greedy(
     (text, generated)
 }
 
+/// Compare a generated id stream against the golden one, panicking with a DIAGNOSIS rather than
+/// a bare inequality. Extracted so `golden_failure_names_the_divergent_token` exercises the real
+/// code path instead of a copy of it.
+fn assert_ids_match(generated: &[u16], golden: &[u16]) {
+    if generated == golden {
+        return;
+    }
+    match generated.iter().zip(golden).position(|(a, b)| a != b) {
+        // Real numeric divergence: show a window of both streams around it.
+        Some(at) => panic!(
+            "token stream diverges at index {at} (rust {} ids, golden {} ids)\n  rust:   {:?}\n  golden: {:?}",
+            generated.len(),
+            golden.len(),
+            &generated[at..generated.len().min(at + 8)],
+            &golden[at..golden.len().min(at + 8)],
+        ),
+        // Every SHARED id matches and only the lengths differ — that is not a numerics bug, it is
+        // a stale golden: SEQ_CAP or the step budget moved on one side only. Say that, because
+        // "diverges at index None" sends the reader hunting for a rounding error.
+        None => panic!(
+            "token streams AGREE on all {} shared ids but lengths differ (rust {}, golden {}) \
+             — SEQ_CAP or the step budget changed on one side only; rerun \
+             tools/bard_golden_baseline.sh to regenerate the goldens",
+            generated.len().min(golden.len()),
+            generated.len(),
+            golden.len(),
+        ),
+    }
+}
+
 #[test]
 fn golden_matches_python_reference() {
     let golden = include_str!("../src/bard/testdata/golden_ref.txt");
@@ -253,29 +283,7 @@ fn golden_matches_python_reference() {
     // anything short of exact is a regression and should fail as loudly as possible. The
     // divergence index is reported first because it localises a numeric bug far better than a
     // prose diff — see the reference's docstring for the accumulation-order contract.
-    if generated != golden_ids {
-        match generated.iter().zip(&golden_ids).position(|(a, b)| a != b) {
-            // Real numeric divergence: show a window of both streams around it.
-            Some(at) => panic!(
-                "token stream diverges at index {at} (rust {} ids, golden {} ids)\n  rust:   {:?}\n  golden: {:?}",
-                generated.len(),
-                golden_ids.len(),
-                &generated[at..generated.len().min(at + 8)],
-                &golden_ids[at..golden_ids.len().min(at + 8)],
-            ),
-            // Every SHARED id matches and only the lengths differ — that is not a numerics bug,
-            // it is a stale golden: SEQ_CAP or the step budget moved on one side only. Say that,
-            // because "diverges at index None" sends the reader hunting for a rounding error.
-            None => panic!(
-                "token streams AGREE on all {} shared ids but lengths differ (rust {}, golden {}) \
-                 — SEQ_CAP or the step budget changed on one side only; rerun \
-                 tools/bard_golden_baseline.sh to regenerate the goldens",
-                generated.len().min(golden_ids.len()),
-                generated.len(),
-                golden_ids.len(),
-            ),
-        }
-    }
+    assert_ids_match(&generated, &golden_ids);
     assert_eq!(text, golden_cont, "text differs despite identical token ids");
 }
 
@@ -493,4 +501,48 @@ fn wrap_tail_survives_every_reveal_position_of_a_real_story() {
     // With the bottom row reserved for `~ fin ~`, the story gets 4 rows and still fits.
     let n = wrap_tail(bytes, COLS, ROWS - 1, &mut spans[..ROWS - 1]);
     assert_eq!(n, ROWS - 1);
+}
+
+#[test]
+fn golden_failure_names_the_divergent_token() {
+    // The length-only arm has been exercised for real (planting stale goldens against a changed
+    // SEQ_CAP). The numeric-divergence arm never has, because the two implementations have never
+    // disagreed — so provoke it deliberately, on an in-memory COPY. The committed testdata is
+    // never touched: a test that corrupts a fixture it shares with another test is a trap.
+    let golden: std::vec::Vec<u16> = include_str!("../src/bard/testdata/golden_tokens.txt")
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.trim().parse().expect("token id"))
+        .collect();
+    let at = 40usize;
+    assert!(golden.len() > at + 8, "fixture too short to window around {at}");
+    let mut mutated = golden.clone();
+    mutated[at] = 999; // not a real id in this vocabulary — unmistakable in the output
+
+    // Silence the expected panic so a passing run does not print a scary backtrace.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(std::boxed::Box::new(|_| {}));
+    let payload = std::panic::catch_unwind(|| assert_ids_match(&mutated, &golden))
+        .expect_err("a flipped id must fail the comparison");
+    std::panic::set_hook(prev_hook);
+
+    let msg = payload
+        .downcast_ref::<std::string::String>()
+        .map(|s| s.as_str())
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic payload>");
+    // It must name the position, not just complain.
+    assert!(
+        msg.contains(&std::format!("diverges at index {at}")),
+        "expected the divergence index in: {msg}"
+    );
+    // And BOTH windows must straddle the divergence — the rust side showing the flipped id, the
+    // golden side the original, each starting at `at`.
+    let want_rust = std::format!("{:?}", &mutated[at..at + 8]);
+    let want_golden = std::format!("{:?}", &golden[at..at + 8]);
+    assert!(msg.contains(&want_rust), "expected rust window {want_rust} in: {msg}");
+    assert!(
+        msg.contains(&want_golden),
+        "expected golden window {want_golden} in: {msg}"
+    );
 }
