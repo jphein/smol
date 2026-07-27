@@ -128,15 +128,15 @@ input_text:
   # publishes retained smol/<id>/config/custom (KV key Y, #56). e.g.
   #   lc {sensor.smol_7_temp}°F|sl Bench|sl Door {binary_sensor.shed_door}
   smol_7_custom:
-    name: "smol 7 Custom screen (author)"
+    name: "Dominion Custom screen (author)"
     max: 120
     initial: ""
   smol_8_custom:
-    name: "smol 8 Custom screen (author)"
+    name: "Nexus Custom screen (author)"
     max: 120
     initial: ""
   smol_9_custom:
-    name: "smol 9 Custom screen (author)"
+    name: "Herald Custom screen (author)"
     max: 120
     initial: ""
   # --- #100 Stage 2/3 per-node network overrides (dashboard-managed, un-brickable). BROKER =
@@ -145,28 +145,61 @@ input_text:
   # RFC1918-validates before applying and self-heals a wrong broker via the CONNACK fallback
   # (surfaced as brk=fb in smol/<id>/diag); a wrong OTA host can only refuse a fetch (never a brick).
   smol_7_broker:
-    name: "smol 7 broker override (ip[:port])"
+    name: "Dominion broker override (ip[:port])"
     max: 21
     initial: ""
   smol_8_broker:
-    name: "smol 8 broker override (ip[:port])"
+    name: "Nexus broker override (ip[:port])"
     max: 21
     initial: ""
   smol_9_broker:
-    name: "smol 9 broker override (ip[:port])"
+    name: "Herald broker override (ip[:port])"
     max: 21
     initial: ""
   smol_7_ota_host:
-    name: "smol 7 OTA host override (ip)"
+    name: "Dominion OTA host override (ip)"
     max: 15
     initial: ""
   smol_8_ota_host:
-    name: "smol 8 OTA host override (ip)"
+    name: "Nexus OTA host override (ip)"
     max: 15
     initial: ""
   smol_9_ota_host:
-    name: "smol 9 OTA host override (ip)"
+    name: "Herald OTA host override (ip)"
     max: 15
+    initial: ""
+  # --- #72 IO registry (per-node, #194/#31). IO map = pin→kind config → retained smol/<id>/config/io
+  # (";"-sep "<pin><kind>"); IO set = pin state command → retained smol/<id>/io/set (";"-sep "<pin>=<0|1>").
+  # Labels/wire per the meshscope operator-mode parity checklist. Empty = no-op / clear.
+  smol_7_io_map:
+    name: "Dominion · IO map"
+    max: 80
+    initial: ""
+  smol_8_io_map:
+    name: "Nexus · IO map"
+    max: 80
+    initial: ""
+  smol_9_io_map:
+    name: "Herald · IO map"
+    max: 80
+    initial: ""
+  smol_7_io_set:
+    name: "Dominion · IO set"
+    max: 80
+    initial: ""
+  smol_8_io_set:
+    name: "Nexus · IO set"
+    max: 80
+    initial: ""
+  smol_9_io_set:
+    name: "Herald · IO set"
+    max: 80
+    initial: ""
+  # --- channel_hint (FLEET, #194/#31): steer the elected mesh channel → retained smol/mesh/channel_hint
+  # (decimal channel; empty = CLEAR). ONE fleet value (crown consumes), not per-node.
+  smol_channel_hint:
+    name: "smol · channel hint"
+    max: 3
     initial: ""
 
 input_boolean:
@@ -177,99 +210,99 @@ input_boolean:
   # automation ORs the set bits (stable bit0..6) → retained smol/<id>/config/plugins = 4-hex u16.
   # Default ALL ON (=007F); fw: 0000/bad/empty → keep-all (safety), masked live screen → board default.
   smol_7_plugin_clock:
-    name: "smol 7 · Clock visible"
+    name: "Dominion · Clock visible"
     icon: "mdi:clock-outline"
     initial: true
   smol_7_plugin_snake:
-    name: "smol 7 · Snake visible"
+    name: "Dominion · Snake visible"
     icon: "mdi:snake"
     initial: true
   smol_7_plugin_bench:
-    name: "smol 7 · Bench visible"
+    name: "Dominion · Bench visible"
     icon: "mdi:test-tube"
     initial: true
   smol_7_plugin_batt:
-    name: "smol 7 · Batt visible"
+    name: "Dominion · Batt visible"
     icon: "mdi:battery"
     initial: true
   smol_7_plugin_grid:
-    name: "smol 7 · Grid visible"
+    name: "Dominion · Grid visible"
     icon: "mdi:transmission-tower"
     initial: true
   smol_7_plugin_wled:
-    name: "smol 7 · Wled visible"
+    name: "Dominion · Wled visible"
     icon: "mdi:led-strip-variant"
     initial: true
   smol_7_plugin_about:
-    name: "smol 7 · About visible"
+    name: "Dominion · About visible"
     icon: "mdi:information-outline"
     initial: true
   smol_7_plugin_familiar:
-    name: "smol 7 · Familiar visible"
+    name: "Dominion · Familiar visible"
     icon: "mdi:paw"
     initial: true
   smol_8_plugin_clock:
-    name: "smol 8 · Clock visible"
+    name: "Nexus · Clock visible"
     icon: "mdi:clock-outline"
     initial: true
   smol_8_plugin_snake:
-    name: "smol 8 · Snake visible"
+    name: "Nexus · Snake visible"
     icon: "mdi:snake"
     initial: true
   smol_8_plugin_bench:
-    name: "smol 8 · Bench visible"
+    name: "Nexus · Bench visible"
     icon: "mdi:test-tube"
     initial: true
   smol_8_plugin_batt:
-    name: "smol 8 · Batt visible"
+    name: "Nexus · Batt visible"
     icon: "mdi:battery"
     initial: true
   smol_8_plugin_grid:
-    name: "smol 8 · Grid visible"
+    name: "Nexus · Grid visible"
     icon: "mdi:transmission-tower"
     initial: true
   smol_8_plugin_wled:
-    name: "smol 8 · Wled visible"
+    name: "Nexus · Wled visible"
     icon: "mdi:led-strip-variant"
     initial: true
   smol_8_plugin_about:
-    name: "smol 8 · About visible"
+    name: "Nexus · About visible"
     icon: "mdi:information-outline"
     initial: true
   smol_8_plugin_familiar:
-    name: "smol 8 · Familiar visible"
+    name: "Nexus · Familiar visible"
     icon: "mdi:paw"
     initial: true
   smol_9_plugin_clock:
-    name: "smol 9 · Clock visible"
+    name: "Herald · Clock visible"
     icon: "mdi:clock-outline"
     initial: true
   smol_9_plugin_snake:
-    name: "smol 9 · Snake visible"
+    name: "Herald · Snake visible"
     icon: "mdi:snake"
     initial: true
   smol_9_plugin_bench:
-    name: "smol 9 · Bench visible"
+    name: "Herald · Bench visible"
     icon: "mdi:test-tube"
     initial: true
   smol_9_plugin_batt:
-    name: "smol 9 · Batt visible"
+    name: "Herald · Batt visible"
     icon: "mdi:battery"
     initial: true
   smol_9_plugin_grid:
-    name: "smol 9 · Grid visible"
+    name: "Herald · Grid visible"
     icon: "mdi:transmission-tower"
     initial: true
   smol_9_plugin_wled:
-    name: "smol 9 · Wled visible"
+    name: "Herald · Wled visible"
     icon: "mdi:led-strip-variant"
     initial: true
   smol_9_plugin_about:
-    name: "smol 9 · About visible"
+    name: "Herald · About visible"
     icon: "mdi:information-outline"
     initial: true
   smol_9_plugin_familiar:
-    name: "smol 9 · Familiar visible"
+    name: "Herald · Familiar visible"
     icon: "mdi:paw"
     initial: true
 
@@ -329,7 +362,7 @@ input_select:
   # --- set-all (writes every per-node topic) ---
   smol_all_screen:
     name: "smol all · default screen"
-    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom]
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom, Familiar]
     initial: Menu
     icon: mdi:monitor-multiple
   smol_all_page:
@@ -339,34 +372,34 @@ input_select:
     icon: mdi:book-open-page-variant
   # --- id7 (one copy-paste block per node; new node = duplicate + renumber) ---
   smol_7_screen:
-    name: "smol id7 · default screen"
-    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom]
+    name: "Dominion · default screen"
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom, Familiar]
     initial: Menu
     icon: mdi:monitor
   smol_7_page:
-    name: "smol id7 · default page"
+    name: "Dominion · default page"
     options: ["0", "1", "2", "3"]   # 0=voltage/entry; 1-3 = Batt SOC detail pages (#17); fw wraps % page_count for screens with fewer
     initial: "0"
     icon: mdi:book-open-page-variant
   # --- id8 ---
   smol_8_screen:
-    name: "smol id8 · default screen"
-    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom]
+    name: "Nexus · default screen"
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom, Familiar]
     initial: Menu
     icon: mdi:monitor
   smol_8_page:
-    name: "smol id8 · default page"
+    name: "Nexus · default page"
     options: ["0", "1", "2", "3"]   # 0=voltage/entry; 1-3 = Batt SOC detail pages (#17); fw wraps % page_count for screens with fewer
     initial: "0"
     icon: mdi:book-open-page-variant
   # --- id9 ---
   smol_9_screen:
-    name: "smol id9 · default screen"
-    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom]
+    name: "Herald · default screen"
+    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom, Familiar]
     initial: Menu
     icon: mdi:monitor
   smol_9_page:
-    name: "smol id9 · default page"
+    name: "Herald · default page"
     options: ["0", "1", "2", "3"]   # 0=voltage/entry; 1-3 = Batt SOC detail pages (#17); fw wraps % page_count for screens with fewer
     initial: "0"
     icon: mdi:book-open-page-variant
@@ -378,76 +411,54 @@ input_select:
     initial: status
     icon: mdi:led-on
   smol_7_led:
-    name: "smol id7 · LED mode"
+    name: "Dominion · LED mode"
     options: [status, "on", "off"]
     initial: status
     icon: mdi:led-on
   smol_8_led:
-    name: "smol id8 · LED mode"
+    name: "Nexus · LED mode"
     options: [status, "on", "off"]
     initial: status
     icon: mdi:led-on
   smol_9_led:
-    name: "smol id9 · LED mode"
+    name: "Herald · LED mode"
     options: [status, "on", "off"]
     initial: status
     icon: mdi:led-on
-  # --- #100 network switch (per-node: iot/roam → slot 0/1) → retained smol/<id>/config/net (qos 1).
-  # ⚠️ MAPPING: option "iot (jplovescl)" = slot 0, "roam" = slot 1 — this MUST match the local
-  # secrets.rs WIFI_NETWORKS order. A wrong pick self-heals via the fw assoc fallback (visible as
-  # net=<slot>:fb in smol/<id>/diag) so it never bricks, but the label would mislead — verify against
-  # secrets.rs at canary. Set-all fans out to every per-node select (no broadcast topic).
-  smol_all_network:
-    name: "smol all · network"
-    options: ["iot (jplovescl)", "roam"]
-    initial: "iot (jplovescl)"
-    icon: mdi:wifi-sync
-  smol_7_network:
-    name: "smol id7 · network"
-    options: ["iot (jplovescl)", "roam"]
-    initial: "iot (jplovescl)"
-    icon: mdi:wifi
-  smol_8_network:
-    name: "smol id8 · network"
-    options: ["iot (jplovescl)", "roam"]
-    initial: "iot (jplovescl)"
-    icon: mdi:wifi
-  smol_9_network:
-    name: "smol id9 · network"
-    options: ["iot (jplovescl)", "roam"]
-    initial: "iot (jplovescl)"
-    icon: mdi:wifi
+  # --- #142: config/net (WiFi-slot switch) RETIRED. The per-node `smol_<id>_network` selects +
+  # their publish automations were removed 2026-07-19 (#194/#31) — net is not a live control.
+  # The board's actual slot is still surfaced read-only from `net=` in smol/<id>/diag (mirror sensors).
 
 input_button:
   smol_all_apply:
     name: "smol all · apply"
     icon: mdi:send-check
   smol_7_apply:
-    name: "smol id7 · apply"
+    name: "Dominion · apply"
     icon: mdi:send
   smol_7_reset:
-    name: "smol id7 · reset to board default"
+    name: "Dominion · reset to board default"
     icon: mdi:backup-restore
   smol_8_apply:
-    name: "smol id8 · apply"
+    name: "Nexus · apply"
     icon: mdi:send
   smol_8_reset:
-    name: "smol id8 · reset to board default"
+    name: "Nexus · reset to board default"
     icon: mdi:backup-restore
   smol_9_apply:
-    name: "smol id9 · apply"
+    name: "Herald · apply"
     icon: mdi:send
   smol_9_reset:
-    name: "smol id9 · reset to board default"
+    name: "Herald · reset to board default"
     icon: mdi:backup-restore
   smol_ota_install_7:
-    name: "smol OTA · install staged → id7"
+    name: "smol OTA · install staged → Dominion"
     icon: mdi:download
   smol_ota_install_8:
-    name: "smol OTA · install staged → id8"
+    name: "smol OTA · install staged → Nexus"
     icon: mdi:download
   smol_ota_install_9:
-    name: "smol OTA · install staged → id9"
+    name: "smol OTA · install staged → Herald"
     icon: mdi:download
   # --- #52 remote REBOOT (TRANSIENT cmd) — named *_reboot to avoid colliding with the #21
   # "*_reset to board default" config buttons above. Topic = smol/<id>/cmd/reset (locked). ---
@@ -455,14 +466,35 @@ input_button:
     name: "smol all · reboot"
     icon: mdi:restart-alert
   smol_7_reboot:
-    name: "smol id7 · reboot"
+    name: "Dominion · reboot"
     icon: mdi:restart
   smol_8_reboot:
-    name: "smol id8 · reboot"
+    name: "Nexus · reboot"
     icon: mdi:restart
   smol_9_reboot:
-    name: "smol id9 · reboot"
+    name: "Herald · reboot"
     icon: mdi:restart
+  # --- #71 on-demand WiFi SCAN (per-node + all, #194/#31) → TRANSIENT smol/<id>/cmd/scan (retain:FALSE).
+  # Same transient discipline as reboot (cmd/ topic, never retained). Topic-triggered (payload ignored).
+  smol_all_scan:
+    name: "smol all · scan"
+    icon: mdi:wifi-refresh
+  smol_7_scan:
+    name: "Dominion · scan"
+    icon: mdi:wifi-refresh
+  smol_8_scan:
+    name: "Nexus · scan"
+    icon: mdi:wifi-refresh
+  smol_9_scan:
+    name: "Herald · scan"
+    icon: mdi:wifi-refresh
+  # --- channel_hint apply/clear buttons (fleet, #194/#31) ---
+  smol_channel_hint_apply:
+    name: "smol · apply channel hint"
+    icon: mdi:access-point-check
+  smol_channel_hint_clear:
+    name: "smol · clear channel hint"
+    icon: mdi:access-point-remove
 
 # --- Dashboard mirror: subscribe the retained topic so a card shows exactly ---
 # what the boards fetch (the payload is <=96 chars, well under the 255 state cap).
@@ -617,6 +649,17 @@ mqtt:
       expire_after: 90   # #68/#94: online source. Flap-tune (90→180) was CONSIDERED then DROPPED — the all-192 flap was a mesh-SETTLING artifact (cadence briefly ~90s); at healthy steady-state status republishes ~11s, far under 90, so online is stable. F6-gated republish, ages out
       # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
       icon: "mdi:chip"
+    # --- #73 id5/Aegis (HEADLESS) base plumbing — Aegis publishes STAT|<screen>:<page>|<build> like 7/8/9
+    # (verified on wire: smol/5/status = "STAT|Custom:0|342"); it was just never mirrored, so the #69
+    # telemetry generator couldn't discover it. Same pattern → makes Aegis carry online/build + OTA tiles. ---
+    - name: "smol 5 screen"
+      unique_id: smol_5_status_mirror
+      state_topic: "smol/5/status"
+      value_template: "{{ value.split('|')[1] if '|' in value else value }}"
+      json_attributes_topic: "smol/5/status"
+      json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
+      expire_after: 90   # online source (drives binary_sensor.smol_5_online), same as 7/8/9
+      icon: "mdi:chip"
     # --- #40 running BUILD# as a first-class device-merged value (JP ask 2026-07-11) ---
     # Promotes the `build` attr of smol_<id>_screen to a plain visible sensor so the
     # leaf-mesh-OTA canary is verifiable HEADLESS in HA (build# flipping = update stuck;
@@ -637,6 +680,12 @@ mqtt:
     - name: "smol 9 build"
       unique_id: smol_9_build_mirror
       state_topic: "smol/9/status"
+      value_template: "{% set p = value.split('|') %}{{ p[2] if p | length >= 3 else 'unknown' }}"
+      entity_category: diagnostic
+      icon: "mdi:tag-text"
+    - name: "smol 5 build"
+      unique_id: smol_5_build_mirror
+      state_topic: "smol/5/status"
       value_template: "{% set p = value.split('|') %}{{ p[2] if p | length >= 3 else 'unknown' }}"
       entity_category: diagnostic
       icon: "mdi:tag-text"
@@ -842,6 +891,57 @@ mqtt:
       expire_after: 90
       icon: "mdi:lan-connect"
 
+    # --- COEXIST: per-board WiFi-uplink AP channel (crown-channel-health, the OTA-liveness signal).
+    # Only the elected crown associates to an uplink AP, so `ap=<ch>:<rssi>:<bssid>` appears ONLY in
+    # the crown's smol/<id>/diag (leaves omit it). State = AP channel (int) or 'none' when absent;
+    # rssi (signed dBm) + bssid ride as attributes. The template sensor `smol coexist health` below
+    # coalesces these (whichever board reports a real channel IS the crown) and compares to the
+    # elected mesh channel — a mismatch = the ch1-AP-vs-ch6-mesh coexist trap that silently kills OTA.
+    - name: "smol 7 ap channel"
+      unique_id: smol_7_ap_channel_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      icon: "mdi:access-point-network"
+      value_template: >-
+        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ p[0] if (ns.v and p[0]) else 'none' }}
+      json_attributes_topic: "smol/7/diag"
+      json_attributes_template: >-
+        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ {'rssi': (p[1] | int(0)) if p | length >= 2 else 0, 'bssid': (p[2] if p | length >= 3 else ''), 'raw': ns.v} | tojson }}
+      expire_after: 90
+    - name: "smol 8 ap channel"
+      unique_id: smol_8_ap_channel_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      icon: "mdi:access-point-network"
+      value_template: >-
+        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ p[0] if (ns.v and p[0]) else 'none' }}
+      json_attributes_topic: "smol/8/diag"
+      json_attributes_template: >-
+        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ {'rssi': (p[1] | int(0)) if p | length >= 2 else 0, 'bssid': (p[2] if p | length >= 3 else ''), 'raw': ns.v} | tojson }}
+      expire_after: 90
+    - name: "smol 9 ap channel"
+      unique_id: smol_9_ap_channel_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      icon: "mdi:access-point-network"
+      value_template: >-
+        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ p[0] if (ns.v and p[0]) else 'none' }}
+      json_attributes_topic: "smol/9/diag"
+      json_attributes_template: >-
+        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ {'rssi': (p[1] | int(0)) if p | length >= 2 else 0, 'bssid': (p[2] if p | length >= 3 else ''), 'raw': ns.v} | tojson }}
+      expire_after: 90
+    - name: "smol 5 ap channel"
+      unique_id: smol_5_ap_channel_mirror
+      state_topic: "smol/5/diag"
+      entity_category: diagnostic
+      icon: "mdi:access-point-network"
+      value_template: >-
+        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ p[0] if (ns.v and p[0]) else 'none' }}
+      json_attributes_topic: "smol/5/diag"
+      json_attributes_template: >-
+        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ {'rssi': (p[1] | int(0)) if p | length >= 2 else 0, 'bssid': (p[2] if p | length >= 3 else ''), 'raw': ns.v} | tojson }}
+      expire_after: 90
+
     # =====================================================================
     # #70 device-diag + #74 wave-2 observability sensors (Luna, ha-wave).
     # ALL parse the single retained smol/<id>/diag record (+ /display, /ota/history).
@@ -971,6 +1071,44 @@ mqtt:
       icon: "mdi:memory"
       value_template: >-
         {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('hmin=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
+    # --- #194/#31 NTP freshness (per-node) — parsed from `tage=`(s since last time-sync) + `tsrc=` in
+    # smol/<id>/diag. State: fresh(<300s) / aging(<3600s) / stale(>=3600s) / no-sync (thresholds = #187
+    # SYNC_FRESH_S 300 / SYNC_STALE_S 3600). ⚠ HONEST: boots sync once then age climbs — reads
+    # STALE fleet-wide until #192 periodic re-sync ships. That is EXPECTED, not a dashboard bug
+    # (see the `note` attribute). expire_after → 'unavailable' if a node stops publishing diag. ---
+    - name: "smol 7 NTP fresh"
+      unique_id: smol_7_ntp_fresh
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      icon: "mdi:clock-check-outline"
+      expire_after: 180
+      value_template: >-
+        {% set ns = namespace(age=-1, src='none') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.age = kv.split('=',1)[1] | int(-1) %}{% elif kv.startswith('tsrc=') %}{% set ns.src = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% if ns.src in ['none',''] or ns.age < 0 %}no-sync{% elif ns.age < 300 %}fresh{% elif ns.age < 3600 %}aging{% else %}stale{% endif %}
+      json_attributes_topic: "smol/7/diag"
+      json_attributes_template: >-
+        {% set ns = namespace(age=-1, src='none') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.age = kv.split('=',1)[1] | int(-1) %}{% elif kv.startswith('tsrc=') %}{% set ns.src = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ {'age_s': ns.age, 'source': ns.src, 'fresh_below_s': 300, 'stale_above_s': 3600, 'note': 'boot-only sync ages out → reads stale/red fleet-wide until #192 periodic re-sync ships; NOT a dashboard bug'} | tojson }}
+    - name: "smol 8 NTP fresh"
+      unique_id: smol_8_ntp_fresh
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      icon: "mdi:clock-check-outline"
+      expire_after: 180
+      value_template: >-
+        {% set ns = namespace(age=-1, src='none') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.age = kv.split('=',1)[1] | int(-1) %}{% elif kv.startswith('tsrc=') %}{% set ns.src = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% if ns.src in ['none',''] or ns.age < 0 %}no-sync{% elif ns.age < 300 %}fresh{% elif ns.age < 3600 %}aging{% else %}stale{% endif %}
+      json_attributes_topic: "smol/8/diag"
+      json_attributes_template: >-
+        {% set ns = namespace(age=-1, src='none') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.age = kv.split('=',1)[1] | int(-1) %}{% elif kv.startswith('tsrc=') %}{% set ns.src = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ {'age_s': ns.age, 'source': ns.src, 'fresh_below_s': 300, 'stale_above_s': 3600, 'note': 'boot-only sync ages out → reads stale/red fleet-wide until #192 periodic re-sync ships; NOT a dashboard bug'} | tojson }}
+    - name: "smol 9 NTP fresh"
+      unique_id: smol_9_ntp_fresh
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      icon: "mdi:clock-check-outline"
+      expire_after: 180
+      value_template: >-
+        {% set ns = namespace(age=-1, src='none') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.age = kv.split('=',1)[1] | int(-1) %}{% elif kv.startswith('tsrc=') %}{% set ns.src = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% if ns.src in ['none',''] or ns.age < 0 %}no-sync{% elif ns.age < 300 %}fresh{% elif ns.age < 3600 %}aging{% else %}stale{% endif %}
+      json_attributes_topic: "smol/9/diag"
+      json_attributes_template: >-
+        {% set ns = namespace(age=-1, src='none') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.age = kv.split('=',1)[1] | int(-1) %}{% elif kv.startswith('tsrc=') %}{% set ns.src = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ {'age_s': ns.age, 'source': ns.src, 'fresh_below_s': 300, 'stale_above_s': 3600, 'note': 'boot-only sync ages out → reads stale/red fleet-wide until #192 periodic re-sync ships; NOT a dashboard bug'} | tojson }}
     # --- id9 device diagnostics (#70) ---
     - name: "smol 9 boot slot"
       unique_id: smol_9_boot_slot_mirror
@@ -1617,6 +1755,17 @@ mqtt:
 # =====================================================================
 template:
   - sensor:
+      # --- #194/#31 NTP freshness FLEET counter — how many of 7/8/9 are time-fresh. HONEST: expect
+      # "0/3 fresh" (stale) until #192 periodic re-sync ships; boot-only sync ages past 3600s. ---
+      - name: "smol NTP fleet"
+        unique_id: smol_ntp_fleet
+        icon: mdi:clock-check
+        # STATIC entity refs (not concatenated) so HA reliably tracks them as dependencies.
+        state: "{{ [states('sensor.smol_7_ntp_fresh'), states('sensor.smol_8_ntp_fresh'), states('sensor.smol_9_ntp_fresh')] | select('eq', 'fresh') | list | count }}/3 fresh"
+        attributes:
+          aging: "{{ [states('sensor.smol_7_ntp_fresh'), states('sensor.smol_8_ntp_fresh'), states('sensor.smol_9_ntp_fresh')] | select('eq', 'aging') | list | count }}"
+          stale: "{{ [states('sensor.smol_7_ntp_fresh'), states('sensor.smol_8_ntp_fresh'), states('sensor.smol_9_ntp_fresh')] | reject('in', ['fresh', 'aging']) | list | count }}"
+          note: "Expect 0/3 fresh until #192 periodic re-sync ships — boot-only sync ages past 3600s. Not a dashboard bug."
       # --- #45 Custom-screen COMPOSE: turn each node's author string into the wire
       # payload <count>|<size><align>text;… . A TEMPLATE sensor (not a static automation)
       # so it auto-subscribes to whatever {entity_id}s the user references — the clean fix
@@ -1738,6 +1887,9 @@ template:
       - name: "smol 9 online"
         unique_id: smol_9_online
         state: "{{ states('sensor.smol_9_screen') not in ['unavailable', 'unknown', 'none', ''] }}"
+      - name: "smol 5 online"
+        unique_id: smol_5_online
+        state: "{{ states('sensor.smol_5_screen') not in ['unavailable', 'unknown', 'none', ''] }}"
       - name: "smol 7 resync"
         unique_id: smol_7_resync
         state: >-
@@ -1781,6 +1933,48 @@ template:
       - name: "smol mesh asleep"
         unique_id: smol_mesh_asleep
         state: "{{ states('sensor.smol_mesh_channel') in ['unknown','unavailable','none',''] }}"
+
+  # --- COEXIST health — crown WiFi-uplink AP channel vs the elected mesh channel. Co-channel is
+  # REQUIRED (WiFi + ESP-NOW share the one C3 radio): a crown on ch1 while the mesh runs ch6 goes
+  # deaf mid-transfer = OTA dies, and until now this was INVISIBLE (hand-parsed from diag for ~2h).
+  # `ap=` appears ONLY in the crown's diag, so coalesce it across all boards (the one reporting a
+  # real channel IS the crown) and compare to smol/mesh/channel (MC frame). GREEN = co-channel;
+  # RED = mismatch (coexist broken); AMBER = co-channel but AP rssi <= -80 (weak/degraded uplink;
+  # <= to match meshscope's WEAK_LINK_DBM boundary — pixel-identical at exactly -80).
+  # STATIC entity refs only (never a dynamically-built 'sensor.smol_'~id~'_x' — those do NOT track,
+  # and a states.sensor|selectattr scan didn't re-render reliably here either). The four ap_channel
+  # sensors are enumerated LITERALLY so HA registers a listener per entity → re-renders the instant
+  # the crown re-associates to a new channel (the exact event we watch). Crown = the MC owner
+  # (smol/mesh/channel); we read THAT node's ap= (spec agreed w/ meshscope: luna-hatel + luna-otaui).
+  # {%- -%} trims the render to a bare token (idle/violated/…), matching the ota_death sensor idiom.
+  - sensor:
+      - name: "smol coexist health"
+        unique_id: smol_coexist_health
+        state: >-
+          {%- set mesh = states('sensor.smol_mesh_channel') -%}
+          {%- set owner = state_attr('sensor.smol_mesh_channel','owner') | string -%}
+          {%- set cands = [('7', states('sensor.smol_7_ap_channel'), state_attr('sensor.smol_7_ap_channel','rssi')), ('8', states('sensor.smol_8_ap_channel'), state_attr('sensor.smol_8_ap_channel','rssi')), ('9', states('sensor.smol_9_ap_channel'), state_attr('sensor.smol_9_ap_channel','rssi')), ('5', states('sensor.smol_5_ap_channel'), state_attr('sensor.smol_5_ap_channel','rssi'))] -%}
+          {%- set ns = namespace(ch='none', rssi=0) -%}
+          {%- for id, ch, rs in cands -%}{%- if id == owner and ch not in ['unavailable','unknown','none',''] -%}{%- set ns.ch = ch -%}{%- set ns.rssi = rs | int(0) -%}{%- endif -%}{%- endfor -%}
+          {%- if mesh in ['unavailable','unknown','none',''] or ns.ch == 'none' -%}unknown
+          {%- elif (ns.ch | int(-1)) != (mesh | int(-2)) -%}violated
+          {%- elif ns.rssi <= -80 -%}degraded
+          {%- else -%}healthy{%- endif -%}
+        icon: >-
+          {%- set s = states('sensor.smol_coexist_health') -%}
+          {%- if s == 'violated' -%}mdi:wifi-alert{%- elif s == 'degraded' -%}mdi:wifi-strength-2-alert{%- elif s == 'healthy' -%}mdi:wifi-check{%- else -%}mdi:wifi-cancel{%- endif -%}
+        attributes:
+          mesh_channel: "{{ states('sensor.smol_mesh_channel') }}"
+          mesh_owner: "{{ state_attr('sensor.smol_mesh_channel','owner') }}"
+          crown_ap_channel: >-
+            {%- set o = state_attr('sensor.smol_mesh_channel','owner') | string -%}{%- if o == '7' -%}{{ states('sensor.smol_7_ap_channel') }}{%- elif o == '8' -%}{{ states('sensor.smol_8_ap_channel') }}{%- elif o == '9' -%}{{ states('sensor.smol_9_ap_channel') }}{%- elif o == '5' -%}{{ states('sensor.smol_5_ap_channel') }}{%- else -%}none{%- endif -%}
+          ap_rssi: >-
+            {%- set o = state_attr('sensor.smol_mesh_channel','owner') | string -%}{%- if o == '7' -%}{{ state_attr('sensor.smol_7_ap_channel','rssi') }}{%- elif o == '8' -%}{{ state_attr('sensor.smol_8_ap_channel','rssi') }}{%- elif o == '9' -%}{{ state_attr('sensor.smol_9_ap_channel','rssi') }}{%- elif o == '5' -%}{{ state_attr('sensor.smol_5_ap_channel','rssi') }}{%- else -%}none{%- endif -%}
+          ap_bssid: >-
+            {%- set o = state_attr('sensor.smol_mesh_channel','owner') | string -%}{%- if o == '7' -%}{{ state_attr('sensor.smol_7_ap_channel','bssid') }}{%- elif o == '8' -%}{{ state_attr('sensor.smol_8_ap_channel','bssid') }}{%- elif o == '9' -%}{{ state_attr('sensor.smol_9_ap_channel','bssid') }}{%- elif o == '5' -%}{{ state_attr('sensor.smol_5_ap_channel','bssid') }}{%- else -%}none{%- endif -%}
+          ap_reporters: >-
+            {%- set ns = namespace(c=0) -%}{%- for e in ['sensor.smol_7_ap_channel','sensor.smol_8_ap_channel','sensor.smol_9_ap_channel','sensor.smol_5_ap_channel'] -%}{%- if states(e) not in ['unavailable','unknown','none',''] -%}{%- set ns.c = ns.c + 1 -%}{%- endif -%}{%- endfor -%}{{ ns.c }}
+          note: "GREEN=crown AP co-channel with mesh · RED=mismatch (coexist broken -> OTA dead, the ch1-vs-ch6 trap) · AMBER=co-channel but AP rssi<=-80. crown=the MC owner (smol/mesh/channel); only the WiFi-uplink crown reports ap=. Cause of the OTA death-point tiles below."
 
   - sensor:
       # --- #74 RSSI-matrix union (HELD; populates when every node publishes smol/<id>/peers) ---
@@ -2166,81 +2360,11 @@ automation:
           option: "{{ trigger.to_state.state }}"
 
   # =====================================================================
-  # #100 network switch — per-node select → RETAINED smol/<id>/config/net = 0/1 (qos 1). Slot 0 =
-  # "iot (jplovescl)", slot 1 = "roam" (MUST match secrets.rs WIFI_NETWORKS order). qos 1 so the
-  # switch is delivered even through a flaky link (transient-command lesson). RETAINED = the gateway
-  # reads it on its burst + relays it to leaves; a wrong pick self-heals (fw fallback → net=<slot>:fb).
+  # #142 RETIRED (removed 2026-07-19, #194/#31): the config/net WiFi-slot switch. Both the
+  # `smol_net_publish` and `smol_all_net_fanout` automations (and their `smol_<id>_network`
+  # selects above) were dead plumbing — net is not a live control. The board's slot is still
+  # visible read-only via the `net=` diag mirror. No publisher writes smol/<id>/config/net anymore.
   # =====================================================================
-  - id: smol_net_publish
-    alias: "smol #100: publish per-node network slot"
-    description: >-
-      On any per-node network select changing, publish retained smol/<id>/config/net = 0|1.
-    mode: parallel
-    max: 10
-    trigger:
-      - platform: state
-        entity_id:
-          - input_select.smol_7_network
-          - input_select.smol_8_network
-          - input_select.smol_9_network
-    condition:
-      - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
-    action:
-      - service: mqtt.publish
-        data:
-          topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/config/net"
-          retain: true
-          qos: 1
-          payload: "{{ '0' if trigger.to_state.state == 'iot (jplovescl)' else '1' }}"
-      # #116: the slot IS the full network identity — clear the broker + OTA-host override
-      # retained topics (and their inputs) on every switch, else the stale retained override
-      # RESURRECTS on the node's next burst (one avoidable reboot + a cross-VLAN fallback
-      # dance; the fw self-heals via the CONNACK fallback, this just skips the detour).
-      - service: mqtt.publish
-        data:
-          topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/config/broker"
-          retain: true
-          qos: 1
-          payload: ""
-      - service: mqtt.publish
-        data:
-          topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/config/ota_host"
-          retain: true
-          qos: 1
-          payload: ""
-      - service: input_text.set_value
-        target:
-          entity_id: "input_text.smol_{{ trigger.entity_id.split('.')[1].split('_')[1] }}_broker"
-        data:
-          value: ""
-      - service: input_text.set_value
-        target:
-          entity_id: "input_text.smol_{{ trigger.entity_id.split('.')[1].split('_')[1] }}_ota_host"
-        data:
-          value: ""
-
-  - id: smol_all_net_fanout
-    alias: "smol #100: set-all network → per-node selects"
-    description: >-
-      On the ALL network select changing, fan out to every per-node network select (each then
-      publishes its retained smol/<id>/config/net). No broadcast topic (mirrors the LED fanout).
-    mode: single
-    trigger:
-      - platform: state
-        entity_id: input_select.smol_all_network
-    condition:
-      - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
-    action:
-      - service: input_select.select_option
-        target:
-          entity_id:
-            - input_select.smol_7_network
-            - input_select.smol_8_network
-            - input_select.smol_9_network
-        data:
-          option: "{{ trigger.to_state.state }}"
 
   # =====================================================================
   # #100 Stage 2 broker override — per-node input_text → RETAINED smol/<id>/config/broker (qos 1).
@@ -2299,6 +2423,60 @@ automation:
           payload: "{{ trigger.to_state.state }}"
 
   # =====================================================================
+  # #72 IO registry (#194/#31) — per-node input_text → RETAINED smol/<id>/config/io (map) or
+  # smol/<id>/io/set (set). One automation; the trigger entity's suffix picks the topic.
+  # =====================================================================
+  - id: smol_io_publish
+    alias: "smol #72: publish per-node IO map + set"
+    mode: parallel
+    max: 10
+    trigger:
+      - platform: state
+        entity_id:
+          - input_text.smol_7_io_map
+          - input_text.smol_8_io_map
+          - input_text.smol_9_io_map
+          - input_text.smol_7_io_set
+          - input_text.smol_8_io_set
+          - input_text.smol_9_io_set
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
+    action:
+      - variables:
+          n: "{{ trigger.entity_id.split('.')[1].split('_')[1] }}"
+          sub: "{{ 'io/set' if trigger.entity_id.endswith('_io_set') else 'config/io' }}"
+      - service: mqtt.publish
+        data:
+          topic: "smol/{{ n }}/{{ sub }}"
+          retain: true
+          qos: 1
+          payload: "{{ trigger.to_state.state }}"
+
+  # =====================================================================
+  # channel_hint (#194/#31) — FLEET crown-steer. Apply publishes the input_text value; Clear
+  # publishes empty (CLEAR). RETAINED so the elected crown consumes it. → smol/mesh/channel_hint
+  # =====================================================================
+  - id: smol_channel_hint_publish
+    alias: "smol #194: publish fleet channel_hint"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id:
+          - input_button.smol_channel_hint_apply
+          - input_button.smol_channel_hint_clear
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/mesh/channel_hint"
+          retain: true
+          qos: 1
+          payload: "{{ '' if trigger.entity_id.endswith('_clear') else states('input_text.smol_channel_hint') }}"
+
+  # =====================================================================
   # #52 remote REBOOT — per-node button → TRANSIENT smol/<id>/cmd/reset (retain:FALSE).
   # ⚠️ HARD SAFETY: the reset command is NEVER retained — a retained reset = reboot-loop /
   # soft-brick (same discipline as OTA-install). cmd/ = transient commands; config/ = retained.
@@ -2352,6 +2530,48 @@ automation:
             - input_button.smol_7_reboot
             - input_button.smol_8_reboot
             - input_button.smol_9_reboot
+
+  # =====================================================================
+  # #71 on-demand WiFi SCAN (#194/#31) — per-node button → TRANSIENT smol/<id>/cmd/scan
+  # (retain:FALSE, qos:1 — same discipline as reboot; topic-triggered, payload ignored by fw).
+  # =====================================================================
+  - id: smol_scan_publish
+    alias: "smol #71: per-node on-demand WiFi scan (transient)"
+    mode: parallel
+    max: 10
+    trigger:
+      - platform: state
+        entity_id:
+          - input_button.smol_7_scan
+          - input_button.smol_8_scan
+          - input_button.smol_9_scan
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/cmd/scan"
+          retain: false
+          qos: 1
+          payload: "SCAN"
+
+  - id: smol_all_scan_fanout
+    alias: "smol #71: scan-all → per-node scan buttons"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_all_scan
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
+    action:
+      - service: input_button.press
+        target:
+          entity_id:
+            - input_button.smol_7_scan
+            - input_button.smol_8_scan
+            - input_button.smol_9_scan
 
   # =====================================================================
   # NODE MANAGER automations (issue #21) — publish the retained per-node config.
@@ -2608,12 +2828,20 @@ automation:
       - repeat:
           for_each: ["7", "8", "9"]
           sequence:
-            - service: mqtt.publish
-              data:
-                topic: "smol/{{ repeat.item }}/config/custom"
-                retain: true
-                qos: 0
-                payload: "{{ states('sensor.smol_' ~ repeat.item ~ '_custom_lay') }}"
+            # #160: a node with an ACTIVE notification (input_text.smol_<id>_notify_wire set) owns
+            # config/custom — skip it here so the heartbeat/start republish never WIPES the message.
+            # The notify script publishes the notification wire directly; on clear the flag drops and
+            # the next republish restores the author-composed layout. Run-time state read = always fresh.
+            - if:
+                - condition: template
+                  value_template: "{{ states('input_text.smol_' ~ repeat.item ~ '_notify_wire') in ['unknown', 'unavailable', 'none', ''] }}"
+              then:
+                - service: mqtt.publish
+                  data:
+                    topic: "smol/{{ repeat.item }}/config/custom"
+                    retain: true
+                    qos: 0
+                    payload: "{{ states('sensor.smol_' ~ repeat.item ~ '_custom_lay') }}"
 
   # --- #55 publish per-node plugin visibility mask (retained → smol/<id>/config/plugins) ---
   - id: smol_publish_plugins

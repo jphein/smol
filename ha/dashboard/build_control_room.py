@@ -4,17 +4,21 @@
 # card that renders EMPTY. Fix = splice node cards DIRECTLY into the view grid (span 4, like
 # glass/power/forge which render). Node cards stay LIVE mushroom boxes (header + OLED + entities).
 # If mushroom still doesn't render un-nested → it's mushroom, swap to SVG faceplate then.
-#   HA_TOKEN=<your-ha-long-lived-token> python3 build_control_room.py
+#   HA_TOKEN=$(cat ~/.cache/ha-token-tmp) python3 build_control_room.py
+#   (HA_WS_URI / HA_SSH override the endpoints; the defaults are this homelab's.)
 import asyncio, json, os, re, ssl, subprocess, hashlib, yaml, websockets
 try:
     from defusedxml.minidom import parseString as xml_parse
 except ImportError:
     from xml.dom.minidom import parseString as xml_parse
-URI=os.environ.get("HA_WS_URI","wss://homeassistant.local:8123/api/websocket"); TOKEN=os.environ["HA_TOKEN"]; DASH="dashboard-dashboard"
+# Defaults are THIS homelab's real endpoints. The old placeholders ("homeassistant.local",
+# "user@...") resolved nowhere, so a first run always died halfway — after writing the SVG but
+# before saving the view. Both stay env-overridable.
+URI=os.environ.get("HA_WS_URI","wss://ha.jphe.in/api/websocket"); TOKEN=os.environ["HA_TOKEN"]; DASH="dashboard-dashboard"
 SSLCTX=ssl.create_default_context()  # verifies by default
 if os.environ.get("HA_WS_INSECURE"):  # explicit opt-out for a LAN self-signed HA cert (like curl -k)
     SSLCTX.check_hostname=False; SSLCTX.verify_mode=ssl.CERT_NONE
-HA=os.environ.get("HA_SSH","user@homeassistant.local"); WWW="/config/www/luna-cards"; LOCAL="/local/luna-cards"
+HA=os.environ.get("HA_SSH","jp@10.0.6.108"); WWW="/config/www/luna-cards"; LOCAL="/local/luna-cards"
 KNOWN={5:{"name":"Silent Aegis","role":"leaf","headless":True},  # headless board (no OLED — #headless); telemetry-only card
        7:{"name":"Draconic Dominion","role":"the Seat","gate":True},
        8:{"name":"Eldritch Nexus","role":"leaf"},
@@ -153,6 +157,8 @@ def node_card(nid, meta, present, span=4):
     prow(top,f"input_select.smol_{nid}_page","page")
     prow(top,f"input_select.smol_{nid}_led","LED (status / on / off)","mdi:led-on")            # #48
     prow(top,f"input_text.smol_{nid}_custom","Custom lines (‹sa› text, | per line)","mdi:card-text")  # #45 · edit when screen=Custom
+    prow(top,f"input_text.smol_{nid}_tale","Story opening (Bard)","mdi:feather")               # #303 · empty = this node's own protagonist
+    prow(top,f"sensor.smol_{nid}_tale","  ↳ in use","mdi:book-open-variant")                   # #303 readback of the retained prompt
     prow(top,f"input_button.smol_{nid}_apply",f"Apply → id{nid}","mdi:send")
     prow(top,f"input_button.smol_{nid}_reset","Reset to board default","mdi:backup-restore")
     rb=f"input_button.smol_{nid}_reboot"                                                       # #52 tap-guarded reboot

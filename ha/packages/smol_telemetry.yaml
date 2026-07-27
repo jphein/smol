@@ -1,0 +1,331 @@
+# smol · telemetry package (#69) — v344/v346 telemetry entities for the HA tiles.
+# =====================================================================
+# Additive companion to smol_mesh.yaml (merged by domain — HA merges the mqtt:/
+# template: lists across package files). Everything here is NEW; nothing in
+# smol_mesh.yaml is touched. Deploy: tee → /homeassistant/packages/smol_telemetry.yaml
+# then ONE HA restart (template/MQTT sensor edits need a restart — ha-skill gotcha #5).
+#
+# WIRE GROUND-TRUTH (probed on the live broker 2026-07-20 before writing a parser —
+# the "don't guess the wire" lesson):
+#   • smol/<id>/ota/progress = "<done>|<total>|<phase>"  (bytes; phase self|relayfetch|
+#     relaychunks) — RETAINED, #188. CONFIRMED on wire (smol/13/ota/progress = 0|1105456|self)
+#     AND in the sibling meshscope parser (rust/viz/mesh-model/src/parse.rs::parse_ota_progress).
+#   • mac_ok / mac_fail (#190 group-HMAC, ships v346) — ride smol/<id>/diag as NEW pipe keys.
+#     NOT on wire yet. Key abbrev INFERRED (see the HMAC block) — degrade-safe to 'unknown'.
+#   • ledger depth/anchor (#249, v346) — ride smol/<id>/diag. NOT on wire; format unpinned →
+#     placeholder tile only (no guessed live parser).
+#   • weather (#227) — candidate smol/weather (temp_f + WMO code). NOT on wire → placeholder tile.
+#   • peer-source id (#237, v345) — provenance of a relayed image. NOT on wire → placeholder tile.
+#
+# NOTE ⚠ vok/vfl in smol/<id>/diag are OTA ed25519/readback VERIFY counters (#32/#49,
+# already surfaced in smol_mesh.yaml) — they are NOT the #190 HMAC counters. Do not conflate.
+# =====================================================================
+
+mqtt:
+  sensor:
+    # --- #188 OTA live transfer progress (smol/<id>/ota/progress = done|total|phase) ---
+    # State = integer percent (floor(100*done/total)); done/total/phase carried as attributes
+    # so the death-point template (below) can read them + this sensor's last_changed age.
+    # expire_after 1800s: a finished/gone node's retained value ages out after 30 min so the
+    # tile self-clears (matches the batt "stale > 30 min" convention). A live transfer
+    # republishes far faster; a STALLED transfer stops republishing → last_changed ages →
+    # the death sensor flips to 'stalled' well before the 30-min expiry hides it.
+    - name: "smol 7 ota progress"
+      unique_id: smol_7_ota_progress_mirror
+      state_topic: "smol/7/ota/progress"
+      unit_of_measurement: "%"
+      state_class: measurement
+      expire_after: 1800
+      entity_category: diagnostic
+      icon: "mdi:progress-upload"
+      value_template: >-
+        {% set p = value.split('|') %}
+        {%- if p | length >= 2 and (p[1] | int(0)) > 0 -%}
+        {{ (100 * (p[0] | int(0))) // (p[1] | int(0)) }}
+        {%- else -%}0{%- endif -%}
+      json_attributes_topic: "smol/7/ota/progress"
+      json_attributes_template: >-
+        {% set p = value.split('|') %}
+        {{ {'done': (p[0] | int(0)) if p | length >= 1 else 0,
+            'total': (p[1] | int(0)) if p | length >= 2 else 0,
+            'phase': (p[2] if p | length >= 3 else '')} | tojson }}
+    - name: "smol 8 ota progress"
+      unique_id: smol_8_ota_progress_mirror
+      state_topic: "smol/8/ota/progress"
+      unit_of_measurement: "%"
+      state_class: measurement
+      expire_after: 1800
+      entity_category: diagnostic
+      icon: "mdi:progress-upload"
+      value_template: >-
+        {% set p = value.split('|') %}
+        {%- if p | length >= 2 and (p[1] | int(0)) > 0 -%}
+        {{ (100 * (p[0] | int(0))) // (p[1] | int(0)) }}
+        {%- else -%}0{%- endif -%}
+      json_attributes_topic: "smol/8/ota/progress"
+      json_attributes_template: >-
+        {% set p = value.split('|') %}
+        {{ {'done': (p[0] | int(0)) if p | length >= 1 else 0,
+            'total': (p[1] | int(0)) if p | length >= 2 else 0,
+            'phase': (p[2] if p | length >= 3 else '')} | tojson }}
+    - name: "smol 9 ota progress"
+      unique_id: smol_9_ota_progress_mirror
+      state_topic: "smol/9/ota/progress"
+      unit_of_measurement: "%"
+      state_class: measurement
+      expire_after: 1800
+      entity_category: diagnostic
+      icon: "mdi:progress-upload"
+      value_template: >-
+        {% set p = value.split('|') %}
+        {%- if p | length >= 2 and (p[1] | int(0)) > 0 -%}
+        {{ (100 * (p[0] | int(0))) // (p[1] | int(0)) }}
+        {%- else -%}0{%- endif -%}
+      json_attributes_topic: "smol/9/ota/progress"
+      json_attributes_template: >-
+        {% set p = value.split('|') %}
+        {{ {'done': (p[0] | int(0)) if p | length >= 1 else 0,
+            'total': (p[1] | int(0)) if p | length >= 2 else 0,
+            'phase': (p[2] if p | length >= 3 else '')} | tojson }}
+    # --- #79: id5/Aegis OTA progress (base plumbing #73 landed → now discoverable + on v345) ---
+    - name: "smol 5 ota progress"
+      unique_id: smol_5_ota_progress_mirror
+      state_topic: "smol/5/ota/progress"
+      unit_of_measurement: "%"
+      state_class: measurement
+      expire_after: 1800
+      entity_category: diagnostic
+      icon: "mdi:progress-upload"
+      value_template: >-
+        {% set p = value.split('|') %}
+        {%- if p | length >= 2 and (p[1] | int(0)) > 0 -%}
+        {{ (100 * (p[0] | int(0))) // (p[1] | int(0)) }}
+        {%- else -%}0{%- endif -%}
+      json_attributes_topic: "smol/5/ota/progress"
+      json_attributes_template: >-
+        {% set p = value.split('|') %}
+        {{ {'done': (p[0] | int(0)) if p | length >= 1 else 0,
+            'total': (p[1] | int(0)) if p | length >= 2 else 0,
+            'phase': (p[2] if p | length >= 3 else '')} | tojson }}
+
+    # --- #190 group-HMAC transport-auth health (mac_ok / mac_fail) — SHIPS v346 ---
+    # The #190 observe-release bumps per-node mac_ok / mac_fail counters folded into the
+    # already-retained smol/<id>/diag record (issue #190 §7.1). Same DIAG key-picker idiom
+    # as the fok/ffl/vok/vfl counters in smol_mesh.yaml.
+    #
+    # ⚠ WIRE KEY (mesh-model-sourced, not yet broker-live): #190 is NOT on the broker yet (v346
+    # train). Keys below are `mo=` / `mf=` — corrected 2026-07-20 to match the meshscope mesh-model
+    # parser (the fw-contract source of truth; via luna-hatel), superseding the earlier inferred
+    # `mok=`/`mfl=`. RE-VERIFY against a real v346 board's DIAG line when the train lands.
+    # DEGRADE-SAFE: defaults to 'unknown' (→ grey "pending #190" tile) while the key is absent —
+    # it can NEVER show wrong data, because an inferred-but-wrong key simply never matches an
+    # existing field (it won't collide). 'unknown' (not 0) so "not shipped" reads distinct from
+    # "0 failures = healthy".
+    - name: "smol 7 mac ok"
+      unique_id: smol_7_mac_ok_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-key-outline"
+      value_template: >-
+        {% set ns = namespace(v=none) %}
+        {% for kv in value.split('|') %}{% if kv.startswith('mo=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) if ns.v is not none else 'unknown' }}
+    - name: "smol 7 mac fail"
+      unique_id: smol_7_mac_fail_mirror
+      state_topic: "smol/7/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-off-outline"
+      value_template: >-
+        {% set ns = namespace(v=none) %}
+        {% for kv in value.split('|') %}{% if kv.startswith('mf=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) if ns.v is not none else 'unknown' }}
+    - name: "smol 8 mac ok"
+      unique_id: smol_8_mac_ok_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-key-outline"
+      value_template: >-
+        {% set ns = namespace(v=none) %}
+        {% for kv in value.split('|') %}{% if kv.startswith('mo=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) if ns.v is not none else 'unknown' }}
+    - name: "smol 8 mac fail"
+      unique_id: smol_8_mac_fail_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-off-outline"
+      value_template: >-
+        {% set ns = namespace(v=none) %}
+        {% for kv in value.split('|') %}{% if kv.startswith('mf=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) if ns.v is not none else 'unknown' }}
+    - name: "smol 9 mac ok"
+      unique_id: smol_9_mac_ok_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-key-outline"
+      value_template: >-
+        {% set ns = namespace(v=none) %}
+        {% for kv in value.split('|') %}{% if kv.startswith('mo=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) if ns.v is not none else 'unknown' }}
+    - name: "smol 9 mac fail"
+      unique_id: smol_9_mac_fail_mirror
+      state_topic: "smol/9/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-off-outline"
+      value_template: >-
+        {% set ns = namespace(v=none) %}
+        {% for kv in value.split('|') %}{% if kv.startswith('mf=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) if ns.v is not none else 'unknown' }}
+
+template:
+  - sensor:
+      # --- #188 OTA death-point — the "where did the transfer die" glance ---
+      # State machine keyed to the progress sensor + its last_changed age (STATIC refs per
+      # ha-skill gotcha #6 — dynamic states('sensor.'~id) refs don't register as listeners):
+      #   idle      progress unavailable/unknown (no transfer / aged out)
+      #   active    done < total, fresh (≤30s since last update)
+      #   stalled   done < total AND >30s since last update — TRANSFER DIED HERE (LOUD red tile)
+      #   complete  done >= total (> 0)
+      # now() makes this re-render each minute → staleness re-evaluates without a trigger.
+      # Attrs (done/total/phase/pct/age_s) drive the tile text ("STALLED @ done/total").
+      # ⚠ retained-replay caveat: after an HA restart the broker replays the last retained
+      # progress value → last_changed resets to now → a previously-stalled transfer briefly
+      # reads 'active'; it self-corrects to 'stalled' ~30s later (no new message arrives).
+      - name: "smol 7 ota death"
+        unique_id: smol_7_ota_death
+        icon: >-
+          {% set s = states('sensor.smol_7_ota_death') %}
+          {%- if s == 'stalled' -%}mdi:progress-alert{%- elif s == 'complete' -%}mdi:progress-check{%- elif s == 'active' -%}mdi:progress-upload{%- else -%}mdi:progress-helper{%- endif -%}
+        state: >-
+          {%- set st = states('sensor.smol_7_ota_progress') -%}
+          {%- if st in ['unavailable','unknown','none',''] -%}idle
+          {%- else -%}
+          {%- set done = state_attr('sensor.smol_7_ota_progress','done') | int(0) -%}
+          {%- set total = state_attr('sensor.smol_7_ota_progress','total') | int(0) -%}
+          {%- set age = (now() - states.sensor.smol_7_ota_progress.last_changed).total_seconds() | int(0) -%}
+          {%- if total > 0 and done >= total -%}complete
+          {%- elif done < total and age > 30 -%}stalled
+          {%- else -%}active{%- endif -%}
+          {%- endif -%}
+        attributes:
+          done: "{{ state_attr('sensor.smol_7_ota_progress','done') | int(0) }}"
+          total: "{{ state_attr('sensor.smol_7_ota_progress','total') | int(0) }}"
+          phase: "{{ state_attr('sensor.smol_7_ota_progress','phase') | default('', true) }}"
+          pct: "{{ states('sensor.smol_7_ota_progress') }}"
+          age_s: >-
+            {%- if states('sensor.smol_7_ota_progress') in ['unavailable','unknown','none',''] -%}0
+            {%- else -%}{{ (now() - states.sensor.smol_7_ota_progress.last_changed).total_seconds() | int(0) }}{%- endif -%}
+      - name: "smol 8 ota death"
+        unique_id: smol_8_ota_death
+        icon: >-
+          {% set s = states('sensor.smol_8_ota_death') %}
+          {%- if s == 'stalled' -%}mdi:progress-alert{%- elif s == 'complete' -%}mdi:progress-check{%- elif s == 'active' -%}mdi:progress-upload{%- else -%}mdi:progress-helper{%- endif -%}
+        state: >-
+          {%- set st = states('sensor.smol_8_ota_progress') -%}
+          {%- if st in ['unavailable','unknown','none',''] -%}idle
+          {%- else -%}
+          {%- set done = state_attr('sensor.smol_8_ota_progress','done') | int(0) -%}
+          {%- set total = state_attr('sensor.smol_8_ota_progress','total') | int(0) -%}
+          {%- set age = (now() - states.sensor.smol_8_ota_progress.last_changed).total_seconds() | int(0) -%}
+          {%- if total > 0 and done >= total -%}complete
+          {%- elif done < total and age > 30 -%}stalled
+          {%- else -%}active{%- endif -%}
+          {%- endif -%}
+        attributes:
+          done: "{{ state_attr('sensor.smol_8_ota_progress','done') | int(0) }}"
+          total: "{{ state_attr('sensor.smol_8_ota_progress','total') | int(0) }}"
+          phase: "{{ state_attr('sensor.smol_8_ota_progress','phase') | default('', true) }}"
+          pct: "{{ states('sensor.smol_8_ota_progress') }}"
+          age_s: >-
+            {%- if states('sensor.smol_8_ota_progress') in ['unavailable','unknown','none',''] -%}0
+            {%- else -%}{{ (now() - states.sensor.smol_8_ota_progress.last_changed).total_seconds() | int(0) }}{%- endif -%}
+      - name: "smol 9 ota death"
+        unique_id: smol_9_ota_death
+        icon: >-
+          {% set s = states('sensor.smol_9_ota_death') %}
+          {%- if s == 'stalled' -%}mdi:progress-alert{%- elif s == 'complete' -%}mdi:progress-check{%- elif s == 'active' -%}mdi:progress-upload{%- else -%}mdi:progress-helper{%- endif -%}
+        state: >-
+          {%- set st = states('sensor.smol_9_ota_progress') -%}
+          {%- if st in ['unavailable','unknown','none',''] -%}idle
+          {%- else -%}
+          {%- set done = state_attr('sensor.smol_9_ota_progress','done') | int(0) -%}
+          {%- set total = state_attr('sensor.smol_9_ota_progress','total') | int(0) -%}
+          {%- set age = (now() - states.sensor.smol_9_ota_progress.last_changed).total_seconds() | int(0) -%}
+          {%- if total > 0 and done >= total -%}complete
+          {%- elif done < total and age > 30 -%}stalled
+          {%- else -%}active{%- endif -%}
+          {%- endif -%}
+        attributes:
+          done: "{{ state_attr('sensor.smol_9_ota_progress','done') | int(0) }}"
+          total: "{{ state_attr('sensor.smol_9_ota_progress','total') | int(0) }}"
+          phase: "{{ state_attr('sensor.smol_9_ota_progress','phase') | default('', true) }}"
+          pct: "{{ states('sensor.smol_9_ota_progress') }}"
+          age_s: >-
+            {%- if states('sensor.smol_9_ota_progress') in ['unavailable','unknown','none',''] -%}0
+            {%- else -%}{{ (now() - states.sensor.smol_9_ota_progress.last_changed).total_seconds() | int(0) }}{%- endif -%}
+      # --- #79 id5/Aegis OTA death-point (mirrors 7/8/9) ---
+      - name: "smol 5 ota death"
+        unique_id: smol_5_ota_death
+        icon: >-
+          {% set s = states('sensor.smol_5_ota_death') %}
+          {%- if s == 'stalled' -%}mdi:progress-alert{%- elif s == 'complete' -%}mdi:progress-check{%- elif s == 'active' -%}mdi:progress-upload{%- else -%}mdi:progress-helper{%- endif -%}
+        state: >-
+          {%- set st = states('sensor.smol_5_ota_progress') -%}
+          {%- if st in ['unavailable','unknown','none',''] -%}idle
+          {%- else -%}
+          {%- set done = state_attr('sensor.smol_5_ota_progress','done') | int(0) -%}
+          {%- set total = state_attr('sensor.smol_5_ota_progress','total') | int(0) -%}
+          {%- set age = (now() - states.sensor.smol_5_ota_progress.last_changed).total_seconds() | int(0) -%}
+          {%- if total > 0 and done >= total -%}complete
+          {%- elif done < total and age > 30 -%}stalled
+          {%- else -%}active{%- endif -%}
+          {%- endif -%}
+        attributes:
+          done: "{{ state_attr('sensor.smol_5_ota_progress','done') | int(0) }}"
+          total: "{{ state_attr('sensor.smol_5_ota_progress','total') | int(0) }}"
+          phase: "{{ state_attr('sensor.smol_5_ota_progress','phase') | default('', true) }}"
+          pct: "{{ states('sensor.smol_5_ota_progress') }}"
+          age_s: >-
+            {%- if states('sensor.smol_5_ota_progress') in ['unavailable','unknown','none',''] -%}0
+            {%- else -%}{{ (now() - states.sensor.smol_5_ota_progress.last_changed).total_seconds() | int(0) }}{%- endif -%}
+
+      # --- #190 per-node HMAC health rollup (green/amber/pending) ---
+      # ok        mac_fail == 0 (and counters present) — auth healthy
+      # degraded  mac_fail > 0 — a frame failed the group-MAC check (outsider / key-epoch skew)
+      # pending   counters absent (pre-v346) — grey; nothing on the wire yet
+      # STATIC refs. Reads the mac ok/fail mirrors above (which are 'unknown' until #190 ships).
+      - name: "smol 7 mac health"
+        unique_id: smol_7_mac_health
+        icon: >-
+          {% set s = states('sensor.smol_7_mac_health') %}
+          {%- if s == 'degraded' -%}mdi:shield-alert{%- elif s == 'ok' -%}mdi:shield-check{%- else -%}mdi:shield-sync-outline{%- endif -%}
+        state: >-
+          {%- set f = states('sensor.smol_7_mac_fail') -%}
+          {%- if f in ['unavailable','unknown','none',''] -%}pending
+          {%- elif (f | int(0)) > 0 -%}degraded
+          {%- else -%}ok{%- endif -%}
+      - name: "smol 8 mac health"
+        unique_id: smol_8_mac_health
+        icon: >-
+          {% set s = states('sensor.smol_8_mac_health') %}
+          {%- if s == 'degraded' -%}mdi:shield-alert{%- elif s == 'ok' -%}mdi:shield-check{%- else -%}mdi:shield-sync-outline{%- endif -%}
+        state: >-
+          {%- set f = states('sensor.smol_8_mac_fail') -%}
+          {%- if f in ['unavailable','unknown','none',''] -%}pending
+          {%- elif (f | int(0)) > 0 -%}degraded
+          {%- else -%}ok{%- endif -%}
+      - name: "smol 9 mac health"
+        unique_id: smol_9_mac_health
+        icon: >-
+          {% set s = states('sensor.smol_9_mac_health') %}
+          {%- if s == 'degraded' -%}mdi:shield-alert{%- elif s == 'ok' -%}mdi:shield-check{%- else -%}mdi:shield-sync-outline{%- endif -%}
+        state: >-
+          {%- set f = states('sensor.smol_9_mac_fail') -%}
+          {%- if f in ['unavailable','unknown','none',''] -%}pending
+          {%- elif (f | int(0)) > 0 -%}degraded
+          {%- else -%}ok{%- endif -%}

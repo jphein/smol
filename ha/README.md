@@ -349,17 +349,42 @@ python3 ~/Projects/ha/tools/ha_supervisor.py GET /addons/e4069849_juicepassproxy
 **Never paste the password into committed files, findings, logs, or issue comments.**
 Addon ACL: authed users have readwrite on `#`, so `smol/#` needs no ACL changes.
 
-> ### ⚠️ Package layout on the LIVE instance differs from this repo (found 2026-07-27)
-> The live `/homeassistant/packages/` holds **`smol_notify.yaml`** and **`smol_telemetry.yaml`**
-> (neither is in this repo) and **no `smol_mesh.yaml`** — only five `.bak` generations of it —
-> yet the package-defined helpers (e.g. `input_select.smol_8_screen`) are live and
-> `check_config` passes. So this repo's `smol_mesh.yaml` is **not** the deployed artifact, and
-> `cat smol_mesh.yaml | tee` would be a guess, not an update. Unresolved; JP knows the history.
->
-> Consequence for new work: ship additive **self-contained** package files (the pattern the two
-> live companions already use — HA merges same-domain keys across files). `smol_bard.yaml`
-> (#303) is done that way and deployed cleanly; do the same rather than editing `smol_mesh.yaml`
-> and hoping.
+## Deploying: `tools/ha_deploy.sh` (2026-07-27 — use this, not hand-run `tee`)
+
+The HA half of smol lives in `ha/packages/*.yaml`; HA runs from `/homeassistant/packages/` on the
+VM. One script now keeps both honest, in both directions:
+
+```bash
+./tools/ha_deploy.sh status        # what differs, repo vs live (read-only; the default)
+./tools/ha_deploy.sh diff [file]   # full unified diff
+./tools/ha_deploy.sh pull          # live -> repo, so out-of-band edits become commits
+./tools/ha_deploy.sh push          # repo -> live: backup, copy, check_config, THEN reload
+./tools/ha_deploy.sh push --dry-run
+```
+
+`push` is recoverable by construction: every overwritten file is backed up on the VM first
+(`<name>.bak-deploy-<stamp>`), local YAML is validated before anything is sent, and HA's
+`check_config` runs **before** any reload — a rejection restores the whole batch and exits
+non-zero. Be precise about that last layer though: check_config validates the *core config load*,
+not package schemas. Probed 2026-07-27, it accepted both `automation: "not a list"` and an
+`input_text` with `max: 999999`. It catches load-breaking mistakes; the **backups** are what
+actually make a bad push undoable. It also picks the reload that actually
+works: `reload_all` when helpers/mqtt/template entities changed (`automation.reload` does **not**
+register new ones), otherwise `automation.reload`. Unchanged files are skipped, so re-running is
+free — run `status` whenever you wonder.
+
+**Why it exists.** Before it, deploys were hand-run `cat | ssh tee` in one direction only, and the
+two sides drifted for months without anyone doing anything wrong. Measured on 2026-07-27: the live
+`smol_mesh.yaml` was **17.5 KB ahead of the repo** (id5 mirrors, AP-channel mirrors, NTP-freshness,
+coexist-health — edited live, never committed) and two whole packages, `smol_notify.yaml` and
+`smol_telemetry.yaml`, existed **only** on the VM. Live was a strict superset, so `pull` reconciled
+it without losing anything; all four packages are now tracked and byte-identical to live.
+
+> An earlier draft of this note claimed the live `smol_mesh.yaml` was *missing* — that was wrong,
+> and worth recording as a method lesson: it came from reading `ls … | tail -3`, whose truncation
+> hid the real file and left only its `.bak` siblings visible. The conclusion was drawn from
+> truncated output rather than the full listing. `ha_deploy.sh status` now answers this question
+> properly so nobody has to eyeball a directory again.
 
 ## Install / redeploy (DEPLOYED & LIVE 2026-07-08 — this is the update procedure)
 

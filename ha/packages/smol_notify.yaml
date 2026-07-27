@@ -1,0 +1,496 @@
+# smol boards as first-class HA notify targets (issue #160 — "text your clocks")
+# ===========================================================================
+# Promotes the #45 custom-screen channel into a PRODUCT feature: any HA automation
+# can put text on a board's 72×40 glass. Self-contained package — merges with
+# smol_mesh.yaml (unique keys only; HA merges same-domain keys across package files).
+#
+# CAPABILITY (delivered as SCRIPTS — the only YAML-native way to hit BOTH topics the
+# firmware needs; callable from any automation exactly like a notify service):
+#   • script.smol_notify        — send text to target board(s). The engine.
+#   • script.smol_notify_all     — convenience wrapper (target: all).  [issue notify.smol_all]
+#   • script.smol_notify_clear   — companion clear + revert to prior screen.
+#
+# WIRE (rust/clock/src/custom.rs): retained smol/<id>/config/custom =
+#   "<count>[!][~dur]|<size><align>text;…"   size s/m/l (5x8/6x10/10x20) · align l/c/r.
+#   Then retained smol/<id>/config/default_screen = "Custom:0" makes the board SHOW it.
+#   Fit budget (fw drops any row past y+line_h>40):  l = 1 row/7ch · m = 3 rows/12ch · s = 4 rows/14ch.
+#   The message is auto WORD-WRAPPED to the chosen size so it reads as intentional, never clipped mid-word.
+#
+# FUTURE-FIRMWARE PASSTHROUGH (issue firmware side, NOT built): the auto-revert TTL and
+# the priority-interrupt flag ride the COUNT-PREFIX region — "<count>[!][~dur]|…". Today's
+# firmware ignores the prefix entirely (it parses the actual ';' segments), so a bare
+# message (duration 0 / priority off) is BYTE-IDENTICAL to today and the existing #45
+# mirror/compose are untouched. When firmware #160 lands, `!`/`~dur` light up for free.
+#   (Issue prose said "~sec SUFFIX"; PREFIX chosen for clean backward-compat — a tail ~30
+#    would render "text~30" on today's glass. One-line change if firmware prefers suffix.)
+# Real timed auto-revert works TODAY via a best-effort HA delay+guarded-clear (below).
+#
+# Roster = 7/8/9 (id5 headless = future). Table-driven: change the three lists to add a node.
+# NO new smol/* command topics — only the documented config/custom + config/default_screen.
+
+# --- helpers: the dashboard "herald" compose card ---
+input_text:
+  smol_msg_text:
+    name: "smol herald · message"
+    max: 120
+    icon: mdi:message-text-outline
+  # revert memory — the screen each board showed BEFORE a message interrupted it (per-node).
+  smol_7_prev_screen:
+    name: "smol 7 · pre-message screen"
+    max: 20
+  smol_8_prev_screen:
+    name: "smol 8 · pre-message screen"
+    max: 20
+  smol_9_prev_screen:
+    name: "smol 9 · pre-message screen"
+    max: 20
+  # notification-ACTIVE flag (per-node): holds the live notification wire while a message is up.
+  # Its ROLE is a guard — the #45 publish automation (smol_mesh.yaml) SKIPS a node whose flag is
+  # set, so the heartbeat/start republish never wipes the message. '' = no active notification →
+  # heartbeat resumes publishing the author-composed layout for that node.
+  smol_7_notify_wire:
+    name: "smol 7 · notification-active flag"
+    max: 60
+  smol_8_notify_wire:
+    name: "smol 8 · notification-active flag"
+    max: 60
+  smol_9_notify_wire:
+    name: "smol 9 · notification-active flag"
+    max: 60
+  # last-message record (per-node): the script sets this directly (bulletproof — no trigger/event
+  # reactivity needed). state = the message text or "(cleared)"; the helper's own last_changed is
+  # the sent timestamp. sensor.smol_<id>_last_message mirrors it + exposes that timestamp.
+  smol_7_last_msg:
+    name: "smol 7 · last message (raw)"
+    max: 120
+  smol_8_last_msg:
+    name: "smol 8 · last message (raw)"
+    max: 120
+  smol_9_last_msg:
+    name: "smol 9 · last message (raw)"
+    max: 120
+
+input_number:
+  smol_msg_duration:
+    name: "smol herald · show for (seconds, 0 = keep)"
+    min: 0
+    max: 3600
+    step: 5
+    mode: box
+    unit_of_measurement: s
+    icon: mdi:timer-sand
+
+input_select:
+  smol_msg_target:
+    name: "smol herald · target"
+    options: ["All sigils", "id7", "id8", "id9"]
+    initial: "All sigils"
+    icon: mdi:target
+  smol_msg_size:
+    name: "smol herald · size"
+    options: ["small", "medium", "large"]
+    initial: "medium"
+    icon: mdi:format-size
+  smol_msg_align:
+    name: "smol herald · align"
+    options: ["left", "center", "right"]
+    initial: "center"
+    icon: mdi:format-align-center
+
+input_boolean:
+  smol_msg_priority:
+    name: "smol herald · priority (interrupt — future fw)"
+    icon: mdi:alert-decagram
+
+input_button:
+  smol_msg_send:
+    name: "smol herald · SEND to glass"
+    icon: mdi:send
+  smol_msg_clear:
+    name: "smol herald · CLEAR + revert"
+    icon: mdi:backspace-outline
+
+# ===========================================================================
+# SCRIPTS — the notify capability
+# ===========================================================================
+script:
+  # --- THE ENGINE: send text to one/many/all boards ---
+  smol_notify:
+    alias: "smol: notify — put text on a board's glass (#160)"
+    icon: mdi:message-flash
+    mode: parallel
+    max: 10
+    fields:
+      target:
+        description: "'all', a single id (7/8/9), or a list of ids"
+        example: "all"
+      message:
+        description: "text; {entity_id} refs are resolved; auto-wraps to fit the panel"
+        example: "Dinner is ready"
+      size:
+        description: "s / m / l  (default m). l fits ~7 chars, m ~12, s ~14 per row"
+        example: "m"
+      align:
+        description: "l / c / r  (default c)"
+        example: "c"
+      duration:
+        description: "seconds to show then auto-clear (0 = keep until cleared)"
+        example: 30
+      priority:
+        description: "true = interrupt the active screen (future firmware; rides the wire prefix)"
+        example: false
+      via:
+        description: "provenance tag for the last-message record (default 'script')"
+        example: "dashboard"
+    variables:
+      # normalize target → a list of id strings
+      ids: >-
+        {% set t = target if target is defined else 'all' %}
+        {% if t is iterable and t is not string %}{{ t | map('string') | list }}
+        {% elif (t | string | lower) == 'all' %}{{ ['7', '8', '9'] }}
+        {% else %}{{ [t | string] }}{% endif %}
+      # resolve {entity} refs (reuse the #45 subst idiom) + strip frame chars
+      sane: >-
+        {% macro subst(src) %}{% set ns = namespace(out=src) %}{% for id in src | regex_findall('\{([a-z0-9_.]+)\}') %}{% set v = states(id) %}{% set v = '--' if (v | lower) in ['unknown', 'unavailable', 'none', ''] else v %}{% set ns.out = ns.out | replace('{' ~ id ~ '}', v) %}{% endfor %}{{ ns.out }}{% endmacro %}
+        {{ subst(message | default('')) | replace(';', ' ') | replace('|', ' ') | trim }}
+      sz: "{{ (size | default('m'))[0] if (size | default('m'))[0] in 'sml' else 'm' }}"
+      al: "{{ (align | default('c'))[0] if (align | default('c'))[0] in 'lcr' else 'c' }}"
+      # greedy word-wrap → rows that fit the chosen size (native list)
+      rows: >-
+        {% set text = sane %}
+        {% if text == '' %}{{ [] }}
+        {% else %}
+        {% set width = 7 if sz == 'l' else (12 if sz == 'm' else 14) %}
+        {% set maxrows = 1 if sz == 'l' else (3 if sz == 'm' else 4) %}
+        {% set ns = namespace(rows=[], cur='') %}
+        {% for w in text.split() %}
+        {% set wclip = w[:width] %}
+        {% if ns.cur == '' %}{% set ns.cur = wclip %}
+        {% elif (ns.cur ~ ' ' ~ wclip) | length <= width %}{% set ns.cur = ns.cur ~ ' ' ~ wclip %}
+        {% else %}{% set ns.rows = ns.rows + [ns.cur] %}{% set ns.cur = wclip %}{% endif %}
+        {% endfor %}
+        {% if ns.cur != '' %}{% set ns.rows = ns.rows + [ns.cur] %}{% endif %}
+        {{ ns.rows[:maxrows] }}
+        {% endif %}
+      # the wire: "<count>[!][~dur]|<sa>row;<sa>row;…"  ('' = clear)
+      wire: >-
+        {% if rows | length == 0 %}{{ '' }}
+        {% else %}
+        {% set sa = sz ~ al %}
+        {% set segs = rows | map('regex_replace', '^', sa) | list %}
+        {% set prefix = (rows | length) | string ~ ('!' if priority | default(false) | bool(false) else '') ~ ('~' ~ (duration | default(0) | int(0)) if (duration | default(0) | int(0)) > 0 else '') %}
+        {{ prefix ~ '|' ~ (segs | join(';')) }}
+        {% endif %}
+      first_row: "{{ rows[0] if rows | length > 0 else '' }}"
+    sequence:
+      # empty message → route to clear (so "send blank" behaves intuitively)
+      - if:
+          - condition: template
+            value_template: "{{ wire == '' }}"
+        then:
+          - service: script.smol_notify_clear
+            data:
+              target: "{{ target | default('all') }}"
+          - stop: "empty message → cleared"
+      - repeat:
+          for_each: "{{ ids }}"
+          sequence:
+            - variables:
+                n: "{{ repeat.item }}"
+                prev: "{{ states('sensor.smol_' ~ repeat.item ~ '_config') }}"
+            # remember the prior screen ONLY if a message isn't already up (don't clobber the true prior)
+            - if:
+                - condition: template
+                  value_template: "{{ not (prev | string).startswith('Custom') }}"
+              then:
+                - service: input_text.set_value
+                  target:
+                    entity_id: "input_text.smol_{{ n }}_prev_screen"
+                  data:
+                    value: "{{ prev if prev not in ['unknown', 'unavailable', 'none', ''] else '' }}"
+            # mark the notification ACTIVE (heartbeat skip-guard in smol_mesh.yaml) BEFORE publishing,
+            # then publish the wire directly to config/custom (retained). The flag keeps the #45
+            # heartbeat/start republish off this slot so the message is never wiped.
+            - service: input_text.set_value
+              target:
+                entity_id: "input_text.smol_{{ n }}_notify_wire"
+              data:
+                value: "{{ wire }}"
+            - service: mqtt.publish
+              data:
+                topic: "smol/{{ n }}/config/custom"
+                retain: true
+                qos: 0
+                payload: "{{ wire }}"
+            - service: mqtt.publish
+              data:
+                topic: "smol/{{ n }}/config/default_screen"
+                retain: true
+                qos: 0
+                payload: "Custom:0"
+            # keep the node-manager card in sync (cosmetic; no publish side-effect)
+            - service: input_select.select_option
+              target:
+                entity_id: "input_select.smol_{{ n }}_screen"
+              data:
+                option: "Custom"
+            - service: input_select.select_option
+              target:
+                entity_id: "input_select.smol_{{ n }}_page"
+              data:
+                option: "0"
+            # last-message record (set DIRECTLY — bulletproof) + last_changed = the sent timestamp
+            - service: input_text.set_value
+              target:
+                entity_id: "input_text.smol_{{ n }}_last_msg"
+              data:
+                value: "{{ sane | truncate(120, true) }}"
+            # HA-side event record + #158 visualizer parity signal
+            - event: smol_notify_sent
+              event_data:
+                id: "{{ n }}"
+                text: "{{ sane }}"
+                wire: "{{ wire }}"
+                duration: "{{ duration | default(0) | int(0) }}"
+                priority: "{{ priority | default(false) | bool(false) }}"
+                via: "{{ via | default('script') }}"
+      # best-effort timed auto-revert TODAY (until firmware TTL lands). Guarded so a
+      # newer message is never wiped by a stale timer. Restart mid-window → manual clear.
+      - if:
+          - condition: template
+            value_template: "{{ (duration | default(0) | int(0)) > 0 }}"
+        then:
+          - delay:
+              seconds: "{{ duration | int(0) }}"
+          - repeat:
+              for_each: "{{ ids }}"
+              sequence:
+                - variables:
+                    n: "{{ repeat.item }}"
+                    cur: "{{ states('sensor.smol_' ~ repeat.item ~ '_custom') }}"
+                - if:
+                    - condition: template
+                      value_template: "{{ first_row != '' and cur == first_row }}"
+                  then:
+                    - service: script.smol_notify_clear
+                      data:
+                        target: "{{ n }}"
+
+  # --- convenience: fleet-wide (issue's notify.smol_all) ---
+  smol_notify_all:
+    alias: "smol: notify ALL boards (#160)"
+    icon: mdi:message-flash
+    mode: parallel
+    max: 10
+    fields:
+      message: {description: "text (see smol_notify)", example: "USB me — plug me in"}
+      size: {description: "s/m/l", example: "m"}
+      align: {description: "l/c/r", example: "c"}
+      duration: {description: "seconds, 0 = keep", example: 0}
+      priority: {description: "interrupt (future fw)", example: false}
+    sequence:
+      - service: script.smol_notify
+        data:
+          target: "all"
+          message: "{{ message | default('') }}"
+          size: "{{ size | default('m') }}"
+          align: "{{ align | default('c') }}"
+          duration: "{{ duration | default(0) }}"
+          priority: "{{ priority | default(false) }}"
+          via: "{{ via | default('script') }}"
+
+  # --- companion CLEAR: wipe the message + revert the board to its prior screen ---
+  smol_notify_clear:
+    alias: "smol: notify — clear a board's message + revert (#160)"
+    icon: mdi:message-off
+    mode: parallel
+    max: 10
+    fields:
+      target:
+        description: "'all', a single id, or a list of ids"
+        example: "all"
+    variables:
+      ids: >-
+        {% set t = target if target is defined else 'all' %}
+        {% if t is iterable and t is not string %}{{ t | map('string') | list }}
+        {% elif (t | string | lower) == 'all' %}{{ ['7', '8', '9'] }}
+        {% else %}{{ [t | string] }}{% endif %}
+      screens: "{{ ['Menu', 'Clock', 'Batt', 'Grid', 'Snake', 'Bench', 'MeshSnake', 'About', 'Custom'] }}"
+    sequence:
+      - repeat:
+          for_each: "{{ ids }}"
+          sequence:
+            - variables:
+                n: "{{ repeat.item }}"
+                prev: "{{ states('input_text.smol_' ~ repeat.item ~ '_prev_screen') }}"
+            # drop the notification flag, then restore config/custom from the author-composed layout
+            # (empty author → retain-delete; authored content → restored). Heartbeat resumes this slot.
+            - service: input_text.set_value
+              target:
+                entity_id: "input_text.smol_{{ n }}_notify_wire"
+              data:
+                value: ""
+            - service: mqtt.publish
+              data:
+                topic: "smol/{{ n }}/config/custom"
+                retain: true
+                qos: 0
+                payload: "{{ states('sensor.smol_' ~ n ~ '_custom_lay') }}"
+            # revert default_screen to the remembered prior (empty = board default, matches #21 reset)
+            - service: mqtt.publish
+              data:
+                topic: "smol/{{ n }}/config/default_screen"
+                retain: true
+                qos: 0
+                payload: "{{ prev if prev not in ['unknown', 'unavailable', 'none', ''] else '' }}"
+            # resync the node-manager selects from the remembered prior (only if valid)
+            - if:
+                - condition: template
+                  value_template: "{{ (prev | string).split(':')[0] in screens }}"
+              then:
+                - service: input_select.select_option
+                  target:
+                    entity_id: "input_select.smol_{{ n }}_screen"
+                  data:
+                    option: "{{ prev.split(':')[0] }}"
+                - service: input_select.select_option
+                  target:
+                    entity_id: "input_select.smol_{{ n }}_page"
+                  data:
+                    option: "{{ prev.split(':')[1] if ':' in prev else '0' }}"
+            - service: input_text.set_value
+              target:
+                entity_id: "input_text.smol_{{ n }}_prev_screen"
+              data:
+                value: ""
+            - service: input_text.set_value
+              target:
+                entity_id: "input_text.smol_{{ n }}_last_msg"
+              data:
+                value: "(cleared)"
+            - event: smol_notify_cleared
+              event_data:
+                id: "{{ n }}"
+
+  # ⏸ HELD (built, UNWIRED) until the herald TOAST wave merges — dock #211/#215 + fw receive #28/#204
+  # (build-and-hold, #38, mirrors the #211 pattern so neither side ships a no-op). NOTHING references
+  # this script yet (no card, no automation) — activating = add a dashboard card once fw toasts on glass.
+  # DISTINCT from script.smol_notify: a TRANSIENT auto-dismiss overlay toast (smol/<id>/notify, non-retained),
+  # NOT the persistent Custom SCREEN (config/custom, retained). Wire `[~<dur>]<msg>` per 158's dock; the
+  # board word-wraps the raw msg to the overlay box (wrap parity = identical wire, board-side wrap).
+  smol_toast:
+    alias: "smol: toast — transient on-glass overlay (#38 · HELD until herald wave)"
+    icon: mdi:message-flash-outline
+    mode: parallel
+    max: 10
+    fields:
+      target:
+        description: "'all' (→ smol/255/notify broadcast), a single id (7/8/9), or a list of ids"
+        example: "all"
+      message:
+        description: "toast text; the board word-wraps it to the overlay box (same wrap as the dock)"
+        example: "USB me — plug me in"
+      duration:
+        description: "auto-dismiss seconds (0/blank = board default); rides the wire as the `~<sec>` prefix"
+        example: 8
+    variables:
+      # 'all' → the broadcast target 255 (smol/255/notify); else per-node id(s)
+      ids: >-
+        {% set t = target if target is defined else 'all' %}
+        {% if t is iterable and t is not string %}{{ t | map('string') | list }}
+        {% elif (t | string | lower) == 'all' %}{{ ['255'] }}
+        {% else %}{{ [t | string] }}{% endif %}
+      sane: "{{ (message | default('')) | replace('\n', ' ') | replace(chr(13), ' ') | trim }}"
+      # wire = "[~<dur>]<msg>" — optional ~seconds auto-dismiss prefix, then the raw message
+      wire: >-
+        {% set d = duration | default(0) | int(0) %}{{ ('~' ~ d if d > 0 else '') ~ sane }}
+    sequence:
+      - condition: template
+        value_template: "{{ sane != '' }}"
+      - repeat:
+          for_each: "{{ ids }}"
+          sequence:
+            # TRANSIENT toast — retain:FALSE (never retained; a retained toast would re-fire on reconnect)
+            - service: mqtt.publish
+              data:
+                topic: "smol/{{ repeat.item }}/notify"
+                retain: false
+                qos: 1
+                payload: "{{ wire }}"
+
+# ===========================================================================
+# LAST-MESSAGE sensors (per node) — simple STATE-based mirror of the last_msg helper the
+# script sets directly. state = message text / "(cleared)" / "(none)"; sent = the helper's
+# last_changed (the moment the message was sent). (Trigger-on-event sensors were abandoned —
+# this HA instance has template-reactivity quirks on event triggers; direct-set is bulletproof.)
+# ===========================================================================
+template:
+  - sensor:
+      - name: "smol 7 last message"
+        unique_id: smol_7_last_message
+        icon: mdi:message-text
+        state: >-
+          {% set v = states('input_text.smol_7_last_msg') %}
+          {{ v if v not in ['unknown', 'unavailable', 'none', ''] else '(none)' }}
+        attributes:
+          sent: "{{ states.input_text.smol_7_last_msg.last_changed if states.input_text.smol_7_last_msg is not none else None }}"
+      - name: "smol 8 last message"
+        unique_id: smol_8_last_message
+        icon: mdi:message-text
+        state: >-
+          {% set v = states('input_text.smol_8_last_msg') %}
+          {{ v if v not in ['unknown', 'unavailable', 'none', ''] else '(none)' }}
+        attributes:
+          sent: "{{ states.input_text.smol_8_last_msg.last_changed if states.input_text.smol_8_last_msg is not none else None }}"
+      - name: "smol 9 last message"
+        unique_id: smol_9_last_message
+        icon: mdi:message-text
+        state: >-
+          {% set v = states('input_text.smol_9_last_msg') %}
+          {{ v if v not in ['unknown', 'unavailable', 'none', ''] else '(none)' }}
+        attributes:
+          sent: "{{ states.input_text.smol_9_last_msg.last_changed if states.input_text.smol_9_last_msg is not none else None }}"
+
+# ===========================================================================
+# Dashboard button → script bridges (the "herald" compose card lives on smol-control)
+# ===========================================================================
+automation:
+  - id: smol_msg_send
+    alias: "smol herald: SEND message (dashboard → script)"
+    mode: queued
+    max: 10
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_msg_send
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
+    action:
+      - service: script.smol_notify
+        data:
+          target: >-
+            {% set o = states('input_select.smol_msg_target') %}
+            {% if o.startswith('All') %}all{% else %}{{ o | regex_replace('[^0-9]', '') }}{% endif %}
+          message: "{{ states('input_text.smol_msg_text') }}"
+          size: "{{ states('input_select.smol_msg_size')[0] }}"
+          align: "{{ states('input_select.smol_msg_align')[0] }}"
+          duration: "{{ states('input_number.smol_msg_duration') | int(0) }}"
+          priority: "{{ is_state('input_boolean.smol_msg_priority', 'on') }}"
+          via: "dashboard"
+
+  - id: smol_msg_clear
+    alias: "smol herald: CLEAR message (dashboard → script)"
+    mode: queued
+    max: 10
+    trigger:
+      - platform: state
+        entity_id: input_button.smol_msg_clear
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
+    action:
+      - service: script.smol_notify_clear
+        data:
+          target: >-
+            {% set o = states('input_select.smol_msg_target') %}
+            {% if o.startswith('All') %}all{% else %}{{ o | regex_replace('[^0-9]', '') }}{% endif %}
