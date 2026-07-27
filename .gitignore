@@ -69,3 +69,5 @@ web/emulator/*.wasm
 # build.sh; source of truth is index.template.html + build.sh (no blob churn in git).
 web/emulator/index.html
 web/emulator/dist/
+# A killed export leaves a 277 KB tmp blob behind; never let it near a commit.
+rust/clock/model/*.tmp

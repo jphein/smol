@@ -6,7 +6,7 @@
 //! compile without the `hw` crates.
 #![cfg(feature = "hostsim")]
 use clock::bard_tokenizer::Tokenizer;
-use clock::nano_llm::{Bufs, Model, ParseErr, Session};
+use clock::nano_llm::{Bufs, Model, ParseErr, Session, StepOut, Story};
 
 pub const BLOB: &[u8] = include_bytes!("../model/stories260K-q8.bin");
 
@@ -275,4 +275,56 @@ fn greedy_from_bos_is_the_known_opening() {
         text.starts_with("Once upon a time, there was a little girl named Lily"),
         "greedy-from-BOS opening changed: {text:?}"
     );
+}
+
+/// Drive a `Story` to completion, returning its text and the number of `step()` calls.
+fn run_story(m: &Model, t: &Tokenizer, bufs: &mut Bufs, seed: u32) -> (std::string::String, u32) {
+    let mut story = Story::new(t, GOLDEN_PROMPT, seed);
+    let mut text = std::string::String::new();
+    let mut steps = 0u32;
+    loop {
+        match story.step(m, t, bufs) {
+            StepOut::Text(bytes) => text.push_str(core::str::from_utf8(bytes).unwrap()),
+            StepOut::Working => {}
+            StepOut::Done => break,
+        }
+        steps += 1;
+        assert!(steps < 300, "no termination");
+    }
+    (text, steps)
+}
+
+#[test]
+fn story_generates_and_terminates() {
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+    let mut bufs = std::boxed::Box::new(Bufs::INIT);
+    let mut story = Story::new(&t, "Once upon a time, there was a little dragon", 0xC0FFEE);
+    let mut text = std::string::String::new();
+    let mut steps = 0;
+    loop {
+        match story.step(&m, &t, &mut bufs) {
+            StepOut::Text(bytes) => text.push_str(core::str::from_utf8(bytes).unwrap()),
+            StepOut::Working => {}
+            StepOut::Done => break,
+        }
+        steps += 1;
+        assert!(steps < 300, "no termination");
+    }
+    assert!(text.len() > 80, "story too short: {text}");
+    assert!(text.is_ascii());
+}
+
+#[test]
+fn different_seeds_different_stories() {
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+    let mut bufs = std::boxed::Box::new(Bufs::INIT);
+    let (a, _) = run_story(&m, &t, &mut bufs, 1);
+    let (b, _) = run_story(&m, &t, &mut bufs, 2);
+    assert_ne!(a, b, "two seeds produced the same story");
+    // Reusing one Bufs must not couple the runs: the same seed replays identically even after
+    // another story has scribbled all over the KV cache.
+    let (a_again, _) = run_story(&m, &t, &mut bufs, 1);
+    assert_eq!(a, a_again, "story is not reproducible from its seed");
 }

@@ -405,6 +405,11 @@ pub struct Bufs {
     v_scale: [f32; MAX_LAYERS * SEQ_CAP],
 }
 
+/// Spec §5's RAM budget, enforced by the compiler rather than by a comment: if a future model
+/// or a bigger SEQ_CAP pushes the scratch past 100 KB, the BUILD fails instead of the board
+/// OOMing at boot next to esp-wifi's heap.
+const _: () = assert!(core::mem::size_of::<Bufs>() <= 100_000);
+
 impl Bufs {
     /// All-zero buffers: `static mut BUFS: Bufs = Bufs::INIT` costs `.bss`, not flash.
     pub const INIT: Bufs = Bufs {
@@ -451,6 +456,8 @@ fn rmsnorm(out: &mut [f32], x: &[f32], w: &[u8]) {
 /// `gs`: `hidden = 172` with `gs = 64` gives groups of 64, 64, 44). The rounding —
 /// `(v/scale ± 0.5) as i8` — is deliberately the truncating C form, part of the golden contract.
 fn quantize(x: &[f32], gs: usize, q: &mut [i8], s: &mut [f32]) {
+    debug_assert!(s.len() >= x.len().div_ceil(gs), "scale buffer too short for the tail group");
+    debug_assert!(q.len() >= x.len());
     for (g, chunk) in x.chunks(gs).enumerate() {
         let mut m = 0f32;
         for v in chunk {
@@ -500,7 +507,9 @@ fn matmul(out: &mut [f32], x: &QAct, w: &QTensor, w_off: usize, n_in: usize, gs:
 
 /// In-place softmax, max-shifted for stability.
 fn softmax(x: &mut [f32]) {
-    let mut mx = f32::MIN;
+    // NEG_INFINITY, not MIN: MIN is the most negative FINITE float, so a hypothetical all--inf
+    // slice would leave `mx` above every element and produce exp(-inf - MIN) = 0 everywhere.
+    let mut mx = f32::NEG_INFINITY;
     for v in x.iter() {
         if *v > mx {
             mx = *v;
@@ -566,9 +575,13 @@ impl Session {
             SEQ_CAP <= c.seq_len,
             "cache deeper than the trained context — RoPE positions would be extrapolated"
         );
+        // KV-cache ownership (see `Story`): positions must arrive monotonically from zero, or
+        // this pass reads keys the previous story wrote and calls them context. `Story` is the
+        // only caller and guarantees it; this is the tripwire for anyone else.
+        debug_assert_eq!(pos, self.pos as usize, "forward() called out of sequence");
+        self.pos = self.pos.saturating_add(1);
         let pos = pos.min(SEQ_CAP - 1);
         debug_assert!(pos < SEQ_CAP);
-        self.pos = pos as u16;
 
         // 1. Embed: dequantize the token's row of tok_emb straight into the residual stream.
         let emb = m.tensor(0);
@@ -720,5 +733,245 @@ impl Session {
             gs,
         );
         &b.logits[..c.vocab]
+    }
+}
+
+// ===================================================================================
+// Sampling + story state machine
+// ===================================================================================
+
+// The Bard's tokenizer. Under `hostsim` the pure cores are flat crate-root modules; in the
+// firmware they live under `crate::bard::` (Task 9's mod.rs). Both paths are spelled out here
+// so neither world has to patch this file.
+#[cfg(feature = "hostsim")]
+use crate::bard_tokenizer::Tokenizer;
+#[cfg(not(feature = "hostsim"))]
+use crate::bard::tokenizer::Tokenizer;
+
+/// Longest prompt, in tokens. The 16 personas encode to well under this (Task 9 tests it).
+pub const MAX_PROMPT: usize = 48;
+
+/// xorshift32 — the generator `src/snake.rs` already uses on this board. Seeded from `now_ms`
+/// at the button press, so each story differs; the seed alone reproduces a story exactly.
+pub struct Rng32 {
+    s: u32,
+}
+
+impl Rng32 {
+    /// Seed the generator. Zero would be a fixed point of xorshift, so it is remapped.
+    pub fn new(seed: u32) -> Self {
+        Self {
+            s: if seed == 0 { 0xA5A5_A5A5 } else { seed },
+        }
+    }
+
+    fn next(&mut self) -> u32 {
+        let mut x = self.s;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.s = x;
+        x
+    }
+
+    /// A float in `[0, 1)` from the top 24 bits — every value exactly representable in f32.
+    fn unit(&mut self) -> f32 {
+        (self.next() >> 8) as f32 / (1u32 << 24) as f32
+    }
+}
+
+/// What one [`Story::step`] produced.
+pub enum StepOut<'a> {
+    /// A prompt token was fed to prime the KV cache; nothing to show yet.
+    Working,
+    /// Newly generated text (borrowed straight from the model blob — no copy).
+    Text(&'a [u8]),
+    /// The story ended: end-of-text token, token budget, or cache depth.
+    Done,
+}
+
+/// Nucleus (top-p) sampling from `logits`, which are consumed in place.
+///
+/// `logits /= temp`, softmax, sort by probability descending, keep the shortest prefix whose
+/// cumulative probability passes `top_p`, then draw inside that prefix.
+///
+/// The pre-filter is llama2.c's: a token below `(1-top_p)/(n-1)` cannot reach the nucleus, so
+/// dropping it before the sort leaves the selected prefix identical while making an O(n²)
+/// insertion sort cheap. Insertion sort (not a heap) because `n` is 512 and this runs once per
+/// token against a ~20-100 ms forward pass — the simple thing is free here.
+fn sample_top_p(
+    logits: &mut [f32],
+    temp: f32,
+    top_p: f32,
+    rng: &mut Rng32,
+    idx: &mut [u16; MAX_VOCAB],
+) -> u16 {
+    let n = logits.len();
+    for v in logits.iter_mut() {
+        *v /= temp;
+    }
+    softmax(logits);
+
+    let cutoff = (1.0 - top_p) / (n as f32 - 1.0);
+    let mut m = 0usize;
+    for (i, &p) in logits.iter().enumerate() {
+        if p >= cutoff {
+            idx[m] = i as u16;
+            m += 1;
+        }
+    }
+    if m == 0 {
+        // Degenerate distribution (every probability below the cutoff): fall back to the
+        // arg-max so we always return a valid token instead of indexing an empty prefix.
+        let mut best = 0usize;
+        for (i, &p) in logits.iter().enumerate() {
+            if p > logits[best] {
+                best = i;
+            }
+        }
+        return best as u16;
+    }
+
+    // Insertion sort, probability descending.
+    for i in 1..m {
+        let key = idx[i];
+        let kp = logits[key as usize];
+        let mut j = i;
+        while j > 0 && logits[idx[j - 1] as usize] < kp {
+            idx[j] = idx[j - 1];
+            j -= 1;
+        }
+        idx[j] = key;
+    }
+
+    // Shortest prefix whose cumulative probability passes top_p.
+    let mut cum = 0f32;
+    let mut last = m - 1;
+    for (i, &id) in idx[..m].iter().enumerate() {
+        cum += logits[id as usize];
+        if cum > top_p {
+            last = i;
+            break;
+        }
+    }
+
+    // Draw within the nucleus, rescaled to its own mass.
+    let r = rng.unit() * cum;
+    let mut cdf = 0f32;
+    for &id in idx[..=last].iter() {
+        cdf += logits[id as usize];
+        if r < cdf {
+            return id;
+        }
+    }
+    idx[last]
+}
+
+/// One story, told one token per [`Story::step`] call.
+///
+/// **KV-cache ownership.** The cache lives in [`Bufs`] and has no owner of its own, so two
+/// interleaved generations would silently corrupt each other and a first `forward` at
+/// `pos > 0` would read the previous story's keys as plausible garbage. `Story` is therefore
+/// the ONLY thing that calls [`Session::forward`]: it starts at `pos = 0` and advances by
+/// exactly one per step, which `Session` checks with a `debug_assert`. Termination is explicit
+/// — the `pos` clamp inside `forward` is a safety net, never a stop condition.
+pub struct Story {
+    prompt: [u16; MAX_PROMPT],
+    prompt_len: u8,
+    /// Prompt tokens already fed (all but the last, which seeds generation).
+    fed: u8,
+    pos: u16,
+    /// The token whose logits the next step will produce — also the predecessor `decode` needs.
+    cur: u16,
+    rng: Rng32,
+    session: Session,
+    /// Sampler scratch: vocabulary indices, re-sorted every step. Lives here rather than in
+    /// [`Bufs`] to keep that struct inside its RAM budget.
+    idx: [u16; MAX_VOCAB],
+    done: bool,
+}
+
+impl Story {
+    /// Sampling temperature — flattens the distribution enough to break greedy's repetition
+    /// loops without losing the grammar.
+    pub const TEMP: f32 = 0.9;
+    /// Nucleus mass.
+    pub const TOP_P: f32 = 0.9;
+    /// Generated-token budget, on top of the prompt.
+    pub const MAX_TOKENS: u16 = 220;
+
+    /// Encode `prompt` and arm the generator. Same `seed` ⇒ same story, always.
+    pub fn new(t: &Tokenizer, prompt: &str, seed: u32) -> Story {
+        let mut p = [0u16; MAX_PROMPT];
+        let n = t.encode(prompt, &mut p);
+        Story {
+            prompt: p,
+            prompt_len: n as u8,
+            fed: 0,
+            pos: 0,
+            // The last prompt token is not "fed" — it is the one whose logits start the story.
+            cur: p[n.saturating_sub(1)],
+            rng: Rng32::new(seed),
+            session: Session::new(),
+            idx: [0; MAX_VOCAB],
+            done: false,
+        }
+    }
+
+    /// Whether the story has finished (further steps return [`StepOut::Done`]).
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// Tokens generated or fed so far — the tick counter a UI can show progress from.
+    pub fn pos(&self) -> u16 {
+        self.pos
+    }
+
+    /// Advance by exactly ONE forward pass: either priming the cache with a prompt token
+    /// ([`StepOut::Working`]) or generating one ([`StepOut::Text`]). ~20-100 ms on the C3, so
+    /// this is the unit a cooperative UI tick can afford.
+    pub fn step<'b>(&mut self, m: &Model<'_>, t: &Tokenizer<'b>, b: &'b mut Bufs) -> StepOut<'b> {
+        if self.done {
+            return StepOut::Done;
+        }
+        let plen = self.prompt_len as usize;
+
+        // Prime the cache with every prompt token but the last.
+        if (self.fed as usize) + 1 < plen {
+            let tok = self.prompt[self.fed as usize];
+            self.session.forward(m, b, tok, self.pos as usize);
+            self.fed += 1;
+            self.pos += 1;
+            return StepOut::Working;
+        }
+
+        // Stop BEFORE a pass that would exceed the token budget or the cache depth. Checking
+        // here (rather than reacting to the clamp in `forward`) is what keeps termination
+        // explicit — a clamped `pos` would quietly overwrite the last slot forever.
+        if self.pos >= Self::MAX_TOKENS + plen as u16 || (self.pos as usize) + 1 >= SEQ_CAP {
+            self.done = true;
+            return StepOut::Done;
+        }
+
+        // Ignore the returned view: the logits live in `b.logits`, and the sampler needs them
+        // mutably. Reborrowing keeps `b` usable afterwards.
+        let _ = self.session.forward(m, &mut *b, self.cur, self.pos as usize);
+        self.pos += 1;
+        let next = sample_top_p(
+            &mut b.logits[..m.cfg.vocab],
+            Self::TEMP,
+            Self::TOP_P,
+            &mut self.rng,
+            &mut self.idx,
+        );
+        // 1 = BOS, 2 = EOS: llama2.c treats either as end-of-story.
+        if next == 1 || next == 2 {
+            self.done = true;
+            return StepOut::Done;
+        }
+        let text = t.decode(self.cur, next);
+        self.cur = next;
+        StepOut::Text(text)
     }
 }
