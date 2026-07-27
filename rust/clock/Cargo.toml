@@ -225,6 +225,13 @@ cast = ["espnow"]
 # Pulls no alloc — the core is static-buffer only (spec §5).
 bard = ["hw", "dep:libm"]
 
+# #300 BENCH ONLY — stack high-water measurement (src/bard/stack_paint.rs). Paints the unused
+# stack with a sentinel at boot and reports how deep the story actually went, turning "14240 B
+# should be enough" into a measured number. Deliberately NOT in the canonical fleet list in
+# tools/repro_build.sh: it writes the whole free stack at boot, which is a diagnostic cost no
+# shipped image should pay.
+stack-paint = ["bard"]
+
 # COEXIST SOAK (issue #23 PART 1 — the gating experiment, NOT for production).
 # The gateway stays WiFi-associated after boot (no switch to ESP-NOW time-share),
 # the mesh rides the AP channel (pinned to ch1 = north-bedroom), and mesh + MQTT

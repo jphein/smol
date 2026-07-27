@@ -546,3 +546,28 @@ fn golden_failure_names_the_divergent_token() {
         "expected golden window {want_golden} in: {msg}"
     );
 }
+
+#[test]
+fn stack_paint_scanner_finds_the_high_water_mark() {
+    use clock::stack_paint::{untouched_bytes, SENTINEL};
+    // The paint itself is device-only (linker symbols, raw writes); the SCAN is pure arithmetic
+    // and is where an off-by-one would silently flatter the bench number, so test it here.
+    let mut region = [SENTINEL; 16];
+
+    // Nothing overwritten: the whole painted span is still untouched.
+    assert_eq!(untouched_bytes(&region), 64);
+
+    // The stack grows DOWN, so index 0 is the deepest address. A frame that reached word 4
+    // leaves words 0..4 untouched = 16 bytes.
+    region[4] = 0xDEAD_BEEF;
+    assert_eq!(untouched_bytes(&region), 16);
+
+    // A deeper excursion wins even if shallower marks exist above it.
+    region[1] = 0x1234_5678;
+    assert_eq!(untouched_bytes(&region), 4);
+
+    // Fully consumed, and the degenerate empty region — neither may panic or wrap.
+    region[0] = 1;
+    assert_eq!(untouched_bytes(&region), 0);
+    assert_eq!(untouched_bytes(&[]), 0);
+}

@@ -14,6 +14,11 @@
 
 pub mod nano_llm;
 pub mod persona;
+// Bench-only stack measurement. Gated on the feature in the FIRMWARE tree: with `stack-paint`
+// off nothing calls it, and an uncompiled module beats nine `dead_code` allows. The host lib
+// exports the same file separately (lib.rs) so its pure scanner stays testable regardless.
+#[cfg(feature = "stack-paint")]
+pub mod stack_paint;
 pub mod textflow;
 pub mod tokenizer;
 
@@ -322,6 +327,21 @@ impl Plugin for BardApp {
                     avg,
                     self.tok_ms_max
                 );
+                // Bench builds only: how much of the (floor-gated) stack the story actually used.
+                #[cfg(feature = "stack-paint")]
+                {
+                    let region = stack_paint::region_bytes();
+                    let used = stack_paint::high_water();
+                    // checked_div, not a zero test: a region of 0 means the linker symbols were
+                    // nonsense, and reporting 0% is the honest answer rather than dividing.
+                    let pct = (used * 100).checked_div(region).unwrap_or(0);
+                    log::info!(
+                        "smol #300: stack high-water {} of {} B ({}%)",
+                        used,
+                        region,
+                        pct
+                    );
+                }
             }
         }
         let text_len = unsafe { *core::ptr::addr_of!(STORY_LEN) } as u16;

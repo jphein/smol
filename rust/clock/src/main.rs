@@ -340,6 +340,13 @@ fn millis() -> u64 {
 
 #[main]
 fn main() -> ! {
+    // #300 bench builds only: paint the free stack BEFORE anything grows a deep call chain, so
+    // the high-water report after a story covers the whole run. First statement in `main` on
+    // purpose — even HAL init would otherwise go unmeasured. See src/bard/stack_paint.rs for why
+    // writing below the live frame is sound.
+    #[cfg(feature = "stack-paint")]
+    bard::stack_paint::paint();
+
     // --- Clocks & peripherals ------------------------------------------------
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
 

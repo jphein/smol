@@ -67,6 +67,10 @@ pub mod persona;
 #[cfg(feature = "hostsim")]
 #[path = "bard/textflow.rs"]
 pub mod textflow;
+// Only the pure sentinel scanner compiles here; the paint itself is device-only (linker symbols).
+#[cfg(feature = "hostsim")]
+#[path = "bard/stack_paint.rs"]
+pub mod stack_paint;
 #[cfg(feature = "hostsim")]
 pub mod sensors;
 #[cfg(feature = "hostsim")]
