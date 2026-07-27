@@ -156,6 +156,12 @@ The runtime parses the header (no hardcoded dims beyond compile-time maxima), so
 | **Total RAM** | | **~101KB** |
 
 - Flash: image grows ~590KB → **~880KB** — 45% of a slot, mesh-OTA-able unchanged.
+  > ⚠️ **PROJECTED, and it was wrong.** Measured: **1,432,400 B = 70.5% of a slot, 1.42× headroom**
+  > (~550 KB heavier than this estimate). This line is a *pre-build projection* left standing as a
+  > record of what was expected — §5's table is design-time, the `✏️ AMENDMENT` blocks are measured.
+  > A reader quoting this line in good faith already got the headroom wrong once (2026-07-27), so:
+  > **for any physical number, prefer the artifact over the prose.** At 1.42× the `size ≤ 0x1F0000`
+  > publish gate is a real constraint, not a formality — budget flash before a feature lands.
 - **`SEQ_CAP` is the pressure-relief knob**: KV cost is linear (256→160 tokens ≈ 92→58KB). Free `.bss` headroom beside the ESP-NOW stack is the one number we only learn at first link; if it doesn't fit at 256 we ship at a lower cap — stories target ~200 tokens anyway.
 - KV is quantized (weights would fit even f32; the cache wouldn't: f32 KV at seq 256 is 327KB — more than exists).
 
