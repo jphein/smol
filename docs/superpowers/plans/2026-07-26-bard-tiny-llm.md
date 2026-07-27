@@ -915,7 +915,8 @@ log::info!("smol #300: bard story done — {} tok, avg {} ms/tok, max {} ms",
 
 ### Task 13: Bench-board validation (hardware — Eldritch Nexus id8, see Worker constraints for port/MAC)
 
-- [ ] **Step 13.0:** `espflash board-info` on the target port — proceed ONLY if the MAC is `ac:a7:04:ba:1f:24` (id8) or `ACM0`'s known Nexus identity. Any other MAC = STOP.
+- [ ] **Step 13.0:** identity check — `udevadm info --query=property --name=<port> | grep ID_SERIAL_SHORT` (passive; espflash board-info RESETS targets): proceed ONLY on `ACA704BA1F24` (id8). Any other MAC = STOP.
+- [ ] **Step 13.0b (stack high-water — GATES THE FLEET ROLL, oracle T9 critical):** the bench build paints the `.stack` region at boot (fill `_stack_end.._stack_start` minus the live frame with a sentinel), then after ≥3 full stories + normal mesh duty, log the deepest touched address. **Required margin: high-water usage ≤ 75% of the region.** Below that margin → SEQ_CAP down another notch or pull the #140 heap lever (JP decision) before T14.
 - [ ] **Step 13.1:** Flash the bench board over USB: `cargo build --release --features espnow,bard` → `espflash flash` per `docs/BUILDING.md`. ⚠️ After ANY prior OTA on this board: `espflash erase-region 0xf000 0x2000` first (otadata → ota_0 trap), then verify the `Loaded app from offset 0x20000` boot line.
 - [ ] **Step 13.2:** With `ESP_LOG=info` build (release images are serial-silent), on-glass run: menu → Bard → short press. Verify: story composes typewriter-style, mesh LED stays in its normal state (peer solid), Familiar/roster unaffected on a second board, long-press exits cleanly mid-compose.
 - [ ] **Step 13.3:** Capture the Task-11 perf line for 3 stories. **Record avg/max ms/token + observed mesh health as an AMENDMENT block in the spec** (house style), including the go/no-go on the §7 per-layer-yield fallback (needed only if max-stall visibly degrades mesh RX — check a leaf's DIAG link-quality while composing).
