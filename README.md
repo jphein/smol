@@ -10,7 +10,7 @@ It started as *"can we make this into a tiny game player? can it run Minecraft?"
 
 > A shared-world creature that migrates across $3 microcontrollers when you pull power is, as far as we know, one-of-a-kind for a `no_std`-Rust ESP-NOW fleet.
 
-🌐 **Live site:** https://jphein.github.io/smol/ &nbsp;·&nbsp; 🕹️ Hardware-verified on real boards (the id7/id8/id9 bench fleet).
+🌐 **Live site:** https://jphein.github.io/smol/ &nbsp;·&nbsp; 🕹️ Hardware-verified on real boards (the bench fleet).
 
 ## What runs on it (the apps)
 

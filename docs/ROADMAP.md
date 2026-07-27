@@ -5,7 +5,7 @@ build, what's been **researched** (go/no-go), and the open decisions. Companion 
 GitHub tracking issue [#24](https://github.com/jphein/smol/issues/24) (this is the
 in-repo narrative version; the issue is the living checklist).
 
-**Honesty rule:** *shipped* means hardware-verified on the id7/8/9 fleet; nothing here is
+**Honesty rule:** *shipped* means hardware-verified on the bench fleet; nothing here is
 overstated. Verification legend: 🟢 hardware-verified · 🟡 compile/spec-verified, not fully
 exercised on hardware · ⚪ design only.
 
@@ -29,7 +29,7 @@ formula are a bug in this document** — check them together.
 
 | What | Issue | Evidence |
 |---|---|---|
-| **MQTT-native display link** — collector retired; nodes ↔ HA directly over MQTT (retained downlink + discovery uplink) | #10/#11/#15 | Full leaf→gateway→MQTT→HA path proven on id7/8/9; commits `96f44d5`, `bb5092a` |
+| **MQTT-native display link** — collector retired; nodes ↔ HA directly over MQTT (retained downlink + discovery uplink) | #10/#11/#15 | Full leaf→gateway→MQTT→HA path proven across three bench boards; commits `96f44d5`, `bb5092a` |
 | **Batt screen + 6-segment SOC pages** — retained `smol/display/batt`; voltage overview + big per-battery SOC/charge detail pages (short-press to page) | #16/#17 | Both payloads cached on all 3 boards; big pages render on glass; commits `96f44d5`/`f6d56d2`/`b7fd71a` |
 | **Grid screen** — retained `smol/display/grid` (yurt total + two phase clamps, watts) + `SMOLv1 GRID` mesh frame | #16 | Live HA mirror `sensor.smol_display_grid`; on-glass verified |
 | **Default screen at boot** — compile-time `DEFAULT_APP`/`DEFAULT_PAGE` one-shot (long-press always escapes) | #18 | Default build byte-identical (const-false DCE); verified |
@@ -269,10 +269,12 @@ than an open one. **Nine of twelve are now closed;** D6/D9/D11 are what's left.
   supported coex shape, so this is now downstream of #198 rather than a standalone spike.
   Proximity shipped anyway, without BLE, from ESP-NOW roster RSSI (#58/#60).
 - [ ] **D11 — Structured HA entities + device grouping (#12)** · *Split the telemetry line into
-  typed `_voltage`/`_soc`/`_rssi`/`_role` under one `smol <id>` device.* #12 closed 2026-07-12 and
-  #228 enriched the discovery device block (model/manufacturer), **but I could not find evidence
-  that the typed-entity split itself landed** — so this stays open rather than being ticked on the
-  strength of a nearby issue closing. Needs a look at the live discovery JSON to settle.
+  typed `_voltage`/`_soc`/`_rssi`/`_role` under one `smol <id>` device.* **PARTIALLY SHIPPED — and
+  that is why the box stays unticked.** Live discovery on 2026-07-27 carries **3 `_voltage` and 3
+  `_rssi` entities and ZERO `_soc`**, so the split landed for two of the four types and the SOC half
+  did not. #12 closed 2026-07-12 and #228 enriched the discovery device block
+  (model/manufacturer), neither of which is the same thing. A half-landed split is exactly the
+  state a docket must not tick — finish `_soc` (and `_role`), then tick.
 - [x] **D12 — Multi-hop #13 + self-healing #14** · *SHIPPED — #14 (election #76) + #13 (routed
   multi-hop, PR #123, merged 2026-07-14; first routed frame hardware-proven). Throughput +
   observability follow-ups: #126 / #124.*

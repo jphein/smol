@@ -1,7 +1,7 @@
 {
   "fields": {
-    "hero.title": "A whole game console that fits on your <em>fingertip</em>.",
-    "hero.sub": "smol turns a $3 ESP32-C3 and a tiny 0.42″ OLED into a whole handheld — games, a shared-world MMO, and a fleet of boards that talk directly over ESP-NOW, update themselves with signed firmware over the air — even the WiFi-less ones, over the mesh, now peer-to-peer so one download seeds the whole fleet — and host a living creature that hops from board to board.",
+    "hero.title": "A $3 chip that writes you a <em>story</em>.",
+    "hero.sub": "A real 260K-parameter transformer, composing children’s tales on an ESP32-C3 — no WiFi, no cloud, no gateway. And that is only the newest trick: smol is a fleet of $1–$3 boards running one <b>no_std</b> Rust binary, talking directly over ESP-NOW with no router in the middle, updating themselves with signed firmware over the air — even the WiFi-less ones, over the mesh — and hosting a living creature that hops from board to board when you pull the power.",
     "vitals.intro": "Every number below was pulled from the chip over USB with esptool — not a datasheet guess. This is exactly what we're working with.",
     "spec.cpu": "RISC-V · single core · 160 MHz",
     "spec.ram": "~400 KB SRAM · no PSRAM",

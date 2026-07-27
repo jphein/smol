@@ -79,6 +79,23 @@ The single most contradiction-prone fact in the repo. Two independent traps:
 **Rule: never put a live build number in prose.** Point at `version.txt` instead. If you must
 name one, name it *with* its sigil word so the pair self-checks.
 
+### Never enumerate the fleet
+
+Docs used to say "the id7/8/9 fleet". **Don't.** Live HA on 2026-07-27 showed node ids 5, 7, 8, 9,
+13, 42, 50, 51, 122, 236 — and most of those are *not* fleet members: **50 and 51 are id7's and
+id9's hardware repurposed as bench measurement DUTs** for #198 Phase 2, **42 is JP's C6 smartwatch**
+(a different project), and 122/236 are rig/test ids. Only id8 was reporting; 5/7/9 last spoke
+2026-07-26.
+
+So an enumeration is wrong in both directions at once — it lists boards that aren't fleet members
+*and* rots every time hardware is repurposed. Instead:
+
+- **In prose, say "the bench fleet."** No numbers.
+- **Name a node only where a specific claim was verified on it** — "verified on id8", "202 ms/tok
+  measured on id8". That's provenance, and provenance doesn't rot.
+- A count of what a past test covered ("across three bench boards") is fine; a claim about the
+  *current* roster is not.
+
 ---
 
 ## 3. The two habits that prevent most rot
@@ -190,10 +207,25 @@ for `jphein.github.io/smol` and fix all of them.
 8. Fix what you have evidence for; write the rest down with the evidence you'd need. Ask rather
    than guess when a claim's evidence is ambiguous.
 
-**Cadence:** after every release train or feature merge for a quick §5.1–5.2 pass; a full sweep
-roughly monthly, or whenever a wave of issues closes at once. The website specifically deserves a
-look **every time something ships that a stranger would find remarkable** — that is the whole
-point of it.
+**Cadence** (agreed 2026-07-27): a **10-minute check after every feature merge or release train** —
+just §5.1–5.2 — plus a **full sweep monthly**, or whenever a wave of issues closes at once.
+
+The argument for the per-merge check is a measurement, not a principle: **the Bard scored 1 of 3 on
+merge day.** It shipped, hardware-verified, and that same day it was in `README.md`, absent from
+`ROADMAP.md §1`, and had **zero** mentions anywhere in `site/` — the most remarkable thing the
+project had ever done was invisible on its own front page. Ten minutes of "does the newest shipped
+thing exist in all three surfaces?" would have caught it.
+
+The website specifically deserves a look **every time something ships that a stranger would find
+remarkable.** That is the whole point of it, and it is the surface most likely to be forgotten
+because nothing breaks when it's stale.
+
+### Partially-shipped states
+
+Do not tick a checkbox for a feature that half-landed, and do not badge it 🟢 — record the split
+with counts and a date. Worked example, D11: live discovery carried **3 `_voltage` + 3 `_rssi` and
+zero `_soc`** on 2026-07-27, so two of four typed-entity kinds exist. "#12 closed" was *not*
+evidence the split shipped. **A nearby issue closing is never evidence for the claim next to it.**
 
 ---
 

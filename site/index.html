@@ -420,8 +420,10 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <div class="hero"><div class="wrap hero-grid">
   <div class="reveal in">
     <span class="kicker">ESP32-C3 · 72×40 OLED · Bluetooth</span>
-    <h1 class="h1" data-edit="hero.title">A whole game console that fits on your <em>fingertip</em>.</h1>
-    <p class="lead" data-edit="hero.sub">smol turns a $3 ESP32-C3 and a tiny 0.42″ OLED into a pocket handheld — driven by a Bluetooth Stadia controller, running a Minecraft-ish block digger.</p>
+    <!-- Visitors read content.json, NOT these defaults (app.js overwrites any data-edit
+         key present there). Kept in step on purpose so the two don't contradict. -->
+    <h1 class="h1" data-edit="hero.title">A $3 chip that writes you a <em>story</em>.</h1>
+    <p class="lead" data-edit="hero.sub">A real 260K-parameter transformer, composing children’s tales on an ESP32-C3 — no WiFi, no cloud, no gateway. And that is only the newest trick: smol is a fleet of $1–$3 boards running one <b>no_std</b> Rust binary, talking directly over ESP-NOW with no router in the middle, updating themselves with signed firmware over the air — even the WiFi-less ones, over the mesh — and hosting a living creature that hops from board to board when you pull the power.</p>
     <div class="chips">
       <span class="chip">RISC-V <b>160MHz</b></span>
       <span class="chip"><b>72×40</b> 1-bit OLED</span>
@@ -448,7 +450,9 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
         </div>
       </div>
     </div>
-    <div class="hint"><b>▲▼◀▶</b> move · <b>A</b> dig · <b>B</b> place — <span style="color:var(--glow)">it's live, try it</span></div>
+    <div class="hint">It plays games too — this is Block Digger's <b>real render logic</b>, live in
+      your browser. <b>▲▼◀▶</b> move · <b>A</b> dig · <b>B</b> place<br>
+      <a href="#bard" style="color:var(--glow)">↓ or watch it write a story</a></div>
   </div>
 </div></div>
 

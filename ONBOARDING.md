@@ -97,12 +97,23 @@ Operational half (entities, YAML, deploy): `ha/README.md`.
   leaves render them too (the broker is the cache; the mesh is the last hop).
 - **Node manager** (#21) — HA publishes a retained `smol/<id>/config/default_screen`; the board
   **consumes** it on its burst (strict, panic-free parse) and applies the screen — no reflash.
-- **OTA** — a native **Update** entity (#33) + the canary flow: a retained
-  `smol/ota/announce/<id>` (per-id = canary) / `/all` (fleet); the board fetches over HTTP → SHA-256
-  verify → activate → first-boot self-test → app-side rollback. **Operator guide + safety model:
-  [`docs/ota.md`](docs/ota.md).** OTA is **built + deployed, hardware-canary-pending** — treat it as
-  canary-one-board-at-a-time; bootloader revert-on-boot-fail is off, so app-side rollback + canary
-  are the mass-brick defense.
+- **OTA** — a native **Update** entity (#33) + a canary flow that is **structural, not procedural**.
+  Two topics, and only two: `tools/ota_publish.sh stage` publishes retained **`smol/ota/staged`**,
+  which *arms* every board's Update entity but makes **no board fetch anything**; then
+  `install <id>` publishes retained **`smol/<id>/ota/install`** — **per-node**, mirroring HA's
+  Install button. **There is deliberately NO fleet-push topic.** The old
+  `announce/<id>` / `announce/all` act-path was **retired at the Model-A #32 closure**, precisely so
+  that "update everything at once" is not expressible. If you find yourself looking for a fleet
+  topic, that is the design working — install one board, confirm its version advances, then the
+  next.
+  The leaf **verifies an ed25519 signature before it writes a byte** (#32); sha256 is the image
+  *identity* used against reproducible builds (#44), never the trust gate. Then activate →
+  first-boot self-test → app-side rollback.
+  🟢 OTA is **hardware-proven**, including ~1 MB images delivered to WiFi-less leaves over the mesh
+  (#6/#40/#32). What remains unproven is **bootloader revert-on-boot-fail** — espflash's bundled
+  bootloader ships with app-rollback *off* — so **app-side rollback + canary-one-board-at-a-time are
+  the mass-brick defense**, and that has not changed. **Operator guide + safety model:
+  [`docs/ota.md`](docs/ota.md).**
 
 ---
 
