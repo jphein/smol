@@ -419,7 +419,10 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- HERO -->
 <div class="hero"><div class="wrap hero-grid">
   <div class="reveal in">
-    <span class="kicker">ESP32-C3 · 72×40 OLED · Bluetooth</span>
+    <!-- was "· Bluetooth": true only of the Arduino Block Digger build (Bluepad32).
+         Native BLE was refuted on hardware for the Rust fleet (#22), so the hero
+         should not imply it. Matches the OG card's kicker. -->
+    <span class="kicker">ESP32-C3 · 72×40 OLED · no_std Rust</span>
     <!-- Visitors read content.json, NOT these defaults (app.js overwrites any data-edit
          key present there). Kept in step on purpose so the two don't contradict. -->
     <h1 class="h1" data-edit="hero.title">A $3 chip that writes you a <em>story</em>.</h1>
