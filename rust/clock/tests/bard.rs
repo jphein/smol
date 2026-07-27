@@ -286,7 +286,7 @@ fn run_story(m: &Model, t: &Tokenizer, bufs: &mut Bufs, seed: u32) -> (std::stri
         match story.step(m, t, bufs) {
             StepOut::Text(bytes) => text.push_str(core::str::from_utf8(bytes).unwrap()),
             StepOut::Working => {}
-            StepOut::Done => break,
+            StepOut::Done { .. } => break,
         }
         steps += 1;
         assert!(steps < 300, "no termination");
@@ -306,7 +306,7 @@ fn story_generates_and_terminates() {
         match story.step(&m, &t, &mut bufs) {
             StepOut::Text(bytes) => text.push_str(core::str::from_utf8(bytes).unwrap()),
             StepOut::Working => {}
-            StepOut::Done => break,
+            StepOut::Done { .. } => break,
         }
         steps += 1;
         assert!(steps < 300, "no termination");
@@ -327,4 +327,28 @@ fn different_seeds_different_stories() {
     // another story has scribbled all over the KV cache.
     let (a_again, _) = run_story(&m, &t, &mut bufs, 1);
     assert_eq!(a, a_again, "story is not reproducible from its seed");
+}
+
+#[test]
+fn story_reports_how_it_ended() {
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+    let mut bufs = std::boxed::Box::new(Bufs::INIT);
+    let mut story = Story::new(&t, GOLDEN_PROMPT, 1);
+    let ending = loop {
+        if let StepOut::Done { truncated } = story.step(&m, &t, &mut bufs) {
+            break truncated;
+        }
+    };
+    // The step result and the getter must agree — a renderer may consult either.
+    assert_eq!(ending, story.truncated());
+    assert!(story.is_done());
+    // At 260K params EOS is essentially never sampled, so this seed runs to the budget. If this
+    // ever flips to a natural stop, the UI's `…` path stops being the common case — worth knowing.
+    assert!(ending, "expected a budget cut; EOS-terminated instead");
+    // Once done, further steps keep reporting the same ending rather than resuming.
+    assert!(matches!(
+        story.step(&m, &t, &mut bufs),
+        StepOut::Done { truncated: true }
+    ));
 }

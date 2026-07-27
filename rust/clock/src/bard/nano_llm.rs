@@ -786,8 +786,18 @@ pub enum StepOut<'a> {
     Working,
     /// Newly generated text (borrowed straight from the model blob — no copy).
     Text(&'a [u8]),
-    /// The story ended: end-of-text token, token budget, or cache depth.
-    Done,
+    /// The story ended.
+    ///
+    /// `truncated` distinguishes the two endings, because they read differently to a person:
+    /// `false` means the model chose to stop (it sampled end-of-text), `true` means we cut it
+    /// off at the token budget or the cache depth — mid-sentence, almost always. At 260K
+    /// parameters EOS is essentially never sampled, so `true` is the NORMAL case (measured:
+    /// every seed tried ran to the 220-token budget). A UI should trail off with `…` on a cut
+    /// rather than presenting it as a finished thought.
+    Done {
+        /// `true` when the budget or cache depth ended the story, not the model.
+        truncated: bool,
+    },
 }
 
 /// Nucleus (top-p) sampling from `logits`, which are consumed in place.
@@ -885,6 +895,8 @@ pub struct Story {
     cur: u16,
     rng: Rng32,
     session: Session,
+    /// How the story ended — see [`StepOut::Done`]. Meaningless until `done`.
+    truncated: bool,
     /// Sampler scratch: vocabulary indices, re-sorted every step. Lives here rather than in
     /// [`Bufs`] to keep that struct inside its RAM budget.
     idx: [u16; MAX_VOCAB],
@@ -913,6 +925,7 @@ impl Story {
             cur: p[n.saturating_sub(1)],
             rng: Rng32::new(seed),
             session: Session::new(),
+            truncated: false,
             idx: [0; MAX_VOCAB],
             done: false,
         }
@@ -921,6 +934,12 @@ impl Story {
     /// Whether the story has finished (further steps return [`StepOut::Done`]).
     pub fn is_done(&self) -> bool {
         self.done
+    }
+
+    /// Whether the ending was a hard cut rather than the model stopping — the same flag
+    /// [`StepOut::Done`] carries, for a renderer that consults state instead of the step result.
+    pub fn truncated(&self) -> bool {
+        self.truncated
     }
 
     /// Tokens generated or fed so far — the tick counter a UI can show progress from.
@@ -933,7 +952,9 @@ impl Story {
     /// this is the unit a cooperative UI tick can afford.
     pub fn step<'b>(&mut self, m: &Model<'_>, t: &Tokenizer<'b>, b: &'b mut Bufs) -> StepOut<'b> {
         if self.done {
-            return StepOut::Done;
+            return StepOut::Done {
+                truncated: self.truncated,
+            };
         }
         let plen = self.prompt_len as usize;
 
@@ -951,7 +972,8 @@ impl Story {
         // explicit — a clamped `pos` would quietly overwrite the last slot forever.
         if self.pos >= Self::MAX_TOKENS + plen as u16 || (self.pos as usize) + 1 >= SEQ_CAP {
             self.done = true;
-            return StepOut::Done;
+            self.truncated = true; // cut off mid-thought — the usual ending at this model size
+            return StepOut::Done { truncated: true };
         }
 
         // Ignore the returned view: the logits live in `b.logits`, and the sampler needs them
@@ -967,8 +989,8 @@ impl Story {
         );
         // 1 = BOS, 2 = EOS: llama2.c treats either as end-of-story.
         if next == 1 || next == 2 {
-            self.done = true;
-            return StepOut::Done;
+            self.done = true; // the model chose to stop; `truncated` stays false
+            return StepOut::Done { truncated: false };
         }
         let text = t.decode(self.cur, next);
         self.cur = next;
