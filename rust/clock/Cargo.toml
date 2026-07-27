@@ -44,6 +44,14 @@ name = "clock"
 path = "src/main.rs"
 required-features = ["hw"]
 
+# The #300 story batch is a HOST tool: it uses `std` and the hostsim library target, so it can
+# only build for a host triple. Declaring that keeps `--all-targets` honest on the firmware
+# target (it is skipped instead of failing on `use std`).
+[[example]]
+name = "bard_stories"
+path = "examples/bard_stories.rs"
+required-features = ["hostsim"]
+
 [dependencies]
 # --- Core HAL (Phase 1, always on) ---------------------------------------
 # `unstable` is required for I2C/SPI/RNG and is also a hard requirement of
