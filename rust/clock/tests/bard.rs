@@ -254,17 +254,27 @@ fn golden_matches_python_reference() {
     // divergence index is reported first because it localises a numeric bug far better than a
     // prose diff — see the reference's docstring for the accumulation-order contract.
     if generated != golden_ids {
-        let at = generated
-            .iter()
-            .zip(&golden_ids)
-            .position(|(a, b)| a != b);
-        panic!(
-            "token stream diverges at index {at:?} (rust {} ids, golden {} ids)\n  rust:   {:?}\n  golden: {:?}",
-            generated.len(),
-            golden_ids.len(),
-            &generated[at.unwrap_or(0)..generated.len().min(at.unwrap_or(0) + 8)],
-            &golden_ids[at.unwrap_or(0)..golden_ids.len().min(at.unwrap_or(0) + 8)],
-        );
+        match generated.iter().zip(&golden_ids).position(|(a, b)| a != b) {
+            // Real numeric divergence: show a window of both streams around it.
+            Some(at) => panic!(
+                "token stream diverges at index {at} (rust {} ids, golden {} ids)\n  rust:   {:?}\n  golden: {:?}",
+                generated.len(),
+                golden_ids.len(),
+                &generated[at..generated.len().min(at + 8)],
+                &golden_ids[at..golden_ids.len().min(at + 8)],
+            ),
+            // Every SHARED id matches and only the lengths differ — that is not a numerics bug,
+            // it is a stale golden: SEQ_CAP or the step budget moved on one side only. Say that,
+            // because "diverges at index None" sends the reader hunting for a rounding error.
+            None => panic!(
+                "token streams AGREE on all {} shared ids but lengths differ (rust {}, golden {}) \
+                 — SEQ_CAP or the step budget changed on one side only; rerun \
+                 tools/bard_golden_baseline.sh to regenerate the goldens",
+                generated.len().min(golden_ids.len()),
+                generated.len(),
+                golden_ids.len(),
+            ),
+        }
     }
     assert_eq!(text, golden_cont, "text differs despite identical token ids");
 }
