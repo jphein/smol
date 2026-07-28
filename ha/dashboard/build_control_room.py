@@ -165,6 +165,9 @@ def node_card(nid, meta, present, span=4):
     prow(top,f"input_text.smol_{nid}_custom","Custom lines (‹sa› text, | per line)","mdi:card-text")  # #45 · edit when screen=Custom
     prow(top,f"input_text.smol_{nid}_tale","Story opening (Bard)","mdi:feather")               # #303 · empty = this node's own protagonist
     prow(top,f"sensor.smol_{nid}_tale","  ↳ in use","mdi:book-open-variant")                   # #303 readback of the retained prompt
+    prow(top,f"input_number.smol_{nid}_bard_speed","Typewriter (ms/char)","mdi:speedometer")    # #302 reveal clock, NOT the generation clock
+    prow(top,f"input_select.smol_{nid}_bard_mode","Delivery (inf / page)","mdi:book-open-page-variant")  # #302 endless vs one screenful
+    prow(top,f"sensor.smol_{nid}_delivery","  ↳ in use","mdi:play-speed")                       # #302 readback of the retained <ms>:<mode>
     prow(top,f"input_button.smol_{nid}_apply",f"Apply → id{nid}","mdi:send")
     prow(top,f"input_button.smol_{nid}_reset","Reset to board default","mdi:backup-restore")
     rb=f"input_button.smol_{nid}_reboot"                                                       # #52 tap-guarded reboot
@@ -430,8 +433,16 @@ async def main():
                 is_node_box = (t == "vertical-stack"
                                and (c.get("view_layout") or {}).get("grid-column") == f"span {NODE_SPAN}")
                 m = re.search(r"smol_(\d+)_", json.dumps(c)) if is_node_box else None
-                lbl = (f"node{m.group(1)}" if m
-                       else "sha:" + hashlib.sha1(json.dumps(c, sort_keys=True).encode()).hexdigest()[:12])
+                if m:
+                    lbl = f"node{m.group(1)}"
+                else:
+                    # Hash the card with CACHE-BUSTING QUERY STRINGS STRIPPED. `serve()` appends
+                    # `?v=<md5-of-svg>` to the topology image, so a card that is semantically the
+                    # same becomes byte-different whenever the SVG changes — the previous run's
+                    # copy then looks "unknown" and gets preserved, and the view grows by a card or
+                    # two on EVERY run. Caught it accreting 30 -> 32 with two sha-identified strays.
+                    norm = re.sub(r"\?v=[0-9a-f]+", "", json.dumps(c, sort_keys=True))
+                    lbl = "sha:" + hashlib.sha1(norm.encode()).hexdigest()[:12]
             return f"{t}|{lbl[:45]}"
 
         prev = next((v for v in cfg["views"] if v.get("path") == "smol-control"), None)

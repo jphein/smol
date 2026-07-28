@@ -30,6 +30,60 @@
 #         then POST /api/services/homeassistant/reload_all (new input_* helpers AND mqtt
 #         sensors need reload_all; automation.reload alone does not register them).
 
+input_number:
+  # #302 typewriter pace, in MILLISECONDS PER CHARACTER — the reveal clock, which is NOT the
+  # generation clock. The board generates at ~224-274 ms/token in endless mode; this only sets how
+  # fast finished text is unveiled. (Confusing the two axes has already caused one bug.) The leaf
+  # clamps to 20..=500, so out-of-range values are corrected on the node, not here.
+  smol_7_bard_speed:
+    name: "smol 7 typewriter (ms/char)"
+    min: 20
+    max: 500
+    step: 10
+    initial: 160
+    unit_of_measurement: "ms"
+    mode: slider
+    icon: "mdi:speedometer"
+  smol_8_bard_speed:
+    name: "smol 8 typewriter (ms/char)"
+    min: 20
+    max: 500
+    step: 10
+    initial: 160
+    unit_of_measurement: "ms"
+    mode: slider
+    icon: "mdi:speedometer"
+  smol_9_bard_speed:
+    name: "smol 9 typewriter (ms/char)"
+    min: 20
+    max: 500
+    step: 10
+    initial: 160
+    unit_of_measurement: "ms"
+    mode: slider
+    icon: "mdi:speedometer"
+
+input_select:
+  # #302 delivery mode. `inf` = the story never ends (the screen is a window the tale moves past);
+  # `page` = one screenful of new text, then wait for a button press. NOTE: `inf` is near-continuous
+  # compute — measured 0.2 W / ~40 mA at the USB side, the fleet's worst-case draw — so it is the
+  # mode to avoid on a battery build.
+  smol_7_bard_mode:
+    name: "smol 7 delivery"
+    options: ["inf", "page"]
+    initial: "inf"
+    icon: "mdi:book-open-page-variant"
+  smol_8_bard_mode:
+    name: "smol 8 delivery"
+    options: ["inf", "page"]
+    initial: "inf"
+    icon: "mdi:book-open-page-variant"
+  smol_9_bard_mode:
+    name: "smol 9 delivery"
+    options: ["inf", "page"]
+    initial: "inf"
+    icon: "mdi:book-open-page-variant"
+
 input_text:
   # #303 Bard story prompt: the OPENING the on-device LLM continues. Empty = that node's
   # built-in persona ("Once upon a time, there was a little owl" for id8). The NODE validates
@@ -53,6 +107,38 @@ input_text:
     initial: ""
 
 automation:
+  - id: smol_bard_delivery_publish
+    alias: "smol #302: publish per-node Bard delivery (pace + mode)"
+    description: >-
+      Either helper changing republishes the whole retained value, because CFG key `V` carries
+      BOTH fields as `<ms_per_char>:<mode>` in one frame (the same compound-in-one-key shape as
+      `S`'s `<AppKind>:<page>`). Applies live on the node, mid-tale, without a reboot.
+    mode: parallel
+    max: 10
+    trigger:
+      - platform: state
+        entity_id:
+          - input_number.smol_7_bard_speed
+          - input_number.smol_8_bard_speed
+          - input_number.smol_9_bard_speed
+          - input_select.smol_7_bard_mode
+          - input_select.smol_8_bard_mode
+          - input_select.smol_9_bard_mode
+    condition:
+      - condition: template
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
+    action:
+      - variables:
+          nid: "{{ trigger.entity_id.split('.')[1].split('_')[1] }}"
+      - service: mqtt.publish
+        data:
+          topic: "smol/{{ nid }}/config/delivery"
+          retain: true
+          qos: 1
+          # int() because an input_number carries a float ("160.0" would not parse on the leaf).
+          payload: >-
+            {{ states('input_number.smol_' ~ nid ~ '_bard_speed') | int }}:{{ states('input_select.smol_' ~ nid ~ '_bard_mode') }}
+
   - id: smol_tale_publish
     alias: "smol #303: publish per-node Bard story prompt"
     description: >-
@@ -81,6 +167,22 @@ automation:
 
 mqtt:
   sensor:
+    # #302 delivery readback: what the node was actually told, as `<ms>:<mode>`.
+    - name: "smol 7 delivery"
+      unique_id: smol_7_delivery_mirror
+      state_topic: "smol/7/config/delivery"
+      icon: "mdi:play-speed"
+      value_template: "{{ value if value else '(default)' }}"
+    - name: "smol 8 delivery"
+      unique_id: smol_8_delivery_mirror
+      state_topic: "smol/8/config/delivery"
+      icon: "mdi:play-speed"
+      value_template: "{{ value if value else '(default)' }}"
+    - name: "smol 9 delivery"
+      unique_id: smol_9_delivery_mirror
+      state_topic: "smol/9/config/delivery"
+      icon: "mdi:play-speed"
+      value_template: "{{ value if value else '(default)' }}"
     # #303 Bard story-prompt mirror: read back the retained prompt so the card shows what was
     # commanded. '(default)' when empty = the node is using its built-in persona.
     - name: "smol 7 tale"
