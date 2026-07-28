@@ -55,6 +55,11 @@ fleet: the apps, the ESP-NOW mesh (`src/net/`), the Familiar (`src/familiar/`), 
 - **[cases.md](cases.md)** — existing printable cases for this board.
 - **[enclosure-resin.md](enclosure-resin.md)** — resin/SLA enclosure notes.
 
+- **[superpowers/HANDOFF-2026-07-28.md](superpowers/HANDOFF-2026-07-28.md)** — **start here after a
+  gap.** What shipped and is hardware-verified vs code-read, what is in flight and who holds it, what is
+  blocked on JP, the open Embassy decision, and the live-state gotchas a newcomer trips on in the first
+  ten minutes (no board on USB · the crown moves · dead-but-live entity families · two unidentified ids).
+
 ## Research — decisions and status
 
 - **[superpowers/research/embassy-migration-status.md](superpowers/research/embassy-migration-status.md)**
