@@ -373,9 +373,25 @@ def freeze_md(nodes, dormant, present):
             "{% if g in na %}### — ms\n\n"
             "_no burst measured yet · the field is absent until a board measures one, so this is "
             "**not** zero. Needs a board on a build that publishes `brst=`._\n"
-            "{% else %}### {{ g }} ms\n\n"
+            # SATURATION. `note_burst` does `gap_ms.min(u16::MAX as u32) as u16`, so 65535 is not a
+            # measurement — it is the ceiling, and the true gap is longer by an unreported amount.
+            # Printing "65535 ms" states a precision the wire does not carry.
+            "{% else %}{% set gi=g|int(0) %}{% set bi=bm|int(0) %}{% set sat=gi>=65535 %}"
+            "### {% if sat %}≥ 65.5 s{% elif gi>=1000 %}{{ (gi/1000)|round(1) }} s{% else %}{{ gi }} ms{% endif %}\n\n"
             "_longest stretch the active screen got **no service at all** · {{ kl }} · "
-            "burst {{ bm }} ms · reported by **{{ sig.get(nd, 'id' ~ nd) }}**_\n\n"
+            "reported by **{{ sig.get(nd, 'id' ~ nd) }}**_\n\n"
+            "{% if sat %}_⚠ **Clamped at the u16 ceiling** (65535 ms). The real gap is longer than "
+            "this and the firmware does not say by how much — read it as a floor, not a value._\n\n{% endif %}"
+            # PAIRING. The firmware documents the pair as "the longest stretch INSIDE it", and
+            # note_burst claims the pair "always describes ONE real burst". A gap that exceeds its
+            # own burst falsifies that, and id51 is live right now with brst=65535:0:r — a 0 ms
+            # burst supposedly containing a 65 s gap. Do not narrate a causal story the numbers
+            # do not support; say which half is trustworthy and flag the contradiction.
+            "{% if bi < gi %}_⚠ **The pair is inconsistent**: the burst is reported as "
+            "**{{ bi }} ms**, shorter than the gap it is supposed to contain. The gap is the "
+            "half worth reading; the burst duration and the causal link to a WiFi burst are not "
+            "trustworthy in this record._\n\n"
+            "{% else %}_burst {{ bi }} ms — the gap occurred inside it._\n\n{% endif %}"
             "_This is the **peak since that board's last report**, not a live sample: the firmware "
             "keeps the window's worst gap and resets after publishing._\n{% endif %}\n\n"
             # The absence caveat is the honest half of this panel. A leaf's DIAG is ONE ESP-NOW
