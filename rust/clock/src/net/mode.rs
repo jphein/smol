@@ -259,6 +259,41 @@ const STAT_PREFIX: &[u8] = b"SMOLv1 STAT "; // + "NNN" + verbatim "<AppKind>:<pa
 /// Value bounded by `RELAY_VALUE_MAX`.
 const DIAG_PREFIX: &[u8] = b"SMOLv1 DIAG "; // + "NNN" + verbatim "up=.. bt=.. rr=.. …"
 
+/// Bytes of DIAG payload an MQTT publish can carry: the 512 B `pkt` buffer in `wifi.rs`, less the
+/// PUBLISH fixed header + 2 B topic-length prefix, less the longest topic (`smol/255/diag`).
+///
+/// This is a CLIFF, not a truncation: `encode_publish` returns `None` when the payload will not fit,
+/// so the publish is skipped and the record does not go out AT ALL. With no board on USB, DIAG is the
+/// fleet's only observability channel — so an over-budget record makes a healthy board look dead, and
+/// we would be debugging a phantom outage caused by a field that grew 33 bytes.
+#[cfg(feature = "espnow")]
+const DIAG_BUDGET: usize = 512 - 4 - "smol/255/diag".len();
+
+/// TYPE-PROVABLE worst case of the record's UNSHEDDABLE core: the fixed positional block plus the
+/// three fields `diag_record` appends unconditionally. Each term is a maximum decimal width implied by
+/// a field's TYPE (u8→3, u16→5, u32→10) or the longest member of a fixed string set — so this is a
+/// bound, not an observation, and it cannot be flattered by a board being in a mild state.
+///
+///   167  format-string literal (keys, `|` separators, `DIAG|` prefix)
+///   220  the 32 positional values at type-max width, after the u32 `up=` narrowing
+///    19  `|brst=<u16>:<u16>:<c>`   38  `|blrev=<3>` + `|apch=<u8>`
+///
+/// The assertion below is the whole point: it proves the record can NEVER be unpublishable, because
+/// the core always fits and everything else is appended only while there is room (see the shed list
+/// in `diag_record`). The cliff stops being reachable rather than being watched for.
+///
+/// ⚠️ If you add a positional field, add its width here. The build breaks if the core stops fitting —
+/// which is the intended failure: a compile error instead of a fleet going quiet.
+#[cfg(feature = "espnow")]
+const DIAG_CORE_MAX: usize = 167 + 220 + 19 + 38;
+
+#[cfg(feature = "espnow")]
+const _: () = assert!(
+    DIAG_CORE_MAX <= DIAG_BUDGET,
+    "the DIAG record's unsheddable core no longer fits one MQTT publish — shed a positional field \
+     (see the shed list in diag_record); do NOT raise the pkt buffer without re-deriving both bounds"
+);
+
 // The ESP-NOW frame a leaf DIAG rides must FIT: 12 B prefix + 3 B id + the value bound, against
 // the ~250 B ESP-NOW payload ceiling. Asserted at COMPILE TIME because the obvious repair for the
 // truncation above — "just raise RELAY_VALUE_MAX" — silently overflows the frame instead, and that
@@ -3213,7 +3248,10 @@ impl RadioManager {
     /// first so `hmin <= heap` holds. Heap `String` (like the STAT/telemetry builders) — panic-free.
     pub fn diag_record(&mut self) -> alloc::string::String {
         self.diag_sample_heap();
-        let up_s = now_ms() / 1000;
+        // u32, not u64: the worst-case DIAG length is bounded by TYPE (see DIAG_CORE_MAX), and a u64
+        // seconds field costs 20 digits of that bound to express a number that cannot exceed 10.
+        // u32 seconds is 136 years of uptime — 10 B of provable headroom for no information at all.
+        let up_s = (now_ms() / 1000).min(u32::MAX as u64) as u32;
         let d = crate::ota::boot_diag();
         let ota = crate::ota::ota_outcome_token(); // live — boot_confirm sets it after capture
         let heap = esp_alloc::HEAP.free();
@@ -3251,6 +3289,23 @@ impl RadioManager {
         // review): min would hide an asymmetric drag. The per-peer roster surface is the precise
         // path for an options-1/2 policy (leaf→crown link); this DIAG field is the coarse beacon.
         let etx_worst = self.roster.worst_link_cost(now_ms());
+        // ⚠️ BEFORE YOU ADD A FIELD HERE, READ THIS.
+        //
+        // This record must fit ONE MQTT publish (`DIAG_BUDGET`, 495 B) or `encode_publish` refuses it
+        // and the board publishes NOTHING — on a fleet with no serial, a healthy board then looks dead.
+        // It must also fit ONE ESP-NOW frame from a leaf (`RELAY_VALUE_MAX`, 232 B), which it ALREADY
+        // does not: see `broadcast_diag`, where the overflow is now reported as `|cut=`.
+        //
+        // The type-provable worst case of this positional block plus the protected tail is
+        // `DIAG_CORE_MAX` (444 B), asserted against the budget at compile time. A new POSITIONAL field
+        // here costs its type-max width against that 51 B of proven slack, and the build breaks when it
+        // runs out — deliberately, because the alternative is a fleet going quiet.
+        //
+        // So: prefer the SHEDDABLE tail below (appended only while there is room, and it says when it
+        // shed), and prefer replacing a field over adding one. `net=` is a frozen constant since #142
+        // (always `0:ok`, 9 B) and `cc=` is derivable HA-side from `apch=` — those are the two to spend
+        // before anything else. Changing this block's fields is also an HA CONTRACT change: the fixed
+        // fields are parsed POSITIONALLY, so removing one shifts every field after it.
         let mut rec = alloc::format!(
             "DIAG|slot={}|rst={}|boot={}|ota={}|up={}|heap={}|hmin={}|btn={}|btnl={}|fok={}|ffl={}|vok={}|vfl={}|loss={}|rtt={}|rx={}|tx={}|led={}:{}|tage={}|tsrc={}|net={}:{}|brk={}|otah={}|fwd={}|dedup={}|ttl={}|hop={}|dlseq={}|dfwd={}|etx={}",
             d.boot_slot,
@@ -3289,93 +3344,14 @@ impl RadioManager {
             self.diag.dfwd,
             etx_worst, // #164 worst per-peer link cost (0 = all perfect … 253 = dragging … 255 = isolated)
         );
-        // #74 item 3 (stage-2): fold in the APPLIED-config string for HA config-drift, ONLY when
-        // `main` populated it (espnow build). ASCII by construction (as_wire/to_wire/hex/F24). HA
-        // reconstructs the same string from its command topics + plain-string-compares (luna's
-        // `sensor.smol_<id>_config_applied` + drift binary_sensor) — no hash primitive needed.
-        if e.cfg_len > 0 {
-            if let Ok(cfg) = core::str::from_utf8(&e.cfg[..e.cfg_len as usize]) {
-                rec.push_str("|cfg=");
-                rec.push_str(cfg);
-            }
-        }
-        // #72: append the io registry's bound-input press counters (io=<pin>:<count>,…) AFTER cfg=.
-        // `io`-gated + only when populated → the DIAG string is byte-identical on a non-io build.
-        #[cfg(feature = "io")]
-        if self.diag_io_len > 0 {
-            if let Ok(io) = core::str::from_utf8(&self.diag_io[..self.diag_io_len]) {
-                rec.push_str("|io=");
-                rec.push_str(io);
-            }
-        }
-        // #13 MESH-TEST rig: surface the deaf-list state so a leftover entry is visible in HA at a
-        // glance (the anti-"won't-rejoin-ghost" guard) — `deaf` = active entries, `ddrops` = frames
-        // dropped by it. `mesh-test`-gated → the DIAG string is byte-identical on a production build.
-        #[cfg(feature = "mesh-test")]
-        {
-            let deaf_n = self.deaf.iter().flatten().count();
-            rec.push_str(&alloc::format!("|deaf={}|ddrops={}", deaf_n, self.diag.ddrops));
-        }
-        // #204: the crown's CURRENT AP association (channel:rssi:bssid). Makes the coexist
-        // off-ch6-starvation hypothesis testable from telemetry — the forensics gap that cost ~3h
-        // of pcap. Only meaningful while associated (a leaf isn't) → `current_ap_info` returns None
-        // off-association and the field is skipped, keeping the DIAG string byte-identical for a
-        // non-associated board. Appended LAST → positional DIAG parse of the fixed fields is intact.
-        if let Some((ap_ch, ap_rssi, b)) = crate::net::current_ap_info() {
-            rec.push_str(&alloc::format!(
-                "|ap={}:{}:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                ap_ch, ap_rssi, b[0], b[1], b[2], b[3], b[4], b[5]
-            ));
-        }
-        // #217 rung-3 coexist-channel health (luna tile #82). `cc` = crown is CO-CHANNEL (live
-        // associated AP channel == the mesh channel) — the direct OTA-capability + off-ch6-
-        // starvation signal; `degraded` = strand-guard latched off-channel (MQTT alive, OTA off,
-        // never crownless). Both always present (0 on a leaf / non-associated). Appended LAST —
-        // positional parse of the fixed DIAG fields intact.
-        let cc = crate::net::current_ap_info()
-            .map(|(ch, _, _)| u8::from(ch == ESP_NOW_FIXED_CHANNEL))
-            .unwrap_or(0);
-        let degraded = u8::from(self.crown_state == crate::net::coexist::CrownState::Degraded);
-        rec.push_str(&alloc::format!("|cc={}|degraded={}", cc, degraded));
-        // #204: crown dead-downstream telemetry — <deaf-streak>:<reassoc-cycles>:<deaf_shed 0/1>.
-        // Named `cdeaf` (crown-deaf) to NOT collide with the mesh-test-only `deaf=` (an ESP-NOW
-        // deaf-LIST count). Reads 0:0:0 on a healthy crown or any leaf; the shed flag latches 1 after
-        // a 2b deaf-shed until re-lock. Appended LAST — positional parse of the fixed DIAG fields intact.
-        rec.push_str(&alloc::format!(
-            "|cdeaf={}:{}:{}",
-            self.relay.crown_deaf_streak,
-            self.relay.reassoc_cycles,
-            self.relay.deaf_shed as u8
-        ));
-        // #153 UI-freeze telemetry: <longest app gap ms>:<burst ms>:<kind>. Appended LAST and ONLY
-        // once a burst has been measured, so the DIAG string is byte-identical on a board that has not
-        // yet flushed (and the positional parse of the fixed fields stays intact). ~16 B against the
-        // ~490 B publish cap — ONE field, not two, for exactly that reason.
-        //
-        // Reset here because here IS the publish: every board reaches this once per DIAG (a leaf via
-        // the mesh broadcast, a gateway via the MQTT flush), so the next record carries the next
-        // window's peak instead of a running maximum that can only ever grow.
-        // #217 OFF-CHANNEL VISIBILITY: the AP channel this board's coexist logic BELIEVES it is on,
-        // `0` = unknown / not yet scanned (matching the `my_ap_channel: 0` convention at init).
-        // Always present, so a harness can read it unconditionally and `0` is an unambiguous
-        // "no answer yet" rather than a missing field.
-        //
-        // Named `apch=`, NOT `ap=`: an unanchored grep for `ap=` matches the tail of `heap=42040`,
-        // which is exactly how `tools/ota_verify.sh` came to compare free heap against channel 6 and
-        // tell the operator to re-channel a live AP. A field name that cannot be a substring of
-        // another field's name costs nothing and removes the whole class.
-        //
-        // It is NOT redundant with the existing `ap=<ch>:<rssi>:<bssid>` field, and the difference is
-        // the interesting part: `ap=` is what the HAL reports for the LIVE association (and is absent
-        // when unassociated), while this is what the coexist logic BELIEVES after its last scan — the
-        // value the off-channel decision is actually made from. If the two ever disagree, that
-        // disagreement is the bug, and off-channel is a PROVEN OTA blocker here (co-channel moved
-        // 48 KB, off-channel moved 0). Publishing both makes the contradiction visible.
+        // ── PROTECTED tail: appended unconditionally, and first ───────────────────────────────
+        // These three are inside `DIAG_CORE_MAX`, so the compile-time assertion above proves they
+        // always fit. They go first because if anything must be lost it must not be these: `brst=` is
+        // the UI-freeze number the bench is waiting on, `blrev=` answers a question the ROADMAP has
+        // carried as UNPROVEN since July, and `apch=` is the off-channel signal behind a proven OTA
+        // blocker. Order does not affect HA — every appended field is parsed by KEY, not position (the
+        // positional contract covers the fixed block above and is untouched).
         rec.push_str(&alloc::format!("|apch={}", self.my_ap_channel));
-        // #153: the bootloader's measured auto-revert capability — `on` closes a gate the ROADMAP
-        // has carried as UNPROVEN since July, `off` confirms the app-side net is the only one. Omitted
-        // when never observed (no OTA boot this power-on session), so the string stays byte-identical
-        // on a board that has only ever been USB-flashed and power-cycled. ~10 B, appended LAST.
         if let Some(blrev) = crate::ota::bl_revert_token() {
             rec.push_str("|blrev=");
             rec.push_str(blrev);
@@ -3390,6 +3366,94 @@ impl RadioManager {
             self.diag.brst_gap = 0;
             self.diag.brst_ms = 0;
             self.diag.brst_kind = 0;
+        }
+
+        // ── SHEDDABLE tail: appended ONLY while the budget allows ─────────────────────────────
+        // An over-budget record is not truncated by the publisher — `encode_publish` refuses it and
+        // the board goes SILENT, which is indistinguishable from a dead board on a fleet with no
+        // serial. So the record sheds instead, in a documented priority order, and SAYS that it did.
+        //
+        // Shed order (first to go is least missed): `cc`/`degraded` — `cc` is derivable HA-side as
+        // `apch == 6`, so it is nearly redundant with a protected field; `io` — bound-input press
+        // counters, absent on most boards anyway; `cdeaf` — crown-deaf telemetry, 0:0:0 on a healthy
+        // board or any leaf; `cfg` — config-drift echo, valuable but reconstructible from the command
+        // topics HA already holds; `ap` — the live association, whose channel the protected `apch=`
+        // approximates. Nothing here is lost while there is room for it.
+        let mut shed = 0u8;
+        {
+            let mut room_for = |rec: &mut alloc::string::String, field: alloc::string::String| {
+                if rec.len() + field.len() <= DIAG_BUDGET {
+                    rec.push_str(&field);
+                } else {
+                    shed = shed.saturating_add(1);
+                }
+            };
+            // #204: crown dead-downstream telemetry — <deaf-streak>:<reassoc-cycles>:<deaf_shed 0/1>.
+            // Named `cdeaf` to NOT collide with the mesh-test-only `deaf=` (an ESP-NOW deaf-LIST count).
+            room_for(
+                &mut rec,
+                alloc::format!(
+                    "|cdeaf={}:{}:{}",
+                    self.relay.crown_deaf_streak,
+                    self.relay.reassoc_cycles,
+                    self.relay.deaf_shed as u8
+                ),
+            );
+            // #217 rung-3 coexist-channel health: `cc` = crown is CO-CHANNEL (live AP channel == mesh
+            // channel); `degraded` = strand-guard latched off-channel (MQTT alive, OTA off).
+            let cc = crate::net::current_ap_info()
+                .map(|(ch, _, _)| u8::from(ch == ESP_NOW_FIXED_CHANNEL))
+                .unwrap_or(0);
+            let degraded = u8::from(self.crown_state == crate::net::coexist::CrownState::Degraded);
+            room_for(&mut rec, alloc::format!("|cc={}|degraded={}", cc, degraded));
+            // #204: the crown's CURRENT AP association (channel:rssi:bssid) — the coexist
+            // off-ch6-starvation evidence. Only meaningful while associated (a leaf is not), so
+            // `current_ap_info` returns None off-association and the field is simply absent.
+            if let Some((ap_ch, ap_rssi, b)) = crate::net::current_ap_info() {
+                room_for(
+                    &mut rec,
+                    alloc::format!(
+                        "|ap={}:{}:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                        ap_ch, ap_rssi, b[0], b[1], b[2], b[3], b[4], b[5]
+                    ),
+                );
+            }
+            // #74 item 3: the APPLIED-config string for HA config-drift, ONLY when `main` populated it.
+            // ASCII by construction (as_wire/to_wire/hex/F24).
+            if e.cfg_len > 0 {
+                if let Ok(cfg) = core::str::from_utf8(&e.cfg[..e.cfg_len as usize]) {
+                    room_for(&mut rec, alloc::format!("|cfg={}", cfg));
+                }
+            }
+            // #72: the io registry's bound-input press counters (io=<pin>:<count>,…).
+            #[cfg(feature = "io")]
+            if self.diag_io_len > 0 {
+                if let Ok(io) = core::str::from_utf8(&self.diag_io[..self.diag_io_len]) {
+                    room_for(&mut rec, alloc::format!("|io={}", io));
+                }
+            }
+            // #13 MESH-TEST rig: deaf-list state. `mesh-test`-gated → a production record is
+            // byte-identical without it.
+            #[cfg(feature = "mesh-test")]
+            {
+                let deaf_n = self.deaf.iter().flatten().count();
+                room_for(
+                    &mut rec,
+                    alloc::format!("|deaf={}|ddrops={}", deaf_n, self.diag.ddrops),
+                );
+            }
+        }
+        // Loud, and it costs 6 B of the budget it is reporting on — worth it: a reader that cannot see
+        // a field must be able to tell it was SHED rather than never sent. Absent when nothing was shed,
+        // so a healthy record is byte-identical to one from a build without this guard.
+        if shed > 0 {
+            rec.push_str(&alloc::format!("|shed={}", shed));
+            log::warn!(
+                "smol #74: DIAG record over budget — {} field(s) shed to keep it publishable ({} of {} B used)",
+                shed,
+                rec.len(),
+                DIAG_BUDGET
+            );
         }
         rec
     }
