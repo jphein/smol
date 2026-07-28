@@ -164,6 +164,28 @@ pub trait Plugin {
     /// own cadence fires, owning `ctx.display.clear()/…/flush()` and its per-frame
     /// dedup — so every existing redraw pattern stays expressible unchanged.
     fn update(&mut self, ctx: &mut Ctx);
+
+    /// **Render-only tick, called from inside a WiFi burst** (#302 follow-up, JP: "I'm still
+    /// getting UI freezes for wifi and stuff"). Default: do nothing, i.e. the pre-existing
+    /// behaviour of leaving the last frame frozen on the glass.
+    ///
+    /// A routine burst (telemetry flush, NTP re-sync, leaf re-election) blocks `main`'s superloop
+    /// for as long as the radio needs, and its yield callbacks deliberately paint NOTHING (#153) —
+    /// so an animated screen looks CRASHED, which for the Bard's typewriter is indistinguishable
+    /// from the wedge we spent today's other fix making visible.
+    ///
+    /// Why this cannot simply be `update`: the yield happens INSIDE a `&mut RadioManager` method
+    /// that also holds `&mut batt_cache` / `&mut grid_cache`, and [`Ctx`] borrows all three. A full
+    /// `Ctx` is therefore unconstructible there — not awkward, impossible — so this hands over the
+    /// display and the clock and nothing else.
+    ///
+    /// **Contract, and it is load-bearing:** this runs on the radio's hot path, where `main.rs`'s
+    /// HARDWARE-WATCH note warns that lengthening a yield can cost association / DHCP / MQTT. So:
+    /// repaint from state you ALREADY have, in a few ms at most. No generation (a Bard token is
+    /// 224-274 ms measured — two orders of magnitude too long), no sensor reads, no radio, no
+    /// flash. `main` calls it at most every `SYNC_REDRAW_MS`, the same cadence the OTA progress
+    /// screens have already been hardware-watched at.
+    fn paint_burst(&mut self, _display: &mut Oled, _now_ms: u64) {}
 }
 
 /// Lightweight Copy tag: menu targets, transitions, equality. Carries NO state
@@ -488,6 +510,41 @@ impl App {
     }
 
     /// The ONE dispatch point for per-tick update+render. UFCS — see `on_button`.
+    /// Render-only dispatch for a WiFi-burst yield — see [`Plugin::paint_burst`]. Statically
+    /// dispatched exactly like [`Self::update`], so a screen that does not implement it costs
+    /// nothing at all (the default body is empty and inlines away).
+    pub fn paint_burst(&mut self, display: &mut Oled, now_ms: u64) {
+        match self {
+            App::Menu(s) => Plugin::paint_burst(s, display, now_ms),
+            App::Clock(s) => Plugin::paint_burst(s, display, now_ms),
+            App::Snake(s) => Plugin::paint_burst(s, display, now_ms),
+            App::About(s) => Plugin::paint_burst(s, display, now_ms),
+            App::Sigil(s) => Plugin::paint_burst(s, display, now_ms),
+            #[cfg(feature = "wifi")]
+            App::Batt(s) => Plugin::paint_burst(s, display, now_ms),
+            #[cfg(feature = "wifi")]
+            App::Grid(s) => Plugin::paint_burst(s, display, now_ms),
+            #[cfg(feature = "espnow")]
+            App::Bench(s) => Plugin::paint_burst(s, display, now_ms),
+            #[cfg(feature = "espnow")]
+            App::MeshSnake(s) => Plugin::paint_burst(s, display, now_ms),
+            #[cfg(feature = "espnow")]
+            App::Watch(s) => Plugin::paint_burst(s, display, now_ms),
+            #[cfg(feature = "espnow")]
+            App::Hunt(s) => Plugin::paint_burst(s, display, now_ms),
+            #[cfg(feature = "espnow")]
+            App::Finder(s) => Plugin::paint_burst(s, display, now_ms),
+            #[cfg(feature = "espnow")]
+            App::Familiar(s) => Plugin::paint_burst(s, display, now_ms),
+            #[cfg(feature = "wled")]
+            App::WledRemote(s) => Plugin::paint_burst(s, display, now_ms),
+            #[cfg(feature = "espnow")]
+            App::Custom(s) => Plugin::paint_burst(s, display, now_ms),
+            #[cfg(feature = "bard")]
+            App::Bard(s) => Plugin::paint_burst(s, display, now_ms),
+        }
+    }
+
     pub fn update(&mut self, ctx: &mut Ctx) {
         match self {
             App::Menu(s) => Plugin::update(s, ctx),

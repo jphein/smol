@@ -30,7 +30,7 @@ use embedded_graphics::{
     text::{Baseline, Text},
 };
 
-use crate::app::{AppKind, Ctx, Plugin, Transition};
+use crate::app::{AppKind, Ctx, Oled, Plugin, Transition};
 use crate::input::Press;
 use delivery::Delivery;
 use nano_llm::{Bufs, Model, StepOut, Story};
@@ -602,6 +602,62 @@ impl BardApp {
     fn wants_token(&self, len: usize) -> bool {
         matches!(self.phase, Phase::Composing) && len.saturating_sub(self.shown as usize) < BACKLOG_MAX
     }
+
+    /// Render-only: advance the typewriter and repaint. NO generation, so this is the half of
+    /// `update` that a WiFi-burst yield can afford (see [`Plugin::paint_burst`]) — one pass over
+    /// ≤1 KB of text plus a panel flush, against a forward pass's measured 224-274 ms.
+    fn reveal_and_paint(&mut self, display: &mut Oled, now: u64, redraw: bool, d: Delivery) {
+        let text_len = unsafe { text_len() } as u16;
+
+        // Reveal on a wall-clock schedule (`next_reveal_ms` accumulates rather than resetting to
+        // `now`), so a slow token or a missed tick catches up instead of drifting.
+        if matches!(self.phase, Phase::Paused) {
+            // HOLD. Not just "stop advancing": park the schedule at `now` too, so a pause of any
+            // length banks no reveal credit and the resume types on rather than dumping a burst.
+            // Checked before `fast` because the two can meet (a `page`-mode hurry, then a switch to
+            // `inf`, then a press) and holding still has to win.
+            self.next_reveal_ms = now;
+        } else if self.fast {
+            self.shown = text_len;
+        } else if self.shown >= text_len {
+            // Caught up: park the schedule at `now`. Without this, any wait — a page turn, the
+            // backpressure gate, a slow token — banks reveal credit and then dumps a burst of
+            // characters the instant text arrives, which in `page` mode would mean every page after
+            // the first appears all at once instead of typing itself out.
+            self.next_reveal_ms = now;
+        } else {
+            while self.shown < text_len && now >= self.next_reveal_ms {
+                self.shown += 1;
+                self.next_reveal_ms = self.next_reveal_ms.saturating_add(d.reveal_ms());
+            }
+        }
+
+        // Repaint only when something a viewer can see changed.
+        let blink = (now / BLINK_MS).is_multiple_of(2);
+        let held = matches!(self.phase, Phase::Paused);
+        let page_done = matches!(self.phase, Phase::Paged) && self.shown >= text_len;
+        // The quill means "the bard is writing", so it must not blink while paused — that is the
+        // one state where a moving quill would be a lie.
+        let quill = !held && !page_done && blink;
+        let marker = if held {
+            // Blinking, but the ROW STAYS RESERVED on both halves of the blink (an empty string
+            // draws nothing and keeps `rows` the same), or the story would reflow twice a second.
+            Some(if blink { PAUSE_MARK } else { "" })
+        } else if page_done {
+            Some(MORE_MARK)
+        } else {
+            None
+        };
+        // One flag for both blinking things (they are mutually exclusive), and `false` in the static
+        // states so a `page` waiting for a press does not flush the panel forever.
+        let blinking = quill || (held && blink);
+        if !(redraw || self.shown != self.painted || blinking != self.blink_on) {
+            return;
+        }
+        self.painted = self.shown;
+        self.blink_on = blinking;
+        draw_story(display, self.shown, quill, marker);
+    }
 }
 
 impl Plugin for BardApp {
@@ -642,10 +698,24 @@ impl Plugin for BardApp {
         }
     }
 
+    /// Keep the typewriter alive through a WiFi burst (JP: "I'm still getting UI freezes for wifi").
+    /// A routine burst paints nothing by design (#153), which for THIS screen means a story that
+    /// looks crashed — the same paused-vs-wedged confusion the `|| paused` blink exists to prevent,
+    /// arriving from the other direction. Reveal + repaint only: generation is the expensive half and
+    /// stays out of the radio's hot path entirely, so a burst slows the story down (it does not
+    /// advance while the radio has the CPU) without ever freezing it.
+    fn paint_burst(&mut self, display: &mut Oled, now_ms: u64) {
+        if matches!(self.phase, Phase::Mute) {
+            return;
+        }
+        // `redraw: false` — a burst repaint is a cadence repaint, never a forced one.
+        self.reveal_and_paint(display, now_ms, false, unsafe { delivery() });
+    }
+
     fn update(&mut self, ctx: &mut Ctx) {
         if matches!(self.phase, Phase::Mute) {
             if ctx.redraw {
-                draw_lines(ctx, &["the bard", "is mute"]);
+                draw_lines(ctx.display, &["the bard", "is mute"]);
             }
             return;
         }
@@ -703,56 +773,7 @@ impl Plugin for BardApp {
         if self.tok_count >= REPORT_TOKENS || ctx.now_ms >= self.next_report_ms {
             self.report_perf(ctx.now_ms, "narrating");
         }
-        let text_len = unsafe { text_len() } as u16;
-
-        // Reveal on a wall-clock schedule (`next_reveal_ms` accumulates rather than resetting to
-        // `now`), so a slow token or a missed tick catches up instead of drifting.
-        if matches!(self.phase, Phase::Paused) {
-            // HOLD. Not just "stop advancing": park the schedule at `now` too, so a pause of any
-            // length banks no reveal credit and the resume types on rather than dumping a burst.
-            // Checked before `fast` because the two can meet (a `page`-mode hurry, then a switch to
-            // `inf`, then a press) and holding still has to win.
-            self.next_reveal_ms = ctx.now_ms;
-        } else if self.fast {
-            self.shown = text_len;
-        } else if self.shown >= text_len {
-            // Caught up: park the schedule at `now`. Without this, any wait — a page turn, the
-            // backpressure gate, a slow token — banks reveal credit and then dumps a burst of
-            // characters the instant text arrives, which in `page` mode would mean every page after
-            // the first appears all at once instead of typing itself out.
-            self.next_reveal_ms = ctx.now_ms;
-        } else {
-            while self.shown < text_len && ctx.now_ms >= self.next_reveal_ms {
-                self.shown += 1;
-                self.next_reveal_ms = self.next_reveal_ms.saturating_add(d.reveal_ms());
-            }
-        }
-
-        // Repaint only when something a viewer can see changed.
-        let blink = (ctx.now_ms / BLINK_MS).is_multiple_of(2);
-        let held = matches!(self.phase, Phase::Paused);
-        let page_done = matches!(self.phase, Phase::Paged) && self.shown >= text_len;
-        // The quill means "the bard is writing", so it must not blink while paused — that is the
-        // one state where a moving quill would be a lie.
-        let quill = !held && !page_done && blink;
-        let marker = if held {
-            // Blinking, but the ROW STAYS RESERVED on both halves of the blink (an empty string
-            // draws nothing and keeps `rows` the same), or the story would reflow twice a second.
-            Some(if blink { PAUSE_MARK } else { "" })
-        } else if page_done {
-            Some(MORE_MARK)
-        } else {
-            None
-        };
-        // One flag for both blinking things (they are mutually exclusive), and `false` in the static
-        // states so a `page` waiting for a press does not flush the panel forever.
-        let blinking = quill || (held && blink);
-        if !(ctx.redraw || self.shown != self.painted || blinking != self.blink_on) {
-            return;
-        }
-        self.painted = self.shown;
-        self.blink_on = blinking;
-        draw_story(ctx, self.shown, quill, marker);
+        self.reveal_and_paint(ctx.display, ctx.now_ms, ctx.redraw, unsafe { delivery() });
     }
 }
 
@@ -760,7 +781,7 @@ impl Plugin for BardApp {
 /// `marker` on the bottom row when it is waiting (`page` mode). The marker IS the affordance — the
 /// panel has no room for instructions — so it appears only when a press will actually do something
 /// (#302: there is no story-over marker any more, because a story is never over).
-fn draw_story(ctx: &mut Ctx, shown: u16, quill: bool, marker: Option<&str>) {
+fn draw_story(display: &mut Oled, shown: u16, quill: bool, marker: Option<&str>) {
     let text = unsafe { &*core::ptr::addr_of!(STORY_TEXT) };
     let visible = &text[..(shown as usize).min(text.len())];
     // Reserve the bottom row for the marker, so it never overwrites a line of story.
@@ -768,7 +789,7 @@ fn draw_story(ctx: &mut Ctx, shown: u16, quill: bool, marker: Option<&str>) {
     let mut spans = [(0u16, 0u16); ROWS];
     let n = textflow::wrap_tail(visible, COLS, rows, &mut spans[..rows]);
 
-    ctx.display.clear(BinaryColor::Off).ok();
+    display.clear(BinaryColor::Off).ok();
     let style = MonoTextStyleBuilder::new()
         .font(&FONT_5X8)
         .text_color(BinaryColor::On)
@@ -784,7 +805,7 @@ fn draw_story(ctx: &mut Ctx, shown: u16, quill: bool, marker: Option<&str>) {
             style,
             Baseline::Top,
         )
-        .draw(ctx.display)
+        .draw(display)
         .ok();
         last_end = line.chars().count() as i32;
     }
@@ -797,7 +818,7 @@ fn draw_story(ctx: &mut Ctx, shown: u16, quill: bool, marker: Option<&str>) {
             style,
             Baseline::Top,
         )
-        .draw(ctx.display)
+        .draw(display)
         .ok();
     }
     if let Some(mark) = marker {
@@ -808,23 +829,23 @@ fn draw_story(ctx: &mut Ctx, shown: u16, quill: bool, marker: Option<&str>) {
             style,
             Baseline::Top,
         )
-        .draw(ctx.display)
+        .draw(display)
         .ok();
     }
-    ctx.display.flush().ok();
+    display.flush().ok();
 }
 
 /// Clear and draw up to [`ROWS`] left-aligned FONT_5X8 lines. Panic-free.
-fn draw_lines(ctx: &mut Ctx, lines: &[&str]) {
-    ctx.display.clear(BinaryColor::Off).ok();
+fn draw_lines(display: &mut Oled, lines: &[&str]) {
+    display.clear(BinaryColor::Off).ok();
     let style = MonoTextStyleBuilder::new()
         .font(&FONT_5X8)
         .text_color(BinaryColor::On)
         .build();
     for (i, line) in lines.iter().take(ROWS).enumerate() {
         Text::with_baseline(line, Point::new(0, i as i32 * ROW_H), style, Baseline::Top)
-            .draw(ctx.display)
+            .draw(display)
             .ok();
     }
-    ctx.display.flush().ok();
+    display.flush().ok();
 }

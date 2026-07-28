@@ -281,6 +281,33 @@ const SPLASH_MIN_MS: u64 = 2_000;
 /// this value (throttle further); do not lower it without a hardware re-check.
 #[cfg(feature = "espnow")]
 const SYNC_REDRAW_MS: u64 = 500;
+
+/// Service the BOOT button from inside a WiFi-burst yield: returns `true` when a LONG press asks
+/// the burst to abort (unchanged), and LATCHES a short press into `pending` for the main dispatch to
+/// deliver once the burst ends.
+///
+/// Before this, every burst yield matched only `Press::Long` and **discarded a short press** — so a
+/// tap during a flush did nothing at all, which is the other half of JP's "UI freezes" (the screen
+/// stopped AND the button stopped). A latch is the honest fix: the press acts late rather than never,
+/// and there is nothing else it could do, because the app it belongs to cannot run until the radio
+/// gives the CPU back.
+///
+/// First press wins (mashing during a long burst must not queue five pauses), and a LONG press CLEARS
+/// the latch — a user who holds to leave the screen does not also want the tap they gave up on.
+#[cfg(feature = "espnow")]
+fn burst_button(button: &mut input::Button, pending: &mut Option<input::Press>, t: u64) -> bool {
+    match button.poll(t) {
+        Some(input::Press::Long) => {
+            *pending = None;
+            true
+        }
+        Some(input::Press::Short) => {
+            pending.get_or_insert(input::Press::Short);
+            false
+        }
+        None => false,
+    }
+}
 /// (1a defer) A recurring flush is postponed while the user pressed a button within
 /// this window — so the ~15 s mesh-deaf burst never freezes an active session.
 #[cfg(feature = "espnow")]
@@ -775,6 +802,17 @@ fn main() -> ! {
     // the plugins. Cleared at the end of every tick.
     let mut redraw = true;
 
+    // A short press seen INSIDE a WiFi burst, held until the dispatch below can deliver it
+    // (`burst_button`). The burst owns the CPU, so the app it belongs to cannot run yet; latching is
+    // the difference between a tap that acts late and a tap that never happened at all.
+    #[cfg(feature = "espnow")]
+    let mut pending_press: Option<input::Press> = None;
+    // Last render-only repaint inside a burst. Loop-scoped, so ALL the burst yields share one
+    // ≤2 Hz budget: three of them firing back-to-back (flush → NTP re-sync → re-election) must not
+    // add up to three times the panel traffic the HARDWARE-WATCH note bounds.
+    #[cfg(feature = "espnow")]
+    let mut burst_draw_ms: u64 = 0;
+
     // #161: state for the RECEIVING-leaf OTA takeover — an inbound mesh-OTA paints the
     // dedicated OTA screen OVER the app frame each tick while the leaf session is live.
     // `ota_rx_eta` estimates the ETA from block-rate; `was_ota_rx` is the edge latch that
@@ -837,13 +875,20 @@ fn main() -> ! {
             // flush (LED + throttled spinner + latching long-press abort).
             {
                 let mut reelect_abort = false;
-                // #153: re-election is a routine burst → draw NOTHING; the last app frame
-                // stays frozen on the glass (a still clock beats a spinner). LED + abort only.
+                // #153 said: routine burst → draw NOTHING, the last app frame stays frozen (a still
+                // clock beats a spinner). True for a clock; a LIE for the Bard, whose frozen
+                // typewriter reads as a crash — so the active screen now gets a render-only tick
+                // (`paint_burst`) at the same SYNC_REDRAW_MS cadence the OTA screens are already
+                // hardware-watched at. Generation stays out of here; see Plugin::paint_burst.
                 if r.maybe_leaf_reelect(&mut batt_cache, &mut grid_cache, now, &mut || {
                     let t = millis();
                     led.apply(led::LedState::WifiSync, t);
-                    if matches!(button.poll(t), Some(input::Press::Long)) {
+                    if burst_button(&mut button, &mut pending_press, t) {
                         reelect_abort = true;
+                    }
+                    if t.saturating_sub(burst_draw_ms) >= SYNC_REDRAW_MS {
+                        burst_draw_ms = t;
+                        app.paint_burst(&mut display, t);
                     }
                     reelect_abort
                 }) {
@@ -1323,8 +1368,14 @@ fn main() -> ! {
                     r.flush_telemetry(own.as_bytes(), stat.as_bytes(), &mut batt_cache, &mut grid_cache, &mut leaf_ota, &mut || {
                         let t = millis();
                         led.apply(led::LedState::WifiSync, t);
-                        if matches!(button.poll(t), Some(input::Press::Long)) {
+                        if burst_button(&mut button, &mut pending_press, t) {
                             flush_abort = true;
+                        }
+                        // The freeze JP reported: this is the burst a board runs every ~30 s, and it
+                        // painted nothing at all. Render-only tick, ≤2 Hz.
+                        if t.saturating_sub(burst_draw_ms) >= SYNC_REDRAW_MS {
+                            burst_draw_ms = t;
+                            app.paint_burst(&mut display, t);
                         }
                         flush_abort
                     });
@@ -1351,8 +1402,12 @@ fn main() -> ! {
                             let fresh = r.resync_ntp(&mut || {
                                 let t = millis();
                                 led.apply(led::LedState::WifiSync, t);
-                                if matches!(button.poll(t), Some(input::Press::Long)) {
+                                if burst_button(&mut button, &mut pending_press, t) {
                                     resync_abort = true;
+                                }
+                                if t.saturating_sub(burst_draw_ms) >= SYNC_REDRAW_MS {
+                                    burst_draw_ms = t;
+                                    app.paint_burst(&mut display, t);
                                 }
                                 resync_abort
                             });
@@ -1936,7 +1991,21 @@ fn main() -> ! {
         // #72: advance the bound-input debouncers every subtick (press-edge counting for DIAG).
         #[cfg(feature = "io")]
         io_pins.poll_inputs(now);
-        if let Some(press) = button.poll(now) {
+        // A press from THIS subtick, or the one a burst swallowed.
+        #[cfg(feature = "espnow")]
+        let press_now = match button.poll(now) {
+            // A fresh press SUPERSEDES a latched one rather than queueing behind it: delivered one
+            // subtick apart they would cancel each other out (pause then resume = nothing visibly
+            // happened), and the newer press is the one the user is watching for.
+            Some(p) => {
+                pending_press = None;
+                Some(p)
+            }
+            None => pending_press.take(),
+        };
+        #[cfg(not(feature = "espnow"))]
+        let press_now = button.poll(now);
+        if let Some(press) = press_now {
             ctx.redraw = true;
             // #20 (1a): any press marks activity so the next recurring flush defers.
             #[cfg(feature = "espnow")]
