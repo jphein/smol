@@ -22,23 +22,17 @@ layout:
 cards:
 
   # ---- BANNER (span 12) ----
+  # #311: the build script fills this. It used to be inline Jinja that read the headline **build**
+  # and **last sync** from `update.smol_7_dominion_update` / `sensor.smol_7_status` — id7, which
+  # turned out to be a RETAINED GHOST (cleared 2026-07-28). The dashboard's most prominent
+  # fleet-wide figures were sourced from a board that was not there, and after the clear had no
+  # backing at all. The generator now resolves them from the ELECTED crown, and counts lit sigils
+  # from the discovered fleet rather than `^binary_sensor\.smol_\d+_online$` — a pattern that only
+  # ever matched the hand-written 5/7/8/9 sensors, so it counted ghosts and missed the C6 watches.
+  # The filled content is still Jinja, so channel/seq/lit stay live between runs.
   - type: markdown
     view_layout: {grid-column: "span 12"}
-    content: |
-      {% set na = ['unknown','unavailable','none','None',''] %}
-      {% set on = states.binary_sensor | selectattr('state','eq','on') | map(attribute='entity_id') | select('search','^binary_sensor\.smol_\d+_online$') | list | count %}
-      {% set tot = states.binary_sensor | map(attribute='entity_id') | select('search','^binary_sensor\.smol_\d+_online$') | list | count %}
-      {% set owner = state_attr('sensor.smol_mesh_channel','owner') %}
-      {% set ch = states('sensor.smol_mesh_channel') %}
-      {% set seq = state_attr('sensor.smol_mesh_channel','seq') %}
-      {% set re = is_state('binary_sensor.smol_mesh_reelecting','on') %}
-      {% set bt = state_attr('update.smol_7_dominion_update','title') or ('build ' ~ (state_attr('update.smol_7_dominion_update','installed_version') or '—')) %}
-      # control room
-      **smol · esp-now mesh · home assistant**
-
-      {% if re %}⚠️ **RE-ELECTING** — mesh choosing a new gateway…{% else %}🟢 **MESH LIVE** · gateway **id{{ owner if owner not in na else '?' }}** · seq **{{ seq if seq not in na else '—' }}** (advancing = alive) · ch {{ ch if ch not in na else '—' }}{% endif %} · **{{ on }}/{{ tot }}** sigils lit
-
-      build **{{ bt }}** · last sync **{{ relative_time(states.sensor.smol_7_status.last_changed) if states.sensor.smol_7_status else '—' }}** ago · retained MQTT, applies on next burst
+    content: "BANNER"
     card_mod:
       style:
         .: |
@@ -381,6 +375,26 @@ cards:
     content: "**05**&nbsp;&nbsp;overrides · IO · scan · crown-steer"
     card_mod: *kick
 
+  # ---- per-node overrides & IO — GENERATED (#311) ----
+  # The build script replaces this with one card per LIVE sigil, resolved from the HA device
+  # registry and gated on the node's helpers actually existing.
+  - type: markdown
+    content: "OVERRIDES"
+    view_layout: {grid-column: "span 12"}
+
+  # ---- JP's hand-written cards for ids 7 and 9 — KEPT (#311) --------------------------------
+  # These stay because they are JP's and they are on his dashboard today; removing them from the
+  # scaffold would make the repo unable to reproduce live, which is the exact defect #305 fixed.
+  # But know what they are: ids 7 and 9 are RETAINED GHOSTS, cleared 2026-07-28 and confirmed on
+  # the wire (no diag or status across ~8 min while live boards advanced). These five controls
+  # each publish to a board that is not answering. Deleting them is JP's call, not the
+  # generator's — when he makes it, delete these two cards and the check stays green.
+  #
+  # The id8 "Nexus" card that used to sit alongside them is GONE ON PURPOSE: the OVERRIDES
+  # placeholder above now generates it from the registry, under the identical title, so keeping
+  # both would render id8 twice. If id7 or id9 ever rejoins the mesh AND keeps its helpers, the
+  # generator will emit a card for it too — at which point these become the duplicates and
+  # should go.
   - type: entities
     view_layout: {grid-column: "span 4"}
     title: "Dominion · overrides & IO"
@@ -399,28 +413,6 @@ cards:
         name: IO set
         icon: mdi:pin-outline
       - entity: input_button.smol_7_scan
-        name: Scan (WiFi)
-        icon: mdi:wifi-refresh
-    card_mod: *accent
-
-  - type: entities
-    view_layout: {grid-column: "span 4"}
-    title: "Nexus · overrides & IO"
-    show_header_toggle: false
-    entities:
-      - entity: input_text.smol_8_broker
-        name: Broker (ip[:port])
-        icon: mdi:server-network
-      - entity: input_text.smol_8_ota_host
-        name: OTA host (ip)
-        icon: mdi:download-network
-      - entity: input_text.smol_8_io_map
-        name: IO map
-        icon: mdi:pin
-      - entity: input_text.smol_8_io_set
-        name: IO set
-        icon: mdi:pin-outline
-      - entity: input_button.smol_8_scan
         name: Scan (WiFi)
         icon: mdi:wifi-refresh
     card_mod: *accent

@@ -151,10 +151,13 @@ def live_expr(meta, present):
     ORs the package's hand-written `binary_sensor.smol_<id>_online` (where a human wrote one)
     with the firmware-discovered entities, which carry expire_after. Either alone is wrong: the
     package sensor exists for only 5/7/8/9 (so id50/51/122 would read a permanent ⛔), and id5's
-    happens to sit at 'unavailable' while the board is demonstrably alive."""
+    happens to sit at 'unavailable' while the board is demonstrably alive.
+
+    #312 — the hand-written `binary_sensor.smol_<id>_online` term is GONE, in lockstep with
+    discover_fleet()'s `on`. It cannot go false for a board that has left (no expire_after), so
+    it painted retained ghosts green. Every node that reaches this function has firmware
+    heartbeat entities, which do expire, so nothing that is really there loses its dot."""
     parts=[]
-    ob=f"binary_sensor.smol_{meta['id']}_online"
-    if ob in present: parts.append(f"is_state('{ob}','on')")
     for f in HEARTBEAT:
         e=meta.get("fw",{}).get(f)
         if e: parts.append(f"states('{e}') not in {NAJ}")
@@ -441,6 +444,80 @@ def dormant_card(dormant):
     return {"type":"markdown","content":"\n".join(lines),"view_layout":{"grid-column":"span 12"},
             "card_mod":{"style":"ha-card{opacity:.72;"+accent_top("#6f8f78")+"}"}}
 
+# ---------- #311 per-node OVERRIDES & IO — generated, was three hand-written cards ----------
+# The scaffold used to carry one static card each for ids 7/8/9. That set was wrong in BOTH
+# directions at once: ids 7 and 9 were retained ghosts (cleared 2026-07-28) so it invented
+# controls for boards that were not there, while ids 5/50/51 — demonstrably on the mesh — had
+# no controls at all. A hand-written card set is a frozen snapshot of a fleet that churns; the
+# fleet moved twice in fifteen minutes while #305 was being written.
+#
+# Generated cards are GENERATOR-OWNED, so a node that leaves takes its card with it via
+# GEN_OWNED, the same way node boxes retire. That is the property the static cards could never
+# have: to the merge they were indistinguishable from a card a human added on purpose, which is
+# exactly why ids 7 and 9 kept a full set of controls long after the boards stopped answering.
+OVERRIDE_ROWS=[("broker","Broker (ip[:port])","mdi:server-network","input_text"),
+               ("ota_host","OTA host (ip)","mdi:download-network","input_text"),
+               ("io_map","IO map","mdi:pin","input_text"),
+               ("io_set","IO set","mdi:pin-outline","input_text"),
+               ("scan","Scan (WiFi)","mdi:wifi-refresh","input_button")]
+def overrides_card(nid, meta, present, span=4):
+    """One overrides/IO card for a node, or None when HA has none of its helpers.
+
+    Every row is gated on the entity being PRESENT. A card of five `unavailable` rows is worse
+    than no card: it looks like a broken board rather than a node whose helpers were never
+    declared (only 7/8/9 ever had them hand-written in smol_mesh.yaml)."""
+    rows=[{"entity":f"{dom}.smol_{nid}_{key}","name":name,"icon":icon}
+          for key,name,icon,dom in OVERRIDE_ROWS if f"{dom}.smol_{nid}_{key}" in present]
+    if not rows: return None
+    return {"type":"entities","view_layout":{"grid-column":f"span {span}"},
+            "title":f"{meta['name']} · overrides & IO","show_header_toggle":False,
+            "entities":rows,"card_mod":{"style":accent_top(ACCENT)}}
+
+def overrides_cards(nodes, present):
+    """Live nodes only, tiled like the fleet. Ghosts get nothing — that is the whole point."""
+    per_row={1:1,2:2,4:2}.get(len(nodes),3); span=12//per_row
+    return [c for c in (overrides_card(n["id"],n,present,span) for n in nodes) if c]
+
+# ---------- #311 BANNER — headline build/last-sync from the SEAT, never a hardcoded id ----------
+def banner_md(nodes, fleet_total, seat):
+    """The banner's Jinja, with every entity resolved from the ELECTED crown.
+
+    It used to hardcode `update.smol_7_dominion_update` and `sensor.smol_7_status` — id7, which
+    turned out to be a retained ghost whose topics have since been cleared. So the dashboard's
+    headline **build** and **last sync**, presented as fleet-wide facts, were being read off a
+    board that was not there, and now have no backing at all.
+
+    `{{ }}` is preserved rather than baked: HA re-renders a markdown card continuously, so the
+    channel, seq and lit-count stay live between generator runs. Only the ENTITY IDS are
+    resolved here, because they cannot be derived in Jinja — HA's naming is inconsistent
+    (`sensor.smol_8_status` vs `sensor.smol_5_aegis_status`), which is why the registry lookup
+    has to happen on this side."""
+    up=seat.get("fw",{}).get("update"); stat=seat.get("fw",{}).get("status")
+    bt=(f"state_attr('{up}','title') or ('build ' ~ (state_attr('{up}','installed_version') or '—'))"
+        if up else f"'{esc(str(seat.get('sw') or '—'))}'")
+    # Lit count from the fleet's OWN liveness expressions. The old form counted
+    # `^binary_sensor\\.smol_\\d+_online$`, which only ever existed for 5/7/8/9 — so it counted
+    # ghosts and missed the C6 watches, and today would read "2/2 lit" with five boards up.
+    lit="+".join(f"(1 if {n['onx']} else 0)" for n in nodes) or "0"
+    sync=(f"relative_time(states.{stat}.last_changed) if states.{stat} else '—'" if stat else "'—'")
+    return (
+        "{% set na = ['unknown','unavailable','none','None',''] %}\n"
+        f"{{% set lit = {lit} %}}\n"
+        "{% set owner = state_attr('sensor.smol_mesh_channel','owner') %}\n"
+        "{% set ch = states('sensor.smol_mesh_channel') %}\n"
+        "{% set seq = state_attr('sensor.smol_mesh_channel','seq') %}\n"
+        "{% set re = is_state('binary_sensor.smol_mesh_reelecting','on') %}\n"
+        f"{{% set bt = {bt} %}}\n"
+        "# control room\n"
+        "**smol · esp-now mesh · home assistant**\n\n"
+        "{% if re %}⚠️ **RE-ELECTING** — mesh choosing a new gateway…{% else %}"
+        "🟢 **MESH LIVE** · gateway **id{{ owner if owner not in na else '?' }}** · "
+        "seq **{{ seq if seq not in na else '—' }}** (advancing = alive) · "
+        "ch {{ ch if ch not in na else '—' }}{% endif %} · "
+        f"**{{{{ lit }}}}/{fleet_total}** sigils lit\n\n"
+        f"build **{{{{ bt }}}}** · last sync **{{{{ {sync} }}}}** ago · "
+        "retained MQTT, applies on next burst")
+
 # ---------- FLEET-OTA row: staged build vs each node's RUNNING build# (+ live relay % / phase) ----------
 # Uses sensor.smol_<id>_build (running, #40) vs sensor.smol_ota_staged; when a node lags the staged
 # build it shows run **B** → **S** with the live relay % + phase chip. Scales with the fleet.
@@ -640,9 +717,16 @@ async def discover_fleet(ws, st):
         # `smol/<id>/ota/state` with no expire_after, so a long-dead board still reports a
         # cheerful 'off'/'on' there forever.
         NA=("unavailable","unknown","none","None","",None)
-        meta["on"]=(any(st.get(meta["fw"][f],{}).get("state") not in NA
-                        for f in HEARTBEAT if meta["fw"].get(f))
-                    or st.get(f"binary_sensor.smol_{nid}_online",{}).get("state")=="on")
+        # #312 — a second clause used to sit here: `or binary_sensor.smol_<id>_online == 'on'`.
+        # It was a GHOST GENERATOR. That sensor is hand-written in smol_mesh.yaml, which
+        # enumerates exactly 5/7/8/9, and nothing can make it false once the board is gone, so
+        # the test really answered "is this id declared in that file?". It reported ids 7 and 9
+        # — retained ghosts frozen at v904, since cleared — as live, while ids 122/236 (JP's C6
+        # watches, which the crown was actively hearing at −53/−34 dBm) read DORMANT for want of
+        # a hand-written sensor. Wrong in both directions at once. Dropping it costs nothing:
+        # a board that is really there answers clause A, or the crown's roster in main().
+        meta["on"]=any(st.get(meta["fw"][f],{}).get("state") not in NA
+                       for f in HEARTBEAT if meta["fw"].get(f))
         meta.update(HW.get(nid,{})); out[nid]=meta
     return out
 
@@ -709,6 +793,18 @@ async def main():
         except (TypeError,ValueError): seat_id=None
         if seat_id not in fleet:                      # stale/absent MC → believe the roster's role-G publisher
             seat_id=next((c for c in roster if c in fleet), None)
+        # #312 — THE MESH'S OWN ANSWER. The crown republishes its PEERS list every ~15 s, and a
+        # peer in it is by definition on the air. The generator already had this and spent it on
+        # an RSSI label. Consulting it fixes the direction HA gets wrong: ids 122/236 (the C6
+        # watches) publish no HA telemetry the heartbeat test recognises, so they read dormant
+        # while the crown was hearing them at −53/−34 dBm.
+        #
+        # ONLY THE SEAT'S ROSTER. `roster` holds every RETAINED `smol/<id>/peers`, including
+        # topics left by crowns that lost the throne — the retained id7 roster still lists
+        # `5,8,9`, so trusting all of them would resurrect the exact ghosts this fixes. The Seat
+        # comes from the mesh-wide elected `smol/mesh/channel`, so this reads the current crown.
+        for i in set(roster.get(seat_id,{}).get("peers",{})) | ({seat_id} if seat_id else set()):
+            if i in fleet: fleet[i]["on"]=True
         live={i for i,m in fleet.items() if m["on"]}
         if seat_id in fleet: live.add(seat_id)        # the crown is on the mesh by definition
         if not live: live=set(fleet)                  # nothing live at all → show everything rather than a blank room
@@ -727,9 +823,19 @@ async def main():
         legend=legend_card(nodes,present)
         mesh_ovw=mesh_overview_md(nodes,dormant,present); vitals=vitals_history_cards(nodes,present)
         freeze=freeze_md(nodes,dormant,present)
-        cards=view["cards"]; out=[]; done={"topo":0,"legend":0,"meshovw":0,"freeze":0,"fleet":0,"vitals":0,"forge":0,"install":0}
+        banner=banner_md(nodes,len(fleet),seat); ovr=overrides_cards(nodes,present)
+        cards=view["cards"]; out=[]; done={"banner":0,"topo":0,"legend":0,"meshovw":0,"freeze":0,
+                                           "fleet":0,"vitals":0,"overrides":0,"forge":0,"install":0}
         for c in cards:
-            if c.get("type")=="picture" and c.get("image")=="TOPO": c["image"]=topo_url; done["topo"]+=1; out.append(c)
+            if c.get("type")=="markdown" and c.get("content")=="BANNER":
+                bc=dict(c); bc["content"]=banner; done["banner"]+=1; out.append(bc)
+            elif c.get("type")=="markdown" and c.get("content")=="OVERRIDES":
+                # A fleet with no override helpers at all would silently drop the section, and a
+                # silently-missing section is how #305 started. Keep the placeholder visible.
+                if ovr: out.extend(ovr)
+                else: out.append({**c,"content":"_no override helpers declared for any live sigil_"})
+                done["overrides"]+=1
+            elif c.get("type")=="picture" and c.get("image")=="TOPO": c["image"]=topo_url; done["topo"]+=1; out.append(c)
             elif c.get("type")=="markdown" and c.get("content")=="LEGEND":
                 lc=dict(legend); lc["view_layout"]=c.get("view_layout") or lc.get("view_layout"); done["legend"]+=1; out.append(lc)
             elif c.get("type")=="markdown" and c.get("content")=="MESHOVW":
