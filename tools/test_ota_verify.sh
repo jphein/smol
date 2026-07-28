@@ -75,14 +75,27 @@ run() { # run <case-file> <id> <target> <window>
 ok()   { pass=$((pass+1)); printf '   ok   - %s\n' "$1"; }
 bad()  { fail=$((fail+1)); printf '   FAIL - %s\n' "$1"; }
 # ── assertions use PURE BASH, no pipelines, and that is a correctness requirement ──────────────
-# `printf '%s' "$OUT" | grep -qaF "$pat"` under `pipefail` returns non-zero ~0.2% of the time EVEN
-# WHEN THE PATTERN MATCHES (grep -q exits on first match without draining → writer takes EPIPE →
-# pipefail surfaces the writer's status). Measured: 3 spurious non-matches in 1500 runs on real
-# output, position-independent; `case` was 0 in 1500. At ~124 assertions per run that is a ~25%
-# chance of at least one PHANTOM FAILURE per suite run — and it is exactly what produced the
-# wandering counts (100/2, 119/4, 122/2, 124/0) across otherwise identical runs, including two
-# failures I could not reproduce and briefly suspected in the code under test. A flaky assertion is
-# worse than no assertion: it REDs an audit at random and teaches everyone to re-run until green.
+# `printf '%s' "$OUT" | grep -qaF "$pat"` under `pipefail` returns non-zero EVEN WHEN THE PATTERN
+# MATCHES: `grep -q` exits on first match without draining, the writer takes EPIPE, and pipefail
+# surfaces the WRITER's status as the pipeline's. `case` was 0 in 1500 runs.
+#
+# THE MATCH POSITION IS THE LOAD-BEARING VARIABLE — I first reported this as position-independent and
+# oracle-verify refuted it with the decisive measurement:
+#     payload   3.9 KB, match on line 1  →    3 spurious non-matches / 1500   (a race)
+#     payload 395 KB,   match on line 1  → 1500 spurious non-matches / 1500   (DETERMINISTIC)
+#     match on the LAST line             →    0 / 1500   (grep must drain, so no EPIPE is possible)
+# So below the 64 KB pipe buffer it is a ~0.2% race; ABOVE it, piping a large log into `grep -q` under
+# pipefail is not flaky, it is ALWAYS WRONG. That is worth a sweep well beyond this file.
+# Unresolved discrepancy, recorded rather than smoothed over: my own second-to-last-line pattern also
+# measured 3/1500 on a 2.9 KB payload, which oracle's model does not predict. Possibly a second,
+# smaller source (note `grep` here is ugrep 7.5.0, not GNU grep). Moot for this suite now that no
+# assertion uses a pipeline, but do not assume "match late" is a safe workaround elsewhere.
+#
+# At ~124 assertions per run the race alone gave a ~25% chance of at least one PHANTOM FAILURE, which
+# is exactly what produced the wandering counts (100/2, 119/4, 122/2, 124/0) across otherwise
+# identical runs — including two failures I could not reproduce and briefly suspected in the code under
+# test. A flaky assertion is worse than no assertion: it REDs an audit at random and teaches everyone
+# to re-run until green.
 verdict_is() { # verdict_is <expected>
   local got="${OUT#*VERDICT: }"; got="${got%%[! A-Z]*}"; got="${got%% *}"
   [ "$got" = "$1" ] && ok "verdict $1" || bad "verdict: want $1, got ${got:-<none>}"
@@ -278,7 +291,8 @@ OUT="$(OTA_VERIFY_RETRY_GRACE=30 OTA_VERIFY_FIXTURE="$CASES/retry_loop_no_progre
 printf '\n── retry_loop_no_progress · RETRY_GRACE=30 (retries stay fresh)\n'
 verdict_is FAIL; rc_is 1
 has   "a barren retry loop FAILS"            "RETRY-LOOP"
-has   "and says a longer window won't help"  "LONGER WINDOW WILL NOT HELP"
+has   "and says extending has not helped"    "Extending the window has NOT helped"
+has   "while owning that it is a so-far claim" "a claim about the run SO FAR"
 has   "high-water never advanced"            "NO high-water advance"
 hasnt "not left as extend-the-window"        "Re-run with a longer window"
 # O5 residual — two gateway caches with different freshness gates (STAT 45 s vs DIAG_FRESH_MS 150 s)
@@ -299,6 +313,32 @@ printf '── a threshold at or below POLL is refused, not tolerated\n'
 rc_is 4
 has "names the jitter reason" "decided by scheduling jitter"
 has "names the offending knob" "RETRY_GRACE=1 must be GREATER than POLL=1"
+
+echo
+echo "═══ AUDIT ROUND 4 · two attacks built by oracle-verify, kept verbatim ═══"
+# Q1 — the false PASS that defeated conjunct F. The gateway stops republishing a leaf's diag once its
+# cache entry ages out, so the retained topic holds the PRE-OTA record indefinitely; the OTA then
+# completes unobserved and any later unrelated reboot (wdt here) resets `up=` while ota=confirmed
+# survives in rtc_fast, making F pass again. A-B-D-E-F all hold. Only the BOOT DELTA gives it away:
+# 492→495 is three boots, and one in-window OTA reboot is exactly one.
+run stale_cache_plus_reboot 8 907 5
+verdict_is UNPROVEN; rc_is 1
+proof A yes; proof B yes; proof D yes; proof E yes; proof F yes
+proof C NO
+has   "the boot delta is the tell"      "delta 3, want EXACTLY 1"
+hasnt "and it is never a PASS"          "over the air"
+# The unreported second attack in the same directory: a BARREN retry sequence that then SUCCEEDS.
+# `barren` is history; the RETRY-LOOP verdict is a claim about NOW. Before the fix, a completed OTA
+# still carried barren=2 at the final poll and reported CONFLICT with exit 1 — the same "reporting
+# failure on an OTA that worked" family as the original death-point bug, in the arm added to fix it.
+OUT="$(OTA_VERIFY_RETRY_GRACE=30 OTA_VERIFY_FIXTURE="$CASES/barren_then_success.mqtt" \
+       bash "$SCRIPT" 8 907 34 2>&1)"; RC=$?
+printf '\n── barren_then_success · RETRY_GRACE=30 (a barren streak that then completes)\n'
+verdict_is PASS; rc_is 0
+hasnt "a later advance clears the barren streak" "[FAIL   ] RETRY-LOOP"
+has   "and it is reported as retrying-AND-progressing" "the high-water advanced between them"
+hasnt "and it is not a CONFLICT"                 "CONFLICT"
+has   "the stall history is still reported"      "stall episodes=3"
 
 printf '\n════════════════════════════════════════════\n'
 printf '  %d passed · %d failed\n' "$pass" "$fail"

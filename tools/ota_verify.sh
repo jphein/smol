@@ -390,12 +390,22 @@ while :; do
     if [ -n "$prev_total" ]; then
       images=$((images+1))
       hwm=""; last_off=-1; last_off_t="$now"; monotonic=1; restarts=0; stalls=0; stall_at=""; stall_latched=0
+      hwm_at_stall=""; barren=0
     fi
     prev_total="$total"
   fi
 
   if [ -n "$off" ]; then
     { [ -z "$hwm" ] || [ "$off" -gt "$hwm" ]; } && hwm="$off"
+    # A HIGH-WATER ADVANCE CLEARS THE BARREN STREAK, IMMEDIATELY — not at the next stall episode.
+    # `barren` is history; the RETRY-LOOP verdict is a claim about NOW. Consulting an accumulated
+    # counter as if it were a current condition is the same mistake as reading a retained value as a
+    # current one, which is this file's founding defect — and it bit here: a transfer that stalled
+    # barrenly and then SUCCEEDED still had barren=2 at the final poll, so a completed OTA reported
+    # `CONFLICT` with exit 1 and the self-refuting text "HWM stuck at 1440528/1440528".
+    if [ -n "$hwm_at_stall" ] && [ -n "$hwm" ] && [ "$hwm" -gt "$hwm_at_stall" ]; then
+      barren=0; hwm_at_stall="$hwm"
+    fi
     if [ "$off" != "$last_off" ]; then
       if [ "$last_off" != -1 ] && [ "$off" -lt "$last_off" ]; then
         # A RESTART is not corruption. The relay legitimately re-fetches from 0 after a failed
@@ -411,12 +421,7 @@ while :; do
     if [ "$stall_latched" = 0 ] && [ "$off" -gt 0 ] && is_num "$total" && [ "$off" -lt "$total" ] \
        && [ $((now-last_off_t)) -ge "$STALL_AFTER" ]; then
       stalls=$((stalls+1)); stall_at="${stall_at:+$stall_at, }$off"; stall_latched=1
-      if [ -n "$hwm_at_stall" ] && [ -n "$hwm" ] && [ "$hwm" -le "$hwm_at_stall" ]; then
-        barren=$((barren+1))
-      else
-        barren=0
-      fi
-      hwm_at_stall="$hwm"
+      barren=$((barren+1)); hwm_at_stall="$hwm"
     fi
   fi
 
@@ -488,7 +493,7 @@ while :; do
   # high-water mark never advances. Without this arm an endlessly-retrying board can NEVER fail — it
   # reports UNPROVEN/extend-the-window forever, and extending the window is exactly the wrong advice.
   if [ "$barren" -ge "$BARREN_STALLS" ]; then
-    add FAIL 15 RETRY-LOOP "$barren consecutive stall episodes with NO high-water advance (stalls at $stall_at; HWM stuck at ${hwm:-none}/${total:-?}; restarts=$restarts; retry signals=$retry_n). The board keeps retrying and keeps arriving nowhere — a LONGER WINDOW WILL NOT HELP. Escalate: check the source path (src=${src:-none}) and the crown, not the timeout."
+    add FAIL 15 RETRY-LOOP "$barren consecutive stall episodes with NO high-water advance (stalls at $stall_at; HWM stuck at ${hwm:-none}/${total:-?}; restarts=$restarts; retry signals=$retry_n). The board keeps retrying and keeps arriving nowhere. Extending the window has NOT helped across those stalls, so suspect the source path (src=${src:-none}) or the crown rather than the timeout — but note this is a claim about the run SO FAR: a later advance clears it, and this finding disappears if one arrives."
   elif [ "$stalls" -gt 0 ]; then
     add ok 0 RETRY-LOOP "$stalls stall episode(s), but the high-water advanced between them (HWM ${hwm:-none}) — retrying AND progressing."
   fi
@@ -541,7 +546,22 @@ while :; do
   A=0; B=0; C=0; D=0; E=0
   [ -n "$st_first" ] && [ "$st_first" != "$TARGET" ] && [ "$st_live" = "$TARGET" ] && A=1
   [ -n "$slot_first" ] && [ -n "$slot_live" ] && [ "$slot_first" != "$slot_live" ] && B=1
-  is_num "$boot_first" && is_num "$boot_live" && [ "$boot_live" -gt "$boot_first" ] && C=1
+  # EXACTLY ONE boot, not merely an increase. `-gt` was defeated by a real attack: the gateway stops
+  # republishing a leaf's diag once its cache entry ages past DIAG_FRESH_MS, so the RETAINED topic
+  # holds the pre-OTA record INDEFINITELY (not for 150 s — that bound was wrong). An OTA then completes
+  # unobserved, and ANY later unrelated reboot — wdt, panic, brownout — resets `up=` while
+  # `ota=confirmed` survives in rtc_fast. That reboot makes F pass again, so F alone bounds nothing.
+  # The tell was already being printed and ignored: `boot 492→495`, a delta of THREE. One in-window OTA
+  # reboot is a delta of ONE.
+  # Fail-closed cost, stated: a genuine in-window OTA is REFUSED if any extra reboot lands in the same
+  # window, or if our baseline diag is more than one boot stale. That is the direction this file chooses
+  # everywhere, and the rollback path cannot slip through either — two boots there end at
+  # `rolled-back`, and D demands `confirmed`.
+  boot_delta=""
+  if is_num "$boot_first" && is_num "$boot_live"; then
+    boot_delta=$((boot_live - boot_first))
+    [ "$boot_delta" = 1 ] && C=1
+  fi
   { [ "$ota_first" = "none" ] || [ "$ota_first" = "rolled-back" ]; } && [ "$ota_live" = "confirmed" ] && D=1
   # E requires an OBSERVED live rst — an ABSENT rst must not read as "not a USB flash". `rst=` is an
   # early positional field, so truncation (which eats the tail) never removes it; demanding it is
@@ -555,10 +575,16 @@ while :; do
   # hand us a stale `ota=none` followed by a fresh `confirmed`, which LOOKS like an in-window transition
   # for an install that finished before we subscribed. The install claim would still be true; "I watched
   # it happen" would not — and that is the one place the stated invariant leaks.
-  # `up=` (mode.rs:3280, seconds since boot, stamped when the record is generated) closes it: if the
-  # boot that set `confirmed` were older than this run, `up` would exceed our elapsed time. Slack of
-  # 30 s + SETTLE + 2 polls absorbs cache and clock skew, so the residual uncertainty is a bounded ~30 s
-  # instead of an unbounded 150 s. Absent `up=` refuses PASS, like every other missing operand.
+  # `up=` (mode.rs:3280, seconds since boot, stamped when the record is generated) narrows it: if the
+  # CURRENT boot were older than this run, `up` would exceed our elapsed time. Absent `up=` refuses
+  # PASS, like every other missing operand.
+  #
+  # F IS NOT SUFFICIENT ON ITS OWN, and the first version of this comment claimed otherwise. F asks
+  # whether the CURRENT boot is ours; any later unrelated reboot resets `up=` while `ota=confirmed`
+  # survives in rtc_fast, so a fresh `up` can belong to a reboot that has nothing to do with the OTA.
+  # C's exactly-one-boot rule is what closes that, and the two are only strong together. The earlier
+  # claim that this bounded the hole to ~30 s was doubly wrong: the retained record can be
+  # ARBITRARILY stale, because the gateway stops republishing once the cache entry ages out.
   F=0
   if is_num "$up_live"; then
     [ "$up_live" -le $(( (now-start) + SETTLE + 2*POLL + 30 )) ] && F=1
@@ -631,7 +657,8 @@ printf '  ── OTA proof · all four transitions required, LIVE, in-window ─
 y() { [ "$1" = 1 ] && printf 'yes' || printf 'NO '; }
 printf '    [%s] A state flip   %s → %s   (target v%s)\n'  "$(y $A)" "${st_first:-unknown}"   "${st_live:-unknown}"   "$TARGET"
 printf '    [%s] B slot flip    %s → %s\n'                 "$(y $B)" "${slot_first:-unknown}" "${slot_live:-unknown}"
-printf '    [%s] C boot incr    %s → %s\n'                 "$(y $C)" "${boot_first:-unknown}" "${boot_live:-unknown}"
+printf '    [%s] C boot incr    %s → %s   (delta %s, want EXACTLY 1 — more boots than the one OTA we claim to have watched)\n' \
+  "$(y $C)" "${boot_first:-unknown}" "${boot_live:-unknown}" "${boot_delta:-unknown}"
 printf '    [%s] D ota token    %s → %s   (want none|rolled-back → confirmed)\n' "$(y $D)" "${ota_first:-unknown}" "${ota_live:-unknown}"
 printf '    [%s] E not usb      rst=%s\n'                  "$(y $E)" "${rst_live:-unknown}"
 printf '    [%s] F boot in-window  up=%ss (elapsed %ss + %ss slack) — defeats a cache-lagged ota= flip\n' \
