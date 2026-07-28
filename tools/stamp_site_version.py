@@ -12,10 +12,36 @@ A hand-maintained version string would be the exact antipattern the site has now
 cleaned of twice (a green LED over a three-week-old archive; a leaderboard drawing labelled
 "live"). A number a human updates is a number that is wrong. This one is derived, or absent.
 
-WHERE THE WORDS COME FROM
+WHERE THE WORDS COME FROM — AND WHICH CORPUS THAT ACTUALLY IS
 The corpus is read out of `rust/clock/src/net/names.rs` — the `no_std` port the FIRMWARE
 already carries — so the repo holds ONE forge word list, not a third copy of it. If that
 file's shape changes, this degrades to no sigil word rather than inventing one (see below).
+
+⚠️ That corpus is NOT current realm-sigil, and this file used to claim it was. Correcting my
+own error: names.rs is byte-identical to sigil's `python`/`go`/`js`/`wordpress` bindings, but
+those have been FROZEN since 2026-04-05, while `words/realms.json` was cut over to
+lexicon-derived words on 2026-05-07 (`be59e52`). Verifying against the python binding and
+calling it "canonical" measured the wrong reference — the exact mistake this site has been
+audited for twice today, made by me.
+
+The forge realm differs in SIZE as well as words: 20×20 frozen vs 14×14 current. Since the
+index is `seed % len`, that renames everything, not just the entries that changed:
+
+    smol build 341        Riveted Bellows   (frozen)  ->  Bellowed Smithy  (current)
+    this site at 53f45bf  Dense Rivet       (frozen)  ->  Forged Crucible  (current)
+
+Reading names.rs is still the RIGHT choice, deliberately: it makes the site agree with the
+firmware, whose version words are flashed onto boards, shown on the OLED, and cited by name
+across the issue history ("Bellows = 341"). A site that renamed those builds would contradict
+the fleet it documents. So this is knowingly three months behind upstream, and consistent
+with the thing a reader is holding.
+
+Migrating is NOT a site decision. `sigil.realm.watch/rust` (2026-07-28) is a no_std crate
+built precisely so smol can depend on the corpus instead of copying it, and it const-proves
+injectivity over all 256 ids. When the firmware adopts it, this should follow in the same
+change — and every historical build name moves at once. Until then, do not "update" the words
+here alone: that would make the site disagree with the boards, which is strictly worse than
+being uniformly behind.
 
 Canonical realm-sigil is NOT importable here: `sigil.realm.watch/python/pyproject.toml`
 declares `build-backend = "setuptools.backends._legacy:_Backend"`, which does not exist, so
