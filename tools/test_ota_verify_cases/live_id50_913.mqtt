@@ -1,0 +1,109 @@
+# live_id50_913 — REAL fleet capture (id50 912→913, 2026-07-28), timeline /8.
+# Payloads, orderings and retain flags are verbatim from the broker. TWO deliberate changes:
+#   1. elapsed prefixes divided by 8 so the case runs in ~1 min instead of ~8;
+#   2. `up=` divided by 8 TOO, because it is a DEVICE-reported duration that lives in the
+#      payload and does not scale with the replay. Omitting this produced a false F=NO — the
+#      auditor's own near-miss, and the reason rule 5 exists in this file's header.
+# `tage=` is left unscaled: nothing here reads it, and changing more than necessary would cost
+# the property that makes this fixture valuable — that the fleet, not us, produced the fields.
+@0	1	smol/50/diag	DIAG|slot=0|rst=sw|boot=14|ota=confirmed|up=795|heap=42052|hmin=27228|btn=0|btnl=0|fok=93|ffl=1|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=1027|tsrc=mesh|net=0:ok|brk=baked|otah=slot|fwd=477|dedup=459|ttl=0|cut=139
+@0	1	smol/50/ota/state	{"installed_version":"912","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@0	1	smol/50/ota/progress	1450608|1450608|self
+@0	1	smol/50/ota/diag	confirmed src=gw
+@0	1	smol/50/ota/armdiag	install-caught=none pending=none staged_raw=913 leaf_ota=0
+@0	1	smol/50/status	STAT|Menu:0|912
+@0	1	smol/mesh/channel	MC|5|6|4160043685
+@0	1	smol/ota/staged	OTA|913|1450320|a3038a00d0ab3ecdb744228010910438ae9e3c349fa35c4a5ce4a8241cf40b80|45a84733b60138d53aad7060431095293218588401bde96fe6bd43f75b52e624a0cfffdccaed2d4b3ac4e56a2daa17b2e6a598b4a7971e0912028786fefa8e02|http://10.0.11.117:8087/ota/smol-913.bin
+@0	0	smol/50/diag	DIAG|slot=0|rst=sw|boot=14|ota=confirmed|up=795|heap=42052|hmin=27228|btn=0|btnl=0|fok=93|ffl=1|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=1027|tsrc=mesh|net=0:ok|brk=baked|otah=slot|fwd=477|dedup=459|ttl=0|cut=139
+@0	0	smol/mesh/channel	MC|5|6|4160043686
+@0	0	smol/50/ota/state	{"installed_version":"912","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@2	0	smol/50/ota/progress	0|1450320|relayfetch
+@2	0	smol/50/ota/progress	245760|1450320|relayfetch
+@3	0	smol/50/ota/progress	589824|1450320|relayfetch
+@4	0	smol/50/ota/progress	884736|1450320|relayfetch
+@4	0	smol/50/ota/progress	1228800|1450320|relayfetch
+@14	0	smol/mesh/channel	MC|8|6|4160043687
+@14	0	smol/mesh/channel	MC|8|6|4160043688
+@17	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":true,"title":"v913+dev.9170907 Nozzle"}
+@18	0	smol/50/ota/progress	0|1450320|relayfetch
+@18	0	smol/50/ota/progress	196608|1450320|relayfetch
+@19	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":true,"title":"v913+dev.9170907 Nozzle"}
+@19	0	smol/50/ota/progress	491520|1450320|relayfetch
+@20	0	smol/50/ota/progress	786432|1450320|relayfetch
+@20	0	smol/50/ota/progress	1130496|1450320|relayfetch
+@21	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":true,"title":"v913+dev.9170907 Nozzle"}
+@21	0	smol/50/ota/progress	1425408|1450320|relayfetch
+@21	0	smol/50/ota/progress	1450320|1450320|relayfetch
+@23	0	smol/mesh/channel	MC|51|6|4160043689
+@23	0	smol/mesh/channel	MC|51|6|4160043690
+@27	0	smol/50/ota/progress	0|1450320|relayfetch
+@27	0	smol/50/ota/progress	245760|1450320|relayfetch
+@28	0	smol/50/ota/diag	relay-failed retry=3 src=gw
+@28	0	smol/mesh/channel	MC|8|6|4160043691
+@28	0	smol/50/ota/progress	589824|1450320|relayfetch
+@29	0	smol/50/ota/progress	933888|1450320|relayfetch
+@30	0	smol/50/ota/progress	1277952|1450320|relayfetch
+@30	0	smol/50/ota/progress	1450320|1450320|relayfetch
+@30	0	smol/50/status	STAT|Menu:0|913
+@30	0	smol/50/diag	DIAG|slot=1|rst=sw|boot=15|ota=confirmed|up=15|heap=42100|hmin=42100|btn=0|btnl=0|fok=0|ffl=0|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=103|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=0|dedup=0|ttl=0
+@30	0	smol/mesh/channel	MC|8|6|4160043692
+@31	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@34	0	smol/50/status	STAT|Menu:0|913
+@34	0	smol/50/diag	DIAG|slot=1|rst=sw|boot=15|ota=confirmed|up=17|heap=41916|hmin=41916|btn=0|btnl=0|fok=0|ffl=0|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=103|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=0|dedup=0|ttl=0
+@34	0	smol/mesh/channel	MC|8|6|4160043693
+@34	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@36	0	smol/50/status	STAT|Menu:0|913
+@36	0	smol/50/diag	DIAG|slot=1|rst=sw|boot=15|ota=confirmed|up=17|heap=41916|hmin=41916|btn=0|btnl=0|fok=0|ffl=0|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=103|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=0|dedup=0|ttl=0
+@36	0	smol/50/ota/diag	confirmed src=gw
+@36	0	smol/mesh/channel	MC|5|6|4160043694
+@36	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@37	0	smol/50/status	STAT|Menu:0|913
+@37	0	smol/50/ota/diag	relay-failed retry=1 src=gw
+@37	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@39	0	smol/50/status	STAT|Menu:0|913
+@39	0	smol/50/diag	DIAG|slot=1|rst=sw|boot=15|ota=confirmed|up=22|heap=42052|hmin=41916|btn=0|btnl=0|fok=0|ffl=0|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=163|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=3|dedup=0|ttl=0
+@39	0	smol/50/status	STAT|Menu:0|913
+@39	0	smol/50/diag	DIAG|slot=1|rst=sw|boot=15|ota=confirmed|up=22|heap=42052|hmin=41916|btn=0|btnl=0|fok=0|ffl=0|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=163|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=3|dedup=0|ttl=0
+@39	0	smol/mesh/channel	MC|5|6|4160043695
+@39	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@40	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@42	0	smol/50/status	STAT|Menu:0|913
+@42	0	smol/50/diag	DIAG|slot=1|rst=sw|boot=15|ota=confirmed|up=22|heap=42052|hmin=41916|btn=0|btnl=0|fok=0|ffl=0|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=163|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=3|dedup=0|ttl=0
+@42	0	smol/mesh/channel	MC|5|6|4160043696
+@42	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@43	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913+dev.9170907 Nozzle"}
+@44	0	smol/50/diag	DIAG|slot=1|rst=sw|boot=15|ota=confirmed|up=22|heap=42052|hmin=41916|btn=0|btnl=0|fok=0|ffl=0|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=163|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=3|dedup=0|ttl=0
+@44	0	smol/mesh/channel	MC|5|6|4160043697
+@44	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@46	0	smol/50/status	STAT|Menu:0|913
+@46	0	smol/50/diag	DIAG|slot=1|rst=sw|boot=15|ota=confirmed|up=30|heap=40332|hmin=40332|btn=0|btnl=0|fok=0|ffl=0|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=223|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=15|dedup=7|ttl=0
+@46	0	smol/mesh/channel	MC|5|6|4160043698
+@46	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@48	0	smol/50/status	STAT|Menu:0|913
+@48	0	smol/50/diag	DIAG|slot=1|rst=sw|boot=15|ota=confirmed|up=30|heap=40332|hmin=40332|btn=0|btnl=0|fok=0|ffl=0|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=223|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=15|dedup=7|ttl=0
+@48	0	smol/mesh/channel	MC|5|6|4160043699
+@48	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@50	0	smol/50/status	STAT|Menu:0|913
+@50	0	smol/50/diag	DIAG|slot=1|rst=sw|boot=15|ota=confirmed|up=30|heap=40332|hmin=40332|btn=0|btnl=0|fok=0|ffl=0|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=223|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=15|dedup=7|ttl=0
+@50	0	smol/mesh/channel	MC|5|6|4160043700
+@50	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@51	0	smol/50/status	STAT|Menu:0|913
+@51	0	smol/50/diag	DIAG|slot=1|rst=sw|boot=15|ota=confirmed|up=30|heap=40332|hmin=40332|btn=0|btnl=0|fok=0|ffl=0|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=223|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=15|dedup=7|ttl=0
+@52	0	smol/mesh/channel	MC|5|6|4160043701
+@52	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@53	0	smol/50/status	STAT|Menu:0|913
+@53	0	smol/50/diag	DIAG|slot=1|rst=sw|boot=15|ota=confirmed|up=37|heap=40272|hmin=40272|btn=0|btnl=0|fok=0|ffl=0|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=283|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=29|dedup=21|ttl=0
+@53	0	smol/mesh/channel	MC|5|6|4160043702
+@53	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@55	0	smol/50/status	STAT|Menu:0|913
+@55	0	smol/50/diag	DIAG|slot=1|rst=sw|boot=15|ota=confirmed|up=37|heap=40272|hmin=40272|btn=0|btnl=0|fok=0|ffl=0|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=283|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=29|dedup=21|ttl=0
+@56	0	smol/mesh/channel	MC|5|6|4160043703
+@56	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@57	0	smol/50/status	STAT|Menu:0|913
+@57	0	smol/50/diag	DIAG|slot=1|rst=sw|boot=15|ota=confirmed|up=37|heap=40272|hmin=40272|btn=0|btnl=0|fok=0|ffl=0|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=283|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=29|dedup=21|ttl=0
+@57	0	smol/mesh/channel	MC|5|6|4160043704
+@57	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}
+@59	0	smol/50/status	STAT|Menu:0|913
+@59	0	smol/50/diag	DIAG|slot=1|rst=sw|boot=15|ota=confirmed|up=37|heap=40272|hmin=40272|btn=0|btnl=0|fok=0|ffl=0|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=283|tsrc=ntp|net=0:ok|brk=baked|otah=slot|fwd=29|dedup=21|ttl=0
+@59	0	smol/mesh/channel	MC|5|6|4160043705
+@59	0	smol/50/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913 Nozzle"}

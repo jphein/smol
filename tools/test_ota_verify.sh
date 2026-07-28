@@ -49,7 +49,14 @@
 #      observable. Dropping a raw capture in as a fixture therefore yields a FALSE GREEN.
 #      `tools/ota_capture.sh` emits the prefixes for exactly this reason.
 #
-#   4. Leave GENEROUS margins around anything time-derived. A stall episode is only counted if a poll
+#   4. TIME-SCALING A FIXTURE IS UNSAFE for any assertion comparing OUR elapsed clock against a
+#      DEVICE-REPORTED duration — `up=`, `tage=`, anything the board measures about itself. Those values
+#      live in the PAYLOAD and do not scale when you divide the timeline. The auditor scaled a real
+#      capture by 8, left `up=300` untouched, and got a false `F=NO` it nearly reported as a live
+#      false negative. If you scale the timeline, scale those fields by the same factor — and say in
+#      the fixture header exactly which fields you touched.
+#
+#   5. Leave GENEROUS margins around anything time-derived. A stall episode is only counted if a poll
 #      lands inside the frozen span, and under the suite's own load a poll iteration can stretch well
 #      past POLL seconds. `retry_restart_then_pass` originally had a 4 s frozen span with
 #      STALL_AFTER=2 and passed on a loaded box while FAILING in a pristine checkout — a flaky
@@ -134,7 +141,28 @@ hasnt()  { case "$OUT" in *"$2"*) bad "$1 (unexpected: $2)";; *) ok "$1";; esac;
 proof()  { local p="$2"; [ "$p" = NO ] && p="NO "
   case "$OUT" in *"[$p] $1 "*) ok "proof $1=$2";; *) bad "proof $1: want $2";; esac; }
 
-echo "═══ PASS must be REACHABLE (it was not, for a long time) ═══"
+echo "═══ THE CANONICAL PASS · real fleet bytes, not ours ═══"
+# id50 912→913, captured live 2026-07-28 by tools/ota_capture.sh, timeline and `up=` both /8 (see the
+# fixture header). This is the ONLY fixture that cannot be wrong about the schema, because the fleet
+# produced every field: real truncation (cut=139), real crown churn mid-OTA (MC|5 → MC|51 → MC|8), a
+# real post-completion retry artefact, and a real single-boot increment. It certifies a genuine OTA —
+# something this harness could not do AT ALL for most of its life, and then refused to do for two
+# systematic reasons only a live run exposed.
+# Thresholds are scaled with the timeline; RETRY_GRACE=19 is 150/8 and STALL_AFTER=4 is 30/8.
+OUT="$(OTA_VERIFY_STALL_AFTER=4 OTA_VERIFY_RETRY_GRACE=19 \
+       OTA_VERIFY_FIXTURE="$CASES/live_id50_913.mqtt" bash "$SCRIPT" 50 913 65 2>&1)"; RC=$?
+printf '\n── live_id50_913 (id50 → v913, REAL capture)\n'
+verdict_is PASS; rc_is 0
+proof A yes; proof B yes; proof C yes; proof D yes; proof E yes; proof F yes
+has  "a real single-boot increment"          "C boot incr    14 → 15"
+has  "real truncation, named as sent-and-lost" "cut=139 bytes"
+# The artefact that would have defeated the pre-latch code: `relay-failed retry=1` arrives AFTER the
+# completion publish, so the old arm re-armed on a finished transfer.
+has  "post-completion retry cannot un-finish it" "live completion already observed"
+hasnt "and no death-point on a successful OTA"   "[FAIL   ] DEATH-POINT"
+
+echo
+echo "═══ PASS must be REACHABLE (synthetic supplement) ═══"
 run pass_peer_sourced 8 907 12
 verdict_is PASS; rc_is 0
 proof A yes; proof B yes; proof C yes; proof D yes; proof E yes
