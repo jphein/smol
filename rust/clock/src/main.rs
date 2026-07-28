@@ -372,6 +372,17 @@ impl BurstProbe {
         self.last_yield_ms = t;
     }
 
+    /// Whether a burst ACTUALLY ran. The three instrumented arms are POLLED every tick and
+    /// early-return internally (`maybe_leaf_reelect` returns immediately on a gateway and unless the
+    /// owner has been silent past its threshold; the flush and re-sync are cadence-gated), so a probe
+    /// that reports unconditionally reports mostly nothing — see the call sites for what that cost.
+    ///
+    /// A burst that never yielded never blocked, so `yields > 0` is exactly the question.
+    #[inline]
+    fn ran(&self) -> bool {
+        self.yields > 0
+    }
+
     /// The active screen was repainted (`Plugin::paint_burst`).
     #[inline]
     fn painted(&mut self, t: u64) {
@@ -1032,9 +1043,20 @@ fn main() -> ! {
                     }
                     reelect_abort
                 });
-                let kind = BurstKind::Reelection;
-                let (gap, dur) = probe.finish(kind, millis());
-                r.note_burst(gap, dur, kind.tag());
+                // Report ONLY if the burst ran. Reporting unconditionally was a real bug, and the
+                // bench caught it: `brst=3009:0:r` on id8 — a 3,009 ms app gap attributed to a
+                // re-election of ZERO duration. Both halves were wrong in different ways. The gap was
+                // real but came from the OTA/association path in the PREVIOUS tick (`last_app_ms` is a
+                // tick behind at this point), and the duration was 0 because `maybe_leaf_reelect` had
+                // returned immediately without doing anything at all. So the field named the wrong
+                // cause, claimed an impossible duration, and polluted the max-since-publish with gaps
+                // from paths that are not instrumented — while also printing a serial line EVERY TICK
+                // in an ESP_LOG build.
+                if probe.ran() {
+                    let kind = BurstKind::Reelection;
+                    let (gap, dur) = probe.finish(kind, millis());
+                    r.note_burst(gap, dur, kind.tag());
+                }
                 if reelected {
                     redraw = true; // a recovery burst ran → role may have changed; repaint
                 }
@@ -1527,9 +1549,13 @@ fn main() -> ! {
                         }
                         flush_abort
                     });
-                    let kind = BurstKind::TelemetryFlush;
-                    let (gap, dur) = probe.finish(kind, millis());
-                    r.note_burst(gap, dur, kind.tag());
+                    // Same `ran()` guard as the re-election arm — a flush that found nothing to do
+                    // must not report a burst that did not happen.
+                    if probe.ran() {
+                        let kind = BurstKind::TelemetryFlush;
+                        let (gap, dur) = probe.finish(kind, millis());
+                        r.note_burst(gap, dur, kind.tag());
+                    }
                     flush_defer_since_ms = 0;
                     // #192: opportunistic NTP RE-SYNC riding the flush cadence. `try_time_sync`
                     // runs ONLY at boot, so without this the wall-clock free-runs on the C3
@@ -1566,9 +1592,11 @@ fn main() -> ! {
                                 }
                                 resync_abort
                             });
-                            let kind = BurstKind::NtpResync;
-                            let (gap, dur) = probe.finish(kind, millis());
-                            r.note_burst(gap, dur, kind.tag());
+                            if probe.ran() {
+                                let kind = BurstKind::NtpResync;
+                                let (gap, dur) = probe.finish(kind, millis());
+                                r.note_burst(gap, dur, kind.tag());
+                            }
                             if let Some(unix) = fresh {
                                 // Re-anchor the free-running clock to the fresh SNTP time. The next
                                 // broadcast_time carries the new my_synced_at → leaves adopt it.
