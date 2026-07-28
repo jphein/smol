@@ -92,7 +92,15 @@ prose or a machine check the better guard for an invariant?**
 or making a change that contradicted it.** Three were written by the people who then found them.
 
 **The conclusion: an invariant stated in prose is a wish; an invariant asserted in code is a
-constraint.** Prefer a const assertion, an exhaustive enumeration or a failing build to any amount of
+constraint.**
+
+> 🔄 **The corollary that keeps this from being self-defeating** (morpheus-sigil): **prose is still the
+> only place the *why* can live.** Every const assertion written today needed a paragraph explaining
+> **what breaks if it fires** — and *"the assertion without that paragraph would have been deleted by the
+> next person who found it inconvenient."* So the division of labour is: **the check holds the invariant,
+> the prose holds the reason.** A check with no reason gets removed; a reason with no check goes quietly
+> false. Today produced five of the second kind and zero of the first, which is why this file argues for
+> checks — not for writing less. Prefer a const assertion, an exhaustive enumeration or a failing build to any amount of
 careful wording — and when prose is the only option, expect it to be wrong and date it.
 
 ### ⚠️ Ask whether a claim is about a VALUE or a KIND — kinds are cheap to refute
