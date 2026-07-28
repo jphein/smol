@@ -2927,7 +2927,22 @@ impl RadioManager {
         const CUT_TAG_MAX: usize = 8; // "|cut=999"
         let cap = crate::net::wifi::RELAY_VALUE_MAX;
         let n = if value.len() > cap {
-            cap - CUT_TAG_MAX
+            // Cut on a FIELD BOUNDARY, not at the byte the cap lands on. The raw cap fell mid-value
+            // (measured: `…|dlseq=` with its digits gone), so every leaf has been delivering a record
+            // whose LAST FIELD IS CORRUPT — worse than short, because a positional parse cannot tell a
+            // truncated value from a real one. Backing up to the last `|` yields a record that is
+            // merely SHORTER and still well-formed, which every existing receiver already handles:
+            // `cfg=`/`io=`/`ap=` are conditional fields, so a reader must already tolerate absence.
+            //
+            // This is independent of any framing change and stays correct under one: a part B that
+            // begins on a field boundary needs no partial-field stitching.
+            let room = cap - CUT_TAG_MAX;
+            match value[..room].iter().rposition(|&b| b == b'|') {
+                Some(i) => i,
+                // No separator at all in that span — not a DIAG record shape. Fall back to the raw
+                // cut rather than sending nothing; `|cut=` still reports the deficit.
+                None => room,
+            }
         } else {
             value.len()
         };
