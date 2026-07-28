@@ -140,6 +140,13 @@ automation:
           # iteration would re-read the helpers and could straddle an operator's second change.
           # int() because an input_number carries a float ("160.0" would not parse on the leaf).
           #
+          # REVISIT once the whole fleet runs a build containing 7017d39. That firmware change
+          # (taken from this finding) makes an absent font mean DEFAULT rather than keep-current,
+          # which makes omitting `:5x8` correct again — and omitting it restores pace/mode control
+          # on boards too old to parse a font field. It is NOT safe yet: every board is on v906,
+          # where absent still means keep-current, so omitting would resurrect the unreachable
+          # default this same commit fixed. Condition to flip: no board on a pre-7017d39 build.
+          #
           # The font is ALWAYS sent, including `5x8`. It used to be omitted when 5x8, for
           # compatibility with firmware predating the field — but the firmware reads an ABSENT
           # third field as "keep the current font" (delivery.rs: `None | Some(b"") => current.font`).
