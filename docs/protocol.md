@@ -507,14 +507,33 @@ changes, and see the truncation warning.
 | `brst=<ms>` | conditional | #153 — the **burst-freeze peak** for the window. ~16 B, and **one** field rather than two precisely because of the budget below. Reset at publish, so each record carries that window's peak rather than a running maximum |
 | `cut=<bytes>` | conditional | bytes lost to truncation — see below |
 
-> ⚠️ **This record lives near a hard cap.** Worst case measured **462 B (~479 B on the wire) against a
-> 512 B buffer**, and the fields above are appended **last** — so `blrev=`/`brst=` are exactly where a
-> truncation lands. A measured leaf record offered 307 B, sent 232, and **75 B vanished with no signal of
-> any kind**; `cut=<bytes>` exists to spend 8 B of the short budget saying so, on the grounds that **a
-> reader who cannot see the field it wants must at least be able to tell that it was cut.**
+> ⚠️ **TWO different caps, and the tighter one is already breached** *(updated 2026-07-28, `6133675`)*.
+> This is the single most important thing to know about this record:
 >
-> **So a parser must treat an absent `brst=`/`blrev=` as `unknown`, never as `0`.** Per
-> [DOC-UPKEEP](DOC-UPKEEP.md) §2: a check whose operand may be absent must print *unknown* and **skip**.
+> | Path | Cap | State |
+> |---|---|---|
+> | **Gateway → MQTT** (self-publish) | ~490 B publish / **512 B** buffer | **462 B worst case — ~33 B of headroom.** Tight, not yet breached. `encode_publish` returns `None` on overflow, so the **whole record stops publishing** rather than losing a field |
+> | **Leaf → ESP-NOW** (`broadcast_diag`, ONE frame) | **`RELAY_VALUE_MAX` = 232 B** | 🔴 **ALREADY BREACHED.** A realistic leaf record (up 494 s, no OTA yet) **offered 307 B, sent 232, and dropped 75 B with no signal of any kind** |
+>
+> **What a leaf loses today:** the cut lands mid-`dlseq=`, so it loses the tail of the positional block
+> (`dfwd`, `etx`) **and every appended field** — `cc`, `degraded`, `cdeaf`, `apch`, `blrev`, `brst`.
+> Consequences worth stating plainly:
+> - **`brst=` (JP's burst-freeze metric) is crown-only — it has never reached HA from a leaf.**
+> - **`blrev=` is invisible on exactly the boards it is about**: a leaf is what gets OTA'd, and its
+>   bootloader-revert answer is in the discarded tail.
+>
+> **Why this hid for months:** the crown self-publishes the full record, so **the one board anybody looks
+> at is the one that works.** The 512 B figure was the wrong cap to worry about first.
+>
+> `cut=<bytes>` (+ a `log::warn!`) now makes the loss impossible to miss — 8 B of the very budget that is
+> short, which is the right trade: **a reader who cannot see the field it wants must at least be able to
+> tell that it was cut.** Shrinking the record was deliberately *not* done in that fix, because it sheds
+> fields HA parses.
+>
+> **So a parser must treat an absent `brst=`/`blrev=` as `unknown`, never as `0`** — and on a leaf, absent
+> is the *normal* case until the record shrinks. Per [DOC-UPKEEP](DOC-UPKEEP.md) §2: a check whose operand
+> may be absent must print *unknown* and **skip**. See also
+> [#306](https://github.com/jphein/smol/issues/306).
 
 > 🔎 **Two naming decisions in this record are load-bearing, not style.** `apch=` is **not** `ap=` because
 > *"an unanchored grep for `ap=` matches the tail of `heap=42040`"* (`mode.rs:3316`) — a real harness bug
