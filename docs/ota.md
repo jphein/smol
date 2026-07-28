@@ -252,8 +252,16 @@ the image — the board is back. **Identity is runtime, from NVS:** the baked `b
 is only a first-boot **seed** (written to the `nvs` partition on the first USB boot after an
 erase-flash); thereafter the board reads its id from NVS. Because OTA writes only the inactive
 app slot + `otadata` and **never** touches `nvs`, identity survives any image — so a single
-fleet-shared OTA image (built with no `SMOL_NODE_ID`) installs onto id7/id8/id9/… and each keeps
-its own id. `board.rs`/`secrets.rs` still hold the per-board factory seed + creds (see
+fleet-shared OTA image (built with no `SMOL_NODE_ID`) installs onto id5/id8/id50/id51/… and each keeps
+its own id.
+
+> 🔎 **This has a real-world proof, and its flip side bites people.** The hardware that used to be
+> **id7 (Dominion)** has run as **id50 (Ember)** since 2026-07-22, re-provisioned for #198's Phase-2
+> work. It has since taken OTAs and it is **still id50** — the property above, demonstrated. The flip
+> side: **an OTA will therefore never restore an old id.** If a board is answering under an id you did
+> not expect, updating the firmware cannot fix it; only **re-provisioning** can. See
+> [BUILDING.md](BUILDING.md) — *a name mapping is a pure function, an id↔board assignment is a
+> setting.* `board.rs`/`secrets.rs` still hold the per-board factory seed + creds (see
 [BUILDING.md](BUILDING.md)); do **not** USB-flash the fleet-staged `.bin` as a factory image
 without `SMOL_NODE_ID=<n>`, or a fresh (erased) board seeds NVS to the default id 7.
 
