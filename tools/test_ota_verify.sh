@@ -399,6 +399,20 @@ has  "and the rollback is REPORTED"        "rollback episode(s) OBSERVED LIVE in
 run stale_cache_plus_reboot 8 907 5
 has  "a non-PASS keeps its evidence"       "raw capture KEPT for audit:"
 
+echo
+echo "═══ INTEROP · tools/ota_capture.sh output must replay VERBATIM ═══"
+# The capture tool writes `@<elapsed_s>\t<retain>\t<topic>\t<payload>` plus a `# format:` header, which
+# is this seam's format exactly. Asserted so the two tools cannot drift apart silently — a captured
+# fixture that fails to parse would look like a harness bug, and a captured fixture whose header lines
+# leaked into the log would only be harmless by accident (they happen not to contain a topic pattern).
+# Also the reason the capture tool exists at all: an UNTIMED replay of real bytes understates itself —
+# the lead measured restarts=0/monotonic=yes on a raw replay vs restarts=1/monotonic=NO on a timed
+# replay of the SAME capture, with four backward offset moves present and none observable.
+run capture_tool_format 51 913 6
+verdict_is PASS; rc_is 0
+has "comment header is skipped, not ingested" "A state flip   912 → 913"
+has "and the capture's own boot delta reads"  "41 → 42"
+
 printf '\n════════════════════════════════════════════\n'
 printf '  %d passed · %d failed\n' "$pass" "$fail"
 printf '════════════════════════════════════════════\n'

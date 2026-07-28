@@ -220,6 +220,12 @@ if [ -n "$FIXTURE" ]; then
   (
     t0=$(date +%s)
     while IFS= read -r line; do
+      # Skip comments and blanks so a fixture produced by `tools/ota_capture.sh` can be replayed
+      # VERBATIM — that tool writes a `# format: …` header, and its output is otherwise byte-identical
+      # to this seam's format (`@<elapsed_s>\t<retain>\t<topic>\t<payload>`). Without this, header
+      # lines were appended to the log; harmless only because they happen not to contain a topic
+      # pattern, which is an alibi rather than a guarantee.
+      case "$line" in ''|'#'*) continue ;; esac
       case "$line" in
         @*) at="${line%%$'\t'*}"; at="${at#@}"; rest="${line#*$'\t'}" ;;
         *)  at=0; rest="$line" ;;

@@ -1,0 +1,8 @@
+# format: @<elapsed_s>\t<retain>\t<topic>\t<payload>   (retain=1 lines are pre-existing)
+# captured 2026-07-28 by ota_capture.sh
+@0	1	smol/51/ota/state	{"installed_version":"912","latest_version":"913","in_progress":false,"title":"v913"}
+@0	1	smol/51/diag	DIAG|slot=0|rst=sw|boot=41|ota=confirmed|up=3000|heap=41968|tsrc=mesh|hop=1|cut=98
+@0	1	smol/mesh/channel	MC|5|6|1
+@2	0	smol/51/ota/progress	1450320|1450320|self
+@3	0	smol/51/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913"}
+@3	0	smol/51/diag	DIAG|slot=1|rst=sw|boot=42|ota=confirmed|up=9|heap=41968|tsrc=mesh|hop=1|cut=98
