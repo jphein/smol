@@ -989,14 +989,14 @@ GEN_OWNED = re.compile(r"^vertical-stack\|node\d+$")
 # cards, so a scaffold deletion leaves the card on the dashboard forever and the drift check red
 # forever. This is the other half of that action.
 #
-# 2026-07-28 · ids 7 and 9 `overrides & IO` (#311). 53f45bf retired the helpers behind them, so
-# after the next package push every row would read 'Entity not found'. Authorised by team-lead.
-# DELETE THESE ENTRIES once a real run has removed them — a stale entry is a licence to delete a
-# card someone re-adds on purpose, which is the exact failure this list is shaped to avoid.
-RETIRE_LIVE = {
-    "entities|Dominion · overrides & IO",
-    "entities|Herald · overrides & IO",
-}
+# EMPTY IS THE CORRECT STEADY STATE. An entry lives here only between the decision to delete a
+# card and the run that deletes it — leaving one behind is a standing licence to delete a card
+# someone re-adds on purpose, which is the exact failure this list is shaped to avoid.
+#
+# 2026-07-28 · held `entities|Dominion · overrides & IO` and `entities|Herald · overrides & IO`
+# (#311, authorised by team-lead, coupled to 53f45bf retiring their helpers). A real run removed
+# both; live went 32 cards → 31 with LIVE-ONLY 0, so the entries were cleared the same day.
+RETIRE_LIVE = set()
 
 
 def classify(cfg, view):

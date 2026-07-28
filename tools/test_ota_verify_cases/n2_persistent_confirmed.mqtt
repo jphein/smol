@@ -1,0 +1,5 @@
+1	smol/9/ota/state	{"installed_version":"906","latest_version":"907","in_progress":false,"title":"v907 Hammer"}
+1	smol/9/diag	DIAG|slot=1|rst=sw|boot=493|ota=confirmed|up=3000|heap=41968|tsrc=mesh|hop=1
+1	smol/mesh/channel	MC|5|6|1
+@2	0	smol/9/ota/state	{"installed_version":"907","latest_version":"907","in_progress":false,"title":"v907 Hammer"}
+@2	0	smol/9/diag	DIAG|slot=1|rst=brownout|boot=495|ota=confirmed|up=8|heap=41968|tsrc=mesh|hop=1

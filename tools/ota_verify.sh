@@ -1,207 +1,416 @@
 #!/usr/bin/env bash
-# smol OTA-roll verify harness — one-command PASS/FAIL for a board's OTA install.
+# smol OTA-roll verify harness — PASS / FAIL for one board's OTA install.
 #
 #   Usage:  ota_verify.sh <board_id> <target_build> [window_s]
-#   e.g.    ota_verify.sh 7 346 360
-#   Exit:   0 = PASS, 1 = FAIL/INFO, 3 = setup error (no creds)
+#   e.g.    ota_verify.sh 8 907 360
+#   Exit:   0 = PASS · 1 = FAIL / UNPROVEN / CONFLICT · 3 = setup error (no creds)
+#   Test:   tools/test_ota_verify.sh   (fixture replay, no broker, no hardware)
 #
-# Tails smol/<id>/ota/{progress,diag,state} + smol/<id>/diag + smol/mesh/channel and prints
-# a PASS/FAIL verdict. Encodes the v346-wave (2026-07-20) hard-won lessons:
+# ═════════════════════════════════════════════════════════════════════════════════════════
+# THE INVARIANT — the whole design, and the reason this file was RESTRUCTURED on 2026-07-28
 #
-#   * RETAINED-GHOST discipline — a fresh subscribe redelivers retained values (MQTT retain
-#     flag = 1); only a LIVE publish (retain = 0) is trustworthy. mosquitto_sub -F '%r' gives
-#     the flag; a PASS requires a LIVE flip, not a persisted value. (Cost us a false
-#     "fleet installing" alarm before we caught it.)
-#   * grep -a EVERYWHERE — one binary byte in an MQTT payload flips grep to binary mode and it
-#     silently prints nothing; a plain-grep waiter read "no event" while the event sat in the
-#     log. -a (text mode) is mandatory.
-#   * USB vs OTA — installed_version flipping to target is NOT proof; the discriminator is the
-#     RESET REASON. A USB flash resets over the cable → `rst=usb-jtag`; an OTA reboots in
-#     software → `rst=sw`. (id5 hit v346 via USB and read as an "OTA win" until this caught it.)
-#     CORRECTED 2026-07-28 against live payloads: this file previously asserted a real OTA shows
-#     `slot=ota_1` / `rst=ota`. Neither string is ever published — `slot=` is a NUMERIC index
-#     (mode.rs:3208 ← d.boot_slot) and reset_reason_token() (ota.rs) emits no `ota` token at all.
-#     The PASS arm was therefore unreachable and every genuine OTA was reported as a USB flash.
-#     LESSON: this harness was written against an IMAGINED schema. A diagnostic must be validated
-#     against a live payload, because a wrong one does not error — it prints a confident verdict
-#     in the same format as a correct one, which is worse than a crash.
-#   * SCHEMA (verified live 2026-07-28, smol/<id>/diag):
-#       slot=<0|1> · rst=<panic|power-on|sw|deep-sleep|brownout|wdt|usb-jtag|glitch|other|unk>
-#       ota=<none|confirmed|rolled-back>   ← `rolled-back` is the firmware's EXPLICIT revert
-#       signal; prefer it over inferring a revert from a build number that moved.
-#     `ap=<channel>` is CONDITIONAL — appended last and only once known (same precedent as
-#     `brst=`/`io=`), so it is present on an associated crown and ABSENT on a leaf that has not
-#     associated. That conditionality is what hid the bug below: `tail -1` grabbed the real
-#     `ap=6` on the crown and the tail of `heap=` on every leaf, so the check was right on one
-#     board and silently wrong on the rest. A field that is sometimes absent is more dangerous
-#     than one that never exists — it buys the broken code an alibi.
-#   * DEATH-POINT — offset frozen >30s with done<total = the transfer died AT that byte.
-#   * OFF-CHANNEL — the coexist disease is a CHANNEL MISMATCH: crown AP ch != ESP-NOW mesh ch
-#     stalls the WiFi fetch (proven: co-channel moved 48KB, off-channel moved 0).
-#   * PEER-SOURCE (#237) — ota/diag ` src=id<n>` = a peer HOLDER served it over ESP-NOW
-#     (vs src=gw = crown/gateway WiFi-fetch).
+#     Conclude only from TRANSITIONS OBSERVED LIVE INSIDE THIS RUN'S WINDOW.
+#     Never from a state value that was merely read.
+#
+# In this system almost every operand is either a RETAINED MQTT topic or lives in rtc_fast
+# persistent RAM. Both mean the same thing to a reader: **a value tells you what is true, never
+# WHEN it became true.** `ota/state`, `ota/diag`, `ota/progress` and `<id>/diag` are all retained,
+# so a fresh subscribe replays yesterday's truth with today's timestamp; `ota=confirmed` lives in
+# `#[esp_hal::ram(rtc_fast, persistent)] OTA_OUTCOME` (ota.rs:2081-2083) and survives every
+# software reset — only a power cycle clears it.
+#
+# Three rounds of incremental patching failed an adversarial audit three times, because every
+# defect was one of two structural mistakes, not a local bug:
+#
+#   1. VERDICTS COMPUTED FROM VALUE SNAPSHOTS. Each poll re-read `tail -1` of a topic and compared
+#      it to a constant. A snapshot cannot distinguish "this became true just now" from "this has
+#      been true since a boot last week", which is exactly the question the harness exists to
+#      answer. Fix: an OBSERVATION LEDGER — for every operand keep (first observation, last LIVE
+#      observation) and conclude only from the DIFFERENCE between them.
+#   2. A FIRST-MATCH-WINS VERDICT LADDER. Any arm placed above another masked it; the same slot
+#      masked a genuine death-point FOUR separate times. Fix: EVERY check is evaluated EVERY poll
+#      and EVERY finding is printed. Ordering now selects only the HEADLINE, so a wrong or
+#      over-eager check can no longer delete the evidence for a right one. (Tradeoff: the output is
+#      longer, and the headline is still a judgement call. But the operator always sees the full
+#      set, so a misranked headline costs a glance, not a masked failure.)
+#
+# Corollaries, each of which was a reported defect:
+#   * Every FAIL arm requires a LIVE (retain=0) message. `%r` is the retain flag. `%R` is NOT a
+#     mosquitto specifier — it silently expands to the empty string, which inverted the entire
+#     retained-ghost discipline for one earlier round (proved: `-F '[%R]'` → `[]`, `-F '[%r]'` → `[1]`).
+#   * A MISSING OPERAND IS NEVER A VERDICT. It prints `unknown` and the check is SKIPPED. An absent
+#     field must never be readable as a value (an empty baseline used to satisfy `baseline != TARGET`
+#     and produced a false PASS reading `v? → v907`).
+#   * A CHECK THAT CANNOT WORK SAYS SO, rather than sitting present-but-broken. See OFF-CHANNEL on a
+#     leaf target below: it is inapplicable today and prints that fact.
+#   * EVERY VERDICT PRINTS THE OPERANDS IT FIRED ON, so an operator can audit it without a rerun.
+#
+# ── SCHEMA: THERE ARE TWO PRODUCERS, WITH DIVERGENT VOCABULARIES ─────────────────────────
+# Verified against live payloads and source on 2026-07-28. Do not "simplify" this into one schema.
+#
+#   A) smol C3 firmware (this repo) — rust/clock/src/net/mode.rs:3325 `DIAG|slot=…|rst=…|boot=…|ota=…`
+#        slot=<0|1>        NUMERIC boot-slot index (← d.boot_slot). Never the string `ota_1`.
+#        rst=<panic|power-on|sw|deep-sleep|brownout|wdt|usb-jtag|glitch|other|unk>
+#                          reset_reason_token() (ota.rs:1761) emits NO `ota` token — an OTA reboot
+#                          is a SOFTWARE reset and reads `rst=sw`.
+#        boot=<n>          boot counter, increments every boot.
+#        ota=<none|confirmed|rolled-back>   ota_outcome_token(); rtc_fast persistent (see above).
+#        cc=<0|1|2>        #217 coexist health. THREE-VALUED since 6a62946 (2026-07-28):
+#                          1 = associated AND co-channel · 0 = associated AND off-channel
+#                          2 = NOT ASSOCIATED (nothing to conclude).
+#                          Older DEPLOYED images are TWO-valued and fold "not associated" into 0
+#                          (`unwrap_or(0)`), so a bare `cc=0` from the fleet is AMBIGUOUS. This
+#                          harness therefore acts on cc=0 only with independent association proof.
+#        ap=<ch>:<rssi>:<bssid>  the TARGET's OWN current association — NOT the crown's. Emitted
+#                          from the same `current_ap_info()` as `cc`, but AFTER it, so truncation
+#                          drops `ap=` while keeping `cc=`. CONDITIONAL: absent when unassociated.
+#        cut=<bytes>       mode.rs truncation marker: this record lost <bytes> off its tail.
+#
+#   B) esp32c6-watch (SEPARATE REPO, READ-ONLY here — remote is `wakizashi` only; cite, never push)
+#        ~/Projects/esp32c6-watch/src/main.rs:2651 emits a CONSTANT prefix:
+#        `DIAG|slot=ota_0|rst=unknown|boot=0|ota=none|…`
+#        So `slot=ota_0` IS published on this fleet — an earlier header asserted it never was and
+#        was wrong. For a C6 target, slot/boot/ota are hardcoded and CANNOT transition, which makes
+#        the OTA proof below structurally unreachable. The harness detects this and says so instead
+#        of reporting a failed OTA.
+#
+# ── WHY THE OFF-CHANNEL CHECK IS INAPPLICABLE FOR THE CASE THIS HARNESS EXISTS FOR ───────
+# A leaf's DIAG reaches the gateway inside ONE ESP-NOW frame, capped at RELAY_VALUE_MAX = 232 B
+# (wifi.rs:1857). A realistic leaf record is ~307 B offered, so the tail is cut on a field boundary
+# and `cc=` and `ap=` — both at the tail — are the first casualties. Measured on the live fleet:
+# id5 `len=340 cc=1 ap=6` (crown, self-published over MQTT, full record) vs id8/50/51/122/236 all
+# `cc=- ap=-`. So for a LEAF OTA the off-channel check CANNOT FIRE. That is printed as an explicit
+# `unknown`, never silently skipped. When two-frame leaf records land `cc=` in leaf DIAGs, a
+# two-valued `cc=0` would fire a false OFF-CHANNEL fleet-wide — which is precisely why the
+# association requirement below must stay even after every image speaks three-valued `cc`.
+#
+# ── OTHER HARD-WON LESSONS (kept: each cost a real misdiagnosis) ─────────────────────────
+#   * grep -a EVERYWHERE. One binary byte in a payload flips grep to binary mode and it silently
+#     prints nothing; a waiter then reads "no event" while the event sits in the log.
+#   * ANCHOR EVERY FIELD READ on `(^|\|)`. Unanchored `ap=[0-9]+` matches the TAIL of `heap=42040`
+#     (he|ap=…), so the harness compared FREE HEAP to the mesh channel — a guaranteed mismatch that
+#     fired a false OFF-CHANNEL on every run, masked every real verdict, and sent an operator to
+#     re-channel a healthy AP. Same hazard: `src=` vs `tsrc=`, `ota=` vs `otah=`, `cc=` vs `cdeaf=`.
+#   * A CONDITIONAL FIELD IS MORE DANGEROUS THAN AN ABSENT ONE — it buys broken code an alibi: the
+#     unanchored `ap=` read was correct on the one associated crown anybody looks at and silently
+#     wrong on every leaf.
+#   * USB vs OTA: `installed_version` reaching the target is NOT proof. `rst=usb-jtag` is the cable
+#     tell, and a USB flash is explicitly EXEMPTED from setting `ota=confirmed`.
+#   * DEATH-POINT: offset frozen >STALE s with 0<done<total = the transfer died AT that byte.
+#   * PEER-SOURCE (#237): ota/diag ` src=id<n>` = a peer HOLDER served it over ESP-NOW (vs `src=gw`).
+#   * The broker password NEVER reaches argv. `-P "$PW"` published it in the process table for the
+#     whole window and one agent read another's out of `ps`. It now goes in a private config file.
 set -uo pipefail
 
 ID="${1:?usage: ota_verify.sh <board_id> <target_build> [window_s]}"
-TARGET="${2:?target build number, e.g. 346}"
+TARGET="${2:?target build number, e.g. 907}"
 WINDOW="${3:-360}"
-STALE=30   # offset unchanged this long (0<done<total) = death-point
+STALE="${OTA_VERIFY_STALE:-30}"    # offset unchanged this long (0<done<total) = death-point
+POLL="${OTA_VERIFY_POLL:-3}"       # re-evaluate every N s
+SETTLE="${OTA_VERIFY_SETTLE:-2}"   # let the retained baseline land before the first evaluation
+FIXTURE="${OTA_VERIFY_FIXTURE:-}"  # test seam: replay a canned log instead of subscribing
 
-# ---- broker creds (mirrors tools/ota_publish.sh; password never printed) --------------
-OTA_ENV="$HOME/Projects/smol/tools/ota_publish.env"; [ -f "$OTA_ENV" ] && . "$OTA_ENV"
-BROKER="${BROKER:-10.0.0.1}"; MQTT_USER="${MQTT_USER:-<mqtt-user>}"; ADDON="${ADDON:-<addon-slug>}"   # placeholders; real values from tools/ota_publish.env (git-ignored)
-PW="$(timeout 25 bash -c 'tok=$(bw get password ha-llat 2>/dev/null) || exit 1
-  HA_TOKEN="$tok" python3 "$HOME/Projects/ha/tools/ha_supervisor.py" GET "/addons/'"$ADDON"'/info" 2>/dev/null \
-  | python3 -c "import sys,json;print(json.load(sys.stdin)[\"options\"][\"mqtt_password\"])" 2>/dev/null')"
-[ -n "$PW" ] || { echo "FATAL: could not source mqtt password (bw locked? addon $ADDON unreachable?)"; exit 3; }
+# ═══ message source ══════════════════════════════════════════════════════════════════════
+# Log format is `<retain>\t<topic>\t<payload>`, one message per line, in ARRIVAL ORDER. The
+# retain flag is load-bearing: it is the only thing separating "the broker replayed history" from
+# "this board just said something".
+if [ -n "$FIXTURE" ]; then
+  # Fixture replay. A line may be prefixed `@<seconds>\t` to be emitted that many seconds after
+  # replay starts; unprefixed lines land at t=0 (i.e. in the retained-at-subscribe batch). This is
+  # what makes TRANSITIONS testable — the previous test copy read a static file, so "first
+  # observation" and "last observation" were always the same line and no transition could ever be
+  # exercised. A harness whose tests cannot express its central concept is not tested.
+  [ -f "$FIXTURE" ] || { echo "FATAL: fixture not found: $FIXTURE" >&2; exit 3; }
+  BROKER="fixture($(basename "$FIXTURE"))"
+  LOG="$(mktemp "/tmp/ota_verify_fix_${ID}_XXXX.log")"
+  (
+    t0=$(date +%s)
+    while IFS= read -r line; do
+      case "$line" in
+        @*) at="${line%%$'\t'*}"; at="${at#@}"; rest="${line#*$'\t'}" ;;
+        *)  at=0; rest="$line" ;;
+      esac
+      while [ $(( $(date +%s) - t0 )) -lt "$at" ]; do sleep 0.2; done
+      printf '%s\n' "$rest" >> "$LOG"
+    done < "$FIXTURE"
+  ) &
+  SUB=$!
+  trap 'kill "$SUB" 2>/dev/null; rm -f "$LOG"' EXIT
+else
+  # ---- broker creds (mirrors tools/ota_publish.sh) --------------------------------------
+  OTA_ENV="$HOME/Projects/smol/tools/ota_publish.env"
+  # shellcheck source=/dev/null
+  [ -f "$OTA_ENV" ] && . "$OTA_ENV"
+  BROKER="${BROKER:-10.0.0.1}"; MQTT_USER="${MQTT_USER:-<mqtt-user>}"; ADDON="${ADDON:-<addon-slug>}"
+  PW="$(timeout 25 bash -c 'tok=$(bw get password ha-llat 2>/dev/null) || exit 1
+    HA_TOKEN="$tok" python3 "$HOME/Projects/ha/tools/ha_supervisor.py" GET "/addons/'"$ADDON"'/info" 2>/dev/null \
+    | python3 -c "import sys,json;print(json.load(sys.stdin)[\"options\"][\"mqtt_password\"])" 2>/dev/null')"
+  [ -n "$PW" ] || { echo "FATAL: could not source mqtt password (bw locked? addon $ADDON unreachable?)" >&2; exit 3; }
 
-LOG="$(mktemp "/tmp/ota_verify_${ID}_XXXX.log")"
-# %r = retain flag (1 ghost / 0 live); tab-delimited so | : = in payloads parse cleanly.
-# 2026-07-28: this was `%R`, which is NOT a mosquitto specifier — it expands to the EMPTY string
-# (proved: `-F '[%R]'` → `[]`, `-F '[%r]'` → `[1]`). Every line therefore began with a tab, so
-# g_live()'s `^0\t` never matched, `inst_live` was always empty, and the whole retained-ghost
-# discipline was INVERTED: every message read as a ghost. That single wrong character is why PASS
-# was unreachable and why the death-point gate silently disabled itself.
-mosquitto_sub -h "$BROKER" -p 1883 -u "$MQTT_USER" -P "$PW" -i "ota_verify_${ID}_$$" -F '%r\t%t\t%p' \
-  -t "smol/$ID/ota/progress" -t "smol/$ID/ota/diag" -t "smol/$ID/ota/state" \
-  -t "smol/$ID/diag" -t "smol/mesh/channel" > "$LOG" 2>&1 &
-SUB=$!; trap 'kill "$SUB" 2>/dev/null; rm -f "$LOG"' EXIT
-sleep 2   # let the retained baseline land so we can tell "already-target" from a live flip
+  # The password goes in a PRIVATE config file, never in argv. mosquitto_sub reads
+  # `$XDG_CONFIG_HOME/mosquitto_sub` (one `-option value` per line) as if those options preceded the
+  # command line — verified against mosquitto_sub 2.0.18 by planting an unknown option there and
+  # watching it error. We point XDG_CONFIG_HOME at a private 0700 tmpdir rather than writing
+  # $HOME/.config/mosquitto_sub, because that file is SHARED user-global state: clobbering it would
+  # break other tooling and race every concurrent agent on this host. PW is never exported (so it
+  # stays out of /proc/*/environ) and never printed.
+  umask 077
+  CFGDIR="$(mktemp -d "/tmp/ota_verify_cfg_${ID}_XXXX")"
+  printf -- '-P %s\n' "$PW" > "$CFGDIR/mosquitto_sub"
+  LOG="$(mktemp "/tmp/ota_verify_${ID}_XXXX.log")"
+  XDG_CONFIG_HOME="$CFGDIR" mosquitto_sub -h "$BROKER" -p 1883 -u "$MQTT_USER" \
+    -i "ota_verify_${ID}_$$" -F '%r\t%t\t%p' \
+    -t "smol/$ID/ota/progress" -t "smol/$ID/ota/diag" -t "smol/$ID/ota/state" \
+    -t "smol/$ID/diag" -t "smol/mesh/channel" > "$LOG" 2>&1 &
+  SUB=$!
+  trap 'kill "$SUB" 2>/dev/null; rm -f "$LOG"; rm -rf "$CFGDIR"' EXIT
+fi
+sleep "$SETTLE"
 
-# grep helpers — always -a; g_all matches any retain flag, g_live only retain=0.
-g_all()  { grep -a $'\t'"smol/$1"$'\t' "$LOG"; }
+# ═══ readers ═════════════════════════════════════════════════════════════════════════════
+# g_all = every observation of a topic (any retain flag) · g_live = LIVE ones only (retain=0).
+g_all()  { grep -a  $'\t'"smol/$1"$'\t' "$LOG"; }
 g_live() { grep -a "^0"$'\t'"smol/$1"$'\t' "$LOG"; }
+pay()    { cut -f3-; }   # payload column (cut's default delimiter is TAB; -f3- keeps any tabs within)
 ver()    { grep -oaE '"installed_version":"[0-9]+"' | grep -oaE '[0-9]+' | tail -1; }
-# A WiFi channel, or it isn't one. An operand outside these bands is ABSENT, not "different" —
-# without this, any junk number is silently a valid side of the off-channel comparison.
-# 2.4 GHz ONLY, deliberately: both operands are 2.4-by-construction (`ap=` is this C3's own STA
-# association; mesh_ch is ESP_NOW_FIXED_CHANNEL). A 5 GHz band here was dead code that WIDENED the
-# gate it exists to narrow — it accepted 40 as a channel.
+# Field read out of one DIAG line. ANCHORED on `(^|\|)` — see the header; unanchored reads have
+# produced two separate false verdicts in this file's history.
+fld()    { printf '%s' "${2:-}" | grep -oaE "(^|\|)$1=[^|[:space:]]+" | head -1 | cut -d= -f2; }
+# First / last-LIVE observation of a DIAG line that actually CARRIES the field. Selecting on the
+# field (not just on the topic) means a record that lost the field to truncation cannot blank an
+# operand we already observed — absence and change stay distinguishable.
+d_first() { g_all  "$ID/diag" | grep -aE "(^|\|)$1=" | head -1; }
+d_live()  { g_live "$ID/diag" | grep -aE "(^|\|)$1=" | tail -1; }
+# A WiFi channel, or it isn't one. An operand outside 1-14 is ABSENT, not "different" — otherwise
+# any junk number is silently a valid side of the off-channel comparison. 2.4 GHz only, deliberately:
+# both operands are 2.4-by-construction (`ap=` is this C3's own STA association, `mesh_ch` is
+# ESP_NOW_FIXED_CHANNEL). A 5 GHz branch here was dead code that WIDENED the gate it exists to
+# narrow — it accepted 40 as a channel.
 valid_ch() {
   case "${1:-}" in ''|*[!0-9]*) return 1;; esac
   [ "$1" -ge 1 ] && [ "$1" -le 14 ]
 }
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1;; esac; }
 
-baseline="$(g_all "$ID/ota/state" | tail -1 | ver)"
-# Slot at subscribe, so a PASS can show the A/B flip (0→1 or 1→0) rather than a bare index.
-baseline_slot="$(g_all "$ID/diag" | tail -1 | grep -oaE '(^|\|)slot=[^|[:space:]]+' | head -1 | cut -d= -f2)"
-echo "── ota_verify: id$ID → v$TARGET · window ${WINDOW}s · broker $BROKER · baseline v${baseline:-?} ──"
+echo "── ota_verify: id$ID → v$TARGET · window ${WINDOW}s · stale ${STALE}s · broker $BROKER ──"
 
-verdict=""; reason=""; start=$(date +%s); last_off=-1; last_off_t=$start; hwm=0; monotonic=1
-total="?"; phase="none"; src="none"; saw_live_prog=0; ota_tok=""
+start=$(date +%s); last_off=-1; last_off_t=$start; hwm=""; monotonic=1; saw_live_prog=0
+findings=(); pass_ok=0; fail_n=0; headline=""; verdict=""
+
+# add <severity> <rank> <code> <text>   — rank orders the HEADLINE only; every finding prints.
+add() { findings+=("$1"$'\t'"$2"$'\t'"$3"$'\t'"$4"); }
 
 while :; do
   now=$(date +%s)
-  mesh_ch="$(g_all mesh/channel | tail -1 | awk -F'\t' '{print $3}' | awk -F'|' '{print $3}')"
-  d="$(g_all "$ID/diag" | tail -1)"
-  d_live="$(g_live "$ID/diag" | tail -1)"   # DIAG is published RETAINED (wifi.rs:2639)
-  # 2026-07-28: ANCHORED + range-checked. `ap=[0-9]+` unanchored matches the TAIL of
-  # `heap=42040` (he|ap=…), so this read FREE HEAP and compared it to the mesh channel — a
-  # guaranteed mismatch that fired a false OFF-CHANNEL on every run and, being first in the
-  # ladder, MASKED every other verdict (incl. the correct DEATH-POINT). It also told the
-  # operator to re-channel a live AP. `ap=` is real but CONDITIONAL (appended only once known),
-  # so the old read worked on an associated crown and silently read heap on every leaf.
-  # NOTE `ap=<ch>:<rssi>:<bssid>` is the TARGET's OWN association, not the crown's — so for a
-  # LEAF target (the case this harness exists for) it is absent and this check cannot fire.
-  # `cc=` below is the deployed, always-present boolean that actually answers the question.
-  ap_ch="$(printf '%s' "$d" | grep -oaE '(^|\|)ap=[0-9]+' | grep -oaE '[0-9]+' | tail -1)"
-  valid_ch "$ap_ch"   || ap_ch=""
-  valid_ch "$mesh_ch" || mesh_ch=""
-  # `cc=` (mode.rs) — firmware's own "crown is co-channel" verdict: 1 = co-channel, 0 = NOT.
-  # Prefer a field that states the conclusion over two fields we compare ourselves.
-  cc="$(printf '%s' "$d" | grep -oaE '(^|\|)cc=[0-9]+' | grep -oaE '[0-9]+' | tail -1)"
-  slot="$(printf '%s' "$d" | grep -oaE '(^|\|)slot=[^|[:space:]]+' | head -1 | cut -d= -f2)"
-  rst="$(printf '%s' "$d" | grep -oaE '(^|\|)rst=[^|[:space:]]+' | head -1 | cut -d= -f2)"
-  # `ota=` ∈ {none, confirmed, rolled-back} (ota.rs ota_outcome_token). `confirmed` is the REAL
-  # OTA proof: boot_confirm() sets it only when the image was New/PendingVerify AND
-  # ota_was_activated_for(BUILD_NUMBER) AND self-test passed — and a USB flash takes an explicit
-  # exemption and returns WITHOUT marking. That is precisely "this image arrived over our OTA
-  # path and passed health check", which `rst` cannot express at all.
-  ota_tok="$(printf '%s' "$d" | grep -oaE '(^|\|)ota=[^|[:space:]]+' | head -1 | cut -d= -f2)"
-  # …and the same token from a LIVE line only, so a stale `rolled-back` cannot condemn this run.
-  # OTA_OUTCOME lives in rtc_fast persistent RAM: only a POWER CYCLE clears it, so it survives
-  # every later software reset and keeps being republished retained.
-  ota_tok_live="$(printf '%s' "$d_live" | grep -oaE '(^|\|)ota=[^|[:space:]]+' | head -1 | cut -d= -f2)"
-  inst_live="$(g_live "$ID/ota/state" | tail -1 | ver)"
-  inst_any="$(g_all "$ID/ota/state" | tail -1 | ver)"
-  dg="$(g_all "$ID/ota/diag" | tail -1 | awk -F'\t' '{print $3}')"
-  # anchored: DIAG carries `tsrc=`, which differs from `src=` only by a prefix. It doesn't collide
-  # today solely because its values aren't gw/idN — one rename away from silently matching.
-  src="$(printf '%s' "$dg" | grep -oaE '(^| )src=(gw|id[0-9]+)' | tr -d ' ' | tail -1)"; src="${src:-none}"
-  pl="$(g_all "$ID/ota/progress" | tail -1 | awk -F'\t' '{print $3}')"
-  # progress is RETAINED and published on a ~5 s cadence (wifi.rs:4890), so a subscribe replays
-  # the last offset of whatever attempt died LAST — possibly for a different image entirely
-  # (compare `total` against the staged size). A retained value never changes, so it satisfies
-  # "frozen for STALE seconds" for free and the death-point arm below would condemn a ghost.
-  # Require at least one LIVE (retain=0) progress publish first: a genuinely dying transfer
-  # publishes live every 5 s before it stops, so this keeps real death-points and drops ghosts.
-  [ -n "$(g_live "$ID/ota/progress" | tail -1)" ] && saw_live_prog=1
-  off="$(printf '%s' "$pl" | cut -d'|' -f1)"; total="$(printf '%s' "$pl" | cut -d'|' -f2)"
-  phase="$(printf '%s' "$pl" | cut -d'|' -f3)"; [[ "$off" =~ ^[0-9]+$ ]] || off=""
+  findings=(); pass_ok=0; fail_n=0
+
+  # ═══ observation ledger ════════════════════════════════════════════════════════════════
+  # Baselines are the FIRST observation (retained is fine — that is legitimately "the state when we
+  # arrived"). Conclusions come only from the LAST LIVE observation differing from it.
+  st_first="$(g_all  "$ID/ota/state" | head -1 | ver)"
+  st_live="$( g_live "$ID/ota/state" | tail -1 | ver)"
+  # Spelled out rather than looped through `printf -v`: indirect assignment hides these names from
+  # both shellcheck and a reader, and a typo in the loop list would silently leave an operand empty —
+  # which in this file means "check skipped", the one failure mode that must never be accidental.
+  slot_first="$(fld slot "$(d_first slot)")"; slot_live="$(fld slot "$(d_live slot)")"
+  boot_first="$(fld boot "$(d_first boot)")"; boot_live="$(fld boot "$(d_live boot)")"
+  ota_first="$( fld ota  "$(d_first ota)")";  ota_live="$( fld ota  "$(d_live ota)")"
+  cut_first="$( fld cut  "$(d_first cut)")";  cut_live="$( fld cut  "$(d_live cut)")"
+  rst_live="$(  fld rst  "$(d_live rst)")"
+  cc_live="$(   fld cc   "$(d_live cc)")"
+  # `ap=` must come from the SAME live record as `cc=`: association is only evidence for the
+  # co-channel verdict if both were true at the same instant on the same board.
+  cc_line="$(d_live cc)"
+  ap_cc="$(printf '%s' "$(fld ap "$cc_line")" | cut -d: -f1)"; valid_ch "$ap_cc" || ap_cc=""
+  ap_live="$(printf '%s' "$(fld ap "$(d_live ap)")" | cut -d: -f1)"; valid_ch "$ap_live" || ap_live=""
+  # mesh channel: a compile-time fleet constant (ESP_NOW_FIXED_CHANNEL), so a retained value is
+  # epistemically fine here — it cannot have "become" something else per boot. Stated openly
+  # because it is the ONE operand below not required to be live, and any FAIL that leans on it says so.
+  mesh_ch="$(g_all mesh/channel | tail -1 | pay | awk -F'|' '{print $3}')"; valid_ch "$mesh_ch" || mesh_ch=""
+
+  dg_live="$(g_live "$ID/ota/diag" | tail -1 | pay)"
+  dg_any="$( g_all  "$ID/ota/diag" | tail -1 | pay)"
+  # anchored: ota/diag carries `tsrc=`, one prefix away from silently matching `src=`.
+  src="$(printf '%s' "$dg_any" | grep -oaE '(^| )src=(gw|id[0-9]+)' | tr -d ' ' | tail -1)"; src="${src#src=}"
+
+  # The freeze clock must run on LIVE progress only. Reading the offset from `tail -1` of ALL
+  # progress observations while merely checking that SOME live publish existed would let a retained
+  # ghost — which never changes, and so satisfies "frozen" for free — supply the offset that a
+  # verdict fires on. `pl_any` is kept for the evidence line and for saying "retained only", never
+  # for the death-point arm.
+  pl_any="$( g_all  "$ID/ota/progress" | tail -1 | pay)"
+  pl_live="$(g_live "$ID/ota/progress" | tail -1 | pay)"
+  [ -n "$pl_live" ] && saw_live_prog=1
+  off="$( printf '%s' "$pl_live" | cut -d'|' -f1)"; total="$(printf '%s' "$pl_live" | cut -d'|' -f2)"
+  phase="$(printf '%s' "$pl_live" | cut -d'|' -f3)"; is_num "$off" || off=""
+  off_any="$(  printf '%s' "$pl_any" | cut -d'|' -f1)"; is_num "$off_any" || off_any=""
+  total_any="$(printf '%s' "$pl_any" | cut -d'|' -f2)"
   if [ -n "$off" ]; then
-    [ "$off" -gt "$hwm" ] && hwm="$off"
+    { [ -z "$hwm" ] || [ "$off" -gt "$hwm" ]; } && hwm="$off"
     if [ "$off" != "$last_off" ]; then
       [ "$last_off" != -1 ] && [ "$off" -lt "$last_off" ] && monotonic=0
       last_off="$off"; last_off_t="$now"
     fi
   fi
 
-  # ---- verdict ladder (first match wins) ----
-  # ORDER MATTERS AND IS LOAD-BEARING. Anything placed above a check MASKS it, which is exactly
-  # how the free-heap OFF-CHANNEL bug hid every real DEATH-POINT. So: hard local blockers first,
-  # then a RELIABLE cause, then the observed symptom, and only then inferences from persistent
-  # state. `ROLLED BACK` sits BELOW death-point deliberately — its token survives power-cycles in
-  # rtc_fast RAM, so it is the most likely thing here to be stale.
-  if printf '%s' "$dg" | grep -qaE '(^| )at=slot'; then
-    verdict=FAIL; reason="at=slot — local otadata problem (#226); needs a USB flash, OTA can't proceed."; break
-  elif [ "$cc" = "0" ]; then
-    verdict=FAIL; reason="OFF-CHANNEL — firmware reports cc=0: the crown is NOT co-channel with the ESP-NOW mesh (ch$mesh_ch). Proven OTA blocker — co-channel moved 48KB, off-channel moved 0."; break
-  elif [ -z "$cc" ] && [ -n "$mesh_ch" ] && [ -n "$ap_ch" ] && [ "$ap_ch" != "$mesh_ch" ]; then
-    # fallback only when cc= is absent (pre-#217 image). `ap=` is the TARGET's own association.
-    verdict=FAIL; reason="OFF-CHANNEL — id$ID's own AP ch=$ap_ch != ESP-NOW mesh ch=$mesh_ch (coexist disease; WiFi fetch will stall)."; break
-  elif [ "$saw_live_prog" = 1 ] && [ -n "$off" ] && [ -n "$total" ] && [ "$total" != "?" ] && [ "$off" -gt 0 ] && [ "$off" -lt "$total" ] && [ $((now-last_off_t)) -ge "$STALE" ]; then
-    verdict=FAIL; reason="DEATH-POINT — offset frozen at $off/$total for ${STALE}s+ (transfer died mid-flight)."; break
-  elif [ "$ota_tok_live" = "rolled-back" ]; then
-    verdict=FAIL; reason="ROLLED BACK — a LIVE diag reports ota=rolled-back: the board booted a new image, failed its health check, and boot_confirm reverted it. App-side rollback worked as designed; the IMAGE is the problem, not the network."; break
-  elif [ "$inst_live" = "$TARGET" ]; then
-    # 2026-07-28: the old proof tested `slot = "ota_1"`. Firmware publishes `slot=<0|1>` as a
-    # NUMERIC index (mode.rs:3208 ← d.boot_slot) and reset_reason_token() has no `ota` token —
-    # an OTA reboot is a software reset, so it reads `rst=sw`. So the PASS arm was unreachable
-    # and EVERY genuine OTA fell through to "USB flash, NOT an OTA": the harness's core proof,
-    # inverted. Discriminate on what the wire actually carries — `rst=usb-jtag` is the USB
-    # tell (a cable reset), and its absence with the target running is over-the-air.
-    if [ "$rst" = "usb-jtag" ]; then
-      verdict=INFO; reason="reports v$TARGET but rst=usb-jtag → USB flash, NOT an OTA (no over-the-air proof)."; break
-    elif [ "$baseline" = "$TARGET" ]; then
-      verdict=INFO; reason="already on v$TARGET when we subscribed — no transition observed, so nothing here proves an OTA. Run BEFORE arming to verify a fresh flip."; break
-    elif [ "$ota_tok" = "confirmed" ]; then
-      verdict=PASS; reason="v${baseline:-?} → v$TARGET · ota=confirmed (boot_confirm: activated by OUR OTA + self-test passed; a USB flash is explicitly exempted and never marks it) · rst=$rst · slot=$slot${baseline_slot:+ (was $baseline_slot)} — real OTA-over-WiFi. source: $src"
-      [ "${src#src=id}" != "$src" ] && reason="$reason  ← PEER-SOURCED (#237)"; break
-    elif [ -n "$ota_tok" ]; then
-      verdict=INFO; reason="reached v$TARGET but ota=$ota_tok, not 'confirmed' — no OTA proof. Note a POWER CYCLE clears the marker (rtc_fast persistent RAM), so a genuine OTA also looks like this after one."; break
-    fi   # ota token not yet known — keep waiting for a diag
+  # ═══ CHECK 1 · AT-SLOT — local otadata write failure (#226) ═════════════════════════════
+  if printf '%s' "$dg_live" | grep -qaE '(^| )at=slot'; then
+    add FAIL 40 AT-SLOT "a LIVE ota/diag reports at=slot — the slot/otadata write itself failed (#226); needs a USB flash, OTA cannot proceed. payload: '$dg_live'"
+  elif printf '%s' "$dg_any" | grep -qaE '(^| )at=slot'; then
+    add unknown 0 AT-SLOT "a RETAINED ota/diag carries at=slot but NO live one does — ota/diag is published RETAINED (wifi.rs:3299), so this is a ghost of an earlier attempt and is NOT a verdict. (This ghost once condemned a board whose OTA had just succeeded, and told the operator to USB-flash it.) payload: '$dg_any'"
+  else
+    add ok 0 AT-SLOT "no live ota/diag at=slot."
   fi
 
-  if [ $((now-start)) -ge "$WINDOW" ]; then
-    verdict=FAIL
-    if [ "$inst_any" = "$TARGET" ] && [ "$baseline" = "$TARGET" ]; then
-      reason="already on v$TARGET at subscribe (retained baseline) — no LIVE OTA observed. Run BEFORE arming to verify a fresh flip."
-    else
-      reason="window ${WINDOW}s elapsed, no completion — HWM ${hwm}/${total} (monotonic=$([ $monotonic = 1 ] && echo yes || echo NO)), last phase '${phase:-none}', last diag '${dg:-none}'."
-    fi
-    break
+  # ═══ CHECK 2 · OFF-CHANNEL ═════════════════════════════════════════════════════════════
+  # `cc=0` alone is NOT off-channel. Pre-6a62946 images fold "not associated" into 0, and even a
+  # three-valued image can have `ap=` truncated off an associated leaf's record. So: act only with
+  # association proof from the same live record. This slot has masked a genuine death-point four
+  # times; it can no longer mask anything, but it can still MISLEAD, so it stays conservative.
+  if [ "$cc_live" = "0" ] && [ -n "$ap_cc" ]; then
+    add FAIL 30 OFF-CHANNEL "LIVE diag: cc=0 AND ap=$ap_cc in the SAME record → id$ID IS associated and its own AP (ch$ap_cc) is off the ESP-NOW mesh (ch${mesh_ch:-unknown}). Proven OTA blocker: co-channel moved 48 KB, off-channel moved 0. NOTE this is id$ID's OWN association, NOT the crown's — do not re-channel the crown on this evidence alone."
+  elif [ "$cc_live" = "0" ]; then
+    add unknown 0 OFF-CHANNEL "cc=0 but NO ap= in the same LIVE record → AMBIGUOUS, so no verdict. Deployed two-valued images fold 'not associated' into cc=0 (mode.rs unwrap_or(0)), and a truncated leaf record drops ap= before cc=. Off-channel and unassociated demand OPPOSITE responses (re-channel the AP / do nothing), so this is skipped rather than guessed."
+  elif [ "$cc_live" = "2" ]; then
+    add ok 0 OFF-CHANNEL "cc=2 = NOT ASSOCIATED (three-valued cc, 6a62946) — nothing to conclude; check N/A."
+  elif [ "$cc_live" = "1" ]; then
+    add ok 0 OFF-CHANNEL "cc=1 — live diag reports co-channel with the mesh."
+  elif [ -n "$ap_live" ] && [ -n "$mesh_ch" ] && [ "$ap_live" != "$mesh_ch" ]; then
+    add FAIL 35 OFF-CHANNEL "no cc= (pre-#217 image) but a LIVE diag carries ap=$ap_live != mesh ch$mesh_ch (coexist disease; the WiFi fetch will stall). Mesh channel read from a RETAINED smol/mesh/channel — it is a compile-time fleet constant, not per-boot state."
+  elif [ -n "$cut_live$cut_first" ]; then
+    add unknown 0 OFF-CHANNEL "INAPPLICABLE: no cc= or ap= survived, and the record says why — cut=${cut_live:-$cut_first} bytes were truncated off its tail (mode.rs |cut=). The operands were sent and LOST, not absent."
+  else
+    add unknown 0 OFF-CHANNEL "INAPPLICABLE: no cc=/ap= in any live diag. Expected for a LEAF target: the leaf record is capped at 232 B (RELAY_VALUE_MAX, wifi.rs:1857) and cc=/ap= sit at the tail, so they are cut first (measured: crown id5 cc=1 ap=6; leaves id8/50/51/122/236 all cc=- ap=-). This check therefore CANNOT FIRE for the case this harness exists for — printed, not silently skipped."
   fi
-  sleep 3
+
+  # ═══ CHECK 3 · DEATH-POINT ═════════════════════════════════════════════════════════════
+  if [ "$saw_live_prog" = 1 ] && [ -n "$off" ] && is_num "$total" && [ "$off" -gt 0 ] \
+     && [ "$off" -lt "$total" ] && [ $((now-last_off_t)) -ge "$STALE" ]; then
+    add FAIL 10 DEATH-POINT "offset frozen at $off/$total for ${STALE}s+ after a LIVE progress publish — the transfer died AT that byte (phase='${phase:-none}', monotonic=$([ $monotonic = 1 ] && echo yes || echo NO), src=${src:-none})."
+  elif [ "$saw_live_prog" = 0 ] && [ -n "$off_any" ]; then
+    add unknown 0 DEATH-POINT "progress seen RETAINED ONLY (${off_any}/${total_any:-?}) — no live publish this run, so this offset is a ghost of an earlier attempt, possibly of a different image (compare total against the staged size). A retained value never changes, so it would satisfy 'frozen' for free; not a verdict."
+  elif [ -z "$off" ] && [ -z "$off_any" ]; then
+    add unknown 0 DEATH-POINT "no ota/progress observed at all — nothing to freeze; check skipped."
+  else
+    add ok 0 DEATH-POINT "live progress advancing (or complete): ${off:-unknown}/${total:-?}."
+  fi
+
+  # ═══ CHECK 4 · ROLLED BACK ═════════════════════════════════════════════════════════════
+  # A live `rolled-back` proves the firmware STILL HOLDS that outcome, which is not the same as it
+  # having happened during this window: the token is rtc_fast persistent (ota.rs:2081). So the two
+  # cases are reported DIFFERENTLY rather than collapsed.
+  if [ "$ota_live" = "rolled-back" ] && [ -n "$ota_first" ] && [ "$ota_first" != "rolled-back" ]; then
+    add FAIL 20 ROLLED-BACK "TRANSITION observed live in-window: ota=$ota_first → rolled-back. The board booted the new image, failed its self-test, and boot_confirm reverted it. App-side rollback worked as designed — the IMAGE is the problem, not the network."
+  elif [ "$ota_live" = "rolled-back" ]; then
+    add SUSPECT 50 ROLLED-BACK "a live diag reports ota=rolled-back, but it ALREADY read rolled-back at our first observation (${ota_first:-unknown}) — the token is rtc_fast persistent and only a power cycle clears it (ota.rs:2081), so this may predate this run entirely. Actionable, but NOT proof that this attempt rolled back."
+  else
+    add ok 0 ROLLED-BACK "no live ota=rolled-back."
+  fi
+
+  # ═══ CHECK 5 · PRODUCER CAPABILITY ═════════════════════════════════════════════════════
+  producer="smol-c3"
+  if [ -n "$slot_first" ] && ! is_num "$slot_first"; then producer="esp32c6-watch"
+  elif [ "$boot_first" = "0" ] && [ "$boot_live" = "0" ] && [ "$rst_live" = "unknown" ]; then producer="esp32c6-watch"
+  fi
+  if [ "$producer" = "esp32c6-watch" ]; then
+    add unknown 0 PRODUCER "this target speaks the esp32c6-watch DIAG vocabulary (slot=${slot_first:-?} rst=${rst_live:-?} boot=${boot_live:-?}), which is a CONSTANT string (esp32c6-watch/src/main.rs:2651). slot/boot/ota cannot transition on this producer, so the OTA proof below is STRUCTURALLY UNREACHABLE — a non-PASS here says nothing about whether the install worked. Verify a C6 install another way."
+  fi
+  if [ -n "$cut_live$cut_first" ]; then
+    add unknown 0 TRUNCATION "this target's DIAG is truncated: cut=${cut_live:-$cut_first} bytes lost off the tail (mode.rs). Any field reported 'unknown' below may have been SENT and LOST rather than never published."
+  fi
+
+  # ═══ THE OTA PROOF · four live in-window transitions, all required ══════════════════════
+  # Individually each conjunct is forgeable; the CONJUNCTION is what is hard to forge:
+  #   A state flip   — a live ota/state flip to TARGET from a KNOWN, different baseline. Requiring a
+  #                    non-empty baseline is what kills the old false PASS (`v? → v907`): an EMPTY
+  #                    baseline used to satisfy `baseline != TARGET`.
+  #   B slot flip    — the A/B partition actually changed. THIS is what defeats a persistent
+  #                    `ota=confirmed`: a `confirmed` set by a real 905→906 OTA survives a later
+  #                    usb-jtag reflash to 907 and every non-power-cycle reboot (wdt/panic/sw/
+  #                    brownout — id8 runs rst=brownout live), so the old `rst=usb-jtag` arm caught
+  #                    only the immediate post-flash boot and a stale `confirmed` read as a PASS.
+  #                    No slot flip, no PASS.
+  #   C boot inc     — the board actually rebooted inside our window.
+  #   D ota token    — none|rolled-back → confirmed, observed LIVE HERE. boot_confirm sets it only
+  #                    when the image was New/PendingVerify AND ota_was_activated_for(BUILD) AND the
+  #                    self-test passed; a USB flash takes an explicit exemption and never marks it.
+  #                    Requiring the TRANSITION (not the value) is what makes the persistent marker
+  #                    unusable as a forgery.
+  #   E not-usb      — a live rst=usb-jtag disqualifies outright.
+  # Residual, stated rather than hidden: if we never observe a baseline (no retained diag lands), the
+  # operands are `unknown` and PASS is REFUSED. That is the fail-closed direction — this harness
+  # would rather under-report a real OTA than certify one it did not watch happen.
+  A=0; B=0; C=0; D=0; E=0
+  [ -n "$st_first" ] && [ "$st_first" != "$TARGET" ] && [ "$st_live" = "$TARGET" ] && A=1
+  [ -n "$slot_first" ] && [ -n "$slot_live" ] && [ "$slot_first" != "$slot_live" ] && B=1
+  is_num "$boot_first" && is_num "$boot_live" && [ "$boot_live" -gt "$boot_first" ] && C=1
+  { [ "$ota_first" = "none" ] || [ "$ota_first" = "rolled-back" ]; } && [ "$ota_live" = "confirmed" ] && D=1
+  # E requires an OBSERVED live rst — an ABSENT rst must not read as "not a USB flash". `rst=` is an
+  # early positional field, so truncation (which eats the tail) never removes it; demanding it is
+  # safe as well as fail-closed.
+  [ -n "$rst_live" ] && [ "$rst_live" != "usb-jtag" ] && E=1
+  [ $((A+B+C+D)) = 4 ] && [ "$E" = 1 ] && pass_ok=1
+
+  for x in "${findings[@]}"; do
+    case "$x" in FAIL*) fail_n=$((fail_n+1));; esac
+  done
+
+  # ═══ decide ════════════════════════════════════════════════════════════════════════════
+  if [ "$pass_ok" = 1 ] && [ "$fail_n" = 0 ]; then verdict=PASS; break; fi
+  if [ "$pass_ok" = 1 ] && [ "$fail_n" -gt 0 ]; then verdict=CONFLICT; break; fi
+  if [ "$fail_n" -gt 0 ]; then verdict=FAIL; break; fi
+  if [ $((now-start)) -ge "$WINDOW" ]; then verdict=UNPROVEN; break; fi
+  sleep "$POLL"
 done
 
-printf '\n════════════════════════════════════════════════════════════\n'
-printf '  VERDICT: %s — id%s → v%s\n  %s\n' "$verdict" "$ID" "$TARGET" "$reason"
-printf '  ── evidence ──\n'
-printf '  installed v%s (target v%s) · slot=%s%s · rst=%s · ota=%s\n' "${inst_any:-?}" "$TARGET" "${slot:-?}" "$([ -n "${baseline_slot:-}" ] && [ "${baseline_slot:-}" != "${slot:-}" ] && printf ' (was %s)' "$baseline_slot")" "${rst:-?}" "${ota_tok:-?}"
-printf '  offset HWM %s/%s · monotonic=%s · phase=%s%s\n' "$hwm" "$total" "$([ $monotonic = 1 ] && echo yes || echo NO)" "${phase:-none}" "$([ "$saw_live_prog" = 0 ] && printf '  [RETAINED ONLY — no live progress publish this run; offset is a ghost of an earlier attempt, compare total vs the staged size]')"
-# "unknown" not "?" — the off-channel check is DISABLED when the AP channel is unpublished, and
-# the evidence line must say so rather than imply a value was read and compared.
-printf '  crown AP ch=%s · mesh ch=%s · %s\n' "${ap_ch:-unknown (no ap= field in DIAG)}" "${mesh_ch:-?}" "${src:-none}"
-printf '  last ota/diag: %s\n' "${dg:-none}"
-printf '════════════════════════════════════════════════════════════\n'
+# ═══ report ══════════════════════════════════════════════════════════════════════════════
+# Headline selection ONLY. Nothing is dropped: every finding prints below, which is what makes
+# masking structurally impossible rather than repeatedly re-fixed.
+if [ "$verdict" = "FAIL" ] || [ "$verdict" = "CONFLICT" ]; then
+  best=99
+  for x in "${findings[@]}"; do
+    IFS=$'\t' read -r s r c t <<<"$x"
+    case "$s" in FAIL|SUSPECT) [ "$r" -lt "$best" ] && { best="$r"; headline="$c — $t"; };; esac
+  done
+  [ "$verdict" = CONFLICT ] && headline="CONFLICT — the OTA proof is COMPLETE and a failure signal also fired. Both are printed below; trust neither until you have read the operands. Leading failure: $headline"
+elif [ "$verdict" = PASS ]; then
+  headline="v$st_first → v$TARGET over the air. All four transitions observed LIVE in-window: state $st_first→$st_live · slot $slot_first→$slot_live · boot $boot_first→$boot_live · ota $ota_first→$ota_live · rst=$rst_live${src:+ · source: $src}"
+  case "$src" in id*) headline="$headline  ← PEER-SOURCED (#237)";; esac
+else
+  # UNPROVEN is the honest default, and it is NOT the same as FAIL. Say which operand is missing.
+  if [ "$producer" = "esp32c6-watch" ]; then
+    headline="UNPROVABLE BY THIS HARNESS, not failed — the target publishes the esp32c6-watch constant DIAG, whose slot/boot/ota fields cannot transition (see PRODUCER below). state ${st_first:-unknown}→${st_live:-unknown} is all that is observable here."
+  elif [ -n "$st_first" ] && [ "$st_first" = "$TARGET" ]; then
+    headline="already on v$TARGET at our FIRST observation — no flip was observable, so nothing here proves an OTA either way. Run this BEFORE arming."
+  elif [ "$pass_ok" = 0 ] && [ $((A+B+C+D)) -gt 0 ]; then
+    headline="window ${WINDOW}s elapsed with the OTA proof INCOMPLETE ($((A+B+C+D))/4 transitions, see below) — no failure was observed either. This is 'not proven', not 'failed'."
+  else
+    headline="window ${WINDOW}s elapsed, no OTA transition observed at all — HWM ${hwm:-none}/${total:-?}, last phase '${phase:-none}', last ota/diag '${dg_any:-none}'."
+  fi
+fi
+
+printf '\n════════════════════════════════════════════════════════════════════════\n'
+printf '  VERDICT: %s — id%s → v%s\n  %s\n' "$verdict" "$ID" "$TARGET" "$headline"
+printf '  ── findings · every check evaluated; none can mask another ──\n'
+for x in "${findings[@]}"; do
+  IFS=$'\t' read -r s r c t <<<"$x"
+  printf '  [%-7s] %-12s %s\n' "$s" "$c" "$t"
+done
+printf '  ── OTA proof · all four transitions required, LIVE, in-window ──\n'
+y() { [ "$1" = 1 ] && printf 'yes' || printf 'NO '; }
+printf '    [%s] A state flip   %s → %s   (target v%s)\n'  "$(y $A)" "${st_first:-unknown}"   "${st_live:-unknown}"   "$TARGET"
+printf '    [%s] B slot flip    %s → %s\n'                 "$(y $B)" "${slot_first:-unknown}" "${slot_live:-unknown}"
+printf '    [%s] C boot incr    %s → %s\n'                 "$(y $C)" "${boot_first:-unknown}" "${boot_live:-unknown}"
+printf '    [%s] D ota token    %s → %s   (want none|rolled-back → confirmed)\n' "$(y $D)" "${ota_first:-unknown}" "${ota_live:-unknown}"
+printf '    [%s] E not usb      rst=%s\n'                  "$(y $E)" "${rst_live:-unknown}"
+printf '  ── operands (first observed → last LIVE; "unknown" = never observed, check skipped) ──\n'
+printf '    producer=%s · cc=%s · ap=%s · mesh ch=%s · cut=%s\n' \
+  "$producer" "${cc_live:-unknown}" "${ap_live:-unknown}" "${mesh_ch:-unknown}" "${cut_live:-${cut_first:-none}}"
+# HWM is the high-water mark of LIVE offsets only — a retained ghost cannot inflate it. `none` (not
+# `0`) when no live progress was ever seen, because 0 is a legitimate offset and would read as one.
+printf '    live progress HWM %s/%s · monotonic=%s · phase=%s · live progress seen=%s · last seen (any) %s/%s\n' \
+  "${hwm:-none}" "${total:-unknown}" "$([ $monotonic = 1 ] && echo yes || echo NO)" "${phase:-none}" \
+  "$([ "$saw_live_prog" = 1 ] && echo yes || echo NO)" "${off_any:-none}" "${total_any:-unknown}"
+printf '    last ota/diag: %s\n' "${dg_any:-none}"
+printf '════════════════════════════════════════════════════════════════════════\n'
 [ "$verdict" = "PASS" ] && exit 0 || exit 1
