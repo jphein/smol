@@ -6,10 +6,11 @@
 **Short answer:** the migration is **much further along than the issue tracker suggests** — a branch
 exists that already carries the whole #233 matched-set upgrade *and* an async port through crown
 election, and its central claim is **measured on metal, not argued** (a ~15 s mesh-deaf WiFi burst
-becomes **169 ms** — ~89×). But **it is not what should ship next**, for one reason that has nothing
-to do with code quality: **the fleet is currently one board**, so nothing about post-migration mesh
-behaviour can be verified today, and the branch's OTA path is unverified — which means the rollback
-from a bad roll is USB, by hand, per board.
+becomes **169 ms** — ~89×). It **builds** on the current toolchain (§7). But **it is still not what
+should ship next**, and as of 2026-07-28 for exactly **one** reason: **the branch's OTA path has never
+been exercised**, so the rollback from a bad roll is USB, by hand, per board. (The one-board fleet and
+the "does it compile" question both resolved on 2026-07-28 — see §5 and §7. Neither was the real
+blocker, and their clearing makes the remaining one easier to see, not smaller.)
 
 It also gates more than the freeze: the migration is the only route to **BLE on the Rust firmware**
 (#22 — *"embassy/async is the only supported coex shape"*), so it buys **three** things, not one (§6).
@@ -203,19 +204,39 @@ asked three times — and the rule answers all three without re-deriving anythin
 
 ## 5. Risk — and the thing that actually decides this
 
-This is a **full re-platform of a fleet that currently works**, and three facts stack badly:
+This is a **full re-platform of a fleet that currently works.** When this section was first written
+three facts stacked badly; **two have since resolved, and the remaining one is the whole decision.**
 
-1. **The fleet is one board.** As of 2026-07-27/28 the crown (Nexus, **build 906**) reports **no
-   peers** (team-lead, from the bench). **Therefore every mesh claim about the migrated firmware is
-   untestable today** — including the one that justifies the migration. Phase 2's own numbers required
-   a **2-board** bench (DUT + a dedicated ~50 ms ch6 beacon source). *This document deliberately
-   promises no verification that nobody can currently perform.*
-2. **The OTA path on the branch is unverified** (§2). If a migrated image is rolled and misbehaves,
+1. ~~**The fleet is one board.**~~ ✅ **RESOLVED 2026-07-28 — a two-board bench now exists.** JP
+   plugged in three more; verified from the crown's peer view and *fresh* telemetry, not retained
+   ghosts:
+   - **id5 Aegis — LIVE on build 906**, having **self-fetched over WiFi and rebooted into it** (uptime
+     reset; HA confirms `installed=906`).
+   - **id8 Nexus — LIVE**, running the interim fix `443ea34`.
+   - **id7 / id9 — plugged in but not running.** No telemetry in 13 h and, decisively, **absent from
+     the crown's ESP-NOW peer list**. With JP for a physical check.
+
+   > 🔎 **Why that last inference is sound, and worth reusing:** absent *telemetry* is weak evidence —
+   > it could be the broker, the WiFi leg, or a retained ghost. Absence from the **ESP-NOW peer list**
+   > is strong: ESP-NOW needs **no router, no DHCP, no broker**, so a booted smol is seen within
+   > seconds. *"Not in the peer list"* therefore means *"not running"*, where *"no telemetry"* only
+   > means *"something in a long chain is broken."* Prefer the shortest-chain signal when deciding
+   > whether a board is alive.
+
+   So **Phase 2's harness is runnable again** (it needs a DUT + a ch6 beacon source), and Step 2 is off
+   the critical path. This does **not** soften the recommendation — see below.
+2. **The OTA path on the branch is unverified** (§2). **This is now the only blocker, and it is the
+   one that matters.** Note the pointed contrast the bench just supplied: **OTA demonstrably works on
+   `main`** — id5 self-fetched 906 over WiFi and came back on it, today. On the branch the same path
+   has never been exercised. So the risk is not "OTA is hard"; it is "**this** OTA is untested, and it
+   is the mechanism by which you would undo a bad roll." If a migrated image is rolled and misbehaves,
    recovery is **USB, by hand, per board** — and per [ota.md](../../ota.md) the bootloader's
    revert-on-boot-fail is **off**, so app-side rollback plus canary discipline is the entire safety
    net. A re-platform is exactly the change most likely to break app-side rollback.
-3. **`esp-storage` and `esp-bootloader-esp-idf` change their otadata APIs** in the same set (§3). The
-   OTA path is being rewritten *and* its dependencies are moving *and* its verification is missing.
+3. **`esp-storage` and `esp-bootloader-esp-idf` change their otadata APIs** in the same set (§3) — and
+   the branch now demonstrably *compiles* against `esp-bootloader-esp-idf 0.5.0` (§7), which proves the
+   API port, **not** that otadata behaves. The OTA path is being rewritten *and* its dependencies are
+   moving *and* its verification is missing. Two of those three are fine; the third is the gap.
 
 ### What "half-migrated" looks like
 Better than feared, because of the yielding superloop (§2): the app/plugin layer is shared, so a
@@ -262,10 +283,13 @@ annoying."
 observable without a second board, which is what made this step available when the migration's
 verification was not.
 
-### Step 2 — restore a two-board bench · **the real gate**
-Nothing about the migration can be honestly signed off on one board. This is a hardware/logistics
-task, not a code task, and it blocks Step 3 rather than being part of it. Phase 2's rig is the
-template: DUT + a dedicated ch6 beacon source.
+### Step 2 — restore a two-board bench · ✅ **DONE 2026-07-28, off the critical path**
+Nothing about the migration could be honestly signed off on one board. **id5 Aegis and id8 Nexus are
+both live** (§5), so Phase 2's rig — DUT + a dedicated ch6 beacon source — is runnable again. This was
+a hardware/logistics gate, not a code task, and it has cleared without anyone writing code for it.
+
+⚠️ **This does not advance the decision by itself.** It removes an *excuse* for not verifying; it does
+not perform the verification. Step 3.2 is still the gate.
 
 ### Step 3 — finish and gate the branch, in this order
 1. **Triage the 15 stale `TODO`s** so the file is a map again (cheap; likely mostly deletions).
@@ -329,9 +353,11 @@ shippable is verification, not code.
 
 Stated rather than hedged:
 
-- **Does the branch compile today?** Not verified — building is outside this task's remit (docs only)
-  and `rust/` has a live agent. Its last commit describes a coherent atomic change, and Phase 2 ran on
-  metal, but *"compiles at `b6413d3` on the current toolchain"* is unconfirmed. **Check this first.**
+- ~~**Does the branch compile today?**~~ ✅ **ANSWERED 2026-07-28 — yes.** Built by team-lead in an
+  isolated worktree at `b6413d3`: `cargo build --release --features espnow,cast,io` → **Finished in
+  30.12 s**, clean, with `esp-bootloader-esp-idf 0.5.0` and `embassy-net 0.9.1` compiling. So the whole
+  #233 matched-set port is not merely written, it **builds**. The remaining unknowns are all
+  **behavioural**, which is a much better place to be than "we don't know if it compiles."*
 - **Are the 15 `TODO`s stale or live?** They *look* stale (they ask for `net_task`/`mqtt_task`, which
   exist). Not proven.
 - **Does the async OTA fetch work?** Unknown, and the highest-value unknown in the document.

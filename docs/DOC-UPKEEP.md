@@ -182,6 +182,20 @@ grep -rn "<number>" docs/superpowers/specs/
 "In flight" should mean **commits on `main` or an open PR** — not intent. Everything else is
 spec'd/queued.
 
+### Prefer the shortest-chain signal when asking "is it alive?"
+
+Absent **telemetry** is weak evidence. It travels board → ESP-NOW → crown → WiFi → broker → HA, so
+"no telemetry" only means *"something in a long chain is broken"* — and retained MQTT has faked
+liveness here repeatedly.
+
+Absence from the **crown's ESP-NOW peer list** is strong evidence. ESP-NOW needs **no router, no DHCP,
+no broker**: a booted smol is seen within seconds. So *"not in the peer list"* really does mean *"not
+running."*
+
+Worked example (2026-07-28): four boards plugged in, two live. id7/id9 had no telemetry for 13 h —
+inconclusive on its own — but were **also absent from the peer list**, which settled it as unpowered or
+wedged rather than a broker problem. **When two signals disagree, trust the one with fewer hops.**
+
 ### The build number and its sigil word
 
 The single most contradiction-prone fact in the repo. Two independent traps:
