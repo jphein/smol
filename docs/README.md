@@ -89,6 +89,8 @@ PSRAM.
 
 **The rest of the tree:** `blockdigger/` + `games/` (Arduino/C++ games, Bluepad32) ·
 `oled_test/` (hardware sanity check) · `ha/` (the Home Assistant packages + dashboard) ·
-`tools/` (OTA publish, reproducible build, image verify) · `site/` (the editable project site,
+`tools/` (OTA publish + verify, reproducible build, image verify, HA package deploy, the Bard's
+model export/fetch/golden-baseline, retained-command reconcile, site version stamp, and their test
+harnesses) · `site/` (the editable project site,
 auto-deployed to GitHub Pages) · `experiments/` (`pocketwatch/`, `atomic14-games/`, `nes-c3/`,
 `case-mod/`).

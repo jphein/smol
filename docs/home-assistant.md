@@ -46,6 +46,13 @@ partial:** live discovery on **2026-07-27** carried **3 `_voltage` and 3 `_rssi`
 reason. A one-time HA retained-clear removed the legacy build-56 config (a stale-retained artifact,
 not a firmware defect; #36 closed as a no-op).
 
+⚠️ **A retained ghost is only cosmetic while it is telemetry.** The same mechanism on a **command**
+topic is an instruction the fleet keeps obeying — a retained `smol/<dead-id>/ota/install` suppresses the
+crown's own OTA indefinitely and reports nothing. Registry-derived dashboards stop *displaying* ghosts
+without stopping them *acting*: see [ota.md § when nothing installs and there is no
+error](ota.md#-when-nothing-installs-and-there-is-no-error--a-dead-boards-retained-order-308) for the
+mechanism and `tools/ghost_reconcile.sh` for the check.
+
 ### Downlink — HA → every display (retained + mesh re-broadcast)
 HA automations publish **retained**, display-ready payloads that the gateway grabs in its
 burst and **re-broadcasts** over ESP-NOW so leaves render them too — single-hop normally, or through a relay since #13 shipped routed multi-hop (`BATT2`/`GRID2` carry the downlink behind a strictly-newer freshness gate):

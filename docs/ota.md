@@ -127,6 +127,59 @@ or chase a phantom.** Trust in this order:
    stale read can show an old request as if it were current. Reading it as live truth **misled
    two separate sessions** into misdiagnosing a fetch that the pcap showed was already dead.
 
+
+### ⚠️ When nothing installs and there is no error — a dead board's retained order (#308)
+
+**Symptom:** a newer build is staged, the crown stays on the old one, **and nothing anywhere reports a
+failure.** Observed 2026-07-28: the crown sat on **906 with 907 staged**, while
+`smol/9/ota/diag` read `mac-unknown retry=15 src=gw`.
+
+**Why it is silent, and why it never times out.** A retained `smol/<id>/ota/install` for a board that no
+longer exists is an order the fleet keeps trying to obey. The crown relays it, no leaf answers, and
+`record_leaf_ota` classifies the outcome `MacUnknown`/`FetchFailed` — **`!reached_leaf()`, which is #134
+case 2: a PRE-RELAY transient the feed must NEVER clear** (`net/mode.rs:4177`). That is exactly right for
+a live leaf that will retry, and **immortal for a board that is gone.** `leaf_ota_pending` stays set, and
+because the gateway gates its **own** self-OTA on `!leaf_installs_outstanding()` (`main.rs:1199`), the
+crown will not update itself until the ghost is cleared. **A stale telemetry ghost is cosmetic; a stale
+COMMAND is an instruction the fleet is still following.**
+
+**The check:** `tools/ghost_reconcile.sh` — enumerates retained per-id command topics, establishes
+liveness **from the wire**, and classifies every id.
+
+```
+tools/ghost_reconcile.sh [--window N] [--clear] [--json] [--root R] [--strict]
+                         [--selftest] [--check-suffixes]
+exit 0 = clean · 1 = ACTION NEEDED (stale and/or malformed) · 2 = COULD NOT CHECK
+```
+
+Four things about it are worth an operator's attention, because each is a way the obvious version of
+this tool would have been wrong:
+
+- **Liveness comes from the wire, never from HA.** The HA device registry is *materialised from* retained
+  discovery configs, so it lists ghosts as devices complete with a `sw_version` — a registry-based
+  reconciler is blind to precisely what it hunts.
+- **Three states, never two: live · dead · unknown.** *"Can't tell"* is not *clean*, and it exits **2**,
+  not 0 — the same discipline as [§ a broken diagnostic prints a confident wrong
+  verdict](DOC-UPKEEP.md).
+- **`--clear` is not an undo.** Clearing a *config* topic does not revert the board: there is no
+  empty-payload guard in the apply path and the leaf's `from_wire` keeps its current value on an empty
+  payload (#46 clamp), so a clear is a **loss of observability** — the board goes on applying a value the
+  broker no longer shows. Safe on a dead id, wrong on a live one; the tool only clears ids it has proven
+  dead.
+- **`id42` is a sentinel, not a board (#314)** — every C6 watch's unset-config default, remapped on
+  provisioning. It **recurs by design**, so it is reported and never cleared. Flagging it as a ghost
+  would teach the operator to ignore the tool.
+
+`--check-suffixes` re-derives the per-id command list from the firmware's own `encode_subscribe` /
+`encode_subscribe_qos1` calls and fails loudly on drift — a hand-maintained list that goes quietly stale
+is #308 one level up. `--selftest` plants its fixtures on a **separate `smoltest` root**, because
+planting `smol/199/ota/install` on the live root would *cause* the bug the tool detects.
+
+It talks to the broker with `mosquitto_sub`/`mosquitto_pub` and reads `BROKER`/`MQTT_USER` from
+`tools/ota_publish.env` — **the same transport `ota_publish.sh` uses**, so where a roll works from, this
+works from. (Inference from identical `-h "$BROKER" -p 1883` invocations in both scripts, not a separate
+measurement.) Credentials go into a `0700` `XDG_CONFIG_HOME`, never argv (#313).
+
 Rule of thumb: **packets > transitions > logs.** If the pcap and the log disagree, the pcap is
 right.
 
