@@ -82,7 +82,7 @@ baseline_slot="$(g_all "$ID/diag" | tail -1 | grep -oaE '(^|\|)slot=[^|[:space:]
 echo "── ota_verify: id$ID → v$TARGET · window ${WINDOW}s · broker $BROKER · baseline v${baseline:-?} ──"
 
 verdict=""; reason=""; start=$(date +%s); last_off=-1; last_off_t=$start; hwm=0; monotonic=1
-total="?"; phase="none"; src="none"
+total="?"; phase="none"; src="none"; saw_live_prog=0; ota_tok=""
 
 while :; do
   now=$(date +%s)
@@ -109,6 +109,13 @@ while :; do
   dg="$(g_all "$ID/ota/diag" | tail -1 | awk -F'\t' '{print $3}')"
   src="$(printf '%s' "$dg" | grep -oaE 'src=(gw|id[0-9]+)' | tail -1)"; src="${src:-none}"
   pl="$(g_all "$ID/ota/progress" | tail -1 | awk -F'\t' '{print $3}')"
+  # progress is RETAINED and published on a ~5 s cadence (wifi.rs:4890), so a subscribe replays
+  # the last offset of whatever attempt died LAST — possibly for a different image entirely
+  # (compare `total` against the staged size). A retained value never changes, so it satisfies
+  # "frozen for STALE seconds" for free and the death-point arm below would condemn a ghost.
+  # Require at least one LIVE (retain=0) progress publish first: a genuinely dying transfer
+  # publishes live every 5 s before it stops, so this keeps real death-points and drops ghosts.
+  [ -n "$(g_live "$ID/ota/progress" | tail -1)" ] && saw_live_prog=1
   off="$(printf '%s' "$pl" | cut -d'|' -f1)"; total="$(printf '%s' "$pl" | cut -d'|' -f2)"
   phase="$(printf '%s' "$pl" | cut -d'|' -f3)"; [[ "$off" =~ ^[0-9]+$ ]] || off=""
   if [ -n "$off" ]; then
@@ -128,7 +135,7 @@ while :; do
     verdict=FAIL; reason="OFF-CHANNEL — crown AP ch=$ap_ch != ESP-NOW mesh ch=$mesh_ch (coexist disease; WiFi fetch will stall). Move the crown to ch$mesh_ch."; break
   elif printf '%s' "$dg" | grep -qa 'at=slot'; then
     verdict=FAIL; reason="at=slot — local otadata problem (#226); needs a USB flash, OTA can't proceed."; break
-  elif [ -n "$off" ] && [ "$total" != "?" ] && [ "$off" -gt 0 ] && [ "$off" -lt "$total" ] && [ $((now-last_off_t)) -ge "$STALE" ]; then
+  elif [ "$saw_live_prog" = 1 ] && [ -n "$off" ] && [ "$total" != "?" ] && [ "$off" -gt 0 ] && [ "$off" -lt "$total" ] && [ $((now-last_off_t)) -ge "$STALE" ]; then
     verdict=FAIL; reason="DEATH-POINT — offset frozen at $off/$total for ${STALE}s+ (transfer died mid-flight)."; break
   elif [ "$inst_live" = "$TARGET" ]; then
     # 2026-07-28: the old proof tested `slot = "ota_1"`. Firmware publishes `slot=<0|1>` as a
@@ -161,7 +168,7 @@ printf '\n═══════════════════════�
 printf '  VERDICT: %s — id%s → v%s\n  %s\n' "$verdict" "$ID" "$TARGET" "$reason"
 printf '  ── evidence ──\n'
 printf '  installed v%s (target v%s) · slot=%s%s · rst=%s · ota=%s\n' "${inst_any:-?}" "$TARGET" "${slot:-?}" "$([ -n "${baseline_slot:-}" ] && [ "${baseline_slot:-}" != "${slot:-}" ] && printf ' (was %s)' "$baseline_slot")" "${rst:-?}" "${ota_tok:-?}"
-printf '  offset HWM %s/%s · monotonic=%s · phase=%s\n' "$hwm" "$total" "$([ $monotonic = 1 ] && echo yes || echo NO)" "${phase:-none}"
+printf '  offset HWM %s/%s · monotonic=%s · phase=%s%s\n' "$hwm" "$total" "$([ $monotonic = 1 ] && echo yes || echo NO)" "${phase:-none}" "$([ "$saw_live_prog" = 0 ] && printf '  [RETAINED ONLY — no live progress publish this run; offset is a ghost of an earlier attempt, compare total vs the staged size]')"
 # "unknown" not "?" — the off-channel check is DISABLED when the AP channel is unpublished, and
 # the evidence line must say so rather than imply a value was read and compared.
 printf '  crown AP ch=%s · mesh ch=%s · %s\n' "${ap_ch:-unknown (no ap= field in DIAG)}" "${mesh_ch:-?}" "${src:-none}"
