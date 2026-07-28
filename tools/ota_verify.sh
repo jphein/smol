@@ -9,7 +9,7 @@
 # a PASS/FAIL verdict. Encodes the v346-wave (2026-07-20) hard-won lessons:
 #
 #   * RETAINED-GHOST discipline — a fresh subscribe redelivers retained values (MQTT retain
-#     flag = 1); only a LIVE publish (retain = 0) is trustworthy. mosquitto_sub -F '%R' gives
+#     flag = 1); only a LIVE publish (retain = 0) is trustworthy. mosquitto_sub -F '%r' gives
 #     the flag; a PASS requires a LIVE flip, not a persisted value. (Cost us a false
 #     "fleet installing" alarm before we caught it.)
 #   * grep -a EVERYWHERE — one binary byte in an MQTT payload flips grep to binary mode and it
