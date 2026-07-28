@@ -108,6 +108,28 @@ from a single session, both from the team lead, both *correct when written*:
 Neither was carelessness. On a repo moving this fast, a brief is a snapshot of a tree that has since
 moved. Read the spec/tree, **then** write. This is cheap and it has caught real defects.
 
+### ⚠️ A partial contract is worse than a missing one
+
+An undocumented field makes a reader go and look. A **half**-documented one makes them confident and
+wrong — and the wrongness is silent, because their parser runs.
+
+Worked example, 2026-07-28: `protocol.md` documented `brst=` as a single value. It is
+**`<gap>:<ms>:<kind>`** — three. **A parser built from that contract reads the gap as the burst
+duration**, which is precisely the misattribution that produced a wrong freeze number, handed it to JP,
+and sent two agents after the wrong subsystem. `etx=` was simply absent from the block, and nobody was
+misled by it. **The partial field did the damage.**
+
+So when documenting a wire format:
+- **Write the whole shape or none of it.** `<gap>:<ms>:<kind>` or a `TODO`, never `<ms>`.
+- **Say which parts are optional and which are new** — CFG-`V` gained a third `font` field
+  (`9210ef4`), and a reader on the two-field shape silently ignores the panel geometry rather than
+  failing.
+- **Document sentinels and saturation**, because they invert meaning: `brst=` uses `0` for *nothing
+  measured yet* and a **`+`** suffix for a saturated `u16` — so `65535:65535:o+` means *"at least
+  65.5 s"*, and reading it as exact is a 65-second lie.
+- **Then check the producer**, not the doc you are editing. All three of these were found by an agent
+  reading `mode.rs` — and the same pass caught that this file's own **shed order was wrong**.
+
 ### ⚠️ Upgrades are as invisible as retirements
 
 The mirror image of the retirement blind spot, and the more dangerous one because it makes docs

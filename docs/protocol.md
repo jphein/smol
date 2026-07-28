@@ -381,7 +381,7 @@ firmware predates is DROPPED (forward-compat, #46). Parse is panic-free/heap-fre
 | `G` | #72 | **IO pin-map** — the whole per-node driver map (see below) (`5689b1b`, #113) | yes | live, **no reboot** (edge-triggered re-bind) |
 | `g` | #72 | **IO output states** — commanded output levels (see below) (`5689b1b`, #113) | yes | live, no reboot |
 | `T` | #303 | **Bard story prompt** — the opening the on-device LLM continues; empty = the node's built-in persona. **The LEAF validates** against the model's own 512-token vocabulary (bytes with no token are refused with an offset; merely-unknown ASCII is accepted but fragments) and keeps its previous prompt on refusal — validation cannot live gateway-side because it needs the tokenizer, which lives with the model | yes | live, no reboot (next story uses it) |
-| `V` | #302 | **Bard delivery** — `<ms_per_char>:<mode>`, e.g. `160:inf` or `80:page`. `inf` narrates for ever (continuous scroll); `page` writes one screenful of new text then waits for a button press. Empty = defaults (`160:inf`); an empty FIELD keeps that field (`:page`, `80:`); the colon is required otherwise. **The LEAF clamps** the pace to `20..=500` ms/char (a 0 would peg the reveal loop) and logs that it did; a malformed value is refused with the previous setting kept | yes | live, no reboot — takes effect **mid-tale**, on the next tick |
+| `V` | #302 | **Bard delivery** — `<ms_per_char>:<mode>[:<font>]`, e.g. `160:inf` or `80:page`. ⚠️ **A third `font` field was added in `9210ef4`** and is not optional to *readers* — a parser written from the two-field shape will silently ignore the panel geometry. `inf` narrates for ever (continuous scroll); `page` writes one screenful of new text then waits for a button press. Empty = defaults (`160:inf`); an empty FIELD keeps that field (`:page`, `80:`); the colon is required otherwise. **The LEAF clamps** the pace to `20..=500` ms/char (a 0 would peg the reveal loop) and logs that it did; a malformed value is refused with the previous setting kept | yes | live, no reboot — takes effect **mid-tale**, on the next tick |
 
 - **Reboot vs live.** Live-apply (no reboot): `S L U P Y O W G g T V`. Reboot on apply: `B` (broker-leg
   change) — **edge-triggered** (only when the value changes, so the ~10 s re-arm never
@@ -486,7 +486,8 @@ DIAG|slot=<bootslot>|rst=<reset-reason>|boot=<bootcount>|ota=<outcome>|up=<sec>|
     |fwd=<uplink-fwds>|dedup=<dup-drops>|ttl=<ttl-drops>|hop=<1|2>|dlseq=<last-adopted>|dfwd=<downlink-refloods>
     [|cfg=<applied-config>][|io=<pin>:<count>,…][|deaf=<n>|ddrops=<n>]
     [|ap=<ch>:<rssi>:<bssid>]|cc=<0|1>|degraded=<0|1>|cdeaf=<streak>:<reassocs>:<shed>
-    |apch=<ch>[|blrev=<token>][|brst=<ms>][|shed=<n>][|cut=<bytes>]
+    |etx=<worst-peer-cost>|apch=<ch>[|blrev=<token>][|brst=<gap>:<ms>:<kind>][|sog=<octal>]
+    [|shed=<n>][|cut=<bytes>]
 ```
 
 (one line on the wire; wrapped here for reading.)
@@ -504,7 +505,9 @@ changes, and see the truncation warning.
 | `cc=<0\|1>` · `degraded=<0\|1>` | **always** (0 on a leaf) | #217 rung-3 coexist health. `cc=1` = crown is **co-channel** (live AP channel == mesh channel) — the direct OTA-capability / off-ch6-starvation signal. `degraded=1` = strand-guard latched off-channel (MQTT alive, OTA off, never crownless) |
 | `cdeaf=<streak>:<reassocs>:<shed>` | **always** (`0:0:0` healthy, and on any leaf) | #204 crown dead-downstream telemetry. The shed flag latches `1` after a 2b deaf-shed until re-lock |
 | `blrev=<token>` | conditional | the bootloader **auto-revert probe** — present when `ota::bl_revert_token()` has an answer. This is what settles the long-standing *"is revert-on-boot-fail enabled?"* question (see [ROADMAP §3a](ROADMAP.md)) |
-| `brst=<ms>` | conditional | #153 — the **burst-freeze peak** for the window. ~16 B, and **one** field rather than two precisely because of the budget below. Reset at publish, so each record carries that window's peak rather than a running maximum |
+| `etx=<cost>` | **always** (positional) | #164 — worst per-peer link cost. It was **absent from this block entirely** until 2026-07-28 despite being on the wire |
+| `brst=<gap>:<ms>:<kind>` | conditional | 🔴 **THREE parts, not one.** #153's worst app-service gap **in ms**, the **burst duration** that produced it, and a **one-byte kind tag**: `f` flush · `n` ntp · `r` re-election · a SelfOta kind (`6f952d7`). `0` = nothing measured yet. A **`+`** suffix means a `u16` **saturated** at 65.5 s — `brst=65535:65535:o+` honestly reads *"at least 65.5 s"*, not *"exactly"*. It is a **max-since-report**, not a sample (DIAG cadence is 60 s, a burst is seconds, so an instantaneous read would miss the event JP feels), and it resets at publish |
+| `sog=<octal>` | conditional, **sheddable** | `a35c5b0` — why a crown did **not** self-install, as an octal bitfield: **bit 0** `leaf_ota_pending` · **bit 1** `leaf_installs_outstanding` · **bit 2** armed-in-RAM. `sog=4` = armed and waiting on nothing (it will fire); `sog=6` = armed but **held** |
 | `shed=<n>` | conditional | fields dropped from the **sheddable** tail to stay inside budget (`7a4823e`) — with a `log::warn!`. Absent = nothing shed |
 | `cut=<bytes>` | conditional | bytes lost to truncation — see below |
 
@@ -527,7 +530,11 @@ changes, and see the truncation warning.
 > 2. **The tail is split PROTECTED vs SHEDDABLE.** `brst=` · `blrev=` · `apch=` are appended
 >    **unconditionally and first** — the freeze metric, the bootloader answer, and the off-channel signal
 >    behind a proven OTA blocker. The rest is appended only while budget allows, in a documented priority
->    order (`cdeaf` → `cc`/`degraded` → `ap` → `cfg` → `io`), and the record stamps **`|shed=<n>`** plus a
+>    order — **first to go is least missed**: `cc`/`degraded` (`cc` is derivable HA-side as `apch == 6`, so
+>    it is nearly redundant with a *protected* field) → `io` (bound-input counters, absent on most boards)
+>    → `cdeaf` (`0:0:0` on a healthy board or any leaf) → `cfg` (reconstructible from the command topics
+>    HA already holds) → `ap` (its channel is approximated by the protected `apch=`). *An earlier version
+>    of this doc listed that order wrongly; it is `mode.rs`'s, not a guess.* The record stamps **`|shed=<n>`** plus a
 >    `log::warn!` when it drops any. **Reordering is free because appended fields are parsed by KEY** —
 >    the positional contract on the fixed block is untouched.
 > 3. **A compile-time assertion that the unsheddable core fits:** `DIAG_CORE_MAX` (444 B) ≤ `DIAG_BUDGET`
