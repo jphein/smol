@@ -938,44 +938,70 @@ fn wrap_tail_lays_out_the_panel() {
 }
 
 #[test]
-fn wrap_tail_survives_every_reveal_position_of_a_real_story() {
-    // The typewriter re-wraps a growing prefix every frame, so the invariants have to hold at
-    // EVERY prefix — not just for the tidy synthetic cases above. This walks a real generated
-    // story one revealed character at a time, exactly as the panel does.
+fn wrap_tail_survives_every_reveal_position_at_every_font() {
+    // The typewriter re-wraps a growing prefix every frame, so the invariants have to hold at EVERY
+    // prefix — not just for the tidy synthetic cases above. This walks a real generated story one
+    // revealed character at a time, exactly as the panel does.
+    //
+    // #302 widened it to every SELECTABLE FONT. This is the test that caught the 14-vs-15 wrap bug at
+    // one fixed size, and a runtime font makes the geometry an input rather than a constant: 7 columns
+    // and 2 rows exercise the rotating window, the swallowed space and the hard mid-word break far
+    // harder than 14x5 ever did (more breaks per character revealed, and the window turns over every
+    // two lines instead of every five).
     let golden = include_str!("../src/bard/testdata/golden_ref.txt");
     let story = golden.lines().skip(1).collect::<std::vec::Vec<_>>().join("\n");
     let bytes = story.as_bytes();
-    const COLS: usize = 14;
-    const ROWS: usize = 5;
-    let mut spans = [(0u16, 0u16); ROWS];
-    for shown in 0..=bytes.len() {
-        let n = wrap_tail(&bytes[..shown], COLS, ROWS, &mut spans);
-        assert!(n <= ROWS, "shown={shown}: {n} lines exceeds the panel");
-        for (i, &(a, b)) in spans[..n].iter().enumerate() {
-            assert!(a <= b, "shown={shown} line{i}: inverted span ({a},{b})");
-            assert!(
-                (b as usize) <= shown,
-                "shown={shown} line{i}: span end {b} past the revealed text"
-            );
-            let w = (b - a) as usize;
-            assert!(w <= COLS, "shown={shown} line{i}: {w} chars is wider than the panel");
-            // A line must never begin with the space we were supposed to swallow, or the text
-            // would visibly drift right as the story scrolls.
-            if w > 0 && a > 0 {
-                assert_ne!(
-                    bytes[a as usize], b' ',
-                    "shown={shown} line{i}: line starts with a space"
+
+    for font in [
+        clock::delivery::Font::F5x8,
+        clock::delivery::Font::F6x10,
+        clock::delivery::Font::F9x15,
+        clock::delivery::Font::F10x20,
+    ] {
+        let (cols, rows) = font.grid();
+        // The firmware's own buffer bound: spans are cut to the SMALLEST face's row count, since they
+        // cannot be runtime-sized without alloc.
+        let mut spans = [(0u16, 0u16); 5];
+        assert!(rows <= spans.len(), "{font:?} wants {rows} rows, buffer holds {}", spans.len());
+        for shown in 0..=bytes.len() {
+            let n = wrap_tail(&bytes[..shown], cols, rows, &mut spans[..rows]);
+            assert!(n <= rows, "{font:?} shown={shown}: {n} lines exceeds the panel");
+            for (i, &(a, b)) in spans[..n].iter().enumerate() {
+                assert!(a <= b, "{font:?} shown={shown} line{i}: inverted span ({a},{b})");
+                assert!(
+                    (b as usize) <= shown,
+                    "{font:?} shown={shown} line{i}: span end {b} past the revealed text"
+                );
+                let w = (b - a) as usize;
+                assert!(
+                    w <= cols,
+                    "{font:?} shown={shown} line{i}: {w} chars is wider than {cols}"
+                );
+                // A line must never begin with the space we were supposed to swallow, or the text
+                // would visibly drift right as the story scrolls.
+                if w > 0 && a > 0 {
+                    assert_ne!(
+                        bytes[a as usize], b' ',
+                        "{font:?} shown={shown} line{i}: line starts with a space"
+                    );
+                }
+            }
+            // Lines must be in reading order and non-overlapping.
+            for w in spans[..n].windows(2) {
+                assert!(
+                    w[0].1 <= w[1].0,
+                    "{font:?} shown={shown}: spans out of order/overlapping"
                 );
             }
         }
-        // Lines must be in reading order and non-overlapping.
-        for w in spans[..n].windows(2) {
-            assert!(w[0].1 <= w[1].0, "shown={shown}: spans out of order/overlapping");
+        // And with the bottom row given to the `|| paused` / `~ more ~` marker, the story still fills
+        // what is left. Only meaningful where a marker is actually drawn: at 2 rows the panel keeps
+        // both for the story (see `draw_story`), so there is no reserved row to test.
+        if rows > 2 {
+            let n = wrap_tail(bytes, cols, rows - 1, &mut spans[..rows - 1]);
+            assert_eq!(n, rows - 1, "{font:?}: a full story should fill the reserved layout");
         }
     }
-    // With the bottom row reserved for `~ fin ~`, the story gets 4 rows and still fits.
-    let n = wrap_tail(bytes, COLS, ROWS - 1, &mut spans[..ROWS - 1]);
-    assert_eq!(n, ROWS - 1);
 }
 
 // ── #302 rolling scrollback: what a continuation does to the text buffer ────────────────
