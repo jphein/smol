@@ -29,7 +29,6 @@ use crate::app::{AppKind, Ctx, MeshStatus, Plugin, TimeSource, Transition};
 use crate::input::Press;
 use crate::led::LedState;
 use crate::net::mode::{BenchStats, NodeView, RosterView};
-use crate::net::names::name_for_id;
 
 /// Per-peer rows per NODES page (3 rows + 1 own-status line fills the 5×8 grid).
 const PEERS_PER_PAGE: usize = 3;
@@ -189,8 +188,9 @@ where
     D: DrawTarget<Color = BinaryColor>,
 {
     let style = text_style();
-    let noun = if n.id_known { name_for_id(n.id).1 } else { "?" };
-    Text::with_baseline(clip(noun, 8), Point::new(0, y), style, Baseline::Top)
+    let short = crate::net::names::short_name(n.id, 8);
+    let noun = if n.id_known { short.as_str() } else { "?" };
+    Text::with_baseline(noun, Point::new(0, y), style, Baseline::Top)
         .draw(display)
         .ok();
 
@@ -226,7 +226,8 @@ where
     D: DrawTarget<Color = BinaryColor>,
 {
     let style = text_style();
-    let noun = name_for_id(node_id).1;
+    let short = crate::net::names::short_name(node_id, 6);
+    let noun = short.as_str();
 
     let mut left = Line::new();
     let _ = write!(left, "{} ", clip(noun, 6));
@@ -237,7 +238,9 @@ where
         TimeSource::Adopted(src) => {
             // Read the adoption source id → its noun (provenance: who we adopted
             // from). This is the spec's `adopt<Noun>` intent, compacted to `<Noun`.
-            let _ = write!(left, "<{}", clip(name_for_id(src).1, 5));
+            // Provenance, not identity: the ADOPTED-FROM id alone. At 5 chars a noun+id would
+            // leave two letters of noun, which reads worse than the bare id and says less.
+            let _ = write!(left, "<{}", src);
         }
         TimeSource::None => {
             let _ = write!(left, "free");

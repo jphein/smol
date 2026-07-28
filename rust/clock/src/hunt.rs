@@ -25,8 +25,7 @@ use embedded_graphics::{
 use crate::app::{AppKind, Ctx, Plugin, Transition};
 use crate::input::Press;
 use crate::net::mode::RosterView;
-use crate::net::names::name_for_id;
-use crate::rssi::{bar_px, clip, label, proximity, Line, RssiSmoother};
+use crate::rssi::{bar_px, label, proximity, Line, RssiSmoother};
 
 /// Compare the smoothed RSSI against its value this many ms ago for the trend.
 const TREND_LAG_MS: u64 = 1500;
@@ -178,7 +177,8 @@ impl Plugin for HuntState {
         let mut hdr = Line::new();
         match self.target {
             Some(t) => {
-                let _ = write!(hdr, "SEEK {}", clip(name_for_id(t).1, 7));
+                let _ = write!(hdr, "SEEK ");
+                crate::net::names::write_short(&mut hdr, t, 9);
             }
             None => {
                 let _ = write!(hdr, "SEEK --");

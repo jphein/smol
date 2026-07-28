@@ -1238,6 +1238,64 @@ impl core::fmt::Write for JsonScratch {
 #[cfg(feature = "wifi")]
 static mut MQTT_JSON: JsonScratch = JsonScratch::new();
 
+/// The HA device-block extras. HA merges device blocks across discovery messages sharing
+/// `identifiers`, so these need to arrive on exactly ONE of a node's configs — carrying them
+/// on all three cost 2 ⨯ 48 B of a budget that had none to spare (see [`DISCOVERY_BUDGET`]).
+#[cfg(feature = "wifi")]
+const DEVICE_EXTRAS: &str = ",\"model\":\"smol ESP32-C3\",\"manufacturer\":\"jphein\"";
+
+/// Payload bytes ONE HA discovery PUBLISH can carry: the 512 B `pkt` buffer, less the PUBLISH
+/// fixed header (1), the remaining-length varint (2 for any payload in 128..16383), the 2 B
+/// topic-length prefix, and the longest discovery topic we ever publish.
+///
+/// This is a CLIFF, exactly like [`super::mode::DIAG_BUDGET`], and it bites HARDER because it is
+/// silent on BOTH sides: `encode_publish` returns `None` when the packet will not fit, so the
+/// config is never sent, so HA never creates the entity — and there is no error anywhere. A board
+/// boots, joins, publishes telemetry, and simply has no sensors. Before the device-block was
+/// de-duplicated, 29 of the 256 possible ids were over this line: a board provisioned as id191
+/// would never have appeared in Home Assistant at all.
+#[cfg(feature = "wifi")]
+const DISCOVERY_BUDGET: usize =
+    512 - 1 - 2 - 2 - "homeassistant/sensor/smol255/voltage/config".len();
+
+/// TYPE-PROVABLE worst case of the WIDEST per-node config (`voltage`: longest template AND
+/// longest `extra`). Each term is a maximum implied by a type or by the longest member of a fixed
+/// set, so this is a bound — it cannot be flattered by a node having a short name.
+///
+///   215  format-string literal (device extras parameterised out)
+///    14  `field` ⨯2 ("voltage")            7  `name` ("Voltage")
+///    90  longest `value_template`          51  longest `extra`
+///    15  `id` ⨯5 at u8 max width (3)       17  longest adjective (9) + longest noun (8)
+///     5  build number (5 digits)            8  longest FORGE noun ("Crucible")
+///
+/// ⚠️ If you add a field, widen a corpus word, or lengthen a template, update this. The build
+/// breaks if a config stops fitting — which is the intended failure: a compile error instead of a
+/// board that is silently invisible in HA. Do NOT raise `pkt` to make room without re-deriving
+/// this AND the `mqtt_session` stack frame it was sized against.
+#[cfg(feature = "wifi")]
+const DISCOVERY_CFG_MAX: usize = 215 + 14 + 7 + 90 + 51 + 15 + 17 + 5 + 8;
+
+/// Same bound for the ONE config that also carries [`DEVICE_EXTRAS`] (`status`: shortest
+/// template, no `extra` — which is why it was chosen to carry them).
+///   215 literal + 12 field⨯2 + 6 name + 73 template + 0 extra + 48 extras + 15 id⨯5 + 17 name + 5 build + 8 forge
+#[cfg(feature = "wifi")]
+const DISCOVERY_CFG_MAX_WITH_EXTRAS: usize = 215 + 12 + 6 + 73 + 48 + 15 + 17 + 5 + 8;
+
+#[cfg(feature = "wifi")]
+const _: () = assert!(
+    DISCOVERY_CFG_MAX <= DISCOVERY_BUDGET,
+    "an HA discovery config no longer fits one MQTT publish — the entity would SILENTLY never be \
+     created (same cliff as DIAG_BUDGET). Shrink the device block or a template; do NOT raise the \
+     `pkt` buffer without re-deriving this bound and the mqtt_session stack frame."
+);
+
+#[cfg(feature = "wifi")]
+const _: () = assert!(
+    DISCOVERY_CFG_MAX_WITH_EXTRAS <= DISCOVERY_BUDGET,
+    "the discovery config carrying DEVICE_EXTRAS no longer fits one MQTT publish — move the \
+     extras to a config with a shorter template, or drop a device field."
+);
+
 /// F4 (oracle): the inbound MQTT byte-stream accumulation buffer, 512 B, in a `.bss`
 /// static — NOT on the mqtt_session stack. At 256 B it OVERFLOWED on a long-url #33
 /// staged announce (`OTA|build|size|sha|url`, url ≤160 B ⇒ packet ~380–410 B): the
@@ -2537,30 +2595,40 @@ fn mqtt_session(
         // entity_ids (HA's registry is sticky), so this is cosmetic-safe, and luna's parser takes
         // whatever follows `smol <id> ` — the adjective appears with no dashboard change.
         let (adj, noun) = crate::net::names::name_for_id(id);
-        let cfgs: [(&str, &str, &str, &str); 3] = [
+        // 5th field = the DEVICE-block extras, and it is carried by exactly ONE of the three
+        // configs. HA merges device blocks across discovery messages that share `identifiers`,
+        // so `model`/`manufacturer` only need to arrive once — but they were being repeated in
+        // all three, which cost 3 ⨯ 48 B and put 29 of the 256 possible ids OVER the 512 B
+        // `pkt` buffer. Over-budget is not truncation: `encode_publish` returns None and the
+        // entity is NEVER CREATED (see DISCOVERY_BUDGET). `status` carries them because it has
+        // the shortest template and no `extra`, so it has the most room to spare.
+        let cfgs: [(&str, &str, &str, &str, &str); 3] = [
             (
                 "temp", "Temp",
                 "{% set p = value.split(' ') %}{{ p[0][:-1] if p|length>0 and p[0].endswith('F') else '' }}",
                 ",\"unit_of_measurement\":\"°F\",\"device_class\":\"temperature\"",
+                "",
             ),
             (
                 "voltage", "Voltage",
                 "{% set p = value.split(' ') %}{{ p[1][:-1] if p|length>1 and p[1].endswith('V') else '' }}",
                 ",\"unit_of_measurement\":\"V\",\"device_class\":\"voltage\"",
+                "",
             ),
             (
                 "status", "Status",
                 "{% set p = value.split(' ') %}{{ p[2:]|join(' ') if p|length>2 else '' }}",
                 "",
+                DEVICE_EXTRAS,
             ),
         ];
-        for (field, name, tmpl, extra) in cfgs {
+        for (field, name, tmpl, extra, dev_extra) in cfgs {
             if Instant::now() > deadline {
                 break;
             }
             let mut dtopic = MqttScratch::new();
             let _ = write!(dtopic, "homeassistant/sensor/smol{}/{}/config", id, field);
-            // F1: build the 373-B config in the `.bss` static JsonScratch (512), NOT a
+            // F1: build the ~420-B config in the `.bss` static JsonScratch (512), NOT a
             // stack MqttScratch — keeps the oversized payload off the mqtt_session frame.
             // Single-caller → the &'static mut borrow is alias-safe; clear() per config.
             let json = unsafe { &mut *core::ptr::addr_of_mut!(MQTT_JSON) };
@@ -2569,9 +2637,10 @@ fn mqtt_session(
                 json,
                 // #228: device block enriched with model/manufacturer/sw_version so HA groups
                 // every entity under one device card with the running sigil version shown.
-                // sw_version = "v<build#> <forge-noun>" (e.g. "v342 Jig"); none of these are secret.
-                "{{\"unique_id\":\"smol{}_{}\",\"object_id\":\"smol_{}_{}\",\"has_entity_name\":true,\"name\":\"{}\",\"state_topic\":\"smol/{}/telemetry\",\"value_template\":\"{}\"{},\"expire_after\":300,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {} {}\",\"model\":\"smol ESP32-C3\",\"manufacturer\":\"jphein\",\"sw_version\":\"v{} {}\"}}}}",
-                id, field, id, field, name, id, tmpl, extra, id, id, adj, noun, env!("BUILD_NUMBER"), crate::net::names::version_name().1
+                // sw_version = "v<build#> <forge-noun>" — e.g. build 345 → "v345 Furnace"
+                // (`FORGE.nouns[n % 20]`, NOT the `>>8` formula). None of these are secret.
+                "{{\"unique_id\":\"smol{}_{}\",\"object_id\":\"smol_{}_{}\",\"has_entity_name\":true,\"name\":\"{}\",\"state_topic\":\"smol/{}/telemetry\",\"value_template\":\"{}\"{},\"expire_after\":300,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {} {}\"{},\"sw_version\":\"v{} {}\"}}}}",
+                id, field, id, field, name, id, tmpl, extra, id, id, adj, noun, dev_extra, env!("BUILD_NUMBER"), crate::net::names::version_name().1
             );
             if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), json.as_bytes(), true) {
                 let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);

@@ -119,6 +119,7 @@ dependencies = [
  "log",
  "nb 1.1.0",
  "sha2",
+ "sigil-names",
  "smoltcp",
  "ssd1306",
 ]
@@ -1401,6 +1402,10 @@ dependencies = [
  "cpufeatures",
  "digest 0.11.3",
 ]
+
+[[package]]
+name = "sigil-names"
+version = "0.1.0"
 
 [[package]]
 name = "smoltcp"

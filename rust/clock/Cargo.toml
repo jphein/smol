@@ -53,6 +53,11 @@ path = "examples/bard_stories.rs"
 required-features = ["hostsim"]
 
 [dependencies]
+# VENDORED realm-sigil Rust binding (rust/sigil-names). A path dep INSIDE this repo, so it builds
+# for everyone — unlike a path dep to ~/Projects/realm-sigil, which builds on one machine. Zero
+# transitive deps and no_std, so it adds nothing to the pinned esp-hal lockfile but itself.
+# `default-features = false` is explicit: smol must never get the divergent themed realms.
+sigil-names = { path = "../sigil-names", default-features = false }
 # --- Core HAL (Phase 1, always on) ---------------------------------------
 # `unstable` is required for I2C/SPI/RNG and is also a hard requirement of
 # esp-wifi. `esp32c3` selects the chip. `rt` + `exception-handler` come from

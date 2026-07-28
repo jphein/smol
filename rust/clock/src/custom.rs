@@ -123,7 +123,9 @@ where
     // Nothing to show (empty / all-malformed): a placeholder so the screen is never a mystery
     // blank — the node's own noun, centred, tells the user which node + that no custom is set.
     if rendered == 0 {
-        let noun = crate::net::names::name_for_id(crate::node_id()).1;
+        // #12: id-suffixed, so two boards sharing a noun are still distinguishable here.
+        let short = crate::net::names::short_name(crate::node_id(), 12);
+        let noun = short.as_str();
         let style = MonoTextStyleBuilder::new().font(&FONT_6X10).text_color(BinaryColor::On).build();
         let tw = noun.chars().count() as i32 * 6;
         let x = ((PANEL_W - tw) / 2).max(0);

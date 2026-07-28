@@ -18,6 +18,12 @@ publish = false
 description = "Shared MQTT ingest + world-model for the smol mesh visualizers (meshscope / observatory)"
 
 [dependencies]
+# The SAME vendored realm-sigil binding the firmware uses (rust/sigil-names). This crate used to
+# carry its own hand-copied duplicate of the corpus, kept in sync by hand with
+# rust/clock/src/net/names.rs — two copies of one table, which is the drift this whole change
+# removes. Outside this workspace on purpose (host vs embedded stay separate); zero deps, so it
+# adds nothing to the lockfile but itself.
+sigil-names = { path = "../../sigil-names", default-features = false }
 rumqttc.workspace = true
 serde_json.workspace = true
 dotenvy.workspace = true
