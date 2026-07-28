@@ -259,6 +259,20 @@ const STAT_PREFIX: &[u8] = b"SMOLv1 STAT "; // + "NNN" + verbatim "<AppKind>:<pa
 /// Value bounded by `RELAY_VALUE_MAX`.
 const DIAG_PREFIX: &[u8] = b"SMOLv1 DIAG "; // + "NNN" + verbatim "up=.. bt=.. rr=.. …"
 
+// The ESP-NOW frame a leaf DIAG rides must FIT: 12 B prefix + 3 B id + the value bound, against
+// the ~250 B ESP-NOW payload ceiling. Asserted at COMPILE TIME because the obvious repair for the
+// truncation above — "just raise RELAY_VALUE_MAX" — silently overflows the frame instead, and that
+// failure would present as frames vanishing rather than as a build error.
+//
+// Note what this does NOT prove: that the record FITS. The record is a runtime-formatted string of
+// variable-width decimals, so its length is not a compile-time value and no assertion here can
+// bound it. Making it statically provable would mean fixed-width fields — a bigger change, and an
+// HA-contract one. Until then the runtime `|cut=` marker above is the instrument.
+const _: () = assert!(
+    DIAG_PREFIX.len() + 3 + crate::net::wifi::RELAY_VALUE_MAX <= 250,
+    "leaf DIAG frame exceeds the ESP-NOW payload ceiling — lower RELAY_VALUE_MAX"
+);
+
 /// #71 observability UPLINK tag: `"SMOLv1 SCAN "` (12 B, trailing space) then `"NNN"` (SENDER id)
 /// then the verbatim one-shot WiFi-scan record. Exact twin of `DIAG` (own gateway cache
 /// `scan_cache` → retained `smol/<id>/scan`) but produced ON-DEMAND (a `W` command), never
@@ -2863,11 +2877,44 @@ impl RadioManager {
         msg[base] = b'0' + own / 100;
         msg[base + 1] = b'0' + (own / 10) % 10;
         msg[base + 2] = b'0' + own % 10;
-        let n = value.len().min(crate::net::wifi::RELAY_VALUE_MAX);
+        // A LEAF's DIAG rides one ESP-NOW frame, so `RELAY_VALUE_MAX` is a HARD bound — and this
+        // truncation used to be silent (`value.len().min(RELAY_VALUE_MAX)`). It is no longer
+        // hypothetical: the record has grown past 232 B, so every leaf has been dropping its trailing
+        // fields, which is exactly where the newest and most wanted ones live (`cc`, `cdeaf`, `apch`,
+        // `blrev`, `brst` — and the tail of the positional block with them). Measured on a realistic
+        // leaf record: 307 B offered, 232 sent, 75 B gone with no signal of any kind.
+        //
+        // So say so, on the wire and on the serial line. `|cut=<bytes>` costs 8 B of the very budget
+        // that is short, which is the correct trade: a reader that cannot see the field it wants must
+        // at least be able to tell that it was cut rather than never sent. The crown is unaffected (it
+        // self-publishes the full record over MQTT), which is precisely why this hid for so long — the
+        // one board anybody looks at is the one that is fine.
+        const CUT_TAG_MAX: usize = 8; // "|cut=999"
+        let cap = crate::net::wifi::RELAY_VALUE_MAX;
+        let n = if value.len() > cap {
+            cap - CUT_TAG_MAX
+        } else {
+            value.len()
+        };
         msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
-        self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
-        self.relay_wrap_observability(&msg[..base + 3 + n]);
+        let mut end = base + 3 + n;
+        if value.len() > cap {
+            let dropped = value.len() - n;
+            let tag = alloc::format!("|cut={}", dropped.min(999));
+            let t = tag.len().min(CUT_TAG_MAX);
+            msg[end..end + t].copy_from_slice(&tag.as_bytes()[..t]);
+            end += t;
+            log::warn!(
+                "smol #74: leaf DIAG TRUNCATED — {} of {} B dropped (cap {}); trailing fields are not reaching HA",
+                dropped,
+                value.len(),
+                cap
+            );
+        }
+        self.send_to(&BROADCAST_ADDRESS, &msg[..end]);
+        self.relay_wrap_observability(&msg[..end]);
     }
+
 
     /// #71: broadcast this node's one-shot WiFi-scan record as a `SMOLv1 SCAN` frame — twin of
     /// [`broadcast_diag`]. Leaf path: the gateway caches it (`scan_cache`) + republishes retained
