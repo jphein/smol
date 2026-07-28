@@ -73,12 +73,18 @@ SIZE="$(stat -c%s "$WORK/a.bin")"; SHA="$(sha256sum "$WORK/a.bin" | cut -d' ' -f
 #   MEASURED on a real 1,435,008 B image (`strings` = 86,363 B = 1.32x the 64 KB pipe
 #   buffer), 20 runs each: OLD form DETECTED 0 / MISSED 20. NEW form DETECTED 20 /
 #   MISSED 0. Deterministic, not flaky.
-#   THE DECIDING VARIABLE IS POSITION, not size: the first match sat at line 23, so grep
-#   exited with ~86 KB still to push. An earlier note here claimed this was only a
-#   LATENT hazard because one test showed the old form detecting correctly — that test
-#   used an image whose first match sat near the END, where grep drains almost
-#   everything and no EPIPE occurs. That note said "do not cite this as evidence the
-#   guard was broken"; it WAS broken, 20/20, and the instruction was wrong.
+#   POSITION MAKES IT WORSE BUT IS NOT A SAFE HARBOUR — that model was refuted too.
+#   Here the first match sat at line 23, so grep exited with ~86 KB still to push and the
+#   miss was 20/20. But measured separately: a LAST-LINE match at 266 KB still fails
+#   2-3.5% (ugrep 14/400, GNU 8/400), and a ~3.9 KB input fails 3/1500. It is also not
+#   tool-specific — GNU grep 3.11 and ugrep 7.5.0 behave identically, so it generalises to
+#   CI and every other host. `grep -q` reading a FILE is 0/2000: the pipeline is the
+#   defect, not grep.
+#   SO THE RULE IS ABSOLUTE, NOT SIZED: never decide on `cmd | grep -q` status under
+#   pipefail, at any size or match position. An earlier note here called this merely a
+#   LATENT hazard because one test showed the old form detecting correctly — that image's
+#   first match sat near the end. It said "do not cite this as evidence the guard was
+#   broken"; it WAS broken, 20/20, and the instruction was wrong.
 #
 # HALF 2 — what it reported was noise. Two SHAPE-based alternatives matched the remap
 # TARGET, not host paths: `repro_build.sh` remaps the sysroot to `/rust`, so

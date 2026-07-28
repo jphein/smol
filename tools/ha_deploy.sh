@@ -341,7 +341,21 @@ cmd_push() {
       --allow-revert) allow_revert=1 ;;
       -*) die "unknown push flag '$1' (--dry-run | --from-worktree | --all | --allow-revert)" ;;
       "") ;;
-      *) packages | grep -qxF "$1" || die "no such package '$1' (have: $(packages | tr '\n' ' '))"
+      # 2026-07-28: was `packages | grep -qxF "$1" || die …`. Under `pipefail`, deciding on
+      # the status of `cmd | grep -q` is unreliable AT ANY SIZE — grep -q exits on first
+      # match, the writer takes EPIPE, and pipefail surfaces the WRITER's status. Measured
+      # in this repo: 3/1500 spurious non-matches on a ~3.9 KB input, and identical
+      # behaviour from GNU grep 3.11 and ugrep 7.5.0, so it is not tool-specific and it
+      # generalises to CI. `grep -q` reading a FILE is 0/2000 — the pipeline is the defect,
+      # not grep. I first triaged this site as "small input, low risk, leave it" on the
+      # since-refuted theory that only large inputs or early matches were affected; a late
+      # match at 266 KB still failed 2-3.5%. So the rule is absolute rather than sized, and
+      # this is now a pipe-free membership test that cannot fail for pipeline reasons.
+      *) _pkgs="$(packages)"
+         case $'\n'"$_pkgs"$'\n' in
+           *$'\n'"$1"$'\n'*) ;;
+           *) die "no such package '$1' (have: $(printf '%s' "$_pkgs" | tr '\n' ' '))" ;;
+         esac
          scope+=("$1") ;;
     esac; shift
   done
