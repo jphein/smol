@@ -2054,6 +2054,37 @@ template:
             maybe_leaf_reelect returns early on a gateway, so re-election bursts are
             leaf-ONLY), which means a missing value is NOT evidence that leaves never freeze.
 
+  # A leaf's DIAG travels as ONE ESP-NOW frame capped at RELAY_VALUE_MAX=232 B, and the record
+  # outgrew it, so leaves silently lost their trailing fields — `cc`, `cdeaf`, `apch`, `blrev`
+  # and `brst` all live in that tail. Firmware now cuts on a field boundary and appends
+  # `|cut=<bytes>` (capped 999) to say how much went. That marker turns "brst= is missing from
+  # leaves" from an assertion into a measurement: if this sensor has a value, the burst-freeze
+  # panel can name the board and the byte count instead of hand-waving.
+  - trigger:
+      - platform: mqtt
+        topic: "smol/+/diag"
+    condition:
+      - condition: template
+        value_template: "{{ trigger.payload is string and (trigger.payload.split('|') | select('search','^cut=') | list | count) > 0 }}"
+    sensor:
+      - name: "smol diag truncated"
+        unique_id: smol_diag_truncated
+        unit_of_measurement: "B"
+        state_class: measurement
+        icon: "mdi:content-cut"
+        state: >-
+          {%- set ns = namespace(v='') -%}
+          {%- for kv in trigger.payload.split('|') -%}{%- if kv.startswith('cut=') -%}{%- set ns.v = kv.split('=',1)[1] -%}{%- endif -%}{%- endfor -%}
+          {{ ns.v | int(0) }}
+        attributes:
+          node: "{{ trigger.topic.split('/')[1] }}"
+          note: >-
+            Bytes dropped from the END of this board's DIAG record because it exceeded the
+            232 B ESP-NOW relay cap. The lost tail is where the newest fields live — cc,
+            cdeaf, apch, blrev, brst — so a board reporting a cut here CANNOT deliver its
+            burst-freeze measurement. Value is capped at 999 by the publisher, so 999 means
+            "at least 999". Crowns are unaffected: they self-publish the full record over MQTT.
+
   - trigger:
       - platform: mqtt
         topic: "smol/+/diag"

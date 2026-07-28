@@ -355,6 +355,7 @@ def legend_card(nodes, present):
 # lives only on the board) and to be careful about the difference between "no measurement" and
 # "a measurement of zero".
 BF="sensor.smol_burst_freeze"; CBM="binary_sensor.smol_coexist_belief_mismatch"
+TRUNC="sensor.smol_diag_truncated"
 def freeze_md(nodes, dormant, present):
     sig={str(n["id"]):n["name"] for n in list(nodes)+list(dormant)}
     # First line is a LITERAL: `_ident` keys a markdown card on content[:45], so leading with a
@@ -385,9 +386,14 @@ def freeze_md(nodes, dormant, present):
             # we currently cannot measure, and the crown has been re-electing repeatedly.
             "_Only the **crown** can currently report this. A leaf's DIAG rides one 232 B ESP-NOW "
             "frame and a realistic record offers ~307 B, so the tail — `brst=` included — is "
-            "**dropped with no signal** (issue #306). Re-election bursts are leaf-**only**, so a leaf "
-            "freezing during a takeover is real and currently invisible: absence here is not "
-            "evidence of calm._")
+            "dropped (issue #306). Re-election bursts are leaf-**only**, so a leaf freezing during "
+            "a takeover is real and currently invisible: absence here is not evidence of calm._"
+            # `cut=` makes that claim measurable rather than asserted — name the board and the
+            # byte count when firmware tells us a tail was dropped.
+            +("\n\n{% set cb=states('"+TRUNC+"') %}{% set cn=state_attr('"+TRUNC+"','node')|string %}"
+              "{% if cb not in na %}_Measured now: **{{ sig.get(cn, 'id' ~ cn) }}** dropped "
+              "**{{ cb }} B** off the end of its DIAG — its `brst=` is among the lost fields._"
+              "{% endif %}" if TRUNC in present else ""))
     else:
         out.append("### — ms\n\n_`"+BF+"` not present — deploy ha/packages/smol_mesh.yaml._\n")
     if CBM in present:
