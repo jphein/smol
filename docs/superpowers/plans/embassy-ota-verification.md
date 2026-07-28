@@ -22,18 +22,67 @@ a branch result on its own.
 
 | | Path | What is new on the branch | Risk |
 |---|---|---|---|
-| **P1** | **Gateway self-fetch** — crown pulls the image over WiFi/HTTP-range into its inactive slot | **Everything**: embassy-net sockets, an async HTTP range fetch, flash writes interleaved with the executor, on a `wifi.rs` that lost 3,560 lines | 🔴 **higher — test first** |
-| **P2** | **Leaf mesh-OTA relay** — crown relays chunk-by-chunk over ESP-NOW (windowed-NAK); leaf verifies the ed25519 signature **before the first byte** | Mostly *old logic under a new executor* — `run_leaf_ota_relay` and `ServeSource::GatewayFetch` survived the port (`mode.rs:5003`) | 🟠 lower |
+| **P1** | **Gateway self-fetch** — crown pulls the image over WiFi/HTTP-range into its inactive slot | embassy-net sockets, an async HTTP range fetch, flash writes interleaved with the executor, on a `wifi.rs` that lost 3,560 lines — **but with a working reference implementation on the same crates (§0b)** | 🟠 **still first** (P2 depends on it), risk **reduced** by prior art |
+| **P2** | **Leaf mesh-OTA relay** — crown relays chunk-by-chunk over ESP-NOW (windowed-NAK); leaf verifies the ed25519 signature **before the first byte** | Mostly *old logic under a new executor* — `run_leaf_ota_relay` and `ServeSource::GatewayFetch` survived (`mode.rs:5003`) — **and it has NO prior art anywhere: the watch has no relay** | 🔴 **now the real unknown** |
 
-**P1 is riskier and must go first — and not only because it is newer: P2 cannot be tested until P1
-works,** because the relay serves an image the crown has already fetched. A P1 failure blocks P2
-mechanically, so there is no ordering choice to make.
+**P1 goes first, but no longer because it is the riskier half.** Since the prior art landed (§0b) the
+ranking has *inverted*: P1 has a working reference implementation on the same crates, while **P2 has
+none anywhere** — the watch implements no relay at all. What has not changed is the ordering, and it was
+never a preference: **P2 serves an image the crown has already fetched**, so a P1 failure blocks P2
+mechanically. You test the better-understood path first because you have to, and the real unknown
+second.
 
 ⚠️ **The uncomfortable structural fact:** P1 requires the DUT to **be the crown**, and the crown is the
 board whose loss is most expensive (it is the fleet's only uplink, hence the only way to observe or roll
 anything). §3 handles that with the `channel_hint` lever rather than by hoping.
 
 ---
+
+## 0b. Step zero — read the working reference first
+
+**There is prior art for the risky half, on JP's own hardware, on the exact crate versions.**
+`~/Projects/esp32c6-watch` (read-only for us; its remote is **wakizashi only — never push there**) runs
+`esp-rtos 0.3.0`, **`esp-storage 0.9.0`**, **`esp-bootloader-esp-idf 0.5.0`**, `embassy-executor 0.10.0`
+— the branch's set — and does **async OTA over them in the field**.
+
+**Read these three before Phase B, in this order:**
+
+| File | Why |
+|---|---|
+| `src/net/ota_http.rs` | `pub async fn ota_update(...)`, `Ota::new(region, 2)`, `set_current_ota_state(OtaImageState::New)` — a working async fetch on the same API |
+| the same file's boot-confirm path | 🔑 **This closes §9's load-bearing gap.** On first boot it maps `New \| PendingVerify → Valid` and logs *"rollback cancelled"*, and its comment says it is correct **whether or not the bootloader was built with auto-rollback** — which is exactly smol's situation. **You no longer have to derive app-side rollback from scratch; you have a reference to diff against.** |
+| `src/net/mqtt_ha.rs` → `check_ota_announce` + `docs/ota-deploy.md` | the retained-announce + **strictly-greater build-id monotonicity gate** that stops a still-retained announce re-trigger-looping — the same hazard smol handles with `staged.build > running` |
+
+### ⚠️ What the prior art actually buys — and the sharper thing it hands us
+
+I agree with the credit, with one correction of emphasis. **The strongest reading is not "de-risked."**
+It is: **this API bricked a board on real hardware, the root cause is written down, and it is the same
+failure family smol already has an issue for.** That is *better* than reassurance — it is a test case.
+
+`esp32c6-watch` **#55 (CRITICAL)**, *"OTA never writes the running slot"*: the root cause of an
+*"eldritch-lantern boot-loop brick"* was that slot selection trusted `Ota::current_app_partition` —
+**otadata is a boot REQUEST, not a boot FACT.** Stale otadata (a cable flash never rewrote it) made
+*"the other slot"* resolve to **the partition the CPU was executing from**; a retained announce then
+zero-touch triggered a self-overwrite, chunk-erasing the live image until it erased in-use WiFi rodata
+and died mid read-modify-write → *"No bootable app partitions"*, on every re-flash. **The fix: derive
+the running slot from the MMU, not from otadata.**
+
+**smol has the same family already: [#226](https://github.com/jphein/smol/issues/226) — *"blank otadata
+→ OTA targets the RUNNING slot (self-overwrite); add first-boot otadata init"*, closed 2026-07-20.** Two
+chips, two codebases, one mechanism. So:
+
+- ✅ **`esp-storage 0.9` + `esp-bootloader-esp-idf 0.5` move from "unknown behaviour" to "known-good
+  **after a known critical fix**"** — a more useful phrasing than "proven", because it names what to
+  check.
+- ✅ **§9's app-side-rollback gap is closed by reading, not building.**
+- ➕ **A mandatory new test falls out of it** — §6 gains the self-overwrite check.
+- ❌ **The blocker is not retired.** Different chip (C6 bootloader quirks, a different partition table —
+  their brick involved a *"pre-#50 4 MB layout"*), different codebase, and **smol's leaf mesh-OTA relay
+  over ESP-NOW has no counterpart in the watch at all** — confirmed by grep, nothing in its `src/`
+  implements a relay. **That half is exactly as unverified as it was.**
+
+**Net effect on this plan: P1's risk drops materially; P2's does not move at all.** The risk table in §0
+is re-marked accordingly.
 
 ## 1. Preconditions
 
@@ -163,6 +212,12 @@ Explicit checks, none of which Phases B/C cover implicitly:
 - [ ] **App-side self-rollback still fires.** This is the one that matters if anything else is wrong,
       and it is the hardest to test without deliberately staging a bad image.
       ⚠️ **See §9 — I cannot specify this step honestly without reading firmware I would have to build.**
+- [ ] 🔴 **Self-overwrite / running-slot check — added because the prior art bricked on it (§0b).**
+      Confirm the branch derives the running slot from a boot **fact**, not from otadata (a boot
+      *request*). Test with **deliberately stale otadata**: OTA a board, then USB-flash it *without*
+      `erase-region`, then OTA again — the very sequence that bricked the watch. It must target the
+      genuinely-inactive slot or refuse. **A failure here is a brick, not a failed download**, which is
+      why it belongs above the alignment check and not below it.
 - [ ] **Flash-write alignment.** smol has been bitten before by raw flash writes needing a
       multiple-of-4 length (silent `NotAligned`, record never persists). A changed `esp-storage` write
       API is exactly where that class returns. Verify-after-write is the guard.
@@ -222,11 +277,12 @@ stop rule is stated before the procedure rather than after it.
 
 Stated as findings rather than hedged, per the brief:
 
-- **App-side self-rollback (§6) is not specifiable from documentation.** I know it is the primary
-  brick-defense and that the bootloader will not do it, but *how to deliberately trigger it* — what
-  makes the app decide it is unhealthy, and over what window — requires reading `ota.rs`'s
-  `boot_confirm` path on the branch. **This is the most important untestable-from-here step**, and it
-  should be specified by whoever can read that code before Phase D is attempted.
+- ~~**App-side self-rollback is not specifiable from documentation.**~~ ✅ **CLOSED by the prior art
+  (§0b).** `esp32c6-watch`'s `ota_http.rs` implements the reference on the same crates: stage as
+  `OtaImageState::New`, and on first boot map `New | PendingVerify → Valid` ("rollback cancelled"),
+  explicitly *"correct whether or not the bootloader was built with auto-rollback."* **Diff the
+  branch's `boot_confirm` against that** rather than deriving it. Still worth reading the branch's own
+  `ota.rs` to confirm it agrees — but this is now a comparison, not an invention.
 - **Whether espflash v4 accepts branch (esp-hal 1.1) images** — untested. Affects only recovery
   convenience, but you find out during a recovery, which is the worst time.
 - **The otadata `erase-region` trap is undocumented.** It is in nobody's `docs/`; it survives in

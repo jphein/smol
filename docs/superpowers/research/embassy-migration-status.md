@@ -247,6 +247,36 @@ three facts stacked badly; **two have since resolved, and the remaining one is t
    API port, **not** that otadata behaves. The OTA path is being rewritten *and* its dependencies are
    moving *and* its verification is missing. Two of those three are fine; the third is the gap.
 
+### 🔑 There is a living reference for the whole stack — the unknowns are C3-and-mesh-shaped
+
+`~/Projects/esp32c6-watch` **already runs this stack in the field**: `esp-rtos 0.3.0`, `esp-radio 0.18`,
+`esp-hal ~1.1`, `embassy-executor 0.10.0`, `esp-storage 0.9.0`, `esp-bootloader-esp-idf 0.5.0` — the
+branch's set, on JP's own hardware. (Read-only for smol; its remote is **wakizashi only**.)
+
+**That reframes the risk.** The open questions are **not** *"does Embassy work on this stack"* — a
+shipping smartwatch answers that. They are:
+
+1. **C3-shaped** — different bootloader quirks and a different partition table from the C6.
+2. **Mesh-shaped** — the watch has **no ESP-NOW OTA relay**, no crown election to port, no fleet to
+   keep alive during a burst. Everything smol-specific is exactly the part with no reference.
+
+So every Embassy *pattern* smol needs has been solved once next door, and every smol *mesh* behaviour has
+not. Budget accordingly: the framework risk is much lower than a from-scratch re-platform, the
+integration risk is unchanged. Details and the concrete reading list are in
+[plans/embassy-ota-verification.md](../plans/embassy-ota-verification.md) §0b — including the **critical
+brick** the watch hit on this very API, which smol has an issue for already (#226).
+
+### Open question — are the watches already on the mesh?
+
+**The watches speak SMOLv1**, so they are candidate mesh *peers*, not merely a reference codebase. Two
+unexplained ids are in play, and there is a mechanism that makes the connection plausible rather than
+speculative: the watch treats **`node_id == 42` as a sentinel meaning "derive the id from the MAC"**
+(`src/main.rs:1131`). So a watch in the field reports **whatever its MAC derives to** — which makes an
+unattributed roster entry like **id122 (*Celestial Crown*)** a plausible watch rather than a rig board,
+and `id42` a watch that never got configured. **Unresolved — do not assume either way**; settle it by
+matching the roster MAC against the watches. Flagged because a mesh peer nobody has accounted for is a
+variable in every mesh measurement taken from now on.
+
 ### What "half-migrated" looks like
 Better than feared, because of the yielding superloop (§2): the app/plugin layer is shared, so a
 half-migrated tree is not two firmwares. But **the fleet cannot be half-migrated across boards**: the
