@@ -73,13 +73,19 @@ SIZE="$(stat -c%s "$WORK/a.bin")"; SHA="$(sha256sum "$WORK/a.bin" | cut -d' ' -f
 #   MEASURED on a real 1,435,008 B image (`strings` = 86,363 B = 1.32x the 64 KB pipe
 #   buffer), 20 runs each: OLD form DETECTED 0 / MISSED 20. NEW form DETECTED 20 /
 #   MISSED 0. Deterministic, not flaky.
-#   POSITION MAKES IT WORSE BUT IS NOT A SAFE HARBOUR — that model was refuted too.
-#   Here the first match sat at line 23, so grep exited with ~86 KB still to push and the
-#   miss was 20/20. But measured separately: a LAST-LINE match at 266 KB still fails
-#   2-3.5% (ugrep 14/400, GNU 8/400), and a ~3.9 KB input fails 3/1500. It is also not
-#   tool-specific — GNU grep 3.11 and ugrep 7.5.0 behave identically, so it generalises to
-#   CI and every other host. `grep -q` reading a FILE is 0/2000: the pipeline is the
-#   defect, not grep.
+#   THE VARIABLE IS BYTES REMAINING AFTER THE MATCH — not size, and not position. Two
+#   earlier models (a flat ~0.2% flake; "safe below 64 KB or if the match is late") were
+#   both refuted; this is the third and the only one that predicts every datapoint. EPIPE
+#   occurs iff the writer still has unwritten bytes when grep -q exits, the rate scales
+#   with the residual, and it becomes certain past the pipe buffer. Measured at 263 KB,
+#   300 iterations each: residual 0 bytes -> 0/300 both tools; residual SIXTEEN BYTES ->
+#   ugrep 1/300, GNU grep 3.11 9/300. Here the first match sat at line 23 with ~86 KB
+#   still to push, hence 20/20.
+#   So "the match is at the end" is the most dangerous-looking exemption: almost true, and
+#   false the moment anything appends. And GNU flaked 9x more than ugrep at identical
+#   residual — existence is implementation-independent, RATE is not, so a site that
+#   measures clean here can be worse on a CI runner. `grep -q` reading a FILE is 0/2000:
+#   the pipeline is the defect, not grep.
 #   SO THE RULE IS ABSOLUTE, NOT SIZED: never decide on `cmd | grep -q` status under
 #   pipefail, at any size or match position. An earlier note here called this merely a
 #   LATENT hazard because one test showed the old form detecting correctly — that image's
