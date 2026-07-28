@@ -1301,7 +1301,7 @@ const fn discovery_topic_max() -> usize {
     // DIAG family (#309): the component and the object_id both vary per row.
     let mut i = 0;
     while i < DIAG_DISCOVERY.len() {
-        let (_key, obj, _uid, _name, comp, _extra) = DIAG_DISCOVERY[i];
+        let (_key, obj, _uid, comp, _extra) = DIAG_DISCOVERY[i];
         // "homeassistant/" + comp + "/smol" + <3-digit id> + "/" + obj + "/config"
         let t = 14 + comp.len() + 5 + 3 + 1 + obj.len() + 7;
         if t > worst {
@@ -1378,9 +1378,8 @@ const _: () = assert!(
 /// `|apch=` (a real harness bug that read free heap as a channel — `mode.rs:3316`).
 ///
 /// **The names are NOT new — they are the ones the YAML already published,** and that is the whole
-/// migration. `object_id` reproduces the entity_id HA derived from the YAML's `name:` (`smol 7 heap
-/// free` → `sensor.smol_7_heap_free`) and `unique_id` reproduces the YAML's `unique_id`
-/// (`smol_7_heap_free_mirror`), so a board that had hand-written entities keeps the SAME entity_ids,
+/// migration. The entity NAME reproduces the YAML's `name:` verbatim (`smol 7 heap free`), so HA slugs
+/// out the same `sensor.smol_7_heap_free`, and `unique_id` reproduces the YAML's `unique_id`
 /// the SAME registry rows and therefore its recorder history, while a board that never had any gets
 /// them for the first time. Two things depend on this and would otherwise break silently:
 ///   * `ha/dashboard/build_control_room.py` probes `sensor.smol_<id>_heap_free` / `_uptime` /
@@ -1389,7 +1388,8 @@ const _: () = assert!(
 ///   * the cross-node consumers in `smol_mesh.yaml` (`smol_ota_rollback_alert`,
 ///     `binary_sensor.smol_<id>_config_drift`) reference those entity_ids by hand.
 ///
-/// So the third column is a CONTRACT with HA's registry, not a label. Changing it renames entities.
+/// So the object_id stem is a CONTRACT with HA's registry, not a label — it is what the entity NAME
+/// is built from, and renaming it renames entities.
 ///
 /// **Deliberately NOT here:**
 ///   * `ap=` — its YAML family splits `ch:rssi:bssid` into a state plus `json_attributes`, and
@@ -1405,73 +1405,84 @@ const _: () = assert!(
 ///
 /// Composite values (`led`, `cdeaf`, `brst`) are published verbatim as strings, as the YAML did.
 ///
-/// **No `entity_category`.** It belongs on diagnostics, but the `uplink` config learned the hard way
-/// that touching this family's keys re-derives entity_ids (HA's registry is sticky) — the doubled
-/// `sensor.smol_<id>_dominion_smol_<id>` bug. `has_entity_name` + `object_id` are what keep the ids
-/// clean, so this stays byte-identical in shape to the configs that already work.
+/// **`object_id` does NOT pin the entity_id, and no config here relies on it.** The first version of
+/// this table did, on the strength of the `#12`/`uplink` comments claiming `has_entity_name` +
+/// `object_id` "kill the doubling". That is FOLKLORE, and it shipped a broken feature: HA ignores
+/// `object_id` and prefixes the DEVICE NAME, so ids 50/51/122 came out as
+/// `sensor.smol_50_mystic_chalice_heap_free` and the dashboard probe for `sensor.smol_50_heap_free`
+/// went on missing them. The clean legacy ids that comment points to survived by registry STICKINESS,
+/// not by `object_id` — visible fleet-wide, where only id8 is clean and every other node carries an
+/// old bare-noun device name (`smol_5_aegis_temp`, `smol_51_sigil_temp`, `smol_122_crown_temp`,
+/// `smol_236_herald_temp`, `smol_50_ember_temp`). See the call site for the measurement that settled
+/// it, and note the corollary: the telemetry family still has this bug for any NEW id.
 ///
-/// Columns: `(diag_key, object_id_stem, unique_id_stem, name, component, extra_json)`. The two stems
-/// are carried separately because the YAML's own two did not always agree — `button count` is
-/// `sensor.smol_7_button_count` with unique_id `smol_7_btn_count_mirror`.
+/// **No `entity_category`** either — it belongs on diagnostics, but it is one more field whose effect
+/// on entity_id derivation nobody here has measured, and the cost of being wrong is a renamed entity.
+///
+/// Columns: `(diag_key, object_id_stem, unique_id_stem, component, extra_json)`. There is no `name`
+/// column: the name is DERIVED from the stem ('_' -> ' ') so the two cannot drift, which is the
+/// property that makes `entity_id == smol_<id>_<stem>` true by construction rather than by review.
+/// The two stems are carried separately because the YAML's own two did not always agree — `button
+/// count` is `sensor.smol_7_button_count` with unique_id `smol_7_btn_count_mirror`.
 #[cfg(feature = "wifi")]
 #[rustfmt::skip]
-const DIAG_DISCOVERY: &[(&str, &str, &str, &str, &str, &str)] = &[
+const DIAG_DISCOVERY: &[(&str, &str, &str, &str, &str)] = &[
     // ── boot / image identity ─────────────────────────────────────────────────────────────────
     // `slot` and `rst` stay PLAIN STRING sensors on purpose: the C6 watches publish `slot=ota_0`
     // and `rst=unknown`, so a numeric device_class here would make those two devices' records
     // unreadable rather than merely different. The YAML mapped `0`/`1` → `ota_0`/`ota_1` and
     // anything else → the string `unknown`; the raw token is published instead, which is honest
     // for BOTH producers and is what `smol_ota_rollback_alert` already compares against.
-    ("slot",     "boot_slot",           "boot_slot_mirror",           "Boot slot",         "sensor", ""),
-    ("rst",      "reset_reason",        "reset_reason_mirror",        "Reset reason",      "sensor", ""),
-    ("ota",      "ota_outcome",         "ota_outcome_mirror",         "OTA outcome",       "sensor", ""),
-    ("boot",     "boot_count",          "boot_count_mirror",          "Boot count",        "sensor", ",\"state_class\":\"total_increasing\""),
-    ("blrev",    "bl_revert",           "bl_revert_mirror",           "Bootloader revert", "sensor", ""),
-    ("brk",      "broker_state",        "broker_state_mirror",        "Broker state",      "sensor", ""),
-    ("otah",     "ota_host_state",      "ota_host_state_mirror",      "OTA host state",    "sensor", ""),
-    ("vok",      "verify_ok",           "verify_ok_mirror",           "Verify ok",         "sensor", ",\"state_class\":\"total_increasing\""),
-    ("vfl",      "verify_fail",         "verify_fail_mirror",         "Verify fail",       "sensor", ",\"state_class\":\"total_increasing\""),
+    ("slot",      "boot_slot",             "boot_slot_mirror",            "sensor", ""),
+    ("rst",       "reset_reason",          "reset_reason_mirror",         "sensor", ""),
+    ("ota",       "ota_outcome",           "ota_outcome_mirror",          "sensor", ""),
+    ("boot",      "boot_count",            "boot_count_mirror",           "sensor", ",\"state_class\":\"total_increasing\""),
+    ("blrev",     "bl_revert",             "bl_revert_mirror",            "sensor", ""),
+    ("brk",       "broker_state",          "broker_state_mirror",         "sensor", ""),
+    ("otah",      "ota_host_state",        "ota_host_state_mirror",       "sensor", ""),
+    ("vok",       "verify_ok",             "verify_ok_mirror",            "sensor", ",\"state_class\":\"total_increasing\""),
+    ("vfl",       "verify_fail",           "verify_fail_mirror",          "sensor", ",\"state_class\":\"total_increasing\""),
     // ── resources ─────────────────────────────────────────────────────────────────────────────
-    ("up",       "uptime",              "uptime_mirror",              "Uptime",            "sensor", ",\"unit_of_measurement\":\"s\",\"device_class\":\"duration\",\"state_class\":\"measurement\""),
-    ("heap",     "heap_free",           "heap_free_mirror",           "Heap free",         "sensor", ",\"unit_of_measurement\":\"B\",\"device_class\":\"data_size\",\"state_class\":\"measurement\""),
-    ("hmin",     "heap_min",            "heap_min_mirror",            "Heap min",          "sensor", ",\"unit_of_measurement\":\"B\",\"device_class\":\"data_size\",\"state_class\":\"measurement\""),
+    ("up",        "uptime",                "uptime_mirror",               "sensor", ",\"unit_of_measurement\":\"s\",\"device_class\":\"duration\",\"state_class\":\"measurement\""),
+    ("heap",      "heap_free",             "heap_free_mirror",            "sensor", ",\"unit_of_measurement\":\"B\",\"device_class\":\"data_size\",\"state_class\":\"measurement\""),
+    ("hmin",      "heap_min",              "heap_min_mirror",             "sensor", ",\"unit_of_measurement\":\"B\",\"device_class\":\"data_size\",\"state_class\":\"measurement\""),
     // ── mesh link quality ─────────────────────────────────────────────────────────────────────
-    ("loss",     "mesh_loss",           "mesh_loss_mirror",           "Mesh loss",         "sensor", ",\"unit_of_measurement\":\"%\",\"state_class\":\"measurement\""),
-    ("rtt",      "mesh_rtt",            "mesh_rtt_mirror",            "Mesh RTT",          "sensor", ",\"unit_of_measurement\":\"ms\",\"state_class\":\"measurement\""),
-    ("rx",       "mesh_rx",             "mesh_rx_mirror",             "Mesh RX",           "sensor", ",\"state_class\":\"total_increasing\""),
-    ("tx",       "mesh_tx",             "mesh_tx_mirror",             "Mesh TX",           "sensor", ",\"state_class\":\"total_increasing\""),
-    ("etx",      "link_cost",           "link_cost_mirror",           "Worst link cost",   "sensor", ",\"state_class\":\"measurement\""),
+    ("loss",      "mesh_loss",             "mesh_loss_mirror",            "sensor", ",\"unit_of_measurement\":\"%\",\"state_class\":\"measurement\""),
+    ("rtt",       "mesh_rtt",              "mesh_rtt_mirror",             "sensor", ",\"unit_of_measurement\":\"ms\",\"state_class\":\"measurement\""),
+    ("rx",        "mesh_rx",               "mesh_rx_mirror",              "sensor", ",\"state_class\":\"total_increasing\""),
+    ("tx",        "mesh_tx",               "mesh_tx_mirror",              "sensor", ",\"state_class\":\"total_increasing\""),
+    ("etx",       "link_cost",             "link_cost_mirror",            "sensor", ",\"state_class\":\"measurement\""),
     // ── flood / relay counters. `fwd` is the C0 all-hear invariant: it must read 0 fleet-wide, ──
     //    which is exactly the kind of check nobody could run before because it had no entity.
-    ("fwd",      "mesh_fwd",            "mesh_fwd_mirror",            "Uplink forwards",   "sensor", ",\"state_class\":\"total_increasing\""),
-    ("dfwd",     "mesh_dfwd",           "mesh_dfwd_mirror",           "Downlink refloods", "sensor", ",\"state_class\":\"total_increasing\""),
-    ("dedup",    "mesh_dedup",          "mesh_dedup_mirror",          "Duplicate drops",   "sensor", ",\"state_class\":\"total_increasing\""),
-    ("ttl",      "mesh_ttl",            "mesh_ttl_mirror",            "TTL drops",         "sensor", ",\"state_class\":\"total_increasing\""),
-    ("hop",      "mesh_hop",            "mesh_hop_mirror",            "Origin hop",        "sensor", ""),
-    ("dlseq",    "downlink_seq",        "downlink_seq_mirror",        "Downlink seq",      "sensor", ""),
+    ("fwd",       "mesh_fwd",              "mesh_fwd_mirror",             "sensor", ",\"state_class\":\"total_increasing\""),
+    ("dfwd",      "mesh_dfwd",             "mesh_dfwd_mirror",            "sensor", ",\"state_class\":\"total_increasing\""),
+    ("dedup",     "mesh_dedup",            "mesh_dedup_mirror",           "sensor", ",\"state_class\":\"total_increasing\""),
+    ("ttl",       "mesh_ttl",              "mesh_ttl_mirror",             "sensor", ",\"state_class\":\"total_increasing\""),
+    ("hop",       "mesh_hop",              "mesh_hop_mirror",             "sensor", ""),
+    ("dlseq",     "downlink_seq",          "downlink_seq_mirror",         "sensor", ""),
     // ── coexist / channel: the evidence behind a PROVEN OTA blocker, and none of it had an ─────
     //    entity before, on any board. `ap=` is deliberately absent — see the doc comment.
-    ("apch",     "ap_channel_believed", "ap_channel_believed_mirror", "AP channel believed", "sensor", ""),
-    ("cc",       "co_channel",          "co_channel_mirror",          "Co-channel",        "binary_sensor", ",\"payload_on\":\"1\",\"payload_off\":\"0\""),
-    ("degraded", "coexist_degraded",    "coexist_degraded_mirror",    "Coexist degraded",  "binary_sensor", ",\"payload_on\":\"1\",\"payload_off\":\"0\",\"device_class\":\"problem\""),
-    ("cdeaf",    "crown_deaf",          "crown_deaf_mirror",          "Crown deaf",        "sensor", ""),
-    ("brst",     "burst_freeze_peak",   "burst_freeze_peak_mirror",   "Burst freeze peak", "sensor", ""),
+    ("apch",      "ap_channel_believed",   "ap_channel_believed_mirror",  "sensor", ""),
+    ("cc",        "co_channel",            "co_channel_mirror",           "binary_sensor", ",\"payload_on\":\"1\",\"payload_off\":\"0\""),
+    ("degraded",  "coexist_degraded",      "coexist_degraded_mirror",     "binary_sensor", ",\"payload_on\":\"1\",\"payload_off\":\"0\",\"device_class\":\"problem\""),
+    ("cdeaf",     "crown_deaf",            "crown_deaf_mirror",           "sensor", ""),
+    ("brst",      "burst_freeze_peak",     "burst_freeze_peak_mirror",    "sensor", ""),
     // ── node state ────────────────────────────────────────────────────────────────────────────
-    ("led",      "led_state",           "led_state_mirror",           "LED state",         "sensor", ""),
-    ("tage",     "time_sync_age",       "time_sync_age_mirror",       "Time sync age",     "sensor", ",\"unit_of_measurement\":\"s\",\"device_class\":\"duration\",\"state_class\":\"measurement\""),
-    ("tsrc",     "time_source",         "time_source_mirror",         "Time source",       "sensor", ""),
-    ("net",      "network",             "network_mirror",             "Network",           "sensor", ""),
-    ("btn",      "button_count",        "btn_count_mirror",           "Button count",      "sensor", ",\"state_class\":\"total_increasing\""),
-    ("btnl",     "long_press_count",    "btnl_count_mirror",          "Long press count",  "sensor", ",\"state_class\":\"total_increasing\""),
-    ("fok",      "flush_ok",            "flush_ok_mirror",            "Flush ok",          "sensor", ",\"state_class\":\"total_increasing\""),
-    ("ffl",      "flush_fail",          "flush_fail_mirror",          "Flush fail",        "sensor", ",\"state_class\":\"total_increasing\""),
-    ("cfg",      "config_applied",      "cfg_applied_mirror",         "Config applied",    "sensor", ""),
+    ("led",       "led_state",             "led_state_mirror",            "sensor", ""),
+    ("tage",      "time_sync_age",         "time_sync_age_mirror",        "sensor", ",\"unit_of_measurement\":\"s\",\"device_class\":\"duration\",\"state_class\":\"measurement\""),
+    ("tsrc",      "time_source",           "time_source_mirror",          "sensor", ""),
+    ("net",       "network",               "network_mirror",              "sensor", ""),
+    ("btn",       "button_count",          "btn_count_mirror",            "sensor", ",\"state_class\":\"total_increasing\""),
+    ("btnl",      "long_press_count",      "btnl_count_mirror",           "sensor", ",\"state_class\":\"total_increasing\""),
+    ("fok",       "flush_ok",              "flush_ok_mirror",             "sensor", ",\"state_class\":\"total_increasing\""),
+    ("ffl",       "flush_fail",            "flush_fail_mirror",           "sensor", ",\"state_class\":\"total_increasing\""),
+    ("cfg",       "config_applied",        "cfg_applied_mirror",          "sensor", ""),
     // ── record integrity: how much of the record did NOT survive the wire. A leaf's DIAG is cut ─
     //    at 232 B and these two are the only way to see it from the dashboard. Absence is
     //    AMBIGUOUS here (nothing cut/shed, or the marker itself was cut), which is exactly why
     //    they render `unknown` rather than `0` like everything else.
-    ("cut",      "diag_cut",            "diag_cut_mirror",            "DIAG bytes cut",    "sensor", ",\"unit_of_measurement\":\"B\""),
-    ("shed",     "diag_shed",           "diag_shed_mirror",           "DIAG fields shed",  "sensor", ""),
+    ("cut",       "diag_cut",              "diag_cut_mirror",             "sensor", ",\"unit_of_measurement\":\"B\""),
+    ("shed",      "diag_shed",             "diag_shed_mirror",            "sensor", ""),
 ];
 
 /// #309: how many DIAG fields get a config per flush, and where the rotation is.
@@ -1500,7 +1511,7 @@ static mut DIAG_DISCOVERY_CURSOR: usize = 0;
 /// Note what is NOT in it: no `model`, no `manufacturer`, no `sw_version`, no device `name`. Those
 /// ride the telemetry configs once and HA merges them by `identifiers` — see the call site.
 #[cfg(feature = "wifi")]
-const DIAG_DISCOVERY_SCAFFOLD: usize = 253;
+const DIAG_DISCOVERY_SCAFFOLD: usize = 181;
 
 /// #309: the widest PAYLOAD any row of [`DIAG_DISCOVERY`] can produce, asserted against the SHARED
 /// [`DISCOVERY_BUDGET`]. Unlike the DIAG record's own length this really is a compile-time value:
@@ -1522,15 +1533,11 @@ const fn diag_discovery_worst_payload() -> usize {
     let mut worst = 0;
     let mut i = 0;
     while i < DIAG_DISCOVERY.len() {
-        let (key, obj, uid, name, _comp, extra) = DIAG_DISCOVERY[i];
-        // The id is substituted 4× (unique_id, object_id, state_topic, identifiers) at 3 digits max.
-        let payload = DIAG_DISCOVERY_SCAFFOLD
-            + 4 * 3
-            + uid.len()
-            + obj.len()
-            + name.len()
-            + key.len()
-            + extra.len();
+        let (key, obj, uid, _comp, extra) = DIAG_DISCOVERY[i];
+        // The id is substituted 3× (unique_id, name, state_topic) at 3 digits max. `obj` appears once,
+        // as the DERIVED entity name ('_' -> ' ', so the same length).
+        let payload =
+            DIAG_DISCOVERY_SCAFFOLD + 3 * 3 + uid.len() + obj.len() + key.len() + extra.len();
         if payload > worst {
             worst = payload;
         }
@@ -3093,7 +3100,7 @@ fn mqtt_session(
         if n_ids > 0 {
             let cursor = unsafe { DIAG_DISCOVERY_CURSOR };
             'rotate: for step in 0..DIAG_DISCOVERY_PER_FLUSH {
-                let (key, obj, uid, name, comp, extra) =
+                let (key, obj, uid, comp, extra) =
                     DIAG_DISCOVERY[(cursor + step) % DIAG_DISCOVERY.len()];
                 for &id in &ids[..n_ids] {
                     if Instant::now() > deadline {
@@ -3109,20 +3116,37 @@ fn mqtt_session(
                     // on a field boundary, so a field that survives is always whole — a partial value
                     // cannot reach this template, which is what makes the by-key parse safe.
                     //
-                    // The device block carries `identifiers` and NOTHING ELSE — the whole of
-                    // `f63dbea`'s lesson, applied before it could bite here. HA merges device blocks
-                    // across every config sharing `identifiers`, so `name`/`model`/`manufacturer`/
-                    // `sw_version` need to arrive on exactly ONE of a node's configs; the telemetry
-                    // configs already carry them. Repeating the sigil across 39 more configs would
-                    // have spent ~36 B apiece to say what HA already knows — and that is precisely
-                    // how the telemetry configs put 29 of the 256 ids over the 512 B line, where
-                    // `encode_publish` returns `None` and the board is SILENTLY absent from HA.
-                    // It also means these configs assert nothing about the hardware, so they cannot
-                    // misreport the two C6 watches that publish into this same topic shape.
+                    // ⚠️ NO `device` BLOCK, NO `object_id`, NO `has_entity_name` — and every one of
+                    // those omissions is load-bearing. MEASURED on the live broker (throwaway id254,
+                    // four variants, cleaned up afterwards), because the first shipped version of this
+                    // got it wrong on exactly this point:
+                    //
+                    //   has_entity_name + object_id + device  -> sensor.smol_254_<devicename>_probe_a
+                    //   full name + object_id + device        -> sensor.smol_254_<devicename>_smol_254_probe_b
+                    //   full name, no object_id, device       -> same doubling
+                    //   full name, NO DEVICE BLOCK            -> sensor.smol_254_probe_d   ✅
+                    //
+                    // **HA ignores `object_id` and prefixes the DEVICE NAME into the entity_id.** The
+                    // retained JSON was read back off the broker to prove `object_id` was present and
+                    // well-formed, so this is HA's behaviour, not our serialisation. Attaching a device
+                    // therefore COSTS the entity_id, and the entity_id is the whole contract: the
+                    // dashboard probes `sensor.smol_<id>_heap_free` and the registry rows these must
+                    // reclaim are keyed to it. Grouping under the device card is not worth that — and
+                    // it is no regression, because the hand-written YAML entities this replaces were
+                    // never device-grouped either. The device/fleet manifest still comes from the
+                    // telemetry configs, so 439fb95 is untouched.
+                    //
+                    // The name is DERIVED from `obj` by mapping '_' -> ' ', so the entity_id HA slugs
+                    // back out of it is `smol_<id>_<obj>` BY CONSTRUCTION. That is why there is no
+                    // `name` column to disagree with the object_id stem.
+                    let _ = write!(json, "{{\"unique_id\":\"smol_{}_{}\",\"name\":\"smol {} ", id, uid, id);
+                    for &b in obj.as_bytes() {
+                        let _ = json.write_char(if b == b'_' { ' ' } else { b as char });
+                    }
                     let _ = write!(
                         json,
-                        "{{\"unique_id\":\"smol_{}_{}\",\"object_id\":\"smol_{}_{}\",\"has_entity_name\":true,\"name\":\"{}\",\"state_topic\":\"smol/{}/diag\",\"value_template\":\"{{% set p=value.split('|{}=') %}}{{{{ p[1].split('|')[0] if p|length>1 else None }}}}\"{},\"expire_after\":900,\"device\":{{\"identifiers\":[\"smol{}\"]}}}}",
-                        id, uid, id, obj, name, id, key, extra, id
+                        "\",\"state_topic\":\"smol/{}/diag\",\"value_template\":\"{{% set p=value.split('|{}=') %}}{{{{ p[1].split('|')[0] if p|length>1 else None }}}}\"{},\"expire_after\":900}}",
+                        id, key, extra
                     );
                     // Fail closed. A truncated build is still a perfectly sendable packet, and HA
                     // would reject the malformed JSON for good; skipping lets the rotation retry it.
