@@ -3308,23 +3308,6 @@ impl RadioManager {
         // Reset here because here IS the publish: every board reaches this once per DIAG (a leaf via
         // the mesh broadcast, a gateway via the MQTT flush), so the next record carries the next
         // window's peak instead of a running maximum that can only ever grow.
-        // #217 OFF-CHANNEL VISIBILITY: the AP channel this board's coexist logic BELIEVES it is on,
-        // `0` = unknown / not yet scanned (matching the `my_ap_channel: 0` convention at init).
-        // Always present, so a harness can read it unconditionally and `0` is an unambiguous
-        // "no answer yet" rather than a missing field.
-        //
-        // Named `apch=`, NOT `ap=`: an unanchored grep for `ap=` matches the tail of `heap=42040`,
-        // which is exactly how `tools/ota_verify.sh` came to compare free heap against channel 6 and
-        // tell the operator to re-channel a live AP. A field name that cannot be a substring of
-        // another field's name costs nothing and removes the whole class.
-        //
-        // It is NOT redundant with the existing `ap=<ch>:<rssi>:<bssid>` field, and the difference is
-        // the interesting part: `ap=` is what the HAL reports for the LIVE association (and is absent
-        // when unassociated), while this is what the coexist logic BELIEVES after its last scan — the
-        // value the off-channel decision is actually made from. If the two ever disagree, that
-        // disagreement is the bug, and off-channel is a PROVEN OTA blocker here (co-channel moved
-        // 48 KB, off-channel moved 0). Publishing both makes the contradiction visible.
-        rec.push_str(&alloc::format!("|apch={}", self.my_ap_channel));
         // #153: the bootloader's measured auto-revert capability — `on` closes a gate the ROADMAP
         // has carried as UNPROVEN since July, `off` confirms the app-side net is the only one. Omitted
         // when never observed (no OTA boot this power-on session), so the string stays byte-identical

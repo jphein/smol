@@ -29,7 +29,12 @@
 #       slot=<0|1> · rst=<panic|power-on|sw|deep-sleep|brownout|wdt|usb-jtag|glitch|other|unk>
 #       ota=<none|confirmed|rolled-back>   ← `rolled-back` is the firmware's EXPLICIT revert
 #       signal; prefer it over inferring a revert from a build number that moved.
-#     There is NO `ap=` field — the crown's AP channel is not published anywhere in MQTT.
+#     `ap=<channel>` is CONDITIONAL — appended last and only once known (same precedent as
+#     `brst=`/`io=`), so it is present on an associated crown and ABSENT on a leaf that has not
+#     associated. That conditionality is what hid the bug below: `tail -1` grabbed the real
+#     `ap=6` on the crown and the tail of `heap=` on every leaf, so the check was right on one
+#     board and silently wrong on the rest. A field that is sometimes absent is more dangerous
+#     than one that never exists — it buys the broken code an alibi.
 #   * DEATH-POINT — offset frozen >30s with done<total = the transfer died AT that byte.
 #   * OFF-CHANNEL — the coexist disease is a CHANNEL MISMATCH: crown AP ch != ESP-NOW mesh ch
 #     stalls the WiFi fetch (proven: co-channel moved 48KB, off-channel moved 0).
@@ -87,8 +92,9 @@ while :; do
   # `heap=42040` (he|ap=…), so this read FREE HEAP and compared it to the mesh channel — a
   # guaranteed mismatch that fired a false OFF-CHANNEL on every run and, being first in the
   # ladder, MASKED every other verdict (incl. the correct DEATH-POINT). It also told the
-  # operator to re-channel a live AP. DIAG publishes no ap= field at all today (mode.rs:3208),
-  # so the anchored read is empty and the check correctly self-disables.
+  # operator to re-channel a live AP. `ap=` is real but CONDITIONAL (appended only once known),
+  # so the old read worked on an associated crown and silently read heap on every leaf. Anchored
+  # + range-gated: the real field is used when present, and the check self-disables when absent.
   ap_ch="$(printf '%s' "$d" | grep -oaE '(^|\|)ap=[0-9]+' | grep -oaE '[0-9]+' | tail -1)"
   valid_ch "$ap_ch"   || ap_ch=""
   valid_ch "$mesh_ch" || mesh_ch=""
