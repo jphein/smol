@@ -1219,6 +1219,17 @@ impl JsonScratch {
     fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len]
     }
+    /// #309: TRUE when the last build may have lost bytes off the end. `write_str` below drops
+    /// overflow silently and returns `Ok`, so a too-long config yields TRUNCATED JSON that is
+    /// still a perfectly sendable packet — HA then rejects it and the entity never appears,
+    /// which is the exact failure mode the 320→512 bump was made to fix (see [`MqttScratch`]).
+    /// A full buffer cannot be distinguished from an overflowed one, so both count as overflow:
+    /// every payload here is ≤ ~450 B by design, so `len == 512` only ever means "too long".
+    /// Callers must SKIP the publish — a missing config self-heals on the next flush (they are
+    /// retained + republished on a rotation), while malformed JSON is silently permanent.
+    fn overflowed(&self) -> bool {
+        self.len >= self.buf.len()
+    }
 }
 
 #[cfg(feature = "wifi")]
@@ -1254,9 +1265,52 @@ const DEVICE_EXTRAS: &str = ",\"model\":\"smol ESP32-C3\",\"manufacturer\":\"jph
 /// boots, joins, publishes telemetry, and simply has no sensors. Before the device-block was
 /// de-duplicated, 29 of the 256 possible ids were over this line: a board provisioned as id191
 /// would never have appeared in Home Assistant at all.
+/// The packet buffer in [`mqtt_session`] — the 512 B the #12 discovery work bumped it to. Named so
+/// that buffer and every bound derived from it cannot drift apart the way a copied literal can.
 #[cfg(feature = "wifi")]
-const DISCOVERY_BUDGET: usize =
-    512 - 1 - 2 - 2 - "homeassistant/sensor/smol255/voltage/config".len();
+const MQTT_PKT_CAP: usize = 512;
+
+/// #309: derived from the longest topic across **every** discovery family, not just the telemetry
+/// one. It was `512 - 5 - "…/sensor/smol255/voltage/config".len()` — a 43 B topic — which made it
+/// **16 B too generous** the moment a second family arrived with longer topics (the DIAG configs
+/// reach 59 B: `binary_sensor` is a longer component than `sensor`, and their object_ids are
+/// semantic). A budget whose derivation silently assumes one family's topic shape is exactly the
+/// guard that *looks* general and is not, so the assumption is now computed rather than written in.
+#[cfg(feature = "wifi")]
+const DISCOVERY_BUDGET: usize = MQTT_PKT_CAP - 1 - 2 - 2 - discovery_topic_max();
+
+/// The longest discovery topic this firmware can ever publish, over BOTH config families. A bound,
+/// not a sample: the telemetry fields are a fixed 3-member set and the DIAG rows are a fixed table,
+/// so the only variable is the id, at its 3-digit maximum.
+///
+/// Keeping ONE budget honest is worth more than two tight ones, and the trade is worth stating
+/// precisely rather than glossing. A family whose topics are SHORTER than this maximum is bounded
+/// more tightly than it strictly needs: the telemetry configs really do have 42 B of packet headroom
+/// (their topic is 43 B, not 59), but they are held to 26 B here. That direction is safe — the worst
+/// case is a build break that is a FALSE ALARM, and the fix is to check the family's own topic length
+/// before shortening anything. The direction this prevents is the dangerous one: a family adopting a
+/// budget derived from someone else's SHORTER topic, passing the assert, and shipping over the cliff
+/// where `encode_publish` returns `None` and HA silently never creates the entity.
+///
+/// If that ever costs a real 16 B, split it into per-family budgets that each derive from their OWN
+/// `discovery_topic_max`-style computation — but never by reusing one family's number for another.
+#[cfg(feature = "wifi")]
+const fn discovery_topic_max() -> usize {
+    // Telemetry family (#12): "homeassistant/sensor/smol<id>/<field>/config" — `voltage` is longest.
+    let mut worst = "homeassistant/sensor/smol255/voltage/config".len();
+    // DIAG family (#309): the component and the object_id both vary per row.
+    let mut i = 0;
+    while i < DIAG_DISCOVERY.len() {
+        let (_key, obj, _uid, _name, comp, _extra) = DIAG_DISCOVERY[i];
+        // "homeassistant/" + comp + "/smol" + <3-digit id> + "/" + obj + "/config"
+        let t = 14 + comp.len() + 5 + 3 + 1 + obj.len() + 7;
+        if t > worst {
+            worst = t;
+        }
+        i += 1;
+    }
+    worst
+}
 
 /// TYPE-PROVABLE worst case of the WIDEST per-node config (`voltage`: longest template AND
 /// longest `extra`). Each term is a maximum implied by a type or by the longest member of a fixed
@@ -1295,6 +1349,208 @@ const _: () = assert!(
     "the discovery config carrying DEVICE_EXTRAS no longer fits one MQTT publish — move the \
      extras to a config with a shorter template, or drop a device field."
 );
+
+/// #309: the DIAG record's fields, as HA entities — `(key, name, component, extra_json)`.
+///
+/// **Why this exists.** `ha/packages/smol_mesh.yaml` hand-wrote these entities PER NODE ID, so a
+/// board only appeared in the dashboard if somebody had typed a stanza for it. ids 50/51/122 were on
+/// the mesh with nothing drawn, while dead families for 7/9 kept rendering. A hand-maintained id list
+/// cannot know an id exists; the firmware always does. Same move `439fb95` made for the device
+/// registry — the fleet manifest becomes self-reported — extended from the device block to the fields.
+///
+/// **This costs the DIAG record ZERO bytes.** These are separate retained PUBLISHes on
+/// `homeassistant/<comp>/smol<id>/diag_<key>/config`; the record on `smol/<id>/diag` is untouched, so
+/// neither the leaf's one ESP-NOW frame (`RELAY_VALUE_MAX` = 232 B, already breached) nor the
+/// gateway's `DIAG_BUDGET` (495 B) moves by a byte. Nothing here may ever add a field to the record.
+///
+/// **Absent ⇒ UNKNOWN, never 0.** Each `value_template` renders Jinja `None` when its key is missing,
+/// which HA's MQTT platform maps to state `unknown` (`PAYLOAD_NONE`). This is load-bearing, not
+/// defensive: `blrev=`/`brst=` are absent-until-measured by design, a leaf's record is cut on a field
+/// boundary (`broadcast_diag`) so ANY tail field can vanish, the sheddable tail drops under budget
+/// pressure, and the C6 watches (a second, divergent producer — `esp32c6-watch/src/main.rs:2599`)
+/// stop at `dfwd=` and never emit `etx`/`apch`/`blrev`/`brst`/`cdeaf`/`cc`/`degraded` at all. An
+/// entity reporting `0` for "no answer yet" is a lie that looks like data.
+///
+/// **The parse is by KEY, not position.** The YAML parsed the fixed block POSITIONALLY, which is why
+/// the record's comments warn that removing a field shifts every field after it. Splitting on
+/// `|<key>=` is immune to that, and immune to the two documented substring traps: the leading `|`
+/// stops `|deaf=` matching inside `|cdeaf=`, and the trailing `=` stops `|ap=` matching inside
+/// `|apch=` (a real harness bug that read free heap as a channel — `mode.rs:3316`).
+///
+/// **The names are NOT new — they are the ones the YAML already published,** and that is the whole
+/// migration. `object_id` reproduces the entity_id HA derived from the YAML's `name:` (`smol 7 heap
+/// free` → `sensor.smol_7_heap_free`) and `unique_id` reproduces the YAML's `unique_id`
+/// (`smol_7_heap_free_mirror`), so a board that had hand-written entities keeps the SAME entity_ids,
+/// the SAME registry rows and therefore its recorder history, while a board that never had any gets
+/// them for the first time. Two things depend on this and would otherwise break silently:
+///   * `ha/dashboard/build_control_room.py` probes `sensor.smol_<id>_heap_free` / `_uptime` /
+///     `_boot_slot` to decide a card is "thin" — the exact ids above. Publishing under a fresh
+///     namespace would have left ids 50/51/122 thin and fixed nothing visible.
+///   * the cross-node consumers in `smol_mesh.yaml` (`smol_ota_rollback_alert`,
+///     `binary_sensor.smol_<id>_config_drift`) reference those entity_ids by hand.
+///
+/// So the third column is a CONTRACT with HA's registry, not a label. Changing it renames entities.
+///
+/// **Deliberately NOT here:**
+///   * `ap=` — its YAML family splits `ch:rssi:bssid` into a state plus `json_attributes`, and
+///     `sensor.smol_coexist_health` reads those attributes. A single value_template cannot reproduce
+///     them inside the packet budget, so that family STAYS hand-written. `apch=` (what coexist
+///     BELIEVES) is published instead and is the more useful of the two.
+///   * `toff=` — the YAML parses it, but **no producer has ever emitted it** (`set_diag_extra`'s own
+///     doc says "toff deferred"), so its sensor has always rendered a fabricated `0`.
+///   * `net=` IS here, unlike the first draft: it is a frozen constant (`0:ok` since #142), but its
+///     YAML family is being deleted and the rule is that nothing gets deleted without a replacement.
+///   * `deaf=`/`ddrops=` (`mesh-test` rig only) and `io=` (`io` feature only) — a config for either
+///     would strand a permanently-`unknown` entity on every production board.
+///
+/// Composite values (`led`, `cdeaf`, `brst`) are published verbatim as strings, as the YAML did.
+///
+/// **No `entity_category`.** It belongs on diagnostics, but the `uplink` config learned the hard way
+/// that touching this family's keys re-derives entity_ids (HA's registry is sticky) — the doubled
+/// `sensor.smol_<id>_dominion_smol_<id>` bug. `has_entity_name` + `object_id` are what keep the ids
+/// clean, so this stays byte-identical in shape to the configs that already work.
+///
+/// Columns: `(diag_key, object_id_stem, unique_id_stem, name, component, extra_json)`. The two stems
+/// are carried separately because the YAML's own two did not always agree — `button count` is
+/// `sensor.smol_7_button_count` with unique_id `smol_7_btn_count_mirror`.
+#[cfg(feature = "wifi")]
+#[rustfmt::skip]
+const DIAG_DISCOVERY: &[(&str, &str, &str, &str, &str, &str)] = &[
+    // ── boot / image identity ─────────────────────────────────────────────────────────────────
+    // `slot` and `rst` stay PLAIN STRING sensors on purpose: the C6 watches publish `slot=ota_0`
+    // and `rst=unknown`, so a numeric device_class here would make those two devices' records
+    // unreadable rather than merely different. The YAML mapped `0`/`1` → `ota_0`/`ota_1` and
+    // anything else → the string `unknown`; the raw token is published instead, which is honest
+    // for BOTH producers and is what `smol_ota_rollback_alert` already compares against.
+    ("slot",     "boot_slot",           "boot_slot_mirror",           "Boot slot",         "sensor", ""),
+    ("rst",      "reset_reason",        "reset_reason_mirror",        "Reset reason",      "sensor", ""),
+    ("ota",      "ota_outcome",         "ota_outcome_mirror",         "OTA outcome",       "sensor", ""),
+    ("boot",     "boot_count",          "boot_count_mirror",          "Boot count",        "sensor", ",\"state_class\":\"total_increasing\""),
+    ("blrev",    "bl_revert",           "bl_revert_mirror",           "Bootloader revert", "sensor", ""),
+    ("brk",      "broker_state",        "broker_state_mirror",        "Broker state",      "sensor", ""),
+    ("otah",     "ota_host_state",      "ota_host_state_mirror",      "OTA host state",    "sensor", ""),
+    ("vok",      "verify_ok",           "verify_ok_mirror",           "Verify ok",         "sensor", ",\"state_class\":\"total_increasing\""),
+    ("vfl",      "verify_fail",         "verify_fail_mirror",         "Verify fail",       "sensor", ",\"state_class\":\"total_increasing\""),
+    // ── resources ─────────────────────────────────────────────────────────────────────────────
+    ("up",       "uptime",              "uptime_mirror",              "Uptime",            "sensor", ",\"unit_of_measurement\":\"s\",\"device_class\":\"duration\",\"state_class\":\"measurement\""),
+    ("heap",     "heap_free",           "heap_free_mirror",           "Heap free",         "sensor", ",\"unit_of_measurement\":\"B\",\"device_class\":\"data_size\",\"state_class\":\"measurement\""),
+    ("hmin",     "heap_min",            "heap_min_mirror",            "Heap min",          "sensor", ",\"unit_of_measurement\":\"B\",\"device_class\":\"data_size\",\"state_class\":\"measurement\""),
+    // ── mesh link quality ─────────────────────────────────────────────────────────────────────
+    ("loss",     "mesh_loss",           "mesh_loss_mirror",           "Mesh loss",         "sensor", ",\"unit_of_measurement\":\"%\",\"state_class\":\"measurement\""),
+    ("rtt",      "mesh_rtt",            "mesh_rtt_mirror",            "Mesh RTT",          "sensor", ",\"unit_of_measurement\":\"ms\",\"state_class\":\"measurement\""),
+    ("rx",       "mesh_rx",             "mesh_rx_mirror",             "Mesh RX",           "sensor", ",\"state_class\":\"total_increasing\""),
+    ("tx",       "mesh_tx",             "mesh_tx_mirror",             "Mesh TX",           "sensor", ",\"state_class\":\"total_increasing\""),
+    ("etx",      "link_cost",           "link_cost_mirror",           "Worst link cost",   "sensor", ",\"state_class\":\"measurement\""),
+    // ── flood / relay counters. `fwd` is the C0 all-hear invariant: it must read 0 fleet-wide, ──
+    //    which is exactly the kind of check nobody could run before because it had no entity.
+    ("fwd",      "mesh_fwd",            "mesh_fwd_mirror",            "Uplink forwards",   "sensor", ",\"state_class\":\"total_increasing\""),
+    ("dfwd",     "mesh_dfwd",           "mesh_dfwd_mirror",           "Downlink refloods", "sensor", ",\"state_class\":\"total_increasing\""),
+    ("dedup",    "mesh_dedup",          "mesh_dedup_mirror",          "Duplicate drops",   "sensor", ",\"state_class\":\"total_increasing\""),
+    ("ttl",      "mesh_ttl",            "mesh_ttl_mirror",            "TTL drops",         "sensor", ",\"state_class\":\"total_increasing\""),
+    ("hop",      "mesh_hop",            "mesh_hop_mirror",            "Origin hop",        "sensor", ""),
+    ("dlseq",    "downlink_seq",        "downlink_seq_mirror",        "Downlink seq",      "sensor", ""),
+    // ── coexist / channel: the evidence behind a PROVEN OTA blocker, and none of it had an ─────
+    //    entity before, on any board. `ap=` is deliberately absent — see the doc comment.
+    ("apch",     "ap_channel_believed", "ap_channel_believed_mirror", "AP channel believed", "sensor", ""),
+    ("cc",       "co_channel",          "co_channel_mirror",          "Co-channel",        "binary_sensor", ",\"payload_on\":\"1\",\"payload_off\":\"0\""),
+    ("degraded", "coexist_degraded",    "coexist_degraded_mirror",    "Coexist degraded",  "binary_sensor", ",\"payload_on\":\"1\",\"payload_off\":\"0\",\"device_class\":\"problem\""),
+    ("cdeaf",    "crown_deaf",          "crown_deaf_mirror",          "Crown deaf",        "sensor", ""),
+    ("brst",     "burst_freeze_peak",   "burst_freeze_peak_mirror",   "Burst freeze peak", "sensor", ""),
+    // ── node state ────────────────────────────────────────────────────────────────────────────
+    ("led",      "led_state",           "led_state_mirror",           "LED state",         "sensor", ""),
+    ("tage",     "time_sync_age",       "time_sync_age_mirror",       "Time sync age",     "sensor", ",\"unit_of_measurement\":\"s\",\"device_class\":\"duration\",\"state_class\":\"measurement\""),
+    ("tsrc",     "time_source",         "time_source_mirror",         "Time source",       "sensor", ""),
+    ("net",      "network",             "network_mirror",             "Network",           "sensor", ""),
+    ("btn",      "button_count",        "btn_count_mirror",           "Button count",      "sensor", ",\"state_class\":\"total_increasing\""),
+    ("btnl",     "long_press_count",    "btnl_count_mirror",          "Long press count",  "sensor", ",\"state_class\":\"total_increasing\""),
+    ("fok",      "flush_ok",            "flush_ok_mirror",            "Flush ok",          "sensor", ",\"state_class\":\"total_increasing\""),
+    ("ffl",      "flush_fail",          "flush_fail_mirror",          "Flush fail",        "sensor", ",\"state_class\":\"total_increasing\""),
+    ("cfg",      "config_applied",      "cfg_applied_mirror",         "Config applied",    "sensor", ""),
+    // ── record integrity: how much of the record did NOT survive the wire. A leaf's DIAG is cut ─
+    //    at 232 B and these two are the only way to see it from the dashboard. Absence is
+    //    AMBIGUOUS here (nothing cut/shed, or the marker itself was cut), which is exactly why
+    //    they render `unknown` rather than `0` like everything else.
+    ("cut",      "diag_cut",            "diag_cut_mirror",            "DIAG bytes cut",    "sensor", ",\"unit_of_measurement\":\"B\""),
+    ("shed",     "diag_shed",           "diag_shed_mirror",           "DIAG fields shed",  "sensor", ""),
+];
+
+/// #309: how many DIAG fields get a config per flush, and where the rotation is.
+///
+/// The configs are RETAINED, so each needs publishing once per broker lifetime — but there are
+/// `DIAG_DISCOVERY.len()` of them per node and up to `1 + RELAY_CACHE_CAP` nodes, and emitting all
+/// of them in one burst would swamp a window that also carries telemetry, downlinks and OTA. So a
+/// slice goes out each flush and the cursor walks the table, covering every field in
+/// `ceil(len / PER)` flushes (~13 at the ~60 s cadence). Steady state is already populated: only a
+/// NEW node or a NEW field needs a lap, and a config skipped by the burst deadline simply lands on
+/// the next one — the rotation is self-healing, which is why nothing here needs an ack.
+#[cfg(feature = "wifi")]
+const DIAG_DISCOVERY_PER_FLUSH: usize = 3;
+
+/// #309: rotation cursor into [`DIAG_DISCOVERY`]. `.bss`, single-caller (one burst at a time), same
+/// alias-safety argument as [`MQTT_JSON`].
+#[cfg(feature = "wifi")]
+static mut DIAG_DISCOVERY_CURSOR: usize = 0;
+
+/// Bytes of the discovery-config format string that are LITERAL — every `"key":"`, quote, comma and
+/// brace, with no argument substituted. Cross-checked against all 39 rendered configs by the host
+/// harness in `scratch/309-discovery/` (it derives this number from the rendered length minus the
+/// arguments and asserts a single consistent value, so a format-string edit that changes it fails
+/// there as well as here).
+///
+/// Note what is NOT in it: no `model`, no `manufacturer`, no `sw_version`, no device `name`. Those
+/// ride the telemetry configs once and HA merges them by `identifiers` — see the call site.
+#[cfg(feature = "wifi")]
+const DIAG_DISCOVERY_SCAFFOLD: usize = 253;
+
+/// #309: the widest PAYLOAD any row of [`DIAG_DISCOVERY`] can produce, asserted against the SHARED
+/// [`DISCOVERY_BUDGET`]. Unlike the DIAG record's own length this really is a compile-time value:
+/// every part is a literal in the table, the scaffold, or a 3-digit id, so it is an exact maximum and
+/// not a realistic case — the distinction `DIAG_BUDGET` was learned from, since a *realistic* bound
+/// is exactly what lets a cliff stay reachable.
+///
+/// **There is now ONE discovery budget, and it covers both families.** This used to compute a whole
+/// packet and assert it against the 512 B buffer directly, because `DISCOVERY_BUDGET` derived its
+/// topic allowance from the telemetry family alone (`…/sensor/smol255/voltage/config`, 43 B) and was
+/// therefore 16 B too generous for these longer DIAG topics. Rather than keep two bounds that each
+/// looked general, [`discovery_topic_max`] now computes the longest topic over BOTH families, so a
+/// single budget is honest for both and every config family asserts against the same number.
+///
+/// **If you add a row and the build breaks, shorten an object_id/name/`extra` — do not raise the
+/// buffer** without re-deriving this, `DISCOVERY_CFG_MAX`, and the `mqtt_session` stack frame.
+#[cfg(feature = "wifi")]
+const fn diag_discovery_worst_payload() -> usize {
+    let mut worst = 0;
+    let mut i = 0;
+    while i < DIAG_DISCOVERY.len() {
+        let (key, obj, uid, name, _comp, extra) = DIAG_DISCOVERY[i];
+        // The id is substituted 4× (unique_id, object_id, state_topic, identifiers) at 3 digits max.
+        let payload = DIAG_DISCOVERY_SCAFFOLD
+            + 4 * 3
+            + uid.len()
+            + obj.len()
+            + name.len()
+            + key.len()
+            + extra.len();
+        if payload > worst {
+            worst = payload;
+        }
+        i += 1;
+    }
+    worst
+}
+
+#[cfg(feature = "wifi")]
+const _: () = assert!(
+    diag_discovery_worst_payload() <= DISCOVERY_BUDGET,
+    "a DIAG discovery config no longer fits one MQTT publish — `encode_publish` would return `None`, \
+     the config would never be sent, and HA would SILENTLY never create the entity (the same cliff as \
+     DISCOVERY_CFG_MAX and DIAG_BUDGET). Shorten an object_id/name/extra in DIAG_DISCOVERY."
+);
+
+// The JSON must also fit `JsonScratch` (512) BEFORE the packet is framed, or `write!` truncates it
+// into malformed-but-sendable JSON. No separate assertion: DISCOVERY_BUDGET is already the 512 B
+// buffer less framing and the longest topic, so a payload inside it is comfortably inside 512.
+// `JsonScratch::overflowed()` is the runtime backstop if that reasoning ever stops holding.
 
 /// F4 (oracle): the inbound MQTT byte-stream accumulation buffer, 512 B, in a `.bss`
 /// static — NOT on the mqtt_session stack. At 256 B it OVERFLOWED on a long-url #33
@@ -2314,7 +2570,9 @@ fn mqtt_session(
     // ~377 B JSON + MQTT framing ≈ 420 B) overflowed the old 320 B `pkt` →
     // `encode_publish` returned None → the publish was SILENTLY DROPPED (typed
     // entities never created). 512 holds it with margin (+ #27 peers + #21 CFG).
-    let mut pkt = [0u8; 512];
+    // #309: named so `DISCOVERY_BUDGET` — and therefore every discovery bound asserted against it —
+    // derives from the SAME number this buffer is declared with, not a copy of it that can drift.
+    let mut pkt = [0u8; MQTT_PKT_CAP];
     // F4: 512-B inbound accumulator in a `.bss` static (`MQTT_ACC`), NOT on the stack —
     // 256 overflowed on a long-url/signed OTA announce → the PUBLISH never accumulated →
     // announce silently never read. Static keeps the +256 off the mqtt_session frame.
@@ -2779,6 +3037,97 @@ fn mqtt_session(
                 {
                     let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
                 }
+            }
+        }
+    }
+
+    // #309: RETAINED HA discovery configs for the DIAG fields — one entity per field per node, so a
+    // board's health shows up in the dashboard because the FIRMWARE says the board exists, not
+    // because somebody hand-wrote a stanza for its id in `ha/packages/smol_mesh.yaml`. That file only
+    // ever covered the ids someone happened to type out: 50/51/122 were on the mesh with nothing
+    // drawn, while dead families for 7/9 kept rendering. See [`DIAG_DISCOVERY`] for the full contract
+    // — including why this cannot cost the DIAG record a single byte on either path.
+    //
+    // The node set is exactly "who has a `smol/<id>/diag` topic": self (when we published one just
+    // above) plus every FRESH `diag_cache` entry, reusing the same #68 F6 gate as the republish — so a
+    // node that ages out stops having its configs refreshed as well. That set IS the self-reported
+    // manifest; a newly-provisioned id gets entities the moment it is first heard.
+    {
+        let mut ids = [0u8; 1 + RELAY_CACHE_CAP];
+        let mut n_ids = 0usize;
+        if !diag.is_empty() {
+            ids[0] = node_id;
+            n_ids = 1;
+        }
+        if let Some(dc) = diag_cache {
+            let now_ms = Instant::now().duration_since_epoch().as_millis();
+            for i in 0..dc.count() {
+                if let Some((nid, val)) = dc.entry_fresh(i, now_ms, DIAG_FRESH_MS) {
+                    if nid == node_id || val.is_empty() || n_ids >= ids.len() {
+                        continue;
+                    }
+                    ids[n_ids] = nid;
+                    n_ids += 1;
+                }
+            }
+        }
+        if n_ids > 0 {
+            let cursor = unsafe { DIAG_DISCOVERY_CURSOR };
+            'rotate: for step in 0..DIAG_DISCOVERY_PER_FLUSH {
+                let (key, obj, uid, name, comp, extra) =
+                    DIAG_DISCOVERY[(cursor + step) % DIAG_DISCOVERY.len()];
+                for &id in &ids[..n_ids] {
+                    if Instant::now() > deadline {
+                        break 'rotate;
+                    }
+                    let mut dtopic = MqttScratch::new();
+                    let _ = write!(dtopic, "homeassistant/{}/smol{}/{}/config", comp, id, obj);
+                    // F1 discipline: build the config in the `.bss` JsonScratch, never on this frame.
+                    let json = unsafe { &mut *core::ptr::addr_of_mut!(MQTT_JSON) };
+                    json.clear();
+                    // `value.split('|<key>=')`, then take up to the next `|`. Jinja `None` when the
+                    // key is absent → HA state `unknown`, NEVER 0. `broadcast_diag` cuts a leaf record
+                    // on a field boundary, so a field that survives is always whole — a partial value
+                    // cannot reach this template, which is what makes the by-key parse safe.
+                    //
+                    // The device block carries `identifiers` and NOTHING ELSE — the whole of
+                    // `f63dbea`'s lesson, applied before it could bite here. HA merges device blocks
+                    // across every config sharing `identifiers`, so `name`/`model`/`manufacturer`/
+                    // `sw_version` need to arrive on exactly ONE of a node's configs; the telemetry
+                    // configs already carry them. Repeating the sigil across 39 more configs would
+                    // have spent ~36 B apiece to say what HA already knows — and that is precisely
+                    // how the telemetry configs put 29 of the 256 ids over the 512 B line, where
+                    // `encode_publish` returns `None` and the board is SILENTLY absent from HA.
+                    // It also means these configs assert nothing about the hardware, so they cannot
+                    // misreport the two C6 watches that publish into this same topic shape.
+                    let _ = write!(
+                        json,
+                        "{{\"unique_id\":\"smol_{}_{}\",\"object_id\":\"smol_{}_{}\",\"has_entity_name\":true,\"name\":\"{}\",\"state_topic\":\"smol/{}/diag\",\"value_template\":\"{{% set p=value.split('|{}=') %}}{{{{ p[1].split('|')[0] if p|length>1 else None }}}}\"{},\"expire_after\":900,\"device\":{{\"identifiers\":[\"smol{}\"]}}}}",
+                        id, uid, id, obj, name, id, key, extra, id
+                    );
+                    // Fail closed. A truncated build is still a perfectly sendable packet, and HA
+                    // would reject the malformed JSON for good; skipping lets the rotation retry it.
+                    if json.overflowed() {
+                        log::warn!(
+                            "smol #309: DIAG discovery config for id{} `{}` overflowed {} B — skipped",
+                            id,
+                            key,
+                            json.as_bytes().len()
+                        );
+                        continue;
+                    }
+                    if let Some(n) = crate::net::mqtt::encode_publish(
+                        &mut pkt,
+                        dtopic.as_bytes(),
+                        json.as_bytes(),
+                        true,
+                    ) {
+                        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                    }
+                }
+            }
+            unsafe {
+                DIAG_DISCOVERY_CURSOR = (cursor + DIAG_DISCOVERY_PER_FLUSH) % DIAG_DISCOVERY.len();
             }
         }
     }
