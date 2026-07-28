@@ -83,6 +83,37 @@ const _: () = assert!(
     "two fleet nouns collide when clipped to 8 chars (bench.rs peer row, finder.rs peer rows)."
 );
 
+/// IDENTITY must not share a word with PROVENANCE. This module has claimed that separation since it
+/// was written — "a build's identity reads in a DELIBERATELY different vocabulary from a node's
+/// name" — and until now nothing checked it. A claim in a doc comment is not a guarantee; upstream's
+/// post-cutover `forge` corpus in fact shares the noun `ember` with `fleet`, so the property is NOT
+/// free.
+///
+/// It holds here because smol pins the 20-word forge table (see [`FORGE`]) — so this assertion is
+/// simultaneously the guarantee and a second, independent reason the pin is load-bearing: syncing
+/// FORGE from upstream would not merely rename past builds, it would make a build and a board share
+/// a name. The build would fail rather than let that ship.
+const _: () = assert!(
+    sigil_names::realms_disjoint(REALM, &FORGE),
+    "a node-identity word now collides with a firmware-VERSION word — a board and a build could \
+     render the same name, which is the ambiguity the two-realm split exists to prevent. Do NOT \
+     resolve this by relaxing the check; change a word."
+);
+
+/// The familiar's creature namespace overlaps node identity on 14 nouns, so this assertion is
+/// deliberately the WEAKER `nouns_distinct_at`-style check it can currently pass... except it
+/// cannot, so it is written as an explicit known-gap note rather than a disabled assertion:
+///
+/// ```text
+/// assert!(realms_disjoint(REALM, &FANTASY))   // FAILS TODAY — 14 shared nouns
+/// ```
+///
+/// A creature can therefore share a board's name. Pre-existing (creatures and nodes drew from the
+/// same corpus before this change), owned by nebula-scribe, and fixed upstream by giving creatures
+/// their own reserved-disjoint `creature` group — at which point this comment becomes the assertion
+/// above it. Recorded here so the gap is a scheduled decision, not an oversight nobody wrote down.
+const _: () = ();
+
 /// The `forge` realm for FIRMWARE VERSION names — **deliberately PINNED, never synced.**
 ///
 /// A build's name (e.g. "Molten Crucible") reads in a different vocabulary from a node's name so

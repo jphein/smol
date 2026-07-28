@@ -30,11 +30,23 @@
 //! ## Node identity vs. provenance — two namespaces, deliberately
 //!
 //! [`FLEET`] names **things** (a board, a node — an identity). The themed realms name **builds**
-//! (a version — provenance). They draw from disjoint vocabularies on purpose, so a name never
-//! leaves you wondering whether you are looking at *which board* or *which build*. The
-//! [`reserved`] set extends the same separation one level further out: a node must never be named
-//! after a role, a frame, a feature or a tool. `crown` IS the gateway role — a board permanently
-//! called Crown is a permanent ambiguity, and it cost real debugging time on 2026-07-28.
+//! (a version — provenance). A name should never leave you wondering whether you are looking at
+//! *which board* or *which build*. The [`reserved`] set extends the same separation one level
+//! further out: a node must never be named after a role, a frame, a feature or a tool. `crown` IS
+//! the gateway role — a board permanently called Crown is a permanent ambiguity, and it cost real
+//! debugging time on 2026-07-28.
+//!
+//! ⚠️ **That separation is an intent, NOT yet a fact — do not rely on it.** `identity_vs_provenance_
+//! overlaps_are_a_shrinking_list` enumerates the current violations: `forge` shares the noun `ember`
+//! with `fleet`, so one word can name a build *and* a board; `signal` shares `keystone` and
+//! `pulsar`. I wrote "they draw from disjoint vocabularies" here first and my own test refuted it
+//! within the hour, which is precisely the failure mode the reserved set exists to prevent — a
+//! separation asserted in prose and enforced nowhere. It is now enforced as a shrinking list, so it
+//! can only improve.
+//!
+//! [`realms_disjoint`] and [`nouns_disjoint`] are the check to use when you need the property to
+//! actually hold for a specific pair (smol asserts `FLEET` against its pinned 20-word forge table,
+//! which IS disjoint — it is upstream's post-cutover 14-word forge that is not).
 //!
 //! ## What is guaranteed, and how
 //!
@@ -216,6 +228,54 @@ pub const fn is_reserved(word: &str) -> bool {
     false
 }
 
+/// True iff `a` and `b` share no word at all — no adjective, no noun, in any position.
+///
+/// The reserved set stops an identity colliding with a *role*, *frame*, *feature* or *tool*. It
+/// does not stop **two naming namespaces colliding with each other**, and that gap is not
+/// hypothetical: smol's familiar draws creature names from one corpus while nodes draw from
+/// another, and `familiar/mod.rs` has carried the comment *"distinct from any node's name"* since
+/// it was written — while both namespaces drew from the **identical** corpus. The property was
+/// documented and never held.
+///
+/// So: assert it. Any two namespaces that a person might see side by side — identity vs. version,
+/// identity vs. creature — should be provably disjoint, not disjoint by intention.
+pub const fn realms_disjoint(a: &Realm, b: &Realm) -> bool {
+    nouns_disjoint(a, b) && adjectives_disjoint(a, b)
+}
+
+/// True iff `a` and `b` share no NOUN. The sharper half of [`realms_disjoint`]: the noun is what a
+/// cramped display shows, so a shared noun is what actually renders ambiguously.
+pub const fn nouns_disjoint(a: &Realm, b: &Realm) -> bool {
+    let mut i = 0;
+    while i < a.nouns.len() {
+        let mut j = 0;
+        while j < b.nouns.len() {
+            if str_eq_ascii_ci(a.nouns[i], b.nouns[j]) {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// True iff `a` and `b` share no ADJECTIVE.
+pub const fn adjectives_disjoint(a: &Realm, b: &Realm) -> bool {
+    let mut i = 0;
+    while i < a.adjectives.len() {
+        let mut j = 0;
+        while j < b.adjectives.len() {
+            if str_eq_ascii_ci(a.adjectives[i], b.adjectives[j]) {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// True iff every noun in `realm` is still distinct when truncated to `prefix` characters.
 ///
 /// For consumers with a hard display budget. smol's OLED is 72×40 and clips node names to 5–8
@@ -364,6 +424,80 @@ mod tests {
         assert_eq!(distinct(32, 16), 256, "32x16 = 512 combos, also collision-free");
         assert_eq!(distinct(24, 25), 55, "24x25 = 600 combos yet collides 201 times");
         assert_eq!(distinct(40, 40), 249, "40x40 = 1600 combos and STILL collides");
+    }
+
+    /// The disjointness helpers must detect an overlap in EITHER position, and must not
+    /// false-positive on genuinely disjoint sets. Tested with fixtures rather than live realms so
+    /// the assertion cannot silently become vacuous if a corpus changes.
+    #[test]
+    fn disjointness_detects_overlap_in_either_position() {
+        const A: Realm = Realm { name: "a", adjectives: &["Ashen"], nouns: &["Vigil"] };
+        const SHARED_NOUN: Realm = Realm { name: "b", adjectives: &["Molten"], nouns: &["Vigil"] };
+        const SHARED_ADJ: Realm = Realm { name: "c", adjectives: &["ashen"], nouns: &["Anvil"] };
+        const CLEAN: Realm = Realm { name: "d", adjectives: &["Molten"], nouns: &["Anvil"] };
+
+        assert!(!nouns_disjoint(&A, &SHARED_NOUN), "a shared noun must be caught");
+        assert!(!realms_disjoint(&A, &SHARED_NOUN));
+        // Case-insensitive: "ashen" must collide with "Ashen".
+        assert!(!adjectives_disjoint(&A, &SHARED_ADJ), "case must not hide an overlap");
+        assert!(!realms_disjoint(&A, &SHARED_ADJ));
+        assert!(nouns_disjoint(&A, &SHARED_ADJ), "only the adjective overlaps here");
+        assert!(realms_disjoint(&A, &CLEAN));
+    }
+
+    /// Identity should not share a noun with provenance: `fleet` names boards, the themed realms
+    /// name builds, and a reader glancing at a screen must never have to wonder which they are
+    /// looking at.
+    ///
+    /// **It does not currently hold, and this test says so out loud rather than being weakened to
+    /// green.** The overlaps below are a DEFECT LIST awaiting curation, not an accepted state — the
+    /// test asserts that no *new* overlap appears and that every listed one still exists, so the
+    /// list can only shrink. Deleting a line as a word is fixed is the intended workflow; if a
+    /// listed overlap disappears the test fails and tells you to remove the line.
+    ///
+    /// The `forge` entry is the one that matters: **forge is the VERSION realm**, so `ember` can
+    /// name a build AND a board simultaneously — exactly the ambiguity the split exists to prevent,
+    /// and exactly what `smol/rust/clock/src/net/names.rs` has claimed to provide since it was
+    /// written. (smol is insulated today only because it pins the OLD 20-word forge table, which is
+    /// disjoint from `fleet`; upstream's post-cutover 14-word forge is not.)
+    ///
+    /// `fantasy` overlapping heavily is different in kind and arguably fine: `fleet` was curated
+    /// largely FROM the fantasy pool. But it means "identity vs fantasy" is not a separation at all,
+    /// which is worth knowing before anyone relies on it.
+    #[cfg(feature = "divergent-themed-realms")]
+    #[test]
+    fn identity_vs_provenance_overlaps_are_a_shrinking_list() {
+        // (realm, nouns known to be shared with `fleet`). Shrink me.
+        let known: &[(&Realm, &[&str])] = &[
+            (&FORGE, &["ember"]),                 // ⚠️ the version realm — worst case
+            (&SIGNAL, &["keystone", "pulsar"]),
+            (&ORACLE, &[]),
+            (&STELLAR, &[]),
+            (&TAROT, &[]),
+            (&VOID, &[]),
+        ];
+        for (themed, expected) in known {
+            let actual: std::vec::Vec<&str> = FLEET
+                .nouns
+                .iter()
+                .filter(|n| themed.nouns.iter().any(|t| t.eq_ignore_ascii_case(n)))
+                .map(|n| *n)
+                .collect();
+            let actual_lower: std::vec::Vec<std::string::String> =
+                actual.iter().map(|s| s.to_ascii_lowercase()).collect();
+            let mut expect_sorted: std::vec::Vec<std::string::String> =
+                expected.iter().map(|s| s.to_ascii_lowercase()).collect();
+            let mut got_sorted = actual_lower.clone();
+            expect_sorted.sort();
+            got_sorted.sort();
+            assert_eq!(
+                got_sorted, expect_sorted,
+                "identity/provenance noun overlap with `{}` CHANGED. If you fixed one, delete it \
+                 from the list. If a new one appeared, a board can now read as a build — fix the \
+                 vocabulary, do not extend this list.",
+                themed.name
+            );
+        }
     }
 
     /// smol clips node names to 5-8 chars on a 72x40 OLED.
