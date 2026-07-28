@@ -57,9 +57,13 @@ fleet: the apps, the ESP-NOW mesh (`src/net/`), the Familiar (`src/familiar/`), 
 
 ## Design specs & as-built plans
 - **`superpowers/specs/`** and **`superpowers/plans/`** — per-feature design specs and their
-  as-built execution logs, amended in place as hardware findings land. These are the primary
-  source for **measured numbers** (RAM geometry, timings, verification outcomes); the ROADMAP and
-  README quote them, so cite the spec rather than re-deriving a number from memory.
+  as-built execution logs, amended in place as hardware findings land. The best source for
+  **measured numbers** (RAM geometry, timings, verification outcomes) — but ⚠️ **a spec holds two
+  kinds of number and the formatting does not distinguish them:** the design body is *pre-build
+  projection*, the `✏️ AMENDMENT` blocks are *measurements*, and the amendments routinely contradict
+  the body, which is left standing on purpose as a record of what was expected. Quote the
+  amendments. Full rule in [DOC-UPKEEP.md](DOC-UPKEEP.md) §2 — it is how a stale `~3.3×` slot
+  figure got "corrected" to a projected `~2.3×` when the measurement was `1.42×`.
 
 **Hardware:** ESP32-C3 SuperMini · 0.42″ SSD1306 OLED (72×40, I²C `0x3C`, SDA=GPIO5 /
 SCL=GPIO6) · Bluetooth 5 LE (unused — see #22) · 4 MB flash · single-core RISC-V @160 MHz, no
