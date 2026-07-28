@@ -338,7 +338,7 @@ retry_t=0; retry_n=0
 # reset with it — otherwise a high-water mark accumulates ACROSS images and the report pairs one
 # image's offset with another's total (observed: hwm 1277952 from a 906 whose total was 1435280,
 # printed against 907's total of 1440528).
-prev_total=""; images=0; restarts=0; stalls=0; stall_at=""; stall_latched=0
+prev_total=""; images=0; restarts=0; stalls=0; stall_at=""; stall_latched=0; last_phase=""
 # Live completion, LATCHED. `hwm` is fed only from live offsets, so `hwm >= total` proves the board
 # PUBLISHED completion live — a fact about the run that no later message can undo.
 # First live run (id8 → 913, OTA independently confirmed successful) headlined
@@ -462,9 +462,24 @@ while :; do
         # attempt, and #267 resume can re-enter at a checkpoint > 0 — so "went backwards" is only a
         # REGRESSION when the board is NOT telling us it retried. Using the board's signal to
         # classify our own measurement is the same discipline as `cc=0` needing `ap=`.
-        if [ "$off" = 0 ] || [ "$retry_fresh" = 1 ]; then restarts=$((restarts+1)); else monotonic=0; fi
+        # THIRD legitimate cause: the PHASE CHANGED, i.e. the board switched SOURCE mid-transfer.
+        # Seen on a real id51 capture: `1450320|relayfetch` → `294912|self` — being relay-fed, then
+        # self-fetching. The offset legitimately restarts and the EXPLANATION IS IN THE PAYLOAD. Without
+        # this it landed as `monotonic=NO`, which then got quoted inside the DEATH-POINT text as
+        # corroborating evidence, making a healthy re-source read as corruption. Measured on that
+        # capture: four backward moves, only one accepted as a restart.
+        # Same discipline as the other two causes and as `cc=0` needing `ap=`: prefer the board's own
+        # explanation over an inference from our measurement. Low blast radius by construction —
+        # `restarts` and `monotonic` are EVIDENCE, and no conjunct reads either (which is exactly why
+        # `+ restarts` was rejected for C), so a spurious phase flip cannot buy a verdict.
+        if [ "$off" = 0 ] || [ "$retry_fresh" = 1 ] \
+           || { [ -n "$last_phase" ] && [ -n "$phase" ] && [ "$phase" != "$last_phase" ]; }; then
+          restarts=$((restarts+1))
+        else
+          monotonic=0
+        fi
       fi
-      last_off="$off"; last_off_t="$now"; stall_latched=0
+      last_off="$off"; last_off_t="$now"; stall_latched=0; last_phase="$phase"
     fi
     # Count stall EPISODES (latched), so the evidence can say "stalled twice and recovered" instead
     # of implying one endless freeze.
@@ -530,7 +545,7 @@ while :; do
     add SUSPECT 45 STALLED "offset frozen at $off/$total for $((now-last_off_t))s, BUT a live ota/diag reports a retry $((now-retry_t))s ago, inside the ${RETRY_GRACE}s retry-grace (retry signals seen: $retry_n) — the board has NOT given up, so this is a retry, not a death. Still watching; a completion will override this. last live ota/diag: '${dg_live:-none}'"
   elif [ "$saw_live_prog" = 1 ] && [ -n "$off" ] && is_num "$total" && [ "$off" -gt 0 ] \
      && [ "$off" -lt "$total" ] && [ $((now-last_off_t)) -ge "$STALL_AFTER" ]; then
-    add FAIL 10 DEATH-POINT "offset frozen at $off/$total for $((now-last_off_t))s (>= ${STALL_AFTER}s stall-after) and NO retry signal inside the ${RETRY_GRACE}s grace (last retry signal: $([ "$retry_t" = 0 ] && printf none || printf %ss $((now-retry_t))) ago; $retry_n seen this run) — the transfer died AT that byte (phase='${phase:-none}', monotonic=$([ $monotonic = 1 ] && echo yes || echo NO), restarts=$restarts, src=${src:-none}). NOT terminal to this run: still watching, and a completion would override this."
+    add FAIL 10 DEATH-POINT "offset frozen at $off/$total for $((now-last_off_t))s (>= ${STALL_AFTER}s stall-after) and NO retry signal inside the ${RETRY_GRACE}s grace (last retry signal: $([ "$retry_t" = 0 ] && printf 'NONE seen this run' || printf '%ss ago' $((now-retry_t))); $retry_n total) — the transfer died AT that byte (phase='${phase:-none}', monotonic=$([ $monotonic = 1 ] && echo yes || echo NO), restarts=$restarts, src=${src:-none}). NOT terminal to this run: still watching, and a completion would override this."
   elif [ "$saw_live_prog" = 0 ] && [ -n "$off_any" ]; then
     add unknown 0 DEATH-POINT "progress seen RETAINED ONLY (${off_any}/${total_any:-?}) — no live publish this run, so this offset is a ghost of an earlier attempt, possibly of a different image (compare total against the staged size). A retained value never changes, so it would satisfy 'frozen' for free; not a verdict."
   elif [ -z "$off" ] && [ -z "$off_any" ]; then
@@ -559,7 +574,7 @@ while :; do
   elif [ "$ota_live" = "rolled-back" ]; then
     add SUSPECT 50 ROLLED-BACK "a live diag reports ota=rolled-back, but it ALREADY read rolled-back at our first observation (${ota_first:-unknown}) — the token is rtc_fast persistent and only a power cycle clears it (ota.rs:2081), so this may predate this run entirely. Actionable, but NOT proof that this attempt rolled back."
   elif [ "$rollbacks" -gt 0 ]; then
-    add unknown 0 ROLLED-BACK "$rollbacks rollback episode(s) OBSERVED LIVE in-window, and the board has since moved on to ota=${ota_live:-unknown}. The image failed a self-test at least once during this run and the app-side rollback net caught it — reported because it HAPPENED under observation, even though it is no longer the current state. C's expected boot delta is raised by $rollbacks to account for the extra boot(s)."
+    add unknown 0 ROLLED-BACK "$rollbacks rollback episode(s) OBSERVED LIVE in-window, and the board has since moved on to ota=${ota_live:-unknown}. The image failed a self-test at least once during this run and the app-side rollback net caught it — reported because it HAPPENED under observation, even though it is no longer the current state. C's expected boot delta is raised by $((2*rollbacks)) to account for the extra boots (TWO per episode: the bad-image boot that ran the failing self-test, plus the good-slot boot that reports it)."
   else
     add ok 0 ROLLED-BACK "no live ota=rolled-back, and no rollback transition observed this run."
   fi

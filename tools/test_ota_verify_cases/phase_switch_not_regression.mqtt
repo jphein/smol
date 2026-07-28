@@ -1,0 +1,6 @@
+1	smol/51/ota/state	{"installed_version":"912","latest_version":"913","in_progress":true,"title":"v913"}
+1	smol/51/diag	DIAG|slot=0|rst=sw|boot=41|ota=confirmed|up=2000|heap=41968|dedup=36|brst=608:3102:f|cut=98
+1	smol/mesh/channel	MC|5|6|1
+@1	0	smol/51/ota/progress	900000|1450320|relayfetch
+@1	0	smol/51/diag	DIAG|slot=0|rst=sw|boot=41|ota=confirmed|up=3000|heap=41968|dedup=36|brst=608:3102:f|cut=98
+@4	0	smol/51/ota/progress	294912|1450320|self

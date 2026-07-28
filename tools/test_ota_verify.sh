@@ -42,7 +42,14 @@
 #      loop, and a subtle bug there makes tests pass FOR THE WRONG REASON — the one outcome worse
 #      than flakiness. Until it exists, obey the margin rule above.
 #
-#   3. Leave GENEROUS margins around anything time-derived. A stall episode is only counted if a poll
+#   3. A RAW CAPTURE WITH NO `@<elapsed>` PREFIXES UNDERSTATES ITSELF, silently. Every line lands at
+#      t=0, so the poll loop only ever observes the FINAL value of each topic. Measured on a real id51
+#      capture: raw replay gave `restarts=0 monotonic=yes`, timed replay of the IDENTICAL BYTES gave
+#      `restarts=1 monotonic=NO` — four backward offset moves were in the file and none were
+#      observable. Dropping a raw capture in as a fixture therefore yields a FALSE GREEN.
+#      `tools/ota_capture.sh` emits the prefixes for exactly this reason.
+#
+#   4. Leave GENEROUS margins around anything time-derived. A stall episode is only counted if a poll
 #      lands inside the frozen span, and under the suite's own load a poll iteration can stretch well
 #      past POLL seconds. `retry_restart_then_pass` originally had a 4 s frozen span with
 #      STALL_AFTER=2 and passed on a loaded box while FAILING in a pristine checkout — a flaky
@@ -85,21 +92,30 @@ bad()  { fail=$((fail+1)); printf '   FAIL - %s\n' "$1"; }
 # It is stated that way because the model went through three wrong versions (one mine, two from the
 # auditor who found the real rate), and the rule is invariant to which of them is right.
 #
-# What IS firmly established, measured on this host:
-#   * SIZE dominates. Above the 64 KB pipe buffer a first-line match fails DETERMINISTICALLY —
-#     independently measured 200/200 here and 400/400 by the auditor, on a 265 KB payload.
-#   * NOT implementation-specific. GNU grep 3.11 (`/usr/bin/grep`) behaves identically to ugrep 7.5.0
-#     (which is what bare `grep` resolves to on this host). So the hazard travels to CI and any other
-#     machine — that is the part that matters for sweeping other tools.
+# THE MECHANISM, now RESOLVED — and the variable is BYTES REMAINING AFTER THE MATCH. Not position, not
+# load. EPIPE occurs iff the writer still has unwritten bytes when `grep -q` exits, so the rate scales
+# with the residual and becomes CERTAIN once more than the pipe buffer remains. Reconciling measurement,
+# 263 KB payload, 300 iterations, same box, same minute:
+#     match at the TRUE END (0 bytes after)       ugrep 0/300  ·  GNU 3.11 0/300
+#     match + ONE trailing line (16 bytes after)  ugrep 1/300  ·  GNU 3.11 9/300
+# SIXTEEN BYTES after the match is enough. Three models preceded this one — "position-independent"
+# (mine), "position is load-bearing" (the auditor's), "possibly load-dependent" (mine again) — and all
+# three were wrong. "Position" was only ever a proxy for the residual, and the proxy broke exactly where
+# two probes differed by one trailing line: that single difference is the whole 14/400-vs-0/200
+# contradiction we spent a round unable to reconcile. It also explains my 3/1500 at 2.9 KB, which was a
+# second-to-last-line match, i.e. a few bytes remaining.
+#
+# DO NOT read "a match at the end is safe" out of these numbers. That holds only for a match at the
+# LITERAL final bytes, which nobody controls in a real log — a log gains trailing output the moment
+# anything is appended. It is a WORSE trap than "late is safe" because it is almost true.
+#
+# Also firmly established:
+#   * NOT implementation-specific — GNU grep 3.11 (`/usr/bin/grep`) and ugrep 7.5.0 (bare `grep` here)
+#     both exhibit it, so the hazard travels to CI. Implementation changes the RATE, not the existence:
+#     GNU flaked 9x more often than ugrep at identical residual, so a site that looks clean on this box
+#     can be materially worse on a runner.
 #   * THE PIPELINE IS THE DEFECT, NOT GREP. The same `grep -qaF` reading a FILE, where EPIPE is
-#     impossible, was 0/400 here and 0/2000 for the auditor.
-#   * Below the buffer the rate is LOW AND UNSTABLE — not zero. Both of us measured ~3/1500 at
-#     2.9-3.9 KB; neither of us can reproduce it on demand.
-# UNRESOLVED, recorded rather than smoothed over: for a LAST-line match on a 265 KB payload the
-# auditor measured 14/400 (ugrep) and 8/400 (GNU), while I measured 0/200 for both. At a 2-3.5% rate,
-# 0/200 is unlikely (p≈0.02), so the two runs genuinely disagree — most plausibly load-dependence, this
-# host being a 13-agent box. DO NOT conclude from either number that "match late" is safe; that
-# inference was made once from a single 0/1500 datapoint and was wrong.
+#     impossible: 0/400 here, 0/2000 for the auditor.
 #
 # At ~124 assertions per run the race alone gave a ~25% chance of at least one PHANTOM FAILURE, which
 # is exactly what produced the wandering counts (100/2, 119/4, 122/2, 124/0) across otherwise
@@ -236,7 +252,7 @@ has  "the stall episode is on the record"  "stall episodes=1"
 run stall_no_retry_is_death 8 907 8
 verdict_is FAIL; rc_is 1
 has  "a stall with NO retry signal is a death" "NO retry signal inside the"
-has  "and names the grace it measured against" "grace (last retry signal: none"
+has  "and names the grace it measured against" "grace (last retry signal: NONE seen this run;"
 has  "and says it was not terminal to the run" "NOT terminal to this run"
 run stall_with_retry_not_death 8 907 8
 verdict_is UNPROVEN; rc_is 1
@@ -412,6 +428,23 @@ run capture_tool_format 51 913 6
 verdict_is PASS; rc_is 0
 has "comment header is skipped, not ingested" "A state flip   912 → 913"
 has "and the capture's own boot delta reads"  "41 → 42"
+
+echo
+echo "═══ A SOURCE SWITCH IS NOT A DATA REGRESSION ═══"
+# Found by oracle-verify on a real id51 capture: `1450320|relayfetch` → `294912|self`, i.e. the board
+# stopped being relay-fed and started self-fetching. The offset legitimately restarts and the reason is
+# IN THE PAYLOAD — `phase` changed. Without reading it, this landed as monotonic=NO, which then got
+# quoted inside the DEATH-POINT text as corroborating evidence: a healthy re-source reading as
+# corruption. `midstream_regression` is the control — same shape of drop, phase UNCHANGED, still NO.
+# This fixture also carries the live-payload field collisions oracle confirmed (`dedup=36` vs `up=`,
+# `brst=608:3102:f` vs `rst=`), so the anchored reads are exercised against the real hazard: an
+# unanchored `up=` would grab `dedup=36` and hand conjunct F a garbage operand.
+run phase_switch_not_regression 51 913 7
+has   "a phase change counts as a restart"          "restarts from a lower offset=1"
+hasnt "and is NOT called a regression"              "monotonic=NO"
+has   "anchored up= ignores dedup=36"               "up=3000s"
+run midstream_regression 8 907 6
+has   "the control: no phase change, still flagged" "monotonic=NO"
 
 printf '\n════════════════════════════════════════════\n'
 printf '  %d passed · %d failed\n' "$pass" "$fail"
