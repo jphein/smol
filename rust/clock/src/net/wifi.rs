@@ -1742,6 +1742,12 @@ pub struct CfgCache {
     /// cfg_cache (downlink configs) passes a zero MAC + is never mac-queried.
     macs: [[u8; 6]; CFG_CACHE_CAP],
     count: usize,
+    /// #21/#56: configs DROPPED because the cache was full and no slot could be reclaimed.
+    /// A `log::warn!` was the only signal before, and release images are serial-silent (the
+    /// logger is baked at build time), so a full cache silently ate every new dashboard
+    /// control on the fleet with nothing to read anywhere. Counted so it is at least
+    /// answerable; see `dropped()`.
+    dropped: u32,
 }
 
 #[cfg(feature = "wifi")]
@@ -1759,6 +1765,7 @@ impl CfgCache {
             last_ms: [0; CFG_CACHE_CAP],
             macs: [[0; 6]; CFG_CACHE_CAP],
             count: 0,
+            dropped: 0,
         }
     }
 
@@ -1781,23 +1788,66 @@ impl CfgCache {
                 return;
             }
         }
-        if self.count < CFG_CACHE_CAP {
-            let i = self.count;
-            self.ids[i] = id;
-            self.keys[i] = key;
-            self.vals[i][..n].copy_from_slice(&value[..n]);
-            self.lens[i] = n as u8;
-            self.last_ms[i] = now;
-            self.macs[i] = mac;
-            self.count += 1;
+        // Free slot, else RECLAIM one from a redundant clear. A full cache used to simply drop
+        // the new entry, which froze membership at the first CFG_CACHE_CAP arrivals for the rest
+        // of the crown's tenure — so every dashboard control added after that point was inert,
+        // silently. Worse, a config that is *deleted* arrives as an empty retained payload and
+        // was stored as a permanent empty-valued ghost, so testing a config cost a slot forever.
+        // Measured on the live fleet 2026-07-28: 19 distinct (id,key) pairs wanted 16 slots.
+        //
+        // An empty value means "keep current / board default", which is exactly what a leaf that
+        // never hears it does anyway — so a clear is the one entry that is safe to forget, and a
+        // real config outranks it. `evict_slot` is the pure, host-tested choice (cfgsched).
+        // NOTE: bumping CFG_CACHE_CAP is deliberately not the fix — `vals` is
+        // [[u8; CFG_VALUE_MAX]; CAP], so +16 slots is ~1.3 KB of .bss, and esp-hal shrinks
+        // .stack silently as .bss grows. Fix the eviction, don't spend the stack floor.
+        #[cfg(feature = "espnow")]
+        let reclaim = if self.count >= CFG_CACHE_CAP && n > 0 {
+            crate::net::cfgsched::evict_slot(&self.lens[..self.count])
         } else {
-            log::warn!(
-                "smol #21/#56: cfg cache full ({}) — dropping id{} key '{}'",
-                CFG_CACHE_CAP,
-                id,
-                key as char
-            );
+            None
+        };
+        #[cfg(not(feature = "espnow"))]
+        let reclaim: Option<usize> = None;
+        let slot = if self.count < CFG_CACHE_CAP {
+            let i = self.count;
+            self.count += 1;
+            Some(i)
+        } else {
+            reclaim
+        };
+        match slot {
+            Some(i) => {
+                self.ids[i] = id;
+                self.keys[i] = key;
+                self.vals[i][..n].copy_from_slice(&value[..n]);
+                self.lens[i] = n as u8;
+                self.last_ms[i] = now;
+                self.macs[i] = mac;
+            }
+            None => {
+                // Every slot holds a real config: drop, but COUNT it — a log line is not
+                // observability in a release image (ESP_LOG is compile-time; the serial port
+                // is silent), and this is precisely the state in which the whole control plane
+                // goes quietly dead.
+                self.dropped = self.dropped.saturating_add(1);
+                log::warn!(
+                    "smol #21/#56: cfg cache full ({}) — dropping id{} key '{}' (dropped={})",
+                    CFG_CACHE_CAP,
+                    id,
+                    key as char,
+                    self.dropped
+                );
+            }
         }
+    }
+
+    /// #21/#56: configs dropped for want of a cache slot since boot. Nonzero means the crown
+    /// is silently discarding dashboard controls — the condition that made every leaf-facing
+    /// HA control on the fleet inert on 2026-07-28.
+    #[allow(dead_code)]
+    pub fn dropped(&self) -> u32 {
+        self.dropped
     }
 
     /// Number of cached leaf configs.
