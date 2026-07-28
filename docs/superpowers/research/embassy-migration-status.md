@@ -234,12 +234,33 @@ the expensive direction, and is the risk being managed.
 
 **Do not merge or roll the migration yet. Take the interim fix first.** In order:
 
-### Step 1 — the interim fix (days, not weeks) · **do this now**
-Service the app during burst yields (aurora is already evaluating it). If it removes most of the felt
-freeze, JP's actual complaint is answered for a fraction of the cost, **and it does so on the fleet
-image that is already proven**. Measure the freeze before and after — `SUBTICK_MS` starvation is
-observable without a second board, which is precisely what makes this step available today when the
-migration's verification is not.
+### Step 1 — the interim fix · ✅ **LANDED 2026-07-28 while this document was being written**
+`443ea34` — *"keep the active screen alive (and the button honoured) through a WiFi burst."* It also
+**corrected the diagnosis in a way that matters here**, so the mechanism section above (§1) is right
+about the cause but was wrong about the symptom:
+
+> In steady state **nothing paints a clock — the screen is frozen on the last app frame, deliberately**
+> (#153: *"a routine burst → draw NOTHING; the last app frame stays frozen on the glass (a still clock
+> beats a spinner)"*). The clock-instead-of-your-screen behaviour is **boot-only** (#89 Stage 1
+> prologue). So the freeze JP feels is not starvation *painting the wrong thing* — it is a **deliberate
+> no-paint policy** that reads as a crash now that the Bard is on the glass: a frozen typewriter looks
+> wedged. Same paused-vs-wedged confusion the `|| paused` blink exists to prevent, arriving from the
+> other direction.
+
+Sites audited in that commit: boot prologue (paints a clock, boot-only), leaf re-election (nothing),
+**telemetry flush (nothing — the ~30 s one JP actually feels)**, NTP re-sync (nothing), OTA self-fetch
+and OTA relay ×2 (correctly paint progress). The three "nothing" sites were the targets.
+
+**Consequence for this recommendation:** benefit 1 is now **substantially addressed on the proven fleet
+image, without the migration** — exactly the outcome this step was there to test for. That does not
+weaken the case for migrating; it **removes the urgency argument** and leaves benefits 2 and 3 (§below)
+to stand on their own merits, which is a healthier basis for a re-platform decision than "the UI is
+annoying."
+
+⚠️ Still worth doing: **measure it.** `SUBTICK_MS`-era freeze duration has never been timed on `main`
+(§7), so "substantially addressed" is currently a code-reading, not a measurement — and it is
+observable without a second board, which is what made this step available when the migration's
+verification was not.
 
 ### Step 2 — restore a two-board bench · **the real gate**
 Nothing about the migration can be honestly signed off on one board. This is a hardware/logistics
@@ -264,14 +285,19 @@ The migration is easy to mis-price as *"a large re-platform to fix a UI freeze."
 
 | # | Benefit | Status | Caveat |
 |---|---|---|---|
-| 1 | **App responsiveness during bursts** — JP's actual complaint | mechanism understood, not separately timed (§7) | ⚠️ **aurora may deliver most of the felt improvement without the migration** — that is Step 1, and it is why this benefit alone does not justify the cost |
+| 1 | **App responsiveness during bursts** — JP's actual complaint | ✅ **substantially addressed WITHOUT the migration** — `443ea34`, 2026-07-28 | so this benefit **no longer argues for migrating at all**. Not yet measured (§7) |
 | 2 | **The mesh deaf-window** | 🟢 **measured: ~15 s → 169 ms, ~89×** | not eliminated; 169 ms against a 279 ms floor |
 | 3 | **BLE at all on the Rust firmware** (#22) | 🔓 unblocked — *"embassy/async is the only supported coex shape"*, deliverables banked on `feat/22-ble-observer` | **advertise only.** Proxy/continuous scan stays refused on the second line of the rule |
 
 Benefit 2 is the one with a number on it. Benefit 3 is the one that is otherwise **unreachable** — no
 amount of interim polish on the superloop delivers BLE, because #22's hang is in ROM busy-waits under
-every init order. So the honest framing is: **Step 1 may well answer benefit 1 cheaply, but benefits 2
-and 3 have no other route.** That is the trade to put in front of JP.
+every init order.
+
+**And Step 1 has now landed, so this is no longer hypothetical:** benefit 1 came without the migration.
+The trade to put in front of JP is therefore **narrower and clearer than when he asked**: the migration
+is no longer the answer to *"my UI freezes"* — it is the answer to *"I want the mesh to stay alive
+through a burst"* (measured, 89×) and *"I want BLE"* (otherwise impossible). If he wants neither of
+those yet, **the honest answer is: not now.**
 
 ### Sizing, honestly
 | Step | Effort | Confidence |
