@@ -386,6 +386,55 @@ dropped. Folding them into one number hides whichever is smaller. When both fire
 (a card the repo cannot rebuild at all outranks one it can rebuild but which points somewhere
 dead), and both sections always print.
 
+### ⚠️ Both deploy tools publish more than you asked for — the guards (#318)
+
+Neither tool had a scope. `build_control_room.py` reads the scaffold **from disk** and runs **the
+code on disk**, so a real run publishes whatever is in the working tree — including a colleague's
+half-finished edit, in a repo several people share. `ha_deploy.sh push` had **no file argument**
+at all: `diff` took one, `push` did not, so *"push my package"* was inexpressible and it sent
+every differing package in one batch. On 2026-07-28 that carried another author's committed
+id7/id9 retire — 1439 lines, 172 entities — inside someone else's routine push, and separately a
+deploy came within a timing accident of shipping an uncommitted tile that rendered `_None_`.
+
+**Both now build from `HEAD` by default**, which is not a new idea: it is the trick an operator
+reached for by hand that same day to avoid deploying a colleague's changes.
+
+```bash
+python3 ha/dashboard/build_control_room.py            # deploy: scaffold from HEAD
+python3 ha/dashboard/build_control_room.py --check    # read-only; reads the WORKTREE
+python3 ha/dashboard/build_control_room.py --from-worktree
+
+./tools/ha_deploy.sh push smol_mesh.yaml   # scope it — how to push your own work
+./tools/ha_deploy.sh push --all            # the whole batch, having read the list
+./tools/ha_deploy.sh push --from-worktree
+```
+
+Shared vocabulary — **4 = refused**, **2 = could not check**, and the check runs *before* the
+network so a refusal is not buried under output:
+
+| | generator | `push` |
+|---|---|---|
+| default source | `HEAD` (`--check` reads the worktree) | `HEAD` |
+| refuses when **its own script** is dirty | ✅ | ✅ |
+| refuses an unscoped multi-file batch | n/a | ✅ (`--all` to override) |
+| names what would ship | added `def`/constant names | last commit per file |
+
+Refusing on a dirty *script* is the strict case in both: content can be read from `HEAD`, but the
+**code executing** cannot, so an uncommitted script means the thing running is not the thing
+reviewed.
+
+They differ in strictness on purpose. `push` converges toward *committed* state, so what it
+carries has been reviewed by someone; the generator reads the working tree and can publish work
+nobody finished — the milder disease and the worse one.
+
+Attribution is deliberately weak-but-honest. Every agent here commits as the same git user, so
+authorship identifies nobody; the generator names the **definitions** a dirty file adds and
+`push` names each file's **commit subject**, because you recognise your own work. Prose-matching
+heuristics mislabelled ownership twice in one session, in both directions.
+
+Note `status` compares your **working tree** against live while `push` sends **HEAD** — with a
+dirty tree `status` says so, because otherwise "DIFFERS" reads as "push will fix it".
+
 **Why the dead-row pass exists:** the banner rendered `build —` in the largest type on the page
 while every check was green, because nothing asked whether the dashboard *works* — only whether
 the repo could reproduce it. Two different questions. It checks the **built** view, i.e. what a
