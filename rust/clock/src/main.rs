@@ -282,6 +282,97 @@ const SPLASH_MIN_MS: u64 = 2_000;
 #[cfg(feature = "espnow")]
 const SYNC_REDRAW_MS: u64 = 500;
 
+/// Per-burst instrumentation (#153 / #198): how long a WiFi burst blocked the superloop, and — the
+/// number that IS the felt freeze — the longest stretch inside it during which the active screen got
+/// no service at all.
+///
+/// The Embassy research doc's honest gap was that `SUBTICK_MS` starvation on `main` had never been
+/// MEASURED, only inferred from the mesh deaf-window's mechanism. So the burst-paint fix above was a
+/// code-reading, not a number. This makes it a number.
+///
+/// **One line contains both the after and the before.** `longest app gap` is what the screen suffers
+/// now; `burst` is what it suffered before, because pre-fix the yields painted nothing at all — zero
+/// app services in a burst means the gap WAS the whole burst. That is not an assumption about the old
+/// build, it is what the old code did (the yields matched `Press::Long` and nothing else), so the
+/// comparison needs no second flash — though flashing 906 beside it costs nothing if you want the
+/// belt-and-braces version.
+///
+/// `longest yield gap` is the floor: the app cannot be serviced more often than the radio yields, so
+/// if that number is large, no repaint cadence can help and only the Embassy re-platform (#198/#233)
+/// can. Cost per yield is two subtractions and two maxes; the only formatting happens once, in
+/// [`Self::finish`], after the burst is over.
+#[cfg(feature = "espnow")]
+struct BurstProbe {
+    start_ms: u64,
+    last_app_ms: u64,
+    last_yield_ms: u64,
+    worst_app_gap: u32,
+    worst_yield_gap: u32,
+    paints: u16,
+    yields: u16,
+}
+
+#[cfg(feature = "espnow")]
+impl BurstProbe {
+    /// Start timing. `last_app_ms` is when the screen was last serviced BEFORE the burst, so the
+    /// first gap includes the run-up rather than pretending the burst began with a fresh frame.
+    fn begin(now_ms: u64, last_app_ms: u64) -> Self {
+        Self {
+            start_ms: now_ms,
+            last_app_ms,
+            last_yield_ms: now_ms,
+            worst_app_gap: 0,
+            worst_yield_gap: 0,
+            paints: 0,
+            yields: 0,
+        }
+    }
+
+    /// The radio handed control back for a moment.
+    #[inline]
+    fn yielded(&mut self, t: u64) {
+        self.yields = self.yields.saturating_add(1);
+        self.worst_yield_gap = self
+            .worst_yield_gap
+            .max(t.saturating_sub(self.last_yield_ms).min(u32::MAX as u64) as u32);
+        self.last_yield_ms = t;
+    }
+
+    /// The active screen was repainted (`Plugin::paint_burst`).
+    #[inline]
+    fn painted(&mut self, t: u64) {
+        self.paints = self.paints.saturating_add(1);
+        self.note_app(t);
+    }
+
+    #[inline]
+    fn note_app(&mut self, t: u64) {
+        self.worst_app_gap = self
+            .worst_app_gap
+            .max(t.saturating_sub(self.last_app_ms).min(u32::MAX as u64) as u32);
+        self.last_app_ms = t;
+    }
+
+    /// Close the burst and log it. `kind` names which burst, because JP feels the ~30 s telemetry
+    /// flush specifically and an NTP re-sync riding the same tick would otherwise be indistinguishable.
+    ///
+    /// Counts the tail (last service → burst end) as a gap candidate, so the figure covers the whole
+    /// window. It excludes only the few ms from the burst's end to the dispatch that follows it in the
+    /// same tick — constant across builds, so it cannot flatter a comparison.
+    fn finish(mut self, kind: &str, now_ms: u64) {
+        self.note_app(now_ms);
+        log::info!(
+            "smol #153: burst {} {} ms — longest app gap {} ms ({} paints, {} yields, longest yield gap {} ms)",
+            kind,
+            now_ms.saturating_sub(self.start_ms),
+            self.worst_app_gap,
+            self.paints,
+            self.yields,
+            self.worst_yield_gap
+        );
+    }
+}
+
 /// Service the BOOT button from inside a WiFi-burst yield: returns `true` when a LONG press asks
 /// the burst to abort (unchanged), and LATCHES a short press into `pending` for the main dispatch to
 /// deliver once the burst ends.
@@ -812,6 +903,10 @@ fn main() -> ! {
     // add up to three times the panel traffic the HARDWARE-WATCH note bounds.
     #[cfg(feature = "espnow")]
     let mut burst_draw_ms: u64 = 0;
+    // When the active screen was last serviced — by the dispatch below, or by a burst repaint. The
+    // input to every app-gap measurement (see `BurstProbe`).
+    #[cfg(feature = "espnow")]
+    let mut last_app_ms: u64 = boot_ms;
 
     // #161: state for the RECEIVING-leaf OTA takeover — an inbound mesh-OTA paints the
     // dedicated OTA screen OVER the app frame each tick while the leaf session is live.
@@ -880,8 +975,10 @@ fn main() -> ! {
                 // typewriter reads as a crash — so the active screen now gets a render-only tick
                 // (`paint_burst`) at the same SYNC_REDRAW_MS cadence the OTA screens are already
                 // hardware-watched at. Generation stays out of here; see Plugin::paint_burst.
-                if r.maybe_leaf_reelect(&mut batt_cache, &mut grid_cache, now, &mut || {
+                let mut probe = BurstProbe::begin(now, last_app_ms);
+                let reelected = r.maybe_leaf_reelect(&mut batt_cache, &mut grid_cache, now, &mut || {
                     let t = millis();
+                    probe.yielded(t);
                     led.apply(led::LedState::WifiSync, t);
                     if burst_button(&mut button, &mut pending_press, t) {
                         reelect_abort = true;
@@ -889,9 +986,13 @@ fn main() -> ! {
                     if t.saturating_sub(burst_draw_ms) >= SYNC_REDRAW_MS {
                         burst_draw_ms = t;
                         app.paint_burst(&mut display, t);
+                        probe.painted(t);
+                        last_app_ms = t;
                     }
                     reelect_abort
-                }) {
+                });
+                probe.finish("re-election", millis());
+                if reelected {
                     redraw = true; // a recovery burst ran → role may have changed; repaint
                 }
             }
@@ -1365,8 +1466,10 @@ fn main() -> ! {
                     // #40: a flush that hears a leaf's retained OTA install surfaces
                     // `(leaf_id, staged announce)` here → relayed below.
                     let mut leaf_ota: Option<(u8, ota::Announce)> = None;
+                    let mut probe = BurstProbe::begin(now, last_app_ms);
                     r.flush_telemetry(own.as_bytes(), stat.as_bytes(), &mut batt_cache, &mut grid_cache, &mut leaf_ota, &mut || {
                         let t = millis();
+                        probe.yielded(t);
                         led.apply(led::LedState::WifiSync, t);
                         if burst_button(&mut button, &mut pending_press, t) {
                             flush_abort = true;
@@ -1376,9 +1479,12 @@ fn main() -> ! {
                         if t.saturating_sub(burst_draw_ms) >= SYNC_REDRAW_MS {
                             burst_draw_ms = t;
                             app.paint_burst(&mut display, t);
+                            probe.painted(t);
+                            last_app_ms = t;
                         }
                         flush_abort
                     });
+                    probe.finish("telemetry-flush", millis());
                     flush_defer_since_ms = 0;
                     // #192: opportunistic NTP RE-SYNC riding the flush cadence. `try_time_sync`
                     // runs ONLY at boot, so without this the wall-clock free-runs on the C3
@@ -1399,8 +1505,10 @@ fn main() -> ! {
                         // normal ~1h staleness cadence resumes (airtime-conscious once synced).
                         if (my_synced_at == 0 || stale_s > net::NTP_RESYNC_AGE_S) && r.is_gateway() {
                             let mut resync_abort = false;
+                            let mut probe = BurstProbe::begin(millis(), last_app_ms);
                             let fresh = r.resync_ntp(&mut || {
                                 let t = millis();
+                                probe.yielded(t);
                                 led.apply(led::LedState::WifiSync, t);
                                 if burst_button(&mut button, &mut pending_press, t) {
                                     resync_abort = true;
@@ -1408,9 +1516,12 @@ fn main() -> ! {
                                 if t.saturating_sub(burst_draw_ms) >= SYNC_REDRAW_MS {
                                     burst_draw_ms = t;
                                     app.paint_burst(&mut display, t);
+                                    probe.painted(t);
+                                    last_app_ms = t;
                                 }
                                 resync_abort
                             });
+                            probe.finish("ntp-resync", millis());
                             if let Some(unix) = fresh {
                                 // Re-anchor the free-running clock to the fresh SNTP time. The next
                                 // broadcast_time carries the new my_synced_at → leaves adopt it.
@@ -2054,6 +2165,10 @@ fn main() -> ! {
                         },
                     );
                     was_ota_rx = true;
+                    // The OTA view is deliberately painted OVER the app while a transfer runs, so the
+                    // glass IS being serviced — count it, or the first burst after a transfer would
+                    // report the whole OTA as one app gap and read as a regression.
+                    last_app_ms = now;
                 }
                 None => {
                     if was_ota_rx {
@@ -2062,6 +2177,8 @@ fn main() -> ! {
                         ctx.redraw = true; // transfer ended → repaint the app over our screen
                     }
                     app.update(&mut ctx);
+                    // The screen was serviced: the reference point every burst gap is measured from.
+                    last_app_ms = now;
                 }
             }
         }
