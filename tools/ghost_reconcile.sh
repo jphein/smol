@@ -262,6 +262,20 @@ for id in $(cut -f1 "$WORK/cmds" 2>/dev/null | sort -un); do
         state=DUTY-CYC; why="C6/Embassy producer (slot=ota_*) — duty-cycled device, sleeps between windows; command topics are legitimate"
       fi
     fi
+    # 2026-07-28 (audit G2): NO PRODUCER EVIDENCE AT ALL IS NOT PROOF OF DEATH.
+    # prodclass() returns `none` when no DIAG line exists for the id, and the duty-cycle
+    # exemption above is gated on `= c6` — so `none` used to fall straight through to DEAD,
+    # i.e. into the one state --clear mutates. Every OTHER guard here keys off some OBSERVED
+    # signal (roster entry, advancing up=, live publish, producer class); an id with retained
+    # command topics and zero producer evidence satisfied none of them and was clearable.
+    # Reachable in a normal flow: a board configured in HA before its first boot, or one whose
+    # retained DIAG was cleared. That contradicted this tool's own doctrine — it prints
+    # "'Can't tell' is not clean" and exits 2 for UNKNOWN, then treated total absence of
+    # evidence as certainty. Structurally present but unexercised when found (every id in that
+    # run had at least a retained DIAG), which is exactly when it is cheapest to fix.
+    if [ "$state" = DEAD ] && [ "$(prodclass "$id")" = none ]; then
+      state=UNKNOWN; why="NO producer evidence at all — no DIAG line for this id, so its silence is unexplained rather than explained. Absence of evidence is not evidence of death; refusing to call it dead."
+    fi
     # No trustworthy fleet view at all ⇒ we cannot call anything dead.
     if [ "$crown_live" = 0 ] && [ "$state" = DEAD ]; then
       state=UNKNOWN; why="no LIVE crown observed (mesh/channel seq did not advance) — fleet view untrustworthy"
@@ -327,17 +341,41 @@ fi
 
 # ── 6. optional clear — backup first, DEAD only ────────────────────────────────────────
 if [ "$DO_CLEAR" = 1 ] && [ "$stale" -gt 0 ]; then
-  BK="$HOME/.claude/projects/-home-jp/scratch/nexus-345/cmdghost-backup-$(date -u +%Y%m%dT%H%M%SZ).txt"
-  mkdir -p "$(dirname "$BK")"
+  # 2026-07-28 (audit G3): the backup lives OUTSIDE agent scratch. It used to be written to
+  # ~/.claude/projects/…/scratch/nexus-345/, which is an agent TASK dir — and this project's
+  # housekeeping policy says to delete stale task dirs at conversation start. The sole restore
+  # path for destroyed fleet state was parked somewhere policy marks disposable, under one
+  # agent's task name where nobody would think to look.
+  BK="$HOME/.smol-ghost-backups/cmdghost-backup-$(date -u +%Y%m%dT%H%M%SZ).txt"
+  mkdir -p "$(dirname "$BK")" || { echo "FATAL: cannot create backup dir $(dirname "$BK") — refusing to clear" >&2; exit 2; }
   { echo "# smol COMMAND-ghost backup — $(date -u +%Y-%m-%dT%H:%M:%SZ) — root $ROOT"
     echo "# restore: mosquitto_pub -r -t <topic> -m <payload>"; } > "$BK"
   awk -F'\t' 'NR==FNR{if($2=="DEAD")d[$1];next} ($1 in d){printf "%s\t%s\n",$2,$3}' "$WORK/report" "$WORK/cmds" >> "$BK"
-  echo; echo "   backup → $BK"
+  # 2026-07-28 (audit G1): VERIFY the backup before destroying what it protects. This used to
+  # print a reassuring "backup → <path>" and clear the fleet regardless — so a failed write
+  # (full disk, bad permissions, unwritable parent) produced a confident path and no rollback.
+  # CLAUDE.md's rule is snapshot AND VERIFY before a destructive infra op; this snapshotted and
+  # hoped. Checks non-empty AND that it contains at least one topic line, since the header alone
+  # would satisfy -s while protecting nothing.
+  if [ ! -s "$BK" ] || ! grep -q "^$ROOT/" "$BK"; then
+    echo "FATAL: backup at $BK is empty or contains no topic lines — refusing to clear." >&2
+    echo "       (nothing was published; the fleet is untouched)" >&2
+    exit 2
+  fi
+  echo; echo "   backup → $BK  ($(grep -c "^$ROOT/" "$BK") topic(s), verified non-empty)"
   echo "   ⚠ config/* clears do NOT revert a board (empty payload is cached + relayed; the leaf's"
   echo "     from_wire keeps its CURRENT value, #46 clamp). Safe here only because these ids are dead."
+  # 2026-07-28 (audit G4): a FAILED clear used to be silent — `mpub … && echo cleared` printed
+  # nothing on failure, the loop continued, and the exit code was unaffected, so a partial clear
+  # looked like a full one minus a line the operator would have to count.
+  cfail=0
   awk -F'\t' 'NR==FNR{if($2=="DEAD")d[$1];next} ($1 in d){print $2}' "$WORK/report" "$WORK/cmds" \
   | while read -r t; do
-      case "$t" in "$ROOT"/*) mpub -i "grec_c_$$_$RANDOM" -r -n -t "$t" && echo "   cleared $t";; esac
+      case "$t" in
+        "$ROOT"/*)
+          if mpub -i "grec_c_$$_$RANDOM" -r -n -t "$t"; then echo "   cleared $t"
+          else echo "   ⚠ FAILED to clear $t — still retained on the broker" >&2; cfail=$((cfail+1)); fi ;;
+      esac
     done
   echo "   re-run without --clear to verify."
 fi
