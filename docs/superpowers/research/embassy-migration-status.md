@@ -26,10 +26,14 @@ bench.** Detail in §6.
 > - `grep -c bard` on the branch's `main.rs` = **0**. All **2,982 lines** of `src/bard/` show as deleted
 >   in `main → branch`. The branch is dated **2026-07-22**; the Bard shipped **07-26/27**.
 > - So the verified *"compiles clean in 30.12 s"* was a tree **without** the Bard. **The branch and the
->   Bard have never been compiled together** — and per [ROADMAP §2](../../ROADMAP.md) `main` now has only
->   **~2,400 B of stack slack** before `tools/repro_build.sh` hard-fails, while Embassy adds three task
+>   Bard have never been compiled together** — and per [ROADMAP §2](../../ROADMAP.md) `main` has only
+>   **~2,300 B of stack slack** before `tools/repro_build.sh` hard-fails, while Embassy adds three task
 >   stacks plus `embassy-net` socket buffers, in kilobytes. **Expect the rebase to break the stack-floor
->   gate.** It fails closed (good), and the lever is `SEQ_CAP` — i.e. **the Bard's sequence length.**
+>   gate.** It fails closed (good). **Levers in order: `embassy-net`/RX buffers first — the cost Embassy
+>   itself added — then the esp-wifi heap, and `SEQ_CAP` only last, with JP's sign-off.** Note `SEQ_CAP`
+>   is **not** story length since #302: it is how far back the Bard *remembers*, not how long a tale runs.
+>   **The rebase's deliverable is a measured `.bss`/`.stack` delta**, not a green build — procedure in
+>   [the plan](../plans/embassy-ota-verification.md) §0c.
 >
 > **This reframes §5 and §6.** "Rollback of the *code* is free — the branch is not merged" is true and
 > incomplete: **merging the branch as it stands would delete the flagship feature JP shipped this week.**

@@ -321,13 +321,26 @@ flag was **never read at all**; it is `%r`. **Use current HEAD.**
 
   > **Expect the rebase to break the stack-floor gate, not to squeeze under it.**
 
-  Two consolations and one cost. It **fails closed** — the gate catches this at build time rather than
-  on a board (that gate exists precisely because a pre-gate image linked clean with 2,592 B of stack
-  and would have died on hardware). And a lever exists: ROADMAP lists `SEQ_CAP` 80→64 freeing ~5.8 KB,
-  80→48 freeing ~11.5 KB. **The cost is that the lever is the Bard's sequence length** — so
-  *"Embassy may shorten the Bard's context"* is a real product trade JP should get to make explicitly,
-  not discover as a build error. **Do not raise the floor to make a build pass** — it is derived from a
-  measurement (peak × 4/3).
+  It **fails closed** — the gate catches this at build time rather than on a board (it exists precisely
+  because a pre-gate image linked clean with 2,592 B of stack and would have died on hardware).
+
+  **The lever order matters, and `SEQ_CAP` is the wrong default.** Look first at what Embassy itself
+  added — `embassy-net`'s socket buffers and the RX-buffer tuning in `.cargo/config.toml` — then the
+  esp-wifi heap (re-run #140's audit; already cut to 96 KiB once, so not free), and only then `SEQ_CAP`.
+
+  > 🎁 **And `SEQ_CAP` is cheaper than it is usually quoted at.** Since **#302 (2026-07-27)** it
+  > **no longer caps a story at all** — the KV cache is a ring and the Bard narrates endlessly, so the
+  > dial controls **how far back the model remembers** (prose coherence across sentences), **never the
+  > length of a tale.** The trade is *"less coherent prose"*, **not** *"shorter stories"*. Still JP's
+  > call — but do not price it as a length regression.
+
+  **Do not raise the floor to make a build pass** — it is derived from a measurement (peak × 4/3). And
+  per ROADMAP §2, **budget the `.bss` delta before rebasing, not after**: the shortfall should arrive as
+  a number, not as a red gate. Procedure: [the plan](../plans/embassy-ota-verification.md) §0c.
+
+  ⚠️ **One ROADMAP discrepancy to fix before anyone quotes a slack figure:** its geometry gives
+  `76,128 − 73,728 =` **2,400 B**, its prose says *"~2,280 B"*. ~120 B apart. Either supports the
+  argument; neither should be cited as precision until reconciled.
 - **The cost of the 98-commit rebase.** The branch changes 671 lines of `main.rs`; the Bard campaign
   changed the same file heavily. Not attempted, not estimated.
 - **Whether E1's ODEL path is wired end-to-end on the branch.** `take_pending_serve` is called

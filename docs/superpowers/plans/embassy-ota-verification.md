@@ -40,8 +40,8 @@ a branch result on its own.
 
 | | Path | What is new on the branch | Risk |
 |---|---|---|---|
-| **P1** | **Gateway self-fetch** — crown pulls the image over WiFi/HTTP-range into its inactive slot | embassy-net sockets, an async HTTP range fetch, flash writes interleaved with the executor, on a `wifi.rs` that lost 3,560 lines — **but with a working reference implementation on the same crates (§0b)** | 🟠 **still first** (P2 depends on it), risk **reduced** by prior art |
-| **P2** | **Leaf mesh-OTA relay** — crown relays chunk-by-chunk over ESP-NOW (windowed-NAK); leaf verifies the ed25519 signature **before the first byte** | Mostly *old logic under a new executor* — `run_leaf_ota_relay` and `ServeSource::GatewayFetch` survived (`mode.rs:5003`) — **and it has NO prior art anywhere: the watch has no relay** | 🔴 **now the real unknown** |
+| **P1** | **Gateway self-fetch** — crown pulls the image over WiFi/HTTP-range into its inactive slot | ~~embassy-net sockets, an async HTTP range fetch, flash writes interleaved with the executor~~ — **NONE of that exists.** `run_ota_fetch` is a **stub returning `false`** (branch `wifi.rs:1659-1675`) | ⬛ **NOT TESTABLE.** Not "de-risked" — **unwritten.** What the watch de-risked is the **crate set**, not this branch's path |
+| **P2** | **Leaf mesh-OTA relay** — crown relays chunk-by-chunk over ESP-NOW (windowed-NAK); leaf verifies the ed25519 signature **before the first byte** | *Old **blocking** logic hosted inside an async executor, unported* — still `pub fn` + `tick` callback (branch `mode.rs:5003`). Prior art exists for **ESP-NOW under Embassy** and for the **arbitration verdict**, not for the OTA relay or its scale | 🟡 **UNSTARTED, not unknown** — and see the false-green trap in §8.0 |
 
 **P1 goes first, but no longer because it is the riskier half.** Since the prior art landed (§0b) the
 ranking has *inverted*: P1 has a working reference implementation on the same crates, while **P2 has
@@ -123,6 +123,65 @@ chips, two codebases, one mechanism. So:
 
 **Net effect on this plan: P1's risk drops materially; P2's does not move at all.** The risk table in §0
 is re-marked accordingly.
+
+## 0c. Phase R — the rebase, and the stack delta as a **deliverable**
+
+**P0. Nothing else in this plan is meaningful until this lands**, because `b6413d3` is 98 commits behind
+`main` and contains **no Bard** (merge-base `36e6345`; `grep -c bard` = 0; 2,982 L absent). The verified
+30.12 s clean build was a tree *without* the feature that shipped this week.
+
+### The gate you will meet, with numbers
+
+[ROADMAP §2](../../ROADMAP.md) gives post-#300 geometry on `main`: `.bss` **195,224 B** · `.stack`
+**76,128 B** · esp-wifi heap **96 KiB** · measured stack peak **54,960 B**, with `tools/repro_build.sh`
+**hard-failing below 73,728 B**.
+
+> ⚠️ **Reconcile a ROADMAP discrepancy before quoting a slack figure.** Its own geometry gives
+> `76,128 − 73,728 = ` **2,400 B**, while its prose says the slack is *"unchanged at ~2,280 B"* — a
+> ~120 B disagreement. **Either number makes the point** (Embassy adds three task stacks plus
+> `embassy-net` socket buffers, in kilobytes), but fix the source before it is cited as precision it
+> doesn't have.
+
+**Expect the gate to go red.** That is the design working — it exists precisely because a pre-gate image
+linked clean with 2,592 B of stack and would have died on hardware. **It fails closed.**
+
+### 🔑 The deliverable is a NUMBER, not a green build
+
+**Budget the `.bss` delta before rebasing, not after** (ROADMAP §2's own instruction). Phase R is not
+done when it compiles — it is done when it **reports**:
+
+- [ ] `.bss`, `.stack`, and stack **peak** before and after, so the Embassy delta is isolated from the
+      Bard's. Attribute per-source: task stacks vs `embassy-net` buffers vs everything else.
+- [ ] **Measured with `--features stack-paint` under LIVE RADIO.** ROADMAP: *"idle numbers are
+      meaningless."* Per [`stack-is-not-headroom`], "it links" proves nothing — esp-hal shrinks `.stack`
+      silently as `.bss` grows.
+- [ ] The **shortfall** stated as bytes, so the lever conversation starts from arithmetic.
+
+### The levers — and `SEQ_CAP` is explicitly NOT the default
+
+Cheapest first, per ROADMAP §2, **in this order**:
+
+1. **`embassy-net` RX/TX socket buffers** and the **RX-buffer tuning in `.cargo/config.toml`** — the
+   *new* consumers. **Look here first: it is the cost Embassy itself introduced**, and sizing it is a
+   tuning decision, not a feature regression.
+2. **esp-wifi heap** (`net::init_heap`) — **re-run #140's audit first.** Already cut to 96 KiB once
+   (low-watermark 24,136 B free), so it is not free.
+3. **`SEQ_CAP`** (`src/bard/nano_llm.rs`) — 80→64 frees ~5.8 KB, 80→48 frees ~11.5 KB. **Last resort,
+   and it needs JP's sign-off, not a build-error discovery.**
+
+> 🎁 **`SEQ_CAP` costs LESS than it is usually quoted at — get this right before putting it to JP.**
+> Since **#302 (2026-07-27)** it **no longer caps a story at all.** The KV cache is a ring and the Bard
+> narrates endlessly, so turning the dial down shortens **how far back the model remembers** — prose
+> holds together less well across sentences — and **never the length of a tale.**
+> So the trade is **"less coherent prose"**, not *"shorter stories"*. Still user-visible, still JP's
+> call, but a materially cheaper and different question than a length regression. **Do not present it as
+> story length.**
+
+**Stop condition for Phase R:** if the shortfall cannot be met from levers 1-2, **stop and put numbers to
+JP** rather than spending lever 3 silently. A product regression bought to fund an infrastructure
+migration is exactly the trade that must be explicit.
+
+---
 
 ## 1. Preconditions
 
@@ -412,7 +471,37 @@ flashing ([BUILDING.md](../../BUILDING.md)).
 
 ## 8. Stop rule
 
-**Abandon the roll and stay on `main`** — not "debug forward" — if **any** of these:
+### 8.0 🔴 Rule zero — a PASS on the unported branch is a FALSE GREEN. Do not record it as progress.
+
+**This rule comes first because it is the only one that fires on success**, and every other rule in this
+section assumes failure is what you have to guard against.
+
+> **A blocking function inside an executor preserves every invariant it needs — by starving everything
+> else.** The relay on `b6413d3` is still the sole ESP-NOW RX consumer, still the exclusive owner of
+> radio mode and channel, still the only toucher of the `static mut` window buffers — **because nothing
+> else gets to run while it executes.**
+
+So the branch will most likely **pass** a relay test **while delivering none of the migration's
+benefit**: the mesh stays deaf, the UI stays frozen except for the `tick()` callback, and `net_task` /
+`mqtt_task` are starved for minutes.
+
+**Therefore:**
+- **A green relay transfer on `b6413d3` retires NOTHING.** It is not evidence about the migration; it is
+  evidence that blocking code blocks.
+- **The verdict to record from an unported run is the STARVATION measurement, not the transfer result**
+  (E1/F1 in [research/embassy-p2-mesh-relay.md](../research/embassy-p2-mesh-relay.md) §4).
+- **P2 may only be marked retired after the relay is actually async** (E2), A/B'd against the E1
+  baseline so a regression is *attributable* rather than arguable.
+
+**Why this rule is stated so loudly:** a test that passes for the wrong reason is worse than one that
+fails, because it ends the investigation. This exact shape has bitten this repo repeatedly in one day —
+`tools/ota_verify.sh`'s PASS being unreachable while reporting confidently (§2), an `ap=` regex matching
+the tail of `heap=`, and `brst=3009:0:r` reporting a freeze from a burst that never ran (`5261df8`).
+**The failure mode is not "wrong answer". It is "confident answer, wrong question."**
+
+### 8.1 Abandon the roll and stay on `main`
+
+**Not "debug forward"** — if **any** of these:
 
 1. **Phase D's A/B alternation fails.** A board that cannot alternate slots has **no rollback**, and
    rollback is the entire reason this campaign exists. Rolling a fleet in that state means a bad image
