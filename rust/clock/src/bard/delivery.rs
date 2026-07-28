@@ -5,7 +5,9 @@
 //! over the air, so "strict and panic-free" is the whole specification. A refusal must keep the
 //! previous setting (the caller's job) and say which field was wrong (this module's job).
 //!
-//! Wire format: `<ms_per_char>:<mode>`, e.g. `160:inf`, `80:page`.
+//! Wire format: `<ms_per_char>:<mode>[:<font>]`, e.g. `160:inf`, `80:page`, `120:inf:9x15`.
+//!   * the FONT field is OPTIONAL, so every value already retained on a broker (`120:inf`) keeps
+//!     parsing and keeps its font — a new field must never invalidate a fleet's stored config.
 //!   * EMPTY value ⇒ every default (the house "empty = board default" convention, as `S` and `T`).
 //!   * an EMPTY FIELD ⇒ that field's default: `:page` sets the mode and leaves the speed alone,
 //!     `80:` the reverse. Cheap to support and it saves the dashboard from having to know both.
@@ -25,6 +27,54 @@ pub enum Mode {
     Page,
 }
 
+/// Panel font, i.e. how much story fits on the glass at once (#302, JP: "we should make font size a
+/// slider in ha as well"). embedded-graphics ships these four ASCII monospace faces; the token is the
+/// face's own name so it stays self-describing if the set ever changes.
+///
+/// The geometry each one yields on the 72×40 panel is computed in `bard::mod` — a bigger font means
+/// FEWER characters, not less story: the KV window is sized in TOKENS, so generation is completely
+/// unaffected (the model never learns what font it is being read in).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Font {
+    /// 5×8 — 14 cols × 5 rows. The pre-#302 default and the most story per screen.
+    F5x8,
+    /// 6×10 — 12 cols × 4 rows.
+    F6x10,
+    /// 9×15 — 8 cols × 2 rows.
+    F9x15,
+    /// 10×20 — 7 cols × 2 rows. Readable across a room, about a phrase at a time.
+    F10x20,
+}
+
+/// The 0.42" SSD1306 panel, in pixels. The character grid every font yields is this divided by the
+/// face's glyph box — kept HERE, beside the font choice, so the geometry is host-testable and so the
+/// operator-facing "how much fits" answer lives with the thing that decides it.
+pub const PANEL_W: usize = 72;
+/// Panel height in pixels.
+pub const PANEL_H: usize = 40;
+
+impl Font {
+    /// The face's glyph box `(width, height)` in pixels. Mirrors embedded-graphics' own metrics for
+    /// each face; `bard::panel_font` debug-asserts the two agree, so this cannot drift silently.
+    pub const fn glyph(&self) -> (usize, usize) {
+        match self {
+            Font::F5x8 => (5, 8),
+            Font::F6x10 => (6, 10),
+            Font::F9x15 => (9, 15),
+            Font::F10x20 => (10, 20),
+        }
+    }
+
+    /// Characters that fit the panel at this face: `(cols, rows)`. At least 1×1 whatever the face, so
+    /// no layout arithmetic downstream can divide into nothing.
+    pub const fn grid(&self) -> (usize, usize) {
+        let (w, h) = self.glyph();
+        let cols = PANEL_W / w;
+        let rows = PANEL_H / h;
+        (if cols == 0 { 1 } else { cols }, if rows == 0 { 1 } else { rows })
+    }
+}
+
 /// A delivery setting: reveal pace plus mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Delivery {
@@ -32,6 +82,8 @@ pub struct Delivery {
     pub ms_per_char: u16,
     /// Continuous or page-at-a-time.
     pub mode: Mode,
+    /// Panel font — how much of the story is on the glass at once.
+    pub font: Font,
 }
 
 /// A parsed value, plus whether the speed had to be clamped into range (worth a log line: the
@@ -65,6 +117,8 @@ pub enum DeliveryErr {
     BadSpeed,
     /// The mode field is neither `inf` nor `page`.
     BadMode,
+    /// The optional font field is not one of the four faces.
+    BadFont,
 }
 
 impl Delivery {
@@ -75,6 +129,7 @@ impl Delivery {
     pub const DEFAULT: Delivery = Delivery {
         ms_per_char: Self::MS_DEFAULT,
         mode: Mode::Inf,
+        font: Font::F5x8,
     };
     /// Reveal interval as the millisecond clock the screen compares against.
     pub const fn reveal_ms(&self) -> u64 {
@@ -90,8 +145,8 @@ impl Delivery {
     /// Slowest reveal: one character every half second. Slower than this and a screenful takes
     /// minutes, which reads as a hung board rather than as a slow bard.
     pub const MS_MAX: u16 = 500;
-    /// Longest legal value (`500:page` is 8) with room for a future mode word.
-    pub const MAX_LEN: usize = 16;
+    /// Longest legal value (`500:page:10x20` is 14) with a little room to spare.
+    pub const MAX_LEN: usize = 20;
 
     /// Parse a CFG `V` value against `current` (whose fields survive where the value omits them).
     ///
@@ -112,7 +167,13 @@ impl Delivery {
         let Some(sep) = value.iter().position(|&b| b == b':') else {
             return Err(DeliveryErr::Malformed);
         };
-        let (speed, mode) = (&value[..sep], &value[sep + 1..]);
+        let (speed, rest) = (&value[..sep], &value[sep + 1..]);
+        // The font is an OPTIONAL third field: absent ⇒ keep the current one, so a retained
+        // two-field value neither breaks nor silently resets a font the operator chose.
+        let (mode, font) = match rest.iter().position(|&b| b == b':') {
+            Some(i) => (&rest[..i], Some(&rest[i + 1..])),
+            None => (rest, None),
+        };
 
         let mut clamped = false;
         let ms_per_char = if speed.is_empty() {
@@ -144,8 +205,23 @@ impl Delivery {
             return Err(DeliveryErr::BadMode);
         };
 
+        let font = match font {
+            // An empty third field reads like an omitted one (`120:inf:`) — keep the current font
+            // rather than refusing a value the dashboard could plausibly send.
+            None | Some(b"") => current.font,
+            Some(f) if f.eq_ignore_ascii_case(b"5x8") => Font::F5x8,
+            Some(f) if f.eq_ignore_ascii_case(b"6x10") => Font::F6x10,
+            Some(f) if f.eq_ignore_ascii_case(b"9x15") => Font::F9x15,
+            Some(f) if f.eq_ignore_ascii_case(b"10x20") => Font::F10x20,
+            Some(_) => return Err(DeliveryErr::BadFont),
+        };
+
         Ok(Accepted {
-            delivery: Delivery { ms_per_char, mode },
+            delivery: Delivery {
+                ms_per_char,
+                mode,
+                font,
+            },
             clamped,
         })
     }

@@ -1793,11 +1793,17 @@ fn main() -> ! {
                     Ok(None) => {}
                     Ok(Some(a)) => {
                         log::info!(
-                            "smol #302: bard delivery = {} ms/char, {}{}",
+                            "smol #302: bard delivery = {} ms/char, {}, font {}{}",
                             a.delivery.ms_per_char,
                             match a.delivery.mode {
                                 crate::bard::delivery::Mode::Inf => "inf (endless scroll)",
                                 crate::bard::delivery::Mode::Page => "page (press to turn)",
+                            },
+                            match a.delivery.font {
+                                crate::bard::delivery::Font::F5x8 => "5x8 (14x5)",
+                                crate::bard::delivery::Font::F6x10 => "6x10 (12x4)",
+                                crate::bard::delivery::Font::F9x15 => "9x15 (8x2)",
+                                crate::bard::delivery::Font::F10x20 => "10x20 (7x2)",
                             },
                             if a.clamped { " [speed CLAMPED into 20..=500]" } else { "" }
                         );

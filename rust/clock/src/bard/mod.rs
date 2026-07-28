@@ -24,7 +24,7 @@ pub mod textflow;
 pub mod tokenizer;
 
 use embedded_graphics::{
-    mono_font::{ascii::FONT_5X8, MonoTextStyleBuilder},
+    mono_font::{ascii::{FONT_5X8, FONT_6X10, FONT_9X15, FONT_10X20}, MonoFont, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
     prelude::*,
     text::{Baseline, Text},
@@ -351,21 +351,46 @@ fn now_ms_live() -> u64 {
 
 /// Quill blink half-period.
 const BLINK_MS: u64 = 400;
-/// FONT_5X8 columns across the 72 px panel (14 × 5 px = 70).
-const COLS: usize = 14;
-/// FONT_5X8 rows down the 40 px panel (5 × 8 px = 40).
-const ROWS: usize = 5;
-/// Pixel advance of one FONT_5X8 glyph.
-const GLYPH_W: i32 = 5;
-/// Pixel height of one text row.
-const ROW_H: i32 = 8;
+/// Widest and tallest the panel can be in CHARACTERS, over every selectable font — the sizes the
+/// span buffer and the page budget are cut to, since those cannot be runtime-sized without alloc.
+/// `FONT_5X8` is the smallest face, so it sets both.
+const MAX_COLS: usize = delivery::Font::F5x8.grid().0;
+const MAX_ROWS: usize = delivery::Font::F5x8.grid().1;
 
-/// New characters one `page` delivers before waiting for a press: the story rows of a full panel
-/// (the bottom row is the `~ more ~` marker). Counted in BYTES of generated text, so word-wrap
-/// makes it "about a screenful" rather than exactly one — the honest bound for a variable-width
-/// wrap, and a page that came up one word short would read as a bug where a slightly long one
-/// just scrolls.
-const PAGE_BYTES: u16 = (COLS * (ROWS - 1)) as u16;
+/// The glyph table and the character grid it yields on this panel (#302 font slider).
+///
+/// A bigger font shows FEWER characters, not less story: the KV window is measured in TOKENS, so
+/// generation is untouched — only how much of the scroll is visible changes. That is also why
+/// `page` mode's "one screenful" shrinks with the font, which is correct (a page IS a screen) and
+/// why [`page_bytes`] derives from the live geometry instead of being a constant.
+fn panel_font(f: delivery::Font) -> (&'static MonoFont<'static>, usize, usize) {
+    let font: &MonoFont = match f {
+        delivery::Font::F5x8 => &FONT_5X8,
+        delivery::Font::F6x10 => &FONT_6X10,
+        delivery::Font::F9x15 => &FONT_9X15,
+        delivery::Font::F10x20 => &FONT_10X20,
+    };
+    // The grid is computed in `delivery` (host-testable, no embedded-graphics); this is the one place
+    // that can check the two agree, so a future upstream metric change fails a debug build here
+    // instead of quietly wrapping text to the wrong width on the glass.
+    debug_assert_eq!(
+        (
+            font.character_size.width as usize,
+            font.character_size.height as usize
+        ),
+        f.glyph(),
+        "delivery::Font::glyph disagrees with the embedded-graphics face"
+    );
+    let (cols, rows) = f.grid();
+    (font, cols.min(MAX_COLS), rows.min(MAX_ROWS))
+}
+/// New characters one `page` delivers before waiting for a press: the story rows of a full panel at
+/// the CURRENT font (the bottom row is the marker). Counted in BYTES of generated text, so word-wrap
+/// makes it "about a screenful" rather than exactly one — the honest bound for a variable-width wrap,
+/// and a page one word short would read as a bug where a slightly long one just scrolls.
+fn page_bytes(cols: usize, rows: usize) -> u16 {
+    (cols * rows.saturating_sub(1).max(1)) as u16
+}
 
 /// How far generation may run AHEAD of the reveal in `inf` mode before it waits (#302).
 ///
@@ -526,7 +551,7 @@ impl BardApp {
         self.painted = u16::MAX; // clear the marker
     }
 
-    /// Turn the page in `page` mode: another [`PAGE_BYTES`] of new text, at reading pace again.
+    /// Turn the page in `page` mode: another screenful of new text, at reading pace again.
     fn turn_page(&mut self, now_ms: u64) {
         self.phase = Phase::Composing;
         self.page_bytes = 0;
@@ -656,7 +681,7 @@ impl BardApp {
         }
         self.painted = self.shown;
         self.blink_on = blinking;
-        draw_story(display, self.shown, quill, marker);
+        draw_story(display, self.shown, quill, marker, d.font);
     }
 }
 
@@ -747,7 +772,8 @@ impl Plugin for BardApp {
                     let written = unsafe { text_len() } + dropped - len;
                     self.page_bytes = self.page_bytes.saturating_add(written as u16);
                     self.rewind(dropped);
-                    if d.mode == delivery::Mode::Page && self.page_bytes >= PAGE_BYTES {
+                    let (_, cols, rows) = panel_font(d.font);
+                    if d.mode == delivery::Mode::Page && self.page_bytes >= page_bytes(cols, rows) {
                         self.phase = Phase::Paged;
                     }
                 }
@@ -781,17 +807,36 @@ impl Plugin for BardApp {
 /// `marker` on the bottom row when it is waiting (`page` mode). The marker IS the affordance — the
 /// panel has no room for instructions — so it appears only when a press will actually do something
 /// (#302: there is no story-over marker any more, because a story is never over).
-fn draw_story(display: &mut Oled, shown: u16, quill: bool, marker: Option<&str>) {
+fn draw_story(
+    display: &mut Oled,
+    shown: u16,
+    quill: bool,
+    marker: Option<&str>,
+    font: delivery::Font,
+) {
+    let (face, cols, panel_rows) = panel_font(font);
+    let (glyph_w, row_h) = (
+        face.character_size.width as i32,
+        face.character_size.height as i32,
+    );
     let text = unsafe { &*core::ptr::addr_of!(STORY_TEXT) };
     let visible = &text[..(shown as usize).min(text.len())];
-    // Reserve the bottom row for the marker, so it never overwrites a line of story.
-    let rows = if marker.is_some() { ROWS - 1 } else { ROWS };
-    let mut spans = [(0u16, 0u16); ROWS];
-    let n = textflow::wrap_tail(visible, COLS, rows, &mut spans[..rows]);
+    // Reserve the bottom row for the marker, so it never overwrites a line of story. At the two
+    // biggest faces the panel is only 2 rows tall, so a marker would cost HALF the glass — there the
+    // story keeps every row and the marker is dropped; the blinking quill still says "writing", and
+    // `|| paused` gives up its row rather than the story giving up half of itself.
+    let marker = if panel_rows > 2 { marker } else { None };
+    let rows = if marker.is_some() {
+        panel_rows - 1
+    } else {
+        panel_rows
+    };
+    let mut spans = [(0u16, 0u16); MAX_ROWS];
+    let n = textflow::wrap_tail(visible, cols, rows, &mut spans[..rows]);
 
     display.clear(BinaryColor::Off).ok();
     let style = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(face)
         .text_color(BinaryColor::On)
         .build();
     let mut last_end = 0i32;
@@ -799,33 +844,23 @@ fn draw_story(display: &mut Oled, shown: u16, quill: bool, marker: Option<&str>)
         // A line that is not valid UTF-8 (a raw byte-fallback token) is skipped rather than
         // panicked on; the rest of the story still reads.
         let line = core::str::from_utf8(&visible[a as usize..b as usize]).unwrap_or("");
-        Text::with_baseline(
-            line,
-            Point::new(0, i as i32 * ROW_H),
-            style,
-            Baseline::Top,
-        )
-        .draw(display)
-        .ok();
+        Text::with_baseline(line, Point::new(0, i as i32 * row_h), style, Baseline::Top)
+            .draw(display)
+            .ok();
         last_end = line.chars().count() as i32;
     }
     if quill && n > 0 {
         // The nib sits after the last revealed character, clamped inside the panel.
-        let x = (last_end * GLYPH_W).min(COLS as i32 * GLYPH_W - GLYPH_W);
-        Text::with_baseline(
-            "|",
-            Point::new(x, (n as i32 - 1) * ROW_H),
-            style,
-            Baseline::Top,
-        )
-        .draw(display)
-        .ok();
+        let x = (last_end * glyph_w).min(cols as i32 * glyph_w - glyph_w);
+        Text::with_baseline("|", Point::new(x, (n as i32 - 1) * row_h), style, Baseline::Top)
+            .draw(display)
+            .ok();
     }
     if let Some(mark) = marker {
-        let x = ((COLS as i32 * GLYPH_W) - mark.len() as i32 * GLYPH_W) / 2;
+        let x = ((cols as i32 * glyph_w) - mark.len() as i32 * glyph_w) / 2;
         Text::with_baseline(
             mark,
-            Point::new(x.max(0), (ROWS as i32 - 1) * ROW_H),
+            Point::new(x.max(0), (panel_rows as i32 - 1) * row_h),
             style,
             Baseline::Top,
         )
@@ -835,15 +870,17 @@ fn draw_story(display: &mut Oled, shown: u16, quill: bool, marker: Option<&str>)
     display.flush().ok();
 }
 
-/// Clear and draw up to [`ROWS`] left-aligned FONT_5X8 lines. Panic-free.
+/// Clear and draw up to a panelful of left-aligned lines in the SMALLEST face. Panic-free, and
+/// deliberately font-independent: this renders the "bard is mute" notice, which must fit whatever
+/// the operator set the story font to.
 fn draw_lines(display: &mut Oled, lines: &[&str]) {
     display.clear(BinaryColor::Off).ok();
     let style = MonoTextStyleBuilder::new()
         .font(&FONT_5X8)
         .text_color(BinaryColor::On)
         .build();
-    for (i, line) in lines.iter().take(ROWS).enumerate() {
-        Text::with_baseline(line, Point::new(0, i as i32 * ROW_H), style, Baseline::Top)
+    for (i, line) in lines.iter().take(MAX_ROWS).enumerate() {
+        Text::with_baseline(line, Point::new(0, i as i32 * 8), style, Baseline::Top)
             .draw(display)
             .ok();
     }

@@ -686,13 +686,89 @@ fn delivery_parses_the_documented_forms() {
     assert_eq!(ok("80:PAGE").delivery.mode, Mode::Page);
     assert_eq!(ok("80:Inf").delivery.mode, Mode::Inf);
     // Empty FIELD = keep that field; empty VALUE = back to the board defaults (retain-clear).
-    let paged = Delivery { ms_per_char: 40, mode: Mode::Page };
+    let paged = Delivery { ms_per_char: 40, mode: Mode::Page, font: Delivery::DEFAULT.font };
     assert_eq!(Delivery::parse(b":inf", paged).unwrap().delivery.ms_per_char, 40);
     assert_eq!(Delivery::parse(b"300:", paged).unwrap().delivery.mode, Mode::Page);
     assert_eq!(Delivery::parse(b"", paged).unwrap().delivery, Delivery::DEFAULT);
     // Nothing above should report a clamp.
     for v in ["160:inf", "80:page", "20:inf", "500:page"] {
         assert!(!ok(v).clamped, "{v} should not clamp");
+    }
+}
+
+#[test]
+fn delivery_parses_the_optional_font_field() {
+    use clock::delivery::{Delivery, Font, Mode};
+    let cur = Delivery::DEFAULT;
+    let ok = |v: &str, c: Delivery| Delivery::parse(v.as_bytes(), c).expect("should parse");
+
+    // THE compatibility requirement: a value already retained on the broker has TWO fields, and it
+    // must keep parsing and keep its font — a new field that invalidates a fleet's stored config
+    // would take every node back to the default the moment this shipped.
+    let big = Delivery { ms_per_char: 200, mode: Mode::Page, font: Font::F9x15 };
+    assert_eq!(ok("120:inf", big).delivery.font, Font::F9x15, "a 2-field value must keep the font");
+    assert_eq!(ok("120:inf", big).delivery.ms_per_char, 120);
+    assert_eq!(ok("120:inf", big).delivery.mode, Mode::Inf);
+    // An EMPTY third field reads like an omitted one — the dashboard could plausibly send it.
+    assert_eq!(ok("120:inf:", big).delivery.font, Font::F9x15);
+
+    // All four faces, case-insensitively, and the default.
+    assert_eq!(ok("160:inf:5x8", big).delivery.font, Font::F5x8);
+    assert_eq!(ok("160:inf:6x10", big).delivery.font, Font::F6x10);
+    assert_eq!(ok("160:inf:9X15", big).delivery.font, Font::F9x15);
+    assert_eq!(ok("160:inf:10X20", big).delivery.font, Font::F10x20);
+    assert_eq!(Delivery::DEFAULT.font, Font::F5x8, "the default must stay the densest face");
+    // An empty VALUE is still the full reset, font included.
+    assert_eq!(Delivery::parse(b"", big).unwrap().delivery, Delivery::DEFAULT);
+
+    // The longest legal value must fit the length bound, or the dashboard's own maximum is refused.
+    assert!("500:page:10x20".len() <= Delivery::MAX_LEN);
+    assert!(Delivery::parse(b"500:page:10x20", cur).is_ok());
+}
+
+#[test]
+fn delivery_refuses_an_unknown_font() {
+    use clock::delivery::{Delivery, DeliveryErr, Font, Mode};
+    let cur = Delivery { ms_per_char: 40, mode: Mode::Page, font: Font::F6x10 };
+    // A plausible-looking but wrong token must be refused rather than guessed at — and the previous
+    // font kept, since a refusal applies nothing.
+    assert_eq!(Delivery::parse(b"160:inf:8x13", cur), Err(DeliveryErr::BadFont));
+    assert_eq!(Delivery::parse(b"160:inf:big", cur), Err(DeliveryErr::BadFont));
+    assert_eq!(Delivery::parse(b"160:inf:5x9", cur), Err(DeliveryErr::BadFont));
+    // A fourth field is not a font token, so it is refused rather than silently ignored.
+    assert!(matches!(
+        Delivery::parse(b"160:inf:5x8:x", cur),
+        Err(DeliveryErr::BadFont)
+    ));
+    assert_eq!(cur.font, Font::F6x10);
+}
+
+#[test]
+fn every_font_lays_out_a_sane_panel() {
+    use clock::delivery::Font;
+    // The geometry the panel actually gets, and the invariants `draw_story` depends on: a font must
+    // never yield zero rows/cols (division by nothing) nor more than the smallest face does (the span
+    // buffer and page budget are cut to that maximum, since they cannot be runtime-sized without
+    // alloc). Values are the 72x40 panel divided by each face's glyph box.
+    for (f, cols, rows) in [
+        (Font::F5x8, 14usize, 5usize),
+        (Font::F6x10, 12, 4),
+        (Font::F9x15, 8, 2),
+        (Font::F10x20, 7, 2),
+    ] {
+        let (c, r) = f.grid();
+        assert_eq!((c, r), (cols, rows), "{f:?} geometry");
+        assert!(c >= 1 && r >= 1, "{f:?} must have at least one row and column");
+        assert!(c <= 14 && r <= 5, "{f:?} must fit the buffers cut for the smallest face");
+        // wrap_tail must stay correct at every size — it is parameterised, so this is the check that
+        // the parameters we now pass at runtime are ones it handles.
+        let mut spans = [(0u16, 0u16); 5];
+        let text = "the little dragon flew over the sleeping town and sang";
+        let n = wrap_tail(text.as_bytes(), c, r, &mut spans[..r]);
+        assert!(n <= r, "{f:?}: {n} lines exceeds {r} rows");
+        for &(a, b) in &spans[..n] {
+            assert!(a <= b && (b - a) as usize <= c, "{f:?}: span wider than {c} cols");
+        }
     }
 }
 
@@ -721,7 +797,7 @@ fn delivery_clamps_the_speed_instead_of_refusing_it() {
 #[test]
 fn delivery_refuses_the_rest_and_keeps_the_previous_setting() {
     use clock::delivery::{Delivery, DeliveryErr, Mode};
-    let cur = Delivery { ms_per_char: 40, mode: Mode::Page };
+    let cur = Delivery { ms_per_char: 40, mode: Mode::Page, font: Delivery::DEFAULT.font };
 
     // No separator: refused rather than guessed at.
     assert_eq!(Delivery::parse(b"160", cur), Err(DeliveryErr::Malformed));
@@ -742,7 +818,10 @@ fn delivery_refuses_the_rest_and_keeps_the_previous_setting() {
 
     // A refusal returns Err and NOTHING else — the caller keeps `cur` because there is no other
     // value to apply. (The firmware's `set_delivery` only writes the static on Ok.)
-    assert_eq!(cur, Delivery { ms_per_char: 40, mode: Mode::Page });
+    assert_eq!(
+        cur,
+        Delivery { ms_per_char: 40, mode: Mode::Page, font: Delivery::DEFAULT.font }
+    );
 }
 
 #[test]
