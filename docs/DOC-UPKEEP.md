@@ -298,6 +298,11 @@ earned its place the same day:
    same author had deleted from §4b hours earlier). Before committing a rewrite:
    `grep -rn "<a distinctive phrase you are removing>" docs/ README.md ONBOARDING.md site/`.
 
+4. **A phrase sweep only finds the phrasing you thought of.** Yesterday's pass corrected nine `all
+   three boards` claims and missed `all 3 boards` — same defect, different string, in the same two
+   files. Sweep the *numeral and the word*, singular and plural, and the abbreviation: `3`/`three`,
+   `id7`/`id 7`, `$9`/`\$9`. When you fix a phrasing, grep for its siblings before you commit.
+
 A cheap CI-able smell test for the first class of rot:
 
 ```bash
@@ -432,6 +437,25 @@ Its remedy line advised re-channelling a live AP.
 
 Note the species: `ap=` inside `heap=` is a **correct regex attached to the wrong field** — §2's family
 again, this time inside a tool rather than a document.
+
+### A "live" indicator must measure the thing it names
+
+The site's Mission Control panel read `tasks.json` (last written 2026-07-07) under the heading **"Live
+build status."** with a pulsing green LED — because the LED goes green when the **fetch succeeds**. It
+reported *the feed being reachable* and was labelled *the data being live*, so a three-week-old ledger
+looked current on the public site for three weeks.
+
+**Same species as the frozen `smol_7_*` entity families** (§2): a successful read of an unchanging thing
+looks exactly like liveness.
+
+- **Label an indicator by what it measures** — "feed ok", not "live" — and leave a comment saying why,
+  or someone will helpfully "improve" it back.
+- **If data is a snapshot, say so where the heading is**, not only in a small `updated` line the heading
+  contradicts.
+- **Prefer fixing the label to refreshing the data** when the data is hand-maintained. Re-populating a
+  hand-written "live" list guarantees the same rot next month — and it is the anti-pattern the HA
+  dashboard's registry discovery (`439fb95`) deliberately replaced: **a self-reported manifest beats a
+  hand-maintained list.**
 
 ### Site checklist
 
