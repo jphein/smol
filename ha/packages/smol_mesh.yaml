@@ -1979,6 +1979,157 @@ template:
             {%- set ns = namespace(c=0) -%}{%- for e in ['sensor.smol_7_ap_channel','sensor.smol_8_ap_channel','sensor.smol_9_ap_channel','sensor.smol_5_ap_channel'] -%}{%- if states(e) not in ['unavailable','unknown','none',''] -%}{%- set ns.c = ns.c + 1 -%}{%- endif -%}{%- endfor -%}{{ ns.c }}
           note: "GREEN=crown AP co-channel with mesh · RED=mismatch (coexist broken -> OTA dead, the ch1-vs-ch6 trap) · AMBER=co-channel but AP rssi<=-80. crown=the MC owner (smol/mesh/channel); only the WiFi-uplink crown reports ap=. Cause of the OTA death-point tiles below."
 
+  # ======================================================================================
+  # #153 burst-freeze (`brst=`) and #217 coexist belief-vs-observation (`apch=` vs `ap=`)
+  #
+  # WILDCARD-SUBSCRIBED, deliberately. Both fields live in `smol/<id>/diag`, a per-id topic,
+  # and every other consumer of that topic in this file is hand-written per id (5/7/8/9) —
+  # which is exactly why the peers roster went dark the moment the crown moved to id50, and
+  # why `smol coexist health` above can only ever see four boards. An MQTT *trigger* takes a
+  # topic wildcard, and `trigger.topic` carries the id, so ONE block covers the whole fleet
+  # including boards HA has never seen. No per-id duplication, nothing to extend when a node
+  # is added.
+  #
+  # Field extraction splits on `|` and matches with startswith, never a bare substring test:
+  # an unanchored search for `ap=` matches the tail of `heap=42040`, which is how
+  # tools/ota_verify.sh came to compare free heap against a WiFi channel and tell the
+  # operator to re-channel a live AP (fixed in da1cba8). The firmware named the field `apch=`
+  # to kill that class; this parser does its half.
+  # ======================================================================================
+  - trigger:
+      - platform: mqtt
+        topic: "smol/+/diag"
+    condition:
+      # Only act on a record that actually carries a measurement. The firmware appends
+      # `brst=` ONLY once a burst has been measured (mode.rs ~3336), so its ABSENCE means
+      # "nothing measured yet", not zero — and a sensor that recomputed on every DIAG would
+      # overwrite a real peak with a confident `0 ms`. Filtering here leaves the entity at
+      # `unknown` until there is something true to say.
+      - condition: template
+        value_template: "{{ trigger.payload is string and (trigger.payload.split('|') | select('search','^brst=') | list | count) > 0 }}"
+    sensor:
+      - name: "smol burst freeze"
+        unique_id: smol_burst_freeze
+        # THE number JP asks about: how long the active screen got no service at all inside a
+        # WiFi burst. This IS the felt freeze — the burst's own duration is only supporting
+        # detail, since the app can be serviced partway through a long burst.
+        unit_of_measurement: "ms"
+        state_class: measurement
+        icon: "mdi:snowflake-alert"
+        state: >-
+          {%- set ns = namespace(v='') -%}
+          {%- for kv in trigger.payload.split('|') -%}{%- if kv.startswith('brst=') -%}{%- set ns.v = kv.split('=',1)[1] -%}{%- endif -%}{%- endfor -%}
+          {{ ns.v.split(':')[0] | int(0) }}
+        attributes:
+          burst_ms: >-
+            {%- set ns = namespace(v='') -%}
+            {%- for kv in trigger.payload.split('|') -%}{%- if kv.startswith('brst=') -%}{%- set ns.v = kv.split('=',1)[1] -%}{%- endif -%}{%- endfor -%}
+            {%- set p = ns.v.split(':') -%}{{ (p[1] | int(0)) if p | length >= 2 else 0 }}
+          kind: >-
+            {%- set ns = namespace(v='') -%}
+            {%- for kv in trigger.payload.split('|') -%}{%- if kv.startswith('brst=') -%}{%- set ns.v = kv.split('=',1)[1] -%}{%- endif -%}{%- endfor -%}
+            {%- set p = ns.v.split(':') -%}{{ p[2] if p | length >= 3 else '' }}
+          # `f` and `n` are crown-only (the MQTT telemetry flush; the NTP resync is gated on
+          # is_gateway()). `r` is the opposite — maybe_leaf_reelect() returns early on a
+          # gateway, so a RE-ELECTION burst can only ever be reported by a LEAF attempting a
+          # takeover. So this is not a crown-only metric, and a leaf showing `r` is election
+          # churn freezing that leaf's screen.
+          kind_label: >-
+            {%- set ns = namespace(v='') -%}
+            {%- for kv in trigger.payload.split('|') -%}{%- if kv.startswith('brst=') -%}{%- set ns.v = kv.split('=',1)[1] -%}{%- endif -%}{%- endfor -%}
+            {%- set p = ns.v.split(':') -%}{%- set k = p[2] if p | length >= 3 else '' -%}
+            {%- if k == 'f' -%}telemetry flush (crown)
+            {%- elif k == 'n' -%}NTP resync (crown)
+            {%- elif k == 'r' -%}re-election (leaf takeover)
+            {%- else -%}unknown{%- endif -%}
+          node: "{{ trigger.topic.split('/')[1] }}"
+          note: >-
+            PEAK since that board's previous DIAG, not a live sample: the firmware keeps the
+            worst gap in the window and RESETS the field after publishing, so each record is
+            one window's high-water mark. Absent until a burst is measured, so `unknown` means
+            "not yet measured", never 0 ms. CAVEAT (#306): in practice only the CROWN can
+            reach HA with this. A leaf's DIAG travels as ONE ESP-NOW frame capped at
+            RELAY_VALUE_MAX=232 B and a realistic leaf record offers ~307 B, so the tail —
+            including brst= — is dropped with no signal. Leaves DO burst (kind `r`,
+            maybe_leaf_reelect returns early on a gateway, so re-election bursts are
+            leaf-ONLY), which means a missing value is NOT evidence that leaves never freeze.
+
+  - trigger:
+      - platform: mqtt
+        topic: "smol/+/diag"
+    condition:
+      # `ap=` is present only while a board holds a live WiFi association, i.e. the crown.
+      # Split-then-startswith so `heap=` cannot masquerade as `ap=`.
+      - condition: template
+        value_template: "{{ trigger.payload is string and (trigger.payload.split('|') | select('search','^ap=') | list | count) > 0 }}"
+      # ...and only from the board that is CURRENTLY the elected crown. Every DIAG topic is
+      # retained, so on an HA restart the retained records of former crowns (id7 and id13 still
+      # hold retained role-G payloads) all replay at subscribe time and the last one to arrive
+      # would win — publishing a confident verdict about a board that has not been crown for
+      # hours. Owner comes from the mesh-wide `smol/mesh/channel`, so this stays id-agnostic.
+      # If the owner is not yet known, accept rather than go silent.
+      - condition: template
+        value_template: >-
+          {% set o = state_attr('sensor.smol_mesh_channel','owner') %}
+          {{ o is none or (o | string) == trigger.topic.split('/')[1] }}
+    binary_sensor:
+      - name: "smol coexist belief mismatch"
+        unique_id: smol_coexist_belief_mismatch
+        device_class: problem
+        # `ap=<ch>:<rssi>:<bssid>` is what the HAL reports for the LIVE association;
+        # `apch=<ch>` is what the coexist logic BELIEVES after its last scan — and the belief
+        # is what the off-channel decision is actually made from. Either number alone looks
+        # fine; the DISAGREEMENT is the bug, and off-channel is a proven OTA blocker here
+        # (co-channel moved 48 KB, off-channel moved 0).
+        state: >-
+          {%- set ns = namespace(obs='', bel='') -%}
+          {%- for kv in trigger.payload.split('|') -%}
+            {%- if kv.startswith('ap=') -%}{%- set ns.obs = kv.split('=',1)[1].split(':')[0] -%}
+            {%- elif kv.startswith('apch=') -%}{%- set ns.bel = kv.split('=',1)[1] -%}{%- endif -%}
+          {%- endfor -%}
+          {#- apch=0 is "not yet scanned", NOT channel zero: treating it as a channel would
+              report a mismatch against every real association on boot. -#}
+          {{ ns.obs != '' and ns.bel not in ['', '0'] and (ns.bel | int(-1)) != (ns.obs | int(-2)) }}
+        # Cleared if the reporting board stops publishing (it demoted, or went away). A real
+        # standing mismatch re-arms this on every DIAG (~60 s), so the timer only ever expires
+        # once the evidence has genuinely stopped arriving.
+        auto_off: "00:05:00"
+        attributes:
+          node: "{{ trigger.topic.split('/')[1] }}"
+          observed_channel: >-
+            {%- set ns = namespace(v='') -%}
+            {%- for kv in trigger.payload.split('|') -%}{%- if kv.startswith('ap=') -%}{%- set ns.v = kv.split('=',1)[1].split(':')[0] -%}{%- endif -%}{%- endfor -%}
+            {{ ns.v if ns.v else 'none' }}
+          # THREE distinct outcomes, not two. `absent` = this build does not publish apch= at
+          # all (pre-907), `unscanned` = apch=0, i.e. published but no answer yet, and a number
+          # = a real belief. Collapsing the first two into "unknown" made the sensor read a
+          # confident `off` — "belief verified OK" — on a board that cannot report a belief in
+          # the first place. Same failure shape as rendering a missing brst= as 0 ms.
+          believed_channel: >-
+            {%- set ns = namespace(v='', seen=false) -%}
+            {%- for kv in trigger.payload.split('|') -%}{%- if kv.startswith('apch=') -%}{%- set ns.v = kv.split('=',1)[1] -%}{%- set ns.seen = true -%}{%- endif -%}{%- endfor -%}
+            {%- if not ns.seen -%}absent{%- elif ns.v == '0' -%}unscanned{%- else -%}{{ ns.v }}{%- endif -%}
+          # What the card should actually say. `unevaluable` is NOT the same as `ok`.
+          verdict: >-
+            {%- set ns = namespace(obs='', bel='', seen=false) -%}
+            {%- for kv in trigger.payload.split('|') -%}
+              {%- if kv.startswith('ap=') -%}{%- set ns.obs = kv.split('=',1)[1].split(':')[0] -%}
+              {%- elif kv.startswith('apch=') -%}{%- set ns.bel = kv.split('=',1)[1] -%}{%- set ns.seen = true -%}{%- endif -%}
+            {%- endfor -%}
+            {%- if not ns.seen -%}unevaluable · firmware does not publish apch= yet
+            {%- elif ns.bel == '0' -%}unevaluable · coexist has not scanned yet (apch=0)
+            {%- elif (ns.bel | int(-1)) != (ns.obs | int(-2)) -%}mismatch · believes ch{{ ns.bel }}, associated on ch{{ ns.obs }}
+            {%- else -%}ok · belief agrees with the live association (ch{{ ns.obs }}){%- endif -%}
+          observed_rssi: >-
+            {%- set ns = namespace(v='') -%}
+            {%- for kv in trigger.payload.split('|') -%}{%- if kv.startswith('ap=') -%}{%- set ns.v = kv.split('=',1)[1] -%}{%- endif -%}{%- endfor -%}
+            {%- set p = ns.v.split(':') -%}{{ (p[1] | int(0)) if p | length >= 2 else 0 }}
+          note: >-
+            ON = the coexist logic believes a different AP channel than the one it is actually
+            associated on. That disagreement is itself the bug. OFF is NOT automatically a pass —
+            read `verdict`: believed_channel `absent` (pre-907 firmware) or `unscanned` (apch=0)
+            both mean the comparison could not be made at all.
+
   - sensor:
       # --- #74 RSSI-matrix union (HELD; populates when every node publishes smol/<id>/peers) ---
       - name: "smol mesh matrix"

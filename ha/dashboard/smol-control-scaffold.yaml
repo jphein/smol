@@ -92,6 +92,26 @@ cards:
           strong { color:var(--primary-color); }
           em { color:var(--secondary-text-color); font-style:normal; opacity:.7; font-size:11px; }
 
+  # ---- #153 burst freeze + #217 coexist belief-vs-observation (span 12) ----
+  # JP's standing complaint is UI freezes during WiFi, so the longest app gap gets the big
+  # phosphor number and everything else is supporting text.
+  - type: markdown
+    content: "FREEZE"    # ← build script fills the burst-freeze + coexist verdict panel
+    view_layout: {grid-column: "span 12"}
+    card_mod:
+      style:
+        .: |
+          ha-card { position:relative; overflow:hidden; }
+          ha-card:before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,transparent,#5bd0ff,transparent); opacity:.55; }
+        ha-markdown$: |
+          h3 { margin:2px 0 0; font-family:'VT323','IBM Plex Mono',monospace; font-size:46px;
+               line-height:.9; font-weight:400; color:#5bd0ff; text-shadow:0 0 10px rgba(91,208,255,.45); }
+          p { margin:3px 0 9px; font-size:13px; color:var(--secondary-text-color); }
+          p:first-child { font-size:11px; letter-spacing:3px; text-transform:uppercase; }
+          strong { color:var(--primary-color); }
+          em { font-style:normal; opacity:.78; font-size:11.5px; }
+          code { font-size:11px; opacity:.8; }
+
   # ---- 02 · THE FLEET ----
   - type: markdown
     view_layout: {grid-column: "span 12"}

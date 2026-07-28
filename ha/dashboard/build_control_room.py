@@ -348,6 +348,63 @@ def legend_card(nodes, present):
     return {"type":"entities","title":"the mesh","show_header_toggle":False,"entities":ents,
             "card_mod":{"style":accent_top(PHOS)},"view_layout":{"grid-column":"span 5"}}
 
+# ---------- #153 burst freeze + #217 coexist belief-vs-observation ----------
+# Both are fed by ONE wildcard-subscribed MQTT trigger per metric in smol_mesh.yaml, so they
+# follow whichever board publishes rather than a hardcoded id. The generator's only job here is
+# to turn the reporting node id into its sigil (build-time map — the id→name algorithm still
+# lives only on the board) and to be careful about the difference between "no measurement" and
+# "a measurement of zero".
+BF="sensor.smol_burst_freeze"; CBM="binary_sensor.smol_coexist_belief_mismatch"
+def freeze_md(nodes, dormant, present):
+    sig={str(n["id"]):n["name"] for n in list(nodes)+list(dormant)}
+    # First line is a LITERAL: `_ident` keys a markdown card on content[:45], so leading with a
+    # fixed string keeps this card's identity stable no matter how the templates below change.
+    # A card whose identity moves with its content is how the forge ended up duplicated.
+    out=["**freeze & coexist** · what the WiFi bursts cost the screen",
+         "{% set na="+NAJ+" %}{% set sig="+json.dumps(sig)+" %}"]
+    if BF in present:
+        out.append(
+            "{% set g=states('"+BF+"') %}{% set kl=state_attr('"+BF+"','kind_label') %}"
+            "{% set bm=state_attr('"+BF+"','burst_ms') %}{% set nd=state_attr('"+BF+"','node')|string %}"
+            # `unknown` here is meaningful: firmware appends brst= only once a burst has been
+            # measured, so there is no honest number to show yet. Rendering 0 ms would claim the
+            # UI never froze — the opposite of the truth we are trying to establish.
+            "{% if g in na %}### — ms\n\n"
+            "_no burst measured yet · the field is absent until a board measures one, so this is "
+            "**not** zero. Needs a board on a build that publishes `brst=`._\n"
+            "{% else %}### {{ g }} ms\n\n"
+            "_longest stretch the active screen got **no service at all** · {{ kl }} · "
+            "burst {{ bm }} ms · reported by **{{ sig.get(nd, 'id' ~ nd) }}**_\n\n"
+            "_This is the **peak since that board's last report**, not a live sample: the firmware "
+            "keeps the window's worst gap and resets after publishing._\n{% endif %}\n\n"
+            # The absence caveat is the honest half of this panel. A leaf's DIAG is ONE ESP-NOW
+            # frame capped at 232 B and a realistic record offers ~307 B, so the tail — brst=
+            # included — is dropped with no signal (#306). Leaves genuinely DO burst: re-election
+            # bursts are leaf-only (maybe_leaf_reelect returns early on a gateway). So a blank or
+            # crown-only reading must never be read as "leaves don't freeze" — it is the one case
+            # we currently cannot measure, and the crown has been re-electing repeatedly.
+            "_Only the **crown** can currently report this. A leaf's DIAG rides one 232 B ESP-NOW "
+            "frame and a realistic record offers ~307 B, so the tail — `brst=` included — is "
+            "**dropped with no signal** (issue #306). Re-election bursts are leaf-**only**, so a leaf "
+            "freezing during a takeover is real and currently invisible: absence here is not "
+            "evidence of calm._")
+    else:
+        out.append("### — ms\n\n_`"+BF+"` not present — deploy ha/packages/smol_mesh.yaml._\n")
+    if CBM in present:
+        out.append(
+            "{% set v=state_attr('"+CBM+"','verdict') %}{% set n2=state_attr('"+CBM+"','node')|string %}"
+            "{% set ob=state_attr('"+CBM+"','observed_channel') %}{% set be=state_attr('"+CBM+"','believed_channel') %}"
+            # OFF is deliberately NOT reported as a pass. `absent`/`unscanned` mean the comparison
+            # could not be made, which reads identically to "fine" if you only show the state.
+            "**coexist · belief vs observation** — "
+            "{% if v in na %}awaiting a crown DIAG{% else %}{{ v }}{% endif %}"
+            "{% if n2 not in na %} · <small>reported by {{ sig.get(n2, 'id' ~ n2) }}</small>{% endif %}\n\n"
+            "_`ap=` is the live association the HAL reports; `apch=` is what the coexist logic "
+            "believes and decides from. Off-channel is a proven OTA blocker here — co-channel moved "
+            "48 KB, off-channel moved 0 — so a disagreement is itself the bug. "
+            "observed `{{ ob }}` · believed `{{ be }}`._")
+    return "\n\n".join(out)
+
 # ---------- dormant sigils: registered with HA, not currently on the air ----------
 # These are boards the firmware once announced whose firmware-discovered entities have all
 # expired. Deliberately NOT hidden — a node that quietly disappears is how ids 7 and 9 stayed
@@ -647,13 +704,16 @@ async def main():
         if dormant: node_cards.append(dormant_card(dormant))
         legend=legend_card(nodes,present)
         mesh_ovw=mesh_overview_md(nodes,dormant,present); vitals=vitals_history_cards(nodes,present)
-        cards=view["cards"]; out=[]; done={"topo":0,"legend":0,"meshovw":0,"fleet":0,"vitals":0,"forge":0,"install":0}
+        freeze=freeze_md(nodes,dormant,present)
+        cards=view["cards"]; out=[]; done={"topo":0,"legend":0,"meshovw":0,"freeze":0,"fleet":0,"vitals":0,"forge":0,"install":0}
         for c in cards:
             if c.get("type")=="picture" and c.get("image")=="TOPO": c["image"]=topo_url; done["topo"]+=1; out.append(c)
             elif c.get("type")=="markdown" and c.get("content")=="LEGEND":
                 lc=dict(legend); lc["view_layout"]=c.get("view_layout") or lc.get("view_layout"); done["legend"]+=1; out.append(lc)
             elif c.get("type")=="markdown" and c.get("content")=="MESHOVW":
                 mc=dict(c); mc["content"]=mesh_ovw; done["meshovw"]+=1; out.append(mc)
+            elif c.get("type")=="markdown" and c.get("content")=="FREEZE":
+                fc=dict(c); fc["content"]=freeze; done["freeze"]+=1; out.append(fc)
             elif c.get("type")=="markdown" and c.get("content")=="FLEET":
                 out.extend(node_cards); done["fleet"]+=1
             elif c.get("type")=="markdown" and c.get("content")=="VITALS":
