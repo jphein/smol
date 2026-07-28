@@ -423,6 +423,36 @@ Refusing on a dirty *script* is the strict case in both: content can be read fro
 **code executing** cannot, so an uncommitted script means the thing running is not the thing
 reviewed.
 
+### "cannot attribute — live matches no committed version": diagnose before you override
+
+This refusal has **two causes that look identical and want opposite responses**, so read the bytes
+before reaching for `--all`:
+
+```bash
+git show HEAD:ha/packages/<file>.yaml > /tmp/head.yaml
+ssh jp@<ha-host> 'cat /homeassistant/packages/<file>.yaml' > /tmp/live.yaml
+wc -c /tmp/head.yaml /tmp/live.yaml     # a 1-byte gap is the tell
+cmp /tmp/head.yaml /tmp/live.yaml
+```
+
+- **Off by exactly one byte, live shorter, `cmp` points at EOF** → the trailing newline the
+  pre-`96f1029`-era tool stripped when reading `HEAD` through `$( )`. The content is identical;
+  overriding is safe, and re-pushing fixes it permanently. **Every package written by that older
+  tool trips this refusal once.**
+- **Any other difference** → live genuinely holds something no commit does. Do **not** override
+  yet. Two possibilities, and both have happened here: an edit made on the VM, or — more likely on
+  this repo — *somebody deployed before committing*, which is indistinguishable from a hand-edit
+  because it is one, just originating in a working tree. Find the author before you overwrite them.
+
+If you do overwrite, the pre-push backup on the VM (`*.bak-deploy-<stamp>`) is the only record of
+what was there. **Check that backup rather than the current state** — current state cannot tell you
+what you replaced. `cmp` it against the commit you believe it came from; if it matches, nothing was
+lost and you can say so with evidence instead of hoping.
+
+Both cases occurred on 2026-07-28 within an hour, which is why this is written down rather than
+rediscovered: the false positive invites the habit of overriding on faith, and the habit is what
+loses the real one.
+
 They differ in strictness on purpose. `push` converges toward *committed* state, so what it
 carries has been reviewed by someone; the generator reads the working tree and can publish work
 nobody finished — the milder disease and the worse one.
