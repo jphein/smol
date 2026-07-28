@@ -31,9 +31,22 @@ path = "src/lib.rs"
 [dependencies]
 
 [features]
-# Node identity only. smol must NEVER enable `divergent-themed-realms`: its version names come from
-# the deliberately-pinned FORGE table in `clock/src/net/names.rs`, because version names are
+# Node identity + creatures only. smol must NEVER enable `divergent-themed-realms`: its version names
+# come from the deliberately-pinned FORGE table in `clock/src/net/names.rs`, because version names are
 # historical record (v345 is "Furnace" in commits, memories and speech) and the upstream themed
-# corpora have moved. `fleet` is the one namespace that cannot diverge — it exists in no other
-# binding, so nothing else can produce a conflicting node name.
+# corpora have moved. `fleet` and `creature` are the namespaces that cannot diverge — they exist in
+# no other binding, so nothing else can produce a conflicting name.
 default = []
+
+# DECLARED BUT NEVER ENABLED, and it has to be declared to stay that way.
+#
+# Omitting it did not disable the gate — it made `cfg(feature = "divergent-themed-realms")` an
+# UNKNOWN cfg, which Rust compiles out while emitting `unexpected cfg condition value` (12 of them,
+# once the host workspace built this crate). Two problems with that: the warnings are permanent
+# noise, and an unknown cfg is silently-always-false rather than deliberately-false — so the gate
+# would have kept "working" even if the condition were later misspelled, which is exactly the class
+# of check that cannot fail.
+#
+# Declaring it makes the choice explicit and auditable: the feature exists, smol does not take it,
+# and `default-features = false` at each dependency site says so out loud.
+divergent-themed-realms = []

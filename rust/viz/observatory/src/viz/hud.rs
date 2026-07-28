@@ -89,7 +89,7 @@ pub fn update_hud(
         };
 
         let crown = match &m.crown {
-            Some(c) => format!("crown {} ch{} seq{}", mesh_model::names::noun_for_id(c.owner), c.channel, c.seq),
+            Some(c) => format!("crown {} ch{} seq{}", mesh_model::names::sigil_for_id(c.owner), c.channel, c.seq),
             None => "no crown".to_string(),
         };
 

@@ -1,66 +1,53 @@
-//! Deterministic magical node names — a host copy of the firmware's `net/names.rs`
-//! (itself a faithful port of realm-sigil's `GenerateName`). A node's noun is
-//! computed from its 3-digit id, identically on-device and here, so meshscope shows
-//! the same fantasy handle the OLED does with ZERO dependency on HA discovery being
-//! present. Node id is the only identity on the wire.
+//! Node names for the host tools — a thin re-export of the `sigil-names` crate.
 //!
-//! CORPUS is pinned VERBATIM to sigil's generated `fantasy` embed (20 adj / 20 noun)
-//! — matching `rust/clock/src/net/names.rs`. If that table ever changes, re-copy it.
+//! This file used to hold a SECOND full copy of the 20x20 corpus, hand-kept in sync with
+//! `rust/clock/src/net/names.rs`. Two hand-synced copies of one table is precisely the drift the
+//! sigil binding exists to remove, so the table is gone and only the accessors remain: meshscope and
+//! the firmware now fold identical names through one implementation, and `tools/sigil_vendor.sh`
+//! checks that implementation against upstream.
+//!
+//! Unlike the 72x40 OLED, host tools have room for the **full sigil** — and the full pair is unique
+//! across all 256 ids, so nothing here needs the firmware's `noun+id` disambiguation.
 
-struct Realm {
-    adjectives: &'static [&'static str],
-    nouns: &'static [&'static str],
-}
-
-static FANTASY: Realm = Realm {
-    adjectives: &[
-        "Arcane", "Blazing", "Celestial", "Draconic", "Eldritch", "Fabled", "Gilded",
-        "Hallowed", "Infernal", "Jade", "Kindled", "Luminous", "Mythic", "Noble", "Obsidian",
-        "Primal", "Radiant", "Spectral", "Twilight", "Valiant",
-    ],
-    nouns: &[
-        "Aegis", "Beacon", "Crown", "Dominion", "Ember", "Forge", "Grimoire", "Herald",
-        "Insignia", "Jewel", "Keystone", "Lantern", "Monolith", "Nexus", "Oracle", "Pinnacle",
-        "Quartz", "Relic", "Sigil", "Throne",
-    ],
-};
-
-/// Knuth multiplicative-hash constant (2^32 / phi, rounded to odd).
-const GOLDEN_U32: u32 = 2_654_435_761;
-
-fn seed_from_id(id: u8) -> u32 {
-    (id as u32).wrapping_mul(GOLDEN_U32)
-}
-
-/// `(adjective, noun)` for a node id — same math as sigil / the firmware.
+/// `(adjective, noun)` for a node id — identical to what the board computes for itself.
 pub fn name_for_id(id: u8) -> (&'static str, &'static str) {
-    let seed = seed_from_id(id);
-    let adj = FANTASY.adjectives[(seed as usize) % FANTASY.adjectives.len()];
-    let noun = FANTASY.nouns[((seed >> 8) as usize) % FANTASY.nouns.len()];
-    (adj, noun)
+    sigil_names::name_for_id(id, sigil_names::FLEET)
 }
 
-/// The short handle (noun) meshscope labels a node with — matches the OLED.
+/// The noun alone.
+///
+/// ⚠️ **Not an identifier.** 32 nouns over 256 ids forces at least 8 ids (9 at worst) to share every
+/// noun, so this can only be used where the id is printed alongside it. Prefer [`sigil_for_id`].
 pub fn noun_for_id(id: u8) -> &'static str {
     name_for_id(id).1
+}
+
+/// The full sigil as one string — `"Obsidian Aegis"`. **Unique for every one of the 256 ids**
+/// (proven at compile time in the crate), so this identifies a node on its own.
+pub fn sigil_for_id(id: u8) -> String {
+    let (a, n) = name_for_id(id);
+    format!("{a} {n}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The property the OLED cannot use but meshscope can: the pair alone identifies a node, with no
+    /// id suffix needed. Exhaustive, matching the crate's own const-eval proof.
     #[test]
-    fn nouns_vary_between_adjacent_ids() {
-        // The golden-ratio spread must give adjacent ids different nouns (the whole
-        // reason seed_from_id exists — without it every id < 256 shares noun[0]).
-        let a = noun_for_id(7);
-        let b = noun_for_id(8);
-        let c = noun_for_id(9);
-        assert!(a != b || b != c, "adjacent ids collapsed to one noun: {a} {b} {c}");
+    fn full_sigil_is_unique_across_the_whole_id_space() {
+        let mut seen = std::collections::BTreeSet::new();
+        for id in 0..=u8::MAX {
+            assert!(seen.insert(sigil_for_id(id)), "id {id} collides");
+        }
+        assert_eq!(seen.len(), 256);
     }
 
+    /// And the reason `noun_for_id` must never stand alone.
     #[test]
-    fn deterministic() {
-        assert_eq!(name_for_id(42), name_for_id(42));
+    fn the_bare_noun_is_not_an_identifier() {
+        let distinct: std::collections::BTreeSet<_> = (0..=u8::MAX).map(noun_for_id).collect();
+        assert_eq!(distinct.len(), 32, "32 nouns over 256 ids — a noun cannot identify a node");
     }
 }

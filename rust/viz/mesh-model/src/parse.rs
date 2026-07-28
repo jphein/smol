@@ -174,13 +174,25 @@ pub fn parse_ota_src(payload: &str) -> Option<OtaSource> {
     }
 }
 
-/// Extract the device noun from an HA discovery config JSON, e.g. device.name
-/// `"smol 7 Draconic"` -> `"Draconic"`. Belt-and-suspenders next to the vendored
-/// `names` table (works even if the firmware corpus ever drifts).
-pub fn parse_discovery_noun(payload: &str) -> Option<String> {
+/// Extract the device SIGIL from an HA discovery config JSON: `device.name` is
+/// `"smol <id> <words...>"`, so this returns everything after the id —
+/// `"smol 7 Obsidian Aegis"` -> `"Obsidian Aegis"`. Belt-and-suspenders next to the
+/// `names` accessors (works even if the firmware corpus drifts from ours).
+///
+/// This was `rsplit(' ').next()` — the LAST token — which was correct only while the firmware
+/// published a bare noun. Once it began publishing the full pair, taking the last token silently
+/// threw the adjective away and meshscope kept displaying exactly the ambiguity the pair removes.
+/// It never errored; it just quietly showed less. Splitting from the FRONT (past the `smol` literal
+/// and the id) keeps every remaining word however many there are.
+pub fn parse_discovery_sigil(payload: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(payload.as_bytes()).ok()?;
-    let name = v.get("device")?.get("name")?.as_str()?;
-    name.rsplit(' ').next().map(|s| s.to_string()).filter(|s| !s.is_empty())
+    let name = v.get("device")?.get("name")?.as_str()?.trim();
+    // `smol` `<id>` `<words...>` — skip the two leading tokens, keep the rest verbatim.
+    let mut it = name.split_whitespace();
+    let (Some("smol"), Some(id)) = (it.next(), it.next()) else { return None };
+    id.parse::<u8>().ok()?;
+    let rest = it.collect::<std::vec::Vec<_>>().join(" ");
+    (!rest.is_empty()).then_some(rest)
 }
 
 /// A parsed DIAG record: the raw string plus a key->value map. Typed accessors pull
@@ -309,10 +321,29 @@ mod tests {
         assert!(parse_ota_progress("abc|1|self").is_none());
     }
 
+    /// The old version of this test asserted `"smol 7 Draconic"` -> `"Draconic"` and called the
+    /// result "the noun". It is the ADJECTIVE — the fixture predates the firmware publishing the
+    /// full pair — so the test passed while asserting the wrong thing about the wrong field. Now it
+    /// pins the behaviour that matters: keep EVERY word after the id, however many there are.
     #[test]
-    fn discovery_noun() {
-        let j = r#"{"unique_id":"smol7_telemetry","device":{"identifiers":["smol7"],"name":"smol 7 Draconic"}}"#;
-        assert_eq!(parse_discovery_noun(j).as_deref(), Some("Draconic"));
+    fn discovery_sigil_keeps_every_word_after_the_id() {
+        let two = r#"{"device":{"identifiers":["smol7"],"name":"smol 7 Obsidian Aegis"}}"#;
+        assert_eq!(parse_discovery_sigil(two).as_deref(), Some("Obsidian Aegis"));
+
+        // A single word still works — a board on old firmware, or a human rename.
+        let one = r#"{"device":{"identifiers":["smol7"],"name":"smol 7 Draconic"}}"#;
+        assert_eq!(parse_discovery_sigil(one).as_deref(), Some("Draconic"));
+
+        // Three or more: the whole point of splitting from the front rather than taking the last
+        // token. `rsplit(' ').next()` returned "Three" here and silently dropped the rest.
+        let three = r#"{"device":{"identifiers":["smol7"],"name":"smol 7 One Two Three"}}"#;
+        assert_eq!(parse_discovery_sigil(three).as_deref(), Some("One Two Three"));
+
+        // Rejections: no id, no name, a non-numeric id, and a rename that drops the prefix.
+        assert!(parse_discovery_sigil(r#"{"device":{"name":"smol 7"}}"#).is_none());
+        assert!(parse_discovery_sigil(r#"{"device":{"name":"smol xx Aegis"}}"#).is_none());
+        assert!(parse_discovery_sigil(r#"{"device":{"name":"Kitchen Sensor"}}"#).is_none());
+        assert!(parse_discovery_sigil("not json").is_none());
     }
 
     #[test]

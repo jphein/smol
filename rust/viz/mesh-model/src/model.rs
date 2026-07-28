@@ -102,7 +102,8 @@ pub struct Event {
 pub struct Node {
     pub id: u8,
     pub noun: &'static str,
-    pub discovery_noun: Option<String>, // from HA discovery, if present
+    pub adj: &'static str,
+    pub discovery_sigil: Option<String>, // full sigil from HA discovery, if present
     pub gateway: bool,
     pub channel: Option<u8>,
     pub telemetry: Option<String>,
@@ -131,7 +132,8 @@ impl Node {
         Node {
             id,
             noun: names::noun_for_id(id),
-            discovery_noun: None,
+            adj: names::name_for_id(id).0,
+            discovery_sigil: None,
             gateway: false,
             channel: None,
             telemetry: None,
@@ -151,10 +153,17 @@ impl Node {
         }
     }
 
-    /// The label meshscope shows: the discovery noun if HA gave us one, else the
-    /// vendored id->noun (always available).
-    pub fn label(&self) -> &str {
-        self.discovery_noun.as_deref().unwrap_or(self.noun)
+    /// The label the host tools show: the full sigil HA published if we have it, else the pair
+    /// derived locally from the id (always available, no radio, no discovery needed).
+    ///
+    /// Returns the FULL PAIR, not the noun. Host tools have the width the 72x40 OLED lacks, and the
+    /// pair is unique across all 256 ids — so unlike the firmware's cramped screens this needs no
+    /// `noun+id` suffix to identify a node.
+    pub fn label(&self) -> String {
+        match self.discovery_sigil.as_deref() {
+            Some(s) => s.to_string(),
+            None => format!("{} {}", self.adj, self.noun),
+        }
     }
 
     /// Installed build number, if the node has published an ota/state.
@@ -313,7 +322,7 @@ impl Model {
                 if let Some(mc) = text.and_then(parse::parse_mesh_channel) {
                     let changed = self.crown.map(|c| c.owner) != Some(mc.owner);
                     if changed {
-                        let noun = names::noun_for_id(mc.owner);
+                        let noun = names::sigil_for_id(mc.owner);
                         self.event(
                             now_s,
                             EventKind::Crown,
@@ -342,10 +351,10 @@ impl Model {
         if topic.starts_with("homeassistant/") {
             if topic.ends_with("/config") {
                 if let Some(text) = text {
-                    if let Some(noun) = parse::parse_discovery_noun(text) {
+                    if let Some(sigil) = parse::parse_discovery_sigil(text) {
                         if let Some(id) = discovery_node_id(topic) {
-                            self.nodes.entry(id).or_insert_with(|| Node::new(id, now_s)).discovery_noun =
-                                Some(noun);
+                            self.nodes.entry(id).or_insert_with(|| Node::new(id, now_s)).discovery_sigil =
+                                Some(sigil);
                         }
                     }
                 }
