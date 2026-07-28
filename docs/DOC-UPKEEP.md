@@ -229,12 +229,21 @@ So an enumeration is wrong in both directions at once — it lists boards that a
 ## 4. Two habits that prevent most rot
 
 Separate from the traps above — those are about *reading* a source; these two are about *writing*
-one. Roughly a dozen findings in the last audit trace to their absence:
+one. Roughly a dozen findings in the last audit trace to their absence — and a third habit
+earned its place the same day:
 
 1. **Never write a live build number in prose** (above). It is stale the next release.
 2. **Date every proof.** "58→59 in ~17 s" reads as present tense forever. Write "58→59 in ~17 s
    **on 2026-07-10**" and it ages into history instead of becoming false. Same for "running now",
    "the fleet is on…", "next wave".
+
+3. **When you rewrite a section, grep for citations *to* it.** A fix is not finished until what
+   points **at** it still agrees — and the inverse bites too: rewriting a passage silently breaks
+   every quote of it elsewhere. This has now happened twice in one day, both times to the author of
+   the rewrite. Once outward (the power measurement left three pointers stale), once inward (a
+   research doc quoted *"single radio + the multi-second WiFi hold"* from ROADMAP §4b — a phrase the
+   same author had deleted from §4b hours earlier). Before committing a rewrite:
+   `grep -rn "<a distinctive phrase you are removing>" docs/ README.md ONBOARDING.md site/`.
 
 A cheap CI-able smell test for the first class of rot:
 

@@ -209,7 +209,16 @@ canary-then-rest rather than a single fleet button. The wire is documented in
   #198 dependency, not a standalone spike. Verdict confidence: high; spike cost: 1 day.
   **smol stays BLE-free**; the presence path is an ESPHome `bluetooth_proxy` on a spare ESP32 →
   HA → gateway-pull-on-flush, tracked in the #75 dollhouse epic where it's consumed. The
-  host-tested HCI codec + SightingTable are preserved on `feat/22-ble-observer`. Note that
+  host-tested HCI codec + SightingTable are preserved on `feat/22-ble-observer`.
+  > **The refusal had two legs, and only one has expired.** Proxy/metric BLE was ruled out because
+  > *"a single radio **+ the multi-second WiFi hold** preclude it."* **#23 retired the hold**, and
+  > #198's async interleave shrinks what remains of it to ~169 ms — so that leg is gone. **The single
+  > radio is untouched and load-bearing**, which is why *advertise* becomes cheap under Embassy while
+  > *continuous scan* stays refused: async changes whether other work can run while the radio is busy,
+  > it does not create a second radio. Full treatment in
+  > [research/embassy-migration-status.md](superpowers/research/embassy-migration-status.md) §4.
+
+  Note that
   Marauder's Watch (#58) and Treasure Hunt (#60) deliver proximity **without BLE at all**, from
   ESP-NOW roster RSSI — that turned out to be the better answer.
 - **4c. Multi-hop (#13) + self-healing gateway re-election (#14) — ✅ SHIPPED.** Both landed:

@@ -11,6 +11,9 @@ to do with code quality: **the fleet is currently one board**, so nothing about 
 behaviour can be verified today, and the branch's OTA path is unverified — which means the rollback
 from a bad roll is USB, by hand, per board.
 
+It also gates more than the freeze: the migration is the only route to **BLE on the Rust firmware**
+(#22 — *"embassy/async is the only supported coex shape"*), so it buys **three** things, not one (§6).
+
 **Recommendation: take the interim fix now, finish the migration deliberately behind a two-board
 bench.** Detail in §6.
 
@@ -140,15 +143,40 @@ changed"*). Given [smol's flash-write word-alignment history](../../ota.md) and 
 **~15 s → 169 ms, about 89×.** Robust: the blocking baseline lands at ~15 s under *both* emulations,
 so the result does not depend on how blocking was modelled.
 
-### What that does and does not fix — three different problems, often conflated
+### 🔑 The one rule that settles every "does async fix X?" question
+
+State it once and apply it everywhere, because almost every wrong claim in this area is a failure to
+apply it:
+
+> ## **Async changes whether other work can run while the radio is busy.**
+> ## **It does not create a second radio.**
+
+Everything the executor fixes is on the first line. Everything it cannot touch is on the second. The
+deaf-window win, the co-channel constraint, and the BLE-scan question are all the *same* question
+asked three times — and the rule answers all three without re-deriving anything.
+
+### What that does and does not fix
 
 | Problem | Does the executor fix it? |
 |---|---|
 | **JP's UI freeze** | **Yes, directly.** The freeze is the display tick starving while a blocking WiFi burst owns the only thread. `Timer::after().await` lets the loop keep rendering between await points. This is the same root cause as the deaf window, seen from the user's side. |
 | **Mesh deaf-window during a burst** | **Yes — 89×, measured.** Not eliminated: 169 ms remains, against a 279 ms ambient floor. |
-| **The single-radio, single-channel constraint** | **No. This is physics, not scheduling.** One radio is on one channel at a time; off-channel WiFi work makes the mesh deaf no matter who schedules it. That is what #23's **co-channel coexist** addresses (keep WiFi and the mesh on the same channel), and it already shipped on `main`. |
+| **The single-radio, single-channel constraint** | **No — second line of the rule.** One radio sits on one channel at a time; off-channel WiFi work makes the mesh deaf no matter who schedules it. #23's **co-channel coexist** is the fix, and it already shipped on `main`. |
 | **Crown unicast-RX starvation** | **No.** **#204 (OPEN)** — a crown under bulk inbound goes downstream-deaf within ~1 ms of its own transmit. Reproduces identically on the new esp-radio 0.18 stack, so **the radio rewrite is not the cure** and neither is the executor. |
+| **BLE at all, on the Rust firmware** | **Yes — and it is a whole capability, not a nicety (benefit 3 in §6).** #22 (CLOSED, verdict confidence *high*) refuted native BLE on the blocking runtime: **ROM busy-waits in btdm init / PHY calibration under *every* init order**, at 3 hardware-distinguished hang points, 1 day of spike. Its own conclusion names the exit: ***"embassy/async is the only supported coex shape."*** Deliverables are already banked on `feat/22-ble-observer` — a host-tested HCI codec + `SightingTable` — so this is a resumption, not a fresh start. |
+| **BLE beacon — ADVERTISE** (the node *is tracked*) | **Yes, first line of the rule.** Brief periodic adverts fit the burst duty cycle, and room-level presence comes from external fixed anchors (Bermuda/HACS). **This is the real BLE win.** |
+| **BLE PROXY / continuous SCAN** (the node *tracks others*) | **No — second line of the rule.** A proxy must listen ~continuously; a board that is also meshing, bursting and running a game is a **lossy part-time scanner**, and no executor conjures the airtime. #22: *"better left to dedicated always-on nodes."* The shipped answer stays **ESPHome `bluetooth_proxy` on a spare ESP32**, consumed by the #75 dollhouse epic. |
 | **The DRAM ceiling** | **No — that is the C6, not Embassy.** The ROADMAP pairs #198/#233 with "the C6 dissolves the DRAM problem"; the dissolving agent is **512 KB of SRAM on different silicon**, not the async model. Keep the two claims apart. |
+
+> 📌 **The BLE "no" lost one of its two legs — and still holds.** Worth stating precisely, because it
+> is exactly the case [DOC-UPKEEP](../../DOC-UPKEEP.md) means by *when a premise expires, check the
+> conclusion before deleting*. The original refusal of proxy/metric BLE rested on **two** reasons:
+> *"single radio **+ the multi-second WiFi hold** preclude it"* ([ROADMAP §4b](../../ROADMAP.md)).
+> **#23 retired the second leg** — the multi-second hold is gone — and the migration shrinks what
+> remains of it to ~169 ms. **The first leg is load-bearing and untouched.** So the verdict survives,
+> for a narrower and cleaner reason: not *"the radio is away for seconds at a time"* but simply
+> *"there is one radio."* Do not read the retired half as a reason to revisit the conclusion; do read
+> it as the reason **advertise** got easier while **scan** did not.
 
 > 📌 **"#53" is overloaded in this repo — cite the study by path, not by number.** The brief for
 > this task attributed the co-channel physics finding to *"#53's finding,"* and my first draft
@@ -228,6 +256,22 @@ template: DUT + a dedicated ch6 beacon source.
    less running).
 4. **Canary one board**, then hold. Per [ROADMAP §3a](../../ROADMAP.md), canary-one-board is
    mandatory, and it matters most here.
+
+### Three benefits, not one — which changes the sizing conversation
+
+The migration is easy to mis-price as *"a large re-platform to fix a UI freeze."* It is not. It gates
+**three** things, and JP should see them added up rather than have to add them up himself:
+
+| # | Benefit | Status | Caveat |
+|---|---|---|---|
+| 1 | **App responsiveness during bursts** — JP's actual complaint | mechanism understood, not separately timed (§7) | ⚠️ **aurora may deliver most of the felt improvement without the migration** — that is Step 1, and it is why this benefit alone does not justify the cost |
+| 2 | **The mesh deaf-window** | 🟢 **measured: ~15 s → 169 ms, ~89×** | not eliminated; 169 ms against a 279 ms floor |
+| 3 | **BLE at all on the Rust firmware** (#22) | 🔓 unblocked — *"embassy/async is the only supported coex shape"*, deliverables banked on `feat/22-ble-observer` | **advertise only.** Proxy/continuous scan stays refused on the second line of the rule |
+
+Benefit 2 is the one with a number on it. Benefit 3 is the one that is otherwise **unreachable** — no
+amount of interim polish on the superloop delivers BLE, because #22's hang is in ROM busy-waits under
+every init order. So the honest framing is: **Step 1 may well answer benefit 1 cheaply, but benefits 2
+and 3 have no other route.** That is the trade to put in front of JP.
 
 ### Sizing, honestly
 | Step | Effort | Confidence |
