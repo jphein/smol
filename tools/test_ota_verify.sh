@@ -116,6 +116,27 @@ bad()  { fail=$((fail+1)); printf '   FAIL - %s\n' "$1"; }
 # LITERAL final bytes, which nobody controls in a real log — a log gains trailing output the moment
 # anything is appended. It is a WORSE trap than "late is safe" because it is almost true.
 #
+# THE METHOD LESSON, which outlives the mechanism and is the reason this block is so long.
+# Four wrong beliefs were produced during this investigation — "position-independent" (mine),
+# "position is load-bearing" (the auditor's), "possibly load-dependent" (mine again), and a false
+# `F=NO` from scaling a fixture's timeline while leaving a device-reported `up=` unscaled (the
+# auditor's). EVERY ONE was falsified by RE-READING THE FIXTURE, not by collecting more data. More
+# iterations would have ENTRENCHED each of them, because each was self-consistent within the probe
+# that produced it: a probe whose match sat at the end of its payload genuinely never flakes, and a
+# scaled timeline genuinely does fail F. So the operational rule is not "measure more":
+#
+#     BEFORE YOU BELIEVE A MEASUREMENT, READ THE THING YOU MEASURED.
+#
+# Which is this file's founding lesson one level up — a summary is not evidence, INCLUDING a summary
+# you wrote yourself. The harness learned not to trust a retained value; its authors had to learn not
+# to trust their own probes.
+#
+# A SECOND GENERAL POINT, from the same review: `restarts` and `monotonic` are safe as EVIDENCE and
+# were unsafe as a THRESHOLD INPUT — the identical signal, and `+ restarts` for conjunct C would have
+# handed back a known false PASS while printing the same number harmlessly in the evidence block.
+# WHERE A VALUE IS CONSUMED MATTERS AS MUCH AS WHETHER IT IS TRUE. When adding a field here, ask not
+# only "is this correct?" but "what decision will it be allowed to make?"
+#
 # Also firmly established:
 #   * NOT implementation-specific — GNU grep 3.11 (`/usr/bin/grep`) and ugrep 7.5.0 (bare `grep` here)
 #     both exhibit it, so the hazard travels to CI. Implementation changes the RATE, not the existence:
