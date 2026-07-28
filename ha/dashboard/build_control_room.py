@@ -236,6 +236,8 @@ def node_card(nid, meta, present, span=4):
     if fw: bot.append({"entity":fw,"name":"firmware (version + update)"})
     inst=f"input_button.smol_ota_install_{nid}"
     if inst in present: bot.append({"entity":inst,"name":"Install staged (gateway consumes)","icon":"mdi:rocket-launch"})
+    if len(bot)==1:   # heading only → say so rather than showing an empty "firmware" strip
+        bot.append({"type":"section","label":"— no update entity discovered yet"})
     ctrl_bottom={"type":"entities","show_header_toggle":False,"entities":bot,
                  "card_mod":{"style":"ha-card{border-radius:0 0 10px 10px;border-top:none;margin-top:-1px;"+OP+"}"}}
     # ---- #vitals ALWAYS-ON telemetry (heap / uptime / boot / slot / reset + mesh counters).
@@ -260,16 +262,39 @@ def node_card(nid, meta, present, span=4):
                    "entities":[{"entity":f"sensor.smol_{nid}_heap_free","name":"heap free"}]
                               +([{"entity":f"sensor.smol_{nid}_heap_min","name":"heap min"}] if f"sensor.smol_{nid}_heap_min" in present else []),
                    "card_mod":{"style":"ha-card{border-radius:0;border-top:none;border-bottom:none;margin-top:-1px;"+OP+"}"}}
+    # An `entities` card whose rows all got skipped still renders its section HEADINGS — an
+    # empty "telemetry · live" strip. Nodes discovered purely over MQTT (id50/51/122…) have no
+    # hand-written family in smol_mesh.yaml, so most of their rows are absent and their box was
+    # mostly headings. Drop any card that ended up with no real entity row.
+    def nonempty(card):
+        if not card or card.get("type")!="entities": return card
+        return card if any(isinstance(e,dict) and e.get("entity") for e in card.get("entities",[])) else None
+    # …and say WHY the box is thin, rather than leaving JP to wonder if it's broken. This is the
+    # per-id YAML gap, not a dead node: the rich diag sensors are hand-written per id, so a
+    # newly-discovered board only surfaces what firmware MQTT-discovery gives it.
+    thin=not any(f"sensor.smol_{nid}_{k}" in present for k in ("heap_free","uptime","boot_slot"))
+    note=({"type":"markdown","content":
+           f"_{esc(meta['name'])} is discovered over MQTT only — the richer diag rows "
+           f"(heap · uptime · slot · mesh counters) are hand-written per id in "
+           f"`ha/packages/smol_mesh.yaml` and this board has none yet._",
+           "card_mod":{"style":"ha-card{border-radius:0;border-top:none;border-bottom:none;margin-top:-1px;"
+                       "font-size:11px;opacity:.62;"+OP+"}"}} if thin else None)
     ota=ota_progress_card(nid,meta['name'])   # #40 relay progress bar + phase chip — self-hides (display:none) when idle
     dev=device_card(nid,meta['name'])         # #70/#74 rollback / abnormal-reset alarm — self-hides when clean
     plug=plugin_chips(nid,present)  # #55 plugin-visibility toggle chips
     if headless:
         # #headless board: no OLED / screen-mode / plugin controls to show — telemetry-first box.
-        seq=[header,telemetry]+([heap_hist] if heap_hist else [])+[ota,dev,ctrl_bottom]
+        seq=[header,telemetry]+([heap_hist] if heap_hist else [])+[note,ota,dev,ctrl_bottom]
     else:
-        seq=[header,oled,ctrl_top,cond_leaf,cond_gw,telemetry]+([heap_hist] if heap_hist else [])+[ota,dev]
+        seq=[header,oled,ctrl_top,cond_leaf,cond_gw,telemetry]+([heap_hist] if heap_hist else [])+[note,ota,dev]
         if plug: seq.append(plug)
         seq.append(ctrl_bottom)
+    # nonempty() strips heading-only entities cards; the `note`/`plug`/`heap_hist` slots are None
+    # when they don't apply. Whatever survives keeps its order, so the stack still joins cleanly.
+    # ctrl_bottom is EXEMPT from the strip: it owns the stack's rounded bottom corner, so
+    # dropping it would leave the box ending on a square edge. When it has no rows to show it
+    # states that instead of displaying a bare "firmware" heading.
+    seq=[c for c in (nonempty(c) if c is not ctrl_bottom else c for c in seq) if c]
     return {"type":"vertical-stack","view_layout":{"grid-column":f"span {span}"},"cards":seq}
 
 def legend_card(nodes, present):
