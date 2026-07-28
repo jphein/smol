@@ -30,6 +30,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/configure-pages@v6
+      # realm-sigil version surface. Pages is static and cannot serve a dynamic
+      # /api/version, so the honest equivalent is a file stamped from the commit being
+      # published — see the header of the script for why it is derived rather than
+      # hand-kept, and why it reads its word list out of the firmware's names.rs instead
+      # of pip-installing canonical realm-sigil (whose pyproject does not build).
+      # site/version.json is gitignored: it exists only inside a publish.
+      - name: Stamp site/version.json
+        run: python3 tools/stamp_site_version.py
       - uses: actions/upload-pages-artifact@v5
         with:
           path: site

@@ -393,6 +393,56 @@
     });
   }
 
+  /* ================================ version ================================
+     Reads the realm-sigil stamp from site/version.json, which is written at PUBLISH time
+     by tools/stamp_site_version.py and gitignored — so there is no version in this repo to
+     go stale, and nothing here to hand-update. Three honest outcomes and no fourth:
+
+       · fetched        → the sigil word + short hash, linked to the commit
+       · not there      → "version unknown" (a local run or file:// open; nothing was stamped)
+       · fetch failed   → "version unavailable" — an unreachable capability ANNOUNCES itself
+                          rather than silently vanishing, the same rule the share button and
+                          the feed LED follow.
+
+     `cache: 'no-store'` is load-bearing: a cached version.json is precisely the
+     confidently-stale number this whole surface exists to avoid.
+
+     Everything from the JSON goes in via textContent, and the href is accepted only if it is
+     really a github.com URL — the file is generated from CI environment values, and a version
+     stamp is not a good reason to hand the DOM an unchecked string. */
+  async function initVersion() {
+    const el = $('#site-version');
+    if (!el) return;
+    const say = (txt, title) => {
+      el.textContent = txt;                     // textContent, never innerHTML
+      if (title) el.title = title;
+    };
+    let v;
+    try {
+      const r = await fetch('version.json', { cache: 'no-store' });
+      if (!r.ok) { say(r.status === 404 ? 'version unknown' : 'version unavailable'); return; }
+      v = await r.json();
+    } catch { say('version unavailable'); return; }
+
+    const label = (v && (v.version || v.hash)) ? String(v.version || v.hash) : '';
+    if (!label) { say('version unknown'); return; }
+
+    const built = v.built ? ` · built ${String(v.built).replace('T', ' ').replace('Z', ' UTC')}` : '';
+    const title = `branch ${v.branch || 'unknown'}${built}${v.dirty ? ' · working tree was dirty' : ''}`;
+    const url = typeof v.commit_url === 'string' ? v.commit_url : '';
+    el.className = 'ver known';
+    if (/^https:\/\/github\.com\//.test(url)) {
+      el.textContent = '';
+      const a = document.createElement('a');
+      a.href = url; a.target = '_blank'; a.rel = 'noopener';
+      a.textContent = label;                    // textContent, never innerHTML
+      el.appendChild(a);
+      el.title = title;
+    } else {
+      say(label, title);
+    }
+  }
+
   /* ================================ boot ================================ */
   // On the published (GitHub Pages) copy or a file:// open there is no server
   // to POST edits to, so hide the editor dock and run read-only. Editing works
@@ -404,6 +454,7 @@
   loadContent();
   bardTypewriter();
   initShare();
+  initVersion();
   wsGlass();
   poll(); setInterval(poll, 4000);
   clock(); setInterval(clock, 15000);

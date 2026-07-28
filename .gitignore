@@ -74,3 +74,7 @@ rust/clock/model/*.tmp
 
 # Build artifacts from the experiments/ scratch crates (never shipped, churn on every cargo run)
 experiments/*/Cargo.lock
+
+# Stamped at publish time by tools/stamp_site_version.py, from the commit being published.
+# Never commit it: a checked-in version file is a hand-maintained one, i.e. wrong.
+site/version.json

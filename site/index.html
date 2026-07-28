@@ -303,6 +303,12 @@ ul.feat li::before{content:"▚";position:absolute;left:0;color:var(--glow)}
 /* footer */
 footer{padding:50px 0 80px;border-top:1px solid var(--line2);color:var(--faint);font-family:var(--mono);font-size:.78rem;display:flex;justify-content:space-between;flex-wrap:wrap;gap:16px}
 footer a{color:var(--dim)}footer a:hover{color:var(--glow)}
+/* Build stamp. `.ver.known` is the only state that gets ink — an unknown or unreachable
+   version stays deliberately quiet rather than dressing itself up as a real one. */
+.ver{color:var(--faint)}
+.ver.known{color:var(--dim)}
+.ver.known a{color:var(--dim);border-bottom:1px dotted var(--line)}
+.ver.known a:hover{color:var(--glow);border-bottom-color:var(--glow)}
 
 /* ---------- WYSIWYG dock ---------- */
 [data-edit]{border-radius:6px;transition:box-shadow .2s,background .2s;outline:none}
@@ -1026,7 +1032,12 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 
 <footer class="wrap">
   <span data-edit="footer.note">smol — built on a fingertip, documented on a page that edits itself.</span>
-  <span>· <a href="https://github.com/jphein/smol" target="_blank">github.com/jphein/smol</a> · <a href="https://www.aliexpress.us/item/3256807156068355.html" target="_blank">buy the board ↗</a> · ESP32-C3 · <span id="clock"></span></span>
+  <!-- The realm-sigil build stamp. The initial text is "version unknown" ON PURPOSE: this
+       file ships with no version baked in, so if the fetch fails or scripts never run the
+       page says it does not know, rather than confidently showing a number that was true
+       once. Filled by initVersion() in app.js from site/version.json, which only exists
+       inside a publish (stamped by tools/stamp_site_version.py, gitignored). -->
+  <span>· <a href="https://github.com/jphein/smol" target="_blank">github.com/jphein/smol</a> · <a href="https://www.aliexpress.us/item/3256807156068355.html" target="_blank">buy the board ↗</a> · ESP32-C3 · <span id="site-version" class="ver">version unknown</span> · <span id="clock"></span></span>
 </footer>
 
 <!-- WYSIWYG DOCK -->
