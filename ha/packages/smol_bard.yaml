@@ -51,7 +51,6 @@ input_number:
     min: 20
     max: 500
     step: 10
-    initial: 160
     unit_of_measurement: "ms"
     mode: slider
     icon: "mdi:speedometer"
@@ -68,12 +67,10 @@ input_select:
   smol_all_bard_font:
     name: "smol fleet text size"
     options: ["5x8 · 14x5 small", "6x10 · 12x4 medium", "9x15 · 8x2 large", "10x20 · 7x2 huge"]
-    initial: "5x8 · 14x5 small"
     icon: "mdi:format-size"
   smol_all_bard_mode:
     name: "smol fleet delivery"
     options: ["inf", "page"]
-    initial: "inf"
     icon: "mdi:book-open-page-variant"
 
 input_text:
@@ -88,7 +85,6 @@ input_text:
   smol_all_tale:
     name: "smol fleet story prompt (Bard)"
     max: 64
-    initial: ""
 
 automation:
   - id: smol_bard_delivery_publish
@@ -107,7 +103,13 @@ automation:
           - input_select.smol_all_bard_font
     condition:
       - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
+        # Blocks the entity APPEARING (from_state None) and an availability blip, but NOT
+        # `unknown` -> value. With `initial:` removed these helpers start `unknown` and stay
+        # there until an operator chooses, so `unknown` is exactly the from_state of JP's FIRST
+        # selection. Excluding it would have made the very first change a silent no-op — a worse
+        # bug than the revert that removing `initial:` fixes, and the same "control does nothing"
+        # class as the 5x8 omission.
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
     action:
       # The FLEET is discovered at run time, not listed. `sensor.smol_<id>[_<slug>…]_status` is a
       # firmware-published MQTT-discovery entity, so its existence IS the node announcing itself —
@@ -115,6 +117,17 @@ automation:
       # number of segments): a `?` there allowed only one and would miss the two-segment ids that
       # appear once discovery publishes the full sigil, which is exactly the quantifier that caused
       # a whole-fleet blackout in the generator (960bf1e).
+      # WHY THIS IS SAFE, and it is a property to protect rather than luck: it keys on
+      # `sensor.smol_<id>…_status`, an entity the FIRMWARE publishes via MQTT discovery. Clearing
+      # a discovery config removes the entity outright, whereas a YAML-defined entity with a
+      # `unique_id` leaves a `restored: true` REGISTRY HUSK behind — the id7/id9 retirement left
+      # 110 of them. A husk that matched would make this fan out to a board that does not exist,
+      # forever. Verified against live state: 6 matches (ids 5/8/50/51/122/236), no id7/id9 husk.
+      # Do NOT "improve" this to also match YAML-defined entities.
+      #
+      # Dormant boards ARE included on purpose (id236 unavailable, id122 empty state): the publish
+      # is RETAINED, so a sleeping board picks the value up when it wakes. Gate on state if that is
+      # ever not wanted — but a config the fleet agrees on is worth more than one only live boards saw.
       - variables:
           fleet: >-
             {%- set ns = namespace(ids=[]) -%}
@@ -141,11 +154,22 @@ automation:
           # mode have nothing to act on there. The better long-term fix is firmware-side — read an
           # absent font as the DEFAULT rather than as "keep current" — and then this can go back to
           # omitting it.
+          # EVERY field is defaulted, because any of the three can be `unknown`. Removing
+          # `initial:` (so an operator's choice survives a restart) means a helper reads `unknown`
+          # until someone touches THAT control — so changing the speed slider first would other-
+          # wise publish `200:unknown:unknown`, and the firmware refuses the whole value on a bad
+          # mode or font. The operator would have moved a slider and had nothing happen, which is
+          # the third form of this same bug today. Defaults match the firmware's own: 160 ms,
+          # `inf`, `5x8`.
           value: >-
-            {%- set ms = states('input_number.smol_all_bard_speed') | int -%}
-            {%- set mode = states('input_select.smol_all_bard_mode') -%}
-            {%- set font = (states('input_select.smol_all_bard_font') | default('')).split(' ')[0] -%}
-            {{ ms }}:{{ mode }}{% if font %}:{{ font }}{% endif %}
+            {%- set na = ['unknown', 'unavailable', 'none', ''] -%}
+            {%- set ms_raw = states('input_number.smol_all_bard_speed') -%}
+            {%- set ms = 160 if ms_raw in na else ms_raw | int(160) -%}
+            {%- set mode_raw = states('input_select.smol_all_bard_mode') -%}
+            {%- set mode = 'inf' if mode_raw in na else mode_raw -%}
+            {%- set font_raw = states('input_select.smol_all_bard_font') -%}
+            {%- set font = '5x8' if font_raw in na else font_raw.split(' ')[0] -%}
+            {{ ms }}:{{ mode }}:{{ font }}
       - repeat:
           for_each: "{{ fleet }}"
           sequence:
@@ -171,7 +195,13 @@ automation:
           - input_text.smol_all_tale
     condition:
       - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
+        # Blocks the entity APPEARING (from_state None) and an availability blip, but NOT
+        # `unknown` -> value. With `initial:` removed these helpers start `unknown` and stay
+        # there until an operator chooses, so `unknown` is exactly the from_state of JP's FIRST
+        # selection. Excluding it would have made the very first change a silent no-op — a worse
+        # bug than the revert that removing `initial:` fixes, and the same "control does nothing"
+        # class as the 5x8 omission.
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
     action:
       - variables:
           fleet: >-
