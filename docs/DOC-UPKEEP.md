@@ -149,6 +149,30 @@ So when you check a subsystem, ask both questions:
   brick-safety, error handling. An understated guarantee is still a wrong doc, and it costs you the
   credit for work that was actually done.
 
+### ⚠️ A correction in the body under a stale headline is worse than no correction
+
+The headline is what gets read and quoted. A refutation buried in §5 under a summary that still asserts
+the refuted thing doesn't correct the document — **it makes it self-contradictory, and the reader takes
+the top.**
+
+Worked example, 2026-07-28: **both** Embassy documents carried the memory finding that inverted the
+verdict (Embassy costs 58,144 B against 2,232 B of slack — a platform problem, not a tuning one) while
+their summaries still said *"not what should ship next, for exactly one reason: the OTA path"* and
+*"take the interim fix now, **finish the migration**."* Anyone reading only the top would have
+sequenced a C3 fleet roll that cannot run.
+
+**So when a finding changes a conclusion:**
+- **Fix the summary in the same commit as the body.** If you only have time for one, fix the summary —
+  a stale body under a correct headline merely wastes a reader's time; the reverse misdirects them.
+- **Grep the document's own top for the claim you just refuted**, and every *other* document that
+  restates it. This one needed the research doc **and** the handoff.
+- **Don't over-correct either.** *"The migration is dead"* would have been a fresh overclaim: the 89×
+  measured win, the #233 upgrade and the port through crown election all survive — as the **next
+  platform's head start**. State what died and what didn't.
+
+This is §2's partial-contract rule one scale up: a **partially corrected document**, like a
+half-documented field, makes a reader confident and wrong.
+
 ### ⚠️ When a premise expires, check the conclusion before deleting
 
 A doc's *reason* can go stale while its *answer* stays right. Deleting the section loses a correct
