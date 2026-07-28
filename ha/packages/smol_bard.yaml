@@ -12,7 +12,11 @@
 # sets the OPENING it continues, per node, at runtime — no reflash:
 #   input_text.smol_<id>_tale  ->  retained  smol/<id>/config/tale  ->  CFG key `T`
 # Empty value = retain-clear => the node falls back to its built-in persona prompt
-# (id7 dragon / id8 owl / id9 bird), the same "empty = default" convention as the `S` key.
+# (id8 owl), the same "empty = default" convention as the `S` key. The firmware still carries a
+# persona per id — the dragon and bird belonged to id7/id9, which no longer exist on the air
+# (the hardware runs as id50/id51 since #198 Phase-2, and identity lives in NVS, which OTA
+# never touches). Their controls were retired 2026-07-28; id50/id51 get theirs from the
+# firmware-published discovery configs of #309, NOT from a hand-written block here.
 #
 # THE VALIDATION LIVES ON THE NODE, NOT HERE — and that is not laziness. Checking a prompt
 # means encoding it with the model's own 512-token vocabulary, and the model is on the board.
@@ -35,26 +39,8 @@ input_number:
   # generation clock. The board generates at ~224-274 ms/token in endless mode; this only sets how
   # fast finished text is unveiled. (Confusing the two axes has already caused one bug.) The leaf
   # clamps to 20..=500, so out-of-range values are corrected on the node, not here.
-  smol_7_bard_speed:
-    name: "smol 7 typewriter (ms/char)"
-    min: 20
-    max: 500
-    step: 10
-    initial: 160
-    unit_of_measurement: "ms"
-    mode: slider
-    icon: "mdi:speedometer"
   smol_8_bard_speed:
     name: "smol 8 typewriter (ms/char)"
-    min: 20
-    max: 500
-    step: 10
-    initial: 160
-    unit_of_measurement: "ms"
-    mode: slider
-    icon: "mdi:speedometer"
-  smol_9_bard_speed:
-    name: "smol 9 typewriter (ms/char)"
     min: 20
     max: 500
     step: 10
@@ -72,33 +58,13 @@ input_select:
   # where a slider would imply sizes that do not exist. The label carries what actually changes:
   # the character grid. Bigger text = fewer characters on the 72x40 glass; the story window is
   # measured in TOKENS, so a larger font shows LESS story without changing what the model writes.
-  smol_7_bard_font:
-    name: "smol 7 text size"
-    options: ["5x8 · 14x5 small", "6x10 · 12x4 medium", "9x15 · 8x2 large", "10x20 · 7x2 huge"]
-    initial: "5x8 · 14x5 small"
-    icon: "mdi:format-size"
   smol_8_bard_font:
     name: "smol 8 text size"
     options: ["5x8 · 14x5 small", "6x10 · 12x4 medium", "9x15 · 8x2 large", "10x20 · 7x2 huge"]
     initial: "5x8 · 14x5 small"
     icon: "mdi:format-size"
-  smol_9_bard_font:
-    name: "smol 9 text size"
-    options: ["5x8 · 14x5 small", "6x10 · 12x4 medium", "9x15 · 8x2 large", "10x20 · 7x2 huge"]
-    initial: "5x8 · 14x5 small"
-    icon: "mdi:format-size"
-  smol_7_bard_mode:
-    name: "smol 7 delivery"
-    options: ["inf", "page"]
-    initial: "inf"
-    icon: "mdi:book-open-page-variant"
   smol_8_bard_mode:
     name: "smol 8 delivery"
-    options: ["inf", "page"]
-    initial: "inf"
-    icon: "mdi:book-open-page-variant"
-  smol_9_bard_mode:
-    name: "smol 9 delivery"
     options: ["inf", "page"]
     initial: "inf"
     icon: "mdi:book-open-page-variant"
@@ -112,16 +78,8 @@ input_text:
   # outright, and unusual names fragment into char-level tokens and read worse. max 64 = the
   # firmware's CFG_VALUE_MAX and prompt buffer; every prompt token is a story token spent from
   # the shared 80-token window, so shorter openings leave longer tales.
-  smol_7_tale:
-    name: "smol 7 story prompt (Bard)"
-    max: 64
-    initial: ""
   smol_8_tale:
     name: "smol 8 story prompt (Bard)"
-    max: 64
-    initial: ""
-  smol_9_tale:
-    name: "smol 9 story prompt (Bard)"
     max: 64
     initial: ""
 
@@ -137,15 +95,9 @@ automation:
     trigger:
       - platform: state
         entity_id:
-          - input_number.smol_7_bard_speed
           - input_number.smol_8_bard_speed
-          - input_number.smol_9_bard_speed
-          - input_select.smol_7_bard_mode
           - input_select.smol_8_bard_mode
-          - input_select.smol_9_bard_mode
-          - input_select.smol_7_bard_font
           - input_select.smol_8_bard_font
-          - input_select.smol_9_bard_font
     condition:
       - condition: template
         value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
@@ -179,9 +131,7 @@ automation:
     trigger:
       - platform: state
         entity_id:
-          - input_text.smol_7_tale
           - input_text.smol_8_tale
-          - input_text.smol_9_tale
     condition:
       - condition: template
         value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
@@ -196,35 +146,15 @@ automation:
 mqtt:
   sensor:
     # #302 delivery readback: what the node was actually told, as `<ms>:<mode>`.
-    - name: "smol 7 delivery"
-      unique_id: smol_7_delivery_mirror
-      state_topic: "smol/7/config/delivery"
-      icon: "mdi:play-speed"
-      value_template: "{{ value if value else '(default)' }}"
     - name: "smol 8 delivery"
       unique_id: smol_8_delivery_mirror
       state_topic: "smol/8/config/delivery"
       icon: "mdi:play-speed"
       value_template: "{{ value if value else '(default)' }}"
-    - name: "smol 9 delivery"
-      unique_id: smol_9_delivery_mirror
-      state_topic: "smol/9/config/delivery"
-      icon: "mdi:play-speed"
-      value_template: "{{ value if value else '(default)' }}"
     # #303 Bard story-prompt mirror: read back the retained prompt so the card shows what was
     # commanded. '(default)' when empty = the node is using its built-in persona.
-    - name: "smol 7 tale"
-      unique_id: smol_7_tale_mirror
-      state_topic: "smol/7/config/tale"
-      icon: "mdi:feather"
-      value_template: "{{ value if value else '(default)' }}"
     - name: "smol 8 tale"
       unique_id: smol_8_tale_mirror
       state_topic: "smol/8/config/tale"
-      icon: "mdi:feather"
-      value_template: "{{ value if value else '(default)' }}"
-    - name: "smol 9 tale"
-      unique_id: smol_9_tale_mirror
-      state_topic: "smol/9/config/tale"
       icon: "mdi:feather"
       value_template: "{{ value if value else '(default)' }}"

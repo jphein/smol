@@ -25,7 +25,15 @@
 #    would render "text~30" on today's glass. One-line change if firmware prefers suffix.)
 # Real timed auto-revert works TODAY via a best-effort HA delay+guarded-clear (below).
 #
-# Roster = 7/8/9 (id5 headless = future). Table-driven: change the three lists to add a node.
+# Roster = id8 (id5 headless = no glass). Table-driven: change the three lists to add a node —
+# the `all` list in smol_notify, the same list in smol_notify_clear, and the target select's
+# options. ⚠ THE THREE MUST AGREE: a roster id with no matching per-node helper aborts the
+# whole repeat (input_text.set_value on a missing entity fails the script), so a stale id does
+# not just skip its own board — it silently kills delivery to the boards after it.
+# Was 7/8/9 until 2026-07-28: id7/id9 have not existed on the air since #198 Phase-2
+# re-provisioned that hardware as id50/id51 (NVS identity; OTA never touches it), so their
+# helpers were retired. id50/id51 are NOT hand-added back here — a per-node control surface
+# published by the firmware is #309's job, and hand-writing one re-arms the same bug.
 # NO new smol/* command topics — only the documented config/custom + config/default_screen.
 
 # --- helpers: the dashboard "herald" compose card ---
@@ -35,39 +43,21 @@ input_text:
     max: 120
     icon: mdi:message-text-outline
   # revert memory — the screen each board showed BEFORE a message interrupted it (per-node).
-  smol_7_prev_screen:
-    name: "smol 7 · pre-message screen"
-    max: 20
   smol_8_prev_screen:
     name: "smol 8 · pre-message screen"
-    max: 20
-  smol_9_prev_screen:
-    name: "smol 9 · pre-message screen"
     max: 20
   # notification-ACTIVE flag (per-node): holds the live notification wire while a message is up.
   # Its ROLE is a guard — the #45 publish automation (smol_mesh.yaml) SKIPS a node whose flag is
   # set, so the heartbeat/start republish never wipes the message. '' = no active notification →
   # heartbeat resumes publishing the author-composed layout for that node.
-  smol_7_notify_wire:
-    name: "smol 7 · notification-active flag"
-    max: 60
   smol_8_notify_wire:
     name: "smol 8 · notification-active flag"
-    max: 60
-  smol_9_notify_wire:
-    name: "smol 9 · notification-active flag"
     max: 60
   # last-message record (per-node): the script sets this directly (bulletproof — no trigger/event
   # reactivity needed). state = the message text or "(cleared)"; the helper's own last_changed is
   # the sent timestamp. sensor.smol_<id>_last_message mirrors it + exposes that timestamp.
-  smol_7_last_msg:
-    name: "smol 7 · last message (raw)"
-    max: 120
   smol_8_last_msg:
     name: "smol 8 · last message (raw)"
-    max: 120
-  smol_9_last_msg:
-    name: "smol 9 · last message (raw)"
     max: 120
 
 input_number:
@@ -83,7 +73,7 @@ input_number:
 input_select:
   smol_msg_target:
     name: "smol herald · target"
-    options: ["All sigils", "id7", "id8", "id9"]
+    options: ["All sigils", "id8"]
     initial: "All sigils"
     icon: mdi:target
   smol_msg_size:
@@ -122,7 +112,7 @@ script:
     max: 10
     fields:
       target:
-        description: "'all', a single id (7/8/9), or a list of ids"
+        description: "'all', a single id (8), or a list of ids"
         example: "all"
       message:
         description: "text; {entity_id} refs are resolved; auto-wraps to fit the panel"
@@ -147,7 +137,7 @@ script:
       ids: >-
         {% set t = target if target is defined else 'all' %}
         {% if t is iterable and t is not string %}{{ t | map('string') | list }}
-        {% elif (t | string | lower) == 'all' %}{{ ['7', '8', '9'] }}
+        {% elif (t | string | lower) == 'all' %}{{ ['8'] }}
         {% else %}{{ [t | string] }}{% endif %}
       # resolve {entity} refs (reuse the #45 subst idiom) + strip frame chars
       sane: >-
@@ -313,7 +303,7 @@ script:
       ids: >-
         {% set t = target if target is defined else 'all' %}
         {% if t is iterable and t is not string %}{{ t | map('string') | list }}
-        {% elif (t | string | lower) == 'all' %}{{ ['7', '8', '9'] }}
+        {% elif (t | string | lower) == 'all' %}{{ ['8'] }}
         {% else %}{{ [t | string] }}{% endif %}
       screens: "{{ ['Menu', 'Clock', 'Batt', 'Grid', 'Snake', 'Bench', 'MeshSnake', 'About', 'Custom'] }}"
     sequence:
@@ -385,7 +375,7 @@ script:
     max: 10
     fields:
       target:
-        description: "'all' (→ smol/255/notify broadcast), a single id (7/8/9), or a list of ids"
+        description: "'all' (→ smol/255/notify broadcast), a single id (8), or a list of ids"
         example: "all"
       message:
         description: "toast text; the board word-wraps it to the overlay box (same wrap as the dock)"
@@ -426,14 +416,6 @@ script:
 # ===========================================================================
 template:
   - sensor:
-      - name: "smol 7 last message"
-        unique_id: smol_7_last_message
-        icon: mdi:message-text
-        state: >-
-          {% set v = states('input_text.smol_7_last_msg') %}
-          {{ v if v not in ['unknown', 'unavailable', 'none', ''] else '(none)' }}
-        attributes:
-          sent: "{{ states.input_text.smol_7_last_msg.last_changed if states.input_text.smol_7_last_msg is not none else None }}"
       - name: "smol 8 last message"
         unique_id: smol_8_last_message
         icon: mdi:message-text
@@ -442,14 +424,6 @@ template:
           {{ v if v not in ['unknown', 'unavailable', 'none', ''] else '(none)' }}
         attributes:
           sent: "{{ states.input_text.smol_8_last_msg.last_changed if states.input_text.smol_8_last_msg is not none else None }}"
-      - name: "smol 9 last message"
-        unique_id: smol_9_last_message
-        icon: mdi:message-text
-        state: >-
-          {% set v = states('input_text.smol_9_last_msg') %}
-          {{ v if v not in ['unknown', 'unavailable', 'none', ''] else '(none)' }}
-        attributes:
-          sent: "{{ states.input_text.smol_9_last_msg.last_changed if states.input_text.smol_9_last_msg is not none else None }}"
 
 # ===========================================================================
 # Dashboard button → script bridges (the "herald" compose card lives on smol-control)
