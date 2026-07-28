@@ -159,8 +159,8 @@ this tool would have been wrong:
   discovery configs, so it lists ghosts as devices complete with a `sw_version` — a registry-based
   reconciler is blind to precisely what it hunts.
 - **Three states, never two: live · dead · unknown.** *"Can't tell"* is not *clean*, and it exits **2**,
-  not 0 — the same discipline as [§ a broken diagnostic prints a confident wrong
-  verdict](DOC-UPKEEP.md).
+  not 0 — the same discipline as [DOC-UPKEEP § a broken diagnostic prints a confident wrong
+  verdict](DOC-UPKEEP.md#-a-broken-diagnostic-prints-a-confident-wrong-verdict).
 - **`--clear` is not an undo.** Clearing a *config* topic does not revert the board: there is no
   empty-payload guard in the apply path and the leaf's `from_wire` keeps its current value on an empty
   payload (#46 clamp), so a clear is a **loss of observability** — the board goes on applying a value the
