@@ -27,6 +27,18 @@ Ranked. When two sources disagree, the higher one wins.
 | 6 | **`git log`** | Sequencing, and the *reasoning* — commit bodies here are long on purpose. |
 | 7 | `docs/ROADMAP.md`, `README.md`, `site/` | Nothing. These are **derived** — they are the things you are checking. |
 
+⚠️ **Six ways a source misleads you even when you read it correctly** — §2 below. Read those
+before trusting anything in the table above; four of them defeat a careful reader who *did* cite a
+source.
+
+---
+
+## 2. How sources mislead — six traps
+
+Each of these has bitten this repo, most of them in a single 2026-07-27 audit. They are grouped here
+because they share a property: **none is caught by reading more carefully.** They are caught by
+asking a *different* question.
+
 ### ⚠️ The projection trap — a spec's estimates look exactly like its measurements
 
 A design spec has two kinds of number in it and **the formatting does not distinguish them**:
@@ -47,6 +59,38 @@ sitting in a document full of measurements.
 Measure the ELF/binary, or take the figure from a source that says it measured one (an amendment,
 a PR's measured table, `Cargo.toml`'s partition rationale). If you cannot tell whether a number was
 projected or measured, treat it as projected.
+
+### ⚠️ A number you derived is not a number you measured
+
+Sibling of the projection trap, and distinct in a way that matters: the projection trap is
+**someone else's estimate mistaken for a measurement**. This one is **your own correct measurement
+applied to the wrong dimension.** Both survive the "but I cited a source" defence, which is exactly
+why they need writing down.
+
+Four cases, two authors, one day (2026-07-27):
+
+| the error | the real number | the axis it belonged to |
+|---|---|---|
+| build `45 → 905` | OTA **staged/ratchet** build 905 | **release version** — 345 |
+| site reveal rate | 202 ms per **token** (generation) | 160 ms per **character** (CFG-`V` reveal) |
+| renderer wrap width | 15 columns (what the mock did) | **14** — `FONT_5X8` on 72 px |
+| slot headroom `~2.3×` | a real figure in the #300 spec | a **projection**, not the measurement (1.42×) |
+
+Every one of these was a *correct number*, read accurately, from a real source. Each was then applied
+to a quantity it did not describe. Note that no amount of double-checking the number would have
+caught any of them — the number was never wrong.
+
+**The test that catches all four is one question: *what are the units, and of what?***
+
+- `905` — 905 *what*? Staged builds and released versions are different counters.
+- `202 ms` — per *what*? Generation and reveal are separate clocks on this device.
+- `15` columns — of *which font*, on *which panel width*?
+- `~2.3×` — headroom measured, or headroom expected?
+
+**State the denominator and the error becomes visible.** So: when a doc quotes a number, make it
+carry its unit *and* its subject — "202 ms/token (generation)", "160 ms/char (reveal)", "build 345
+(released)", "1.42× (measured)". Verbose beats ambiguous, because a bare number silently accepts any
+axis a reader brings to it.
 
 ### ⚠️ The orchestrator's brief is a lead, not a source
 
@@ -97,7 +141,9 @@ Ask: *if the stale premise were simply false, would the conclusion still hold fo
 If yes, re-ground it. If no, the conclusion goes too — and that is a finding worth reporting, not a
 quiet deletion.
 
-⚠️ **Retirements are the blind spot.** Closed issues tell you what shipped; nothing tells you
+### ⚠️ Retirements are the blind spot
+
+Closed issues tell you what shipped; nothing tells you
 what got *un*-shipped. Grep the tree for the mechanism before describing it as live. Known
 retirements that documentation has gotten wrong: **CFG-`N`** WiFi-slot switch and its
 "un-brickable auto-revert" (#100 → **retired by #142**, single-network now — a received `N` is
@@ -106,7 +152,7 @@ drained and ignored); the **UDP collector** (retired for MQTT-native); the **syn
 
 ---
 
-## 2. Verifying a claim
+## 3. Verifying a claim
 
 ```bash
 # Did it ship, and when?
@@ -168,9 +214,10 @@ So an enumeration is wrong in both directions at once — it lists boards that a
 
 ---
 
-## 3. The two habits that prevent most rot
+## 4. Two habits that prevent most rot
 
-Roughly a dozen of the findings in the last audit trace to exactly two missing habits:
+Separate from the traps above — those are about *reading* a source; these two are about *writing*
+one. Roughly a dozen findings in the last audit trace to their absence:
 
 1. **Never write a live build number in prose** (above). It is stale the next release.
 2. **Date every proof.** "58→59 in ~17 s" reads as present tense forever. Write "58→59 in ~17 s
@@ -200,7 +247,7 @@ map** — several docs disagree with the firmware's own reject-list, including o
 
 ---
 
-## 4. The website (`site/`)
+## 5. The website (`site/`)
 
 `site/` auto-deploys to **GitHub Pages on every push touching `site/**`**
 (`.github/workflows/pages.yml`, publish dir `site/`). **Your edit is the public face — verify
@@ -267,6 +314,10 @@ Practical rule for a new mockup: if it depicts the OLED, draw it through `oled.j
 it (`image-rendering: pixelated`, glow as a `filter` **outside** the glass). If it depicts something
 larger than the panel, it is a diagram — label it as one. Never leave a third category.
 
+The same discipline applies to **time**, not only space: the Bard panel loops a fixed excerpt while
+the real board never stops, so the caption says so. A mockup that differs from the hardware in *any*
+dimension — resolution, extent, duration — should say which.
+
 ### Site checklist
 
 - [ ] Favicon present; **dark *and* light** via `prefers-color-scheme` (JP's standing preference).
@@ -287,7 +338,7 @@ larger than the panel, it is a diagram — label it as one. Never leave a third 
 
 ---
 
-## 5. A maintenance pass, in order
+## 6. A maintenance pass, in order
 
 1. `git log --oneline -30` and `gh pr list --state open` — what happened since last time.
 2. **Anything shipped that no doc mentions?** Newest feature first; it is the most likely to be
@@ -300,14 +351,15 @@ larger than the panel, it is a diagram — label it as one. Never leave a third 
    went *differently* than recommended. Two had (D3 landed the stronger option; D5's physical
    long-press was never built — the accept gate is HA's Install command). A quietly-reversed
    decision is worse than an open one.
-5. **The retirement sweep** (§1 above). The direction nothing else checks.
-6. Run the greps in §3.
-7. `site/`: content.json currency, then the §4 checklist.
+5. **The retirement sweep** (§2). The direction nothing else checks — and its mirror, the
+   upgrade sweep: *has anything here got stronger since it was written?*
+6. Run the greps in §4.
+7. `site/`: content.json currency, then the §5 checklist.
 8. Fix what you have evidence for; write the rest down with the evidence you'd need. Ask rather
    than guess when a claim's evidence is ambiguous.
 
 **Cadence** (agreed 2026-07-27): a **10-minute check after every feature merge or release train** —
-just §5.1–5.2 — plus a **full sweep monthly**, or whenever a wave of issues closes at once.
+just §6.1–6.2 — plus a **full sweep monthly**, or whenever a wave of issues closes at once.
 
 The argument for the per-merge check is a measurement, not a principle: **the Bard scored 1 of 3 on
 merge day.** It shipped, hardware-verified, and that same day it was in `README.md`, absent from
