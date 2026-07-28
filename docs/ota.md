@@ -255,6 +255,12 @@ app slot + `otadata` and **never** touches `nvs`, identity survives any image �
 fleet-shared OTA image (built with no `SMOL_NODE_ID`) installs onto id5/id8/id50/id51/… and each keeps
 its own id.
 
+> ⚠️ **Recovering a board by USB after an OTA? Clear otadata first.** The OTA left otadata selecting
+> `ota_1`, so an `espflash` write lands in `ota_0` and the board keeps booting the OTA'd image — a
+> successful flash that changes nothing. `espflash erase-region 0xf000 0x2000` (otadata only; spares
+> `nvs`), reset, then flash, then read the `Loaded app from offset` line. Full gotcha in
+> [BUILDING.md](BUILDING.md).
+
 > 🔎 **This has a real-world proof, and its flip side bites people.** The hardware that used to be
 > **id7 (Dominion)** has run as **id50 (Ember)** since 2026-07-22, re-provisioned for #198's Phase-2
 > work. It has since taken OTAs and it is **still id50** — the property above, demonstrated. The flip

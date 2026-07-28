@@ -73,7 +73,12 @@ Feature tiers: default = Clock + Snake · `--features wifi` = + NTP · `--featur
 
 ## Gotchas (the ones that cost us time)
 
-- **espflash v4 won't flash** esp-hal `1.0.0-rc.0` images (wants an ESP-IDF app descriptor). Use **espflash v3**.
+- ⚠️ **After ANY OTA, a USB flash silently lands in the slot that will not run.** The OTA left otadata pointing at `ota_1`; a subsequent `espflash` write goes to `ota_0`, succeeds, and the board keeps booting the OTA'd image. It reads as a brick or a failed flash and is **neither** — you flashed fine, into the slot the bootloader is not selecting. Clear otadata first, then reset, then flash:
+  ```bash
+  espflash erase-region 0xf000 0x2000   # otadata ONLY — spares `nvs`, so the node id survives
+  ```
+  **Check the `Loaded app from offset` line after every flash** — it names the slot that actually ran, and it is the only cheap confirmation you flashed the thing you are about to debug. *(Cost an hour on 2026-07-28; it had been living in operator memory and no `docs/` file.)*
+- **espflash v4 won't flash** esp-hal `1.0.0-rc.0` images (wants an ESP-IDF app descriptor). Use **espflash v3**. *(Untested for esp-hal 1.1 images such as the `dream/feat-embassy` branch — v4 may accept those; do not assume either way while recovering a board.)*
 - **`esp-wifi` pins to esp-hal internals:** it needs **`esp-hal = "=1.0.0-rc.0"`** exactly (newer rc.1/1.0 changed `Rng::new()` and break the build despite passing semver). Full working pin-set is in `rust/clock/Cargo.toml` + comments.
 - **Rust serial logs go over USB-JTAG:** build with `ESP_LOG=info` (level is compile-time) and view with `espflash monitor` — plain `cat /dev/ttyACM0` won't show them, and the monitor needs a real TTY (fails under a pipe).
 - **`espflash monitor` reset mode matters on this native-USB C3:** `--before default-reset` (the UART-bridge DTR/RTS reset) **fails silently** — it drops the chip into download/stub mode, so you get the monitor banner and then nothing. Use **`--before usb-reset`** (the USB-JTAG-Serial peripheral reset) to actually reboot the app and catch its boot log. The firmware only logs at **boot + state changes**, so a silent idle board looks identical to a broken capture — you must catch the boot.

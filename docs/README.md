@@ -63,6 +63,11 @@ fleet: the apps, the ESP-NOW mesh (`src/net/`), the Familiar (`src/familiar/`), 
   it explicitly does *not* fix, and a recommended sequence. Answers JP's *"when do we move to
   Embassy?"* — short version: take the interim fix now, finish the migration behind a two-board bench.
 
+- **[superpowers/plans/embassy-ota-verification.md](superpowers/plans/embassy-ota-verification.md)**
+  — the runnable bench procedure that would retire the Embassy migration's one remaining blocker: an
+  A/B test of both OTA paths (gateway self-fetch, leaf mesh-relay) against a same-day `main` control,
+  with a pass/fail oracle per step, an action for every failure mode, and **a stop rule**.
+
 ## Design specs & as-built plans
 - **`superpowers/specs/`** and **`superpowers/plans/`** — per-feature design specs and their
   as-built execution logs, amended in place as hardware findings land. The best source for

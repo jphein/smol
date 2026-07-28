@@ -304,7 +304,11 @@ not perform the verification. Step 3.2 is still the gate.
 1. **Triage the 15 stale `TODO`s** so the file is a map again (cheap; likely mostly deletions).
 2. **Port + verify the OTA path** — offer → fetch → verify → activate → boot-confirm → **app-side
    rollback**, on hardware, before anything else. Until this is green the branch is not rollable, and
-   everything else is moot.
+   everything else is moot. **The procedure now exists:**
+   [plans/embassy-ota-verification.md](../plans/embassy-ota-verification.md) — A/B against a same-day
+   `main` control, both paths separately, `tools/ota_verify.sh` as the oracle, an action per failure
+   mode, and a stop rule. It also names the steps it *cannot* specify from docs alone (app-side
+   rollback is the load-bearing one).
 3. **Re-run Phase 2's harness** on the completed Phase 3 to confirm the 169 ms result survives the
    full task set (election + MQTT + downlink now share the executor; the 169 ms was measured with
    less running).
