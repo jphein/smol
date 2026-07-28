@@ -39,8 +39,15 @@ input_number:
   # generation clock. The board generates at ~224-274 ms/token in endless mode; this only sets how
   # fast finished text is unveiled. (Confusing the two axes has already caused one bug.) The leaf
   # clamps to 20..=500, so out-of-range values are corrected on the node, not here.
-  smol_8_bard_speed:
-    name: "smol 8 typewriter (ms/char)"
+  # FLEET-WIDE, not per id. An `input_*` helper cannot be wildcarded in YAML the way an MQTT
+  # trigger can, so "one definition for the whole fleet" here means ONE control that fans out,
+  # rather than N controls generated per node. That is the honest shape: the previous per-id set
+  # existed only for 7/8/9, and 7/9 are retired while id8 runs a pre-Bard build — so the only
+  # boards that can actually render a font (id50/id51) had NO control at all, and the dashboard
+  # rendered them a row pointing at a nonexistent entity. That is what JP was looking for and
+  # not finding. Adding 50/51 by hand would just move the goalposts (#308/#309/#310).
+  smol_all_bard_speed:
+    name: "smol fleet typewriter (ms/char)"
     min: 20
     max: 500
     step: 10
@@ -58,13 +65,13 @@ input_select:
   # where a slider would imply sizes that do not exist. The label carries what actually changes:
   # the character grid. Bigger text = fewer characters on the 72x40 glass; the story window is
   # measured in TOKENS, so a larger font shows LESS story without changing what the model writes.
-  smol_8_bard_font:
-    name: "smol 8 text size"
+  smol_all_bard_font:
+    name: "smol fleet text size"
     options: ["5x8 · 14x5 small", "6x10 · 12x4 medium", "9x15 · 8x2 large", "10x20 · 7x2 huge"]
     initial: "5x8 · 14x5 small"
     icon: "mdi:format-size"
-  smol_8_bard_mode:
-    name: "smol 8 delivery"
+  smol_all_bard_mode:
+    name: "smol fleet delivery"
     options: ["inf", "page"]
     initial: "inf"
     icon: "mdi:book-open-page-variant"
@@ -78,8 +85,8 @@ input_text:
   # outright, and unusual names fragment into char-level tokens and read worse. max 64 = the
   # firmware's CFG_VALUE_MAX and prompt buffer; every prompt token is a story token spent from
   # the shared 80-token window, so shorter openings leave longer tales.
-  smol_8_tale:
-    name: "smol 8 story prompt (Bard)"
+  smol_all_tale:
+    name: "smol fleet story prompt (Bard)"
     max: 64
     initial: ""
 
@@ -95,29 +102,59 @@ automation:
     trigger:
       - platform: state
         entity_id:
-          - input_number.smol_8_bard_speed
-          - input_select.smol_8_bard_mode
-          - input_select.smol_8_bard_font
+          - input_number.smol_all_bard_speed
+          - input_select.smol_all_bard_mode
+          - input_select.smol_all_bard_font
     condition:
       - condition: template
         value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
     action:
+      # The FLEET is discovered at run time, not listed. `sensor.smol_<id>[_<slug>…]_status` is a
+      # firmware-published MQTT-discovery entity, so its existence IS the node announcing itself —
+      # the same source the dashboard generator discovers from. The slug is `(_[a-z0-9]+)*` (ANY
+      # number of segments): a `?` there allowed only one and would miss the two-segment ids that
+      # appear once discovery publishes the full sigil, which is exactly the quantifier that caused
+      # a whole-fleet blackout in the generator (960bf1e).
       - variables:
-          nid: "{{ trigger.entity_id.split('.')[1].split('_')[1] }}"
-      - service: mqtt.publish
-        data:
-          topic: "smol/{{ nid }}/config/delivery"
-          retain: true
-          qos: 1
+          fleet: >-
+            {%- set ns = namespace(ids=[]) -%}
+            {%- for e in states.sensor | map(attribute='entity_id') | select('search','^sensor\\.smol_\\d+(_[a-z0-9]+)*_status$') -%}
+              {%- set id = e.split('.')[1].split('_')[1] -%}
+              {%- if id not in ns.ids -%}{%- set ns.ids = ns.ids + [id] -%}{%- endif -%}
+            {%- endfor -%}
+            {{ ns.ids }}
+          # Built ONCE, outside the loop: every node gets the identical value, and building it per
+          # iteration would re-read the helpers and could straddle an operator's second change.
           # int() because an input_number carries a float ("160.0" would not parse on the leaf).
-          # The font field is OPTIONAL, appended only when it is NOT the default 5x8, so firmware
-          # that predates it keeps parsing `<ms>:<mode>` exactly as before — adding this control
-          # cannot break pace/mode on a board running an older image.
-          payload: >-
-            {%- set ms = states('input_number.smol_' ~ nid ~ '_bard_speed') | int -%}
-            {%- set mode = states('input_select.smol_' ~ nid ~ '_bard_mode') -%}
-            {%- set font = (states('input_select.smol_' ~ nid ~ '_bard_font') | default('')).split(' ')[0] -%}
-            {{ ms }}:{{ mode }}{% if font and font != '5x8' %}:{{ font }}{% endif %}
+          #
+          # The font is ALWAYS sent, including `5x8`. It used to be omitted when 5x8, for
+          # compatibility with firmware predating the field — but the firmware reads an ABSENT
+          # third field as "keep the current font" (delivery.rs: `None | Some(b"") => current.font`).
+          # The two together made the default UNREACHABLE: once an operator picked 9x15, selecting
+          # "5x8 · 14x5 small" published `160:inf`, the node kept 9x15, and the control silently
+          # did nothing. A control that cannot return to its own default is the same defect class as
+          # a row pointing at a nonexistent entity — it reads as a broken board.
+          #
+          # The cost is that a board on pre-font firmware now REFUSES the whole delivery value
+          # (`inf:5x8` fails its mode match) instead of accepting pace/mode. Accepted deliberately:
+          # a build too old to parse the font field is too old to run the Bard at all, so pace and
+          # mode have nothing to act on there. The better long-term fix is firmware-side — read an
+          # absent font as the DEFAULT rather than as "keep current" — and then this can go back to
+          # omitting it.
+          value: >-
+            {%- set ms = states('input_number.smol_all_bard_speed') | int -%}
+            {%- set mode = states('input_select.smol_all_bard_mode') -%}
+            {%- set font = (states('input_select.smol_all_bard_font') | default('')).split(' ')[0] -%}
+            {{ ms }}:{{ mode }}{% if font %}:{{ font }}{% endif %}
+      - repeat:
+          for_each: "{{ fleet }}"
+          sequence:
+            - service: mqtt.publish
+              data:
+                topic: "smol/{{ repeat.item }}/config/delivery"
+                retain: true
+                qos: 1
+                payload: "{{ value }}"
 
   - id: smol_tale_publish
     alias: "smol #303: publish per-node Bard story prompt"
@@ -131,17 +168,28 @@ automation:
     trigger:
       - platform: state
         entity_id:
-          - input_text.smol_8_tale
+          - input_text.smol_all_tale
     condition:
       - condition: template
         value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
     action:
-      - service: mqtt.publish
-        data:
-          topic: "smol/{{ trigger.entity_id.split('.')[1].split('_')[1] }}/config/tale"
-          retain: true
-          qos: 1
-          payload: "{{ trigger.to_state.state }}"
+      - variables:
+          fleet: >-
+            {%- set ns = namespace(ids=[]) -%}
+            {%- for e in states.sensor | map(attribute='entity_id') | select('search','^sensor\\.smol_\\d+(_[a-z0-9]+)*_status$') -%}
+              {%- set id = e.split('.')[1].split('_')[1] -%}
+              {%- if id not in ns.ids -%}{%- set ns.ids = ns.ids + [id] -%}{%- endif -%}
+            {%- endfor -%}
+            {{ ns.ids }}
+      - repeat:
+          for_each: "{{ fleet }}"
+          sequence:
+            - service: mqtt.publish
+              data:
+                topic: "smol/{{ repeat.item }}/config/tale"
+                retain: true
+                qos: 1
+                payload: "{{ trigger.to_state.state }}"
 
 mqtt:
   sensor:
