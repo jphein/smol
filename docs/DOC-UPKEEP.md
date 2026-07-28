@@ -100,8 +100,22 @@ constraint.**
 > next person who found it inconvenient."* So the division of labour is: **the check holds the invariant,
 > the prose holds the reason.** A check with no reason gets removed; a reason with no check goes quietly
 > false. Today produced five of the second kind and zero of the first, which is why this file argues for
-> checks — not for writing less. Prefer a const assertion, an exhaustive enumeration or a failing build to any amount of
-careful wording — and when prose is the only option, expect it to be wrong and date it.
+> checks — **not for writing less.**
+
+So: prefer a const assertion, an exhaustive enumeration or a failing build to any amount of careful
+wording — and when prose is the only option, **expect it to be wrong and date it.**
+
+**Two more of the same shape landed one layer down**, in the same day's code: splitting a binding in
+`clock.rs` **orphaned a `label` outside its one-statement `#[cfg(not(feature = "espnow"))]`**, and six
+imports went dead. **Both were invisible to reading — including to the author, immediately after writing
+them — and both were instant under `cargo`.** Same lesson as the table: *a constraint the toolchain
+checks beats one a human reads, even when the human is the author and the text is three lines long.*
+
+⚠️ **They are deliberately not rows in the table, and the reason is itself the point.** The table counts
+one specific thing — *documented properties that were never true* — and these two are code defects, not
+documented properties. Widening the category to make the number bigger is exactly the provenance error
+this file is about, so the tally stays at **five**, and these live in a paragraph. **When a count is the
+evidence, the category has to hold still.**
 
 ### ⚠️ Ask whether a claim is about a VALUE or a KIND — kinds are cheap to refute
 
@@ -121,6 +135,33 @@ negative.) One definition beat a measurement campaign.
 **So: check the kind first.** It is cheaper, it is often decisive, and a surviving kind-claim tells you
 which value-claims are even worth measuring. Sibling of *fix the summary first* — both are about
 spending scarce correction effort where it pays.
+
+### ⚠️ Ask what the string is FOR — overlap only matters where the reader has to tell two things apart
+
+A vocabulary audit looks like a set-intersection problem and is not one. **Two word lists sharing a word
+is only a defect if the two names can appear in one view where a reader must distinguish them.** So the
+question is never *"do these lists overlap?"* but *"what is each string for, and do they ever meet?"*
+
+**A real collision, verified:** `nouns.forge` names **builds**, `nouns.fleet` names **boards**, and both
+shared `ember`. They meet on glass — `rust/clock/src/sigil.rs` draws the node's noun at y=12 and
+`v{build} {forge-noun}` at y=29, with a hairline between them whose own comment says it separates
+*"identity (WHO) from provenance (WHICH firmware)."* A shared word defeats that divider entirely: `Ember`
+above the line, `v903 Ember` below it, on a 72 px screen with no room to explain. `forge` gave the word
+up (→ `quench`, replaced in place so only that one index shifts).
+
+**A non-collision, same day and the same word:** `ember` still sits in **both** `realms.forge.words` and
+`realms.fantasy.words`, and that is fine. `sync-vocabularies.sh` emits only each realm's *adjectives and
+nouns*, so `realms[].words` never reaches sigil — it flavours project and branch rolls and can never
+become a build name or a node name. **The two cases are indistinguishable in the YAML**; the difference
+is entirely in the consumer, which is why this one was settled by reading the sync script instead of the
+vocabulary file.
+
+**The same shape one level down** (morpheus-sigil, on the bare-noun audit): the question is not *"is this
+a bare noun?"* but **"is this noun doing identification work, and is the id already nearby?"** Twelve
+sites needed the id appended; **two deliberately did not** — `ota_screen` already prints `i{id}` beside
+the noun (a suffix would render `from Aegis5 i5`), and `bench.rs`'s 5-char time-source shows
+**provenance, not identity**, where two letters of noun say less than the bare id. **A naming rule
+applied without asking what the string is for is how the original defect got written.**
 
 ### ⚠️ A number you derived is not a number you measured
 
