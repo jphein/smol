@@ -88,12 +88,52 @@ Feature tiers: default = Clock + Snake · `--features wifi` = + NTP · `--featur
 ## Multi-board / ESP-NOW mesh
 Give each board a **distinct peer id**. ⚠️ **This is no longer a source literal.** It used to be an argument to `mode::start(...)` in `main.rs`; identity now lives in a **runtime NVS record** (`main.rs` passes `node_id()`), which is what lets **one image serve the whole fleet** and is why OTA never touches identity. Set it per board in the git-ignored `src/board.rs` (`cp src/board.rs.example src/board.rs`), or provision it on-device. Distinct ids let the blue-LED handshake and the Bench link stats work between boards (same id can be filtered as self-echo). Boards auto-pair over ESP-NOW on the AP's channel; watch the blue LED go slow-blink (detected) → solid (connected).
 
-Each id maps to a deterministic **magical name** (via realm-sigil) — id 7 = *Draconic Dominion*, id 8 = *Eldritch Nexus*, id 9 = *Jade Herald*. The name is that board's identity in the mesh: it shows on peers' World-Snake screens and in the leaderboard.
+Each id maps to a deterministic **magical name** (via realm-sigil). The mapping is pure and derivable —
+`name_for_id()` in `src/net/names.rs`: `adj = FANTASY.adjectives[seed % 20]`,
+`noun = FANTASY.nouns[(seed >> 8) % 20]`, `seed = id * 2_654_435_761`. So:
+
+| id | name | | id | name |
+|---|---|---|---|---|
+| 5 | Spectral **Aegis** | | 50 | Kindled **Ember** |
+| 7 | Draconic **Dominion** | | 51 | Primal **Sigil** |
+| 8 | Eldritch **Nexus** | | 122 | Celestial **Crown** |
+| 9 | Jade **Herald** | | 13 | Fabled **Relic** |
+
+The name is that board's identity in the mesh: it shows on peers' World-Snake screens and the
+leaderboard.
+
+### ⚠️ A name mapping is not a board assignment — and id7/id9 have moved
+
+**These are two different facts and conflating them cost real time on 2026-07-28.** *"id 7 = Draconic
+Dominion"* is a **pure function**, permanently true. *"id 7 is a board on the bench"* is a **hardware
+assignment**, and it changed:
+
+> **The hardware formerly running as id7 (Dominion) and id9 (Herald) has run as id50 (Ember) and
+> id51 (Sigil) since 2026-07-22**, re-provisioned as the **#198 Phase-2 measurement boards** (the
+> commit calls them *"board-B beacon + dominion DUT"*). **id7 and id9 do not exist on the air.**
+
+Two consequences that trip people up:
+
+1. **An OTA will not restore the old ids.** Identity lives in the **NVS record**, and **OTA never
+   touches NVS** — that is deliberate, it is what lets one image serve the whole fleet. Only
+   **re-provisioning** changes an id. Anyone who assumes "update the firmware and the naming will sort
+   itself out" will wait forever.
+2. **HA still has the dead entity families.** `sensor.smol_7_*` / `smol_9_*` and
+   `update.smol_7_dominion` are alive in Home Assistant and answer queries, for node ids nothing has
+   broadcast in months. **A per-node entity existing is not a node existing** — see
+   [DOC-UPKEEP](DOC-UPKEEP.md) §2. Cleanup of those families is tracked separately.
+
+**Live roster, 2026-07-28** (from the crown's ESP-NOW peer attribute + fresh telemetry, not retained
+values): **id8 Nexus**, **id5 Aegis**, **id50 Ember**, **id51 Sigil**, plus **id122** — a rig id whose
+purpose is unidentified, and which the formula names *Celestial **Crown***. ⚠️ Note the collision: smol
+calls its elected gateway "the crown", so a log line mentioning *Crown* may be a **node name**, not a
+**role**. Prefer "the bench fleet" in prose and name a node only where a claim was verified on it —
+[DOC-UPKEEP](DOC-UPKEEP.md) *never enumerate the fleet*.
 
 ### "Which board am I holding?" — identify by name / MAC, not the port
 With several identical boards on the bench, don't trust the `ttyACMx` number (it's not stable, and a keyboard can squat a low one — see the espflash gotchas above). Instead:
 - **On-screen:** the board prints its name at boot (`smol: I am Draconic Dominion (id 7)`) and shows it in the mesh UI — read the OLED to know which physical unit you're holding.
-- **By USB vendor/MAC:** Espressif boards are `303a:…` (`lsusb`); pin the exact unit by MAC (`espflash board-info`, `udevadm info /dev/ttyACM* | grep -i serial`, or the boot log). Keep an id ↔ MAC ↔ name map for your fleet. Verified today: `ac:a7:04:b9:77:14` = id 7 *Draconic Dominion* (the WiFi/NTP root), `ac:a7:04:ba:1f:24` = id 8 *Eldritch Nexus*, `10:00:3b:ce:95:cc` = id 9 *Jade Herald*.
-- **Final-flash flow:** confirm the target unit by MAC/`board-info` first, flash with its intended id (`mode::start(…, <id>, …)`), then watch the boot log echo the expected name — that name+id on the OLED is your confirmation you flashed the right physical board.
+- **By USB vendor/MAC:** Espressif boards are `303a:…` (`lsusb`); pin the exact unit by MAC (`espflash board-info`, `udevadm info /dev/ttyACM* | grep -i serial`, or the boot log). Keep an id ↔ MAC ↔ name map for your fleet. **Historical, verified 2026-07 *before* the Phase-2 re-provisioning** (§above): `ac:a7:04:b9:77:14` was id 7 *Draconic Dominion* (then the WiFi/NTP root), `ac:a7:04:ba:1f:24` = id 8 *Eldritch Nexus*, `10:00:3b:ce:95:cc` was id 9 *Jade Herald*. **The MACs are still those boards; the ids on two of them are not** — the first and third now answer as id50/id51. This is exactly why the map is worth keeping *per-MAC*: the MAC is the board, the id is a setting.
+- **Final-flash flow:** confirm the target unit by MAC/`board-info` first, flash with its intended id (via `src/board.rs` / on-device provisioning — **not** the retired `mode::start(…, <id>, …)` literal), then watch the boot log echo the expected name — that name+id on the OLED is your confirmation you flashed the right physical board.
 
 The mesh wire protocol — exact byte layouts, cadence and per-frame verification status — is documented in **[docs/protocol.md](protocol.md)**: HELLO/ACK, BEACON, TIME, BATT/GRID, **CFG**, **DIAG**, **SCAN**, RELAY/RELAYACK, **RELAY2/RELAYACK2** (routed multi-hop, #13), **BATT2/GRID2**, SNK (**shipped**, not design-stage — #5 closed 2026-07-08), **FAM** (the Familiar, #57) and the **leaf mesh-OTA** frames (#40). Treat protocol.md as the list; enumerating frames here just goes stale.

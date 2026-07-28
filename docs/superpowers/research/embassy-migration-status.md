@@ -210,11 +210,19 @@ three facts stacked badly; **two have since resolved, and the remaining one is t
 1. ~~**The fleet is one board.**~~ ✅ **RESOLVED 2026-07-28 — a two-board bench now exists.** JP
    plugged in three more; verified from the crown's peer view and *fresh* telemetry, not retained
    ghosts:
-   - **id5 Aegis — LIVE on build 906**, having **self-fetched over WiFi and rebooted into it** (uptime
-     reset; HA confirms `installed=906`).
-   - **id8 Nexus — LIVE**, running the interim fix `443ea34`.
-   - **id7 / id9 — plugged in but not running.** No telemetry in 13 h and, decisively, **absent from
-     the crown's ESP-NOW peer list**. With JP for a physical check.
+   **Four boards live**, from the crown's ESP-NOW peer attribute + fresh telemetry:
+   **id8 Nexus** (interim fix `443ea34`) · **id5 Aegis** (906 — self-fetched over WiFi and rebooted into
+   it; HA confirms `installed=906`) · **id50 Ember** (906) · **id51 Sigil** (mid-OTA), plus **id122**,
+   a rig id.
+
+   > 📌 **Correction to an earlier reading of this same evidence** — kept because it is the reason the
+   > "one board" claim existed at all. id7 and id9 were reported absent; they are neither absent nor
+   > present, because **those ids do not exist on the air.** That hardware has run as **id50/id51 since
+   > 2026-07-22**, re-provisioned for #198's own Phase-2 measurement work. Their HA entity families kept
+   > answering while frozen, which read as *"boards dead"*; and the roster was read from
+   > `sensor.smol_8_peers`'s **state** (only the role) rather than its **`peers` attribute**. Both traps
+   > are now in [DOC-UPKEEP](../../DOC-UPKEEP.md) §2–3; the identity record is in
+   > [BUILDING.md](../../BUILDING.md).
 
    > 🔎 **Why that last inference is sound, and worth reusing:** absent *telemetry* is weak evidence —
    > it could be the broker, the WiFi leg, or a retained ghost. Absence from the **ESP-NOW peer list**
@@ -223,7 +231,8 @@ three facts stacked badly; **two have since resolved, and the remaining one is t
    > means *"something in a long chain is broken."* Prefer the shortest-chain signal when deciding
    > whether a board is alive.
 
-   So **Phase 2's harness is runnable again** (it needs a DUT + a ch6 beacon source), and Step 2 is off
+   So **Phase 2's harness is runnable again** — with a pleasing circularity: **the boards it needs are
+   the very boards Phase 2 re-provisioned to be its rig.** Step 2 is off
    the critical path. This does **not** soften the recommendation — see below.
 2. **The OTA path on the branch is unverified** (§2). **This is now the only blocker, and it is the
    one that matters.** Note the pointed contrast the bench just supplied: **OTA demonstrably works on
@@ -285,7 +294,7 @@ verification was not.
 
 ### Step 2 — restore a two-board bench · ✅ **DONE 2026-07-28, off the critical path**
 Nothing about the migration could be honestly signed off on one board. **id5 Aegis and id8 Nexus are
-both live** (§5), so Phase 2's rig — DUT + a dedicated ch6 beacon source — is runnable again. This was
+both live** (§5) alongside **id50 Ember** and **id51 Sigil**, which *are* Phase 2's rig boards, so its harness is runnable again. This was
 a hardware/logistics gate, not a code task, and it has cleared without anyone writing code for it.
 
 ⚠️ **This does not advance the decision by itself.** It removes an *excuse* for not verifying; it does

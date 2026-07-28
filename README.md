@@ -29,7 +29,7 @@ Every board runs the **unified Rust firmware** (`rust/clock/`, `no_std` esp-hal)
 | **Clock · Snake · Mesh Snake · Benchmark · atomic14 pack** | NTP clock, one-button Snake, 2-board head-to-head, a live ESP-NOW link tester, and 5 single-button games | 🟢 flashed |
 | **Block Digger** | Minecraft-ish dig/build with a Bluetooth **Stadia** controller (Bluepad32; the Arduino build) | 🟢 flashed |
 
-Mesh time-sync (loop-free, newest-NTP-wins) and **magical realm names** (id7 *Draconic Dominion*, id8 *Eldritch Nexus*, id9 *Jade Herald*, from [realm-sigil](https://github.com/jphein/realm-sigil)) run under all of it; the boot splash shows the sigil version name.
+Mesh time-sync (loop-free, newest-NTP-wins) and **magical realm names** — a pure function of the node id, so id8 is always *Eldritch Nexus* and id5 always *Spectral Aegis* (from [realm-sigil](https://github.com/jphein/realm-sigil); the mapping is derivable, the id↔board assignment is not — see [BUILDING.md](docs/BUILDING.md)) run under all of it; the boot splash shows the sigil version name.
 
 ## The fleet: config, OTA, observability & mesh
 

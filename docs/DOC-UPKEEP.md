@@ -75,6 +75,7 @@ Four cases, two authors, one day (2026-07-27):
 | site reveal rate | 202 ms per **token** (generation) | 160 ms per **character** (CFG-`V` reveal) |
 | renderer wrap width | 15 columns (what the mock did) | **14** — `FONT_5X8` on 72 px |
 | slot headroom `~2.3×` | a real figure in the #300 spec | a **projection**, not the measurement (1.42×) |
+| "the fleet is one board" | `sensor.smol_8_peers`'s **state** (correctly read: the role) | the roster, which is in its **attributes** |
 
 Every one of these was a *correct number*, read accurately, from a real source. Each was then applied
 to a quantity it did not describe. Note that no amount of double-checking the number would have
@@ -153,6 +154,25 @@ wrong. Both readings were defensible from the number alone.
 you meet a bare `#N` whose subject does not match the issue, search `docs/superpowers/` before
 concluding the citation is wrong — the number may belong to a document.
 
+### ⚠️ A per-node entity existing is not a node existing
+
+The retained-ghost problem **one level up**: not a stale *value* but a stale **identity**.
+
+`sensor.smol_7_*` and `update.smol_7_dominion` are alive in Home Assistant and answer queries today —
+for a node id **nothing has broadcast in months**. The hardware that was id7 has run as **id50** since
+2026-07-22 (#198 Phase-2 re-provisioning). An entity family outlives the node it was discovered for,
+because MQTT discovery is retained and nobody publishes a tombstone.
+
+So **"HA has entities for it" is not evidence a board exists**, and — the sharper half — **an entity
+whose values are frozen is not evidence a board is dead.** On 2026-07-28 both errors were made about
+the same four boards within an hour: frozen `smol_7_*`/`smol_9_*` read as *"boards absent"* when the
+boards were fine under different ids.
+
+Ask instead: **is anything broadcasting under this id right now?** (See §3, *shortest-chain signal*.)
+And remember the corollary from [BUILDING.md](BUILDING.md): **a name mapping is a pure function; an
+id↔board assignment is a setting.** `id 7 = Draconic Dominion` is permanently true and says nothing
+about whether a board is on the bench.
+
 ### ⚠️ Retirements are the blind spot
 
 Closed issues tell you what shipped; nothing tells you
@@ -181,6 +201,25 @@ grep -rn "<number>" docs/superpowers/specs/
 
 "In flight" should mean **commits on `main` or an open PR** — not intent. Everything else is
 spec'd/queued.
+
+### When an entity has attributes, the state is a summary
+
+`sensor.smol_8_peers` **state** is only the role — `gateway` / `leaf`. The roster lives in its
+**`peers` attribute**. Reading the state and concluding *"no peers"* is how the fleet got reported as
+one board on 2026-07-28, twice. The state was read correctly; it simply wasn't the field that holds the
+answer.
+
+**So: before concluding anything from an entity, check whether what you want is in the attributes.**
+
+```bash
+# state only — often a summary, sometimes a role label
+curl -s -H "Authorization: Bearer $TOKEN" https://ha.jphe.in/api/states/sensor.smol_8_peers | jq .state
+# the whole object, attributes included — read this first
+curl -s -H "Authorization: Bearer $TOKEN" https://ha.jphe.in/api/states/sensor.smol_8_peers | jq .
+```
+
+This is the same shape as the traps in §2 — a correct reading of the wrong field — so it belongs to
+that family, not to carelessness.
 
 ### Prefer the shortest-chain signal when asking "is it alive?"
 
