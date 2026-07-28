@@ -136,6 +136,30 @@ negative.) One definition beat a measurement campaign.
 which value-claims are even worth measuring. Sibling of *fix the summary first* — both are about
 spending scarce correction effort where it pays.
 
+### ⚠️ An illustration is a claim — derive it or drop it
+
+The class that keeps catching me, four times in two days, is not *wrong facts* — it is **plausible
+examples nobody derived.** A worked example feels like prose, so it skips the check that a number in a
+table would get.
+
+The clearest case: this repo's snake guide showed the death-screen leaderboard as
+`1 Chalice22 / 2 Jewel8 / 3 Vigil51`. Every part of it was invented from a teammate's *illustration of a
+different point*, and reading the render code (`mesh_snake/mod.rs:488-493`, `write_short`) made it wrong
+three ways at once: the label budget is **9 chars, not 6**; id22's noun is **Pinnacle**, not Chalice, so
+the label is `Pinnacl22`; and the separator is `<rank>.<label> <length>` with a `*` on your own row, not
+a bare space. Two of the three would have survived any amount of proofreading, because nothing about
+them looks wrong.
+
+**The test:** every literal in an example — a rendered row, a topic name, a CLI line, an id→name pair —
+is a **claim about behaviour**, and it costs one grep to derive from the code that produces it. When that
+is not worth doing, **describe the shape instead of inventing an instance**: *"rank, the clipped
+noun+id, then length"* cannot rot. What must never happen is the middle option — a specific-looking
+literal nobody checked, which is strictly worse than a vague description because it invites belief.
+
+Its sibling: **an illustration borrowed to make point A is not evidence for point B.** `Vigi51` vs
+`Vig122` was coined to show that a 6-char clip stays unique; lifting it into a screen that clips at 9
+carried the *numbers* somewhere they were never measured.
+
 ### ⚠️ A verification badge belongs to the artifact that was tested, not to the feature's name
 
 The worst doc defect found so far — and it survived every proofread because **every sentence in it was

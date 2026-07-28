@@ -75,12 +75,14 @@ Every board sorts all the snakes it can hear (plus you) by length, so **everyone
 sees the same ranking of magical names**:
 
 - **Always on:** your rank rides the HUD (e.g. `#2 L:14 P:5` — rank #2, length 14).
-- **Top-3 on your death/respawn screen** (the natural pause): e.g.
-  `1 Chalice22 / 2 Jewel8 / 3 Vigil51`, with you highlighted. The label is **noun + id**, and that
-  suffix is not decoration: **uniqueness rides entirely on the id, so it survives however brutally the
-  noun is clipped** — the noun is there to be *recognisable*, not to *identify*. At a 6-character budget
-  `Vigi51` and `Vig122` are still distinguishable despite sharing a noun. *(Pending the chain in
-  [BUILDING.md](BUILDING.md); on `main` today these screens still show a bare noun.)*
+- **Top-3 on your death/respawn screen** (the natural pause), one row per line as
+  `<rank>.<label> <length>` with a `*` marking your own row — e.g. `1.Jewel8 14`, `2.*Vigil51 9`,
+  `3.Pinnacl22 5`. The label is **noun + id**, clipped to a **9-character budget**
+  (`short_name(id, 9)`), and the id suffix is not decoration: **uniqueness rides entirely on the id, so
+  it survives however brutally the noun is clipped** — the noun is there to be *recognisable*, not to
+  *identify*. `Vigi51` and `Vig122` stay distinguishable at 6 chars despite sharing a noun. **Landed on
+  `main` 2026-07-28** — ⚠️ a board renders it only once flashed with that firmware; older builds still
+  show a bare noun ([BUILDING.md](BUILDING.md)).
 - A dead snake keeps its place for a moment, then drops to `L:3` on respawn; a
   snake that goes silent falls off the board after ~5 s.
 
