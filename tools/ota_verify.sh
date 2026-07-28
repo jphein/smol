@@ -112,7 +112,8 @@
 #     wrong on every leaf.
 #   * USB vs OTA: `installed_version` reaching the target is NOT proof. `rst=usb-jtag` is the cable
 #     tell, and a USB flash is explicitly EXEMPTED from setting `ota=confirmed`.
-#   * DEATH-POINT: offset frozen >STALE s with 0<done<total = the transfer died AT that byte.
+#   * DEATH-POINT: offset frozen >STALL_AFTER with 0<done<total AND no live retry signal inside
+#     RETRY_GRACE = the transfer died AT that byte. With a fresh retry signal it is a STALL, not a death.
 #   * PEER-SOURCE (#237): ota/diag ` src=id<n>` = a peer HOLDER served it over ESP-NOW (vs `src=gw`).
 #   * The broker password NEVER reaches argv. `-P "$PW"` published it in the process table for the
 #     whole window and one agent read another's out of `ps`. It now goes in a private config file.
@@ -125,11 +126,40 @@ TARGET="${2:?target build number, e.g. 907}"
 # twice, and completed ~3.5 minutes after the first stall. A window shorter than that budget reports
 # an intermediate state as an outcome.
 WINDOW="${3:-600}"
-# STALE=150, provenance: the retry interval measured on that run was ~58 s, so 150 s ≈ 2.5 retry
-# intervals — TWO consecutive missed retries are needed before a stall is called. The old 30 s was
-# BELOW one retry interval, which made a mid-retry stall indistinguishable from a dead transfer and
-# guaranteed a false DEATH-POINT on any transfer that retried once.
-STALE="${OTA_VERIFY_STALE:-150}"
+# ── TWO thresholds, deliberately TWO knobs ─────────────────────────────────────────────────────
+# These both default from the same measured number today and they currently agree. They are split
+# anyway, because ONE KNOB WITH TWO SEMANTICS is the exact conflation pattern behind most of this
+# file's defects: `cc=0` meaning off-channel OR unassociated; `ota=confirmed` meaning "a build was
+# confirmed" OR "THIS build was". Each was harmless until the two meanings diverged, and then it was
+# a silent wrong answer. Someone must be able to move one of these without moving the other WITHOUT
+# NOTICING THEY DID.
+#
+# They measure different planes, and would diverge for different reasons:
+#
+#   STALL_AFTER — the DATA plane, measured by US. How long the offset may sit unchanged (with
+#     0<off<total) before we call the transfer stalled. Derivation: it must exceed the longest quiet
+#     gap a HEALTHY transfer can have between live progress publishes. The 907/id8 run retried at
+#     ~58 s intervals, so 150 s ≈ 2.5 intervals = two consecutive missed retries. The old value was
+#     30 s — BELOW one retry interval — so it structurally could not tell a mid-retry stall from a
+#     dead transfer, and a threshold shorter than the process it measures can only ever be wrong.
+#
+#   RETRY_GRACE — the CONTROL plane, stated by the BOARD. How long a `retry=`/`leaf-timeout`/
+#     `relay-failed` on ota/diag keeps a stall non-terminal. Derivation: it must exceed the longest
+#     gap between the board's retry ANNOUNCEMENTS, which is a different quantity from the gap between
+#     progress publishes — a relay can announce once per failed attempt while publishing progress
+#     every few seconds during one. Same 58 s observation, different reason for depending on it.
+#
+# If the relay's cadence changes, re-derive them SEPARATELY.
+STALL_AFTER="${OTA_VERIFY_STALL_AFTER:-150}"
+RETRY_GRACE="${OTA_VERIFY_RETRY_GRACE:-150}"
+# A retired knob that silently does nothing is the same trap as an absent field read as a value: the
+# caller believes they set a threshold and gets the default. Fail loudly instead of ignoring it.
+if [ -n "${OTA_VERIFY_STALE:-}" ]; then
+  echo "FATAL: OTA_VERIFY_STALE is retired — it conflated two thresholds. Set OTA_VERIFY_STALL_AFTER" >&2
+  echo "       (offset-frozen threshold, data plane) and/or OTA_VERIFY_RETRY_GRACE (how long the" >&2
+  echo "       board's own retry signal keeps a stall non-terminal, control plane). See the header." >&2
+  exit 3
+fi
 POLL="${OTA_VERIFY_POLL:-3}"       # re-evaluate every N s
 SETTLE="${OTA_VERIFY_SETTLE:-2}"   # let the retained baseline land before the first evaluation
 FIXTURE="${OTA_VERIFY_FIXTURE:-}"  # test seam: replay a canned log instead of subscribing
@@ -216,7 +246,7 @@ valid_ch() {
 }
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1;; esac; }
 
-echo "── ota_verify: id$ID → v$TARGET · window ${WINDOW}s · stale ${STALE}s · broker $BROKER ──"
+echo "── ota_verify: id$ID → v$TARGET · window ${WINDOW}s · stall-after ${STALL_AFTER}s · retry-grace ${RETRY_GRACE}s · broker $BROKER ──"
 
 start=$(date +%s); last_off=-1; last_off_t=$start; hwm=""; monotonic=1; saw_live_prog=0
 findings=(); pass_ok=0; fail_n=0; headline=""; verdict=""
@@ -285,7 +315,8 @@ while :; do
   rn="$(g_live "$ID/ota/diag" | grep -acE 'retry=[0-9]+|leaf-timeout|relay-failed')"
   is_num "$rn" || rn=0
   if [ "$rn" -gt "$retry_n" ]; then retry_n="$rn"; retry_t="$now"; fi
-  retry_fresh=0; [ "$retry_t" != 0 ] && [ $((now-retry_t)) -le "$STALE" ] && retry_fresh=1
+  # Control plane: how long the board's own "still trying" statement remains fresh.
+  retry_fresh=0; [ "$retry_t" != 0 ] && [ $((now-retry_t)) -le "$RETRY_GRACE" ] && retry_fresh=1
 
   # ── a changed `total` is a different image: reset every offset-derived statistic ────────
   if [ -n "$total" ] && [ "$total" != "$prev_total" ]; then
@@ -311,7 +342,7 @@ while :; do
     # Count stall EPISODES (latched), so the evidence can say "stalled twice and recovered" instead
     # of implying one endless freeze.
     if [ "$stall_latched" = 0 ] && [ "$off" -gt 0 ] && is_num "$total" && [ "$off" -lt "$total" ] \
-       && [ $((now-last_off_t)) -ge "$STALE" ]; then
+       && [ $((now-last_off_t)) -ge "$STALL_AFTER" ]; then
       stalls=$((stalls+1)); stall_at="${stall_at:+$stall_at, }$off"; stall_latched=1
     fi
   fi
@@ -348,14 +379,14 @@ while :; do
 
   # ═══ CHECK 3 · DEATH-POINT ═════════════════════════════════════════════════════════════
   if [ "$saw_live_prog" = 1 ] && [ -n "$off" ] && is_num "$total" && [ "$off" -gt 0 ] \
-     && [ "$off" -lt "$total" ] && [ $((now-last_off_t)) -ge "$STALE" ] && [ "$retry_fresh" = 1 ]; then
+     && [ "$off" -lt "$total" ] && [ $((now-last_off_t)) -ge "$STALL_AFTER" ] && [ "$retry_fresh" = 1 ]; then
     # Stalled, but the board says it is retrying. NOT a death and NOT terminal: report it as a
     # standing suspicion and keep watching. This is the exact case that produced a FAIL on a
     # successful OTA.
-    add SUSPECT 45 STALLED "offset frozen at $off/$total for $((now-last_off_t))s, BUT a live ota/diag reports a retry $((now-retry_t))s ago (retry signals seen: $retry_n) — the board has NOT given up, so this is a retry, not a death. Still watching; a completion will override this. last live ota/diag: '${dg_live:-none}'"
+    add SUSPECT 45 STALLED "offset frozen at $off/$total for $((now-last_off_t))s, BUT a live ota/diag reports a retry $((now-retry_t))s ago, inside the ${RETRY_GRACE}s retry-grace (retry signals seen: $retry_n) — the board has NOT given up, so this is a retry, not a death. Still watching; a completion will override this. last live ota/diag: '${dg_live:-none}'"
   elif [ "$saw_live_prog" = 1 ] && [ -n "$off" ] && is_num "$total" && [ "$off" -gt 0 ] \
-     && [ "$off" -lt "$total" ] && [ $((now-last_off_t)) -ge "$STALE" ]; then
-    add FAIL 10 DEATH-POINT "offset frozen at $off/$total for $((now-last_off_t))s (>= ${STALE}s, ~2.5 retry intervals) with NO live retry signal — the transfer died AT that byte (phase='${phase:-none}', monotonic=$([ $monotonic = 1 ] && echo yes || echo NO), restarts=$restarts, src=${src:-none}). NOT terminal to this run: still watching, and a completion would override this."
+     && [ "$off" -lt "$total" ] && [ $((now-last_off_t)) -ge "$STALL_AFTER" ]; then
+    add FAIL 10 DEATH-POINT "offset frozen at $off/$total for $((now-last_off_t))s (>= ${STALL_AFTER}s stall-after) with NO live retry signal — the transfer died AT that byte (phase='${phase:-none}', monotonic=$([ $monotonic = 1 ] && echo yes || echo NO), restarts=$restarts, src=${src:-none}). NOT terminal to this run: still watching, and a completion would override this."
   elif [ "$saw_live_prog" = 0 ] && [ -n "$off_any" ]; then
     add unknown 0 DEATH-POINT "progress seen RETAINED ONLY (${off_any}/${total_any:-?}) — no live publish this run, so this offset is a ghost of an earlier attempt, possibly of a different image (compare total against the staged size). A retained value never changes, so it would satisfy 'frozen' for free; not a verdict."
   elif [ -z "$off" ] && [ -z "$off_any" ]; then

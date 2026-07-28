@@ -29,9 +29,11 @@ CASES="$HERE/test_ota_verify_cases"
 [ -d "$CASES" ] || { echo "missing $CASES" >&2; exit 2; }
 
 pass=0; fail=0; OUT=""; RC=0
-# Short STALE/POLL so a death-point case takes ~3 s instead of ~33 s. These are the only knobs the
-# tests move; every code path under test is the shipped one.
-export OTA_VERIFY_STALE=2 OTA_VERIFY_POLL=1 OTA_VERIFY_SETTLE=1
+# Compressed thresholds so a stall case takes ~3 s instead of ~153 s. These are the only knobs the
+# tests move; every code path under test is the shipped one. STALL_AFTER (data plane) and RETRY_GRACE
+# (control plane) are separate on purpose — see the header of ota_verify.sh — and the
+# `knobs_are_independent` case below proves moving one does not move the other.
+export OTA_VERIFY_STALL_AFTER=2 OTA_VERIFY_RETRY_GRACE=2 OTA_VERIFY_POLL=1 OTA_VERIFY_SETTLE=1
 
 run() { # run <case-file> <id> <target> <window>
   # `.mqtt`, not `.log`: the repo's .gitignore has a blanket `*.log`, so fixtures named .log are
@@ -179,6 +181,34 @@ hasnt "no HWM carried across images"    "HWM 1277952"
 run midstream_regression 8 907 6
 has   "a regression with no retry is still flagged" "monotonic=NO"
 hasnt "and is not excused as a restart"             "restarts from a lower offset=1"
+
+echo
+echo "═══ THE TWO THRESHOLDS ARE SEPARATE KNOBS ═══"
+echo "     One knob with two semantics is the conflation pattern behind most of this file's defects"
+echo "     (cc=0 = off-channel OR unassociated; ota=confirmed = a build OR THIS build). Each was"
+echo "     harmless until the two meanings diverged. These must move independently."
+# Same fixture, same STALL_AFTER: a WIDE retry-grace forgives the stall (still retrying),
+# a NARROW one calls it dead. Only RETRY_GRACE moved, so only the control-plane arm may change.
+OUT="$(OTA_VERIFY_RETRY_GRACE=30 OTA_VERIFY_FIXTURE="$CASES/stall_with_retry_not_death.mqtt" \
+       bash "$SCRIPT" 8 907 8 2>&1)"; RC=$?
+printf '\n── stall_with_retry_not_death · RETRY_GRACE=30 (wide)\n'
+verdict_is UNPROVEN
+has "a wide retry-grace forgives the stall" "the board has NOT given up"
+OUT="$(OTA_VERIFY_RETRY_GRACE=1 OTA_VERIFY_FIXTURE="$CASES/stall_with_retry_not_death.mqtt" \
+       bash "$SCRIPT" 8 907 8 2>&1)"; RC=$?
+printf '── stall_with_retry_not_death · RETRY_GRACE=1 (narrow), STALL_AFTER unchanged\n'
+verdict_is FAIL
+has "a narrow retry-grace calls the same stall dead" "NO live retry signal"
+has "and the stall threshold did NOT move with it"   ">= 2s stall-after"
+# The retired single knob must fail LOUDLY, not be silently ignored — a caller who sets it believes
+# they changed a threshold, and getting the default instead is exactly the class of silent-wrong-answer
+# this file exists to prevent.
+OUT="$(OTA_VERIFY_STALE=2 OTA_VERIFY_FIXTURE="$CASES/pass_peer_sourced.mqtt" \
+       bash "$SCRIPT" 8 907 4 2>&1)"; RC=$?
+printf '── the retired OTA_VERIFY_STALE knob\n'
+rc_is 3
+has "refuses to run rather than ignore it" "OTA_VERIFY_STALE is retired"
+has "and names both replacements"          "OTA_VERIFY_RETRY_GRACE"
 
 printf '\n════════════════════════════════════════════\n'
 printf '  %d passed · %d failed\n' "$pass" "$fail"
