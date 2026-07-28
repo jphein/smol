@@ -60,6 +60,25 @@ Measure the ELF/binary, or take the figure from a source that says it measured o
 a PR's measured table, `Cargo.toml`'s partition rationale). If you cannot tell whether a number was
 projected or measured, treat it as projected.
 
+### ⚠️ Ask whether a claim is about a VALUE or a KIND — kinds are cheap to refute
+
+Before spending effort re-deriving a claim, classify it. **Value-claims** (*this is 462 B*, *this is
+202 ms/token*, *this build is 905*) need measurement or arithmetic, and **nine of them needed
+re-derivation on 2026-07-28**. **Kind-claims** (*this field lives in `.bss`*, *this exit code is a
+verdict*, *this list is authoritative*) often die to a **single definitional check** — and when they die
+they take every value-claim built on them with them.
+
+Worked example: *"short string literals land in `.data`, so some of Embassy's 58 KB might be
+reclaimable by a linker-script change."* Plausible, and it would have cost hours to bound
+statistically. It died in one step: **`.bss` is `NOBITS`** — it occupies no file bytes and holds no
+initialized content, **so a string literal cannot live there** — and **55,736 of the 58,144 B is
+`.bss`.** (Confirming, `.data` actually *shrank* 4,420 B on the branch, so the lever's contribution is
+negative.) One definition beat a measurement campaign.
+
+**So: check the kind first.** It is cheaper, it is often decisive, and a surviving kind-claim tells you
+which value-claims are even worth measuring. Sibling of *fix the summary first* — both are about
+spending scarce correction effort where it pays.
+
 ### ⚠️ A number you derived is not a number you measured
 
 Sibling of the projection trap, and distinct in a way that matters: the projection trap is
