@@ -423,6 +423,36 @@ Refusing on a dirty *script* is the strict case in both: content can be read fro
 **code executing** cannot, so an uncommitted script means the thing running is not the thing
 reviewed.
 
+### What the deploy tooling does NOT cover — the theme and the fonts
+
+`ha_deploy.sh` syncs `ha/packages/*.yaml` only. **`ha/themes/smol.yaml` and `ha/www/luna-fonts/`
+are outside `status`, `diff` *and* `push`** — hand-installed per the dashboard header, never
+compared, so nothing would notice them drifting. That is the same shape as the gap `#307` closed
+for the Lovelace view, which is how ten live-only cards survived months (found by morpheus-yaml
+while answering #320).
+
+**Checked 2026-07-28 — the theme and fonts had NOT drifted** (18 days since either changed), so
+this is a missing mechanism rather than a live problem. One real divergence was found and fixed:
+`ATTRIBUTION.md` existed in the repo and had never been deployed, i.e. the SIL OFL notice was
+missing from beside the two fonts HA actually serves to browsers.
+
+Until the tool covers them, this is the manual check — takes a few seconds and answers the
+question the tooling can't:
+
+```bash
+HA=jp@<ha-host>                     # /config and /homeassistant are the same tree on HA OS
+ssh $HA 'cat /config/themes/smol.yaml' | cmp - ha/themes/smol.yaml
+for f in ATTRIBUTION.md vt323.woff2 ibmplexmono.woff2; do
+  ssh $HA "md5sum /config/www/luna-fonts/$f" | awk '{print $1}'
+  md5sum "ha/www/luna-fonts/$f" | awk '{print $1}'
+done                                # each pair must match; a missing file prints nothing
+```
+
+Stakes are lower than a package (a stale theme is cosmetic, a stale font is invisible), but
+*"nobody has ever checked"* is precisely how the dashboard gap reached ten cards. Deploying a
+changed theme needs an HA restart or a theme reload to take effect; the fonts are static files and
+need neither.
+
 ### "cannot attribute — live matches no committed version": diagnose before you override
 
 This refusal has **two causes that look identical and want opposite responses**, so read the bytes
