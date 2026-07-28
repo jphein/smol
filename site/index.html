@@ -342,6 +342,12 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 .ws-tag .pill{border:1px solid var(--line);border-radius:999px;padding:3px 10px;background:rgba(125,249,255,.05)}
 .ws-live{display:inline-flex;align-items:center;gap:7px;color:var(--lime);margin-left:auto}
 .ws-live i{width:7px;height:7px;border-radius:50%;background:var(--lime);box-shadow:0 0 9px var(--lime);animation:pulse 1.6s ease-in-out infinite}
+/* The deliberate opposite of .ws-live, for panels that are DRAWN rather than fed.
+   Same slot, same 7px dot — but hollow and unlit, and it never pulses. A lit LED
+   on this page is a promise that something is being measured; anything hand-authored
+   has to wear the unlit one, or the badge is decoration pretending to be telemetry. */
+.ws-mock{display:inline-flex;align-items:center;gap:7px;color:var(--faint);margin-left:auto}
+.ws-mock::before{content:"";width:7px;height:7px;border-radius:50%;border:1px solid currentColor;flex:none}
 .ws-stage{background:#05090a;border-radius:12px;padding:12px;border:1px solid var(--line);box-shadow:inset 0 0 26px rgba(0,0,0,.7),0 0 50px -26px var(--glow-soft)}
 .ws-screen{position:relative;border-radius:5px;overflow:hidden;background:#02100f;box-shadow:inset 0 0 40px rgba(0,0,0,.6)}
 .ws-screen svg{display:block;width:100%;height:auto}
@@ -606,8 +612,14 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
         </div>
 </div>
       <p class="ws-cap">one board's viewport into the shared 256×256 world — peers dead-reckoned so a dropped frame never ghosts them</p>
-      <div class="ws-board" aria-label="Mesh leaderboard, ranked by length">
-        <div class="lb-head"><span>◈ mesh leaderboard</span><span class="ws-live"><i></i>live</span></div>
+      <!-- Hand-authored rows: nothing populates these (no JS touches .lb-row). It wore a
+           pulsing green "live" LED, which made a drawing look like a feed — the same trick
+           the build-status widget was pulling. Names here are ILLUSTRATIVE: board names come
+           from a pure id→name function and the naming scheme is being reworked, so no current
+           fleet name should be readable as present state. Wire it to real data or leave it
+           labelled — do not quietly relight the LED. -->
+      <div class="ws-board" aria-label="An example mesh leaderboard, ranked by length — an illustration, not live fleet data">
+        <div class="lb-head"><span>◈ mesh leaderboard</span><span class="ws-mock">example · not a live feed</span></div>
         <div class="lb-row top"><span class="lb-rank">1</span><span class="lb-name">Jade Herald</span><span class="lb-bar"><i style="width:94%"></i></span><span class="lb-len">214</span></div>
         <div class="lb-row me"><span class="lb-rank">2</span><span class="lb-name">you · Eldritch Nexus</span><span class="lb-bar"><i style="width:80%"></i></span><span class="lb-len">188</span></div>
         <div class="lb-row"><span class="lb-rank">3</span><span class="lb-name">Draconic Dominion</span><span class="lb-bar"><i style="width:64%"></i></span><span class="lb-len">151</span></div>

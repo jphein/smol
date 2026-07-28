@@ -7,7 +7,29 @@
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%23070b0c'/><path d='M3 8 L8 4 L13 8' fill='none' stroke='%237df9ff' stroke-width='1'/><rect x='4.5' y='8' width='7' height='5' fill='none' stroke='%237df9ff' stroke-width='1'/><rect x='6.5' y='9.5' width='3' height='3.5' fill='%23ffb454'/></svg>" />
 <meta name="theme-color" content="#070b0c" media="(prefers-color-scheme: dark)" />
 <meta name="theme-color" content="#e9efee" media="(prefers-color-scheme: light)" />
-<meta name="description" content="A design preview for smol issue #75 — one $9 smol per room as an OLED smart-home panel. Vision, not built." />
+<meta name="description" content="A design preview for smol issue #75 — one $3 smol per room as an OLED smart-home panel. Vision, not built." />
+<!-- Open Graph / Twitter — this page had none, so every shared dollhouse link rendered as a
+     bare URL while the index rendered a card. og:url and og:image MUST stay absolute:
+     crawlers do not resolve relative paths. The image is the shared project card (a real
+     1200×630 raster — crawlers reject SVG); a dollhouse-specific card would be better and is
+     a follow-up, not a blocker. Both the title and description say "design preview" on
+     purpose: the card should not promise a shipped product, because this one isn't. -->
+<link rel="canonical" href="https://jphein.github.io/smol/dollhouse.html" />
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="smol" />
+<meta property="og:url" content="https://jphein.github.io/smol/dollhouse.html" />
+<meta property="og:title" content="smol · the dollhouse — a design preview" />
+<meta property="og:description" content="One ~$3 smol per room as an OLED smart-home panel: every room shows who's home and what the light's doing. A design preview for issue #75 — vision, not built." />
+<meta property="og:image" content="https://jphein.github.io/smol/assets/og-card.png" />
+<meta property="og:image:secure_url" content="https://jphein.github.io/smol/assets/og-card.png" />
+<meta property="og:image:type" content="image/png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:alt" content="The smol wordmark beside a scaled-up 72×40 OLED showing a story the board wrote itself." />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="smol · the dollhouse — a design preview" />
+<meta name="twitter:description" content="One ~$3 smol per room as an OLED smart-home panel — a design preview for issue #75. Vision, not built." />
+<meta name="twitter:image" content="https://jphein.github.io/smol/assets/og-card.png" />
 <!-- self-hosted webfonts (no Google-Fonts CDN → no visitor-IP disclosure); see fonts/fonts.css -->
 <link rel="stylesheet" href="fonts/fonts.css" />
 <style>
@@ -145,6 +167,15 @@ button.btn:active{transform:translateY(0)}
 footer{padding:44px 0 74px;border-top:1px solid var(--line2);color:var(--faint);font-family:var(--mono);font-size:.78rem;
   display:flex;justify-content:space-between;flex-wrap:wrap;gap:16px}
 footer a{color:var(--dim)}footer a:hover{color:var(--glow)}
+/* One share button, always visible — same rule as the index's share row: hiding it unless
+   navigator.share exists means every desktop visitor sees nothing, so the clipboard
+   fallback is strictly better. The full six-target row lives on the index; a sub-page
+   duplicating it would be noise. */
+.share-mini{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:.78rem;
+  color:var(--dim);background:var(--panel2);border:1px solid var(--line);border-radius:10px;
+  padding:8px 13px;cursor:pointer;transition:.18s}
+.share-mini:hover{border-color:var(--glow);color:var(--glow);box-shadow:0 0 20px -8px var(--glow-soft)}
+.share-mini svg{width:15px;height:15px;fill:currentColor;flex:none}
 
 /* ===================== light theme ===================== */
 @media (prefers-color-scheme: light){
@@ -187,7 +218,10 @@ footer a{color:var(--dim)}footer a:hover{color:var(--glow)}
 <div class="hero"><div class="wrap">
   <span class="kicker">◇ Design preview · issue #75 · vision, not built</span>
   <h1 class="h1">The <em>dollhouse</em>.</h1>
-  <p class="lead">One ~$9 smol per room — an OLED panel, a WS2812 room light, and BLE-tag presence.
+  <!-- Pricing is a real number, not a vibe: the OLED board is $2.76 and the headless one
+       $1.00, so the whole site says "$3" and never "$9" (that figure predates the parts
+       actually being sourced). If you change it here, change the meta description too. -->
+  <p class="lead">One ~$3 smol per room — an OLED panel, a WS2812 room light, and BLE-tag presence.
      Every room shows who's home and what the light's doing, at a glance. Tap a room to press its button; shuffle the dolls to watch presence drive the lights.</p>
   <div class="chips">
     <span class="chip"><b>72×40</b> real OLED</span>
@@ -248,7 +282,12 @@ footer a{color:var(--dim)}footer a:hover{color:var(--glow)}
 
 <footer class="wrap">
   <span>smol · the dollhouse — a design preview for <a href="https://github.com/jphein/smol/issues/75" target="_blank" rel="noopener">issue #75 ↗</a>. Vision, not built.</span>
-  <span><a href="index.html">← back to smol</a></span>
+  <span style="display:inline-flex;align-items:center;gap:18px">
+    <button class="share-mini" id="share-mini" aria-label="Share the smol dollhouse — opens your share sheet, or copies the link">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 16a3 3 0 00-2.2 1L8.9 13a3 3 0 000-2l6.9-4a3 3 0 10-1-1.7L7.9 9.2a3 3 0 100 5.6l6.9 3.9A3 3 0 1018 16z"/></svg>
+      <span id="share-mini-label">Share…</span></button>
+    <a href="index.html">← back to smol</a>
+  </span>
 </footer>
 
 <script>
@@ -453,6 +492,31 @@ rooms.forEach(r => { if(r.who.length) r.on = true; });
 buildHouse(); buildSpecs(); buildGallery();
 // re-tint on colour-scheme change (phosphor is fixed, but keeps canvases crisp)
 matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', () => { buildHouse(); buildSpecs(); buildGallery(); });
+
+/* ---- share ----
+   SHARE_URL is the deployed Pages URL for THIS page and must stay in step with the
+   canonical + og:url meta above. Failure is reported, never swallowed: clipboard needs a
+   secure context, so on file:// or plain http the button says so instead of going quiet. */
+const SHARE_URL = 'https://jphein.github.io/smol/dollhouse.html';
+const SHARE_TEXT = 'The smol dollhouse — one ~$3 ESP32-C3 per room as an OLED smart-home panel.';
+const shareBtn = document.getElementById('share-mini');
+const shareLbl = document.getElementById('share-mini-label');
+if (shareBtn && shareLbl) {
+  const restore = shareLbl.textContent;
+  shareBtn.addEventListener('click', () => {
+    if (navigator.share) {
+      navigator.share({ title: 'smol · the dollhouse', text: SHARE_TEXT, url: SHARE_URL }).catch(() => {});
+      return;
+    }
+    const done = ok => {
+      shareLbl.textContent = ok ? 'Link copied ✓' : 'Copy failed — the URL is in the address bar';
+      setTimeout(() => { shareLbl.textContent = restore; }, 2200);
+    };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(SHARE_URL).then(() => done(true), () => done(false));
+    } else done(false);
+  });
+}
 })();
 </script>
 </body>
