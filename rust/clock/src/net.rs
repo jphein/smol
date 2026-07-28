@@ -76,6 +76,14 @@ pub mod ota_resume;
 #[cfg(feature = "espnow")]
 pub mod flood;
 
+// #21/#56 keyed-CFG relay SCHEDULING: the PURE rotating-cursor + slot-eviction decisions that
+// make "a config the dashboard set is never relayed" structurally impossible. Extracted from
+// `mode::broadcast_cached_configs` + `wifi::CfgCache` after both silently starved their tail
+// entries on the live fleet. Host-testable (experiments/cfg_relay_verify), no HAL deps;
+// espnow-gated like `flood`/`wire` since the relay is the only consumer.
+#[cfg(feature = "espnow")]
+pub mod cfgsched;
+
 // #13: the PURE SMOLv1 relay-family wire codec (RELAY/RELAYACK/RELAY2/RELAYACK2/BATT2/GRID2 +
 // the fixed-width ASCII field helpers), extracted from `mode` so the frame formats are
 // host-unit-testable off-target (see `experiments/relay_compat`) — the mixed-fleet / #124
