@@ -196,6 +196,15 @@ carry its unit *and* its subject — "202 ms/token (generation)", "160 ms/char (
 (released)", "1.42× (measured)". Verbose beats ambiguous, because a bare number silently accepts any
 axis a reader brings to it.
 
+**And the mirror-image case, where two sources disagree and neither is wrong.** The site says the Bard's
+weights are **283 KB**; `bard/mod.rs:41` and the T3/T4 report say **277 KB**. Measured, the blob is
+**283,096 B** — which is **283.1 kB decimal** *and* **276.5 KiB binary**. One measurement, two unit
+conventions, a 6-unit gap, and **the most likely outcome of noticing it is someone "fixing" a correct
+number.** So it is recorded here rather than harmonised away: the public page keeps decimal `KB` (the lay
+convention), the firmware keeps `KiB` — **and the fix for that class is a unit suffix, not a new
+measurement.** Before re-deriving a mismatch, check whether ÷1000 vs ÷1024 explains it; two numbers
+about 2.4 % apart in the 100 KB–1 MB range usually means exactly this.
+
 ### ⚠️ The orchestrator's brief is a lead, not a source
 
 Adopted as a standing rule 2026-07-27, at the team lead's own request. **Re-derive any claim handed
