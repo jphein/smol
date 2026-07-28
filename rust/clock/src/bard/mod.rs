@@ -397,6 +397,13 @@ const REPORT_MS: u64 = 60_000;
 /// has no glyph beyond it, and a missing glyph draws as a blank.
 const MORE_MARK: &str = "~ more ~";
 
+/// Marker shown while the narration is PAUSED, and it BLINKS — which is the whole point. A paused
+/// endless story and a wedged one show identical text, so the only thing that can tell them apart on
+/// a 72×40 panel is something moving: a blinking marker proves the tick loop is still running, and a
+/// frozen one is a board to go and debug. (The quill is hidden while paused, because a blinking
+/// quill means "the bard is writing" and it is not.)
+const PAUSE_MARK: &str = "|| paused";
+
 /// Where the screen is in the narration.
 ///
 /// No `Idle` and no `Told` (#302): [`BardApp::new`] either starts narrating or fails the blob, and
@@ -407,6 +414,11 @@ enum Phase {
     Composing,
     /// `page` mode: this page's text is written; waiting for a press to turn it.
     Paged,
+    /// `inf` mode: held by a press (JP, 2026-07-27). Generation AND the typewriter are stopped and
+    /// the glass holds exactly what it showed; a press resumes mid-sentence from the same KV window.
+    /// Nothing about the tale is reset — a pause is the absence of `step` calls, not a state the
+    /// generator knows about, which is why resuming cannot perturb the token stream.
+    Paused,
     /// The blob failed its checks — render nothing but the notice.
     Mute,
 }
@@ -423,8 +435,11 @@ pub struct BardApp {
     shown: u16,
     /// When the next character is due.
     next_reveal_ms: u64,
-    /// Quill state at the last paint (a repaint trigger).
-    quill_on: bool,
+    /// Whether anything BLINKING was visible at the last paint — the quill while composing, the
+    /// `|| paused` marker while paused (a repaint trigger). One flag because the two are mutually
+    /// exclusive, and it deliberately stays `false` in the static states (`page` waiting) so those
+    /// do not flush the panel 2.5 times a second forever.
+    blink_on: bool,
     /// `shown` at the last paint (a repaint trigger).
     painted: u16,
     /// Set by a tap: stop throttling and catch the reveal up (spec §9). Expires at the next tale
@@ -450,7 +465,7 @@ impl BardApp {
             phase: if ok { Phase::Composing } else { Phase::Mute },
             shown: 0,
             next_reveal_ms: ctx.now_ms,
-            quill_on: false,
+            blink_on: false,
             painted: u16::MAX, // force the first paint
             fast: false,
             page_bytes: 0,
@@ -479,6 +494,36 @@ impl BardApp {
         self.page_bytes = self.page_bytes.saturating_add(written as u16);
         self.rewind(dropped);
         self.fast = false;
+    }
+
+    /// Hold the narration where it is (`inf` mode). Generation stops because [`Self::wants_token`]
+    /// only fires in `Composing`, so a paused board runs no forward pass, writes no KV slot and
+    /// spends no cycles on the model — pause is the fleet's power saver as much as a reading
+    /// control, which matters on a device where `inf` mode is otherwise near-continuous compute.
+    fn pause(&mut self, now_ms: u64) {
+        self.phase = Phase::Paused;
+        // Unconditional, so the bench can always answer "did my press register?" — the perf flush
+        // below is silent when no token has been generated since the last report, and silence is the
+        // one thing this line must never be. (ESP_LOG is baked at compile time: a release fleet
+        // image prints neither.)
+        log::info!("smol #302: bard PAUSED — press to resume");
+        // Close the window here so the tokens belong to the narration that just stopped, rather than
+        // being averaged in with whatever comes after the pause.
+        self.report_perf(now_ms, "at pause");
+        // A pause ends any outstanding "hurry": the two would contradict each other, and `fast`
+        // would keep dragging the reveal forward while the glass is supposed to be holding still.
+        self.fast = false;
+        self.painted = u16::MAX; // the marker has to appear on the next paint, not on the next token
+    }
+
+    /// Carry on from exactly where [`Self::pause`] stopped. Nothing is re-fed, re-primed or
+    /// re-seeded — the `Story`, its `Session` and the KV window were never touched — so the next
+    /// token is the one the pause interrupted.
+    fn resume(&mut self, now_ms: u64) {
+        self.phase = Phase::Composing;
+        log::info!("smol #302: bard RESUMED");
+        self.next_reveal_ms = now_ms;
+        self.painted = u16::MAX; // clear the marker
     }
 
     /// Turn the page in `page` mode: another [`PAGE_BYTES`] of new text, at reading pace again.
@@ -566,9 +611,20 @@ impl Plugin for BardApp {
             Press::Long => Transition::Switch(AppKind::Menu),
             Press::Short => {
                 match self.phase {
-                    // Composing: skip the typewriter. There is nothing to "restart" any more —
-                    // the narration never ended — so the impatient tap is the only meaning left.
-                    Phase::Composing => self.fast = true,
+                    // What a press MEANS depends on the delivery mode, and each mode gets exactly
+                    // one meaning — a single button with three jobs would be a guessing game.
+                    //   inf:  pause / play (JP's ask). An endless stream has nothing to restart and
+                    //         nothing to skip to, so "hold it right there" is the useful gesture;
+                    //         "skip the typewriter" is what it replaces, deliberately.
+                    //   page: hurry, then turn (below) — the right pair for pages, unchanged.
+                    Phase::Composing => match unsafe { delivery() }.mode {
+                        delivery::Mode::Inf => self.pause(ctx.now_ms),
+                        delivery::Mode::Page => self.fast = true,
+                    },
+                    // Paused: play. Deliberately mode-independent — if the mode changed to `page`
+                    // while the board was held, a press still means "carry on" rather than silently
+                    // meaning something new.
+                    Phase::Paused => self.resume(ctx.now_ms),
                     // Page turn, with the courtesy of finishing THIS page first: a press while the
                     // typewriter is still catching up means "hurry", a press once it has caught up
                     // means "next page". Same button, and neither reading is ever surprising.
@@ -651,7 +707,13 @@ impl Plugin for BardApp {
 
         // Reveal on a wall-clock schedule (`next_reveal_ms` accumulates rather than resetting to
         // `now`), so a slow token or a missed tick catches up instead of drifting.
-        if self.fast {
+        if matches!(self.phase, Phase::Paused) {
+            // HOLD. Not just "stop advancing": park the schedule at `now` too, so a pause of any
+            // length banks no reveal credit and the resume types on rather than dumping a burst.
+            // Checked before `fast` because the two can meet (a `page`-mode hurry, then a switch to
+            // `inf`, then a press) and holding still has to win.
+            self.next_reveal_ms = ctx.now_ms;
+        } else if self.fast {
             self.shown = text_len;
         } else if self.shown >= text_len {
             // Caught up: park the schedule at `now`. Without this, any wait — a page turn, the
@@ -667,14 +729,30 @@ impl Plugin for BardApp {
         }
 
         // Repaint only when something a viewer can see changed.
-        let paused = matches!(self.phase, Phase::Paged) && self.shown >= text_len;
-        let quill = !paused && (ctx.now_ms / BLINK_MS).is_multiple_of(2);
-        if !(ctx.redraw || self.shown != self.painted || quill != self.quill_on) {
+        let blink = (ctx.now_ms / BLINK_MS).is_multiple_of(2);
+        let held = matches!(self.phase, Phase::Paused);
+        let page_done = matches!(self.phase, Phase::Paged) && self.shown >= text_len;
+        // The quill means "the bard is writing", so it must not blink while paused — that is the
+        // one state where a moving quill would be a lie.
+        let quill = !held && !page_done && blink;
+        let marker = if held {
+            // Blinking, but the ROW STAYS RESERVED on both halves of the blink (an empty string
+            // draws nothing and keeps `rows` the same), or the story would reflow twice a second.
+            Some(if blink { PAUSE_MARK } else { "" })
+        } else if page_done {
+            Some(MORE_MARK)
+        } else {
+            None
+        };
+        // One flag for both blinking things (they are mutually exclusive), and `false` in the static
+        // states so a `page` waiting for a press does not flush the panel forever.
+        let blinking = quill || (held && blink);
+        if !(ctx.redraw || self.shown != self.painted || blinking != self.blink_on) {
             return;
         }
         self.painted = self.shown;
-        self.quill_on = quill;
-        draw_story(ctx, self.shown, quill, paused.then_some(MORE_MARK));
+        self.blink_on = blinking;
+        draw_story(ctx, self.shown, quill, marker);
     }
 }
 

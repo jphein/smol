@@ -602,6 +602,59 @@ fn an_ended_tale_stays_ended_and_the_next_one_starts_clean() {
 }
 
 #[test]
+fn a_pause_cannot_perturb_the_token_stream() {
+    // JP's pause/play (#302): a press holds the narration and a press resumes it mid-sentence. The
+    // property that has to hold is that pausing is INVISIBLE to generation — resume must produce the
+    // token the pause interrupted, not a re-primed or re-seeded one.
+    //
+    // On the device a pause is simply the absence of `step` calls, so this passes by construction
+    // today; it is here as the REGRESSION guard for that design. It fails the moment generation
+    // acquires a dependency on wall-clock time, on how many times it was called per tick, or on any
+    // screen-side state — e.g. if someone later re-seeds the RNG per token from `now_ms`, or decides
+    // a resume should re-feed the prompt "to re-establish context".
+    let m = Model::parse(BLOB).unwrap();
+    let t = Tokenizer::new(m.tok_table, m.cfg.vocab).unwrap();
+
+    // Straight through, past the ring's wrap so the paused run has eviction in play too.
+    let steps = SEQ_CAP as u32 * 2;
+    let uninterrupted = {
+        let mut bufs = std::boxed::Box::new(Bufs::INIT);
+        let mut story = Story::new(&t, GOLDEN_PROMPT, 13);
+        narrate(&m, &t, &mut bufs, &mut story, steps).0
+    };
+
+    // The same run, held twice — once before the wrap and once after — with the screen-side work a
+    // paused board actually does in between (it keeps painting: wrapping the text for the panel and
+    // rolling the scrollback), to prove none of that reaches the generator.
+    let paused = {
+        let mut bufs = std::boxed::Box::new(Bufs::INIT);
+        let mut story = Story::new(&t, GOLDEN_PROMPT, 13);
+        let mut text = std::string::String::new();
+        let third = steps / 3;
+        for (i, chunk) in [third, third, steps - 2 * third].iter().enumerate() {
+            if i > 0 {
+                // "While paused": many ticks of panel work, and NOT ONE `step` call.
+                let mut spans = [(0u16, 0u16); 5];
+                let mut buf = text.as_bytes().to_vec();
+                for _ in 0..50 {
+                    wrap_tail(buf.as_slice(), 14, 5, &mut spans);
+                    let len = buf.len();
+                    clock::textflow::append_rolling(&mut buf, len, b"", 512, len);
+                }
+            }
+            text.push_str(&narrate(&m, &t, &mut bufs, &mut story, *chunk).0);
+        }
+        text
+    };
+
+    assert_eq!(
+        uninterrupted, paused,
+        "a pause changed the story — generation has acquired a dependency it must not have"
+    );
+    assert!(uninterrupted.len() > 200, "fixture too short to mean anything");
+}
+
+#[test]
 fn the_position_cursor_cannot_wrap() {
     // POS_MAX is the only limit an endless narrator has left, so the arithmetic around it has to be
     // provably safe: `Story` stops AT it and `forward` asserts it, both in u16.
