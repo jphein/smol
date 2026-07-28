@@ -412,50 +412,48 @@ merges into existing state — dashboards, config, generated docs, the site's `c
 that check, and a volatile field (a hash, a timestamp, a `?v=`) inside an identity key is the usual
 culprit.
 
-### A broken diagnostic prints a confident wrong verdict
+### ⚠️ A broken diagnostic prints a confident wrong verdict
 
-Sibling of the idempotency rule, and worse, because there is no crash to notice. **A tool that reports
-FAIL when it should report PASS looks exactly like a tool that is working** — same format, same
-confidence, same exit code shape.
+**The most dangerous class in this file, and the newest.** Broken *code* crashes. A broken **diagnostic**
+does neither: it emits a **confident wrong verdict in the same authoritative format as a correct one**,
+and the operator acts on it. **An unvalidated diagnostic is worse than no diagnostic** — it replaces
+"I don't know" with a wrong answer that looks checked.
 
-Worked example (`da1cba8`, 2026-07-28): `tools/ota_verify.sh` was written against an *imagined* DIAG
-schema and never validated against a live payload. Its off-channel check used `grep -oE 'ap=[0-9]+'`,
-unanchored — so it matched the **tail of `heap=42040`** (`he|ap=…`). DIAG has **no `ap=` field at all**.
-The check could only ever read free heap; heap is never a valid channel, so it **failed every run** — and
-being **first in a first-match-wins ladder it masked every other verdict**, including the correct one.
-Its remedy line advised re-channelling a live AP.
+**Worked example, and it is worth reading all four.** `tools/ota_verify.sh` — the one-command OTA
+verification harness — had **four defects** (`da1cba8`, `fa2e6aa`, 2026-07-28), every one from writing
+against an **imagined** wire schema:
 
-**So, for any tool that parses live payloads:**
-- **Validate the parser against a captured real payload**, not against the schema you believe exists.
-  Grep the field name in the *producer* (`mode.rs`, `wifi.rs`) and confirm it is emitted at all.
-- **Anchor field matches** — `(^|\|)field=` — or a short field name will match inside a longer one.
-- **A first-match-wins verdict ladder is a masking hazard:** the earliest check that can misfire hides
-  every later one. Order the cheapest-to-be-wrong checks last, or make them self-disable when their field
-  is absent.
-- **Run it once where you know the answer.** A control you *expect* to pass is where a broken oracle
-  reveals itself; a run you cannot predict is where it hides.
+| # | Defect | What the operator was told |
+|---|---|---|
+| 1 | `grep -oE 'ap=[0-9]+'` **unanchored**, matching the tail of **`heap=42040`** | compared **free heap** to the mesh channel → FAILed every run; **first in a first-match-wins ladder, so it masked every other verdict** and advised re-channelling a live AP |
+| 2 | PASS tested `slot="ota_1"`; firmware publishes a **numeric** slot, and `reset_reason_token()` has **no `ota` token** (an OTA reboot is `rst=sw`) | **PASS was unreachable — every genuine OTA reported as "USB flash, NOT an OTA."** The harness's core proof, inverted |
+| 3 | `ota=rolled-back` — an **explicit** firmware token — never read | a rollback could only be *inferred* from a build number moving |
+| 4 | `DEATH-POINT` fired on **retained ghosts** — progress is retained, a retained value never changes, so it satisfies *"frozen for 30 s+"* **for free** | condemned a ghost of an earlier image as a live dying transfer. **The file's own header warns that only a live `retain=0` publish is trustworthy** — the death-point arm was the one check ignoring its own documented rule |
 
-Note the species: `ap=` inside `heap=` is a **correct regex attached to the wrong field** — §2's family
-again, this time inside a tool rather than a document.
+**The rule: a tool that parses a wire format must be validated against a CAPTURED LIVE PAYLOAD, and its
+field list dated.** Grep the field name in the **producer** (`mode.rs`, `wifi.rs`) and confirm it is
+emitted at all. Two corollaries, each earned above:
 
-### A "live" indicator must measure the thing it names
+- **(a) A check whose operands may be absent must print `unknown` and SKIP — never emit a verdict from a
+  partial comparison.** Junk must not be allowed to be a valid side of a comparison.
+- **(b) A *sometimes-absent* field is more dangerous than a missing one, because it buys broken code an
+  alibi.** Defect 1 survived precisely because `ap=` is **conditional** — present on an associated crown,
+  absent on a leaf — so the check was correct where anyone would test it and silently wrong everywhere
+  else. *(An earlier version of this section claimed DIAG has no `ap=` field at all. It does:
+  `ap=<ch>:<rssi>:<bssid>`, `mode.rs:3279`. The correction makes the lesson stronger — see (b).)*
 
-The site's Mission Control panel read `tasks.json` (last written 2026-07-07) under the heading **"Live
-build status."** with a pulsing green LED — because the LED goes green when the **fetch succeeds**. It
-reported *the feed being reachable* and was labelled *the data being live*, so a three-week-old ledger
-looked current on the public site for three weeks.
+**Belief vs observation is not redundancy.** The firmware now publishes **`apch=`** (coexist's *believed*
+channel) **alongside `ap=`** (the HAL's *observed* association), deliberately: **a disagreement between
+belief and observation is itself the bug**, so collapsing them to one field would delete the signal. And
+the naming carries its own rationale — `mode.rs:3316`: *"Named `apch=`, **NOT** `ap=`: an unanchored grep
+for `ap=` matches the tail of `heap=42040`."*
 
-**Same species as the frozen `smol_7_*` entity families** (§2): a successful read of an unchanging thing
-looks exactly like liveness.
+**Also treat a first-match-wins verdict ladder as a masking hazard**, and **run the tool once where you
+already know the answer** — a control you *expect* to pass is where a broken oracle reveals itself; a run
+you cannot predict is where it hides.
 
-- **Label an indicator by what it measures** — "feed ok", not "live" — and leave a comment saying why,
-  or someone will helpfully "improve" it back.
-- **If data is a snapshot, say so where the heading is**, not only in a small `updated` line the heading
-  contradicts.
-- **Prefer fixing the label to refreshing the data** when the data is hand-maintained. Re-populating a
-  hand-written "live" list guarantees the same rot next month — and it is the anti-pattern the HA
-  dashboard's registry discovery (`439fb95`) deliberately replaced: **a self-reported manifest beats a
-  hand-maintained list.**
+Species note: defect 1 is a **correct regex on the wrong field**; defect 4 is a **correct reading of a
+stale fact**. Both are §2's family, inside a tool rather than a document. Nobody mistyped anything.
 
 ### Site checklist
 

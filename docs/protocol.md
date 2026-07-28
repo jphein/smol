@@ -485,9 +485,47 @@ DIAG|slot=<bootslot>|rst=<reset-reason>|boot=<bootcount>|ota=<outcome>|up=<sec>|
     |tsrc=<ntp|mesh|none>|net=0:ok|brk=<baked|ovr|fb>|otah=<slot|ovr>
     |fwd=<uplink-fwds>|dedup=<dup-drops>|ttl=<ttl-drops>|hop=<1|2>|dlseq=<last-adopted>|dfwd=<downlink-refloods>
     [|cfg=<applied-config>][|io=<pin>:<count>,…][|deaf=<n>|ddrops=<n>]
+    [|ap=<ch>:<rssi>:<bssid>]|cc=<0|1>|degraded=<0|1>|cdeaf=<streak>:<reassocs>:<shed>
+    |apch=<ch>[|blrev=<token>][|brst=<ms>][|cut=<bytes>]
 ```
 
 (one line on the wire; wrapped here for reading.)
+
+### The appended-last block (#204/#217/#153) — documented 2026-07-28
+
+Everything below is appended **after** the positional block, deliberately, so a positional parse of the
+fixed fields stays intact as fields are added. **Field list dated because it grows** — re-date it when it
+changes, and see the truncation warning.
+
+| Field | Always? | Meaning |
+|---|---|---|
+| `ap=<ch>:<rssi>:<bssid>` | **conditional** — skipped off-association | the HAL's **observed** association. Absence keeps the string byte-identical for a non-associated board |
+| `apch=<ch>` | **always** | #217 — the AP channel coexist **believes** it is on. `0` = unknown / not yet scanned |
+| `cc=<0\|1>` · `degraded=<0\|1>` | **always** (0 on a leaf) | #217 rung-3 coexist health. `cc=1` = crown is **co-channel** (live AP channel == mesh channel) — the direct OTA-capability / off-ch6-starvation signal. `degraded=1` = strand-guard latched off-channel (MQTT alive, OTA off, never crownless) |
+| `cdeaf=<streak>:<reassocs>:<shed>` | **always** (`0:0:0` healthy, and on any leaf) | #204 crown dead-downstream telemetry. The shed flag latches `1` after a 2b deaf-shed until re-lock |
+| `blrev=<token>` | conditional | the bootloader **auto-revert probe** — present when `ota::bl_revert_token()` has an answer. This is what settles the long-standing *"is revert-on-boot-fail enabled?"* question (see [ROADMAP §3a](ROADMAP.md)) |
+| `brst=<ms>` | conditional | #153 — the **burst-freeze peak** for the window. ~16 B, and **one** field rather than two precisely because of the budget below. Reset at publish, so each record carries that window's peak rather than a running maximum |
+| `cut=<bytes>` | conditional | bytes lost to truncation — see below |
+
+> ⚠️ **This record lives near a hard cap.** Worst case measured **462 B (~479 B on the wire) against a
+> 512 B buffer**, and the fields above are appended **last** — so `blrev=`/`brst=` are exactly where a
+> truncation lands. A measured leaf record offered 307 B, sent 232, and **75 B vanished with no signal of
+> any kind**; `cut=<bytes>` exists to spend 8 B of the short budget saying so, on the grounds that **a
+> reader who cannot see the field it wants must at least be able to tell that it was cut.**
+>
+> **So a parser must treat an absent `brst=`/`blrev=` as `unknown`, never as `0`.** Per
+> [DOC-UPKEEP](DOC-UPKEEP.md) §2: a check whose operand may be absent must print *unknown* and **skip**.
+
+> 🔎 **Two naming decisions in this record are load-bearing, not style.** `apch=` is **not** `ap=` because
+> *"an unanchored grep for `ap=` matches the tail of `heap=42040`"* (`mode.rs:3316`) — a real harness bug
+> that read free heap as a channel. And `cdeaf=` is **not** `deaf=` because the latter is the
+> mesh-test-only ESP-NOW deaf-**list** count. **When you add a DIAG field, check its name is not a
+> substring-tail of an existing one.**
+>
+> Note also that `apch=` is **always present with `0` = unknown** rather than conditional — deliberately,
+> *"so a harness can read it unconditionally and `0` is an unambiguous 'no answer yet' rather than a
+> missing field."* That is the cleanest available answer to the absent-operand problem: **make absence
+> impossible and encode ignorance in the value.**
 
 | Field | Meaning | Since |
 |---|---|---|

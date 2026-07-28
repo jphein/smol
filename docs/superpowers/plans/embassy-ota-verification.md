@@ -133,14 +133,33 @@ as P1 can be silently served by a peer. **A P1 PASS requires `src=gw`.**
 This document told you to trust the harness rather than hand-judge. **That was right in principle and,
 until 2026-07-28, wrong in fact.** `tools/ota_verify.sh` had **four** defects across two fixes
 (`da1cba8`, then `fa2e6aa`), all one species: *written against an imagined schema and never validated
-against a live payload.* **`8ac9636` also added the `apch=` DIAG field the off-channel check needed to
-exist in the first place** — so the fix spans firmware and tool.
+against a live payload.* **`8ac9636` also added the `apch=` DIAG field** the check should have been
+reading — so the repair spans firmware and tool. **Two of the four inverted the harness's own core
+proof:**
+- **PASS was unreachable.** It tested `slot="ota_1"`, but the firmware publishes a **numeric** slot index,
+  and `reset_reason_token()` has **no `ota` token** — an OTA reboot reports `rst=sw`. So **every genuine
+  OTA was reported as "USB flash, NOT an OTA."** The one thing the harness existed to prove, reported
+  backwards.
+- **`ota=rolled-back` was never read**, though the firmware publishes that token explicitly — so a
+  rollback could only be *inferred* from a build number moving.
 
 The worst was the OFF-CHANNEL check. `grep -oE 'ap=[0-9]+'` is unanchored, so it matched the **tail of
-`heap=42040`** — `he|ap=…`. **DIAG has no `ap=` field at all** (`mode.rs:3208`), so the check could only
-ever read free heap; heap is never 6, so it **FAILed every run** — and being **first in a
-first-match-wins ladder it MASKED every other verdict, including a correct DEATH-POINT.** Its remedy line
-then told the operator to go re-channel a live AP.
+`heap=42040`** — `he|ap=…` — and compared **free heap** against the mesh channel. Heap is never a valid
+channel, so it **FAILed every run**; being **first in a first-match-wins ladder it MASKED every other
+verdict, including a correct DEATH-POINT**, and its remedy line told the operator to go re-channel a live
+AP.
+
+> 📌 **Correction, 2026-07-28.** An earlier version of this box said *"DIAG has no `ap=` field at all."*
+> **It does** — `ap=<ch>:<rssi>:<bssid>` (`mode.rs:3279`), appended **conditionally** and absent when the
+> node is unassociated. Aurora caught that. **The truth makes the lesson sharper, not weaker:** a field
+> that is *sometimes* present is **more dangerous than a missing one**, because it buys broken code an
+> alibi. This check was correct on an associated crown and silently wrong on every leaf — which is why it
+> survived. See DOC-UPKEEP §2.
+>
+> The firmware's own fix carries the rationale in its naming: `mode.rs:3316` — *"Named `apch=`, **NOT**
+> `ap=`: an unanchored grep for `ap=` matches the tail of `heap=42040`."* **`apch=` is coexist's
+> *believed* channel; `ap=` is the HAL's *observed* association.** They are deliberately not redundant —
+> **a disagreement between belief and observation is itself the bug.**
 
 > **The lesson to carry into the bench session, and the reason this box is loud:** *a broken diagnostic
 > does not error. It prints a confident wrong verdict in the same format as a right one.* An operator
