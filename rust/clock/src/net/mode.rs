@@ -3613,7 +3613,9 @@ impl RadioManager {
         // turns "these particular configs never arrive" into "every config arrives within a
         // bounded delay", which is the property the leaf's edge-triggered, idempotent apply
         // was always written to assume.
-        let mut slots = [0usize; crate::net::cfgsched::CFG_RELAY_PER_TICK];
+        // A PRIMING tick (fresh crown after a handover, or a control just added) sweeps the whole
+        // cache; steady-state ticks emit CFG_RELAY_PER_TICK. The buffer is sized for the larger.
+        let mut slots = [0usize; crate::net::cfgsched::CFG_RELAY_MAX_BURST];
         let n = self.cfg_relay_cursor.take(count, &mut slots);
         for &i in slots.iter().take(n) {
             // Copy the entry out to release the `cfg_cache` borrow before the

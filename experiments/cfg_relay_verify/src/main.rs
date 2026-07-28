@@ -33,10 +33,10 @@ use cfgsched::*;
 /// Home Assistant that the board will never hear.
 fn coverage(cursor: &mut RelayCursor, count: usize, ticks: usize) -> Vec<usize> {
     let mut hits = vec![0usize; count];
-    let mut out = [0usize; CFG_RELAY_PER_TICK];
+    let mut out = [0usize; CFG_RELAY_MAX_BURST];
     for _ in 0..ticks {
         let n = cursor.take(count, &mut out);
-        assert!(n <= CFG_RELAY_PER_TICK, "a tick may never exceed its frame budget");
+        assert!(n <= CFG_RELAY_MAX_BURST, "a tick may never exceed the burst budget");
         assert!(n <= count, "a tick may never emit more frames than there are slots");
         for &i in out.iter().take(n) {
             assert!(i < count, "slot index {i} out of range for a {count}-slot cache");
@@ -46,6 +46,21 @@ fn coverage(cursor: &mut RelayCursor, count: usize, ticks: usize) -> Vec<usize> 
     hits
 }
 
+/// Consume the PRIMING tick so what follows measures the ROTATING CURSOR in steady state.
+///
+/// Load-bearing: priming sweeps the whole cache in one tick, so every coverage assertion below
+/// would pass trivially on a fresh cursor and would no longer be testing the thing that broke.
+/// The anti-starvation contract rests on the cursor, so the cursor is what gets tested.
+fn warm(cursor: &mut RelayCursor, count: usize) {
+    let mut out = [0usize; CFG_RELAY_MAX_BURST];
+    let n = cursor.take(count, &mut out);
+    assert_eq!(
+        n,
+        count.min(CFG_RELAY_MAX_BURST),
+        "the first tick at count={count} must PRIME (full sweep), not emit a steady-state slice"
+    );
+}
+
 fn main() {
     // ---- THE REGRESSION: no slot may be starved -------------------------------------------
     // The old relay always started at 0, so with a burst that only got the first K frames out,
@@ -53,6 +68,7 @@ fn main() {
     // every cache size the crown can hold: after `ticks_to_cover`, EVERY slot has had a turn.
     for count in 1..=16 {
         let mut c = RelayCursor::new();
+        warm(&mut c, count); // measure the CURSOR, not the priming sweep
         let hits = coverage(&mut c, count, ticks_to_cover(count));
         for (i, &h) in hits.iter().enumerate() {
             assert!(
@@ -75,7 +91,8 @@ fn main() {
     for count in 1..=16 {
         for skip in 0..count {
             let mut c = RelayCursor::new();
-            let mut out = [0usize; CFG_RELAY_PER_TICK];
+            warm(&mut c, count);
+            let mut out = [0usize; CFG_RELAY_MAX_BURST];
             for _ in 0..skip {
                 c.take(count, &mut out);
             }
@@ -93,6 +110,7 @@ fn main() {
     // waits. (A modulo cursor with count < PER_TICK is the easy way to get this wrong.)
     for count in 1..=16 {
         let mut c = RelayCursor::new();
+        warm(&mut c, count);
         let hits = coverage(&mut c, count, ticks_to_cover(count));
         let (lo, hi) = (hits.iter().min().unwrap(), hits.iter().max().unwrap());
         assert!(
@@ -105,20 +123,25 @@ fn main() {
     // duplicate while a different config goes unrelayed.
     for count in 1..=16 {
         let mut c = RelayCursor::new();
-        let mut out = [0usize; CFG_RELAY_PER_TICK];
+        let mut out = [0usize; CFG_RELAY_MAX_BURST];
         for _ in 0..(count * 3) {
             let n = c.take(count, &mut out);
             let mut seen = out[..n].to_vec();
             seen.sort_unstable();
             seen.dedup();
-            assert_eq!(seen.len(), n, "duplicate slot within one tick ({count} slots): {out:?}");
+            assert_eq!(
+                seen.len(),
+                n,
+                "duplicate slot within one tick ({count} slots): {:?}",
+                &out[..n]
+            );
         }
     }
 
     // ---- total / panic-free edges ---------------------------------------------------------
     // Empty cache (a crown that has drained no configs yet, or a fresh crown after a handover).
     let mut c = RelayCursor::new();
-    let mut out = [0usize; CFG_RELAY_PER_TICK];
+    let mut out = [0usize; CFG_RELAY_MAX_BURST];
     assert_eq!(c.take(0, &mut out), 0, "an empty cache emits nothing");
     assert_eq!(c.peek(), 0, "an empty cache resets the cursor");
     assert_eq!(ticks_to_cover(0), 0);
@@ -126,10 +149,64 @@ fn main() {
     // The cache SHRANK under the cursor (crown handover refills it smaller / differently
     // ordered). A stale index must wrap, never index out of bounds, and coverage must recover.
     let mut c = RelayCursor::new();
+    warm(&mut c, 16);
     coverage(&mut c, 16, 3); // cursor now well past 2
     assert!(c.peek() > 2);
     let hits = coverage(&mut c, 2, ticks_to_cover(2) + 1);
     assert!(hits.iter().all(|&h| h >= 1), "coverage must survive a cache shrink: {hits:?}");
+
+    // ---- PRIMING: a fresh crown, and a control somebody just added ------------------------
+    // The handover case. A new crown's cfg_cache starts EMPTY, so until it is swept once NO leaf
+    // config is reachable at all — measured live: a board took the crown at up=16 s reporting
+    // cfgq=0/16. The first tick at a nonzero count must sweep EVERYTHING.
+    for count in 1..=16 {
+        let mut c = RelayCursor::new();
+        let mut out = [0usize; CFG_RELAY_MAX_BURST];
+        let n = c.take(count, &mut out);
+        assert_eq!(n, count, "a fresh crown must PRIME all {count} slots in one tick, got {n}");
+        let mut seen = out[..n].to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), count, "a priming sweep must name every slot exactly once");
+    }
+
+    // ...and the tick AFTER priming must fall back to the steady-state budget, or the burst is
+    // not an optimisation, it is the delivery mechanism — which is what we are moving away from.
+    let mut c = RelayCursor::new();
+    let mut out = [0usize; CFG_RELAY_MAX_BURST];
+    assert_eq!(c.take(16, &mut out), 16, "prime");
+    assert_eq!(
+        c.take(16, &mut out),
+        CFG_RELAY_PER_TICK,
+        "the tick after priming must be steady-state, not another full sweep"
+    );
+
+    // GROWTH re-primes: somebody adds a control, the cache goes N -> N+1, and the new entry is
+    // appended LAST. Under a pure cursor the one config a person is waiting on waits a full
+    // rotation; priming on growth puts it on the air immediately.
+    let mut c = RelayCursor::new();
+    warm(&mut c, 8);
+    assert_eq!(c.take(8, &mut out), CFG_RELAY_PER_TICK, "steady state at 8");
+    let n = c.take(9, &mut out);
+    assert_eq!(n, 9, "cache growth 8 -> 9 must re-prime a full sweep, got {n}");
+    // And the newly-appended slot (index 8) must actually be in that sweep.
+    assert!(out[..n].contains(&8), "the NEW entry must be in the priming sweep: {:?}", &out[..n]);
+
+    // An empty cache RE-ARMS priming, so a crown that is demoted and later regains the role
+    // primes again rather than trickling 4 slots per tick through the window where nothing works.
+    let mut c = RelayCursor::new();
+    warm(&mut c, 10);
+    assert_eq!(c.take(10, &mut out), CFG_RELAY_PER_TICK, "steady state");
+    assert_eq!(c.take(0, &mut out), 0, "demoted / cache cleared");
+    assert_eq!(c.take(10, &mut out), 10, "re-promoted: must prime again");
+
+    // A repeated identical count must NOT prime — otherwise every tick is a full burst and the
+    // cursor is decorative.
+    let mut c = RelayCursor::new();
+    warm(&mut c, 12);
+    for _ in 0..10 {
+        assert_eq!(c.take(12, &mut out), CFG_RELAY_PER_TICK, "steady state must stay steady");
+    }
 
     // ---- eviction: a real config outranks a redundant clear -------------------------------
     // A DELETED retained config arrives as an empty payload. It used to occupy a slot forever,
@@ -151,6 +228,7 @@ fn main() {
     for count in 1..=16 {
         let need = ticks_to_cover(count);
         let mut c = RelayCursor::new();
+        warm(&mut c, count);
         let hits = coverage(&mut c, count, need.saturating_sub(1));
         if need > 1 {
             assert!(
@@ -162,8 +240,10 @@ fn main() {
     }
 
     println!(
-        "cfg_relay_verify: OK — no starvation for 1..=16 slots from any cursor, \
-         PER_TICK={CFG_RELAY_PER_TICK}, worst-case cover for a full 16-slot cache = {} ticks (~{} s)",
+        "cfg_relay_verify: OK — no starvation for 1..=16 slots from any cursor (measured in \
+         STEADY STATE, priming consumed first); priming sweeps all slots on a fresh crown and on \
+         cache growth, then falls back to PER_TICK={CFG_RELAY_PER_TICK}; MAX_BURST={CFG_RELAY_MAX_BURST}; \
+         steady-state worst-case cover for a full 16-slot cache = {} ticks (~{} s)",
         ticks_to_cover(16),
         ticks_to_cover(16) * 10
     );

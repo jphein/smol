@@ -1701,6 +1701,17 @@ pub struct RelayDiag {
 #[cfg(feature = "wifi")]
 const CFG_CACHE_CAP: usize = 16;
 
+// #21/#56: a PRIMING relay tick sweeps the WHOLE cache in one go, naming every slot, so its index
+// buffer must be able to hold every slot. If CFG_CACHE_CAP ever outgrows CFG_RELAY_MAX_BURST the
+// sweep would silently cover only the first MAX_BURST entries and the tail would be reachable by
+// the rotating cursor alone — quietly reintroducing the very starvation cfgsched exists to
+// prevent, on the entries most recently added. Fail the BUILD instead.
+#[cfg(feature = "espnow")]
+const _: () = assert!(
+    CFG_CACHE_CAP <= crate::net::cfgsched::CFG_RELAY_MAX_BURST,
+    "CFG_RELAY_MAX_BURST must be >= CFG_CACHE_CAP or a priming sweep cannot name every slot"
+);
+
 /// #68 F6: a cached leaf STAT older than this (ms since last heard) is treated as STALE — its
 /// `smol/<id>/status` republish is skipped (no ghost) and its MAC no longer resolves a relay arm.
 /// ~4.5× the 10 s STAT cadence: a leaf that missed several STATs is genuinely gone, not just laggy.
