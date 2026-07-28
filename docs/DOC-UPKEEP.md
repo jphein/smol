@@ -136,6 +136,38 @@ negative.) One definition beat a measurement campaign.
 which value-claims are even worth measuring. Sibling of *fix the summary first* — both are about
 spending scarce correction effort where it pays.
 
+### ⚠️ A verification badge belongs to the artifact that was tested, not to the feature's name
+
+The worst doc defect found so far — and it survived every proofread because **every sentence in it was
+once true.** `protocol.md` carried a byte-accurate section for `SMOLv1 RELAY2 `, with the **🟢
+hardware-verified** badge, for a frame that **does not exist in the firmware**: #124 replaced the tag
+with the `UP2` envelope, and `grep -rn 'SMOLv1 RELAY2' rust/` returns nothing. The frame that *does* fly
+had **no section at all** — it appeared three times, as a *future follow-up*. The listed source symbols
+(`RELAY2_PREFIX`, `encode_relay2`, `parse_relay2`) were all gone.
+
+**How the badge got orphaned.** Routed multi-hop *was* hardware-verified — the first routed frame landed
+2026-07-14 11:03:19, and that is real. But the run carried `RELAY2`, and when the envelope replaced the
+frame **the 🟢 stayed on the section title while the thing it certified was deleted.** Nobody added a
+false claim; the claim's *subject* was swapped underneath it.
+
+**So: a badge is evidence about a specific artifact.** When an implementation is replaced, its evidence
+does not come along — the new artifact starts at whatever its own evidence supports (here 🟡: host-tested
+golden bytes, no fleet observation). Write the badge as *"🟢 the capability, verified with the frame that
+has since been replaced; 🟡 the frame that replaced it"* rather than letting one symbol cover both. **The
+useful by-product is a real bench question** — *has a `UP2` frame ever flown?* — which the tidy version
+of this doc would have hidden.
+
+Three of this file's own rules fired here at once, which is why it is worth a section: **retirements are
+the blind spot** (nobody deletes a section when its subject dies), **upgrades are as invisible as
+retirements** (#124 and #126 both closed *completed* on 2026-07-15 and both surfaces still called them
+pending), and **a partial contract is worse than a missing one** (an implementer following the old
+section builds a frame the fleet cannot parse — and a second implementation of this protocol exists, so
+that is not hypothetical).
+
+**Cheap standing check:** for every wire tag a protocol doc names, grep the firmware for the literal
+byte string. A tag with no match is either retired or never shipped, and both cases are lies in a
+byte-accurate reference. That single grep is what found this.
+
 ### ⚠️ Ask what the string is FOR — overlap only matters where the reader has to tell two things apart
 
 A vocabulary audit looks like a set-intersection problem and is not one. **Two word lists sharing a word

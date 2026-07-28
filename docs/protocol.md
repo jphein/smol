@@ -89,8 +89,9 @@ stays well under 250 B.
 | [GRID2](#batt2--grid2--downlink-freshness-13-stage-b) | `SMOLv1 GRID2 ` | ≤120 | broadcast | on-change + strict-newer re-flood | espnow | 🟢 |
 | [RELAY](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAY ` | ≤91 | broadcast | ~15 s (leaf) | espnow | 🟢 |
 | [RELAYACK](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAYACK ` | 25 | unicast | reactive | espnow | 🟢 |
-| [RELAY2](#relay2--relayack2--routed-multi-hop-uplink-13) | `SMOLv1 RELAY2 ` | ≤94 | broadcast (flood) | ~15 s (stranded leaf) | espnow | 🟢 |
-| [RELAYACK2](#relay2--relayack2--routed-multi-hop-uplink-13) | `SMOLv1 RELAYACK2 ` | 32 | broadcast (flood) | reactive | espnow | 🟢 |
+| [UP2](#up2--relayack2--routed-multi-hop-uplink-13124) | `SMOLv1 UP2 ` | ≤250 (23 B envelope + ≤227 inner) | broadcast (flood) | ~15 s (stranded leaf) | espnow | 🟡 |
+| [RELAYACK2](#up2--relayack2--routed-multi-hop-uplink-13124) | `SMOLv1 RELAYACK2 ` | 32 | broadcast (flood) | reactive | espnow | 🟢 |
+| ~~RELAY2~~ | ~~`SMOLv1 RELAY2 `~~ | — | — | — | — | ⛔ **RETIRED** — replaced by `UP2` (#124). No longer emitted or parsed; see [below](#up2--relayack2--routed-multi-hop-uplink-13124). |
 | [SNK](#snk--mmo-mesh-snake) | `SMOLv1 SNK ` | 18 | broadcast | 5 Hz jittered | espnow | 🟢 |
 | [OTAM](#leaf-mesh-ota-frames-40) | `SMOLv1 OTAM ` | ≤178 | gw→leaf broadcast | per session | espnow | 🟢 |
 | [OTAD](#leaf-mesh-ota-frames-40) | `SMOLv1 OTAD ` | ≤250 | gw→leaf broadcast | windowed burst | espnow | 🟢 |
@@ -580,10 +581,10 @@ changes, and see the truncation warning.
 | `net=0:ok` | **FROZEN** constant (#142 single-network — no slot/fallback; `0` = the historical primary baseline). Kept only so the dashboard's positional DIAG parse stays stable; a dashboard follow-up repurposes/drops it | #100 S1b → #142 |
 | `brk=<baked\|ovr\|fb>` | broker: baked-in · override active · override auto-disabled | #100 S2 (#110) |
 | `otah=<slot\|ovr>` | OTA host: slot allowlist · runtime override appended | #100 S3 (#110) |
-| `fwd` | **uplink** RELAY2 re-broadcasts forwarded by this node — the C0 byte-identical invariant: **must be 0 fleet-wide in all-hear** (increments at exactly one site, the RELAY2 forward arm) | #13 |
-| `dedup` | inbound RELAY2 fragments dropped as already-seen (the `(origin,msgid,frag)` seen-set — bounds the flood) | #13 |
-| `ttl` | RELAY2 frames dropped with hop budget exhausted (`hop ≤ 1` at a non-gateway) | #13 |
-| `hop` | this leaf's **current origin hop**: `1` = single-hop (normal / byte-identical), `2` (= `MAX_HOP`) = escalated & emitting RELAY2. A gateway always reads `1` | #13 |
+| `fwd` | **uplink** `UP2` envelope re-broadcasts forwarded by this node (`RELAY2` before #124) — the C0 byte-identical invariant: **must be 0 fleet-wide in all-hear** (increments at exactly one site, the `UP2` forward arm) | #13 |
+| `dedup` | inbound `UP2` envelopes dropped as already-seen (the `(origin,env_msgid,0)` seen-set — bounds the flood) | #13 |
+| `ttl` | `UP2` frames dropped with hop budget exhausted (`hop ≤ 1` at a non-gateway) | #13 |
+| `hop` | this leaf's **current origin hop**: `1` = single-hop (normal / byte-identical), `2` (= `MAX_HOP`) = escalated & emitting `UP2`. A gateway always reads `1` | #13 |
 | `dlseq` | last-adopted BATT2/GRID2 downlink `dl_seq` (rig P4: advances on a value change, unchanged on a replayed/older seq). `0` on a gateway (source) or a v1-only leaf | #13 |
 | `dfwd` | **downlink** BATT2/GRID2 strictly-newer re-floods — **nonzero by design** (like TIME), kept separate from `fwd` so the uplink invariant stays machine-checkable | #13 |
 | `cfg=<applied-config>` | **optional** (espnow): the applied-config echo (≤40 B, `DIAG_CFG_MAX`) HA plain-string-compares against its command topics for **config-drift** detection | #74 S2 (`b1c2c5c`, #109) |
@@ -591,7 +592,7 @@ changes, and see the truncation warning.
 | `deaf=<n>\|ddrops=<n>` | **optional** (`mesh-test` feature only — the #13 rig): active deaf-list entries · frames dropped by it, so a leftover test entry is visible. **Absent entirely on a production build** | #13 |
 
 **Counter & uptime semantics (authoritative — #13).**
-- **`fwd` vs `dfwd` are split on purpose.** `fwd` = **uplink** RELAY2 forwards only (the C0
+- **`fwd` vs `dfwd` are split on purpose.** `fwd` = **uplink** `UP2` forwards only (the C0
   invariant, 0 fleet-wide in all-hear); `dfwd` = **downlink** BATT2/GRID2 re-floods (nonzero by
   design). The split keeps the uplink invariant machine-checkable, so any nonzero `fwd` in all-hear
   is always a real uplink signal (e.g. storm-tail residue from a pre-quiet convergence window),
@@ -673,11 +674,11 @@ the [MQTT burst](#mqtt-burst--the-lan-transport-that-retires-the-udp-collector) 
 to Home Assistant (the collector is retired) — the ESP-NOW RELAY frame here is
 **unchanged**, only the gateway's internet hop moved.
 **Multi-hop (shipped, #13).** The "next-hop/TTL header" stub that used to live here is
-now real: a stranded leaf escalates plain `RELAY` → [`RELAY2`](#relay2--relayack2--routed-multi-hop-uplink-13)
-(hop-limited managed flood) so its telemetry reaches the gateway **through a relay**, and
+now real: a stranded leaf escalates plain `RELAY` → [`UP2`](#up2--relayack2--routed-multi-hop-uplink-13124)
+(a hop-limited managed flood of a wrapped inner frame; `RELAY2` before #124) so its telemetry reaches the gateway **through a relay**, and
 [`BATT2`/`GRID2`](#batt2--grid2--downlink-freshness-13-stage-b) carry the downlink the other way
 with a freshness gate. The plain `RELAY`/`RELAYACK` frames above are **unchanged** — a
-non-escalated leaf never emits `RELAY2`, so the all-hear case is byte-identical to pre-#13.
+non-escalated leaf never emits `UP2`, so the all-hear case is byte-identical to pre-#13.
 **Flag.** espnow. **Status.** 🟢 **hardware-proven end-to-end** — on the wave-6 fleet
 (build 36 "Oxidized Spark", `bcafa7e`) leaf id8's telemetry reaches
 `disks:~/smol-collector/collector.jsonl` as `node_id 8`, sustained ~02:06Z→02:44Z. The
@@ -688,32 +689,53 @@ non-blocking cold-ARP first-round nit remains — see [relay.md](relay.md#the-fl
 **Source.** `mode.rs` relay-bridge section (`RELAY_PREFIX`, `RELAYACK_PREFIX`,
 `Relay`/`RelayTx`/reassembly); spec `relay-bridge-spec.md`.
 
-## RELAY2 / RELAYACK2 — routed multi-hop uplink (#13)
+## UP2 / RELAYACK2 — routed multi-hop uplink (#13/#124)
 
-**Purpose.** Carry a **stranded** leaf's telemetry home when it is out of direct ESP-NOW
-range of the elected gateway — the single-hop [RELAY](#relay--relayack--espnow--internet-telemetry)
-above can't. #13 adds **Meshtastic-lineage managed flood**: a hop-limit (`H`) + an
-`(origin, msgid, frag)` seen-set + a forward path, rooted at the #76-elected owner and
-**table-free** (so it rides roam/re-election for free). A leaf only ever emits `RELAY2`
-**after it escalates** (see the latch below); in the ordinary all-hear case no `RELAY2`
-frame is ever on the wire.
+> ⛔ **`RELAY2` is retired — do not implement it.** #13 shipped this path as `SMOLv1 RELAY2 `; **#124
+> replaced that tag with the `UP2` envelope** and `RELAY2` is **gone from the firmware** — no
+> `RELAY2_PREFIX`, no `encode_relay2`, no `parse_relay2` (`grep -rn 'SMOLv1 RELAY2' rust/` returns
+> nothing; `wire.rs:177` states it outright). **This section documented the retired frame, with a
+> 🟢 badge, until 2026-07-28.** Recorded rather than quietly deleted: a second implementation of this
+> protocol exists (the C6 watch, #231), and anyone who read the old text needs to know *which* claim
+> was wrong.
 
-**RELAY2 layout (30 B header + ≤64 B chunk = ≤94 B).**
+**Purpose.** Carry a **stranded** leaf's traffic home when it is out of direct ESP-NOW range of the
+elected gateway — the single-hop [RELAY](#relay--relayack--espnow--internet-telemetry) above can't.
+#13 adds **Meshtastic-lineage managed flood**: a hop-limit (`H`) + an `(origin, msgid)` seen-set + a
+forward path, rooted at the #76-elected owner and **table-free** (so it rides roam/re-election for
+free). A leaf only ever emits `UP2` **after it escalates** (see the latch below); in the ordinary
+all-hear case no `UP2` frame is ever on the wire.
+
+**What #124 changed, and why it is not cosmetic.** `RELAY2` was a telemetry frame with a chunk field
+— it could carry *only* telemetry. `UP2` is a **generic envelope around any verbatim inner SMOLv1
+frame** (`RELAY`, `STAT`, `DIAG`, `SCAN`), so a stranded leaf's **observability** reaches home too:
+before #124 the one node you most needed to diagnose was the one that could not tell you anything.
+
+**UP2 layout (23 B envelope + ≤227 B inner = ≤250 B = `ESP_NOW_MTU`).**
 
 | Field | Bytes | Encoding | Meaning |
 |---|---|---|---|
-| tag | 14 | `b"SMOLv1 RELAY2 "` | namespace (diverges from `RELAY` at byte 12: `'2'` vs `' '`) |
+| tag | 11 | `b"SMOLv1 UP2 "` | namespace (`UP2_PREFIX`) |
 | `origin` | 3 | ASCII `OOO` | **originating** leaf id — stamped by the true source, **survives every hop** (unlike a src MAC, which changes per hop) |
 | ` ` | 1 | space | |
-| `msgid` | 5 | ASCII `MMMMM` (u16) | per-origin rolling message id |
+| `env_msgid` | 5 | ASCII `MMMMM` (u16) | the **envelope's own** per-origin rolling id — the **flood-dedup key** |
 | ` ` | 1 | space | |
 | `hop` | 1 | ASCII `H` | hop-limit remaining — originated at `MAX_HOP = 2`, each relay decrements by 1 |
 | ` ` | 1 | space | |
-| `frag` | 1 | ASCII `F` | fragment index (0 … count−1) |
-| ` ` | 1 | space | |
-| `count` | 1 | ASCII `C` | total fragments |
-| ` ` | 1 | space | |
-| `chunk` | ≤64 | bytes | telemetry payload fragment (same `RELAY_CHUNK = 64`) |
+| `inner` | ≤227 | bytes | a **verbatim** inner SMOLv1 frame (`UP2_INNER_MAX = ESP_NOW_MTU − UP2_OVERHEAD = 250 − 23`) |
+
+⚠️ **`env_msgid` is NOT the inner frame's `msgid`, and conflating them is the implementer bug this
+layout invites.** The **envelope** msgid keys the **flood seen-set**; the **inner `RELAY`'s** msgid
+stays the **reassembly + ACK** key (`RELAYACK2` acks the *inner* msgid). A fragmented telemetry
+message therefore emits **one UP2 per inner fragment, each with a fresh `env_msgid`** while all of
+them share the inner `msgid` (`mode.rs:3838-3844`). A relay **re-wraps the same inner verbatim at
+`hop − 1` and preserves `env_msgid`** (`mode.rs:5812-5815`) — which is exactly what makes the
+dedup key work across hops.
+
+⚠️ **Clamping ends on a field boundary, not at byte 227.** `clamp_inner_field_boundary` cuts at the
+last `|` at or before the limit, so a wrapped `DIAG`/`SCAN` never truncates mid-`key=val`; the tail
+that falls off (`cfg=`/`io=`/`dlseq=`/`dfwd=`, appended last) is what a prefix-tolerant parser would
+ignore anyway. `encode_up2` also applies a raw clamp so **the frame can never exceed the MTU**.
 
 **RELAYACK2 layout (32 B), broadcast — flooded leaf-ward (NOT unicast).** The gateway can't
 unicast an ACK back to a leaf it can't hear directly, so `RELAYACK2` is **flooded** back at
@@ -731,7 +753,9 @@ unicast an ACK back to a leaf it can't hear directly, so `RELAYACK2` is **floode
 | `hop` | 1 | ASCII `H` | hop-limit remaining (flooded back at `MAX_HOP`) |
 
 **The managed flood (loop-free by construction).** A node deciding what to do with an inbound
-`RELAY2` uses `flood::forward_decision(is_gateway, hop, already_seen)`:
+`UP2` uses `flood::forward_decision(is_gateway, hop, already_seen)`. Since #124 the forwarding guard
+keys on **`(origin, env_msgid, 0)`** — each `UP2` is one atomic frame, so the `frag` slot is always
+`0` and fragmentation now lives *inside* the envelope (`mode.rs:1685`):
 - **already in the seen-set** → drop, bump `dedup`. The `(origin, msgid, frag)` seen-set
   (16-slot `.bss` ring, drop-oldest) is what makes the flood **terminate**. It is keyed
   **per-fragment** on purpose — a fragmented message shares one `msgid`, so a per-`(origin,msgid)`
@@ -742,13 +766,14 @@ unicast an ACK back to a leaf it can't hear directly, so `RELAYACK2` is **floode
   `00:00:00:00:00:<origin>` (a real Espressif STA MAC is never all-zero, so it can't alias a
   single-hop leaf's real MAC), and on completion **flood a `RELAYACK2` back**. A gateway never
   re-forwards (it's the sink).
-- **relay, `hop > 1`** → re-broadcast as `RELAY2` at `hop − 1`, bump `fwd`, record in the seen-set.
+- **relay, `hop > 1`** → re-broadcast the **same inner verbatim** as `UP2` at `hop − 1` (`env_msgid`
+  preserved), bump `fwd`, record in the seen-set.
 - **relay, `hop ≤ 1`** → hop budget exhausted, drop, bump `ttl`.
 
 **Escalation latch + hysteresis (`flood::HopLatch`).** A leaf starts single-hop (`H = 1`, plain
 `RELAY`) and only latches into multi-hop under **genuine** strandedness — the hysteresis is what
 keeps the byte-identical `fwd = 0` invariant intact under ordinary packet loss:
-- **Escalate (down→up):** latch to `RELAY2` at `MAX_HOP` only after `ESCALATE_STREAK = 3`
+- **Escalate (down→up):** latch to `UP2` at `MAX_HOP` only after `ESCALATE_STREAK = 3`
   **consecutive fully-un-ACKed** messages (~45 s at the 15 s cadence). **Any** ACK — a fully- or
   even partially-ACKed message — **resets the streak to 0**, so a single transient full-loss in a
   healthy all-hear mesh never escalates. The streak is fed both by retry-exhaustion
@@ -758,7 +783,7 @@ keeps the byte-identical `fwd = 0` invariant intact under ordinary packet loss:
 - **Un-latch (up→down):** while latched, emit a 1-in-`PROBE_EVERY = 8` **direct** `H = 1` probe —
   but **only** while the owner's HELLO is heard **directly + fresh** (else the leaf is definitely
   still stranded and a probe would just waste airtime). After `UNLATCH_STREAK = 2` consecutive
-  **direct**-ACK probes succeed, drop back to single-hop. A latched leaf whose `RELAY2` is ACKed
+  **direct**-ACK probes succeed, drop back to single-hop. A latched leaf whose `UP2` is ACKed
   *via the flood* is still stranded on the direct path, so a flooded ACK does **not** un-latch.
 
 **Best-effort ACK — a documented v1 limit.** Multi-hop uplink is **best-effort**. In a
@@ -767,43 +792,55 @@ suppresses the retransmit forward) — telemetry is loss-tolerant, and the next 
 flood. `RELAYACK2` loop-safety rides the `MAX_HOP = 2` hop decrement, not a seen-set; a 3-hop
 follow-up would add a `RELAYACK2` seen-set. **Scan-hop throughput** is the other v1 limit: a
 stranded leaf never locks a channel (it never hears its owner's HELLO), so it keeps hopping
-ch 1/6/11 while scanning and its `RELAY2` lands on the relay's channel only ~⅓ of the time — the
+ch 1/6/11 while scanning and its `UP2` lands on the relay's channel only ~⅓ of the time — the
 rig saw R forward ~1 of ~30. **Pre-#13 the delivered count was ZERO**, so v1's bar (a stranded
-leaf *can* reach home) is met; **[#126](https://github.com/jphein/smol/issues/126)** (latched-leaf
-channel parking) raises the rate.
+leaf *can* reach home) is met. **[#126](https://github.com/jphein/smol/issues/126)** (latched-leaf
+channel parking) raises that rate and **landed** — closed *completed* 2026-07-15;
+`flood.rs:262+` implements `ChannelPark` (park on a signal — a relay echoing our own `UP2`, or a
+`RELAYACK2` for us — and reset when the leaf is no longer stranded). ⚠️ **The ~⅓ figure above is
+the pre-parking measurement**; the post-parking rate has not been re-measured on the rig.
 
 **The byte-identical invariant (the uplink safety gate).** A non-escalated leaf emits ONLY plain
-`RELAY` (`H = 1`), so in the all-hear case **no `RELAY2`/`RELAYACK2` frame ever exists and nobody
+`RELAY` (`H = 1`), so in the all-hear case **no `UP2`/`RELAYACK2` frame ever exists and nobody
 forwards** — behaviour is byte-for-byte identical to pre-#13. The machine-checkable measurement of
 this is canary gate **C0 = `fwd = 0` on every node** across a normal all-hear window. Proven
 byte-free by cfg-gating, not ELF equality; and a permanent bidirectional wire-compat guard
 (`experiments/relay_compat`) `#[path]`-includes the real codec and asserts a new-code frame parses
 under a vendored **pre-#13** parser and an old `RELAYACK` parses under the new matcher — the
-mixed-fleet / [#124](https://github.com/jphein/smol/issues/124) UP2-migration checkpoint.
+mixed-fleet / [#124](https://github.com/jphein/smol/issues/124) `UP2`-migration checkpoint.
 
 **Mixed-fleet compat.** All new tags are **additions** (not appends to the fixed-offset
 `RELAY`/`RELAYACK` headers): old firmware `classify()`s them to `None` (harmless) and cannot relay
 anyway — no flag-day flash. A leaf that needs `H ≥ 2` was, by definition, already stranded pre-#13,
 so no rolling-upgrade window can strand a leaf that worked before. #13 only ever **adds** reach.
 
-**Flag.** espnow. **Status.** 🟢 **hardware-verified — the first routed frame in smol's history.**
+**Flag.** espnow. **Status.** 🟢 **routed multi-hop is hardware-verified — the first routed frame in
+smol's history** — but ⚠️ **that run predates the envelope, and the badge does not transfer to `UP2`.**
 On the deaf-list rig (G = id7 crown ↔ F = id9 mutually deaf, R = id8 relaying), F latched at
-exactly 3 emit cycles (`escalated to multi-hop (RELAY2) — gateway unreachable, 3 un-ACKed msgs`),
+exactly 3 emit cycles (`escalated to multi-hop (RELAY2) — gateway unreachable, 3 un-ACKed msgs`
+— quoted verbatim; ⚠️ **that firmware log line still names the retired frame**, `mode.rs:3879`),
 emitted at hop 2, R forwarded, and at **2026-07-14 11:03:19 `smol/9/telemetry` arrived at the
 broker from a leaf that provably cannot hear its crown.** The pure decision core
 (`SeenSet`/`forward_decision`/`HopLatch`) is host-tested in `experiments/flood_verify` (ALL PASS,
-incl. the multi-fragment + hysteresis regressions). v1 limits above; observability-via-relay
-(`/stat`+`/diag`+`deaf=`) is the [#124](https://github.com/jphein/smol/issues/124) UP2 follow-up.
+incl. the multi-fragment + hysteresis regressions).
 
-**Source.** `net/wire.rs` (pure codec: `RELAY2_PREFIX`/`RELAYACK2_PREFIX`, `encode_relay2`/
-`parse_relay2`, `encode_relayack2`/`parse_relayack2`, `synth_origin_mac`); `net/flood.rs` (pure
+**`UP2`'s own evidence class is 🟡, and the gap is worth naming.** The 2026-07-14 run carried
+`RELAY2`; #124 then replaced the frame. `UP2` is verified by **host-tested golden bytes**
+(`experiments/relay_compat`: wrap → unwrap → re-parse-inner → clamp) and by every consumer written
+since — but **no record shows a `UP2` envelope observed on the fleet.** Observability-via-relay
+(`/stat`+`/diag`+`deaf=`) is the thing #124 *delivered*, not a follow-up: closed *completed*
+2026-07-15. **The open bench question is therefore: has a `UP2` frame ever flown?** Until that is
+answered, 🟡 is the honest badge for the envelope and 🟢 belongs to the capability.
+
+**Source.** `net/wire.rs` (pure codec: `UP2_PREFIX`/`RELAYACK2_PREFIX`, `encode_up2`/`parse_up2`,
+`clamp_inner_field_boundary`, `encode_relayack2`/`parse_relayack2`, `synth_origin_mac`); `net/flood.rs` (pure
 decision core: `MAX_HOP`/`ESCALATE_STREAK`/`UNLATCH_STREAK`/`PROBE_EVERY`, `SeenSet`,
-`forward_decision`, `HopLatch`); live path in `net/mode.rs` (RELAY2 service arm + `HopLatch`
+`forward_decision`, `HopLatch`); live path in `net/mode.rs` (`UP2` service arm + `HopLatch`
 drive). Design: `scratch/13-multihop/scope-proposal.md`.
 
 ## BATT2 / GRID2 — downlink freshness (#13 Stage B)
 
-**Purpose.** Reach a **stranded** leaf with the HA battery/grid downlink the same way `RELAY2`
+**Purpose.** Reach a **stranded** leaf with the HA battery/grid downlink the same way `UP2`
 reaches the gateway on the uplink. Plain [BATT](#batt--ha-battery-snapshot)/[GRID](#grid--ha-grid-power-snapshot-16)
 are **single-hop** (leaves never re-broadcast — no freshness field, so a re-flood could loop or
 overwrite a fresher cache). `BATT2`/`GRID2` add a monotonic freshness counter (`dl_seq`) so a leaf
@@ -1148,13 +1185,14 @@ from `run_mqtt_burst` (`net/wifi.rs:674`); broker addr/creds in `secrets.rs`. HA
   (2-board adoption)** are hardware-verified. BEACON is compile-verified (runs in
   Bench mode, not accuracy-checked). RELAY/RELAYACK are **hardware-proven e2e** (sustained
   `node_id 8` telemetry to the collector, wave 6). SNK is **flashed on the fleet** (build 36).
-- **Routed multi-hop (#13) shipped 2026-07-14 (PR #123, `0b83714`).** RELAY2/RELAYACK2 +
-  BATT2/GRID2 are hardware-verified end-to-end — the **first routed frame** (a crown-deaf leaf's
+- **Routed multi-hop (#13) shipped 2026-07-14 (PR #123, `0b83714`).** `UP2`/RELAYACK2 +
+  BATT2/GRID2 are hardware-verified end-to-end (as `RELAY2`, the tag #124 later replaced) — the **first routed frame** (a crown-deaf leaf's
   telemetry home via a relay) landed at the broker 2026-07-14 11:03:19. Honest v1 limits: uplink
-  ACK is **best-effort**, and a stranded leaf's scan-hopping caps throughput (R forwarded ~1 of
-  ~30) — [#126](https://github.com/jphein/smol/issues/126) (channel parking) raises the rate, and
-  observability-via-relay (`/stat`+`/diag`+`deaf=`) is the [#124](https://github.com/jphein/smol/issues/124)
-  UP2-envelope follow-up. The all-hear byte-identical invariant (`fwd = 0`) is machine-checked (C0)
+  ACK is **best-effort**, and a stranded leaf's scan-hopping capped throughput (R forwarded ~1 of
+  ~30) until [#126](https://github.com/jphein/smol/issues/126) (channel parking) **landed**
+  2026-07-15 — post-parking rate not re-measured. Observability-via-relay
+  (`/stat`+`/diag`+`deaf=`) **shipped** with the [#124](https://github.com/jphein/smol/issues/124)
+  `UP2` envelope, also 2026-07-15; ⚠️ `UP2` itself is 🟡 (host-golden), not fleet-observed. The all-hear byte-identical invariant (`fwd = 0`) is machine-checked (C0)
   and guarded executable (`relay_compat`).
 - **MQTT burst is hardware-verified; the BATT frame's leaf delivery is not (build 40,
   2026-07-08).** The [MQTT burst](#mqtt-burst--the-lan-transport-that-retires-the-udp-collector)
