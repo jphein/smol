@@ -374,9 +374,23 @@ or CI can gate on it:
 
 | exit | meaning |
 |------|---------|
-| `0` | the scaffold reproduces every live card |
+| `0` | the scaffold reproduces every live card, and every wired entity exists |
 | `1` | **LIVE-ONLY cards** — the repo cannot reproduce the dashboard; back-port them |
 | `2` | the check could not run — the dashboard is *unverified*, not proven clean |
+| `3` | **DEAD ROWS** — reproducible, but wired to entities HA does not have |
+
+`1` and `3` are deliberately separate because the fixes differ: live-only means *back-port a
+card*, a dead row means *the card exists but points at nothing* and must be repointed, gated or
+dropped. Folding them into one number hides whichever is smaller. When both fire the exit is `1`
+(a card the repo cannot rebuild at all outranks one it can rebuild but which points somewhere
+dead), and both sections always print.
+
+**Why the dead-row pass exists:** the banner rendered `build —` in the largest type on the page
+while every check was green, because nothing asked whether the dashboard *works* — only whether
+the repo could reproduce it. Two different questions. It checks the **built** view, i.e. what a
+real run would ship, and only structured `entity:` rows, which are the ones that render
+"Entity not found"; template references degrade to `—` and scraping them would cost the
+precision a gate needs to stay trusted.
 
 It is `build_control_room.py --check` underneath: the generator builds the view exactly as a
 real run would, then saves nothing — no `lovelace/config/save`, no SSH tee, no local file. The

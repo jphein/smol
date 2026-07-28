@@ -254,9 +254,14 @@ def node_card(nid, meta, present, span=4):
     cond_leaf={"type":"conditional",                                                           # shown when this node is NOT the elected crown
         "conditions":[{"condition":"state","entity_id":OWNER,"attribute":"owner","state_not":I}],
         "card":{"type":"entities","show_header_toggle":False,"card_mod":{"style":JOIN},"entities":leaf_rows}}
-    gw_rows=[{"type":"section","label":"gateway anchor · WiFi uplink"},
-             {"entity":up,"name":"WiFi uplink (RSSI)","icon":"mdi:wifi-arrow-up"},  # #64, registry-resolved
-             {"type":"attribute","entity":OWNER,"attribute":"channel","name":"mesh channel (owned)","icon":"mdi:wifi"},
+    gw_rows=[{"type":"section","label":"gateway anchor · WiFi uplink"}]
+    # #64 registry-resolved — but GATED through prow() like every other row, which it was not.
+    # `up` falls back to a CONSTRUCTED `sensor.smol_<id>_uplink` when the registry has no uplink
+    # entity for this node, and a constructed id that does not exist renders 'Entity not found'.
+    # id122 hit exactly that the moment #312 started classifying the C6 watches as live — the
+    # dead-row check caught it on its first run, which is the check paying for itself.
+    prow(gw_rows,up,"WiFi uplink (RSSI)","mdi:wifi-arrow-up")
+    gw_rows+=[{"type":"attribute","entity":OWNER,"attribute":"channel","name":"mesh channel (owned)","icon":"mdi:wifi"},
              {"type":"attribute","entity":OWNER,"attribute":"seq","name":"mesh seq (advancing)","icon":"mdi:counter"}]
     prow(gw_rows,f"sensor.smol_{nid}_peers","peers / roster","mdi:lan")
     cond_gw={"type":"conditional",                                                             # shown when this node IS the elected crown
@@ -866,13 +871,17 @@ async def main():
         assert all(done.values()), f"placeholders not all filled: {done}"
         cfg=(await rpc(ws,{"type":"lovelace/config","url_path":DASH}))["result"]
         if not CHECK: json.dump(cfg,open("lovelace_PRESAVE_backup.json","w"),indent=1)
-        prev, extras, retired = classify(cfg, view)
+        prev, extras, retired, retiring = classify(cfg, view)
         if CHECK:
             # The fleet explains the card counts: node boxes are per-node, so "built 33 / live 31"
             # is a node that joined since the last real run, not a mystery.
             report_fleet(nodes, dormant, roster)
-            return report_check(cfg, view, prev, extras, retired)
+            return report_check(cfg, view, prev, extras, retired, retiring, present)
         if prev:
+            if retiring:
+                print(f"  REMOVED {len(retiring)} card(s) listed in RETIRE_LIVE:",
+                      [_ident(c) for c in retiring])
+                print("    → delete their RETIRE_LIVE entries now that they are gone.")
             if retired:
                 print(f"  RETIRED {len(retired)} node box(es) for nodes no longer in the fleet:",
                       [_ident(c) for c in retired])
@@ -971,24 +980,68 @@ def _ident(c):
 # forever (ids 7 and 9 being exactly that case).
 GEN_OWNED = re.compile(r"^vertical-stack\|node\d+$")
 
+# Cards we INTEND to delete from the live dashboard, by identity. Deliberately an explicit,
+# dated list rather than a rule: the merge's entire job is to never delete a card it does not
+# recognise, and weakening that to express "these two should go" would trade a known bug for an
+# unknown one. An allowlist keeps the merge strict and makes each removal auditable.
+#
+# Removing a card from the scaffold is NOT enough on its own — the merge preserves live-only
+# cards, so a scaffold deletion leaves the card on the dashboard forever and the drift check red
+# forever. This is the other half of that action.
+#
+# 2026-07-28 · ids 7 and 9 `overrides & IO` (#311). 53f45bf retired the helpers behind them, so
+# after the next package push every row would read 'Entity not found'. Authorised by team-lead.
+# DELETE THESE ENTRIES once a real run has removed them — a stale entry is a licence to delete a
+# card someone re-adds on purpose, which is the exact failure this list is shaped to avoid.
+RETIRE_LIVE = {
+    "entities|Dominion · overrides & IO",
+    "entities|Herald · overrides & IO",
+}
+
 
 def classify(cfg, view):
     """Split the LIVE view's cards against the freshly-built one. The single source of truth
     for both the save path and --check, so the check can never disagree with the merge.
 
-    Returns (prev, extras, retired):
-      prev     the live view dict, or None if the dashboard has no Control Room yet
-      extras   live cards the scaffold does not define — the repo CANNOT reproduce these
-      retired  generator-owned node boxes whose node has left the fleet — the save deletes these
+    Returns (prev, extras, retired, retiring):
+      prev      the live view dict, or None if the dashboard has no Control Room yet
+      extras    live cards the scaffold does not define — the repo CANNOT reproduce these
+      retired   generator-owned node boxes whose node has left the fleet — the save deletes these
+      retiring  cards listed in RETIRE_LIVE — deliberate one-off deletions, also dropped
     """
     prev = next((v for v in cfg["views"] if v.get("path") == "smol-control"), None)
     if not prev:
-        return None, [], []
+        return None, [], [], []
     known = {_ident(c) for c in view["cards"]}
     unknown = [c for c in prev.get("cards", []) if _ident(c) not in known]
     retired = [c for c in unknown if GEN_OWNED.match(_ident(c))]
-    extras = [c for c in unknown if not GEN_OWNED.match(_ident(c))]
-    return prev, extras, retired
+    retiring = [c for c in unknown if _ident(c) in RETIRE_LIVE]
+    # extras excludes both: a card we mean to delete is not drift to be back-ported, and
+    # counting it as such would leave the check permanently red on a decision already made.
+    extras = [c for c in unknown
+              if not GEN_OWNED.match(_ident(c)) and _ident(c) not in RETIRE_LIVE]
+    return prev, extras, retired, retiring
+
+
+ENTITY_RE=re.compile(r"^[a-z_]+\.[a-z0-9_]+$")
+def referenced_entities(cards):
+    """{entity_id: {card ident, …}} for every entity a card WIRES A ROW TO.
+
+    Structured `entity:` fields only — deliberately not entity ids scraped out of Jinja. These
+    are the references that render as a dead row ('Entity not found' / unavailable) when the
+    thing is gone, which is the failure this check exists to catch. Template references degrade
+    to '—' instead, and scraping them costs precision: a gate that cries wolf gets ignored, and
+    an ignored gate is worth less than no gate."""
+    out={}
+    def walk(o, ident):
+        if isinstance(o,dict):
+            e=o.get("entity")
+            if isinstance(e,str) and ENTITY_RE.match(e): out.setdefault(e,set()).add(ident)
+            for v in o.values(): walk(v, ident)
+        elif isinstance(o,list):
+            for v in o: walk(v, ident)
+    for c in cards: walk(c, _ident(c))
+    return out
 
 
 def _excerpt(c):
@@ -997,8 +1050,29 @@ def _excerpt(c):
     return " ".join(str(txt).split())[:72]
 
 
-def report_check(cfg, view, prev, extras, retired):
-    """--check output. Returns the process exit code: 1 iff the repo cannot reproduce live."""
+def report_dead_rows(view, present):
+    """Do the cards we would DEPLOY wire rows to entities HA does not have? Returns them.
+
+    A SEPARATE QUESTION from live-only drift, and separately fatal, because the fixes differ:
+    live-only means back-port a card; a dead row means the card is wired to something that no
+    longer exists and must be repointed or removed. Conflating them into one number would hide
+    whichever is smaller.
+
+    This is the gap that let the banner render `build —` in the largest type on the page while
+    every check was green: nothing asked whether the dashboard WORKS, only whether the repo
+    could reproduce it. Checked against the BUILT view — what a real run would ship — because
+    that is the thing this repo controls and can fix."""
+    refs = referenced_entities(view["cards"])
+    return {e: idents for e, idents in sorted(refs.items()) if e not in present}
+
+
+def report_check(cfg, view, prev, extras, retired, retiring, present):
+    """--check output. Exit code: 1 live-only drift · 3 dead rows · 0 clean.
+
+    Precedence when both fire: 1. Live-only is the more structural failure — a card the repo
+    cannot rebuild at all outranks a card it can rebuild but which points somewhere dead. Both
+    sections always print, so the exit code chooses your first action without hiding the rest."""
+    dead = report_dead_rows(view, present)
     if not prev:
         print(f"\ndashboard '{DASH}' has no view with path 'smol-control' yet — nothing to drift "
               f"from; a real run would create it.")
@@ -1016,20 +1090,43 @@ def report_check(cfg, view, prev, extras, retired):
         for c in retired:
             print(f"    - {_ident(c)}")
 
-    if not extras:
+    # Deliberate one-off deletions. Never fatal: this is a decision already taken, listed in
+    # RETIRE_LIVE with a reason. Printed so the deletion is announced before it happens and so a
+    # stale entry is visible rather than silently armed.
+    if retiring:
+        print(f"\nRETIRING · {len(retiring)} card(s) listed in RETIRE_LIVE — a real run DELETES these")
+        for c in retiring:
+            print(f"    - {_ident(c)}")
+        print("    → once a real run has removed them, delete their RETIRE_LIVE entries.")
+
+    if extras:
+        print(f"\nLIVE-ONLY · {len(extras)} card(s) exist live that smol-control-scaffold.yaml does "
+              f"NOT define.")
+        print("  They survive only because the save merges. Nothing rebuilds them if HA is rebuilt,")
+        print("  and one regression in that merge deletes them (it already happened once).")
+        for c in extras:
+            span = (c.get("view_layout") or {}).get("grid-column") or "-"
+            print(f"    - {_ident(c)}")
+            print(f"        span={span} · {_excerpt(c)}")
+        print("\n  FIX: copy each card into ha/dashboard/smol-control-scaffold.yaml, then re-run")
+        print("       this check until LIVE-ONLY is 0.")
+    else:
         print(f"\nLIVE-ONLY · 0 — the scaffold reproduces every card on '{DASH}'.")
-        return 0
-    print(f"\nLIVE-ONLY · {len(extras)} card(s) exist live that smol-control-scaffold.yaml does "
-          f"NOT define.")
-    print("  They survive only because the save merges. Nothing rebuilds them if HA is rebuilt,")
-    print("  and one regression in that merge deletes them (it already happened once).")
-    for c in extras:
-        span = (c.get("view_layout") or {}).get("grid-column") or "-"
-        print(f"    - {_ident(c)}")
-        print(f"        span={span} · {_excerpt(c)}")
-    print("\n  FIX: copy each card into ha/dashboard/smol-control-scaffold.yaml, then re-run")
-    print("       this check until LIVE-ONLY is 0.")
-    return 1
+
+    if dead:
+        print(f"\nDEAD ROWS · {len(dead)} entit{'y' if len(dead)==1 else 'ies'} wired to a card "
+              f"but ABSENT from HA.")
+        print("  These render as 'Entity not found' / unavailable — a control that looks broken")
+        print("  rather than one that is simply not offered. A card can be perfectly reproducible")
+        print("  and still be wired to nothing, which is why this is not the LIVE-ONLY count.")
+        for e, idents in dead.items():
+            print(f"    - {e}")
+            print(f"        on: {', '.join(sorted(idents))}")
+        print("\n  FIX: repoint the row, gate it on the entity existing, or drop the card.")
+    else:
+        print(f"DEAD ROWS · 0 — every wired entity exists in HA.")
+
+    return 1 if extras else (3 if dead else 0)
 
 
 def report_fleet(nodes, dormant, roster):

@@ -99,7 +99,9 @@ cmd_status() {
   fi
   echo
   local drc=0; cmd_dash || drc=$?
-  [ "$drc" -eq 1 ] && drift=1
+  # 1 (unreproducible) and 3 (dead rows) are both real drift; 2 means we could not tell, which
+  # must not be reported as "in sync" either.
+  { [ "$drc" -eq 1 ] || [ "$drc" -eq 3 ]; } && drift=1
   echo
   [ "$drift" -eq 0 ] && echo "everything in sync." || echo "drift found (see above)."
   return 0
@@ -148,10 +150,14 @@ cmd_dash() { # read-only; prints the generator's report, returns 0 in sync / 1 d
   # worthless if its exit code is even slightly untrustworthy.
   HA_TOKEN="$tok" python3 "$DASH_GEN" --check > "$out" 2>&1 || rc=$?
   sed 's/^/  /' "$out"; rm -f "$out"
+  # Distinguish the failures. Collapsing them would undo the point of having separate codes —
+  # and mislabelling a real finding as "couldn't check" is the worse direction of the two.
   case "$rc" in
     0) ;;
     1) echo "  → LIVE-ONLY cards: the repo cannot reproduce the live dashboard. Back-port them"
        echo "    into ha/dashboard/smol-control-scaffold.yaml (see #305 for how)." ;;
+    3) echo "  → DEAD ROWS: the dashboard is reproducible but wired to entities HA does not have."
+       echo "    Repoint or gate them — the card renders 'Entity not found' as it stands." ;;
     *) echo "  → check could not run (exit $rc); the dashboard is UNVERIFIED, not proven clean." ;;
   esac
   return "$rc"

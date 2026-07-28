@@ -382,62 +382,16 @@ cards:
     content: "OVERRIDES"
     view_layout: {grid-column: "span 12"}
 
-  # ---- JP's hand-written cards for ids 7 and 9 — KEPT (#311) --------------------------------
-  # These stay because they are JP's and they are on his dashboard today; removing them from the
-  # scaffold would make the repo unable to reproduce live, which is the exact defect #305 fixed.
-  # But know what they are: ids 7 and 9 are RETAINED GHOSTS, cleared 2026-07-28 and confirmed on
-  # the wire (no diag or status across ~8 min while live boards advanced). These five controls
-  # each publish to a board that is not answering. Deleting them is JP's call, not the
-  # generator's — when he makes it, delete these two cards and the check stays green.
+  # ---- ids 7 and 9: cards REMOVED, coupled to the package retire (#311) ---------------------
+  # These were JP's two hand-written `Dominion` / `Herald · overrides & IO` cards. They are gone
+  # because 53f45bf retired the helpers behind them from ha/packages/smol_mesh.yaml: at the next
+  # `ha_deploy.sh push` every row would render 'Entity not found', so JP would open his dashboard
+  # to two visibly broken panels the day after we finished fixing it. Removing them is coupled to
+  # that deploy — it is not an opinion about whether he wants the controls.
   #
-  # The id8 "Nexus" card that used to sit alongside them is GONE ON PURPOSE: the OVERRIDES
-  # placeholder above now generates it from the registry, under the identical title, so keeping
-  # both would render id8 twice. If id7 or id9 ever rejoins the mesh AND keeps its helpers, the
-  # generator will emit a card for it too — at which point these become the duplicates and
-  # should go.
-  - type: entities
-    view_layout: {grid-column: "span 4"}
-    title: "Dominion · overrides & IO"
-    show_header_toggle: false
-    entities:
-      - entity: input_text.smol_7_broker
-        name: Broker (ip[:port])
-        icon: mdi:server-network
-      - entity: input_text.smol_7_ota_host
-        name: OTA host (ip)
-        icon: mdi:download-network
-      - entity: input_text.smol_7_io_map
-        name: IO map
-        icon: mdi:pin
-      - entity: input_text.smol_7_io_set
-        name: IO set
-        icon: mdi:pin-outline
-      - entity: input_button.smol_7_scan
-        name: Scan (WiFi)
-        icon: mdi:wifi-refresh
-    card_mod: *accent
-
-  - type: entities
-    view_layout: {grid-column: "span 4"}
-    title: "Herald · overrides & IO"
-    show_header_toggle: false
-    entities:
-      - entity: input_text.smol_9_broker
-        name: Broker (ip[:port])
-        icon: mdi:server-network
-      - entity: input_text.smol_9_ota_host
-        name: OTA host (ip)
-        icon: mdi:download-network
-      - entity: input_text.smol_9_io_map
-        name: IO map
-        icon: mdi:pin
-      - entity: input_text.smol_9_io_set
-        name: IO set
-        icon: mdi:pin-outline
-      - entity: input_button.smol_9_scan
-        name: Scan (WiFi)
-        icon: mdi:wifi-refresh
-    card_mod: *accent
+  # The hardware those ids named is not lost; it answers as id50/id51 now, and the OVERRIDES
+  # placeholder above gives any live sigil a card automatically the moment its helpers exist.
+  # To restore: `git show 18ceba5:ha/dashboard/smol-control-scaffold.yaml` has them verbatim.
 
   - type: entities
     view_layout: {grid-column: "span 6"}
