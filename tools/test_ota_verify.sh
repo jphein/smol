@@ -79,17 +79,27 @@ bad()  { fail=$((fail+1)); printf '   FAIL - %s\n' "$1"; }
 # MATCHES: `grep -q` exits on first match without draining, the writer takes EPIPE, and pipefail
 # surfaces the WRITER's status as the pipeline's. `case` was 0 in 1500 runs.
 #
-# THE MATCH POSITION IS THE LOAD-BEARING VARIABLE — I first reported this as position-independent and
-# oracle-verify refuted it with the decisive measurement:
-#     payload   3.9 KB, match on line 1  →    3 spurious non-matches / 1500   (a race)
-#     payload 395 KB,   match on line 1  → 1500 spurious non-matches / 1500   (DETERMINISTIC)
-#     match on the LAST line             →    0 / 1500   (grep must drain, so no EPIPE is possible)
-# So below the 64 KB pipe buffer it is a ~0.2% race; ABOVE it, piping a large log into `grep -q` under
-# pipefail is not flaky, it is ALWAYS WRONG. That is worth a sweep well beyond this file.
-# Unresolved discrepancy, recorded rather than smoothed over: my own second-to-last-line pattern also
-# measured 3/1500 on a 2.9 KB payload, which oracle's model does not predict. Possibly a second,
-# smaller source (note `grep` here is ugrep 7.5.0, not GNU grep). Moot for this suite now that no
-# assertion uses a pipeline, but do not assume "match late" is a safe workaround elsewhere.
+# THE RULE IS ABSOLUTE, and deliberately simpler than the model behind it:
+#   NEVER let `cmd | grep -q` STATUS decide anything under `pipefail` — any size, any match position,
+#   any grep implementation.
+# It is stated that way because the model went through three wrong versions (one mine, two from the
+# auditor who found the real rate), and the rule is invariant to which of them is right.
+#
+# What IS firmly established, measured on this host:
+#   * SIZE dominates. Above the 64 KB pipe buffer a first-line match fails DETERMINISTICALLY —
+#     independently measured 200/200 here and 400/400 by the auditor, on a 265 KB payload.
+#   * NOT implementation-specific. GNU grep 3.11 (`/usr/bin/grep`) behaves identically to ugrep 7.5.0
+#     (which is what bare `grep` resolves to on this host). So the hazard travels to CI and any other
+#     machine — that is the part that matters for sweeping other tools.
+#   * THE PIPELINE IS THE DEFECT, NOT GREP. The same `grep -qaF` reading a FILE, where EPIPE is
+#     impossible, was 0/400 here and 0/2000 for the auditor.
+#   * Below the buffer the rate is LOW AND UNSTABLE — not zero. Both of us measured ~3/1500 at
+#     2.9-3.9 KB; neither of us can reproduce it on demand.
+# UNRESOLVED, recorded rather than smoothed over: for a LAST-line match on a 265 KB payload the
+# auditor measured 14/400 (ugrep) and 8/400 (GNU), while I measured 0/200 for both. At a 2-3.5% rate,
+# 0/200 is unlikely (p≈0.02), so the two runs genuinely disagree — most plausibly load-dependence, this
+# host being a 13-agent box. DO NOT conclude from either number that "match late" is safe; that
+# inference was made once from a single 0/1500 datapoint and was wrong.
 #
 # At ~124 assertions per run the race alone gave a ~25% chance of at least one PHANTOM FAILURE, which
 # is exactly what produced the wandering counts (100/2, 119/4, 122/2, 124/0) across otherwise
@@ -339,6 +349,21 @@ hasnt "a later advance clears the barren streak" "[FAIL   ] RETRY-LOOP"
 has   "and it is reported as retrying-AND-progressing" "the high-water advanced between them"
 hasnt "and it is not a CONFLICT"                 "CONFLICT"
 has   "the stall history is still reported"      "stall episodes=3"
+
+echo
+echo "═══ THE RESIDUAL, PINNED · these are DOCUMENTATION tests, not bug tests ═══"
+# What survives conjunct C's exactly-one-boot rule plus F: an OTA that completed shortly BEFORE the run,
+# seen through a cache exactly one boot stale. The bound is F's slack (30 s + SETTLE + 2·POLL), and it is
+# intended. Pinning both sides means a future slack change shows up as a test diff rather than as a
+# silently wider hole. Fixtures built by oracle-verify to measure the bound, kept verbatim.
+run delta1_up30 8 907 4
+verdict_is PASS; rc_is 0
+has  "inside the slack, F holds"   "F boot in-window  up=30s"
+run delta1_up45 8 907 4
+verdict_is UNPROVEN; rc_is 1
+proof A yes; proof B yes; proof C yes; proof D yes; proof E yes
+proof F NO
+has  "outside the slack, F refuses" "F boot in-window  up=45s"
 
 printf '\n════════════════════════════════════════════\n'
 printf '  %d passed · %d failed\n' "$pass" "$fail"
