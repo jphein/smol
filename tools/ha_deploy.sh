@@ -11,9 +11,14 @@
 #
 #   ./tools/ha_deploy.sh status        # what differs, repo vs live (READ-ONLY; the default)
 #   ./tools/ha_deploy.sh diff [file]   # full unified diff for one package (or all)
+#   ./tools/ha_deploy.sh dash          # dashboard-only drift check (READ-ONLY; exits 1 on drift)
 #   ./tools/ha_deploy.sh pull          # live -> repo, so out-of-band edits become commits
 #   ./tools/ha_deploy.sh push          # repo -> live, validated, with rollback
 #   ./tools/ha_deploy.sh push --dry-run
+#
+# `status` and `diff` now cover the Lovelace DASHBOARD as well as the packages (#305) — see
+# cmd_dash below for why that gap mattered. Only `dash` propagates the drift exit code, so a
+# hook can gate on it; `status` stays exit-0 as a human report, as it always has.
 #
 # PUSH IS RECOVERABLE — and be precise about how much each layer actually buys:
 #   1. BACKUPS (the real safety net): every file it overwrites is copied to
@@ -93,6 +98,9 @@ cmd_status() {
     echo "$extra" | sed 's/^/    /'; drift=1
   fi
   echo
+  local drc=0; cmd_dash || drc=$?
+  [ "$drc" -eq 1 ] && drift=1
+  echo
   [ "$drift" -eq 0 ] && echo "everything in sync." || echo "drift found (see above)."
   return 0
 }
@@ -107,6 +115,46 @@ cmd_diff() {
     echo "=== $f  (< repo | > live)"
     diff -u "$LOCAL_DIR/$f" "$tmp/$f" || true
   done
+  # The dashboard has no textual diff — a Lovelace view is JSON in HA's .storage, and the repo
+  # side is a scaffold plus a generator. Card-level drift is the only meaningful comparison.
+  [ -n "$only" ] && return 0
+  echo "=== dashboard  (card-level; the view has no file to diff)"
+  cmd_dash || true
+}
+
+# --- dashboard (the Lovelace VIEW, not a package) -------------------------------------------
+# Everything above this line syncs `ha/packages/*.yaml`. The Control Room VIEW is not a file on
+# the VM at all — it lives in HA's `.storage` and is written over the WebSocket API, so it was
+# covered by NOTHING here. That is not a footnote: it is why ten hand-made cards drifted out of
+# `smol-control-scaffold.yaml` unnoticed for months and were then deleted by a generator
+# rebuilding from the stale scaffold (2026-07-27). Drift you cannot see is drift you keep.
+#
+# We shell out to the generator's own `--check` instead of reimplementing the comparison. The
+# question "is this card one of ours?" is answered by `_ident()`, whose rules are subtle enough
+# to have been wrong three times (span re-keying, prefix collisions, the `?v=` cache-buster). A
+# second copy here would drift from that one the first time either is edited, and then this
+# tool would report "in sync" about a dashboard that is not.
+DASH_GEN="$REPO_DIR/ha/dashboard/build_control_room.py"
+
+cmd_dash() { # read-only; prints the generator's report, returns 0 in sync / 1 drift / 2 error
+  echo "dashboard (Lovelace view, via build_control_room.py --check):"
+  [ -f "$DASH_GEN" ] || { note "generator not found at $DASH_GEN — skipped"; return 0; }
+  command -v python3 >/dev/null || { note "python3 not available — skipped"; return 0; }
+  local tok; tok="$(ha_token)"
+  [ -n "$tok" ] || { note "no HA token — skipped"; return 0; }
+  local out rc=0; out="$(mktemp)"
+  # Output goes to a file rather than through a pipe: `cmd | sed` under `set -o pipefail`
+  # makes the generator's exit code fiddly to recover (PIPESTATUS games), and this check is
+  # worthless if its exit code is even slightly untrustworthy.
+  HA_TOKEN="$tok" python3 "$DASH_GEN" --check > "$out" 2>&1 || rc=$?
+  sed 's/^/  /' "$out"; rm -f "$out"
+  case "$rc" in
+    0) ;;
+    1) echo "  → LIVE-ONLY cards: the repo cannot reproduce the live dashboard. Back-port them"
+       echo "    into ha/dashboard/smol-control-scaffold.yaml (see #305 for how)." ;;
+    *) echo "  → check could not run (exit $rc); the dashboard is UNVERIFIED, not proven clean." ;;
+  esac
+  return "$rc"
 }
 
 # --- pull (live -> repo) -------------------------------------------------------------------
@@ -210,8 +258,9 @@ cmd_push() {
 case "${1:-status}" in
   status) cmd_status ;;
   diff)   cmd_diff "${2:-}" ;;
+  dash)   cmd_dash ;;   # exit code propagates: 0 in sync · 1 live-only drift · 2 could not check
   pull)   cmd_pull ;;
   push)   cmd_push "${2:-}" ;;
   -h|--help|help) sed -n '2,30p' "${BASH_SOURCE[0]}" ;;
-  *) die "unknown mode '${1}' (status | diff | pull | push)" ;;
+  *) die "unknown mode '${1}' (status | diff | dash | pull | push)" ;;
 esac

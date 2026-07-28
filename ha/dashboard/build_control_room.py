@@ -5,8 +5,30 @@
 # glass/power/forge which render). Node cards stay LIVE mushroom boxes (header + OLED + entities).
 # If mushroom still doesn't render un-nested → it's mushroom, swap to SVG faceplate then.
 #   HA_TOKEN=$(cat ~/.cache/ha-token-tmp) python3 build_control_room.py
+#   HA_TOKEN=…                            python3 build_control_room.py --check
 #   (HA_WS_URI / HA_SSH override the endpoints; the defaults are this homelab's.)
-import asyncio, json, os, re, ssl, subprocess, hashlib, yaml, websockets
+#
+# --check — DRIFT CHECK (#305), read-only. Builds the view exactly as a real run would, then
+# compares it against the live dashboard and SAVES NOTHING: no `lovelace/config/save`, no SSH
+# tee, no local file written. It answers the question `ha_deploy.sh status` could never ask,
+# because that tool covers `ha/packages/*.yaml` and the Lovelace VIEW lives in HA's .storage —
+# covered by nothing at all until now. That gap is why ten hand-made cards drifted out of the
+# scaffold for months and were then deleted by a rebuild from a stale scaffold (2026-07-27).
+# The check lives HERE, in the generator, rather than in a sibling script, so it uses the real
+# `_ident()`/`GEN_OWNED` rules; a second copy of a subtle identity function drifts from the
+# original the first time someone edits one of them, and then the check lies.
+#
+# It reports the two drift directions separately, because they call for different responses:
+#   LIVE-ONLY  a card exists live that the scaffold does not define. The repo cannot reproduce
+#              the dashboard; the card survives only by the merge's grace. → back-port it.
+#              This is the failing condition.
+#   RETIRED    a generator-owned node box whose node has left the fleet; the next real run
+#              deletes it. Usually correct and NOT a failure — reported so that a box wrongly
+#              keyed as retired (that has happened) is visible before it is deleted.
+#
+# Exit codes: 0 in sync · 1 live-only cards exist · 2 operational failure (nothing discovered,
+# save rejected). A failed save used to exit 0, which is exactly the silence a hook cannot see.
+import asyncio, json, os, re, ssl, subprocess, sys, hashlib, yaml, websockets
 try:
     from defusedxml.minidom import parseString as xml_parse
 except ImportError:
@@ -14,6 +36,16 @@ except ImportError:
 # Defaults are THIS homelab's real endpoints. The old placeholders ("homeassistant.local",
 # "user@...") resolved nowhere, so a first run always died halfway — after writing the SVG but
 # before saving the view. Both stay env-overridable.
+# Reject anything we do not understand instead of ignoring it. A tolerated typo (`--chek`)
+# would run the REAL path and save — the one mistake this flag exists to make impossible.
+CHECK="--check" in sys.argv[1:]
+_bad=[a for a in sys.argv[1:] if a!="--check"]
+if _bad: sys.exit(f"unknown argument(s): {' '.join(_bad)} — the only flag is --check")
+# The scaffold, the SVG and the pre-save backup are all opened by RELATIVE path, so the script
+# only ever worked when run from its own directory — README documented `python3
+# dashboard/build_control_room.py` from the repo root, which died on the scaffold open(). Anchor
+# to __file__ so the documented invocation, ha_deploy.sh, and a hook all behave the same.
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 URI=os.environ.get("HA_WS_URI","wss://ha.jphe.in/api/websocket"); TOKEN=os.environ["HA_TOKEN"]
 # The Control Room lives on the dashboard titled "smol" (url_path `smol-mesh`) — that is the one
 # JP opens. It was hardcoded to "dashboard-dashboard" (the general "Dashboard"), so every run
@@ -444,9 +476,15 @@ def gen_topology(nodes, seat, rost=None):
     return "".join(P)
 
 def serve(name, svg):
-    xml_parse(svg); open(name,"w").write(svg)
+    xml_parse(svg)                     # parse either way — a malformed SVG is a finding, not a no-op
+    url=f"{LOCAL}/{name}?v={hashlib.md5(svg.encode()).hexdigest()[:8]}"
+    # --check writes NOTHING: not the local file, and above all not the SSH tee to the HA VM.
+    # The returned URL still carries the real `?v=` hash, and `_ident()` strips that query
+    # string before hashing a card, so skipping the write cannot change a single identity.
+    if CHECK: return url
+    open(name,"w").write(svg)
     subprocess.run(["ssh",HA,f"sudo tee {WWW}/{name} >/dev/null"],input=svg.encode(),check=True)
-    return f"{LOCAL}/{name}?v={hashlib.md5(svg.encode()).hexdigest()[:8]}"
+    return url
 
 async def rpc(ws,m,_i=[1]):
     m=dict(m); m["id"]=_i[0]; _i[0]+=1; await ws.send(json.dumps(m))
@@ -571,10 +609,21 @@ async def main():
     view=yaml.safe_load(open("smol-control-scaffold.yaml"))
     async with websockets.connect(URI,max_size=16*1024*1024,ssl=SSLCTX) as ws:
         json.loads(await ws.recv()); await ws.send(json.dumps({"type":"auth","access_token":TOKEN})); await ws.recv()
+        # SAY WHICH DASHBOARD, EVERY RUN. A previous session verified its work against
+        # `dashboard-dashboard` — a real dashboard that nobody opens — and the mistake was
+        # invisible for an hour because no output ever named the target. Resolving the slug
+        # against the live list also refuses a typo'd HA_DASH instead of failing obscurely later.
+        _dl=(await rpc(ws,{"type":"lovelace/dashboards/list"}))["result"]
+        _me=next((d for d in _dl if d.get("url_path")==DASH),None)
+        if not _me:
+            print(f"!! HA_DASH={DASH!r} is not a dashboard on this instance. Available:")
+            for d in _dl: print(f"    {str(d.get('title')):<28} url_path={d.get('url_path')!r}")
+            return 2
+        print(f"{'CHECK (read-only) · ' if CHECK else ''}dashboard: url_path={DASH!r} title={_me.get('title')!r}")
         st={s["entity_id"]:s for s in (await rpc(ws,{"type":"get_states"}))["result"]}; present=set(st)
         fleet=await discover_fleet(ws,st)
         roster=await read_roster(ws)
-        if not fleet: print("!! no smol devices in the registry — nothing to render"); return
+        if not fleet: print("!! no smol devices in the registry — nothing to render"); return 2
         # The Seat is the ELECTED crown, from the mesh-wide (id-agnostic) `smol/mesh/channel`.
         owner=st.get("sensor.smol_mesh_channel",{}).get("attributes",{}).get("owner")
         try: seat_id=int(owner)
@@ -620,76 +669,14 @@ async def main():
         fill_forge(view["cards"])
         assert all(done.values()), f"placeholders not all filled: {done}"
         cfg=(await rpc(ws,{"type":"lovelace/config","url_path":DASH}))["result"]
-        json.dump(cfg,open("lovelace_PRESAVE_backup.json","w"),indent=1)
-        # --- NON-DESTRUCTIVE SAVE (2026-07-27 incident) --------------------------------------
-        # This line used to be `[...remove smol-control...] + [view]`, which did two harmful
-        # things: it DROPPED any card added to the live view that the scaffold does not know
-        # about, and it APPENDED the rebuilt view, moving the Control Room to the end of the
-        # dashboard. Both fired on 2026-07-27: ten cards vanished (the herald section, the
-        # per-node overrides/IO section, and NTP freshness — all added live, never back-ported
-        # to the scaffold) and the view demoted itself to second. The live dashboard drifts
-        # AHEAD of the generator; a generator that rebuilds from a stale scaffold must merge,
-        # not replace.
-        def _ident(c):
-            """Stable identity for a card, so an UPDATED generator card is recognised as the
-            same card (not preserved as a duplicate) while a genuinely unknown card is kept."""
-            t = c.get("type", "?")
-            lbl = c.get("title") or (c.get("content", "")[:45] if t == "markdown" else "")
-            if not lbl:
-                # A NODE BOX has no title, so identify it by node id — that way an UPDATED box
-                # (e.g. gaining the #303 story-prompt rows) is recognised as the same card.
-                # Detect one the way the verifier below does: vertical-stack at the node span.
-                # EVERYTHING else falls back to a hash of the whole card, NOT a JSON prefix:
-                # prefixes collide (two untitled vertical-stacks share their first 45 chars, and a
-                # fleet-wide card that merely mentions `smol_8_` looked like the id8 box), and a
-                # collision makes a genuinely-new live card look "known" — silently dropping it,
-                # which is precisely the bug this merge exists to prevent.
-                # Match a node box at ANY span, not just this run's NODE_SPAN. The span is
-                # derived from the fleet SIZE (per_row), so discovering one more node silently
-                # re-keyed every existing box — the previous run's boxes then looked "unknown"
-                # and were preserved alongside the new ones, doubling the fleet on screen.
-                is_node_box = (t == "vertical-stack"
-                               and re.fullmatch(r"span \d+", str((c.get("view_layout") or {}).get("grid-column") or "")))
-                # A node box references EXACTLY ONE node id. Keying off the first id found
-                # instead collided with the fleet-wide forge stack, whose OTA table mentions
-                # `sensor.smol_5_build` and so identified as the id5 box — two different cards
-                # sharing one identity, which is precisely how a live card gets silently
-                # dropped. Several distinct ids ⇒ fleet-wide card ⇒ fall through to the hash.
-                seen_ids = set(re.findall(r"smol_(\d+)_", json.dumps(c))) if is_node_box else set()
-                if len(seen_ids) == 1:
-                    lbl = f"node{seen_ids.pop()}"
-                elif t == "vertical-stack" and (c.get("cards") or [{}])[0].get("title"):
-                    # A wrapper stack inherits its FIRST CHILD's title. The forge is exactly
-                    # this shape: generator-filled (its OTA table lists a row per node) but
-                    # untitled at the top level, so it fell through to a content hash — and a
-                    # content hash of a card whose content tracks the fleet changes whenever the
-                    # fleet does. Each fleet change therefore stranded the previous forge as an
-                    # "unknown" card and preserved it forever: JP's dashboard already carries
-                    # TWO forge stacks from earlier runs, and this run would have added a third.
-                    # An inherited title is fleet-invariant, so all copies collapse to one
-                    # identity and the duplicates finally retire.
-                    lbl = str((c.get("cards") or [{}])[0]["title"])
-                else:
-                    # Hash the card with CACHE-BUSTING QUERY STRINGS STRIPPED. `serve()` appends
-                    # `?v=<md5-of-svg>` to the topology image, so a card that is semantically the
-                    # same becomes byte-different whenever the SVG changes — the previous run's
-                    # copy then looks "unknown" and gets preserved, and the view grows by a card or
-                    # two on EVERY run. Caught it accreting 30 -> 32 with two sha-identified strays.
-                    norm = re.sub(r"\?v=[0-9a-f]+", "", json.dumps(c, sort_keys=True))
-                    lbl = "sha:" + hashlib.sha1(norm.encode()).hexdigest()[:12]
-            return f"{t}|{lbl[:45]}"
-
-        prev = next((v for v in cfg["views"] if v.get("path") == "smol-control"), None)
-        idx = cfg["views"].index(prev) if prev else len(cfg["views"])
-        # A node box is GENERATOR-OWNED: this script is the only thing that creates one, so when
-        # a node leaves the fleet its box must DIE. Without this the merge below — whose whole
-        # job is to protect cards it does not recognise — would faithfully resurrect the box of
-        # every retired node forever (ids 7 and 9 being exactly that case).
-        GEN_OWNED = re.compile(r"^vertical-stack\|node\d+$")
+        if not CHECK: json.dump(cfg,open("lovelace_PRESAVE_backup.json","w"),indent=1)
+        prev, extras, retired = classify(cfg, view)
+        if CHECK:
+            # The fleet explains the card counts: node boxes are per-node, so "built 33 / live 31"
+            # is a node that joined since the last real run, not a mystery.
+            report_fleet(nodes, dormant, roster)
+            return report_check(cfg, view, prev, extras, retired)
         if prev:
-            known = {_ident(c) for c in view["cards"]}
-            retired = [c for c in prev.get("cards", []) if _ident(c) not in known and GEN_OWNED.match(_ident(c))]
-            extras = [c for c in prev.get("cards", []) if _ident(c) not in known and not GEN_OWNED.match(_ident(c))]
             if retired:
                 print(f"  RETIRED {len(retired)} node box(es) for nodes no longer in the fleet:",
                       [_ident(c) for c in retired])
@@ -699,11 +686,12 @@ async def main():
                 for c in extras:
                     print(f"    · {_ident(c)}")
                 print("    → back-port these into smol-control-scaffold.yaml, or they stay orphaned here.")
+        idx = cfg["views"].index(prev) if prev else len(cfg["views"])
         cfg["views"] = [v for v in cfg["views"]
                         if v.get("title") != "smol Nodes" and v.get("path") != "smol-control"]
         cfg["views"].insert(idx, view)        # in place: never reorder the user's dashboard
         s=await rpc(ws,{"type":"lovelace/config/save","url_path":DASH,"config":cfg})
-        if not s.get("success"): print("!! SAVE FAILED",s); return
+        if not s.get("success"): print("!! SAVE FAILED",s); return 2
         r2=(await rpc(ws,{"type":"lovelace/config","url_path":DASH}))["result"]
         vv=next(x for x in r2["views"] if x.get("path")=="smol-control")
         # Count NODE boxes specifically, via the same identity the merge uses. Matching on
@@ -712,17 +700,167 @@ async def main():
         nb=[c for c in vv["cards"] if GEN_OWNED.match(_ident(c))]
         print(f"SAVE ok · dashboard '{DASH}' · the Seat = {seat['name']} (id{seat_id})"
               f" · node span {NODE_SPAN}")
-        print("  fleet (HA device registry, firmware-authored):")
-        for n in nodes:
-            b=n.get("bond"); bond=f" · bond {b['rssi']} dBm (age {b['age']}s)" if b else ""
-            print(f"    {'♛' if n['gate'] else '·'} {n['name']:<22} id{n['id']:<4} {'live':<5}"
-                  f" sw={n.get('sw') or '—':<12}{bond}")
-        for n in dormant:
-            print(f"    ⚫ {n['name']:<22} id{n['id']:<4} {'dormant':<5} sw={n.get('sw') or '—'}")
-        if roster:
-            for cid,r in sorted(roster.items()):
-                print(f"  roster · crown id{cid} ch{r['ch']} → {sorted(r['peers'])}")
+        report_fleet(nodes, dormant, roster)
         print("  node boxes spliced into view grid:",len(nb),"· done:",done)
         print("  each box:",[c.get("type") for c in nb[0]["cards"]] if nb else "NONE")
+        return 0
+
+
+# --- NON-DESTRUCTIVE SAVE (2026-07-27 incident) --------------------------------------------
+# The save used to be `[...remove smol-control...] + [view]`, which did two harmful things:
+# it DROPPED any card added to the live view that the scaffold does not know about, and it
+# APPENDED the rebuilt view, moving the Control Room to the end of the dashboard. Both fired
+# on 2026-07-27: ten cards vanished (the herald section, the per-node overrides/IO section,
+# and NTP freshness — all added live, never back-ported to the scaffold) and the view demoted
+# itself to second. The live dashboard drifts AHEAD of the generator; a generator that
+# rebuilds from a stale scaffold must merge, not replace.
+#
+# `_ident`/`GEN_OWNED`/`classify` sit at MODULE scope (they were nested in main()) for one
+# reason: `--check` must answer with the same rules the save will use. Nested, the only way to
+# check was a second implementation, and a copy of an identity function this subtle drifts from
+# the original the first time either is edited — at which point the check quietly lies.
+def _ident(c):
+    """Stable identity for a card, so an UPDATED generator card is recognised as the
+    same card (not preserved as a duplicate) while a genuinely unknown card is kept."""
+    t = c.get("type", "?")
+    lbl = c.get("title") or (c.get("content", "")[:45] if t == "markdown" else "")
+    if not lbl:
+        # A NODE BOX has no title, so identify it by node id — that way an UPDATED box
+        # (e.g. gaining the #303 story-prompt rows) is recognised as the same card.
+        # Detect one the way the verifier below does: vertical-stack at the node span.
+        # EVERYTHING else falls back to a hash of the whole card, NOT a JSON prefix:
+        # prefixes collide (two untitled vertical-stacks share their first 45 chars, and a
+        # fleet-wide card that merely mentions `smol_8_` looked like the id8 box), and a
+        # collision makes a genuinely-new live card look "known" — silently dropping it,
+        # which is precisely the bug this merge exists to prevent.
+        # Match a node box at ANY span, not just this run's NODE_SPAN. The span is
+        # derived from the fleet SIZE (per_row), so discovering one more node silently
+        # re-keyed every existing box — the previous run's boxes then looked "unknown"
+        # and were preserved alongside the new ones, doubling the fleet on screen.
+        is_node_box = (t == "vertical-stack"
+                       and re.fullmatch(r"span \d+", str((c.get("view_layout") or {}).get("grid-column") or "")))
+        # A node box references EXACTLY ONE node id. Keying off the first id found
+        # instead collided with the fleet-wide forge stack, whose OTA table mentions
+        # `sensor.smol_5_build` and so identified as the id5 box — two different cards
+        # sharing one identity, which is precisely how a live card gets silently
+        # dropped. Several distinct ids ⇒ fleet-wide card ⇒ fall through to the hash.
+        seen_ids = set(re.findall(r"smol_(\d+)_", json.dumps(c))) if is_node_box else set()
+        if len(seen_ids) == 1:
+            lbl = f"node{seen_ids.pop()}"
+        elif t == "vertical-stack" and (c.get("cards") or [{}])[0].get("title"):
+            # A wrapper stack inherits its FIRST CHILD's title. The forge is exactly
+            # this shape: generator-filled (its OTA table lists a row per node) but
+            # untitled at the top level, so it fell through to a content hash — and a
+            # content hash of a card whose content tracks the fleet changes whenever the
+            # fleet does. Each fleet change therefore stranded the previous forge as an
+            # "unknown" card and preserved it forever: JP's dashboard already carries
+            # TWO forge stacks from earlier runs, and this run would have added a third.
+            # An inherited title is fleet-invariant, so all copies collapse to one
+            # identity and the duplicates finally retire.
+            lbl = str((c.get("cards") or [{}])[0]["title"])
+        else:
+            # Hash the card with CACHE-BUSTING QUERY STRINGS STRIPPED. `serve()` appends
+            # `?v=<md5-of-svg>` to the topology image, so a card that is semantically the
+            # same becomes byte-different whenever the SVG changes — the previous run's
+            # copy then looks "unknown" and gets preserved, and the view grows by a card or
+            # two on EVERY run. Caught it accreting 30 -> 32 with two sha-identified strays.
+            norm = re.sub(r"\?v=[0-9a-f]+", "", json.dumps(c, sort_keys=True))
+            lbl = "sha:" + hashlib.sha1(norm.encode()).hexdigest()[:12]
+    return f"{t}|{lbl[:45]}"
+
+
+# A node box is GENERATOR-OWNED: this script is the only thing that creates one, so when a node
+# leaves the fleet its box must DIE. Without this the merge — whose whole job is to protect
+# cards it does not recognise — would faithfully resurrect the box of every retired node
+# forever (ids 7 and 9 being exactly that case).
+GEN_OWNED = re.compile(r"^vertical-stack\|node\d+$")
+
+
+def classify(cfg, view):
+    """Split the LIVE view's cards against the freshly-built one. The single source of truth
+    for both the save path and --check, so the check can never disagree with the merge.
+
+    Returns (prev, extras, retired):
+      prev     the live view dict, or None if the dashboard has no Control Room yet
+      extras   live cards the scaffold does not define — the repo CANNOT reproduce these
+      retired  generator-owned node boxes whose node has left the fleet — the save deletes these
+    """
+    prev = next((v for v in cfg["views"] if v.get("path") == "smol-control"), None)
+    if not prev:
+        return None, [], []
+    known = {_ident(c) for c in view["cards"]}
+    unknown = [c for c in prev.get("cards", []) if _ident(c) not in known]
+    retired = [c for c in unknown if GEN_OWNED.match(_ident(c))]
+    extras = [c for c in unknown if not GEN_OWNED.match(_ident(c))]
+    return prev, extras, retired
+
+
+def _excerpt(c):
+    """One human-readable line for a card, so a report says WHAT to back-port, not just how many."""
+    txt = c.get("title") or (c.get("content", "").strip().splitlines() or [""])[0]
+    return " ".join(str(txt).split())[:72]
+
+
+def report_check(cfg, view, prev, extras, retired):
+    """--check output. Returns the process exit code: 1 iff the repo cannot reproduce live."""
+    if not prev:
+        print(f"\ndashboard '{DASH}' has no view with path 'smol-control' yet — nothing to drift "
+              f"from; a real run would create it.")
+        return 0
+    print(f"\nview 'smol-control' · index {cfg['views'].index(prev)} of {len(cfg['views'])} views"
+          f" · live cards {len(prev.get('cards', []))} · built from scaffold {len(view['cards'])}")
+
+    # RETIRED first, and never fatal: deleting the box of a node that has left the fleet is the
+    # generator working correctly. It is printed because the identity rules have mis-keyed a LIVE
+    # box before (span-derived keys changed when the fleet grew), and a wrongly-retired box is
+    # only visible in the moment before a real run deletes it.
+    if retired:
+        print(f"\nRETIRED · {len(retired)} generator-owned node box(es) a real run would DELETE")
+        print("  (expected when a node leaves the fleet — check none of these is a live node)")
+        for c in retired:
+            print(f"    - {_ident(c)}")
+
+    if not extras:
+        print(f"\nLIVE-ONLY · 0 — the scaffold reproduces every card on '{DASH}'.")
+        return 0
+    print(f"\nLIVE-ONLY · {len(extras)} card(s) exist live that smol-control-scaffold.yaml does "
+          f"NOT define.")
+    print("  They survive only because the save merges. Nothing rebuilds them if HA is rebuilt,")
+    print("  and one regression in that merge deletes them (it already happened once).")
+    for c in extras:
+        span = (c.get("view_layout") or {}).get("grid-column") or "-"
+        print(f"    - {_ident(c)}")
+        print(f"        span={span} · {_excerpt(c)}")
+    print("\n  FIX: copy each card into ha/dashboard/smol-control-scaffold.yaml, then re-run")
+    print("       this check until LIVE-ONLY is 0.")
+    return 1
+
+
+def report_fleet(nodes, dormant, roster):
+    print("  fleet (HA device registry, firmware-authored):")
+    for n in nodes:
+        b = n.get("bond"); bond = f" · bond {b['rssi']} dBm (age {b['age']}s)" if b else ""
+        print(f"    {'♛' if n['gate'] else '·'} {n['name']:<22} id{n['id']:<4} {'live':<5}"
+              f" sw={n.get('sw') or '—':<12}{bond}")
+    for n in dormant:
+        print(f"    ⚫ {n['name']:<22} id{n['id']:<4} {'dormant':<5} sw={n.get('sw') or '—'}")
+    if roster:
+        for cid, r in sorted(roster.items()):
+            print(f"  roster · crown id{cid} ch{r['ch']} → {sorted(r['peers'])}")
+
+
 if __name__=="__main__":
-    asyncio.run(main())
+    # The exit code is the contract a hook or CI holds: 0 in sync · 1 live-only drift · 2 broken.
+    # `asyncio.run(main())` used to discard it, so even "SAVE FAILED" exited 0.
+    #
+    # Crashes must NOT land on 1. An unhandled exception exits 1 by default, and a WS handshake
+    # timeout (seen once while building this) would then be indistinguishable from "drift found"
+    # — a flaky network would read as a dashboard problem and send someone hunting a phantom.
+    # 1 means live-only drift and nothing else; every other failure is 2.
+    try:
+        sys.exit(asyncio.run(main()) or 0)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception:
+        import traceback; traceback.print_exc()
+        sys.exit(2)

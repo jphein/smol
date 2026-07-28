@@ -357,10 +357,38 @@ VM. One script now keeps both honest, in both directions:
 ```bash
 ./tools/ha_deploy.sh status        # what differs, repo vs live (read-only; the default)
 ./tools/ha_deploy.sh diff [file]   # full unified diff
+./tools/ha_deploy.sh dash          # dashboard drift check (read-only; exits 1 on drift)
 ./tools/ha_deploy.sh pull          # live -> repo, so out-of-band edits become commits
 ./tools/ha_deploy.sh push          # repo -> live: backup, copy, check_config, THEN reload
 ./tools/ha_deploy.sh push --dry-run
 ```
+
+### The dashboard is covered too now (#305)
+
+`status`/`diff` used to cover `ha/packages/*.yaml` and nothing else. The Control Room **view**
+is not a file on the VM — it lives in HA's `.storage`, written over the WebSocket API — so it
+was checked by nothing, which is how ten hand-made cards drifted out of the scaffold for months
+and were then deleted by a rebuild from the stale scaffold. `status` and `diff` now include a
+card-level dashboard check, and `dash` runs it alone and **propagates its exit code**, so a hook
+or CI can gate on it:
+
+| exit | meaning |
+|------|---------|
+| `0` | the scaffold reproduces every live card |
+| `1` | **LIVE-ONLY cards** — the repo cannot reproduce the dashboard; back-port them |
+| `2` | the check could not run — the dashboard is *unverified*, not proven clean |
+
+It is `build_control_room.py --check` underneath: the generator builds the view exactly as a
+real run would, then saves nothing — no `lovelace/config/save`, no SSH tee, no local file. The
+check lives inside the generator on purpose, so it uses the same `_ident()` rules the merge
+uses; a separate script would drift from them and then report "in sync" about a dashboard that
+is not. It prints the dashboard it read (`url_path` **and** title) on every run — a previous
+session verified against the wrong dashboard for an hour, and output that names its target is
+the cheap fix for that whole class of mistake.
+
+`RETIRED` in that output is reported but never fatal: it means a generator-owned node box whose
+node has left the fleet, which a real run correctly deletes. It is printed because the identity
+rules have mis-keyed a *live* box before, and that is only visible in the moment before deletion.
 
 `push` is recoverable by construction: every overwritten file is backed up on the VM first
 (`<name>.bak-deploy-<stamp>`), local YAML is validated before anything is sent, and HA's
