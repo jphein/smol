@@ -271,8 +271,11 @@ for id in $(cut -f1 "$WORK/cmds" 2>/dev/null | sort -un); do
     # Reachable in a normal flow: a board configured in HA before its first boot, or one whose
     # retained DIAG was cleared. That contradicted this tool's own doctrine — it prints
     # "'Can't tell' is not clean" and exits 2 for UNKNOWN, then treated total absence of
-    # evidence as certainty. Structurally present but unexercised when found (every id in that
-    # run had at least a retained DIAG), which is exactly when it is cheapest to fix.
+    # evidence as certainty. OBSERVED on the live fleet 2026-07-28, after id7/id9's retained DIAG was cleared: both
+    # now report UNKNOWN with this reason. The audit that found it called it "structurally
+    # present but unexercised — every id had at least a retained DIAG", which was true when
+    # measured and false within the hour, because a DIFFERENT cleanup removed the condition
+    # that made it unreachable. Date reachability claims; the system moves under them.
     if [ "$state" = DEAD ] && [ "$(prodclass "$id")" = none ]; then
       state=UNKNOWN; why="NO producer evidence at all — no DIAG line for this id, so its silence is unexplained rather than explained. Absence of evidence is not evidence of death; refusing to call it dead."
     fi
@@ -340,7 +343,32 @@ else
 fi
 
 # ── 6. optional clear — backup first, DEAD only ────────────────────────────────────────
-if [ "$DO_CLEAR" = 1 ] && [ "$stale" -gt 0 ]; then
+# 2026-07-28 (audit G8): TWO INDEPENDENT QUESTIONS, ONE GATE — now separated.
+# Clearing used to require state==DEAD. After the G2 fix, id7/id9 can never regain producer
+# evidence, so they can never leave UNKNOWN, so this tool could never go green and never clear
+# them — permanently exit 2 on a fleet known to be correct. That is exactly the #314 failure
+# mode this file is written to avoid: a check that cannot be satisfied by any future state of
+# the world is a check that gets switched off.
+#
+# The resolution needs no weakening of the liveness logic, because the two questions are
+# independent:
+#   "is this id ALIVE?"      -> genuinely needs producer evidence. Fail-safe is right.
+#   "is this payload VALID?" -> needs NO liveness evidence at all. `config/custom = unavailable`
+#                               is garbage on a live board, a dead board and an unknown one
+#                               alike; from_wire rejects it and keeps the current value, so the
+#                               broker and the board disagree REGARDLESS of who is home.
+# So malformed payloads are clearable independent of state. Clearing a garbage instruction on
+# an UNKNOWN id destroys nothing — the board was never obeying it. The alternative (an operator
+# assertion that an id is retired) is strictly worse: it needs a human to be RIGHT, where this
+# route needs nobody to be right about anything.
+if [ "$DO_CLEAR" = 1 ] && { [ "$stale" -gt 0 ] || [ "$malformed" -gt 0 ]; }; then
+  # Build the clear set: DEAD ids' command topics (liveness-gated) PLUS malformed payloads on
+  # ANY state (payload-gated). Deduplicated, since a DEAD id's topic may also be malformed.
+  : > "$WORK/toclear"
+  awk -F'\t' 'NR==FNR{if($2=="DEAD")d[$1];next} ($1 in d){printf "%s\t%s\n",$2,$3}' \
+      "$WORK/report" "$WORK/cmds" >> "$WORK/toclear"
+  awk -F'\t' '{printf "%s\t%s\n",$3,$4}' "$WORK/malformed" >> "$WORK/toclear"
+  sort -u "$WORK/toclear" -o "$WORK/toclear"
   # 2026-07-28 (audit G3): the backup lives OUTSIDE agent scratch. It used to be written to
   # ~/.claude/projects/…/scratch/nexus-345/, which is an agent TASK dir — and this project's
   # housekeeping policy says to delete stale task dirs at conversation start. The sole restore
@@ -350,13 +378,17 @@ if [ "$DO_CLEAR" = 1 ] && [ "$stale" -gt 0 ]; then
   mkdir -p "$(dirname "$BK")" || { echo "FATAL: cannot create backup dir $(dirname "$BK") — refusing to clear" >&2; exit 2; }
   { echo "# smol COMMAND-ghost backup — $(date -u +%Y-%m-%dT%H:%M:%SZ) — root $ROOT"
     echo "# restore: mosquitto_pub -r -t <topic> -m <payload>"; } > "$BK"
-  awk -F'\t' 'NR==FNR{if($2=="DEAD")d[$1];next} ($1 in d){printf "%s\t%s\n",$2,$3}' "$WORK/report" "$WORK/cmds" >> "$BK"
+  cat "$WORK/toclear" >> "$BK"
   # 2026-07-28 (audit G1): VERIFY the backup before destroying what it protects. This used to
   # print a reassuring "backup → <path>" and clear the fleet regardless — so a failed write
   # (full disk, bad permissions, unwritable parent) produced a confident path and no rollback.
   # CLAUDE.md's rule is snapshot AND VERIFY before a destructive infra op; this snapshotted and
   # hoped. Checks non-empty AND that it contains at least one topic line, since the header alone
   # would satisfy -s while protecting nothing.
+  # NB: this `grep -q` reads a FILE, not a pipeline, so it is OUTSIDE the EPIPE-under-pipefail
+  # hazard that bit three other tools today (measured 0/2000 in the file form). Do NOT
+  # "improve" it into `cat "$BK" | grep -q` — that would make this guard the very class of
+  # silent-wrong-answer it exists to prevent.
   if [ ! -s "$BK" ] || ! grep -q "^$ROOT/" "$BK"; then
     echo "FATAL: backup at $BK is empty or contains no topic lines — refusing to clear." >&2
     echo "       (nothing was published; the fleet is untouched)" >&2
@@ -364,12 +396,13 @@ if [ "$DO_CLEAR" = 1 ] && [ "$stale" -gt 0 ]; then
   fi
   echo; echo "   backup → $BK  ($(grep -c "^$ROOT/" "$BK") topic(s), verified non-empty)"
   echo "   ⚠ config/* clears do NOT revert a board (empty payload is cached + relayed; the leaf's"
-  echo "     from_wire keeps its CURRENT value, #46 clamp). Safe here only because these ids are dead."
+  echo "     from_wire keeps its CURRENT value, #46 clamp). Safe because every topic here is either"
+  echo "     on a DEAD id, or carries a MALFORMED payload the board was already rejecting."
   # 2026-07-28 (audit G4): a FAILED clear used to be silent — `mpub … && echo cleared` printed
   # nothing on failure, the loop continued, and the exit code was unaffected, so a partial clear
   # looked like a full one minus a line the operator would have to count.
   cfail=0
-  awk -F'\t' 'NR==FNR{if($2=="DEAD")d[$1];next} ($1 in d){print $2}' "$WORK/report" "$WORK/cmds" \
+  cut -f1 "$WORK/toclear" \
   | while read -r t; do
       case "$t" in
         "$ROOT"/*)
