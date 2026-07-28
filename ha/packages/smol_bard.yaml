@@ -68,6 +68,25 @@ input_select:
   # `page` = one screenful of new text, then wait for a button press. NOTE: `inf` is near-continuous
   # compute — measured 0.2 W / ~40 mA at the USB side, the fleet's worst-case draw — so it is the
   # mode to avoid on a battery build.
+  # #302 TEXT SIZE. Discrete, not continuous — the panel has four fonts, so a select is honest
+  # where a slider would imply sizes that do not exist. The label carries what actually changes:
+  # the character grid. Bigger text = fewer characters on the 72x40 glass; the story window is
+  # measured in TOKENS, so a larger font shows LESS story without changing what the model writes.
+  smol_7_bard_font:
+    name: "smol 7 text size"
+    options: ["5x8 · 14x5 small", "6x10 · 12x4 medium", "9x15 · 8x2 large", "10x20 · 7x2 huge"]
+    initial: "5x8 · 14x5 small"
+    icon: "mdi:format-size"
+  smol_8_bard_font:
+    name: "smol 8 text size"
+    options: ["5x8 · 14x5 small", "6x10 · 12x4 medium", "9x15 · 8x2 large", "10x20 · 7x2 huge"]
+    initial: "5x8 · 14x5 small"
+    icon: "mdi:format-size"
+  smol_9_bard_font:
+    name: "smol 9 text size"
+    options: ["5x8 · 14x5 small", "6x10 · 12x4 medium", "9x15 · 8x2 large", "10x20 · 7x2 huge"]
+    initial: "5x8 · 14x5 small"
+    icon: "mdi:format-size"
   smol_7_bard_mode:
     name: "smol 7 delivery"
     options: ["inf", "page"]
@@ -124,6 +143,9 @@ automation:
           - input_select.smol_7_bard_mode
           - input_select.smol_8_bard_mode
           - input_select.smol_9_bard_mode
+          - input_select.smol_7_bard_font
+          - input_select.smol_8_bard_font
+          - input_select.smol_9_bard_font
     condition:
       - condition: template
         value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
@@ -136,8 +158,14 @@ automation:
           retain: true
           qos: 1
           # int() because an input_number carries a float ("160.0" would not parse on the leaf).
+          # The font field is OPTIONAL, appended only when it is NOT the default 5x8, so firmware
+          # that predates it keeps parsing `<ms>:<mode>` exactly as before — adding this control
+          # cannot break pace/mode on a board running an older image.
           payload: >-
-            {{ states('input_number.smol_' ~ nid ~ '_bard_speed') | int }}:{{ states('input_select.smol_' ~ nid ~ '_bard_mode') }}
+            {%- set ms = states('input_number.smol_' ~ nid ~ '_bard_speed') | int -%}
+            {%- set mode = states('input_select.smol_' ~ nid ~ '_bard_mode') -%}
+            {%- set font = (states('input_select.smol_' ~ nid ~ '_bard_font') | default('')).split(' ')[0] -%}
+            {{ ms }}:{{ mode }}{% if font and font != '5x8' %}:{{ font }}{% endif %}
 
   - id: smol_tale_publish
     alias: "smol #303: publish per-node Bard story prompt"

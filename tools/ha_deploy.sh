@@ -152,7 +152,17 @@ cmd_push() {
     # exactly one test run here — it picked automation.reload for a new input_text, which is the
     # silent failure where a new helper never registers and nobody can see why.
     diff "$LOCAL_DIR/$f" "$tmp/$f" > "$tmp/$f.diff" || true
-    if grep -qE '^[<>].*(input_[a-z]+:|unique_id:|state_topic:|mqtt:|template:)' "$tmp/$f.diff"; then
+    # Which reload? Default to the SAFE one and narrow only when it is provably enough.
+    # The first version matched `input_[a-z]+:` — i.e. a DOMAIN being added — and so missed the
+    # far commoner case: a new helper added under a domain that already existed. Adding
+    # `smol_8_bard_font:` under an existing `input_select:` picked automation.reload, which does
+    # not register new entities, and the control silently did not appear (caught by JP asking
+    # where it was). So: reload_all unless EVERY changed line is inside the automation block.
+    if grep -qE '^[<>]' "$tmp/$f.diff" \
+       && ! grep -qE '^[<>].*(input_[a-z]+:|unique_id:|state_topic:|mqtt:|template:|^[<>]  [a-z0-9_]+:)' "$tmp/$f.diff" \
+       && grep -qE '^[<>].*(alias:|trigger:|action:|service:|condition:|mode: (single|parallel|queued|restart))' "$tmp/$f.diff"; then
+      : # automations only — automation.reload is sufficient
+    else
       needs_full=1
     fi
   done

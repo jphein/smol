@@ -167,6 +167,7 @@ def node_card(nid, meta, present, span=4):
     prow(top,f"sensor.smol_{nid}_tale","  ↳ in use","mdi:book-open-variant")                   # #303 readback of the retained prompt
     prow(top,f"input_number.smol_{nid}_bard_speed","Typewriter (ms/char)","mdi:speedometer")    # #302 reveal clock, NOT the generation clock
     prow(top,f"input_select.smol_{nid}_bard_mode","Delivery (inf / page)","mdi:book-open-page-variant")  # #302 endless vs one screenful
+    prow(top,f"input_select.smol_{nid}_bard_font","Text size","mdi:format-size")                # #302 bigger text = fewer chars on the glass
     prow(top,f"sensor.smol_{nid}_delivery","  ↳ in use","mdi:play-speed")                       # #302 readback of the retained <ms>:<mode>
     prow(top,f"input_button.smol_{nid}_apply",f"Apply → id{nid}","mdi:send")
     prow(top,f"input_button.smol_{nid}_reset","Reset to board default","mdi:backup-restore")
