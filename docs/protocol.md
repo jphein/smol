@@ -486,7 +486,7 @@ DIAG|slot=<bootslot>|rst=<reset-reason>|boot=<bootcount>|ota=<outcome>|up=<sec>|
     |fwd=<uplink-fwds>|dedup=<dup-drops>|ttl=<ttl-drops>|hop=<1|2>|dlseq=<last-adopted>|dfwd=<downlink-refloods>
     [|cfg=<applied-config>][|io=<pin>:<count>,…][|deaf=<n>|ddrops=<n>]
     [|ap=<ch>:<rssi>:<bssid>]|cc=<0|1>|degraded=<0|1>|cdeaf=<streak>:<reassocs>:<shed>
-    |apch=<ch>[|blrev=<token>][|brst=<ms>][|cut=<bytes>]
+    |apch=<ch>[|blrev=<token>][|brst=<ms>][|shed=<n>][|cut=<bytes>]
 ```
 
 (one line on the wire; wrapped here for reading.)
@@ -505,36 +505,51 @@ changes, and see the truncation warning.
 | `cdeaf=<streak>:<reassocs>:<shed>` | **always** (`0:0:0` healthy, and on any leaf) | #204 crown dead-downstream telemetry. The shed flag latches `1` after a 2b deaf-shed until re-lock |
 | `blrev=<token>` | conditional | the bootloader **auto-revert probe** — present when `ota::bl_revert_token()` has an answer. This is what settles the long-standing *"is revert-on-boot-fail enabled?"* question (see [ROADMAP §3a](ROADMAP.md)) |
 | `brst=<ms>` | conditional | #153 — the **burst-freeze peak** for the window. ~16 B, and **one** field rather than two precisely because of the budget below. Reset at publish, so each record carries that window's peak rather than a running maximum |
+| `shed=<n>` | conditional | fields dropped from the **sheddable** tail to stay inside budget (`7a4823e`) — with a `log::warn!`. Absent = nothing shed |
 | `cut=<bytes>` | conditional | bytes lost to truncation — see below |
 
-> ⚠️ **TWO different caps, and the tighter one is already breached** *(updated 2026-07-28, `6133675`)*.
-> This is the single most important thing to know about this record:
+> ⚠️ **TWO different caps, and they are now handled in opposite ways** *(updated 2026-07-28,
+> `6133675` + `7a4823e`)*. The most important thing to know about this record:
 >
-> | Path | Cap | State |
+> | Path | Budget | State |
 > |---|---|---|
-> | **Gateway → MQTT** (self-publish) | ~490 B publish / **512 B** buffer | **462 B worst case — ~33 B of headroom.** Tight, not yet breached. `encode_publish` returns `None` on overflow, so the **whole record stops publishing** rather than losing a field |
-> | **Leaf → ESP-NOW** (`broadcast_diag`, ONE frame) | **`RELAY_VALUE_MAX` = 232 B** | 🔴 **ALREADY BREACHED.** A realistic leaf record (up 494 s, no OTA yet) **offered 307 B, sent 232, and dropped 75 B with no signal of any kind** |
+> | **Gateway → MQTT** (self-publish) | **495 B** | ✅ **cliff made unreachable** (`7a4823e`). It was **reachable**: an over-budget record is *not* truncated — `encode_publish` returns `None` and **the record does not go out at all**, so a board that grew by 33 B became **indistinguishable from a dead board** |
+> | **Leaf → ESP-NOW** (`broadcast_diag`, ONE frame) | **`RELAY_VALUE_MAX` = 232 B** | 🔴 **still breached** — a realistic leaf record **offers 307 B, sends 232, drops 75 B.** Loss is now *announced* (`cut=`) but not fixed |
 >
-> **What a leaf loses today:** the cut lands mid-`dlseq=`, so it loses the tail of the positional block
-> (`dfwd`, `etx`) **and every appended field** — `cc`, `degraded`, `cdeaf`, `apch`, `blrev`, `brst`.
-> Consequences worth stating plainly:
-> - **`brst=` (JP's burst-freeze metric) is crown-only — it has never reached HA from a leaf.**
-> - **`blrev=` is invisible on exactly the boards it is about**: a leaf is what gets OTA'd, and its
->   bootloader-revert answer is in the discarded tail.
+> **The true gateway worst case was 574 B against 495 — over by 79.** That figure is bounded **by type**,
+> not observed: every term is the maximum decimal width a field's type implies (u8→3, u16→5, u32→10) or
+> the longest member of a fixed string set, so **no board state can be milder than it.** The earlier
+> **462 B** was a *realistic* case — and a realistic number is exactly what lets a cliff stay reachable.
 >
-> **Why this hid for months:** the crown self-publishes the full record, so **the one board anybody looks
-> at is the one that works.** The 512 B figure was the wrong cap to worry about first.
+> **How it was made unreachable — three moves, and the third is the durable one:**
+> 1. **`up=` narrowed u64 → u32** — 20 digits of bound to express a value that cannot exceed 10; u32
+>    seconds is 136 years of uptime. **10 B of provable headroom for zero information.**
+> 2. **The tail is split PROTECTED vs SHEDDABLE.** `brst=` · `blrev=` · `apch=` are appended
+>    **unconditionally and first** — the freeze metric, the bootloader answer, and the off-channel signal
+>    behind a proven OTA blocker. The rest is appended only while budget allows, in a documented priority
+>    order (`cdeaf` → `cc`/`degraded` → `ap` → `cfg` → `io`), and the record stamps **`|shed=<n>`** plus a
+>    `log::warn!` when it drops any. **Reordering is free because appended fields are parsed by KEY** —
+>    the positional contract on the fixed block is untouched.
+> 3. **A compile-time assertion that the unsheddable core fits:** `DIAG_CORE_MAX` (444 B) ≤ `DIAG_BUDGET`
+>    (495 B), leaving **51 B of proven slack** for the sheddable tail. **A new positional field costs its
+>    type-max against that slack and breaks the BUILD when it runs out** — so the record can never become
+>    unpublishable. *This is the pattern worth copying: make the failure unrepresentable rather than
+>    documented.*
 >
-> `cut=<bytes>` (+ a `log::warn!`) now makes the loss impossible to miss — 8 B of the very budget that is
-> short, which is the right trade: **a reader who cannot see the field it wants must at least be able to
-> tell that it was cut.** Shrinking the record was deliberately *not* done in that fix, because it sheds
-> fields HA parses.
+> **What a leaf still loses:** the 232 B cut lands mid-`dlseq=`, taking the tail of the positional block
+> (`dfwd`, `etx`) and the appended fields that don't fit. **`brst=` and `blrev=` are protected in the
+> gateway budget but a leaf frame is less than half of it**, so on leaves they may still be absent —
+> and `blrev=` is invisible on exactly the boards that get OTA'd. **Why this hid for months: the crown
+> self-publishes the full record, so the one board anybody looks at is the one that works.**
 >
-> **So a parser must treat an absent `brst=`/`blrev=` as `unknown`, never as `0`** — and on a leaf, absent
-> is the *normal* case until the record shrinks. Per [DOC-UPKEEP](DOC-UPKEEP.md) §2: a check whose operand
-> may be absent must print *unknown* and **skip**. See also
+> `cut=<bytes>` (+ `log::warn!`) makes any loss impossible to miss — 8 B of the very budget that is short,
+> which is the right trade: **a reader who cannot see the field it wants must at least be able to tell it
+> was cut.**
+>
+> **So a parser must treat an absent `brst=`/`blrev=`/`shed=` as `unknown`, never `0`.** Per
+> [DOC-UPKEEP](DOC-UPKEEP.md) §2: a check whose operand may be absent prints *unknown* and **skips**. See
 > [#306](https://github.com/jphein/smol/issues/306).
-
+>
 > 🔎 **Two naming decisions in this record are load-bearing, not style.** `apch=` is **not** `ap=` because
 > *"an unanchored grep for `ap=` matches the tail of `heap=42040`"* (`mode.rs:3316`) — a real harness bug
 > that read free heap as a channel. And `cdeaf=` is **not** `deaf=` because the latter is the
