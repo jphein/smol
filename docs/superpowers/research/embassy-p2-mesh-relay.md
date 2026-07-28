@@ -503,6 +503,39 @@ config; smol's C6 `.bss` is projected from its C3 `imc` build onto `imac`, so tr
 estimate with wide margin — the margin is what makes it safe to state, since it would have to be wrong
 by ~50 KB to change the answer. The watch ELF is a week old (07-21).*
 
+### ❌ Checked: the "short string literals land in `.data`" lead does **not** apply to the 58 KB
+
+A real finding (another agent, chasing 376 B: short literals folded into `.data` by the esp linker
+script on this target, so they cost DRAM not flash) was routed here in case it explained some of
+Embassy's cost. **It does not, and the refutation is definitional rather than statistical:**
+
+1. **`.bss` is `NOBITS`** (confirmed on the branch ELF). It occupies no file bytes and holds **no
+   initialized content** — so **a string literal cannot live there.** And **55,736 B of the 58,144 B
+   delta is `.bss`.**
+2. **`.data` *shrank*.** Branch `.data` = **8,792 B** vs `main`-no-bard **13,212 B** — **−4,420 B**. The
+   branch has *fewer* DRAM-resident literals than `main`, so this lever's contribution to the delta is
+   **negative**.
+3. **The whole lever is bounded below 8.8 KB anyway** — that is the branch's *entire* `.data`, literals
+   and genuine initialized statics together.
+
+**And the `.bss` attribution confirms it positively** — the top objects are all runtime state, which is
+what `.bss` is for:
+
+| object | size | |
+|---|---|---|
+| `__embassy_main::POOL` | **17,480 B** | 🔑 the executor's task pool — **the single largest item, and it is Embassy** |
+| `OTA_WINDOW_BUF` + `GW_OTA_WINDOW` | 14,784 + 14,784 B | pre-existing on `main` — **not part of the delta** |
+| `mqtt_task::POOL` | 3,920 B | second Embassy task pool |
+| `MQTT_TX` · `DOWNLINK` · `RELAYED` | 2,688 · 1,696 · 1,160 B | the branch's new MQTT/downlink buffers |
+| `NET_RESOURCES` | 1,864 B | `embassy-net` resources |
+
+≈28.8 KB identifiable straight away, **all of it futures, task stacks and socket buffers** — i.e.
+genuine design trades, exactly the categories already in the lever list. **None of it is placement.**
+
+**So the conclusion is unchanged and the lead is correctly closed rather than left flagged.** (It remains
+valid for its own 376 B case, and `.data`-resident literals are still worth knowing about on this
+target — just not as Embassy headroom.)
+
 ### The honest caveats, which do not rescue it
 
 - The 73,728 B floor is bard-derived and over-strict for no-bard builds. **Irrelevant to the verdict** —
