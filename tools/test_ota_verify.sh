@@ -148,12 +148,15 @@ echo "═══ N2 · a PERSISTENT ota=confirmed must not read as this run's pro
 echo "     (rtc_fast survives sw/wdt/panic/brownout resets AND a usb-jtag reflash)"
 run n2_persistent_confirmed 9 907 4
 verdict_is UNPROVEN; rc_is 1
-proof B NO; proof D NO
+proof B NO; proof C NO
 has "no slot flip is the catch"  "B slot flip    1 → 1"
-has "token never transitioned"   "confirmed → confirmed"
+# D is now the VALUE, not the transition (firmware c5a2f47 build-scopes it), so `confirmed → confirmed`
+# no longer refuses. Oracle verified B and C carry this fixture without D.
+proof D yes
+has "B and C refuse it without D"  "delta 2, want EXACTLY 1"
 run n2b_usb_reflash 8 907 4
 verdict_is UNPROVEN; rc_is 1
-proof D NO; proof E NO
+proof E NO
 has "usb-jtag disqualifies"      "rst=usb-jtag"
 
 echo
@@ -364,6 +367,37 @@ verdict_is UNPROVEN; rc_is 1
 proof A yes; proof B yes; proof C yes; proof D yes; proof E yes
 proof F NO
 has  "outside the slack, F refuses" "F boot in-window  up=45s"
+
+echo
+echo "═══ THE LIVE PATH · findings no fixture could produce ═══"
+echo "     The lead ran this against a REAL in-flight OTA (id8 → 913, success independently confirmed)."
+echo "     144 fixture assertions had passed; the live run found two systematic FALSE NEGATIVES."
+# T1 — the headline said the transfer DIED while the evidence said HWM == total. `hwm` is live-only, so
+# hwm == total proves the board published completion; a later lower publish re-armed the stall arm.
+# Mirror of the barren bug: that used history where NOW was meant, this uses NOW where the historical
+# maximum was meant. The tense of the operand is the recurring defect in this file.
+run completion_then_lower_publish 8 907 6
+hasnt "a later lower publish cannot un-finish a transfer" "[FAIL   ] DEATH-POINT"
+has   "completion is latched and says so"                 "live completion already observed"
+# The live case, reconstructed from that run's own report (the raw log had been deleted — hence T4).
+# window 30, not 12: the real run had elapsed=540s against up=56s. F's slack is
+# 30 + SETTLE + 2*POLL, so a short window would refuse F for a reason that has nothing to do
+# with what this case exists to test. Keeping `up=56` faithful and widening the window instead.
+run live_id8_913_reconstructed 8 913 30
+verdict_is PASS; rc_is 0
+proof A yes; proof B yes; proof C yes; proof D yes; proof E yes; proof F yes
+has  "D passes on the fleet's normal confirmed→confirmed" "D ota token    confirmed → confirmed"
+has  "and cites where the guarantee now lives"            "build-scoped in firmware since c5a2f47"
+hasnt "no death-point on a completed transfer"            "[FAIL   ] DEATH-POINT"
+# Oracle's Q1/Q2 — a rollback-then-recover is a legitimate success, and the rollback must leave a trace.
+run rollback_then_recover 8 907 8
+verdict_is PASS; rc_is 0
+proof C yes
+has  "both rollback boots are accounted for" "want EXACTLY 3 = 1 OTA boot + 2 per observed rollback episode, 1 seen"
+has  "and the rollback is REPORTED"        "rollback episode(s) OBSERVED LIVE in-window"
+# T4 — a non-PASS keeps its raw capture and prints the path.
+run stale_cache_plus_reboot 8 907 5
+has  "a non-PASS keeps its evidence"       "raw capture KEPT for audit:"
 
 printf '\n════════════════════════════════════════════\n'
 printf '  %d passed · %d failed\n' "$pass" "$fail"

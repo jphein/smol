@@ -229,7 +229,8 @@ if [ -n "$FIXTURE" ]; then
     done < "$FIXTURE"
   ) &
   SUB=$!
-  trap 'kill "$SUB" 2>/dev/null; rm -f "$LOG"' EXIT
+  # Keep the raw log unless the run PASSED — see the note on the live trap below.
+  trap 'kill "$SUB" 2>/dev/null; [ "${verdict:-}" = PASS ] && rm -f "$LOG"' EXIT
 else
   # ---- broker creds (mirrors tools/ota_publish.sh) --------------------------------------
   OTA_ENV="$HOME/Projects/smol/tools/ota_publish.env"
@@ -257,7 +258,12 @@ else
     -t "smol/$ID/ota/progress" -t "smol/$ID/ota/diag" -t "smol/$ID/ota/state" \
     -t "smol/$ID/diag" -t "smol/mesh/channel" > "$LOG" 2>&1 &
   SUB=$!
-  trap 'kill "$SUB" 2>/dev/null; rm -f "$LOG"; rm -rf "$CFGDIR"' EXIT
+  # THE RAW LOG SURVIVES A NON-PASS. It is the only place the per-poll `<retain>\t<topic>\t<payload>`
+  # stream exists, and `rm -f` on exit destroyed the first real-fleet capture anyone had — the exact
+  # evidence needed to tell a one-boot-stale gateway cache from a genuine second reboot. For a tool
+  # whose entire value is post-hoc auditability, deleting the evidence on the runs that NEED auditing
+  # was the wrong default. A PASS still cleans up, because there is nothing to argue about.
+  trap 'kill "$SUB" 2>/dev/null; [ "${verdict:-}" = PASS ] && rm -f "$LOG"; rm -rf "$CFGDIR"' EXIT
   # The trap is not enough. `mosquitto_sub` reads its config ONCE at startup and keeps the credential
   # in memory, so the file only needs to exist for that instant — and leaving it for the whole window
   # means a SIGKILL (this host has a documented OOM-scope-kill history that has taken whole agent trees)
@@ -282,6 +288,12 @@ fld()    { printf '%s' "${2:-}" | grep -oaE "(^|\|)$1=[^|[:space:]]+" | head -1 
 # First / last-LIVE observation of a DIAG line that actually CARRIES the field. Selecting on the
 # field (not just on the topic) means a record that lost the field to truncation cannot blank an
 # operand we already observed — absence and change stay distinguishable.
+# ⚠️ CO-SELECTION IS NOT GUARANTEED BY THIS CODE. Each field is selected independently, so
+# `boot_first` and `ota_first` can in principle come from DIFFERENT records. Today they cannot, because
+# `boot=` and `ota=` are the 3rd and 4th DIAG fields and truncation only ever eats the TAIL — so no
+# record carries one without the other. The proof-conjunct reasoning leans on that. If `ota=` ever
+# becomes CONDITIONAL the way `ap=` is, this opens silently, which is the same conditional-field alibi
+# this file has already paid for twice. (Named by oracle-verify; it was load-bearing and undocumented.)
 d_first() { g_all  "$ID/diag" | grep -aE "(^|\|)$1=" | head -1; }
 d_live()  { g_live "$ID/diag" | grep -aE "(^|\|)$1=" | tail -1; }
 # A WiFi channel, or it isn't one. An operand outside 1-14 is ABSENT, not "different" — otherwise
@@ -321,6 +333,16 @@ retry_t=0; retry_n=0
 # image's offset with another's total (observed: hwm 1277952 from a 906 whose total was 1435280,
 # printed against 907's total of 1440528).
 prev_total=""; images=0; restarts=0; stalls=0; stall_at=""; stall_latched=0
+# Live completion, LATCHED. `hwm` is fed only from live offsets, so `hwm >= total` proves the board
+# PUBLISHED completion live — a fact about the run that no later message can undo.
+# First live run (id8 → 913, OTA independently confirmed successful) headlined
+# `FAIL — DEATH-POINT — the transfer died AT that byte` while its own evidence block said
+# `live progress HWM 1450320/1450320`. The arm tested `off < total` on the LATEST live offset, and a
+# later lower publish re-armed it after the transfer had finished.
+# This is the EXACT MIRROR of the barren-counter bug: that one consulted HISTORY where the current
+# condition was meant; this one consulted the CURRENT VALUE where the historical maximum was meant.
+# The recurring defect in this file is not any individual arm — it is THE TENSE OF THE OPERAND.
+completed=0
 # High-water at the previous stall episode, and how many consecutive episodes have shown no advance
 # since. These were computed and PRINTED but consulted by nothing, so a board stuck in a retry loop
 # reported "still in progress, re-run with a longer window" forever and the operator's only exit was
@@ -359,6 +381,15 @@ while :; do
   # because it is the ONE operand below not required to be live, and any FAIL that leans on it says so.
   mesh_ch="$(g_all mesh/channel | tail -1 | pay | awk -F'|' '{print $3}')"; valid_ch "$mesh_ch" || mesh_ch=""
 
+  # Rollback EPISODES — transitions INTO `rolled-back` seen on LIVE diags, seeded with the first
+  # observation so a retained `rolled-back` baseline is not miscounted as an in-window event. An
+  # observed rollback used to leave NO TRACE in the output once the board moved on: the check reported
+  # "no live ota=rolled-back", true of the current value and useless to an operator whose board rolled
+  # back and recovered under our observation. Each episode also COSTS A BOOT, which is what lets C stay
+  # strict without refusing a legitimate rollback-then-recover.
+  rollbacks="$(g_live "$ID/diag" | grep -oaE '(^|\|)ota=[^|[:space:]]+' | cut -d= -f2 \
+    | awk -v prev="${ota_first:-}" '$0!=prev && $0=="rolled-back"{n++} {prev=$0} END{print n+0}')"
+  is_num "$rollbacks" || rollbacks=0
   dg_live="$(g_live "$ID/ota/diag" | tail -1 | pay)"
   dg_any="$( g_all  "$ID/ota/diag" | tail -1 | pay)"
   # anchored: ota/diag carries `tsrc=`, one prefix away from silently matching `src=`.
@@ -390,13 +421,26 @@ while :; do
     if [ -n "$prev_total" ]; then
       images=$((images+1))
       hwm=""; last_off=-1; last_off_t="$now"; monotonic=1; restarts=0; stalls=0; stall_at=""; stall_latched=0
-      hwm_at_stall=""; barren=0
+      hwm_at_stall=""; barren=0; completed=0   # a new image has its own completion to prove
     fi
     prev_total="$total"
   fi
 
+  # HIGH-WATER OVER EVERY LIVE PUBLISH FOR THE CURRENT IMAGE — not over the values a poll happened to
+  # sample. Building it from the sampled latest offset loses any publish that was superseded between two
+  # polls, and that is not hypothetical: a fixture that published completion at t=1 and a lower offset
+  # at t=2 recorded a high-water of 720000 instead of 1440528, so the completion latch never armed and
+  # DEATH-POINT fired on a finished transfer. Deriving it from the log makes it poll-INDEPENDENT.
+  # Filtered on the CURRENT total, so it also cannot accumulate across images — the cross-image
+  # high-water bug this file already fixed once, which a naive "max over all history" would reintroduce.
+  # (`monotonic`, `restarts` and the freeze clock remain sampled: they are about ORDER and DURATION,
+  # which the log cannot supply without timestamps.)
+  if is_num "$total"; then
+    hwm="$(g_live "$ID/ota/progress" | pay \
+      | awk -F'|' -v T="$total" '$2==T && $1 ~ /^[0-9]+$/ { if (!s || $1+0>m) { m=$1+0; s=1 } } END { if (s) print m }')"
+    [ -n "$hwm" ] && [ "$hwm" -ge "$total" ] && completed=1
+  fi
   if [ -n "$off" ]; then
-    { [ -z "$hwm" ] || [ "$off" -gt "$hwm" ]; } && hwm="$off"
     # A HIGH-WATER ADVANCE CLEARS THE BARREN STREAK, IMMEDIATELY — not at the next stall episode.
     # `barren` is history; the RETRY-LOOP verdict is a claim about NOW. Consulting an accumulated
     # counter as if it were a current condition is the same mistake as reading a retained value as a
@@ -470,7 +514,9 @@ while :; do
   fi
 
   # ═══ CHECK 3 · DEATH-POINT ═════════════════════════════════════════════════════════════
-  if [ "$saw_live_prog" = 1 ] && [ -n "$off" ] && is_num "$total" && [ "$off" -gt 0 ] \
+  if [ "$completed" = 1 ]; then
+    add ok 0 DEATH-POINT "live completion already observed — a LIVE progress publish reported ${hwm}/${total}, so the transfer finished and no later offset can un-finish it. Stall arms suppressed."
+  elif [ "$saw_live_prog" = 1 ] && [ -n "$off" ] && is_num "$total" && [ "$off" -gt 0 ] \
      && [ "$off" -lt "$total" ] && [ $((now-last_off_t)) -ge "$STALL_AFTER" ] && [ "$retry_fresh" = 1 ]; then
     # Stalled, but the board says it is retrying. NOT a death and NOT terminal: report it as a
     # standing suspicion and keep watching. This is the exact case that produced a FAIL on a
@@ -502,12 +548,14 @@ while :; do
   # A live `rolled-back` proves the firmware STILL HOLDS that outcome, which is not the same as it
   # having happened during this window: the token is rtc_fast persistent (ota.rs:2081). So the two
   # cases are reported DIFFERENTLY rather than collapsed.
-  if [ "$ota_live" = "rolled-back" ] && [ -n "$ota_first" ] && [ "$ota_first" != "rolled-back" ]; then
+  if [ "$ota_live" = "rolled-back" ] && [ "$rollbacks" -gt 0 ]; then
     add FAIL 20 ROLLED-BACK "TRANSITION observed live in-window: ota=$ota_first → rolled-back. The board booted the new image, failed its self-test, and boot_confirm reverted it. App-side rollback worked as designed — the IMAGE is the problem, not the network."
   elif [ "$ota_live" = "rolled-back" ]; then
     add SUSPECT 50 ROLLED-BACK "a live diag reports ota=rolled-back, but it ALREADY read rolled-back at our first observation (${ota_first:-unknown}) — the token is rtc_fast persistent and only a power cycle clears it (ota.rs:2081), so this may predate this run entirely. Actionable, but NOT proof that this attempt rolled back."
+  elif [ "$rollbacks" -gt 0 ]; then
+    add unknown 0 ROLLED-BACK "$rollbacks rollback episode(s) OBSERVED LIVE in-window, and the board has since moved on to ota=${ota_live:-unknown}. The image failed a self-test at least once during this run and the app-side rollback net caught it — reported because it HAPPENED under observation, even though it is no longer the current state. C's expected boot delta is raised by $rollbacks to account for the extra boot(s)."
   else
-    add ok 0 ROLLED-BACK "no live ota=rolled-back."
+    add ok 0 ROLLED-BACK "no live ota=rolled-back, and no rollback transition observed this run."
   fi
 
   # ═══ CHECK 5 · PRODUCER CAPABILITY ═════════════════════════════════════════════════════
@@ -557,12 +605,50 @@ while :; do
   # window, or if our baseline diag is more than one boot stale. That is the direction this file chooses
   # everywhere, and the rollback path cannot slip through either — two boots there end at
   # `rolled-back`, and D demands `confirmed`.
-  boot_delta=""
+  # ...one boot for the OTA, PLUS one for each rollback episode we actually watched happen. A
+  # rollback-then-recover is a legitimate success — it is what the app-side rollback net exists to
+  # produce — and a bare `delta == 1` refused it (boot 492→495 across rollback+retry). Each `+1` here is
+  # paid for by an in-window `rolled-back` transition, so this loosens nothing that was not observed.
+  # NOT `+ restarts`: restarts count the fetch OFFSET going backwards, which involves no reboot at all
+  # and so cannot change the boot counter. The live run's `restarts=2` alongside `boot 268→270` was a
+  # COINCIDENCE, and a flaky fetch with 5 restarts would have licensed delta 6 while the known false
+  # PASS needed only delta 3.
+  # TWO boots per rollback episode, not one — verified at ota.rs:1005-1013: on self-test failure
+  # `boot_confirm` marks the outcome and calls `esp_hal::system::software_reset()`, and the comment is
+  # explicit that "the good-slot boot reports it". So an episode costs the bad-image boot that ran the
+  # failing self-test PLUS the good-slot boot that reports `rolled-back`. A rollback-then-recover is
+  # therefore 492 → 495: one pre-OTA baseline, two for the rollback, one for the successful retry.
+  boot_delta=""; boot_want=$((1 + 2*rollbacks))
   if is_num "$boot_first" && is_num "$boot_live"; then
     boot_delta=$((boot_live - boot_first))
-    [ "$boot_delta" = 1 ] && C=1
+    [ "$boot_delta" = "$boot_want" ] && C=1
   fi
-  { [ "$ota_first" = "none" ] || [ "$ota_first" = "rolled-back" ]; } && [ "$ota_live" = "confirmed" ] && D=1
+  # D was `ota_first ∈ {none, rolled-back} AND ota_live == confirmed` — a TRANSITION. That was right
+  # when the token was not build-scoped, because a `confirmed` left over from a previous image could
+  # vouch for one it had never seen. IT IS NOW UNSATISFIABLE IN THE FLEET'S NORMAL MODE, and the first
+  # live run proved it: `D: confirmed → confirmed` on a genuinely successful 912→913 install. The token
+  # lives in rtc_fast and only a POWER CYCLE clears it, so after any successful OTA a board sits at
+  # `confirmed` for the rest of that power cycle and every consecutive OTA is refused.
+  #
+  # Relaxed to the VALUE, because firmware `c5a2f47` moved the guarantee to where it belongs:
+  #     1 if m[2] == BUILD_NUMBER => "confirmed",
+  #     1                         => "none",   // a stale vouch from a previous image
+  # `confirmed` now MEANS "THIS build was confirmed" — the stale-marker attack is closed at source, so
+  # the harness no longer has to reconstruct build-scope from a transition. That also explains the live
+  # reading exactly: the token was confirmed-for-912 before and confirmed-for-913 after, so the MEANING
+  # transitioned while the STRING did not, and D was comparing two different assertions that serialise
+  # identically.
+  #
+  # Verified not load-bearing before relaxing: every adversarial fixture is refused by something else —
+  # n2_persistent_confirmed by B and C, n2b_usb_reflash by E, n1_no_baseline_state by A,
+  # retained_only_ghosts by A/B/C/E/F, stale_cache_plus_reboot by C.
+  # HONEST RESIDUAL: on an image OLDER than c5a2f47 the token is not build-scoped, so a stale bare
+  # `confirmed` satisfies D. The guarantee there degrades from "the token transitioned under
+  # observation" to "the token reads confirmed AND a single-boot in-window slot flip to TARGET
+  # occurred" — which still blocks every known attack, but rests on B/C/E rather than on D.
+  # A firmware `ota=confirmed:<build>` would make the scope readable on the wire instead of implied;
+  # worth asking for, not worth waiting for.
+  [ "$ota_live" = "confirmed" ] && D=1
   # E requires an OBSERVED live rst — an ABSENT rst must not read as "not a USB flash". `rst=` is an
   # early positional field, so truncation (which eats the tail) never removes it; demanding it is
   # safe as well as fail-closed.
@@ -657,9 +743,10 @@ printf '  ── OTA proof · all four transitions required, LIVE, in-window ─
 y() { [ "$1" = 1 ] && printf 'yes' || printf 'NO '; }
 printf '    [%s] A state flip   %s → %s   (target v%s)\n'  "$(y $A)" "${st_first:-unknown}"   "${st_live:-unknown}"   "$TARGET"
 printf '    [%s] B slot flip    %s → %s\n'                 "$(y $B)" "${slot_first:-unknown}" "${slot_live:-unknown}"
-printf '    [%s] C boot incr    %s → %s   (delta %s, want EXACTLY 1 — more boots than the one OTA we claim to have watched)\n' \
-  "$(y $C)" "${boot_first:-unknown}" "${boot_live:-unknown}" "${boot_delta:-unknown}"
-printf '    [%s] D ota token    %s → %s   (want none|rolled-back → confirmed)\n' "$(y $D)" "${ota_first:-unknown}" "${ota_live:-unknown}"
+printf '    [%s] C boot incr    %s → %s   (delta %s, want EXACTLY %s = 1 OTA boot + 2 per observed rollback episode, %s seen)\n' \
+  "$(y $C)" "${boot_first:-unknown}" "${boot_live:-unknown}" "${boot_delta:-unknown}" "$boot_want" "$rollbacks"
+printf '    [%s] D ota token    %s → %s   (want live=confirmed; build-scoped in firmware since c5a2f47)\n' \
+  "$(y $D)" "${ota_first:-unknown}" "${ota_live:-unknown}"
 printf '    [%s] E not usb      rst=%s\n'                  "$(y $E)" "${rst_live:-unknown}"
 printf '    [%s] F boot in-window  up=%ss (elapsed %ss + %ss slack) — defeats a cache-lagged ota= flip\n' \
   "$(y $F)" "${up_live:-unknown}" "$((now-start))" "$((SETTLE + 2*POLL + 30))"
@@ -680,5 +767,6 @@ printf '    live progress HWM %s/%s · monotonic=%s · phase=%s · live progress
   "$([ "$saw_live_prog" = 1 ] && echo yes || echo NO)" "${off_any:-none}" "${total_any:-unknown}"
 printf '    last ota/diag (LIVE):     %s\n' "${dg_live:-none}"
 printf '    last ota/diag (any, may be retained): %s\n' "${dg_any:-none}"
+[ "$verdict" = PASS ] || printf '    raw capture KEPT for audit: %s\n' "$LOG"
 printf '════════════════════════════════════════════════════════════════════════\n'
 [ "$verdict" = "PASS" ] && exit 0 || exit 1
