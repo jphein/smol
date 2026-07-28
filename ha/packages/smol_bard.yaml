@@ -193,6 +193,15 @@ automation:
             {%- set font = '5x8' if font_raw in na else font_raw.split(' ')[0] -%}
             {{ ms }}:{{ mode }}:{{ font }}
       - choose:
+          # The notification_id is PER CONTROL (`_delivery` / `_tale`), not shared. With one id the
+          # two automations cross-clear: a successful tale fan-out dismisses a warning raised by a
+          # failed delivery fan-out, and the font value stays unapplied with no warning and nothing
+          # to re-apply against. There is a defensible fleet-wide reading — "no node was discovered"
+          # is not per-control — but the message promises the operator that the notice tracks THEIR
+          # control ("re-apply the control ... and this notice will clear itself"), and a signal
+          # cleared by something other than the condition it described is the bug we keep finding.
+          # Two notices when two controls failed is correct, not noise.
+          #
           # An empty fleet reaching zero nodes and reporting SUCCESS is the exact disease this
           # whole campaign is about. `fleet` comes from MQTT-discovery entities, and after an HA
           # restart there is a window before the retained discovery configs replay — a control
@@ -202,8 +211,8 @@ automation:
             sequence:
               - service: persistent_notification.create
                 data:
-                  notification_id: smol_bard_fanout_empty
-                  title: "smol: a Bard setting reached NO nodes"
+                  notification_id: smol_bard_fanout_empty_delivery
+                  title: "smol: a Bard delivery setting reached NO nodes"
                   message: >-
                     A Bard delivery setting (text size / pace / mode) changed, but no smol node was discovered at that moment, so
                     nothing was published. This is usually the window just after an HA restart,
@@ -214,7 +223,7 @@ automation:
           # outlive the condition it described.
           - service: persistent_notification.dismiss
             data:
-              notification_id: smol_bard_fanout_empty
+              notification_id: smol_bard_fanout_empty_delivery
           - repeat:
               for_each: "{{ fleet }}"
               sequence:
@@ -281,8 +290,8 @@ automation:
             sequence:
               - service: persistent_notification.create
                 data:
-                  notification_id: smol_bard_fanout_empty
-                  title: "smol: a Bard setting reached NO nodes"
+                  notification_id: smol_bard_fanout_empty_tale
+                  title: "smol: the Bard story prompt reached NO nodes"
                   message: >-
                     The Bard story prompt changed, but no smol node was discovered at that moment, so
                     nothing was published. This is usually the window just after an HA restart,
@@ -293,7 +302,7 @@ automation:
           # outlive the condition it described.
           - service: persistent_notification.dismiss
             data:
-              notification_id: smol_bard_fanout_empty
+              notification_id: smol_bard_fanout_empty_tale
           - repeat:
               for_each: "{{ fleet }}"
               sequence:
