@@ -41,9 +41,11 @@ fleet: the apps, the ESP-NOW mesh (`src/net/`), the Familiar (`src/familiar/`), 
 - **[nes-on-c3.md](nes-on-c3.md)** — a concrete plan to actually run NES on the C3 (needs a
   colour ST7735 TFT + ESP-IDF; a genuine port).
 - **[board-repos.md](board-repos.md)** — other projects built for this exact board + OLED.
-- **[power.md](power.md)** — battery, regulation and runtime research. ⚠️ Its runtime table is
-  BLE-based, and the Rust fleet has no BLE (#22 was refuted on hardware) — so no measured
-  runtime exists yet for the mode the fleet actually runs in.
+- **[power.md](power.md)** — battery, regulation and runtime research. **§4 now opens with the
+  first measured figure:** 0.2 W at the 5 V input on id8 during Bard `inf` narration ⇒ ~40 mA ⇒
+  **~5 h** on a 250 mAh cell. ⚠️ Everything *below* that row is borrowed third-party data, and most
+  of it describes **BLE modes this firmware never enters** (#22 refuted native BLE on the C3) —
+  the flag is in the doc. Idle, `page` mode and a never-associating leaf remain unmeasured.
 - **[sound.md](sound.md)** · **[le-audio.md](le-audio.md)** ·
   **[walkie-talkie.md](walkie-talkie.md)** — audio feasibility: piezo and I²S output, why LE
   Audio is out of reach on this silicon, and the push-to-talk-over-ESP-NOW design study.

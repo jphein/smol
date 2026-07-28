@@ -115,8 +115,11 @@ formula are a bug in this document** — check them together.
     21 → 36; `.bss` byte-identical to pre-#302 and the whole feature costs 48 B of `.data`.
     ⚠️ **Two honest caveats.** (1) Quote the ms/tok as a **range** — the 224↔274 spread tracks whether
     the radio is bursting during that window, not the model. (2) `inf` mode is **near-continuous
-    compute**, making it the fleet's **worst-case power draw**; this 🟢 says nothing about battery
-    life, and [power.md](power.md) still owes a measurement for the mode the fleet actually runs in.
+    compute**, making it the fleet's **worst-case power draw** — now **measured**: 0.2 W at the 5 V
+    input on id8 during `inf` narration ⇒ ~40 mA ⇒ **~5 h** on a 250 mAh cell
+    ([power.md §4](power.md)), the first measured figure that section has ever had. Idle, `page` mode
+    and a never-associating leaf are still unmeasured. Practical consequence: **`page` and the pause
+    are the power lever** — `inf` pins the CPU, and pausing genuinely stops generation.
   - ⚪ **#304** — a custom-trained, realm-flavored model as a weights-only swap. Design only.
   > **The idea worth keeping in mind when writing about any of this:** only ~5 lines × ~15
   > characters are on the glass at once, so **the screen is a window the story moves past, not a
