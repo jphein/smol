@@ -3414,11 +3414,38 @@ impl RadioManager {
                     self.relay.deaf_shed as u8
                 ),
             );
-            // #217 rung-3 coexist-channel health: `cc` = crown is CO-CHANNEL (live AP channel == mesh
-            // channel); `degraded` = strand-guard latched off-channel (MQTT alive, OTA off).
-            let cc = crate::net::current_ap_info()
-                .map(|(ch, _, _)| u8::from(ch == ESP_NOW_FIXED_CHANNEL))
-                .unwrap_or(0);
+            // #217 rung-3 coexist-channel health. `cc` is THREE-VALUED, and that is the fix:
+            //   1 = associated and CO-CHANNEL (live AP channel == mesh channel) — healthy
+            //   0 = associated and OFF-CHANNEL — act on this; a proven OTA blocker
+            //   2 = NOT ASSOCIATED — nothing to say (a leaf, or a crown between associations)
+            //
+            // It used to be two-valued, with `unwrap_or(0)` folding "not associated" into the SAME
+            // value as "off-channel" — two states whose correct responses are opposite: one means
+            // re-channel the AP, the other means nothing is wrong. That was survivable only because
+            // the field is truncated off every leaf record today; the moment a leaf's tail reaches
+            // HA, every unassociated leaf would report `cc=0` and a reader would blame a healthy
+            // crown, fleet-wide. An audit reproduced exactly that: a false OFF-CHANNEL that also
+            // masked a genuine death-point and a perfect OTA.
+            //
+            // Three values in the same one character, so this costs ZERO bytes of a record that has
+            // 51 B of proven slack — and it is strictly better for every EXISTING consumer: readers
+            // testing `cc == 1` for healthy are unaffected, and readers testing `cc == 0` for
+            // off-channel get FEWER false positives than before, never more. Numeric (not `?`) so no
+            // parser has to learn a non-integer. luna's HA mismatch sensor already wanted a third
+            // outcome for this exact reason.
+            //
+            // The principle is the one `apch=0` uses for absence, applied to ignorance: encode "I
+            // cannot tell" in the VALUE, so a consumer can never mistake it for a verdict.
+            const CC_OFF_CHANNEL: u8 = 0;
+            const CC_CO_CHANNEL: u8 = 1;
+            const CC_NOT_ASSOCIATED: u8 = 2;
+            let cc = match crate::net::current_ap_info() {
+                Some((ch, _, _)) if ch == ESP_NOW_FIXED_CHANNEL => CC_CO_CHANNEL,
+                Some(_) => CC_OFF_CHANNEL,
+                None => CC_NOT_ASSOCIATED,
+            };
+            // `degraded` = strand-guard latched off-channel (MQTT alive, OTA off). Unchanged: it is a
+            // latch, so 0 genuinely means "not latched" on every board including a leaf.
             let degraded = u8::from(self.crown_state == crate::net::coexist::CrownState::Degraded);
             room_for(&mut rec, alloc::format!("|cc={}|degraded={}", cc, degraded));
             // #204: the crown's CURRENT AP association (channel:rssi:bssid) — the coexist
