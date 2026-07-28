@@ -150,10 +150,26 @@ so the result does not depend on how blocking was modelled.
 | **Crown unicast-RX starvation** | **No.** **#204 (OPEN)** — a crown under bulk inbound goes downstream-deaf within ~1 ms of its own transmit. Reproduces identically on the new esp-radio 0.18 stack, so **the radio rewrite is not the cure** and neither is the executor. |
 | **The DRAM ceiling** | **No — that is the C6, not Embassy.** The ROADMAP pairs #198/#233 with "the C6 dissolves the DRAM problem"; the dissolving agent is **512 KB of SRAM on different silicon**, not the async model. Keep the two claims apart. |
 
-> 📌 **Correction to the brief for this task:** the co-channel physics finding was cited as *"#53's
-> finding."* **#53 is unrelated** — it is *"battery display shows staleness instead of blanking"*,
-> closed 2026-07-12 as *"i don't care about that battery staleness issue."* The live coexist residual
-> is **#204**. Flagging because a decision doc citing the wrong issue propagates.
+> 📌 **"#53" is overloaded in this repo — cite the study by path, not by number.** The brief for
+> this task attributed the co-channel physics finding to *"#53's finding,"* and my first draft
+> "corrected" that as simply wrong. **Both were half right.** There are two #53s:
+> - **GitHub issue #53** = *"battery display shows staleness instead of blanking"*, closed 2026-07-12
+>   as *"i don't care about that battery staleness issue."* Unrelated.
+> - **[`coexist-disease-esp-radio-018-study.md`](coexist-disease-esp-radio-018-study.md)**, whose own
+>   title is *"#53 — the #198-fix question."* **This is the real source**, and it is the authority for
+>   the boundary above.
+>
+> The study is worth reading in full before anyone re-argues this, because its conclusions are
+> stronger than a summary: *"the `coex` feature is the wrong mechanism"* — coexistence arbitrates
+> Wi-Fi ↔ BT/BLE ↔ 802.15.4, and **ESP-NOW is not a coex participant because ESP-NOW *is* Wi-Fi**
+> (vendor action frames on the Wi-Fi MAC), so the disease is Wi-Fi-vs-itself on one MAC and `coex`
+> *cannot* arbitrate it; and *"the off-channel variant is RF physics, not software"* — the radio
+> cannot change channel while associated, so **no stack upgrade removes a one-radio/one-channel
+> constraint.** Its bottom line is explicit: **#198 should not be reprioritised as "the OTA fix."**
+> This document agrees, and §4 is that finding applied to JP's question.
+>
+> The live coexist residual is **#204**. Lesson for the docs: an internal study numbered like a GitHub
+> issue collides with it — always cite the path.
 
 ---
 

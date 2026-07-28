@@ -141,6 +141,18 @@ Ask: *if the stale premise were simply false, would the conclusion still hold fo
 If yes, re-ground it. If no, the conclusion goes too — and that is a finding worth reporting, not a
 quiet deletion.
 
+### ⚠️ A bare `#N` is ambiguous — internal studies collide with GitHub issues
+
+`#53` means two different things in this repo: **GitHub issue #53** (*battery display shows staleness*,
+closed 2026-07-12 as *"i don't care"*) and **`superpowers/research/coexist-disease-esp-radio-018-study.md`**,
+whose own title is *"#53 — the #198-fix question."* A brief citing *"#53's finding"* for the coexist
+physics was therefore *half* right — and a first attempt to "correct" it to "wrong issue" was half
+wrong. Both readings were defensible from the number alone.
+
+**So: cite internal design docs and studies by PATH, never by number.** Reserve `#N` for GitHub. When
+you meet a bare `#N` whose subject does not match the issue, search `docs/superpowers/` before
+concluding the citation is wrong — the number may belong to a document.
+
 ### ⚠️ Retirements are the blind spot
 
 Closed issues tell you what shipped; nothing tells you
