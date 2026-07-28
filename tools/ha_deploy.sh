@@ -69,6 +69,60 @@ ha_api() { # $1 method, $2 path, $3 body(optional) -> prints body, returns curl'
        ${3:+-d "$3"} "$HA_URL$2"
 }
 
+# --- live-baseline attribution (morpheus-yaml's `live_is_ahead`, taken verbatim from b002ab4) --
+# Kept as THEIR code rather than reimplemented: one maintained version beats two that agree today.
+# It fixes three things my first attempt got wrong, and the first one produced a false alarm I
+# reported as actionable — I told the team a live file had been hand-edited on the VM when it was
+# byte-identical to commit 3565997, which my branch simply did not contain.
+#   1. `--all` in the history walk. "Live matches no commit I CAN SEE" and "live matches no commit
+#      that EXISTS" are different facts, and the first is usually just being behind your own repo.
+#      Conflating them sends someone hunting a person who did nothing wrong.
+#   2. BEHIND vs UNKNOWN. Once the baseline is found, ask whether HEAD contains it; if not, live is
+#      NEWER than you and pushing REVERTS deployed work. Invisible in a batch listing, because
+#      every line looks normal. Its own flag (--allow-revert), because "ship it forward" is not
+#      consent to undo — the same reasoning that made refusal exit 4 rather than 1.
+#   3. Trailing-whitespace tolerance as a SECOND pass, exact match first. Live's bard was once one
+#      final newline short of its commit, and an exact-only test cried "hand-edited" over a byte
+#      no YAML parser can see. A guard that raises false alarms gets switched off.
+LIVE_BASELINE_DEPTH=60
+
+_norm_hash() { # $1 file -> blob hash with trailing newlines normalised to exactly one
+  local t; t="$(mktemp)"; printf '%s\n' "$(cat "$1")" > "$t"
+  git -C "$REPO_DIR" hash-object "$t"; rm -f "$t"
+}
+
+live_is_ahead() { # $1 basename, $2 path-to-live-copy
+  local f="$1" live="$2" livehash livenorm sha blob base='' ws='' bt
+  [ -s "$live" ] || return 0                       # not on live yet: nothing to overwrite
+  livehash="$(git -C "$REPO_DIR" hash-object "$live" 2>/dev/null)" || return 0
+  local -a hist=()
+  readarray -t hist < <(git -C "$REPO_DIR" log --all -n "$LIVE_BASELINE_DEPTH" --format='%H' \
+                          -- "ha/packages/$f" 2>/dev/null || true)
+  for sha in "${hist[@]}"; do
+    [ -n "$sha" ] || continue
+    blob="$(git -C "$REPO_DIR" rev-parse "$sha:ha/packages/$f" 2>/dev/null || true)"
+    [ "$blob" = "$livehash" ] && { base="$sha"; break; }
+  done
+  # Trailing-whitespace-tolerant second pass. The very first live run reported "hand-edited on the
+  # VM" when the whole difference from the deploying commit was a missing final newline — a false
+  # alarm over a byte no YAML parser can see, and a guard that cries wolf gets switched off.
+  if [ -z "$base" ]; then
+    livenorm="$(_norm_hash "$live")"
+    for sha in "${hist[@]}"; do
+      [ -n "$sha" ] || continue
+      bt="$(mktemp)"
+      if git -C "$REPO_DIR" cat-file blob "$sha:ha/packages/$f" > "$bt" 2>/dev/null \
+         && [ "$(_norm_hash "$bt")" = "$livenorm" ]; then
+        base="$sha"; ws=' (differs only in trailing whitespace)'; rm -f "$bt"; break
+      fi
+      rm -f "$bt"
+    done
+  fi
+  [ -n "$base" ] || { echo 'UNKNOWN'; return 0; }
+  git -C "$REPO_DIR" merge-base --is-ancestor "$base" HEAD 2>/dev/null && return 0
+  echo "BEHIND $(git -C "$REPO_DIR" log -1 --format='%h %s' "$base")$ws"
+}
+
 reload_signature() { # $1 yaml file -> sorted set of REGISTERABLE entity keys; non-zero if unparseable
   # What `automation.reload` cannot create: helpers (`input_*` children) and anything carrying a
   # `unique_id` (mqtt/template entities). Comparing this set between the outgoing file and the
@@ -258,45 +312,34 @@ git_or_die() { # $@ git args -> stdout; returns 1 on failure
   printf '%s' "$out"
 }
 
-push_unshipped() { # $1 basename, $2 path to the fetched LIVE copy -> the commits not yet live
-  # morpheus-yaml's design, and strictly better than the `git log -1` this replaces. The newest
-  # commit touching a file may already BE live, and if several commits are unshipped it hides all
-  # but one — so the old line could name a change that was not in the envelope while omitting the
-  # ones that were. Here: hash the live copy, then walk this path's history comparing each
-  # commit's blob for that path. The first blob that matches IS the live baseline; everything
-  # after it is what this push would actually send.
-  local f="$1" live="$2" livehash
-  livehash="$(git -C "$REPO_DIR" hash-object "$live" 2>/dev/null)" || { echo "    (cannot hash live copy)"; return; }
-  local shas; shas="$(git -C "$REPO_DIR" log --format=%H -- "ha/packages/$f" 2>/dev/null)" || true
-  [ -n "$shas" ] || { echo "    (no commit history for $f)"; return; }
-  local found="" out=""
+push_unshipped_line() { # $1 basename, $2 live copy -> one-line summary of what is unshipped
+  # Only reached once live_is_ahead() has confirmed the baseline IS an ancestor of HEAD, so this
+  # is purely cosmetic: name the commits between that baseline and here. All the judgement lives
+  # in live_is_ahead; this just reads the list out.
+  local f="$1" live="$2" livehash n
+  livehash="$(git -C "$REPO_DIR" hash-object "$live" 2>/dev/null)" || { echo "(unknown)"; return; }
+  local base=""
   while read -r sha; do
     [ -n "$sha" ] || continue
-    local blob; blob="$(git -C "$REPO_DIR" rev-parse "$sha:ha/packages/$f" 2>/dev/null)" || blob=""
-    if [ "$blob" = "$livehash" ]; then found=1; break; fi
-    out+="      $(git -C "$REPO_DIR" log -1 --format='%h %s' "$sha")"$'\n'
-  done <<< "$shas"
-  if [ -z "$found" ]; then
-    # FAIL CLOSED. Live matches no committed blob, so it was hand-edited on the VM — which has
-    # happened here (smol_mesh.yaml was once 17.5 KB ahead of the repo). We cannot say what this
-    # push would overwrite, and an unattributable batch is the one that most deserves a human.
-    PUSH_UNATTRIBUTABLE=1
-    echo "      !! cannot attribute — live matches no committed version of this file."
-    echo "         It was edited on the VM; a push OVERWRITES those edits. \`pull\` first to see them."
-    return
-  fi
-  [ -n "$out" ] && printf '%s' "$out" || echo "      (live is at HEAD for this file)"
+    [ "$(git -C "$REPO_DIR" rev-parse "$sha:ha/packages/$f" 2>/dev/null || true)" = "$livehash" ] \
+      && { base="$sha"; break; }
+  done < <(git -C "$REPO_DIR" log --all -n "$LIVE_BASELINE_DEPTH" --format=%H -- "ha/packages/$f" 2>/dev/null || true)
+  [ -n "$base" ] || { echo "(live is at an unrecognised baseline)"; return; }
+  n="$(git -C "$REPO_DIR" log --format=%H "$base..HEAD" -- "ha/packages/$f" 2>/dev/null | grep -c . || true)"
+  [ "${n:-0}" -eq 0 ] && { echo "(live is at HEAD for this file)"; return; }
+  echo "$n unshipped: $(git -C "$REPO_DIR" log -1 --format='%h %s' HEAD -- "ha/packages/$f")"
 }
 
 # --- push (repo -> live) -------------------------------------------------------------------
 cmd_push() {
-  local dry=0 from_worktree=0 all=0; local -a scope=()
+  local dry=0 from_worktree=0 all=0 allow_revert=0; local -a scope=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --dry-run) dry=1 ;;
       --from-worktree) from_worktree=1 ;;
       --all) all=1 ;;
-      -*) die "unknown push flag '$1' (--dry-run | --from-worktree | --all)" ;;
+      --allow-revert) allow_revert=1 ;;
+      -*) die "unknown push flag '$1' (--dry-run | --from-worktree | --all | --allow-revert)" ;;
       "") ;;
       *) packages | grep -qxF "$1" || die "no such package '$1' (have: $(packages | tr '\n' ' '))"
          scope+=("$1") ;;
@@ -408,16 +451,32 @@ cmd_push() {
   # commit SUBJECT can, because you recognise your own work. Say what is knowable, not what
   # would merely look authoritative.
   echo
-  echo "  would push ${#changed[@]} package(s) · unshipped commits per file:"
-  PUSH_UNATTRIBUTABLE=0
+  echo "  would push ${#changed[@]} package(s):"
+  local -a behind=() unknown=(); local verdict
   for f in "${changed[@]}"; do
-    echo "    $f"
-    push_unshipped "$f" "$tmp/$f"
+    verdict="$(live_is_ahead "$f" "$tmp/$f")"
+    case "$verdict" in
+      BEHIND*)  behind+=("$f");  printf '    %-22s %s\n' "$f" "live is NEWER — ${verdict#BEHIND }" ;;
+      UNKNOWN)  unknown+=("$f"); printf '    %-22s %s\n' "$f" "cannot attribute — live matches no commit anywhere" ;;
+      *)        printf '    %-22s %s\n' "$f" "$(push_unshipped_line "$f" "$tmp/$f")" ;;
+    esac
   done
-  if [ "$PUSH_UNATTRIBUTABLE" -eq 1 ] && [ "$all" -eq 0 ]; then
+  # BEHIND gets its OWN refusal and its own flag. It is not a wider batch, it is the opposite
+  # hazard: pushing would UNDO work already deployed, and nothing in a batch listing looks wrong
+  # while it happens — one file, one plausible subject. "Ship it forward" is not consent to undo.
+  if [ ${#behind[@]} -gt 0 ] && [ "$allow_revert" -eq 0 ]; then
     echo
-    echo "  REFUSED · at least one file above cannot be attributed: live does not match any" >&2
-    echo "  committed version, so a push would silently overwrite edits made on the VM." >&2
+    echo "  REFUSED · live is NEWER than your HEAD for: ${behind[*]}" >&2
+    echo "  Pushing would REVERT work that is already deployed. Update your branch first:" >&2
+    echo "      git pull   (or rebase onto the branch that carries it)" >&2
+    echo "      ./tools/ha_deploy.sh push --allow-revert    (if undoing it is the intent)" >&2
+    return 4
+  fi
+  [ ${#behind[@]} -gt 0 ] && note "--allow-revert: OVERWRITING live's newer copy of ${behind[*]}"
+  if [ ${#unknown[@]} -gt 0 ] && [ "$all" -eq 0 ]; then
+    echo
+    echo "  REFUSED · cannot attribute ${unknown[*]}: live matches no committed version anywhere," >&2
+    echo "  so it was edited on the VM and a push would silently overwrite those edits." >&2
     echo "  Run \`pull\` to capture them, or --all if you have decided to discard them." >&2
     return 4
   fi
