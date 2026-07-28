@@ -3,7 +3,10 @@
 #
 #   Usage:  ota_verify.sh <board_id> <target_build> [window_s]
 #   e.g.    ota_verify.sh 8 907 360
-#   Exit:   0 = PASS · 1 = FAIL / UNPROVEN / CONFLICT · 3 = setup error (no creds)
+#   Exit:   0 = PASS · 1 = FAIL / UNPROVEN / CONFLICT · 2 = bad invocation · 3 = setup error (no creds)
+#           2 and 3 are SEPARATE deliberately: a renamed knob is the CALLER's mistake and is fixed by
+#           editing the command, while 3 means the environment (bw locked, addon unreachable). They
+#           shared code 3 for one revision, and an audit read a test failure as an env failure.
 #   Test:   tools/test_ota_verify.sh   (fixture replay, no broker, no hardware)
 #
 # ═════════════════════════════════════════════════════════════════════════════════════════
@@ -152,13 +155,20 @@ WINDOW="${3:-600}"
 # If the relay's cadence changes, re-derive them SEPARATELY.
 STALL_AFTER="${OTA_VERIFY_STALL_AFTER:-150}"
 RETRY_GRACE="${OTA_VERIFY_RETRY_GRACE:-150}"
+# BARREN_STALLS — how many CONSECUTIVE stall episodes with NO high-water advance between them mean
+# the board is thrashing rather than progressing. Derivation: the observed successful run stalled and
+# restarted from 0 TWICE and its high-water still advanced (0 → 1440528), so "no advance across two
+# consecutive stalls" is outside anything healthy that has been observed. This is a COUNT of repeated
+# non-progress, not a timer — deliberately, because the time axis is what the retry grace already
+# covers and a thrashing board can retry forever without a timer ever expiring.
+BARREN_STALLS="${OTA_VERIFY_BARREN_STALLS:-2}"
 # A retired knob that silently does nothing is the same trap as an absent field read as a value: the
 # caller believes they set a threshold and gets the default. Fail loudly instead of ignoring it.
 if [ -n "${OTA_VERIFY_STALE:-}" ]; then
   echo "FATAL: OTA_VERIFY_STALE is retired — it conflated two thresholds. Set OTA_VERIFY_STALL_AFTER" >&2
   echo "       (offset-frozen threshold, data plane) and/or OTA_VERIFY_RETRY_GRACE (how long the" >&2
   echo "       board's own retry signal keeps a stall non-terminal, control plane). See the header." >&2
-  exit 3
+  exit 2   # NOT 3: this is a bad invocation, not a broken environment.
 fi
 POLL="${OTA_VERIFY_POLL:-3}"       # re-evaluate every N s
 SETTLE="${OTA_VERIFY_SETTLE:-2}"   # let the retained baseline land before the first evaluation
@@ -174,7 +184,7 @@ if [ -n "$FIXTURE" ]; then
   # what makes TRANSITIONS testable — the previous test copy read a static file, so "first
   # observation" and "last observation" were always the same line and no transition could ever be
   # exercised. A harness whose tests cannot express its central concept is not tested.
-  [ -f "$FIXTURE" ] || { echo "FATAL: fixture not found: $FIXTURE" >&2; exit 3; }
+  [ -f "$FIXTURE" ] || { echo "FATAL: fixture not found: $FIXTURE" >&2; exit 2; }
   BROKER="fixture($(basename "$FIXTURE"))"
   LOG="$(mktemp "/tmp/ota_verify_fix_${ID}_XXXX.log")"
   (
@@ -218,6 +228,15 @@ else
     -t "smol/$ID/diag" -t "smol/mesh/channel" > "$LOG" 2>&1 &
   SUB=$!
   trap 'kill "$SUB" 2>/dev/null; rm -f "$LOG"; rm -rf "$CFGDIR"' EXIT
+  # The trap is not enough. `mosquitto_sub` reads its config ONCE at startup and keeps the credential
+  # in memory, so the file only needs to exist for that instant — and leaving it for the whole window
+  # means a SIGKILL (this host has a documented OOM-scope-kill history that has taken whole agent trees)
+  # skips the EXIT trap and strands a plaintext password in /tmp. So delete it as soon as it has been
+  # read, and keep the settle wait AFTER that. The floor of 2 s is the read guard: below it we would be
+  # racing the child's own startup, which is why SETTLE is clamped here rather than trusted.
+  [ "$SETTLE" -lt 2 ] && SETTLE=2
+  sleep 2
+  rm -f "$CFGDIR/mosquitto_sub"
 fi
 sleep "$SETTLE"
 
@@ -245,6 +264,18 @@ valid_ch() {
   [ "$1" -ge 1 ] && [ "$1" -le 14 ]
 }
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1;; esac; }
+# `at=slot` at start-of-payload or after a space — the anchored equivalent of the old
+# `grep -qaE '(^| )at=slot'`, but WITHOUT A PIPELINE, and that is a correctness fix, not tidying.
+#
+# `printf '%s' "$x" | grep -q PATTERN` under `set -o pipefail` returns NON-ZERO roughly 0.2% of the
+# time EVEN WHEN THE PATTERN MATCHES: `grep -q` exits on first match without draining, the writer
+# takes EPIPE, and pipefail surfaces the WRITER's failure as the pipeline's. Measured 3 spurious
+# non-matches in 1500 runs on real output, position-independent; `case` was 0 in 1500. Anywhere a
+# `grep -q` STATUS is a verdict decision, that is a ~0.2%-per-poll chance of a check silently NOT
+# FIRING — exactly the failure mode this whole file exists to eliminate, arriving through the shell
+# rather than the data. Every other grep here feeds a command substitution where the OUTPUT is what
+# matters and no reader exits early, so this hazard is specific to `-q`.
+has_at_slot() { case "${1:-}" in "at=slot"*|*" at=slot"*) return 0;; esac; return 1; }
 
 echo "── ota_verify: id$ID → v$TARGET · window ${WINDOW}s · stall-after ${STALL_AFTER}s · retry-grace ${RETRY_GRACE}s · broker $BROKER ──"
 
@@ -260,6 +291,11 @@ retry_t=0; retry_n=0
 # image's offset with another's total (observed: hwm 1277952 from a 906 whose total was 1435280,
 # printed against 907's total of 1440528).
 prev_total=""; images=0; restarts=0; stalls=0; stall_at=""; stall_latched=0
+# High-water at the previous stall episode, and how many consecutive episodes have shown no advance
+# since. These were computed and PRINTED but consulted by nothing, so a board stuck in a retry loop
+# reported "still in progress, re-run with a longer window" forever and the operator's only exit was
+# judgement. A distinguishable failure with no check behind it is not a reported failure.
+hwm_at_stall=""; barren=0
 
 # add <severity> <rank> <code> <text>   — rank orders the HEADLINE only; every finding prints.
 add() { findings+=("$1"$'\t'"$2"$'\t'"$3"$'\t'"$4"); }
@@ -281,6 +317,7 @@ while :; do
   ota_first="$( fld ota  "$(d_first ota)")";  ota_live="$( fld ota  "$(d_live ota)")"
   cut_first="$( fld cut  "$(d_first cut)")";  cut_live="$( fld cut  "$(d_live cut)")"
   rst_live="$(  fld rst  "$(d_live rst)")"
+  up_live="$(   fld up   "$(d_live up)")"
   cc_live="$(   fld cc   "$(d_live cc)")"
   # `ap=` must come from the SAME live record as `cc=`: association is only evidence for the
   # co-channel verdict if both were true at the same instant on the same board.
@@ -344,13 +381,21 @@ while :; do
     if [ "$stall_latched" = 0 ] && [ "$off" -gt 0 ] && is_num "$total" && [ "$off" -lt "$total" ] \
        && [ $((now-last_off_t)) -ge "$STALL_AFTER" ]; then
       stalls=$((stalls+1)); stall_at="${stall_at:+$stall_at, }$off"; stall_latched=1
+      if [ -n "$hwm_at_stall" ] && [ -n "$hwm" ] && [ "$hwm" -le "$hwm_at_stall" ]; then
+        barren=$((barren+1))
+      else
+        barren=0
+      fi
+      hwm_at_stall="$hwm"
     fi
   fi
 
   # ═══ CHECK 1 · AT-SLOT — local otadata write failure (#226) ═════════════════════════════
-  if printf '%s' "$dg_live" | grep -qaE '(^| )at=slot'; then
-    add FAIL 40 AT-SLOT "a LIVE ota/diag reports at=slot — the slot/otadata write itself failed (#226); needs a USB flash, OTA cannot proceed. payload: '$dg_live'"
-  elif printf '%s' "$dg_any" | grep -qaE '(^| )at=slot'; then
+  if has_at_slot "$dg_live"; then
+    # Rank 5, ABOVE death-point (10): a death-point CAUSED BY a failed otadata write must not headline
+    # as a generic death-point, because the instruction differs (USB-flash it vs investigate the path).
+    add FAIL 5 AT-SLOT "a LIVE ota/diag reports at=slot — the slot/otadata write itself failed (#226); needs a USB flash, OTA cannot proceed. payload: '$dg_live'"
+  elif has_at_slot "$dg_any"; then
     add unknown 0 AT-SLOT "a RETAINED ota/diag carries at=slot but NO live one does — ota/diag is published RETAINED (wifi.rs:3299), so this is a ghost of an earlier attempt and is NOT a verdict. (This ghost once condemned a board whose OTA had just succeeded, and told the operator to USB-flash it.) payload: '$dg_any'"
   else
     add ok 0 AT-SLOT "no live ota/diag at=slot."
@@ -369,8 +414,20 @@ while :; do
     add ok 0 OFF-CHANNEL "cc=2 = NOT ASSOCIATED (three-valued cc, 6a62946) — nothing to conclude; check N/A."
   elif [ "$cc_live" = "1" ]; then
     add ok 0 OFF-CHANNEL "cc=1 — live diag reports co-channel with the mesh."
-  elif [ -n "$ap_live" ] && [ -n "$mesh_ch" ] && [ "$ap_live" != "$mesh_ch" ]; then
-    add FAIL 35 OFF-CHANNEL "no cc= (pre-#217 image) but a LIVE diag carries ap=$ap_live != mesh ch$mesh_ch (coexist disease; the WiFi fetch will stall). Mesh channel read from a RETAINED smol/mesh/channel — it is a compile-time fleet constant, not per-boot state."
+  # The `ap=` vs `smol/mesh/channel` fallback arm that used to sit here is DELETED (2026-07-28), and
+  # this comment is its headstone so nobody reinvents it. I had justified reading a retained
+  # `mesh/channel` on the grounds that it is a compile-time fleet constant. That is FALSE on the wire:
+  # wifi.rs:3864 publishes `MC|<id>|<pub_ch>|<seq>` where
+  #     pub_ch = if co_channel && mesh_channel != 0 { mesh_channel } else { my_channel }
+  # and `my_channel` is the crown's own LEARNED channel (mode.rs:2439/4983, "advisory 0 until a frame's
+  # rx_control is learned"). So field 3 is the mesh channel ONLY WHILE THE CROWN IS CO-CHANNEL —
+  # meaning the operand goes wrong precisely in the disease state the check existed to detect. An
+  # off-channel crown that has learned ch1 publishes MC|5|1|…, and a target associated on ch1 would then
+  # read as CO-channel: a false NEGATIVE, the worst direction for this file. `valid_ch` rejecting 0 only
+  # covered the unlearned case. The honest operand is the firmware constant ESP_NOW_FIXED_CHANNEL
+  # (mode.rs:67, =6; =1 under `coexist-soak`) which the shell cannot see, and the arm bought nothing:
+  # the primary cc+ap path never used it, and every board that can be OTA'd today truncates cc=/ap=
+  # off its record anyway.
   elif [ -n "$cut_live$cut_first" ]; then
     add unknown 0 OFF-CHANNEL "INAPPLICABLE: no cc= or ap= survived, and the record says why — cut=${cut_live:-$cut_first} bytes were truncated off its tail (mode.rs |cut=). The operands were sent and LOST, not absent."
   else
@@ -386,13 +443,24 @@ while :; do
     add SUSPECT 45 STALLED "offset frozen at $off/$total for $((now-last_off_t))s, BUT a live ota/diag reports a retry $((now-retry_t))s ago, inside the ${RETRY_GRACE}s retry-grace (retry signals seen: $retry_n) — the board has NOT given up, so this is a retry, not a death. Still watching; a completion will override this. last live ota/diag: '${dg_live:-none}'"
   elif [ "$saw_live_prog" = 1 ] && [ -n "$off" ] && is_num "$total" && [ "$off" -gt 0 ] \
      && [ "$off" -lt "$total" ] && [ $((now-last_off_t)) -ge "$STALL_AFTER" ]; then
-    add FAIL 10 DEATH-POINT "offset frozen at $off/$total for $((now-last_off_t))s (>= ${STALL_AFTER}s stall-after) with NO live retry signal — the transfer died AT that byte (phase='${phase:-none}', monotonic=$([ $monotonic = 1 ] && echo yes || echo NO), restarts=$restarts, src=${src:-none}). NOT terminal to this run: still watching, and a completion would override this."
+    add FAIL 10 DEATH-POINT "offset frozen at $off/$total for $((now-last_off_t))s (>= ${STALL_AFTER}s stall-after) and NO retry signal inside the ${RETRY_GRACE}s grace (last retry signal: $([ "$retry_t" = 0 ] && printf none || printf %ss $((now-retry_t))) ago; $retry_n seen this run) — the transfer died AT that byte (phase='${phase:-none}', monotonic=$([ $monotonic = 1 ] && echo yes || echo NO), restarts=$restarts, src=${src:-none}). NOT terminal to this run: still watching, and a completion would override this."
   elif [ "$saw_live_prog" = 0 ] && [ -n "$off_any" ]; then
     add unknown 0 DEATH-POINT "progress seen RETAINED ONLY (${off_any}/${total_any:-?}) — no live publish this run, so this offset is a ghost of an earlier attempt, possibly of a different image (compare total against the staged size). A retained value never changes, so it would satisfy 'frozen' for free; not a verdict."
   elif [ -z "$off" ] && [ -z "$off_any" ]; then
     add unknown 0 DEATH-POINT "no ota/progress observed at all — nothing to freeze; check skipped."
   else
     add ok 0 DEATH-POINT "live progress advancing (or complete): ${off:-unknown}/${total:-?}."
+  fi
+
+  # ═══ CHECK 3b · RETRY-LOOP — trying forever, arriving nowhere ═══════════════════════════
+  # DEATH-POINT catches "stopped trying". STALLED forgives "still trying". Neither catches "trying and
+  # never getting anywhere", which is a real, distinguishable failure: repeated stall episodes whose
+  # high-water mark never advances. Without this arm an endlessly-retrying board can NEVER fail — it
+  # reports UNPROVEN/extend-the-window forever, and extending the window is exactly the wrong advice.
+  if [ "$barren" -ge "$BARREN_STALLS" ]; then
+    add FAIL 15 RETRY-LOOP "$barren consecutive stall episodes with NO high-water advance (stalls at $stall_at; HWM stuck at ${hwm:-none}/${total:-?}; restarts=$restarts; retry signals=$retry_n). The board keeps retrying and keeps arriving nowhere — a LONGER WINDOW WILL NOT HELP. Escalate: check the source path (src=${src:-none}) and the crown, not the timeout."
+  elif [ "$stalls" -gt 0 ]; then
+    add ok 0 RETRY-LOOP "$stalls stall episode(s), but the high-water advanced between them (HWM ${hwm:-none}) — retrying AND progressing."
   fi
 
   # ═══ CHECK 4 · ROLLED BACK ═════════════════════════════════════════════════════════════
@@ -449,7 +517,23 @@ while :; do
   # early positional field, so truncation (which eats the tail) never removes it; demanding it is
   # safe as well as fail-closed.
   [ -n "$rst_live" ] && [ "$rst_live" != "usb-jtag" ] && E=1
-  [ $((A+B+C+D)) = 4 ] && [ "$E" = 1 ] && pass_ok=1
+  # F — THE BOOT ITSELF HAPPENED INSIDE OUR WINDOW. A→E prove the values transitioned as we watched;
+  # for a LEAF target that is not quite the same thing, because the operands reach us through TWO
+  # INDEPENDENT GATEWAY CACHES with DIFFERENT freshness gates: `ota/state` is republished under STAT's
+  # 45 s gate while `<id>/diag` uses its own DIAG_FRESH_MS = 150 s (wifi.rs:1716, deliberately longer or
+  # "a live node's record would flicker stale between broadcasts"). So a DIAG lagging a completed OTA can
+  # hand us a stale `ota=none` followed by a fresh `confirmed`, which LOOKS like an in-window transition
+  # for an install that finished before we subscribed. The install claim would still be true; "I watched
+  # it happen" would not — and that is the one place the stated invariant leaks.
+  # `up=` (mode.rs:3280, seconds since boot, stamped when the record is generated) closes it: if the
+  # boot that set `confirmed` were older than this run, `up` would exceed our elapsed time. Slack of
+  # 30 s + SETTLE + 2 polls absorbs cache and clock skew, so the residual uncertainty is a bounded ~30 s
+  # instead of an unbounded 150 s. Absent `up=` refuses PASS, like every other missing operand.
+  F=0
+  if is_num "$up_live"; then
+    [ "$up_live" -le $(( (now-start) + SETTLE + 2*POLL + 30 )) ] && F=1
+  fi
+  [ $((A+B+C+D)) = 4 ] && [ "$E" = 1 ] && [ "$F" = 1 ] && pass_ok=1
 
   for x in "${findings[@]}"; do
     case "$x" in FAIL*) fail_n=$((fail_n+1));; esac
@@ -520,11 +604,15 @@ printf '    [%s] B slot flip    %s → %s\n'                 "$(y $B)" "${slot_f
 printf '    [%s] C boot incr    %s → %s\n'                 "$(y $C)" "${boot_first:-unknown}" "${boot_live:-unknown}"
 printf '    [%s] D ota token    %s → %s   (want none|rolled-back → confirmed)\n' "$(y $D)" "${ota_first:-unknown}" "${ota_live:-unknown}"
 printf '    [%s] E not usb      rst=%s\n'                  "$(y $E)" "${rst_live:-unknown}"
+printf '    [%s] F boot in-window  up=%ss (elapsed %ss + %ss slack) — defeats a cache-lagged ota= flip\n' \
+  "$(y $F)" "${up_live:-unknown}" "$((now-start))" "$((SETTLE + 2*POLL + 30))"
 printf '  ── operands (first observed → last LIVE; "unknown" = never observed, check skipped) ──\n'
 # Every value on these lines is LIVE (verdict-time) unless explicitly tagged (retained) — the old
 # evidence block printed `tail -1` of ALL observations, so it could contradict its own verdict
 # (observed: `installed v345 · rst=brownout · ota=none` printed for a board that was on 907 by then).
-printf '    producer=%s · cc=%s · ap=%s · mesh ch=%s (retained) · cut=%s\n' \
+# `crown-adv ch` is NOT necessarily the mesh channel — see the headstone above. Labelled as what it
+# literally is (whatever the crown advertised) so nobody reads a verdict into it.
+printf '    producer=%s · cc=%s · ap=%s · crown-adv ch=%s (retained; mesh ch only while co-channel) · cut=%s\n' \
   "$producer" "${cc_live:-unknown}" "${ap_live:-unknown}" "${mesh_ch:-unknown}" "${cut_live:-${cut_first:-none}}"
 printf '    retry signals=%s · stall episodes=%s%s · restarts from a lower offset=%s · images seen=%s\n' \
   "$retry_n" "$stalls" "${stall_at:+ (at $stall_at)}" "$restarts" "$((images+1))"

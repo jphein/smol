@@ -16,9 +16,19 @@
 #
 # The fixture format is the harness's own log format, `<retain>\t<topic>\t<payload>`, optionally
 # prefixed `@<seconds>\t` to be delivered that many seconds in. Unprefixed lines are the
-# retained-at-subscribe batch. Timed lines are what make a TRANSITION expressible: the previous test
-# copy read a static file, so first-observation and last-observation were always the same line and
-# the central concept of this harness was literally untestable.
+# retained-at-subscribe batch. Timed lines are what make a TRANSITION expressible.
+#
+# TWO SHARP EDGES FOR FIXTURE AUTHORS:
+#
+#   1. Replay is SEQUENTIAL, so timestamps must be NON-DECREASING. An unprefixed line placed AFTER an
+#      `@5` line lands at t=5, not t=0 — the replayer is already past t=5 and never goes back. Put the
+#      whole retained batch first. (Raised by oracle-verify while auditing this seam.)
+#   2. Leave GENEROUS margins around anything time-derived. A stall episode is only counted if a poll
+#      lands inside the frozen span, and under the suite's own load a poll iteration can stretch well
+#      past POLL seconds. `retry_restart_then_pass` originally had a 4 s frozen span with
+#      STALL_AFTER=2 and passed on a loaded box while FAILING in a pristine checkout — a flaky
+#      assertion, which is worse than no assertion because it REDs a future audit at random. The span
+#      is now 9 s. If an assertion depends on a poll landing in an interval, make the interval wide.
 #
 # Run:  tools/test_ota_verify.sh        (exit 0 = all green)
 set -uo pipefail
@@ -43,15 +53,26 @@ run() { # run <case-file> <id> <target> <window>
 }
 ok()   { pass=$((pass+1)); printf '   ok   - %s\n' "$1"; }
 bad()  { fail=$((fail+1)); printf '   FAIL - %s\n' "$1"; }
+# ── assertions use PURE BASH, no pipelines, and that is a correctness requirement ──────────────
+# `printf '%s' "$OUT" | grep -qaF "$pat"` under `pipefail` returns non-zero ~0.2% of the time EVEN
+# WHEN THE PATTERN MATCHES (grep -q exits on first match without draining → writer takes EPIPE →
+# pipefail surfaces the writer's status). Measured: 3 spurious non-matches in 1500 runs on real
+# output, position-independent; `case` was 0 in 1500. At ~124 assertions per run that is a ~25%
+# chance of at least one PHANTOM FAILURE per suite run — and it is exactly what produced the
+# wandering counts (100/2, 119/4, 122/2, 124/0) across otherwise identical runs, including two
+# failures I could not reproduce and briefly suspected in the code under test. A flaky assertion is
+# worse than no assertion: it REDs an audit at random and teaches everyone to re-run until green.
 verdict_is() { # verdict_is <expected>
-  local got; got="$(printf '%s' "$OUT" | grep -aoE 'VERDICT: [A-Z]+' | head -1 | awk '{print $2}')"
+  local got="${OUT#*VERDICT: }"; got="${got%%[! A-Z]*}"; got="${got%% *}"
   [ "$got" = "$1" ] && ok "verdict $1" || bad "verdict: want $1, got ${got:-<none>}"
 }
 rc_is()  { [ "$RC" = "$1" ] && ok "exit $1" || bad "exit: want $1, got $RC"; }
-has()    { printf '%s' "$OUT" | grep -qaF -- "$2" && ok "$1" || bad "$1 (missing: $2)"; }
-hasnt()  { printf '%s' "$OUT" | grep -qaF -- "$2" && bad "$1 (unexpected: $2)" || ok "$1"; }
-# A proof conjunct's state, read off the proof block: proof <A|B|C|D|E> <yes|NO>
-proof()  { printf '%s' "$OUT" | grep -qaE "\[$2 *\] $1 " && ok "proof $1=$2" || bad "proof $1: want $2"; }
+has()    { case "$OUT" in *"$2"*) ok "$1";; *) bad "$1 (missing: $2)";; esac; }
+hasnt()  { case "$OUT" in *"$2"*) bad "$1 (unexpected: $2)";; *) ok "$1";; esac; }
+# A proof conjunct's state, read off the proof block: proof <A|B|C|D|E|F> <yes|NO>
+# y() renders 'yes' or 'NO ' (3 chars, padded), so match the padded form exactly.
+proof()  { local p="$2"; [ "$p" = NO ] && p="NO "
+  case "$OUT" in *"[$p] $1 "*) ok "proof $1=$2";; *) bad "proof $1: want $2";; esac; }
 
 echo "═══ PASS must be REACHABLE (it was not, for a long time) ═══"
 run pass_peer_sourced 8 907 12
@@ -167,7 +188,8 @@ has  "the restart is counted"              "restarts from a lower offset=1"
 has  "the stall episode is on the record"  "stall episodes=1"
 run stall_no_retry_is_death 8 907 8
 verdict_is FAIL; rc_is 1
-has  "a stall with NO retry signal is a death" "NO live retry signal"
+has  "a stall with NO retry signal is a death" "NO retry signal inside the"
+has  "and names the grace it measured against" "grace (last retry signal: none"
 has  "and says it was not terminal to the run" "NOT terminal to this run"
 run stall_with_retry_not_death 8 907 8
 verdict_is UNPROVEN; rc_is 1
@@ -190,15 +212,15 @@ echo "     harmless until the two meanings diverged. These must move independent
 # Same fixture, same STALL_AFTER: a WIDE retry-grace forgives the stall (still retrying),
 # a NARROW one calls it dead. Only RETRY_GRACE moved, so only the control-plane arm may change.
 OUT="$(OTA_VERIFY_RETRY_GRACE=30 OTA_VERIFY_FIXTURE="$CASES/stall_with_retry_not_death.mqtt" \
-       bash "$SCRIPT" 8 907 8 2>&1)"; RC=$?
+       bash "$SCRIPT" 8 907 12 2>&1)"; RC=$?
 printf '\n── stall_with_retry_not_death · RETRY_GRACE=30 (wide)\n'
 verdict_is UNPROVEN
 has "a wide retry-grace forgives the stall" "the board has NOT given up"
 OUT="$(OTA_VERIFY_RETRY_GRACE=1 OTA_VERIFY_FIXTURE="$CASES/stall_with_retry_not_death.mqtt" \
-       bash "$SCRIPT" 8 907 8 2>&1)"; RC=$?
+       bash "$SCRIPT" 8 907 12 2>&1)"; RC=$?
 printf '── stall_with_retry_not_death · RETRY_GRACE=1 (narrow), STALL_AFTER unchanged\n'
 verdict_is FAIL
-has "a narrow retry-grace calls the same stall dead" "NO live retry signal"
+has "a narrow retry-grace calls the same stall dead" "NO retry signal inside the 1s grace"
 has "and the stall threshold did NOT move with it"   ">= 2s stall-after"
 # The retired single knob must fail LOUDLY, not be silently ignored — a caller who sets it believes
 # they changed a threshold, and getting the default instead is exactly the class of silent-wrong-answer
@@ -206,9 +228,40 @@ has "and the stall threshold did NOT move with it"   ">= 2s stall-after"
 OUT="$(OTA_VERIFY_STALE=2 OTA_VERIFY_FIXTURE="$CASES/pass_peer_sourced.mqtt" \
        bash "$SCRIPT" 8 907 4 2>&1)"; RC=$?
 printf '── the retired OTA_VERIFY_STALE knob\n'
-rc_is 3
+# 2, not 3: a renamed knob is the CALLER's mistake. Sharing code 3 with "could not source mqtt
+# password" made an audit read a TEST failure as an ENVIRONMENT failure.
+rc_is 2
 has "refuses to run rather than ignore it" "OTA_VERIFY_STALE is retired"
 has "and names both replacements"          "OTA_VERIFY_RETRY_GRACE"
+
+echo
+echo "═══ AUDIT ROUND 2 · findings from oracle-verify ═══"
+# O6 — at=slot is the more specific root cause and carries a DIFFERENT instruction (USB-flash it), so
+# a death-point CAUSED BY a failed otadata write must not headline as a generic death-point.
+run atslot_outranks_deathpoint 8 907 8
+verdict_is FAIL; rc_is 1
+has   "at=slot headlines over the stall"  "VERDICT: FAIL"
+has   "and names the otadata cause first" "AT-SLOT"
+has   "the stall still prints underneath" "720000/1440528"
+# O4 — trying forever, arriving nowhere. Neither DEATH-POINT (stopped trying) nor STALLED (still
+# trying) catches it, and without an arm the board reports extend-the-window forever.
+OUT="$(OTA_VERIFY_RETRY_GRACE=30 OTA_VERIFY_FIXTURE="$CASES/retry_loop_no_progress.mqtt" \
+       bash "$SCRIPT" 8 907 20 2>&1)"; RC=$?
+printf '\n── retry_loop_no_progress · RETRY_GRACE=30 (retries stay fresh)\n'
+verdict_is FAIL; rc_is 1
+has   "a barren retry loop FAILS"            "RETRY-LOOP"
+has   "and says a longer window won't help"  "LONGER WINDOW WILL NOT HELP"
+has   "high-water never advanced"            "NO high-water advance"
+hasnt "not left as extend-the-window"        "Re-run with a longer window"
+# O5 residual — two gateway caches with different freshness gates (STAT 45 s vs DIAG_FRESH_MS 150 s)
+# can hand us a stale ota=none then a fresh confirmed, which LOOKS like an in-window transition for an
+# OTA that finished before we subscribed. up= proves whether the BOOT was ours.
+run stale_cache_confirmed 8 907 6
+verdict_is UNPROVEN; rc_is 1
+proof A yes; proof B yes; proof C yes; proof D yes; proof E yes
+proof F NO
+has   "A-E can all hold and it still is not a PASS" "F boot in-window"
+hasnt "no over-claim of having watched it"          "over the air"
 
 printf '\n════════════════════════════════════════════\n'
 printf '  %d passed · %d failed\n' "$pass" "$fail"
