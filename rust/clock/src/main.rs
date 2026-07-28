@@ -1255,6 +1255,25 @@ fn main() -> ! {
                             }
                             ota_abort
                         }, &ota_prog);
+                        // RAN-PREDICATE FOR THIS ARM, STATED RATHER THAN INHERITED. The other three
+                        // use `yields > 0` because they are polled every tick and early-return; the
+                        // worry here is the opposite failure — association can block, so a predicate
+                        // that needs a yield could DISCARD a real freeze and fail closed and
+                        // invisibly, leaving the panel calm while JP keeps feeling freezes.
+                        //
+                        // Checked, and `yields > 0` is correct for this path: the self-fetch's
+                        // association wait (`wifi.rs:4761`) and its DHCP wait are POLLING loops whose
+                        // first statement is `if tick() { return false }`, so the closure is invoked on
+                        // every iteration from the first. An association that takes any measurable time
+                        // therefore yields many times; a `run_ota_update` that yields ZERO times
+                        // returned before reaching either loop (no partition, bad announce), where
+                        // nothing blocked and discarding it is right.
+                        //
+                        // The residual is measured, not lost: if a single HAL call (`connect()`) blocks
+                        // internally between two yields, that time lands in `worst_yield_gap` and — if
+                        // no progress repaint intervened — in `worst_app_gap` too, because `finish`
+                        // accounts the tail up to `now`. So a non-yielding block inside the burst is
+                        // still reported; only a burst that never started is dropped.
                         if probe.ran() {
                             let kind = BurstKind::SelfOta;
                             let (gap, dur) = probe.finish(kind, millis());
