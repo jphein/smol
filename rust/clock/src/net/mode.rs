@@ -547,6 +547,21 @@ struct DiagCounters {
     dedup: u32,
     ttl: u32,
     dfwd: u32,
+    /// #153 WORST app-service gap seen in a WiFi burst since the last DIAG publish, in ms, with the
+    /// burst duration that produced it and a one-byte kind tag (`f` flush · `n` ntp · `r` re-election;
+    /// 0 = nothing measured yet, which keeps the DIAG string byte-identical until a burst happens).
+    ///
+    /// A MAX-since-report, not a sample: the DIAG cadence is 60 s and a burst is seconds, so an
+    /// instantaneous reading would almost always miss the event JP feels. Reset by `diag_record`,
+    /// which for every board is called exactly once per publish (leaf → mesh broadcast, gateway →
+    /// MQTT flush; `main` gates the former on `!is_gateway`, so the two are mutually exclusive).
+    ///
+    /// `u16` ms saturates at 65.5 s. The instrumented bursts are seconds and an OTA (minutes) is
+    /// deliberately not measured, so a saturated reading means something has gone very wrong — which
+    /// is itself the right thing to send.
+    brst_gap: u16,
+    brst_ms: u16,
+    brst_kind: u8,
     /// #13 MESH-TEST rig ONLY: count of inbound frames dropped by the deaf-list (surfaced as
     /// `ddrops=` in DIAG). A production build has no deaf-list, so this field doesn't exist.
     #[cfg(feature = "mesh-test")]
@@ -565,6 +580,9 @@ impl DiagCounters {
             dedup: 0,
             ttl: 0,
             dfwd: 0,
+            brst_gap: 0,
+            brst_ms: 0,
+            brst_kind: 0,
             #[cfg(feature = "mesh-test")]
             ddrops: 0,
         }
@@ -3069,6 +3087,24 @@ impl RadioManager {
         }
     }
 
+    /// #153: record what a WiFi burst did to the UI — the longest stretch with no app service, and
+    /// the burst duration that produced it. Keeps the WORST since the last DIAG publish (see
+    /// `DiagCounters::brst_gap`), so a 60 s record reports the peak rather than the last burst.
+    ///
+    /// This is the serial-free half of the burst probe. With every board wall-powered and no USB, the
+    /// `log::info!` line in `main` is unreadable in the field — the repo's own lore, learned the hard
+    /// way: release images are serial-silent, so soak instrumentation belongs in DIAG/MQTT.
+    pub fn note_burst(&mut self, gap_ms: u32, burst_ms: u32, kind: u8) {
+        let gap = gap_ms.min(u16::MAX as u32) as u16;
+        // Strictly greater: the FIRST burst to reach a given peak keeps its own duration, so the pair
+        // always describes ONE real burst rather than a mix of two.
+        if gap > self.diag.brst_gap || self.diag.brst_kind == 0 {
+            self.diag.brst_gap = gap;
+            self.diag.brst_ms = burst_ms.min(u16::MAX as u32) as u16;
+            self.diag.brst_kind = kind;
+        }
+    }
+
     /// #49: record an MQTT flush outcome (`ok` = reached CONNACK). The flush-success rate proves
     /// the #9 flush-win on hardware (was UART0-only). Gateway-only in practice (leaves never flush).
     pub fn note_flush(&mut self, ok: bool) {
@@ -3264,6 +3300,25 @@ impl RadioManager {
             self.relay.reassoc_cycles,
             self.relay.deaf_shed as u8
         ));
+        // #153 UI-freeze telemetry: <longest app gap ms>:<burst ms>:<kind>. Appended LAST and ONLY
+        // once a burst has been measured, so the DIAG string is byte-identical on a board that has not
+        // yet flushed (and the positional parse of the fixed fields stays intact). ~16 B against the
+        // ~490 B publish cap — ONE field, not two, for exactly that reason.
+        //
+        // Reset here because here IS the publish: every board reaches this once per DIAG (a leaf via
+        // the mesh broadcast, a gateway via the MQTT flush), so the next record carries the next
+        // window's peak instead of a running maximum that can only ever grow.
+        if self.diag.brst_kind != 0 {
+            rec.push_str(&alloc::format!(
+                "|brst={}:{}:{}",
+                self.diag.brst_gap,
+                self.diag.brst_ms,
+                self.diag.brst_kind as char
+            ));
+            self.diag.brst_gap = 0;
+            self.diag.brst_ms = 0;
+            self.diag.brst_kind = 0;
+        }
         rec
     }
 

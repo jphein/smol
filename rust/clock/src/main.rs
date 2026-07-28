@@ -282,6 +282,40 @@ const SPLASH_MIN_MS: u64 = 2_000;
 #[cfg(feature = "espnow")]
 const SYNC_REDRAW_MS: u64 = 500;
 
+/// Which WiFi burst a [`BurstProbe`] measured. Carries both spellings so a call site names the kind
+/// once: the human word for the serial line, and one byte for the DIAG field (where the ~490 B publish
+/// cap makes a word an extravagance).
+#[cfg(feature = "espnow")]
+#[derive(Clone, Copy)]
+enum BurstKind {
+    /// The ~30 s telemetry flush — the burst JP feels.
+    TelemetryFlush,
+    /// An opportunistic SNTP re-sync riding a flush.
+    NtpResync,
+    /// A leaf's recovery re-election.
+    Reelection,
+}
+
+#[cfg(feature = "espnow")]
+impl BurstKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::TelemetryFlush => "telemetry-flush",
+            Self::NtpResync => "ntp-resync",
+            Self::Reelection => "re-election",
+        }
+    }
+
+    /// DIAG tag. Never 0 — that value means "no burst measured yet" in the record.
+    fn tag(self) -> u8 {
+        match self {
+            Self::TelemetryFlush => b'f',
+            Self::NtpResync => b'n',
+            Self::Reelection => b'r',
+        }
+    }
+}
+
 /// Per-burst instrumentation (#153 / #198): how long a WiFi burst blocked the superloop, and — the
 /// number that IS the felt freeze — the longest stretch inside it during which the active screen got
 /// no service at all.
@@ -353,23 +387,30 @@ impl BurstProbe {
         self.last_app_ms = t;
     }
 
-    /// Close the burst and log it. `kind` names which burst, because JP feels the ~30 s telemetry
-    /// flush specifically and an NTP re-sync riding the same tick would otherwise be indistinguishable.
+    /// Close the burst: log the full picture to serial, and return `(longest app gap, burst duration)`
+    /// for the caller to hand to `note_burst`. The DIAG field carries only those two — with every board
+    /// wall-powered and no USB, serial is the bench-only channel and DIAG is the one that exists in the
+    /// field, so the richer line stays where it is free and the decision-carrying pair travels.
+    ///
+    /// `kind` names which burst, because JP feels the ~30 s telemetry flush specifically and an NTP
+    /// re-sync riding the same tick would otherwise be indistinguishable.
     ///
     /// Counts the tail (last service → burst end) as a gap candidate, so the figure covers the whole
     /// window. It excludes only the few ms from the burst's end to the dispatch that follows it in the
     /// same tick — constant across builds, so it cannot flatter a comparison.
-    fn finish(mut self, kind: &str, now_ms: u64) {
+    fn finish(mut self, kind: BurstKind, now_ms: u64) -> (u32, u32) {
         self.note_app(now_ms);
+        let burst_ms = now_ms.saturating_sub(self.start_ms).min(u32::MAX as u64) as u32;
         log::info!(
             "smol #153: burst {} {} ms — longest app gap {} ms ({} paints, {} yields, longest yield gap {} ms)",
-            kind,
-            now_ms.saturating_sub(self.start_ms),
+            kind.name(),
+            burst_ms,
             self.worst_app_gap,
             self.paints,
             self.yields,
             self.worst_yield_gap
         );
+        (self.worst_app_gap, burst_ms)
     }
 }
 
@@ -991,7 +1032,9 @@ fn main() -> ! {
                     }
                     reelect_abort
                 });
-                probe.finish("re-election", millis());
+                let kind = BurstKind::Reelection;
+                let (gap, dur) = probe.finish(kind, millis());
+                r.note_burst(gap, dur, kind.tag());
                 if reelected {
                     redraw = true; // a recovery burst ran → role may have changed; repaint
                 }
@@ -1484,7 +1527,9 @@ fn main() -> ! {
                         }
                         flush_abort
                     });
-                    probe.finish("telemetry-flush", millis());
+                    let kind = BurstKind::TelemetryFlush;
+                    let (gap, dur) = probe.finish(kind, millis());
+                    r.note_burst(gap, dur, kind.tag());
                     flush_defer_since_ms = 0;
                     // #192: opportunistic NTP RE-SYNC riding the flush cadence. `try_time_sync`
                     // runs ONLY at boot, so without this the wall-clock free-runs on the C3
@@ -1521,7 +1566,9 @@ fn main() -> ! {
                                 }
                                 resync_abort
                             });
-                            probe.finish("ntp-resync", millis());
+                            let kind = BurstKind::NtpResync;
+                            let (gap, dur) = probe.finish(kind, millis());
+                            r.note_burst(gap, dur, kind.tag());
                             if let Some(unix) = fresh {
                                 // Re-anchor the free-running clock to the fresh SNTP time. The next
                                 // broadcast_time carries the new my_synced_at → leaves adopt it.
