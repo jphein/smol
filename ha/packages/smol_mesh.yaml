@@ -987,21 +987,64 @@ template:
   # the crown re-associates to a new channel (the exact event we watch). Crown = the MC owner
   # (smol/mesh/channel); we read THAT node's ap= (spec agreed w/ meshscope: luna-hatel + luna-otaui).
   # {%- -%} trims the render to a bare token (idle/violated/…), matching the ota_death sensor idiom.
-  - sensor:
+  # ======================================================================================
+  # `smol coexist health` — REBUILT crown-derived, and now sourced from the firmware's OWN verdict.
+  #
+  # It used to enumerate candidate ids LITERALLY (5/7/8/9, then 5/8 after the id7/id9 retirement)
+  # and compare that board's `sensor.smol_<id>_ap_channel` against the elected mesh channel. Two
+  # problems, one of them live:
+  #   · The list is not the fleet. With the crown at id50/id51/id122 the state read `unknown` —
+  #     and a health indicator that says "unknown" when it means "I cannot see the crown" is the
+  #     worst possible failure for the one signal that tells us OTA is dead. It read `healthy`
+  #     only because the crown happened to be id5, one of the two ids still on the list.
+  #   · It re-derived a verdict the BOARD already computes. `cc=<0|1>` is the crown's own
+  #     co-channel answer (live AP channel == mesh channel), computed where both values actually
+  #     live, and it is on the wire today (verified: id5 publishes `ap=6:-43:… cc=1 degraded=0`).
+  #     Comparing two HA entities that update independently could always skew; reading one field
+  #     from one record cannot.
+  #
+  # The literal-enumeration comment that used to sit here was right about WHY it was written that
+  # way — a `states.sensor | selectattr` scan registers no per-entity listener and did not
+  # re-render reliably. An MQTT trigger sidesteps that entirely: it fires on message arrival, so
+  # it needs no listeners and is *more* prompt than the entity-listener version it replaces.
+  #
+  # State vocabulary is UNCHANGED (`healthy` · `degraded` · `violated` · `unknown`) because that is
+  # a documented contract. `ap_reporters` is gone: it counted how many entries of a hardcoded
+  # 2-board list were reporting, i.e. it measured the list rather than the fleet. Nothing in the
+  # tree reads it (meshscope classifies the crown itself from MQTT, not from these attributes).
+  # ======================================================================================
+  - trigger:
+      - platform: mqtt
+        topic: "smol/+/diag"
+    condition:
+      # Only the ELECTED crown, and only a record that carries `cc=`. Both matter: `cc` is
+      # documented as always present and 0 on a leaf, so an untruncated leaf record would
+      # otherwise land here as a confident "crown off-channel". Split-then-startswith so `cc=`
+      # cannot be matched inside another field.
+      - condition: template
+        value_template: "{{ trigger.payload is string and (trigger.payload.split('|') | select('search','^cc=') | list | count) > 0 }}"
+      - condition: template
+        value_template: >-
+          {% set o = state_attr('sensor.smol_mesh_channel','owner') %}
+          {{ o is none or (o | string) == trigger.topic.split('/')[1] }}
+    sensor:
       - name: "smol coexist health"
         unique_id: smol_coexist_health
         state: >-
-          {%- set mesh = states('sensor.smol_mesh_channel') -%}
-          {%- set owner = state_attr('sensor.smol_mesh_channel','owner') | string -%}
-          {#- hand-listed candidates: id8 + id5. If the crown is a board not in this list (id50/
-          id51/id122 today) the state reads 'unknown' — a blind spot, not a healthy verdict.
-          #309's discovery configs are what removes the list. -#}
-          {%- set cands = [('8', states('sensor.smol_8_ap_channel'), state_attr('sensor.smol_8_ap_channel','rssi')), ('5', states('sensor.smol_5_ap_channel'), state_attr('sensor.smol_5_ap_channel','rssi'))] -%}
-          {%- set ns = namespace(ch='none', rssi=0) -%}
-          {%- for id, ch, rs in cands -%}{%- if id == owner and ch not in ['unavailable','unknown','none',''] -%}{%- set ns.ch = ch -%}{%- set ns.rssi = rs | int(0) -%}{%- endif -%}{%- endfor -%}
-          {%- if mesh in ['unavailable','unknown','none',''] or ns.ch == 'none' -%}unknown
-          {%- elif (ns.ch | int(-1)) != (mesh | int(-2)) -%}violated
-          {%- elif ns.rssi <= -80 -%}degraded
+          {%- set ns = namespace(cc='', rssi=0, ap='') -%}
+          {%- for kv in trigger.payload.split('|') -%}
+            {%- if kv.startswith('cc=') -%}{%- set ns.cc = kv.split('=',1)[1] -%}
+            {%- elif kv.startswith('ap=') -%}{%- set ns.ap = kv.split('=',1)[1] -%}{%- endif -%}
+          {%- endfor -%}
+          {%- set p = ns.ap.split(':') -%}
+          {%- set ns.rssi = (p[1] | int(0)) if p | length >= 2 else 0 -%}
+          {#- cc=0 is off-channel: the ch1-AP-vs-ch6-mesh trap that silently kills OTA
+              (co-channel moved 48 KB, off-channel moved 0). AMBER stays "co-channel but the
+              uplink is weak", which is a DIFFERENT condition from the firmware's own
+              `degraded=` flag — see strand_guard_latched below. -#}
+          {%- if ns.cc == '' -%}unknown
+          {%- elif ns.cc != '1' -%}violated
+          {%- elif ns.rssi <= -80 and ns.rssi != 0 -%}degraded
           {%- else -%}healthy{%- endif -%}
         icon: >-
           {%- set s = states('sensor.smol_coexist_health') -%}
@@ -1009,15 +1052,34 @@ template:
         attributes:
           mesh_channel: "{{ states('sensor.smol_mesh_channel') }}"
           mesh_owner: "{{ state_attr('sensor.smol_mesh_channel','owner') }}"
+          node: "{{ trigger.topic.split('/')[1] }}"
           crown_ap_channel: >-
-            {%- set o = state_attr('sensor.smol_mesh_channel','owner') | string -%}{%- if o == '8' -%}{{ states('sensor.smol_8_ap_channel') }}{%- elif o == '5' -%}{{ states('sensor.smol_5_ap_channel') }}{%- else -%}none{%- endif -%}
+            {%- set ns = namespace(v='') -%}
+            {%- for kv in trigger.payload.split('|') -%}{%- if kv.startswith('ap=') -%}{%- set ns.v = kv.split('=',1)[1].split(':')[0] -%}{%- endif -%}{%- endfor -%}
+            {{ ns.v if ns.v else 'none' }}
           ap_rssi: >-
-            {%- set o = state_attr('sensor.smol_mesh_channel','owner') | string -%}{%- if o == '8' -%}{{ state_attr('sensor.smol_8_ap_channel','rssi') }}{%- elif o == '5' -%}{{ state_attr('sensor.smol_5_ap_channel','rssi') }}{%- else -%}none{%- endif -%}
-          ap_bssid: >-
-            {%- set o = state_attr('sensor.smol_mesh_channel','owner') | string -%}{%- if o == '8' -%}{{ state_attr('sensor.smol_8_ap_channel','bssid') }}{%- elif o == '5' -%}{{ state_attr('sensor.smol_5_ap_channel','bssid') }}{%- else -%}none{%- endif -%}
-          ap_reporters: >-
-            {%- set ns = namespace(c=0) -%}{%- for e in ['sensor.smol_8_ap_channel','sensor.smol_5_ap_channel'] -%}{%- if states(e) not in ['unavailable','unknown','none',''] -%}{%- set ns.c = ns.c + 1 -%}{%- endif -%}{%- endfor -%}{{ ns.c }}
-          note: "GREEN=crown AP co-channel with mesh · RED=mismatch (coexist broken -> OTA dead, the ch1-vs-ch6 trap) · AMBER=co-channel but AP rssi<=-80. crown=the MC owner (smol/mesh/channel); only the WiFi-uplink crown reports ap=. Cause of the OTA death-point tiles below."
+            {%- set ns = namespace(v='') -%}
+            {%- for kv in trigger.payload.split('|') -%}{%- if kv.startswith('ap=') -%}{%- set ns.v = kv.split('=',1)[1] -%}{%- endif -%}{%- endfor -%}
+            {%- set p = ns.v.split(':') -%}{{ (p[1] | int(0)) if p | length >= 2 else 0 }}
+          co_channel: >-
+            {%- set ns = namespace(v='') -%}
+            {%- for kv in trigger.payload.split('|') -%}{%- if kv.startswith('cc=') -%}{%- set ns.v = kv.split('=',1)[1] -%}{%- endif -%}{%- endfor -%}
+            {{ ns.v }}
+          # DELIBERATELY not called `degraded`: the firmware's `degraded=1` means the strand-guard
+          # has LATCHED because the crown is off-channel (MQTT alive, OTA off, never crownless).
+          # This sensor's `degraded` STATE means co-channel with a weak uplink. Two different
+          # conditions; giving them one name would make a latched strand-guard read as bad signal.
+          strand_guard_latched: >-
+            {%- set ns = namespace(v='') -%}
+            {%- for kv in trigger.payload.split('|') -%}{%- if kv.startswith('degraded=') -%}{%- set ns.v = kv.split('=',1)[1] -%}{%- endif -%}{%- endfor -%}
+            {{ ns.v == '1' }}
+          note: >-
+            GREEN=crown AP co-channel with the mesh (firmware `cc=1`) · RED=off-channel (coexist
+            broken -> OTA dead, the ch1-vs-ch6 trap) · AMBER=co-channel but AP rssi<=-80.
+            Sourced from the ELECTED crown's own DIAG, so it follows a takeover to any id with no
+            candidate list. `unknown` means no crown record carrying `cc=` has arrived — that is
+            "cannot see the crown", NOT a pass. `strand_guard_latched` is the firmware's own
+            `degraded=` flag and is a different condition from this sensor's `degraded` state.
 
   # ======================================================================================
   # #153 burst-freeze (`brst=`) and #217 coexist belief-vs-observation (`apch=` vs `ap=`)
@@ -1125,6 +1187,61 @@ template:
             cdeaf, apch, blrev, brst — so a board reporting a cut here CANNOT deliver its
             burst-freeze measurement. Value is capped at 999 by the publisher, so 999 means
             "at least 999". Crowns are unaffected: they self-publish the full record over MQTT.
+
+  # ======================================================================================
+  # #153 `blrev=` — the MEASURED bootloader auto-revert capability.
+  #
+  # This closes a gate the roadmap has carried as UNPROVEN since July: does the bootloader do
+  # app-rollback, or is the app-side `boot_confirm` path the only thing between a bad image and a
+  # brick? `on` = the net exists. `off` = it does not, and canary discipline is load-bearing.
+  #
+  # THREE answers, and absent is not one of them. The field is omitted entirely when never
+  # observed, and that is the COMMON case, because the value is only measurable on a post-OTA boot:
+  # it lives in RTC-fast persistent RAM, survives the rollback's software_reset, holds for the
+  # power-on session the OTA started, and a power cycle clears it. So `unknown` here means "no OTA
+  # boot has been observed since this board last lost power" — emphatically NOT "no net".
+  # Rendering absence as `off` would invent a brick risk; rendering it as `on` would invent safety.
+  #
+  # Deliberately NOT crown-filtered. Any board that boots an OTA image can answer, and the boards
+  # that get OTA'd are exactly the ones worth hearing from. In practice a leaf's answer is lost to
+  # the 232 B tail truncation (#306) — `blrev=` sits in the dropped region — so today this is
+  # crown-or-recently-crowned in effect, which `sensor.smol_diag_truncated` will corroborate.
+  #
+  # It holds its value on purpose (no reset-to-unknown between reports): the failure mode here is
+  # boring, per the lead — an OTA campaign runs, the answer scrolls past, nobody writes it down.
+  # The `measured_by`/`last_changed` pair is the provenance that makes a held value readable.
+  # ======================================================================================
+  - trigger:
+      - platform: mqtt
+        topic: "smol/+/diag"
+    condition:
+      - condition: template
+        value_template: "{{ trigger.payload is string and (trigger.payload.split('|') | select('search','^blrev=') | list | count) > 0 }}"
+    sensor:
+      - name: "smol bootloader revert"
+        unique_id: smol_bootloader_revert
+        icon: >-
+          {%- set s = states('sensor.smol_bootloader_revert') -%}
+          {%- if s == 'on' -%}mdi:shield-check{%- elif s == 'off' -%}mdi:shield-off-outline{%- else -%}mdi:shield-question-outline{%- endif -%}
+        state: >-
+          {%- set ns = namespace(v='') -%}
+          {%- for kv in trigger.payload.split('|') -%}{%- if kv.startswith('blrev=') -%}{%- set ns.v = kv.split('=',1)[1] -%}{%- endif -%}{%- endfor -%}
+          {{ ns.v if ns.v in ['on','off'] else 'unknown' }}
+        attributes:
+          measured_by: "{{ trigger.topic.split('/')[1] }}"
+          verdict: >-
+            {%- set ns = namespace(v='') -%}
+            {%- for kv in trigger.payload.split('|') -%}{%- if kv.startswith('blrev=') -%}{%- set ns.v = kv.split('=',1)[1] -%}{%- endif -%}{%- endfor -%}
+            {%- if ns.v == 'on' -%}bootloader DOES auto-revert — a bad OTA image has a net beneath the app
+            {%- elif ns.v == 'off' -%}bootloader does NOT auto-revert — the app-side boot_confirm is the ONLY net, canary one board at a time
+            {%- else -%}not measured — only observable on a post-OTA boot, and a power cycle clears it{%- endif -%}
+          note: >-
+            Measured, not assumed: recorded by boot_confirm on a post-OTA boot, held in RTC-fast
+            persistent RAM for that power-on session. `unknown` means no OTA boot has been seen
+            since this board last lost power — NOT that there is no net. `off` is the honest
+            reading of "not promoted": whether rollback is disabled or the bootloader simply did
+            not set the state, the operational consequence is the same. On a leaf the answer is
+            usually lost to the 232 B DIAG tail truncation (#306).
 
   - trigger:
       - platform: mqtt
