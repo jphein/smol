@@ -39,8 +39,10 @@ except ImportError:
 # Reject anything we do not understand instead of ignoring it. A tolerated typo (`--chek`)
 # would run the REAL path and save — the one mistake this flag exists to make impossible.
 CHECK="--check" in sys.argv[1:]
-_bad=[a for a in sys.argv[1:] if a!="--check"]
-if _bad: sys.exit(f"unknown argument(s): {' '.join(_bad)} — the only flag is --check")
+FROM_WORKTREE="--from-worktree" in sys.argv[1:]
+_FLAGS=("--check","--from-worktree")
+_bad=[a for a in sys.argv[1:] if a not in _FLAGS]
+if _bad: sys.exit(f"unknown argument(s): {' '.join(_bad)} — flags are {' '.join(_FLAGS)}")
 # The scaffold, the SVG and the pre-save backup are all opened by RELATIVE path, so the script
 # only ever worked when run from its own directory — README documented `python3
 # dashboard/build_control_room.py` from the repo root, which died on the scaffold open(). Anchor
@@ -660,6 +662,113 @@ def gen_topology(nodes, seat, rost=None):
     P.append('</svg>')
     return "".join(P)
 
+# ============================ DEPLOY GUARD ==============================================
+# A deploy publishes WHATEVER IS IN THE WORKING TREE. That is the whole hazard: this script's
+# input is the scaffold on disk and the code is itself on disk, so every real run publishes
+# unreviewed state — including a colleague's half-finished edit, since one repo is routinely
+# shared by several people at once.
+#
+# Not theoretical. 2026-07-28: a routine deploy executed an armed RETIRE_LIVE removal belonging
+# to someone else, and with slightly different timing would have shipped an uncommitted `blrev`
+# tile that rendered a literal `_None_` on the dashboard. Nothing refused; nothing even said so.
+#
+# So the default inverts: BUILD FROM `HEAD`, the reviewed state, and make the working tree the
+# thing you opt into. That is not a new idea — it is the trick an operator already reached for
+# by hand that day to avoid deploying a colleague's changes. Turning a discovered workaround
+# into the mechanism is usually the sign of a correct default.
+#
+#   --check           read-only; always reads the WORKTREE, because its job is "what would my
+#                     current edits produce". Never refuses. Prints its source so the answer is
+#                     never mistaken for what a deploy would ship.
+#   (deploy)          reads HEAD. REFUSES (exit 4) if this script itself is dirty, because the
+#                     code about to run would not be the reviewed code.
+#   --from-worktree   deliberate iteration: deploy the working tree anyway. Never silent — it
+#                     names every modified file and what each one adds first.
+GUARD_PATHS=("build_control_room.py","smol-control-scaffold.yaml")   # what a build actually reads
+
+def _git(*a):
+    """Run git; (stdout, None) or (None, reason). A guard that cannot check must never pass."""
+    try:
+        r=subprocess.run(("git",)+a,capture_output=True,text=True,timeout=15)
+    except (OSError,subprocess.SubprocessError) as e:
+        return None,f"{type(e).__name__}: {e}"
+    if r.returncode!=0: return None,(r.stderr.strip() or f"git {' '.join(a)} exited {r.returncode}")
+    return r.stdout,None
+
+def dirty_paths():
+    """({path: status}, None) or (None, reason). Staged AND unstaged both count: `git add` is
+    not review, and a staged-but-uncommitted hunk ships exactly like an unstaged one."""
+    out,err=_git("status","--porcelain","--",*GUARD_PATHS)
+    if err: return None,err
+    d={}
+    for line in out.splitlines():
+        if len(line)>3: d[line[3:].strip()]=line[:2]
+    return d,None
+
+def _added_defs(path):
+    """Top-level names a dirty file ADDS, as identification.
+
+    Names, not prose. Ownership heuristics that grep for words appearing in both authors' diffs
+    mislabel — that happened twice in one session, in both directions. An added `def`/CONSTANT is
+    unambiguous, and it is what lets an operator recognise at a glance that a change is not
+    theirs."""
+    # `:/` = repo-root-relative pathspec. `git status --porcelain` reports paths from the repo
+    # root while this process has chdir'd to ha/dashboard, so a bare path resolved to
+    # ha/dashboard/ha/dashboard/… and matched nothing — the guard printed no `adds:` line at all
+    # and looked like it had simply found nothing to say. Caught only by testing the refusal and
+    # noticing the silence. A guard whose evidence quietly comes out empty is worse than loud.
+    out,err=_git("diff","HEAD","--unified=0","--",f":/{path}")
+    if err or not out: return []
+    return sorted({m.group(1) for m in
+                   re.finditer(r"^\+(?:def |class )?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(|=)",out,re.M)})
+
+def read_scaffold():
+    """The scaffold text a build should use, plus a human label for where it came from."""
+    name="smol-control-scaffold.yaml"
+    if CHECK or FROM_WORKTREE:
+        return open(name).read(), "WORKTREE"
+    out,err=_git("show",f"HEAD:./{name}")
+    if err:                       # cannot reach HEAD → cannot claim reviewed → do not guess
+        return None,f"cannot read {name} from HEAD ({err})"
+    return out,"HEAD"
+
+def deploy_guard():
+    """Called only on the deploy path. Returns None to proceed, or an exit code to stop.
+
+    Refusal (4) is deliberately distinct from failure (2) and from clean (0): 'I stopped you' and
+    'I broke' demand different responses, and collapsing them is how an operator learns to
+    re-run past a real refusal."""
+    dirty,err=dirty_paths()
+    if err:
+        print(f"!! cannot determine whether the working tree is clean — {err}")
+        print("   Refusing to deploy: unverified is not the same as clean.")
+        return 2
+    if not dirty:
+        print("guard: working tree clean for the files a build reads · scaffold from HEAD")
+        return None
+
+    print("\n  ── DEPLOY GUARD ─────────────────────────────────────────────")
+    print("  These files a build READS are modified and NOT committed:")
+    for p,stat in sorted(dirty.items()):
+        adds=_added_defs(p)
+        print(f"    {stat}  {p}")
+        if adds: print(f"          adds: {', '.join(adds[:8])}{' …' if len(adds)>8 else ''}")
+    print("  Uncommitted work has no author on it. If you do not recognise the names above,")
+    print("  they are someone else's, and a deploy publishes them to the live dashboard.")
+
+    self_dirty=any(p.endswith("build_control_room.py") for p in dirty)
+    if not FROM_WORKTREE:
+        if self_dirty:
+            print("\n  REFUSED · this script itself is modified, so the code about to run is not")
+            print("  the reviewed code. Commit it, or re-run with --from-worktree to accept that.")
+            return 4
+        print("\n  Proceeding: the scaffold is read from HEAD, so the modifications above are")
+        print("  NOT shipped. Re-run with --from-worktree if you meant to deploy them.")
+        return None
+    print("\n  --from-worktree: deploying the modifications above ON PURPOSE.")
+    return None
+# ========================================================================================
+
 def serve(name, svg):
     xml_parse(svg)                     # parse either way — a malformed SVG is a finding, not a no-op
     url=f"{LOCAL}/{name}?v={hashlib.md5(svg.encode()).hexdigest()[:8]}"
@@ -806,7 +915,15 @@ async def read_roster(ws, timeout=8.0):
     return out
 
 async def main():
-    view=yaml.safe_load(open("smol-control-scaffold.yaml"))
+    # The guard runs BEFORE the network: refusing after a full discovery pass wastes a minute and,
+    # worse, prints a wall of fleet output above the refusal where nobody reads it.
+    if not CHECK:
+        rc=deploy_guard()
+        if rc is not None: return rc
+    text,src=read_scaffold()
+    if text is None: print(f"!! {src}"); return 2
+    print(f"scaffold source: {src}")
+    view=yaml.safe_load(text)
     async with websockets.connect(URI,max_size=16*1024*1024,ssl=SSLCTX) as ws:
         json.loads(await ws.recv()); await ws.send(json.dumps({"type":"auth","access_token":TOKEN})); await ws.recv()
         # SAY WHICH DASHBOARD, EVERY RUN. A previous session verified its work against
