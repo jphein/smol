@@ -318,6 +318,21 @@ The same discipline applies to **time**, not only space: the Bard panel loops a 
 the real board never stops, so the caption says so. A mockup that differs from the hardware in *any*
 dimension — resolution, extent, duration — should say which.
 
+### Idempotency is the property to test, not correctness of a single run
+
+A generator that produces the right output *once* can still be broken. The `ha/` dashboard generator
+was **accreting a card or two per run**: the topology image's cache-busting `?v=<hash>` query changed
+every run, which broke card *identity*, so the merge step saw a new card instead of the existing one.
+A single run looked perfect. Only *repeated* runs exposed it — and the fix that introduced it had
+traded a destructive bug (eating live cards) for a slow-growth one, which is the harder failure to
+notice.
+
+**So: run any generator twice and diff.** `tools/ha_deploy.sh status|diff` exists for this. The
+question is not "did it produce the right thing?" but "**is the second run a no-op?**" Anything that
+merges into existing state — dashboards, config, generated docs, the site's `content.json` — needs
+that check, and a volatile field (a hash, a timestamp, a `?v=`) inside an identity key is the usual
+culprit.
+
 ### Site checklist
 
 - [ ] Favicon present; **dark *and* light** via `prefers-color-scheme` (JP's standing preference).

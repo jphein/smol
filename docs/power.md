@@ -9,7 +9,7 @@
 - **Feed the protected cell into the SuperMini's `5V`/`VBUS` pin and let the onboard ME6211 LDO make 3.3 V.** This is the simplest safe path and works for smol's low current. You do **not** strictly need a boost/buck-boost.
 - **Never wire a raw 4.2 V cell to the `3V3` pin.** `3V3` is the LDO *output* and connects straight to the ESP32-C3, whose absolute max is **3.6 V**. 4.2 V there **destroys the chip**.
 - **Two real gotchas:** (a) don't back-power `5V` while USB is plugged into the SuperMini — you'd fight the USB 5 V rail; add a **Schottky diode** or a switch. (b) The **default TP4056 charges at 1 A, which is 4C for a 250 mAh cell — unsafe.** Swap the program resistor to charge at ~125 mA (0.5C).
-- **Battery life:** roughly **2.5–5 h** BLE-active (biggest driver is the radio, ~40–100 mA), **6–10+ h** if you idle the OLED and radio, and **weeks** if you use deep sleep between wakes.
+- **Battery life:** **~5 h measured** on id8 in the Bard's `inf` mode — smol's worst case, 0.2 W at the 5 V input (§4). Longer if you idle the OLED and radio; **weeks** with deep sleep between wakes. *(The older "2.5–5 h BLE-active" figure was borrowed and described BLE modes this firmware does not run — #22 refuted native BLE on the C3.)*
 
 ---
 
@@ -163,9 +163,56 @@ We deepened the interior by **~6.5 mm for the battery only.** Assessment:
 
 ## 4. Battery-life estimate (250 mAh)
 
-### Stated assumptions (measured/typical ESP32-C3 figures)
+### 🟢 MEASURED — smol's actual worst case (2026-07-27)
 
-These are **at 3.3 V**; the numbers below fold in the OLED and treat the LDO as ~lossless at these currents (true within a few percent). Sources: robdobson C3 measurements, Espressif docs, OLED vendor figures.
+**The first measured number in this section.** Everything after it is borrowed (see the flag below).
+JP put an inline USB meter on **id8** while the Bard narrated in `inf` mode:
+
+| | value |
+|---|---|
+| **Measured at the 5 V USB input** (inline meter — *not* the 3.3 V rail, *not* chip-only) | **0.2 W** |
+| ⇒ input current, `0.2 W ÷ 5 V` | **~40 mA** |
+| ⇒ power actually delivered to the board at 3.3 V | ~0.13 W (the other ~0.07 W is LDO heat) |
+| ⇒ battery-side draw at 3.7 V nominal | ~0.15 W |
+| ⇒ runtime on this doc's ~200 mAh usable | **~5 h** |
+
+**What was running** — this is a *specific* worst case, not a generic one: id8 on **gateway/crown duty
+with the radio live**, **OLED on**, Bard in **`inf` mode at 120 ms/char**, narrating from JP's own
+32-token prompt. `inf` is **near-continuous compute**, which is exactly why it is the ceiling.
+
+> **Why 40 mA is comparable to the 3.3 V table below** — worth spelling out, because comparing a 5 V
+> measurement against chip-side rows is how you get a wrong answer. **An LDO is a current
+> pass-through:** input current ≈ output current, and the surplus volts become *heat*, not extra
+> current. So ~40 mA at 5 V in is ~40 mA at 3.3 V out, directly comparable. Both runtime routes agree:
+> `200 mAh ÷ 40 mA = 5.0 h` and `(0.200 Ah × 3.7 V) ÷ 0.148 W = 5.0 h`.
+> ⚠️ **This equivalence holds only on the LDO path.** On a boost path (§1) input and output currents
+> differ and none of the above transfers. And do **not** divide the 5 V-side *power* by battery energy
+> — `0.74 Wh ÷ 0.2 W` gives 3.7 h, which mixes axes and is wrong.
+
+**Still unmeasured, deliberately left blank rather than interpolated:** **idle**, **`page` mode**, and
+**a leaf that never associates** (no WiFi, no crown duty — likely the fleet's *floor*). Reading a
+meter needs a human, so these are gaps, not estimates. An interpolated value sitting in a row labelled
+*measured* is precisely the trap [DOC-UPKEEP](DOC-UPKEEP.md) calls *a number you derived is not a
+number you measured*.
+
+> **The power story is `page` mode and the pause.** `inf` pins the CPU; **pausing genuinely stops
+> generation**, so short-press pause/resume is a **power feature**, not only a UX nicety — likely the
+> largest single lever on this figure.
+
+### ⚠️ Everything below is BORROWED — and mostly for modes smol does not run
+
+These are **third-party** figures (robdobson's C3 measurements, Espressif docs, OLED vendor numbers),
+not smol measurements. Two consequences:
+
+1. **Most rows describe BLE modes this firmware never enters.** Native BLE was **refuted on hardware**
+   for smol's Rust fleet (#22 — ROM busy-waits in btdm init / PHY calibration), so the BLE-advertising
+   and BLE-connected rows answer a question nobody is asking here. They are kept because they bound
+   the *radio* cost usefully and because the C3 landscape docs reference them.
+2. **The mode the fleet actually runs — WiFi-associated gateway duty with ESP-NOW coexist — has no row
+   at all.** The measured block above is the only figure for it.
+
+These are **at 3.3 V**; they fold in the OLED and treat the LDO as ~lossless at these currents (true
+within a few percent).
 
 | Mode | ESP32-C3 draw | + 0.42" OLED | ≈ System avg | Basis |
 |---|---|---|---|---|
@@ -192,7 +239,7 @@ Usable capacity from a 250 mAh cell is realistically **~200 mAh** (you don't run
 | Deep sleep with periodic wake (real SuperMini ~0.4 mA floor) | ~0.4 mA | **~3 weeks** (floor-limited) |
 | Deep sleep, floor removed (LED + LDO mods, ~40 µA) | ~0.04 mA | **months** (self-discharge dominates) |
 
-**Bottom line:** with BLE active, plan on **~2.5–5 hours** on a single 250 mAh cell. That's the honest number for a BLE handheld. To go longer you must **duty-cycle the radio and OLED**.
+**Bottom line for smol:** plan on **~5 h** on a single 250 mAh cell in the heaviest mode we have measured (Bard `inf`, radio live, OLED on). To go longer, **duty-cycle the radio and OLED** — and **use `page` mode or pause**, which stops generation outright. The BLE figures above are a bound on a *different* device: a BLE handheld, which smol is not (#22).
 
 ### Deep-sleep options to extend it
 
