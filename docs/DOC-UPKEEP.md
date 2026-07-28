@@ -60,6 +60,41 @@ Measure the ELF/binary, or take the figure from a source that says it measured o
 a PR's measured table, `Cargo.toml`'s partition rationale). If you cannot tell whether a number was
 projected or measured, treat it as projected.
 
+### ⚠️ An imprecise SCOPE hides a whole failure class
+
+Not a wrong claim — a **true claim stated too broadly**. It reads as correct, survives every proofread,
+and quietly excludes the case that matters.
+
+Worked example, and the cost is out of all proportion to the words: `names.rs` said node names
+**"NEVER go on the wire."** True of every ESP-NOW frame — and **names do go out as strings in HA
+discovery, against a 512 B packet.** That four-word imprecision is **part of why the discovery budget
+went unwatched until 29 ids were silently publishing nothing.** The corrected version is *"never on the
+**mesh** wire."* One word, and it would have kept a budget visible.
+
+**So when writing a negative claim, name the scope it holds in.** *"Never on the mesh wire"*, not
+*"never on the wire"*. *"Not in `.bss`"*, not *"nowhere in DRAM"*. A negative without a scope is read as
+universal, and the excluded case is exactly where nobody looks.
+
+### 📊 Five documented-but-never-true properties in one day — all found by writing a check
+
+Worth recording as a measurement rather than a maxim, because it settles a real question: **is careful
+prose or a machine check the better guard for an invariant?**
+
+| Property | Claimed | Reality |
+|---|---|---|
+| `familiar/mod.rs:280` | *"distinct from any node's name"* | drew from the **identical** corpus, since it was written |
+| realm-sigil module docs | themed realms *"draw from disjoint vocabularies on purpose"* | `forge` shared `ember` with `fleet` |
+| DOC-UPKEEP (mine) | *"`id 7 = Draconic Dominion` is **permanently** true"* | died to a corpus change **hours later** |
+| `names.rs` corpus-drift warning | named `realms.json` as the stale side | **backwards** — that is the current source |
+| `names.rs` | names *"never go on the wire"* | true of the mesh wire only; see above |
+
+**None of the five was found by proofreading. Every one was found by building a checker, running a test,
+or making a change that contradicted it.** Three were written by the people who then found them.
+
+**The conclusion: an invariant stated in prose is a wish; an invariant asserted in code is a
+constraint.** Prefer a const assertion, an exhaustive enumeration or a failing build to any amount of
+careful wording — and when prose is the only option, expect it to be wrong and date it.
+
 ### ⚠️ Ask whether a claim is about a VALUE or a KIND — kinds are cheap to refute
 
 Before spending effort re-deriving a claim, classify it. **Value-claims** (*this is 462 B*, *this is
