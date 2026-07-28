@@ -232,18 +232,70 @@ attached to a specific experiment.
 
 ## 5. Two corrections to the open measurements
 
-**`brst=` is *structurally* crown-only, not crown-only-because-truncated.** The brief frames it as
-*"crown-only **and** truncated off the leaf record,"* and that conjunction misleads. `note_burst` is
-called at three sites (`main.rs:1037/1532/1571`), all inside gateway burst paths — and **only a
-gateway runs a WiFi telemetry burst at all.** A leaf has *nothing to report*, so truncation is
-irrelevant for `brst`. **The sole blocker is that the crown has not taken the instrumented build.**
-Truncation *is* the blocker for `blrev=`, which every OTA'd board genuinely has — which is exactly
-why HANDOFF §1a calls `blrev` the sharper problem. Keep the two apart.
+### 🔴 `brst=3009:0:r` is an ARTIFACT. Do not cite it. The freeze is still unmeasured.
 
-**Both remain code-readings, and the migration's headline claim depends on one of them.** Any
-statement that Embassy fixes JP's freezes is **unmeasured**. §1's invariant table is likewise a
-code-reading; it is a strong one (the safety arguments are in the source comments) but nothing here
-has been run on hardware.
+A retained reading — `smol/8/diag … |brst=3009:0:r` on id8 Nexus — was circulated as *"a measured
+3,009 ms UI freeze during a crown re-election,"* with the advice *"trust the gap, not the duration."*
+
+**Both halves are wrong, and `main` had already found and fixed the cause.** Commit **`5261df8` —
+*"fix(diag): brst= attributed gaps to bursts that never ran"*** names **this exact reading** as the
+bug it removes (`main.rs:1046-1058`):
+
+> *"`brst=3009:0:r` on id8 — a 3,009 ms app gap attributed to a re-election of ZERO duration. Both
+> halves were wrong in different ways. The gap was real but came from the **OTA/association path in
+> the PREVIOUS tick** (`last_app_ms` is a tick behind at this point), and the duration was 0 because
+> `maybe_leaf_reelect` had **returned immediately without doing anything at all**."*
+
+- **No re-election ran.** `note_burst` used to fire unconditionally; the guard is now
+  `if probe.ran()`, where `ran()` is `yields > 0` — *"a burst that never yielded never blocked, so
+  `yields > 0` is exactly the question."*
+- **"Trust the gap, not the duration" is inverted.** `dur=0` is precisely the **tell** that the gap is
+  misattributed. The duration is what exposes the reading; discarding it discards the evidence.
+- The fix now guards **all three** arms (`main.rs:1055 / 1554 / 1595`), so `f` and `n` could have
+  produced the same artifact and no longer can.
+
+⚠️ **The bad reading is retained on the broker and will be re-read by the next person who subscribes.**
+Treat any `brst=` with a `0` duration as an artifact of a pre-`5261df8` image.
+
+**What survives, and it is worth more than the number would have been.** The 3,009 ms gap was
+**real** — id8 genuinely went ~3 s without servicing the app — and per `5261df8` it came from the
+**OTA/association path**, which is instrumented by **none** of the three arms. So:
+
+> **The instrumentation has a coverage hole, and the one large gap ever observed fell in it.**
+> If the freeze JP feels lives in the OTA/association path, then instrumenting flush and re-election
+> harder will keep missing it.
+
+That is a sharper lead than a re-election number, and it is available now.
+
+### And a correction to this document's own earlier claim
+
+> ❌ **This section previously said `brst=` is "structurally crown-only, because only a gateway runs a
+> WiFi burst." That is wrong, and I retract it.** The three kinds partition by role in **opposite**
+> directions:
+> - **`f` / `n` are crown-only** — both ride `relay_ready_to_flush`, which returns false when
+>   `!is_gateway && !debug_wifi_all` (`mode.rs:3912`). Note the escape hatch: with `debug_wifi_all` set,
+>   **a leaf flushes too.**
+> - **`r` is leaf-only** — `maybe_leaf_reelect` opens with `if self.relay.is_gateway { return false; }`,
+>   *"a gateway re-decides on its own flush; **only leaves recover here**"* (`mode.rs:2396`). A leaf
+>   re-election **re-associates to WiFi**, so leaves absolutely do burst.
+>
+> **My error was the same shape as the one this document criticises elsewhere:** I found one
+> `!r.is_gateway()` guard near the flush region and generalised it to all three `note_burst` sites
+> without checking each. A correct fact attached to the wrong scope — DOC-UPKEEP §2, self-inflicted.
+
+**The misalignment that kept this unmeasured is real, though, and survives both errors.** The
+**crown-only** kinds are the **visible** ones (a crown self-publishes its full record); the
+**leaf-only** kind is the **invisible** one (a leaf's relayed DIAG truncates at 232 B and drops
+`brst=`, #306). The instrumentation and the truncation are biased against each other. The id8 record
+escaped only because Nexus had **just associated to WiFi for an OTA self-fetch** (`ap=6:-56` present,
+no `cut=`) and so published its **own full record** rather than a truncated relayed one — *the only
+reason a leaf's freeze metric was visible at all is that the leaf had temporarily stopped behaving
+like a leaf.*
+
+**So benefit 1 remains a code-reading.** Any statement that Embassy fixes JP's freezes is still
+**unmeasured** — the first candidate number was an artifact. §1's invariant table is likewise a
+code-reading; a strong one (the safety arguments are in the source comments) but nothing here has run
+on hardware.
 
 **The plan's harness floor is stale.** [`embassy-ota-verification.md`](../plans/embassy-ota-verification.md)
 §2 says *"confirm you are on `fa2e6aa` or later."* `tools/ota_verify.sh` was fixed **again** at
