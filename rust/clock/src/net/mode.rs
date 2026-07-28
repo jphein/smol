@@ -3547,6 +3547,22 @@ impl RadioManager {
             if !p.id_known {
                 continue; // no id ⇒ HA can't place it; skip (never emit an unknown id)
             }
+            // luna #4: the roster is keyed by MAC, so ONE board heard under two MACs (a
+            // re-provision, a fresh MAC after a reflash) appears twice — `smol/50/peers` listed id51
+            // as both `51,211,…` and `51,208,…`. Emit each id ONCE, keeping the STRONGEST entry: the
+            // duplicate is the same physical board, and the stronger reading is the live one. Skip
+            // this entry if another with the same id beats it; the index tie-break keeps the choice
+            // total and stable (never emit both, never emit neither). O(n²) over ≤16 slots.
+            let beaten = (0..view.count).any(|j| {
+                let q = view.nodes[j];
+                j != i
+                    && q.id_known
+                    && q.id == p.id
+                    && (q.rssi > p.rssi || (q.rssi == p.rssi && j < i))
+            });
+            if beaten {
+                continue;
+            }
             let flags: u8 = (p.connected as u8) | ((p.has_mesh_time as u8) << 1);
             let sep = if emitted == 0 { "" } else { ";" };
             let start = w.len;
@@ -5261,9 +5277,16 @@ impl RadioManager {
                 self.diag.ddrops = self.diag.ddrops.saturating_add(1);
                 continue;
             }
-            // RSSI of this frame (dBm) from the ESP-NOW RX control info; used by
-            // BENCH. Captured up front so each arm can record it if relevant.
-            let rssi = recv.info.rx_control.rssi;
+            // RSSI of this frame (dBm) from the ESP-NOW RX control info; used by BENCH and the
+            // roster. Captured up front so each arm can record it if relevant.
+            //
+            // luna #1 (a real data bug): the RX control field arrives as an UNSIGNED byte widened to
+            // i32, so -81 dBm reached the roster — and `smol/<id>/peers` — as 175. Every published
+            // value was in 175..=230 and any consumer that did not defend itself was silently wrong,
+            // which is why this belongs at the PUBLISHER and not in each reader. `as i8 as i32`
+            // reinterprets the byte as two's complement; it is idempotent for a value that was
+            // already correctly negative (-81 as i8 is -81), so it cannot double-convert.
+            let rssi = recv.info.rx_control.rssi as i8 as i32;
             // #29: learn the channel this frame arrived on = this board's live ESP-NOW channel.
             // Advisory; the gateway publishes it in the MC record so leaves can pre-tune on roam.
             self.learned_channel = recv.info.rx_control.channel as u8;
