@@ -98,13 +98,16 @@ Each id maps to a deterministic **magical name**. Since `8e47325` the corpus com
 mapping is `adj = fleet.adjectives[seed % 32]`, `noun = fleet.nouns[(seed >> 8) % 32]`,
 `seed = id * 2_654_435_761`.
 
-> ⏳ **Two mappings — check which one your board is running.** The whole naming chain (`f63dbea`,
-> `8e47325`, `af7d678`, `53ee511`, `f091a00`) is **on `feat/sigil-discovery-budget` and NOT on `main`**
-> (verified by `merge-base --is-ancestor`). **The live fleet on 906/907 still uses the LEFT column.**
+> ⏳ **Two mappings — the rename is on `main`, your board probably is not.** The chain merged
+> 2026-07-28 (`5934682`, all five of `f63dbea` `8e47325` `af7d678` `53ee511` `f091a00` now ancestors of
+> `main`), so **`main` produces the RIGHT column** — but **a board keeps answering to the left column
+> until it is flashed with a build containing `f63dbea`.** Check the board's own SIGIL or About screen,
+> not this file.
 
-| id | on `main` + live fleet **today** | after the chain merges |
+| id | what a board flashed **before** `f63dbea` shows | what `main` produces **now** |
 |---|---|---|
 | 5 | Spectral **Aegis** | Obsidian **Aegis** |
+| 7 | Draconic **Dominion** | Radiant **Obelisk** |
 | 8 | Eldritch **Nexus** | Eldritch **Jewel** |
 | 9 | Jade **Herald** | Seraphic **Dominion** |
 | 42 | Celestial **Herald** | Gilded **Quartz** |
@@ -113,15 +116,23 @@ mapping is `adj = fleet.adjectives[seed % 32]`, `noun = fleet.nouns[(seed >> 8) 
 | 122 | Celestial **Crown** | Somber **Vigil** |
 | 236 | Radiant **Herald** | Hollow **Lantern** |
 
-**On merge: delete the left column and this note.**
+Right column regenerated from merged `main`, not copied from the branch:
+`cargo run -q --example board_names --all` in `rust/viz/mesh-model` (a pure function of the id — needs
+no fleet contact).
 
-**After the merge, uniqueness is a compile-time guarantee rather than a hope:** `is_injective_over_u8` enumerates all 256
+**Delete the left column when the FLEET HAS BEEN ROLLED onto a build containing `f63dbea` — the
+trigger is the roll, not the merge.** ⚠️ This note previously said *"on merge, delete the left column"*,
+which was **wrong, and the mistake is worth keeping**: merging changes what `main` *produces*; only a
+flash changes what a board *answers to*. Two different events, and a bench doc lives entirely in the
+second one.
+
+**Uniqueness is now a compile-time guarantee rather than a hope:** `is_injective_over_u8` enumerates all 256
 ids during **const evaluation**, so a colliding namespace **does not compile**. The 32×32 size lock and
 the reserved-word exclusion are const assertions too. Full reasoning:
 [lexicon's node-identity design](https://github.com/jphein/lexicon.realm.watch) →
 `docs/superpowers/design/node-identity-namespace.md`.
 
-> ⚠️ **These names changed on 2026-07-28 and the old ones are wrong.** Previously id7 *Draconic
+> ⚠️ **These names changed on 2026-07-28.** Previously id7 *Draconic
 > Dominion*, id8 *Eldritch Nexus*, id9 *Jade Herald*, id50 *Kindled Ember*, id51 *Primal Sigil*,
 > id122 *Celestial Crown*. The old corpus was 20×20 and could not produce unique names — **93
 > collisions across 256 ids** — and six of its nouns were project vocabulary (`crown` is the gateway
