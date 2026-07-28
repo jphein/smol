@@ -1,0 +1,39 @@
+[package]
+name = "sigil-names"
+version = "0.1.0"
+edition = "2021"
+description = "VENDORED copy of realm-sigil's Rust binding. src/ is byte-identical upstream; do not edit."
+
+# ⚠️ VENDORED, NOT AUTHORED HERE. `src/lib.rs`, `src/realms.rs` and `src/reserved.rs` are
+# byte-identical copies of realm-sigil's `rust/src/`. Edit them THERE, regenerate with
+# `./sync-words.sh --only rust`, then re-vendor with `tools/sigil_vendor.sh --sync`.
+#
+# WHY vendored rather than a dependency: smol is a PUBLIC repo, so a `path` dependency on
+# ~/Projects/realm-sigil builds on JP's workstation and nowhere else, and a `git` dependency needs
+# the upstream commit pushed — which is JP's call. Vendoring is the only shape that builds for
+# everyone today. `tools/sigil_vendor.sh --check` is what keeps it from becoming the very drift it
+# replaced: it diffs against upstream when the sibling repo is present, and verifies a committed
+# sha256 manifest when it is not, so CI can catch in-tree tampering with no sibling checkout.
+#
+# When realm-sigil is pushed, swap this for
+#   sigil-names = { git = "https://github.com/jphein/realm-sigil", ... }
+# and delete this directory. The vendor is a bridge, not a destination.
+#
+# Deliberately OUTSIDE both `rust/clock` and `rust/viz` workspaces (they are kept separate so the
+# no_std firmware never entangles the host tools' lockfile — see rust/viz/Cargo.toml). This crate is
+# path-depended by both. It is safe to share precisely because it has ZERO dependencies and is
+# no_std: it adds nothing to either lockfile but itself.
+
+[lib]
+name = "sigil_names"
+path = "src/lib.rs"
+
+[dependencies]
+
+[features]
+# Node identity only. smol must NEVER enable `divergent-themed-realms`: its version names come from
+# the deliberately-pinned FORGE table in `clock/src/net/names.rs`, because version names are
+# historical record (v345 is "Furnace" in commits, memories and speech) and the upstream themed
+# corpora have moved. `fleet` is the one namespace that cannot diverge — it exists in no other
+# binding, so nothing else can produce a conflicting node name.
+default = []

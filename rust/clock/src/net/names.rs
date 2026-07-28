@@ -30,71 +30,77 @@
 //! likewise there if zero-config per-chip naming is ever wanted; smol is locked to
 //! id-seeding so it is omitted here to keep the module warning-free.)
 
-/// A realm's word corpus. `name = "{adjectives[seed % |A|]} {nouns[(seed>>8) % |N|]}"`.
-pub struct Realm {
-    pub adjectives: &'static [&'static str],
-    pub nouns: &'static [&'static str],
-}
+/// The corpus type and the index arithmetic now come from the sigil crate rather than being
+/// re-implemented here. This is the whole point of the change: there is one algorithm.
+///
+/// `seed_from_id` has no in-crate caller — `name_for_id` is the useful entry point — but it is
+/// re-exported anyway because it is the documented off-device parity function: `docs/BUILDING.md`
+/// tells a reader they can reproduce any node's name with `id * 2654435761`, and that claim should
+/// resolve to a symbol in the module the docs point at, not to a private detail of a dependency.
+#[allow(unused_imports)]
+pub use sigil_names::{name_for_seed, seed_from_id, Realm};
 
-/// The `fantasy` realm — verbatim from sigil's generated corpus (20 adj / 20 noun).
-pub static FANTASY: Realm = Realm {
-    adjectives: &[
-        "Arcane", "Blazing", "Celestial", "Draconic", "Eldritch", "Fabled", "Gilded",
-        "Hallowed", "Infernal", "Jade", "Kindled", "Luminous", "Mythic", "Noble", "Obsidian",
-        "Primal", "Radiant", "Spectral", "Twilight", "Valiant",
-    ],
-    nouns: &[
-        "Aegis", "Beacon", "Crown", "Dominion", "Ember", "Forge", "Grimoire", "Herald",
-        "Insignia", "Jewel", "Keystone", "Lantern", "Monolith", "Nexus", "Oracle", "Pinnacle",
-        "Quartz", "Relic", "Sigil", "Throne",
-    ],
-};
+/// The realm every smol unit agrees on: sigil's **`fleet`** group — node IDENTITY, 32x32,
+/// size-locked, reserved words excluded, and **proven collision-free over the entire `u8` id
+/// space at compile time**.
+///
+/// This replaced a hand-copied 20x20 `fantasy` table under which only 20 of 256 ids had a distinct
+/// noun — id9, id42 and id236 all published as bare "Herald" and were indistinguishable in every
+/// UI. The full adjective+noun pair collided too (163 distinct of 256), so propagating the
+/// adjective alone would not have been a guarantee, merely an improvement.
+pub const REALM: &Realm = sigil_names::FLEET;
 
-/// The realm every smol unit agrees on (sigil's `realm` string). LOCKED to fantasy
-/// for smol — this const is the single switch-point: repoint it (and paste the
-/// realm's table from research §7) to re-theme every node's name at once.
-pub const REALM: &Realm = &FANTASY;
-
-/// Knuth multiplicative-hash constant (2^32 / φ, rounded to odd). Spreads an 8-bit
-/// id across all 32 seed bits — see [`seed_from_id`].
-const GOLDEN_U32: u32 = 2_654_435_761;
-
-/// Faithful port of sigil's index math: `adj = A[seed % |A|]`,
-/// `noun = N[(seed >> 8) % |N|]`. Uses the list LENGTH (not a hard-coded 20),
-/// exactly like sigil's Go/Python source — the README's "% 20" only happens to be
-/// right because the generated lists are 20 long. `(seed >> 8)` still leaves 24
-/// bits for the noun. Matches sigil for any `u32` seed.
-#[inline]
-pub fn name_for_seed(seed: u32, realm: &'static Realm) -> (&'static str, &'static str) {
-    let adj = realm.adjectives[(seed as usize) % realm.adjectives.len()];
-    let noun = realm.nouns[((seed >> 8) as usize) % realm.nouns.len()];
-    (adj, noun)
-}
-
-/// Spread an 8-bit id across 32 bits so BOTH the adjective (`% |A|`) and the noun
-/// (`(>>8) % |N|`) vary between adjacent ids. WITHOUT this every id < 256 has
-/// `(seed >> 8) == 0` and shares noun index 0 — all nodes would get the same noun.
-/// This is the documented off-device parity function (research §6):
-/// `(id * 2654435761) & 0xFFFFFFFF`, which on-device is exactly `wrapping_mul`.
-#[inline]
-pub fn seed_from_id(id: u8) -> u32 {
-    (id as u32).wrapping_mul(GOLDEN_U32)
-}
-
-/// A node's `(adjective, noun)` from its logical id. Both mesh ends call this with
-/// the id carried in the frame to get an identical name. `.1` is the noun (the
-/// OLED handle, always short for fantasy); `.0` is the adjective (logs only).
+/// A node's `(adjective, noun)` from its logical id — **unique for every one of the 256 ids**.
+///
+/// Both mesh ends call this with the id carried in the frame to get an identical name, so names
+/// still never go on the mesh wire.
+///
+/// ⚠️ `.1` alone is NOT an identifier. 32 nouns over 256 ids forces at least 8 ids to share every
+/// noun (9 in the worst case) — that is pigeonhole, not a tuning problem, and no corpus size fixes
+/// it: noun-uniqueness would need 256 nouns. **Any surface too cramped for the pair must show a
+/// disambiguated short form** (`noun`+id, or an adjective initial), never the bare noun. The
+/// nameplate in `sigil.rs` is the only screen with room for the full pair, and it renders it.
 #[inline]
 pub fn name_for_id(id: u8) -> (&'static str, &'static str) {
-    name_for_seed(seed_from_id(id), REALM)
+    sigil_names::name_for_id(id, REALM)
 }
 
-/// The `forge` realm — verbatim from sigil's generated corpus (20 adj / 20 noun),
-/// same source as FANTASY (research `nebula-magical-names.md` §7). Used for the
-/// FIRMWARE VERSION name so a build's identity (e.g. "Molten Crucible") reads in a
-/// DELIBERATELY different vocabulary from a node's fantasy name — provenance is
-/// never confused with identity at a glance (ota-ux-design.md §1).
+/// smol byte-clips node nouns to 5..=8 characters on the 72x40 OLED (`bench.rs`, `finder.rs`,
+/// `hunt.rs`, `watch.rs`). A truncation that collides two nouns would re-create exactly the
+/// ambiguity the unique pair removes, and unlike the pair's uniqueness this depends on the LETTERS
+/// rather than the counts — so it cannot be inferred and has to be asserted.
+const _: () = assert!(
+    sigil_names::nouns_distinct_at(REALM, 5),
+    "two fleet nouns become identical when clipped to 5 chars — the narrowest display budget in \
+     smol (bench.rs time-source column). Rename a word in lexicon's fleet group."
+);
+const _: () = assert!(
+    sigil_names::nouns_distinct_at(REALM, 6),
+    "two fleet nouns collide when clipped to 6 chars (finder.rs hero row, bench.rs own-status)."
+);
+const _: () = assert!(
+    sigil_names::nouns_distinct_at(REALM, 8),
+    "two fleet nouns collide when clipped to 8 chars (bench.rs peer row, finder.rs peer rows)."
+);
+
+/// The `forge` realm for FIRMWARE VERSION names — **deliberately PINNED, never synced.**
+///
+/// A build's name (e.g. "Molten Crucible") reads in a different vocabulary from a node's name so
+/// provenance is never confused with identity at a glance (ota-ux-design.md §1). That separation is
+/// now enforced one level further out: `fleet` and `forge` share no words, and the reserved set
+/// (which contains `forge`) stops a node ever being named after the version namespace.
+///
+/// ⚠️ **Do not source this from upstream.** `words/realms.json`'s `forge` took a different cutover
+/// path and is a **non-superset 14/14** corpus, so adopting it changes the modulus 20 -> 14 and
+/// **renames every past build** — v345 stops being "Furnace". Version names are historical record:
+/// they appear in commits, in memories, and in JP's speech ("Bellows" is build 341). Renaming them
+/// is data loss, not a refresh. Node identity was authorised to churn once; provenance was not.
+///
+/// This is also why the vendored `sigil-names` crate must never enable
+/// `divergent-themed-realms` — that feature exists precisely to make reaching a moved themed
+/// corpus impossible by accident.
 pub static FORGE: Realm = Realm {
+    name: "forge@pinned-20x20",
     adjectives: &[
         "Annealed", "Bolted", "Carbonized", "Dense", "Electric", "Flux", "Galvanized",
         "Hardened", "Ignited", "Joined", "Keen", "Laminated", "Molten", "Nitrided", "Oxidized",
@@ -104,6 +110,32 @@ pub static FORGE: Realm = Realm {
         "Anvil", "Bellows", "Crucible", "Die", "Engine", "Furnace", "Gear", "Hammer", "Ingot",
         "Jig", "Kiln", "Lathe", "Mandrel", "Nozzle", "Oven", "Piston", "Quench", "Rivet", "Spark",
         "Tongs",
+    ],
+};
+
+/// The old `fantasy` corpus, kept ONLY for the familiar's creature names (`familiar/mod.rs`), which
+/// seed from a per-creature `u32` rather than a node id. Pinned for the same reason as FORGE: a
+/// creature's name is a thing JP has already seen, and this is not the namespace he authorised
+/// renaming.
+///
+/// ⚠️ **Known taxonomy smell, deliberately NOT fixed here.** Creatures are a third namespace, and
+/// this corpus overlaps `fleet` on 14 nouns (Aegis, Dominion, Ember, Grimoire, Insignia, Jewel,
+/// Keystone, Lantern, Monolith, Nexus, Pinnacle, Quartz, Relic, Throne) — so a creature can share a
+/// name with a node. That was already true before this change (creatures and nodes both drew from
+/// `fantasy`), so repointing it would be a behaviour change smuggled into a refactor. Filed rather
+/// than silently altered: creatures want their own reserved-disjoint group in lexicon, the same way
+/// `fleet` got one.
+pub static FANTASY: Realm = Realm {
+    name: "fantasy@pinned-creatures",
+    adjectives: &[
+        "Arcane", "Blazing", "Celestial", "Draconic", "Eldritch", "Fabled", "Gilded",
+        "Hallowed", "Infernal", "Jade", "Kindled", "Luminous", "Mythic", "Noble", "Obsidian",
+        "Primal", "Radiant", "Spectral", "Twilight", "Valiant",
+    ],
+    nouns: &[
+        "Aegis", "Beacon", "Crown", "Dominion", "Ember", "Forge", "Grimoire", "Herald",
+        "Insignia", "Jewel", "Keystone", "Lantern", "Monolith", "Nexus", "Oracle", "Pinnacle",
+        "Quartz", "Relic", "Sigil", "Throne",
     ],
 };
 
