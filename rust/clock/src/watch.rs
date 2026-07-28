@@ -20,8 +20,7 @@ use embedded_graphics::{
 
 use crate::app::{AppKind, Ctx, Plugin, Transition};
 use crate::input::Press;
-use crate::net::names::name_for_id;
-use crate::rssi::{clip, proximity, tier_bars, Line, RssiSmoother};
+use crate::rssi::{proximity, tier_bars, Line, RssiSmoother};
 
 /// Peer rows per page: a title row + 4 rows fills the 40 px height at 8 px pitch.
 const PEERS_PER_PAGE: usize = 4;
@@ -87,8 +86,9 @@ fn draw_peer_row<D>(display: &mut D, y: i32, id: u8, id_known: bool, bars: u8)
 where
     D: DrawTarget<Color = BinaryColor>,
 {
-    let noun = if id_known { name_for_id(id).1 } else { "?" };
-    Text::with_baseline(clip(noun, 7), Point::new(0, y), text_style(), Baseline::Top)
+    let short = crate::net::names::short_name(id, 9);
+    let noun = if id_known { short.as_str() } else { "?" };
+    Text::with_baseline(noun, Point::new(0, y), text_style(), Baseline::Top)
         .draw(display)
         .ok();
     draw_signal(display, y, bars);

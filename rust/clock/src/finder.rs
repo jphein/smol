@@ -34,8 +34,7 @@ use embedded_graphics::{
 
 use crate::app::{AppKind, Ctx, Plugin, Transition};
 use crate::input::Press;
-use crate::net::names::name_for_id;
-use crate::rssi::{bar_px, clip, label, proximity, tier_bars, Line, RssiSmoother};
+use crate::rssi::{bar_px, label, proximity, tier_bars, Line, RssiSmoother};
 
 /// The 72×40 OLED panel width used for layout (matches the other screens).
 const PANEL_W: i32 = 72;
@@ -220,7 +219,10 @@ impl Plugin for FinderState {
 
         // Hero row (y=0): nearest peer's noun (left) + live smoothed dBm (right-aligned),
         // the primary placement readout.
-        Text::with_baseline(clip(name_for_id(hid).1, 6), Point::new(0, 0), style_6x10(), Baseline::Top)
+        // 6 cols before the right-aligned dBm (5 at a 3-digit RSSI). id-suffixed so two peers
+        // sharing a noun stay distinguishable — the id, not the noun, is what identifies here.
+        let hero = crate::net::names::short_name(hid, 6);
+        Text::with_baseline(hero.as_str(), Point::new(0, 0), style_6x10(), Baseline::Top)
             .draw(ctx.display)
             .ok();
         let mut dbm = Line::new();
@@ -243,7 +245,8 @@ impl Plugin for FinderState {
         // the live ranking.
         for (row, &(oid, orssi)) in others[..n_others].iter().enumerate() {
             let y = 22 + row as i32 * 9;
-            Text::with_baseline(clip(name_for_id(oid).1, 8), Point::new(0, y), style_5x8(), Baseline::Top)
+            let peer = crate::net::names::short_name(oid, 8);
+            Text::with_baseline(peer.as_str(), Point::new(0, y), style_5x8(), Baseline::Top)
                 .draw(ctx.display)
                 .ok();
             draw_mini_bars(ctx.display, y, tier_bars(proximity(orssi)));

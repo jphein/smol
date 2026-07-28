@@ -36,7 +36,7 @@ use embedded_graphics::{
 use crate::app::{AppKind, Ctx, Plugin, Transition};
 use crate::input::Press;
 use crate::mesh_snake::snake_core::phase_offset_ms;
-use crate::net::names::{name_for_id, name_for_seed, CREATURE};
+use crate::net::names::{name_for_seed, CREATURE};
 
 // ===========================================================================
 // Tuning (all wall-clock; wisp §1.2/§3/§6). Kept together as the single lever.
@@ -990,7 +990,10 @@ where
     if v.holder_id == node_id {
         let _ = write!(ptr, "@here");
     } else {
-        let _ = write!(ptr, "@ {}", name_for_id(v.holder_id).1);
+        // 7 cols at x=26 after the "@ " prefix. id-suffixed for the same reason as everywhere
+        // else: the noun cannot identify the holder on its own.
+        let _ = write!(ptr, "@ ");
+        crate::net::names::write_short(&mut ptr, v.holder_id, 7);
     }
     text(display, ptr.as_str(), 26, 16);
 

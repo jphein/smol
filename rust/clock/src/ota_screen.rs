@@ -306,6 +306,10 @@ pub fn draw(display: &mut Oled, v: &OtaView) {
 
 /// The magical NOUN for a node id (the on-screen handle used across the UI). A thin wrapper so
 /// the source-line formatter reads cleanly.
+/// Bare noun ON PURPOSE here, and the only place that is still correct: both call sites print
+/// `i{id}` immediately after it (`from Aegis i5`), so the id already disambiguates and a
+/// `short_name` suffix would render the redundant `from Aegis5 i5`. Do not "fix" this to match the
+/// other sites without checking that the adjacent id is still there.
 fn name_for_seed_id_noun(id: u8) -> &'static str {
     crate::net::names::name_for_id(id).1
 }

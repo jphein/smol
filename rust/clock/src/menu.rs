@@ -132,8 +132,8 @@ impl Menu {
         // The noun (<= 8 chars for fantasy) fits the 6x10 title within 72 px.
         // Static per boot, so it rides the normal `redraw` with no extra
         // invalidation, and it needs no radio — works in EVERY build.
-        let noun = crate::net::names::name_for_id(crate::node_id()).1;
-        Text::with_baseline(noun, Point::new(1, 0), title, Baseline::Top)
+        let short = crate::net::names::short_name(crate::node_id(), 11);
+        Text::with_baseline(short.as_str(), Point::new(1, 0), title, Baseline::Top)
             .draw(display)
             .ok();
 

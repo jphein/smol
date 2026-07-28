@@ -485,7 +485,8 @@ impl MeshSnake {
             .text_color(BinaryColor::On)
             .build();
         for (i, &(id, len)) in top[..n].iter().enumerate() {
-            let noun = crate::net::names::name_for_id(id).1;
+            let noun_buf = crate::net::names::short_name(id, 9);
+            let noun = noun_buf.as_str();
             let mut line = heapless_line::Line::new();
             // "1.Noun NN" — a '*' marks our own entry.
             let me = if id == self.id { "*" } else { "" };

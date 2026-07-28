@@ -5558,12 +5558,13 @@ impl RadioManager {
                     let len = encode_id_frame(ACK_PREFIX, peer_id, &mut ack);
                     self.send_to(&src, &ack[..len]);
 
-                    // Show the PEER's magical noun, derived LOCALLY from the id in
-                    // the frame (names never travel on the wire). Bare noun (no
-                    // "peer " prefix) — ≤ 8 chars for fantasy, always fits the
-                    // 72 px OLED line, and the blue LED already signals "a peer".
-                    let noun = crate::net::names::name_for_id(peer_id).1;
-                    label = Some(alloc::string::String::from(noun));
+                    // Show the PEER's name, derived LOCALLY from the id in the frame (names never
+                    // travel on the MESH wire). id-suffixed: up to 9 ids share any one noun, so a
+                    // bare noun here could not tell you WHICH peer answered — and "a peer answered"
+                    // is already signalled by the blue LED, so the noun alone added nothing.
+                    // 14 cols at 5x8 across 72 px.
+                    let short = crate::net::names::short_name(peer_id, 14);
+                    label = Some(alloc::string::String::from(short.as_str()));
                 }
                 Some(Frame::Ack(acked_id)) => {
                     // An ACK addressed to US proves a peer received our HELLO ->

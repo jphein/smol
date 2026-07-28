@@ -75,10 +75,89 @@ pub fn name_for_id(id: u8) -> (&'static str, &'static str) {
     sigil_names::name_for_id(id, REALM)
 }
 
-/// smol byte-clips node nouns to 5..=8 characters on the 72x40 OLED (`bench.rs`, `finder.rs`,
-/// `hunt.rs`, `watch.rs`). A truncation that collides two nouns would re-create exactly the
-/// ambiguity the unique pair removes, and unlike the pair's uniqueness this depends on the LETTERS
-/// rather than the counts — so it cannot be inferred and has to be asserted.
+/// The number of decimal digits in `id` — 1, 2 or 3.
+#[inline]
+const fn id_digits(id: u8) -> usize {
+    if id >= 100 {
+        3
+    } else if id >= 10 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Write a **disambiguated** short label for `id` into `w`, fitting `budget` characters:
+/// the noun truncated as needed, then the id — `Vigil122`, `Aegis5`, `Ci42`.
+///
+/// This is the answer to the only ambiguity the unique-pair guarantee does NOT remove. 32 nouns over
+/// 256 ids forces at least 8 ids (9 at worst) to share every noun; that is pigeonhole, so **no corpus
+/// size fixes it** — noun-uniqueness would need 256 nouns. A 72x40 panel cannot render "Obsidian
+/// Aegis", so the cramped surfaces used to render the bare noun, which is the HALF THAT IS NOT
+/// UNIQUE. Three boards showing "Herald" was that choice, not a hash defect.
+///
+/// **The id suffix makes the label injective by construction, and — importantly — independently of
+/// how brutally the noun is clipped.** Uniqueness rides entirely on the id, so the noun is there to
+/// be recognisable, not to identify. `Ci42` and `Ci7` stay distinguishable even when the budget
+/// leaves two characters of noun. Nouns contain no digits, so the split is unambiguous to a reader.
+///
+/// Budget accounting: the id takes 1-3 chars and the noun gets the remainder. A budget too small for
+/// the digits alone yields the id alone, which is still correct — never a bare noun.
+pub fn write_short(w: &mut impl core::fmt::Write, id: u8, budget: usize) {
+    let noun = name_for_id(id).1;
+    let room = budget.saturating_sub(id_digits(id));
+    // char_indices, not byte slicing: the `clip()` helpers in bench.rs/rssi.rs slice bytes and are
+    // safe only while the corpus stays ASCII. This one cannot be made to panic by a word change.
+    let cut = match noun.char_indices().nth(room) {
+        Some((i, _)) => i,
+        None => noun.len(),
+    };
+    let _ = write!(w, "{}{}", &noun[..cut], id);
+}
+
+/// A stack-allocated disambiguated short label — [`write_short`] for the many call sites that want a
+/// `&str` rather than a formatter. No heap, no static: 16 bytes on the caller's frame, which is why
+/// this is a returned value rather than a `&'static str` (there is no static to point at — the label
+/// depends on the id).
+pub struct ShortName {
+    buf: [u8; Self::CAP],
+    len: usize,
+}
+
+impl ShortName {
+    /// Longest possible label: 8-char noun (the corpus max) + 3 id digits, rounded up.
+    const CAP: usize = 12;
+
+    pub fn as_str(&self) -> &str {
+        // Only ever written through `write_short`, which emits ASCII noun bytes + ASCII digits.
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("?")
+    }
+}
+
+impl core::fmt::Write for ShortName {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len < Self::CAP {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The disambiguated short label for `id`, fitting `budget` characters. See [`write_short`] for why
+/// the id suffix — not the noun — is what makes this unique.
+pub fn short_name(id: u8, budget: usize) -> ShortName {
+    let mut s = ShortName { buf: [0; ShortName::CAP], len: 0 };
+    write_short(&mut s, id, budget.min(ShortName::CAP));
+    s
+}
+
+/// smol byte-clips node nouns on the 72x40 OLED. Uniqueness no longer depends on this — see
+/// [`write_short`], where the id carries it — but a truncation that collides two nouns still makes
+/// the label harder to READ, so it stays asserted. Unlike the pair's uniqueness this depends on the
+/// LETTERS rather than the counts, so it cannot be inferred and has to be checked.
 const _: () = assert!(
     sigil_names::nouns_distinct_at(REALM, 5),
     "two fleet nouns become identical when clipped to 5 chars — the narrowest display budget in \
