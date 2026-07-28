@@ -206,9 +206,22 @@ impl Delivery {
         };
 
         let font = match font {
-            // An empty third field reads like an omitted one (`120:inf:`) — keep the current font
-            // rather than refusing a value the dashboard could plausibly send.
-            None | Some(b"") => current.font,
+            // ABSENT (or empty) means DEFAULT, not keep-current — and this was wrong the other way
+            // round until the dashboard proved it. HA omits the third field exactly when the value IS
+            // the default, for compatibility with pre-font firmware, so "keep current" made the
+            // default UNREACHABLE: pick `9x15`, then select 5x8, HA publishes `160:inf`, the node
+            // keeps 9x15, and the control silently does nothing.
+            //
+            // A control that cannot return to its own default reads as a broken board — the same class
+            // of defect as everything else found today, where the system's way of saying nothing is
+            // indistinguishable from it working.
+            //
+            // The compatibility requirement this seemed to violate is intact: a retained two-field
+            // value must keep PARSING, which it does. Keeping its FONT was my addition, and it was
+            // unjustifiable on inspection — a value written before the font field existed cannot
+            // express a font preference, so the only honest reading of it is "the default". A caller
+            // that wants a non-default font must say so, which is one rule instead of two.
+            None | Some(b"") => Self::DEFAULT.font,
             Some(f) if f.eq_ignore_ascii_case(b"5x8") => Font::F5x8,
             Some(f) if f.eq_ignore_ascii_case(b"6x10") => Font::F6x10,
             Some(f) if f.eq_ignore_ascii_case(b"9x15") => Font::F9x15,

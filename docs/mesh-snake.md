@@ -36,7 +36,7 @@ control, exactly like the classic Snake mode:
   locations from the shared mesh clock, so nobody has to negotiate. Eat it to
   grow by one.
 - **Peers**: any snake near your head is drawn inside your viewport as a body of
-  cells, with its **magical name** (e.g. *Draconic Dominion*, *Eldritch Nexus*)
+  cells, with its **magical name** (e.g. *Mystic Chalice*, *Eldritch Jewel*)
   floating by it. Peers are reconstructed by *dead-reckoning* — each board only
   broadcasts its head + heading + length 5×/second, and everyone else extrapolates
   the body between updates. A briefly-missed update self-heals on the next one.
@@ -76,7 +76,9 @@ sees the same ranking of magical names**:
 
 - **Always on:** your rank rides the HUD (e.g. `#2 L:14 P:5` — rank #2, length 14).
 - **Top-3 on your death/respawn screen** (the natural pause): e.g.
-  `1 Dominion 22 / 2 Nexus 14 / 3 Herald 9`, with you highlighted.
+  `1 Chalice 22 / 2 Jewel 14 / 3 Vigil 9`, with you highlighted. ⚠️ Note the leaderboard shows the
+  **noun only** — and up to 9 ids can share a noun, so a bare noun is *not* an identifier. See
+  [BUILDING.md](BUILDING.md).
 - A dead snake keeps its place for a moment, then drops to `L:3` on respawn; a
   snake that goes silent falls off the board after ~5 s.
 

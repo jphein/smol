@@ -130,6 +130,26 @@ cards:
       - entity: input_button.smol_all_apply
         name: Apply to all — retained, on next burst
         icon: mdi:send-check
+      # #302/#303 Bard controls — FLEET-WIDE, and this is where JP was looking for the size
+      # slider. They used to be per-id in smol_bard.yaml for 7/8/9: 7 and 9 are retired, id8
+      # runs a pre-Bard build, and id50/id51 — the only boards that can render a font — had no
+      # control at all, so the node boxes rendered a row pointing at a nonexistent entity. One
+      # set now fans out to every DISCOVERED node (see smol_bard.yaml), so adding a board needs
+      # no edit here. These publish on change; no Apply press needed.
+      - type: section
+        label: Bard · fleet-wide (applies on change)
+      - entity: input_select.smol_all_bard_font
+        name: Text size (all nodes)
+        icon: mdi:format-size
+      - entity: input_number.smol_all_bard_speed
+        name: Typewriter (ms/char) — reveal pace, NOT generation speed
+        icon: mdi:speedometer
+      - entity: input_select.smol_all_bard_mode
+        name: Delivery (inf = endless · page = one screenful)
+        icon: mdi:book-open-page-variant
+      - entity: input_text.smol_all_tale
+        name: Story opening — empty = each node's own persona
+        icon: mdi:feather
       - entity: input_button.smol_all_reboot
         name: Reboot ALL nodes
         icon: mdi:restart-alert
@@ -353,17 +373,15 @@ cards:
   - type: entities
     view_layout: {grid-column: "span 6"}
     title: last message per sigil
+    # ids 7/9 rows removed 2026-07-28 (#311): their sensors survive the package retire as
+    # entity-registry ORPHANS (unique_id keeps the husk, `restored: true`, permanently
+    # `unavailable`), so these rows rendered as dead controls rather than vanishing. Caught
+    # by --check's orphan pass, which exists because a membership test called them healthy.
     show_header_toggle: false
     state_color: true
     entities:
-      - entity: sensor.smol_7_last_message
-        name: Dominion · Molten Sanctum
-        secondary_info: last-changed
       - entity: sensor.smol_8_last_message
         name: Eldritch Nexus
-        secondary_info: last-changed
-      - entity: sensor.smol_9_last_message
-        name: Herald · Familiar
         secondary_info: last-changed
     card_mod: *accent
 
@@ -422,6 +440,10 @@ cards:
   - type: entities
     view_layout: {grid-column: "span 6"}
     title: time sync · NTP freshness
+    # ids 7/9 rows removed 2026-07-28 (#311): their sensors survive the package retire as
+    # entity-registry ORPHANS (unique_id keeps the husk, `restored: true`, permanently
+    # `unavailable`), so these rows rendered as dead controls rather than vanishing. Caught
+    # by --check's orphan pass, which exists because a membership test called them healthy.
     show_header_toggle: false
     state_color: true
     entities:
@@ -429,14 +451,8 @@ cards:
         name: Fleet freshness
         icon: mdi:clock-check
       - type: divider
-      - entity: sensor.smol_7_ntp_fresh
-        name: Dominion
-        secondary_info: last-changed
       - entity: sensor.smol_8_ntp_fresh
         name: Nexus
-        secondary_info: last-changed
-      - entity: sensor.smol_9_ntp_fresh
-        name: Herald
         secondary_info: last-changed
     card_mod: *accent
 

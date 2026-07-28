@@ -60,6 +60,60 @@ Measure the ELF/binary, or take the figure from a source that says it measured o
 a PR's measured table, `Cargo.toml`'s partition rationale). If you cannot tell whether a number was
 projected or measured, treat it as projected.
 
+### ⚠️ An imprecise SCOPE hides a whole failure class
+
+Not a wrong claim — a **true claim stated too broadly**. It reads as correct, survives every proofread,
+and quietly excludes the case that matters.
+
+Worked example, and the cost is out of all proportion to the words: `names.rs` said node names
+**"NEVER go on the wire."** True of every ESP-NOW frame — and **names do go out as strings in HA
+discovery, against a 512 B packet.** That four-word imprecision is **part of why the discovery budget
+went unwatched until 29 ids were silently publishing nothing.** The corrected version is *"never on the
+**mesh** wire."* One word, and it would have kept a budget visible.
+
+**So when writing a negative claim, name the scope it holds in.** *"Never on the mesh wire"*, not
+*"never on the wire"*. *"Not in `.bss`"*, not *"nowhere in DRAM"*. A negative without a scope is read as
+universal, and the excluded case is exactly where nobody looks.
+
+### 📊 Five documented-but-never-true properties in one day — all found by writing a check
+
+Worth recording as a measurement rather than a maxim, because it settles a real question: **is careful
+prose or a machine check the better guard for an invariant?**
+
+| Property | Claimed | Reality |
+|---|---|---|
+| `familiar/mod.rs:280` | *"distinct from any node's name"* | drew from the **identical** corpus, since it was written |
+| realm-sigil module docs | themed realms *"draw from disjoint vocabularies on purpose"* | `forge` shared `ember` with `fleet` |
+| DOC-UPKEEP (mine) | *"`id 7 = Draconic Dominion` is **permanently** true"* | died to a corpus change **hours later** |
+| `names.rs` corpus-drift warning | named `realms.json` as the stale side | **backwards** — that is the current source |
+| `names.rs` | names *"never go on the wire"* | true of the mesh wire only; see above |
+
+**None of the five was found by proofreading. Every one was found by building a checker, running a test,
+or making a change that contradicted it.** Three were written by the people who then found them.
+
+**The conclusion: an invariant stated in prose is a wish; an invariant asserted in code is a
+constraint.** Prefer a const assertion, an exhaustive enumeration or a failing build to any amount of
+careful wording — and when prose is the only option, expect it to be wrong and date it.
+
+### ⚠️ Ask whether a claim is about a VALUE or a KIND — kinds are cheap to refute
+
+Before spending effort re-deriving a claim, classify it. **Value-claims** (*this is 462 B*, *this is
+202 ms/token*, *this build is 905*) need measurement or arithmetic, and **nine of them needed
+re-derivation on 2026-07-28**. **Kind-claims** (*this field lives in `.bss`*, *this exit code is a
+verdict*, *this list is authoritative*) often die to a **single definitional check** — and when they die
+they take every value-claim built on them with them.
+
+Worked example: *"short string literals land in `.data`, so some of Embassy's 58 KB might be
+reclaimable by a linker-script change."* Plausible, and it would have cost hours to bound
+statistically. It died in one step: **`.bss` is `NOBITS`** — it occupies no file bytes and holds no
+initialized content, **so a string literal cannot live there** — and **55,736 of the 58,144 B is
+`.bss`.** (Confirming, `.data` actually *shrank* 4,420 B on the branch, so the lever's contribution is
+negative.) One definition beat a measurement campaign.
+
+**So: check the kind first.** It is cheaper, it is often decisive, and a surviving kind-claim tells you
+which value-claims are even worth measuring. Sibling of *fix the summary first* — both are about
+spending scarce correction effort where it pays.
+
 ### ⚠️ A number you derived is not a number you measured
 
 Sibling of the projection trap, and distinct in a way that matters: the projection trap is
@@ -149,6 +203,30 @@ So when you check a subsystem, ask both questions:
   brick-safety, error handling. An understated guarantee is still a wrong doc, and it costs you the
   credit for work that was actually done.
 
+### ⚠️ A correction in the body under a stale headline is worse than no correction
+
+The headline is what gets read and quoted. A refutation buried in §5 under a summary that still asserts
+the refuted thing doesn't correct the document — **it makes it self-contradictory, and the reader takes
+the top.**
+
+Worked example, 2026-07-28: **both** Embassy documents carried the memory finding that inverted the
+verdict (Embassy costs 58,144 B against 2,232 B of slack — a platform problem, not a tuning one) while
+their summaries still said *"not what should ship next, for exactly one reason: the OTA path"* and
+*"take the interim fix now, **finish the migration**."* Anyone reading only the top would have
+sequenced a C3 fleet roll that cannot run.
+
+**So when a finding changes a conclusion:**
+- **Fix the summary in the same commit as the body.** If you only have time for one, fix the summary —
+  a stale body under a correct headline merely wastes a reader's time; the reverse misdirects them.
+- **Grep the document's own top for the claim you just refuted**, and every *other* document that
+  restates it. This one needed the research doc **and** the handoff.
+- **Don't over-correct either.** *"The migration is dead"* would have been a fresh overclaim: the 89×
+  measured win, the #233 upgrade and the port through crown election all survive — as the **next
+  platform's head start**. State what died and what didn't.
+
+This is §2's partial-contract rule one scale up: a **partially corrected document**, like a
+half-documented field, makes a reader confident and wrong.
+
 ### ⚠️ When a premise expires, check the conclusion before deleting
 
 A doc's *reason* can go stale while its *answer* stays right. Deleting the section loses a correct
@@ -192,8 +270,15 @@ boards were fine under different ids.
 
 Ask instead: **is anything broadcasting under this id right now?** (See §3, *shortest-chain signal*.)
 And remember the corollary from [BUILDING.md](BUILDING.md): **a name mapping is a pure function; an
-id↔board assignment is a setting.** `id 7 = Draconic Dominion` is permanently true and says nothing
+id↔board assignment is a setting.** `id 8 = Eldritch Jewel` is true **for a given corpus** and says nothing
 about whether a board is on the bench.
+
+> 📌 **This rule's own example expired, which sharpens it.** It used to read *"`id 7 = Draconic
+> Dominion` is **permanently** true."* On 2026-07-28 the corpus was expanded 20×20 → 32×32 and **every id
+> re-mapped**, because the indices are `% len`. So the mapping is a pure function **of the corpus**, not
+> of the id — **three layers, not two: id → (corpus) → name → board.** A "pure function" is only as
+> permanent as its inputs, and a document calling a derived value permanent has quietly promoted an input
+> to a constant.
 
 ### ⚠️ Retirements are the blind spot
 
@@ -451,6 +536,21 @@ against an **imagined** wire schema:
 | 2 | PASS tested `slot="ota_1"`; firmware publishes a **numeric** slot, and `reset_reason_token()` has **no `ota` token** (an OTA reboot is `rst=sw`) | **PASS was unreachable — every genuine OTA reported as "USB flash, NOT an OTA."** The harness's core proof, inverted |
 | 3 | `ota=rolled-back` — an **explicit** firmware token — never read | a rollback could only be *inferred* from a build number moving |
 | 4 | `DEATH-POINT` fired on **retained ghosts** — progress is retained, a retained value never changes, so it satisfies *"frozen for 30 s+"* **for free** | condemned a ghost of an earlier image as a live dying transfer. **The file's own header warns that only a live `retain=0` publish is trustworthy** — the death-point arm was the one check ignoring its own documented rule |
+
+#### Three ways a check comes back green when it shouldn't — and they need different fixes
+They all *present* identically ("it passed and it shouldn't have"), which is why they get lumped
+together. **The remedies differ, so lumping them leaves the fault in place.**
+
+| Mode | What happened | Remedy |
+|---|---|---|
+| **Wrong verdict** | The check ran and produced a confident wrong answer in the correct format — the four `ota_verify.sh` defects | **Validate the parser against a captured live payload**, and grep the field name in the *producer* |
+| **Cannot fail** | The check is structurally incapable of reporting failure. `tools/repro_build.sh` is a **helper library** — line 2 says *"SOURCE this file"* and its functions `return 1` — so running it as a script yields the last statement's status, not a verdict | **Make the contract explicit**: have the caller test a **value** (a hash, a byte count) rather than an exit status, or assert that the status means something |
+| **Status swallowed** | The check **did** fail and the plumbing threw it away. The realm-sigil `pip` install **exits 2**; a pipe discarded it and it read as silent success | **`set -o pipefail`**, or test `PIPESTATUS` — the check is fine, the wiring is not |
+
+> ⚠️ **Do not merge these into one rule.** *"pip failed silently"* was a misreading — it exits **2** —
+> and treating it as a cannot-fail case would have sent someone to rewrite a working check instead of
+> adding `pipefail`. Conversely `pipefail` does nothing for `repro_build.sh`, whose exit code was never
+> a verdict to begin with. **Diagnose which of the three before reaching for a fix.**
 
 **The rule: a tool that parses a wire format must be validated against a CAPTURED LIVE PAYLOAD, and its
 field list dated.** Grep the field name in the **producer** (`mode.rs`, `wifi.rs`) and confirm it is

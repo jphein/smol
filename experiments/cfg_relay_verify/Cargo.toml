@@ -1,0 +1,17 @@
+# #21/#56 host guard for the keyed-CFG relay SCHEDULE (net/cfgsched.rs). The firmware crate is
+# no_std/riscv32imc and can't host-test, so this `#[path]`-includes the REAL cfgsched.rs (no
+# drift) and asserts the property whose absence made every Home Assistant control for a LEAF
+# board silently inert on 2026-07-28: NO CACHED CONFIG MAY BE STARVED. Every slot must be
+# emitted within a bounded number of relay ticks, from any cursor state, at any cache size,
+# across a shrink — plus the full-cache eviction that lets a real config reclaim a slot from a
+# redundant clear. Permanent guard.
+[package]
+name = "cfg_relay_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "cfg_relay_verify"
+path = "src/main.rs"
+[profile.dev]
+opt-level = 0

@@ -586,7 +586,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
       <div class="ws-stage">
         <div class="ws-diagram-tag">◇ world map — <b>not</b> what the glass shows</div>
         <div class="ws-screen">
-        <svg viewBox="0 0 260 150" role="img" aria-label="A viewport into World Snake's shared 256 by 256 world: your cyan snake near center, peer snakes Jade Herald and Draconic Dominion roaming in labelled by their magical names, and a treasure glinting.">
+        <svg viewBox="0 0 260 150" role="img" aria-label="A viewport into World Snake's shared 256 by 256 world: your cyan snake near center, peer snakes Ashen Vigil and Mystic Chalice roaming in labelled by their magical names, and a treasure glinting.">
           <defs><pattern id="wsg" width="10" height="10" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r=".6" fill="#0e3b39"/></pattern></defs>
           <rect width="260" height="150" fill="#02100f"/><rect width="260" height="150" fill="url(#wsg)"/>
           <g stroke="#7df9ff" stroke-width="1" opacity=".35" fill="none">
@@ -603,11 +603,11 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
           <g class="ws-peer" fill="none" stroke="#7df9ff" stroke-width="1.2">
             <rect x="26" y="34" width="6" height="6"/><rect x="33" y="34" width="6" height="6"/><rect x="40" y="34" width="6" height="6"/><rect x="47" y="34" width="6" height="6"/><rect x="47" y="41" width="6" height="6"/>
           </g>
-          <text x="26" y="30" font-family="monospace" font-size="7" fill="#7df9ff" class="ws-peer">◈ Jade Herald</text>
+          <text x="26" y="30" font-family="monospace" font-size="7" fill="#7df9ff" class="ws-peer">◈ Ashen Vigil</text>
           <g class="ws-peer b" fill="none" stroke="#7df9ff" stroke-width="1.2">
             <rect x="210" y="112" width="6" height="6"/><rect x="217" y="112" width="6" height="6"/><rect x="224" y="112" width="6" height="6"/><rect x="231" y="112" width="6" height="6"/>
           </g>
-          <text x="250" y="108" text-anchor="end" font-family="monospace" font-size="7" fill="#7df9ff" class="ws-peer b">Draconic Dominion ◈</text>
+          <text x="250" y="108" text-anchor="end" font-family="monospace" font-size="7" fill="#7df9ff" class="ws-peer b">Mystic Chalice ◈</text>
           <polygon class="ws-treasure" points="182,100 189,107 182,114 175,107" fill="#ffb454"/>
         </svg>
       </div>
@@ -626,9 +626,9 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
            labelled — do not quietly relight the LED. -->
       <div class="ws-board" aria-label="An example mesh leaderboard, ranked by length — an illustration, not live fleet data">
         <div class="lb-head"><span>◈ mesh leaderboard</span><span class="ws-mock">example · not a live feed</span></div>
-        <div class="lb-row top"><span class="lb-rank">1</span><span class="lb-name">Jade Herald</span><span class="lb-bar"><i style="width:94%"></i></span><span class="lb-len">214</span></div>
-        <div class="lb-row me"><span class="lb-rank">2</span><span class="lb-name">you · Eldritch Nexus</span><span class="lb-bar"><i style="width:80%"></i></span><span class="lb-len">188</span></div>
-        <div class="lb-row"><span class="lb-rank">3</span><span class="lb-name">Draconic Dominion</span><span class="lb-bar"><i style="width:64%"></i></span><span class="lb-len">151</span></div>
+        <div class="lb-row top"><span class="lb-rank">1</span><span class="lb-name">Ashen Vigil</span><span class="lb-bar"><i style="width:94%"></i></span><span class="lb-len">214</span></div>
+        <div class="lb-row me"><span class="lb-rank">2</span><span class="lb-name">you · Eldritch Jewel</span><span class="lb-bar"><i style="width:80%"></i></span><span class="lb-len">188</span></div>
+        <div class="lb-row"><span class="lb-rank">3</span><span class="lb-name">Mystic Chalice</span><span class="lb-bar"><i style="width:64%"></i></span><span class="lb-len">151</span></div>
       </div>
     </div>
     <div class="ws-story">
@@ -813,7 +813,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
   <ul class="reveal" data-edit="roadmap.list"><li><b>THE BARD — A STORY WRITTEN ON THE CHIP</b>Press the button and a real transformer starts composing: 260,000 parameters, int8, from the same llama2.c/TinyStories lineage the big toy models come from — executed <b>in place from flash</b>, so all 283 KB of weights cost zero bytes of RAM on a chip that has 400 KB and no floating-point unit. It types a story it has never told onto 40 pixels of height at <b>202 ms per token</b>, with no WiFi, no cloud and no gateway in the loop, so a board alone in a drawer can tell a tale. Every node gets its own protagonist. The forward pass was pinned <b>token-for-token against two independent reference implementations</b> — the obvious one, upstream <code>runq.c</code>, was disqualified for silently dropping in-dimension elements of every w2 row. SHIPPED — on glass on the bench, then a canary soak that survived a hard power-cycle from the inactive OTA slot; the fleet-wide roll rides the next release train. Issue #300, PR #301.</li>
     <li><b>THE MESH FAMILIAR</b>One living creature inhabits the whole fleet — it lives on a single board, showing its mood and growth, and HOPS to a neighbour over the mesh when you unplug that board. Non-holders point a Weasley-clock arrow to wherever it is; you can greet, call and feed it. Exactly-one-holder arbitration + migration + orphan re-election. SHIPPED — migration human-verified on glass. Issue #57.</li>
     <li><b>MESH TIME SYNC</b>Boards agree on the time over ESP-NOW — newest NTP sync wins, loop-free. Flashed; a 3-way mesh verified across all three bench boards (July 2026).</li>
-    <li><b>MAGICAL NAMES</b>Every board earns a realm-sigil fantasy name shown on-screen, computed from its node id — id8 is “Eldritch Nexus”, id5 “Spectral Aegis”, id50 “Kindled Ember”. The mapping is a pure function, so any two boards agree on what to call each other without ever negotiating. Flashed fleet-wide.</li>
+    <li><b>MAGICAL NAMES</b>Every board earns a realm-sigil fantasy name shown on-screen, computed from its node id — id8 is “Eldritch Jewel”, id5 “Obsidian Aegis”, id50 “Mystic Chalice”. The mapping is a pure function, so any two boards agree on what to call each other without ever negotiating — and since 2026-07-28 <b>every one of the 256 possible ids gets a distinct name, proven at compile time</b>: the firmware enumerates all of them while building, so a corpus that could collide simply does not compile. Flashed fleet-wide.</li>
     <li><b>INTERNET RELAY</b>An in-range board bridges a far peer’s telemetry out: ESP-NOW → WiFi burst → Home Assistant over MQTT. E2E VERIFIED + sustained on hardware — leaf→gateway→WiFi→HA, still flowing across a firmware upgrade. One follow-up: a cold-ARP first-round retry. Issue #3.</li>
     <li><b>ROUTED MULTI-HOP MESH</b>A board out of direct range of the gateway is no longer stranded — it escalates to a hop-limited managed flood (a hop count + a seen-set, no routing table) and its telemetry reaches home <b>through a neighbour</b>, with the battery and grid downlink flowing back the other way behind a strictly-newer freshness gate. The ordinary all-hear case stays byte-identical to single-hop. SHIPPED — on 2026-07-14 a gateway-deaf smol delivered telemetry home through a neighbour: the first routed frame in smol’s history. Honest v1 limits: best-effort ACK and a channel-scan throughput cap (follow-up #126); observability-over-relay is next (#124). Issue #13.</li>
     <li><b>HOME-ASSISTANT LINK</b>Every board shows live Home Assistant data on its OLED — battery voltage, a 6-segment state-of-charge page, and grid power — pushed over MQTT and cached so it survives the radio’s sync gaps. MQTT-native (no cloud, no bridge daemon); hardware-verified on all three bench boards (July 2026). Issues #10/#16/#17.</li>

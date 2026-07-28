@@ -1962,6 +1962,11 @@ pub struct RadioManager {
     /// ~10 s cadence. Lives here so it persists across bursts (a (re)joined leaf converges
     /// without HA re-publishing). #56 fills only the screen key. Unused on a leaf.
     cfg_cache: crate::net::wifi::CfgCache,
+    /// #21/#56 ANTI-STARVATION: where the last relay tick stopped in `cfg_cache`. Persists
+    /// across ticks so the ~10 s relay walks the cache ROUND-ROBIN instead of restarting at
+    /// slot 0 — without it, the entries at the tail of an append-ordered cache (i.e. every
+    /// config published most recently) were the ones a truncated burst dropped, every time.
+    cfg_relay_cursor: crate::net::cfgsched::RelayCursor,
     /// #50b leaf-status uplink (GATEWAY side): per-leaf live `<screen>:<page>` cache,
     /// filled by the `SMOLv1 STAT` service arm from leaf uplinks (leaves have no MQTT) and
     /// republished as retained `smol/<leaf>/status` on each gateway flush. Twin of
@@ -2247,6 +2252,7 @@ impl RadioManager {
             dl_grid: DlOrigin::new(),
             cfg: CfgTracker::new(),
             cfg_cache: crate::net::wifi::CfgCache::new(),
+            cfg_relay_cursor: crate::net::cfgsched::RelayCursor::new(),
             stat_cache: crate::net::wifi::CfgCache::new(),
             diag_cache: crate::net::wifi::RelayCache::new(),
             scan_cache: crate::net::wifi::RelayCache::new(),
@@ -3562,7 +3568,25 @@ impl RadioManager {
         }
         let own = self.id;
         let count = self.cfg_cache.count();
-        for i in 0..count {
+        // #21/#56 ANTI-STARVATION: emit a BOUNDED, ROTATING window of the cache instead of
+        // walking it from index 0 every tick.
+        //
+        // The old loop sent every entry from slot 0 back-to-back on each ~10 s tick. `CfgCache`
+        // is APPEND-ordered and never reorders, so a config published today is always the LAST
+        // frame of the burst — and whatever truncates a long unspaced ESP-NOW burst (each
+        // `send_to` blocks on `waiter.wait()`, and the crown time-shares the radio with its STA
+        // association) truncated the SAME tail entries every tick, forever. On the live fleet
+        // the head of that burst was entries for node ids 7 and 9, which are not boards any
+        // more, so the wasted slots were also the invisible ones.
+        //
+        // With a cursor, coverage is guaranteed even if only the first frame of a tick ever
+        // reaches the air: every slot is visited within `ticks_to_cover(count)` ticks. That
+        // turns "these particular configs never arrive" into "every config arrives within a
+        // bounded delay", which is the property the leaf's edge-triggered, idempotent apply
+        // was always written to assume.
+        let mut slots = [0usize; crate::net::cfgsched::CFG_RELAY_PER_TICK];
+        let n = self.cfg_relay_cursor.take(count, &mut slots);
+        for &i in slots.iter().take(n) {
             // Copy the entry out to release the `cfg_cache` borrow before the
             // `&mut self` broadcast_config call (disjoint-borrow discipline).
             let mut vbuf = [0u8; crate::net::wifi::CFG_VALUE_MAX];

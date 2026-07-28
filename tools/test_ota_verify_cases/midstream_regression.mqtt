@@ -1,0 +1,5 @@
+1	smol/8/ota/state	{"installed_version":"906","latest_version":"907","in_progress":true,"title":"v907 Hammer"}
+1	smol/8/diag	DIAG|slot=0|rst=sw|boot=492|ota=none|up=900|heap=41968|tsrc=mesh|hop=1|cc=1
+1	smol/mesh/channel	MC|5|6|1
+@1	0	smol/8/ota/progress	900000|1440528|recv
+@3	0	smol/8/ota/progress	500000|1440528|recv
