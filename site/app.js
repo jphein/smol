@@ -91,7 +91,9 @@
   async function pollTasks() {
     try {
       const d = await (await fetch('tasks.json', { cache: 'no-store' })).json();
-      live.classList.add('on'); liveTxt.textContent = 'live';
+      // NB: this reports the FEED being reachable, not the data being fresh — tasks.json is an
+      // archived snapshot. Saying 'live' here made a 3-week-old ledger look current.
+      live.classList.add('on'); liveTxt.textContent = 'feed ok';
       $('#taskList').innerHTML = d.tasks.map(t => `
         <div class="trow ${esc(t.status)}">
           <span class="tled ${ledOf(t.status)}"></span>
@@ -101,7 +103,7 @@
       const done = d.tasks.filter(t => t.status === 'done').length;
       $('#taskCnt').textContent = `${done}/${d.tasks.length}`;
       $('#taskUpd').textContent = 'updated ' + (d.updated || '');
-    } catch { live.classList.remove('on'); liveTxt.textContent = 'offline'; }
+    } catch { live.classList.remove('on'); liveTxt.textContent = 'feed offline'; }
   }
   async function pollAgents() {
     try {
