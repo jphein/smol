@@ -1850,6 +1850,14 @@ impl CfgCache {
         self.dropped
     }
 
+    /// Slot capacity, so the DIAG `cfgq=` field can report occupancy AGAINST the cap rather
+    /// than as a bare number a reader has to know the cap to interpret. `used == cap` is the
+    /// state in which the next new dashboard control is discarded.
+    #[allow(dead_code)]
+    pub const fn cap() -> usize {
+        CFG_CACHE_CAP
+    }
+
     /// Number of cached leaf configs.
     #[allow(dead_code)]
     pub fn count(&self) -> usize {

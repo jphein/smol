@@ -3443,6 +3443,35 @@ impl RadioManager {
                 | ((self.leaf_installs_outstanding as u8) << 1)
                 | ((self.install_requested as u8) << 2);
             room_for(&mut rec, alloc::format!("|sog={}", sog));
+            // #21/#56 CROWN-ONLY: the keyed-CFG relay cache as `<used>/<cap>:<dropped>`.
+            //
+            // This exists because the 2026-07-28 investigation added a drop counter and then could
+            // not read it: `CfgCache::dropped()` had ZERO call sites, so the number was as invisible
+            // as the `log::warn!` it was meant to replace (release images are serial-silent —
+            // ESP_LOG is baked at build time). A counter with no readout is the same bug as no
+            // counter, and the whole leaf control plane dying silently is exactly the failure it was
+            // supposed to make answerable.
+            //
+            // `used == cap` means the next NEW dashboard control is discarded; a climbing `dropped`
+            // means it already is. Those are the two states in which every HA control for a leaf
+            // goes quietly dead, and both are now one field away.
+            //
+            // GATEWAY-ONLY on purpose: `cfg_cache` is a crown-side structure (a leaf reports 0/16:0,
+            // saying nothing), and the LEAF record is the one already over the 232 B relay cap and
+            // shedding real fields. Costing leaves zero bytes is what keeps this from making the
+            // truncation everyone is already fighting any worse. Sheddable, so it can never push a
+            // record over the publish cliff.
+            if self.relay.is_gateway {
+                room_for(
+                    &mut rec,
+                    alloc::format!(
+                        "|cfgq={}/{}:{}",
+                        self.cfg_cache.count(),
+                        crate::net::wifi::CfgCache::cap(),
+                        self.cfg_cache.dropped()
+                    ),
+                );
+            }
             // #204: crown dead-downstream telemetry — <deaf-streak>:<reassoc-cycles>:<deaf_shed 0/1>.
             // Named `cdeaf` to NOT collide with the mesh-test-only `deaf=` (an ESP-NOW deaf-LIST count).
             room_for(
