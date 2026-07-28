@@ -77,6 +77,14 @@ const GRID_TOPIC: &[u8] = b"smol/display/grid";
 #[cfg(feature = "wifi")]
 const MESH_CHANNEL_TOPIC: &[u8] = b"smol/mesh/channel";
 
+/// luna #3: the roster on a FIXED, mesh-wide topic — retained, published by whichever board is crown.
+/// The per-node `smol/<id>/peers` is keyed by the CROWN'S id, so a dashboard would need one mirror
+/// per possible crown; unhardcodable, and exactly why the roster went dark when the crown moved (it
+/// has moved twice in the last hour: id8 → id50 → id5). One fixed topic ends that class of bug. Same
+/// shape and rationale as `smol/mesh/channel` above; the per-node publish stays for per-board history.
+#[cfg(feature = "wifi")]
+const MESH_PEERS_TOPIC: &[u8] = b"smol/mesh/peers";
+
 /// #155 channel-drag OPERATOR LEVER: a retained hint the crown HONORS at claim time.
 /// Payload = a decimal 2.4 GHz channel (the fleet uses `1`/`6`/`11`); an EMPTY payload (the
 /// retain-clear) restores un-hinted behavior. The mesh channel is PHYSICALLY the crown's AP
@@ -2473,7 +2481,12 @@ fn mqtt_session(
         // Templates use single quotes internally → no `\"`-escaping; they're passed as
         // `&str` args so their Jinja `{ }` need no `{{`/`}}` escaping. All length-guarded
         // → a short/garbage line yields "" (never an HA template error).
-        let noun = crate::net::names::name_for_id(id).1;
+        // luna #2: the FULL sigil, adjective included. Nouns COLLIDE — id9 Jade Herald, id42
+        // Celestial Herald and id236 Radiant Herald all published as bare "Herald", so three boards
+        // were indistinguishable in the dashboard. Renaming a device does not re-derive existing
+        // entity_ids (HA's registry is sticky), so this is cosmetic-safe, and luna's parser takes
+        // whatever follows `smol <id> ` — the adjective appears with no dashboard change.
+        let (adj, noun) = crate::net::names::name_for_id(id);
         let cfgs: [(&str, &str, &str, &str); 3] = [
             (
                 "temp", "Temp",
@@ -2507,8 +2520,8 @@ fn mqtt_session(
                 // #228: device block enriched with model/manufacturer/sw_version so HA groups
                 // every entity under one device card with the running sigil version shown.
                 // sw_version = "v<build#> <forge-noun>" (e.g. "v342 Jig"); none of these are secret.
-                "{{\"unique_id\":\"smol{}_{}\",\"object_id\":\"smol_{}_{}\",\"has_entity_name\":true,\"name\":\"{}\",\"state_topic\":\"smol/{}/telemetry\",\"value_template\":\"{}\"{},\"expire_after\":300,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {}\",\"model\":\"smol ESP32-C3\",\"manufacturer\":\"jphein\",\"sw_version\":\"v{} {}\"}}}}",
-                id, field, id, field, name, id, tmpl, extra, id, id, noun, env!("BUILD_NUMBER"), crate::net::names::version_name().1
+                "{{\"unique_id\":\"smol{}_{}\",\"object_id\":\"smol_{}_{}\",\"has_entity_name\":true,\"name\":\"{}\",\"state_topic\":\"smol/{}/telemetry\",\"value_template\":\"{}\"{},\"expire_after\":300,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {} {}\",\"model\":\"smol ESP32-C3\",\"manufacturer\":\"jphein\",\"sw_version\":\"v{} {}\"}}}}",
+                id, field, id, field, name, id, tmpl, extra, id, id, adj, noun, env!("BUILD_NUMBER"), crate::net::names::version_name().1
             );
             if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), json.as_bytes(), true) {
                 let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
@@ -2535,7 +2548,7 @@ fn mqtt_session(
         }
         let mut dtopic = MqttScratch::new();
         let _ = write!(dtopic, "homeassistant/sensor/smol{}/uplink/config", node_id);
-        let unoun = crate::net::names::name_for_id(node_id).1;
+        let (uadj, unoun) = crate::net::names::name_for_id(node_id);
         // F1 discipline: build the config in the .bss JsonScratch (512), not on-stack.
         let json = unsafe { &mut *core::ptr::addr_of_mut!(MQTT_JSON) };
         json.clear();
@@ -2545,8 +2558,8 @@ fn mqtt_session(
             // entity_category) so HA derives the clean entity_id `sensor.smol_<id>_uplink`
             // from object_id instead of the device-name-concatenated form. unique_id bumped
             // (_uplk) to force HA to re-derive the entity_id for the corrected config.
-            "{{\"unique_id\":\"smol{}_uplk\",\"object_id\":\"smol_{}_uplink\",\"has_entity_name\":true,\"name\":\"Uplink\",\"state_topic\":\"smol/{}/uplink\",\"unit_of_measurement\":\"dBm\",\"device_class\":\"signal_strength\",\"expire_after\":120,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {}\",\"model\":\"smol ESP32-C3\",\"manufacturer\":\"jphein\",\"sw_version\":\"v{} {}\"}}}}",
-            node_id, node_id, node_id, node_id, node_id, unoun, env!("BUILD_NUMBER"), crate::net::names::version_name().1
+            "{{\"unique_id\":\"smol{}_uplk\",\"object_id\":\"smol_{}_uplink\",\"has_entity_name\":true,\"name\":\"Uplink\",\"state_topic\":\"smol/{}/uplink\",\"unit_of_measurement\":\"dBm\",\"device_class\":\"signal_strength\",\"expire_after\":120,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {} {}\",\"model\":\"smol ESP32-C3\",\"manufacturer\":\"jphein\",\"sw_version\":\"v{} {}\"}}}}",
+            node_id, node_id, node_id, node_id, node_id, uadj, unoun, env!("BUILD_NUMBER"), crate::net::names::version_name().1
         );
         if let Some(n) =
             crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), json.as_bytes(), true)
@@ -2564,6 +2577,14 @@ fn mqtt_session(
         let mut ptopic = MqttScratch::new();
         let _ = write!(ptopic, "smol/{}/peers", node_id);
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, ptopic.as_bytes(), peers, true) {
+            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        }
+        // luna #3: the SAME payload on the fixed mesh-wide topic, so the dashboard has one place to
+        // read the roster from regardless of which board holds the crown. Only a crown reaches here
+        // with a non-empty roster (a leaf passes an empty slice), so the fixed topic is written by
+        // exactly one publisher at a time and a crown handover simply overwrites it — retained, so a
+        // dashboard restart sees the last roster rather than nothing.
+        if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, MESH_PEERS_TOPIC, peers, true) {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
     }
@@ -4049,7 +4070,7 @@ fn mqtt_session(
             if lid == node_id {
                 continue; // the gateway's own Update is self-published above
             }
-            let noun = crate::net::names::name_for_id(lid).1;
+            let (adj, noun) = crate::net::names::name_for_id(lid);
             // Discovery (retained) — the self-OTA template, for <leaf>. `cmd_t=~/install`
             // = `smol/<leaf>/ota/install`, which the gateway wildcard-subs → relay (§B3).
             let mut dtopic = MqttScratch::new();
@@ -4060,8 +4081,8 @@ fn mqtt_session(
                 // #39: `retain:true` (see the gateway's own Update above) — HA publishes the leaf's
                 // install retained → the gateway wildcard-subs it + relays (§B3), so the native tile
                 // Install works for relayed leaves too, not just the retained HA-side buttons.
-                "{{\"~\":\"smol/{}/ota\",\"stat_t\":\"~/state\",\"cmd_t\":\"~/install\",\"pl_inst\":\"INSTALL\",\"retain\":true,\"dev_cla\":\"firmware\",\"name\":\"Update\",\"has_entity_name\":true,\"uniq_id\":\"smol{}_update\",\"object_id\":\"smol_{}_update\",\"dev\":{{\"ids\":[\"smol{}\"],\"name\":\"smol {} {}\"}}}}",
-                lid, lid, lid, lid, lid, noun
+                "{{\"~\":\"smol/{}/ota\",\"stat_t\":\"~/state\",\"cmd_t\":\"~/install\",\"pl_inst\":\"INSTALL\",\"retain\":true,\"dev_cla\":\"firmware\",\"name\":\"Update\",\"has_entity_name\":true,\"uniq_id\":\"smol{}_update\",\"object_id\":\"smol_{}_update\",\"dev\":{{\"ids\":[\"smol{}\"],\"name\":\"smol {} {} {}\"}}}}",
+                lid, lid, lid, lid, lid, adj, noun
             );
             if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), djson.as_bytes(), true) {
                 let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
