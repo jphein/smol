@@ -9,6 +9,24 @@ retires that, or tells you to walk away.
 **Read the stop rule (§8) before starting.** A verification plan without one becomes a sunk-cost march,
 and this one is guarding against "the thing that recovers you is the thing that broke."
 
+> # 🔴 STOP — this plan is NOT RUNNABLE on `b6413d3` (2026-07-28)
+>
+> Established by reading the branch, not inferred — see
+> [research/embassy-p2-mesh-relay.md](../research/embassy-p2-mesh-relay.md):
+>
+> - **`run_ota_fetch` on the branch is a STUB returning `false`** (branch `wifi.rs:1659-1675`,
+>   *"STUBBED (OTA HTTP fetch -> embassy-net in Phase 5)"*). **Phase B (P1) fails at the stub**, and
+>   Phase C is sequenced behind it. There is no async HTTP range fetch on the branch to test.
+> - **The relay was never ported.** `run_leaf_ota_relay` is still a blocking `pub fn` with the same
+>   `tick: &mut dyn FnMut() -> bool` (branch `mode.rs:5003`); 8 `async fn` in 8024 lines.
+> - **The branch is 98 commits behind `main` and contains no Bard** (merge-base `36e6345`;
+>   `grep -c bard` = 0). The verified 30.12 s clean build was of a tree without it.
+>
+> **What to run instead:** the peer-serve baseline (**E1**) in that document §4 — it uses
+> `ServeSource::HolderActiveSlot`, so it **bypasses the stub**, keeps the crown on known-good `main`,
+> and needs no new code. And note its warning: **a blocking relay inside an executor preserves its own
+> invariants by starving everything else, so a green Phase C here would be a FALSE green.**
+
 ---
 
 ## 0. Shape of the test
@@ -78,8 +96,30 @@ chips, two codebases, one mechanism. So:
 - ➕ **A mandatory new test falls out of it** — §6 gains the self-overwrite check.
 - ❌ **The blocker is not retired.** Different chip (C6 bootloader quirks, a different partition table —
   their brick involved a *"pre-#50 4 MB layout"*), different codebase, and **smol's leaf mesh-OTA relay
-  over ESP-NOW has no counterpart in the watch at all** — confirmed by grep, nothing in its `src/`
-  implements a relay. **That half is exactly as unverified as it was.**
+  over ESP-NOW has no counterpart in the watch**. **That half is exactly as unverified as it was.**
+
+> 📌 **Correction, 2026-07-28 — the sentence above used to end *"no counterpart in the watch at all —
+> confirmed by grep, nothing in its `src/` implements a relay."* That grep searched for the wrong
+> thing.** The watch **does** do ESP-NOW under Embassy, and it **does** implement a fragmented,
+> ACKed, retransmitted relay:
+> - `Cargo.toml:61 "esp-now"`; `src/net/smol_mesh.rs` (896 L) on `esp_radio::esp_now`
+> - `RELAY`/`RELAYACK` frag-bitmap transfer with retransmit of unacked frags — its own comment calls it
+>   a ***"byte-exact port of `wire.rs encode_relay`"***
+> - 🔑 **`net_task.rs:563-569` — the radio-arbitration verdict, written down:**
+>   `mesh_pin_ok = radio_started && !connected && !connecting && !scanning && !scan_pending &&
+>   !assoc_want() && ota.is_none()`. Note **`ota.is_none()`**: the watch already encodes *"an OTA
+>   suppresses the mesh channel pin"* as an explicit scheduling decision — **exactly** the invariant
+>   smol currently gets for free from blocking.
+>
+> **What survives:** no prior art for an **OTA** relay, and none at all for the **scale** — the watch's
+> relay is ≤4 frags / ~15 s / ≤91 B, leaf→gw *uplink*; smol's is 6,237 chunks / 98 windows / 231 B /
+> minutes, gw→leaf *downlink*. Three orders of magnitude.
+> **What changes:** P2's hardest *architectural* question — who owns the radio and channel when long
+> radio work must interleave with WiFi — **has a working answer next door.** Full analysis in
+> [research/embassy-p2-mesh-relay.md](../research/embassy-p2-mesh-relay.md) §2.
+> **Lesson (DOC-UPKEEP §2):** *"nothing implements a relay"* was a correct result for the query
+> `OTA relay` reported as a conclusion about `ESP-NOW`. Absence of evidence for the narrow term was
+> recorded as absence of the broad one.
 
 **Net effect on this plan: P1's risk drops materially; P2's does not move at all.** The risk table in §0
 is re-marked accordingly.
@@ -128,7 +168,15 @@ tools/ota_verify.sh 51 907 360     # exit 0 = PASS · 1 = FAIL/INFO · 3 = setup
 **That last row is the one to watch in this campaign.** With #237 peer-sourcing live, a run you *intend*
 as P1 can be silently served by a peer. **A P1 PASS requires `src=gw`.**
 
-### 🔴 The oracle itself was broken — check you have `fa2e6aa` or later
+### 🔴 The oracle itself was broken — check you have `5264e28` or later
+
+> 📌 **Correction, 2026-07-28: this heading used to say `fa2e6aa`. That floor is stale — there was a
+> FIFTH defect.** `5264e28`: **`-F '%R'` is not a mosquitto specifier.** It expands to the **empty
+> string**, so *the retain flag was never read at all* — the retain check this section leans on was
+> vacuous. The specifier is lowercase **`%r`** (proved: `-F '[%R]'` → `[]`, `-F '[%r]'` → `[1]`). That
+> commit's own message notes an adversarial audit came back RED and **refuted two of three claims from
+> `da1cba8`/`fa2e6aa`** — so treat the causes named in those messages with suspicion, not the fix
+> count. **Use current HEAD, and re-read this whole section as "five defects", not four.**
 
 This document told you to trust the harness rather than hand-judge. **That was right in principle and,
 until 2026-07-28, wrong in fact.** `tools/ota_verify.sh` had **four** defects across two fixes

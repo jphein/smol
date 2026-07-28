@@ -18,6 +18,28 @@ It also gates more than the freeze: the migration is the only route to **BLE on 
 **Recommendation: take the interim fix now, finish the migration deliberately behind a two-board
 bench.** Detail in §6.
 
+> # 🔴 The one fact this document missed, and it outranks everything in it (2026-07-28)
+>
+> **The branch is 98 commits behind `main`, and it contains no Bard.**
+>
+> - Merge-base with `main` is **`36e6345`**; `git rev-list --count 36e6345..main` = **98**.
+> - `grep -c bard` on the branch's `main.rs` = **0**. All **2,982 lines** of `src/bard/` show as deleted
+>   in `main → branch`. The branch is dated **2026-07-22**; the Bard shipped **07-26/27**.
+> - So the verified *"compiles clean in 30.12 s"* was a tree **without** the Bard. **The branch and the
+>   Bard have never been compiled together** — and per [ROADMAP §2](../../ROADMAP.md) `main` now has only
+>   **~2,400 B of stack slack** before `tools/repro_build.sh` hard-fails, while Embassy adds three task
+>   stacks plus `embassy-net` socket buffers, in kilobytes. **Expect the rebase to break the stack-floor
+>   gate.** It fails closed (good), and the lever is `SEQ_CAP` — i.e. **the Bard's sequence length.**
+>
+> **This reframes §5 and §6.** "Rollback of the *code* is free — the branch is not merged" is true and
+> incomplete: **merging the branch as it stands would delete the flagship feature JP shipped this week.**
+> The gate is not P2 and not the OTA verification — it is a **98-commit rebase across the Bard campaign,
+> touching the same `main.rs` the branch rewrites by 671 lines.** Nobody has costed it.
+>
+> **Revised ordering: the rebase is P0.** Then the free peer-serve baseline (**E1**), then the async port
+> (**E2**). Full argument, and why **P2 itself is smaller than advertised**, in
+> [embassy-p2-mesh-relay.md](embassy-p2-mesh-relay.md).
+
 *Every claim below is sourced. Where I could not establish something, §7 says so rather than hedging.*
 
 ---
@@ -83,17 +105,33 @@ important structural fact in this document.
 | 3-inc3d-1 → d-2 | MC election OBSERVE + PUBLISH → **RESOLVE** (`a209858`-faithful; the fleet forms and re-elects a crown) |
 
 ### Not ported / unresolved
-- **The OTA fetch trigger.** ⚠️ *I nearly reported the OTA machinery as missing and was wrong* —
-  `run_leaf_ota_relay` and `ServeSource::GatewayFetch` **do exist** on the branch
-  (`mode.rs:5003`, `main.rs:1734`), so the #40 mesh-relay path survived the port. What is explicitly
-  deferred is the **downlink-offer → fetch trigger** (inc3c: "no fetch"), and **no Phase-3 hardware
-  run has been reported at all**, so whether an async-socket OTA fetch works is **unknown**. See §5 —
-  this is the load-bearing unknown for the whole decision.
-- **15 `TODO`/`unimplemented` markers** remain in the branch's `wifi.rs`, including
-  `TODO(#198 Phase 3): embassy-net stack construction` and `TODO(#198 Phase 3): reimplement
-  run_mqtt_burst as the async MQTT flush task` — both of which *appear already done* (`net_task`
-  exists; `mqtt_task` exists). These read as **stale comments left by later increments**, not real
-  gaps, but they need triage before anyone treats the file as a map.
+
+> # 🔴 Both bullets below were WRONG. Corrected 2026-07-28 — see [embassy-p2-mesh-relay.md](embassy-p2-mesh-relay.md)
+>
+> 1. **The relay "survived the port" — as UNPORTED BLOCKING CODE.** `run_leaf_ota_relay` on the branch
+>    is still a `pub fn` taking the same `tick: &mut dyn FnMut() -> bool` (branch `mode.rs:5003`); there
+>    are **8 `async fn` in 8024 lines**. "It exists" was true and read as "it was migrated." It wasn't.
+> 2. **`run_ota_fetch` is a STUB returning `false`** (branch `wifi.rs:1659-1675`, *"STUBBED (OTA HTTP
+>    fetch -> embassy-net in **Phase 5**)"*). So `ServeSource::GatewayFetch` **always** returns
+>    `FetchFailed`, and the async OTA fetch is not *unverified* — **it does not exist.** No Phase 5 plan
+>    exists in `docs/`.
+> 3. **The TODO triage below was over-generalised.** `run_mqtt_burst` *is* genuinely superseded by
+>    `mqtt_task` — that observation was correct. It was then extended to **all** the markers, including
+>    `run_ota_fetch` and `try_time_sync` (NTP — *"clock free-runs"*), which are **real gaps**. Exactly
+>    DOC-UPKEEP §2: a correct fact attached to the wrong scope.
+>
+> **Net effect on this document:** §5's "one blocker: the OTA path is unverified" is too kind. The OTA
+> path is **unwritten**, and the [verification plan](../plans/embassy-ota-verification.md) is
+> **unrunnable** against `b6413d3`.
+
+- **The OTA fetch trigger.** `run_leaf_ota_relay` and `ServeSource::GatewayFetch` **do exist** on the
+  branch (`mode.rs:5003`, `main.rs:1734`) — but see the correction above: unported, and fed by a stub.
+  What is explicitly deferred is the **downlink-offer → fetch trigger** (inc3c: "no fetch"), and **no
+  Phase-3 hardware run has been reported at all**.
+- **15 `TODO`/`unimplemented` markers** remain in the branch's `wifi.rs`. Three are **real stubs**
+  (`try_time_sync`, `run_mqtt_burst`, `run_ota_fetch` — branch `wifi.rs:707/909/1673`); of those only
+  `run_mqtt_burst` is genuinely superseded by `mqtt_task`. Triage the rest before treating the file as
+  a map.
 - Phase 3 is **not reported complete** on #198 — the latest issue comment is *"Phase 2 … COMPLETE ✅"*.
   The tracker is behind the branch by an entire phase.
 
@@ -268,6 +306,20 @@ shipping smartwatch answers that. They are:
 1. **C3-shaped** — different bootloader quirks and a different partition table from the C6.
 2. **Mesh-shaped** — the watch has **no ESP-NOW OTA relay**, no crown election to port, no fleet to
    keep alive during a burst. Everything smol-specific is exactly the part with no reference.
+
+> 📌 **Correction, 2026-07-28 — point 2 said "no crown election, no fleet, and nothing mesh-shaped at
+> all." Too strong on the middle claim.** The watch **does** do ESP-NOW under Embassy
+> (`src/net/smol_mesh.rs`, 896 L, `esp_radio::esp_now`), including a fragmented + ACKed +
+> retransmitted `RELAY`/`RELAYACK` transfer that its own comment calls a *"byte-exact port of
+> `wire.rs encode_relay`"* — and, decisively, it has **the radio-arbitration verdict written down**:
+> `mesh_pin_ok = radio_started && !connected && !connecting && !scanning && !scan_pending &&
+> !assoc_want() && ota.is_none()` (`net_task.rs:563-569`), *decided* in the task and *executed* in main
+> because **the mesh owns the `esp_now` handle** (`main.rs:2543`). That last term — `ota.is_none()` — is
+> precisely the invariant smol currently gets for free from blocking.
+> **What survives point 2:** no reference for an **OTA** relay, and none for the **scale** (≤4 frags /
+> ~15 s on the watch vs 6,237 chunks / 98 windows / minutes on smol). **What changes:** the hardest
+> *architectural* question has a working answer next door. See
+> [embassy-p2-mesh-relay.md](embassy-p2-mesh-relay.md) §2.
 
 So every Embassy *pattern* smol needs has been solved once next door, and every smol *mesh* behaviour has
 not. Budget accordingly: the framework risk is much lower than a from-scratch re-platform, the
