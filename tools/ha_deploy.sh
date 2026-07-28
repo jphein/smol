@@ -219,15 +219,17 @@ cmd_pull() {
 #   push --dry-run            as before; combines with the above
 PUSH_SCRIPT_REL="tools/ha_deploy.sh"
 
-git_or_die() { # $@ git args -> stdout; sets GIT_ERR and returns 1 on failure
-  GIT_ERR=""
+GIT_ERR=""   # global so `set -u` can never trip on it — see the subshell trap below
+
+git_or_die() { # $@ git args -> stdout; returns 1 on failure
+  # NB: a caller that runs this inside $( ) gets a SUBSHELL, so anything this assigns is lost to
+  # the parent. That bit exactly once, in the worst place: the "cannot determine cleanliness"
+  # branch referenced $GIT_ERR set inside such a subshell, so under `set -u` the guard died with
+  # exit 1 — the code that means "your push was refused for a real reason" — instead of the 2 it
+  # promises for "I could not check". A guard whose own failure path is broken is not a guard.
+  # Callers that need the error TEXT must capture it themselves, as push_dirty now does.
   local out; out="$(git -C "$REPO_DIR" "$@" 2>&1)" || { GIT_ERR="$out"; return 1; }
   printf '%s' "$out"
-}
-
-push_dirty() { # -> newline list of dirty repo-relative paths among the packages + this script
-  git_or_die status --porcelain -- "ha/packages" "$PUSH_SCRIPT_REL" \
-    | sed -n 's/^.\{3\}//p'
 }
 
 push_provenance() { # $1 basename -> "abc1234 3 hours ago · subject"
@@ -253,11 +255,15 @@ cmd_push() {
   local -a changed=() ; local needs_full=0
 
   # ---- GUARD, before the network and long before any mutation ----------------------------
-  local dirty; if ! dirty="$(push_dirty)"; then
-    echo "!! cannot determine whether the working tree is clean — $GIT_ERR" >&2
+  # One substitution captures git's output AND its stderr AND its status, all in this shell —
+  # deliberately not via a helper, so the error text survives to be printed.
+  local raw dirty
+  if ! raw="$(git -C "$REPO_DIR" status --porcelain -- ha/packages "$PUSH_SCRIPT_REL" 2>&1)"; then
+    echo "!! cannot determine whether the working tree is clean — ${raw:-git failed}" >&2
     echo "   Refusing to push: unverified is not the same as clean." >&2
     return 2
   fi
+  dirty="$(printf '%s' "$raw" | sed -n 's/^.\{3\}//p')"
   if [ -n "$dirty" ]; then
     echo "  ── PUSH GUARD ───────────────────────────────────────────────"
     echo "  Modified and NOT committed:"; echo "$dirty" | sed 's/^/    /'
