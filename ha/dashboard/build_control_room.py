@@ -25,10 +25,13 @@ SSLCTX=ssl.create_default_context()  # verifies by default
 if os.environ.get("HA_WS_INSECURE"):  # explicit opt-out for a LAN self-signed HA cert (like curl -k)
     SSLCTX.check_hostname=False; SSLCTX.verify_mode=ssl.CERT_NONE
 HA=os.environ.get("HA_SSH","jp@10.0.6.108"); WWW="/config/www/luna-cards"; LOCAL="/local/luna-cards"
-KNOWN={5:{"name":"Silent Aegis","role":"leaf","headless":True},  # headless board (no OLED — #headless); telemetry-only card
-       7:{"name":"Draconic Dominion","role":"the Seat","gate":True},
-       8:{"name":"Eldritch Nexus","role":"leaf"},
-       9:{"name":"Jade Herald","role":"leaf"}}
+# HARDWARE traits only — facts that are NOT derivable from anything the firmware publishes.
+# Everything identifying (sigil name, running build, which nodes exist) now comes from the HA
+# device registry, which the firmware itself authors; see discover_fleet(). The old KNOWN table
+# hardcoded names per id and had ALREADY drifted: it called id5 "Silent Aegis", but "Silent" is
+# not in the fantasy adjective corpus at all (names.rs) — id5 is Spectral Aegis. A second copy
+# of a deterministic algorithm always loses to the original, so we stopped keeping one.
+HW={5:{"headless":True}}   # id5 has no OLED (#headless) → telemetry-first box, no screen controls
 ACCENT="var(--accent-color)"; PHOS="var(--primary-color)"; VT="'VT323','IBM Plex Mono',monospace"
 NAJ="['unavailable','unknown','none','None','']"
 def esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
@@ -44,7 +47,7 @@ PMAP=("{'confirmed':['✓ confirmed','green','#5bff9a','mdi:check-decagram'],"
       "'mac-unknown':['? mac-unknown','red','#ff6b6b','mdi:help-rhombus'],"
       "'rolled-back':['↩ rolled-back','red','#ff6b6b','mdi:backup-restore']}")
 PDEF="['↑ relaying','blue','#5bd0ff','mdi:progress-upload']"
-def ota_progress_card(nid):
+def ota_progress_card(nid, sigil):
     # Shown ONLY while a relay matters: staged build present & this node not yet on it, OR the phase
     # is non-clean (leaf-timeout / *-failed / …). display:none when idle so the box stays calm.
     # STATE = sensor.smol_<id>_ota_relaydiag (last_wb %, drives the fill); phase chip = ota_diag.
@@ -63,7 +66,7 @@ def ota_progress_card(nid):
         "linear-gradient(90deg,{{ pl[2] }}2e 0,{{ pl[2] }}2e {{ pf }}%,#04120a {{ pf }}%,#04120a 100%);}"
         "ha-card:before{content:'';position:absolute;top:0;bottom:0;left:{{ pf }}%;width:2px;background:{{ pl[2] }};"
         "box-shadow:0 0 9px {{ pl[2] }},0 0 3px {{ pl[2] }};opacity:{% if pf>0 and pf<100 %}.95{% else %}0{% endif %};}"
-        "ha-card:after{content:'◈ MESH-OTA · id"+I+"';position:absolute;top:6px;right:11px;font-size:8.5px;letter-spacing:1.5px;"
+        "ha-card:after{content:'◈ MESH-OTA · "+esc(sigil)+"';position:absolute;top:6px;right:11px;font-size:8.5px;letter-spacing:1.5px;"
         "color:{{ pl[2] }};opacity:.75;font-family:"+VT+";z-index:2;}")
     info=(pre+".primary{font-family:"+VT+";font-size:30px;line-height:.85;color:{{ pl[2] }};text-shadow:0 0 8px {{ pl[2] }}66}"
           ".secondary{font-size:10.5px;opacity:.85;letter-spacing:.3px}")
@@ -74,7 +77,7 @@ def ota_progress_card(nid):
 # ---------- #70/#74 device alarm: self-hides when clean, shows the rollback/abnormal-reset story ----------
 # Shown ONLY when ota_outcome is bad (rolled-back / *-failed) OR reset_reason is abnormal (panic/wdt/
 # brownout/glitch) — the "what just happened to this board" surface #70 exists for. display:none when clean.
-def device_card(nid):
+def device_card(nid, sigil):
     I=str(nid); oo=f"sensor.smol_{nid}_ota_outcome"; rr=f"sensor.smol_{nid}_reset_reason"
     sl=f"sensor.smol_{nid}_boot_slot"; up=f"sensor.smol_{nid}_uptime"; hp=f"sensor.smol_{nid}_heap_free"
     pre=("{% set oo=states('"+oo+"') %}{% set rr=states('"+rr+"') %}"
@@ -85,7 +88,7 @@ def device_card(nid):
     secondary=pre+"slot {{ states('"+sl+"') }} · reset {{ rr }} · up {{ states('"+up+"') }}s · heap {{ states('"+hp+"') }}"
     style=(pre+"ha-card{display:{% if act %}block{% else %}none{% endif %};border-radius:0;border-top:none;border-bottom:none;"
            "margin-top:-2px;border-left:3px solid {{ col }};background:#0b0402;position:relative;overflow:hidden;}"
-           "ha-card:after{content:'◈ DEVICE · id"+I+"';position:absolute;top:6px;right:11px;font-size:8.5px;letter-spacing:1.5px;"
+           "ha-card:after{content:'◈ DEVICE · "+esc(sigil)+"';position:absolute;top:6px;right:11px;font-size:8.5px;letter-spacing:1.5px;"
            "color:{{ col }};opacity:.7;font-family:"+VT+";z-index:2;}")
     info=(pre+".primary{font-family:"+VT+";font-size:17px;line-height:1;color:{{ col }}}.secondary{font-size:10px;opacity:.85}")
     return {"type":"custom:mushroom-template-card","primary":primary,"secondary":secondary,
@@ -111,20 +114,40 @@ def plugin_chips(nid, present):
                         "background:var(--card-background-color);}"}}
 
 # ---------- node box = mushroom header + mushroom OLED + entities; span-4 in the VIEW grid ----------
+def live_expr(meta, present):
+    """Jinja boolean for 'this node is on the air', id-shape-agnostic.
+    ORs the package's hand-written `binary_sensor.smol_<id>_online` (where a human wrote one)
+    with the firmware-discovered entities, which carry expire_after. Either alone is wrong: the
+    package sensor exists for only 5/7/8/9 (so id50/51/122 would read a permanent ⛔), and id5's
+    happens to sit at 'unavailable' while the board is demonstrably alive."""
+    parts=[]
+    ob=f"binary_sensor.smol_{meta['id']}_online"
+    if ob in present: parts.append(f"is_state('{ob}','on')")
+    for f in HEARTBEAT:
+        e=meta.get("fw",{}).get(f)
+        if e: parts.append(f"states('{e}') not in {NAJ}")
+    return "("+" or ".join(parts)+")" if parts else "false"
+
 def node_card(nid, meta, present, span=4):
-    gate=meta["gate"]; headless=meta.get("headless",False); I=str(nid); on=f"is_state('binary_sensor.smol_{I}_online','on')"
-    # #64: the gateway's WiFi-uplink RSSI entity is device-name-derived (HA discovery names
-    # it sensor.smol_<id>_<noun>_uplink, where <noun> is the fantasy noun = last name word).
-    up=f"sensor.smol_{nid}_{meta['name'].split()[-1].lower()}_uplink"
+    gate=meta["gate"]; headless=meta.get("headless",False); I=str(nid); on=meta["onx"]
+    # #64: the gateway's WiFi-uplink RSSI entity — RESOLVED from the registry, not guessed.
+    # HA stickiness gave the fleet two forms (`sensor.smol_7_dominion_uplink` vs
+    # `sensor.smol_50_ember_uplink`), so the old name-derived f-string missed most nodes.
+    up=meta["fw"].get("uplink") or f"sensor.smol_{nid}_uplink"
+    E_T=meta["fw"].get("temp") or f"sensor.smol_{nid}_temp"
+    E_V=meta["fw"].get("voltage") or f"sensor.smol_{nid}_voltage"
     # RSSI pip LIVE (re-evaluates on takeover): gateway → its WiFi-uplink dBm (#64, falls to
     # 'WiFi' until the first burst publishes it); leaf → mesh-bond dBm.
     rssi_pip=(" · {% if gw %}{% set u=states('"+up+"') %}{% if u not in na %}{{ u }} dBm ↑{% else %}WiFi{% endif %}"
               "{% else %}{{ states('sensor.smol_"+I+"_rssi') if states('sensor.smol_"+I+"_rssi') not in na else '—' }} dBm{% endif %}")
-    # LIVE gateway signal = peers-state 'gateway' (an entity STATE → works in mushroom templates AND legacy conditional-card conditions).
-    gw="is_state('sensor.smol_"+I+"_peers','gateway')"
-    hdr=("{% set on="+on+" %}{% set gw="+gw+" %}{% set t=states('sensor.smol_"+I+"_temp') %}{% set v=states('sensor.smol_"+I+"_voltage') %}"
-         "{% set na="+NAJ+" %}{% if not on %}⛔ OFFLINE{% elif gw %}👑 GATEWAY{% else %}◈ leaf{% endif %} · id"+I+""
-         " · {{ t if t not in na else '—' }}° · {{ v if v not in na else '—' }}V"+rssi_pip)
+    # LIVE gateway signal = the MESH-WIDE elected owner, not a per-id peers entity. The old
+    # `sensor.smol_<id>_peers` form only exists for 7/8/9, so when the crown moved to id50 no
+    # node could report itself as gateway at all. `smol/mesh/channel` is one fixed topic every
+    # crown publishes to, so this works for any id — including ones HA has never seen before.
+    gw="(state_attr('sensor.smol_mesh_channel','owner')|string == '"+I+"')"
+    hdr=("{% set on="+on+" %}{% set gw="+gw+" %}{% set t=states('"+E_T+"') %}{% set v=states('"+E_V+"') %}"
+         "{% set na="+NAJ+" %}{% if not on %}⛔ OFFLINE{% elif gw %}👑 GATEWAY{% else %}◈ leaf{% endif %}"
+         " · {{ t if t not in na else '—' }}° · {{ v if v not in na else '—' }}V"+rssi_pip+" · id"+I)
     header={"type":"custom:mushroom-template-card","primary":meta["name"],"secondary":hdr,
             "icon":"{% if "+gw+" %}mdi:crown{% else %}mdi:chip{% endif %}",
             "icon_color":"{% if "+gw+" %}amber{% elif "+on+" %}green{% else %}red{% endif %}",
@@ -185,27 +208,31 @@ def node_card(nid, meta, present, span=4):
     # ---- LIVE role-conditional groups: box RESTRUCTURES on #51 takeover (keyed to owner attr).
     #      Rows added unconditionally; the hidden conditional also hides its (role-absent) entities → no 'entity not found'. ----
     JOIN="ha-card{border-radius:0;border-top:none;border-bottom:none;margin-top:-1px;"+OP+"}"
-    cond_leaf={"type":"conditional",                                                           # shown when this node is NOT the gateway (leaf/offline) — legacy state condition (HA-supported)
-        "conditions":[{"entity":f"sensor.smol_{nid}_peers","state_not":"gateway"}],
-        "card":{"type":"entities","show_header_toggle":False,"card_mod":{"style":JOIN},"entities":[
-            {"type":"section","label":"mesh bond (leaf)"},
-            {"entity":f"sensor.smol_{nid}_rssi","name":"bond (RSSI)","icon":"mdi:signal"},
-            {"entity":f"sensor.smol_{nid}_rssi_band","name":"bond band","icon":"mdi:signal-cellular-2"},
-            {"entity":f"binary_sensor.smol_{nid}_resync","name":"re-syncing","icon":"mdi:sync"}]}}
-    cond_gw={"type":"conditional",                                                             # shown when this node IS the gateway — legacy state condition (HA-supported)
-        "conditions":[{"entity":f"sensor.smol_{nid}_peers","state":"gateway"}],
-        "card":{"type":"entities","show_header_toggle":False,"card_mod":{"style":JOIN},"entities":[
-            {"type":"section","label":"gateway anchor · WiFi uplink"},
-            {"entity":up,"name":"WiFi uplink (RSSI)","icon":"mdi:wifi-arrow-up"},  # #64: gateway AP-uplink RSSI (sensor.smol_<id>_<noun>_uplink)
-            {"type":"attribute","entity":"sensor.smol_mesh_channel","attribute":"channel","name":"mesh channel (owned)","icon":"mdi:wifi"},
-            {"type":"attribute","entity":"sensor.smol_mesh_channel","attribute":"seq","name":"mesh seq (advancing)","icon":"mdi:counter"},
-            {"entity":f"sensor.smol_{nid}_peers","name":"peers / roster","icon":"mdi:lan"}]}}
+    # Role conditions read the MESH-WIDE elected owner attribute rather than a per-id peers
+    # entity, for the same reason `gw` above does: the per-id form doesn't exist for most of
+    # the fleet. HA's conditional card supports `attribute` in the modern condition form.
+    OWNER="sensor.smol_mesh_channel"
+    leaf_rows=[{"type":"section","label":"mesh bond (leaf)"}]
+    prow(leaf_rows,f"sensor.smol_{nid}_rssi","bond (RSSI)","mdi:signal")
+    prow(leaf_rows,f"sensor.smol_{nid}_rssi_band","bond band","mdi:signal-cellular-2")
+    prow(leaf_rows,f"binary_sensor.smol_{nid}_resync","re-syncing","mdi:sync")
+    cond_leaf={"type":"conditional",                                                           # shown when this node is NOT the elected crown
+        "conditions":[{"condition":"state","entity_id":OWNER,"attribute":"owner","state_not":I}],
+        "card":{"type":"entities","show_header_toggle":False,"card_mod":{"style":JOIN},"entities":leaf_rows}}
+    gw_rows=[{"type":"section","label":"gateway anchor · WiFi uplink"},
+             {"entity":up,"name":"WiFi uplink (RSSI)","icon":"mdi:wifi-arrow-up"},  # #64, registry-resolved
+             {"type":"attribute","entity":OWNER,"attribute":"channel","name":"mesh channel (owned)","icon":"mdi:wifi"},
+             {"type":"attribute","entity":OWNER,"attribute":"seq","name":"mesh seq (advancing)","icon":"mdi:counter"}]
+    prow(gw_rows,f"sensor.smol_{nid}_peers","peers / roster","mdi:lan")
+    cond_gw={"type":"conditional",                                                             # shown when this node IS the elected crown
+        "conditions":[{"condition":"state","entity_id":OWNER,"attribute":"owner","state":I}],
+        "card":{"type":"entities","show_header_toggle":False,"card_mod":{"style":JOIN},"entities":gw_rows}}
     # ---- ctrl_bottom: firmware + install (always last → rounded bottom) ----
     bot=[{"type":"section","label":"firmware"}]
     # #40 changed the Update discovery object_id noun-based → nounless (smol_<id>_update, wifi.rs 5efee40),
     # so match BOTH the legacy noun form (update.smol_<id>_<noun>_update, kept by HA registry stickiness on
     # id7/8/9) AND the new nounless form a fresh node (id10+) / a registry reset now creates.
-    fw=next((e for e in present if re.match(rf"update\.smol_{nid}(_.*)?_update$",e)),None)
+    fw=meta["fw"].get("update")
     if fw: bot.append({"entity":fw,"name":"firmware (version + update)"})
     inst=f"input_button.smol_ota_install_{nid}"
     if inst in present: bot.append({"entity":inst,"name":"Install staged (gateway consumes)","icon":"mdi:rocket-launch"})
@@ -233,8 +260,8 @@ def node_card(nid, meta, present, span=4):
                    "entities":[{"entity":f"sensor.smol_{nid}_heap_free","name":"heap free"}]
                               +([{"entity":f"sensor.smol_{nid}_heap_min","name":"heap min"}] if f"sensor.smol_{nid}_heap_min" in present else []),
                    "card_mod":{"style":"ha-card{border-radius:0;border-top:none;border-bottom:none;margin-top:-1px;"+OP+"}"}}
-    ota=ota_progress_card(nid)   # #40 relay progress bar + phase chip — self-hides (display:none) when idle
-    dev=device_card(nid)         # #70/#74 rollback / abnormal-reset alarm — self-hides when clean
+    ota=ota_progress_card(nid,meta['name'])   # #40 relay progress bar + phase chip — self-hides (display:none) when idle
+    dev=device_card(nid,meta['name'])         # #70/#74 rollback / abnormal-reset alarm — self-hides when clean
     plug=plugin_chips(nid,present)  # #55 plugin-visibility toggle chips
     if headless:
         # #headless board: no OLED / screen-mode / plugin controls to show — telemetry-first box.
@@ -254,11 +281,29 @@ def legend_card(nodes, present):
         if e in present: ents.append({"entity":e,"name":nm,"icon":ic})
     ents.append({"type":"section","label":"sigils & bonds (bond=RSSI · adrift when ch≠mesh)"})
     for n in nodes:
-        ents.append({"entity":f"binary_sensor.smol_{n['id']}_online","name":f"{'♛ ' if n['gate'] else ''}{n['name']} · id{n['id']}"})
+        # Prefer the package's online sensor; fall back to a firmware-discovered entity so a
+        # node with no hand-written family still gets a row instead of 'entity not found'.
+        row=f"binary_sensor.smol_{n['id']}_online"
+        if row not in present: row=n["fw"].get("status") or n["fw"].get("temp")
+        if row: ents.append({"entity":row,"name":f"{'♛ ' if n['gate'] else ''}{n['name']} · id{n['id']}"})
         if f"sensor.smol_{n['id']}_rssi" in present: ents.append({"entity":f"sensor.smol_{n['id']}_rssi","name":"   ↳ bond (RSSI)","icon":"mdi:signal"})
         if f"sensor.smol_{n['id']}_peers" in present: ents.append({"entity":f"sensor.smol_{n['id']}_peers","name":"   ↳ peers","icon":"mdi:lan"})
     return {"type":"entities","title":"the mesh","show_header_toggle":False,"entities":ents,
             "card_mod":{"style":accent_top(PHOS)},"view_layout":{"grid-column":"span 5"}}
+
+# ---------- dormant sigils: registered with HA, not currently on the air ----------
+# These are boards the firmware once announced whose firmware-discovered entities have all
+# expired. Deliberately NOT hidden — a node that quietly disappears is how ids 7 and 9 stayed
+# on the dashboard for weeks after their hardware was re-flashed as 50/51. One compact card,
+# so a re-flashed ghost is visible and prunable without eating a full box.
+def dormant_card(dormant):
+    lines=["**dormant sigils** · registered with HA, silent on the air",
+           "_a sigil that never returns is a stale identity — clear its MQTT device in HA to retire it_",""]
+    for n in dormant:
+        sw=n.get("sw") or "—"
+        lines.append(f"· **{esc(n['name'])}** — last seen running `{esc(sw)}` · <small>id{n['id']}</small>")
+    return {"type":"markdown","content":"\n".join(lines),"view_layout":{"grid-column":"span 12"},
+            "card_mod":{"style":"ha-card{opacity:.72;"+accent_top("#6f8f78")+"}"}}
 
 # ---------- FLEET-OTA row: staged build vs each node's RUNNING build# (+ live relay % / phase) ----------
 # Uses sensor.smol_<id>_build (running, #40) vs sensor.smol_ota_staged; when a node lags the staged
@@ -267,11 +312,11 @@ def forge_ota_md(nodes, present):
     out=["**fleet · staged vs running**",
          "staged **{% set s=states('sensor.smol_ota_staged') %}{{ s if s not in "+NAJ+" else '— none' }}**"]
     for n in nodes:
-        I=str(n["id"]); noun=n["name"].split()[-1]; tag=" ⚑" if n["gate"] else ""
+        I=str(n["id"]); tag=" ⚑" if n["gate"] else ""
         row=("{% set na="+NAJ+" %}{% set s=states('sensor.smol_ota_staged') %}{% set b=states('sensor.smol_"+I+"_build') %}"
              "{% set ph=states('sensor.smol_"+I+"_ota_diag') %}{% set p=states('sensor.smol_"+I+"_ota_relaydiag') %}"
-             "{% set on=is_state('binary_sensor.smol_"+I+"_online','on') %}{% set pm="+PMAP+" %}{% set pl=pm.get(ph,"+PDEF+") %}"
-             "**id"+I+"** "+noun+tag+" — "
+             "{% set on="+n["onx"]+" %}{% set pm="+PMAP+" %}{% set pl=pm.get(ph,"+PDEF+") %}"
+             "**"+esc(n["name"])+"**"+tag+" <small>id"+I+"</small> — "
              "{% if not on %}·offline·"
              "{% elif s in na or s=='none' %}run **{{ b }}** · no image staged"
              "{% elif b==s %}✓ **{{ b }}** current"
@@ -286,41 +331,51 @@ def forge_install_rows(nodes, present):
     for n in nodes:   # nodes are pre-sorted gateway-first
         I=str(n["id"]); inst=f"input_button.smol_ota_install_{I}"
         if inst in present:
-            rows.append({"entity":inst,"name":f"Install → id{I} {n['name'].split()[-1]}"+(" · canary / the Seat" if n["gate"] else ""),
+            rows.append({"entity":inst,"name":f"Install → {n['name']} · id{I}"+(" · canary / the Seat" if n["gate"] else ""),
                          "icon":"mdi:rocket-launch" if n["gate"] else "mdi:rocket-launch-outline"})
     return rows
 
 # ---------- mesh-overview matrix — crown/channel + per-node build / slot / reset / OTA state ----------
 # The "whole fleet at one glance" table JP asked for. Every cell is templated so it re-evaluates
 # live (crown moves on #51 takeover; build flips as OTA converges). Build shows run →staged when behind.
-def mesh_overview_md(nodes, present):
+def mesh_overview_md(nodes, dormant, present):
     na=NAJ
-    head=("{% set na="+na+" %}{% set owner=state_attr('sensor.smol_mesh_channel','owner') %}"
+    # The Seat is named by its SIGIL; the id is the fine print. `owner` is the live mesh-wide
+    # attribute, so the crown label follows a #51 takeover without a rebuild — but the NAME has
+    # to come from the build-time fleet map, so we template a tiny id→sigil lookup inline.
+    sig={str(n["id"]):n["name"] for n in list(nodes)+list(dormant)}
+    head=("{% set na="+na+" %}{% set sig="+json.dumps(sig)+" %}"
+          "{% set owner=state_attr('sensor.smol_mesh_channel','owner')|string %}"
           "{% set ch=states('sensor.smol_mesh_channel') %}{% set seq=state_attr('sensor.smol_mesh_channel','seq') %}"
           "{% set re=is_state('binary_sensor.smol_mesh_reelecting','on') %}"
           "**the mesh** · {% if re %}⚠️ **RE-ELECTING** — choosing a gateway…{% else %}"
-          "👑 the Seat **id{{ owner if owner not in na else '?' }}** · ch **{{ ch if ch not in na else '—' }}** · "
+          "👑 the Seat **{{ sig.get(owner, 'unknown sigil') }}** <small>id{{ owner if owner not in na else '?' }}</small> · "
+          "ch **{{ ch if ch not in na else '—' }}** · "
           "seq **{{ seq if seq not in na else '—' }}** _(advancing = alive)_{% endif %}")
     rows=["", "| sigil | link | build | slot | last reset | OTA |", "|:--|:--:|:--:|:--:|:--:|:--:|"]
     for n in nodes:
         I=str(n["id"]); tag="♛ " if n["gate"] else ""
         rows.append(
-            "{% set on=is_state('binary_sensor.smol_"+I+"_online','on') %}"
+            "{% set on="+n["onx"]+" %}"
             "{% set b=states('sensor.smol_"+I+"_build') %}{% set sl=states('sensor.smol_"+I+"_boot_slot') %}"
             "{% set rr=states('sensor.smol_"+I+"_reset_reason') %}{% set oo=states('sensor.smol_"+I+"_ota_outcome') %}"
             "{% set st=states('sensor.smol_ota_staged') %}"
-            "| "+tag+esc(n["name"])+" · id"+I+" "
+            "| "+tag+"**"+esc(n["name"])+"** <small>id"+I+"</small> "
             "| {{ '🟢' if on else '⛔' }} "
             "| {{ b if b not in na else '—' }}{% if b not in na and st not in na and st!='none' and b!=st %} →{{ st }}{% endif %} "
             "| {{ sl|replace('ota_','slot ') if sl not in na else '—' }} "
             "| {{ rr if rr not in na else '—' }} "
             "| {{ oo if oo not in na else '—' }} |")
+    # Dormant sigils get a row too — the whole point of dynamic discovery is that the table
+    # matches the registry, so a re-flashed ghost is visible rather than quietly absent.
+    for n in dormant:
+        rows.append(f"| _{esc(n['name'])}_ <small>id{n['id']}</small> | ⚫ | _{esc(n.get('sw') or '—')}_ | — | — | _dormant_ |")
     return head+"\n"+"\n".join(rows)
 
 # ---------- vitals history — heap-free + uptime across the WHOLE fleet, 24h (JP: history graphs) ----------
 def vitals_history_cards(nodes, present):
     def graph(field, title, accent):
-        ents=[{"entity":f"sensor.smol_{n['id']}_{field}","name":f"id{n['id']}"}
+        ents=[{"entity":f"sensor.smol_{n['id']}_{field}","name":n["name"]}
               for n in nodes if f"sensor.smol_{n['id']}_{field}" in present]
         if not ents: return None
         return {"type":"history-graph","title":title,"hours_to_show":24,"entities":ents,
@@ -328,7 +383,11 @@ def vitals_history_cards(nodes, present):
     return [c for c in (graph("heap_free","heap free · 24h · all sigils",PHOS),
                         graph("uptime","uptime · 24h · reboots = sawtooth",ACCENT)) if c]
 
-def gen_topology(nodes, seat):
+def gen_topology(nodes, seat, rost=None):
+    """Sigil-labelled star of the CURRENT mesh. Edges are drawn from the crown's real retained
+    roster when we have it (`rost['peers']`), so a leaf the crown cannot actually hear renders
+    as a dashed 'adrift' spur instead of a confident solid bond."""
+    peers=(rost or {}).get("peers",{})
     W,H=680,300; cx,cy=W/2,H*0.40; F="ui-monospace,'DejaVu Sans Mono',monospace"
     P=[f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}">',
        '<defs><pattern id="dg" width="16" height="16" patternUnits="userSpaceOnUse"><circle cx="1.5" cy="1.5" r=".8" fill="#0f3a24"/></pattern>'
@@ -338,16 +397,24 @@ def gen_topology(nodes, seat):
     leaves=[n for n in nodes if n["id"]!=seat["id"]]; m=len(leaves); ly=H*0.80
     for i,lf in enumerate(leaves):
         lx=W*0.16+(W*0.68)*(i/(m-1) if m>1 else .5); on=lf["on"]; col="#5bff9a" if on else "#ff6b6b"
+        bond=peers.get(lf["id"])                       # the crown's own view of this leaf, if any
         anim='<animate attributeName="opacity" values="0.9;0.5;0.9" dur="3s" repeatCount="indefinite"/>' if on else ''
-        P.append(f'<line x1="{cx:.0f}" y1="{cy:.0f}" x2="{lx:.0f}" y2="{ly:.0f}" stroke="{col}" stroke-width="{3 if on else 1.5}"{"" if on else " stroke-dasharray=\"6 5\""} opacity="{.85 if on else .7}">{anim}</line>')
+        # solid = the crown lists this leaf in its roster; dashed = we cannot prove the bond
+        bonded=bond is not None
+        P.append(f'<line x1="{cx:.0f}" y1="{cy:.0f}" x2="{lx:.0f}" y2="{ly:.0f}" stroke="{col}" stroke-width="{3 if bonded else 1.5}"{"" if bonded else " stroke-dasharray=\"6 5\""} opacity="{.85 if on else .7}">{anim}</line>')
+        if bond:
+            P.append(f'<text x="{(cx+lx)/2:.0f}" y="{(cy+ly)/2:.0f}" text-anchor="middle" font-family="{F}" font-size="10" fill="#2f7a4e">{bond["rssi"]} dBm</text>')
         P.append(f'<circle cx="{lx:.0f}" cy="{ly:.0f}" r="11" fill="#020402" stroke="{col}" stroke-width="{2.5 if on else 2}"/>')
         P.append(f'<text x="{lx:.0f}" y="{ly+27:.0f}" text-anchor="middle" font-family="{F}" font-size="16" font-weight="600" fill="{"#c9e8d2" if on else "#6f8f78"}">{esc(lf["name"])}</text>')
-        P.append(f'<text x="{lx:.0f}" y="{ly+43:.0f}" text-anchor="middle" font-family="{F}" font-size="11" fill="{col}">id{lf["id"]} · {"attuned" if on else "offline"}</text>')
+        state="attuned" if bonded else ("no bond" if on else "offline")
+        P.append(f'<text x="{lx:.0f}" y="{ly+43:.0f}" text-anchor="middle" font-family="{F}" font-size="11" fill="{col}">id{lf["id"]} · {state}</text>')
     P.append(f'<circle cx="{cx:.0f}" cy="{cy:.0f}" r="46" fill="url(#sg)"/>')
     P.append(f'<circle cx="{cx:.0f}" cy="{cy:.0f}" r="13" fill="#020402" stroke="#ffc24b" stroke-width="2.5"><animate attributeName="r" values="13;15.5;13" dur="2.6s" repeatCount="indefinite"/></circle>')
     P.append(f'<text x="{cx:.0f}" y="{cy+6:.0f}" text-anchor="middle" font-family="{F}" font-size="18" fill="#ffc24b">&#9819;</text>')
-    P.append(f'<text x="{cx:.0f}" y="{cy-30:.0f}" text-anchor="middle" font-family="{F}" font-size="20" font-weight="600" fill="#c9e8d2">the Seat · id{seat["id"]}</text>')
-    P.append(f'<text x="{cx:.0f}" y="{cy+34:.0f}" text-anchor="middle" font-family="{F}" font-size="12" fill="#ffc24b">{esc(seat["name"])} · GATE</text>')
+    # SIGIL FIRST: the name is the headline, the raw id is the fine print beneath it.
+    P.append(f'<text x="{cx:.0f}" y="{cy-30:.0f}" text-anchor="middle" font-family="{F}" font-size="20" font-weight="600" fill="#c9e8d2">{esc(seat["name"])}</text>')
+    ch=(rost or {}).get("ch")
+    P.append(f'<text x="{cx:.0f}" y="{cy+34:.0f}" text-anchor="middle" font-family="{F}" font-size="12" fill="#ffc24b">the Seat · id{seat["id"]}{" · ch"+esc(ch) if ch else ""}</text>')
     P.append('</svg>')
     return "".join(P)
 
@@ -362,29 +429,150 @@ async def rpc(ws,m,_i=[1]):
         r=json.loads(await ws.recv())
         if r.get("id")==m["id"]: return r
 
+# ============================ DYNAMIC FLEET DISCOVERY ==================================
+# The fleet is whatever the FIRMWARE says it is. Each node publishes retained MQTT discovery
+# configs (`homeassistant/sensor/smol<id>/{temp,voltage,status}/config`, plus uplink + the OTA
+# update entity) carrying a `device` block:
+#     {"identifiers":["smol<id>"], "name":"smol <id> <Noun>",
+#      "model":"smol ESP32-C3",    "sw_version":"v<build> <ForgeNoun>"}
+# so HA's device registry IS a firmware-authored fleet manifest — ids, sigil names and running
+# builds, all self-reported. We READ the sigil from there; we never recompute it. `names.rs`'s
+# formula already changed once (#218) and a duplicated algorithm drifts silently, so the only
+# copy that matters is the one on the board.
+#
+# This replaced discovery-by-`binary_sensor.smol_<id>_online`, which only found nodes that a
+# human had hand-written an entity family for in ha/packages/smol_mesh.yaml (5/7/8/9). That
+# rendered ids 7 and 9 — hardware re-flashed as 50/51 in July, gone from the air — while ids
+# 50, 51 and 122 sat on the mesh with no box at all.
+SIGIL_MODEL="smol "          # device.model prefix; excludes the C6 watch (`smolwatch042`)
+def sigil_of(dev_name, nid):
+    """The sigil words the FIRMWARE published, from `device.name` = 'smol <id> <words…>'.
+    Returns whatever follows the id, so when firmware starts sending the adjective too
+    ('smol 50 Kindled Ember') this picks it up with no change here. Falls back to a plainly
+    provisional label rather than inventing a name."""
+    m=re.match(r"^smol\s+%d\s+(.+)$"%nid, (dev_name or "").strip())
+    return m.group(1).strip() if m else f"unnamed id{nid}"
+
+# Firmware-discovery fields → resolved from the registry, NEVER built by convention.
+# HA registry stickiness left the fleet in two irreconcilable naming forms: id7/8/9 got the
+# nounless `sensor.smol_7_temp` but the noun-infixed `sensor.smol_7_dominion_uplink`, while
+# id5/13/42/50/51/122/236 got `sensor.smol_50_ember_temp`. An f-string is therefore wrong for
+# most of the fleet — the entity id has to be looked up.
+HEARTBEAT=("status","temp","voltage","uplink")   # carry expire_after → genuine liveness
+def resolve_fw(nid, own):
+    out={}
+    for f in HEARTBEAT:
+        pat=re.compile(rf"^sensor\.smol_{nid}(?:_[a-z0-9]+)?_{f}$")
+        out[f]=next((e for e in sorted(own) if pat.match(e)), None)
+    out["update"]=next((e for e in sorted(own) if re.match(rf"^update\.smol_{nid}(?:_[a-z0-9]+)?_update$",e)), None)
+    return out
+
+async def discover_fleet(ws, st):
+    """{id: meta} for every smol board the firmware has ever announced to HA."""
+    devs=(await rpc(ws,{"type":"config/device_registry/list"}))["result"]
+    ents=(await rpc(ws,{"type":"config/entity_registry/list"}))["result"]
+    fleet={}
+    for d in devs:
+        if not (d.get("model") or "").startswith(SIGIL_MODEL): continue
+        for ident in d.get("identifiers") or []:
+            tail=str(ident[-1]) if isinstance(ident,(list,tuple)) else str(ident)
+            m=re.fullmatch(r"smol(\d{1,3})",tail)
+            if not m: continue
+            nid=int(m.group(1))
+            fleet[d["id"]]={"id":nid,"name":sigil_of(d.get("name_by_user") or d.get("name"),nid),
+                            "sw":d.get("sw_version"),"own":[]}
+            break
+    for e in ents:
+        if e.get("device_id") in fleet: fleet[e["device_id"]]["own"].append(e["entity_id"])
+    out={}
+    for meta in fleet.values():
+        nid=meta["id"]; meta["fw"]=resolve_fw(nid,meta["own"])
+        # LIVENESS — only the firmware-discovered entities may be trusted. They carry
+        # expire_after (300 telemetry / 120 uplink) so they genuinely go unavailable when a
+        # board stops talking. The hand-written package sensors mostly do NOT: ids 7/8/9 each
+        # hold 40+ non-unavailable entities that are pure stale-retained ghosts, so "has a
+        # live entity" would report long-dead hardware as present.
+        # Kept in lockstep with live_expr()'s Jinja form — the same inputs, so a node the
+        # dashboard paints green is never one this script filed as dormant.
+        # HEARTBEAT fields only. `update` is excluded on purpose: it mirrors the RETAINED
+        # `smol/<id>/ota/state` with no expire_after, so a long-dead board still reports a
+        # cheerful 'off'/'on' there forever.
+        NA=("unavailable","unknown","none","None","",None)
+        meta["on"]=(any(st.get(meta["fw"][f],{}).get("state") not in NA
+                        for f in HEARTBEAT if meta["fw"].get(f))
+                    or st.get(f"binary_sensor.smol_{nid}_online",{}).get("state")=="on")
+        meta.update(HW.get(nid,{})); out[nid]=meta
+    return out
+
+async def read_roster(ws, timeout=8.0):
+    """Retained `smol/+/peers` straight off the broker — the crown's real bond list.
+    Read here rather than through an entity because the topic is per-crown-id: the mirror in
+    smol_mesh.yaml exists only for 7/8/9, so when the crown moved 8→50 the roster vanished from
+    HA entirely even though `smol/50/peers` was sitting on the broker. Wire format (mode.rs
+    serialize_peers): `PEERS|<role>|<ch>|id,rssi,age,ch,flags;…`, flags bit0=connected
+    bit1=has_mesh_time. Returns {crown_id: {"ch":n,"peers":{id:{rssi,age,flags}}}} for role G."""
+    sub=await rpc(ws,{"type":"mqtt/subscribe","topic":"smol/+/peers"})
+    if not sub.get("success"): print("  !! mqtt/subscribe unavailable — topology falls back to registry only"); return {}
+    raw={}
+    try:
+        while True:
+            r=json.loads(await asyncio.wait_for(ws.recv(),timeout=timeout))
+            if r.get("type")=="event" and r.get("id")==sub["id"]:
+                ev=r["event"]
+                m=re.fullmatch(r"smol/(\d{1,3})/peers",ev.get("topic",""))
+                if m: raw[int(m.group(1))]=ev.get("payload","")
+    except asyncio.TimeoutError: pass
+    out={}
+    for cid,payload in raw.items():
+        p=payload.split("|")
+        if len(p)<4 or p[0]!="PEERS" or p[1]!="G": continue   # leaves / malformed → not a roster
+        peers={}
+        for tok in p[3].split(";"):
+            f=tok.split(",")
+            if len(f)<5: continue
+            try: pid,rssi,age,flags=int(f[0]),int(f[1]),int(f[2]),int(f[4])
+            except ValueError: continue
+            # rssi arrives as an UNSIGNED byte (firmware feeds rx_control.rssi through an i32
+            # without the i8 cast), so -45 dBm is on the wire as 211. Decode defensively; the
+            # publisher is the real fix (reported to the firmware agent).
+            if rssi>127: rssi-=256
+            # A roster can list the same id twice (one entry per MAC) — keep the strongest.
+            if pid not in peers or rssi>peers[pid]["rssi"]:
+                peers[pid]={"rssi":rssi,"age":age,"flags":flags}
+        out[cid]={"ch":p[2],"peers":peers}
+    return out
+
 async def main():
     view=yaml.safe_load(open("smol-control-scaffold.yaml"))
     async with websockets.connect(URI,max_size=16*1024*1024,ssl=SSLCTX) as ws:
         json.loads(await ws.recv()); await ws.send(json.dumps({"type":"auth","access_token":TOKEN})); await ws.recv()
         st={s["entity_id"]:s for s in (await rpc(ws,{"type":"get_states"}))["result"]}; present=set(st)
-        ids=sorted(int(m.group(1)) for e in present if (m:=re.match(r"binary_sensor\.smol_(\d+)_online$",e))) or [7,8,9]
-        online={i for i in ids if st.get(f"binary_sensor.smol_{i}_online",{}).get("state")=="on"}
+        fleet=await discover_fleet(ws,st)
+        roster=await read_roster(ws)
+        if not fleet: print("!! no smol devices in the registry — nothing to render"); return
+        # The Seat is the ELECTED crown, from the mesh-wide (id-agnostic) `smol/mesh/channel`.
         owner=st.get("sensor.smol_mesh_channel",{}).get("attributes",{}).get("owner")
         try: seat_id=int(owner)
-        except (TypeError,ValueError): seat_id=min(online) if online else min(ids)
-        nodes=[]
-        for i in ids:
-            meta=dict(KNOWN.get(i,{"name":f"Sigil id{i}","role":"leaf"}))
-            meta.update(role=meta.get("role","leaf"),name=meta.get("name",f"Sigil id{i}"),gate=(i==seat_id),on=(i in online),id=i)
-            nodes.append(meta)
-        nodes.sort(key=lambda n:(not n["gate"],not n["on"],n["id"]))
-        seat=next(n for n in nodes if n["id"]==seat_id)
-        topo_url=serve("smol-topology.svg", gen_topology(nodes,seat))
+        except (TypeError,ValueError): seat_id=None
+        if seat_id not in fleet:                      # stale/absent MC → believe the roster's role-G publisher
+            seat_id=next((c for c in roster if c in fleet), None)
+        live={i for i,m in fleet.items() if m["on"]}
+        if seat_id in fleet: live.add(seat_id)        # the crown is on the mesh by definition
+        if not live: live=set(fleet)                  # nothing live at all → show everything rather than a blank room
+        if seat_id is None: seat_id=min(live)
+        for i,m in fleet.items():
+            m["gate"]=(i==seat_id); m["bond"]=roster.get(seat_id,{}).get("peers",{}).get(i)
+            m["onx"]=live_expr(m,present)   # id-shape-agnostic Jinja liveness, reused by every card
+        nodes=sorted((fleet[i] for i in live),key=lambda n:(not n["gate"],not n["on"],n["id"]))
+        dormant=sorted((m for i,m in fleet.items() if i not in live),key=lambda n:n["id"])
+        seat=fleet[seat_id]
+        topo_url=serve("smol-topology.svg", gen_topology(nodes,seat,roster.get(seat_id,{})))
         # adaptive fleet tiling: 4 sigils → 2×2 (span 6), 3 → 3-up (span 4), 2 → span 6, 1 → full width.
         per_row={1:1,2:2,4:2}.get(len(nodes),3); NODE_SPAN=12//per_row
         node_cards=[node_card(n["id"],n,present,NODE_SPAN) for n in nodes]
+        if dormant: node_cards.append(dormant_card(dormant))
         legend=legend_card(nodes,present)
-        mesh_ovw=mesh_overview_md(nodes,present); vitals=vitals_history_cards(nodes,present)
+        mesh_ovw=mesh_overview_md(nodes,dormant,present); vitals=vitals_history_cards(nodes,present)
         cards=view["cards"]; out=[]; done={"topo":0,"legend":0,"meshovw":0,"fleet":0,"vitals":0,"forge":0,"install":0}
         for c in cards:
             if c.get("type")=="picture" and c.get("image")=="TOPO": c["image"]=topo_url; done["topo"]+=1; out.append(c)
@@ -431,11 +619,31 @@ async def main():
                 # fleet-wide card that merely mentions `smol_8_` looked like the id8 box), and a
                 # collision makes a genuinely-new live card look "known" — silently dropping it,
                 # which is precisely the bug this merge exists to prevent.
+                # Match a node box at ANY span, not just this run's NODE_SPAN. The span is
+                # derived from the fleet SIZE (per_row), so discovering one more node silently
+                # re-keyed every existing box — the previous run's boxes then looked "unknown"
+                # and were preserved alongside the new ones, doubling the fleet on screen.
                 is_node_box = (t == "vertical-stack"
-                               and (c.get("view_layout") or {}).get("grid-column") == f"span {NODE_SPAN}")
-                m = re.search(r"smol_(\d+)_", json.dumps(c)) if is_node_box else None
-                if m:
-                    lbl = f"node{m.group(1)}"
+                               and re.fullmatch(r"span \d+", str((c.get("view_layout") or {}).get("grid-column") or "")))
+                # A node box references EXACTLY ONE node id. Keying off the first id found
+                # instead collided with the fleet-wide forge stack, whose OTA table mentions
+                # `sensor.smol_5_build` and so identified as the id5 box — two different cards
+                # sharing one identity, which is precisely how a live card gets silently
+                # dropped. Several distinct ids ⇒ fleet-wide card ⇒ fall through to the hash.
+                seen_ids = set(re.findall(r"smol_(\d+)_", json.dumps(c))) if is_node_box else set()
+                if len(seen_ids) == 1:
+                    lbl = f"node{seen_ids.pop()}"
+                elif t == "vertical-stack" and (c.get("cards") or [{}])[0].get("title"):
+                    # A wrapper stack inherits its FIRST CHILD's title. The forge is exactly
+                    # this shape: generator-filled (its OTA table lists a row per node) but
+                    # untitled at the top level, so it fell through to a content hash — and a
+                    # content hash of a card whose content tracks the fleet changes whenever the
+                    # fleet does. Each fleet change therefore stranded the previous forge as an
+                    # "unknown" card and preserved it forever: JP's dashboard already carries
+                    # TWO forge stacks from earlier runs, and this run would have added a third.
+                    # An inherited title is fleet-invariant, so all copies collapse to one
+                    # identity and the duplicates finally retire.
+                    lbl = str((c.get("cards") or [{}])[0]["title"])
                 else:
                     # Hash the card with CACHE-BUSTING QUERY STRINGS STRIPPED. `serve()` appends
                     # `?v=<md5-of-svg>` to the topology image, so a card that is semantically the
@@ -448,9 +656,18 @@ async def main():
 
         prev = next((v for v in cfg["views"] if v.get("path") == "smol-control"), None)
         idx = cfg["views"].index(prev) if prev else len(cfg["views"])
+        # A node box is GENERATOR-OWNED: this script is the only thing that creates one, so when
+        # a node leaves the fleet its box must DIE. Without this the merge below — whose whole
+        # job is to protect cards it does not recognise — would faithfully resurrect the box of
+        # every retired node forever (ids 7 and 9 being exactly that case).
+        GEN_OWNED = re.compile(r"^vertical-stack\|node\d+$")
         if prev:
             known = {_ident(c) for c in view["cards"]}
-            extras = [c for c in prev.get("cards", []) if _ident(c) not in known]
+            retired = [c for c in prev.get("cards", []) if _ident(c) not in known and GEN_OWNED.match(_ident(c))]
+            extras = [c for c in prev.get("cards", []) if _ident(c) not in known and not GEN_OWNED.match(_ident(c))]
+            if retired:
+                print(f"  RETIRED {len(retired)} node box(es) for nodes no longer in the fleet:",
+                      [_ident(c) for c in retired])
             if extras:
                 view["cards"] = view["cards"] + extras
                 print(f"  PRESERVED {len(extras)} live card(s) the scaffold does not define:")
@@ -464,8 +681,22 @@ async def main():
         if not s.get("success"): print("!! SAVE FAILED",s); return
         r2=(await rpc(ws,{"type":"lovelace/config","url_path":DASH}))["result"]
         vv=next(x for x in r2["views"] if x.get("path")=="smol-control")
-        nb=[c for c in vv["cards"] if (c.get("view_layout") or {}).get("grid-column")==f"span {NODE_SPAN}" and c.get("type")=="vertical-stack"]
-        print("SAVE ok · nodes:",ids,"Seat id",seat_id,"online",sorted(online),"· node span",NODE_SPAN)
+        # Count NODE boxes specifically, via the same identity the merge uses. Matching on
+        # "vertical-stack at span N" over-counted: glass/power/forge are also span-N stacks, so
+        # a 3-node fleet cheerfully reported 6 node boxes.
+        nb=[c for c in vv["cards"] if GEN_OWNED.match(_ident(c))]
+        print(f"SAVE ok · dashboard '{DASH}' · the Seat = {seat['name']} (id{seat_id})"
+              f" · node span {NODE_SPAN}")
+        print("  fleet (HA device registry, firmware-authored):")
+        for n in nodes:
+            b=n.get("bond"); bond=f" · bond {b['rssi']} dBm (age {b['age']}s)" if b else ""
+            print(f"    {'♛' if n['gate'] else '·'} {n['name']:<22} id{n['id']:<4} {'live':<5}"
+                  f" sw={n.get('sw') or '—':<12}{bond}")
+        for n in dormant:
+            print(f"    ⚫ {n['name']:<22} id{n['id']:<4} {'dormant':<5} sw={n.get('sw') or '—'}")
+        if roster:
+            for cid,r in sorted(roster.items()):
+                print(f"  roster · crown id{cid} ch{r['ch']} → {sorted(r['peers'])}")
         print("  node boxes spliced into view grid:",len(nb),"· done:",done)
         print("  each box:",[c.get("type") for c in nb[0]["cards"]] if nb else "NONE")
 if __name__=="__main__":
