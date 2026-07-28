@@ -678,12 +678,20 @@ def sigil_of(dev_name, nid):
 # id5/13/42/50/51/122/236 got `sensor.smol_50_ember_temp`. An f-string is therefore wrong for
 # most of the fleet — the entity id has to be looked up.
 HEARTBEAT=("status","temp","voltage","uplink")   # carry expire_after → genuine liveness
+# The name infix is `*`, not `?` — ANY number of slug segments, including none.
+# `?` allowed at most one, which was right only while the firmware published a bare
+# noun. Since 018ed6c discovery emits `smol <id> <adj> <noun>`, so a registry entry
+# derived after that carries TWO segments (`sensor.smol_9_jade_herald_status`) and `?`
+# missed it — every HEARTBEAT field resolved to None, `meta["on"]` went False, and the
+# board read DORMANT while it was talking. A whole-fleet blackout from one quantifier.
+# `*` still matches both legacy forms (`smol_9_status`, `smol_9_herald_status`), and the
+# leading `_` on each segment keeps nid=9 from ever matching `smol_90_…`.
 def resolve_fw(nid, own):
     out={}
     for f in HEARTBEAT:
-        pat=re.compile(rf"^sensor\.smol_{nid}(?:_[a-z0-9]+)?_{f}$")
+        pat=re.compile(rf"^sensor\.smol_{nid}(?:_[a-z0-9]+)*_{f}$")
         out[f]=next((e for e in sorted(own) if pat.match(e)), None)
-    out["update"]=next((e for e in sorted(own) if re.match(rf"^update\.smol_{nid}(?:_[a-z0-9]+)?_update$",e)), None)
+    out["update"]=next((e for e in sorted(own) if re.match(rf"^update\.smol_{nid}(?:_[a-z0-9]+)*_update$",e)), None)
     return out
 
 async def discover_fleet(ws, st):
