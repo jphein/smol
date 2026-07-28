@@ -2080,7 +2080,7 @@ pub fn boot_slot() -> u8 {
 /// so uninitialised RTC RAM reads as `none`, never a false outcome.
 #[cfg(feature = "wifi")]
 #[esp_hal::ram(rtc_fast, persistent)]
-static mut OTA_OUTCOME: [u32; 2] = [0u32; 2]; // [magic, 1=confirmed / 2=rolled-back]
+static mut OTA_OUTCOME: [u32; 3] = [0u32; 3]; // [magic, 1=confirmed / 2=rolled-back, build]
 
 #[cfg(feature = "wifi")]
 const OTA_OUTCOME_MAGIC: u32 = 0x736D_6C4F; // "smlO"
@@ -2108,7 +2108,7 @@ const OTA_OUTCOME_MAGIC: u32 = 0x736D_6C4F; // "smlO"
 /// only change by being reflashed.
 #[cfg(feature = "wifi")]
 #[esp_hal::ram(rtc_fast, persistent)]
-static mut BL_REVERT: [u32; 2] = [0u32; 2];
+static mut BL_REVERT: [u32; 3] = [0u32; 3]; // [magic, 1=on / 2=off, build]
 
 #[cfg(feature = "wifi")]
 const BL_REVERT_MAGIC: u32 = 0x736D_6C42; // "smlB"
@@ -2121,6 +2121,10 @@ pub fn mark_bl_revert(on: bool) {
         let m = &mut *core::ptr::addr_of_mut!(BL_REVERT);
         m[0] = BL_REVERT_MAGIC;
         m[1] = if on { 1 } else { 2 };
+        // Build-scoped for the same reason as `OTA_OUTCOME`, and one extra: a USB reflash can replace
+        // the BOOTLOADER as well as the app, so an observation made under a different build is not
+        // evidence about the bootloader now running.
+        m[2] = BUILD_NUMBER;
     }
 }
 
@@ -2134,8 +2138,8 @@ pub fn mark_bl_revert(on: bool) {
 pub fn bl_revert_token() -> Option<&'static str> {
     unsafe {
         let m = core::ptr::addr_of!(BL_REVERT).read();
-        if m[0] != BL_REVERT_MAGIC {
-            return None;
+        if m[0] != BL_REVERT_MAGIC || m[2] != BUILD_NUMBER {
+            return None; // never observed, or observed under a different image — omit the field
         }
         match m[1] {
             1 => Some("on"),
@@ -2153,6 +2157,13 @@ pub fn mark_ota_outcome(rolled_back: bool) {
         let m = &mut *core::ptr::addr_of_mut!(OTA_OUTCOME);
         m[0] = OTA_OUTCOME_MAGIC;
         m[1] = if rolled_back { 2 } else { 1 };
+        // #153: WHICH build this verdict is about. Without it the token asserts "a build was
+        // confirmed, once" and is read as "the running image arrived over OTA and passed health
+        // check" — an unscoped claim that survives a USB reflash and every non-power-cycle reboot
+        // (`wdt`, `panic`, `sw`, `brownout`; id8 reads `rst=brownout` right now). An audit built a
+        // PASS on exactly that: "v906 -> v907 · ota=confirmed · rst=wdt" for an image that arrived
+        // over USB.
+        m[2] = BUILD_NUMBER;
     }
 }
 
@@ -2166,7 +2177,16 @@ pub fn ota_outcome_token() -> &'static str {
             return "none";
         }
         match m[1] {
-            1 => "confirmed",
+            // `confirmed` is an assertion about the RUNNING image, so it is build-SCOPED: a verdict
+            // recorded for another build cannot vouch for this one. That is the fix — the token now
+            // means "THIS build was confirmed" and a reader can check it against
+            // `installed_version`, so the claim is verifiable instead of trusted.
+            1 if m[2] == BUILD_NUMBER => "confirmed",
+            1 => "none", // a stale vouch from a previous image — say nothing rather than lie
+            // `rolled-back` is deliberately NOT scoped, and the asymmetry is the point: it describes
+            // the image we rolled AWAY from, and its intended reader is the GOOD slot — i.e. a
+            // DIFFERENT build by construction. Scoping it would suppress the one signal it exists to
+            // deliver (#70: the good-slot boot reports `rolled-back`).
             2 => "rolled-back",
             _ => "none",
         }
