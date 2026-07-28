@@ -3403,6 +3403,27 @@ impl RadioManager {
                     shed = shed.saturating_add(1);
                 }
             };
+            // #33 WHY a crown did not self-install, as one octal digit: bit 0 = `leaf_ota_pending`,
+            // bit 1 = `leaf_installs_outstanding`, bit 2 = an install already ARMED in RAM. `1` bits
+            // in 0/1 are suppressing.
+            //
+            // `main`'s gate is `!leaf_ota_pending && !leaf_installs_outstanding &&
+            // take_install_request()`, and the `&&` short-circuits BEFORE the take — so a suppressed
+            // install KEEPS its RAM arm and waits silently, while its RETAINED topic is already gone
+            // (cleared at catch, deliberately: #111, so a bad self-image cannot re-fetch for ever).
+            // That pair of behaviours is indistinguishable from a swallowed command unless the gates
+            // are visible, which cost two operator arms and a code read to work out on id5. `sog=4`
+            // means armed and waiting on nothing — i.e. it will fire; `sog=6` means armed but held by
+            // an outstanding leaf install.
+            //
+            // In the DIAG record rather than the armdiag because `diag_record` already has `&mut self`
+            // — the armdiag is built inside `mqtt_session`, which takes disjoint field borrows and
+            // would need the value threaded through three signatures and three call sites for the same
+            // 7 bytes. Sheddable, so it can never push the record over the publish cliff.
+            let sog = (self.leaf_ota_pending as u8)
+                | ((self.leaf_installs_outstanding as u8) << 1)
+                | ((self.install_requested as u8) << 2);
+            room_for(&mut rec, alloc::format!("|sog={}", sog));
             // #204: crown dead-downstream telemetry — <deaf-streak>:<reassoc-cycles>:<deaf_shed 0/1>.
             // Named `cdeaf` to NOT collide with the mesh-test-only `deaf=` (an ESP-NOW deaf-LIST count).
             room_for(
