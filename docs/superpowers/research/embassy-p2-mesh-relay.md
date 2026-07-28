@@ -465,6 +465,44 @@ loss and should be stated to JP as one.**
 4. **Put the C3-vs-C6 fork to JP with these numbers**, including option (c) as *his* call rather than
    ours.
 
+### 🎁 Does the Bard fit on C6 *alongside* async? **Yes — but in a smol-shaped firmware, not by extending the watch**
+
+Team-lead's closing question, and it does turn the trade-off into a sequencing question — with one
+correction to the obvious assumption.
+
+**Measured from the watch's own release ELF** (`riscv32imac`, Embassy + ESP-NOW, no bard, 2026-07-21):
+
+| | value |
+|---|---|
+| **C6 DRAM pool** | **366,660 B** — only **+80,952 B** over the C3's 285,708 B, **not** the +112 KB that "512 vs 400 KB SRAM" suggests |
+| watch `.bss` | **285,480 B** (framebuffer, apps, fonts) |
+| watch `.stack` | **60,912 B** |
+
+> ⚠️ **So the watch itself is nearly full.** Adding the Bard's 39,080 B to *the watch firmware* leaves
+> **~21,832 B** of stack against a 54,960 B peak — **it would not fit either.** "The C6 has room" is
+> true of the *chip* and false of *that firmware*.
+
+**But a smol-shaped firmware on C6 is a different picture**, because smol's `.bss` is far smaller than
+the watch's (213,200 B with Embassy, no bard):
+
+| config on C6 | projected `.stack` | vs 54,960 B peak |
+|---|---|---|
+| smol + Embassy, no bard | ~144,668 B | ✅ |
+| **smol + Embassy + Bard** | **~105,588 B** | ✅ **fits, ~1.9× margin** |
+
+**Against the C3's 17,800–24,600 B for the same config, that is ~84 KB of headroom** — so on C6 the
+Bard and async stop competing entirely.
+
+**Which sharpens the recommendation:** (b) is **a smol C6 port**, not "move development to the watch
+repo." The watch remains the *reference* for Embassy patterns, ESP-NOW-under-async and the
+`mesh_pin_ok` verdict (§2) — it is not the host for smol's features. **And it means option (c) is not a
+permanent trade: on C6 both fit, so dropping the Bard would only ever be a C3-lifetime decision.**
+
+*Caveats: the C6 pool is taken from one firmware's ELF and could shift with a different linker/radio
+config; smol's C6 `.bss` is projected from its C3 `imc` build onto `imac`, so treat ~105 KB as an
+estimate with wide margin — the margin is what makes it safe to state, since it would have to be wrong
+by ~50 KB to change the answer. The watch ELF is a week old (07-21).*
+
 ### The honest caveats, which do not rescue it
 
 - The 73,728 B floor is bard-derived and over-strict for no-bard builds. **Irrelevant to the verdict** —
