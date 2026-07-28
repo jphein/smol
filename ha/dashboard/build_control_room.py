@@ -900,7 +900,7 @@ async def main():
             # The fleet explains the card counts: node boxes are per-node, so "built 33 / live 31"
             # is a node that joined since the last real run, not a mystery.
             report_fleet(nodes, dormant, roster)
-            return report_check(cfg, view, prev, extras, retired, retiring, present)
+            return report_check(cfg, view, prev, extras, retired, retiring, st)
         if prev:
             if retiring:
                 print(f"  REMOVED {len(retiring)} card(s) listed in RETIRE_LIVE:",
@@ -1074,7 +1074,7 @@ def _excerpt(c):
     return " ".join(str(txt).split())[:72]
 
 
-def report_dead_rows(view, present):
+def report_dead_rows(view, st):
     """Do the cards we would DEPLOY wire rows to entities HA does not have? Returns them.
 
     A SEPARATE QUESTION from live-only drift, and separately fatal, because the fixes differ:
@@ -1085,18 +1085,38 @@ def report_dead_rows(view, present):
     This is the gap that let the banner render `build —` in the largest type on the page while
     every check was green: nothing asked whether the dashboard WORKS, only whether the repo
     could reproduce it. Checked against the BUILT view — what a real run would ship — because
-    that is the thing this repo controls and can fix."""
+    that is the thing this repo controls and can fix.
+
+    TWO KINDS, and the second nearly escaped. "Absent" is the easy one: no such entity id.
+    "Orphan" is an entity that still EXISTS in `get_states` but only as an entity-registry
+    husk — HA keeps any entity carrying a `unique_id` after its integration stops providing it.
+    Retiring ids 7/9 deleted 56 `input_*` helpers outright but left 110 sensors behind exactly
+    like this, all `unavailable`. A membership test alone calls those healthy, so the check
+    would have been blind to precisely the corpses it exists to find (morpheus-yaml's catch).
+
+    `restored: True` is the discriminator, and it is exact: all 110 husks carry it, while a LIVE
+    board's momentarily-`unavailable` sensor (`sensor.smol_8_nexus_uplink`) does not. So this
+    distinguishes "the integration behind this is gone" from "a real board has nothing to say
+    right now" — which matters, because flagging the latter would make the gate cry wolf on
+    every transient and get it ignored."""
     refs = referenced_entities(view["cards"])
-    return {e: idents for e, idents in sorted(refs.items()) if e not in present}
+    out = {}
+    for e, idents in sorted(refs.items()):
+        s = st.get(e)
+        if s is None:
+            out[e] = ("absent", idents)
+        elif (s.get("attributes") or {}).get("restored") is True:
+            out[e] = ("orphan", idents)
+    return out
 
 
-def report_check(cfg, view, prev, extras, retired, retiring, present):
+def report_check(cfg, view, prev, extras, retired, retiring, st):
     """--check output. Exit code: 1 live-only drift · 3 dead rows · 0 clean.
 
     Precedence when both fire: 1. Live-only is the more structural failure — a card the repo
     cannot rebuild at all outranks a card it can rebuild but which points somewhere dead. Both
     sections always print, so the exit code chooses your first action without hiding the rest."""
-    dead = report_dead_rows(view, present)
+    dead = report_dead_rows(view, st)
     if not prev:
         print(f"\ndashboard '{DASH}' has no view with path 'smol-control' yet — nothing to drift "
               f"from; a real run would create it.")
@@ -1143,12 +1163,16 @@ def report_check(cfg, view, prev, extras, retired, retiring, present):
         print("  These render as 'Entity not found' / unavailable — a control that looks broken")
         print("  rather than one that is simply not offered. A card can be perfectly reproducible")
         print("  and still be wired to nothing, which is why this is not the LIVE-ONLY count.")
-        for e, idents in dead.items():
-            print(f"    - {e}")
+        for e, (kind, idents) in dead.items():
+            why = ("no such entity" if kind == "absent"
+                   else "entity-registry ORPHAN — exists but nothing provides it (restored)")
+            print(f"    - {e}  [{kind}] {why}")
             print(f"        on: {', '.join(sorted(idents))}")
         print("\n  FIX: repoint the row, gate it on the entity existing, or drop the card.")
+        print("       An orphan usually means the card outlived its integration — drop the card,")
+        print("       and clear the husk in HA so it stops looking like a real entity.")
     else:
-        print(f"DEAD ROWS · 0 — every wired entity exists in HA.")
+        print("\nDEAD ROWS · 0 — every wired entity exists and is actually provided.")
 
     return 1 if extras else (3 if dead else 0)
 

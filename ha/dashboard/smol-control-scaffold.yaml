@@ -353,17 +353,15 @@ cards:
   - type: entities
     view_layout: {grid-column: "span 6"}
     title: last message per sigil
+    # ids 7/9 rows removed 2026-07-28 (#311): their sensors survive the package retire as
+    # entity-registry ORPHANS (unique_id keeps the husk, `restored: true`, permanently
+    # `unavailable`), so these rows rendered as dead controls rather than vanishing. Caught
+    # by --check's orphan pass, which exists because a membership test called them healthy.
     show_header_toggle: false
     state_color: true
     entities:
-      - entity: sensor.smol_7_last_message
-        name: Dominion · Molten Sanctum
-        secondary_info: last-changed
       - entity: sensor.smol_8_last_message
         name: Eldritch Nexus
-        secondary_info: last-changed
-      - entity: sensor.smol_9_last_message
-        name: Herald · Familiar
         secondary_info: last-changed
     card_mod: *accent
 
@@ -422,6 +420,10 @@ cards:
   - type: entities
     view_layout: {grid-column: "span 6"}
     title: time sync · NTP freshness
+    # ids 7/9 rows removed 2026-07-28 (#311): their sensors survive the package retire as
+    # entity-registry ORPHANS (unique_id keeps the husk, `restored: true`, permanently
+    # `unavailable`), so these rows rendered as dead controls rather than vanishing. Caught
+    # by --check's orphan pass, which exists because a membership test called them healthy.
     show_header_toggle: false
     state_color: true
     entities:
@@ -429,14 +431,8 @@ cards:
         name: Fleet freshness
         icon: mdi:clock-check
       - type: divider
-      - entity: sensor.smol_7_ntp_fresh
-        name: Dominion
-        secondary_info: last-changed
       - entity: sensor.smol_8_ntp_fresh
         name: Nexus
-        secondary_info: last-changed
-      - entity: sensor.smol_9_ntp_fresh
-        name: Herald
         secondary_info: last-changed
     card_mod: *accent
 
