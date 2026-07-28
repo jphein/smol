@@ -174,7 +174,19 @@ if [ "$MODE" = "install" ]; then
   # RETAINED (-r): the fw does a retained-read on subscribe (wifi.rs:1126); a non-retained INSTALL
   # is missed by id7's bursty subscribe window (lucid A/B: retained→fetch 6s; non-retained→miss).
   # Idempotent: fw gate is staged.build > running, so a retained re-fire won't re-install same build.
-  mosquitto_pub -h "$BROKER" -p 1883 -u "$MQTT_USER" -P "$(mqtt_pw)" -r -t "smol/${ID}/ota/install" -m "INSTALL"
+  # 2026-07-28: the publish result MUST be checked. This block used to run mosquitto_pub,
+  # print the success line unconditionally, and `exit 0` — so a failed arm announced itself
+  # as an arm. Hit twice in one rollout ("Error: The connection was refused", transient
+  # broker pressure): the operator sees an error on stderr amid other output, any caller
+  # reading $? sees success, and the board simply never updates. An arm that silently
+  # doesn't arm is the worst failure this tool can have, because the symptom is a board
+  # that stays on the old build with nothing reporting why.
+  if ! mosquitto_pub -h "$BROKER" -p 1883 -u "$MQTT_USER" -P "$(mqtt_pw)" \
+        -r -t "smol/${ID}/ota/install" -m "INSTALL"; then
+    echo "FAILED to arm id${ID}: the INSTALL publish did not succeed — id${ID} is NOT armed." >&2
+    echo "  retry; if it persists check broker reachability (transient refusals seen under load)." >&2
+    exit 5
+  fi
   echo "install  smol/${ID}/ota/install  <-  INSTALL (RETAINED — id${ID} reliably catches it; fetches STAGED if staged.build>running)"
   exit 0
 fi
