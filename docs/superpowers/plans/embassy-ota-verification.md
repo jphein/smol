@@ -128,11 +128,13 @@ tools/ota_verify.sh 51 907 360     # exit 0 = PASS · 1 = FAIL/INFO · 3 = setup
 **That last row is the one to watch in this campaign.** With #237 peer-sourcing live, a run you *intend*
 as P1 can be silently served by a peer. **A P1 PASS requires `src=gw`.**
 
-### 🔴 The oracle itself was broken until `da1cba8` — check you have the fix
+### 🔴 The oracle itself was broken — check you have `fa2e6aa` or later
 
 This document told you to trust the harness rather than hand-judge. **That was right in principle and,
-until 2026-07-28, wrong in fact.** `tools/ota_verify.sh` had three defects, all one species: *written
-against an imagined DIAG schema and never validated against a live payload.*
+until 2026-07-28, wrong in fact.** `tools/ota_verify.sh` had **four** defects across two fixes
+(`da1cba8`, then `fa2e6aa`), all one species: *written against an imagined schema and never validated
+against a live payload.* **`8ac9636` also added the `apch=` DIAG field the off-channel check needed to
+exist in the first place** — so the fix spans firmware and tool.
 
 The worst was the OFF-CHANNEL check. `grep -oE 'ap=[0-9]+'` is unanchored, so it matched the **tail of
 `heap=42040`** — `he|ap=…`. **DIAG has no `ap=` field at all** (`mode.rs:3208`), so the check could only
@@ -145,12 +147,23 @@ then told the operator to go re-channel a live AP.
 > following this plan on the old harness would have chased a phantom channel mismatch, never seen the
 > real death-point, and concluded the branch was fine or broken **on the strength of a heap reading.**
 
-**Before Phase A: confirm you are on `da1cba8` or later**, and treat the first Phase-A run as a
+**The fourth defect is the one to internalise, because this plan leans on the metric it broke.**
+`smol/<id>/ota/progress` is **retained** and republished on a ~5 s cadence, so a fresh subscribe replays
+the last offset of whatever attempt died *last* — possibly for a **different image**. A retained value
+never changes, so it satisfies *"offset frozen for STALE seconds"* **for free**, and the death-point arm
+condemned a ghost as a live dying transfer. **The tell was in the numbers:** id5's retained progress read
+`1228800/1435280` while the staged 907 manifest is `1440528` bytes — **a different total means a
+different image.** So: **check that `total` matches the manifest you staged before believing any
+progress reading.** This is the retained-ghost trap (DOC-UPKEEP §2) *inside the tool built to defend
+against it.*
+
+**Before Phase A: confirm you are on `fa2e6aa` or later**, and treat the first Phase-A run as a
 validation of *the harness* as much as of the board — a control that is *expected* to pass is exactly
 where a broken oracle reveals itself.
 
-This is the sixth instance of the session's pattern (DOC-UPKEEP §2): `ap=` inside `heap=` is a **correct
-regex attached to the wrong field.** Nobody mistyped anything.
+Two instances of the session's pattern (DOC-UPKEEP §2) in one tool: `ap=` inside `heap=` is a **correct
+regex attached to the wrong field**, and a retained progress payload is **a correct reading of a stale
+fact**. Nobody mistyped anything.
 
 ---
 
