@@ -126,17 +126,9 @@ input_text:
   # (5x8/6x10/10x20), align l/c/r. {entity_id} refs are resolved HA-side (subst());
   # the compose template sensor converts to the wire form <count>|<sa>text;… and
   # publishes retained smol/<id>/config/custom (KV key Y, #56). e.g.
-  #   lc {sensor.smol_7_temp}°F|sl Bench|sl Door {binary_sensor.shed_door}
-  smol_7_custom:
-    name: "Dominion Custom screen (author)"
-    max: 120
-    initial: ""
+  #   lc {sensor.smol_8_temp}°F|sl Bench|sl Door {binary_sensor.shed_door}
   smol_8_custom:
     name: "Nexus Custom screen (author)"
-    max: 120
-    initial: ""
-  smol_9_custom:
-    name: "Herald Custom screen (author)"
     max: 120
     initial: ""
   # --- #100 Stage 2/3 per-node network overrides (dashboard-managed, un-brickable). BROKER =
@@ -144,55 +136,23 @@ input_text:
   # RFC1918 image host appended to the fetch allowlist (empty = slot default). The board
   # RFC1918-validates before applying and self-heals a wrong broker via the CONNACK fallback
   # (surfaced as brk=fb in smol/<id>/diag); a wrong OTA host can only refuse a fetch (never a brick).
-  smol_7_broker:
-    name: "Dominion broker override (ip[:port])"
-    max: 21
-    initial: ""
   smol_8_broker:
     name: "Nexus broker override (ip[:port])"
     max: 21
-    initial: ""
-  smol_9_broker:
-    name: "Herald broker override (ip[:port])"
-    max: 21
-    initial: ""
-  smol_7_ota_host:
-    name: "Dominion OTA host override (ip)"
-    max: 15
     initial: ""
   smol_8_ota_host:
     name: "Nexus OTA host override (ip)"
     max: 15
     initial: ""
-  smol_9_ota_host:
-    name: "Herald OTA host override (ip)"
-    max: 15
-    initial: ""
   # --- #72 IO registry (per-node, #194/#31). IO map = pin→kind config → retained smol/<id>/config/io
   # (";"-sep "<pin><kind>"); IO set = pin state command → retained smol/<id>/io/set (";"-sep "<pin>=<0|1>").
   # Labels/wire per the meshscope operator-mode parity checklist. Empty = no-op / clear.
-  smol_7_io_map:
-    name: "Dominion · IO map"
-    max: 80
-    initial: ""
   smol_8_io_map:
     name: "Nexus · IO map"
     max: 80
     initial: ""
-  smol_9_io_map:
-    name: "Herald · IO map"
-    max: 80
-    initial: ""
-  smol_7_io_set:
-    name: "Dominion · IO set"
-    max: 80
-    initial: ""
   smol_8_io_set:
     name: "Nexus · IO set"
-    max: 80
-    initial: ""
-  smol_9_io_set:
-    name: "Herald · IO set"
     max: 80
     initial: ""
   # --- channel_hint (FLEET, #194/#31): steer the elected mesh channel → retained smol/mesh/channel_hint
@@ -209,38 +169,6 @@ input_boolean:
   # --- #55 plugin visibility (per-node) — one input_boolean per maskable AppKind. The compose
   # automation ORs the set bits (stable bit0..6) → retained smol/<id>/config/plugins = 4-hex u16.
   # Default ALL ON (=007F); fw: 0000/bad/empty → keep-all (safety), masked live screen → board default.
-  smol_7_plugin_clock:
-    name: "Dominion · Clock visible"
-    icon: "mdi:clock-outline"
-    initial: true
-  smol_7_plugin_snake:
-    name: "Dominion · Snake visible"
-    icon: "mdi:snake"
-    initial: true
-  smol_7_plugin_bench:
-    name: "Dominion · Bench visible"
-    icon: "mdi:test-tube"
-    initial: true
-  smol_7_plugin_batt:
-    name: "Dominion · Batt visible"
-    icon: "mdi:battery"
-    initial: true
-  smol_7_plugin_grid:
-    name: "Dominion · Grid visible"
-    icon: "mdi:transmission-tower"
-    initial: true
-  smol_7_plugin_wled:
-    name: "Dominion · Wled visible"
-    icon: "mdi:led-strip-variant"
-    initial: true
-  smol_7_plugin_about:
-    name: "Dominion · About visible"
-    icon: "mdi:information-outline"
-    initial: true
-  smol_7_plugin_familiar:
-    name: "Dominion · Familiar visible"
-    icon: "mdi:paw"
-    initial: true
   smol_8_plugin_clock:
     name: "Nexus · Clock visible"
     icon: "mdi:clock-outline"
@@ -271,38 +199,6 @@ input_boolean:
     initial: true
   smol_8_plugin_familiar:
     name: "Nexus · Familiar visible"
-    icon: "mdi:paw"
-    initial: true
-  smol_9_plugin_clock:
-    name: "Herald · Clock visible"
-    icon: "mdi:clock-outline"
-    initial: true
-  smol_9_plugin_snake:
-    name: "Herald · Snake visible"
-    icon: "mdi:snake"
-    initial: true
-  smol_9_plugin_bench:
-    name: "Herald · Bench visible"
-    icon: "mdi:test-tube"
-    initial: true
-  smol_9_plugin_batt:
-    name: "Herald · Batt visible"
-    icon: "mdi:battery"
-    initial: true
-  smol_9_plugin_grid:
-    name: "Herald · Grid visible"
-    icon: "mdi:transmission-tower"
-    initial: true
-  smol_9_plugin_wled:
-    name: "Herald · Wled visible"
-    icon: "mdi:led-strip-variant"
-    initial: true
-  smol_9_plugin_about:
-    name: "Herald · About visible"
-    icon: "mdi:information-outline"
-    initial: true
-  smol_9_plugin_familiar:
-    name: "Herald · Familiar visible"
     icon: "mdi:paw"
     initial: true
 
@@ -370,18 +266,9 @@ input_select:
     options: ["0", "1", "2", "3"]   # 0=voltage/entry; 1-3 = Batt SOC detail pages (#17); fw wraps % page_count for screens with fewer
     initial: "0"
     icon: mdi:book-open-page-variant
-  # --- id7 (one copy-paste block per node; new node = duplicate + renumber) ---
-  smol_7_screen:
-    name: "Dominion · default screen"
-    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom, Familiar]
-    initial: Menu
-    icon: mdi:monitor
-  smol_7_page:
-    name: "Dominion · default page"
-    options: ["0", "1", "2", "3"]   # 0=voltage/entry; 1-3 = Batt SOC detail pages (#17); fw wraps % page_count for screens with fewer
-    initial: "0"
-    icon: mdi:book-open-page-variant
-  # --- id8 ---
+  # --- id8. ONE COPY-PASTE BLOCK PER NODE is the shape of this file and also its bug
+  # (#309): the file cannot know an id exists, so a re-provisioned fleet gets silence, not an
+  # error. Do not duplicate-and-renumber for id50/id51 — that re-arms it. ---
   smol_8_screen:
     name: "Nexus · default screen"
     options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom, Familiar]
@@ -392,17 +279,6 @@ input_select:
     options: ["0", "1", "2", "3"]   # 0=voltage/entry; 1-3 = Batt SOC detail pages (#17); fw wraps % page_count for screens with fewer
     initial: "0"
     icon: mdi:book-open-page-variant
-  # --- id9 ---
-  smol_9_screen:
-    name: "Herald · default screen"
-    options: [Menu, Clock, Batt, Grid, Snake, Bench, MeshSnake, About, Custom, Familiar]
-    initial: Menu
-    icon: mdi:monitor
-  smol_9_page:
-    name: "Herald · default page"
-    options: ["0", "1", "2", "3"]   # 0=voltage/entry; 1-3 = Batt SOC detail pages (#17); fw wraps % page_count for screens with fewer
-    initial: "0"
-    icon: mdi:book-open-page-variant
   # --- #48 blue-LED mode (per-node: status/on/off, default status) → retained smol/<id>/config/led ---
   # status = LED tracks node state (fw default) · on = force on · off = force off.
   smol_all_led:
@@ -410,18 +286,8 @@ input_select:
     options: [status, "on", "off"]
     initial: status
     icon: mdi:led-on
-  smol_7_led:
-    name: "Dominion · LED mode"
-    options: [status, "on", "off"]
-    initial: status
-    icon: mdi:led-on
   smol_8_led:
     name: "Nexus · LED mode"
-    options: [status, "on", "off"]
-    initial: status
-    icon: mdi:led-on
-  smol_9_led:
-    name: "Herald · LED mode"
     options: [status, "on", "off"]
     initial: status
     icon: mdi:led-on
@@ -433,60 +299,30 @@ input_button:
   smol_all_apply:
     name: "smol all · apply"
     icon: mdi:send-check
-  smol_7_apply:
-    name: "Dominion · apply"
-    icon: mdi:send
-  smol_7_reset:
-    name: "Dominion · reset to board default"
-    icon: mdi:backup-restore
   smol_8_apply:
     name: "Nexus · apply"
     icon: mdi:send
   smol_8_reset:
     name: "Nexus · reset to board default"
     icon: mdi:backup-restore
-  smol_9_apply:
-    name: "Herald · apply"
-    icon: mdi:send
-  smol_9_reset:
-    name: "Herald · reset to board default"
-    icon: mdi:backup-restore
-  smol_ota_install_7:
-    name: "smol OTA · install staged → Dominion"
-    icon: mdi:download
   smol_ota_install_8:
     name: "smol OTA · install staged → Nexus"
-    icon: mdi:download
-  smol_ota_install_9:
-    name: "smol OTA · install staged → Herald"
     icon: mdi:download
   # --- #52 remote REBOOT (TRANSIENT cmd) — named *_reboot to avoid colliding with the #21
   # "*_reset to board default" config buttons above. Topic = smol/<id>/cmd/reset (locked). ---
   smol_all_reboot:
     name: "smol all · reboot"
     icon: mdi:restart-alert
-  smol_7_reboot:
-    name: "Dominion · reboot"
-    icon: mdi:restart
   smol_8_reboot:
     name: "Nexus · reboot"
-    icon: mdi:restart
-  smol_9_reboot:
-    name: "Herald · reboot"
     icon: mdi:restart
   # --- #71 on-demand WiFi SCAN (per-node + all, #194/#31) → TRANSIENT smol/<id>/cmd/scan (retain:FALSE).
   # Same transient discipline as reboot (cmd/ topic, never retained). Topic-triggered (payload ignored).
   smol_all_scan:
     name: "smol all · scan"
     icon: mdi:wifi-refresh
-  smol_7_scan:
-    name: "Dominion · scan"
-    icon: mdi:wifi-refresh
   smol_8_scan:
     name: "Nexus · scan"
-    icon: mdi:wifi-refresh
-  smol_9_scan:
-    name: "Herald · scan"
     icon: mdi:wifi-refresh
   # --- channel_hint apply/clear buttons (fleet, #194/#31) ---
   smol_channel_hint_apply:
@@ -509,23 +345,9 @@ mqtt:
   # NOTE: supersedes luna's staged TEXT `smol/<id>/display` (DISP|line;…) mirror — that HELD
   # approach needed an invasive per-plugin text tap; this bitmap path is non-invasive + faithful.
   image:
-    - name: "smol 7 screen"
-      unique_id: smol_7_screen_mirror
-      image_topic: "smol/7/screen"
-      image_encoding: b64
-      content_type: image/bmp
-      entity_category: diagnostic
-      icon: "mdi:monitor-screenshot"
     - name: "smol 8 screen"
       unique_id: smol_8_screen_mirror
       image_topic: "smol/8/screen"
-      image_encoding: b64
-      content_type: image/bmp
-      entity_category: diagnostic
-      icon: "mdi:monitor-screenshot"
-    - name: "smol 9 screen"
-      unique_id: smol_9_screen_mirror
-      image_topic: "smol/9/screen"
       image_encoding: b64
       content_type: image/bmp
       entity_category: diagnostic
@@ -543,51 +365,23 @@ mqtt:
     # Reflect the commanded config (the retained value HA published) so the card
     # shows what was set. LIVE actual screen + running build needs the firmware
     # smol/<id>/status publish (design F4) — deferred; v1 = commanded config only.
-    - name: "smol 7 config"
-      unique_id: smol_7_config_mirror
-      state_topic: "smol/7/config/default_screen"
-      icon: "mdi:cog"
     - name: "smol 8 config"
       unique_id: smol_8_config_mirror
       state_topic: "smol/8/config/default_screen"
       icon: "mdi:cog"
-    - name: "smol 9 config"
-      unique_id: smol_9_config_mirror
-      state_topic: "smol/9/config/default_screen"
-      icon: "mdi:cog"
     # --- #45 Custom-screen mirror: read back the retained wire payload the compose
     # template sensor published (round-trip confirmation + dashboard preview). State =
     # the FIRST line's resolved text (2-char size/align prefix stripped); '(none)' when empty. ---
-    - name: "smol 7 custom"
-      unique_id: smol_7_custom_mirror
-      state_topic: "smol/7/config/custom"
-      icon: "mdi:card-text-outline"
-      value_template: >-
-        {% set p = value.split('|', 1) %}{% if p | length > 1 and p[1] %}{{ p[1].split(';')[0][2:] }}{% else %}(none){% endif %}
     - name: "smol 8 custom"
       unique_id: smol_8_custom_mirror
       state_topic: "smol/8/config/custom"
       icon: "mdi:card-text-outline"
       value_template: >-
         {% set p = value.split('|', 1) %}{% if p | length > 1 and p[1] %}{{ p[1].split(';')[0][2:] }}{% else %}(none){% endif %}
-    - name: "smol 9 custom"
-      unique_id: smol_9_custom_mirror
-      state_topic: "smol/9/config/custom"
-      icon: "mdi:card-text-outline"
-      value_template: >-
-        {% set p = value.split('|', 1) %}{% if p | length > 1 and p[1] %}{{ p[1].split(';')[0][2:] }}{% else %}(none){% endif %}
     # --- #55 plugin-mask mirror (read back the retained hex the compose published) ---
-    - name: "smol 7 plugins"
-      unique_id: smol_7_plugins_mirror
-      state_topic: "smol/7/config/plugins"
-      icon: "mdi:puzzle-outline"
     - name: "smol 8 plugins"
       unique_id: smol_8_plugins_mirror
       state_topic: "smol/8/config/plugins"
-      icon: "mdi:puzzle-outline"
-    - name: "smol 9 plugins"
-      unique_id: smol_9_plugins_mirror
-      state_topic: "smol/9/config/plugins"
       icon: "mdi:puzzle-outline"
     # --- #43 display units (GLOBAL) — mirror of the retained smol/config/units ---
     - name: "smol units"
@@ -625,15 +419,6 @@ mqtt:
     # landed — the retirement/arrival blind spot in docs/DOC-UPKEEP.md, corrected 2026-07-27.)
     # Feeds the OTA no-downgrade gate (running build) AND the node-manager live
     # current-screen reflection.
-    - name: "smol 7 screen"
-      unique_id: smol_7_status_mirror
-      state_topic: "smol/7/status"
-      value_template: "{{ value.split('|')[1] if '|' in value else value }}"
-      json_attributes_topic: "smol/7/status"
-      json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
-      expire_after: 90   # #68/#94: online source. Flap-tune (90→180) was CONSIDERED then DROPPED — the all-192 flap was a mesh-SETTLING artifact (cadence briefly ~90s); at healthy steady-state status republishes ~11s, far under 90, so online is stable. F6-gated republish, ages out
-      # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
-      icon: "mdi:chip"
     - name: "smol 8 screen"
       unique_id: smol_8_status_mirror
       state_topic: "smol/8/status"
@@ -643,16 +428,7 @@ mqtt:
       expire_after: 90   # #68/#94: online source. Flap-tune (90→180) was CONSIDERED then DROPPED — the all-192 flap was a mesh-SETTLING artifact (cadence briefly ~90s); at healthy steady-state status republishes ~11s, far under 90, so online is stable. F6-gated republish, ages out
       # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
       icon: "mdi:chip"
-    - name: "smol 9 screen"
-      unique_id: smol_9_status_mirror
-      state_topic: "smol/9/status"
-      value_template: "{{ value.split('|')[1] if '|' in value else value }}"
-      json_attributes_topic: "smol/9/status"
-      json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
-      expire_after: 90   # #68/#94: online source. Flap-tune (90→180) was CONSIDERED then DROPPED — the all-192 flap was a mesh-SETTLING artifact (cadence briefly ~90s); at healthy steady-state status republishes ~11s, far under 90, so online is stable. F6-gated republish, ages out
-      # when the gateway stops refreshing a dead leaf. Drives binary_sensor.smol_<id>_online.
-      icon: "mdi:chip"
-    # --- #73 id5/Aegis (HEADLESS) base plumbing — Aegis publishes STAT|<screen>:<page>|<build> like 7/8/9
+    # --- #73 id5/Aegis (HEADLESS) base plumbing — Aegis publishes STAT|<screen>:<page>|<build> like id8
     # (verified on wire: smol/5/status = "STAT|Custom:0|342"); it was just never mirrored, so the #69
     # telemetry generator couldn't discover it. Same pattern → makes Aegis carry online/build + OTA tiles. ---
     - name: "smol 5 screen"
@@ -661,28 +437,16 @@ mqtt:
       value_template: "{{ value.split('|')[1] if '|' in value else value }}"
       json_attributes_topic: "smol/5/status"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'build': p[2]} if p | length >= 3 else {}) | tojson }}"
-      expire_after: 90   # online source (drives binary_sensor.smol_5_online), same as 7/8/9
+      expire_after: 90   # online source (drives binary_sensor.smol_5_online), same as id8
       icon: "mdi:chip"
     # --- #40 running BUILD# as a first-class device-merged value (JP ask 2026-07-11) ---
     # Promotes the `build` attr of smol_<id>_screen to a plain visible sensor so the
     # leaf-mesh-OTA canary is verifiable HEADLESS in HA (build# flipping = update stuck;
     # the ESP32-C3 USB-JTAG boards give no reliable headless serial). Same
     # STAT|<screen>:<page>|<build> source; length-guarded split (panic-free).
-    - name: "smol 7 build"
-      unique_id: smol_7_build_mirror
-      state_topic: "smol/7/status"
-      value_template: "{% set p = value.split('|') %}{{ p[2] if p | length >= 3 else 'unknown' }}"
-      entity_category: diagnostic
-      icon: "mdi:tag-text"
     - name: "smol 8 build"
       unique_id: smol_8_build_mirror
       state_topic: "smol/8/status"
-      value_template: "{% set p = value.split('|') %}{{ p[2] if p | length >= 3 else 'unknown' }}"
-      entity_category: diagnostic
-      icon: "mdi:tag-text"
-    - name: "smol 9 build"
-      unique_id: smol_9_build_mirror
-      state_topic: "smol/9/status"
       value_template: "{% set p = value.split('|') %}{{ p[2] if p | length >= 3 else 'unknown' }}"
       entity_category: diagnostic
       icon: "mdi:tag-text"
@@ -696,21 +460,9 @@ mqtt:
     # after relaying to this leaf: confirmed / rolled-back / fetch-failed / relay-failed /
     # leaf-timeout / mac-unknown. The mesh-only leaf has no serial, so this retained topic is
     # the ONLY window into a relay attempt's outcome. `none` until a relay is attempted.
-    - name: "smol 7 ota diag"
-      unique_id: smol_7_ota_diag_mirror
-      state_topic: "smol/7/ota/diag"
-      value_template: "{{ value if value else 'none' }}"
-      entity_category: diagnostic
-      icon: "mdi:cloud-upload-outline"
     - name: "smol 8 ota diag"
       unique_id: smol_8_ota_diag_mirror
       state_topic: "smol/8/ota/diag"
-      value_template: "{{ value if value else 'none' }}"
-      entity_category: diagnostic
-      icon: "mdi:cloud-upload-outline"
-    - name: "smol 9 ota diag"
-      unique_id: smol_9_ota_diag_mirror
-      state_topic: "smol/9/ota/diag"
       value_template: "{{ value if value else 'none' }}"
       entity_category: diagnostic
       icon: "mdi:cloud-upload-outline"
@@ -718,21 +470,9 @@ mqtt:
     # "install-caught=<id|none> pending=<id|none> staged_raw=<build|none> leaf_ota=<0|1>".
     # Pinpoints which arm link is null in one reflash (the C3 has no serial). Published by
     # whichever node is currently the gateway; the others read `none`.
-    - name: "smol 7 ota armdiag"
-      unique_id: smol_7_ota_armdiag_mirror
-      state_topic: "smol/7/ota/armdiag"
-      value_template: "{{ value if value else 'none' }}"
-      entity_category: diagnostic
-      icon: "mdi:link-variant"
     - name: "smol 8 ota armdiag"
       unique_id: smol_8_ota_armdiag_mirror
       state_topic: "smol/8/ota/armdiag"
-      value_template: "{{ value if value else 'none' }}"
-      entity_category: diagnostic
-      icon: "mdi:link-variant"
-    - name: "smol 9 ota armdiag"
-      unique_id: smol_9_ota_armdiag_mirror
-      state_topic: "smol/9/ota/armdiag"
       value_template: "{{ value if value else 'none' }}"
       entity_category: diagnostic
       icon: "mdi:link-variant"
@@ -745,38 +485,6 @@ mqtt:
     # Retained + STICKY: last_wb persists at 100% after a completed transfer — the dashboard gates
     # visibility on build#-behind-staged / non-clean phase, NOT on this number alone. Length- and
     # divide-guarded (panic-free): 'unknown' until a relay publishes a parseable last_wb.
-    - name: "smol 7 ota relaydiag"
-      unique_id: smol_7_ota_relaydiag_mirror
-      state_topic: "smol/7/ota/relaydiag"
-      unit_of_measurement: "%"
-      entity_category: diagnostic
-      icon: "mdi:progress-upload"
-      value_template: >-
-        {% set ns = namespace(w=0, t=0, ok=false) %}
-        {% for tok in value.split() %}
-          {% if tok.startswith('last_wb=') and '/' in tok %}
-            {% set f = tok.split('=', 1)[1].split('/') %}
-            {% set ns.w = f[0] | int(0) %}{% set ns.t = f[1] | int(0) %}{% set ns.ok = true %}
-          {% endif %}
-        {% endfor %}
-        {% if ns.ok and ns.t > 0 %}{{ (100.0 * ns.w / ns.t) | round(1) }}{% else %}unknown{% endif %}
-      json_attributes_topic: "smol/7/ota/relaydiag"
-      json_attributes_template: >-
-        {% set ns = namespace(rx='', otan='', wb='', otam='', settle='', leaf='') %}
-        {% for t in value.split() %}
-          {% if t.startswith('rx=') %}{% set ns.rx = t[3:] %}
-          {% elif t.startswith('otan=') %}{% set ns.otan = t[5:] %}
-          {% elif t.startswith('last_wb=') %}{% set ns.wb = t[8:] %}
-          {% elif t.startswith('otam_tx=') %}{% set ns.otam = t[8:] %}
-          {% elif t.startswith('settle=') %}{% set ns.settle = t[7:] %}
-          {% elif t.startswith('leaf=') %}{% set ns.leaf = t[5:] %}
-          {% endif %}
-        {% endfor %}
-        {% set wp = ns.wb.split('/') %}
-        {{ {'rx': ns.rx, 'otan': ns.otan, 'last_wb': ns.wb,
-            'wb_done': (wp[0] | int(0)) if wp | length == 2 else 0,
-            'wb_total': (wp[1] | int(0)) if wp | length == 2 else 0,
-            'otam_tx': ns.otam, 'settle': ns.settle, 'leaf': ns.leaf, 'raw': value} | tojson }}
     - name: "smol 8 ota relaydiag"
       unique_id: smol_8_ota_relaydiag_mirror
       state_topic: "smol/8/ota/relaydiag"
@@ -809,50 +517,10 @@ mqtt:
             'wb_done': (wp[0] | int(0)) if wp | length == 2 else 0,
             'wb_total': (wp[1] | int(0)) if wp | length == 2 else 0,
             'otam_tx': ns.otam, 'settle': ns.settle, 'leaf': ns.leaf, 'raw': value} | tojson }}
-    - name: "smol 9 ota relaydiag"
-      unique_id: smol_9_ota_relaydiag_mirror
-      state_topic: "smol/9/ota/relaydiag"
-      unit_of_measurement: "%"
-      entity_category: diagnostic
-      icon: "mdi:progress-upload"
-      value_template: >-
-        {% set ns = namespace(w=0, t=0, ok=false) %}
-        {% for tok in value.split() %}
-          {% if tok.startswith('last_wb=') and '/' in tok %}
-            {% set f = tok.split('=', 1)[1].split('/') %}
-            {% set ns.w = f[0] | int(0) %}{% set ns.t = f[1] | int(0) %}{% set ns.ok = true %}
-          {% endif %}
-        {% endfor %}
-        {% if ns.ok and ns.t > 0 %}{{ (100.0 * ns.w / ns.t) | round(1) }}{% else %}unknown{% endif %}
-      json_attributes_topic: "smol/9/ota/relaydiag"
-      json_attributes_template: >-
-        {% set ns = namespace(rx='', otan='', wb='', otam='', settle='', leaf='') %}
-        {% for t in value.split() %}
-          {% if t.startswith('rx=') %}{% set ns.rx = t[3:] %}
-          {% elif t.startswith('otan=') %}{% set ns.otan = t[5:] %}
-          {% elif t.startswith('last_wb=') %}{% set ns.wb = t[8:] %}
-          {% elif t.startswith('otam_tx=') %}{% set ns.otam = t[8:] %}
-          {% elif t.startswith('settle=') %}{% set ns.settle = t[7:] %}
-          {% elif t.startswith('leaf=') %}{% set ns.leaf = t[5:] %}
-          {% endif %}
-        {% endfor %}
-        {% set wp = ns.wb.split('/') %}
-        {{ {'rx': ns.rx, 'otan': ns.otan, 'last_wb': ns.wb,
-            'wb_done': (wp[0] | int(0)) if wp | length == 2 else 0,
-            'wb_total': (wp[1] | int(0)) if wp | length == 2 else 0,
-            'otam_tx': ns.otam, 'settle': ns.settle, 'leaf': ns.leaf, 'raw': value} | tojson }}
     # --- #48 LED mode — mirror of the retained smol/<id>/config/led (commanded value) ---
-    - name: "smol 7 LED"
-      unique_id: smol_7_led_mirror
-      state_topic: "smol/7/config/led"
-      icon: "mdi:led-on"
     - name: "smol 8 LED"
       unique_id: smol_8_led_mirror
       state_topic: "smol/8/config/led"
-      icon: "mdi:led-on"
-    - name: "smol 9 LED"
-      unique_id: smol_9_led_mirror
-      state_topic: "smol/9/config/led"
       icon: "mdi:led-on"
     # --- MESH TOPOLOGY (issue #27) — HELD; needs the firmware peers/channel publish ---
     # NOT YET PUBLISHED BY FIRMWARE. These + the template block below back the topology
@@ -869,27 +537,11 @@ mqtt:
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'owner': p[1], 'channel': p[2], 'seq': p[3]} if p | length >= 4 else {}) | tojson }}"
       expire_after: 90
       icon: "mdi:lan"
-    - name: "smol 7 peers"
-      unique_id: smol_7_peers_mirror
-      state_topic: "smol/7/peers"
-      value_template: "{% set p = value.split('|') %}{{ 'gateway' if (p | length > 1 and p[1] == 'G') else 'leaf' }}"
-      json_attributes_topic: "smol/7/peers"
-      json_attributes_template: "{% set p = value.split('|') %}{{ ({'ch': p[2], 'peers': (p[3].split(';') if p | length >= 4 and p[3] else [])} if p | length >= 3 else {'peers': []}) | tojson }}"
-      expire_after: 90
-      icon: "mdi:lan-connect"
     - name: "smol 8 peers"
       unique_id: smol_8_peers_mirror
       state_topic: "smol/8/peers"
       value_template: "{% set p = value.split('|') %}{{ 'gateway' if (p | length > 1 and p[1] == 'G') else 'leaf' }}"
       json_attributes_topic: "smol/8/peers"
-      json_attributes_template: "{% set p = value.split('|') %}{{ ({'ch': p[2], 'peers': (p[3].split(';') if p | length >= 4 and p[3] else [])} if p | length >= 3 else {'peers': []}) | tojson }}"
-      expire_after: 90
-      icon: "mdi:lan-connect"
-    - name: "smol 9 peers"
-      unique_id: smol_9_peers_mirror
-      state_topic: "smol/9/peers"
-      value_template: "{% set p = value.split('|') %}{{ 'gateway' if (p | length > 1 and p[1] == 'G') else 'leaf' }}"
-      json_attributes_topic: "smol/9/peers"
       json_attributes_template: "{% set p = value.split('|') %}{{ ({'ch': p[2], 'peers': (p[3].split(';') if p | length >= 4 and p[3] else [])} if p | length >= 3 else {'peers': []}) | tojson }}"
       expire_after: 90
       icon: "mdi:lan-connect"
@@ -900,17 +552,6 @@ mqtt:
     # rssi (signed dBm) + bssid ride as attributes. The template sensor `smol coexist health` below
     # coalesces these (whichever board reports a real channel IS the crown) and compares to the
     # elected mesh channel — a mismatch = the ch1-AP-vs-ch6-mesh coexist trap that silently kills OTA.
-    - name: "smol 7 ap channel"
-      unique_id: smol_7_ap_channel_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      icon: "mdi:access-point-network"
-      value_template: >-
-        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ p[0] if (ns.v and p[0]) else 'none' }}
-      json_attributes_topic: "smol/7/diag"
-      json_attributes_template: >-
-        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ {'rssi': (p[1] | int(0)) if p | length >= 2 else 0, 'bssid': (p[2] if p | length >= 3 else ''), 'raw': ns.v} | tojson }}
-      expire_after: 90
     - name: "smol 8 ap channel"
       unique_id: smol_8_ap_channel_mirror
       state_topic: "smol/8/diag"
@@ -919,17 +560,6 @@ mqtt:
       value_template: >-
         {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ p[0] if (ns.v and p[0]) else 'none' }}
       json_attributes_topic: "smol/8/diag"
-      json_attributes_template: >-
-        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ {'rssi': (p[1] | int(0)) if p | length >= 2 else 0, 'bssid': (p[2] if p | length >= 3 else ''), 'raw': ns.v} | tojson }}
-      expire_after: 90
-    - name: "smol 9 ap channel"
-      unique_id: smol_9_ap_channel_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      icon: "mdi:access-point-network"
-      value_template: >-
-        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ p[0] if (ns.v and p[0]) else 'none' }}
-      json_attributes_topic: "smol/9/diag"
       json_attributes_template: >-
         {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ {'rssi': (p[1] | int(0)) if p | length >= 2 else 0, 'bssid': (p[2] if p | length >= 3 else ''), 'raw': ns.v} | tojson }}
       expire_after: 90
@@ -950,68 +580,6 @@ mqtt:
     # ALL parse the single retained smol/<id>/diag record (+ /display, /ota/history).
     # DEGRADES SAFE: read 'unknown'/empty until the #70/#74 FIRMWARE publishes the topics.
     # =====================================================================
-    # --- id7 device diagnostics (#70) ---
-    - name: "smol 7 boot slot"
-      unique_id: smol_7_boot_slot_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      icon: "mdi:swap-horizontal-bold"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('slot=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ 'ota_' ~ ns.v if ns.v in ['0','1'] else 'unknown' }}
-    - name: "smol 7 ota outcome"
-      unique_id: smol_7_ota_outcome_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      icon: "mdi:history"
-      value_template: >-
-        {% set ns = namespace(v='none') %}{% for kv in value.split('|') %}{% if kv.startswith('ota=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
-    - name: "smol 7 reset reason"
-      unique_id: smol_7_reset_reason_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      icon: "mdi:restart-alert"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('rst=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
-    - name: "smol 7 boot count"
-      unique_id: smol_7_boot_count_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:counter"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('boot=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 7 uptime"
-      unique_id: smol_7_uptime_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      device_class: duration
-      unit_of_measurement: s
-      state_class: measurement
-      icon: "mdi:timer-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('up=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 7 heap free"
-      unique_id: smol_7_heap_free_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      device_class: data_size
-      unit_of_measurement: B
-      state_class: measurement
-      icon: "mdi:memory"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('heap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 7 heap min"
-      unique_id: smol_7_heap_min_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      device_class: data_size
-      unit_of_measurement: B
-      state_class: measurement
-      icon: "mdi:memory"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('hmin=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
     # --- id8 device diagnostics (#70) ---
     - name: "smol 8 boot slot"
       unique_id: smol_8_boot_slot_mirror
@@ -1079,17 +647,6 @@ mqtt:
     # SYNC_FRESH_S 300 / SYNC_STALE_S 3600). ⚠ HONEST: boots sync once then age climbs — reads
     # STALE fleet-wide until #192 periodic re-sync ships. That is EXPECTED, not a dashboard bug
     # (see the `note` attribute). expire_after → 'unavailable' if a node stops publishing diag. ---
-    - name: "smol 7 NTP fresh"
-      unique_id: smol_7_ntp_fresh
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      icon: "mdi:clock-check-outline"
-      expire_after: 180
-      value_template: >-
-        {% set ns = namespace(age=-1, src='none') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.age = kv.split('=',1)[1] | int(-1) %}{% elif kv.startswith('tsrc=') %}{% set ns.src = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% if ns.src in ['none',''] or ns.age < 0 %}no-sync{% elif ns.age < 300 %}fresh{% elif ns.age < 3600 %}aging{% else %}stale{% endif %}
-      json_attributes_topic: "smol/7/diag"
-      json_attributes_template: >-
-        {% set ns = namespace(age=-1, src='none') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.age = kv.split('=',1)[1] | int(-1) %}{% elif kv.startswith('tsrc=') %}{% set ns.src = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ {'age_s': ns.age, 'source': ns.src, 'fresh_below_s': 300, 'stale_above_s': 3600, 'note': 'boot-only sync ages out → reads stale/red fleet-wide until #192 periodic re-sync ships; NOT a dashboard bug'} | tojson }}
     - name: "smol 8 NTP fresh"
       unique_id: smol_8_ntp_fresh
       state_topic: "smol/8/diag"
@@ -1101,105 +658,11 @@ mqtt:
       json_attributes_topic: "smol/8/diag"
       json_attributes_template: >-
         {% set ns = namespace(age=-1, src='none') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.age = kv.split('=',1)[1] | int(-1) %}{% elif kv.startswith('tsrc=') %}{% set ns.src = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ {'age_s': ns.age, 'source': ns.src, 'fresh_below_s': 300, 'stale_above_s': 3600, 'note': 'boot-only sync ages out → reads stale/red fleet-wide until #192 periodic re-sync ships; NOT a dashboard bug'} | tojson }}
-    - name: "smol 9 NTP fresh"
-      unique_id: smol_9_ntp_fresh
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      icon: "mdi:clock-check-outline"
-      expire_after: 180
-      value_template: >-
-        {% set ns = namespace(age=-1, src='none') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.age = kv.split('=',1)[1] | int(-1) %}{% elif kv.startswith('tsrc=') %}{% set ns.src = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% if ns.src in ['none',''] or ns.age < 0 %}no-sync{% elif ns.age < 300 %}fresh{% elif ns.age < 3600 %}aging{% else %}stale{% endif %}
-      json_attributes_topic: "smol/9/diag"
-      json_attributes_template: >-
-        {% set ns = namespace(age=-1, src='none') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.age = kv.split('=',1)[1] | int(-1) %}{% elif kv.startswith('tsrc=') %}{% set ns.src = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ {'age_s': ns.age, 'source': ns.src, 'fresh_below_s': 300, 'stale_above_s': 3600, 'note': 'boot-only sync ages out → reads stale/red fleet-wide until #192 periodic re-sync ships; NOT a dashboard bug'} | tojson }}
-    # --- id9 device diagnostics (#70) ---
-    - name: "smol 9 boot slot"
-      unique_id: smol_9_boot_slot_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      icon: "mdi:swap-horizontal-bold"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('slot=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ 'ota_' ~ ns.v if ns.v in ['0','1'] else 'unknown' }}
-    - name: "smol 9 ota outcome"
-      unique_id: smol_9_ota_outcome_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      icon: "mdi:history"
-      value_template: >-
-        {% set ns = namespace(v='none') %}{% for kv in value.split('|') %}{% if kv.startswith('ota=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
-    - name: "smol 9 reset reason"
-      unique_id: smol_9_reset_reason_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      icon: "mdi:restart-alert"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('rst=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
-    - name: "smol 9 boot count"
-      unique_id: smol_9_boot_count_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:counter"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('boot=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 9 uptime"
-      unique_id: smol_9_uptime_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      device_class: duration
-      unit_of_measurement: s
-      state_class: measurement
-      icon: "mdi:timer-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('up=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 9 heap free"
-      unique_id: smol_9_heap_free_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      device_class: data_size
-      unit_of_measurement: B
-      state_class: measurement
-      icon: "mdi:memory"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('heap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 9 heap min"
-      unique_id: smol_9_heap_min_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      device_class: data_size
-      unit_of_measurement: B
-      state_class: measurement
-      icon: "mdi:memory"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('hmin=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
     # --- #100 network identity (parsed from smol/<id>/diag; #100 Stage 1/2/3) ---
     # net=<slot>:<ok|fb>  (fb = the WiFi assoc fallback fired — the commanded slot was unreachable)
     # brk=<baked|ovr|fb>  (broker: baked slot leg | override active | override auto-disabled by CONNACK)
     # otah=<slot|ovr>     (OTA fetch host: slot default | an override is appended to the allowlist)
     # Degrades safe: 'unknown' until the Stage-2/3 firmware ships the keys.
-    - name: "smol 7 network"
-      unique_id: smol_7_network_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      icon: "mdi:wifi"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('net=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
-    - name: "smol 7 broker state"
-      unique_id: smol_7_broker_state_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      icon: "mdi:server-network"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('brk=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
-    - name: "smol 7 ota host state"
-      unique_id: smol_7_ota_host_state_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      icon: "mdi:cloud-download-outline"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('otah=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
     - name: "smol 8 network"
       unique_id: smol_8_network_mirror
       state_topic: "smol/8/diag"
@@ -1221,120 +684,6 @@ mqtt:
       icon: "mdi:cloud-download-outline"
       value_template: >-
         {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('otah=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
-    - name: "smol 9 network"
-      unique_id: smol_9_network_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      icon: "mdi:wifi"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('net=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
-    - name: "smol 9 broker state"
-      unique_id: smol_9_broker_state_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      icon: "mdi:server-network"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('brk=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
-    - name: "smol 9 ota host state"
-      unique_id: smol_9_ota_host_state_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      icon: "mdi:cloud-download-outline"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('otah=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
-    # --- id7 mesh-health + time-sync (#74 fold-ins) ---
-    - name: "smol 7 led state"
-      unique_id: smol_7_led_state_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      icon: "mdi:led-on"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('led=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
-    - name: "smol 7 mesh loss"
-      unique_id: smol_7_mesh_loss_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      unit_of_measurement: "%"
-      state_class: measurement
-      icon: "mdi:transmission-tower-off"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('loss=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 7 mesh rtt"
-      unique_id: smol_7_mesh_rtt_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      unit_of_measurement: ms
-      state_class: measurement
-      icon: "mdi:timer-sync-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('rtt=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 7 mesh rx"
-      unique_id: smol_7_mesh_rx_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:arrow-down-bold"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('rx=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 7 mesh tx"
-      unique_id: smol_7_mesh_tx_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:arrow-up-bold"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('tx=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 7 time offset"
-      unique_id: smol_7_time_offset_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      unit_of_measurement: ms
-      state_class: measurement
-      icon: "mdi:clock-alert-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('toff=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 7 time sync age"
-      unique_id: smol_7_time_sync_age_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      device_class: duration
-      unit_of_measurement: s
-      state_class: measurement
-      icon: "mdi:clock-check-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 7 time source"
-      unique_id: smol_7_time_source_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      icon: "mdi:source-branch"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('tsrc=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
-    # --- id7 display text mirror (#74 item 5) ---
-    - name: "smol 7 display"
-      unique_id: smol_7_display_mirror
-      state_topic: "smol/7/display"
-      entity_category: diagnostic
-      icon: "mdi:monitor-eye"
-      value_template: >-
-        {% set p = value.split('|') %}{{ (p[1].split(';') | join(' / ')) if p | length > 1 and p[1] else '' }}
-      json_attributes_topic: "smol/7/display"
-      json_attributes_template: >-
-        {% set p = value.split('|') %}{{ {'lines': (p[1].split(';') if p | length > 1 and p[1] else [])} | tojson }}
-    # --- id7 OTA history ring (#74 item 4) ---
-    - name: "smol 7 ota history"
-      unique_id: smol_7_ota_history_mirror
-      state_topic: "smol/7/ota/history"
-      entity_category: diagnostic
-      icon: "mdi:history"
-      value_template: >-
-        {% set p = value.split('|') %}{% set e = (p[1].split(';')[0] if p | length > 1 and p[1] else '') %}{{ e.split(':')[0] ~ (' ' ~ e.split(':')[1] if ':' in e else '') }}
-      json_attributes_topic: "smol/7/ota/history"
-      json_attributes_template: >-
-        {% set p = value.split('|') %}{% set ns = namespace(rows=[]) %}
-        {% for e in (p[1].split(';') if p | length > 1 and p[1] else []) %}{% set f = e.split(':') %}
-        {% if f | length >= 4 %}{% set ns.rows = ns.rows + [{'builds': f[0], 'outcome': f[1], 'dur_s': f[2] | int(0), 'at_up': f[3] | int(0)}] %}{% endif %}{% endfor %}
-        {{ {'entries': ns.rows} | tojson }}
     # --- id8 mesh-health + time-sync (#74 fold-ins) ---
     - name: "smol 8 led state"
       unique_id: smol_8_led_state_mirror
@@ -1428,125 +777,14 @@ mqtt:
         {% for e in (p[1].split(';') if p | length > 1 and p[1] else []) %}{% set f = e.split(':') %}
         {% if f | length >= 4 %}{% set ns.rows = ns.rows + [{'builds': f[0], 'outcome': f[1], 'dur_s': f[2] | int(0), 'at_up': f[3] | int(0)}] %}{% endif %}{% endfor %}
         {{ {'entries': ns.rows} | tojson }}
-    # --- id9 mesh-health + time-sync (#74 fold-ins) ---
-    - name: "smol 9 led state"
-      unique_id: smol_9_led_state_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      icon: "mdi:led-on"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('led=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
-    - name: "smol 9 mesh loss"
-      unique_id: smol_9_mesh_loss_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      unit_of_measurement: "%"
-      state_class: measurement
-      icon: "mdi:transmission-tower-off"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('loss=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 9 mesh rtt"
-      unique_id: smol_9_mesh_rtt_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      unit_of_measurement: ms
-      state_class: measurement
-      icon: "mdi:timer-sync-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('rtt=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 9 mesh rx"
-      unique_id: smol_9_mesh_rx_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:arrow-down-bold"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('rx=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 9 mesh tx"
-      unique_id: smol_9_mesh_tx_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:arrow-up-bold"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('tx=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 9 time offset"
-      unique_id: smol_9_time_offset_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      unit_of_measurement: ms
-      state_class: measurement
-      icon: "mdi:clock-alert-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('toff=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 9 time sync age"
-      unique_id: smol_9_time_sync_age_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      device_class: duration
-      unit_of_measurement: s
-      state_class: measurement
-      icon: "mdi:clock-check-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}{% for kv in value.split('|') %}{% if kv.startswith('tage=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v | int(0) }}
-    - name: "smol 9 time source"
-      unique_id: smol_9_time_source_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      icon: "mdi:source-branch"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}{% for kv in value.split('|') %}{% if kv.startswith('tsrc=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{{ ns.v }}
-    # --- id9 display text mirror (#74 item 5) ---
-    - name: "smol 9 display"
-      unique_id: smol_9_display_mirror
-      state_topic: "smol/9/display"
-      entity_category: diagnostic
-      icon: "mdi:monitor-eye"
-      value_template: >-
-        {% set p = value.split('|') %}{{ (p[1].split(';') | join(' / ')) if p | length > 1 and p[1] else '' }}
-      json_attributes_topic: "smol/9/display"
-      json_attributes_template: >-
-        {% set p = value.split('|') %}{{ {'lines': (p[1].split(';') if p | length > 1 and p[1] else [])} | tojson }}
-    # --- id9 OTA history ring (#74 item 4) ---
-    - name: "smol 9 ota history"
-      unique_id: smol_9_ota_history_mirror
-      state_topic: "smol/9/ota/history"
-      entity_category: diagnostic
-      icon: "mdi:history"
-      value_template: >-
-        {% set p = value.split('|') %}{% set e = (p[1].split(';')[0] if p | length > 1 and p[1] else '') %}{{ e.split(':')[0] ~ (' ' ~ e.split(':')[1] if ':' in e else '') }}
-      json_attributes_topic: "smol/9/ota/history"
-      json_attributes_template: >-
-        {% set p = value.split('|') %}{% set ns = namespace(rows=[]) %}
-        {% for e in (p[1].split(';') if p | length > 1 and p[1] else []) %}{% set f = e.split(':') %}
-        {% if f | length >= 4 %}{% set ns.rows = ns.rows + [{'builds': f[0], 'outcome': f[1], 'dur_s': f[2] | int(0), 'at_up': f[3] | int(0)}] %}{% endif %}{% endfor %}
-        {{ {'entries': ns.rows} | tojson }}
     # --- #74 config-drift DEVICE ECHO (item 3) — applied-config string the node reports.
     # CONTRACT PINNED (fw #74 stage-2): the DIAG record now carries `cfg=<screen>:<page>,<led>,
     # <mask4hexU>,<units>` (e.g. `Grid:1,status,0000,F24`; screen = the LIVE rendered screen, mask
     # = #55's %04X hex, units = temp+clock e.g. F24). The `_expected` reconstruction + `config_drift`
     # binary_sensor live in the template: section below (search "config-drift COMPARATOR").
-    - name: "smol 7 config applied"
-      unique_id: smol_7_cfg_applied_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      icon: "mdi:cog-sync"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('cfg=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ ns.v }}
     - name: "smol 8 config applied"
       unique_id: smol_8_cfg_applied_mirror
       state_topic: "smol/8/diag"
-      entity_category: diagnostic
-      icon: "mdi:cog-sync"
-      value_template: >-
-        {% set ns = namespace(v='unknown') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('cfg=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ ns.v }}
-    - name: "smol 9 config applied"
-      unique_id: smol_9_cfg_applied_mirror
-      state_topic: "smol/9/diag"
       entity_category: diagnostic
       icon: "mdi:cog-sync"
       value_template: >-
@@ -1559,26 +797,6 @@ mqtt:
     # without replaying on HA restart / gateway republish, so a COUNTER (an INCREMENT = a press) is the
     # mesh-safe form for WiFi-less leaves; total_increasing tolerates the per-boot reset. Trigger on the
     # counter's increase for "button pressed" automations.
-    - name: "smol 7 button count"
-      unique_id: smol_7_btn_count_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:gesture-tap-button"
-      value_template: >-
-        {% set ns = namespace(v='0') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('btn=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ ns.v | int(0) }}
-    - name: "smol 7 long press count"
-      unique_id: smol_7_btnl_count_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:gesture-tap-hold"
-      value_template: >-
-        {% set ns = namespace(v='0') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('btnl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ ns.v | int(0) }}
     - name: "smol 8 button count"
       unique_id: smol_8_btn_count_mirror
       state_topic: "smol/8/diag"
@@ -1599,69 +817,9 @@ mqtt:
         {% set ns = namespace(v='0') %}
         {% for kv in value.split('|') %}{% if kv.startswith('btnl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
         {{ ns.v | int(0) }}
-    - name: "smol 9 button count"
-      unique_id: smol_9_btn_count_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:gesture-tap-button"
-      value_template: >-
-        {% set ns = namespace(v='0') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('btn=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ ns.v | int(0) }}
-    - name: "smol 9 long press count"
-      unique_id: smol_9_btnl_count_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:gesture-tap-hold"
-      value_template: >-
-        {% set ns = namespace(v='0') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('btnl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ ns.v | int(0) }}
     # --- #49 DIAG counters (vesper folds into the same smol/<id>/diag record) —
     # flush ok/fail + OTA-verify ok/fail. Same key-picker; forward-compat (parser
     # already ignores unknown keys). total_increasing; degrade-safe (0 until fw). ---
-    - name: "smol 7 flush ok"
-      unique_id: smol_7_flush_ok_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:check-network-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('fok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ ns.v | int(0) }}
-    - name: "smol 7 flush fail"
-      unique_id: smol_7_flush_fail_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:close-network-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('ffl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ ns.v | int(0) }}
-    - name: "smol 7 verify ok"
-      unique_id: smol_7_verify_ok_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:shield-check-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('vok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ ns.v | int(0) }}
-    - name: "smol 7 verify fail"
-      unique_id: smol_7_verify_fail_mirror
-      state_topic: "smol/7/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:shield-alert-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('vfl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ ns.v | int(0) }}
     - name: "smol 8 flush ok"
       unique_id: smol_8_flush_ok_mirror
       state_topic: "smol/8/diag"
@@ -1702,51 +860,13 @@ mqtt:
         {% set ns = namespace(v='0') %}
         {% for kv in value.split('|') %}{% if kv.startswith('vfl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
         {{ ns.v | int(0) }}
-    - name: "smol 9 flush ok"
-      unique_id: smol_9_flush_ok_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:check-network-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('fok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ ns.v | int(0) }}
-    - name: "smol 9 flush fail"
-      unique_id: smol_9_flush_fail_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:close-network-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('ffl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ ns.v | int(0) }}
-    - name: "smol 9 verify ok"
-      unique_id: smol_9_verify_ok_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:shield-check-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('vok=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ ns.v | int(0) }}
-    - name: "smol 9 verify fail"
-      unique_id: smol_9_verify_fail_mirror
-      state_topic: "smol/9/diag"
-      entity_category: diagnostic
-      state_class: total_increasing
-      icon: "mdi:shield-alert-outline"
-      value_template: >-
-        {% set ns = namespace(v='0') %}
-        {% for kv in value.split('|') %}{% if kv.startswith('vfl=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
-        {{ ns.v | int(0) }}
 
 # =====================================================================
 # MESH TOPOLOGY derived sensors (issue #27) — HELD; back the topology card.
 # rssi = each spoke's signal as heard by the ELECTED owner (dynamic — reads the
-# owner's peers list, defaults id7). online = the node's STAT is fresh — reads
+# owner's peers list; an UNKNOWN owner now yields 'unknown' rather than falling back to a
+# named board, because the old id7 fallback outlived id7 and would have read a deleted
+# entity). online = the node's STAT is fresh — reads
 # sensor.smol_<id>_screen (the cache-republished smol/<id>/status, reliable single-frame),
 # NOT the sparse relay-fragmented telemetry voltage that FALSE-offlined a live-but-sparse
 # leaf (#68). F6 (net/wifi.rs:1656) freshness-gates the gateway leaf-status republish at 45s
@@ -1758,17 +878,19 @@ mqtt:
 # =====================================================================
 template:
   - sensor:
-      # --- #194/#31 NTP freshness FLEET counter — how many of 7/8/9 are time-fresh. HONEST: expect
-      # "0/3 fresh" (stale) until #192 periodic re-sync ships; boot-only sync ages past 3600s. ---
+      # --- #194/#31 NTP freshness FLEET counter. HONEST TWICE OVER: expect "0/1 fresh" (stale)
+      # until #192 periodic re-sync ships (boot-only sync ages past 3600s), AND the denominator is
+      # 1, not the fleet — this counts the hand-listed ids, which since the id7/id9 retirement is
+      # only id8. A real fleet counter has to come off the device registry (#309/#308). ---
       - name: "smol NTP fleet"
         unique_id: smol_ntp_fleet
         icon: mdi:clock-check
         # STATIC entity refs (not concatenated) so HA reliably tracks them as dependencies.
-        state: "{{ [states('sensor.smol_7_ntp_fresh'), states('sensor.smol_8_ntp_fresh'), states('sensor.smol_9_ntp_fresh')] | select('eq', 'fresh') | list | count }}/3 fresh"
+        state: "{{ [states('sensor.smol_8_ntp_fresh')] | select('eq', 'fresh') | list | count }}/1 fresh"
         attributes:
-          aging: "{{ [states('sensor.smol_7_ntp_fresh'), states('sensor.smol_8_ntp_fresh'), states('sensor.smol_9_ntp_fresh')] | select('eq', 'aging') | list | count }}"
-          stale: "{{ [states('sensor.smol_7_ntp_fresh'), states('sensor.smol_8_ntp_fresh'), states('sensor.smol_9_ntp_fresh')] | reject('in', ['fresh', 'aging']) | list | count }}"
-          note: "Expect 0/3 fresh until #192 periodic re-sync ships — boot-only sync ages past 3600s. Not a dashboard bug."
+          aging: "{{ [states('sensor.smol_8_ntp_fresh')] | select('eq', 'aging') | list | count }}"
+          stale: "{{ [states('sensor.smol_8_ntp_fresh')] | reject('in', ['fresh', 'aging']) | list | count }}"
+          note: "Expect 0/1 fresh until #192 periodic re-sync ships — boot-only sync ages past 3600s. Not a dashboard bug. Denominator = the hand-listed ids (id8 only since the id7/id9 retirement), NOT the live fleet — see #309."
       # --- #45 Custom-screen COMPOSE: turn each node's author string into the wire
       # payload <count>|<size><align>text;… . A TEMPLATE sensor (not a static automation)
       # so it auto-subscribes to whatever {entity_id}s the user references — the clean fix
@@ -1776,32 +898,6 @@ template:
       # them). Reuses the Batt display-override subst() macro; strips ';', clips per size
       # (7 for l, 12 for s/m). Empty author → '' (clears the custom). The publish
       # automation ships this on change. ---
-      - name: "smol 7 custom lay"
-        unique_id: smol_7_custom_lay
-        state: >-
-          {%- macro subst(src) -%}
-          {%- set ns = namespace(out=src) -%}
-          {%- for id in src | regex_findall('\{([a-z0-9_.]+)\}') -%}
-          {%- set v = states(id) -%}
-          {%- set v = '--' if (v | lower) in ['unknown','unavailable','none',''] else v -%}
-          {%- set ns.out = ns.out | replace('{' ~ id ~ '}', v) -%}
-          {%- endfor -%}{{- ns.out -}}
-          {%- endmacro -%}
-          {%- set author = states('input_text.smol_7_custom') -%}
-          {%- if (author | lower) in ['unknown','unavailable','none',''] -%}{{- '' -}}
-          {%- else -%}
-          {%- set ns = namespace(segs=[]) -%}
-          {%- for raw in author.split('|')[:4] -%}
-          {%- set ln = raw.strip() -%}
-          {%- if ln | length >= 2 -%}
-          {%- set size = ln[0] if ln[0] in 'sml' else 's' -%}
-          {%- set align = ln[1] if ln[1] in 'lcr' else 'l' -%}
-          {%- set text = (subst(ln[2:] | trim) | replace(';','')) -%}
-          {%- set ns.segs = ns.segs + [size ~ align ~ text[:(7 if size == 'l' else 12)]] -%}
-          {%- endif -%}
-          {%- endfor -%}
-          {%- if ns.segs | length > 0 -%}{{- ns.segs | length -}}|{{- ns.segs | join(';') -}}{%- else -%}{{- '' -}}{%- endif -%}
-          {%- endif -%}
       - name: "smol 8 custom lay"
         unique_id: smol_8_custom_lay
         state: >-
@@ -1828,109 +924,50 @@ template:
           {%- endfor -%}
           {%- if ns.segs | length > 0 -%}{{- ns.segs | length -}}|{{- ns.segs | join(';') -}}{%- else -%}{{- '' -}}{%- endif -%}
           {%- endif -%}
-      - name: "smol 9 custom lay"
-        unique_id: smol_9_custom_lay
-        state: >-
-          {%- macro subst(src) -%}
-          {%- set ns = namespace(out=src) -%}
-          {%- for id in src | regex_findall('\{([a-z0-9_.]+)\}') -%}
-          {%- set v = states(id) -%}
-          {%- set v = '--' if (v | lower) in ['unknown','unavailable','none',''] else v -%}
-          {%- set ns.out = ns.out | replace('{' ~ id ~ '}', v) -%}
-          {%- endfor -%}{{- ns.out -}}
-          {%- endmacro -%}
-          {%- set author = states('input_text.smol_9_custom') -%}
-          {%- if (author | lower) in ['unknown','unavailable','none',''] -%}{{- '' -}}
-          {%- else -%}
-          {%- set ns = namespace(segs=[]) -%}
-          {%- for raw in author.split('|')[:4] -%}
-          {%- set ln = raw.strip() -%}
-          {%- if ln | length >= 2 -%}
-          {%- set size = ln[0] if ln[0] in 'sml' else 's' -%}
-          {%- set align = ln[1] if ln[1] in 'lcr' else 'l' -%}
-          {%- set text = (subst(ln[2:] | trim) | replace(';','')) -%}
-          {%- set ns.segs = ns.segs + [size ~ align ~ text[:(7 if size == 'l' else 12)]] -%}
-          {%- endif -%}
-          {%- endfor -%}
-          {%- if ns.segs | length > 0 -%}{{- ns.segs | length -}}|{{- ns.segs | join(';') -}}{%- else -%}{{- '' -}}{%- endif -%}
-          {%- endif -%}
   - sensor:
-      # --- #51 dynamic-role gap fix: EVERY node needs leaf-bond entities (any node can be a leaf now).
-      # id7 was gateway-only, so its rssi/band/resync were never defined; #51 (id8 can take over) makes
-      # id7 a leaf → its dashboard box showed 'entity not found' ×3. Defined for id7 here, mirroring 8/9;
-      # they read the DYNAMIC elected owner's peers (sensor.smol_<owner>_peers → the '7,' entry). ---
-      - name: "smol 7 rssi"
-        unique_id: smol_7_rssi
-        state: >-
-          {% set owner = state_attr('sensor.smol_mesh_channel', 'owner') or '7' %}
-          {% set ps = state_attr('sensor.smol_' ~ owner ~ '_peers', 'peers') or [] %}
-          {% set m = ps | select('match', '^7,') | list %}
-          {% if m %}{% set v = m[0].split(',')[1] | int(-999) %}{{ v - 256 if v > 127 else v }}{% else %}unknown{% endif %}
+      # --- #51 dynamic-role gap fix: EVERY node needs leaf-bond entities (any node can be a leaf).
+      # These read the DYNAMIC elected owner's peers (sensor.smol_<owner>_peers → this node's entry),
+      # so they follow the crown wherever it moves. What they can NOT follow is the id list itself:
+      # the id7/id9 copies were deleted 2026-07-28 with those boards, and id50/id51 have none. ---
       - name: "smol 8 rssi"
         unique_id: smol_8_rssi
         state: >-
-          {% set owner = state_attr('sensor.smol_mesh_channel', 'owner') or '7' %}
+          {#- NO `or '<id>'` default. It used to be `or '7'`, so an unknown owner silently read
+          sensor.smol_7_peers — a board that stopped existing in July and whose entity is now
+          deleted outright. Unknown owner must read 'unknown', never borrow a named board. -#}
+          {% set owner = state_attr('sensor.smol_mesh_channel', 'owner') %}
           {% set ps = state_attr('sensor.smol_' ~ owner ~ '_peers', 'peers') or [] %}
           {% set m = ps | select('match', '^8,') | list %}
           {% if m %}{% set v = m[0].split(',')[1] | int(-999) %}{{ v - 256 if v > 127 else v }}{% else %}unknown{% endif %}
-      - name: "smol 9 rssi"
-        unique_id: smol_9_rssi
-        state: >-
-          {% set owner = state_attr('sensor.smol_mesh_channel', 'owner') or '7' %}
-          {% set ps = state_attr('sensor.smol_' ~ owner ~ '_peers', 'peers') or [] %}
-          {% set m = ps | select('match', '^9,') | list %}
-          {% if m %}{% set v = m[0].split(',')[1] | int(-999) %}{{ v - 256 if v > 127 else v }}{% else %}unknown{% endif %}
   - binary_sensor:
-      - name: "smol 7 online"
-        unique_id: smol_7_online
-        state: "{{ states('sensor.smol_7_screen') not in ['unavailable', 'unknown', 'none', ''] }}"
       - name: "smol 8 online"
         unique_id: smol_8_online
         state: "{{ states('sensor.smol_8_screen') not in ['unavailable', 'unknown', 'none', ''] }}"
-      - name: "smol 9 online"
-        unique_id: smol_9_online
-        state: "{{ states('sensor.smol_9_screen') not in ['unavailable', 'unknown', 'none', ''] }}"
       - name: "smol 5 online"
         unique_id: smol_5_online
         state: "{{ states('sensor.smol_5_screen') not in ['unavailable', 'unknown', 'none', ''] }}"
-      - name: "smol 7 resync"
-        unique_id: smol_7_resync
-        state: >-
-          {% set ch = state_attr('sensor.smol_7_peers', 'ch') %}
-          {{ ch is not none and ch != state_attr('sensor.smol_mesh_channel', 'channel') }}
       - name: "smol 8 resync"
         unique_id: smol_8_resync
         state: >-
           {% set ch = state_attr('sensor.smol_8_peers', 'ch') %}
           {{ ch is not none and ch != state_attr('sensor.smol_mesh_channel', 'channel') }}
-      - name: "smol 9 resync"
-        unique_id: smol_9_resync
-        state: >-
-          {% set ch = state_attr('sensor.smol_9_peers', 'ch') %}
-          {{ ch is not none and ch != state_attr('sensor.smol_mesh_channel', 'channel') }}
       - name: "smol mesh reelecting"
         unique_id: smol_mesh_reelecting
         state: >-
-          {% set owner = state_attr('sensor.smol_mesh_channel', 'owner') or '7' %}
+          {#- same retired-default fix as `smol 8 rssi` above: was `or '7'`. is_state() on a
+          missing entity is False, so the old default did not error — it quietly answered
+          "not re-electing" using a dead board. The unavailable-channel clause below is the
+          honest signal when the owner is unknown. -#}
+          {% set owner = state_attr('sensor.smol_mesh_channel', 'owner') %}
           {{ is_state('binary_sensor.smol_' ~ owner ~ '_online', 'off')
              or states('sensor.smol_mesh_channel') in ['unavailable', 'unknown'] }}
 
   # --- #27 topology edge-weighting helpers (luna, issue-27 Appendix A) ---
   - sensor:
-      - name: "smol 7 rssi band"
-        unique_id: smol_7_rssi_band
-        state: >-
-          {% set r = states('sensor.smol_7_rssi') | int(-999) %}
-          {{ 'unknown' if r == -999 else 'strong' if r >= -55 else 'good' if r >= -70 else 'weak' if r >= -82 else 'faint' }}
       - name: "smol 8 rssi band"
         unique_id: smol_8_rssi_band
         state: >-
           {% set r = states('sensor.smol_8_rssi') | int(-999) %}
-          {{ 'unknown' if r == -999 else 'strong' if r >= -55 else 'good' if r >= -70 else 'weak' if r >= -82 else 'faint' }}
-      - name: "smol 9 rssi band"
-        unique_id: smol_9_rssi_band
-        state: >-
-          {% set r = states('sensor.smol_9_rssi') | int(-999) %}
           {{ 'unknown' if r == -999 else 'strong' if r >= -55 else 'good' if r >= -70 else 'weak' if r >= -82 else 'faint' }}
   - binary_sensor:
       - name: "smol mesh asleep"
@@ -1956,7 +993,10 @@ template:
         state: >-
           {%- set mesh = states('sensor.smol_mesh_channel') -%}
           {%- set owner = state_attr('sensor.smol_mesh_channel','owner') | string -%}
-          {%- set cands = [('7', states('sensor.smol_7_ap_channel'), state_attr('sensor.smol_7_ap_channel','rssi')), ('8', states('sensor.smol_8_ap_channel'), state_attr('sensor.smol_8_ap_channel','rssi')), ('9', states('sensor.smol_9_ap_channel'), state_attr('sensor.smol_9_ap_channel','rssi')), ('5', states('sensor.smol_5_ap_channel'), state_attr('sensor.smol_5_ap_channel','rssi'))] -%}
+          {#- hand-listed candidates: id8 + id5. If the crown is a board not in this list (id50/
+          id51/id122 today) the state reads 'unknown' — a blind spot, not a healthy verdict.
+          #309's discovery configs are what removes the list. -#}
+          {%- set cands = [('8', states('sensor.smol_8_ap_channel'), state_attr('sensor.smol_8_ap_channel','rssi')), ('5', states('sensor.smol_5_ap_channel'), state_attr('sensor.smol_5_ap_channel','rssi'))] -%}
           {%- set ns = namespace(ch='none', rssi=0) -%}
           {%- for id, ch, rs in cands -%}{%- if id == owner and ch not in ['unavailable','unknown','none',''] -%}{%- set ns.ch = ch -%}{%- set ns.rssi = rs | int(0) -%}{%- endif -%}{%- endfor -%}
           {%- if mesh in ['unavailable','unknown','none',''] or ns.ch == 'none' -%}unknown
@@ -1970,22 +1010,23 @@ template:
           mesh_channel: "{{ states('sensor.smol_mesh_channel') }}"
           mesh_owner: "{{ state_attr('sensor.smol_mesh_channel','owner') }}"
           crown_ap_channel: >-
-            {%- set o = state_attr('sensor.smol_mesh_channel','owner') | string -%}{%- if o == '7' -%}{{ states('sensor.smol_7_ap_channel') }}{%- elif o == '8' -%}{{ states('sensor.smol_8_ap_channel') }}{%- elif o == '9' -%}{{ states('sensor.smol_9_ap_channel') }}{%- elif o == '5' -%}{{ states('sensor.smol_5_ap_channel') }}{%- else -%}none{%- endif -%}
+            {%- set o = state_attr('sensor.smol_mesh_channel','owner') | string -%}{%- if o == '8' -%}{{ states('sensor.smol_8_ap_channel') }}{%- elif o == '5' -%}{{ states('sensor.smol_5_ap_channel') }}{%- else -%}none{%- endif -%}
           ap_rssi: >-
-            {%- set o = state_attr('sensor.smol_mesh_channel','owner') | string -%}{%- if o == '7' -%}{{ state_attr('sensor.smol_7_ap_channel','rssi') }}{%- elif o == '8' -%}{{ state_attr('sensor.smol_8_ap_channel','rssi') }}{%- elif o == '9' -%}{{ state_attr('sensor.smol_9_ap_channel','rssi') }}{%- elif o == '5' -%}{{ state_attr('sensor.smol_5_ap_channel','rssi') }}{%- else -%}none{%- endif -%}
+            {%- set o = state_attr('sensor.smol_mesh_channel','owner') | string -%}{%- if o == '8' -%}{{ state_attr('sensor.smol_8_ap_channel','rssi') }}{%- elif o == '5' -%}{{ state_attr('sensor.smol_5_ap_channel','rssi') }}{%- else -%}none{%- endif -%}
           ap_bssid: >-
-            {%- set o = state_attr('sensor.smol_mesh_channel','owner') | string -%}{%- if o == '7' -%}{{ state_attr('sensor.smol_7_ap_channel','bssid') }}{%- elif o == '8' -%}{{ state_attr('sensor.smol_8_ap_channel','bssid') }}{%- elif o == '9' -%}{{ state_attr('sensor.smol_9_ap_channel','bssid') }}{%- elif o == '5' -%}{{ state_attr('sensor.smol_5_ap_channel','bssid') }}{%- else -%}none{%- endif -%}
+            {%- set o = state_attr('sensor.smol_mesh_channel','owner') | string -%}{%- if o == '8' -%}{{ state_attr('sensor.smol_8_ap_channel','bssid') }}{%- elif o == '5' -%}{{ state_attr('sensor.smol_5_ap_channel','bssid') }}{%- else -%}none{%- endif -%}
           ap_reporters: >-
-            {%- set ns = namespace(c=0) -%}{%- for e in ['sensor.smol_7_ap_channel','sensor.smol_8_ap_channel','sensor.smol_9_ap_channel','sensor.smol_5_ap_channel'] -%}{%- if states(e) not in ['unavailable','unknown','none',''] -%}{%- set ns.c = ns.c + 1 -%}{%- endif -%}{%- endfor -%}{{ ns.c }}
+            {%- set ns = namespace(c=0) -%}{%- for e in ['sensor.smol_8_ap_channel','sensor.smol_5_ap_channel'] -%}{%- if states(e) not in ['unavailable','unknown','none',''] -%}{%- set ns.c = ns.c + 1 -%}{%- endif -%}{%- endfor -%}{{ ns.c }}
           note: "GREEN=crown AP co-channel with mesh · RED=mismatch (coexist broken -> OTA dead, the ch1-vs-ch6 trap) · AMBER=co-channel but AP rssi<=-80. crown=the MC owner (smol/mesh/channel); only the WiFi-uplink crown reports ap=. Cause of the OTA death-point tiles below."
 
   # ======================================================================================
   # #153 burst-freeze (`brst=`) and #217 coexist belief-vs-observation (`apch=` vs `ap=`)
   #
   # WILDCARD-SUBSCRIBED, deliberately. Both fields live in `smol/<id>/diag`, a per-id topic,
-  # and every other consumer of that topic in this file is hand-written per id (5/7/8/9) —
-  # which is exactly why the peers roster went dark the moment the crown moved to id50, and
-  # why `smol coexist health` above can only ever see four boards. An MQTT *trigger* takes a
+  # and every other consumer of that topic in this file is hand-written per id (5/8 — it was
+  # 5/7/8/9 until the id7/id9 retirement) — which is exactly why the peers roster went dark the
+  # moment the crown moved to id50, and why `smol coexist health` above can only ever see two
+  # boards, one fewer blind spot than yesterday and still not the fleet. An MQTT *trigger* takes a
   # topic wildcard, and `trigger.topic` carries the id, so ONE block covers the whole fleet
   # including boards HA has never seen. No per-id duplication, nothing to extend when a node
   # is added.
@@ -2094,8 +1135,9 @@ template:
       - condition: template
         value_template: "{{ trigger.payload is string and (trigger.payload.split('|') | select('search','^ap=') | list | count) > 0 }}"
       # ...and only from the board that is CURRENTLY the elected crown. Every DIAG topic is
-      # retained, so on an HA restart the retained records of former crowns (id7 and id13 still
-      # hold retained role-G payloads) all replay at subscribe time and the last one to arrive
+      # retained, so on an HA restart the retained records of former crowns (id13 still holds a
+      # role-G payload; id7's was cleared 2026-07-28 with the board's retirement, which removes one
+      # such ghost and not the hazard) all replay at subscribe time and the last one to arrive
       # would win — publishing a confident verdict about a board that has not been crown for
       # hours. Owner comes from the mesh-wide `smol/mesh/channel`, so this stays id-agnostic.
       # If the owner is not yet known, accept rather than go silent.
@@ -2190,18 +1232,10 @@ template:
   # tolerates a commanded default that omits the `:page`. So a half-configured node does NOT
   # false-alarm; drift lights only on a genuine live≠desired (dropped CFG relay / stale NVS /
   # manual nav off the commanded default). Attributes surface applied-vs-expected for debug.
-  # NOTE: logic host-validated (jinja mocks, 10 scenarios); confirm on the id7 canary that the
-  # live cfg= string parses as expected before trusting the dashboard drift chip.
+  # NOTE: logic host-validated (jinja mocks, 10 scenarios); confirm on a LIVE board (id8 — the
+  # id7 canary this note named has not existed since #198 Phase-2) that the live cfg= string
+  # parses as expected before trusting the dashboard drift chip.
   - sensor:
-      - name: "smol 7 config expected"
-        unique_id: smol_7_config_expected
-        icon: "mdi:cog-outline"
-        state: >-
-          {% set scr = states('sensor.smol_7_config') %}
-          {% set led = states('sensor.smol_7_led') %}
-          {% set mask = states('sensor.smol_7_plugins') %}
-          {% set units = (state_attr('sensor.smol_units','temp') or 'F') ~ (state_attr('sensor.smol_units','clock') or '24') %}
-          {{ scr }},{{ led }},{{ mask }},{{ units }}
       - name: "smol 8 config expected"
         unique_id: smol_8_config_expected
         icon: "mdi:cog-outline"
@@ -2211,43 +1245,7 @@ template:
           {% set mask = states('sensor.smol_8_plugins') %}
           {% set units = (state_attr('sensor.smol_units','temp') or 'F') ~ (state_attr('sensor.smol_units','clock') or '24') %}
           {{ scr }},{{ led }},{{ mask }},{{ units }}
-      - name: "smol 9 config expected"
-        unique_id: smol_9_config_expected
-        icon: "mdi:cog-outline"
-        state: >-
-          {% set scr = states('sensor.smol_9_config') %}
-          {% set led = states('sensor.smol_9_led') %}
-          {% set mask = states('sensor.smol_9_plugins') %}
-          {% set units = (state_attr('sensor.smol_units','temp') or 'F') ~ (state_attr('sensor.smol_units','clock') or '24') %}
-          {{ scr }},{{ led }},{{ mask }},{{ units }}
   - binary_sensor:
-      - name: "smol 7 config drift"
-        unique_id: smol_7_config_drift
-        device_class: problem
-        icon: "mdi:cog-sync"
-        state: >-
-          {% set ap = states('sensor.smol_7_config_applied') %}
-          {% set ns = namespace(drift=false) %}
-          {% if ap not in ['unknown','unavailable','none',''] %}
-            {% set f = ap.split(',') %}
-            {% if f | length >= 4 %}
-              {% set e_scr = states('sensor.smol_7_config') %}
-              {% set e_led = states('sensor.smol_7_led') %}
-              {% set e_mask = states('sensor.smol_7_plugins') %}
-              {% set e_units = (state_attr('sensor.smol_units','temp') or '') ~ (state_attr('sensor.smol_units','clock') or '') %}
-              {% if e_scr not in ['unknown','unavailable','none',''] %}
-                {% set a_cmp = f[0] if ':' in e_scr else f[0].split(':')[0] %}
-                {% if a_cmp != e_scr %}{% set ns.drift = true %}{% endif %}
-              {% endif %}
-              {% if e_led not in ['unknown','unavailable','none',''] and f[1] != e_led %}{% set ns.drift = true %}{% endif %}
-              {% if e_mask not in ['unknown','unavailable','none',''] and f[2] != e_mask %}{% set ns.drift = true %}{% endif %}
-              {% if e_units | length == 3 and f[3] != e_units %}{% set ns.drift = true %}{% endif %}
-            {% endif %}
-          {% endif %}
-          {{ ns.drift }}
-        attributes:
-          applied: "{{ states('sensor.smol_7_config_applied') }}"
-          expected: "{{ states('sensor.smol_7_config_expected') }}"
       - name: "smol 8 config drift"
         unique_id: smol_8_config_drift
         device_class: problem
@@ -2275,33 +1273,6 @@ template:
         attributes:
           applied: "{{ states('sensor.smol_8_config_applied') }}"
           expected: "{{ states('sensor.smol_8_config_expected') }}"
-      - name: "smol 9 config drift"
-        unique_id: smol_9_config_drift
-        device_class: problem
-        icon: "mdi:cog-sync"
-        state: >-
-          {% set ap = states('sensor.smol_9_config_applied') %}
-          {% set ns = namespace(drift=false) %}
-          {% if ap not in ['unknown','unavailable','none',''] %}
-            {% set f = ap.split(',') %}
-            {% if f | length >= 4 %}
-              {% set e_scr = states('sensor.smol_9_config') %}
-              {% set e_led = states('sensor.smol_9_led') %}
-              {% set e_mask = states('sensor.smol_9_plugins') %}
-              {% set e_units = (state_attr('sensor.smol_units','temp') or '') ~ (state_attr('sensor.smol_units','clock') or '') %}
-              {% if e_scr not in ['unknown','unavailable','none',''] %}
-                {% set a_cmp = f[0] if ':' in e_scr else f[0].split(':')[0] %}
-                {% if a_cmp != e_scr %}{% set ns.drift = true %}{% endif %}
-              {% endif %}
-              {% if e_led not in ['unknown','unavailable','none',''] and f[1] != e_led %}{% set ns.drift = true %}{% endif %}
-              {% if e_mask not in ['unknown','unavailable','none',''] and f[2] != e_mask %}{% set ns.drift = true %}{% endif %}
-              {% if e_units | length == 3 and f[3] != e_units %}{% set ns.drift = true %}{% endif %}
-            {% endif %}
-          {% endif %}
-          {{ ns.drift }}
-        attributes:
-          applied: "{{ states('sensor.smol_9_config_applied') }}"
-          expected: "{{ states('sensor.smol_9_config_expected') }}"
 
 automation:
   - id: smol_publish_batt_display
@@ -2508,9 +1479,7 @@ automation:
     trigger:
       - platform: state
         entity_id:
-          - input_select.smol_7_led
           - input_select.smol_8_led
-          - input_select.smol_9_led
     condition:
       - condition: template
         value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
@@ -2538,9 +1507,7 @@ automation:
       - service: input_select.select_option
         target:
           entity_id:
-            - input_select.smol_7_led
             - input_select.smol_8_led
-            - input_select.smol_9_led
         data:
           option: "{{ trigger.to_state.state }}"
 
@@ -2565,9 +1532,7 @@ automation:
     trigger:
       - platform: state
         entity_id:
-          - input_text.smol_7_broker
           - input_text.smol_8_broker
-          - input_text.smol_9_broker
     condition:
       - condition: template
         value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
@@ -2593,9 +1558,7 @@ automation:
     trigger:
       - platform: state
         entity_id:
-          - input_text.smol_7_ota_host
           - input_text.smol_8_ota_host
-          - input_text.smol_9_ota_host
     condition:
       - condition: template
         value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
@@ -2618,12 +1581,8 @@ automation:
     trigger:
       - platform: state
         entity_id:
-          - input_text.smol_7_io_map
           - input_text.smol_8_io_map
-          - input_text.smol_9_io_map
-          - input_text.smol_7_io_set
           - input_text.smol_8_io_set
-          - input_text.smol_9_io_set
     condition:
       - condition: template
         value_template: "{{ trigger.from_state is not none and trigger.from_state.state not in ['unavailable', 'unknown'] }}"
@@ -2676,9 +1635,7 @@ automation:
     trigger:
       - platform: state
         entity_id:
-          - input_button.smol_7_reboot
           - input_button.smol_8_reboot
-          - input_button.smol_9_reboot
     condition:
       # Button guard: allow 'unknown' (a button's pre-first-press state) so the FIRST press
       # fires; `from_state is not none` still blocks the None->unknown startup event.
@@ -2712,9 +1669,7 @@ automation:
       - service: input_button.press
         target:
           entity_id:
-            - input_button.smol_7_reboot
             - input_button.smol_8_reboot
-            - input_button.smol_9_reboot
 
   # =====================================================================
   # #71 on-demand WiFi SCAN (#194/#31) — per-node button → TRANSIENT smol/<id>/cmd/scan
@@ -2727,9 +1682,7 @@ automation:
     trigger:
       - platform: state
         entity_id:
-          - input_button.smol_7_scan
           - input_button.smol_8_scan
-          - input_button.smol_9_scan
     condition:
       - condition: template
         value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
@@ -2754,9 +1707,7 @@ automation:
       - service: input_button.press
         target:
           entity_id:
-            - input_button.smol_7_scan
             - input_button.smol_8_scan
-            - input_button.smol_9_scan
 
   # =====================================================================
   # NODE MANAGER automations (issue #21) — publish the retained per-node config.
@@ -2764,44 +1715,6 @@ automation:
   # closed-set input_selects (so it is always a valid token). "Set all" fans out
   # to every per-node topic (no broadcast). Reset publishes empty = clear.
   # =====================================================================
-  - id: smol_nodemgr_7_apply
-    alias: "smol nodemgr: id7 apply default screen"
-    description: >-
-      On the id7 Apply button, publish retained smol/7/config/default_screen =
-      <AppKind>:<page> from the id7 helpers (broker retention = persistence).
-    mode: single
-    trigger:
-      - platform: state
-        entity_id: input_button.smol_7_apply
-    condition:
-      - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
-    action:
-      - service: mqtt.publish
-        data:
-          topic: "smol/7/config/default_screen"
-          retain: true
-          qos: 0
-          payload: "{{ states('input_select.smol_7_screen') }}:{{ states('input_select.smol_7_page') }}"
-  - id: smol_nodemgr_7_reset
-    alias: "smol nodemgr: id7 reset to board default"
-    description: >-
-      On the id7 Reset button, publish an EMPTY retained payload (retain-delete) so
-      id7 falls back to its board.rs DEFAULT_APP/DEFAULT_PAGE (design §2.5, R-P1).
-    mode: single
-    trigger:
-      - platform: state
-        entity_id: input_button.smol_7_reset
-    condition:
-      - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
-    action:
-      - service: mqtt.publish
-        data:
-          topic: "smol/7/config/default_screen"
-          retain: true
-          qos: 0
-          payload: ""
   - id: smol_nodemgr_8_apply
     alias: "smol nodemgr: id8 apply default screen"
     description: >-
@@ -2838,48 +1751,14 @@ automation:
           retain: true
           qos: 0
           payload: ""
-  - id: smol_nodemgr_9_apply
-    alias: "smol nodemgr: id9 apply default screen"
-    description: >-
-      On the id9 Apply button, publish retained smol/9/config/default_screen.
-    mode: single
-    trigger:
-      - platform: state
-        entity_id: input_button.smol_9_apply
-    condition:
-      - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
-    action:
-      - service: mqtt.publish
-        data:
-          topic: "smol/9/config/default_screen"
-          retain: true
-          qos: 0
-          payload: "{{ states('input_select.smol_9_screen') }}:{{ states('input_select.smol_9_page') }}"
-  - id: smol_nodemgr_9_reset
-    alias: "smol nodemgr: id9 reset to board default"
-    description: >-
-      On the id9 Reset button, publish an EMPTY retained payload (clear).
-    mode: single
-    trigger:
-      - platform: state
-        entity_id: input_button.smol_9_reset
-    condition:
-      - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
-    action:
-      - service: mqtt.publish
-        data:
-          topic: "smol/9/config/default_screen"
-          retain: true
-          qos: 0
-          payload: ""
   - id: smol_nodemgr_set_all
     alias: "smol nodemgr: SET ALL default screen"
     description: >-
-      On the Apply-to-all button, fan the set-all screen+page out to EVERY per-node
-      topic (id7/id8/id9) — no broadcast topic (ruling #3 / design §2.1). Each
-      per-node retained value is overwritten.
+      On the Apply-to-all button, fan the set-all screen+page out to every per-node
+      topic — no broadcast topic (ruling #3 / design §2.1). Each per-node retained value is
+      overwritten. ⚠️ "EVERY" MEANS EVERY ID WRITTEN BELOW, which since the id7/id9 retirement
+      is id8 alone — so "set all" does NOT reach id5/id50/id51. A fan-out over a hand-written
+      topic list cannot notice the fleet changed; #309 is the fix, not another publish step.
     mode: single
     trigger:
       - platform: state
@@ -2890,44 +1769,10 @@ automation:
     action:
       - service: mqtt.publish
         data:
-          topic: "smol/7/config/default_screen"
-          retain: true
-          qos: 0
-          payload: "{{ states('input_select.smol_all_screen') }}:{{ states('input_select.smol_all_page') }}"
-      - service: mqtt.publish
-        data:
           topic: "smol/8/config/default_screen"
           retain: true
           qos: 0
           payload: "{{ states('input_select.smol_all_screen') }}:{{ states('input_select.smol_all_page') }}"
-      - service: mqtt.publish
-        data:
-          topic: "smol/9/config/default_screen"
-          retain: true
-          qos: 0
-          payload: "{{ states('input_select.smol_all_screen') }}:{{ states('input_select.smol_all_page') }}"
-  - id: smol_ota_install_id7
-    alias: "smol OTA: install staged to id7 (retained)"
-    description: >-
-      On the id7 OTA-Install button, publish RETAINED smol/7/ota/install = INSTALL.
-      RETAINED because the fw does a retained-read on connect (wifi.rs:336/:822) — a bursty
-      node (~2s/burst) misses a non-retained publish. The fw self-clears the retained install
-      after acting (no re-trigger). The native Update entity stays the "update available"
-      indicator; this is the working install trigger until fw discovery adds retain:true (#33 follow-up).
-    mode: single
-    trigger:
-      - platform: state
-        entity_id: input_button.smol_ota_install_7
-    condition:
-      - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
-    action:
-      - service: mqtt.publish
-        data:
-          topic: "smol/7/ota/install"
-          retain: true
-          qos: 0
-          payload: "INSTALL"
   - id: smol_ota_install_id8
     alias: "smol OTA: install staged to id8 (retained)"
     description: >-
@@ -2950,28 +1795,6 @@ automation:
           retain: true
           qos: 0
           payload: "INSTALL"
-  - id: smol_ota_install_id9
-    alias: "smol OTA: install staged to id9 (retained)"
-    description: >-
-      On the id9 OTA-Install button, publish RETAINED smol/9/ota/install = INSTALL.
-      RETAINED because the fw does a retained-read on connect (wifi.rs:336/:822) — a bursty
-      node (~2s/burst) misses a non-retained publish. The fw self-clears the retained install
-      after acting (no re-trigger). The native Update entity stays the "update available"
-      indicator; this is the working install trigger until fw discovery adds retain:true (#33 follow-up).
-    mode: single
-    trigger:
-      - platform: state
-        entity_id: input_button.smol_ota_install_9
-    condition:
-      - condition: template
-        value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
-    action:
-      - service: mqtt.publish
-        data:
-          topic: "smol/9/ota/install"
-          retain: true
-          qos: 0
-          payload: "INSTALL"
 
   # --- #70 silent-rollback alert — pushes the instant a node reports ota=rolled-back ---
   - alias: "smol · OTA rolled back → alert (#70)"
@@ -2979,9 +1802,7 @@ automation:
     trigger:
       - platform: state
         entity_id:
-          - sensor.smol_7_ota_outcome
           - sensor.smol_8_ota_outcome
-          - sensor.smol_9_ota_outcome
         to: "rolled-back"
     action:
       - service: persistent_notification.create
@@ -3002,9 +1823,7 @@ automation:
     trigger:
       - platform: state
         entity_id:
-          - sensor.smol_7_custom_lay
           - sensor.smol_8_custom_lay
-          - sensor.smol_9_custom_lay
       - platform: homeassistant
         event: start
       - platform: time_pattern
@@ -3036,14 +1855,6 @@ automation:
     trigger:
       - platform: state
         entity_id:
-          - input_boolean.smol_7_plugin_clock
-          - input_boolean.smol_7_plugin_snake
-          - input_boolean.smol_7_plugin_bench
-          - input_boolean.smol_7_plugin_batt
-          - input_boolean.smol_7_plugin_grid
-          - input_boolean.smol_7_plugin_wled
-          - input_boolean.smol_7_plugin_about
-          - input_boolean.smol_7_plugin_familiar
           - input_boolean.smol_8_plugin_clock
           - input_boolean.smol_8_plugin_snake
           - input_boolean.smol_8_plugin_bench
@@ -3052,14 +1863,6 @@ automation:
           - input_boolean.smol_8_plugin_wled
           - input_boolean.smol_8_plugin_about
           - input_boolean.smol_8_plugin_familiar
-          - input_boolean.smol_9_plugin_clock
-          - input_boolean.smol_9_plugin_snake
-          - input_boolean.smol_9_plugin_bench
-          - input_boolean.smol_9_plugin_batt
-          - input_boolean.smol_9_plugin_grid
-          - input_boolean.smol_9_plugin_wled
-          - input_boolean.smol_9_plugin_about
-          - input_boolean.smol_9_plugin_familiar
       - platform: homeassistant
         event: start
     action:
