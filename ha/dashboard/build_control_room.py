@@ -200,7 +200,14 @@ def node_card(nid, meta, present, span=4):
     scr="(states('sensor.smol_"+I+"_screen') if states('sensor.smol_"+I+"_screen') not in "+NAJ+" else states('input_select.smol_"+I+"_screen'))"
     oled_p=("{% set scr="+scr+" %}{% set t=states('sensor.smol_"+I+"_temp') %}{% set g=states('sensor.smol_display_grid') %}{% set na="+NAJ+" %}"
             "{% if not "+on+" %}—{% elif scr=='Grid' %}{{ g.split('|')[1] if '|' in g else '—' }}"
-            "{% elif scr=='Batt' %}{{ states('sensor.ev_battery_soc') }}%{% elif scr=='Clock' %}{{ now().strftime('%H:%M') }}"
+            # #305's dead-row check found `sensor.ev_battery_soc` absent from HA, so the mini-OLED's
+            # Batt page rendered the literal string "unknown%". Prefer the originally-intended
+            # entity if it ever returns, fall back to the HV pack SOC that actually exists
+            # (`sensor.battery_average_soc`, 57% — agrees with the inverter's own state_of_charge),
+            # and degrade to an em dash rather than printing a non-number with a unit stuck on it.
+            "{% elif scr=='Batt' %}{% set soc=states('sensor.ev_battery_soc') %}"
+            "{% if soc in na %}{% set soc=states('sensor.battery_average_soc') %}{% endif %}"
+            "{{ (soc ~ '%') if soc not in na else '—' }}{% elif scr=='Clock' %}{{ now().strftime('%H:%M') }}"
             "{% elif scr=='Custom' %}{{ states('sensor.smol_"+I+"_custom')[:8] if states('sensor.smol_"+I+"_custom') not in na else '—' }}"  # #45
             "{% else %}{{ t if t not in na else '—' }}{% endif %}")
     oled_s=("{% set scr="+scr+" %}{{ scr|upper }} · {% if not "+on+" %}no link{% elif scr=='Grid' %}shared glass{% elif scr=='Batt' %}HV pack{% elif scr=='Clock' %}mesh time{% elif scr=='Custom' %}user lines{% else %}live °F{% endif %}")
@@ -363,7 +370,7 @@ def legend_card(nodes, present):
 # lives only on the board) and to be careful about the difference between "no measurement" and
 # "a measurement of zero".
 BF="sensor.smol_burst_freeze"; CBM="binary_sensor.smol_coexist_belief_mismatch"
-TRUNC="sensor.smol_diag_truncated"
+TRUNC="sensor.smol_diag_truncated"; BLREV="sensor.smol_bootloader_revert"
 def freeze_md(nodes, dormant, present):
     sig={str(n["id"]):n["name"] for n in list(nodes)+list(dormant)}
     # First line is a LITERAL: `_ident` keys a markdown card on content[:45], so leading with a
@@ -433,6 +440,23 @@ def freeze_md(nodes, dormant, present):
             "believes and decides from. Off-channel is a proven OTA blocker here — co-channel moved "
             "48 KB, off-channel moved 0 — so a disagreement is itself the bug. "
             "observed `{{ ob }}` · believed `{{ be }}`._")
+    # #153 blrev — the bootloader auto-revert gate the roadmap has carried as UNPROVEN since July.
+    # Three answers and absent is none of them: `unknown` means no post-OTA boot has been observed
+    # since that board last lost power (the measurement lives in RTC-fast RAM a power cycle
+    # clears), NOT that there is no net. Rendering absence as `off` would invent a brick risk;
+    # rendering it as `on` would invent safety. So the verdict string is printed verbatim.
+    if BLREV in present:
+        out.append(
+            "{% set b=states('"+BLREV+"') %}{% set bv=state_attr('"+BLREV+"','verdict') %}"
+            "{% set mb=state_attr('"+BLREV+"','measured_by')|string %}"
+            "**bootloader auto-revert** — "
+            "{% if b=='on' %}🛡 **yes** — a bad OTA image has a net beneath the app"
+            "{% elif b=='off' %}⚠ **no** — the app-side `boot_confirm` is the only net; canary one board at a time"
+            "{% else %}**not measured yet**{% endif %}"
+            "{% if mb not in na %} · <small>measured by {{ sig.get(mb, 'id' ~ mb) }}</small>{% endif %}\n\n"
+            "_{% if bv not in na %}{{ bv }}{% else %}Only observable on a post-OTA boot, and a power "
+            "cycle clears it — so a blank here is 'nobody has booted an OTA image since losing "
+            "power', not 'no net'.{% endif %}_")
     return "\n\n".join(out)
 
 # ---------- dormant sigils: registered with HA, not currently on the air ----------
