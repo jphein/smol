@@ -512,7 +512,7 @@ fn main() -> ! {
     esp_println::logger::init_logger_from_env();
     log::info!("smol booting: unified firmware (menu: Clock / Snake / Bench)");
 
-    // Identity + provenance, both DERIVED (never on the wire): the node's FANTASY
+    // Identity + provenance, both DERIVED (never on the wire): the node's FLEET
     // name from NODE_ID, and the firmware's FORGE version name seeded from the git
     // short hash baked in by build.rs. The full "Adjective Noun" of each appears
     // ONLY in this log; the OLED (splash + menu) shows the noun handles. `env!`

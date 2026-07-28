@@ -1,34 +1,44 @@
-//! Deterministic magical node names — a faithful `no_std` port of realm-sigil's
-//! `GenerateName` (github.com/jphein/realm-sigil). A node's `(adjective, noun)`
-//! matches `sigil.generate_name(hex(seed), realm)` in Go/Python/JS for any `u32`
-//! seed, so any node's name is reproducible off-device (see the parity snippet in
-//! research §6).
+//! Deterministic magical names for the three things smol names: **nodes**, **builds**, and the
+//! familiar's **creatures**. The corpus and the arithmetic come from the `sigil-names` crate
+//! (vendored realm-sigil) — this module no longer holds a word list of its own.
 //!
-//! WHY derive on-device (not bake a `&str` at build time): every node must render
-//! a *peer's* name too, and the only peer identity on the wire is the 3-digit id
-//! already carried in HELLO/ACK/BEACON/TIME. Deriving names from that id keeps the
-//! hardware-verified frame formats byte-identical — **names NEVER go on the wire**
-//! — and costs zero airtime: both mesh ends compute the same name from the same
-//! id. It is pure integer math over a static string table (no heap, no crypto, no
-//! float), so it compiles into every build; our own name needs no radio at all.
+//! WHY derive on-device rather than bake a `&str` at build time: every node must render a *peer's*
+//! name too, and the only peer identity on the wire is the 3-digit id already carried in
+//! HELLO/ACK/BEACON/TIME. Deriving from that id keeps the hardware-verified frame formats
+//! byte-identical — **names never go on the MESH wire** — and costs zero airtime: both ends compute
+//! the same name from the same id. Pure integer math over a static `.rodata` table: no heap, no
+//! stack, no crypto, no float. (Names *do* go out as strings over WiFi in HA discovery, which is a
+//! budgeted 512 B packet — see `DISCOVERY_BUDGET` in `net/wifi.rs`. The old wording here said "never
+//! on the wire" full stop, and that looseness is part of why the discovery budget went unwatched.)
 //!
-//! ⚠️ CORPUS-DRIFT WARNING — pinned deliberately (research
-//! `scratch/smol/nebula-magical-names.md` §2 verified three *different* word lists
-//! exist). This table is copied VERBATIM from sigil's GENERATED embeds
-//! (`go/realms.go` == `python/realm_sigil/realms.py` == `js/realms.js`; all three
-//! byte-identical, 20 adjectives / 20 nouns per realm). It is NOT sigil's
-//! `words/realms.json` (stale: 28/25 for fantasy) and NOT lexicon's vocabularies
-//! (the lexicon→sigil cutover is designed but unimplemented as of 2026-07). If
-//! sigil re-runs its word-sync, or that cutover lands, this corpus — and therefore
-//! every node's name — will change. Re-copy from sigil's generated source if you
-//! ever want to track it; otherwise these names are frozen here on purpose.
+//! ## What this module guarantees, and how
 //!
-//! Only the `fantasy` realm is embedded (the locked realm for smol). The other six
-//! (tarot / oracle / void / forge / signal / stellar, 20/20 each) are reproduced
-//! verbatim in research §7 — paste a realm's table and repoint [`REALM`] to switch
-//! the whole mesh at once. (The MAC-seed variant `seed_from_mac`, research B2, is
-//! likewise there if zero-config per-chip naming is ever wanted; smol is locked to
-//! id-seeding so it is omitted here to keep the module warning-free.)
+//! **Every one of the 256 `u8` node ids maps to a distinct name.** Enumerated over the complete
+//! space during const evaluation in the crate, so a colliding namespace does not compile. This
+//! replaced a hand-copied 20×20 table under which only 20 of 256 ids had a distinct noun — id9, id42
+//! and id236 all rendered as bare "Herald" — and where even the full adjective+noun pair collided
+//! (163 distinct of 256), so there was no guarantee to restore. There had never been one.
+//!
+//! ## Three namespaces, kept apart by assertion rather than intention
+//!
+//! | namespace | names | source | churns? |
+//! |---|---|---|---|
+//! | [`REALM`] (`fleet`) | a board | crate, 32×32 size-locked | renamed once, authorised |
+//! | [`FORGE`] | a build | **PINNED here, never synced** | never — version names are history |
+//! | [`CREATURE`] | a familiar | crate, 24×24 unlocked | renamed once |
+//!
+//! The `const` assertions below prove they are pairwise disjoint. That matters because this module
+//! *claimed* the identity/provenance split for months with nothing checking it, and
+//! `familiar/mod.rs` claimed creature names were "distinct from any node's name" while both drew
+//! from the identical corpus. Three properties documented and never true — all found by writing the
+//! check, none by re-reading the prose.
+//!
+//! ## Drift
+//!
+//! There is no CORPUS-DRIFT WARNING here any more because there is no copy here to drift. The
+//! previous warning was also **backwards**: it named `words/realms.json` as stale when that file is
+//! the current source (lexicon cut over 2026-05-07) and the generated embeds it copied from are the
+//! frozen ones. `tools/sigil_vendor.sh --check` now enforces what the comment used to ask for.
 
 /// The corpus type and the index arithmetic now come from the sigil crate rather than being
 /// re-implemented here. This is the whole point of the change: there is one algorithm.
@@ -83,16 +93,16 @@ const _: () = assert!(
     "two fleet nouns collide when clipped to 8 chars (bench.rs peer row, finder.rs peer rows)."
 );
 
-/// IDENTITY must not share a word with PROVENANCE. This module has claimed that separation since it
-/// was written — "a build's identity reads in a DELIBERATELY different vocabulary from a node's
-/// name" — and until now nothing checked it. A claim in a doc comment is not a guarantee; upstream's
-/// post-cutover `forge` corpus in fact shares the noun `ember` with `fleet`, so the property is NOT
-/// free.
+/// IDENTITY must not share a word with PROVENANCE. This module claimed that separation from the day
+/// it was written — "a build's identity reads in a DELIBERATELY different vocabulary from a node's
+/// name" — and nothing checked it.
 ///
-/// It holds here because smol pins the 20-word forge table (see [`FORGE`]) — so this assertion is
-/// simultaneously the guarantee and a second, independent reason the pin is load-bearing: syncing
-/// FORGE from upstream would not merely rename past builds, it would make a build and a board share
-/// a name. The build would fail rather than let that ship.
+/// The property was not free, either: upstream's post-cutover `forge` shared the noun `ember` with
+/// `fleet`, so one word could name a build *and* a board. Writing this assertion is what found it
+/// (fixed in lexicon `e690207`, `ember` → `quench`). smol was insulated only by accident, because it
+/// pins the 20-word forge table — which makes this a second, independent reason the pin is
+/// load-bearing: a future FORGE sync would not merely rename past builds, it could collapse the
+/// build/board distinction. Now the build fails instead.
 const _: () = assert!(
     sigil_names::realms_disjoint(REALM, &FORGE),
     "a node-identity word now collides with a firmware-VERSION word — a board and a build could \
@@ -100,19 +110,29 @@ const _: () = assert!(
      resolve this by relaxing the check; change a word."
 );
 
-/// The familiar's creature namespace overlaps node identity on 14 nouns, so this assertion is
-/// deliberately the WEAKER `nouns_distinct_at`-style check it can currently pass... except it
-/// cannot, so it is written as an explicit known-gap note rather than a disabled assertion:
+/// The familiar's creature namespace — a THIRD namespace, neither board nor build.
 ///
-/// ```text
-/// assert!(realms_disjoint(REALM, &FANTASY))   // FAILS TODAY — 14 shared nouns
-/// ```
+/// Was the pinned `fantasy` corpus, which overlapped node identity on **14 nouns**, so a familiar
+/// could render a board's name. The known-gap note that stood here is now the assertion below:
+/// lexicon `e690207` gave creatures their own reserved-disjoint 24×24 group.
 ///
-/// A creature can therefore share a board's name. Pre-existing (creatures and nodes drew from the
-/// same corpus before this change), owned by nebula-scribe, and fixed upstream by giving creatures
-/// their own reserved-disjoint `creature` group — at which point this comment becomes the assertion
-/// above it. Recorded here so the gap is a scheduled decision, not an oversight nobody wrote down.
-const _: () = ();
+/// Deliberately NOT size-locked. A creature seeds from an arbitrary `u32`, so its domain is ~2³² and
+/// injectivity is impossible by pigeonhole — the 32-lock on node identity exists only to make a
+/// 256-element space injective, and copying it here would be applying a rule past the premise that
+/// justifies it. Sized for sound instead (576 combos ≈ 7.5% chance any two of ten concurrent
+/// creatures share a noun, and a collision is cosmetic because a creature is never an addressing
+/// key).
+pub const CREATURE: &Realm = sigil_names::CREATURE;
+
+/// A familiar must never wear a board's name. Asserted rather than intended — `familiar/mod.rs`
+/// carried the comment "distinct from any node's name" for months while both namespaces drew from
+/// the *identical* corpus, so this is the third documented-but-never-true property found today, and
+/// the only durable fix is to make the claim unrepresentable when false.
+const _: () = assert!(
+    sigil_names::realms_disjoint(REALM, CREATURE),
+    "a creature word collides with a node-identity word — a familiar could render a board's name. \
+     Fix the vocabulary in lexicon's creature group; do not relax this."
+);
 
 /// The `forge` realm for FIRMWARE VERSION names — **deliberately PINNED, never synced.**
 ///
@@ -144,31 +164,6 @@ pub static FORGE: Realm = Realm {
     ],
 };
 
-/// The old `fantasy` corpus, kept ONLY for the familiar's creature names (`familiar/mod.rs`), which
-/// seed from a per-creature `u32` rather than a node id. Pinned for the same reason as FORGE: a
-/// creature's name is a thing JP has already seen, and this is not the namespace he authorised
-/// renaming.
-///
-/// ⚠️ **Known taxonomy smell, deliberately NOT fixed here.** Creatures are a third namespace, and
-/// this corpus overlaps `fleet` on 14 nouns (Aegis, Dominion, Ember, Grimoire, Insignia, Jewel,
-/// Keystone, Lantern, Monolith, Nexus, Pinnacle, Quartz, Relic, Throne) — so a creature can share a
-/// name with a node. That was already true before this change (creatures and nodes both drew from
-/// `fantasy`), so repointing it would be a behaviour change smuggled into a refactor. Filed rather
-/// than silently altered: creatures want their own reserved-disjoint group in lexicon, the same way
-/// `fleet` got one.
-pub static FANTASY: Realm = Realm {
-    name: "fantasy@pinned-creatures",
-    adjectives: &[
-        "Arcane", "Blazing", "Celestial", "Draconic", "Eldritch", "Fabled", "Gilded",
-        "Hallowed", "Infernal", "Jade", "Kindled", "Luminous", "Mythic", "Noble", "Obsidian",
-        "Primal", "Radiant", "Spectral", "Twilight", "Valiant",
-    ],
-    nouns: &[
-        "Aegis", "Beacon", "Crown", "Dominion", "Ember", "Forge", "Grimoire", "Herald",
-        "Insignia", "Jewel", "Keystone", "Lantern", "Monolith", "Nexus", "Oracle", "Pinnacle",
-        "Quartz", "Relic", "Sigil", "Throne",
-    ],
-};
 
 /// #218: the FORGE version name for a build NUMBER — the sigil word for `n`. Uses direct
 /// modulo (NOT sigil's `name_for_seed` `>>8` formula): build numbers are small + sequential

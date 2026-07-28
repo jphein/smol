@@ -36,7 +36,7 @@ use embedded_graphics::{
 use crate::app::{AppKind, Ctx, Plugin, Transition};
 use crate::input::Press;
 use crate::mesh_snake::snake_core::phase_offset_ms;
-use crate::net::names::{name_for_id, name_for_seed, FANTASY};
+use crate::net::names::{name_for_id, name_for_seed, CREATURE};
 
 // ===========================================================================
 // Tuning (all wall-clock; wisp §1.2/§3/§6). Kept together as the single lever.
@@ -277,10 +277,16 @@ impl Creature {
         Species::from_seed(self.seed)
     }
 
-    /// The creature's own magical noun (fantasy realm), distinct from any node's
-    /// name — derived from the seed exactly like `name_for_id` derives node names.
+    /// The creature's own magical noun — from the dedicated `creature` realm, and now GENUINELY
+    /// distinct from any node's name rather than merely claimed to be.
+    ///
+    /// This comment used to say "distinct from any node's name" while creatures and nodes drew from
+    /// the IDENTICAL corpus, so the property was documented and never held — it was luck, not
+    /// design, that nobody noticed a familiar wearing a board's name. `creature` is a separate
+    /// namespace, and `names.rs` asserts `realms_disjoint(REALM, CREATURE)` at COMPILE TIME, so the
+    /// claim in this sentence cannot be made again without being true.
     fn noun(&self) -> &'static str {
-        name_for_seed(self.seed, &FANTASY).1
+        name_for_seed(self.seed, CREATURE).1
     }
 
     fn stage(&self, unix_now: u32) -> Stage {

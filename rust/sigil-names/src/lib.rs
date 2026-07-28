@@ -36,17 +36,26 @@
 //! the gateway role — a board permanently called Crown is a permanent ambiguity, and it cost real
 //! debugging time on 2026-07-28.
 //!
-//! ⚠️ **That separation is an intent, NOT yet a fact — do not rely on it.** `identity_vs_provenance_
-//! overlaps_are_a_shrinking_list` enumerates the current violations: `forge` shares the noun `ember`
-//! with `fleet`, so one word can name a build *and* a board; `signal` shares `keystone` and
-//! `pulsar`. I wrote "they draw from disjoint vocabularies" here first and my own test refuted it
-//! within the hour, which is precisely the failure mode the reserved set exists to prevent — a
-//! separation asserted in prose and enforced nowhere. It is now enforced as a shrinking list, so it
-//! can only improve.
+//! ⚠️ **That separation is enforced where it matters and still imperfect elsewhere — check, don't
+//! assume.** I first wrote here that the realms "draw from disjoint vocabularies on purpose", and my
+//! own test refuted it within the hour. That is exactly the failure the reserved set exists to
+//! prevent: a separation asserted in prose and enforced nowhere. (The same sentence had been sitting
+//! in smol's `familiar/mod.rs` for months — "distinct from any node's name", while both namespaces
+//! drew from the *identical* corpus.)
 //!
-//! [`realms_disjoint`] and [`nouns_disjoint`] are the check to use when you need the property to
-//! actually hold for a specific pair (smol asserts `FLEET` against its pinned 20-word forge table,
-//! which IS disjoint — it is upstream's post-cutover 14-word forge that is not).
+//! So it is now machine-checked, as a **shrinking list** that can only improve:
+//! - `forge` shared the noun `ember` with `fleet` — one word naming both a build and a board, the
+//!   worst case, since those two appear in the same sentence ("board X is running build Y").
+//!   **FIXED** in lexicon `e690207` (`ember` → `quench`).
+//! - `signal` still shares `keystone` and `pulsar` with `fleet`. Tolerated deliberately: a *project*
+//!   name never appears in that sentence, so the overlap costs nothing. That triage — an overlap is
+//!   dangerous when both namespaces name things that co-occur in one operational sentence — is what
+//!   makes the remaining entries a judgement someone can check rather than a backlog.
+//!
+//! [`realms_disjoint`] / [`nouns_disjoint`] are the check to use when you need the property to hold
+//! for a specific pair. [`CREATURE`] vs [`FLEET`] is asserted at compile time here; smol additionally
+//! asserts `FLEET` against its pinned forge table, so a future re-sync cannot quietly reintroduce a
+//! build/board name clash.
 //!
 //! ## What is guaranteed, and how
 //!
@@ -348,6 +357,39 @@ const fn ascii_lower(b: u8) -> u8 {
 /// name *builds*. Keeping those apart is the whole point of the split.
 pub const FLEET: &Realm = &realms::FLEET;
 
+/// The creature realm — a THIRD namespace, for entities that are neither boards nor builds
+/// (smol's familiar). Ungated for the same reason as [`FLEET`]: it exists in no other binding, so
+/// nothing can contradict a name it produces.
+///
+/// **Deliberately 24×24, and deliberately NOT a power of two.** The 32-lock on `FLEET` exists only
+/// to make a *256-element* space injective; a creature seeds from an arbitrary `u32`, so its domain
+/// is ~2³² and **injectivity is impossible by pigeonhole, not merely unnecessary**. Copying the lock
+/// here would be cargo-culting a rule past the premise that justifies it. What matters instead is a
+/// birthday bound over concurrently-visible creatures (576 combos ≈ 7.5% across 10) and, critically,
+/// **disjointness from `FLEET`** — a creature that shares a board's name is exactly the ambiguity the
+/// taxonomy exists to prevent, and it is asserted below.
+pub const CREATURE: &Realm = &realms::CREATURE;
+
+const _: () = assert!(
+    has_no_reserved_word(CREATURE),
+    "a creature vocabulary word is in the RESERVED set — see the FLEET assertion."
+);
+
+const _: () = assert!(
+    realms_disjoint(CREATURE, FLEET),
+    "a creature word collides with a node-identity word, so a familiar could render the same name \
+     as a board. This is the gap that let `familiar/mod.rs` claim creature names were \"distinct \
+     from any node's name\" for months while both drew from the identical corpus — now it cannot \
+     be claimed without being true."
+);
+
+/// The familiar renders on the same 72×40 panel as node names, so it inherits the clip budget.
+const _: () = assert!(
+    nouns_distinct_at(CREATURE, 4) && nouns_distinct_at(CREATURE, 5),
+    "two creature nouns become identical when clipped to 4 or 5 chars — the familiar's display \
+     budget. Rename a word in lexicon's creature group."
+);
+
 const _: () = assert!(
     FLEET.adjectives.len() == 32,
     "fleet adjectives must be EXACTLY 32. This is not a floor: 32 = 2^5 makes `seed % 32` the low \
@@ -469,7 +511,7 @@ mod tests {
     fn identity_vs_provenance_overlaps_are_a_shrinking_list() {
         // (realm, nouns known to be shared with `fleet`). Shrink me.
         let known: &[(&Realm, &[&str])] = &[
-            (&FORGE, &["ember"]),                 // ⚠️ the version realm — worst case
+            (&FORGE, &[]),                        // was ["ember"] — FIXED in lexicon e690207
             (&SIGNAL, &["keystone", "pulsar"]),
             (&ORACLE, &[]),
             (&STELLAR, &[]),
@@ -584,7 +626,7 @@ mod tests {
     #[cfg(not(feature = "divergent-themed-realms"))]
     #[test]
     fn default_build_exposes_only_the_non_divergent_realm() {
-        assert_eq!(REALMS.len(), 1);
-        assert_eq!(REALMS[0].name, "fleet");
+        let names: std::vec::Vec<&str> = REALMS.iter().map(|r| r.name).collect();
+        assert_eq!(names, ["creature", "fleet"], "only non-divergent realms may be reachable by default");
     }
 }

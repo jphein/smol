@@ -6,6 +6,63 @@
 
 use crate::Realm;
 
+/// The `creature` realm — 24 adjectives / 24 nouns.
+pub static CREATURE: Realm = Realm {
+    name: "creature",
+    adjectives: &[
+        "Amber",
+        "Bashful",
+        "Chittering",
+        "Curious",
+        "Dappled",
+        "Downy",
+        "Drowsy",
+        "Feathered",
+        "Furred",
+        "Gentle",
+        "Glimmering",
+        "Hungry",
+        "Inquisitive",
+        "Lively",
+        "Mossy",
+        "Nimble",
+        "Plucky",
+        "Quick",
+        "Restless",
+        "Scruffy",
+        "Skittish",
+        "Speckled",
+        "Tufted",
+        "Whiskered",
+    ],
+    nouns: &[
+        "Sprite",
+        "Wisp",
+        "Moth",
+        "Finch",
+        "Wren",
+        "Newt",
+        "Vole",
+        "Hare",
+        "Fawn",
+        "Cub",
+        "Kit",
+        "Imp",
+        "Pika",
+        "Shrew",
+        "Marten",
+        "Otter",
+        "Gecko",
+        "Skink",
+        "Drake",
+        "Wyrmling",
+        "Pixie",
+        "Brownie",
+        "Kelpie",
+        "Faun",
+    ],
+};
+
 /// The `fantasy` realm — 28 adjectives / 25 nouns.
 ///
 /// ⚠️ CORPUS-DIVERGENT from the go/python/js bindings, hence the feature gate. Those three
@@ -178,7 +235,7 @@ pub static FORGE: Realm = Realm {
         "Forge",
         "Anvil",
         "Kiln",
-        "Ember",
+        "Quench",
         "Hammer",
         "Smithy",
         "Smelter",
@@ -448,6 +505,7 @@ pub static VOID: Realm = Realm {
 /// bindings, so this list only contains them when `divergent-themed-realms` is enabled.
 #[cfg(feature = "divergent-themed-realms")]
 pub static REALMS: &[&Realm] = &[
+    &CREATURE,
     &FANTASY,
     &FLEET,
     &FORGE,
@@ -458,10 +516,13 @@ pub static REALMS: &[&Realm] = &[
     &VOID,
 ];
 
-/// Without `divergent-themed-realms`, `fleet` is the only realm this crate will hand out —
-/// node identity, which CANNOT diverge because `fleet` exists in no other binding.
+/// Without `divergent-themed-realms`, only the realms that exist in NO other binding are
+/// handed out — they cannot diverge, so nothing else can contradict a name they produce.
 #[cfg(not(feature = "divergent-themed-realms"))]
-pub static REALMS: &[&Realm] = &[&FLEET];
+pub static REALMS: &[&Realm] = &[
+    &CREATURE,
+    &FLEET,
+];
 
 /// Look up a realm by name, falling back to `fantasy` for an unknown one — matching Go's
 /// `GenerateName`, which falls back rather than erroring.
