@@ -312,7 +312,13 @@ cmd_push() {
   local -a candidates=(); [ ${#scope[@]} -gt 0 ] && candidates=("${scope[@]}") || readarray -t candidates < <(packages)
   for f in "${candidates[@]}"; do
     if [ "$from_worktree" -eq 1 ]; then cp "$LOCAL_DIR/$f" "$SRC/$f"; continue; fi
-    if ! git_or_die show "HEAD:ha/packages/$f" > "$SRC/$f"; then
+    # Redirect git DIRECTLY to the file. Routing it through git_or_die means a command
+    # substitution, and `$( )` STRIPS TRAILING NEWLINES — so every package arrived one byte short
+    # of its committed self. Effect: every file always looked changed, and a push would have
+    # written a file with no final newline to the VM on every run. Caught because push_unshipped
+    # (which hashes the real blob) said "live is at HEAD" while `cmp` insisted it differed; two
+    # components disagreeing is what made a silent byte-level bug visible.
+    if ! git -C "$REPO_DIR" show "HEAD:ha/packages/$f" > "$SRC/$f" 2>/dev/null; then
       note "$f: not in HEAD (new/uncommitted) — skipped; --from-worktree to push it anyway"
       rm -f "$SRC/$f"
     fi
