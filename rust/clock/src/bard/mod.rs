@@ -61,11 +61,20 @@ static mut TOKENIZER: Option<Tokenizer<'static>> = None;
 /// The generator, including its 1 KB sampler scratch (~1.1 KB total).
 static mut STORY: Option<Story> = None;
 
+/// Bytes of story prompt a CFG `T` value may carry — `CFG_VALUE_MAX`, so the wire bound and the
+/// buffer cannot drift apart.
+const PROMPT_MAX: usize = 64;
+
 /// #303 the operator's story opening, set at runtime over CFG key `T` (no reflash). Empty ⇒ the
 /// node uses its built-in per-node persona prompt, so clearing the retained topic restores the
 /// default — the same "empty = board default" convention as the `S` screen key (#21).
 /// 64 B to match both the prompt buffer and `CFG_VALUE_MAX`; costs no flash (`.bss`).
-static mut PROMPT: [u8; 64] = [0; 64];
+///
+/// The size is a `const` rather than being read back off the static: `PROMPT.len()` took a SHARED
+/// REFERENCE to a mutable static, which the 2024 rules make UB and which warns today — a future
+/// edition bump would turn it into an error. The house idiom is `addr_of!`/`addr_of_mut!` and never a
+/// reference; a length needs neither.
+static mut PROMPT: [u8; PROMPT_MAX] = [0; PROMPT_MAX];
 /// Bytes of [`PROMPT`] in use; 0 ⇒ no override.
 static mut PROMPT_LEN: usize = 0;
 /// Whether [`PROMPT`] has been through the vocabulary check. A prompt can arrive before the model
@@ -135,7 +144,7 @@ pub unsafe fn set_prompt(value: &[u8]) -> Result<Option<usize>, persona::PromptE
         return Ok(Some(0));
     }
     // Cheap checks first — these need no model, so they give a straight answer even at boot.
-    if value.len() > PROMPT.len() {
+    if value.len() > PROMPT_MAX {
         return Err(persona::PromptErr::TooLong { got: value.len() });
     }
     if core::str::from_utf8(value).is_err() {
