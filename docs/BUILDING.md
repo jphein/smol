@@ -98,14 +98,24 @@ Each id maps to a deterministic **magical name**. Since `8e47325` the corpus com
 mapping is `adj = fleet.adjectives[seed % 32]`, `noun = fleet.nouns[(seed >> 8) % 32]`,
 `seed = id * 2_654_435_761`.
 
-| id | name | | id | name |
-|---|---|---|---|---|
-| 5 | Obsidian **Aegis** | | 51 | Ashen **Vigil** |
-| 8 | Eldritch **Jewel** | | 122 | Somber **Vigil** |
-| 9 | Seraphic **Dominion** | | 236 | Hollow **Lantern** |
-| 42 | Gilded **Quartz** | | 50 | Mystic **Chalice** |
+> ⏳ **Two mappings — check which one your board is running.** The whole naming chain (`f63dbea`,
+> `8e47325`, `af7d678`, `53ee511`, `f091a00`) is **on `feat/sigil-discovery-budget` and NOT on `main`**
+> (verified by `merge-base --is-ancestor`). **The live fleet on 906/907 still uses the LEFT column.**
 
-**Uniqueness is now a compile-time guarantee, not a hope:** `is_injective_over_u8` enumerates all 256
+| id | on `main` + live fleet **today** | after the chain merges |
+|---|---|---|
+| 5 | Spectral **Aegis** | Obsidian **Aegis** |
+| 8 | Eldritch **Nexus** | Eldritch **Jewel** |
+| 9 | Jade **Herald** | Seraphic **Dominion** |
+| 42 | Celestial **Herald** | Gilded **Quartz** |
+| 50 | Kindled **Ember** | Mystic **Chalice** |
+| 51 | Primal **Sigil** | Ashen **Vigil** |
+| 122 | Celestial **Crown** | Somber **Vigil** |
+| 236 | Radiant **Herald** | Hollow **Lantern** |
+
+**On merge: delete the left column and this note.**
+
+**After the merge, uniqueness is a compile-time guarantee rather than a hope:** `is_injective_over_u8` enumerates all 256
 ids during **const evaluation**, so a colliding namespace **does not compile**. The 32×32 size lock and
 the reserved-word exclusion are const assertions too. Full reasoning:
 [lexicon's node-identity design](https://github.com/jphein/lexicon.realm.watch) →
