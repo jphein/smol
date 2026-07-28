@@ -98,6 +98,11 @@ is re-marked accordingly.
 - [ ] **A `main` recovery image built and hashed**, before you flash anything.
       `tools/verify_image.sh <main-commit>` → note `build size sha256`. **You want this in hand before
       you need it**, not while a board is dark.
+- [ ] 🔴 **The Phase-D DUT has already taken ≥2 OTAs** — otherwise rollback is untestable by design
+      (§6b). Plan Phases A/B to leave it in that state.
+- [ ] **Fleet state (2026-07-28):** all three wall-powered boards on **906** — id5 Aegis, id50 Ember,
+      id51 Sigil — plus **id8 Nexus** on the instrumented build. So Phase C's *"canary that is not the
+      crown"* is available and a `main` fallback uplink is trivially satisfiable.
 - [ ] Broker creds present (`tools/ota_publish.env`), and `tools/ota_verify.sh` runs.
 
 ---
@@ -209,9 +214,7 @@ Explicit checks, none of which Phases B/C cover implicitly:
 - [ ] **First-boot confirm.** After activation the app must mark the slot valid. Confirm `at=`/state
       reaches its confirmed value rather than staying pending — an unconfirmed slot is a board one
       reset away from reverting.
-- [ ] **App-side self-rollback still fires.** This is the one that matters if anything else is wrong,
-      and it is the hardest to test without deliberately staging a bad image.
-      ⚠️ **See §9 — I cannot specify this step honestly without reading firmware I would have to build.**
+- [ ] ✅ **App-side self-rollback — now fully specifiable. See §6b, which is its own phase.**
 - [ ] 🔴 **Self-overwrite / running-slot check — added because the prior art bricked on it (§0b).**
       Confirm the branch derives the running slot from a boot **fact**, not from otadata (a boot
       *request*). Test with **deliberately stale otadata**: OTA a board, then USB-flash it *without*
@@ -221,6 +224,58 @@ Explicit checks, none of which Phases B/C cover implicitly:
 - [ ] **Flash-write alignment.** smol has been bitten before by raw flash writes needing a
       multiple-of-4 length (silent `NotAligned`, record never persists). A changed `esp-storage` write
       API is exactly where that class returns. Verify-after-write is the guard.
+
+### 6b. App-side self-rollback — the one that matters, and it IS wired on the branch
+
+**This was §9's load-bearing gap and it is closed** (verified in both trees, 2026-07-28). The branch has
+the defence at the same two sites as `main`, with the same role-aware logic. What is unverified is
+whether it *behaves under the async executor* — a much smaller residual than "we cannot describe the
+test."
+
+**The trigger** (`ota.rs:1042`) is `state ∈ {New, PendingVerify}` — deliberately **not** `PendingVerify`
+alone, and the comment at `:1013` explains why: the bootloader **never promotes `New → PendingVerify`
+when its rollback config is OFF** (the likely case here), so a `PendingVerify`-only trigger would never
+fire on these boards → **no net → brick.**
+
+> 🎁 **Free answer to a question the docs have called UNPROVEN.** `ota.rs:1056` sets
+> `bl_auto_revert = matches!(state, OtaImageState::PendingVerify)`. So **reading `PendingVerify` at boot
+> is a runtime probe that the bootloader's auto-revert is ON.** Capture that on the first branch OTA and
+> you have settled, from the board itself, the question §3 of the research doc records as never tested.
+> **Log it deliberately — do not let it go by unrecorded.**
+
+#### ⚠️ Two guards a careless test WILL trip
+| Guard | Where | What it means for the test |
+|---|---|---|
+| **USB-flash exemption** | `ota_was_activated_for(BUILD_NUMBER)`, `ota.rs:1051` | The self-test runs only if the running build matches the one `activate()` tagged. A USB-flashed image is accepted as-is with **no self-test**. **You cannot exercise rollback by USB-flashing a bad image** — it must arrive via a real OTA activate. |
+| **Brick-safety refusal** | `can_rollback = target.map(slot_has_valid_image)`, `ota.rs:1078` | It rolls back **only if the other slot holds a valid bootable image.** On a board whose other slot was never written it **accepts the bad image and keeps running** rather than marking both slots unbootable. |
+
+> 🔴 **Therefore a genuine precondition this plan did not have: the DUT must have taken AT LEAST TWO
+> OTAs before rollback can be demonstrated at all.** A virgin-slot board cannot show it — and would
+> "pass" by *accepting* a bad image, which is the correct behaviour and the wrong test result. **Sequence
+> Phase A and Phase B so the Phase-D DUT already has two OTAs behind it.**
+
+#### Health is role-aware — so P1 and P2 have DIFFERENT oracles
+- **Crown / reached DHCP** (`mode.rs:7930`): confirms immediately — `if reached_dhcp { boot_confirm(true) }`.
+- **Leaf / no DHCP:** confirming on `reached_dhcp=false` would **roll back every mesh-OTA**, since a
+  credential-less leaf never does DHCP. So a leaf **defers** to the main loop's mesh predicate — *heard
+  ≥1 valid SMOLv1 frame within N s* (`leaf_selftest_pending`).
+
+**State this in each phase:** Phase B's health is *"did it reach DHCP"*; **Phase C's is "did it hear the
+mesh."** A test that applies the crown oracle to a leaf will read a correct rollback as a failure.
+
+#### How to trigger a rollback deliberately — and no scratch key needed
+Ship an image that **cannot satisfy its own role's predicate**:
+- **Crown path:** a deliberately wrong SSID/PSK → never reaches DHCP → self-test fails → rollback.
+- **Leaf path:** an image that cannot hear a valid SMOLv1 frame.
+
+> ✅ **This also closes §9's other unknown.** Neither case needs a mis-signed image, so **the negative
+> test never touches the fleet's ed25519 trust anchor.** (The wrong-key refusal test in §5 is a
+> *separate* property — signature-before-first-byte — and still wants its own answer.)
+
+#### Also worth one run: the crash-loop net
+`main.rs:499-509` (branch) holds a **K-counter** path that calls `boot_confirm(false)` after repeated
+unconfirmed boots, gated on `ota_was_activated` so a USB flash cannot trip it. That is the **hard-crash**
+net, distinct from the unhealthy-boot one above. An image that panics early exercises it.
 
 ---
 
@@ -291,9 +346,11 @@ Stated as findings rather than hedged, per the brief:
   docs fix I am flagging rather than smuggling into this plan.**
 - **No expected byte-count/duration baseline is stated** for a healthy fetch. Phase A produces one;
   until it runs, "death-point" is detectable but "slower than it should be" is not.
-- **The wrong-key refusal test (§5) assumes a signing key you can deliberately mis-sign with.** The
-  ed25519 key is vault-only; whether a scratch key can be used for a negative test without disturbing
-  the fleet's trust anchor is unverified.
+- ~~**Rollback's negative test needs a mis-signed image.**~~ ✅ **CLOSED — it does not** (§6b): a wrong
+  SSID/PSK (crown) or a mesh-silent image (leaf) fails the health predicate without touching the trust
+  anchor. **Still open, and narrower:** §5's *signature-before-first-byte* refusal is a different
+  property and does still want a deliberately bad signature; whether a scratch key can serve that
+  without disturbing the fleet's anchor is unverified.
 
 ---
 

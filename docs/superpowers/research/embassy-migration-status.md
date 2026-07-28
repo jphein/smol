@@ -127,6 +127,15 @@ changed"*). Given [smol's flash-write word-alignment history](../../ota.md) and 
 
 **So the real blocker is not dependency work. It is verification.** See §5.
 
+> 🎁 **And one long-standing unknown can now be settled for free.** [ROADMAP §3a](../../ROADMAP.md) and
+> [ota.md](../../ota.md) both record that **bootloader revert-on-boot-fail is UNPROVEN** — the hardware
+> test was never run. It turns out the firmware already probes it: `ota.rs:1056` sets
+> `bl_auto_revert = matches!(state, OtaImageState::PendingVerify)`, because **the bootloader only
+> promotes `New → PendingVerify` when its rollback config is ON.** So the *first* branch OTA that logs
+> its boot state answers the question from the board itself, with no separate experiment. Recorded as a
+> deliberate capture in [the verification plan](../plans/embassy-ota-verification.md) §6b — it would be a
+> shame to run the campaign and not write that number down.
+
 ---
 
 ## 4. What it actually buys — measured, with the boundary stated
