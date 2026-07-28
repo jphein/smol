@@ -611,6 +611,9 @@ struct DiagCounters {
     brst_gap: u16,
     brst_ms: u16,
     brst_kind: u8,
+    /// True when `brst_gap` or `brst_ms` hit the `u16` ceiling — surfaced as a `+` on the kind so a
+    /// saturated reading cannot be mistaken for an exact one.
+    brst_clamped: bool,
     /// #13 MESH-TEST rig ONLY: count of inbound frames dropped by the deaf-list (surfaced as
     /// `ddrops=` in DIAG). A production build has no deaf-list, so this field doesn't exist.
     #[cfg(feature = "mesh-test")]
@@ -632,6 +635,7 @@ impl DiagCounters {
             brst_gap: 0,
             brst_ms: 0,
             brst_kind: 0,
+            brst_clamped: false,
             #[cfg(feature = "mesh-test")]
             ddrops: 0,
         }
@@ -3192,6 +3196,12 @@ impl RadioManager {
     /// `log::info!` line in `main` is unreadable in the field — the repo's own lore, learned the hard
     /// way: release images are serial-silent, so soak instrumentation belongs in DIAG/MQTT.
     pub fn note_burst(&mut self, gap_ms: u32, burst_ms: u32, kind: u8) {
+        // A `u16` saturates at 65,535 ms, and a clamped value is otherwise INDISTINGUISHABLE from a
+        // real one — the same failure as `cc=0` meaning both "off-channel" and "cannot tell". So mark
+        // it: the kind char gains a `+` suffix meaning "a value hit the ceiling, the true value is
+        // unknown and larger". 1 byte, and every existing parser still reads the kind from the first
+        // character. `brst=65535:65535:o+` is then honestly "at least 65.5 s", not "exactly".
+        let clamped = gap_ms > u16::MAX as u32 || burst_ms > u16::MAX as u32;
         let gap = gap_ms.min(u16::MAX as u32) as u16;
         // Strictly greater: the FIRST burst to reach a given peak keeps its own duration, so the pair
         // always describes ONE real burst rather than a mix of two.
@@ -3199,6 +3209,7 @@ impl RadioManager {
             self.diag.brst_gap = gap;
             self.diag.brst_ms = burst_ms.min(u16::MAX as u32) as u16;
             self.diag.brst_kind = kind;
+            self.diag.brst_clamped = clamped;
         }
     }
 
@@ -3373,14 +3384,16 @@ impl RadioManager {
         }
         if self.diag.brst_kind != 0 {
             rec.push_str(&alloc::format!(
-                "|brst={}:{}:{}",
+                "|brst={}:{}:{}{}",
                 self.diag.brst_gap,
                 self.diag.brst_ms,
-                self.diag.brst_kind as char
+                self.diag.brst_kind as char,
+                if self.diag.brst_clamped { "+" } else { "" }
             ));
             self.diag.brst_gap = 0;
             self.diag.brst_ms = 0;
             self.diag.brst_kind = 0;
+            self.diag.brst_clamped = false;
         }
 
         // ── SHEDDABLE tail: appended ONLY while the budget allows ─────────────────────────────

@@ -294,6 +294,16 @@ enum BurstKind {
     NtpResync,
     /// A leaf's recovery re-election.
     Reelection,
+    /// The self-OTA association + fetch. Added because the ONE large gap ever observed
+    /// (3,009 ms on id8) landed in this path, which none of the other three cover — the
+    /// instrumentation had a coverage hole exactly where JP's "freezes for wifi and stuff" lives.
+    ///
+    /// What this measures is the ASSOCIATION/pre-screen window, not the whole download: the OTA
+    /// progress screen is counted as an app service (`probe.painted` at its draw), because it IS
+    /// servicing the glass — deliberately, by design. So the gap here is bounded by SYNC_REDRAW_MS
+    /// once the screen starts drawing, and anything larger is the blocking associate/DHCP leg
+    /// before it — which is the freeze worth finding.
+    SelfOta,
 }
 
 #[cfg(feature = "espnow")]
@@ -303,6 +313,7 @@ impl BurstKind {
             Self::TelemetryFlush => "telemetry-flush",
             Self::NtpResync => "ntp-resync",
             Self::Reelection => "re-election",
+            Self::SelfOta => "self-ota",
         }
     }
 
@@ -312,6 +323,7 @@ impl BurstKind {
             Self::TelemetryFlush => b'f',
             Self::NtpResync => b'n',
             Self::Reelection => b'r',
+            Self::SelfOta => b'o',
         }
     }
 }
@@ -412,6 +424,25 @@ impl BurstProbe {
     fn finish(mut self, kind: BurstKind, now_ms: u64) -> (u32, u32) {
         self.note_app(now_ms);
         let burst_ms = now_ms.saturating_sub(self.start_ms).min(u32::MAX as u64) as u32;
+        // STRUCTURAL INVARIANT: the gap happens INSIDE the burst, so it cannot exceed it. A violation
+        // means misattribution — which is exactly how `brst=3009:0:r` was caught, where `dur=0` beside
+        // a 3 s gap was the tell that the gap came from somewhere else entirely. Asserted in debug and
+        // WARNED in release, and deliberately NOT clamped: clamping would repair the arithmetic while
+        // destroying the evidence, and the impossible pair is the diagnostic.
+        debug_assert!(
+            self.worst_app_gap <= burst_ms,
+            "app gap {} ms exceeds its {} ms burst — misattributed",
+            self.worst_app_gap,
+            burst_ms
+        );
+        if self.worst_app_gap > burst_ms {
+            log::warn!(
+                "smol #153: burst {} reports a {} ms gap inside a {} ms burst — MISATTRIBUTED, do not plot",
+                kind.name(),
+                self.worst_app_gap,
+                burst_ms
+            );
+        }
         log::info!(
             "smol #153: burst {} {} ms — longest app gap {} ms ({} paints, {} yields, longest yield gap {} ms)",
             kind.name(),
@@ -1194,14 +1225,24 @@ fn main() -> ! {
                         let mut ota_eta = ota_screen::OtaEta::new();
                         // #195: a SUCCESS reboots inside the fetch (never returns); a `false` return is
                         // a genuine self-fetch failure → count it toward the cap above.
+                        let mut probe = BurstProbe::begin(millis(), last_app_ms);
                         let ok = r.run_ota_update(&announce, &mut || {
                             let t = millis();
+                            probe.yielded(t);
                             led.apply(led::LedState::WifiSync, t);
                             if matches!(button.poll(t), Some(input::Press::Long)) {
                                 ota_abort = true;
                             }
                             if t.saturating_sub(ota_draw_ms) >= SYNC_REDRAW_MS {
                                 ota_draw_ms = t;
+                                // The OTA progress screen IS the glass being serviced here — counting
+                                // it keeps the gap honest. Without this the whole multi-minute download
+                                // would read as one freeze, which is both true and useless: the app is
+                                // deliberately not painted during a transfer. What is left after
+                                // counting it is the blocking associate/DHCP leg before the screen
+                                // starts drawing, which is the part nobody chose.
+                                probe.painted(t);
+                                last_app_ms = t;
                                 let p = ota_prog.get();
                                 ota_screen::draw(&mut display, &ota_screen::OtaView {
                                     kind: ota_screen::OtaKind::SelfFetch { host: ota_host },
@@ -1214,6 +1255,11 @@ fn main() -> ! {
                             }
                             ota_abort
                         }, &ota_prog);
+                        if probe.ran() {
+                            let kind = BurstKind::SelfOta;
+                            let (gap, dur) = probe.finish(kind, millis());
+                            r.note_burst(gap, dur, kind.tag());
+                        }
                         if !ok {
                             r.note_self_ota_failed(announce.build);
                         }
