@@ -13,8 +13,14 @@
 #   ./tools/ha_deploy.sh diff [file]   # full unified diff for one package (or all)
 #   ./tools/ha_deploy.sh dash          # dashboard-only drift check (READ-ONLY; exits 1 on drift)
 #   ./tools/ha_deploy.sh pull          # live -> repo, so out-of-band edits become commits
-#   ./tools/ha_deploy.sh push          # repo -> live, validated, with rollback
+#   ./tools/ha_deploy.sh push [file...] # repo -> live from HEAD, validated, with rollback
+#   ./tools/ha_deploy.sh push --all      # every differing package (required if >1)
+#   ./tools/ha_deploy.sh push --from-worktree   # push uncommitted state on purpose
 #   ./tools/ha_deploy.sh push --dry-run
+#
+# push SENDS HEAD, NOT YOUR WORKING TREE (#318), and refuses an unscoped multi-file batch —
+# see the push guard below for the incident that produced both rules. Exit 4 = refused,
+# 2 = could not check.
 #
 # `status` and `diff` now cover the Lovelace DASHBOARD as well as the packages (#305) — see
 # cmd_dash below for why that gap mattered. Only `dash` propagates the drift exit code, so a
@@ -96,6 +102,13 @@ cmd_status() {
   if [ -n "$extra" ]; then
     echo; echo "  LIVE-ONLY packages (untracked — run 'pull' to bring them into git):"
     echo "$extra" | sed 's/^/    /'; drift=1
+  fi
+  # status compares the WORKTREE against live; `push` sends HEAD. When those differ, say so —
+  # otherwise "DIFFERS" here reads as "push will fix it" when push would send something else.
+  local pdirty; pdirty="$(git -C "$REPO_DIR" status --porcelain -- ha/packages 2>/dev/null | wc -l)"
+  if [ "${pdirty:-0}" -gt 0 ]; then
+    echo "  NOTE: $pdirty package file(s) modified but uncommitted. The comparison above is against"
+    echo "        your WORKING TREE; \`push\` sends HEAD. Commit, or push --from-worktree."
   fi
   echo
   local drc=0; cmd_dash || drc=$?
@@ -186,18 +199,98 @@ cmd_pull() {
                        || echo "repo already matches live."
 }
 
+# --- push guard (#318) ----------------------------------------------------------------------
+# `push` had NO SCOPE ARGUMENT. `diff` takes a file; `push` did not — it iterated every package
+# and pushed each one that differed. So "push my package" was inexpressible, and on 2026-07-28
+# one operator's routine push silently carried another author's committed id7/id9 retire (1439
+# lines, 172 entities) in the same batch. The lead had reserved that push for its author; the
+# tool routed around the reservation without anyone deciding to. That missing argument is the
+# root cause, so it is fixed here rather than papered over with a warning.
+#
+# Milder than the dashboard generator's guard, deliberately. `push` converges toward COMMITTED
+# state, so whatever it carries has at least been reviewed by someone; the generator reads the
+# working tree and can publish work nobody finished. Same vocabulary, different strictness:
+#   exit 4 = REFUSED   · exit 2 = could not check   · 0 = pushed / nothing to do
+#
+#   push                      every differing package — REFUSES if that is more than one
+#   push smol_mesh.yaml …     scope it; this is the way to push your own work
+#   push --all                "yes, the whole batch, I have read the list"
+#   push --from-worktree      deploy uncommitted state on purpose (named first)
+#   push --dry-run            as before; combines with the above
+PUSH_SCRIPT_REL="tools/ha_deploy.sh"
+
+git_or_die() { # $@ git args -> stdout; sets GIT_ERR and returns 1 on failure
+  GIT_ERR=""
+  local out; out="$(git -C "$REPO_DIR" "$@" 2>&1)" || { GIT_ERR="$out"; return 1; }
+  printf '%s' "$out"
+}
+
+push_dirty() { # -> newline list of dirty repo-relative paths among the packages + this script
+  git_or_die status --porcelain -- "ha/packages" "$PUSH_SCRIPT_REL" \
+    | sed -n 's/^.\{3\}//p'
+}
+
+push_provenance() { # $1 basename -> "abc1234 3 hours ago · subject"
+  git_or_die log -1 --format='%h %ar · %s' -- "ha/packages/$1" || echo "(no commit found)"
+}
+
 # --- push (repo -> live) -------------------------------------------------------------------
 cmd_push() {
-  local dry=0; [ "${1:-}" = "--dry-run" ] && dry=1
+  local dry=0 from_worktree=0 all=0; local -a scope=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=1 ;;
+      --from-worktree) from_worktree=1 ;;
+      --all) all=1 ;;
+      -*) die "unknown push flag '$1' (--dry-run | --from-worktree | --all)" ;;
+      "") ;;
+      *) packages | grep -qxF "$1" || die "no such package '$1' (have: $(packages | tr '\n' ' '))"
+         scope+=("$1") ;;
+    esac; shift
+  done
   local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
   local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
   local -a changed=() ; local needs_full=0
 
-  for f in $(packages); do
-    python3 -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" "$LOCAL_DIR/$f" \
+  # ---- GUARD, before the network and long before any mutation ----------------------------
+  local dirty; if ! dirty="$(push_dirty)"; then
+    echo "!! cannot determine whether the working tree is clean — $GIT_ERR" >&2
+    echo "   Refusing to push: unverified is not the same as clean." >&2
+    return 2
+  fi
+  if [ -n "$dirty" ]; then
+    echo "  ── PUSH GUARD ───────────────────────────────────────────────"
+    echo "  Modified and NOT committed:"; echo "$dirty" | sed 's/^/    /'
+    if grep -qxF "$PUSH_SCRIPT_REL" <<<"$dirty" && [ "$from_worktree" -eq 0 ]; then
+      # The strict case, exactly as in the generator: package CONTENT can be read from HEAD,
+      # but the deploy LOGIC running is whatever is on disk. A modified deploy script means the
+      # thing executing is not the thing reviewed, and no amount of reading HEAD fixes that.
+      echo "  REFUSED · $PUSH_SCRIPT_REL is modified, so the deploy logic about to run is not"
+      echo "  the reviewed logic. Commit it, or re-run with --from-worktree." >&2
+      return 4
+    fi
+    [ "$from_worktree" -eq 0 ] \
+      && echo "  Packages are read from HEAD, so the above is NOT pushed (--from-worktree to)." \
+      || echo "  --from-worktree: pushing the above ON PURPOSE."
+  fi
+
+  # ---- materialise the push SOURCE: HEAD by default, worktree only on request ------------
+  local SRC="$tmp/src"; mkdir -p "$SRC"
+  local -a candidates=(); [ ${#scope[@]} -gt 0 ] && candidates=("${scope[@]}") || readarray -t candidates < <(packages)
+  for f in "${candidates[@]}"; do
+    if [ "$from_worktree" -eq 1 ]; then cp "$LOCAL_DIR/$f" "$SRC/$f"; continue; fi
+    if ! git_or_die show "HEAD:ha/packages/$f" > "$SRC/$f"; then
+      note "$f: not in HEAD (new/uncommitted) — skipped; --from-worktree to push it anyway"
+      rm -f "$SRC/$f"
+    fi
+  done
+
+  for f in "${candidates[@]}"; do
+    [ -f "$SRC/$f" ] || continue
+    python3 -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" "$SRC/$f" \
       || die "$f is not valid YAML locally — fix it before pushing"
     fetch_remote "$f" > "$tmp/$f"
-    if cmp -s "$LOCAL_DIR/$f" "$tmp/$f"; then note "$f: in sync, skipping"; continue; fi
+    if cmp -s "$SRC/$f" "$tmp/$f"; then note "$f: in sync, skipping"; continue; fi
     changed+=("$f")
     # Adding/removing helpers or mqtt/template entities needs reload_all; automations alone do not.
     # NB: the diff goes to a FILE before grepping, deliberately. `diff | grep -q` looks obvious but
@@ -205,7 +298,7 @@ cmd_push() {
     # failure even when grep matched, and the `&& needs_full=1` never fires. That bug shipped for
     # exactly one test run here — it picked automation.reload for a new input_text, which is the
     # silent failure where a new helper never registers and nobody can see why.
-    diff "$LOCAL_DIR/$f" "$tmp/$f" > "$tmp/$f.diff" || true
+    diff "$SRC/$f" "$tmp/$f" > "$tmp/$f.diff" || true
     # Which reload? Default to the SAFE one and narrow only when it is provably enough.
     # The first version matched `input_[a-z]+:` — i.e. a DOMAIN being added — and so missed the
     # far commoner case: a new helper added under a domain that already existed. Adding
@@ -222,8 +315,26 @@ cmd_push() {
   done
 
   [ ${#changed[@]} -eq 0 ] && { echo "nothing to push — live already matches the repo."; return 0; }
-  echo "would push: ${changed[*]}"
-  [ "$dry" -eq 1 ] && { echo "(dry run — nothing sent)"; return 0; }
+
+  # ---- NAME THE BATCH, then require intent for a multi-file one --------------------------
+  # This is the part that was missing when one operator's push carried another author's retire:
+  # nothing ever said what else was in the envelope. Provenance is the last commit per file —
+  # every agent here commits as the same git user, so authorship cannot identify anyone; the
+  # commit SUBJECT can, because you recognise your own work. Say what is knowable, not what
+  # would merely look authoritative.
+  echo
+  echo "  would push ${#changed[@]} package(s):"
+  for f in "${changed[@]}"; do printf '    %-22s %s\n' "$f" "$(push_provenance "$f")"; done
+  if [ ${#scope[@]} -eq 0 ] && [ ${#changed[@]} -gt 1 ] && [ "$all" -eq 0 ]; then
+    echo
+    echo "  REFUSED · an unscoped push would send all ${#changed[@]} of the above in one batch," >&2
+    echo "  and at least one of them is probably not yours. Name what you mean:" >&2
+    echo "      ./tools/ha_deploy.sh push ${changed[0]}" >&2
+    echo "  or say you have read the list and want all of it:" >&2
+    echo "      ./tools/ha_deploy.sh push --all" >&2
+    return 4
+  fi
+  [ "$dry" -eq 1 ] && { echo "  (dry run — nothing sent)"; return 0; }
 
   # 1. back up every file we are about to overwrite, so step 3 can undo the whole batch.
   for f in "${changed[@]}"; do
@@ -232,7 +343,7 @@ cmd_push() {
   done
   # 2. copy (HAOS ssh has no scp subsystem — tee is the documented pattern).
   for f in "${changed[@]}"; do
-    < "$LOCAL_DIR/$f" ssh "${SSH_OPTS[@]}" "$HA_SSH" "sudo tee $REMOTE_DIR/$f > /dev/null" \
+    < "$SRC/$f" ssh "${SSH_OPTS[@]}" "$HA_SSH" "sudo tee $REMOTE_DIR/$f > /dev/null" \
       || die "copy of $f failed"
     note "$f: copied"
   done
@@ -266,7 +377,7 @@ case "${1:-status}" in
   diff)   cmd_diff "${2:-}" ;;
   dash)   cmd_dash ;;   # exit code propagates: 0 in sync · 1 live-only drift · 2 could not check
   pull)   cmd_pull ;;
-  push)   cmd_push "${2:-}" ;;
+  push)   shift; cmd_push "$@" ;;
   -h|--help|help) sed -n '2,30p' "${BASH_SOURCE[0]}" ;;
   *) die "unknown mode '${1}' (status | diff | dash | pull | push)" ;;
 esac
