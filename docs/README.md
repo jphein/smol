@@ -55,6 +55,14 @@ fleet: the apps, the ESP-NOW mesh (`src/net/`), the Familiar (`src/familiar/`), 
 - **[cases.md](cases.md)** — existing printable cases for this board.
 - **[enclosure-resin.md](enclosure-resin.md)** — resin/SLA enclosure notes.
 
+## Research — decisions and status
+
+- **[superpowers/research/embassy-migration-status.md](superpowers/research/embassy-migration-status.md)**
+  — where the Embassy/async migration actually stands (further than the tracker says), what #233 does
+  and does not block, the **measured** benefit (a ~15 s mesh-deaf WiFi burst → **169 ms**, ~89×), what
+  it explicitly does *not* fix, and a recommended sequence. Answers JP's *"when do we move to
+  Embassy?"* — short version: take the interim fix now, finish the migration behind a two-board bench.
+
 ## Design specs & as-built plans
 - **`superpowers/specs/`** and **`superpowers/plans/`** — per-feature design specs and their
   as-built execution logs, amended in place as hardware findings land. The best source for
