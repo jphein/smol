@@ -966,6 +966,11 @@ pub fn boot_confirm(self_test_passed: bool) {
     if !matches!(state, OtaImageState::New | OtaImageState::PendingVerify) {
         return; // Valid/Undefined/etc — a normal, already-confirmed boot
     }
+    // #153: capture the auto-revert observation HERE, before the USB exemption below returns —
+    // `PendingVerify` proves the bootloader promoted whether or not we go on to self-test, and a
+    // USB-flashed board is a perfectly good place to learn what its bootloader does.
+    let bl_auto_revert = matches!(state, OtaImageState::PendingVerify);
+    mark_bl_revert(bl_auto_revert);
     // #40 USB-flash EXEMPTION (build#-tagged, bug #5): self-test ONLY if the RUNNING build# is
     // the one our `activate()` tagged — i.e. this exact OTA image booted. A `New` image whose
     // build# doesn't match the marker (a USB flash, incl. a STALE marker that survived the
@@ -977,7 +982,6 @@ pub fn boot_confirm(self_test_passed: bool) {
         log::info!("smol OTA: unconfirmed image but build# doesn't match a fresh OTA activate (USB flash / stale marker) — accepting, no self-test");
         return;
     }
-    let bl_auto_revert = matches!(state, OtaImageState::PendingVerify);
     log::info!(
         "smol OTA: unconfirmed image on boot — running self-test (bootloader auto-revert {})",
         if bl_auto_revert { "ON" } else { "OFF/unknown" }
@@ -2080,6 +2084,66 @@ static mut OTA_OUTCOME: [u32; 2] = [0u32; 2]; // [magic, 1=confirmed / 2=rolled-
 
 #[cfg(feature = "wifi")]
 const OTA_OUTCOME_MAGIC: u32 = 0x736D_6C4F; // "smlO"
+
+/// #153 BOOTLOADER AUTO-REVERT, MEASURED. `[magic, 1 = on / 2 = off]`.
+///
+/// The firmware has probed this since #40 and thrown the answer away into `log::info!` — and
+/// ROADMAP §3a plus `docs/ota.md` have called revert-on-boot-fail UNPROVEN since July, which is the
+/// load-bearing reason for canary-one-board discipline. The probe is exact: the bootloader promotes
+/// `New → PendingVerify` ONLY when its rollback config is on, so reading `PendingVerify` on a
+/// post-OTA first boot IS the observation. It existed for one second on a serial wire nobody was
+/// reading; now it reaches DIAG, and with no board on USB that is the only channel there is.
+///
+/// `on` ⇒ the bootloader net exists and a documented gate can close on evidence. `off` ⇒ the
+/// app-side `boot_confirm` path below is the ONLY thing between a bad image and a brick — which is
+/// the risk the Embassy verification plan is built around. Both are worth a byte.
+///
+/// RTC-fast persistent rather than NVS, deliberately: NVS here is a hand-rolled cell scheme in the
+/// sectors next to the identity record, and taking that risk for an observability nicety is a bad
+/// trade. The scope this gives is the scope that matters — the value is only MEASURABLE on a
+/// post-OTA boot, it survives the rollback's `software_reset` (so the good-slot boot still reports
+/// what the bootloader did), and it holds for the whole power-on session that the OTA started, which
+/// is exactly the window in which canary discipline is being decided. A power cycle clears it and
+/// the field simply disappears until the next OTA re-measures it, which is honest: a bootloader can
+/// only change by being reflashed.
+#[cfg(feature = "wifi")]
+#[esp_hal::ram(rtc_fast, persistent)]
+static mut BL_REVERT: [u32; 2] = [0u32; 2];
+
+#[cfg(feature = "wifi")]
+const BL_REVERT_MAGIC: u32 = 0x736D_6C42; // "smlB"
+
+/// Record the measured bootloader auto-revert capability (call from `boot_confirm`, where an
+/// unconfirmed image is the only state that can observe it).
+#[cfg(feature = "wifi")]
+pub fn mark_bl_revert(on: bool) {
+    unsafe {
+        let m = &mut *core::ptr::addr_of_mut!(BL_REVERT);
+        m[0] = BL_REVERT_MAGIC;
+        m[1] = if on { 1 } else { 2 };
+    }
+}
+
+/// The DIAG `blrev=` token: `on` · `off` · `None` when never observed (a board that has not booted
+/// an OTA image this power-on session), in which case the field is omitted entirely so the record
+/// stays byte-identical.
+///
+/// `off` is the honest reading of "not promoted": whether the bootloader has rollback disabled or
+/// simply did not set the state, the operational consequence is the same — there is no net.
+#[cfg(feature = "wifi")]
+pub fn bl_revert_token() -> Option<&'static str> {
+    unsafe {
+        let m = core::ptr::addr_of!(BL_REVERT).read();
+        if m[0] != BL_REVERT_MAGIC {
+            return None;
+        }
+        match m[1] {
+            1 => Some("on"),
+            2 => Some("off"),
+            _ => None,
+        }
+    }
+}
 
 /// Record the last OTA outcome (call from `boot_confirm`): `rolled_back` true ⇒ `rolled-back`,
 /// else `confirmed`. Set before the rollback's `software_reset` so the next boot reports it.

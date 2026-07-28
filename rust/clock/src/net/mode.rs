@@ -3308,6 +3308,14 @@ impl RadioManager {
         // Reset here because here IS the publish: every board reaches this once per DIAG (a leaf via
         // the mesh broadcast, a gateway via the MQTT flush), so the next record carries the next
         // window's peak instead of a running maximum that can only ever grow.
+        // #153: the bootloader's measured auto-revert capability — `on` closes a gate the ROADMAP
+        // has carried as UNPROVEN since July, `off` confirms the app-side net is the only one. Omitted
+        // when never observed (no OTA boot this power-on session), so the string stays byte-identical
+        // on a board that has only ever been USB-flashed and power-cycled. ~10 B, appended LAST.
+        if let Some(blrev) = crate::ota::bl_revert_token() {
+            rec.push_str("|blrev=");
+            rec.push_str(blrev);
+        }
         if self.diag.brst_kind != 0 {
             rec.push_str(&alloc::format!(
                 "|brst={}:{}:{}",
