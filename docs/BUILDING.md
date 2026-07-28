@@ -127,7 +127,16 @@ the reserved-word exclusion are const assertions too. Full reasoning:
 > - **Version** names keep the pinned **20×20 forge** table. Upstream's `forge` realm is a
 >   *non-superset* 14/14, so adopting it would rename **every past build** — v345 would stop being
 >   "Riveted Furnace" — and version names are **historical record**.
-> - **Creature** names (the Familiar) keep the pinned `fantasy` corpus.
+> - **Creature** names (the Familiar) keep the pinned `fantasy` corpus — **on `main` today.**
+>   ⏳ **Pending:** `53ee511` gives creatures their own lexicon namespace (`creature`, 24×24, disjoint
+>   from `fleet` and `reserved` and compile-time checked) and **deletes `FANTASY` — smol's last
+>   hand-copied word list.** At that point `names.rs` holds **zero corpora and a checker**, and
+>   `familiar/mod.rs`'s *"distinct from any node's name"* comment can no longer be written without being
+>   true. **Not yet on `main`** (verified: not an ancestor of HEAD), so the line above is what the tree
+>   does now. When it merges, delete the pending note and the creature row's "pinned" wording.
+>   ⚠️ **It renames existing familiars once** — seeds are frozen for life. Unlike boards, creature names
+>   appear in no doc, memory or entity id, so the rename is invisible to everything except a person
+>   watching a screen.
 >
 > So *"smol sources its names from lexicon"* is **half true** and worth not writing.
 
