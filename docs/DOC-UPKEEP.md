@@ -452,6 +452,21 @@ against an **imagined** wire schema:
 | 3 | `ota=rolled-back` — an **explicit** firmware token — never read | a rollback could only be *inferred* from a build number moving |
 | 4 | `DEATH-POINT` fired on **retained ghosts** — progress is retained, a retained value never changes, so it satisfies *"frozen for 30 s+"* **for free** | condemned a ghost of an earlier image as a live dying transfer. **The file's own header warns that only a live `retain=0` publish is trustworthy** — the death-point arm was the one check ignoring its own documented rule |
 
+#### Three ways a check comes back green when it shouldn't — and they need different fixes
+They all *present* identically ("it passed and it shouldn't have"), which is why they get lumped
+together. **The remedies differ, so lumping them leaves the fault in place.**
+
+| Mode | What happened | Remedy |
+|---|---|---|
+| **Wrong verdict** | The check ran and produced a confident wrong answer in the correct format — the four `ota_verify.sh` defects | **Validate the parser against a captured live payload**, and grep the field name in the *producer* |
+| **Cannot fail** | The check is structurally incapable of reporting failure. `tools/repro_build.sh` is a **helper library** — line 2 says *"SOURCE this file"* and its functions `return 1` — so running it as a script yields the last statement's status, not a verdict | **Make the contract explicit**: have the caller test a **value** (a hash, a byte count) rather than an exit status, or assert that the status means something |
+| **Status swallowed** | The check **did** fail and the plumbing threw it away. The realm-sigil `pip` install **exits 2**; a pipe discarded it and it read as silent success | **`set -o pipefail`**, or test `PIPESTATUS` — the check is fine, the wiring is not |
+
+> ⚠️ **Do not merge these into one rule.** *"pip failed silently"* was a misreading — it exits **2** —
+> and treating it as a cannot-fail case would have sent someone to rewrite a working check instead of
+> adding `pipefail`. Conversely `pipefail` does nothing for `repro_build.sh`, whose exit code was never
+> a verdict to begin with. **Diagnose which of the three before reaching for a fix.**
+
 **The rule: a tool that parses a wire format must be validated against a CAPTURED LIVE PAYLOAD, and its
 field list dated.** Grep the field name in the **producer** (`mode.rs`, `wifi.rs`) and confirm it is
 emitted at all. Two corollaries, each earned above:
