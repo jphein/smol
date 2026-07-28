@@ -80,23 +80,31 @@ formula are a bug in this document** — check them together.
 > Re-measure with `--features stack-paint` under live radio — idle numbers are meaningless.
 > **#198/#233 (C6, 512 KB SRAM) dissolves the whole problem.**
 >
-> > 🔴 **But on the C3, Embassy is a DRAM CONSUMER, not a relief — and it does not currently fit.**
-> > Measured 2026-07-28 from the `dream/feat-embassy` release ELF (`espnow,cast,io`, **no bard**):
-> > `.bss` **213,200 B** (**+17,904 B** vs `main`-with-bard) · `.stack` **56,888 B** — i.e.
-> > **16,840 B BELOW the 73,728 B floor, before the Bard is added back at all.**
+> > 🔴 **On the C3, Embassy is a DRAM CONSUMER, not a relief — and it does NOT fit alongside the Bard.**
+> > Three tiers measured 2026-07-28 (`readelf`, release ELFs; the no-bard tier built on `familiar`
+> > against a tree verified byte-identical to katana's):
 > >
-> > **Consequence for the lever list above: `SEQ_CAP` cannot close this.** Its entire range is
-> > ~11.5 KB (80→48) against a **≥16,840 B** shortfall — short by ≥5,340 B *even spent in full, even
-> > before the Bard returns*. So the DRAM must come from `embassy-net`'s socket buffers, the RX-buffer
-> > tuning, or the wifi heap — or from the C6. **Do not frame this as a Bard-vs-async trade; the Bard
-> > lever is too small to be the answer.**
+> > | tier | `.bss` | `.data` | `.stack` |
+> > |---|---|---|---|
+> > | `main` + bard | 195,296 B | 14,460 B | **75,952 B** |
+> > | `main` **no bard** | 157,464 B | 13,212 B | **115,032 B** |
+> > | `dream/feat-embassy` **no bard** | 213,200 B | 8,792 B | **56,888 B** |
 > >
-> > ⚠️ Fair caveat: the 73,728 B floor is derived from the **bard** image's peak (54,856 × 4/3), so it
-> > is over-strict for a no-bard build *as it stands*. It is the right floor **post-rebase**, when the
-> > image will have the Bard — and `.stack` can only fall further from 56,888 B then. **The shortfall
-> > is a lower bound.** The one number still missing is `main` **without** bard, which would isolate
-> > the Bard's own `.bss` from Embassy's; that is one cheap build and it is Phase R's first task
-> > ([the plan](superpowers/plans/embassy-ota-verification.md) §0c).
+> > ✅ Method validated: `.bss+.data+.stack` = **285,708 B for both `main` tiers, exactly** — `.stack` is
+> > purely the leftover of a fixed pool. So: **the Bard costs 39,080 B** of stack, and **Embassy costs
+> > 58,144 B** (clean no-bard vs no-bard).
+> >
+> > **Projected `main`+bard+Embassy `.stack` ≈ 17,800–24,600 B** — against this floor (shortfall
+> > **≈49–56 KB**) and, decisively, against the **measured 54,960 B peak**: the image would link and
+> > **die on hardware.** Every lever above spent to its limit is **≈39.5 KB**, still ~10–16 KB short.
+> >
+> > **So `SEQ_CAP` is not the question and neither is any single lever.** Recommendation is a
+> > **platform transition**: async on the C6, the C3 fleet stays blocking. Full argument +
+> > the "drop the Bard on C3" option (numerically viable, ~56,888 B — JP's call) in
+> > [research/embassy-p2-mesh-relay.md](superpowers/research/embassy-p2-mesh-relay.md) §8.
+> >
+> > ⚠️ The floor is bard-derived and over-strict for no-bard builds — **irrelevant to the verdict**, which
+> > rests on stack-vs-peak, not stack-vs-floor.
 >
 > **`SEQ_CAP` is cheaper than it was (#302, 2026-07-27):** it no longer caps a STORY at all, only
 > how far back the model can remember. The KV cache is a ring and the Bard narrates endlessly, so

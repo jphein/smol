@@ -314,23 +314,43 @@ flag was **never read at all**; it is `%r`. **Use current HEAD.**
   does not currently fit.** From real linker output (`readelf -SW`, release ELFs, the gate's own
   `_stack_start − _stack_end`):
 
-  | | `.bss` | `.stack` | vs 73,728 B floor |
-  |---|---|---|---|
-  | `main` (`espnow,cast,io,bard`) | 195,296 B | **75,960 B** | **+2,232 B** |
-  | `dream/feat-embassy` (`espnow,cast,io`, **no bard**) | **213,200 B** | **56,888 B** | 🔴 **−16,840 B** |
+  **All three tiers now measured** — the third built on `familiar` 2026-07-28 against a tree verified
+  byte-identical to katana's (`sha256` over `rust/clock/src` + `Cargo.toml` + `build.rs`):
 
-  > ## The branch already misses the stack floor by 16,840 B — *without* the Bard.
-  > **`SEQ_CAP` cannot close it.** Its whole range is ~11.5 KB against a **≥16,840 B** shortfall: short
-  > by ≥5,340 B spent in full, before the Bard returns. **So there is no Bard-vs-async trade to put to
-  > JP** — the Bard lever cannot buy async at any setting. The DRAM must come from `embassy-net`'s
-  > buffers, the RX tuning, the wifi heap, **or the C6.**
+  | tier | `.bss` | `.data` | `.stack` | vs 73,728 B floor |
+  |---|---|---|---|---|
+  | `main` + bard (canonical) | 195,296 B | 14,460 B | **75,952 B** | **+2,224 B** |
+  | `main` **no bard** | 157,464 B | 13,212 B | **115,032 B** | +41,304 B |
+  | `dream/feat-embassy` **no bard** | **213,200 B** | 8,792 B | **56,888 B** | 🔴 **−16,840 B** |
 
-  Caveat: 73,728 B is derived from the *bard* image's peak (54,856 × 4/3), so it is over-strict for a
-  no-bard build as it stands — but it is the right floor **post-rebase**, and `.stack` only falls
-  further from 56,888 B when 2,982 lines of Bard return. **Treat −16,840 B as a lower bound.**
+  > ✅ **Method validated by the pool:** `.bss + .data + .stack` = **285,708 B for both `main` tiers,
+  > exactly.** `.stack` is purely the leftover of a fixed DRAM pool, which is what makes subtracting
+  > `.bss` deltas legitimate. (The branch tier totals 278,880 B — 6,828 B sits in other DRAM-resident
+  > sections, which is why the projection below is a range.)
 
-  Still missing: `main` **without** bard, which would isolate the Bard's `.bss` from Embassy's. One
-  cheap build; Phase R's first task.
+  **Isolating the two costs — the comparison the earlier figure could not make:**
+
+  | | `.bss` | `.stack` |
+  |---|---|---|
+  | **The Bard** (main+bard − main−bard) | +37,832 B | **−39,080 B** |
+  | **Embassy** (branch−bard − main−bard, *clean*) | **+55,736 B** | **−58,144 B** |
+
+  > ### 🔴 Embassy costs ~58 KB of DRAM on the C3 — **3.2× the 19 KB I reported earlier.**
+  > That earlier +17,904 B was the tangled figure I flagged: it compared branch-**without**-bard against
+  > main-**with**-bard, so the Bard's own 37,832 B was silently cancelling most of Embassy's cost.
+  > **This is the correction that matters, and it points the opposite way from comfort.**
+
+  **Projected `main` + bard + Embassy: `.stack` ≈ 17,800–24,600 B.**
+
+  | Against | Result |
+  |---|---|
+  | the 73,728 B gate floor | 🔴 shortfall **≈49,000–56,000 B** |
+  | the **measured stack peak of 54,960 B** | 🔴 **≈18–25 KB of stack for a 55 KB requirement — it would link and die on hardware** |
+
+  **That second row is the one that decides it, and it does not depend on the floor at all** — so the
+  "the floor is bard-derived and over-strict" caveat, which is true, cannot rescue this. A build with
+  18–25 KB of stack against a measured 55 KB peak is the exact failure the gate exists to catch (the
+  pre-gate image linked clean with 2,592 B and would have died).
 
   It **fails closed** — the gate catches this at build time rather than on a board (it exists precisely
   because a pre-gate image linked clean with 2,592 B of stack and would have died on hardware).
@@ -383,6 +403,77 @@ verification plan.
 **Fix the ranking: the rebase is P0. E1 is free and should run anyway. P2 is P2 — and it is smaller
 than advertised, because the leaf half is already async-shaped and the arbitration question has a
 written answer next door.**
+
+---
+
+## 8. Recommendation — **async lands on the C6; the C3 fleet stays blocking**
+
+Asked for a recommendation with a number rather than three options with a shrug. Here it is.
+
+> # Embassy does not fit on the C3 alongside the Bard, and no combination of levers closes the gap.
+> **Recommendation: reframe #198 from a *migration* to a *platform transition*.** Async development
+> continues on C6 hardware — where it already runs, with ESP-NOW, with the arbitration invariant
+> written down — and the C3 fleet keeps the blocking superloop plus targeted fixes.
+
+### Why (a) "find the DRAM" does not reach
+
+| Lever | Optimistic ceiling | Note |
+|---|---|---|
+| esp-wifi heap | **~20 KB** | 96 KiB with a 24,136 B low-watermark. Reclaiming ~20 KB leaves **zero margin on a radio heap** |
+| `embassy-net` socket buffers + RX tuning | **~8 KB** | the cost Embassy itself added; the right place to look first |
+| `SEQ_CAP` 80→48 | **~11.5 KB** | the lever team-lead ruled last-resort |
+| **Total, every lever spent to its limit** | **≈39.5 KB** | vs a **≈49–56 KB** shortfall |
+
+**Short by ~10–16 KB after spending everything**, including the Bard lever and a radio heap cut to its
+watermark. **(a) is not a tight fit — it is a miss.**
+
+### Why I advise against (c) "drop the Bard on C3"
+
+It is the one option that **works numerically**: branch-without-bard measures **56,888 B** of stack, and
+since the 73,728 B floor is bard-derived, a no-bard image's true peak is far lower — the Bard was the
+dominant stack consumer. **So "Embassy on C3, no Bard" is plausibly runnable today.**
+
+But it trades away **the feature JP shipped, demoed and measured this week** to buy an infrastructure
+migration. That is a product decision, not an engineering one, and it is JP's — but my advice is no:
+the Bard is on the glass and the async benefits it would buy are the two JP has *not* asked for.
+
+### Why (b) is right, and what it costs honestly
+
+**What the C3 fleet gives up:** benefit 2 (the measured 89× mesh-deaf-window improvement) and benefit 3
+(BLE, which #22 proved is unreachable on the blocking runtime). Those stay C6-only. **That is a real
+loss and should be stated to JP as one.**
+
+**What makes it acceptable:**
+1. **Benefit 1 — JP's actual complaint — is already addressed on C3 without Embassy** (`443ea34`), and
+   the sharper freeze lead is now the **OTA/association coverage hole** (§5), which is a targeted C3 fix,
+   not a re-platform.
+2. **The C6 already runs the whole stack**, including ESP-NOW and the `mesh_pin_ok` arbitration verdict
+   (§2). The destination is not speculative — two watches are in the field on it.
+3. **ROADMAP already believed this** — *"#198/#233 (C6, 512 KB SRAM) dissolves the whole problem."* It
+   had the destination right and the vehicle wrong: it read as though the migration *relieves* DRAM,
+   when on the C3 Embassy *consumes* ~58 KB of it.
+
+### What to do next, in order
+
+1. **Do not start the 98-commit rebase.** It was P0 to unblock verification; the arithmetic says the
+   thing it unblocks cannot fit. **Re-run this projection against a real rebased build before spending
+   that effort** — my figure is validated arithmetic on a fixed pool, not a build.
+2. **E1 still runs** (§4). It is free, it needs no rebase, and its starvation number is the baseline any
+   future async relay is judged against — on either chip.
+3. **Close the coverage hole** (§5). That is where JP's freeze actually appears to live, and it is
+   cheap.
+4. **Put the C3-vs-C6 fork to JP with these numbers**, including option (c) as *his* call rather than
+   ours.
+
+### The honest caveats, which do not rescue it
+
+- The 73,728 B floor is bard-derived and over-strict for no-bard builds. **Irrelevant to the verdict** —
+  the 18–25 KB-stack-vs-55 KB-peak comparison is floor-independent.
+- **The projection is arithmetic, not a build.** It subtracts measured `.bss` deltas from a pool proven
+  fixed to the byte across two tiers. A rebased build could differ — but it would have to differ by
+  **~30 KB** to change the answer.
+- `.stack` is a *link-time region*, not a runtime high-water. The 54,960 B peak it is compared against is
+  a **measured** number from a stack-paint build under live radio, which is the right comparison.
 
 ---
 
