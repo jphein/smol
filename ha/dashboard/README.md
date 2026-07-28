@@ -8,7 +8,7 @@ It **auto-discovers** smol nodes and scales as sigils join.
 | File | Role |
 |------|------|
 | `dashboard/build_control_room.py` | **Generator (source of truth).** Discovers nodes from `binary_sensor.smol_<id>_online`, builds one node box each, generates the topology SVG, and saves the view via the HA WebSocket API. |
-| `dashboard/smol-control-scaffold.yaml` | Static frame (banner, section kickers, set-all, glass/power/forge, footer) with placeholders `TOPO` / `LEGEND` / `FLEET` that the generator fills. |
+| `dashboard/smol-control-scaffold.yaml` | Static frame — banner, section kickers, set-all, glass/power/forge, herald (§04), overrides·IO·crown-steer (§05), NTP freshness (§06), footer — with placeholders `TOPO` / `LEGEND` / `FLEET` that the generator fills. |
 | `dashboard/smol_control_room.yaml` | **Exported reference** of the built view (example only — the generator is authoritative). |
 | `themes/smol.yaml` | Phosphor-green theme (dark + light) + card-mod `@font-face` loading VT323 / IBM Plex Mono from `/local/luna-fonts/`. Scoped to `theme: smol`. |
 | `www/luna-cards/smol-topology.svg` | Generated mesh-topology graphic, served at `/local/luna-cards/smol-topology.svg`. |
@@ -31,6 +31,15 @@ board — it appears automatically. Install the theme to `/config/themes/smol.ya
 > (`sensor.battery_bank_soc`, `sensor.ev_battery_soc`, `sensor.house_load`,
 > `sensor.solar_charge_current`, "battery bank" / "EV HV" / "house load"). Remap to your own
 > entities in `smol-control-scaffold.yaml`. All `smol_*` entities are the project's own.
+
+### ⚠️ Back-port live edits into the scaffold (#305)
+
+The generator **merges** rather than replaces, so a card you add by hand in the HA UI survives
+a rebuild — it prints `PRESERVED n live card(s) the scaffold does not define`. **Preserved is
+not reproducible.** A card that lives only in HA's `.storage` is one generator bug away from
+deletion (that is exactly what happened on 2026-07-27: ten cards gone) and cannot be rebuilt if
+the HA instance is. Treat every `PRESERVED` line as a to-do: copy the card into
+`smol-control-scaffold.yaml` and confirm the next run prints none.
 
 ### ⚠️ Gotcha: never nest `custom:grid-layout` as a *card*
 `custom:grid-layout` works as a **view `type:`** only. Used as a *nested card* (a grid-layout card

@@ -125,7 +125,9 @@ cards:
           target: {entity_id: input_button.smol_all_reboot}
           confirmation:
             text: "Reboot ALL smol nodes? The whole fleet drops off the mesh briefly."
-    card_mod:
+    # The accent top-rule every plain data card wears. Anchored here (first use) and aliased
+    # as *accent by the §04/§05/§06 cards below, which carry byte-identical styling live.
+    card_mod: &accent
       style: |
         ha-card { position:relative; overflow:hidden; }
         ha-card:before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,transparent,var(--accent-color),transparent); opacity:.55; }
@@ -273,6 +275,204 @@ cards:
           style: "ha-card{border-radius:0 0 10px 10px;border-top:none;margin-top:-1px}"
         entities:
           - entity: FORGE_INSTALL   # ← build script replaces with per-node install buttons (canary-first)
+
+  # =====================================================================================
+  # §04 / §05 / §06 — BACK-PORTED FROM LIVE (#305, 2026-07-28).
+  # These three sections were hand-built on the live dashboard and never existed here, so
+  # the repo could not reproduce the Control Room. On 2026-07-27 the generator's old
+  # remove-then-append save DELETED all ten of them; the merge in build_control_room.py now
+  # preserves live-only cards, but "preserved" is not "reproducible" — a rebuilt HA would
+  # still have lost them. Transcribed verbatim from the live `smol-mesh` dashboard, verified
+  # deep-equal against it card-for-card.
+  #
+  # Placed BEFORE the footer, which is where the section numbering says they belong. Live
+  # currently shows them AFTER the footer purely because the merge appends unknown cards to
+  # the end — an artifact of the incident, not a layout choice. The next generator run will
+  # therefore move the footer back to last. That is the only visual change this commit implies.
+  #
+  # DEBT (deliberately not fixed here): the per-node cards below are STATIC and name ids
+  # 7/8/9 by hand, but the live fleet is 5/8/50/51 — ids 7 and 9 are retired. Node BOXES are
+  # generator-owned and die with their node; these are not, so they will show `unavailable`
+  # rows forever. The fix is to generate them from the registry like node_card() does, which
+  # is a generator change, not a scaffold one. Left as-is so this commit stays a faithful
+  # back-port; the banner above already hardcodes smol_7 the same way.
+  # =====================================================================================
+
+  # ---- 04 · THE HERALD · messaging (#160) ----
+  - type: markdown
+    view_layout: {grid-column: "span 12"}
+    content: "**04**&nbsp;&nbsp;the herald · text your sigils · notify targets &amp; message log (#160)"
+    card_mod: *kick
+
+  - type: entities
+    view_layout: {grid-column: "span 6"}
+    title: scribe a message → the glass
+    show_header_toggle: false
+    entities:
+      - entity: input_select.smol_msg_target
+        name: Target sigil
+        icon: mdi:target
+      - entity: input_text.smol_msg_text
+        name: Message
+        icon: mdi:message-text-outline
+      - entity: input_select.smol_msg_size
+        name: Size
+        icon: mdi:format-size
+      - entity: input_select.smol_msg_align
+        name: Align
+        icon: mdi:format-align-center
+      - entity: input_number.smol_msg_duration
+        name: Show for (s · 0 = keep)
+        icon: mdi:timer-sand
+      - entity: input_boolean.smol_msg_priority
+        name: Priority (interrupt — future fw)
+        icon: mdi:alert-decagram
+      - type: divider
+      - entity: input_button.smol_msg_send
+        name: SEND to glass
+        icon: mdi:send
+      - entity: input_button.smol_msg_clear
+        name: CLEAR + revert
+        icon: mdi:backspace-outline
+    card_mod: *accent
+
+  - type: entities
+    view_layout: {grid-column: "span 6"}
+    title: last message per sigil
+    show_header_toggle: false
+    state_color: true
+    entities:
+      - entity: sensor.smol_7_last_message
+        name: Dominion · Molten Sanctum
+        secondary_info: last-changed
+      - entity: sensor.smol_8_last_message
+        name: Eldritch Nexus
+        secondary_info: last-changed
+      - entity: sensor.smol_9_last_message
+        name: Herald · Familiar
+        secondary_info: last-changed
+    card_mod: *accent
+
+  # ---- 05 · OVERRIDES · IO · SCAN · CROWN-STEER ----
+  # `broker` / `ota_host` are input_text HELPERS: the dashboard names the control, the VALUE
+  # lives in HA. No LAN address is committed here, and none should be — see ha/README.md.
+  - type: markdown
+    view_layout: {grid-column: "span 12"}
+    content: "**05**&nbsp;&nbsp;overrides · IO · scan · crown-steer"
+    card_mod: *kick
+
+  - type: entities
+    view_layout: {grid-column: "span 4"}
+    title: "Dominion · overrides & IO"
+    show_header_toggle: false
+    entities:
+      - entity: input_text.smol_7_broker
+        name: Broker (ip[:port])
+        icon: mdi:server-network
+      - entity: input_text.smol_7_ota_host
+        name: OTA host (ip)
+        icon: mdi:download-network
+      - entity: input_text.smol_7_io_map
+        name: IO map
+        icon: mdi:pin
+      - entity: input_text.smol_7_io_set
+        name: IO set
+        icon: mdi:pin-outline
+      - entity: input_button.smol_7_scan
+        name: Scan (WiFi)
+        icon: mdi:wifi-refresh
+    card_mod: *accent
+
+  - type: entities
+    view_layout: {grid-column: "span 4"}
+    title: "Nexus · overrides & IO"
+    show_header_toggle: false
+    entities:
+      - entity: input_text.smol_8_broker
+        name: Broker (ip[:port])
+        icon: mdi:server-network
+      - entity: input_text.smol_8_ota_host
+        name: OTA host (ip)
+        icon: mdi:download-network
+      - entity: input_text.smol_8_io_map
+        name: IO map
+        icon: mdi:pin
+      - entity: input_text.smol_8_io_set
+        name: IO set
+        icon: mdi:pin-outline
+      - entity: input_button.smol_8_scan
+        name: Scan (WiFi)
+        icon: mdi:wifi-refresh
+    card_mod: *accent
+
+  - type: entities
+    view_layout: {grid-column: "span 4"}
+    title: "Herald · overrides & IO"
+    show_header_toggle: false
+    entities:
+      - entity: input_text.smol_9_broker
+        name: Broker (ip[:port])
+        icon: mdi:server-network
+      - entity: input_text.smol_9_ota_host
+        name: OTA host (ip)
+        icon: mdi:download-network
+      - entity: input_text.smol_9_io_map
+        name: IO map
+        icon: mdi:pin
+      - entity: input_text.smol_9_io_set
+        name: IO set
+        icon: mdi:pin-outline
+      - entity: input_button.smol_9_scan
+        name: Scan (WiFi)
+        icon: mdi:wifi-refresh
+    card_mod: *accent
+
+  - type: entities
+    view_layout: {grid-column: "span 6"}
+    title: "fleet · crown-steer & scan"
+    show_header_toggle: false
+    entities:
+      - entity: input_text.smol_channel_hint
+        name: Channel hint (empty = clear)
+        icon: mdi:access-point
+      - entity: input_button.smol_channel_hint_apply
+        name: Apply channel hint
+        icon: mdi:access-point-check
+      - entity: input_button.smol_channel_hint_clear
+        name: Clear channel hint
+        icon: mdi:access-point-remove
+      - type: divider
+      - entity: input_button.smol_all_scan
+        name: Scan ALL (WiFi)
+        icon: mdi:wifi-refresh
+    card_mod: *accent
+
+  # ---- 06 · TIME SYNC · NTP freshness ----
+  - type: markdown
+    view_layout: {grid-column: "span 12"}
+    content: "**06**&nbsp;&nbsp;time sync · NTP freshness — reads RED fleet-wide until #192 periodic re-sync ships (not a bug)"
+    card_mod: *kick
+
+  - type: entities
+    view_layout: {grid-column: "span 6"}
+    title: time sync · NTP freshness
+    show_header_toggle: false
+    state_color: true
+    entities:
+      - entity: sensor.smol_ntp_fleet
+        name: Fleet freshness
+        icon: mdi:clock-check
+      - type: divider
+      - entity: sensor.smol_7_ntp_fresh
+        name: Dominion
+        secondary_info: last-changed
+      - entity: sensor.smol_8_ntp_fresh
+        name: Nexus
+        secondary_info: last-changed
+      - entity: sensor.smol_9_ntp_fresh
+        name: Herald
+        secondary_info: last-changed
+    card_mod: *accent
 
   # ---- FOOTER (span 12) ----
   - type: markdown
