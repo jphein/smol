@@ -42,8 +42,21 @@
 /// edge-triggered, idempotent apply on the leaf side.
 pub const CFG_RELAY_PER_TICK: usize = 4;
 
-/// Ticks needed to visit every one of `count` slots at least once. The bound
-/// `experiments/cfg_relay_verify` asserts against — the anti-starvation contract.
+/// Upper bound on frames in ONE relay tick — i.e. the size of the caller's index buffer, and the
+/// budget a PRIMING tick is allowed (see [`RelayCursor::take`]).
+///
+/// MUST be >= the `cfg_cache` capacity so a priming sweep can name every slot. A compile-time
+/// assertion in `wifi.rs` ties the two together, because a silent mismatch here would reintroduce
+/// exactly the starvation this module exists to prevent — the tail of the cache would become
+/// unreachable on a priming tick and only the cursor would ever get to it.
+pub const CFG_RELAY_MAX_BURST: usize = 16;
+
+/// Ticks needed to visit every one of `count` slots at least once **in steady state** — the bound
+/// `experiments/cfg_relay_verify` asserts against, and the anti-starvation contract.
+///
+/// Deliberately ignores priming (which covers everything in one tick): this is the WORST case, and
+/// a bound that assumed the optimisation would be wrong exactly when the optimisation fails, which
+/// is the only time anybody reads it.
 pub const fn ticks_to_cover(count: usize) -> usize {
     if count == 0 {
         0
@@ -60,6 +73,10 @@ pub const fn ticks_to_cover(count: usize) -> usize {
 /// remembered key that has vanished would need a search that could fail.
 pub struct RelayCursor {
     next: usize,
+    /// The `count` seen on the previous tick. GROWTH is the trigger for a priming sweep — see
+    /// [`RelayCursor::take`]. Held rather than a bare `bool` so the trigger covers both "fresh
+    /// crown" (0 → N) and "somebody just added a control" (N → N+1) with one rule.
+    seen_count: usize,
 }
 
 impl Default for RelayCursor {
@@ -70,25 +87,53 @@ impl Default for RelayCursor {
 
 impl RelayCursor {
     pub const fn new() -> Self {
-        Self { next: 0 }
+        Self { next: 0, seen_count: 0 }
     }
 
-    /// Fill `out` with up to [`CFG_RELAY_PER_TICK`] slot indices to relay this tick and
-    /// return how many were written, advancing the cursor past them.
+    /// Fill `out` with the slot indices to relay this tick and return how many were written,
+    /// advancing the cursor past them.
     ///
-    /// Total and panic-free: `count == 0` writes nothing; a cursor left beyond a shrunken
-    /// `count` wraps to 0; a `count` below `CFG_RELAY_PER_TICK` yields each slot exactly
-    /// once (never the same slot twice in one tick, which would waste the tick's budget on
-    /// a duplicate while another slot went unvisited).
-    pub fn take(&mut self, count: usize, out: &mut [usize; CFG_RELAY_PER_TICK]) -> usize {
+    /// Emits [`CFG_RELAY_PER_TICK`] in steady state, or a full sweep of up to
+    /// [`CFG_RELAY_MAX_BURST`] on a **priming** tick.
+    ///
+    /// ## Priming: the cache GREW since the last tick
+    ///
+    /// Two situations want the same thing — everything on the air now, not in N ticks' time:
+    ///
+    /// * **A fresh crown after a handover (0 → N).** A new crown's `cfg_cache` starts EMPTY and
+    ///   repopulates from the retained drain, so until it has been swept once, *no* leaf config is
+    ///   reachable at all. This is not hypothetical: measured live 2026-07-28, a board took the
+    ///   crown at `up=16 s` reporting `cfgq=0/16`. With tenure flapping on a minutes timescale the
+    ///   handover is the COMMON case, not the exception, and it plausibly dominated the observed
+    ///   3–5.5 min config latency far more than any missed 10 s tick did.
+    /// * **Somebody just added a control (N → N+1).** `CfgCache` appends, so the new entry is LAST
+    ///   — under a pure cursor the one config a person is actually waiting on waits a full rotation.
+    ///
+    /// Growth is the trigger for both, which is why `seen_count` is a count and not a flag.
+    ///
+    /// A priming tick reintroduces one long back-to-back burst, which is what the rotating cursor
+    /// was added to stop relying on — deliberately. The combination is strictly better than either
+    /// alone: if the priming burst truncates, the cursor still reaches everything it missed on
+    /// subsequent ticks, so the burst is an OPTIMISATION and never the delivery guarantee. The
+    /// anti-starvation contract still rests entirely on the cursor.
+    ///
+    /// Total and panic-free: `count == 0` writes nothing and re-arms priming (so a crown that loses
+    /// and regains the role primes again); a cursor left beyond a shrunken `count` wraps to 0; a
+    /// `count` below the budget yields each slot exactly once (never the same slot twice in one
+    /// tick, which would waste budget on a duplicate while another slot went unvisited).
+    pub fn take(&mut self, count: usize, out: &mut [usize; CFG_RELAY_MAX_BURST]) -> usize {
         if count == 0 {
             self.next = 0;
+            self.seen_count = 0; // re-arm priming: an empty cache means a fresh (or demoted) crown
             return 0;
         }
+        let prime = count > self.seen_count;
+        self.seen_count = count;
         if self.next >= count {
             self.next = 0; // cache shrank (or first call) — resume from the top
         }
-        let n = count.min(CFG_RELAY_PER_TICK);
+        let budget = if prime { CFG_RELAY_MAX_BURST } else { CFG_RELAY_PER_TICK };
+        let n = count.min(budget);
         for k in 0..n {
             out[k] = (self.next + k) % count;
         }
