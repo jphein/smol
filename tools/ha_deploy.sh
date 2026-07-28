@@ -218,6 +218,7 @@ cmd_pull() {
 #   push --from-worktree      deploy uncommitted state on purpose (named first)
 #   push --dry-run            as before; combines with the above
 PUSH_SCRIPT_REL="tools/ha_deploy.sh"
+PUSH_UNATTRIBUTABLE=0   # set by push_unshipped when live matches no committed blob
 
 GIT_ERR=""   # global so `set -u` can never trip on it — see the subshell trap below
 
@@ -232,8 +233,34 @@ git_or_die() { # $@ git args -> stdout; returns 1 on failure
   printf '%s' "$out"
 }
 
-push_provenance() { # $1 basename -> "abc1234 3 hours ago · subject"
-  git_or_die log -1 --format='%h %ar · %s' -- "ha/packages/$1" || echo "(no commit found)"
+push_unshipped() { # $1 basename, $2 path to the fetched LIVE copy -> the commits not yet live
+  # morpheus-yaml's design, and strictly better than the `git log -1` this replaces. The newest
+  # commit touching a file may already BE live, and if several commits are unshipped it hides all
+  # but one — so the old line could name a change that was not in the envelope while omitting the
+  # ones that were. Here: hash the live copy, then walk this path's history comparing each
+  # commit's blob for that path. The first blob that matches IS the live baseline; everything
+  # after it is what this push would actually send.
+  local f="$1" live="$2" livehash
+  livehash="$(git -C "$REPO_DIR" hash-object "$live" 2>/dev/null)" || { echo "    (cannot hash live copy)"; return; }
+  local shas; shas="$(git -C "$REPO_DIR" log --format=%H -- "ha/packages/$f" 2>/dev/null)" || true
+  [ -n "$shas" ] || { echo "    (no commit history for $f)"; return; }
+  local found="" out=""
+  while read -r sha; do
+    [ -n "$sha" ] || continue
+    local blob; blob="$(git -C "$REPO_DIR" rev-parse "$sha:ha/packages/$f" 2>/dev/null)" || blob=""
+    if [ "$blob" = "$livehash" ]; then found=1; break; fi
+    out+="      $(git -C "$REPO_DIR" log -1 --format='%h %s' "$sha")"$'\n'
+  done <<< "$shas"
+  if [ -z "$found" ]; then
+    # FAIL CLOSED. Live matches no committed blob, so it was hand-edited on the VM — which has
+    # happened here (smol_mesh.yaml was once 17.5 KB ahead of the repo). We cannot say what this
+    # push would overwrite, and an unattributable batch is the one that most deserves a human.
+    PUSH_UNATTRIBUTABLE=1
+    echo "      !! cannot attribute — live matches no committed version of this file."
+    echo "         It was edited on the VM; a push OVERWRITES those edits. \`pull\` first to see them."
+    return
+  fi
+  [ -n "$out" ] && printf '%s' "$out" || echo "      (live is at HEAD for this file)"
 }
 
 # --- push (repo -> live) -------------------------------------------------------------------
@@ -329,8 +356,19 @@ cmd_push() {
   # commit SUBJECT can, because you recognise your own work. Say what is knowable, not what
   # would merely look authoritative.
   echo
-  echo "  would push ${#changed[@]} package(s):"
-  for f in "${changed[@]}"; do printf '    %-22s %s\n' "$f" "$(push_provenance "$f")"; done
+  echo "  would push ${#changed[@]} package(s) · unshipped commits per file:"
+  PUSH_UNATTRIBUTABLE=0
+  for f in "${changed[@]}"; do
+    echo "    $f"
+    push_unshipped "$f" "$tmp/$f"
+  done
+  if [ "$PUSH_UNATTRIBUTABLE" -eq 1 ] && [ "$all" -eq 0 ]; then
+    echo
+    echo "  REFUSED · at least one file above cannot be attributed: live does not match any" >&2
+    echo "  committed version, so a push would silently overwrite edits made on the VM." >&2
+    echo "  Run \`pull\` to capture them, or --all if you have decided to discard them." >&2
+    return 4
+  fi
   if [ ${#scope[@]} -eq 0 ] && [ ${#changed[@]} -gt 1 ] && [ "$all" -eq 0 ]; then
     echo
     echo "  REFUSED · an unscoped push would send all ${#changed[@]} of the above in one batch," >&2
