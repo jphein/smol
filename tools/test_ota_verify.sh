@@ -23,7 +23,26 @@
 #   1. Replay is SEQUENTIAL, so timestamps must be NON-DECREASING. An unprefixed line placed AFTER an
 #      `@5` line lands at t=5, not t=0 — the replayer is already past t=5 and never goes back. Put the
 #      whole retained batch first. (Raised by oracle-verify while auditing this seam.)
-#   2. Leave GENEROUS margins around anything time-derived. A stall episode is only counted if a poll
+#   2. ABSENCE-OF-SIGNAL ASSERTIONS ARE THE RACY FAMILY, and they need a margin rule beside them.
+#      Presence survives coarse polling — the signal is still there on the next poll. Absence does
+#      not: "no retry within N seconds" is answered by which side of a sleep the loop lands on. So for
+#      any assertion of the form "X did NOT happen within N", the window must close more than
+#      N + poll-jitter after the last relevant event, and N itself must EXCEED the poll interval. The
+#      script now REFUSES a threshold at or below POLL (exit 4) so the second half is structural
+#      rather than remembered. This case is the cautionary tale: written as RETRY_GRACE=1 with POLL=1
+#      and window=8 against retries at t=3,5,7,8, it was measured 60% NON-DETERMINISTIC by an auditor
+#      on a frozen tree — the test I had named as the one to beat was itself the least trustworthy
+#      thing in the suite.
+#
+#      THE DETERMINISTIC END STATE, not yet built (oracle-verify's proposal, accepted as the right
+#      direction): a VIRTUAL CLOCK — let the replayer own time and have the script read `now()`
+#      through a seam, so a fixture timeline is exact and load-independent. That removes this whole
+#      class instead of bounding it, which is the same argument this file makes everywhere else.
+#      Deliberately NOT done in this pass: it requires two-way coordination between replayer and poll
+#      loop, and a subtle bug there makes tests pass FOR THE WRONG REASON — the one outcome worse
+#      than flakiness. Until it exists, obey the margin rule above.
+#
+#   3. Leave GENEROUS margins around anything time-derived. A stall episode is only counted if a poll
 #      lands inside the frozen span, and under the suite's own load a poll iteration can stretch well
 #      past POLL seconds. `retry_restart_then_pass` originally had a 4 s frozen span with
 #      STALL_AFTER=2 and passed on a loaded box while FAILING in a pristine checkout — a flaky
@@ -35,8 +54,10 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/ota_verify.sh"
 CASES="$HERE/test_ota_verify_cases"
-[ -x "$SCRIPT" ] || [ -f "$SCRIPT" ] || { echo "missing $SCRIPT" >&2; exit 2; }
-[ -d "$CASES" ] || { echo "missing $CASES" >&2; exit 2; }
+# exit 4, not 2: bash itself returns 2 for a syntax error, so a suite that exits 2 is
+# indistinguishable from a suite that failed to parse. An auditor hit exactly that ambiguity.
+[ -x "$SCRIPT" ] || [ -f "$SCRIPT" ] || { echo "missing $SCRIPT" >&2; exit 4; }
+[ -d "$CASES" ] || { echo "missing $CASES" >&2; exit 4; }
 
 pass=0; fail=0; OUT=""; RC=0
 # Compressed thresholds so a stall case takes ~3 s instead of ~153 s. These are the only knobs the
@@ -205,22 +226,29 @@ has   "a regression with no retry is still flagged" "monotonic=NO"
 hasnt "and is not excused as a restart"             "restarts from a lower offset=1"
 
 echo
-echo "═══ THE TWO THRESHOLDS ARE SEPARATE KNOBS ═══"
+echo "═══ knobs_are_independent · THE TWO THRESHOLDS ARE SEPARATE KNOBS ═══"
 echo "     One knob with two semantics is the conflation pattern behind most of this file's defects"
 echo "     (cc=0 = off-channel OR unassociated; ota=confirmed = a build OR THIS build). Each was"
 echo "     harmless until the two meanings diverged. These must move independently."
-# Same fixture, same STALL_AFTER: a WIDE retry-grace forgives the stall (still retrying),
-# a NARROW one calls it dead. Only RETRY_GRACE moved, so only the control-plane arm may change.
+# Same fixture, same STALL_AFTER: a WIDE retry-grace forgives the stall (still retrying), a NARROW
+# one calls it dead. Only RETRY_GRACE moved, so only the control-plane arm may change.
+#
+# THE NARROW HALF IS AN ABSENCE-OF-SIGNAL ASSERTION, which is the racy family: presence survives
+# coarse polling (the signal is still there next poll), absence does not. It was written as
+# RETRY_GRACE=1 with POLL=1 and window=8 against retries at t=3,5,7,8 — sub-poll, and oracle-verify
+# measured it 60% NON-DETERMINISTIC (3/5 wrong). Two changes, both removing the mechanism rather than
+# lowering the odds: grace=3 is above POLL (the script now REFUSES grace <= POLL outright), and
+# window=14 puts the window's close 6 s past the last retry, which is > grace + any plausible jitter.
 OUT="$(OTA_VERIFY_RETRY_GRACE=30 OTA_VERIFY_FIXTURE="$CASES/stall_with_retry_not_death.mqtt" \
-       bash "$SCRIPT" 8 907 12 2>&1)"; RC=$?
+       bash "$SCRIPT" 8 907 14 2>&1)"; RC=$?
 printf '\n── stall_with_retry_not_death · RETRY_GRACE=30 (wide)\n'
 verdict_is UNPROVEN
 has "a wide retry-grace forgives the stall" "the board has NOT given up"
-OUT="$(OTA_VERIFY_RETRY_GRACE=1 OTA_VERIFY_FIXTURE="$CASES/stall_with_retry_not_death.mqtt" \
-       bash "$SCRIPT" 8 907 12 2>&1)"; RC=$?
-printf '── stall_with_retry_not_death · RETRY_GRACE=1 (narrow), STALL_AFTER unchanged\n'
+OUT="$(OTA_VERIFY_RETRY_GRACE=3 OTA_VERIFY_FIXTURE="$CASES/stall_with_retry_not_death.mqtt" \
+       bash "$SCRIPT" 8 907 14 2>&1)"; RC=$?
+printf '── stall_with_retry_not_death · RETRY_GRACE=3 (narrow), STALL_AFTER unchanged\n'
 verdict_is FAIL
-has "a narrow retry-grace calls the same stall dead" "NO retry signal inside the 1s grace"
+has "a narrow retry-grace calls the same stall dead" "NO retry signal inside the 3s grace"
 has "and the stall threshold did NOT move with it"   ">= 2s stall-after"
 # The retired single knob must fail LOUDLY, not be silently ignored — a caller who sets it believes
 # they changed a threshold, and getting the default instead is exactly the class of silent-wrong-answer
@@ -230,7 +258,7 @@ OUT="$(OTA_VERIFY_STALE=2 OTA_VERIFY_FIXTURE="$CASES/pass_peer_sourced.mqtt" \
 printf '── the retired OTA_VERIFY_STALE knob\n'
 # 2, not 3: a renamed knob is the CALLER's mistake. Sharing code 3 with "could not source mqtt
 # password" made an audit read a TEST failure as an ENVIRONMENT failure.
-rc_is 2
+rc_is 4
 has "refuses to run rather than ignore it" "OTA_VERIFY_STALE is retired"
 has "and names both replacements"          "OTA_VERIFY_RETRY_GRACE"
 
@@ -262,6 +290,15 @@ proof A yes; proof B yes; proof C yes; proof D yes; proof E yes
 proof F NO
 has   "A-E can all hold and it still is not a PASS" "F boot in-window"
 hasnt "no over-claim of having watched it"          "over the air"
+
+# The guard that makes absence-assertions safe by construction: a threshold at or below the poll
+# interval is decided by scheduling jitter, so it is refused rather than tolerated.
+OUT="$(OTA_VERIFY_RETRY_GRACE=1 OTA_VERIFY_POLL=1 OTA_VERIFY_FIXTURE="$CASES/pass_peer_sourced.mqtt" \
+       bash "$SCRIPT" 8 907 4 2>&1)"; RC=$?
+printf '── a threshold at or below POLL is refused, not tolerated\n'
+rc_is 4
+has "names the jitter reason" "decided by scheduling jitter"
+has "names the offending knob" "RETRY_GRACE=1 must be GREATER than POLL=1"
 
 printf '\n════════════════════════════════════════════\n'
 printf '  %d passed · %d failed\n' "$pass" "$fail"

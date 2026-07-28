@@ -3,10 +3,15 @@
 #
 #   Usage:  ota_verify.sh <board_id> <target_build> [window_s]
 #   e.g.    ota_verify.sh 8 907 360
-#   Exit:   0 = PASS · 1 = FAIL / UNPROVEN / CONFLICT · 2 = bad invocation · 3 = setup error (no creds)
-#           2 and 3 are SEPARATE deliberately: a renamed knob is the CALLER's mistake and is fixed by
-#           editing the command, while 3 means the environment (bw locked, addon unreachable). They
-#           shared code 3 for one revision, and an audit read a test failure as an env failure.
+#   Exit:   0 = PASS · 1 = FAIL / UNPROVEN / CONFLICT · 3 = setup error (no creds) · 4 = bad invocation
+#           All three failure codes are DISTINCT deliberately, and the history is instructive:
+#             3  the ENVIRONMENT is wrong (bw locked, addon unreachable) — retry later.
+#             4  the CALLER is wrong (retired knob, racy threshold) — edit the command.
+#             2  DELIBERATELY UNUSED: bash returns 2 for a SYNTAX ERROR, so a script that exits 2 is
+#                indistinguishable from a half-written one. This guard used 3 for a revision (an
+#                auditor read a caller error as a broken environment), then 2 (an auditor was
+#                simultaneously seeing real bash-syntax 2s from a mid-edit file). Two conflations in
+#                the same field; 4 collides with neither.
 #   Test:   tools/test_ota_verify.sh   (fixture replay, no broker, no hardware)
 #
 # ═════════════════════════════════════════════════════════════════════════════════════════
@@ -140,11 +145,16 @@ WINDOW="${3:-600}"
 # They measure different planes, and would diverge for different reasons:
 #
 #   STALL_AFTER — the DATA plane, measured by US. How long the offset may sit unchanged (with
-#     0<off<total) before we call the transfer stalled. Derivation: it must exceed the longest quiet
-#     gap a HEALTHY transfer can have between live progress publishes. The 907/id8 run retried at
-#     ~58 s intervals, so 150 s ≈ 2.5 intervals = two consecutive missed retries. The old value was
-#     30 s — BELOW one retry interval — so it structurally could not tell a mid-retry stall from a
-#     dead transfer, and a threshold shorter than the process it measures can only ever be wrong.
+#     0<off<total) before we call the transfer stalled. Derived FROM THE DATA PLANE: an active
+#     transfer republishes progress every 5 s (`Duration::from_secs(5)`, wifi.rs:5368), so 30 s is
+#     SIX consecutive missed publishes.
+#     It was 150 s for one revision — the retry interval's number wearing a data-plane name, i.e. the
+#     mechanism was split but the CALIBRATION was still conflated (caught by oracle-verify). Deriving
+#     it from the publish cadence instead is what makes a genuine death detectable INSIDE a 600 s
+#     window rather than at its very end. Tightening is nearly free here for two independent reasons:
+#     DEATH-POINT is non-terminal, so a premature one is overridden by a later completion; and
+#     RETRY_GRACE forgives any stall the board is announcing retries through. That is the split
+#     paying off — neither protection existed when 30 s was previously wrong.
 #
 #   RETRY_GRACE — the CONTROL plane, stated by the BOARD. How long a `retry=`/`leaf-timeout`/
 #     `relay-failed` on ota/diag keeps a stall non-terminal. Derivation: it must exceed the longest
@@ -153,7 +163,7 @@ WINDOW="${3:-600}"
 #     every few seconds during one. Same 58 s observation, different reason for depending on it.
 #
 # If the relay's cadence changes, re-derive them SEPARATELY.
-STALL_AFTER="${OTA_VERIFY_STALL_AFTER:-150}"
+STALL_AFTER="${OTA_VERIFY_STALL_AFTER:-30}"
 RETRY_GRACE="${OTA_VERIFY_RETRY_GRACE:-150}"
 # BARREN_STALLS — how many CONSECUTIVE stall episodes with NO high-water advance between them mean
 # the board is thrashing rather than progressing. Derivation: the observed successful run stalled and
@@ -162,17 +172,37 @@ RETRY_GRACE="${OTA_VERIFY_RETRY_GRACE:-150}"
 # non-progress, not a timer — deliberately, because the time axis is what the retry grace already
 # covers and a thrashing board can retry forever without a timer ever expiring.
 BARREN_STALLS="${OTA_VERIFY_BARREN_STALLS:-2}"
+# A threshold at or below the poll interval is decided by SCHEDULING JITTER, not by the system under
+# observation. `retry_fresh` asks "was a retry seen within RETRY_GRACE" — with RETRY_GRACE <= POLL
+# that question is answered by which side of a sleep the loop happens to land on, and it made this
+# file's own independence test 60% non-deterministic (oracle-verify measured 3/5 wrong). Note the
+# asymmetry, because it generalises: PRESENCE-of-signal survives coarse polling (the signal is still
+# there next poll) while ABSENCE-of-signal does not. So refuse the racy configuration outright rather
+# than widen a margin and hope — the same reasoning that deleted the mesh_ch arm instead of tuning it.
+
 # A retired knob that silently does nothing is the same trap as an absent field read as a value: the
 # caller believes they set a threshold and gets the default. Fail loudly instead of ignoring it.
 if [ -n "${OTA_VERIFY_STALE:-}" ]; then
   echo "FATAL: OTA_VERIFY_STALE is retired — it conflated two thresholds. Set OTA_VERIFY_STALL_AFTER" >&2
   echo "       (offset-frozen threshold, data plane) and/or OTA_VERIFY_RETRY_GRACE (how long the" >&2
   echo "       board's own retry signal keeps a stall non-terminal, control plane). See the header." >&2
-  exit 2   # NOT 3: this is a bad invocation, not a broken environment.
+  exit 4   # NOT 3 (environment) and NOT 2 (bash's own syntax-error code).
 fi
 POLL="${OTA_VERIFY_POLL:-3}"       # re-evaluate every N s
 SETTLE="${OTA_VERIFY_SETTLE:-2}"   # let the retained baseline land before the first evaluation
 FIXTURE="${OTA_VERIFY_FIXTURE:-}"  # test seam: replay a canned log instead of subscribing
+
+# Spelled out, not looped through `eval` — indirect assignment hides the name from shellcheck and
+# from a reader, and this file has already paid for that once.
+require_above_poll() { # require_above_poll <knob-name> <value>
+  [ "$2" -gt "$POLL" ] && return 0
+  echo "FATAL: $1=$2 must be GREATER than POLL=$POLL — at or below the poll interval this" >&2
+  echo "       threshold is decided by scheduling jitter rather than by the board." >&2
+  echo "       Raise $1 or lower OTA_VERIFY_POLL." >&2
+  exit 4
+}
+require_above_poll STALL_AFTER "$STALL_AFTER"
+require_above_poll RETRY_GRACE "$RETRY_GRACE"
 
 # ═══ message source ══════════════════════════════════════════════════════════════════════
 # Log format is `<retain>\t<topic>\t<payload>`, one message per line, in ARRIVAL ORDER. The
@@ -184,7 +214,7 @@ if [ -n "$FIXTURE" ]; then
   # what makes TRANSITIONS testable — the previous test copy read a static file, so "first
   # observation" and "last observation" were always the same line and no transition could ever be
   # exercised. A harness whose tests cannot express its central concept is not tested.
-  [ -f "$FIXTURE" ] || { echo "FATAL: fixture not found: $FIXTURE" >&2; exit 2; }
+  [ -f "$FIXTURE" ] || { echo "FATAL: fixture not found: $FIXTURE" >&2; exit 4; }
   BROKER="fixture($(basename "$FIXTURE"))"
   LOG="$(mktemp "/tmp/ota_verify_fix_${ID}_XXXX.log")"
   (
