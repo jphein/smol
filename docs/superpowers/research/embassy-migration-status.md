@@ -3,51 +3,41 @@
 **The question (JP, 2026-07-28):** *"When do we move to Embassy so we can have async?"* — prompted by
 *"I'm still getting UI freezes for wifi and stuff."*
 
-**Short answer:** the migration is **much further along than the issue tracker suggests** — a branch
-exists that already carries the whole #233 matched-set upgrade *and* an async port through crown
-election, and its central claim is **measured on metal, not argued** (a ~15 s mesh-deaf WiFi burst
-becomes **169 ms** — ~89×). It **builds** on the current toolchain (§7). But **it is still not what
-should ship next**, and as of 2026-07-28 for exactly **one** reason: **the branch's OTA path has never
-been exercised**, so the rollback from a bad roll is USB, by hand, per board. (The one-board fleet and
-the "does it compile" question both resolved on 2026-07-28 — see §5 and §7. Neither was the real
-blocker, and their clearing makes the remaining one easier to see, not smaller.)
+**Short answer — and it inverted on 2026-07-28.** Async is no longer a C3 migration to finish. It is a
+**C6 platform transition**, because **Embassy does not fit on the C3 alongside the Bard.**
 
-It also gates more than the freeze: the migration is the only route to **BLE on the Rust firmware**
-(#22 — *"embassy/async is the only supported coex shape"*), so it buys **three** things, not one (§6).
+> **`Embassy costs 58,144 B` of stack. There are `2,232 B` of slack.**
+> Measured, not projected: `.bss+.data+.stack` sums to **285,708 B for both `main` tiers exactly**, so
+> `.stack` is purely the leftover of a fixed pool — which makes the deltas clean. The Bard costs
+> **39,080 B**; Embassy costs **58,144 B**. Projected `main` + bard + Embassy `.stack` is
+> **≈17,800–24,600 B** against a **73,728 B floor** *and* a **measured 54,960 B peak** — so the image
+> would **link and then die on hardware**. **Every lever spent to its limit is ≈39.5 KB, still 10–16 KB
+> short.** There is no combination of `SEQ_CAP`, heap and RX-buffer tuning that closes it.
 
-**Recommendation: take the interim fix now, finish the migration deliberately behind a two-board
-bench.** Detail in §6.
+So the earlier reading of this document — *"one blocker: the OTA path is unverified"* — was **twice too
+kind**, and both corrections are in §5:
 
-> # 🔴 The one fact this document missed, and it outranks everything in it (2026-07-28)
->
-> **The branch is 98 commits behind `main`, and it contains no Bard.**
->
-> - Merge-base with `main` is **`36e6345`**; `git rev-list --count 36e6345..main` = **98**.
-> - `grep -c bard` on the branch's `main.rs` = **0**. All **2,982 lines** of `src/bard/` show as deleted
->   in `main → branch`. The branch is dated **2026-07-22**; the Bard shipped **07-26/27**.
-> - So the verified *"compiles clean in 30.12 s"* was a tree **without** the Bard. **The branch and the
->   Bard have never been compiled together — and MEASURED 2026-07-28, they do not currently fit.**
->   From real linker output: `main`+bard `.stack` = **75,960 B** (**+2,232 B** over the 73,728 B floor);
->   branch **without** bard `.stack` = **56,888 B** — 🔴 **16,840 B BELOW the floor**, `.bss` **+17,904 B**.
->   **The branch already fails the gate before the Bard is added back.**
-> - **And that retires the `SEQ_CAP` question rather than pricing it.** Its whole range is ~11.5 KB
->   against a **≥16,840 B** shortfall — short by ≥5,340 B spent in full. **There is no Bard-vs-async
->   trade to put to JP:** the Bard lever cannot buy async at any setting. The DRAM must come from
->   `embassy-net`'s buffers / RX tuning / the wifi heap — **or from the C6.**
->   *(For the record, since it was mispriced before it was found insufficient: since #302 `SEQ_CAP` caps
->   how far back the Bard **remembers**, never the length of a tale.)*
-> - **The rebase's deliverable is a measured `.bss`/`.stack` delta**, not a green build, and its first
->   task is the one endpoint still missing — `main` **without** bard, to separate the Bard's `.bss` from
->   Embassy's. Procedure: [the plan](../plans/embassy-ota-verification.md) §0c.
->
-> **This reframes §5 and §6.** "Rollback of the *code* is free — the branch is not merged" is true and
-> incomplete: **merging the branch as it stands would delete the flagship feature JP shipped this week.**
-> The gate is not P2 and not the OTA verification — it is a **98-commit rebase across the Bard campaign,
-> touching the same `main.rs` the branch rewrites by 671 lines.** Nobody has costed it.
->
-> **Revised ordering: the rebase is P0.** Then the free peer-serve baseline (**E1**), then the async port
-> (**E2**). Full argument, and why **P2 itself is smaller than advertised**, in
-> [embassy-p2-mesh-relay.md](embassy-p2-mesh-relay.md).
+1. The OTA path is not unverified, it is **unwritten** (fed by a stub), which makes the
+   [verification plan](../plans/embassy-ota-verification.md) **unrunnable against `b6413d3`**.
+2. And it would not matter if it were written: **the resulting image cannot run on a C3 that also
+   carries the Bard.**
+
+**What survives, and it is a lot.** The measured win is real and unchanged — a ~15 s mesh-deaf WiFi
+burst becomes **169 ms (~89×)**, on metal. The #233 matched-set upgrade is done and **builds**. The port
+reaches crown election. **None of that is wasted: it is the C6's head start**, and the C6 has 512 KB of
+SRAM, which dissolves the constraint rather than negotiating with it.
+
+**Recommendation: stop treating #198 as a migration-in-progress.**
+1. **Keep the interim fix** — it already addressed the freeze on the proven image (`443ea34`), without
+   Embassy.
+2. **Retarget async at the C6** (#229/esp32c6-watch), which already runs this exact stack in the field.
+3. **Do not spend more levers on the C3.** The gap is 10–16 KB *after* everything; that is a platform
+   answer, not a tuning answer.
+4. **BLE follows the platform.** #22's *"embassy/async is the only supported coex shape"* still holds —
+   so BLE arrives with the C6 too, and is not a reason to force Embassy onto the C3.
+
+⚠️ **Anything still describing #198 as a migration in progress is now wrong**, including issue text and
+any plan that sequences a C3 fleet roll.
 
 *Every claim below is sourced. Where I could not establish something, §7 says so rather than hedging.*
 
