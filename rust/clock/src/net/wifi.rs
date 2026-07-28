@@ -5234,6 +5234,33 @@ pub fn run_ota_fetch(
     if writer.finalize(announce.size, &announce.sha256)
         && crate::ota::verify_signature(announce.signed_msg(), announce.sig())
     {
+        // #188 follow-up: publish ONE final progress line at `done == total`, so the retained topic
+        // describes the most recent OUTCOME rather than the most recent FAILURE.
+        //
+        // Without it a successful fetch leaves the last THROTTLED value (up to 5 s / one chunk short
+        // of complete) retained for ever, and a subscriber replaying it sees a transfer that appears
+        // to have stopped mid-image. That ghost cost real debugging today: a leftover 1228800/1435280
+        // from the 906 roll read as a live death-point on boards that had already completed 907 — and
+        // a retained value satisfies a "frozen for 30 s" test for free, because it never changes.
+        //
+        // It is free of the thing the 5 s throttle exists to protect: this runs AFTER the last byte is
+        // downloaded and verified, so it cannot take airtime from a download. One publish per
+        // successful fetch, best-effort, swallowed on failure like the throttled one.
+        //
+        // Placed AFTER the verify gate deliberately — publishing `done == total` on bytes that then
+        // failed SHA/ed25519 would just be a better-dressed lie. A verify failure keeps its own
+        // `at=verify` fail-diag and leaves progress showing how far it really got.
+        //
+        // Keeps the existing `relayfetch`/`self` phase tokens rather than inventing a `done` phase, so
+        // no consumer's parser has to learn a new value: `done == total` IS the completion signal.
+        if let Some(pid) = progress_id {
+            let src_port = 49152 + (rng.random() % 16384) as u16;
+            let phase = if relay_mode { "relayfetch" } else { "self" };
+            publish_ota_progress(
+                &mut iface, device, &mut sockets, tcp_handle, src_port, pid,
+                announce.size, announce.size, phase, tick,
+            );
+        }
         if relay_mode {
             // #40: the gateway staged+verified a leaf's image into ITS inactive slot; do
             // NOT activate (this board isn't the one being updated). Hand back the slot so
