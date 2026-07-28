@@ -407,6 +407,32 @@ merges into existing state — dashboards, config, generated docs, the site's `c
 that check, and a volatile field (a hash, a timestamp, a `?v=`) inside an identity key is the usual
 culprit.
 
+### A broken diagnostic prints a confident wrong verdict
+
+Sibling of the idempotency rule, and worse, because there is no crash to notice. **A tool that reports
+FAIL when it should report PASS looks exactly like a tool that is working** — same format, same
+confidence, same exit code shape.
+
+Worked example (`da1cba8`, 2026-07-28): `tools/ota_verify.sh` was written against an *imagined* DIAG
+schema and never validated against a live payload. Its off-channel check used `grep -oE 'ap=[0-9]+'`,
+unanchored — so it matched the **tail of `heap=42040`** (`he|ap=…`). DIAG has **no `ap=` field at all**.
+The check could only ever read free heap; heap is never a valid channel, so it **failed every run** — and
+being **first in a first-match-wins ladder it masked every other verdict**, including the correct one.
+Its remedy line advised re-channelling a live AP.
+
+**So, for any tool that parses live payloads:**
+- **Validate the parser against a captured real payload**, not against the schema you believe exists.
+  Grep the field name in the *producer* (`mode.rs`, `wifi.rs`) and confirm it is emitted at all.
+- **Anchor field matches** — `(^|\|)field=` — or a short field name will match inside a longer one.
+- **A first-match-wins verdict ladder is a masking hazard:** the earliest check that can misfire hides
+  every later one. Order the cheapest-to-be-wrong checks last, or make them self-disable when their field
+  is absent.
+- **Run it once where you know the answer.** A control you *expect* to pass is where a broken oracle
+  reveals itself; a run you cannot predict is where it hides.
+
+Note the species: `ap=` inside `heap=` is a **correct regex attached to the wrong field** — §2's family
+again, this time inside a tool rather than a document.
+
 ### Site checklist
 
 - [ ] Favicon present; **dark *and* light** via `prefers-color-scheme` (JP's standing preference).

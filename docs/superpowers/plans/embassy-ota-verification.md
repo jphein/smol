@@ -121,12 +121,36 @@ tools/ota_verify.sh 51 907 360     # exit 0 = PASS · 1 = FAIL/INFO · 3 = setup
 | **`slot=ota_1` + `rst=ota`**, not just `installed_version` | *"installed_version flipped"* is **not** proof. A USB flash shows `slot=0` / `rst=usb-jtag`. **id5 once read as an OTA win when it had been flashed by USB.** `slot=ota_1` is the proof. |
 | **Live publish, not retained** (`mosquitto_sub -F '%R'`, retain flag 0) | A fresh subscribe redelivers retained values; a persisted value once produced a false *"fleet installing"* alarm. Retained MQTT has faked liveness in this repo repeatedly. |
 | **Death-point:** offset frozen >30 s with `done<total` | The transfer died **at that byte** — far more diagnostic than "it failed". |
-| **Off-channel:** crown AP ch ≠ mesh ch | The coexist disease is a **channel mismatch** — proven: co-channel moved 48 KB, off-channel moved 0. This fails *before* you waste a run. |
+| **Off-channel:** crown AP ch ≠ mesh ch | The coexist disease is a **channel mismatch** — proven: co-channel moved 48 KB, off-channel moved 0. This fails *before* you waste a run. **Fixed `da1cba8` — see the warning below; do not run this campaign on an older harness.** |
 | **`at=slot`** | Local otadata problem (#226) — **OTA cannot proceed, needs USB.** |
 | **`src=id<n>` vs `src=gw`** | Peer-sourced (#237) vs crown WiFi-fetch — i.e. *which path you actually exercised*. Check this or you may believe you tested P1 and have tested P2. |
 
 **That last row is the one to watch in this campaign.** With #237 peer-sourcing live, a run you *intend*
 as P1 can be silently served by a peer. **A P1 PASS requires `src=gw`.**
+
+### 🔴 The oracle itself was broken until `da1cba8` — check you have the fix
+
+This document told you to trust the harness rather than hand-judge. **That was right in principle and,
+until 2026-07-28, wrong in fact.** `tools/ota_verify.sh` had three defects, all one species: *written
+against an imagined DIAG schema and never validated against a live payload.*
+
+The worst was the OFF-CHANNEL check. `grep -oE 'ap=[0-9]+'` is unanchored, so it matched the **tail of
+`heap=42040`** — `he|ap=…`. **DIAG has no `ap=` field at all** (`mode.rs:3208`), so the check could only
+ever read free heap; heap is never 6, so it **FAILed every run** — and being **first in a
+first-match-wins ladder it MASKED every other verdict, including a correct DEATH-POINT.** Its remedy line
+then told the operator to go re-channel a live AP.
+
+> **The lesson to carry into the bench session, and the reason this box is loud:** *a broken diagnostic
+> does not error. It prints a confident wrong verdict in the same format as a right one.* An operator
+> following this plan on the old harness would have chased a phantom channel mismatch, never seen the
+> real death-point, and concluded the branch was fine or broken **on the strength of a heap reading.**
+
+**Before Phase A: confirm you are on `da1cba8` or later**, and treat the first Phase-A run as a
+validation of *the harness* as much as of the board — a control that is *expected* to pass is exactly
+where a broken oracle reveals itself.
+
+This is the sixth instance of the session's pattern (DOC-UPKEEP §2): `ap=` inside `heap=` is a **correct
+regex attached to the wrong field.** Nobody mistyped anything.
 
 ---
 
