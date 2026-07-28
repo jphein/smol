@@ -702,15 +702,23 @@ fn delivery_parses_the_optional_font_field() {
     let cur = Delivery::DEFAULT;
     let ok = |v: &str, c: Delivery| Delivery::parse(v.as_bytes(), c).expect("should parse");
 
-    // THE compatibility requirement: a value already retained on the broker has TWO fields, and it
-    // must keep parsing and keep its font — a new field that invalidates a fleet's stored config
-    // would take every node back to the default the moment this shipped.
+    // The compatibility requirement is that a value already retained on the broker (TWO fields) must
+    // keep PARSING — it does, and its speed and mode are honoured verbatim.
     let big = Delivery { ms_per_char: 200, mode: Mode::Page, font: Font::F9x15 };
-    assert_eq!(ok("120:inf", big).delivery.font, Font::F9x15, "a 2-field value must keep the font");
     assert_eq!(ok("120:inf", big).delivery.ms_per_char, 120);
     assert_eq!(ok("120:inf", big).delivery.mode, Mode::Inf);
-    // An EMPTY third field reads like an omitted one — the dashboard could plausibly send it.
-    assert_eq!(ok("120:inf:", big).delivery.font, Font::F9x15);
+    // But an ABSENT font means DEFAULT, not keep-current. This assertion was the opposite way round
+    // until the dashboard proved it wrong: HA omits the third field exactly when the value IS the
+    // default (pre-font-firmware compatibility), so keep-current made the default UNREACHABLE — pick
+    // 9x15, select 5x8, and the node keeps 9x15 with no error anywhere. A value written before the
+    // field existed cannot express a font preference, so "the default" is its only honest reading.
+    assert_eq!(
+        ok("120:inf", big).delivery.font,
+        Delivery::DEFAULT.font,
+        "an absent font field must mean DEFAULT, or the default is unreachable from the dashboard"
+    );
+    // An EMPTY third field reads the same as an omitted one — one rule, not two.
+    assert_eq!(ok("120:inf:", big).delivery.font, Delivery::DEFAULT.font);
 
     // All four faces, case-insensitively, and the default.
     assert_eq!(ok("160:inf:5x8", big).delivery.font, Font::F5x8);
