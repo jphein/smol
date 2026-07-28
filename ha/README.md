@@ -378,6 +378,7 @@ or CI can gate on it:
 | `1` | **LIVE-ONLY cards** — the repo cannot reproduce the dashboard; back-port them |
 | `2` | the check could not run — the dashboard is *unverified*, not proven clean |
 | `3` | **DEAD ROWS** — reproducible, but wired to entities HA does not have |
+| `4` | **REFUSED** — the deploy guard stopped it (deploy path only, never `--check`) |
 
 `1` and `3` are deliberately separate because the fixes differ: live-only means *back-port a
 card*, a dead row means *the card exists but points at nothing* and must be repointed, gated or
