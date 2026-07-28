@@ -380,7 +380,7 @@ def freeze_md(nodes, dormant, present):
          "{% set na="+NAJ+" %}{% set sig="+json.dumps(sig)+" %}"]
     if BF in present:
         out.append(
-            "{% set g=states('"+BF+"') %}{% set kl=state_attr('"+BF+"','kind_label') %}"
+            "{% set g=states('"+BF+"') %}{% set kl=state_attr('"+BF+"','kind_label')|string %}"
             "{% set bm=state_attr('"+BF+"','burst_ms') %}{% set nd=state_attr('"+BF+"','node')|string %}"
             # `unknown` here is meaningful: firmware appends brst= only once a burst has been
             # measured, so there is no honest number to show yet. Rendering 0 ms would claim the
@@ -429,8 +429,8 @@ def freeze_md(nodes, dormant, present):
         out.append("### — ms\n\n_`"+BF+"` not present — deploy ha/packages/smol_mesh.yaml._\n")
     if CBM in present:
         out.append(
-            "{% set v=state_attr('"+CBM+"','verdict') %}{% set n2=state_attr('"+CBM+"','node')|string %}"
-            "{% set ob=state_attr('"+CBM+"','observed_channel') %}{% set be=state_attr('"+CBM+"','believed_channel') %}"
+            "{% set v=state_attr('"+CBM+"','verdict')|string %}{% set n2=state_attr('"+CBM+"','node')|string %}"
+            "{% set ob=state_attr('"+CBM+"','observed_channel')|string %}{% set be=state_attr('"+CBM+"','believed_channel')|string %}"
             # OFF is deliberately NOT reported as a pass. `absent`/`unscanned` mean the comparison
             # could not be made, which reads identically to "fine" if you only show the state.
             "**coexist · belief vs observation** — "
@@ -447,7 +447,7 @@ def freeze_md(nodes, dormant, present):
     # rendering it as `on` would invent safety. So the verdict string is printed verbatim.
     if BLREV in present:
         out.append(
-            "{% set b=states('"+BLREV+"') %}{% set bv=state_attr('"+BLREV+"','verdict') %}"
+            "{% set b=states('"+BLREV+"') %}{% set bv=state_attr('"+BLREV+"','verdict')|string %}"
             "{% set mb=state_attr('"+BLREV+"','measured_by')|string %}"
             "**bootloader auto-revert** — "
             "{% if b=='on' %}🛡 **yes** — a bad OTA image has a net beneath the app"
