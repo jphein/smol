@@ -69,6 +69,20 @@
 #     leaf target below: it is inapplicable today and prints that fact.
 #   * EVERY VERDICT PRINTS THE OPERANDS IT FIRED ON, so an operator can audit it without a rerun.
 #
+# ── THE LIMIT OF THIS HARNESS: TWO ADVERSARIES, ONE AUDITED ──────────────────────────────
+# Everything above hardens this tool against being fooled by THE BROKER — retained ghosts, stale
+# gateway caches, persistent rtc_fast markers, its own deleted evidence. That adversary has been
+# audited hard, across six rounds, and the tool now wins against it.
+#
+# It remains, BY CONSTRUCTION, entirely trusting of THE BOARD. Every conjunct of the proof is the
+# device's own report about itself. Firmware that publishes wrong DIAG fields defeats this harness
+# completely, and no MQTT-only tool can detect that — a PASS means "the board said, live and in-window,
+# the things a successful OTA would say", which is not the same claim as "the OTA happened".
+#
+# Those are DIFFERENT ADVERSARIES and only one of them has been tested. If you need the other,
+# the project's ground-truth hierarchy already names the instrument: pcap > MQTT flip > server log,
+# and serial for the board's own execution. Do not let a green verdict here substitute for that.
+#
 # ── SCHEMA: THERE ARE TWO PRODUCERS, WITH DIVERGENT VOCABULARIES ─────────────────────────
 # Verified against live payloads and source on 2026-07-28. Do not "simplify" this into one schema.
 #

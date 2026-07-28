@@ -3,7 +3,13 @@
 #   1. elapsed prefixes divided by 8 so the case runs in ~1 min instead of ~8;
 #   2. `up=` divided by 8 TOO, because it is a DEVICE-reported duration that lives in the
 #      payload and does not scale with the replay. Omitting this produced a false F=NO — the
-#      auditor's own near-miss, and the reason rule 5 exists in this file's header.
+#      auditor's own near-miss, and the reason rule 4 exists in the suite header.
+#      ALL SIX values were scaled: 120→15, 137→17, 180→22, 240→30, 300→37, and the pre-OTA
+#      baseline 6360→795. That last one LOOKS raw next to the others because the board had ~106
+#      minutes of uptime before the OTA; it is stated here so a reader can check the claim
+#      without doing the division, and so nobody 're-scales' an already-scaled value. (An
+#      auditor read 795 as unscaled and filed it — the declaration was true but not checkable
+#      at a glance, which in this file counts as a defect in the declaration.)
 # `tage=` is left unscaled: nothing here reads it, and changing more than necessary would cost
 # the property that makes this fixture valuable — that the fleet, not us, produced the fields.
 @0	1	smol/50/diag	DIAG|slot=0|rst=sw|boot=14|ota=confirmed|up=795|heap=42052|hmin=27228|btn=0|btnl=0|fok=93|ffl=1|vok=0|vfl=0|loss=0|rtt=0|rx=0|tx=0|led=status:on|tage=1027|tsrc=mesh|net=0:ok|brk=baked|otah=slot|fwd=477|dedup=459|ttl=0|cut=139
