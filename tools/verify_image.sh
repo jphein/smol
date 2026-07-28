@@ -60,9 +60,36 @@ build_once "$WORK/t1" "$WORK/a.bin"
 SIZE="$(stat -c%s "$WORK/a.bin")"; SHA="$(sha256sum "$WORK/a.bin" | cut -d' ' -f1)"
 
 # Reproducibility self-check: no absolute build path may survive in the shipped image.
-if strings "$WORK/a.bin" | grep -qE '/home/|/Users/|\.cargo/registry|/rustlib/'; then
+#
+# ⚠️ 2026-07-28: this was `if strings … | grep -qE …; then`, which is the
+# EPIPE-under-pipefail hazard. `grep -q` exits 0 the instant it matches; `strings`
+# keeps writing into a closed pipe and takes EPIPE; `set -o pipefail` (line 3)
+# surfaces the WRITER's status, so a successful detection can report non-zero and the
+# `if` goes FALSE — converting "found a leak" into "nothing found". Measured
+# elsewhere in this repo at ~0.2% below the 64 KB pipe buffer and GUARANTEED above it.
+#
+# HONEST SCOPE, because the distinction matters: `strings` on a fleet image emits
+# ~89.7 KB (1.37x the buffer), so the hazard is REACHABLE here — but I did NOT
+# reproduce it firing at this call site; on the image I tested, the old form detected
+# correctly. So this is a latent hazard removed, not an observed failure fixed. Do not
+# cite it as evidence the guard was broken.
+#
+# SEPARATE REAL ISSUE, found while testing: the pattern matches the REMAP TARGET, not
+# just host paths — a correctly-remapped image yields hits like
+# `/rust/lib/rustlib/src/rust/library/core/…` because the alternation includes
+# `/rustlib/`. So this guard WARNs on images that are fine, and a warning that fires
+# on correct output is a warning people learn to ignore. Narrow the pattern to host
+# prefixes (or exclude the remap root) before trusting its silence.
+#
+# Fixed by letting grep DRAIN the stream and testing its output instead of a pipeline
+# status. Also removes the duplicate `strings` pass, so the warning prints the same
+# bytes the decision was made on rather than a second, independently-collected set.
+leaked="$(strings "$WORK/a.bin" \
+  | grep -oE '(/home/|/Users/)[^ ]*|[^ ]*\.cargo/registry[^ ]*|[^ ]*/rustlib/[^ ]*' \
+  | sort -u || true)"
+if [ -n "$leaked" ]; then
   echo "WARN: absolute build paths still present in the image — remap incomplete:" >&2
-  strings "$WORK/a.bin" | grep -oE '(/home/|/Users/)[^ ]*|[^ ]*\.cargo/registry[^ ]*|[^ ]*/rustlib/[^ ]*' | sort -u | head -5 >&2
+  printf '%s\n' "$leaked" | head -5 >&2
 fi
 
 if [ "$TWICE" = 1 ]; then
