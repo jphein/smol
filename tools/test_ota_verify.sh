@@ -152,6 +152,34 @@ run deathpoint_retained_ghost 8 907 6
 hasnt "a retained frozen offset is not a death-point" "[FAIL"
 has   "and says why"              "ghost of an earlier attempt"
 
+echo
+echo "═══ TIME AXIS · a stall is a RETRY, not a death ═══"
+echo "     A real 907 install on id8 SUCCEEDED and this harness reported FAIL DEATH-POINT: it broke"
+echo "     out of a 600 s window at ~60 s and never saw the PASS that landed 3.5 min later. The stall"
+echo "     reading was right; treating a stall as TERMINAL was wrong. No failure ends the run now."
+run retry_restart_then_pass 8 907 14
+verdict_is PASS; rc_is 0
+has  "a stall then a restart still PASSes" "over the air"
+has  "restart from 0 is not corruption"    "monotonic=yes"
+has  "the restart is counted"              "restarts from a lower offset=1"
+has  "the stall episode is on the record"  "stall episodes=1"
+run stall_no_retry_is_death 8 907 8
+verdict_is FAIL; rc_is 1
+has  "a stall with NO retry signal is a death" "NO live retry signal"
+has  "and says it was not terminal to the run" "NOT terminal to this run"
+run stall_with_retry_not_death 8 907 8
+verdict_is UNPROVEN; rc_is 1
+hasnt "a retrying transfer is NOT a death-point" "] DEATH-POINT  offset frozen"
+has   "prefers the board's own signal"           "the board has NOT given up"
+has   "tells the operator to extend the window"  "Re-run with a longer window"
+run total_change_resets_hwm 8 907 6
+has   "a changed total resets the HWM"  "live progress HWM 100000/1440528"
+has   "and is counted as a new image"   "images seen=2"
+hasnt "no HWM carried across images"    "HWM 1277952"
+run midstream_regression 8 907 6
+has   "a regression with no retry is still flagged" "monotonic=NO"
+hasnt "and is not excused as a restart"             "restarts from a lower offset=1"
+
 printf '\n════════════════════════════════════════════\n'
 printf '  %d passed · %d failed\n' "$pass" "$fail"
 printf '════════════════════════════════════════════\n'
