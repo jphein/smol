@@ -199,7 +199,7 @@ the mesh converges and stops. Predicate: `should_adopt(mine, peer) = peer > mine
 A TIME frame also counts as `Detected`.
 **Flag.** espnow. **Status.** 🟢 **hardware-verified — 2-board adoption verified
 2026-07-07.** Built clean (`cargo` + `clippy -D warnings`, all 3 builds) and flashed;
-id 8 *Eldritch Nexus* (started at `synced_at = 0`) **adopted** id 7's exact
+id 8 (then *Eldritch Nexus*; renamed *Eldritch Jewel* on 2026-07-28) started at `synced_at = 0` and **adopted** id 7's exact
 `synced_at = 1783467581` over ESP-NOW, then **re-converged** when id 7's stamp
 advanced on reboot (…8465). Zero panics. (Committed in `76b19e4`.)
 **Security.** Unauthenticated → a forged far-future `synced_at` hijacks every clock

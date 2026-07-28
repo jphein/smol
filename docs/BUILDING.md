@@ -93,16 +93,43 @@ Feature tiers: default = Clock + Snake · `--features wifi` = + NTP · `--featur
 ## Multi-board / ESP-NOW mesh
 Give each board a **distinct peer id**. ⚠️ **This is no longer a source literal.** It used to be an argument to `mode::start(...)` in `main.rs`; identity now lives in a **runtime NVS record** (`main.rs` passes `node_id()`), which is what lets **one image serve the whole fleet** and is why OTA never touches identity. Set it per board in the git-ignored `src/board.rs` (`cp src/board.rs.example src/board.rs`), or provision it on-device. Distinct ids let the blue-LED handshake and the Bench link stats work between boards (same id can be filtered as self-echo). Boards auto-pair over ESP-NOW on the AP's channel; watch the blue LED go slow-blink (detected) → solid (connected).
 
-Each id maps to a deterministic **magical name** (via realm-sigil). The mapping is pure and derivable —
-`name_for_id()` in `src/net/names.rs`: `adj = FANTASY.adjectives[seed % 20]`,
-`noun = FANTASY.nouns[(seed >> 8) % 20]`, `seed = id * 2_654_435_761`. So:
+Each id maps to a deterministic **magical name**. Since `8e47325` the corpus comes from
+**lexicon's `fleet` group** through the realm-sigil Rust binding — not a hand-copied table — and the
+mapping is `adj = fleet.adjectives[seed % 32]`, `noun = fleet.nouns[(seed >> 8) % 32]`,
+`seed = id * 2_654_435_761`.
 
 | id | name | | id | name |
 |---|---|---|---|---|
-| 5 | Spectral **Aegis** | | 50 | Kindled **Ember** |
-| 7 | Draconic **Dominion** | | 51 | Primal **Sigil** |
-| 8 | Eldritch **Nexus** | | 122 | Celestial **Crown** |
-| 9 | Jade **Herald** | | 13 | Fabled **Relic** |
+| 5 | Obsidian **Aegis** | | 51 | Ashen **Vigil** |
+| 8 | Eldritch **Jewel** | | 122 | Somber **Vigil** |
+| 9 | Seraphic **Dominion** | | 236 | Hollow **Lantern** |
+| 42 | Gilded **Quartz** | | 50 | Mystic **Chalice** |
+
+**Uniqueness is now a compile-time guarantee, not a hope:** `is_injective_over_u8` enumerates all 256
+ids during **const evaluation**, so a colliding namespace **does not compile**. The 32×32 size lock and
+the reserved-word exclusion are const assertions too. Full reasoning:
+[lexicon's node-identity design](https://github.com/jphein/lexicon.realm.watch) →
+`docs/superpowers/design/node-identity-namespace.md`.
+
+> ⚠️ **These names changed on 2026-07-28 and the old ones are wrong.** Previously id7 *Draconic
+> Dominion*, id8 *Eldritch Nexus*, id9 *Jade Herald*, id50 *Kindled Ember*, id51 *Primal Sigil*,
+> id122 *Celestial Crown*. The old corpus was 20×20 and could not produce unique names — **93
+> collisions across 256 ids** — and six of its nouns were project vocabulary (`crown` is the gateway
+> **role**; `beacon` is a **wire frame**; `forge` is the **version-name** realm). Expanding the corpus
+> re-maps every id, because indices are `% len`; that is a one-time cost paid deliberately with
+> headroom rather than repeatedly.
+>
+> **`Eldritch Nexus` is the dangerous stale one** — id8's *adjective* is still `Eldritch` and only the
+> noun changed to `Jewel`, so the old name looks plausible instead of obviously wrong. It is the one
+> that survives a proofread.
+
+> 🔴 **Only IDENTITY moved to lexicon. Two other namespaces stay pinned inside smol, deliberately:**
+> - **Version** names keep the pinned **20×20 forge** table. Upstream's `forge` realm is a
+>   *non-superset* 14/14, so adopting it would rename **every past build** — v345 would stop being
+>   "Riveted Furnace" — and version names are **historical record**.
+> - **Creature** names (the Familiar) keep the pinned `fantasy` corpus.
+>
+> So *"smol sources its names from lexicon"* is **half true** and worth not writing.
 
 The name is that board's identity in the mesh: it shows on peers' World-Snake screens and the
 leaderboard.
@@ -137,7 +164,7 @@ calls its elected gateway "the crown", so a log line mentioning *Crown* may be a
 
 ### "Which board am I holding?" — identify by name / MAC, not the port
 With several identical boards on the bench, don't trust the `ttyACMx` number (it's not stable, and a keyboard can squat a low one — see the espflash gotchas above). Instead:
-- **On-screen:** the board prints its name at boot (`smol: I am Draconic Dominion (id 7)`) and shows it in the mesh UI — read the OLED to know which physical unit you're holding.
+- **On-screen:** the board prints its name at boot (`smol: I am Eldritch Jewel (id 8)`) and shows it in the mesh UI — read the OLED to know which physical unit you're holding.
 - **By USB vendor/MAC:** Espressif boards are `303a:…` (`lsusb`); pin the exact unit by MAC (`espflash board-info`, `udevadm info /dev/ttyACM* | grep -i serial`, or the boot log). Keep an id ↔ MAC ↔ name map for your fleet. **Historical, verified 2026-07 *before* the Phase-2 re-provisioning** (§above): `ac:a7:04:b9:77:14` was id 7 *Draconic Dominion* (then the WiFi/NTP root), `ac:a7:04:ba:1f:24` = id 8 *Eldritch Nexus*, `10:00:3b:ce:95:cc` was id 9 *Jade Herald*. **The MACs are still those boards; the ids on two of them are not** — the first and third now answer as id50/id51. This is exactly why the map is worth keeping *per-MAC*: the MAC is the board, the id is a setting.
 - **Final-flash flow:** confirm the target unit by MAC/`board-info` first, flash with its intended id (via `src/board.rs` / on-device provisioning — **not** the retired `mode::start(…, <id>, …)` literal), then watch the boot log echo the expected name — that name+id on the OLED is your confirmation you flashed the right physical board.
 

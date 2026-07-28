@@ -13,7 +13,10 @@ exercised on hardware · ⚪ design only.
 [`rust/clock/version.txt`](../rust/clock/version.txt) (`345`, set by release commit `315b5c8`),
 *not* `git rev-list --count HEAD` — that is only build.rs's fallback when neither the file nor
 `SMOL_BUILD_NUMBER` is set. The sigil word is derivable: `version_name_for()` in
-`rust/clock/src/net/names.rs` maps `noun = FORGE.nouns[n % 20]`, `adj = FORGE.adjectives[(n / 20) % 20]`,
+`rust/clock/src/net/names.rs` maps `noun = FORGE.nouns[n % 20]`, `adj = FORGE.adjectives[(n / 20) % 20]`
+(⚠️ **20, not 32 — do not "fix" this.** The forge/**version** table stays pinned at 20×20 inside smol;
+only *node identity* moved to lexicon's 32×32 `fleet` group. Upstream's `forge` is a non-superset 14/14,
+so adopting it would rename **every past build** — and version names are historical record),
 so `345 → ("Riveted", "Furnace")`. **A build number and a sigil word that don't satisfy that
 formula are a bug in this document** — check them together.
 

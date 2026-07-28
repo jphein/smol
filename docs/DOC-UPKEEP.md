@@ -216,8 +216,15 @@ boards were fine under different ids.
 
 Ask instead: **is anything broadcasting under this id right now?** (See §3, *shortest-chain signal*.)
 And remember the corollary from [BUILDING.md](BUILDING.md): **a name mapping is a pure function; an
-id↔board assignment is a setting.** `id 7 = Draconic Dominion` is permanently true and says nothing
+id↔board assignment is a setting.** `id 8 = Eldritch Jewel` is true **for a given corpus** and says nothing
 about whether a board is on the bench.
+
+> 📌 **This rule's own example expired, which sharpens it.** It used to read *"`id 7 = Draconic
+> Dominion` is **permanently** true."* On 2026-07-28 the corpus was expanded 20×20 → 32×32 and **every id
+> re-mapped**, because the indices are `% len`. So the mapping is a pure function **of the corpus**, not
+> of the id — **three layers, not two: id → (corpus) → name → board.** A "pure function" is only as
+> permanent as its inputs, and a document calling a derived value permanent has quietly promoted an input
+> to a constant.
 
 ### ⚠️ Retirements are the blind spot
 
