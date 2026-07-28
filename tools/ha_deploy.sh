@@ -69,6 +69,31 @@ ha_api() { # $1 method, $2 path, $3 body(optional) -> prints body, returns curl'
        ${3:+-d "$3"} "$HA_URL$2"
 }
 
+reload_signature() { # $1 yaml file -> sorted set of REGISTERABLE entity keys; non-zero if unparseable
+  # What `automation.reload` cannot create: helpers (`input_*` children) and anything carrying a
+  # `unique_id` (mqtt/template entities). Comparing this set between the outgoing file and the
+  # live one answers the only question that matters — "does this change ADD or REMOVE an entity?"
+  # — structurally, from the parsed documents, rather than by pattern-matching a diff.
+  python3 - "$1" <<'PY'
+import sys, yaml
+def walk(o, out):
+    if isinstance(o, dict):
+        u = o.get("unique_id")
+        if isinstance(u, str): out.add("uid:" + u)
+        for v in o.values(): walk(v, out)
+    elif isinstance(o, list):
+        for v in o: walk(v, out)
+d = yaml.safe_load(open(sys.argv[1])) or {}
+out = set()
+if isinstance(d, dict):
+    for dom, body in d.items():
+        if isinstance(dom, str) and dom.startswith("input_") and isinstance(body, dict):
+            out |= {f"{dom}.{k}" for k in body}
+walk(d, out)
+print("\n".join(sorted(out)))
+PY
+}
+
 packages() { # repo package basenames, sorted
   find "$LOCAL_DIR" -maxdepth 1 -name '*.yaml' -printf '%f\n' | sort
 }
@@ -218,6 +243,7 @@ cmd_pull() {
 #   push --from-worktree      deploy uncommitted state on purpose (named first)
 #   push --dry-run            as before; combines with the above
 PUSH_SCRIPT_REL="tools/ha_deploy.sh"
+PUSH_UNATTRIBUTABLE=0   # set by push_unshipped when live matches no committed blob
 
 GIT_ERR=""   # global so `set -u` can never trip on it — see the subshell trap below
 
@@ -232,8 +258,34 @@ git_or_die() { # $@ git args -> stdout; returns 1 on failure
   printf '%s' "$out"
 }
 
-push_provenance() { # $1 basename -> "abc1234 3 hours ago · subject"
-  git_or_die log -1 --format='%h %ar · %s' -- "ha/packages/$1" || echo "(no commit found)"
+push_unshipped() { # $1 basename, $2 path to the fetched LIVE copy -> the commits not yet live
+  # morpheus-yaml's design, and strictly better than the `git log -1` this replaces. The newest
+  # commit touching a file may already BE live, and if several commits are unshipped it hides all
+  # but one — so the old line could name a change that was not in the envelope while omitting the
+  # ones that were. Here: hash the live copy, then walk this path's history comparing each
+  # commit's blob for that path. The first blob that matches IS the live baseline; everything
+  # after it is what this push would actually send.
+  local f="$1" live="$2" livehash
+  livehash="$(git -C "$REPO_DIR" hash-object "$live" 2>/dev/null)" || { echo "    (cannot hash live copy)"; return; }
+  local shas; shas="$(git -C "$REPO_DIR" log --format=%H -- "ha/packages/$f" 2>/dev/null)" || true
+  [ -n "$shas" ] || { echo "    (no commit history for $f)"; return; }
+  local found="" out=""
+  while read -r sha; do
+    [ -n "$sha" ] || continue
+    local blob; blob="$(git -C "$REPO_DIR" rev-parse "$sha:ha/packages/$f" 2>/dev/null)" || blob=""
+    if [ "$blob" = "$livehash" ]; then found=1; break; fi
+    out+="      $(git -C "$REPO_DIR" log -1 --format='%h %s' "$sha")"$'\n'
+  done <<< "$shas"
+  if [ -z "$found" ]; then
+    # FAIL CLOSED. Live matches no committed blob, so it was hand-edited on the VM — which has
+    # happened here (smol_mesh.yaml was once 17.5 KB ahead of the repo). We cannot say what this
+    # push would overwrite, and an unattributable batch is the one that most deserves a human.
+    PUSH_UNATTRIBUTABLE=1
+    echo "      !! cannot attribute — live matches no committed version of this file."
+    echo "         It was edited on the VM; a push OVERWRITES those edits. \`pull\` first to see them."
+    return
+  fi
+  [ -n "$out" ] && printf '%s' "$out" || echo "      (live is at HEAD for this file)"
 }
 
 # --- push (repo -> live) -------------------------------------------------------------------
@@ -285,7 +337,13 @@ cmd_push() {
   local -a candidates=(); [ ${#scope[@]} -gt 0 ] && candidates=("${scope[@]}") || readarray -t candidates < <(packages)
   for f in "${candidates[@]}"; do
     if [ "$from_worktree" -eq 1 ]; then cp "$LOCAL_DIR/$f" "$SRC/$f"; continue; fi
-    if ! git_or_die show "HEAD:ha/packages/$f" > "$SRC/$f"; then
+    # Redirect git DIRECTLY to the file. Routing it through git_or_die means a command
+    # substitution, and `$( )` STRIPS TRAILING NEWLINES — so every package arrived one byte short
+    # of its committed self. Effect: every file always looked changed, and a push would have
+    # written a file with no final newline to the VM on every run. Caught because push_unshipped
+    # (which hashes the real blob) said "live is at HEAD" while `cmp` insisted it differed; two
+    # components disagreeing is what made a silent byte-level bug visible.
+    if ! git -C "$REPO_DIR" show "HEAD:ha/packages/$f" > "$SRC/$f" 2>/dev/null; then
       note "$f: not in HEAD (new/uncommitted) — skipped; --from-worktree to push it anyway"
       rm -f "$SRC/$f"
     fi
@@ -311,10 +369,31 @@ cmd_push() {
     # `smol_8_bard_font:` under an existing `input_select:` picked automation.reload, which does
     # not register new entities, and the control silently did not appear (caught by JP asking
     # where it was). So: reload_all unless EVERY changed line is inside the automation block.
-    if grep -qE '^[<>]' "$tmp/$f.diff" \
-       && ! grep -qE '^[<>].*(input_[a-z]+:|unique_id:|state_topic:|mqtt:|template:|^[<>]  [a-z0-9_]+:)' "$tmp/$f.diff" \
+    # THE ENTITY-SET TEST comes first, and it is structural. The grep below could not answer this
+    # and its author thought it could: the alternative meant to catch a new child key,
+    # `^[<>]  [a-z0-9_]+:`, sits after `.*` in the same pattern, and in ERE a `^` there can never
+    # match. It was DEAD from the day it was written, under a comment describing the case it
+    # fails to catch. So adding four `input_*` helpers under sections that already existed chose
+    # `automation.reload`, check_config passed, the deploy reported SUCCESS — and none of the
+    # four helpers existed (luna, 2026-07-28). A reload that cannot create what was asked for,
+    # reporting success, is the worst failure this script can have.
+    #
+    # Comparing the parsed ENTITY SETS cannot have that bug, because it never looks at text.
+    local sig_new sig_live
+    if ! sig_new="$(reload_signature "$SRC/$f" 2>/dev/null)" \
+       || ! sig_live="$(reload_signature "$tmp/$f" 2>/dev/null)"; then
+      note "$f: cannot parse one side's entity set — choosing reload_all (fail safe)"
+      needs_full=1
+    elif [ "$sig_new" != "$sig_live" ]; then
+      # Say WHICH, because a silent choice is how this went unnoticed for a whole deploy.
+      local added removed
+      added="$(comm -13 <(printf '%s\n' "$sig_live") <(printf '%s\n' "$sig_new") | tr '\n' ' ')"
+      removed="$(comm -23 <(printf '%s\n' "$sig_live") <(printf '%s\n' "$sig_new") | tr '\n' ' ')"
+      note "$f: entity set changes → reload_all${added:+ · adds: $added}${removed:+ · removes: $removed}"
+      needs_full=1
+    elif grep -qE '^[<>]' "$tmp/$f.diff" \
        && grep -qE '^[<>].*(alias:|trigger:|action:|service:|condition:|mode: (single|parallel|queued|restart))' "$tmp/$f.diff"; then
-      : # automations only — automation.reload is sufficient
+      : # same entities, automation bodies changed — automation.reload is genuinely sufficient
     else
       needs_full=1
     fi
@@ -329,8 +408,19 @@ cmd_push() {
   # commit SUBJECT can, because you recognise your own work. Say what is knowable, not what
   # would merely look authoritative.
   echo
-  echo "  would push ${#changed[@]} package(s):"
-  for f in "${changed[@]}"; do printf '    %-22s %s\n' "$f" "$(push_provenance "$f")"; done
+  echo "  would push ${#changed[@]} package(s) · unshipped commits per file:"
+  PUSH_UNATTRIBUTABLE=0
+  for f in "${changed[@]}"; do
+    echo "    $f"
+    push_unshipped "$f" "$tmp/$f"
+  done
+  if [ "$PUSH_UNATTRIBUTABLE" -eq 1 ] && [ "$all" -eq 0 ]; then
+    echo
+    echo "  REFUSED · at least one file above cannot be attributed: live does not match any" >&2
+    echo "  committed version, so a push would silently overwrite edits made on the VM." >&2
+    echo "  Run \`pull\` to capture them, or --all if you have decided to discard them." >&2
+    return 4
+  fi
   if [ ${#scope[@]} -eq 0 ] && [ ${#changed[@]} -gt 1 ] && [ "$all" -eq 0 ]; then
     echo
     echo "  REFUSED · an unscoped push would send all ${#changed[@]} of the above in one batch," >&2
