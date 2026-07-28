@@ -56,13 +56,21 @@ formula are a bug in this document** — check them together.
 
 > ### ⚠️ DRAM budget — read this before adding any static buffer (post-#300)
 > The Bard put a 260K-param model on the fleet image, and DRAM is now the binding constraint on
-> the canonical tier (`espnow,cast,io,bard`). Current geometry: `.bss` **195,224 B** · `.stack`
-> **76,128 B** · esp-wifi heap **96 KiB** (low-watermark 24,136 B free) · measured stack peak
-> **54,960 B**.
+> the canonical tier (`espnow,cast,io,bard`). Geometry **re-measured from linker output 2026-07-28**
+> (`readelf -SW`, release ELF, `_stack_start − _stack_end`): `.bss` **195,296 B** · `.data`
+> **14,452 B** · `.stack` **75,960 B** · esp-wifi heap **96 KiB** (low-watermark 24,136 B free) ·
+> measured stack peak **54,960 B**.
 >
 > **`tools/repro_build.sh` now hard-fails a release build when the stack region drops below
-> 73,728 B** — so there is only **~2,400 B of slack** before a new static allocation *breaks the
-> build*, not the board. This is deliberate: the pre-gate image linked clean with 2,592 B of
+> 73,728 B** — so there is only **2,232 B of slack** before a new static allocation *breaks the
+> build*, not the board.
+>
+> > 📌 **Corrected 2026-07-28 — this block previously disagreed with itself, and BOTH figures were
+> > wrong.** It said `.stack` **76,128 B** (stale by 168 B) while its prose said the slack was
+> > *"~2,280 B"* and the header said *"~2,400 B"* — three numbers for one quantity. The measured truth
+> > is `.stack` **75,960 B** → **2,232 B**, which is *below* all three, so every previous estimate was
+> > optimistic. `.bss` was 72 B stale too. **Take the slack from `readelf`, never from this paragraph:**
+> > `readelf -sW <elf> | awk '$8=="_stack_start"||$8=="_stack_end"'`, exactly as the gate does. This is deliberate: the pre-gate image linked clean with 2,592 B of
 > stack and would have died on hardware (see the #300 spec amendments). Do **not** raise the floor
 > to make a build pass — it is derived from a measurement (peak × 4/3).
 >
@@ -71,6 +79,24 @@ formula are a bug in this document** — check them together.
 > `net::init_heap` (re-run #140's audit first), the **RX-buffer tuning** in `.cargo/config.toml`.
 > Re-measure with `--features stack-paint` under live radio — idle numbers are meaningless.
 > **#198/#233 (C6, 512 KB SRAM) dissolves the whole problem.**
+>
+> > 🔴 **But on the C3, Embassy is a DRAM CONSUMER, not a relief — and it does not currently fit.**
+> > Measured 2026-07-28 from the `dream/feat-embassy` release ELF (`espnow,cast,io`, **no bard**):
+> > `.bss` **213,200 B** (**+17,904 B** vs `main`-with-bard) · `.stack` **56,888 B** — i.e.
+> > **16,840 B BELOW the 73,728 B floor, before the Bard is added back at all.**
+> >
+> > **Consequence for the lever list above: `SEQ_CAP` cannot close this.** Its entire range is
+> > ~11.5 KB (80→48) against a **≥16,840 B** shortfall — short by ≥5,340 B *even spent in full, even
+> > before the Bard returns*. So the DRAM must come from `embassy-net`'s socket buffers, the RX-buffer
+> > tuning, or the wifi heap — or from the C6. **Do not frame this as a Bard-vs-async trade; the Bard
+> > lever is too small to be the answer.**
+> >
+> > ⚠️ Fair caveat: the 73,728 B floor is derived from the **bard** image's peak (54,856 × 4/3), so it
+> > is over-strict for a no-bard build *as it stands*. It is the right floor **post-rebase**, when the
+> > image will have the Bard — and `.stack` can only fall further from 56,888 B then. **The shortfall
+> > is a lower bound.** The one number still missing is `main` **without** bard, which would isolate
+> > the Bard's own `.bss` from Embassy's; that is one cheap build and it is Phase R's first task
+> > ([the plan](superpowers/plans/embassy-ota-verification.md) §0c).
 >
 > **`SEQ_CAP` is cheaper than it was (#302, 2026-07-27):** it no longer caps a STORY at all, only
 > how far back the model can remember. The KV cache is a ring and the Bard narrates endlessly, so

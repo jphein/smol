@@ -26,14 +26,19 @@ bench.** Detail in §6.
 > - `grep -c bard` on the branch's `main.rs` = **0**. All **2,982 lines** of `src/bard/` show as deleted
 >   in `main → branch`. The branch is dated **2026-07-22**; the Bard shipped **07-26/27**.
 > - So the verified *"compiles clean in 30.12 s"* was a tree **without** the Bard. **The branch and the
->   Bard have never been compiled together** — and per [ROADMAP §2](../../ROADMAP.md) `main` has only
->   **~2,300 B of stack slack** before `tools/repro_build.sh` hard-fails, while Embassy adds three task
->   stacks plus `embassy-net` socket buffers, in kilobytes. **Expect the rebase to break the stack-floor
->   gate.** It fails closed (good). **Levers in order: `embassy-net`/RX buffers first — the cost Embassy
->   itself added — then the esp-wifi heap, and `SEQ_CAP` only last, with JP's sign-off.** Note `SEQ_CAP`
->   is **not** story length since #302: it is how far back the Bard *remembers*, not how long a tale runs.
->   **The rebase's deliverable is a measured `.bss`/`.stack` delta**, not a green build — procedure in
->   [the plan](../plans/embassy-ota-verification.md) §0c.
+>   Bard have never been compiled together — and MEASURED 2026-07-28, they do not currently fit.**
+>   From real linker output: `main`+bard `.stack` = **75,960 B** (**+2,232 B** over the 73,728 B floor);
+>   branch **without** bard `.stack` = **56,888 B** — 🔴 **16,840 B BELOW the floor**, `.bss` **+17,904 B**.
+>   **The branch already fails the gate before the Bard is added back.**
+> - **And that retires the `SEQ_CAP` question rather than pricing it.** Its whole range is ~11.5 KB
+>   against a **≥16,840 B** shortfall — short by ≥5,340 B spent in full. **There is no Bard-vs-async
+>   trade to put to JP:** the Bard lever cannot buy async at any setting. The DRAM must come from
+>   `embassy-net`'s buffers / RX tuning / the wifi heap — **or from the C6.**
+>   *(For the record, since it was mispriced before it was found insufficient: since #302 `SEQ_CAP` caps
+>   how far back the Bard **remembers**, never the length of a tale.)*
+> - **The rebase's deliverable is a measured `.bss`/`.stack` delta**, not a green build, and its first
+>   task is the one endpoint still missing — `main` **without** bard, to separate the Bard's `.bss` from
+>   Embassy's. Procedure: [the plan](../plans/embassy-ota-verification.md) §0c.
 >
 > **This reframes §5 and §6.** "Rollback of the *code* is free — the branch is not merged" is true and
 > incomplete: **merging the branch as it stands would delete the flagship feature JP shipped this week.**

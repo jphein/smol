@@ -310,16 +310,27 @@ flag was **never read at all**; it is `%r`. **Use current HEAD.**
   `embassy-net` cannot move packets without its runner, and the relay never reaches an `.await` for
   minutes — but this is **read, not observed**. It is E1's F1 and the single highest-value cheap
   measurement available.
-- **Whether the branch builds with the Bard — and this one is quantified enough to predict.** They have
-  never coexisted. [ROADMAP §2](../../ROADMAP.md) gives post-#300 geometry on `main`: `.bss`
-  **195,224 B** · `.stack` **76,128 B** · esp-wifi heap **96 KiB** · measured stack peak **54,960 B** —
-  with `tools/repro_build.sh` **hard-failing below a 76,128 → 73,728 B floor**, i.e. **~2,400 B of
-  slack.**
+- ~~**Whether the branch builds with the Bard.**~~ ✅ **MEASURED 2026-07-28 — and the answer is that it
+  does not currently fit.** From real linker output (`readelf -SW`, release ELFs, the gate's own
+  `_stack_start − _stack_end`):
 
-  Embassy adds `.bss` in *kilobytes*: three task stacks (`net_task`/`wifi_task`/`mqtt_task`) plus
-  `embassy-net`'s socket RX/TX buffers. And esp-hal **shrinks `.stack` silently as `.bss` grows**. So:
+  | | `.bss` | `.stack` | vs 73,728 B floor |
+  |---|---|---|---|
+  | `main` (`espnow,cast,io,bard`) | 195,296 B | **75,960 B** | **+2,232 B** |
+  | `dream/feat-embassy` (`espnow,cast,io`, **no bard**) | **213,200 B** | **56,888 B** | 🔴 **−16,840 B** |
 
-  > **Expect the rebase to break the stack-floor gate, not to squeeze under it.**
+  > ## The branch already misses the stack floor by 16,840 B — *without* the Bard.
+  > **`SEQ_CAP` cannot close it.** Its whole range is ~11.5 KB against a **≥16,840 B** shortfall: short
+  > by ≥5,340 B spent in full, before the Bard returns. **So there is no Bard-vs-async trade to put to
+  > JP** — the Bard lever cannot buy async at any setting. The DRAM must come from `embassy-net`'s
+  > buffers, the RX tuning, the wifi heap, **or the C6.**
+
+  Caveat: 73,728 B is derived from the *bard* image's peak (54,856 × 4/3), so it is over-strict for a
+  no-bard build as it stands — but it is the right floor **post-rebase**, and `.stack` only falls
+  further from 56,888 B when 2,982 lines of Bard return. **Treat −16,840 B as a lower bound.**
+
+  Still missing: `main` **without** bard, which would isolate the Bard's `.bss` from Embassy's. One
+  cheap build; Phase R's first task.
 
   It **fails closed** — the gate catches this at build time rather than on a board (it exists precisely
   because a pre-gate image linked clean with 2,592 B of stack and would have died on hardware).

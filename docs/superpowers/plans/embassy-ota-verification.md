@@ -132,24 +132,51 @@ is re-marked accordingly.
 
 ### The gate you will meet, with numbers
 
-[ROADMAP §2](../../ROADMAP.md) gives post-#300 geometry on `main`: `.bss` **195,224 B** · `.stack`
-**76,128 B** · esp-wifi heap **96 KiB** · measured stack peak **54,960 B**, with `tools/repro_build.sh`
-**hard-failing below 73,728 B**.
+**Measured 2026-07-28 from real linker output** (`readelf -SW`, release ELFs, `_stack_start −
+_stack_end` — the gate's own method), **not estimated**:
 
-> ⚠️ **Reconcile a ROADMAP discrepancy before quoting a slack figure.** Its own geometry gives
-> `76,128 − 73,728 = ` **2,400 B**, while its prose says the slack is *"unchanged at ~2,280 B"* — a
-> ~120 B disagreement. **Either number makes the point** (Embassy adds three task stacks plus
-> `embassy-net` socket buffers, in kilobytes), but fix the source before it is cited as precision it
-> doesn't have.
+| | `.bss` | `.data` | `.stack` | vs 73,728 B floor |
+|---|---|---|---|---|
+| **`main`** (`espnow,cast,io,bard`) | 195,296 B | 14,452 B | **75,960 B** | **+2,232 B** |
+| **`dream/feat-embassy`** (`espnow,cast,io`, **no bard**) | **213,200 B** | 8,792 B | **56,888 B** | 🔴 **−16,840 B** |
+| delta | **+17,904** | −5,660 | **−19,072** | |
 
-**Expect the gate to go red.** That is the design working — it exists precisely because a pre-gate image
-linked clean with 2,592 B of stack and would have died on hardware. **It fails closed.**
+> # 🔴 The branch already MISSES the stack floor by 16,840 B — without the Bard.
+> **So this is no longer "expect the gate to go red." It is red now**, and the Bard has yet to be added
+> back. `.stack` can only fall further from 56,888 B once 2,982 lines of Bard return.
+>
+> ### Which retires the `SEQ_CAP` question before it reaches JP
+> `SEQ_CAP`'s entire range is **~11.5 KB** (80→48). The shortfall is **≥16,840 B**. **Spent in full, it
+> is short by ≥5,340 B — before the Bard even returns.** So lever 3 is not merely *expensive*, it is
+> **insufficient**. Do not put a Bard-vs-async trade to JP: it isn't one, because the Bard lever cannot
+> buy async at any setting.
+>
+> **The DRAM has to come from levers 1-2 or from the C6.** That is now the actual question.
+
+⚠️ **Honest caveat on the floor.** 73,728 B is derived from the **bard** image's measured peak
+(54,856 × 4/3), so it is over-strict for a no-bard build *as it stands*. It is the correct floor
+**post-rebase**, when the image will have the Bard. **Treat −16,840 B as a lower bound on the
+shortfall, not as the final figure.**
+
+**The gate failing is the design working** — it exists because a pre-gate image linked clean with
+2,592 B of stack and would have died on hardware. **It fails closed.**
+
+> 📌 **ROADMAP §2 has been corrected at source** (2026-07-28). It previously carried **three different
+> numbers for one quantity** — `.stack` 76,128 B, slack *"~2,280 B"*, header *"~2,400 B"* — and **all
+> three were optimistic**; the measured slack is **2,232 B**. Take the figure from `readelf`, never from
+> prose.
 
 ### 🔑 The deliverable is a NUMBER, not a green build
 
 **Budget the `.bss` delta before rebasing, not after** (ROADMAP §2's own instruction). Phase R is not
 done when it compiles — it is done when it **reports**:
 
+- [ ] 🔴 **First, the one missing endpoint: build `main` WITHOUT bard** (`espnow,cast,io`). The table
+      above has `main`+bard and branch−bard, so **the Bard's own `.bss` is still tangled with Embassy's.**
+      This single cheap build separates them and tells you whether the +17,904 B is Embassy's true cost
+      or an artifact of the comparison. **Everything else in the lever conversation depends on it.**
+      *(Offload to `familiar` and don't run it alongside another cargo build — parallel release builds
+      balloon the cgroup page cache into a scope-wide OOM sweep.)*
 - [ ] `.bss`, `.stack`, and stack **peak** before and after, so the Embassy delta is isolated from the
       Bard's. Attribute per-source: task stacks vs `embassy-net` buffers vs everything else.
 - [ ] **Measured with `--features stack-paint` under LIVE RADIO.** ROADMAP: *"idle numbers are
