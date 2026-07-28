@@ -1252,7 +1252,27 @@ static mut MQTT_JSON: JsonScratch = JsonScratch::new();
 /// The HA device-block extras. HA merges device blocks across discovery messages sharing
 /// `identifiers`, so these need to arrive on exactly ONE of a node's configs — carrying them
 /// on all three cost 2 ⨯ 48 B of a budget that had none to spare (see [`DISCOVERY_BUDGET`]).
-#[cfg(feature = "wifi")]
+///
+/// 2026-07-28: `model` is DERIVED FROM THE TARGET, not asserted. It used to be the literal
+/// `"smol ESP32-C3"` for every consumer of this code — correct on a C3 board and a lie
+/// anywhere else. The esp32c6-watch port carries this discovery code, so both C6 watches
+/// advertised themselves as `smol ESP32-C3`, and `model` is the first field anyone checks when
+/// asking "what is this device?" It gave a confident, false answer: a registry-based
+/// identification of id122/id236 concluded they were C3 fleet nodes, twice, and the only
+/// reliable discriminator left was a DIAG format literal in another repo
+/// (`slot=ota_0` + `rst=unknown`) — ugly, and it depends on a string that repo is free to change.
+///
+/// The two chips are distinguishable at COMPILE TIME with no new dependency and no runtime cost:
+/// the C6 is `riscv32imac` (the `a` atomics extension), the C3 is `riscv32imc` (no atomics). So
+/// the label cannot drift from the silicon it describes — a wrong `model` now needs a wrong
+/// TARGET, which fails to link long before it can lie on a dashboard.
+///
+/// Deliberately not a runtime chip probe: this is a compile-time constant that must live in
+/// `.rodata` and be splice-able into the config JSON without allocation, and the target already
+/// carries the answer.
+#[cfg(all(feature = "wifi", target_feature = "a"))]
+const DEVICE_EXTRAS: &str = ",\"model\":\"smol ESP32-C6\",\"manufacturer\":\"jphein\"";
+#[cfg(all(feature = "wifi", not(target_feature = "a")))]
 const DEVICE_EXTRAS: &str = ",\"model\":\"smol ESP32-C3\",\"manufacturer\":\"jphein\"";
 
 /// Payload bytes ONE HA discovery PUBLISH can carry: the 512 B `pkt` buffer, less the PUBLISH
@@ -2917,6 +2937,22 @@ fn mqtt_session(
             // Single-caller → the &'static mut borrow is alias-safe; clear() per config.
             let json = unsafe { &mut *core::ptr::addr_of_mut!(MQTT_JSON) };
             json.clear();
+            // 2026-07-28: DO NOT ASSERT A MODEL FOR A BOARD THAT ISN'T US. This loop is
+            // `for &(id, line) in telemetry` — the gateway publishes discovery for every id whose
+            // telemetry it relays, which includes the C6 watches. Attaching our own
+            // DEVICE_EXTRAS to all of them made a C3 crown declare `model: smol ESP32-C3` for a
+            // C6 watch, and `model` is the FIRST field anyone checks when asking what a device is.
+            // It cost real time: a registry-based identification of id122/id236 concluded twice
+            // that they were C3 fleet nodes, and the only discriminator left was a DIAG format
+            // literal in another repo (`slot=ota_0` + `rst=unknown`) — which that repo is free to
+            // change. The watch publishes its OWN correct block
+            // (esp32c6-watch/src/net/mqtt_ha.rs: "model":"ESP32-C6-Touch-AMOLED-2.06"), so the
+            // relayed claim was not just wrong, it was overwriting a right answer.
+            // HA merges device blocks by `identifiers`, which is exactly why the extras ride one
+            // config in the first place — so omitting them for a relayed id is safe: the subject
+            // supplies its own if it can, and if it can't, HA shows no model. No model is honest;
+            // the wrong model is not.
+            let dev_extra = if id == crate::node_id() { dev_extra } else { "" };
             let _ = write!(
                 json,
                 // #228: device block enriched with model/manufacturer/sw_version so HA groups
