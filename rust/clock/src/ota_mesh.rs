@@ -558,7 +558,7 @@ pub fn stat_build(value: &[u8]) -> Option<u32> {
 // with otadata untouched (the good slot boots; a hard brick ⇒ USB recovery, §4).
 // ===========================================================================
 
-use esp_bootloader_esp_idf::ota::Slot;
+use esp_bootloader_esp_idf::partitions::AppPartitionSubType as Slot;
 
 /// #349: first `dbg_verdict` value reserved for a SUITABILITY refusal at finalize. The
 /// `on_meta` verdicts occupy 0-7, so the target-reject band starts here and runs

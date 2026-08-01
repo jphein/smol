@@ -29,15 +29,18 @@ extern crate alloc;
 use core::net::Ipv4Addr;
 
 use esp_hal::{
-    peripherals::{RNG, TIMG0, WIFI},
+    interrupt::software::SoftwareInterruptControl,
+    peripherals::{SW_INTERRUPT, TIMG0, WIFI},
     rng::Rng,
     time::{Duration, Instant},
     timer::timg::TimerGroup,
 };
-use esp_wifi::{
-    wifi::{ClientConfiguration, Configuration},
-    EspWifiController,
-};
+use esp_radio::wifi::{sta::StationConfig, Config};
+
+use crate::net::SmolWifiDevice;
+// #233: esp-radio 0.18's connect/disconnect are async-only; drive them to completion
+// synchronously (the esp-rtos scheduler preempts the busy loop to run the radio task).
+use embassy_futures::block_on;
 use smoltcp::{
     iface::{Interface, SocketSet, SocketStorage},
     socket::{dhcpv4, tcp, udp},
@@ -437,7 +440,10 @@ pub(crate) const RELAY_FLUSH_BUDGET: Duration = Duration::from_secs(15); // read
 
 pub struct WifiPeripherals {
     pub timg0: TIMG0<'static>,
-    pub rng: RNG<'static>,
+    // #233: esp-radio 0.18's scheduler (esp-rtos) needs SW_INTERRUPT.software_interrupt0
+    // for context switches. The RNG peripheral is no longer threaded in — esp-hal 1.1's
+    // `Rng::new()` is arg-less and esp-radio pulls entropy internally.
+    pub sw_int: SW_INTERRUPT<'static>,
     pub wifi: WIFI<'static>,
 }
 
@@ -450,7 +456,7 @@ fn smoltcp_now() -> smoltcp::time::Instant {
 
 /// Build a smoltcp `Interface` bound to the WiFi STA device (verbatim from the
 /// esp-wifi `wifi_dhcp` example's `create_interface`).
-fn create_interface(device: &mut esp_wifi::wifi::WifiDevice) -> Interface {
+fn create_interface(device: &mut SmolWifiDevice) -> Interface {
     Interface::new(
         smoltcp::iface::Config::new(HardwareAddress::Ethernet(EthernetAddress::from_bytes(
             &device.mac_address(),
@@ -473,19 +479,20 @@ pub fn try_time_sync(
 ) -> Option<u32> {
     super::init_heap();
 
-    // --- Radio init ------------------------------------------------------
+    // --- Radio init (#233: esp-radio 0.18 + esp-rtos scheduler) ----------
     let timg0 = TimerGroup::new(p.timg0);
-    // `Rng` is a `Copy` handle; keep our own copy for the SNTP port seed.
-    let rng = Rng::new(p.rng);
-    let esp_wifi_ctrl: EspWifiController<'static> =
-        esp_wifi::init(timg0.timer0, rng).ok()?;
-    // Leak the controller so its borrow lives 'static for the rest of the
-    // burst; the device is dropped when we return, which stops WiFi cleanly.
-    let esp_wifi_ctrl: &'static EspWifiController<'static> =
-        alloc::boxed::Box::leak(alloc::boxed::Box::new(esp_wifi_ctrl));
-
-    let (mut controller, interfaces) = esp_wifi::wifi::new(esp_wifi_ctrl, p.wifi).ok()?;
-    let mut device = interfaces.sta;
+    let sw = SoftwareInterruptControl::new(p.sw_int);
+    // esp-radio's os-adapter needs the esp-rtos scheduler running BEFORE wifi::new.
+    // NON-embassy: start() converts THIS context into the pinned main task and returns,
+    // so the blocking superloop below runs unchanged while the radio task preempts in.
+    esp_rtos::start(timg0.timer0, sw.software_interrupt0);
+    // `Rng` is a `Copy` handle; keep our own copy for the SNTP source-port seed.
+    let rng = Rng::new();
+    // In 0.18 the WIFI peripheral is 'static, so wifi::new returns an owned 'static
+    // controller + interfaces — no more EspWifiController Box::leak.
+    let (mut controller, interfaces) =
+        esp_radio::wifi::new(p.wifi, super::radio_controller_config()).ok()?;
+    let mut device = SmolWifiDevice::new(interfaces.station);
 
     // Phase-2 (wifi-only) build has no status LED, so the tick is a no-op.
     // wifi-only build has no relay/gateway role, so the reached-DHCP flag is unused.
@@ -643,7 +650,7 @@ impl NtpMachine {
     /// Build the hoisted smoltcp stack (DHCP + UDP/SNTP + TCP/MQTT sockets over the
     /// module `static mut` buffers) and start in `Assoc`. `sntp_src_port` is the
     /// caller's RNG-seeded ephemeral port for the SNTP request.
-    fn new(device: &mut esp_wifi::wifi::WifiDevice, sntp_src_port: u16) -> Self {
+    fn new(device: &mut SmolWifiDevice, sntp_src_port: u16) -> Self {
         let iface = create_interface(device);
 
         // SAFETY: F2 precedent — boot-only, single-caller, main-thread, never re-entered
@@ -706,8 +713,8 @@ impl NtpMachine {
     /// `BURST_POLL_BUDGET` of continuous progress.
     fn poll(
         &mut self,
-        controller: &mut esp_wifi::wifi::WifiController<'static>,
-        device: &mut esp_wifi::wifi::WifiDevice<'static>,
+        controller: &mut esp_radio::wifi::WifiController<'static>,
+        device: &mut SmolWifiDevice,
     ) -> NtpPoll {
         let poll_start = Instant::now();
         loop {
@@ -732,14 +739,14 @@ impl NtpMachine {
     /// reconfigure, not pumpable — design §2) runs once per attempt; then we poll
     /// `is_connected()`. Returns whether the phase advanced this step (`false` = still
     /// waiting → yield).
-    fn step_assoc(&mut self, controller: &mut esp_wifi::wifi::WifiController<'static>) -> bool {
+    fn step_assoc(&mut self, controller: &mut esp_radio::wifi::WifiController<'static>) -> bool {
         let net = &crate::secrets::WIFI_NETWORK;
         // #192: an ALREADY-associated caller (the periodic NTP re-sync burst on a coexist
         // gateway) skips the disconnect/reconfigure/connect FFI — issuing it would TEAR a live
         // coexist association (mesh-deaf + re-election churn) for no reason. Go straight to DHCP.
         // Boot is NOT yet connected here, so the boot burst still runs the full setup below →
         // boot behaviour is byte-identical.
-        if !self.assoc_configured && matches!(controller.is_connected(), Ok(true)) {
+        if !self.assoc_configured && controller.is_connected() {
             self.assoc_configured = true;
             self.deadline = Instant::now() + SYNC_BUDGET; // shared DHCP+SNTP budget
             self.phase = NtpPhase::Dhcp;
@@ -747,19 +754,23 @@ impl NtpMachine {
         }
         if !self.assoc_configured {
             // Drop any prior association before reconfiguring (harmless if not connected).
-            let _ = controller.disconnect();
+            let _ = block_on(controller.disconnect_async());
+            // #233: esp-radio 0.18's StationConfig has private fields — build via BuilderLite.
+            #[allow(unused_mut)]
+            let mut sta_cfg = StationConfig::default()
+                .with_ssid(net.ssid)
+                .with_password(net.pass.into());
+            // COEXIST SOAK (#23 PART 1): pin association to ch1. (0.18 with_channel takes u8,
+            // wrapping it in Some internally.)
+            #[cfg(feature = "coexist-soak")]
+            {
+                sta_cfg = sta_cfg.with_channel(1);
+            }
             let ok = controller
-                .set_configuration(&Configuration::Client(ClientConfiguration {
-                    ssid: net.ssid.into(),
-                    password: net.pass.into(),
-                    // COEXIST SOAK (#23 PART 1): pin association to ch1.
-                    #[cfg(feature = "coexist-soak")]
-                    channel: Some(1),
-                    ..Default::default()
-                }))
+                // #233: set_config STARTS the controller in 0.18 (no separate start()).
+                .set_config(&Config::Station(sta_cfg))
                 .is_ok()
-                && (matches!(controller.is_started(), Ok(true)) || controller.start().is_ok())
-                && controller.connect().is_ok();
+                && block_on(controller.connect_async()).is_ok();
             if !ok {
                 return self.assoc_attempt_failed();
             }
@@ -767,7 +778,7 @@ impl NtpMachine {
             self.deadline = Instant::now() + SYNC_BUDGET; // per-attempt assoc budget
             return true;
         }
-        if matches!(controller.is_connected(), Ok(true)) {
+        if controller.is_connected() {
             log::info!("smol #142: associated to '{}'", net.ssid);
             // Shared DHCP+SNTP budget starts now (mirrors the pre-#89 `deadline` set at
             // the top of the DHCP loop).
@@ -799,7 +810,7 @@ impl NtpMachine {
 
     /// DHCP step: one `iface.poll()`, apply a lease if it arrived. On a lease, set the
     /// gateway qualifier (N3c: `run_ntp_burst` returns `ReachedDhcp`) and advance to SNTP.
-    fn step_dhcp(&mut self, device: &mut esp_wifi::wifi::WifiDevice<'static>) -> bool {
+    fn step_dhcp(&mut self, device: &mut SmolWifiDevice) -> bool {
         let changed = matches!(
             self.iface.poll(smoltcp_now(), device, &mut self.sockets),
             smoltcp::iface::PollResult::SocketStateChanged
@@ -828,7 +839,7 @@ impl NtpMachine {
     /// SNTP step: bind once, send the NTPv4 request once the socket can send, parse a
     /// reply into Unix seconds. Deadline → `Done(None)` (DHCP already succeeded → MQTT
     /// tail still runs, just no time this burst).
-    fn step_sntp(&mut self, device: &mut esp_wifi::wifi::WifiDevice<'static>) -> bool {
+    fn step_sntp(&mut self, device: &mut SmolWifiDevice) -> bool {
         let changed = matches!(
             self.iface.poll(smoltcp_now(), device, &mut self.sockets),
             smoltcp::iface::PollResult::SocketStateChanged
@@ -977,9 +988,9 @@ pub(crate) const NTP_RESYNC_AGE_S: u32 = 3600;
 /// flush/burst is ever in flight in the single-threaded main loop), so the borrows never overlap.
 #[cfg(feature = "espnow")]
 pub fn run_ntp_resync(
-    controller: &mut esp_wifi::wifi::WifiController<'static>,
-    device: &mut esp_wifi::wifi::WifiDevice<'static>,
-    mut rng: Rng,
+    controller: &mut esp_radio::wifi::WifiController<'static>,
+    device: &mut SmolWifiDevice,
+    rng: Rng,
     tick: &mut dyn FnMut() -> bool,
 ) -> Option<u32> {
     let sntp_src_port = 49152 + (rng.random() % 16384) as u16;
@@ -1013,9 +1024,9 @@ pub fn run_ntp_resync(
 /// of the firmware's style and keeping the dependency set on crates.io.
 #[allow(clippy::too_many_arguments)] // +grid (issue #16) tips this to 8 params
 pub fn run_ntp_burst(
-    controller: &mut esp_wifi::wifi::WifiController<'static>,
-    device: &mut esp_wifi::wifi::WifiDevice<'static>,
-    mut rng: Rng,
+    controller: &mut esp_radio::wifi::WifiController<'static>,
+    device: &mut SmolWifiDevice,
+    rng: Rng,
     tick: &mut dyn FnMut() -> bool,
     // #89 Stage 1: painted on each prologue yield (assoc/DHCP/SNTP stall) so the boot
     // screen shows a LIVE clock through the sync window. UI-agnostic here — the display
@@ -2433,7 +2444,7 @@ impl RelayCache {
 #[cfg(feature = "wifi")]
 fn tcp_send(
     iface: &mut Interface,
-    device: &mut esp_wifi::wifi::WifiDevice,
+    device: &mut SmolWifiDevice,
     sockets: &mut SocketSet,
     handle: smoltcp::iface::SocketHandle,
     data: &[u8],
@@ -2576,7 +2587,7 @@ pub(crate) fn ota_fail_is_bulk_deaf(w: u32) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn mqtt_session(
     iface: &mut Interface,
-    device: &mut esp_wifi::wifi::WifiDevice,
+    device: &mut SmolWifiDevice,
     sockets: &mut SocketSet,
     tcp_handle: smoltcp::iface::SocketHandle,
     node_id: u8,
@@ -4902,9 +4913,9 @@ fn mqtt_session(
 #[cfg(feature = "espnow")]
 #[allow(clippy::too_many_arguments)] // +grid (issue #16) tips this to 8 params
 pub fn run_mqtt_burst(
-    controller: &mut esp_wifi::wifi::WifiController<'static>,
-    device: &mut esp_wifi::wifi::WifiDevice<'static>,
-    mut rng: Rng,
+    controller: &mut esp_radio::wifi::WifiController<'static>,
+    device: &mut SmolWifiDevice,
+    rng: Rng,
     node_id: u8,
     messages: &[(u8, &[u8])],
     batt: &mut crate::batt::BattCache,
@@ -5046,12 +5057,12 @@ pub fn run_mqtt_burst(
     // one full RECONNECT_EVERY window before the first retry.
     const RECONNECT_EVERY: Duration = Duration::from_millis(2000);
     let mut next_reconnect = Instant::now() + RECONNECT_EVERY;
-    while !matches!(controller.is_connected(), Ok(true)) {
+    while !controller.is_connected() {
         if tick() {
             return false; // #20 abort during flush re-association
         }
         if Instant::now() > next_reconnect {
-            let _ = controller.connect();
+            let _ = block_on(controller.connect_async());
             next_reconnect = Instant::now() + RECONNECT_EVERY;
         }
         if Instant::now() > deadline {
@@ -5065,7 +5076,7 @@ pub fn run_mqtt_burst(
     // resets the IDF ps state, and here the unicast that matters is the whole TCP /
     // MQTT stream (the old UDP path only needed the ARP reply). Same reasoning,
     // same placement (must be AFTER the reconnect). Tradeoff: higher idle draw.
-    let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
+    let _ = controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
     crate::net::assert_max_tx_power(); // #141
 
     // #64: capture the WiFi-uplink RSSI HERE — the STA is confirmed connected (the loop
@@ -5213,7 +5224,7 @@ const CAST_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(feature = "cast")]
 fn cast_stream(
     iface: &mut Interface,
-    device: &mut esp_wifi::wifi::WifiDevice<'static>,
+    device: &mut SmolWifiDevice,
     sockets: &mut SocketSet,
     cast_handle: smoltcp::iface::SocketHandle,
     src_port: u16,
@@ -5338,7 +5349,7 @@ fn parse_ipv4(host: &str) -> Option<smoltcp::wire::Ipv4Address> {
 #[allow(clippy::too_many_arguments)]
 fn publish_ota_progress(
     iface: &mut Interface,
-    device: &mut esp_wifi::wifi::WifiDevice,
+    device: &mut SmolWifiDevice,
     sockets: &mut SocketSet,
     tcp_handle: smoltcp::iface::SocketHandle,
     src_port: u16,
@@ -5457,9 +5468,9 @@ fn publish_ota_progress(
 #[cfg(feature = "espnow")]
 #[allow(clippy::too_many_arguments)] // +fail diag (#139-followup) tips this to 8 params
 pub fn run_ota_fetch(
-    controller: &mut esp_wifi::wifi::WifiController<'static>,
-    device: &mut esp_wifi::wifi::WifiDevice<'static>,
-    mut rng: Rng,
+    controller: &mut esp_radio::wifi::WifiController<'static>,
+    device: &mut SmolWifiDevice,
+    rng: Rng,
     announce: &crate::ota::Announce,
     tick: &mut dyn FnMut() -> bool,
     // #40 relay-mode: when true, stage+verify the image to the inactive slot but do NOT
@@ -5467,7 +5478,7 @@ pub fn run_ota_fetch(
     // it to a leaf (no gateway reboot). Self-OTA passes `false` + `&mut None` → the fetch
     // body is byte-identical, only the terminal action differs (activate-reboot vs return).
     relay_mode: bool,
-    staged_slot: &mut Option<esp_bootloader_esp_idf::ota::Slot>,
+    staged_slot: &mut Option<esp_bootloader_esp_idf::partitions::AppPartitionSubType>,
     // #139-followup observability: on a genuine self-fetch FAILURE (not a user abort), set to
     // `(chunk_k, chunk_n, retries, stalls)` — how far the download got + the transfer-trouble
     // counters. The self-OTA caller (`run_ota_update`) formats + publishes it retained to
@@ -5545,7 +5556,7 @@ pub fn run_ota_fetch(
     let deadline = Instant::now() + OTA_FETCH_BUDGET;
 
     // The caller's switch(WifiSta) already issued connect(); wait for association.
-    while !matches!(controller.is_connected(), Ok(true)) {
+    while !controller.is_connected() {
         if tick() {
             return false;
         }
@@ -5555,7 +5566,7 @@ pub fn run_ota_fetch(
             return false;
         }
     }
-    let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
+    let _ = controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
     crate::net::assert_max_tx_power(); // #141
 
     // Fresh DHCP lease (interface just rebuilt).
