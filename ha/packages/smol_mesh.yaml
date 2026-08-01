@@ -1356,6 +1356,19 @@ automation:
             {%- endif -%}
             {%- endmacro -%}
             GRID|{{ pcell('', 'sensor.yurt_consumption', 1000) | trim }}|{{ pcell('L1', 'sensor.l1_power_clamp', 1) | trim }}|{{ pcell('L2', 'sensor.l2_power_clamp', 1) | trim }}
+      # Rate limit. The three power sources together change ~2x/second, but the payload
+      # renders whole watts for a human-readable OLED, so most of those publishes were
+      # byte-identical retained messages. mode:single + max_exceeded:silent means any
+      # trigger arriving during this delay is dropped: the first change of a burst still
+      # publishes instantly, then at most one publish per 10s. The /5min heartbeat covers
+      # quiescence. Every subscriber pays for these — including the HA frontend on the
+      # laundry wall tablet, where this automation was the single largest event source.
+      #
+      # RECOVERED FROM THE LIVE VM 2026-08-01 (#310-adjacent, see the reconcile note below).
+      # This existed only on the HA instance and would have been destroyed by a repo→live
+      # push. It is a real fix, not a stray edit, and losing it would have re-flooded the
+      # broker at ~2 Hz with retained duplicates.
+      - delay: "00:00:10"
 
   # =====================================================================
   # #43 DISPLAY UNITS automation — publish the GLOBAL retained units config.
