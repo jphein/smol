@@ -118,6 +118,20 @@ if [ "$run_fw" = 1 ]; then
     printf '%s\n' "$out"; bad "diag budget"
   fi
 
+  # #367: a host verifier `#[path]`-includes a firmware source, which reads a FILE and does not
+  # care whether the crate declares it as a module. So a verifier can be green against code that
+  # is compiled into NO tier — `net/crdt.rs` (#185) is exactly that today, and the gate could not
+  # tell it apart from working code. This asserts the one bit that closes it: every `#[path]`
+  # target is also a declared module. Known, owned exceptions live in the script's KNOWN_PHANTOMS
+  # with their issue, and the check fails BOTH on a new phantom and on an allowlist entry that has
+  # since been wired — a list that outlives its reason is how a check stops checking.
+  step "host verifiers test code the firmware compiles (#367)"
+  if out=$("$ROOT/tools/check_verifier_wiring.py" "$ROOT" 2>&1); then
+    printf '%s\n' "$out"; ok "verifier wiring"
+  else
+    printf '%s\n' "$out"; bad "verifier wiring"
+  fi
+
   # #350: cheap and before any compile, because everything below DERIVES from this manifest —
   # a gate that builds the wrong tier list confidently is worse than one that refuses to start.
   # The arms: the canonical tier matches REPRO_FLEET_FEATURES (the packaging path's own
@@ -369,6 +383,17 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | tail -2; ok "test_check_exclusions"
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_check_exclusions"
+  fi
+
+  # #367: prove the verifier-wiring checker's arms can fail. Operates only on mktemp copies —
+  # never the working tree. Same reasoning as its siblings: this check exists BECAUSE a green
+  # signal over uncompiled code fooled us, so shipping it without watching it go red would be
+  # the same mistake one level up.
+  step "verifier-wiring checker regression suite (#367)"
+  if out=$("$ROOT/tools/test_verifier_wiring.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -2; ok "test_verifier_wiring"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_verifier_wiring"
   fi
 fi
 
