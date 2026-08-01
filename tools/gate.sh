@@ -9,7 +9,8 @@
 # ONBOARDING.md points AT this file rather than restating the commands, so the two cannot drift.
 #
 # WHAT IT COVERS
-#   1. cargo check --release across the build tiers (default / wifi / espnow / canonical fleet)
+#   1. cargo check --release across the build tiers (default / wifi / espnow / canonical fleet /
+#      canonical+bard, which is off the fleet image since #347 but still a supported build)
 #   2. cargo clippy --release -D warnings on EVERY tier (#343 — was canonical-only)
 #   3. the host experiments/*_verify suites
 #   4. the #300 stack floor — the canonical ELF's .stack region vs the 73,728 B floor
@@ -74,8 +75,14 @@ if [ "$run_fw" = 1 ]; then
   # the canonical fleet tier is what actually ships. A feature added to Cargo.toml and NOT added
   # here is a code path nothing compiles — the `ledger-provision` case that motivated this issue.
   # Any feature listed in Cargo.toml's [features] that is not covered below should be added.
+  # #347: `bard` left the canonical fleet list (it starves the C3's runtime stack), so WITHOUT an
+  # explicit tier here nothing would compile it — precisely the "code path nothing compiles" case
+  # this gate exists to prevent, and it would rot exactly while it is being kept alive for the S3
+  # and C6. The tier is `bard` PLUS the fleet list rather than `bard` alone, because the build that
+  # has to keep working on a bigger chip is the COMBINED one. `bard` is named first so the
+  # feature-not-on-this-branch SKIP below tests for `bard` and not for `espnow`.
   step "cargo check — build tiers"
-  for tier in "default:" "wifi:wifi" "espnow:espnow" "fleet:$REPRO_FLEET_FEATURES" "ledger-provision:ledger-provision"; do
+  for tier in "default:" "wifi:wifi" "espnow:espnow" "fleet:$REPRO_FLEET_FEATURES" "bard:bard,$REPRO_FLEET_FEATURES" "ledger-provision:ledger-provision"; do
     name="${tier%%:*}"; feats="${tier#*:}"
     # A tier naming a feature this branch does not have (e.g. ledger-provision before #181 lands)
     # is SKIPPED, not failed — the gate must work on both sides of that merge.
@@ -96,7 +103,7 @@ if [ "$run_fw" = 1 ]; then
   # gate can cover what ONBOARDING has claimed all along. A tier that only gets `cargo check` has
   # its new warnings invisible — which is how the findings accumulated unnoticed in the first place.
   step "cargo clippy -D warnings — every tier"
-  for tier in "default:" "wifi:wifi" "espnow:espnow" "canonical:$REPRO_FLEET_FEATURES"; do
+  for tier in "default:" "wifi:wifi" "espnow:espnow" "canonical:$REPRO_FLEET_FEATURES" "bard:bard,$REPRO_FLEET_FEATURES"; do
     name="${tier%%:*}"; feats="${tier#*:}"
     args=(--release "${JOBS[@]}"); [ -n "$feats" ] && args+=(--features "$feats")
     if (cd "$CLOCK" && cargo clippy "${args[@]}" -- -D warnings) >/tmp/gate-clippy-$name.log 2>&1; then
