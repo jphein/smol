@@ -5,6 +5,10 @@
 //!     name (`net::names::version_name`). Falls back to `"dev"`.
 //!   * `BUILD_NUMBER` — monotonic build count (`git rev-list --count HEAD`) shown
 //!     as `v<N>`. Falls back to `"0"`.
+//!   * `SMOL_CHIP_ID` — (#349) the chip this image is built for, DERIVED from the target
+//!     triple (`riscv32imc`→C3, `riscv32imac`→C6, `xtensa-esp32s3`→S3). Consumed by
+//!     `net::target::SELF_CHIP` and embedded in the image's target descriptor so a board can
+//!     refuse an image built for other silicon. `SMOL_CHIP=<name>` overrides by name.
 //!   * `SMOL_NODE_ID` — (#42) OPTIONAL per-board id override, emitted ONLY when the
 //!     env var is set, so `SMOL_NODE_ID=8 cargo build` builds an id-8 image without
 //!     hand-editing `board.rs` (which reads it via `option_env!`, fallback = its own
@@ -41,6 +45,14 @@ fn main() {
     println!("cargo:rustc-env=BUILD_NUMBER={number}");
     println!("cargo:rustc-env=BUILD_DEV={}", if is_release { "0" } else { "1" });
 
+    // #349: the CHIP this image is built for, DERIVED from the target triple rather than
+    // declared. An image that names its own silicon is only useful if it cannot lie, and the
+    // triple is the one fact a build cannot get wrong. `CARGO_CFG_TARGET_ARCH` is NOT enough —
+    // it reports "riscv32" for both the C3 (imc) and the C6 (imac); `TARGET` carries the ISA
+    // extensions that actually distinguish them.
+    println!("cargo:rustc-env=SMOL_CHIP_ID={}", chip_id());
+    println!("cargo:rerun-if-env-changed=SMOL_CHIP");
+
     // #42: OPTIONAL per-board NODE_ID override. Emitted ONLY when set → a normal build
     // is byte-unchanged; `SMOL_NODE_ID=8 cargo build` overrides board.rs's fallback
     // (read there via `option_env!`). Guards the one-image-to-many id collision.
@@ -59,6 +71,38 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SMOL_BUILD_NUMBER");
     println!("cargo:rerun-if-env-changed=SMOL_RELEASE");
     println!("cargo:rerun-if-env-changed=SMOL_NODE_ID");
+}
+
+/// #349: map the build's target triple to the `net::target::CHIP_*` id embedded in the image
+/// descriptor. `SMOL_CHIP` overrides it by NAME (not by number) for a chip whose triple this
+/// mapping does not yet know — an explicit, greppable act rather than a silent default.
+///
+/// `0` (CHIP_UNKNOWN) is returned when the triple is unrecognised, and `net/target.rs` has a
+/// `const _: () = assert!(SELF_CHIP != CHIP_UNKNOWN)` — so an unmapped chip fails the BUILD
+/// instead of shipping an image that claims to be for nothing in particular. That assert only
+/// exists on `wifi` tiers (the ones that can be OTA'd), so a host/hostsim build is unaffected.
+fn chip_id() -> u8 {
+    if let Ok(name) = std::env::var("SMOL_CHIP") {
+        return match name.trim() {
+            "esp32c3" => 1,
+            "esp32c6" => 2,
+            "esp32s3" => 3,
+            _ => 0,
+        };
+    }
+    let target = std::env::var("TARGET").unwrap_or_default();
+    // riscv32imc = C3; riscv32imac (the A extension) = C6; xtensa-esp32s3 = S3. Ordering
+    // matters: "riscv32imac" contains no "riscv32imc" substring, but match the longer/more
+    // specific arms first anyway so a future triple cannot alias onto the C3.
+    if target.starts_with("xtensa-esp32s3") {
+        3
+    } else if target.starts_with("riscv32imac") {
+        2
+    } else if target.starts_with("riscv32imc") {
+        1
+    } else {
+        0 // host/wasm (hostsim, web-emu) — no descriptor is emitted on those tiers anyway
+    }
 }
 
 /// Prefer the explicit env override (archive/pipeline), else read `path` (relative to the

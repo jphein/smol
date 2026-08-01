@@ -132,6 +132,14 @@ pub mod sth;
 #[cfg(feature = "espnow")]
 pub mod ledger_link;
 
+// #349 image TARGET identity — the structured `TargetId` embedded in every OTA-capable image,
+// and the checker a board runs over an incoming one before it commits. PURE (no HAL), so
+// `experiments/target_guard_verify` `#[path]`-includes this exact file and proves on the host
+// that the guard REFUSES, not merely that it accepts. `wifi`-gated: the tiers that carry no OTA
+// engine also carry no descriptor, so the default build stays byte-free of it.
+#[cfg(feature = "wifi")]
+pub mod target;
+
 // #25 WLED WiZmote-emit (smol as a WLED "linked remote"). `wled = ["espnow"]`, so
 // this is present only in a wled build; the default/wifi/espnow builds are byte-free
 // of it (the module is `#![cfg(feature = "wled")]`). Referenced by `app` (the
