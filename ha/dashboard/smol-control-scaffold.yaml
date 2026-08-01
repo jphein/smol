@@ -243,21 +243,40 @@ cards:
             name: Line 3
 
   # POWER & SOLAR
+  # These four rows shipped as PLACEHOLDER entity ids that never existed in this HA
+  # (`sensor.battery_bank_soc`, `sensor.ev_battery_soc`, `sensor.house_load`,
+  # `sensor.solar_charge_current`) — the README always said "remap to your own". #305's
+  # dead-row check is what finally made them visible instead of silently blank. Mapped to
+  # the real topology 2026-07-28 on JP's instruction ("grid draw watts, solar battery soc
+  # epever, and bmw i3 battery"):
+  #   solar bank SOC  -> sensor.epever_battery_soc      (EPEver charge controller, Modbus)
+  #   EV pack SOC     -> sensor.battery_emulator_0fcc_soc  (the BMW i3 pack, read over CAN
+  #                      by Battery-Emulator; SoH 80% confirms it is the repurposed pack.
+  #                      NOT sensor.battery_average_soc — that is the inverter's average
+  #                      across banks, not the i3.)
+  #   grid draw       -> sensor.yurt_consumption + the two PJ2101A clamps. This is the SAME
+  #                      source `smol_publish_grid_display` renders onto the glass, so the
+  #                      card and the OLED can never disagree. Total is kW; the legs are the
+  #                      watts, which is why both are shown.
+  #   solar charge    -> sensor.epever_charging_current
+  # NOTE: the EPEver rows read `unavailable` whenever its Modbus link is down (it was live
+  # this morning and dropped at 17:46 on 2026-07-28). That is a correct wiring showing a
+  # real outage — do NOT "fix" it by pointing at a different battery.
   - type: vertical-stack
     view_layout: {grid-column: "span 4"}
     cards:
       - type: horizontal-stack
         cards:
           - type: gauge
-            entity: sensor.battery_bank_soc
-            name: battery bank
+            entity: sensor.epever_battery_soc
+            name: solar bank
             unit: "%"
             min: 0
             max: 100
             severity: {green: 60, yellow: 35, red: 0}
           - type: gauge
-            entity: sensor.ev_battery_soc
-            name: EV HV
+            entity: sensor.battery_emulator_0fcc_soc
+            name: i3 pack
             unit: "%"
             min: 0
             max: 100
@@ -266,9 +285,13 @@ cards:
         title: power & solar · sources on the glass
         show_header_toggle: false
         entities:
-          - entity: sensor.house_load
-            name: house load
-          - entity: sensor.solar_charge_current
+          - entity: sensor.yurt_consumption
+            name: grid draw
+          - entity: sensor.l1_power_clamp
+            name: · L1
+          - entity: sensor.l2_power_clamp
+            name: · L2
+          - entity: sensor.epever_charging_current
             name: solar charge
         card_mod:
           style: |
