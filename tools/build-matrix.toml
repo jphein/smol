@@ -152,3 +152,86 @@ hostsim  = "host-only, and covered by the `cargo test` arm in tools/gate.sh"
 # `off-fleet` deliberately has NO entry here: the bard tier names it, so it is covered, and the
 # checker rejects a feature that is both exempted and covered — an exemption whose reason has
 # quietly stopped applying is worse than none. It caught this exact case when first written.
+
+# ── modules #351's exclusion check cannot SEE, declared so the blind spot is a decision ───────
+# `tools/check_exclusions.py` proves a module contributed no code to a tier that excludes it, by
+# asking the tier's DWARF line table which source files its instructions came from. A module of
+# pure `const`/`static` items emits no instructions, therefore no line-table rows, therefore
+# nothing to find — and an absence check that cannot detect presence proves nothing at all. So
+# the checker REFUSES to pass a claim it never observed anywhere, and an honest blind spot has to
+# be written down here with its reason.
+#
+# Same discipline as [exempt] above, including the stale case: a module listed here that IS
+# observed fails the gate, because a reason that has quietly stopped applying reads as a
+# considered decision and is worse than no entry.
+[unobservable]
+"src/secrets.rs" = """\
+consts only (WIFI_NETWORK / MQTT_* / WLED_CAST_*) — 0 fn / 0 impl in both secrets.rs and \
+secrets.rs.example, so it emits .rodata and no line rows. It is also git-ignored and \
+provisioned per tree, so its contents are not a property of the commit at all."""
+
+# ── the tier-exclusion COMMITMENT (#351) ──────────────────────────────────────────────────
+# Which modules smol commits to keeping out of the tiers that do not enable them. The source
+# already says this in each `#[cfg(feature = …)]`, and stating it twice is normally the thing
+# that rots — so why here.
+#
+# Because it was MEASURED to be necessary. The realistic regression is not "someone references
+# an excluded module": that does not compile, the module is not there. It is "someone drops the
+# `#[cfg]` so their new call site compiles, and leaves the BYTE-FREE comment above it". Doing
+# exactly that to `pub mod target;` put src/net/target.rs into the default tier — 11 crate files
+# to 12 — and the ELF check reported **0 leaked**, because the claim it would have violated was
+# derived from the very `#[cfg]` the regression deleted. A gate that can be silenced by editing
+# its subject is not a gate.
+#
+# So: declared here, checked against the source in BOTH directions (same move #350 makes for the
+# chip roster vs budget.rs). Removing a gate now fails the gate until the line below is deleted
+# too — which puts the decision in the diff, where a reviewer sees it. Adding a gated module
+# without an entry fails as well, so the table cannot quietly stop covering what is added later.
+# The value is the gate CONJUNCTION, so changing a gate is caught, not only removing one.
+#
+# Regenerate with: tools/check_exclusions.py claims --toml
+[tier_exclusive]
+"src/bard/delivery.rs" = "bard"
+"src/bard/mod.rs" = "bard"
+"src/bard/nano_llm.rs" = "bard"
+"src/bard/persona.rs" = "bard"
+"src/bard/stack_paint.rs" = "bard+stack-paint"
+"src/bard/textflow.rs" = "bard"
+"src/bard/tokenizer.rs" = "bard"
+"src/batt.rs" = "wifi"
+"src/bench.rs" = "espnow"
+"src/custom.rs" = "espnow"
+"src/familiar/mod.rs" = "espnow"
+"src/finder.rs" = "espnow"
+"src/grid.rs" = "wifi"
+"src/hunt.rs" = "espnow"
+"src/io.rs" = "io"
+"src/led.rs" = "espnow"
+"src/mesh_snake/mod.rs" = "espnow"
+"src/mesh_snake/snake_core.rs" = "espnow"
+"src/net/cast.rs" = "cast"
+"src/net/cast_oled.rs" = "cast"
+"src/net/cfgsched.rs" = "espnow"
+"src/net/coexist.rs" = "espnow"
+"src/net/election.rs" = "wifi"
+"src/net/etx.rs" = "espnow"
+"src/net/flood.rs" = "espnow"
+"src/net/http.rs" = "espnow"
+"src/net/ledger.rs" = "espnow"
+"src/net/ledger_link.rs" = "espnow"
+"src/net/mode.rs" = "espnow"
+"src/net/mqtt.rs" = "wifi"
+"src/net/ota_resume.rs" = "espnow"
+"src/net/radio_dev.rs" = "wifi"
+"src/net/sth.rs" = "espnow"
+"src/net/target.rs" = "wifi"
+"src/net/treehead.rs" = "espnow"
+"src/net/wifi.rs" = "wifi"
+"src/net/wire.rs" = "espnow"
+"src/net/wled.rs" = "wled"
+"src/ota.rs" = "wifi"
+"src/ota_mesh.rs" = "espnow"
+"src/ota_screen.rs" = "espnow"
+"src/rssi.rs" = "espnow"
+"src/secrets.rs" = "wifi"
+"src/watch.rs" = "espnow"

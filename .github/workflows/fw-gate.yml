@@ -133,3 +133,47 @@ jobs:
             tools/build_matrix.py ci-matrix | python3 -m json.tool
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # #351 — the BYTE-FREE claims, checked instead of asserted.
+  #
+  # A SEPARATE JOB, not another step in `firmware`, for one measured reason: this arm LINKS every
+  # tier (the check/clippy loops only compile), which on a dev box is ~70s x 10 on top of a
+  # `firmware` job already budgeted at 45 minutes. Bolting it on would have made the timeout the
+  # thing that fails, and a gate that times out gets deleted. The two jobs share no state — a
+  # different target dir and a different profile (`CARGO_PROFILE_RELEASE_DEBUG`) — so running them
+  # in parallel costs wall-clock nothing.
+  exclusions:
+    name: tier exclusions (#351)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/clock
+          key: excl                      # its own cache: a different profile, so different artifacts
+      # Same assertion as the `firmware` job, for the same reason — and it matters more here,
+      # because without readelf this gate has no instrument at all.
+      - name: Assert readelf present
+        run: readelf --version >/dev/null
+
+      - run: tools/gate.sh excl
+
+      - name: Exclusions → job summary
+        if: always()
+        run: |
+          {
+            echo "### Tier exclusions — the BYTE-FREE claims"
+            echo '```'
+            tools/check_exclusions.py claims || true
+            echo '```'
+            echo "Derived from the \`#[cfg(feature = …)]\` on each \`mod\`, walked from"
+            echo "\`src/main.rs\`, and cross-checked both ways against \`[tier_exclusive]\` in"
+            echo "\`tools/build-matrix.toml\` — so REMOVING a gate fails the gate instead of"
+            echo "quietly removing the claim along with it."
+            echo ""
+            echo "⚠️ This proves no **executable** bytes from an excluded module survived, via the"
+            echo "DWARF line table (which attributes inlined code back to its source file). A"
+            echo "consts-only module emits no line rows and is invisible — those are declared in"
+            echo "\`tools/build-matrix.toml\`'s \`[unobservable]\` with a reason."
+          } >> "$GITHUB_STEP_SUMMARY"

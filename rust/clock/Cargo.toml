@@ -202,7 +202,9 @@ hostsim = ["dep:libm"]
 # Compiles the digital-`Flex` driver menu into ONE image; a runtime pin-map relayed
 # over the #56 keyed-CFG `G` channel selects which driver binds each free GPIO at
 # boot — no recompile. Default-OFF so the default/wifi/espnow builds stay BYTE-FREE
-# of it (#44): `src/io.rs` is `#![cfg(feature = "io")]` and every hook is cfg-gated.
+# of it (#44): `src/io.rs` is gated at its `mod io;` declaration (main.rs) and every hook
+# is cfg-gated. (This line said `src/io.rs` carries `#![cfg(feature = "io")]`; it does not —
+# same effect, wrong citation, corrected while #351 made the CLAIM checkable.)
 # Implies `espnow`: the pin-map's transport (the CfgTracker relay + `take_cfg_offer`
 # apply) lives in the ESP-NOW radio manager, and the fleet runs espnow end-to-end.
 # v1 = digital in/out only (the provably-feasible `Flex` case); ADC/PWM/WS2812-RMT
@@ -248,8 +250,12 @@ ledger-provision = ["espnow"]
 # #25 WLED WiZmote-emit: smol impersonates a WLED "linked remote" (13-B WiZmote
 # ESP-NOW broadcast). Needs the ESP-NOW broadcast path + RadioManager, so it builds
 # on `espnow`. Nothing new links — pure encode + the existing `esp_now.send`. The
-# default build is BYTE-FREE of it (symbol-absence provable; net/wled.rs is
-# `#![cfg(feature = "wled")]` and every hook is `#[cfg(feature = "wled")]`).
+# default build is BYTE-FREE of it (net/wled.rs is `#![cfg(feature = "wled")]` and every
+# hook is `#[cfg(feature = "wled")]`). Since #351 that is CHECKED, not asserted:
+# `tools/check_exclusions.py` links each tier and reads its DWARF line table, and the
+# default tier contributes no row from net/wled.rs. "Symbol-absence provable" was the old
+# wording and was the weaker claim — under fat LTO an inlined module leaves no symbol while
+# its bytes are very much there, which is why the line table is the instrument.
 wled = ["espnow"]
 
 # #26 smol Cast: mirror the gateway's OLED image onto a network WLED matrix as
@@ -259,9 +265,14 @@ wled = ["espnow"]
 # stream, both of which only the espnow build has (a wifi-only board only associates
 # once at boot). Pure-additive: NO new crate links — a DrawTarget tee mirrors the
 # framebuffer, a pure packer encodes DNRGB, and the existing flush association carries
-# it. The default / wifi / espnow / wled builds are BYTE-FREE of it (`net::cast*` is
+# it. The default / wifi / espnow builds are BYTE-FREE of it (`net::cast*` is
 # `#[cfg(feature = "cast")]` and every hook is cfg-gated; the `Oled` type only swaps to
-# the tee under this flag).
+# the tee under this flag) — checked per tier by #351's `tools/check_exclusions.py`.
+# NOTE: this line used to include `wled` in that list. It no longer can: since #350 the
+# `wled` TIER is `wled,${canonical}` and the canonical fleet features include `cast`, so a
+# wled build DOES carry the cast code. The claim was about a hypothetical `--features wled`
+# alone; the exclusion checker judges the tiers that are actually built, and would have
+# called this false. Narrowed rather than waived.
 cast = ["espnow"]
 
 # ── bard (#300): on-device tiny-LLM storyteller ─────────────────────────────
