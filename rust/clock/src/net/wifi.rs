@@ -3393,6 +3393,11 @@ fn mqtt_session(
     // extras are re-seen next burst (retained), so an 8-slot cap never loses an order.
     let mut armed_installs = [0u8; RESET_REQ_MAX];
     let mut armed_n = 0usize;
+    // #329 D3: true iff the staged announce drained this burst was refused as `NotNewer`, i.e.
+    // this board is ALREADY at or above it. That makes our own retained install SATISFIED rather
+    // than refused, which the clear below distinguishes. Stays false when no staged line arrived
+    // (unknown ⇒ preserve the order, same fail-safe direction as every other gate here).
+    let mut staged_satisfied = false;
     loop {
         if tick() {
             break; // #20 abort during downlink wait → fall through to clean DISCONNECT
@@ -3469,12 +3474,29 @@ fn mqtt_session(
                                             crate::ota::BUILD_NUMBER
                                         );
                                         *ota_offer = Some(a);
+                                        // #329 D3: keep the verdict a faithful mirror of the LAST
+                                        // gate result, so a passing staged line can never leave a
+                                        // stale `satisfied` behind from an earlier one this burst.
+                                        staged_satisfied = false;
                                     }
-                                    Err(why) => log::info!(
-                                        "smol OTA: staged build {} not newer/ineligible ({:?})",
-                                        a.build,
-                                        why
-                                    ),
+                                    Err(why) => {
+                                        // #329 D3: distinguish SATISFIED from REFUSED. `NotNewer`
+                                        // means this board is already AT or ABOVE the staged build
+                                        // — the order has been FULFILLED — whereas
+                                        // BadUrl/HostNotAllowed/BadSize mean the staging itself is
+                                        // unusable. #147 preserves the retained order across the
+                                        // latter (a bad staging must not burn an operator's order);
+                                        // it never meant to preserve it across the former. The
+                                        // verdict is carried out of `gate()` rather than
+                                        // re-derived at the clear site, so the monotonicity rule
+                                        // has exactly one home.
+                                        staged_satisfied = why == crate::ota::Reject::NotNewer;
+                                        log::info!(
+                                            "smol OTA: staged build {} not newer/ineligible ({:?})",
+                                            a.build,
+                                            why
+                                        )
+                                    }
                                 }
                             }
                             None => log::warn!("smol OTA: malformed staged line ignored"),
@@ -4706,10 +4728,19 @@ fn mqtt_session(
         // running build's honest stamp (with `+dev.<hash>` for a canary) when up-to-date,
         // else the update TARGET's sigil name ("v<latest> <Word>").
         let mut sjson = MqttScratch::new();
+        // #329 D3 (half 2): `in_progress` means "a fetch WILL happen", not "an order exists".
+        // It was `*install_requested` alone, which is true for an order that can never be acted
+        // on — one refused as `NotNewer` (nothing to fetch) or held by the self-install gate
+        // (`leaf_ota_pending` / `leaf_installs_outstanding`, see the armdiag). HA renders that as
+        // a permanently "installing" Update entity on a board that finished minutes ago; #329
+        // recorded 553 s of it. AND-ing with `ota_offer.is_some()` — the thing `main` actually
+        // fetches via `take_ota_offer` — makes an unsatisfiable order render honestly as idle.
+        // A genuine install is unaffected: the offer is Some exactly while a newer build is
+        // staged and gated OK, and goes None after the reboot when installed == latest.
         let _ = write!(
             sjson,
             "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":{},\"title\":\"",
-            installed, latest, *install_requested
+            installed, latest, *install_requested && ota_offer.is_some()
         );
         if latest == installed {
             crate::net::names::write_version(&mut sjson);
@@ -4739,7 +4770,21 @@ fn mqtt_session(
         // must PRESERVE the order — the same never-clear semantics #135/#134 give pre-relay failures
         // (`reached_leaf()==false`) — so the next good staging (or the next crown) still installs.
         // `ota_offer.is_some()` ⟹ `staged_raw.is_some()`, so the boot-race guard above is unchanged.
-        if *install_requested && ota_offer.is_some() {
+        //
+        // #329 D3 (half 1): ALSO clear when the order is SATISFIED. #147's preservation rule is
+        // about a staging this board cannot use (bad url / host / size) — that must not burn an
+        // operator's order. `NotNewer` is the opposite case: the board is already at or above the
+        // staged build, so the order has been FULFILLED and there is nothing left to preserve it
+        // for. Left retained it is re-caught every flush forever (wifi.rs, the `cmd_topic` arm),
+        // re-setting `install_requested`, and `main` burns the arm each loop with nothing to
+        // fetch — a permanently retained order plus, before half 2 above, a permanently
+        // "installing" tile. The verdict comes from `gate()` via `staged_satisfied`, so
+        // BadUrl/HostNotAllowed/BadSize keep preserving exactly as #147 intends.
+        //
+        // NB this publish is fire-and-forget (`let _ = tcp_send`), so a dropped clear still
+        // leaves the order retained and reproduces the loop from a single arm. Half 2 is what
+        // makes that benign; this half is what stops it recurring.
+        if *install_requested && (ota_offer.is_some() || staged_satisfied) {
             if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, cmd_topic.as_bytes(), &[], true) {
                 let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
             }
