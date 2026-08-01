@@ -3,6 +3,18 @@
 **Author:** morpheus-114h3 · **Branch:** `feat/122-b1-windows` (off main `0a94b1c`) · **Ship: soak-gated.**
 Deliverable = analysis + ready branch so #122 is a *merge-decision*, not research. NO flash/MQTT/mesh.
 
+> **PROVENANCE (added 2026-07-31, #324 step 1 — lucid-canary-roll):** this document belongs to the
+> UNMERGED `feat/122-b1-windows` branch. **The fleet runs F=30 s** (`RELAY_FLUSH_INTERVAL_MS =
+> 30_000`, introduced 76b19e4, never changed on main; the 20 s value exists on exactly one commit,
+> the branch head 16351ee). The *invariant reasoning* here transfers to main — §2 invariant 2
+> (`REELECT_SILENCE_MS > RELAY_FLUSH_BUDGET`, was 15==15) was fixed on main by 9c3d4f9 and its
+> premise was field-confirmed (`brst=500:15020:f`, a 15,020 ms flush) — but every *number* derived
+> from F=20 must be RECOMPUTED before use on the F=30 fleet. At F=30 the operative windows are:
+> re-elect gate 20 s (derived from budget) < `RECOVERY_STALE_MS` base 35 s < **effective takeover
+> floor 45 s** (the #136 runtime floor, F + budget) < `MC_STALE_MS` 90 s. A crown handover faster
+> than 45 s — not 35 — is the #136-violation signature. Main is self-consistent at F=30; the
+> "at F=20 the floor is 35" note at wifi.rs:~4207 is forward-compat, not a stale leftover.
+
 ## 0. TL;DR verdict
 B1 (F 30→20s) is **safe for election stability iff it is NOT done in naive lockstep.** The recovery
 windows #114 tuned do **not** need to shrink with F — `RECOVERY_STALE_MS` (35s) and `REELECT_SILENCE_MS`
