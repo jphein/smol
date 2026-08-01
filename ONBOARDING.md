@@ -138,11 +138,10 @@ Full toolchain + gotchas: **[`docs/BUILDING.md`](docs/BUILDING.md)**. TL;DR for 
    the prose was wrong without anyone noticing: `main` sat red on its own `-D warnings` rule, and a
    feature was added with no matrix to add it to. Add a tier to `gate.sh`, not to this paragraph.
 
-   **Known gaps** (`gate.sh` states them too): `clippy -D` runs on the canonical tier only —
-   `default`/`wifi` carry pre-existing dead-code findings and get `cargo check` alone; `mesh-test`
-   needs a real board's `DEAF_MACS`; image packaging and anything needing hardware are out of scope.
-   The stack check bounds the linked **region**, *not* runtime high-water — green there is not
-   evidence of headroom.
+   **Known gaps** (`gate.sh` states them too): `mesh-test` needs a real board's `DEAF_MACS`; image
+   packaging and anything needing hardware are out of scope. The stack check bounds the linked
+   **region**, *not* runtime high-water — green there is not evidence of headroom.
+   (`clippy -D` covered only the canonical tier until #343; it now runs on **every** tier.)
 
    The `default` build must also stay behaviourally unaffected (prove via cfg-gating, **not** ELF
    byte-equality — `build.rs` stamps a per-commit git hash, so the default ELF changes every commit

@@ -193,6 +193,12 @@ pub fn yield_to_co_channel_owner(
 /// recovery burst and fires RELIABLY — fixing the racy ~2/3 seize where a happy leaf-lock (co_channel
 /// transiently unknown at the boot tick) stopped the bursts that would have seized. A co-channel owner
 /// (`owner_ch == mesh`) or an unknown owner channel (`0`) → lock normally (false). Pure + deterministic.
+/// `#[allow(dead_code)]`: the firmware caller (`net/mode.rs`'s leaf-lock decision) is `espnow`-gated
+/// while this module is `wifi`-gated, so a `wifi`-only build compiles it unused. Deleting it is NOT
+/// an option — `experiments/election_verify` `#[path]`-includes this file and asserts five cases
+/// against this exact function, so it is the tested half of the API, the same shape as
+/// `cfgsched::{ticks_to_cover, peek}`. Item-scoped so the rest of `election` stays under `-D`.
+#[allow(dead_code)]
 pub fn refuse_leaf_lock_off_channel(my_ap_ch: u8, mesh_ch: u8, owner_ch: u8) -> bool {
     mesh_ch != 0 && my_ap_ch == mesh_ch && owner_ch != 0 && owner_ch != mesh_ch
 }
