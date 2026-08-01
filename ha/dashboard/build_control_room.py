@@ -1199,7 +1199,34 @@ GEN_OWNED = re.compile(r"^vertical-stack\|node\d+$")
 # 2026-07-28 · held `entities|Dominion · overrides & IO` and `entities|Herald · overrides & IO`
 # (#311, authorised by team-lead, coupled to 53f45bf retiring their helpers). A real run removed
 # both; live went 32 cards → 31 with LIVE-ONLY 0, so the entries were cleared the same day.
-RETIRE_LIVE = set()
+#
+# 2026-08-01 · holding the last two LIVE-ONLY cards (#305 residual, authorised by team-lead).
+# Both are SUPERSEDED, not drift to be back-ported — which is the opposite of what the check's
+# own FIX line advises, so each was verified against live HA before being listed here:
+#
+#   `entities|Nexus · overrides & IO` — the pre-#311 HARDCODED id8 card, still titled with id8's
+#     old sigil (it is Eldritch Jewel now). Third of the same family as the two above. Verified
+#     the replacement will actually render before retiring it: overrides_card() gates every row
+#     on presence, and all five helpers exist live (input_text.smol_8_{broker,ota_host,io_map,
+#     io_set} + input_button.smol_8_scan), so the generated `Eldritch Jewel · overrides & IO`
+#     carries the full set. Nothing is lost; the stale name goes.
+#
+#   `vertical-stack|sha:19daffe159d0` — the pre-#305 power/solar stack, wired to the four
+#     PLACEHOLDER ids that never existed in this HA. Verified against live: sensor.
+#     {battery_bank_soc,ev_battery_soc,house_load,solar_charge_current} all return DOES NOT
+#     EXIST, so this card renders four blank rows on glass right now. The scaffold already holds
+#     its corrected replacement (POWER & SOLAR, mapped 2026-07-28 on JP's instruction to
+#     sensor.epever_battery_soc 77 / battery_emulator_0fcc_soc 100 / yurt_consumption 1.355 +
+#     the two clamps / epever_charging_current 2.0 — all live). BACK-PORTING THIS CARD WOULD
+#     HAVE REVERTED THAT MAPPING, which is why "the repo cannot reproduce it" was the wrong
+#     conclusion to act on unread.
+#
+# ⚠️ CLEAR BOTH ENTRIES once a real run has removed them and LIVE-ONLY reads 0 — an entry left
+# here is a standing licence to delete a card someone re-adds on purpose.
+RETIRE_LIVE = {
+    "entities|Nexus · overrides & IO",
+    "vertical-stack|sha:19daffe159d0",
+}
 
 
 def classify(cfg, view):
