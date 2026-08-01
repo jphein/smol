@@ -39,7 +39,7 @@ REPRO_TARGET="riscv32imc-unknown-none-elf"
 # gates it; before this was a variable the list lived only inside the build line below, so CI could
 # have gated a DIFFERENT tier than the one that ships and nothing would have said so. Changing this
 # forks the #44 reproducible-image sha lineage — see the note at the build call.
-REPRO_FLEET_FEATURES="${REPRO_FLEET_FEATURES:-espnow,cast,io,bard}"
+REPRO_FLEET_FEATURES="${REPRO_FLEET_FEATURES:-espnow,cast,io}"
 
 # Resolve the rustc sysroot for the toolchain that will ACTUALLY build — rustup picks it from
 # the crate's rust-toolchain.toml, so this MUST be evaluated inside the crate dir (from home it
@@ -202,12 +202,25 @@ repro_build_bin() {
     # display-mirror) + io (#72 registry — inert until a G config binds pins, and the
     # dollhouse's dashboard-only pin-binding depends on it being resident). Changing this
     # list changes the reproducible-image definition (#44): a new sha lineage per commit.
-    # #300: + bard (The Bard storyteller). It is radio-free and self-contained, but it costs
-    # ~285 KB of flash (the model blob in .rodata) and ~67 KB of .bss. That .bss comes straight
-    # out of the RUNTIME STACK: `.stack` gets whatever DRAM is left over and the linker shrinks
-    # it SILENTLY, so "it links" says nothing about whether the firmware can run — see the
-    # stack-floor gate below. ⚠️ FORKS THE #44 SHA LINEAGE: every image built from this commit
-    # forward differs from the pre-bard lineage by definition.
+    # #300 added `bard`; #347 REMOVED it from this list. The Bard is radio-free and
+    # self-contained, but on the C3 it costs +287,392 B of flash (the model blob in .rodata)
+    # and +39,072 B of DRAM (.bss +37,832, .data +1,232) — and that DRAM comes straight out of
+    # the RUNTIME STACK: `.stack` gets whatever is left over and the linker shrinks it SILENTLY,
+    # so "it links" says nothing about whether the firmware can run. Measured on one commit,
+    # one toolchain: canonical WITH bard = 67,488 B of stack, WITHOUT = 106,560 B, against a
+    # re-derived floor of 74,208 B (4/3 x the 55,656 B measured high-water). With the bard in,
+    # the #233 async re-platform does not fit at all — see #335.
+    #
+    # ⚠️ The `bard` FEATURE STAYS IN Cargo.toml AND IS STILL GATED (tools/gate.sh builds a
+    # `bard` tier). It is out of the C3 fleet image, not out of the project: the S3 and C6 have
+    # the DRAM to carry it as a normal smol feature, and bard.realm.watch is a standalone
+    # DEVICE + public face, NOT a fork of this source. Do not delete the feature, and do not
+    # copy nano_llm out of this tree — a second copy is the divergence #347 exists to avoid.
+    #
+    # ⚠️ FORKS THE #44 SHA LINEAGE: every image built from this commit forward differs from
+    # the with-bard lineage by definition. That is the second fork of this lineage (#300 was
+    # the first); an image sha only means something relative to the list in force when it was
+    # built, so a hash compared across this boundary will disagree and is SUPPOSED to.
     cargo build --release --features "$REPRO_FLEET_FEATURES" "${REPRO_CARGO_ARGS[@]}"
   ) || return 1
   # Honor CARGO_TARGET_DIR (verify_image.sh --twice points each build at an isolated dir);
