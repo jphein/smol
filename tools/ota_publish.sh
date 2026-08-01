@@ -12,7 +12,7 @@
 #
 # MODES (Model-A #33: stage arms every board's native Update entity; Install is per-device)
 #   ota_publish.sh stage      [<commit>] [--bin <file>] [--build N]  # build+host+publish smol/ota/staged (arms all boards; NO board fetches)
-#   ota_publish.sh install <id>                                      # publish INSTALL → smol/<id>/ota/install (headless per-node canary; the HA Update button is the GUI path)
+#   ota_publish.sh install <id>                                      # publish INSTALL → smol/<id>/ota/install (headless per-node canary; the HA Update button is the GUI path). id42 is REFUSED (#314: C6 watch unset-config sentinel, not a node).
 # <commit> defaults to HEAD. --bin <file> skips the cargo build and hosts an existing .bin.
 # BUILD number (the staged-line monotonicity value the fw compares): stage RATCHETS it forward —
 #   build = max(`git rev-list --count`, <retained smol/ota/staged build> + 1) — so a prior canary
@@ -119,6 +119,39 @@ mqtt_cfg(){
   trap _mqtt_cfg_cleanup EXIT INT TERM
 }
 
+# ---- #314: reserved ids that are NEVER an OTA target ------------------------
+# 42 is not a node. It is the C6 watch's unset-config sentinel: every watch boots with
+# `watch_cfg.node_id == 42` and esp32c6-watch #34 remaps it to a MAC-derived id, so 42 is a
+# transient alias that TWO DIFFERENT WATCHES can publish under, at different times. An install
+# aimed at 42 is aimed at an unknown board — and the firmware comment records that this very
+# collision has already broken MQTT windows in the field. It also RECURS BY DESIGN (any watch
+# booting unprovisioned republishes it), so this cannot be closed by clearing the ghost once.
+#
+# REFUSE, never skip-with-a-warning: the same discipline as the never-flash MAC allowlist. A
+# warning that is followed by a publish is not a guard, and the operator would have no way to
+# tell an armed-the-wrong-board from an armed-nothing afterwards.
+#
+# Called BEFORE any credential sourcing or publish, so a refusal is guaranteed to have published
+# nothing. Exit 22 = client error (the request itself is invalid), distinct from the 5 an actual
+# failed arm returns. Defense-in-depth only — #349's image target descriptor is what makes a
+# watch refuse a C3 image it somehow receives; this stops the aim, not the shot.
+assert_ota_targetable(){ # <id> — returns 0, or prints the refusal and exits 22
+  case "$1" in
+    42)
+      {
+        echo "REFUSED: id42 is NOT a node — it is the C6 watch's unset-config sentinel (#314)."
+        echo "  Every watch boots with node_id 42 until #34 remaps it to its MAC-derived id, so 42"
+        echo "  is a transient alias two different watches can publish under at different times."
+        echo "  An install aimed at 42 is aimed at an unknown board. NOTHING WAS PUBLISHED."
+        echo "  Fix: find the watch's REAL id (its MAC-derived id — read it off smol/<id>/diag or"
+        echo "  the crown roster) and install that. A device still publishing as 42 is UNPROVISIONED:"
+        echo "  provision it, do not OTA it."
+      } >&2
+      exit 22 ;;
+  esac
+  return 0
+}
+
 pub_retained(){ # topic, payload  (payload may be empty = retain-delete)
   local topic="$1" payload="$2"
   mqtt_cfg
@@ -198,6 +231,7 @@ WARN
 if [ "$MODE" = "install" ]; then
   ID="${2:?usage: ota_publish.sh install <id>}"
   case "$ID" in ''|*[!0-9]*) die "install <id>: id must be a positive integer (got '$ID')";; esac
+  assert_ota_targetable "$ID"   # #314 — refuses the id42 watch sentinel before anything is published
   # RETAINED (-r): the fw does a retained-read on subscribe (wifi.rs:1126); a non-retained INSTALL
   # is missed by id7's bursty subscribe window (lucid A/B: retained→fetch 6s; non-retained→miss).
   # Idempotent: fw gate is staged.build > running, so a retained re-fire won't re-install same build.

@@ -67,6 +67,15 @@ stays well under 250 B.
 - **Feature gating.** The mesh exists **only under `--features espnow`** — the
   *entire* frame set below is `#[cfg(feature = "espnow")]`. The `default` and
   `wifi` builds send no ESP-NOW frames.
+- **Reserved node ids (#314).** **`42` is not a node — it is the C6 watch's
+  unset-config sentinel.** Every watch boots with `watch_cfg.node_id == 42`;
+  esp32c6-watch `#34` remaps that to a MAC-derived id (the live `id122` / `id236`),
+  so `42` is a transient alias that **two different watches can publish under, at
+  different times**, and it **recurs by design** — a reappearing `smol/42/*` means
+  *a watch booted unprovisioned*, never *a dead node came back*. It must never be
+  an OTA target (`tools/ota_publish.sh install 42` refuses), never be counted as a
+  fleet member, and its ghost must never be read as a resurrection. Contrast `13`,
+  a genuinely retired identity that is **not** expected to recur.
 - **Security.** ESP-NOW here is **unauthenticated and unencrypted** — any device
   on the channel can inject any frame (a bogus far-future `synced_at` can hijack
   every mesh clock; a forged RELAYACK can stall a leaf). Acceptable for a hobby
