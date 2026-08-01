@@ -3,8 +3,9 @@
 #
 # Pure-logic: NO broker, NO cargo build, NO publish. It extracts just the two functions under
 # test (choose_build — the ratchet/override decision; read_staged_build — the retained parse +
-# reachable/unreachable disambiguation) and stubs mqtt_pw / mosquitto_sub. The full end-to-end
-# (staging against the LIVE broker) is the real acceptance test; this locks the decision logic.
+# reachable/unreachable disambiguation) and stubs the credential seams (mqtt_pw, mqtt_cfg) plus
+# mosquitto_sub. The full end-to-end (staging against the LIVE broker) is the real acceptance
+# test; this locks the decision logic.
 #
 # Run:  tools/test_ota_ratchet.sh      (exit 0 = all green)
 set -uo pipefail
@@ -16,10 +17,15 @@ SCRIPT="$HERE/ota_publish.sh"
 eval "$(awk '/^choose_build\(\)\{/,/^\}/' "$SCRIPT")"
 eval "$(awk '/^read_staged_build\(\)\{/,/^\}/' "$SCRIPT")"
 
-# read_staged_build references these + calls mqtt_pw/mosquitto_sub — stub them all.
+# read_staged_build references these + calls mqtt_cfg/mosquitto_sub — stub them all.
 # (export: they're read inside the eval'd read_staged_build, invisible to shellcheck here.)
 export BROKER="test.invalid" MQTT_USER="tester"
 mqtt_pw(){ printf 'stub-pw'; }
+# #313: read_staged_build now sources credentials through a private XDG_CONFIG_HOME instead of
+# argv. Stubbed rather than exercised so this stays pure-logic — no mktemp, no files, and the
+# path is deliberately non-existent because nothing here should ever read it.
+mqtt_cfg(){ :; }
+export _MQTT_CFG="/nonexistent-test-cfg"
 
 pass=0; fail=0
 eq(){ # name  expected  actual
