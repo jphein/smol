@@ -99,6 +99,23 @@ pub const ODEL_FRAME_MAX: usize = 12 + 3 + 4 + 2 + 2 + 1 + ota::SIGNED_MSG_MAX +
 /// #237 max `ODON` frame: 12 + 3 (target) + 4 (build) + 2 (session) + 1 (result) = 22 B.
 pub const ODON_FRAME_MAX: usize = 12 + 3 + 4 + 2 + 1;
 
+/// #349: the two frames that carry the signed manifest must fit one ESP-NOW datagram. This was
+/// only ever asserted in PROSE above ("= 184 B — < the 250 B ESP-NOW MTU") — true when written,
+/// and nothing would have caught it becoming false. Extending M for the #349 target tuple
+/// (`SIGNED_MSG_MAX` 96 → 128) is exactly the change that would have broken it silently: an
+/// over-MTU OTAM does not fail loudly, it fails as a leaf that never arms.
+///
+/// The OTA family is EXEMPT from the #190 group-MAC trailer (`should_group_mac`), and ODEL/ODON
+/// go out via `send_arb_raw`, so neither budget needs `MAC_TRAILER_LEN` headroom.
+const _: () = assert!(
+    OTAM_FRAME_MAX <= crate::net::wire::ESP_NOW_MTU,
+    "OTAM no longer fits one ESP-NOW datagram — shrink SIGNED_MSG_MAX or split the frame"
+);
+const _: () = assert!(
+    ODEL_FRAME_MAX <= crate::net::wire::ESP_NOW_MTU,
+    "ODEL no longer fits one ESP-NOW datagram — shrink SIGNED_MSG_MAX or split the frame"
+);
+
 // ---------------------------------------------------------------------------
 // Parsed frames (borrow the RX buffer; used immediately in `service()`)
 // ---------------------------------------------------------------------------
@@ -847,10 +864,29 @@ impl OtaLeafSession {
             self.verify_fail = self.verify_fail.saturating_add(1); // #49: the #32 refuse-line proof
             return LeafAction::None;
         }
-        // (2) Only now is M trustworthy → parse build/size/sha.
-        let Some((build, size, sha256)) = crate::ota::parse_manifest(m) else {
+        // (2) Only now is M trustworthy → parse build/size/sha (+ the #349 target, when the
+        // crown staged from an `OTA2|` line).
+        let Some((build, size, sha256, target)) = crate::ota::parse_manifest(m) else {
             return LeafAction::None;
         };
+        // (2b) #349 PRE-FLASH suitability. This is the biggest win of putting the target in the
+        // SIGNED manifest: a leaf's image arrives chunk-by-chunk over ESP-NOW, so without this
+        // it would spend a whole mesh transfer — minutes of airtime that makes the mesh deaf —
+        // only to refuse at finalize. Here it declines the session outright.
+        //
+        // Trustworthy because the signature was verified in (1) and the target lives inside M.
+        // `None` (a legacy crown relaying a legacy manifest) refuses NOTHING: the finalize
+        // descriptor check still stands behind it.
+        if let Some(t) = target {
+            if let Err(why) = crate::net::target::decide(crate::net::target::SELF, t) {
+                log::warn!(
+                    "smol #349: OTAM declined — image is not for this board ({}) — no session, no flash",
+                    why.label()
+                );
+                self.dbg_verdict = LEAF_VERDICT_TARGET_BASE.saturating_add(why.code());
+                return LeafAction::None;
+            }
+        }
         // (3) FRESHNESS + size gate (design §3C). Monotonicity ∧ floor ∧ slot bound.
         if build <= crate::ota::BUILD_NUMBER {
             log::info!("smol #40: OTAM build {} <= running {} — rejected", build, crate::ota::BUILD_NUMBER);

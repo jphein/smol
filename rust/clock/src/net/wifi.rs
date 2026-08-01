@@ -299,6 +299,31 @@ impl MeshElect {
 #[cfg(feature = "wifi")]
 const OTA_STAGED_TOPIC: &[u8] = b"smol/ota/staged";
 
+/// #349: the PER-CHIP staged topic, `smol/ota/staged/<chip>` (e.g. `smol/ota/staged/esp32c3`),
+/// built at runtime from this board's own [`crate::net::target::SELF`].
+///
+/// The fleet-wide topic above arms EVERY board with ONE retained line. That was fine while the
+/// fleet was one chip; with C3 / C6 / S3 it is a correctness bug independent of any device-side
+/// guard — an S3 staging would arm every C3 in the fleet, each of which then downloads ~1.1 MB
+/// before refusing it. Routing by chip means the wrong image never reaches the board at all.
+///
+/// **Chip only, not chip+tier**, deliberately. #349 proposed `<chip>/<tier>`, but a "tier" here
+/// is a feature BITSET, not a name — putting it in a topic segment would mint a new topic every
+/// time a feature moves and make each board's subscription brittle in exactly the way WLED's
+/// per-env explosion was. Chip is a small, closed, stable set, and it is the axis where a wrong
+/// image is worst (the bootloader catches it by boot-looping into rollback). Every finer
+/// distinction is already carried by the signed target tuple and re-checked against the image's
+/// own descriptor, so the topic does not need to encode it.
+///
+/// The legacy fleet-wide topic is still subscribed, and both feed the same parse+gate. That
+/// overlap is the migration: see `docs/protocol.md` for which step needs a ROLLED fleet.
+#[cfg(feature = "wifi")]
+fn ota_staged_chip_topic() -> MqttScratch {
+    let mut t = MqttScratch::new();
+    let _ = write!(t, "smol/ota/staged/{}", crate::net::target::chip_name(crate::net::target::SELF.chip));
+    t
+}
+
 /// A retained owner whose `seq` has not advanced for this long is presumed DEAD and
 /// may be taken over. The owner re-publishes `MC` (seq++) every gateway flush (~30 s),
 /// so 3 missed refreshes with a frozen seq is a safe "owner gone" threshold. Consumed
@@ -2690,6 +2715,11 @@ fn mqtt_session(
     // #33 Model-A per-board OTA install command topic (native HA Update button → INSTALL).
     let mut cmd_topic = MqttScratch::new();
     let _ = write!(cmd_topic, "smol/{}/ota/install", node_id);
+
+    // #349: this board's per-chip staged topic. Built once per session, beside the other
+    // scratch topics, and used for BOTH the subscribe and the receive-side exact compare — one
+    // construction site, so the filter we ask for and the topic we match cannot diverge.
+    let staged_chip_topic = ota_staged_chip_topic();
     // #26 cast: this board's retained cast-enable topic (payload ON/OFF). feature=cast.
     #[cfg(feature = "cast")]
     let mut cast_topic = MqttScratch::new();
@@ -2799,6 +2829,14 @@ fn mqtt_session(
     // latest_version source + fetch target. No per-id announce-act topic exists (dropped
     // — the #32 closure): staging only advertises "update available"; it never fetches.
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 4, OTA_STAGED_TOPIC) {
+        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+    }
+    // #349: ALSO subscribe this board's PER-CHIP staged topic (pid 30 — the first free id; ids
+    // 1-29 are taken, and two in-flight SUBSCRIBEs sharing one is an MQTT-3.1.1 violation).
+    // Placed here, well above the batt/grid/mc trio, because the drain's break-gate keys on
+    // those three retained topics: a subscribe emitted after them can have its retained payload
+    // land past the gate and be silently dropped (the #100 drain-order defect, HW-observed).
+    if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 30, staged_chip_topic.as_bytes()) {
         let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
     }
     // #21 node-manager: subscribe this board's retained default-screen config (pid 6).
@@ -3478,12 +3516,18 @@ fn mqtt_session(
                                 w.uptime
                             ),
                         }
-                    } else if topic == OTA_STAGED_TOPIC {
+                    } else if topic == OTA_STAGED_TOPIC || topic == staged_chip_topic.as_bytes() {
                         // #33 Model-A: parse + GATE the retained STAGED line (monotonicity +
                         // host allowlist + size). A gate-passing staged build becomes the
                         // latest_version + fetch TARGET (ota_offer) — but it does NOT fetch;
                         // the fetch is AND-gated on this board's own `install` command below.
                         // Stale/foreign/oversize → ignored (up-to-date; no offer).
+                        //
+                        // #349: the fleet-wide and per-chip topics feed the SAME parse+gate on
+                        // purpose. Whichever arrives, the monotonicity gate decides — so during
+                        // the migration a board may see both a legacy `OTA|` line and an
+                        // `OTA2|` line for the same build, and simply takes whichever is newer
+                        // than what it runs. Nothing needs to know which topic it came from.
                         match crate::ota::parse_announce(payload) {
                             Some(a) => {
                                 // #40: PERSIST the RAW announce (pre-gate) for a possible leaf

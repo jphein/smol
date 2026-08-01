@@ -1131,10 +1131,69 @@ struct __attribute__((packed)) smol_target_desc_t {
 runtime (`crate::headless()`); a variant that is not a build artifact needs no OTA guard, no CI
 job, and no row in a table.
 
-**Not yet done** (device-side refusal landed first): the staged manifest still carries no target
-tuple, so a board refuses *after* downloading rather than before; `smol/ota/staged` is still one
-fleet-wide topic; and there is no publisher-side `--force-target-mismatch` escape hatch. Today's
-escape hatch is a USB flash.
+### The signed manifest carries the target too (`OTA2|`)
+
+The descriptor above says what an image is *after* you have downloaded it. The staged announce now
+says the same thing *before*, so an unsuitable image costs nothing instead of ~1.1 MB.
+
+| generation | staged payload | signed M |
+|---|---|---|
+| #32 legacy | `OTA\|build\|size\|sha256\|sig\|url` | `build\|size\|sha256` |
+| #349 | `OTA2\|build\|size\|sha256\|**target**\|sig\|url` | `build\|size\|sha256\|**target**` |
+
+`target` is the **same 16 bytes as the embedded descriptor**, lowercase hex (32 chars) — not a
+second, tidier encoding. `ota_publish.sh` *extracts* it from the binary it just built rather than
+recomputing it from build flags, so the manifest and the image cannot disagree by construction.
+Worst-case M is **119 B** (two 10-digit `u32`s), against `SIGNED_MSG_MAX = 128`; `ota_mesh.rs` now
+carries real `const` asserts that `OTAM`/`ODEL` still fit the 250 B ESP-NOW MTU, a bound that until
+now lived only in a prose comment.
+
+The target sits **inside** M, before the signature field, for two reasons: M stays a contiguous
+prefix of the payload (so it can be rebuilt from exact wire bytes with no re-serialization), and an
+unauthenticated target could be stripped or rewritten by anyone with broker write access — a
+suitability check on unsigned data is theatre.
+
+Versioning is **by prefix, never by field shape**. `strip_prefix("OTA|")` cannot match `"OTA2|"`,
+so pre-#349 firmware ignores a new line *cleanly* rather than mis-slicing it into a bogus fetch.
+That property is asserted in `experiments/target_guard_verify`, not assumed.
+
+Refusals here are the same `TargetReject` tokens, surfaced as `Reject::Target(..)`. A legacy line
+states no target and is therefore **never refused pre-fetch** — `None` means "this staging did not
+say", not "suitable for anyone".
+
+### Per-chip staged topic
+
+`smol/ota/staged/<chip>` (e.g. `smol/ota/staged/esp32c3`), alongside the fleet-wide
+`smol/ota/staged`. One retained line arming every board was fine while the fleet was one chip; with
+C3/C6/S3 it is a correctness bug independent of any device-side guard.
+
+**Chip only, not chip+tier.** A "tier" here is a feature *bitset*, not a name; putting it in a topic
+segment would mint a new topic whenever a feature moves and make each board's subscription brittle
+— the per-env explosion WLED's maintainers say did not scale. Chip is small, closed and stable, and
+it is the axis where a wrong image is worst. Every finer distinction rides the signed target tuple
+and is re-checked against the image's own descriptor.
+
+### Migration — which step needs what
+
+This is the part to get right, because only one step can strand a board. **A merged `main` is not a
+rolled fleet**: boards run whatever was last installed, so the reader only exists in the field after
+boards carry it.
+
+| step | precondition | why |
+|---|---|---|
+| 1. firmware parses **both** generations, subscribes both topics | **merged main** | purely additive; a board that never sees an `OTA2\|` line behaves exactly as before |
+| 2. publisher **dual-stages** (legacy line unchanged + `OTA2\|` per-chip) | **merged main** | old firmware keeps reading the legacy topic it always read; new firmware prefers the per-chip line. Nothing is taken away, so nothing can be stranded |
+| 3. retire the fleet-wide `smol/ota/staged` line | **a ROLLED fleet** | the moment it stops being published, any board that cannot parse `OTA2\|` stops seeing updates — silently, since its symptom is simply never updating |
+
+Step 3 has a second, less obvious dependency: a crown relays the **signed M verbatim** to leaves
+over `OTAM`, so once a crown installs from an `OTA2` line it relays a 119 B M that a pre-#349 leaf
+rejects (`m_len > SIGNED_MSG_MAX`). Leaf mesh-OTA to un-upgraded leaves therefore also depends on
+the legacy path. Both reasons point the same way: **keep dual-staging until every board reports a
+build that carries the `OTA2` parser.**
+
+**Still not done:** no publisher-side `--force-target-mismatch` escape hatch (issue item 6) and no
+device-side override. Today's escape hatch is a USB flash — which is also the honest one, since a
+board that refuses an image is not reachable by the mechanism you would use to override it.
 
 ## MQTT burst — the LAN transport that retires the UDP collector
 

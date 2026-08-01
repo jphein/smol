@@ -83,8 +83,19 @@ pub const CHUNK: usize = 4096;
 /// Max announce URL length kept in an owned [`Announce`] (bounded, no alloc).
 pub const URL_MAX: usize = 160;
 
-/// #32: max bytes of the signed manifest M = `"build|size|sha256hex"` (≤10+1+10+1+64 = 86).
-pub const SIGNED_MSG_MAX: usize = 96;
+/// Max bytes of the signed manifest M.
+///
+/// * #32 legacy (`OTA|`):  `"build|size|sha256hex"`              ≤ 10+1+10+1+64        =  86
+/// * #349 (`OTA2|`):       `"build|size|sha256hex|targethex"`    ≤ 10+1+10+1+64+1+32   = 119
+///
+/// 128 leaves headroom over the 119 worst case (both integers are `u32`, so 10 decimal digits
+/// each is the true ceiling even though a real `size` is capped at `MAX_IMAGE_SIZE` = 7 digits).
+///
+/// **Raising this grows two ESP-NOW frames**, and until #349 the only thing keeping them under
+/// the 250 B MTU was a prose comment ("= 184 B — < the 250 B ESP-NOW MTU"). `ota_mesh.rs` now
+/// carries a real `const _: () = assert!` on `OTAM_FRAME_MAX`/`ODEL_FRAME_MAX`, so the next
+/// person who extends the manifest gets a build error instead of a truncated frame.
+pub const SIGNED_MSG_MAX: usize = 128;
 
 /// Partition-table read scratch (an ESP-IDF table is ≤ 0xC00 bytes). Stack-only,
 /// used transiently by the flash helpers.
@@ -160,6 +171,12 @@ pub struct Announce {
     // Read by the fetch (espnow) integrity gate; parsed but unused in a wifi-only build.
     #[allow(dead_code)]
     pub sha256: [u8; 32],
+    /// #349: the target this image declares, when the announce is an `OTA2|` line. `None` for a
+    /// legacy `OTA|` line, which means "this staging did not say" — NOT "suitable for anyone".
+    /// A `None` here therefore never refuses anything; it just leaves the post-download
+    /// descriptor check as the only guard, exactly as before #349's follow-up. That asymmetry
+    /// is what lets the new publisher and the old fleet coexist.
+    pub target: Option<crate::net::target::TargetId>,
     // #32: the 64-byte Ed25519 signature over M, and the exact signed manifest bytes.
     // Parsed (written) in every build; READ only by the espnow verify-before-activate →
     // unused in a wifi-only build.
@@ -204,17 +221,14 @@ impl Announce {
         if m.is_empty() || m.len() > SIGNED_MSG_MAX {
             return None;
         }
-        let s = core::str::from_utf8(m).ok()?;
-        let mut it = s.splitn(3, '|');
-        let build: u32 = it.next()?.parse().ok()?;
-        let size: u32 = it.next()?.parse().ok()?;
-        let sha256 = parse_hex_n::<32>(it.next()?)?;
+        let (build, size, sha256, target) = split_manifest(m)?;
         let mut signed_msg = [0u8; SIGNED_MSG_MAX];
         signed_msg[..m.len()].copy_from_slice(m);
         Some(Announce {
             build,
             size,
             sha256,
+            target,
             sig: *sig,
             signed_msg,
             signed_len: m.len(),
@@ -224,31 +238,64 @@ impl Announce {
     }
 }
 
-/// Parse `OTA|build|size|sha256hex|sighex|url` (#32: `sighex` = 128-hex Ed25519 sig; url
-/// last so it may contain no `|`). ASCII, decimal build/size. Panic-free — `None` on ANY
-/// malformed field. An OLD unsigned 5-field-less announce (`OTA|build|size|sha|url`) fails
-/// closed: its `url` lands in the `sig` slot and fails the 128-hex parse.
+/// Parse a retained staged announce. **Two formats are accepted, distinguished by PREFIX** —
+/// never by guessing at field shapes:
+///
+/// * `OTA|build|size|sha256hex|sighex|url`                  — #32 legacy, no target
+/// * `OTA2|build|size|sha256hex|targethex|sighex|url`       — #349, target in the SIGNED part
+///
+/// In both, `url` is last so it may contain no `|`, and `sighex` is the 128-hex Ed25519 sig.
+/// M (the signed bytes) stays a CONTIGUOUS PREFIX of the payload in both, which is what lets it
+/// be rebuilt from the exact wire bytes with no re-serialization — hence `targethex` sits
+/// before `sighex` rather than after it. **The target is inside M on purpose:** a target field
+/// outside the signature could be stripped or rewritten by anyone with broker write access, and
+/// a suitability check on unauthenticated data is theatre.
+///
+/// Panic-free — `None` on ANY malformed field. Version by prefix means an older firmware, whose
+/// `strip_prefix("OTA|")` cannot match `"OTA2|"`, ignores a new-format line CLEANLY instead of
+/// mis-slicing it into a bogus fetch.
 pub fn parse_announce(payload: &[u8]) -> Option<Announce> {
     let s = core::str::from_utf8(payload).ok()?;
-    let rest = s.strip_prefix("OTA|")?;
+    // Try the versioned prefix FIRST: "OTA|" is not a prefix of "OTA2|", so the order is only
+    // about clarity, not correctness.
+    if let Some(rest) = s.strip_prefix("OTA2|") {
+        parse_fields(rest, true)
+    } else {
+        parse_fields(s.strip_prefix("OTA|")?, false)
+    }
+}
+
+/// Shared field walk for both announce generations. `has_target` selects whether a `targethex`
+/// field sits between the sha and the sig — and therefore whether it is inside M.
+fn parse_fields(rest: &str, has_target: bool) -> Option<Announce> {
     // Keep the field &strs so M can be rebuilt from their EXACT wire bytes (no re-serialize).
-    let mut it = rest.splitn(5, '|');
+    let mut it = rest.splitn(if has_target { 6 } else { 5 }, '|');
     let build_s = it.next()?;
     let size_s = it.next()?;
     let sha_s = it.next()?;
+    let target_s = if has_target { Some(it.next()?) } else { None };
     let sig_s = it.next()?;
     let url = it.next()?;
     let build: u32 = build_s.parse().ok()?;
     let size: u32 = size_s.parse().ok()?;
     let sha256 = parse_hex_n::<32>(sha_s)?;
     let sig = parse_hex_n::<64>(sig_s)?;
+    // A present-but-unparseable target fails the WHOLE announce rather than degrading to
+    // "no target stated". Silently dropping to the legacy path would turn a corrupted target
+    // into a permissive one — the failure direction this feature exists to prevent.
+    let target = match target_s {
+        Some(t) => Some(crate::net::target::decode_hex(t)?),
+        None => None,
+    };
     if url.is_empty() || url.len() > URL_MAX || !url.is_ascii() {
         return None;
     }
-    // #32: M = the EXACT wire bytes "build|size|sha256hex" (fields 1-3 + their two '|'),
-    // reconstructed from the field lengths so it is byte-identical to what the host signed
-    // (no decimal/hex re-serialization). M is a prefix of `rest`, so the slice is in-bounds.
-    let m_len = build_s.len() + 1 + size_s.len() + 1 + sha_s.len();
+    // M = the EXACT wire bytes of the signed prefix (fields 1-3, plus `targethex` on `OTA2|`)
+    // with their separators, byte-identical to what the host signed.
+    let mut m_len = build_s.len() + 1 + size_s.len() + 1 + sha_s.len();
+    if let Some(t) = target_s {
+        m_len += 1 + t.len();
+    }
     if m_len > SIGNED_MSG_MAX {
         return None;
     }
@@ -260,6 +307,7 @@ pub fn parse_announce(payload: &[u8]) -> Option<Announce> {
         build,
         size,
         sha256,
+        target,
         sig,
         signed_msg,
         signed_len: m_len,
@@ -359,6 +407,13 @@ pub enum Reject {
     BadSize,
     /// URL did not parse.
     BadUrl,
+    /// #349: the announce STATED a target and it is not this board's. Refused before a socket
+    /// opens, so an unsuitable image costs nothing at all rather than a whole download.
+    ///
+    /// Only reachable from an `OTA2|` line. A legacy `OTA|` line states no target and is never
+    /// refused here — the post-download descriptor check remains its guard. That asymmetry is
+    /// deliberate: it is what lets a new publisher and an un-rolled fleet coexist.
+    Target(crate::net::target::TargetReject),
 }
 
 /// Gate an announce in spec order (§3 Stage C-2): monotonicity → host allowlist →
@@ -374,6 +429,18 @@ pub fn gate(a: &Announce) -> Result<(), Reject> {
     }
     if a.size == 0 || a.size > MAX_IMAGE_SIZE {
         return Err(Reject::BadSize);
+    }
+    // #349 pre-fetch suitability. Cheap, and it runs on data the signature COVERS — the target
+    // sits inside M, so this refusal is exactly as trustworthy as the build/size/sha gate.
+    //
+    // NOTE this is an OPTIMIZATION, not the guard. It saves a ~1.1 MB download when the staging
+    // says up front that the image is not ours. The authoritative check remains the descriptor
+    // read out of the written slot at finalize, because that one judges the bytes that will
+    // actually boot rather than what an announce claimed about them.
+    if let Some(t) = a.target {
+        if let Err(why) = crate::net::target::decide(crate::net::target::SELF, t) {
+            return Err(Reject::Target(why));
+        }
     }
     Ok(())
 }
@@ -1217,16 +1284,32 @@ pub fn boot_confirm(self_test_passed: bool) {
 /// caller MUST have already verified the ed25519 signature over these bytes (§3, the
 /// verify-BEFORE-trust order) before acting on the result.
 #[cfg(feature = "espnow")]
-pub fn parse_manifest(m: &[u8]) -> Option<(u32, u32, [u8; 32])> {
+pub fn parse_manifest(m: &[u8]) -> Option<(u32, u32, [u8; 32], Option<crate::net::target::TargetId>)> {
+    split_manifest(m)
+}
+
+/// The ONE parser for the signed manifest M, in both generations:
+///
+/// * `build|size|sha256hex`             — #32 legacy, target `None`
+/// * `build|size|sha256hex|targethex`   — #349
+///
+/// Shared by `Announce::from_signed`, [`parse_manifest`] and the staged-line walk, because M is
+/// the string the SIGNATURE covers: three parsers that disagreed about its shape would be three
+/// chances to verify a signature over one interpretation and act on another.
+///
+/// The field walk itself lives in the PURE `net::target` module (`parse_manifest_str`), because
+/// M is both the signed string and the legacy-compatibility boundary — the thing that decides
+/// whether an un-upgraded fleet is stranded — and that deserves host tests, not hardware.
+/// This is the `&[u8]` → tuple adapter over it, and the single definition every caller shares:
+/// three parsers that disagreed about M's shape would be three chances to verify a signature
+/// over one interpretation and act on another.
+#[cfg(feature = "espnow")]
+fn split_manifest(
+    m: &[u8],
+) -> Option<(u32, u32, [u8; 32], Option<crate::net::target::TargetId>)> {
     let s = core::str::from_utf8(m).ok()?;
-    let mut it = s.splitn(3, '|');
-    let build: u32 = it.next()?.parse().ok()?;
-    let size: u32 = it.next()?.parse().ok()?;
-    let sha256 = parse_hex_n::<32>(it.next()?)?;
-    // The final field must be EXACTLY the 64-hex sha with nothing trailing (splitn(3)
-    // would otherwise fold a `build|size|sha|junk` tail into field 3 — parse_hex_n's
-    // strict length check rejects that, so a trailing field fails closed).
-    Some((build, size, sha256))
+    let p = crate::net::target::parse_manifest_str(s)?;
+    Some((p.build, p.size, p.sha256, p.target))
 }
 
 // ---------------------------------------------------------------------------
