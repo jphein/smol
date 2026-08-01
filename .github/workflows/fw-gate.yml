@@ -1,0 +1,84 @@
+# #338 — the firmware gate, in CI.
+#
+# Before this, `.github/workflows/` held only `pages.yml`: nothing built any feature tier, ran
+# clippy, or ran the host suites. The "4-tier gate" cited in ONBOARDING.md and rust-toolchain.toml
+# was prose plus whoever remembered to run it. On 2026-08-01 that cost us main sitting red on its
+# own `-D warnings` rule unnoticed, a new feature (`ledger-provision`) with no matrix to add it to,
+# and two agents separately hand-building baselines to compute a clippy delta.
+#
+# DELIBERATELY THIN: every actual command lives in `tools/gate.sh`, which a developer runs verbatim
+# before pushing. If the gate logic lived here, the local instructions and CI would be two
+# definitions free to drift — the same failure in a new place. This file only supplies a machine.
+name: fw gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A force-push supersedes its own in-flight run; main runs are never cancelled.
+concurrency:
+  group: fw-gate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep a runner's memory in bounds: these are LTO release builds of an embedded crate.
+  SMOL_GATE_JOBS: 2
+
+jobs:
+  # Split so a Rust-only breakage is distinguishable at a glance from a host-logic regression,
+  # and so the host suites still report when the riscv toolchain is the thing that broke.
+  host:
+    name: host verifier suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins `stable` + the riscv target + clippy; rustup honours it
+      # automatically, so there is no version to restate here (and none to drift).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: experiments
+          key: host
+      - run: tools/gate.sh host
+
+  firmware:
+    name: tiers + clippy + stack floor
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show resolved toolchain
+        working-directory: rust/clock
+        run: rustc -vV && cargo clippy --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/clock
+          key: fw
+      # readelf reads _stack_start/_stack_end out of the riscv ELF (arch-independent); ubuntu-latest
+      # ships binutils, but assert it rather than discovering its absence as a confusing FATAL.
+      - name: Assert readelf present
+        run: readelf --version >/dev/null
+
+      - run: tools/gate.sh fw
+
+      # The single highest-value line in this workflow, surfaced where a reviewer sees it without
+      # opening logs. Both the #233 spike and the #266 rebase turned on this number and both found
+      # it at the last possible moment; it was previously computed only at package time.
+      - name: Stack number → job summary
+        if: always()
+        run: |
+          {
+            echo "### Canonical image stack"
+            if [ -s /tmp/gate-stack-report ]; then
+              echo '```'; cat /tmp/gate-stack-report; echo '```'
+            else
+              echo "_stack number unavailable — the canonical build did not reach the check._"
+            fi
+            echo ""
+            echo "⚠️ This bounds the linked **region**, not runtime high-water. A struct in a"
+            echo "stack-resident \`RadioManager\` can cost ~1.8 KB of real stack while moving this"
+            echo "number by ~32 B. Green here is not evidence of runtime headroom."
+          } >> "$GITHUB_STEP_SUMMARY"
