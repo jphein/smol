@@ -63,6 +63,16 @@ if [ "$run_fw" = 1 ]; then
   step "provisioning (git-ignored; existing files untouched)"
   "$ROOT/tools/ci_provision.sh" "$CLOCK" || { echo "provisioning failed" >&2; exit 1; }
 
+  # Cheap and first, so a source-consistency error is not buried behind ten minutes of LTO.
+  # #339: the prose describing the DIAG shed order had drifted from the appends it described, in a
+  # direction that would send an operator to the wrong fields. Prose cannot be tested; this can.
+  step "DIAG shed order matches its declaration (#339)"
+  if out=$("$ROOT/tools/check_shed_order.py" "$CLOCK/src/net/mode.rs" 2>&1); then
+    printf '%s\n' "$out"; ok "shed order"
+  else
+    printf '%s\n' "$out"; bad "shed order"
+  fi
+
   # The tiers. `default` is the always-green baseline; `wifi`/`espnow` are the documented rungs;
   # the canonical fleet tier is what actually ships. A feature added to Cargo.toml and NOT added
   # here is a code path nothing compiles — the `ledger-provision` case that motivated this issue.
