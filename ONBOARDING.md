@@ -129,10 +129,13 @@ Full toolchain + gotchas: **[`docs/BUILDING.md`](docs/BUILDING.md)**. TL;DR for 
    ignored files, so every board stamps the same clean commit hash.
 2. **Build tiers and the gate: `tools/gate.sh`.** Run it before you push; CI (`.github/workflows/
    fw-gate.yml`) runs the *same script*, so there is nothing here to fall out of step with it.
-   `tools/gate.sh` (or `host` / `fw` for one half) covers: `cargo check` across the tiers — default
-   (always-green) · `wifi` · `espnow` · the canonical fleet tier · any feature it finds in
-   `Cargo.toml` — plus `clippy -D warnings` on **every** tier (#343), the host
-   `experiments/*_verify` suites, and the #300 **stack floor** (printed on every PR).
+   `tools/gate.sh` (or `host` / `fw` for one half) covers: `cargo check` and `clippy -D warnings`
+   across **every tier**, the host `experiments/*_verify` suites, the crate's own `tests/*.rs`
+   suites, and the #300 **stack floor** (printed on every PR).
+
+   **Since #350 the tier and chip lists are DERIVED from `tools/build-matrix.toml`**, which also
+   separates *what CI builds* from *what the release ships* — the S3 is declared and not shipped,
+   OpenWrt's `DEFAULT := n`. Add a tier or a chip **there**, not in `gate.sh`, and not here.
 
    **This list deliberately lives in the script, not here.** Until #338 it lived only in prose, and
    the prose was wrong without anyone noticing: `main` sat red on its own `-D warnings` rule, and a

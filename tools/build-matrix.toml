@@ -1,0 +1,115 @@
+# build-matrix.toml — #350. The (chip, tier) matrix, declared ONCE as data.
+#
+# ── WHY ───────────────────────────────────────────────────────────────────────
+# #338 made the canonical feature set a single variable so CI could not gate a different
+# tier than the one that ships. That fixed the one-variable case. This is the same lesson
+# generalised to a table, before #331 makes `chips x tiers` unbounded.
+#
+# The failure mode being designed against is not hypothetical. WLED's maintainers hand-
+# enumerated their build environments and are on record that it became "impossible to
+# maintain over several years"; their fix was to DERIVE the CI matrix from the config
+# (`pio project config --json-output | jq ...`) rather than list it. Full study:
+# `scratch/parity/multitarget-prior-art.md`.
+#
+# ── THE TWO RULES THIS FILE ENCODES ───────────────────────────────────────────
+#
+# 1. BUILDS AND SHIPS ARE SEPARATE DECLARATIONS. A target can be defined and compiled
+#    while being deliberately absent from the release — OpenWrt's `DEFAULT := n`
+#    (openwrt#12672), which kept 4/32 devices buildable after they stopped being shipped.
+#    `ships = true` on a chip with `builds = false` is a contradiction and the checker
+#    refuses it: you cannot ship what nothing compiles.
+#
+# 2. ONE AXIS AT A TIME. The matrix is (every buildable chip x the canonical tier) UNION
+#    (the canonical chip x every tier). It is NEVER the cross product. Tasmota crosses its
+#    27 locales only with the single spine variant — 99 binaries a release instead of 270 —
+#    and that discipline is the only reason their matrix is still legible. `emit` refuses
+#    to produce a cross product; `tools/test_build_matrix.sh` proves the refusal.
+#
+# ── WHAT THIS FILE DELIBERATELY DOES NOT CONTAIN ──────────────────────────────
+# No expected image size, and no expected stack region. Both are TREE-DEPENDENT: `board.rs`
+# and `secrets.rs` are git-ignored and provisioned per tree, their literals land in
+# `.rodata`/`.data`, and `.stack` is whatever DRAM is left over — so the same commit
+# measures 114,648 B here, 114,640 B under the CI templates locally, and 114,608 B on a
+# GitHub runner (#348, 3dd35d1). A byte-equality assertion on either would be a gate that
+# is red for everyone except the tree it was written on. The gates that DO apply are
+# inequalities with margin — `.stack >= floor`, `image <= slot` — and they live in
+# `repro_stack_check` / `ota_publish.sh`, which measure the artifact. Keep it that way: this
+# file declares WHAT is built, never HOW BIG it came out.
+#
+# Per-chip MEMORY BUDGETS are not here either — they are `rust/clock/src/budget.rs` (#348),
+# which has to be Rust because its mechanism is a compile-time const-assertion, and which
+# moves to `smol-core` at #347 Phase 2, where a CI build matrix has no business. The chip
+# ROSTER is therefore stated in two places by necessity, so `build_matrix.py check` asserts
+# the two agree in BOTH directions and fails the gate if either grows a chip alone.
+
+[meta]
+# The chip whose all-tiers axis is crossed, and the tier crossed with every chip.
+canonical_chip = "esp32c3"
+canonical_tier = "fleet"
+
+# ── CHIPS ─────────────────────────────────────────────────────────────────────
+# `builds` means CI compiles it and a green run says something about it. It is FALSE for a
+# chip the tree cannot compile today — declaring a job that always fails is worse than
+# declaring none, because a permanently-red arm teaches everyone to ignore the gate.
+# `blocked_on` records why, so the row is a tracked commitment rather than a wish.
+
+[chip.esp32c3]
+target = "riscv32imc-unknown-none-elf"
+builds = true
+ships  = true
+
+[chip.esp32s3]
+# JP's next fleet target. Not yet compilable from this tree: `esp-hal` is pinned with
+# `features = ["esp32c3"]`, `.cargo/config.toml` pins `build.target`, and xtensa needs the
+# esp Rust fork rather than the pinned upstream toolchain.
+target     = "xtensa-esp32s3-none-elf"
+builds     = false
+ships      = false
+blocked_on = "#331 multi-target; needs the esp fork toolchain and a per-chip esp-hal feature"
+# When #331 lands, flipping `builds` to true is a ONE-WORD data change and the matrix,
+# the CI jobs and the tier coverage all follow. That is the entire point of this file.
+# `ships` stays false after that: OpenWrt's DEFAULT := n. Buildable is not shipped.
+
+[chip.esp32c6]
+# The esp32c6-watch already runs this chip in its own repo (#347 Phase 2's third consumer).
+target     = "riscv32imac-unknown-none-elf"
+builds     = false
+ships      = false
+blocked_on = "#331 multi-target; esp-hal chip feature is pinned to esp32c3 in Cargo.toml"
+
+# ── TIERS ─────────────────────────────────────────────────────────────────────
+# `features` is passed verbatim to `--features` (empty string = default features only).
+# `${canonical}` expands to the canonical tier's feature string so the combined builds
+# cannot drift from it — the #338 rule applied inside this file.
+#
+# `check` and `clippy` default to TRUE. A tier excluded from either needs a written reason
+# in `why`: #343's finding was that a tier which only gets `cargo check` has its new
+# warnings invisible, which is how findings accumulated unnoticed for months.
+
+[tier.default]
+features = ""
+
+[tier.wifi]
+features = "wifi"
+
+[tier.espnow]
+features = "espnow"
+
+[tier.fleet]
+# THE canonical fleet tier. Must equal `REPRO_FLEET_FEATURES` in tools/repro_build.sh, which
+# stays the source of truth for the PACKAGING path — `repro_build.sh` is sourced by
+# `ota_publish.sh`, and putting a TOML parser on the publish path is new failure surface for
+# no gain. `build_matrix.py check` asserts the two strings are identical.
+features = "espnow,cast,io"
+ships    = true
+
+[tier.bard]
+# #347: off the C3 fleet image, still a supported build for chips with room. `off-fleet` is
+# #348's declaration that this is not the fleet image; without it the budget predicate
+# correctly refuses to compile the Bard for a C3. `repro_build_bin` refuses to PACKAGE
+# anything naming `off-fleet`, so this tier cannot leak into a shipped artifact.
+features = "bard,off-fleet,${canonical}"
+
+[tier.ledger-provision]
+# #181/#266. A deliberate USB-touch provisioning build, never shipped.
+features = "ledger-provision"
