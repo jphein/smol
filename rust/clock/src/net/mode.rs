@@ -3178,15 +3178,45 @@ impl RadioManager {
         // most-relevant APs.
         let record = match block_on(
             self.controller
-                // #233 REGRESSION FIX: esp-radio 0.18's scan_async(ScanConfig::default()) has
-                // max=None and returns EVERY AP in range as a heap Vec — the old esp-wifi
-                // scan_n(16) capped at 16. In a dense RF environment the unbounded Vec is an
-                // OOM-panic risk (alloc failure = rst=panic); .with_max(16) restores the bound.
+                // ⚠️ #367: `.with_max(16)` DOES NOT BOUND THE ALLOCATION. It is accepted and
+                // silently DISCARDED by esp-radio 0.18. Kept only because it is the documented
+                // intent and costs nothing if a future version starts honouring it.
+                //
+                // Why it does nothing (esp-radio-0.18.0, verified in source):
+                //   - `scan_async` collects internally at `wifi/mod.rs:2828` via
+                //     `ScanResults::new(self)?.collect::<Vec<_>>()`.
+                //   - `ScanResults::new(_controller)` (`wifi/scan.rs:138`) takes the CONTROLLER
+                //     only — the `ScanConfig` never reaches it. It sets `remaining = bss_total`
+                //     (the full driver AP count) and the iterator walks every one.
+                //   - So one `AccessPointInfo` is heap-allocated per AP the radio can see.
+                // Upstream: esp-hal#5583 (opened 2026-05-19, closed 2026-05-28) — the fix is NOT
+                // in 0.18.0. A matched-set bump is the real fix (#233's thesis: never piecemeal).
+                //
+                // DO NOT "fix" this with either obvious repair — both are dead ends:
+                //   1. `.take(16)` on the RETURNED value cannot help: `scan_async` returns an
+                //      already-collected `Vec`, so the allocation happened inside the callee
+                //      before we see a byte. It bounds our copy, never the peak.
+                //   2. Driving the scan ourselves to use the public `ScanResults` iterator is
+                //      UNREACHABLE: `wifi_start_scan` is `pub(crate)` (`wifi/mod.rs:1090`) and
+                //      `EVENT_CHANNEL` is private. `scan_async` is the crate's ONLY public scan
+                //      entry point.
+                //
+                // Measured magnitude (so the risk is sized, not feared): `AccessPointInfo` is
+                // 47 B on this target; the heap is 96 KB (`net.rs`). 150 BSSIDs ≈ 7 KB steady,
+                // ~14 KB if the Vec doubles while growing. Real, density-dependent, and invisible
+                // on a 3-AP bench — but not the tens-of-KB spike an earlier estimate suggested.
                 .scan_async(&ScanConfig::default().with_max(16)),
         ) {
             Ok(mut aps) => {
                 // Strongest RSSI first (descending → Reverse of the ascending key).
                 aps.sort_by_key(|a| core::cmp::Reverse(a.signal_strength));
+                // #367 RETAINED-COPY BOUND — deliberately NOT an OOM guard. The peak allocation
+                // already happened inside `scan_async` (see the note above); this cannot undo it.
+                // What it DOES do is bound everything downstream of here — the record we format,
+                // publish and relay — to the 16 strongest, which is the behaviour the old
+                // esp-wifi `scan_n(16)` gave callers. Truncating AFTER the sort keeps the
+                // strongest 16 rather than an arbitrary 16.
+                aps.truncate(16);
                 format_scan_record(&aps)
             }
             Err(_) => alloc::string::String::from("SCAN|err"),
@@ -3234,13 +3264,41 @@ impl RadioManager {
         // co-channel vs the strand fallback in ONE pass). Filter to our SSID; feed the pure selector.
         let decision = match block_on(
             self.controller
-                // #233 REGRESSION FIX: esp-radio 0.18's scan_async(ScanConfig::default()) has
-                // max=None and returns EVERY AP in range as a heap Vec — the old esp-wifi
-                // scan_n(16) capped at 16. In a dense RF environment the unbounded Vec is an
-                // OOM-panic risk (alloc failure = rst=panic); .with_max(16) restores the bound.
+                // ⚠️ #367: `.with_max(16)` DOES NOT BOUND THE ALLOCATION. It is accepted and
+                // silently DISCARDED by esp-radio 0.18. Kept only because it is the documented
+                // intent and costs nothing if a future version starts honouring it.
+                //
+                // Why it does nothing (esp-radio-0.18.0, verified in source):
+                //   - `scan_async` collects internally at `wifi/mod.rs:2828` via
+                //     `ScanResults::new(self)?.collect::<Vec<_>>()`.
+                //   - `ScanResults::new(_controller)` (`wifi/scan.rs:138`) takes the CONTROLLER
+                //     only — the `ScanConfig` never reaches it. It sets `remaining = bss_total`
+                //     (the full driver AP count) and the iterator walks every one.
+                //   - So one `AccessPointInfo` is heap-allocated per AP the radio can see.
+                // Upstream: esp-hal#5583 (opened 2026-05-19, closed 2026-05-28) — the fix is NOT
+                // in 0.18.0. A matched-set bump is the real fix (#233's thesis: never piecemeal).
+                //
+                // DO NOT "fix" this with either obvious repair — both are dead ends:
+                //   1. `.take(16)` on the RETURNED value cannot help: `scan_async` returns an
+                //      already-collected `Vec`, so the allocation happened inside the callee
+                //      before we see a byte. It bounds our copy, never the peak.
+                //   2. Driving the scan ourselves to use the public `ScanResults` iterator is
+                //      UNREACHABLE: `wifi_start_scan` is `pub(crate)` (`wifi/mod.rs:1090`) and
+                //      `EVENT_CHANNEL` is private. `scan_async` is the crate's ONLY public scan
+                //      entry point.
+                //
+                // Measured magnitude (so the risk is sized, not feared): `AccessPointInfo` is
+                // 47 B on this target; the heap is 96 KB (`net.rs`). 150 BSSIDs ≈ 7 KB steady,
+                // ~14 KB if the Vec doubles while growing. Real, density-dependent, and invisible
+                // on a 3-AP bench — but not the tens-of-KB spike an earlier estimate suggested.
                 .scan_async(&ScanConfig::default().with_max(16)),
         ) {
             Ok(aps) => {
+                // #367: NO `truncate` here, unlike the scan-record path above — deliberate.
+                // `select_crown_ap` takes a `max_by_key` over these views, so dropping any entry
+                // risks discarding the very AP it exists to find. `views` is already bounded far
+                // below the raw AP count by the SSID filter below (only our own network), so an
+                // arbitrary cap would trade correctness for memory we do not need back here.
                 let mut views: alloc::vec::Vec<ApView> = alloc::vec::Vec::new();
                 for a in aps.iter() {
                     if a.ssid.as_str() == net.ssid {
