@@ -560,6 +560,17 @@ pub fn stat_build(value: &[u8]) -> Option<u32> {
 
 use esp_bootloader_esp_idf::ota::Slot;
 
+/// #349: first `dbg_verdict` value reserved for a SUITABILITY refusal at finalize. The
+/// `on_meta` verdicts occupy 0-7, so the target-reject band starts here and runs
+/// `LEAF_VERDICT_TARGET_BASE + TargetReject::code()`. Kept as one base + an ordinal rather
+/// than six named constants so adding a rejection reason cannot leave this band stale — the
+/// assertion below is what makes that structural instead of hopeful.
+const LEAF_VERDICT_TARGET_BASE: u8 = 8;
+const _: () = assert!(
+    LEAF_VERDICT_TARGET_BASE as u16 + crate::net::target::TargetReject::COUNT as u16 <= 256,
+    "the #349 target-reject verdict band no longer fits the LDBG dbg_verdict byte"
+);
+
 /// Emit a gap-NAK if a window stays incomplete this long since the last NAK (ms).
 const LEAF_IDLE_NAK_MS: u64 = 500;
 /// Abort the session if NO new chunk arrives for this long (a jam / dead gateway, ms).
@@ -700,7 +711,9 @@ pub struct OtaLeafSession {
     /// `relay-failed` (gateway `rx>0 otan=0`) names WHY the leaf never NAK'd:
     /// `dbg_otam_heard` = OTAMs addressed to us that reached `on_meta`; `dbg_verdict` = the last
     /// `on_meta` outcome (0 never-heard, 1 armed, 2 sig-fail, 3 build≤running, 4 ≤fresh_floor,
-    /// 5 size, 6 writer-open-fail, 7 dedup/live); `dbg_otan_sent` = OTANs this leaf emitted.
+    /// 5 size, 6 writer-open-fail, 7 dedup/live) — or, from [`LEAF_VERDICT_TARGET_BASE`] up, a
+    /// #349 SUITABILITY refusal at finalize (`8 + TargetReject::code()`: 8 absent, 9 descver,
+    /// 10 chip, 11 compat, 12 featloss, 13 bench); `dbg_otan_sent` = OTANs this leaf emitted.
     dbg_otam_heard: u16,
     dbg_verdict: u8,
     dbg_otan_sent: u16,
@@ -1012,7 +1025,22 @@ impl OtaLeafSession {
         match self.writer.take() {
             Some(w) => {
                 let target_slot = w.target(); // capture BEFORE finalize() consumes the writer
-                if w.finalize(size, &sha) {
+                let outcome = w.finalize(size, &sha);
+                // #349: a SUITABILITY refusal is not an integrity failure and must not be
+                // reported as one. It gets its own `dbg_verdict` band (LEAF_VERDICT_TARGET_BASE
+                // + the reason ordinal) so `smol/<leaf>/ota/relaydiag`'s `V<n>` names WHICH
+                // mismatch — a crown relaying the wrong image to a leaf is an operator error
+                // that has to be visible, and release images are serial-silent.
+                if let Err(crate::ota::FinalizeFail::Target(why)) = outcome {
+                    log::error!(
+                        "smol #349: mesh image REFUSED — not for this board ({}) — discarded (good slot intact)",
+                        why.label()
+                    );
+                    self.dbg_verdict = LEAF_VERDICT_TARGET_BASE.saturating_add(why.code());
+                    self.discard();
+                    return LeafAction::Abort;
+                }
+                if outcome.is_ok() {
                     log::info!("smol #40 #157: image VERIFIED — finalize-ack then activate build {}", self.build);
                     self.verify_ok = self.verify_ok.saturating_add(1); // #49: full integrity-verified
                     // Enter the finalize-ack phase; stay `active` so tick() drives ack + activate.
