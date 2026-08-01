@@ -241,7 +241,14 @@ BUILD="$(choose_build "$COUNT" "$STAGED" "$BUILD_OVERRIDE")"
 if [ -z "$BIN" ]; then
   echo "building reproducible espnow release @ $HASH (build $BUILD) ..."
   BIN="/tmp/smol-${BUILD}.bin"
-  repro_build_bin "$CLOCK" "$BIN" "$HASH" "$BUILD" || die "reproducible build failed"
+  # #326: staging IS the release act, so stamp it as one HERE rather than hoping the
+  # operator remembered `export SMOL_RELEASE=1`. Before this line the release-vs-dev stamp
+  # of a STAGED image depended on the operator's shell: repro_build.sh's comment said "the
+  # caller sets SMOL_RELEASE=1" and no caller in the repo ever did — 913/915 shipped
+  # release-stamped only because operators exported it by hand. A canary of an uncommitted
+  # image still goes through --bin, which skips this build path entirely, so dev images
+  # cannot masquerade: this export never touches them.
+  SMOL_RELEASE=1 repro_build_bin "$CLOCK" "$BIN" "$HASH" "$BUILD" || die "reproducible build failed"
 fi
 [ -f "$BIN" ] || die "no image at $BIN"
 

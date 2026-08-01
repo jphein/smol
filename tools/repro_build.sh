@@ -85,23 +85,49 @@ repro_build_bin() {
   [ -n "$number" ] || number="$(tr -d '[:space:]' < "$clock/version.txt" 2>/dev/null)"
   [ -n "$number" ] || number=0
   repro_cargo_args "$clock" || return 1   # resolve the sysroot with the crate's pinned toolchain
-  # #44: pin the esp-bootloader-esp-idf app-descriptor build time. Its build.rs fills the
-  # esp_app_desc time/date from `Timestamp::now()` (wall clock) UNLESS SOURCE_DATE_EPOCH is
-  # set — so without this, two builds of the same commit differ (even with paths remapped).
-  # Pin it to the COMMIT's own Unix time ⇒ deterministic per commit. Precedence: a caller/CI
-  # SOURCE_DATE_EPOCH wins (archive builds with no .git); else the commit time; else a fixed
-  # constant so the build is deterministic even with neither.
-  local sde="${SOURCE_DATE_EPOCH:-}"
-  if [ -z "$sde" ]; then
-    sde="$(git -C "$clock" show -s --format=%ct "$hash" 2>/dev/null || true)"
-    [ -n "$sde" ] || sde=1000000000
-  fi
+  # #44/#326: pin the esp-bootloader-esp-idf app-descriptor build time. Its build.rs fills
+  # the esp_app_desc time/date from `Timestamp::now()` (wall clock) UNLESS SOURCE_DATE_EPOCH
+  # is set — so without this, two builds of the same commit differ (even with paths remapped).
+  #
+  # PRECEDENCE FLIPPED 2026-07-31 (#326): the COMMIT time wins; an ambient/caller
+  # SOURCE_DATE_EPOCH is only a FALLBACK for archive builds with no .git. The old
+  # caller-first order meant a stale `export SOURCE_DATE_EPOCH` from an earlier experiment
+  # in the operator's shell silently stamped the shipped image — staged 915 carries an
+  # ambient epoch, not its commit time, which made its sha irreproducible from the recipe
+  # "commit + flags". An image's identity must be a function of the commit, never of the
+  # operator's shell history.
+  local sde
+  sde="$(git -C "$clock" show -s --format=%ct "$hash" 2>/dev/null || true)"
+  [ -n "$sde" ] || sde="${SOURCE_DATE_EPOCH:-}"
+  [ -n "$sde" ] || sde=1000000000
+  # #326 upstream bug, two halves (esp-bootloader-esp-idf 0.2.0 build.rs): (1) it parses
+  # SOURCE_DATE_EPOCH — a SECONDS value by spec — with Timestamp::from_microsecond(), so
+  # every shipped image claims 1970-01-01 (epoch/10^6 ≈ 1785 s); cosmetic here since we
+  # only need determinism, but documented so nobody "fixes" the date by unpinning. (2) it
+  # declares NO rerun-if-env-changed=SOURCE_DATE_EPOCH (only rerun-if-changed=esp_config.yml),
+  # so a warm target dir keeps the PREVIOUS build's stamp even when the epoch changes —
+  # proven: two commits with different epochs produced the identical warm stamp. Force the
+  # build script to re-run so the pinned epoch actually reaches the image.
+  #
+  # NOT `cargo clean -p esp-bootloader-esp-idf`: measured "Removed 0 files" against a warm
+  # tree that then shipped a stale stamp — with a --target build, clean -p reaches neither
+  # the HOST-side build-script dirs (target/release/build/<crate>-*) nor their fingerprints,
+  # which is exactly where the frozen stamp lives. Delete those two surgically; the cost is
+  # one build-script re-run + relink, and warm/cold builds of the same commit become
+  # byte-identical (the --twice gate in verify_image.sh proves it).
   (
     cd "$clock" || exit 1
     # Pin identity (deterministic per commit); SMOL_NODE_ID only when a board is named
     # (empty ⇒ build.rs omits it ⇒ board.rs NODE_ID fallback — the fleet-shared image).
     export SMOL_GIT_HASH="$hash" SMOL_BUILD_NUMBER="$number" SOURCE_DATE_EPOCH="$sde"
     [ -n "$node_id" ] && export SMOL_NODE_ID="$node_id"
+    # #326: see the upstream-bug note above — without this, the pinned epoch cannot reach
+    # a warm build. `-f` makes an unmatched glob (fresh dir: nothing to delete) a no-op.
+    # cwd is the crate dir here, so the in-tree default is plain `target` ($clock may be
+    # a relative path and would double up after the cd).
+    local _t="${CARGO_TARGET_DIR:-target}"
+    rm -rf "$_t"/release/build/esp-bootloader-esp-idf-* \
+           "$_t"/release/.fingerprint/esp-bootloader-esp-idf-*
     # #119: the canonical fleet image is espnow + cast (#26 WLED-cast + the #74 crown
     # display-mirror) + io (#72 registry — inert until a G config binds pins, and the
     # dollhouse's dashboard-only pin-binding depends on it being resident). Changing this

@@ -8,12 +8,38 @@
 #   verify_image.sh [<commit>] [--node-id N]        # build → print  build size sha256
 #   verify_image.sh [<commit>] [--node-id N] --expect <sha256>   # exit 0 match / 3 mismatch
 #   verify_image.sh --bin <file>                    # just hash an existing .bin (no build)
-#   verify_image.sh [<commit>] [--node-id N] --twice # PROVE determinism: 2 isolated builds,
-#                                                    # assert identical sha + no leaked paths
+#   verify_image.sh [<commit>] --expect-bin <file>  # byte-compare vs a fetched image: full
+#                                                   # sha AND masked sha (metadata excluded)
+#   verify_image.sh [<commit>] [--node-id N] --twice # PROVE determinism: one COLD isolated
+#                                                    # build vs one WARM in-tree build (the
+#                                                    # mode ota_publish.sh actually uses)
+#   verify_image.sh ... --build N                   # the staged build number (see below)
+#   verify_image.sh ... --dev                       # dev stamp (default mirrors staging: release)
 #
-# <commit> defaults to HEAD. Read-only: NO flashing, NO MQTT, NO network — pure local build
-# + sha256. Mirrors the identity contract of ota_publish.sh (same SMOL_GIT_HASH/BUILD_NUMBER
-# pin, same espflash save-image), so a sha printed here equals the one that tool announces.
+# <commit> defaults to HEAD — and MUST equal HEAD (#326 cause D): this tool never checks a
+# commit out, so naming any other commit would stamp that identity onto TODAY'S source and
+# "verify" the wrong bytes. Checking out into an isolated dir is NOT the fix: the build is
+# path-dependent (cargo -C metadata hashes the crate path; measured 151,627 differing bytes
+# from a different directory, zero leaked path strings), so verification only means anything
+# from this repo's canonical path. To verify history: check out the commit HERE, then run.
+#
+# --build (#326 cause A): ota_publish.sh stages with a BROKER-ratcheted number
+# (max(commit-count, staged+1)) which this offline tool cannot read; rust/clock/version.txt
+# is a stale committed ratchet (345 vs a broker line in the 900s). So to match a staged
+# image you MUST pass the build number from its announce (`OTA|<build>|…`). Defaulting is
+# loud about this.
+#
+# --expect-bin masking: images staged before the #326 epoch fix carry an operator-ambient
+# app-descriptor stamp that no honest rebuild reproduces. The masked comparison zeroes the
+# esp_app_desc time/date fields (0x70–0x8F) and the trailing 33 B (esp-image sha digest +
+# checksum, which change WITH the stamp) — everything else must match byte-for-byte. A
+# masked MATCH + full MISMATCH is the expected verdict for pre-fix stages; post-fix stages
+# must match in full.
+#
+# Read-only: NO flashing, NO MQTT, NO network — pure local build + sha256. Mirrors the
+# identity contract of ota_publish.sh (same SMOL_GIT_HASH/BUILD_NUMBER/SOURCE_DATE_EPOCH
+# pin, SMOL_RELEASE=1 by default to match staging, same espflash save-image), so a sha
+# printed here equals the one that tool announces.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,16 +49,21 @@ CLOCK="$REPO/rust/clock"
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
 
-COMMIT="HEAD"; NODE_ID=""; EXPECT=""; BIN=""; TWICE=0
+COMMIT="HEAD"; NODE_ID=""; EXPECT=""; BIN=""; TWICE=0; BUILD_ARG=""; EXPECT_BIN=""; DEV=0
 while [ $# -gt 0 ]; do case "$1" in
-  --node-id) NODE_ID="${2:?}"; shift 2;;
-  --expect)  EXPECT="${2:?}"; shift 2;;
-  --bin)     BIN="${2:?}"; shift 2;;
-  --twice)   TWICE=1; shift;;
-  -h|--help) sed -n '2,17p' "${BASH_SOURCE[0]}"; exit 0;;
-  *)         COMMIT="$1"; shift;;
+  --node-id)    NODE_ID="${2:?}"; shift 2;;
+  --expect)     EXPECT="${2:?}"; shift 2;;
+  --expect-bin) EXPECT_BIN="${2:?}"; shift 2;;
+  --bin)        BIN="${2:?}"; shift 2;;
+  --build)      BUILD_ARG="${2:?}"; shift 2;;
+  --dev)        DEV=1; shift;;
+  --twice)      TWICE=1; shift;;
+  -h|--help)    sed -n '2,41p' "${BASH_SOURCE[0]}"; exit 0;;
+  *)            COMMIT="$1"; shift;;
 esac; done
 [ -z "$NODE_ID" ] || case "$NODE_ID" in *[!0-9]*|'') die "--node-id must be a positive integer";; esac
+[ -z "$BUILD_ARG" ] || case "$BUILD_ARG" in *[!0-9]*|'') die "--build must be a positive integer";; esac
+[ -z "$EXPECT_BIN" ] || [ -f "$EXPECT_BIN" ] || die "no image at $EXPECT_BIN"
 
 # --bin: hash an existing image, no build (parity with ota_publish.sh --bin).
 if [ -n "$BIN" ]; then
@@ -43,15 +74,53 @@ fi
 
 cd "$REPO"
 HASH="$(git rev-parse --short=7 "$COMMIT")" || die "bad commit '$COMMIT'"
-BUILD="$(git rev-list --count "$COMMIT")"
-LABEL="build $BUILD ($HASH)${NODE_ID:+ node $NODE_ID}"
+# #326 cause D: this tool NEVER checks out <commit> — it pins <commit>'s identity onto the
+# source that is present. Verifying any commit other than HEAD therefore built the wrong
+# bytes while printing the right label. Refuse instead: to verify history, check the commit
+# out here (canonical path — see the path-dependence note in the header) and re-run.
+if [ "$(git rev-parse "$COMMIT")" != "$(git rev-parse HEAD)" ]; then
+  die "commit '$COMMIT' is not checked out (HEAD is $(git rev-parse --short=7 HEAD)) — \
+this tool builds the WORKING TREE and cannot verify a commit that isn't checked out. \
+git checkout $HASH here, re-run, then return to your branch."
+fi
+# Warn (don't die) on a dirty crate: the build would include uncommitted edits under the
+# named commit's label. A deliberate local experiment is legitimate; an unnoticed one lies.
+if ! git diff --quiet HEAD -- rust/clock 2>/dev/null; then
+  echo "WARN: rust/clock has uncommitted changes — the built sha will NOT be $HASH's" >&2
+fi
+# #326 cause A: the staged build number comes from ota_publish.sh's BROKER ratchet, which
+# this offline tool cannot read. Precedence: --build (from the staged announce) > the
+# committed version.txt ratchet (stale: 345 while the broker line is in the 900s) > the raw
+# commit count. Loud when defaulting, because a wrong number here silently forks the sha.
+if [ -n "$BUILD_ARG" ]; then
+  BUILD="$BUILD_ARG"
+else
+  BUILD="$(tr -d '[:space:]' < "$CLOCK/version.txt" 2>/dev/null || true)"
+  [ -n "$BUILD" ] || BUILD="$(git rev-list --count "$COMMIT")"
+  echo "note: no --build given — using $BUILD (version.txt/commit-count). Staged images use" >&2
+  echo "      the broker ratchet; to match one, pass --build <N> from its OTA| announce." >&2
+fi
+# #326 cause B: staged images are release-stamped (ota_publish.sh exports SMOL_RELEASE=1),
+# so the verifier must match or every comparison fails on the version-stamp string. --dev
+# opts out for locally-flashed dev images.
+DEVTAG=""
+if [ "$DEV" = 0 ]; then export SMOL_RELEASE=1; else unset SMOL_RELEASE 2>/dev/null || true; DEVTAG=" [dev]"; fi
+LABEL="build $BUILD ($HASH)${NODE_ID:+ node $NODE_ID}${DEVTAG}"
 
 # Build into an ISOLATED target dir so a repeat build is a true from-scratch rebuild (and so
 # --twice proves target-dir/path independence, not just a warm-cache no-op). Cleaned on exit.
-build_once() { # <target_dir> <out_bin>
+build_once() { # <target_dir|""> <out_bin>   ("" = in-tree warm target/, the publish mode)
   local tdir="$1" out="$2"
-  CARGO_TARGET_DIR="$tdir" repro_build_bin "$CLOCK" "$out" "$HASH" "$BUILD" "$NODE_ID" \
-    || die "reproducible build failed ($LABEL)"
+  if [ -n "$tdir" ]; then
+    CARGO_TARGET_DIR="$tdir" repro_build_bin "$CLOCK" "$out" "$HASH" "$BUILD" "$NODE_ID" \
+      || die "reproducible build failed ($LABEL)"
+  else
+    # Drop any ambient CARGO_TARGET_DIR (subshell, since repro_build_bin is a function and
+    # `env -u` can't invoke one): the warm half must build where ota_publish.sh builds —
+    # the in-tree target/ — or the parity proof tests the wrong mode.
+    ( unset CARGO_TARGET_DIR; repro_build_bin "$CLOCK" "$out" "$HASH" "$BUILD" "$NODE_ID" ) \
+      || die "reproducible build failed ($LABEL)"
+  fi
 }
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
@@ -129,13 +198,20 @@ if [ -n "$leaked" ]; then
 fi
 
 if [ "$TWICE" = 1 ]; then
-  echo "second isolated build to prove determinism ..." >&2
-  build_once "$WORK/t2" "$WORK/b.bin"
+  # #326: the second build is WARM and IN-TREE — the mode ota_publish.sh actually uses —
+  # not a second cold isolated dir. The old cold+cold form reported REPRODUCIBLE ✓ while
+  # being STRUCTURALLY INCAPABLE of seeing the warm-cache stamp freeze that made every
+  # staged sha unreproducible (same defect shape as a gate that cannot fail: it proved
+  # determinism only in a mode the publish path never used). Warm-vs-cold parity is the
+  # claim that matters, so it is the claim this tests. Mutates the in-tree target/ cache;
+  # that cache is a build artifact, and exercising it is the point.
+  echo "second build (WARM, in-tree — the ota_publish.sh mode) to prove parity ..." >&2
+  build_once "" "$WORK/b.bin"
   SHA2="$(sha256sum "$WORK/b.bin" | cut -d' ' -f1)"
   if [ "$SHA" = "$SHA2" ]; then
-    echo "REPRODUCIBLE ✓  two isolated builds → identical sha256  ($LABEL)"
+    echo "REPRODUCIBLE ✓  cold isolated build == warm in-tree build  ($LABEL)"
   else
-    echo "NOT REPRODUCIBLE ✗  $SHA != $SHA2  ($LABEL)" >&2
+    echo "NOT REPRODUCIBLE ✗  cold $SHA != warm $SHA2  ($LABEL)" >&2
     exit 4
   fi
 fi
@@ -149,5 +225,49 @@ if [ -n "$EXPECT" ]; then
   else
     echo "MISMATCH ✗  expected $EXPECT  got $SHA  — flashed image is NOT $LABEL" >&2
     exit 3
+  fi
+fi
+
+# --expect-bin: byte-compare the rebuild against a fetched image, full AND masked. The mask
+# covers exactly the bytes an operator-ambient SOURCE_DATE_EPOCH could move on a pre-fix
+# stage: esp_app_desc time[16]+date[16] at 0x70–0x8F, and the trailing 33 B (espflash's
+# appended sha256 digest + checksum byte, which change WITH the stamp). Verdicts:
+#   full ✓             — post-#326 stage, fully reproducible
+#   full ✗ + masked ✓  — pre-#326 stage: code identical, stamp was ambient (expected for 915)
+#   masked ✗           — genuinely different code: exit 3
+if [ -n "$EXPECT_BIN" ]; then
+  ESIZE="$(stat -c%s "$EXPECT_BIN")"
+  if [ "$ESIZE" != "$SIZE" ]; then
+    echo "MISMATCH ✗  size $ESIZE != $SIZE — different image, masking cannot apply" >&2
+    exit 3
+  fi
+  if cmp -s "$WORK/a.bin" "$EXPECT_BIN"; then
+    echo "FULL MATCH ✓  byte-identical to $EXPECT_BIN  ($LABEL)"
+  else
+    MSHA_A="$(python3 - "$WORK/a.bin" <<'EOF'
+import hashlib, sys
+b = bytearray(open(sys.argv[1], 'rb').read())
+b[0x70:0x90] = bytes(0x20)   # esp_app_desc time[16] + date[16]
+b[-33:] = bytes(33)          # espflash trailing checksum + sha256 digest
+print(hashlib.sha256(bytes(b)).hexdigest())
+EOF
+)"
+    MSHA_E="$(python3 - "$EXPECT_BIN" <<'EOF'
+import hashlib, sys
+b = bytearray(open(sys.argv[1], 'rb').read())
+b[0x70:0x90] = bytes(0x20)
+b[-33:] = bytes(33)
+print(hashlib.sha256(bytes(b)).hexdigest())
+EOF
+)"
+    if [ "$MSHA_A" = "$MSHA_E" ]; then
+      echo "MASKED MATCH ✓ (full ✗)  code identical; only the app-desc stamp + digest differ"
+      echo "                         — the pre-#326-fix signature. masked=$MSHA_A"
+    else
+      echo "MISMATCH ✗  masked shas differ — genuinely different code, not a stamp artefact" >&2
+      echo "            built  masked=$MSHA_A" >&2
+      echo "            target masked=$MSHA_E" >&2
+      exit 3
+    fi
   fi
 fi
