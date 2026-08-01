@@ -1749,8 +1749,16 @@ pub const CFG_KEY_TALE: u8 = b'T';
 /// 20..=500 ms/char on the node (a 0 would peg the reveal loop) and a malformed value is REFUSED
 /// with the previous setting kept — see `bard::delivery::Delivery::parse`. Cached + relayed like
 /// S/L/U/P/Y/T, applied live: the next tick uses it, mid-tale, no reboot.
+/// `#[allow(dead_code)]`: every consumer of this key is `espnow`-gated — the relay/cache paths in
+/// `net::mode` and the `take_cfg_offer` apply in `main.rs` — so a `wifi`-only build compiles the
+/// constant and never reads it. Kept HERE, ungated, so the whole keyed-CFG namespace stays in one
+/// place and a future key cannot silently reuse the letter (`V`); an unused `const` emits no code.
+#[allow(dead_code)]
 pub const CFG_KEY_DELIVERY: u8 = b'V';
 
+/// `#[allow(dead_code)]`: same as [`CFG_KEY_DELIVERY`] — consumed only by `espnow` paths
+/// (`net::mode`'s scan-request relay + `main.rs`'s offer apply). Kept for namespace integrity (`W`).
+#[allow(dead_code)]
 pub const CFG_KEY_SCAN: u8 = b'W';
 /// ~~#100 network-switch CONFIG (key `N`)~~ — **RETIRED by #142.** It used to carry the active
 /// WiFi-slot index (`0`/`1`), applied by writing the NVS net-record and rebooting into the slot.

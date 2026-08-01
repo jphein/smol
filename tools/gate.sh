@@ -10,14 +10,11 @@
 #
 # WHAT IT COVERS
 #   1. cargo check --release across the build tiers (default / wifi / espnow / canonical fleet)
-#   2. cargo clippy --release -D warnings on the CANONICAL tier
+#   2. cargo clippy --release -D warnings on EVERY tier (#343 — was canonical-only)
 #   3. the host experiments/*_verify suites
 #   4. the #300 stack floor — the canonical ELF's .stack region vs the 73,728 B floor
 #
 # WHAT IT DOES NOT COVER — read this before trusting a green run:
-#   * clippy -D on `default`/`wifi`: those tiers carry PRE-EXISTING dead-code findings (symbols used
-#     only by espnow builds). They get `cargo check` (compile breaks caught, new warnings NOT). Fixing
-#     them is a separate change; until then this is a known hole, stated rather than hidden.
 #   * `mesh-test`: needs a per-board `DEAF_MACS` that only a real board.rs has.
 #   * espflash `save-image` packaging: not run (no espflash in CI). The stack number does not depend
 #     on it — it is read from the ELF — but image PACKAGING is therefore unproven here.
@@ -93,14 +90,23 @@ if [ "$run_fw" = 1 ]; then
     fi
   done
 
-  step "cargo clippy -D warnings — canonical tier ($REPRO_FLEET_FEATURES)"
-  if (cd "$CLOCK" && cargo clippy --release "${JOBS[@]}" --features "$REPRO_FLEET_FEATURES" -- -D warnings) \
-       >/tmp/gate-clippy.log 2>&1; then
-    ok "clippy canonical"
-  else
-    bad "clippy canonical"
-    grep -E "^(error|warning)" /tmp/gate-clippy.log | grep -v "could not compile" | sort -u | sed 's/^/        /' | head -20
-  fi
+  # `-D warnings` on EVERY tier, not just the canonical one. Until #343 this ran on the canonical
+  # tier alone because `default`/`wifi` carried dead-code findings (symbols whose only callers are
+  # espnow-gated); those now carry item-scoped `#[allow(dead_code)]` with a cited reason, so the
+  # gate can cover what ONBOARDING has claimed all along. A tier that only gets `cargo check` has
+  # its new warnings invisible — which is how the findings accumulated unnoticed in the first place.
+  step "cargo clippy -D warnings — every tier"
+  for tier in "default:" "wifi:wifi" "espnow:espnow" "canonical:$REPRO_FLEET_FEATURES"; do
+    name="${tier%%:*}"; feats="${tier#*:}"
+    args=(--release "${JOBS[@]}"); [ -n "$feats" ] && args+=(--features "$feats")
+    if (cd "$CLOCK" && cargo clippy "${args[@]}" -- -D warnings) >/tmp/gate-clippy-$name.log 2>&1; then
+      ok "clippy $name"
+    else
+      bad "clippy $name"
+      grep -E "^(error|warning)" /tmp/gate-clippy-$name.log | grep -v "could not compile" \
+        | sort -u | sed 's/^/        /' | head -12
+    fi
+  done
 
   # #300 stack floor, measured with the SAME function the packaging path uses (repro_stack_check).
   # Built with repro_cargo_args so the ELF matches the shipped one's geometry.
