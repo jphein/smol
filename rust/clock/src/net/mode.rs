@@ -2518,6 +2518,7 @@ impl RadioManager {
                     &mut _reset_req,
                     &mut install_requested,
                     &mut _leaf_install_seen, // #40 #1: leaf recovery burst — never a gateway relay
+                    0, // #329 F2: recovery burst is not a gateway relay (cfg_cache=None) → no armdiag
                     &[], // #27: election-only recovery burst publishes no peers (leaf/v1)
             &[], // #50: recovery burst publishes no live-screen status
                     None, // #21: a leaf's recovery burst is not a gateway relay
@@ -5092,6 +5093,14 @@ impl RadioManager {
         // self-scanned) — one-shot: publish it THIS flush (retained holds it), then it's cleared.
         let own_scan = self.own_scan.take();
         let scan_bytes: &[u8] = own_scan.as_deref().map(|s| s.as_bytes()).unwrap_or(&[]);
+        // #329 F2: snapshot the two self-install SUPPRESSION latches here, BEFORE the disjoint
+        // `&mut self.*` borrows the burst call takes below — the armdiag is built inside
+        // `mqtt_session`, which cannot reach `&self`. Bits match `sog` in `diag_record` above
+        // (bit 0 = leaf_ota_pending, bit 1 = leaf_installs_outstanding); the third gate bit,
+        // `install_requested`, already rides its own parameter. Read-only — publishing a gate
+        // must never move it.
+        let gate_latches =
+            (self.leaf_ota_pending as u8) | ((self.leaf_installs_outstanding as u8) << 1);
         let sta = self.sta.as_mut();
         let ok = match sta {
             None => false,
@@ -5130,6 +5139,7 @@ impl RadioManager {
                     &mut reset_req, // #52: capture remote-reboot commands (one-shot relay below)
                     &mut install_requested,
                     &mut leaf_install_seen, // #40 #1: latch pending on install-SEEN (below)
+                    gate_latches, // #329 F2: publish the self-install gate latches in the armdiag
                     peers, // #27: gateway publishes its roster as retained smol/<id>/peers
                     status, // #50: gateway publishes its live screen as smol/<id>/status
                     Some(&mut self.cfg_cache), // #21: gateway caches leaf configs to relay

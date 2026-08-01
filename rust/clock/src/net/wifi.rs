@@ -1119,6 +1119,7 @@ pub fn run_ntp_burst(
         &mut _ntp_reset_req,
         install_requested,
         &mut _leaf_seen_boot, // #40 #1: boot burst sees no leaf installs
+        0, // #329 F2: boot burst is not a gateway relay (cfg_cache=None) → no armdiag published
         &[], // #27: boot NTP+downlink burst publishes no peers (no roster yet)
         &[], // #50: boot burst publishes no live-screen status
         None, // #21: boot burst is not a gateway relay (no leaf-config cache)
@@ -2579,6 +2580,13 @@ fn mqtt_session(
     // image). The gateway flush latches `leaf_ota_pending` on this so its OWN self-OTA is
     // suppressed the moment a leaf install exists, closing the self-OTA-first race.
     leaf_install_seen: &mut bool,
+    // #329 F2: the crown's OWN self-install SUPPRESSION latches, snapshotted by the caller
+    // before its disjoint `&mut self.*` borrows. Bit 0 = `leaf_ota_pending`, bit 1 =
+    // `leaf_installs_outstanding` — the SAME bit meaning as `sog` in
+    // `RadioManager::diag_record`, so the two records can be cross-read. Published in the
+    // gateway ARMDIAG below and used for nothing else. `install_requested` (above) is the
+    // third gate bit and already arrives on its own parameter. `0` off-gateway (no armdiag).
+    gate_latches: u8,
     // #27: this node's serialized roster (`PEERS|…`); published retained to
     // `smol/<node_id>/peers` after the telemetry loop iff non-empty.
     peers: &[u8],
@@ -4082,6 +4090,26 @@ fn mqtt_session(
     // staged_raw=<b> + leaf_ota=1 → armed (issue is downstream, in the relay). If
     // staged_raw=none → the persist path never wrote it. If install-caught=none → the wildcard
     // sub / arm never fired. Gateway-only (cfg_cache = Some).
+    //
+    // #329 F2 — the four fields above describe the LEAF-RELAY chain only, and that gap cost a
+    // whole night: id5 refused its OWN install while relaying three leaf installs fine, and the
+    // armdiag's `leaf_ota=0` was read as "no leaf pin held it" when the field says nothing of the
+    // sort. `main`'s self-install gate is `!leaf_ota_pending && !leaf_installs_outstanding &&
+    // take_install_request()` (main.rs:1224) and it short-circuits BEFORE the take — so a
+    // suppressed order keeps its RAM arm, silently, while its retained topic is already gone
+    // (cleared at catch by #111). Three theories were argued from the wire because none of the
+    // three inputs to that gate were ON it. They are now, appended so existing readers are
+    // unaffected:
+    //   install_requested          — a retained INSTALL for THIS board was caught this flush
+    //   leaf_ota_pending           — the sticky relay latch (mode.rs:4265 set / :4257 cleared)
+    //   leaf_installs_outstanding  — a leaf install is still unresolved
+    // Any `1` in the last two SUPPRESSES an own-install; `install_requested=1` with both `0`
+    // means it will fire. Same bits, same meaning, as the sheddable `sog=` in the DIAG record —
+    // but here in a small dedicated record that can never shed them.
+    //
+    // NB for parsers: `leaf_ota_pending=` has `leaf_ota` as a prefix, so match these fields
+    // ANCHORED ON THE `=` (`leaf_ota=` vs `leaf_ota_pending=`), exactly as ota_verify.sh
+    // anchors `tsrc=` against `src=`. Append-only: nothing above was renamed or reordered.
     if cfg_cache.is_some() {
         let mut adtopic = MqttScratch::new();
         let _ = write!(adtopic, "smol/{}/ota/armdiag", node_id);
@@ -4102,6 +4130,16 @@ fn mqtt_session(
             None => { let _ = write!(adval, "none"); }
         }
         let _ = write!(adval, " leaf_ota={}", if leaf_ota.is_some() { 1 } else { 0 });
+        // #329 F2 gate bits. Worst case this whole record is ~130 B — well inside the 320-B
+        // `MqttScratch` (which TRUNCATES SILENTLY when full, so the bound is load-bearing) and
+        // inside the 512-B `MQTT_PKT_CAP` less framing and the 20-B topic. No shedding needed.
+        let _ = write!(
+            adval,
+            " install_requested={} leaf_ota_pending={} leaf_installs_outstanding={}",
+            *install_requested as u8,
+            gate_latches & 1,
+            (gate_latches >> 1) & 1
+        );
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, adtopic.as_bytes(), adval.as_bytes(), true) {
             let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
         }
@@ -4780,6 +4818,10 @@ pub fn run_mqtt_burst(
     install_requested: &mut bool,
     // #40 #1: set true iff a retained leaf `install` (for another node) is seen this burst.
     leaf_install_seen: &mut bool,
+    // #329 F2: the caller's snapshot of its OWN self-install suppression latches — bit 0 =
+    // `leaf_ota_pending`, bit 1 = `leaf_installs_outstanding`. Forwarded verbatim to
+    // `mqtt_session`, which publishes them in the gateway armdiag (see there). `0` off-gateway.
+    gate_latches: u8,
     // #27: this node's serialized roster (`PEERS|…`) to publish retained as
     // `smol/<id>/peers`. Empty ⇒ nothing published (leaf / election-only burst).
     peers: &[u8],
@@ -4996,6 +5038,7 @@ pub fn run_mqtt_burst(
         reset_req, // #52: forward the remote-reboot command capture
         install_requested,
         leaf_install_seen, // #40 #1: forward the leaf-install-seen latch
+        gate_latches, // #329 F2: forward the self-install gate latches for the armdiag
         peers, // #27: forward the caller's serialized roster to publish retained
         status, // #50: forward the live STAT|screen:page for smol/<id>/status
         cfg_cache, // #21: forward the gateway's leaf-config cache (or None)
