@@ -770,6 +770,11 @@ cmd_push() {
     dash_out="$(HA_TOKEN="$HA_TOKEN" timeout 180 python3 \
       "$REPO_DIR/ha/dashboard/build_control_room.py" --check 2>&1)" || dash_rc=$?
     printf '%s\n' "$dash_out" | sed -n '/^LIVE-ONLY/p;/^DEAD ROWS/p;/^  ⚠/p;/^    - /p' | sed 's/^/    /'
+    # #340: that count is DASHBOARD-WIDE — every view, not just `smol-control` — so this warning
+    # now covers rows on views this repo does not generate (a push that deletes an entity can kill
+    # a card on any of them). The generator deliberately keeps it as ONE `DEAD ROWS · N` line so
+    # this regex needs no change; a per-view section would have re-created #340 right here.
+    #
     # DEAD ROWS is read from the OUTPUT, not from the exit code, and that distinction matters:
     # `report_check` returns `1 if extras else (3 if dead else 0)`, so ANY live-only drift MASKS the
     # dead-rows status. Keying this warning off `$dash_rc == 3` alone would mean that on an instance

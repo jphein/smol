@@ -111,6 +111,8 @@ def main():
     check("the generated view is audited as built+live-only",
           "built" in audited[0][1], audited[0][1])
     check("the other view is audited as live", "live" in audited[1][1], audited[1][1])
+    check("both rows are flagged as ON the dashboard", all(a[3] for a in audited),
+          str([(a[0], a[3]) for a in audited]))
 
     print("\n4 · THE PROPERTY: adding a view enrolls it with NO code change")
     #     This is the assertion that makes #340 unrepeatable. If a future view has to be added to a
@@ -146,7 +148,10 @@ def main():
     print("\n6 · prev=None must still audit — it used to `return 0` having looked at nothing")
     d, a = m.audit_views({"views": [telemetry_like("only", HUSK)]}, built, None, [], st)
     check("a dashboard with no Control Room still goes red", HUSK in d, f"got {sorted(d)}")
-    check("the built view is audited too", any("built" in how for _, how, _ in a), str(a))
+    check("the built view is audited too", any("built" in how for _, how, _, _ in a), str(a))
+    # ...and is NOT counted as a view on the dashboard, or the coverage line reads "2 of 1".
+    check("the not-yet-created view is flagged off-dashboard",
+          [a2[3] for a2 in a if "built" in a2[1]] == [False], str(a))
 
     print("\n7 · GREEN AGAIN: unwire the row and the audit clears")
     clean = {"views": [primary, telemetry_like("smol-telemetry", "sensor.smol_mesh_channel")]}

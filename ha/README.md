@@ -506,6 +506,19 @@ real run would ship, and only structured `entity:` rows, which are the ones that
 "Entity not found"; template references degrade to `—` and scraping them would cost the
 precision a gate needs to stay trusted.
 
+**Scope: `DEAD ROWS` covers every view on the dashboard (#340); the drift sections cover one.**
+`LIVE-ONLY` / `RETIRED` / `RETIRING` compare a scaffold against its own output, and only
+`smol-control` has a scaffold. A dead row is a question *any* view can fail, and one this repo's
+own deploys are what make it fail — so it is audited dashboard-wide, enumerated over the live view
+list itself. Adding a view enrolls it; the coverage line reads `VIEWS AUDITED · N of N` and is
+assert-checked, not claimed. It resolved **one** view by path for two releases, which is how
+`smol-telemetry`'s four id7/id9 husks sat on the glass reading `unavailable` while `--check`
+printed `DEAD ROWS · 0` — a correct answer to a narrower question than the one it appeared to
+answer, the same defect as #333's other two faces. Findings on a view this repo does not generate
+carry a `view:<path>` tag, because the fix is in whatever builds that view (`smol-telemetry` comes
+from `~/Projects/ha`) and **the card must be unwired before the registry husk is purged** — purge
+first and `unavailable` merely becomes "Entity not found" (#319).
+
 It is `build_control_room.py --check` underneath: the generator builds the view exactly as a
 real run would, then saves nothing — no `lovelace/config/save`, no SSH tee, no local file. The
 check lives inside the generator on purpose, so it uses the same `_ident()` rules the merge
