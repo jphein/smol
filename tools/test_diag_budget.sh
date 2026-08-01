@@ -71,6 +71,25 @@ arm "core over budget" 1 "does NOT fit" \
 arm "checker blinded (no format string)" 2 "has gone blind" \
     'let mut rec = alloc::format!	let mut rec = notformat!'
 
+echo "== the PROTECTED tail (unconditional push_str) =="
+# The documented hazard, verbatim: "a field appended with a bare push_str and NOT counted here
+# defeats this whole mechanism". Adding one must now be impossible to do quietly.
+arm "undeclared protected append" 1 "UNDECLARED: zzz" \
+    'rec.push_str(&alloc::format!("|apch={}"	rec.push_str("|zzz=x");
+        rec.push_str(&alloc::format!("|apch={}"'
+# The over-count direction — safe for the cliff, but it is how 16 B went missing and nearly made
+# #323 look unaffordable. An over-count must be as loud as an under-count.
+arm "tail term over-counted" 1 "protected-tail widths sum to" \
+    'DIAG-TAIL: mo=28	DIAG-TAIL: mo=44'
+# A protected field deleted from the record but left in the declaration.
+arm "declared tail field vanished" 1 "no longer appended: brst" \
+    'rec.push_str(&alloc::format!(
+                "|brst={}:{}:{}{}"	rec.push_str(&alloc::format!(
+                "|xbrst={}:{}:{}{}"'
+# Blind in the other direction: the tail region delimiters gone.
+arm "checker blinded (no tail region)" 2 "could not delimit" \
+    'PROTECTED tail: appended unconditionally	PROTECTED tail: appended conditionally'
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

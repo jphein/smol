@@ -24,9 +24,15 @@ the format string are the same object:
   * `DIAG_BUDGET` re-derives from its own expression, and the margin is PRINTED, not asserted to be
     "fine" — a gate that answers "green" instead of a number is how the stale 51 survived.
 
-It deliberately does NOT check the three protected-tail terms (19 + 38): those are hand-measured
-against push_str literals and are conservative, so they can only make the bound stricter. Anyone
-wanting that ~18 B back must derive it the same machine-checked way first.
+The PROTECTED tail (the unconditional `rec.push_str` appends) is checked the same way, against a
+`DIAG-TAIL:` declaration keyed by each push's first key. That block had drifted too, in the OTHER
+direction: it read 19 + 38 + 28 = 85 for appends that need 69, with labels that did not match their
+own numbers. An over-count is safe for the cliff but not free — 16 B of unspendable margin is how a
+legitimate field gets called unaffordable. Both directions are now caught.
+
+What it still cannot do is derive a WIDTH from a type; the widths are declared. What it guarantees
+is that the declaration is COMPLETE and CURRENT — every field in the record has one, nothing
+declared has vanished, and the totals are the constant's own terms.
 
 Usage: tools/check_diag_budget.py [path/to/mode.rs]   (exit 0 consistent, 1 drift, 2 malformed)
 """
@@ -35,15 +41,22 @@ import sys
 
 FMT = re.compile(r'let mut rec = alloc::format!\(\s*\n\s*"(.*?)",\n', re.S)
 DECL = re.compile(r"DIAG-WIDTHS:\s*(.+)")
+TAIL_DECL = re.compile(r"DIAG-TAIL:\s*(.+)")
+# The unconditional appends live between the PROTECTED-tail banner and the sheddable block. Only
+# `rec.push_str` counts: the #181 ledger strings are BUILT in that region but appended via
+# `room_for`, so they shed and are correctly outside the bound.
+TAIL_START = "PROTECTED tail: appended unconditionally"
+TAIL_END = "let mut shed = 0u8;"
+PUSH = re.compile(r"rec\.push_str\(\s*(?:&alloc::format!\(\s*)?\"\|([a-z0-9]+)=")
 CORE = re.compile(r"const DIAG_CORE_MAX: usize =\s*([0-9+\s]+);")
 BUDGET = re.compile(r'const DIAG_BUDGET: usize = (\d+) - (\d+) - "([^"]+)"\.len\(\);')
 KEY = re.compile(r"\|([a-z0-9]+)=((?:\{\}:?)+)")
 
 
-def declared_widths(src: str):
-    """[(key, [w, ...]), ...] in declaration order, from the DIAG-WIDTHS: doc lines."""
+def declared_widths(src: str, pattern=DECL):
+    """[(key, [w, ...]), ...] in declaration order, from the DIAG-WIDTHS:/DIAG-TAIL: doc lines."""
     out = []
-    for line in DECL.findall(src):
+    for line in pattern.findall(src):
         for tok in line.split():
             if "=" not in tok:
                 return None, f"malformed DIAG-WIDTHS token {tok!r} (want key=w or key=w:w)"
@@ -116,7 +129,45 @@ def main() -> int:
         fail.append(f"positional value widths sum to {total}, but DIAG_CORE_MAX's second term is "
                     f"{terms[1]} ({total - terms[1]:+d})")
 
-    # 3. the format-string literal must be the length the first term claims.
+    # 3. the PROTECTED tail: every unconditional push_str must be declared, and vice versa.
+    tail, err = declared_widths(src, TAIL_DECL)
+    if err:
+        print(f"FATAL: {err}", file=sys.stderr)
+        return 2
+    if not tail:
+        print(f"FATAL: no DIAG-TAIL: declaration found in {path}.", file=sys.stderr)
+        return 2
+    try:
+        region = src[src.index(TAIL_START):src.index(TAIL_END, src.index(TAIL_START))]
+    except ValueError:
+        print(f"FATAL: could not delimit the PROTECTED tail in {path} — this checker has gone "
+              "blind, fix it.", file=sys.stderr)
+        return 2
+    pushed = PUSH.findall(region)
+    if not pushed:
+        print(f"FATAL: found the PROTECTED tail but parsed ZERO push_str appends in {path}.",
+              file=sys.stderr)
+        return 2
+    t_keys = [k for k, _ in tail]
+    if pushed != t_keys:
+        undeclared = [k for k in pushed if k not in t_keys]
+        vanished = [k for k in t_keys if k not in pushed]
+        fail.append("the DIAG-TAIL declaration does not match the unconditional appends")
+        if undeclared:
+            fail.append(f"  appended unconditionally but UNDECLARED: {', '.join(undeclared)}"
+                        "  <- a protected field outside the bound is exactly what makes a healthy"
+                        " board go silent; add key=<literal+values> to DIAG-TAIL")
+        if vanished:
+            fail.append(f"  declared but no longer appended: {', '.join(vanished)}")
+        if not undeclared and not vanished:
+            fail.append(f"  same fields, different ORDER\n    appended:{' '.join(pushed)}"
+                        f"\n    declared:{' '.join(t_keys)}")
+    t_total = sum(sum(ws) for _, ws in tail)
+    if t_total != sum(terms[2:]):
+        fail.append(f"protected-tail widths sum to {t_total}, but DIAG_CORE_MAX's remaining terms "
+                    f"are {sum(terms[2:])} ({t_total - sum(terms[2:]):+d})")
+
+    # 4. the format-string literal must be the length the first term claims.
     lit = len(fmt) - 2 * sum(p.count("{}") for _, p in actual)
     if lit != terms[0]:
         fail.append(f"format-string literal is {lit} B, but DIAG_CORE_MAX's first term is "
@@ -139,7 +190,8 @@ def main() -> int:
         return 1
 
     print(f"  DIAG budget={budget}  core={core}  margin={margin} B  "
-          f"({len(a_keys)} positional fields, {sum(p.count('{}') for _, p in actual)} values, "
+          f"({len(a_keys)} positional + {len(t_keys)} protected fields, "
+          f"{sum(p.count('{}') for _, p in actual)} values, "
           f"literal {lit} B)")
     return 0
 

@@ -277,23 +277,38 @@ const DIAG_BUDGET: usize = 512 - 4 - "smol/255/diag".len();
 ///
 ///   167  format-string literal (keys, `|` separators, `DIAG|` prefix)
 ///   228  the 32 positional values at type-max width, after the u32 `up=` narrowing
-///    19  `|brst=<u16>:<u16>:<c>`   38  `|blrev=<3>` + `|apch=<u8>`
-///    28  #190 `|mo=<u32>|mf=<u32>` — the group-MAC observe counters (PROTECTED, see `diag_record`)
+///    69  the four PROTECTED appends (`DIAG-TAIL` below) — unconditional, so inside the bound
 ///
-/// **Numbers, re-derived 2026-08-01 (#306).** `DIAG_BUDGET` 495 · core **480** · **margin 15 B**.
-/// The positional term read 220 and was 8 B SHORT of its own stated rule: `rst=` was counted at
-/// `brownout` (8) when `deep-sleep` (10) is the longest token, and `led=`'s mode was counted below
-/// `status` (6). Nothing overflowed — the bound was still an over-estimate overall — but a bound
-/// that is hand-summed drifts silently in the unsafe direction, which is #306's entire thesis, so
-/// the 32 widths are now DECLARED below and machine-checked against the real format string by
-/// `tools/check_shed_order.py`'s sibling `tools/check_diag_budget.py` (run first in `tools/gate.sh`).
-/// The three tail terms (19 + 38) are NOT machine-checked and are conservative by ~18 B against a
-/// hand-measure of the same push_str literals — real slack is therefore ~33 B. Quote 15, the proven
-/// one; do not spend the 18 without re-deriving it the same way.
+/// **Numbers, re-derived 2026-08-01 (#306/#323).** `DIAG_BUDGET` 495 · core **464** · **margin 31 B**,
+/// and every term is now machine-checked — there is no longer a "proven vs hopeful" split to keep
+/// straight, which was itself a trap worth removing.
+///
+/// Two hand-sums were wrong in OPPOSITE directions, which is why nothing had visibly broken:
+///   * the positional term read **220** against a type-provable **228** — `rst=` counted at
+///     `brownout` (8) when `deep-sleep` (10) is the longest token, and `led=`'s mode counted below
+///     `status` (6). 8 B of the bound did not exist.
+///   * the tail read **19 + 38 + 28 = 85** against an attributable **69**, and its labels did not
+///     match its numbers (the "19" was `brst`, which actually needs 21; the "38" was
+///     `blrev` + `apch`, which need 11 + 9). 16 B of margin was being hoarded by a typo.
+///
+/// A bound that is hand-summed drifts silently in BOTH directions — the unsafe one makes the record
+/// unpublishable, the safe one makes a legitimate field look unaffordable (it nearly sank #323). So
+/// both blocks are DECLARED here and proved against the real source by `tools/check_diag_budget.py`
+/// (run in `tools/gate.sh` beside `check_shed_order.py`, same principle: put the fact where a
+/// machine checks it). `tools/test_diag_budget.sh` proves that checker can fail.
 ///
 /// DIAG-WIDTHS: slot=3 rst=10 boot=10 ota=11 up=10 heap=10 hmin=10 btn=5 btnl=5 fok=10 ffl=10
 /// DIAG-WIDTHS: vok=5 vfl=5 loss=3 rtt=10 rx=10 tx=10 led=6:3 tage=10 tsrc=4 net=1:2 brk=5 otah=4
 /// DIAG-WIDTHS: fwd=10 dedup=10 ttl=10 hop=3 dlseq=10 dfwd=10 etx=3
+///
+/// Each `DIAG-TAIL` entry is keyed by the FIRST key of its `rec.push_str`, matching
+/// `check_shed_order.py`'s convention, and is the whole append (literal + values):
+///   `mo`    = `|mo=` + `|mf=` (8) + 2×u32 (20) = 28   ·   `apch` = `|apch=` (6) + u8 (3) = 9
+///   `blrev` = `|blrev=` (7) + longest token `wifi` (4) = 11
+///   `brst`  = `|brst=` + 2×`:` (8) + 2×u16 (10) + `brst_kind as char` (2 — a u8 ≥ 128 casts to a
+///             2-byte UTF-8 scalar, so 1 would be an under-count) + the `+` clamp flag (1) = 21
+///
+/// DIAG-TAIL: mo=28 apch=9 blrev=11 brst=21
 ///
 /// The assertion below is the whole point: it proves the record can NEVER be unpublishable, because
 /// the core always fits and everything else is appended only while there is room (see the shed list
@@ -305,12 +320,12 @@ const DIAG_BUDGET: usize = 512 - 4 - "smol/255/diag".len();
 ///
 /// ⚠️ A field appended with a bare `push_str` and NOT counted here defeats this whole mechanism: the
 /// assertion still passes and the record silently crosses `DIAG_BUDGET` at runtime, which makes a
-/// healthy board look dead. #190's `mo=/mf=` is counted (452 → 480, margin 15). #181's ledger fields
+/// healthy board look dead. #190's `mo=/mf=` is counted (it is the `mo=28` DIAG-TAIL entry). #181's ledger fields
 /// are deliberately NOT counted because they go through `room_for` and shed instead (they would need
 /// 33 B on a leaf and 86 B on the crown — both past the remaining margin, which is exactly why they
 /// must be sheddable and not protected).
 #[cfg(feature = "espnow")]
-const DIAG_CORE_MAX: usize = 167 + 228 + 19 + 38 + 28;
+const DIAG_CORE_MAX: usize = 167 + 228 + 69;
 
 #[cfg(feature = "espnow")]
 const _: () = assert!(
@@ -3480,9 +3495,9 @@ impl RadioManager {
         // does not: see `broadcast_diag`, where the overflow is now reported as `|cut=`.
         //
         // The type-provable worst case of this positional block plus the protected tail is
-        // `DIAG_CORE_MAX` (480 B, re-derived 2026-08-01 under #306 — it read 444/51 here and 472/23
+        // `DIAG_CORE_MAX` (464 B, re-derived 2026-08-01 under #306 — it read 444/51 here and 472/23
         // at the constant, and BOTH were stale), asserted against the budget at compile time. A new
-        // POSITIONAL field here costs its type-max width against **15 B of proven slack**, and the
+        // POSITIONAL field here costs its type-max width against **31 B of machine-checked slack**, and the
         // build breaks when it runs out — deliberately, because the alternative is a fleet going
         // quiet. Declare the new field's width in DIAG-WIDTHS beside the constant: the gate refuses
         // an undeclared field, so the total can no longer drift the way it just did.
@@ -3542,7 +3557,7 @@ impl RadioManager {
         // is the single number the enforce-flip decision rests on (design §7.1) and #336's rollout
         // gate cannot distinguish a zero-keyed fleet without it — a counter that sheds under load is
         // worthless as a gate. Their 28 B is added to `DIAG_CORE_MAX` above, so the assertion PROVES
-        // the record still fits one publish (480 ≤ 495, #306 re-derivation) rather than being blind to it.
+        // the record still fits one publish (464 ≤ 495, #306 re-derivation) rather than being blind to it.
         // `mo`/`mf` = inbound frames whose group HMAC verified / failed.
         rec.push_str(&alloc::format!("|mo={}|mf={}", self.diag.mac_ok, self.diag.mac_fail));
         rec.push_str(&alloc::format!("|apch={}", self.my_ap_channel));
@@ -3575,7 +3590,7 @@ impl RadioManager {
         // the FIRST shed under pressure.
         //
         // They are sheddable (not protected like #190's `mo=/mf=`) because they cannot fit as a
-        // guarantee: 33 B on a leaf and a further 53 B on the crown, against the 15 B that remains
+        // guarantee: 33 B on a leaf and a further 53 B on the crown, against the 31 B that remains
         // after the core. Making them unconditional is precisely the bug the pre-rebase review caught
         // — bare `push_str` would put a leaf at 505 B and the crown at 558 B against a 495 B cliff,
         // and `encode_publish` answers an over-budget record by publishing NOTHING, so a healthy board
