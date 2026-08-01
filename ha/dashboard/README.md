@@ -7,9 +7,9 @@ It **auto-discovers** smol nodes and scales as sigils join.
 ### Files
 | File | Role |
 |------|------|
-| `dashboard/build_control_room.py` | **Generator (source of truth).** Discovers nodes from `binary_sensor.smol_<id>_online`, builds one node box each, generates the topology SVG, and saves the view via the HA WebSocket API. |
+| `dashboard/build_control_room.py` | **Generator (source of truth).** Discovers nodes from the **HA device registry** (firmware-authored, `439fb95`), resolves each node's entities from the **entity registry** rather than by `sensor.smol_<id>_<field>` convention (#322 — that convention holds for only 127 of 312 firmware rows), builds one node box each, generates the topology SVG, and saves the view via the HA WebSocket API. `--check` is read-only and reports live-only cards + dead rows. |
 | `dashboard/smol-control-scaffold.yaml` | Static frame — banner, section kickers, set-all, glass/power/forge, herald (§04), overrides·IO·crown-steer (§05), NTP freshness (§06), footer — with placeholders `TOPO` / `LEGEND` / `FLEET` that the generator fills. |
-| `dashboard/smol_control_room.yaml` | **Exported reference** of the built view (example only — the generator is authoritative). |
+| _(removed)_ `dashboard/smol_control_room.yaml` | Was a 110 KB exported snapshot of the built view. **Deleted, #310** — its header announced `4 sigils (5,7,8,9)` for two weeks after the fleet became 5/8/50/51, and a dated snapshot whose content is enumerated state gets read as current. The view is fully derivable; to see the built output run `build_control_room.py --check` (read-only) instead of trusting a commit. |
 | `themes/smol.yaml` | Phosphor-green theme (dark + light) + card-mod `@font-face` loading VT323 / IBM Plex Mono from `/local/luna-fonts/`. Scoped to `theme: smol`. |
 | `www/luna-cards/smol-topology.svg` | Generated mesh-topology graphic, served at `/local/luna-cards/smol-topology.svg`. |
 

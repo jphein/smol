@@ -19,10 +19,14 @@ configs and needs no HA config (see *MQTT discovery* below).
   - `smol/display/grid` — the grid/consumption screen (issue #16).
   Plus two MQTT **mirror** sensors (`sensor.smol_display_batt` / `sensor.smol_display_grid`)
   so a dashboard card shows exactly what the boards fetch.
-- `dashboard/smol_control_room.yaml` — the **assembled Control Room view** (phosphor-CRT):
-  live mesh-topology graph, per-node status tiles, retained OTA install (canary-first),
-  the shared OLED glass, and power/solar — folds the modular cards below into one themed
-  view. Install steps are in the file header (theme + fonts + paste-the-view).
+- `dashboard/build_control_room.py` — the **generator** for the assembled Control Room view
+  (phosphor-CRT): live mesh-topology graph, per-node status tiles, retained OTA install
+  (canary-first), the shared OLED glass, and power/solar, folded into one themed view. It is the
+  source of truth — the fleet comes from the HA device registry at build time, so there is no
+  id list to maintain. `--check` renders read-only and reports drift. The committed
+  `smol_control_room.yaml` export it used to sit beside was deleted in #310: derivable state kept
+  as a second copy can only ever disagree, and that one had been announcing a two-week-stale
+  fleet in its first line.
 - `themes/smol.yaml` — the phosphor-green Lovelace **theme** (dark + light; zero HACS for
   color, card-mod optional for the VT323 pixel-font). Scopes to any view with `theme: smol`.
 - `www/luna-fonts/` — VT323 + IBM Plex Mono (SIL OFL, see `ATTRIBUTION.md`), loaded locally
