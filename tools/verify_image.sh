@@ -13,8 +13,11 @@
 #   verify_image.sh [<commit>] [--node-id N] --twice # PROVE determinism: one COLD isolated
 #                                                    # build vs one WARM in-tree build (the
 #                                                    # mode ota_publish.sh actually uses)
-#   verify_image.sh ... --build N                   # the staged build number (see below)
+#   verify_image.sh ... --build N                   # the staged build number (see below);
+#                                                   # REQUIRED with --expect/--expect-bin
 #   verify_image.sh ... --dev                       # dev stamp (default mirrors staging: release)
+#   verify_image.sh ... --allow-dirty               # deliberately build uncommitted rust/clock
+#                                                   # (the printed label knowingly lies)
 #
 # <commit> defaults to HEAD — and MUST equal HEAD (#326 cause D): this tool never checks a
 # commit out, so naming any other commit would stamp that identity onto TODAY'S source and
@@ -49,7 +52,7 @@ CLOCK="$REPO/rust/clock"
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
 
-COMMIT="HEAD"; NODE_ID=""; EXPECT=""; BIN=""; TWICE=0; BUILD_ARG=""; EXPECT_BIN=""; DEV=0
+COMMIT="HEAD"; NODE_ID=""; EXPECT=""; BIN=""; TWICE=0; BUILD_ARG=""; EXPECT_BIN=""; DEV=0; ALLOW_DIRTY=0
 while [ $# -gt 0 ]; do case "$1" in
   --node-id)    NODE_ID="${2:?}"; shift 2;;
   --expect)     EXPECT="${2:?}"; shift 2;;
@@ -57,6 +60,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --bin)        BIN="${2:?}"; shift 2;;
   --build)      BUILD_ARG="${2:?}"; shift 2;;
   --dev)        DEV=1; shift;;
+  --allow-dirty) ALLOW_DIRTY=1; shift;;
   --twice)      TWICE=1; shift;;
   -h|--help)    sed -n '2,41p' "${BASH_SOURCE[0]}"; exit 0;;
   *)            COMMIT="$1"; shift;;
@@ -83,10 +87,22 @@ if [ "$(git rev-parse "$COMMIT")" != "$(git rev-parse HEAD)" ]; then
 this tool builds the WORKING TREE and cannot verify a commit that isn't checked out. \
 git checkout $HASH here, re-run, then return to your branch."
 fi
-# Warn (don't die) on a dirty crate: the build would include uncommitted edits under the
-# named commit's label. A deliberate local experiment is legitimate; an unnoticed one lies.
-if ! git diff --quiet HEAD -- rust/clock 2>/dev/null; then
-  echo "WARN: rust/clock has uncommitted changes — the built sha will NOT be $HASH's" >&2
+# REFUSE a dirty crate (nebula-triage, #326 review — argued from a warning into a refusal):
+# a dirty tree corresponds to NO commit, so the `build N (hash)` label is simply false; the
+# output sha gets pasted into audit records where it reads as authoritative regardless of
+# stderr; and warnings vanish when stdout is captured — which is exactly how a verifier's
+# result gets recorded. Live evidence the same night: a review build silently consumed
+# in-flight uncommitted edits, and only an unrelated `git status` caught it. `--allow-dirty`
+# keeps the deliberate-local-experiment case, opted into by name. Porcelain, not
+# `diff --quiet`: untracked new files under rust/clock alter the build too.
+if [ -n "$(git status --porcelain -- rust/clock)" ]; then
+  if [ "$ALLOW_DIRTY" = 1 ]; then
+    echo "WARN: --allow-dirty — building UNCOMMITTED rust/clock under $HASH's label" >&2
+  else
+    die "rust/clock has uncommitted/untracked changes — the built sha would carry $HASH's \
+label while being no commit's bytes. Commit first, or pass --allow-dirty for a deliberate \
+local experiment."
+  fi
 fi
 # #326 cause A: the staged build number comes from ota_publish.sh's BROKER ratchet, which
 # this offline tool cannot read. Precedence: --build (from the staged announce) > the
@@ -95,6 +111,14 @@ fi
 if [ -n "$BUILD_ARG" ]; then
   BUILD="$BUILD_ARG"
 else
+  # Targeted refusal (nebula-triage, #326 review): on the COMPARISON paths a defaulted
+  # build number produces MISMATCH against a GOOD image — the exact false alarm #326
+  # exists to kill, and the kind that trains operators to ignore the verifier. The plain
+  # "what sha does this commit produce?" path keeps the loud default.
+  if [ -n "$EXPECT" ] || [ -n "$EXPECT_BIN" ]; then
+    die "--expect/--expect-bin require --build <N> (from the staged OTA| announce): a \
+defaulted build number would report MISMATCH on a good image."
+  fi
   BUILD="$(tr -d '[:space:]' < "$CLOCK/version.txt" 2>/dev/null || true)"
   [ -n "$BUILD" ] || BUILD="$(git rev-list --count "$COMMIT")"
   echo "note: no --build given — using $BUILD (version.txt/commit-count). Staged images use" >&2
