@@ -25,9 +25,16 @@
 #   RETIRED    a generator-owned node box whose node has left the fleet; the next real run
 #              deletes it. Usually correct and NOT a failure — reported so that a box wrongly
 #              keyed as retired (that has happened) is visible before it is deleted.
+#   DEAD ROWS  a card wires a row to an entity HA does not have (absent) or keeps only as a
+#              registry husk (orphan). DASHBOARD-WIDE since #340: it audits EVERY view on `DASH`,
+#              not just the one this repo generates. It resolved ONE view by path for two
+#              releases, so `smol-telemetry`'s four id7/id9 husks sat on JP's dashboard, reading
+#              `unavailable`, invisible to the check built to find precisely them.
 #
-# Exit codes: 0 in sync · 1 live-only cards exist · 2 operational failure (nothing discovered,
-# save rejected). A failed save used to exit 0, which is exactly the silence a hook cannot see.
+# Exit codes: 0 in sync · 1 live-only cards exist · 3 dead rows · 2 operational failure (nothing
+# discovered, save rejected). A failed save used to exit 0, which is exactly the silence a hook
+# cannot see. 1 outranks 3 when both fire, so consumers that need the dead-row status read the
+# `DEAD ROWS · N` line rather than the exit code (ha_deploy.sh's post-push check does).
 import asyncio, json, os, re, ssl, subprocess, sys, hashlib, yaml, websockets
 try:
     from defusedxml.minidom import parseString as xml_parse
@@ -55,6 +62,12 @@ URI=os.environ.get("HA_WS_URI","wss://ha.jphe.in/api/websocket"); TOKEN=os.envir
 # 2026-07-27 appeared to save fine and was invisible for an hour. Verify with
 # `lovelace/dashboards/list` before changing this. Overridable for testing.
 DASH=os.environ.get("HA_DASH","smol-mesh")
+# The ONE view this repo generates. Everything else on `DASH` is somebody else's view — which is
+# not the same as nobody's problem: `smol-telemetry` is built from ~/Projects/ha and wires rows to
+# smol entities, so this repo's deploys can and did kill rows on it (#340). Named once because it
+# was written out five times, and a path this load-bearing spelled in five places is a rename away
+# from a check that silently audits nothing.
+VIEW_PATH="smol-control"
 SSLCTX=ssl.create_default_context()  # verifies by default
 if os.environ.get("HA_WS_INSECURE"):  # explicit opt-out for a LAN self-signed HA cert (like curl -k)
     SSLCTX.check_hostname=False; SSLCTX.verify_mode=ssl.CERT_NONE
@@ -1109,12 +1122,12 @@ async def main():
                 print("    → back-port these into smol-control-scaffold.yaml, or they stay orphaned here.")
         idx = cfg["views"].index(prev) if prev else len(cfg["views"])
         cfg["views"] = [v for v in cfg["views"]
-                        if v.get("title") != "smol Nodes" and v.get("path") != "smol-control"]
+                        if v.get("title") != "smol Nodes" and v.get("path") != VIEW_PATH]
         cfg["views"].insert(idx, view)        # in place: never reorder the user's dashboard
         s=await rpc(ws,{"type":"lovelace/config/save","url_path":DASH,"config":cfg})
         if not s.get("success"): print("!! SAVE FAILED",s); return 2
         r2=(await rpc(ws,{"type":"lovelace/config","url_path":DASH}))["result"]
-        vv=next(x for x in r2["views"] if x.get("path")=="smol-control")
+        vv=next(x for x in r2["views"] if x.get("path")==VIEW_PATH)
         # Count NODE boxes specifically, via the same identity the merge uses. Matching on
         # "vertical-stack at span N" over-counted: glass/power/forge are also span-N stacks, so
         # a 3-node fleet cheerfully reported 6 node boxes.
@@ -1251,7 +1264,7 @@ def classify(cfg, view):
       retired   generator-owned node boxes whose node has left the fleet — the save deletes these
       retiring  cards listed in RETIRE_LIVE — deliberate one-off deletions, also dropped
     """
-    prev = next((v for v in cfg["views"] if v.get("path") == "smol-control"), None)
+    prev = next((v for v in cfg["views"] if v.get("path") == VIEW_PATH), None)
     if not prev:
         return None, [], [], []
     known = {_ident(c) for c in view["cards"]}
@@ -1266,14 +1279,20 @@ def classify(cfg, view):
 
 
 ENTITY_RE=re.compile(r"^[a-z_]+\.[a-z0-9_]+$")
-def referenced_entities(cards):
-    """{entity_id: {card ident, …}} for every entity a card WIRES A ROW TO.
+def _refs(units):
+    """{entity_id: {label, …}} over (label, object) pairs. The one structural resolver.
 
     Structured `entity:` fields only — deliberately not entity ids scraped out of Jinja. These
     are the references that render as a dead row ('Entity not found' / unavailable) when the
     thing is gone, which is the failure this check exists to catch. Template references degrade
     to '—' instead, and scraping them costs precision: a gate that cries wolf gets ignored, and
-    an ignored gate is worth less than no gate."""
+    an ignored gate is worth less than no gate.
+
+    Text search fails in BOTH directions here and both directions were measured on 2026-08-01.
+    A raw-JSON grep of the telemetry view returned FOUR FALSE hits out of Jinja bodies; a literal
+    grep for constructed ids (`f"sensor.smol_{nid}_delivery"`) reported "nothing references these"
+    and two dead rows shipped to JP's dashboard. Walking the real dicts resolves constructed ids
+    by construction and ignores Jinja by not looking at it."""
     out={}
     def walk(o, ident):
         if isinstance(o,dict):
@@ -1282,8 +1301,41 @@ def referenced_entities(cards):
             for v in o.values(): walk(v, ident)
         elif isinstance(o,list):
             for v in o: walk(v, ident)
-    for c in cards: walk(c, _ident(c))
+    for ident,o in units: walk(o, ident)
     return out
+
+
+def referenced_entities(cards):
+    """{entity_id: {card ident, …}} for every entity a card WIRES A ROW TO."""
+    return _refs((_ident(c), c) for c in cards)
+
+
+def _view_units(v):
+    """(label, object) for every card-like container in a live view, whatever SHAPE it is.
+
+    #340 — a view is not always `{"cards": [...]}`. HA's `sections` view type keeps cards under
+    `sections[].cards`, badges are their own list, and both are shapes this dashboard can grow
+    without anyone editing this file. Handled explicitly so the `on:` label names a real card."""
+    units=[(_ident(c), c) for c in (v.get("cards") or [])]
+    for i,sec in enumerate(v.get("sections") or []):
+        units += [(f"section{i}/{_ident(c)}", c) for c in (sec.get("cards") or [])
+                  if isinstance(c, dict)]
+    units += [(f"badge/{_ident(b)}", b) for b in (v.get("badges") or []) if isinstance(b, dict)]
+    return units
+
+
+def view_entities(v):
+    """{entity_id: {label, …}} for a LIVE view — fail-closed against shapes we do not know.
+
+    The per-card units above give useful labels; the whole-view walk below is the backstop that
+    makes the coverage claim true. Anything the units missed is still reported, under a coarse
+    label instead of being dropped. That ordering matters: #340's failure mode is not a wrong
+    answer, it is a CONFIDENT answer about a subset, so the only acceptable worst case here is a
+    vague label — never a silent omission."""
+    named=_refs(_view_units(v))
+    for e,labels in _refs([("(view body · card shape not recognised — audited anyway)", v)]).items():
+        named.setdefault(e, labels)
+    return named
 
 
 def _excerpt(c):
@@ -1340,7 +1392,8 @@ def report_dead_rows(view, st, extras=()):
     Not two measurements of different things: one selector narrower than the set it described,
     which is the same defect as auditing a diff for `- name:` and missing a bare `- delay:`.
     112 of the 116 were removed 2026-08-01; the remaining 4 are wired by the `smol-telemetry`
-    view, which nothing audits (see the `prev` lookup below — it resolves ONE view by path).
+    view, which NOTHING AUDITED until #340 — `audit_views()` below now covers every view, and
+    those four are exactly what it found on its first run.
 
     `restored: True` is the discriminator, and it is exact: all 110 husks carry it, while a LIVE
     board's momentarily-`unavailable` sensor (`sensor.smol_8_nexus_uplink`) does not. So this
@@ -1353,9 +1406,16 @@ def report_dead_rows(view, st, extras=()):
     # generator CONSTRUCTS (`f"sensor.smol_{nid}_delivery"`) are resolved by construction — a
     # literal-string search would miss every one of them, which is how the id8 Bard rows survived a
     # pre-deploy grep that reported "nothing references these".
+    return _dead((("built", referenced_entities(view["cards"])),
+                  ("live-only", referenced_entities(list(extras)))), st)
+
+
+def _dead(sources, st):
+    """Merge (src_tag, {entity: {label,…}}) pairs and keep only the corpses. See report_dead_rows
+    for WHY 'orphan' is a separate kind from 'absent' and why `restored` is the discriminator."""
     seen = {}
-    for src, cards in (("built", view["cards"]), ("live-only", list(extras))):
-        for e, idents in referenced_entities(cards).items():
+    for src, refs in sources:
+        for e, idents in refs.items():
             r = seen.setdefault(e, {"idents": set(), "src": set()})
             r["idents"] |= idents
             r["src"].add(src)
@@ -1369,19 +1429,94 @@ def report_dead_rows(view, st, extras=()):
     return out
 
 
+def audit_views(cfg, view, prev, extras, st):
+    """#340 — DEAD ROWS for the WHOLE DASHBOARD. Returns (dead, audited).
+
+    THE THIRD FACE OF #333. The first two were about scope within one view (preserved cards were
+    outside it; the check only ran before a change). This one is a level up: `classify()` resolves
+    ONE view by path, `report_check` printed one view's numbers, and so every OTHER Lovelace view
+    on `DASH` was audited by NOTHING — not for dead rows, not for drift.
+
+    That is not a theoretical hole. `sensor.smol_{7,9}_{mac_health,ota_death}` are wired as
+    structured rows in the `smol-telemetry` view and had been rendering `unavailable` there, unseen,
+    for as long as ids 7 and 9 have been retired. The audit that exists to find exactly this could
+    not see them, because it never looked at that view. The defect is not a wrong answer — every
+    number it printed about `smol-control` was correct — it is a CONFIDENT ANSWER ABOUT A SUBSET
+    while the rest of the dashboard rots. Same species as a `smol_<digits>` selector that missed six
+    `smol_nodemgr_id7_*` automations, and as auditing a diff for `- name:` and missing a bare
+    `- delay:`.
+
+    So the loop below is over `cfg["views"]` itself. There is no view list to keep in step, no flag
+    to remember to pass, and no default that covers one view: adding a view to this dashboard
+    enrolls it in the audit, and the only way to remove a view from the audit is to remove the view.
+    `view_entities()` closes the same hole one level down for view SHAPES. The count is printed as
+    'N of N views' so that coverage is an asserted fact on every run rather than an assumption.
+
+    WHICH CARDS, per view, because the question differs:
+      the generated view  audited as BUILT + preserved live-only — what a real run would SHIP, which
+                          is the thing this repo controls and can fix.
+      every other view    audited as it is LIVE. This repo does not build them (`smol-telemetry`
+                          comes from ~/Projects/ha), but it very much removes the entities they
+                          wire, so a row it kills is its own doing and must be visible here.
+
+    Sources are tagged 'built' / 'live-only' / 'view:<path>' and the tag survives into the report,
+    because the remediation differs: fix the scaffold, retire a superseded card, or go unwire a card
+    in another repo. An undifferentiated list would send someone to edit a file that does not
+    contain the card."""
+    sources, audited = [], []
+    for i, v in enumerate(cfg.get("views") or []):
+        label = v.get("path") or v.get("title") or f"#{i}"
+        if prev is not None and (v is prev or v.get("path") == VIEW_PATH):
+            b = referenced_entities(view["cards"]); x = referenced_entities(list(extras))
+            sources += [("built", b), ("live-only", x)]
+            audited.append((label, "built + preserved live-only (generated here)", len(set(b) | set(x))))
+        else:
+            r = view_entities(v)
+            sources.append((f"view:{label}", r))
+            audited.append((label, "live cards (not generated by this repo)", len(r)))
+    if prev is None:
+        # No Control Room on this dashboard yet, so the built view is on no view list to enumerate.
+        # It is still what a real run would ship, and it used to be audited by an early `return 0`
+        # that printed nothing and exited CLEAN — a dashboard-wide audit that skips the audit.
+        b = referenced_entities(view["cards"])
+        sources.append(("built", b))
+        audited.append((f"{VIEW_PATH} (not on this dashboard yet)", "built", len(b)))
+    # Coverage is checked, not asserted in prose. `audited` gains one row per view plus at most the
+    # not-yet-created built view, so anything less means a view escaped the loop above.
+    assert len(audited) >= len(cfg.get("views") or []), \
+        f"a view escaped the audit: {len(audited)} audited of {len(cfg.get('views') or [])}"
+    return _dead(sources, st), audited
+
+
 def report_check(cfg, view, prev, extras, retired, retiring, st):
     """--check output. Exit code: 1 live-only drift · 3 dead rows · 0 clean.
 
     Precedence when both fire: 1. Live-only is the more structural failure — a card the repo
     cannot rebuild at all outranks a card it can rebuild but which points somewhere dead. Both
-    sections always print, so the exit code chooses your first action without hiding the rest."""
-    dead = report_dead_rows(view, st, extras)   # #333: preserved live-only cards are in scope too
+    sections always print, so the exit code chooses your first action without hiding the rest.
+
+    SCOPE, and #340 changed exactly one thing about it. LIVE-ONLY / RETIRED / RETIRING are about
+    the ONE view this repo generates — they compare a scaffold against its own output, and no other
+    view has a scaffold to compare to. DEAD ROWS is DASHBOARD-WIDE: it asks whether a card is wired
+    to something HA does not have, which is a question every view can fail and which this repo's
+    own deploys are what make it fail. Deliberately still ONE `DEAD ROWS · N` line rather than a
+    per-view section, because `ha_deploy.sh push` reads that count out of this output by regex to
+    decide whether a deploy broke a card. A second section it does not grep would have re-created
+    #340 inside the consumer: a confident answer about a subset."""
+    dead, audited = audit_views(cfg, view, prev, extras, st)   # #340: EVERY view, not just ours
+    # Coverage first, and as a list. "DEAD ROWS · 0" is only worth reading if you can see what was
+    # looked at, and for two releases the honest rendering of that line was "0, in one of two views".
+    print(f"\nVIEWS AUDITED · {len(audited)} of {len(cfg.get('views') or [])} view(s) on '{DASH}'"
+          f" — adding a view enrolls it here automatically (#340)")
+    for label, how, n in audited:
+        print(f"    - {label:<26} {n:>3} wired entit{'y ' if n == 1 else 'ies'} · {how}")
     if not prev:
-        print(f"\ndashboard '{DASH}' has no view with path 'smol-control' yet — nothing to drift "
-              f"from; a real run would create it.")
-        return 0
-    print(f"\nview 'smol-control' · index {cfg['views'].index(prev)} of {len(cfg['views'])} views"
-          f" · live cards {len(prev.get('cards', []))} · built from scaffold {len(view['cards'])}")
+        print(f"\ndashboard '{DASH}' has no view with path '{VIEW_PATH}' yet — nothing to drift "
+              f"from; a real run would create it. DEAD ROWS below still applies: the other views on "
+              f"this dashboard are real, and so is the view a real run would ship.")
+    else:
+        print(f"\nview '{VIEW_PATH}' · index {cfg['views'].index(prev)} of {len(cfg['views'])} views"
+              f" · live cards {len(prev.get('cards', []))} · built from scaffold {len(view['cards'])}")
 
     # RETIRED first, and never fatal: deleting the box of a node that has left the fleet is the
     # generator working correctly. It is printed because the identity rules have mis-keyed a LIVE
@@ -1429,7 +1564,7 @@ def report_check(cfg, view, prev, extras, retired, retiring, st):
 
     if dead:
         print(f"\nDEAD ROWS · {len(dead)} entit{'y' if len(dead)==1 else 'ies'} wired to a card "
-              f"but ABSENT from HA.")
+              f"but ABSENT from HA — across all {len(audited)} audited view(s).")
         print("  These render as 'Entity not found' / unavailable — a control that looks broken")
         print("  rather than one that is simply not offered. A card can be perfectly reproducible")
         print("  and still be wired to nothing, which is why this is not the LIVE-ONLY count.")
@@ -1451,8 +1586,19 @@ def report_check(cfg, view, prev, extras, retired, retiring, st):
         if any("built" in src for _, _, src in dead.values()):
             print("\n  (built) means the row is in a card THIS SCRIPT generates or the scaffold")
             print("    defines — fix it here in the repo; a real run will keep re-shipping it.")
+        # #340 — a third source, and its fix is NOT in this repo. Say so plainly rather than let
+        # someone hunt the scaffold for a card the scaffold has never contained.
+        elsewhere = sorted({s for _, _, src in dead.values() for s in src if s.startswith("view:")})
+        if elsewhere:
+            print(f"\n  ({', '.join(elsewhere)}) means the row is on a view this repo does NOT")
+            print("    generate. Nothing here can fix it: find whatever builds that view and unwire")
+            print("    the card there. `smol-telemetry` is built from ~/Projects/ha (see #319/#340).")
+            print("    ORDER MATTERS: unwire the CARD first, THEN purge the entity-registry husk.")
+            print("    Purging first only downgrades 'unavailable' to 'Entity not found' — the row")
+            print("    is still on the glass and now nothing in HA explains why.")
     else:
-        print("\nDEAD ROWS · 0 — every wired entity exists and is actually provided.")
+        print(f"\nDEAD ROWS · 0 — every wired entity on all {len(audited)} audited view(s) exists "
+              f"and is actually provided.")
 
     return 1 if extras else (3 if dead else 0)
 
