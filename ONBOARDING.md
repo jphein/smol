@@ -131,8 +131,8 @@ Full toolchain + gotchas: **[`docs/BUILDING.md`](docs/BUILDING.md)**. TL;DR for 
    fw-gate.yml`) runs the *same script*, so there is nothing here to fall out of step with it.
    `tools/gate.sh` (or `host` / `fw` for one half) covers: `cargo check` across the tiers — default
    (always-green) · `wifi` · `espnow` · the canonical fleet tier · any feature it finds in
-   `Cargo.toml` — plus `clippy -D warnings` on the canonical tier, the host `experiments/*_verify`
-   suites, and the #300 **stack floor** (printed on every PR).
+   `Cargo.toml` — plus `clippy -D warnings` on **every** tier (#343), the host
+   `experiments/*_verify` suites, and the #300 **stack floor** (printed on every PR).
 
    **This list deliberately lives in the script, not here.** Until #338 it lived only in prose, and
    the prose was wrong without anyone noticing: `main` sat red on its own `-D warnings` rule, and a
