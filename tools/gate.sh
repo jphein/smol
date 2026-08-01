@@ -82,6 +82,19 @@ if [ "$run_fw" = 1 ]; then
     printf '%s\n' "$out"; bad "shed order"
   fi
 
+  # #306: the DIAG record is a CLIFF — over budget, `encode_publish` publishes NOTHING and a
+  # healthy board looks dead. `DIAG_CORE_MAX` is the compile-time proof it cannot get there, but its
+  # operands were a hand-summed comment and had drifted 8 B in the unsafe direction while the file
+  # carried three different margins in prose. This proves the declared per-field widths ARE the
+  # record's fields, and PRINTS the margin rather than saying "green". `tools/test_diag_budget.sh`
+  # proves each arm can fail.
+  step "DIAG budget arithmetic matches the record (#306)"
+  if out=$("$ROOT/tools/check_diag_budget.py" "$CLOCK/src/net/mode.rs" 2>&1); then
+    printf '%s\n' "$out"; ok "diag budget"
+  else
+    printf '%s\n' "$out"; bad "diag budget"
+  fi
+
   # #350: cheap and before any compile, because everything below DERIVES from this manifest —
   # a gate that builds the wrong tier list confidently is worse than one that refuses to start.
   # The arms: the canonical tier matches REPRO_FLEET_FEATURES (the packaging path's own
