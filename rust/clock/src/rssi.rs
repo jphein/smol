@@ -167,8 +167,9 @@ impl core::fmt::Write for Line {
     }
 }
 
-/// ASCII-safe left-truncate to `n` bytes (magical nouns are ASCII, so a byte
-/// boundary is a char boundary — never panics).
-pub fn clip(s: &str, n: usize) -> &str {
-    &s[..s.len().min(n)]
-}
+/// #274: re-exported so existing `use crate::rssi::clip` importers keep working, but the body
+/// now lives in [`crate::textclip`] and clips on a CHARACTER boundary. The old form was
+/// `&s[..s.len().min(n)]`, which panics when the cut lands inside a multi-byte character — its
+/// safety rested on the sigil corpus staying ASCII, and that corpus is generated from
+/// `words/realms.json` by `sync-words.sh`.
+pub use crate::textclip::clip;

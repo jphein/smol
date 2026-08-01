@@ -1,0 +1,23 @@
+# #274 host-test harness for the PURE display-text clip (src/textclip.rs). Runs OFF-target (std)
+# via `cargo run`; `#[path]`-includes the real textclip.rs (no drift), like sth_verify /
+# target_guard_verify / ota_http_verify.
+#
+# The point of this harness is the REGRESSION, not the feature. `clip` is a three-line function
+# that looks like an obvious candidate for "simplification" back into `&s[..s.len().min(n)]` — the
+# form that was there for years and panics on a cut inside a multi-byte character. So this suite
+# keeps a verbatim copy of the OLD body, proves it still panics on the exact input that motivated
+# the fix, and proves the new one does not. A test that only exercised the new function would go
+# green against a re-simplified version too.
+#
+# Discovered automatically by tools/gate.sh's `experiments/*_verify` glob → runs on every push.
+[package]
+name = "clip_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "clip_verify"
+path = "src/main.rs"
+[dependencies]
+[profile.dev]
+opt-level = 0

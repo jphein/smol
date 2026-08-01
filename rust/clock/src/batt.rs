@@ -311,14 +311,9 @@ fn render(ctx: &mut Ctx, age_s: Option<u64>, page: u8) {
     ctx.display.flush().ok();
 }
 
-/// Clip `s` to at most `max` characters on a UTF-8 boundary (protocol is ASCII,
-/// but this is boundary-safe regardless — never panics on a byte-slice).
-fn clip(s: &str, max: usize) -> &str {
-    match s.char_indices().nth(max) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
-    }
-}
+/// #274: this copy was already boundary-safe; it now shares the one implementation so the
+/// crate cannot drift back to having several with different units.
+use crate::textclip::clip;
 
 /// Write a compact fetch age (`45s` / `12m` / `3h`) into `out`. Bounded to ≤ 4
 /// glyphs so it always fits beside the title (48 px..72 px = 24 px = 4 chars).

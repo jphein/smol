@@ -161,11 +161,9 @@ fn text_style() -> embedded_graphics::mono_font::MonoTextStyle<'static, BinaryCo
         .build()
 }
 
-/// ASCII-safe left-truncate to `n` bytes (magical nouns are ASCII, so a byte
-/// boundary is a char boundary — no panic).
-fn clip(s: &str, n: usize) -> &str {
-    &s[..s.len().min(n)]
-}
+/// #274: was `&s[..s.len().min(n)]`, which panics on a cut inside a multi-byte character.
+/// Now the shared character-boundary clip.
+use crate::textclip::clip;
 
 /// The `p/N` page indicator, top-right corner (overlaid on any page so the LINK
 /// page stays byte-identical otherwise). `page` is 1-based.

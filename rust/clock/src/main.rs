@@ -109,6 +109,16 @@ mod clock;
 // #282 SIGIL screen — the node's identity nameplate (fantasy name + version sigil). Its own
 // navigable plugin + menu row; compiled in EVERY build (identity needs no radio, like About).
 mod sigil;
+// #274: the ONE character-boundary text clip, replacing four copies with two different units
+// (two of which sliced &str at a raw byte index and could panic). PURE — no HAL, no graphics —
+// so `experiments/clip_verify` host-tests it verbatim.
+//
+// `wifi`-gated because that is the lowest tier with a consumer (batt/grid are wifi; bench/rssi/
+// ota_screen are espnow ⊃ wifi). The default tier has none, so gating keeps it byte-free of the
+// baseline image rather than carrying an `#[allow(dead_code)]` that would mask a genuinely
+// unused helper later.
+#[cfg(feature = "wifi")]
+mod textclip;
 // BENCH mode (ESP-NOW link stats + mesh roster). ESP-NOW-only.
 #[cfg(feature = "espnow")]
 mod bench;
