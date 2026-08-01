@@ -1,0 +1,107 @@
+# #338 — the firmware gate, in CI.
+#
+# Before this, `.github/workflows/` held only `pages.yml`: nothing built any feature tier, ran
+# clippy, or ran the host suites. The "4-tier gate" cited in ONBOARDING.md and rust-toolchain.toml
+# was prose plus whoever remembered to run it. On 2026-08-01 that cost us main sitting red on its
+# own `-D warnings` rule unnoticed, a new feature (`ledger-provision`) with no matrix to add it to,
+# and two agents separately hand-building baselines to compute a clippy delta.
+#
+# DELIBERATELY THIN: every actual command lives in `tools/gate.sh`, which a developer runs verbatim
+# before pushing. If the gate logic lived here, the local instructions and CI would be two
+# definitions free to drift — the same failure in a new place. This file only supplies a machine.
+name: fw gate
+
+on:
+  pull_request:
+  # #345: EVERY branch, not just main. With `branches: [main]` a commit pushed to a feature branch
+  # whose PR had already closed triggered NOTHING — no `pull_request` event (the PR is closed) and
+  # no `push` event (not main) — so it was silently ungated. That is not hypothetical: it happened
+  # to this workflow's own follow-up commit within an hour of it landing (#341 squash-merged while
+  # `ec16fe3` was in flight; the commit sat on a closed branch with zero CI and was only rescued
+  # because the same work had been opened as a second PR).
+  #
+  # `'**'` is branches-only by design — it does NOT match tags. A release tag should not spend
+  # forty minutes re-running a gate that already passed on the commit it points at.
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+# Keyed on the BRANCH, deliberately, so the `push` and `pull_request` events for the same branch
+# land in ONE group and dedupe instead of double-running: `github.head_ref` is the PR's source
+# branch and is empty for a push, where `github.ref_name` supplies the same name. Keying on
+# `github.ref` (the previous form) could not dedupe them — a PR's ref is `refs/pull/N/merge` and a
+# push's is the branch, so they were always distinct groups.
+#
+# `main` gets its OWN group and NEVER cancels: a branch push cannot reach `fw-gate-main`, and
+# cancel-in-progress is false there, so an in-flight main gate always runs to completion. Over-
+# running is the cheap failure here; a main gate cancelled by unrelated branch activity is not.
+# (Two independent guarantees on purpose — either alone would do.)
+#
+# SECURITY: `github.head_ref` is attacker-controlled (a fork can name a branch anything), so it must
+# never reach a `run:` shell or a checkout `ref:`. Here it is used ONLY as part of a concurrency
+# GROUP NAME — an opaque scheduling label that is never evaluated — which is the form GitHub's own
+# docs recommend. These two lines are the only interpolations in this file; keep it that way.
+concurrency:
+  group: fw-gate-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep a runner's memory in bounds: these are LTO release builds of an embedded crate.
+  SMOL_GATE_JOBS: 2
+
+jobs:
+  # Split so a Rust-only breakage is distinguishable at a glance from a host-logic regression,
+  # and so the host suites still report when the riscv toolchain is the thing that broke.
+  host:
+    name: host verifier suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins `stable` + the riscv target + clippy; rustup honours it
+      # automatically, so there is no version to restate here (and none to drift).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: experiments
+          key: host
+      - run: tools/gate.sh host
+
+  firmware:
+    name: tiers + clippy + stack floor
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show resolved toolchain
+        working-directory: rust/clock
+        run: rustc -vV && cargo clippy --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/clock
+          key: fw
+      # readelf reads _stack_start/_stack_end out of the riscv ELF (arch-independent); ubuntu-latest
+      # ships binutils, but assert it rather than discovering its absence as a confusing FATAL.
+      - name: Assert readelf present
+        run: readelf --version >/dev/null
+
+      - run: tools/gate.sh fw
+
+      # The single highest-value line in this workflow, surfaced where a reviewer sees it without
+      # opening logs. Both the #233 spike and the #266 rebase turned on this number and both found
+      # it at the last possible moment; it was previously computed only at package time.
+      - name: Stack number → job summary
+        if: always()
+        run: |
+          {
+            echo "### Canonical image stack"
+            if [ -s /tmp/gate-stack-report ]; then
+              echo '```'; cat /tmp/gate-stack-report; echo '```'
+            else
+              echo "_stack number unavailable — the canonical build did not reach the check._"
+            fi
+            echo ""
+            echo "⚠️ This bounds the linked **region**, not runtime high-water. A struct in a"
+            echo "stack-resident \`RadioManager\` can cost ~1.8 KB of real stack while moving this"
+            echo "number by ~32 B. Green here is not evidence of runtime headroom."
+          } >> "$GITHUB_STEP_SUMMARY"

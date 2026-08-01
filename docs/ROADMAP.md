@@ -57,19 +57,31 @@ formula are a bug in this document** — check them together.
 
 ## 2. 🟡 IN FLIGHT / NEXT WAVE
 
-> ### ⚠️ DRAM budget — read this before adding any static buffer (post-#300)
-> The Bard put a 260K-param model on the fleet image, and DRAM is now the binding constraint on
-> the canonical tier (`espnow,cast,io,bard`). Geometry **re-measured from linker output 2026-07-28**
-> (`readelf -SW`, release ELF, `_stack_start − _stack_end`): `.bss` **195,296 B** · `.data`
-> **14,452 B** · `.stack` **75,960 B** · esp-wifi heap **96 KiB** (low-watermark 24,136 B free) ·
-> measured stack peak **54,960 B**.
+> ### ⚠️ DRAM budget — read this before adding any static buffer (post-#347)
+> DRAM is the binding constraint on the canonical tier, which since #347 is
+> `espnow,cast,io` — **the Bard is no longer in the fleet image.** Geometry **re-measured from
+> linker output 2026-08-01** (`readelf -SW`, release ELF, `_stack_start − _stack_end`): `.bss`
+> **157,472 B** · `.data` **13,588 B** · `.stack` **114,648 B** · esp-wifi heap **96 KiB**.
 >
-> **`tools/repro_build.sh` now hard-fails a release build when the stack region drops below
-> 73,728 B** — so there is only **2,232 B of slack** before a new static allocation *breaks the
-> build*, not the board.
+> **`tools/repro_build.sh` hard-fails a release build when the stack region drops below
+> 73,728 B** — so there is now **40,920 B of slack** before a new static allocation *breaks the
+> build*. That is 18× the 2,232 B this block recorded before #347, and it is the whole reason
+> the Embassy re-platform (#233/#335) went from not-fitting to fitting.
 >
-> > 📌 **Corrected 2026-07-28 — this block previously disagreed with itself, and BOTH figures were
-> > wrong.** It said `.stack` **76,128 B** (stale by 168 B) while its prose said the slack was
+> ⚠️ **Slack is not headroom.** The floor is derived from a *measured runtime peak* (peak × 4/3),
+> and the peak on record — **55,440 B** (#302) — was measured **with the Bard narrating**. A
+> Bard-free peak can only be lower, but nobody has measured it, so the real margin is *at least*
+> this and the floor is *at most* right. Re-run the stack-paint build before spending this slack
+> on anything large.
+>
+> The Bard's DRAM (`.bss` +37,832 B, `.data` +1,232 B) and its ~281 KB of `.rodata` are what
+> moved. The `bard` feature still exists and `tools/gate.sh` still builds a `bard` tier — it is
+> off the C3's shared image, not out of the project. See #347.
+>
+> > 📌 **History, pre-#347 (the figures below describe the with-bard image and are superseded by
+> > the block above).** Corrected 2026-07-28 — this block previously disagreed with itself, and
+> > BOTH figures were
+> > wrong. It said `.stack` **76,128 B** (stale by 168 B) while its prose said the slack was
 > > *"~2,280 B"* and the header said *"~2,400 B"* — three numbers for one quantity. The measured truth
 > > is `.stack` **75,960 B** → **2,232 B**, which is *below* all three, so every previous estimate was
 > > optimistic. `.bss` was 72 B stale too. **Take the slack from `readelf`, never from this paragraph:**
@@ -77,9 +89,10 @@ formula are a bug in this document** — check them together.
 > stack and would have died on hardware (see the #300 spec amendments). Do **not** raise the floor
 > to make a build pass — it is derived from a measurement (peak × 4/3).
 >
-> If a feature needs more than that slack, the levers, cheapest first: **`SEQ_CAP`** in
-> `src/bard/nano_llm.rs` (80→64 frees ~5.8 KB; 80→48 frees ~11.5 KB), the **esp-wifi heap** in
+> If a feature needs more than that slack, the levers, cheapest first: the **esp-wifi heap** in
 > `net::init_heap` (re-run #140's audit first), the **RX-buffer tuning** in `.cargo/config.toml`.
+> **`SEQ_CAP`** in `src/bard/nano_llm.rs` (80→64 frees ~5.8 KB; 80→48 frees ~11.5 KB) is no longer
+> a lever on the fleet image — it only moves a build that has `bard` on.
 > Re-measure with `--features stack-paint` under live radio — idle numbers are meaningless.
 > **#198/#233 (C6, 512 KB SRAM) dissolves the whole problem.**
 >

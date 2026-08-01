@@ -35,6 +35,12 @@
 # The bare-metal target the fleet builds for (matches .cargo/config.toml `build.target`).
 REPRO_TARGET="riscv32imc-unknown-none-elf"
 
+# #338: the CANONICAL fleet feature set, named once. `repro_build_bin` builds it and `tools/gate.sh`
+# gates it; before this was a variable the list lived only inside the build line below, so CI could
+# have gated a DIFFERENT tier than the one that ships and nothing would have said so. Changing this
+# forks the #44 reproducible-image sha lineage — see the note at the build call.
+REPRO_FLEET_FEATURES="${REPRO_FLEET_FEATURES:-espnow,cast,io}"
+
 # Resolve the rustc sysroot for the toolchain that will ACTUALLY build — rustup picks it from
 # the crate's rust-toolchain.toml, so this MUST be evaluated inside the crate dir (from home it
 # would return `stable`, not the pinned 1.96.1, and the remap prefix would miss the build-std
@@ -69,6 +75,54 @@ repro_cargo_args() {
   REPRO_CARGO_ARGS=(
     --config "target.${REPRO_TARGET}.rustflags=[\"--remap-path-prefix=${reg}=/registry\",\"--remap-path-prefix=${sysroot}=/rust\"]"
   )
+}
+
+# #300 STACK FLOOR — the gate that was missing. `.stack` is placed in the DRAM left after `.bss`,
+# and the linker silently shrinks it rather than failing, so a successful link is NOT evidence of a
+# runnable image: with SEQ_CAP 192 the bard image linked with 2592 B of stack (82304 B without bard)
+# and put `__stack_chk_guard` outside the stack region, where the canary cannot detect the overflow
+# it exists to catch. Refuse to package an image that thin.
+#
+# The floor is DERIVED, not chosen: the T13 bench measured a 54,856 B high-water with the stack-paint
+# build (WiFi burst + crown duty + three stories), and 54,856 x 4/3 = 73,141, rounded up to 72 KiB =
+# 73,728. The 4/3 is a third again on top of the worst path we have actually observed — enough to
+# absorb a deeper interrupt nesting or a future radio change without being so generous that the gate
+# stops biting. Re-measure with stack-paint if either the radio stack or the bard's buffers move; a
+# floor copied forward untested is how the last one ended up at 12,288.
+#
+# ⚠️ The floor bounds the linked REGION, which is all an ELF can show. It cannot see runtime
+# high-water: a struct that lives in a stack-resident `RadioManager` costs real stack and moves this
+# number by almost nothing (#181's LedgerLink = 1,760 B on target, but only −32 B of region). So a
+# PASS here means "the region is not absurdly thin", NOT "the image has stack headroom". Re-derive
+# 4/3 x measured-high-water whenever something grows the deep call paths.
+#
+# #338: extracted from `repro_build_bin` so CI measures with the SAME code the packaging path uses.
+# A CI copy of this arithmetic would be a second definition free to drift from the one that actually
+# gates shipping — which is the exact failure this issue exists to remove.
+# repro_stack_check <elf>
+repro_stack_check() {
+  local elf="$1" stack_floor="${REPRO_STACK_FLOOR:-73728}"
+  local ss se
+  ss=$(readelf -sW "$elf" 2>/dev/null | awk '$8=="_stack_start"{print $2; exit}')
+  se=$(readelf -sW "$elf" 2>/dev/null | awk '$8=="_stack_end"{print $2; exit}')
+  if [ -n "$ss" ] && [ -n "$se" ]; then
+    local stack_bytes=$(( 0x$ss - 0x$se ))
+    if [ "$stack_bytes" -lt "$stack_floor" ]; then
+      echo "FATAL: runtime stack is ${stack_bytes} B, below the ${stack_floor} B floor." >&2
+      echo "       Something grew .bss. Shrink it (nano_llm::SEQ_CAP is the bard's lever) or" >&2
+      echo "       reclaim DRAM elsewhere — do NOT ship this image." >&2
+      return 1
+    fi
+    echo "  stack: ${stack_bytes} B (floor ${stack_floor} B)"
+  else
+    # FAIL CLOSED. This gate exists precisely because "it links" was not evidence of a runnable
+    # image; a gate that waves through an unreadable ELF restores that blind spot exactly, and
+    # the one time it matters is the time something is wrong with the build.
+    echo "FATAL: could not read _stack_start/_stack_end from $elf — refusing to package." >&2
+    echo "       Check that the ELF exists and that readelf is available; do NOT ship an" >&2
+    echo "       image whose stack was never measured." >&2
+    return 1
+  fi
 }
 
 # repro_build_bin <clock_dir> <out_bin> <hash> <build_number> [node_id]
@@ -148,52 +202,31 @@ repro_build_bin() {
     # display-mirror) + io (#72 registry — inert until a G config binds pins, and the
     # dollhouse's dashboard-only pin-binding depends on it being resident). Changing this
     # list changes the reproducible-image definition (#44): a new sha lineage per commit.
-    # #300: + bard (The Bard storyteller). It is radio-free and self-contained, but it costs
-    # ~285 KB of flash (the model blob in .rodata) and ~67 KB of .bss. That .bss comes straight
-    # out of the RUNTIME STACK: `.stack` gets whatever DRAM is left over and the linker shrinks
-    # it SILENTLY, so "it links" says nothing about whether the firmware can run — see the
-    # stack-floor gate below. ⚠️ FORKS THE #44 SHA LINEAGE: every image built from this commit
-    # forward differs from the pre-bard lineage by definition.
-    cargo build --release --features espnow,cast,io,bard "${REPRO_CARGO_ARGS[@]}"
+    # #300 added `bard`; #347 REMOVED it from this list. The Bard is radio-free and
+    # self-contained, but on the C3 it costs +287,392 B of flash (the model blob in .rodata)
+    # and +39,072 B of DRAM (.bss +37,832, .data +1,232) — and that DRAM comes straight out of
+    # the RUNTIME STACK: `.stack` gets whatever is left over and the linker shrinks it SILENTLY,
+    # so "it links" says nothing about whether the firmware can run. Measured on one commit,
+    # one toolchain: canonical WITH bard = 67,488 B of stack, WITHOUT = 106,560 B, against a
+    # re-derived floor of 74,208 B (4/3 x the 55,656 B measured high-water). With the bard in,
+    # the #233 async re-platform does not fit at all — see #335.
+    #
+    # ⚠️ The `bard` FEATURE STAYS IN Cargo.toml AND IS STILL GATED (tools/gate.sh builds a
+    # `bard` tier). It is out of the C3 fleet image, not out of the project: the S3 and C6 have
+    # the DRAM to carry it as a normal smol feature, and bard.realm.watch is a standalone
+    # DEVICE + public face, NOT a fork of this source. Do not delete the feature, and do not
+    # copy nano_llm out of this tree — a second copy is the divergence #347 exists to avoid.
+    #
+    # ⚠️ FORKS THE #44 SHA LINEAGE: every image built from this commit forward differs from
+    # the with-bard lineage by definition. That is the second fork of this lineage (#300 was
+    # the first); an image sha only means something relative to the list in force when it was
+    # built, so a hash compared across this boundary will disagree and is SUPPOSED to.
+    cargo build --release --features "$REPRO_FLEET_FEATURES" "${REPRO_CARGO_ARGS[@]}"
   ) || return 1
   # Honor CARGO_TARGET_DIR (verify_image.sh --twice points each build at an isolated dir);
   # default to the in-tree target/ (ota_publish.sh's path) when unset.
   local tdir="${CARGO_TARGET_DIR:-$clock/target}"
-  # #300 STACK FLOOR — the gate that was missing. `.stack` is placed in the DRAM left after
-  # `.bss`, and the linker silently shrinks it rather than failing, so a successful link is NOT
-  # evidence of a runnable image: with SEQ_CAP 192 the bard image linked with 2592 B of stack
-  # (82304 B without bard) and put `__stack_chk_guard` outside the stack region, where the canary
-  # cannot detect the overflow it exists to catch. Refuse to package an image that thin.
-  #
-  # The floor is DERIVED, not chosen: the T13 bench measured a 54,856 B high-water with the
-  # stack-paint build (WiFi burst + crown duty + three stories), and 54,856 x 4/3 = 73,141,
-  # rounded up to 72 KiB = 73,728. The 4/3 is a third again on top of the worst path we have
-  # actually observed — enough to absorb a deeper interrupt nesting or a future radio change
-  # without being so generous that the gate stops biting. Re-measure with stack-paint if either
-  # the radio stack or the bard's buffers move; a floor copied forward untested is how the last
-  # one ended up at 12,288.
-  local elf="$tdir/${REPRO_TARGET}/release/clock" stack_floor=73728
-  local ss se
-  ss=$(readelf -sW "$elf" 2>/dev/null | awk '$8=="_stack_start"{print $2; exit}')
-  se=$(readelf -sW "$elf" 2>/dev/null | awk '$8=="_stack_end"{print $2; exit}')
-  if [ -n "$ss" ] && [ -n "$se" ]; then
-    local stack_bytes=$(( 0x$ss - 0x$se ))
-    if [ "$stack_bytes" -lt "$stack_floor" ]; then
-      echo "FATAL: runtime stack is ${stack_bytes} B, below the ${stack_floor} B floor." >&2
-      echo "       Something grew .bss. Shrink it (nano_llm::SEQ_CAP is the bard's lever) or" >&2
-      echo "       reclaim DRAM elsewhere — do NOT ship this image." >&2
-      return 1
-    fi
-    echo "  stack: ${stack_bytes} B (floor ${stack_floor} B)"
-  else
-    # FAIL CLOSED. This gate exists precisely because "it links" was not evidence of a runnable
-    # image; a gate that waves through an unreadable ELF restores that blind spot exactly, and
-    # the one time it matters is the time something is wrong with the build.
-    echo "FATAL: could not read _stack_start/_stack_end from $elf — refusing to package." >&2
-    echo "       Check that the ELF exists and that readelf is available; do NOT ship an" >&2
-    echo "       image whose stack was never measured." >&2
-    return 1
-  fi
+  repro_stack_check "$tdir/${REPRO_TARGET}/release/clock" || return 1
   "$espflash" save-image --chip esp32c3 \
     "$tdir/${REPRO_TARGET}/release/clock" "$out" >/dev/null || return 1
 }

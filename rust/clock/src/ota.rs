@@ -2161,7 +2161,13 @@ pub fn mark_bl_revert(on: bool) {
 ///
 /// `off` is the honest reading of "not promoted": whether the bootloader has rollback disabled or
 /// simply did not set the state, the operational consequence is the same — there is no net.
+/// `#[allow(dead_code)]`: the sole caller is `diag_record` (`net/mode.rs`, the `|blrev=` PROTECTED
+/// field), which is `espnow`-gated — so a `wifi` build compiles this and never calls it. Left on
+/// `cfg(wifi)` rather than narrowed to `espnow`: it reads OTA bootloader state that belongs to the
+/// `wifi` tier's OTA machinery, and narrowing it would put the reader on a tighter gate than the
+/// `BL_REVERT` state it reads, which is the kind of mismatch that rots.
 #[cfg(feature = "wifi")]
+#[allow(dead_code)]
 pub fn bl_revert_token() -> Option<&'static str> {
     unsafe {
         let m = core::ptr::addr_of!(BL_REVERT).read();

@@ -12,11 +12,19 @@
 #   ./tools/ha_deploy.sh status        # what differs, repo vs live (READ-ONLY; the default)
 #   ./tools/ha_deploy.sh diff [file]   # full unified diff for one package (or all)
 #   ./tools/ha_deploy.sh dash          # dashboard-only drift check (READ-ONLY; exits 1 on drift)
+#   ./tools/ha_deploy.sh assets        # theme/www file pairs (#321) (READ-ONLY; exits 1 on drift)
 #   ./tools/ha_deploy.sh pull          # live -> repo, so out-of-band edits become commits
 #   ./tools/ha_deploy.sh push [file...] # repo -> live from HEAD, validated, with rollback
 #   ./tools/ha_deploy.sh push --all      # every differing package (required if >1)
 #   ./tools/ha_deploy.sh push --from-worktree   # push uncommitted state on purpose
 #   ./tools/ha_deploy.sh push --dry-run
+#
+# `push` RE-CHECKS THE DASHBOARD AFTERWARDS (#333). A push adds and removes entities; the Lovelace
+# view wires entities by id, so a removal turns its card into a dead row — and every pre-flight gate
+# is green at that moment because the entity still exists. It warns, never fails: the push already
+# succeeded, and the actionable output is the entity list, not the exit status.
+#   ./tools/ha_deploy.sh push --assets [path...]  # the theme/www pairs — a SEPARATE batch from
+#                                        packages, so the two classes never ride together
 #
 # push SENDS HEAD, NOT YOUR WORKING TREE (#318), and refuses an unscoped multi-file batch —
 # see the push guard below for the incident that produced both rules. Exit 4 = refused,
@@ -51,6 +59,32 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCAL_DIR="$REPO_DIR/ha/packages"
 REMOTE_DIR="/homeassistant/packages"
 SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes)
+
+# --- #321: the SECOND class of managed path — explicit file PAIRS, not a directory sync ------
+# Everything this repo installs into HA that is not a package and not the Lovelace view. Before
+# this, none of it was compared by anything: `ha/www/luna-fonts/ATTRIBUTION.md` existed in the
+# repo and had NEVER been deployed, and eighteen days of both sides looking identical on every
+# file someone would spot-check never revealed it. That file is the SIL OFL 1.1 notice for the
+# two fonts HA serves to browsers — i.e. the miss landed on the one file with an external
+# obligation, so the consequence did not scale with the plausibility. That is the reason for a
+# manifest: you cannot tell which unwatched file matters until you look.
+#
+#   <repo-relative path>:<absolute live path>:<reload action>
+#
+# The reload action is DECLARED, never inferred — guessing is how the existing reload-choice bug
+# shipped. A changed theme needs `frontend.reload_themes`; fonts need nothing, because the
+# browser refetches. `none` is a real answer here, not a placeholder.
+#
+# Enumerated rather than synced wholesale ON PURPOSE: `/config/www/` is served as `/local/…`
+# WITHOUT authentication, so anything landing there is public to anyone who can reach the
+# instance. That is correct for OFL fonts and a licence notice, and it is exactly why a new
+# file should have to be named here rather than swept up by a directory glob.
+ASSETS=(
+  "ha/themes/smol.yaml:/config/themes/smol.yaml:reload_themes"
+  "ha/www/luna-fonts/vt323.woff2:/config/www/luna-fonts/vt323.woff2:none"
+  "ha/www/luna-fonts/ibmplexmono.woff2:/config/www/luna-fonts/ibmplexmono.woff2:none"
+  "ha/www/luna-fonts/ATTRIBUTION.md:/config/www/luna-fonts/ATTRIBUTION.md:none"
+)
 
 die() { echo "FATAL — $*" >&2; exit 1; }
 note() { echo "  $*"; }
@@ -156,6 +190,51 @@ fetch_remote() { # $1 basename -> stdout (empty if the file does not exist there
   ssh "${SSH_OPTS[@]}" "$HA_SSH" "cat $REMOTE_DIR/$1 2>/dev/null" || true
 }
 
+# --- assets (#321) --------------------------------------------------------------------------
+# Compared by MD5, never by `diff`: two of the four are `.woff2`, and a comparison that silently
+# degrades on binary input is the same class of defect as the gap this closes.
+asset_fields() { # $1 manifest entry -> sets REPO_P / LIVE_P / RELOAD_A in the caller
+  IFS=: read -r REPO_P LIVE_P RELOAD_A <<<"$1"    # no path here contains ':'
+}
+
+assets_live_md5() { # -> "<md5>  <live path>" for those that EXIST live (absent = no line)
+  local -a lp=(); local e
+  for e in "${ASSETS[@]}"; do asset_fields "$e"; lp+=("$LIVE_P"); done
+  # One round trip for all of them. A missing file simply produces no line, which is precisely
+  # the MISSING signal — `md5sum` on an absent path is an error, not an empty hash.
+  ssh "${SSH_OPTS[@]}" "$HA_SSH" "md5sum ${lp[*]} 2>/dev/null" || true
+}
+
+cmd_assets() { # read-only; 0 in sync · 1 drift · 2 could not check
+  local live rc=0
+  if ! live="$(assets_live_md5)"; then return 2; fi
+  echo "assets (theme / www — file pairs, md5-compared):"
+  local e lmd5 rmd5 drift=0 missing_repo=0
+  for e in "${ASSETS[@]}"; do
+    asset_fields "$e"
+    if [ ! -f "$REPO_DIR/$REPO_P" ]; then
+      printf '  %-38s MANIFEST ERROR — not in the repo\n' "$REPO_P"; missing_repo=1; continue
+    fi
+    lmd5="$(md5sum "$REPO_DIR/$REPO_P" | cut -d' ' -f1)"
+    # Match on the live PATH, anchored, so one asset's hash can never be read for another.
+    rmd5="$(printf '%s\n' "$live" | awk -v p="$LIVE_P" '$2==p{print $1; exit}')"
+    if [ -z "$rmd5" ]; then
+      printf '  %-38s MISSING on live (never deployed)\n' "$REPO_P"; drift=1
+    elif [ "$lmd5" = "$rmd5" ]; then
+      printf '  %-38s in sync\n' "$REPO_P"
+    else
+      printf '  %-38s DIFFERS  (repo %s | live %s)\n' "$REPO_P" "${lmd5:0:8}" "${rmd5:0:8}"; drift=1
+    fi
+  done
+  [ "$missing_repo" -eq 1 ] && rc=2
+  [ "$drift" -eq 1 ] && [ "$rc" -eq 0 ] && rc=1
+  case "$rc" in
+    1) echo "  → drift: \`push --assets\` deploys them (reload action is per-asset, declared)." ;;
+    2) echo "  → the manifest names a file the repo does not have; assets are UNVERIFIED." ;;
+  esac
+  return "$rc"
+}
+
 # --- status ------------------------------------------------------------------------------
 cmd_status() {
   local drift=0 tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
@@ -195,6 +274,11 @@ cmd_status() {
   # must not be reported as "in sync" either.
   { [ "$drc" -eq 1 ] || [ "$drc" -eq 3 ]; } && drift=1
   echo
+  # #321 — same rule as the dashboard above: 1 is drift, and 2 ("could not check") must never
+  # read as in sync. A clean answer about a subset is what let ATTRIBUTION.md go undeployed.
+  local arc=0; cmd_assets || arc=$?
+  [ "$arc" -ne 0 ] && drift=1
+  echo
   [ "$drift" -eq 0 ] && echo "everything in sync." || echo "drift found (see above)."
   return 0
 }
@@ -214,6 +298,24 @@ cmd_diff() {
   [ -n "$only" ] && return 0
   echo "=== dashboard  (card-level; the view has no file to diff)"
   cmd_dash || true
+  # #321 — text assets get a real diff; binary ones get their md5 pair and say so, because a
+  # `diff` that quietly reports "Binary files differ" is not a comparison, it is a shrug.
+  echo "=== assets  (text: unified diff · binary: md5 pair)"
+  local e; for e in "${ASSETS[@]}"; do
+    asset_fields "$e"
+    [ -f "$REPO_DIR/$REPO_P" ] || { echo "--- $REPO_P: not in the repo (manifest error)"; continue; }
+    if grep -Iq . "$REPO_DIR/$REPO_P" 2>/dev/null; then     # -I: binary counts as no-match
+      ssh "${SSH_OPTS[@]}" "$HA_SSH" "cat $LIVE_P 2>/dev/null" > "$tmp/asset.live" || true
+      if cmp -s "$REPO_DIR/$REPO_P" "$tmp/asset.live"; then echo "--- $REPO_P: in sync"; continue; fi
+      echo "--- $REPO_P  (< repo | > live)"
+      diff -u "$REPO_DIR/$REPO_P" "$tmp/asset.live" || true
+    else
+      local lm rm; lm="$(md5sum "$REPO_DIR/$REPO_P" | cut -d' ' -f1)"
+      rm="$(ssh "${SSH_OPTS[@]}" "$HA_SSH" "md5sum $LIVE_P 2>/dev/null" | cut -d' ' -f1)"
+      if [ "$lm" = "${rm:-}" ]; then echo "--- $REPO_P: in sync (binary, md5 ${lm:0:8})"
+      else echo "--- $REPO_P: DIFFERS (binary) repo=$lm live=${rm:-MISSING}"; fi
+    fi
+  done
 }
 
 # --- dashboard (the Lovelace VIEW, not a package) -------------------------------------------
@@ -330,16 +432,96 @@ push_unshipped_line() { # $1 basename, $2 live copy -> one-line summary of what 
   echo "$n unshipped: $(git -C "$REPO_DIR" log -1 --format='%h %s' HEAD -- "ha/packages/$f")"
 }
 
+# --- push assets (#321) ----------------------------------------------------------------------
+# A SEPARATE batch from packages, deliberately: #318's incident was one operator's push silently
+# carrying another author's work, and mixing two classes of managed path into one envelope is
+# the same mistake with a new surface. `--assets` pushes assets and nothing else.
+push_assets() { # $1 dry, $2 all, $3 from_worktree, rest: scoped repo paths
+  local dry="$1" all="$2" from_worktree="$3"; shift 3
+  local -a scope=("$@") changed=() reloads=()
+  local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+  local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
+  local live; live="$(assets_live_md5)" || { echo "cannot reach live to compare assets" >&2; return 2; }
+
+  local e lmd5 rmd5 n=0
+  for e in "${ASSETS[@]}"; do
+    asset_fields "$e"
+    if [ ${#scope[@]} -gt 0 ]; then
+      case " ${scope[*]} " in *" $REPO_P "*) ;; *) continue ;; esac
+    fi
+    [ -f "$REPO_DIR/$REPO_P" ] || { note "$REPO_P: not in the repo — skipped"; continue; }
+    # Source is HEAD, exactly as packages are (#318): the bytes pushed must be the bytes
+    # reviewed. `git show` to a FILE, never `$( )` — command substitution strips trailing
+    # newlines and would corrupt every binary asset.
+    n=$((n+1)); local src="$tmp/a$n"
+    if [ "$from_worktree" -eq 1 ]; then cp "$REPO_DIR/$REPO_P" "$src"
+    elif ! git -C "$REPO_DIR" show "HEAD:$REPO_P" > "$src" 2>/dev/null; then
+      note "$REPO_P: not in HEAD (new/uncommitted) — skipped; --from-worktree to push it anyway"
+      continue
+    fi
+    lmd5="$(md5sum "$src" | cut -d' ' -f1)"
+    rmd5="$(printf '%s\n' "$live" | awk -v p="$LIVE_P" '$2==p{print $1; exit}')"
+    [ "$lmd5" = "${rmd5:-}" ] && continue
+    changed+=("$REPO_P:$LIVE_P:$RELOAD_A:$src")
+    printf '    %-38s %s\n' "$REPO_P" "${rmd5:+repo ${lmd5:0:8} -> live ${rmd5:0:8}}${rmd5:-NEW on live}"
+  done
+
+  [ ${#changed[@]} -eq 0 ] && { echo "  assets: nothing to push."; return 0; }
+  # Same refusal shape as the package path: never send a batch nobody named.
+  if [ ${#scope[@]} -eq 0 ] && [ ${#changed[@]} -gt 1 ] && [ "$all" -eq 0 ]; then
+    echo
+    echo "  REFUSED · an unscoped push would send all ${#changed[@]} assets above in one batch." >&2
+    echo "  Name what you mean:  ./tools/ha_deploy.sh push --assets ${changed[0]%%:*}" >&2
+    echo "  or:                  ./tools/ha_deploy.sh push --assets --all" >&2
+    return 4
+  fi
+  [ "$dry" -eq 1 ] && { echo "  (dry run — nothing sent)"; return 0; }
+
+  local c rp lp ra sf
+  for c in "${changed[@]}"; do
+    IFS=: read -r rp lp ra sf <<<"$c"
+    ssh "${SSH_OPTS[@]}" "$HA_SSH" \
+      "sudo mkdir -p $(dirname "$lp"); [ -f $lp ] && sudo cp $lp $lp.bak-deploy-$stamp || true"
+    # base64 over the wire: two of these are .woff2, and a byte-mangled font fails silently in
+    # a browser rather than here. `tee` alone is fine for text and not worth trusting for binary.
+    base64 < "$sf" | ssh "${SSH_OPTS[@]}" "$HA_SSH" "base64 -d | sudo tee $lp > /dev/null" \
+      || die "copy of $rp failed"
+    # VERIFY AFTER WRITE — a copy that reports success and lands wrong is the failure this whole
+    # issue is about. Re-read the live hash rather than trusting an exit status.
+    local want got; want="$(md5sum "$sf" | cut -d' ' -f1)"
+    got="$(ssh "${SSH_OPTS[@]}" "$HA_SSH" "md5sum $lp 2>/dev/null" | cut -d' ' -f1)"
+    [ "$want" = "${got:-}" ] || die "$rp: post-write md5 mismatch (want $want, live ${got:-none}) — restore from $lp.bak-deploy-$stamp"
+    note "$rp -> $lp: copied + verified ($want)"
+    [ "$ra" = "none" ] || case " ${reloads[*]:-} " in *" $ra "*) ;; *) reloads+=("$ra") ;; esac
+  done
+  # Declared, per-asset, deduped. Fonts reload NOTHING: the browser refetches, and inventing a
+  # reload for them would be the same guessing that produced the reload-choice bug.
+  local r
+  for r in "${reloads[@]:-}"; do
+    [ -n "$r" ] || continue
+    ha_api POST "/api/services/frontend/$r" '{}' >/dev/null && note "frontend.$r"
+  done
+  [ ${#reloads[@]} -eq 0 ] && note "no reload needed (browser refetches static assets)"
+  echo
+  echo "pushed ${#changed[@]} asset(s). Backups on the VM: *.bak-deploy-$stamp"
+}
+
 # --- push (repo -> live) -------------------------------------------------------------------
 cmd_push() {
   local dry=0 from_worktree=0 all=0 allow_revert=0; local -a scope=()
+  # #321: decide the CLASS before validating any name, so `--assets` may appear anywhere in the
+  # argument list rather than only first. Validating an asset path against `packages()` would
+  # otherwise die with a confusing "no such package".
+  local assets_mode=0 _a
+  for _a in "$@"; do [ "$_a" = "--assets" ] && assets_mode=1; done
   while [ $# -gt 0 ]; do
     case "$1" in
       --dry-run) dry=1 ;;
       --from-worktree) from_worktree=1 ;;
       --all) all=1 ;;
       --allow-revert) allow_revert=1 ;;
-      -*) die "unknown push flag '$1' (--dry-run | --from-worktree | --all | --allow-revert)" ;;
+      --assets) ;;   # class selector, already scanned above
+      -*) die "unknown push flag '$1' (--dry-run | --from-worktree | --all | --allow-revert | --assets)" ;;
       "") ;;
       # 2026-07-28: was `packages | grep -qxF "$1" || die …`. Under `pipefail`, deciding on
       # the status of `cmd | grep -q` is unreliable AT ANY SIZE — grep -q exits on first
@@ -351,14 +533,27 @@ cmd_push() {
       # since-refuted theory that only large inputs or early matches were affected; a late
       # match at 266 KB still failed 2-3.5%. So the rule is absolute rather than sized, and
       # this is now a pipe-free membership test that cannot fail for pipeline reasons.
-      *) _pkgs="$(packages)"
-         case $'\n'"$_pkgs"$'\n' in
-           *$'\n'"$1"$'\n'*) ;;
-           *) die "no such package '$1' (have: $(printf '%s' "$_pkgs" | tr '\n' ' '))" ;;
-         esac
+      *) if [ "$assets_mode" -eq 1 ]; then
+           _known=""; for _a in "${ASSETS[@]}"; do _known="$_known${_a%%:*} "; done
+           case " $_known" in
+             *" $1 "*) ;;
+             *) die "no such asset '$1' (have: $_known)" ;;
+           esac
+         else
+           _pkgs="$(packages)"
+           case $'\n'"$_pkgs"$'\n' in
+             *$'\n'"$1"$'\n'*) ;;
+             *) die "no such package '$1' (have: $(printf '%s' "$_pkgs" | tr '\n' ' '))" ;;
+           esac
+         fi
          scope+=("$1") ;;
     esac; shift
   done
+  if [ "$assets_mode" -eq 1 ]; then
+    echo "  would push asset(s):"
+    push_assets "$dry" "$all" "$from_worktree" "${scope[@]+"${scope[@]}"}"
+    return $?
+  fi
   local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
   local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
   local -a changed=() ; local needs_full=0
@@ -539,14 +734,73 @@ cmd_push() {
   fi
   echo
   echo "pushed ${#changed[@]} package(s). Backups on the VM: *.bak-deploy-$stamp"
+
+  # --- #333 GAP 2: re-check the DASHBOARD *after* the push, not only before -------------------
+  # A package push adds and REMOVES entities (the push report above prints exactly which). The
+  # Lovelace view wires entities by id, so removing one silently turns its card into a dead row —
+  # and every pre-flight gate is green at that moment BECAUSE THE ENTITY STILL EXISTS. The deploy
+  # is what creates the breakage, so a check that only ever runs beforehand is structurally unable
+  # to see it.
+  #
+  # That is not hypothetical. 2026-08-01: #320 removed `sensor.smol_8_{delivery,tale}`, and
+  # `vertical-stack|node8` was still wired to both. `--check` had passed cleanly minutes earlier.
+  # Two "Entity not found" rows shipped to JP's dashboard and were found only because someone
+  # happened to re-run the check afterwards.
+  #
+  # Run automatically rather than documented as a step, because "remember to re-check after
+  # deploying" is precisely the discipline that failed the first time. WARNS, never fails: the push
+  # already succeeded and rolling HA back over a dashboard row would be wildly disproportionate —
+  # the actionable output is the entity list, not the exit status. Skipped when the generator or a
+  # token is unavailable, and its own failure is reported rather than swallowed.
+  local dash_rc=0
+  if [ -z "${HA_TOKEN:-}" ] && command -v bw >/dev/null 2>&1; then
+    HA_TOKEN="$(timeout 40 bw get password ha-llat 2>/dev/null)" || true
+  fi
+  if [ ! -f "$REPO_DIR/ha/dashboard/build_control_room.py" ]; then
+    note "post-deploy dashboard check SKIPPED (generator not found)"
+  elif [ -z "${HA_TOKEN:-}" ]; then
+    note "post-deploy dashboard check SKIPPED (no HA_TOKEN; run: HA_TOKEN=… $0 push …)"
+  else
+    echo
+    echo "  post-deploy dashboard check (#333) — did this push kill any card's rows?"
+    # ONE invocation. Running it twice (once for text, once for status) would spend a second
+    # websocket round trip and, worse, could report a verdict from a different read than the lines
+    # printed above it — a check disagreeing with its own output is not a check.
+    local dash_out=""
+    dash_out="$(HA_TOKEN="$HA_TOKEN" timeout 180 python3 \
+      "$REPO_DIR/ha/dashboard/build_control_room.py" --check 2>&1)" || dash_rc=$?
+    printf '%s\n' "$dash_out" | sed -n '/^LIVE-ONLY/p;/^DEAD ROWS/p;/^  ⚠/p;/^    - /p' | sed 's/^/    /'
+    # DEAD ROWS is read from the OUTPUT, not from the exit code, and that distinction matters:
+    # `report_check` returns `1 if extras else (3 if dead else 0)`, so ANY live-only drift MASKS the
+    # dead-rows status. Keying this warning off `$dash_rc == 3` alone would mean that on an instance
+    # with pre-existing LIVE-ONLY drift — which is the normal state whenever a back-port is pending —
+    # a push that killed a card's rows would print "pre-existing drift" and say nothing about the
+    # rows it just broke. The exit code answers "what should I fix FIRST", which is a narrower
+    # question than "did this push break anything", and confusing the two is the whole of #333.
+    local dead_line
+    dead_line="$(printf '%s\n' "$dash_out" | sed -n 's/^DEAD ROWS · \([0-9][0-9]*\).*/\1/p' | head -1)"
+    if [ "${dead_line:-0}" -gt 0 ] 2>/dev/null; then
+      echo "  ⚠ DEAD ROWS ($dead_line) — an entity a dashboard card wires is missing from HA." >&2
+      echo "    A push that REMOVES entities is the usual cause; the list is above. Fix the card or" >&2
+      echo "    the generator, then re-run: python3 ha/dashboard/build_control_room.py --check" >&2
+    elif [ "$dash_rc" -eq 0 ]; then
+      note "dashboard still clean (LIVE-ONLY 0 · DEAD ROWS 0)"
+    fi
+    case "$dash_rc" in
+      0|3) : ;;   # 3 is already covered by the DEAD ROWS branch above
+      1) note "dashboard also reports LIVE-ONLY drift (see #305 — back-port vs retire is a decision)" ;;
+      *) echo "  ⚠ post-deploy dashboard check could not run (exit $dash_rc) — run it by hand." >&2 ;;
+    esac
+  fi
 }
 
 case "${1:-status}" in
   status) cmd_status ;;
   diff)   cmd_diff "${2:-}" ;;
   dash)   cmd_dash ;;   # exit code propagates: 0 in sync · 1 live-only drift · 2 could not check
+  assets) cmd_assets ;; # #321; same contract as dash: 0 in sync · 1 drift · 2 could not check
   pull)   cmd_pull ;;
   push)   shift; cmd_push "$@" ;;
-  -h|--help|help) sed -n '2,30p' "${BASH_SOURCE[0]}" ;;
-  *) die "unknown mode '${1}' (status | diff | dash | pull | push)" ;;
+  -h|--help|help) sed -n '2,34p' "${BASH_SOURCE[0]}" ;;
+  *) die "unknown mode '${1}' (status | diff | dash | assets | pull | push)" ;;
 esac

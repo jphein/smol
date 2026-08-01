@@ -185,6 +185,14 @@ pub trait Plugin {
     /// 224-274 ms measured — two orders of magnitude too long), no sensor reads, no radio, no
     /// flash. `main` calls it at most every `SYNC_REDRAW_MS`, the same cadence the OTA progress
     /// screens have already been hardware-watched at.
+    ///
+    /// `#[allow(dead_code)]`: both call sites are radio-gated — `main.rs:1097` under
+    /// `#[cfg(feature = "espnow")]` and `main.rs:1637` under `#[cfg(feature = "coexist-soak")]`
+    /// (which implies `espnow`) — so a `default` or `wifi` build compiles this and never calls it.
+    /// NOT cfg-gated away: this is a trait method with a default body, so gating it would make the
+    /// `Plugin` contract itself feature-dependent and force the cfg onto every implementor. The
+    /// empty default body inlines to nothing, so the lower tiers pay no bytes for the allow.
+    #[allow(dead_code)]
     fn paint_burst(&mut self, _display: &mut Oled, _now_ms: u64) {}
 }
 
@@ -513,6 +521,10 @@ impl App {
     /// Render-only dispatch for a WiFi-burst yield — see [`Plugin::paint_burst`]. Statically
     /// dispatched exactly like [`Self::update`], so a screen that does not implement it costs
     /// nothing at all (the default body is empty and inlines away).
+    ///
+    /// `#[allow(dead_code)]` for the same reason as the trait method it dispatches to: every caller
+    /// is `espnow`-gated, so `default`/`wifi` builds compile this dispatcher unused.
+    #[allow(dead_code)]
     pub fn paint_burst(&mut self, display: &mut Oled, now_ms: u64) {
         match self {
             App::Menu(s) => Plugin::paint_burst(s, display, now_ms),

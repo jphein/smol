@@ -2508,6 +2508,7 @@ impl RadioManager {
         let mut _notify_req = crate::net::wifi::NotifyReq::new(); // #197: recovery burst issues no toasts
         let mut install_requested = false;
         let mut _leaf_install_seen = false; // #40 #1: a leaf's recovery burst is not a gateway relay
+        let mut _leaf_flip_confirmed = false; // #329 B1: no flip sweep off-gateway (stat_cache=None)
         let reached = match self.sta.as_mut() {
             None => false,
             Some(sta) => {
@@ -2527,6 +2528,8 @@ impl RadioManager {
                     &mut _reset_req,
                     &mut install_requested,
                     &mut _leaf_install_seen, // #40 #1: leaf recovery burst — never a gateway relay
+                    &mut _leaf_flip_confirmed, // #329 B1: no flip sweep off-gateway (stat_cache=None)
+                    0, // #329 F2: recovery burst is not a gateway relay (cfg_cache=None) → no armdiag
                     &[], // #27: election-only recovery burst publishes no peers (leaf/v1)
             &[], // #50: recovery burst publishes no live-screen status
                     None, // #21: a leaf's recovery burst is not a gateway relay
@@ -3451,6 +3454,20 @@ impl RadioManager {
         // board or any leaf; `cfg` — config-drift echo, valuable but reconstructible from the command
         // topics HA already holds; `ap` — the live association, whose channel the protected `apch=`
         // approximates. Nothing here is lost while there is room for it.
+        //
+        // ⚠️ The ranking in that paragraph is a statement of what we would least MIND losing. It is
+        // NOT the order things are actually lost in, and the two disagree today (#339): `room_for`
+        // appends while the budget lasts, so APPEND POSITION IS SHED PRIORITY — the LAST field
+        // offered is the FIRST dropped. `cc` is appended 4th and therefore outlives `ap`, `cfg` and
+        // `io`, the reverse of what the prose claims. Reordering the appends is a wire-visible
+        // change and belongs in its own commit; #339 holds that argument.
+        //
+        // The line below is the MACHINE-CHECKED truth. `tools/check_shed_order.py` (run by
+        // `tools/gate.sh`, so on every PR) parses the `room_for` sequence below and fails the gate
+        // unless it equals this list exactly. Change the appends and you must change this line —
+        // which is the point: the prose above rotted precisely because nothing could test it.
+        //
+        // SHED-ORDER: sog, cfgq, cdeaf, cc, ap, cfg, io, deaf
         let mut shed = 0u8;
         {
             let mut room_for = |rec: &mut alloc::string::String, field: alloc::string::String| {
@@ -5109,6 +5126,9 @@ impl RadioManager {
         let mut install_requested = false;
         // #40 #1: set iff this flush SEES a retained leaf install (pre-arm) → latch pending below.
         let mut leaf_install_seen = false;
+        // #329 B1: set by the burst's #111 version-flip sweep when a leaf is confirmed to have
+        // reached the staged build. Applied below, AFTER the install-seen latch — see there.
+        let mut leaf_flip_confirmed = false;
         // #70/#49: build the gateway's OWN DIAG record BEFORE the burst borrow (it takes `&mut self`
         // — the run_mqtt_burst call below already holds disjoint field borrows). Published retained
         // as `smol/<id>/diag`, and cached leaf diags are republished alongside via `diag_cache`.
@@ -5117,6 +5137,14 @@ impl RadioManager {
         // self-scanned) — one-shot: publish it THIS flush (retained holds it), then it's cleared.
         let own_scan = self.own_scan.take();
         let scan_bytes: &[u8] = own_scan.as_deref().map(|s| s.as_bytes()).unwrap_or(&[]);
+        // #329 F2: snapshot the two self-install SUPPRESSION latches here, BEFORE the disjoint
+        // `&mut self.*` borrows the burst call takes below — the armdiag is built inside
+        // `mqtt_session`, which cannot reach `&self`. Bits match `sog` in `diag_record` above
+        // (bit 0 = leaf_ota_pending, bit 1 = leaf_installs_outstanding); the third gate bit,
+        // `install_requested`, already rides its own parameter. Read-only — publishing a gate
+        // must never move it.
+        let gate_latches =
+            (self.leaf_ota_pending as u8) | ((self.leaf_installs_outstanding as u8) << 1);
         let sta = self.sta.as_mut();
         let ok = match sta {
             None => false,
@@ -5155,6 +5183,8 @@ impl RadioManager {
                     &mut reset_req, // #52: capture remote-reboot commands (one-shot relay below)
                     &mut install_requested,
                     &mut leaf_install_seen, // #40 #1: latch pending on install-SEEN (below)
+                    &mut leaf_flip_confirmed, // #329 B1: clear the pending latch on a confirmed flip
+                    gate_latches, // #329 F2: publish the self-install gate latches in the armdiag
                     peers, // #27: gateway publishes its roster as retained smol/<id>/peers
                     status, // #50: gateway publishes its live screen as smol/<id>/status
                     Some(&mut self.cfg_cache), // #21: gateway caches leaf configs to relay
@@ -5375,6 +5405,22 @@ impl RadioManager {
         // `record_leaf_ota` (retained install goes away → not seen next flush).
         if leaf_install_seen {
             self.leaf_ota_pending = true;
+        }
+        // #329 B1: BOUND that latch — a leaf CONFIRMED at the staged build (the #111 version-flip
+        // sweep) releases the crown's own self-install. The safety argument lives at the sweep
+        // (wifi.rs, `leaf_flip_confirmed`): a mid-OTA leaf still reports its OLD build, so the
+        // predicate structurally cannot fire inside the window the latch protects.
+        //
+        // THE ORDERING IS LOAD-BEARING — this MUST stay after the install-seen latch above.
+        // The sweep only considers ids in `armed_installs`, which is filled in the very branch
+        // that sets `leaf_install_seen` (wifi.rs:3853-3858), so a confirmed flip ALWAYS arrives in
+        // a flush that also saw the order. Applied before the latch above, this would be
+        // overwritten to `true` every time and the clear would never happen at all — and the next
+        // flush cannot rescue it, because by then the order is gone (cleared by #111 in the same
+        // burst), so neither the flip edge nor the seen-latch fires and the bool just sits there.
+        // A no-op that looks like a fix is worse than no fix; keep these two adjacent and ordered.
+        if leaf_flip_confirmed {
+            self.leaf_ota_pending = false;
         }
         // #3 (self-OTA-first, multi-leaf gap): the flush is the AUTHORITY on "any leaf still has a
         // retained install." Latch it separately from the per-session `leaf_ota_pending` so the

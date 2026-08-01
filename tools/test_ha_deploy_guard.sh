@@ -25,8 +25,30 @@ PKG=ha/packages
 BASE="$(git rev-parse HEAD)"
 pass=0; fail=0; LAST_OUT=''
 
-cleanup() { git reset -q --hard "$BASE"; git restore -q --source="$BASE" -- "$PKG" 2>/dev/null || true; }
+# ⚠️ THIS TRAP ONCE DESTROYED A COLLEAGUE'S WORK. It was `git reset -q --hard "$BASE"` —
+# repo-WIDE — so every uncommitted tracked change in the working tree died when the test
+# exited, not merely the packages the test touches. On 2026-08-01 it ate ~175 lines of
+# in-progress #321 work (recovered only because its author still had the content); the
+# `test: marker a/b` commits this harness makes were briefly mistaken for someone rehearsing
+# git in the shared tree. Uncommitted content is not in the object store, so fsck/stash/
+# reflog recovery all come back empty — a hard reset is terminal for it.
+#
+# Cleanup is now SCOPED to $PKG (the only tree the test mutates) and the repo-wide reset is
+# gone. A test harness must not have a blast radius larger than its subject.
+cleanup() { git restore -q --source="$BASE" -- "$PKG" 2>/dev/null || true; }
 trap cleanup EXIT
+
+# Refuse to run against a dirty tree OUTSIDE $PKG. The scoped cleanup above protects work
+# elsewhere, but this harness also runs `git commit -am` (below), which would sweep unrelated
+# modified files into its marker commits. Fail closed instead: an unexpected commit in someone
+# else's lane is nearly as costly as a lost edit.
+_dirty_outside="$(git status --porcelain -- . ":(exclude)$PKG" | grep -v '^??' || true)"
+if [ -n "$_dirty_outside" ]; then
+  printf 'REFUSING: uncommitted tracked changes outside %s — this harness commits with `-am`\n' "$PKG" >&2
+  printf '%s\n' "$_dirty_outside" | sed 's/^/  /' >&2
+  printf 'Commit, or run this in a scratch clone (never rehearse git in a shared tree).\n' >&2
+  exit 2
+fi
 
 ok()  { pass=$((pass+1)); printf '  PASS  %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }

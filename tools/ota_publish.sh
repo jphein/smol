@@ -93,12 +93,39 @@ mqtt_pw(){
   printf '%s' "$pw"
 }
 
+# ---- #313: credentials reach mosquitto via a private config dir, NEVER argv --
+# `-P <pw>` is world-readable through /proc/<pid>/cmdline for the life of the process — any
+# local process running `ps -o args` reads it (that is how #313 was found, verbatim, off
+# another agent's subscriber). mosquitto_{pub,sub} read default options from
+# $XDG_CONFIG_HOME/mosquitto_{pub,sub}, one flag per line, so the password never enters argv.
+# Same shape as tools/ota_capture.sh, which already solved this for the capture path.
+#
+# CALL THIS AS A STATEMENT, never `$(mqtt_cfg)`. #128's memoization was silently defeated by
+# exactly that: every `$(mqtt_pw)` ran in a SUBSHELL, so the `_MQTT_PW` it set died with the
+# subshell and each call re-hit `bw` + the HA supervisor (measured: 3 sourcings per stage, not
+# the 1 the comment intends). Setting the global in THIS shell is what makes the password —
+# and this directory — genuinely once-per-run.
+_MQTT_CFG=""
+_mqtt_cfg_cleanup(){ [ -n "$_MQTT_CFG" ] && rm -rf "$_MQTT_CFG"; return 0; }
+mqtt_cfg(){
+  [ -n "$_MQTT_CFG" ] && return 0
+  local pw d f; pw="$(mqtt_pw)"
+  d="$(mktemp -d)"; chmod 700 "$d"
+  for f in mosquitto_pub mosquitto_sub; do
+    printf -- '-h %s\n-u %s\n-P %s\n' "$BROKER" "$MQTT_USER" "$pw" > "$d/$f"
+    chmod 600 "$d/$f"
+  done
+  _MQTT_CFG="$d"
+  trap _mqtt_cfg_cleanup EXIT INT TERM
+}
+
 pub_retained(){ # topic, payload  (payload may be empty = retain-delete)
-  local topic="$1" payload="$2" pw; pw="$(mqtt_pw)"
+  local topic="$1" payload="$2"
+  mqtt_cfg
   if [ -z "$payload" ]; then
-    mosquitto_pub -h "$BROKER" -p 1883 -u "$MQTT_USER" -P "$pw" -r -n -t "$topic"
+    XDG_CONFIG_HOME="$_MQTT_CFG" mosquitto_pub -p 1883 -r -n -t "$topic"
   else
-    mosquitto_pub -h "$BROKER" -p 1883 -u "$MQTT_USER" -P "$pw" -r -t "$topic" -m "$payload"
+    XDG_CONFIG_HOME="$_MQTT_CFG" mosquitto_pub -p 1883 -r -t "$topic" -m "$payload"
   fi
 }
 
@@ -111,10 +138,10 @@ pub_retained(){ # topic, payload  (payload may be empty = retain-delete)
 # and the unreachable case both exit non-zero, so we disambiguate on the stderr text (a real
 # connect failure always prints one of these; a bare -W timeout on an empty topic does not).
 read_staged_build(){
-  local pw msg rc err
-  pw="$(mqtt_pw)"
+  local msg rc err
+  mqtt_cfg
   err="$(mktemp)"
-  msg="$(mosquitto_sub -h "$BROKER" -p 1883 -u "$MQTT_USER" -P "$pw" -C 1 -W 3 \
+  msg="$(XDG_CONFIG_HOME="$_MQTT_CFG" mosquitto_sub -p 1883 -C 1 -W 3 \
         -t "smol/ota/staged" 2>"$err")" && rc=0 || rc=$?
   if [ "$rc" -ne 0 ]; then
     if grep -qiE 'connection refused|connection error|unable to connect|getaddrinfo|unknown host|name or service|network is unreachable|no route to host|not authorised|error: connect' "$err"; then
@@ -181,7 +208,8 @@ if [ "$MODE" = "install" ]; then
   # reading $? sees success, and the board simply never updates. An arm that silently
   # doesn't arm is the worst failure this tool can have, because the symptom is a board
   # that stays on the old build with nothing reporting why.
-  if ! mosquitto_pub -h "$BROKER" -p 1883 -u "$MQTT_USER" -P "$(mqtt_pw)" \
+  mqtt_cfg
+  if ! XDG_CONFIG_HOME="$_MQTT_CFG" mosquitto_pub -p 1883 \
         -r -t "smol/${ID}/ota/install" -m "INSTALL"; then
     echo "FAILED to arm id${ID}: the INSTALL publish did not succeed — id${ID} is NOT armed." >&2
     echo "  retry; if it persists check broker reachability (transient refusals seen under load)." >&2
@@ -272,7 +300,10 @@ URL="http://${OTA_HOST_IP}:${OTA_PORT}/ota/${REMOTE}"
 _msgf="$(mktemp)"; _keyf="$(mktemp -p /dev/shm 2>/dev/null || mktemp)"
 # Shred the key/msg temps even on interrupt (SIGINT/TERM) in the window before the
 # inline shred below — else a Ctrl-C mid-sign could leave the key in /dev/shm.
-trap 'shred -u "$_msgf" "$_keyf" 2>/dev/null' EXIT INT TERM
+# Carries `_mqtt_cfg_cleanup` too (#313): bash traps are REPLACED, not stacked, so setting an
+# EXIT trap here would otherwise silently drop the one mqtt_cfg installed and leave the
+# credential dir behind on every stage.
+trap 'shred -u "$_msgf" "$_keyf" 2>/dev/null; _mqtt_cfg_cleanup' EXIT INT TERM
 printf '%s' "${BUILD}|${SIZE}|${SHA}" > "$_msgf"
 bw get notes "$SMOL_OTA_SIGNING_KEY_ITEM" > "$_keyf" 2>/dev/null \
   || { shred -u "$_msgf" "$_keyf" 2>/dev/null; die "bw: couldn't read signing key '$SMOL_OTA_SIGNING_KEY_ITEM' (locked?)"; }

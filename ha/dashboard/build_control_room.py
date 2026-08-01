@@ -248,11 +248,24 @@ def node_card(nid, meta, present, span=4):
     prow(top,f"input_select.smol_{nid}_led","LED (status / on / off)","mdi:led-on")            # #48
     prow(top,f"input_text.smol_{nid}_custom","Custom lines (‹sa› text, | per line)","mdi:card-text")  # #45 · edit when screen=Custom
     prow(top,f"input_text.smol_{nid}_tale","Story opening (Bard)","mdi:feather")               # #303 · empty = this node's own protagonist
-    prow(top,f"sensor.smol_{nid}_tale","  ↳ in use","mdi:book-open-variant")                   # #303 readback of the retained prompt
     prow(top,f"input_number.smol_{nid}_bard_speed","Typewriter (ms/char)","mdi:speedometer")    # #302 reveal clock, NOT the generation clock
     prow(top,f"input_select.smol_{nid}_bard_mode","Delivery (inf / page)","mdi:book-open-page-variant")  # #302 endless vs one screenful
     prow(top,f"input_select.smol_{nid}_bard_font","Text size","mdi:format-size")                # #302 bigger text = fewer chars on the glass
-    prow(top,f"sensor.smol_{nid}_delivery","  ↳ in use","mdi:play-speed")                       # #302 readback of the retained <ms>:<mode>
+    # The two "↳ in use" readback rows that sat here — `sensor.smol_<id>_{tale,delivery}` — are GONE
+    # with #320, which replaced the per-id mirrors with ONE fleet-wide readback per topic family
+    # (`sensor.smol_bard_{tale,delivery}_agreement`, plus the `_nodes` accumulators holding the
+    # per-node map). Two per-id entities out, a fleet agreement sensor in, exactly as #320 scoped.
+    #
+    # These rows only ever existed for id8 — the mirrors were hand-written for that one id — so they
+    # were also a live instance of the #308/#309 hand-maintained-id-list bug: every other node's box
+    # silently had no readback at all. The fleet sensor covers all six, and it reports AGREEMENT
+    # rather than one node's value, which is the thing worth showing.
+    #
+    # Deleting the rows here is the other half of removing the entities: the merge preserves cards
+    # it does not recognise, so leaving them wired left `vertical-stack|node8` pointing at two
+    # `restored: true` husks and turned DEAD ROWS red the moment smol_bard.yaml deployed.
+    # The fleet readback belongs at fleet level, not per node — see the Bard section of the
+    # scaffold rather than adding a per-id row back here.
     prow(top,f"input_button.smol_{nid}_apply",f"Apply → id{nid}","mdi:send")
     prow(top,f"input_button.smol_{nid}_reset","Reset to board default","mdi:backup-restore")
     rb=f"input_button.smol_{nid}_reboot"                                                       # #52 tap-guarded reboot
@@ -1279,8 +1292,29 @@ def _excerpt(c):
     return " ".join(str(txt).split())[:72]
 
 
-def report_dead_rows(view, st):
-    """Do the cards we would DEPLOY wire rows to entities HA does not have? Returns them.
+def report_dead_rows(view, st, extras=()):
+    """Do the cards on this dashboard wire rows to entities HA does not have? Returns them.
+
+    #333 GAP 1 — `extras` is why this takes a second argument. This used to audit `view["cards"]`
+    alone, i.e. only the cards a real run would WRITE. `classify()` returns the preserved
+    live-only cards separately, and they were never passed in — so the audit's scope was "what we
+    are about to deploy", and every card the merge PRESERVES was outside it.
+
+    That is not academic. On 2026-08-01 this printed `DEAD ROWS · 0` while FOUR dead rows were
+    rendering on JP's dashboard, inside a preserved live-only card wired to
+    `sensor.{battery_bank_soc,ev_battery_soc,house_load,solar_charge_current}` — placeholder ids
+    that have never existed in this HA. The check was not wrong about what it measured; it
+    measured a narrower question than the one it appears to answer, which is this file's own
+    recurring failure mode (see #312's ghost sensor, #322's convention addressing).
+
+    And the fix pays a second dividend, which is the better half. A dead row inside a live-only
+    card is DECISIVE EVIDENCE ABOUT WHAT TO DO WITH THAT CARD. LIVE-ONLY's advice is "back-port it
+    into the scaffold" — correct as a default, and exactly wrong when the repo is the corrected
+    side and live is the stale one. Back-porting that power/solar card would have REVERTED JP's
+    2026-07-28 solar mapping. Determining that took a manual, per-entity probe against live HA;
+    with `extras` audited, the tool states it outright: this card wires four absent entities,
+    therefore it is superseded, therefore retire it rather than back-port it. Same evidence, no
+    manual derivation, and it repairs LIVE-ONLY's advice instead of just adding a warning beside it.
 
     A SEPARATE QUESTION from live-only drift, and separately fatal, because the fixes differ:
     live-only means back-port a card; a dead row means the card is wired to something that no
@@ -1295,23 +1329,43 @@ def report_dead_rows(view, st):
     TWO KINDS, and the second nearly escaped. "Absent" is the easy one: no such entity id.
     "Orphan" is an entity that still EXISTS in `get_states` but only as an entity-registry
     husk — HA keeps any entity carrying a `unique_id` after its integration stops providing it.
-    Retiring ids 7/9 deleted 56 `input_*` helpers outright but left 110 sensors behind exactly
+    Retiring ids 7/9 deleted 56 `input_*` helpers outright but left **116** entities behind exactly
     like this, all `unavailable`. A membership test alone calls those healthy, so the check
     would have been blind to precisely the corpses it exists to find (morpheus-yaml's catch).
+
+    That number used to read "110 sensors" here and was wrong twice (#319, measured 2026-08-01):
+    102 of them are sensors, and 110 is not the total — it is what a `smol_<digits>` selector
+    finds, which misses six id7/id9 automations named `smol_nodemgr_id7_*` /
+    `smol_ota_install_staged_to_id7_retained`, where the id sits later in the name. 110 + 6 = 116.
+    Not two measurements of different things: one selector narrower than the set it described,
+    which is the same defect as auditing a diff for `- name:` and missing a bare `- delay:`.
+    112 of the 116 were removed 2026-08-01; the remaining 4 are wired by the `smol-telemetry`
+    view, which nothing audits (see the `prev` lookup below — it resolves ONE view by path).
 
     `restored: True` is the discriminator, and it is exact: all 110 husks carry it, while a LIVE
     board's momentarily-`unavailable` sensor (`sensor.smol_8_nexus_uplink`) does not. So this
     distinguishes "the integration behind this is gone" from "a real board has nothing to say
     right now" — which matters, because flagging the latter would make the gate cry wolf on
     every transient and get it ignored."""
-    refs = referenced_entities(view["cards"])
+    # Both sets, each tagged with where it came from, because the REMEDIATION differs and a single
+    # undifferentiated list would send someone to fix the scaffold for a card the scaffold does not
+    # contain. Structured `entity:` fields are walked out of the real card dicts, so ids that the
+    # generator CONSTRUCTS (`f"sensor.smol_{nid}_delivery"`) are resolved by construction — a
+    # literal-string search would miss every one of them, which is how the id8 Bard rows survived a
+    # pre-deploy grep that reported "nothing references these".
+    seen = {}
+    for src, cards in (("built", view["cards"]), ("live-only", list(extras))):
+        for e, idents in referenced_entities(cards).items():
+            r = seen.setdefault(e, {"idents": set(), "src": set()})
+            r["idents"] |= idents
+            r["src"].add(src)
     out = {}
-    for e, idents in sorted(refs.items()):
+    for e in sorted(seen):
         s = st.get(e)
         if s is None:
-            out[e] = ("absent", idents)
+            out[e] = ("absent", seen[e]["idents"], seen[e]["src"])
         elif (s.get("attributes") or {}).get("restored") is True:
-            out[e] = ("orphan", idents)
+            out[e] = ("orphan", seen[e]["idents"], seen[e]["src"])
     return out
 
 
@@ -1321,7 +1375,7 @@ def report_check(cfg, view, prev, extras, retired, retiring, st):
     Precedence when both fire: 1. Live-only is the more structural failure — a card the repo
     cannot rebuild at all outranks a card it can rebuild but which points somewhere dead. Both
     sections always print, so the exit code chooses your first action without hiding the rest."""
-    dead = report_dead_rows(view, st)
+    dead = report_dead_rows(view, st, extras)   # #333: preserved live-only cards are in scope too
     if not prev:
         print(f"\ndashboard '{DASH}' has no view with path 'smol-control' yet — nothing to drift "
               f"from; a real run would create it.")
@@ -1357,8 +1411,19 @@ def report_check(cfg, view, prev, extras, retired, retiring, st):
             span = (c.get("view_layout") or {}).get("grid-column") or "-"
             print(f"    - {_ident(c)}")
             print(f"        span={span} · {_excerpt(c)}")
-        print("\n  FIX: copy each card into ha/dashboard/smol-control-scaffold.yaml, then re-run")
-        print("       this check until LIVE-ONLY is 0.")
+        # #333: the advice used to stop at "copy each card into the scaffold", unconditionally.
+        # That is the right DEFAULT and it was exactly wrong twice on 2026-08-01: both live-only
+        # cards were SUPERSEDED, and back-porting one of them would have reverted JP's own solar
+        # mapping. This check can tell you two things differ; it cannot tell you which side is
+        # right — so it must not phrase a guess as an instruction. The DEAD ROWS section below now
+        # supplies the missing fact, which is why these two sections are cross-referenced.
+        print("\n  FIX (default): copy each card into ha/dashboard/smol-control-scaffold.yaml, then")
+        print("       re-run this check until LIVE-ONLY is 0.")
+        print("  BUT CHECK DEAD ROWS FIRST: a live-only card is only DRIFT if the repo is the stale")
+        print("       side. If one of these appears under DEAD ROWS, its rows point at entities HA")
+        print("       does not have — that is a SUPERSEDED card, not a card to back-port, and the")
+        print("       action is RETIRE_LIVE. Back-porting it re-adds a card wired to nothing and can")
+        print("       revert whatever replaced it.")
     else:
         print(f"\nLIVE-ONLY · 0 — the scaffold reproduces every card on '{DASH}'.")
 
@@ -1368,14 +1433,24 @@ def report_check(cfg, view, prev, extras, retired, retiring, st):
         print("  These render as 'Entity not found' / unavailable — a control that looks broken")
         print("  rather than one that is simply not offered. A card can be perfectly reproducible")
         print("  and still be wired to nothing, which is why this is not the LIVE-ONLY count.")
-        for e, (kind, idents) in dead.items():
+        for e, (kind, idents, src) in dead.items():
             why = ("no such entity" if kind == "absent"
                    else "entity-registry ORPHAN — exists but nothing provides it (restored)")
+            where = "+".join(sorted(src))
             print(f"    - {e}  [{kind}] {why}")
-            print(f"        on: {', '.join(sorted(idents))}")
+            print(f"        on: {', '.join(sorted(idents))}   ({where})")
         print("\n  FIX: repoint the row, gate it on the entity existing, or drop the card.")
         print("       An orphan usually means the card outlived its integration — drop the card,")
         print("       and clear the husk in HA so it stops looking like a real entity.")
+        # #333: name the source, because it decides the action.
+        if any("live-only" in src for _, _, src in dead.values()):
+            print("\n  ⚠ (live-only) above means the dead row sits in a card the scaffold does NOT")
+            print("    define. Those two facts together are decisive: a card the repo cannot rebuild,")
+            print("    wired to entities HA does not have, is SUPERSEDED — retire it via RETIRE_LIVE")
+            print("    rather than back-porting it. Do not follow LIVE-ONLY's default for these.")
+        if any("built" in src for _, _, src in dead.values()):
+            print("\n  (built) means the row is in a card THIS SCRIPT generates or the scaffold")
+            print("    defines — fix it here in the repo; a real run will keep re-shipping it.")
     else:
         print("\nDEAD ROWS · 0 — every wired entity exists and is actually provided.")
 

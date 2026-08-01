@@ -57,6 +57,14 @@ pub const CFG_RELAY_MAX_BURST: usize = 16;
 /// Deliberately ignores priming (which covers everything in one tick): this is the WORST case, and
 /// a bound that assumed the optimisation would be wrong exactly when the optimisation fails, which
 /// is the only time anybody reads it.
+///
+/// `#[allow(dead_code)]` because this is the HOST-TEST half of the API: `cfg_relay_verify`
+/// `#[path]`-includes this module and asserts the anti-starvation contract against this bound, but
+/// the firmware binary only ever *cites* it (see the `broadcast_cached_configs` comment in
+/// `mode.rs`), so a binary-crate build sees it as unused. Same precedent as `net::{ledger, treehead,
+/// sth}`. The allow is on the ITEM, not the module, so the rest of `cfgsched` stays under `-D
+/// warnings` — deleting it instead would delete the test's bound, which is the property being proven.
+#[allow(dead_code)]
 pub const fn ticks_to_cover(count: usize) -> usize {
     if count == 0 {
         0
@@ -134,14 +142,19 @@ impl RelayCursor {
         }
         let budget = if prime { CFG_RELAY_MAX_BURST } else { CFG_RELAY_PER_TICK };
         let n = count.min(budget);
-        for k in 0..n {
-            out[k] = (self.next + k) % count;
+        for (k, slot) in out.iter_mut().enumerate().take(n) {
+            *slot = (self.next + k) % count;
         }
         self.next = (self.next + n) % count;
         n
     }
 
     /// The next slot index this cursor will emit (test/observability only).
+    ///
+    /// `#[allow(dead_code)]` for the same reason as [`ticks_to_cover`]: `cfg_relay_verify` reads it
+    /// to prove the cursor ADVANCES between ticks and resets on an empty cache — a property with no
+    /// firmware caller by design (the firmware just calls `take`). Item-scoped, not module-scoped.
+    #[allow(dead_code)]
     pub fn peek(&self) -> usize {
         self.next
     }

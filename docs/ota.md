@@ -337,20 +337,26 @@ ota_0,    app,  ota_0, 0x20000,  0x1F0000   # 1.938 MB slot
 ota_1,    app,  ota_1, 0x210000, 0x1F0000   # 1.938 MB slot
 ```
 
-**The slot is no longer roomy.** The Bard's model blob rides in `.rodata`, taking the canonical
-fleet image (`espnow,cast,io,bard`) from ~590 KB to a **measured 1,432,400 B — 70.5 % of a
-`0x1F0000` (2,031,616 B) slot. Headroom fell from ~3.4× to 1.42×, leaving ~585 KiB spare.**
+**Slot occupancy, measured 2026-08-01 (post-#347).** The canonical fleet image is
+`espnow,cast,io` and comes out at a **measured 1,155,600 B — 56.9 % of a `0x1F0000`
+(2,031,616 B) slot, 1.76× headroom, ~855 KiB spare.** #347 took the Bard's ~281 KB model blob
+out of `.rodata`, which is where the 1,432,400 B / 70.5 % / 1.42× figure recorded here between
+#300 and #347 came from.
 
-> ⚠️ Two wrong numbers have lived here. The original **~3.3×** predates #300 entirely. Its first
+> ⚠️ Three wrong numbers have lived here. The original **~3.3×** predates #300 entirely. Its first
 > correction — **~880 KB / 45 % / ~2.3×** — was worse in a subtler way: that figure is the
 > #300 spec's *pre-build projection* (`§5`'s estimate table), not a measurement, and the built
-> image came out ~550 KB heavier than projected. **Take this number from the artifact, never from
-> a design estimate:** `slot ÷ actual image size`. `rust/clock/Cargo.toml` carries the same
-> measurement next to the partition rationale.
+> image came out ~550 KB heavier than projected. The third was simply left stale by #347.
+> **Take this number from the artifact, never from a design estimate and never from this
+> paragraph:** build with `repro_build_bin` and divide `slot ÷ actual image size`.
+> `rust/clock/Cargo.toml` carries the same measurement next to the partition rationale.
+>
+> A build with `--features bard` on is still ~1.43 MB and still fits — it is off the fleet image,
+> not unbuildable. Size any such image from its own artifact.
 
 `ota_publish.sh` hard-gates `size ≤ 0x1F0000`, so an overflow **fails the publish, not a board** —
-but at 1.42× the gate is now a real constraint rather than a formality, so budget flash before
-adding a feature, not after. The bundled espflash ESP-IDF v5.1.2 bootloader honors otadata
+and at 1.76× that gate is back to being a wide margin rather than a live constraint, though it
+is a gate precisely so nobody has to remember which of those two it currently is. The bundled espflash ESP-IDF v5.1.2 bootloader honors otadata
 slot-select (proven on hardware). `otadata` must be exactly `0x2000` or slot-select fails to
 initialize.
 
