@@ -168,7 +168,9 @@ jobs:
             tools/check_exclusions.py claims || true
             echo '```'
             echo "Derived from the \`#[cfg(feature = …)]\` on each \`mod\`, walked from"
-            echo "\`src/main.rs\`. Gate a module and it is covered; there is no list to update."
+            echo "\`src/main.rs\`, and cross-checked both ways against \`[tier_exclusive]\` in"
+            echo "\`tools/build-matrix.toml\` — so REMOVING a gate fails the gate instead of"
+            echo "quietly removing the claim along with it."
             echo ""
             echo "⚠️ This proves no **executable** bytes from an excluded module survived, via the"
             echo "DWARF line table (which attributes inlined code back to its source file). A"

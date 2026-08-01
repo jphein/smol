@@ -46,6 +46,20 @@ it. Not hypothetical: the default tier's file set omits `budget.rs` and `board.r
 exactly this reason. The `--require-observed` rule below is what keeps that limitation
 from silently widening into "the instrument sees nothing and says PASS".
 
+── THE ARM THE BINARY CANNOT PROVIDE ────────────────────────────────────────
+Planting a real leak exposed a hole in the above, and it is the hole that matters most. The
+realistic regression is not "someone references an excluded module" — that does not compile,
+the module is not there. It is "someone drops the `#[cfg]` so their new call site compiles,
+and leaves the BYTE-FREE comment". MEASURED: doing that to `pub mod target;` put
+src/net/target.rs into the default tier (11 crate files → 12) and this checker reported
+**0 leaked** — the claim it would have violated was derived from the very `#[cfg]` that was
+deleted. A gate that can be silenced by editing its subject is not a gate.
+
+So the commitment is ALSO declared as data, in build-matrix.toml's `[tier_exclusive]`, and
+the source is checked against it in both directions (removed gate / added gate / changed
+gate). Removing a gate now fails until the declaration is deleted too, which puts the
+decision in the diff where a reviewer sees it.
+
 ── THE ANTI-VACUITY RULE ────────────────────────────────────────────────────
 An absence check is worthless unless the instrument can be shown to detect presence. So
 across a whole run, EVERY claim must be OBSERVED at least once: some checked tier must
@@ -346,6 +360,55 @@ def violations(claim: Claim, present: set[str]) -> list[str]:
     return sorted(f for f in present if f == str(claim.path) or f.startswith(sub))
 
 
+def load_declared(manifest: Path) -> dict[str, str]:
+    """`[tier_exclusive]` — the modules smol COMMITS to keeping out of lower tiers.
+
+    ── WHY A SECOND STATEMENT OF A FACT THE SOURCE ALREADY CARRIES ───────────────
+    Found by planting a real leak, which is the only way it could have been found. The
+    realistic regression is not "someone references an excluded module" — that does not
+    compile, because the module is not there. It is "someone drops the `#[cfg]` so their new
+    call site compiles, and leaves the BYTE-FREE comment above it untouched". MEASURED: doing
+    exactly that to `pub mod target;` put `src/net/target.rs` into the default tier (11 crate
+    files → 12) and the checker said **0 leaked** — because the claim it would have violated
+    was derived from the very `#[cfg]` the regression deleted. The expectation evaporated with
+    the gate. A gate that can be silenced by editing its subject is not a gate.
+
+    So the commitment is declared HERE and the source is checked AGAINST it, in both
+    directions — the #350 move for the chip roster (`build-matrix.toml` vs `budget.rs`),
+    applied to the thing that turned out to need it. Ungating a module now has to be written
+    down, where a reviewer sees it in the diff, instead of being a deletion nobody notices.
+
+    Values are the gate conjunction (`"bard+stack-paint"`), so CHANGING a gate is caught too,
+    not just removing one. Regenerate with `tools/check_exclusions.py claims --toml`.
+    """
+    if not manifest.exists():
+        return {}
+    with open(manifest, "rb") as fh:
+        return dict(tomllib.load(fh).get("tier_exclusive") or {})
+
+
+def declaration_fails(claims: list[Claim], declared: dict[str, str]) -> list[str]:
+    fails = []
+    derived = {str(c.path): "+".join(sorted(c.gates)) for c in claims}
+    for path, gates in sorted(declared.items()):
+        if path not in derived:
+            fails.append(
+                f"DECLARATION: {path} is declared tier-exclusive ({gates}) but is NOT "
+                f"cfg-gated in the source any more — it now compiles into EVERY tier. If "
+                f"that is intended, delete the [tier_exclusive] line in the same commit and "
+                f"fix the comment that still calls the lower tiers byte-free of it.")
+        elif derived[path] != gates:
+            fails.append(
+                f"DECLARATION: {path} is declared to require {gates}, but the source gates "
+                f"it on {derived[path]} — one of the two moved.")
+    for path, gates in sorted(derived.items()):
+        if path not in declared:
+            fails.append(
+                f"DECLARATION: {path} is cfg-gated on {gates} but has no [tier_exclusive] "
+                f"entry — add it so removing the gate later cannot go unnoticed.")
+    return fails
+
+
 def load_unobservable(manifest: Path) -> dict[str, str]:
     """Modules the instrument provably cannot see, each with a written reason.
 
@@ -368,6 +431,8 @@ def main() -> int:
     ap.add_argument("--elf", action="append", default=[], metavar="TIER=FEATURES=PATH",
                     help="check: one built tier. Repeatable — pass them ALL in one call so "
                          "the anti-vacuity rule can see the whole run. `files`: a bare path.")
+    ap.add_argument("--toml", action="store_true",
+                    help="claims: emit the [tier_exclusive] block for build-matrix.toml")
     ap.add_argument("--fileset", action="append", default=[], metavar="TIER=FEATURES=PATH",
                     help="check: a tier whose file set is a saved newline list instead of an "
                          "ELF (what `files` prints). Lets tools/test_check_exclusions.sh "
@@ -383,6 +448,13 @@ def main() -> int:
         return 2
 
     if args.command == "claims":
+        if args.toml:
+            # Regenerator for build-matrix.toml's [tier_exclusive]. Printed, never written in
+            # place: the whole value of that table is that a human sees the change in a diff.
+            print("[tier_exclusive]")
+            for c in sorted(claims, key=lambda c: str(c.path)):
+                print(f'"{c.path}" = "{"+".join(sorted(c.gates))}"')
+            return 0
         print(f"  {len(claims)} cfg-gated modules derived from src/main.rs:")
         for c in sorted(claims, key=lambda c: str(c.path)):
             print(f"    {str(c.path):32} requires {'+'.join(sorted(c.gates))}")
@@ -407,9 +479,27 @@ def main() -> int:
         return 2
     try:
         unobs = load_unobservable(args.manifest)
+        declared = load_declared(args.manifest)
     except Exception as exc:                                  # noqa: BLE001 — reported below
         print(f"exclusions: {args.manifest}: {exc}", file=sys.stderr)
         return 2
+
+    # FIRST, and before a single ELF is read: does the source still make the commitments the
+    # manifest says it makes? This is the arm that catches the regression the ELF arm cannot —
+    # a deleted `#[cfg]` deletes the claim, so there is nothing left for the binary to violate.
+    #
+    # Returns IMMEDIATELY on a mismatch rather than folding into the ELF verdict. Once the
+    # derived claim set and the declared one disagree, the ELF arm is checking a different
+    # question than the one that was committed to, and printing its cheerful per-tier
+    # "0 leaked" underneath would be the most misleading output this tool could produce.
+    if declared:
+        dfails = declaration_fails(claims, declared)
+        if dfails:
+            print(f"  declaration: {len(declared)} declared vs {len(claims)} derived — "
+                  f"{len(dfails)} disagreement(s); NOT reading any ELF")
+            for f in dfails:
+                print(f"  FAIL {f}", file=sys.stderr)
+            return 1
 
     fails: list[str] = []
     observed: set[str] = set()
@@ -470,7 +560,8 @@ def main() -> int:
             fails.append(f"[unobservable] names {p}, which is not a cfg-gated module")
 
     print(f"  {checked} tiers · {len(claims)} claims · {len(observed)} observed"
-          + (f" · {len(unobs)} declared unobservable" if unobs else ""))
+          + (f" · {len(unobs)} declared unobservable" if unobs else "")
+          + (f" · {len(declared)} declared tier-exclusive, source agrees" if declared else ""))
     if fails:
         for f in fails:
             print(f"  FAIL {f}", file=sys.stderr)

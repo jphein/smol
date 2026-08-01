@@ -23,10 +23,12 @@
 #   5. the crate's own tests/*.rs suites via cargo test (#350) — bard / budget / input. Nothing
 #      ran these before: 57 tests, including the Bard's bit-for-bit golden, that no gate executed
 #   6. tools/test_build_matrix.sh — proof that (0)'s arms can actually fail
-#   7. #351 the BYTE-FREE tier claims — each tier is LINKED and its DWARF line table is asked
-#      which source files contributed code, so "the default build is BYTE-FREE of it" is a
-#      measurement instead of a comment. Claims are derived from the `#[cfg(feature = …)]` on
-#      each `mod`, walked from src/main.rs; no second list.
+#   7. #351 the BYTE-FREE tier claims, in two arms. (a) build-matrix.toml's [tier_exclusive]
+#      must still agree with the `#[cfg(feature = …)]` in the source, both directions — this
+#      catches the regression (b) structurally cannot, where deleting a gate deletes the claim
+#      along with it. (b) each tier is LINKED and its DWARF line table is asked which source
+#      files contributed code, so "the default build is BYTE-FREE of it" is a measurement
+#      instead of a comment.
 #   8. tools/test_check_exclusions.sh — proof that (7)'s arms can actually fail, including the
 #      vacuous-green one (an ELF with no DWARF has an empty file set and every absence "holds")
 #

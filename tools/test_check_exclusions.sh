@@ -192,5 +192,58 @@ TRUNC=$(fileset trunc src/always.rs)
 arm "refuses a file set with no crate root" 2 "omits src/main.rs" \
   -- check --crate "$CRATE" --manifest "$EMPTY_MANIFEST" --fileset "default==$TRUNC"
 
+# ── the declaration arms (#351, found by planting a real leak) ────────────────
+# The ELF arms above cannot catch the MOST LIKELY regression, and that is not a theory: the
+# plant that proved this gate can fail — drop the `#[cfg]` on `pub mod target;` so a new call
+# site compiles, leave the BYTE-FREE comment — put src/net/target.rs into the default tier
+# (11 crate files → 12) and the checker still said "0 leaked". The claim it would have
+# violated was derived from the very `#[cfg]` that was deleted. Hence [tier_exclusive], and
+# hence these arms: the commitment is checked against the source in BOTH directions.
+DECL="$TMP/decl.toml"
+cat > "$DECL" <<'TOML'
+[tier_exclusive]
+"src/netz.rs" = "wifi"
+"src/wled.rs" = "wled"
+"src/sub/mod.rs" = "espnow"
+"src/sub/child.rs" = "espnow"
+TOML
+arm "declaration — source agrees with the manifest" 0 "4 declared tier-exclusive, source agrees" \
+  -- check --crate "$CRATE" --manifest "$DECL" "${ALL[@]}"
+
+# THE ONE THE ELF ARM CANNOT SEE: the gate is gone, so the claim is gone, so nothing is left
+# to violate. Caught here or not at all.
+UNGATED="$TMP/ungated"; mk_crate "$UNGATED"
+python3 - "$UNGATED/src/main.rs" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, "w").write(s.replace('#[cfg(feature = "wled")]\nmod wled;', 'mod wled;'))
+PY
+arm "declaration — a gate was REMOVED (the ELF arm is blind to this)" 1 \
+  "src/wled.rs is declared tier-exclusive (wled) but is NOT cfg-gated" \
+  -- check --crate "$UNGATED" --manifest "$DECL" "${ALL[@]}"
+
+# …and the reverse, so the table cannot quietly stop covering what is added later.
+cat > "$TMP/decl_short.toml" <<'TOML'
+[tier_exclusive]
+"src/netz.rs" = "wifi"
+"src/sub/mod.rs" = "espnow"
+"src/sub/child.rs" = "espnow"
+TOML
+arm "declaration — a gated module with no entry" 1 \
+  "src/wled.rs is cfg-gated on wled but has no [tier_exclusive] entry" \
+  -- check --crate "$CRATE" --manifest "$TMP/decl_short.toml" "${ALL[@]}"
+
+# …and a gate that MOVED rather than vanished, which a presence-only list would miss.
+cat > "$TMP/decl_wrong.toml" <<'TOML'
+[tier_exclusive]
+"src/netz.rs" = "espnow"
+"src/wled.rs" = "wled"
+"src/sub/mod.rs" = "espnow"
+"src/sub/child.rs" = "espnow"
+TOML
+arm "declaration — a gate CHANGED feature" 1 \
+  "src/netz.rs is declared to require espnow, but the source gates it on wifi" \
+  -- check --crate "$CRATE" --manifest "$TMP/decl_wrong.toml" "${ALL[@]}"
+
 printf '  %d ok, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
