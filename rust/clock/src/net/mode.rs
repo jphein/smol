@@ -277,6 +277,7 @@ const DIAG_BUDGET: usize = 512 - 4 - "smol/255/diag".len();
 ///   167  format-string literal (keys, `|` separators, `DIAG|` prefix)
 ///   220  the 32 positional values at type-max width, after the u32 `up=` narrowing
 ///    19  `|brst=<u16>:<u16>:<c>`   38  `|blrev=<3>` + `|apch=<u8>`
+///    28  #190 `|mo=<u32>|mf=<u32>` — the group-MAC observe counters (PROTECTED, see `diag_record`)
 ///
 /// The assertion below is the whole point: it proves the record can NEVER be unpublishable, because
 /// the core always fits and everything else is appended only while there is room (see the shed list
@@ -284,8 +285,15 @@ const DIAG_BUDGET: usize = 512 - 4 - "smol/255/diag".len();
 ///
 /// ⚠️ If you add a positional field, add its width here. The build breaks if the core stops fitting —
 /// which is the intended failure: a compile error instead of a fleet going quiet.
+///
+/// ⚠️ A field appended with a bare `push_str` and NOT counted here defeats this whole mechanism: the
+/// assertion still passes and the record silently crosses `DIAG_BUDGET` at runtime, which makes a
+/// healthy board look dead. #190's `mo=/mf=` is counted (444 → 472, margin 23). #181's ledger fields
+/// are deliberately NOT counted because they go through `room_for` and shed instead (they would need
+/// 33 B on a leaf and 86 B on the crown — both past the remaining margin, which is exactly why they
+/// must be sheddable and not protected).
 #[cfg(feature = "espnow")]
-const DIAG_CORE_MAX: usize = 167 + 220 + 19 + 38;
+const DIAG_CORE_MAX: usize = 167 + 220 + 19 + 38 + 28;
 
 #[cfg(feature = "espnow")]
 const _: () = assert!(
@@ -314,6 +322,59 @@ const _: () = assert!(
 /// periodically. Diverges from DIAG at byte 9 (`'C'` vs `'I'`) + STAT at byte 8, so `strip_prefix`
 /// never confuses them. Value bounded by `RELAY_VALUE_MAX`.
 const SCAN_PREFIX: &[u8] = b"SMOLv1 SCAN "; // + "NNN" + verbatim "<ssid>,<bssid3>,<ch>,<rssi>|…"
+
+/// #190: enforce policy for the group-MAC (Fork B / B1). `false` = OBSERVE release: append the MAC
+/// on TX, verify on RX, count `mac_ok`/`mac_fail`, but SOFT-ACCEPT un-MAC'd / bad-MAC frames so a
+/// mixed fleet never partitions (design §7.1). Flip to `true` in a later ENFORCE release once the
+/// observe soak shows `mac_fail≈0` steady-state on a quiet fleet — then a frame that fails the MAC
+/// is DROPPED before the parser. The failure mode of enforce is "drops some frames," never a
+/// hardware-layer deafness (the MAC is an appended field, not ESP-NOW encryption). HW-held into v345.
+const MAC_ENFORCE: bool = false;
+
+/// Const-eval all-zero test for [`crate::secrets::GROUP_KEY`], used by the #336 guard below. A plain
+/// `KEY != [0u8; 32]` will not do: array `PartialEq` is not const-callable, and `[0u8; 32]` is an
+/// expression rather than a pattern — so the two obvious one-liners are respectively a const-eval
+/// error and a `matches!` type error. An explicit loop is const-evaluable and says the same thing.
+#[cfg(feature = "espnow")]
+const fn group_key_is_all_zero(k: &[u8; 32]) -> bool {
+    let mut i = 0;
+    while i < k.len() {
+        if k[i] != 0 {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// #336: refuse to BUILD a fleet on the published zero key.
+///
+/// `secrets.rs.example` ships `GROUP_KEY = [0u8; 32]`, and the repo is PUBLIC — so a build from an
+/// unedited example authenticates every frame on a key anybody can read. What makes that worse than
+/// an ordinary footgun is that #190's own rollout gate cannot see it: with a zero key `mac_ok` climbs
+/// and `mac_fail` falls to 0 exactly as they would on a properly-keyed fleet, so the observe→enforce
+/// check (§7.1) green-lights the insecure state. The gate is structurally blind, so the guard has to
+/// live at compile time instead — an all-zero key is now a build failure, not a silent deployment.
+///
+/// This is deliberately NOT in `wire.rs`: `experiments/mac_verify` `#[path]`-includes that file for
+/// its host tests and has no `secrets` module, so the check belongs here at the firmware seam.
+///
+/// The key stays BAKED into the image (JP's ruling, matching the threat model): a staged OTA artifact
+/// therefore IS the fleet credential. Accepted — a LAN/physical adversary already holds the boards.
+#[cfg(feature = "espnow")]
+const _: () = assert!(
+    !group_key_is_all_zero(&crate::secrets::GROUP_KEY),
+    "GROUP_KEY is the all-zero key from secrets.rs.example — the repo is PUBLIC, so this fleet would \
+     authenticate on a published key AND #190's mac_fail gate could not tell. Generate a real one \
+     (`openssl rand -hex 32`) into the git-ignored src/secrets.rs and give the WHOLE fleet the same key."
+);
+
+/// #190: max observability-record value (`DIAG`/`SCAN`) that fits a plain single-hop frame ONCE the
+/// group-MAC trailer is appended at `send_to`: `MTU − MAC_TRAILER_LEN − prefix(12) − id(3)`. Below
+/// the pre-auth `RELAY_VALUE_MAX` (232) by exactly `MAC_TRAILER_LEN`, so `frame + trailer ≤ ESP_NOW_MTU`
+/// (design §4.1 budget). `DIAG_PREFIX.len() == SCAN_PREFIX.len() == 12`. The record tail (cfg=/io=,
+/// appended last) is what truncates — key-parsed by HA, so a lost tail field degrades gracefully.
+const OBS_VALUE_MAX: usize = ESP_NOW_MTU - MAC_TRAILER_LEN - DIAG_PREFIX.len() - 3;
 
 /// #71: max APs in one scan record (strongest-RSSI first) — bounds the record under
 /// `RELAY_VALUE_MAX` and keeps the mesh frame small.
@@ -614,6 +675,14 @@ struct DiagCounters {
     /// True when `brst_gap` or `brst_ms` hit the `u16` ceiling — surfaced as a `+` on the kind so a
     /// saturated reading cannot be mistaken for an exact one.
     brst_clamped: bool,
+    /// #190 group-MAC (Fork B / B1) observe counters, mirroring ota_mesh's `verify_ok`/`verify_fail`.
+    /// `mac_ok` = inbound frames whose truncated HMAC-SHA256 verified against the group key; `mac_fail`
+    /// = frames with no valid MAC (legacy un-MAC'd during the observe rollout, wrong key/epoch, or a
+    /// forgery). Surfaced as `mo=`/`mf=` in DIAG. The observe-phase watch: `mac_ok` should climb
+    /// fleet-wide and `mac_fail` fall to ≈0 once every board is MAC'ing — the gate for the enforce flip
+    /// (design §7.1). Bumped BOTH on a leaf and a gateway (every node verifies what it hears).
+    mac_ok: u32,
+    mac_fail: u32,
     /// #13 MESH-TEST rig ONLY: count of inbound frames dropped by the deaf-list (surfaced as
     /// `ddrops=` in DIAG). A production build has no deaf-list, so this field doesn't exist.
     #[cfg(feature = "mesh-test")]
@@ -636,6 +705,8 @@ impl DiagCounters {
             brst_ms: 0,
             brst_kind: 0,
             brst_clamped: false,
+            mac_ok: 0,
+            mac_fail: 0,
             #[cfg(feature = "mesh-test")]
             ddrops: 0,
         }
@@ -1991,6 +2062,10 @@ pub struct RadioManager {
     diag: DiagCounters,
     /// #74 obs wave-2: node state mirrored from `main` (LED mode + time-sync) for the DIAG record.
     diag_extra: DiagExtra,
+    /// #181 mesh-ledger: this node's L1 hash-chain (own provenance) + the crown's L2 head-set for the
+    /// signed tree-head (L3). The on-device ed25519 signing key (if any) is loaded from NVS at
+    /// construction — see [`crate::ota::resolve_ledger_key`]. Surfaced in the DIAG record each cadence.
+    ledger: crate::net::ledger_link::LedgerLink,
     /// #72 io registry: this node's compact `io=<pin>:<count>,…` DIAG field (bound-input press
     /// counters), pushed from `main` via `set_diag_io` each diag-sample tick. Fixed buffer, no heap.
     #[cfg(feature = "io")]
@@ -2259,6 +2334,14 @@ impl RadioManager {
             own_scan: None,
             diag: DiagCounters::new(),
             diag_extra: DiagExtra::new(),
+            // #181: load the on-device ed25519 signing key from NVS (None ⇒ verify-only / unsigned
+            // anchor). resolve_ledger_key NEVER generates a key — provisioning is a deliberate
+            // USB-touch act (feature `ledger-provision`); the OTA image only ever reads.
+            ledger: {
+                let mut l = crate::net::ledger_link::LedgerLink::new();
+                l.set_signing_key(crate::ota::resolve_ledger_key());
+                l
+            },
             #[cfg(feature = "io")]
             diag_io: [0u8; IO_DIAG_MAX],
             #[cfg(feature = "io")]
@@ -2938,12 +3021,19 @@ impl RadioManager {
         msg[base] = b'0' + own / 100;
         msg[base + 1] = b'0' + (own / 10) % 10;
         msg[base + 2] = b'0' + own % 10;
-        // A LEAF's DIAG rides one ESP-NOW frame, so `RELAY_VALUE_MAX` is a HARD bound — and this
+        // A LEAF's DIAG rides one ESP-NOW frame, so the value cap is a HARD bound — and this
         // truncation used to be silent (`value.len().min(RELAY_VALUE_MAX)`). It is no longer
-        // hypothetical: the record has grown past 232 B, so every leaf has been dropping its trailing
+        // hypothetical: the record has grown past the cap, so every leaf has been dropping its trailing
         // fields, which is exactly where the newest and most wanted ones live (`cc`, `cdeaf`, `apch`,
         // `blrev`, `brst` — and the tail of the positional block with them). Measured on a realistic
         // leaf record: 307 B offered, 232 sent, 75 B gone with no signal of any kind.
+        //
+        // #190 makes this WORSE, and deliberately so: the group-MAC trailer `send_to` appends costs 9 B
+        // of the same frame, so the cap drops `RELAY_VALUE_MAX`(232) → `OBS_VALUE_MAX`(226) and the
+        // field-boundary room with it (226 − 8 = 218). On that same 307 B record the loss grows
+        // 75 → ~89 B. That is the price of authenticating the frame, paid where it is VISIBLE (`cut=`)
+        // rather than silently — which is the whole point of the tag. Shedding a field, or the #306
+        // two-part DIAG framing, is how the loss comes back down; a silent `min()` is not.
         //
         // So say so, on the wire and on the serial line. `|cut=<bytes>` costs 8 B of the very budget
         // that is short, which is the correct trade: a reader that cannot see the field it wants must
@@ -2951,7 +3041,10 @@ impl RadioManager {
         // self-publishes the full record over MQTT), which is precisely why this hid for so long — the
         // one board anybody looks at is the one that is fine.
         const CUT_TAG_MAX: usize = 8; // "|cut=999"
-        let cap = crate::net::wifi::RELAY_VALUE_MAX;
+        // #190: `OBS_VALUE_MAX`, not `RELAY_VALUE_MAX` — the frame must still fit the MTU *after*
+        // `send_to` appends the 9 B group-MAC trailer. Worst case is exact, both branches: cut path
+        // 12+3+218+8 = 241, uncut path 12+3+226 = 241, +9 trailer = 250 = `ESP_NOW_MTU`.
+        let cap = OBS_VALUE_MAX;
         let n = if value.len() > cap {
             // Cut on a FIELD BOUNDARY, not at the byte the cap lands on. The raw cap fell mid-value
             // (measured: `…|dlseq=` with its digits gone), so every leaf has been delivering a record
@@ -3005,7 +3098,8 @@ impl RadioManager {
         msg[base] = b'0' + own / 100;
         msg[base + 1] = b'0' + (own / 10) % 10;
         msg[base + 2] = b'0' + own % 10;
-        let n = value.len().min(crate::net::wifi::RELAY_VALUE_MAX);
+        // #190: clamp to OBS_VALUE_MAX (see broadcast_diag) so frame + group-MAC trailer ≤ ESP_NOW_MTU.
+        let n = value.len().min(OBS_VALUE_MAX);
         msg[base + 3..base + 3 + n].copy_from_slice(&value[..n]);
         self.send_to(&BROADCAST_ADDRESS, &msg[..base + 3 + n]);
         self.relay_wrap_observability(&msg[..base + 3 + n]);
@@ -3393,12 +3487,20 @@ impl RadioManager {
             etx_worst, // #164 worst per-peer link cost (0 = all perfect … 253 = dragging … 255 = isolated)
         );
         // ── PROTECTED tail: appended unconditionally, and first ───────────────────────────────
-        // These three are inside `DIAG_CORE_MAX`, so the compile-time assertion above proves they
-        // always fit. They go first because if anything must be lost it must not be these: `brst=` is
+        // These are inside `DIAG_CORE_MAX`, so the compile-time assertion above proves they always
+        // fit. They go first because if anything must be lost it must not be these: `brst=` is
         // the UI-freeze number the bench is waiting on, `blrev=` answers a question the ROADMAP has
         // carried as UNPROVEN since July, and `apch=` is the off-channel signal behind a proven OTA
         // blocker. Order does not affect HA — every appended field is parsed by KEY, not position (the
         // positional contract covers the fixed block above and is untouched).
+        //
+        // #190 group-MAC (Fork B / B1) observe counters join this PROTECTED set, deliberately: `mf=`
+        // is the single number the enforce-flip decision rests on (design §7.1) and #336's rollout
+        // gate cannot distinguish a zero-keyed fleet without it — a counter that sheds under load is
+        // worthless as a gate. Their 28 B is added to `DIAG_CORE_MAX` above, so the assertion PROVES
+        // the record still fits one publish (472 ≤ 495) rather than being blind to the growth.
+        // `mo`/`mf` = inbound frames whose group HMAC verified / failed.
+        rec.push_str(&alloc::format!("|mo={}|mf={}", self.diag.mac_ok, self.diag.mac_fail));
         rec.push_str(&alloc::format!("|apch={}", self.my_ap_channel));
         if let Some(blrev) = crate::ota::bl_revert_token() {
             rec.push_str("|blrev=");
@@ -3417,6 +3519,65 @@ impl RadioManager {
             self.diag.brst_kind = 0;
             self.diag.brst_clamped = false;
         }
+
+        // #181 mesh-ledger L1/L2/L3. THE WORK IS UNCONDITIONAL; ONLY THE REPORTING SHEDS.
+        //
+        // That split is the whole design of this block. Append the cadence's provenance record to the
+        // L1 chain, and on the crown advance the L2 anchor / L3 signed tree-head, REGARDLESS of how
+        // much DIAG budget is left — a tamper-evident chain whose contents depend on how wide an
+        // unrelated telemetry string happened to be that minute is not tamper-evident at all, and the
+        // STH epoch must advance monotonically or a verifier sees a stalled crown. So the strings are
+        // built here and handed to `room_for` below, where they are the LAST fields offered and thus
+        // the FIRST shed under pressure.
+        //
+        // They are sheddable (not protected like #190's `mo=/mf=`) because they cannot fit as a
+        // guarantee: 33 B on a leaf and a further 53 B on the crown, against the 23 B that remains
+        // after the core. Making them unconditional is precisely the bug the pre-rebase review caught
+        // — bare `push_str` would put a leaf at 505 B and the crown at 558 B against a 495 B cliff,
+        // and `encode_publish` answers an over-budget record by publishing NOTHING, so a healthy board
+        // would simply stop reporting. Shedding a provenance field costs an operator a follow-up
+        // question; shedding the whole record costs them the board.
+        //
+        // CONSEQUENCE, stated here because this is where the strings are born: under budget pressure
+        // these fields DISAPPEAR FROM THE WIRE with no other trace than the record's `|shed=<n>`
+        // counter. They are offered LAST in the sheddable block precisely so they are the first to
+        // go — see the priority rationale at the `room_for` call site below. Absence therefore means
+        // "shed", never "ledger inactive": the chain below is appended on every cadence regardless.
+        let prov = alloc::format!("u{}b{}s{}o{}", up_s, d.boot_count, d.boot_slot, ota);
+        self.ledger.append(prov.as_bytes());
+        let (tip, clen, lok) = self.ledger.chain_summary();
+        let lg_core = alloc::format!(
+            "|lgt={:02x}{:02x}{:02x}{:02x}|lgn={}|lgok={}|lgk={}",
+            tip[0],
+            tip[1],
+            tip[2],
+            tip[3],
+            clen,
+            lok as u8,
+            self.ledger.can_sign() as u8
+        );
+        let lg_crown = if self.relay.is_gateway {
+            if let Some(sth) = self.ledger.sign_and_selfcheck(self.id) {
+                let r = sth.root();
+                Some(alloc::format!(
+                    "|lgan={:02x}{:02x}{:02x}{:02x}|lgep={}|lgsz={}|lgsg=1",
+                    r[0],
+                    r[1],
+                    r[2],
+                    r[3],
+                    sth.epoch(),
+                    sth.size()
+                ))
+            } else {
+                let a = self.ledger.anchor(self.id);
+                Some(alloc::format!(
+                    "|lgan={:02x}{:02x}{:02x}{:02x}|lgsg=0",
+                    a[0], a[1], a[2], a[3]
+                ))
+            }
+        } else {
+            None
+        };
 
         // ── SHEDDABLE tail: appended ONLY while the budget allows ─────────────────────────────
         // An over-budget record is not truncated by the publisher — `encode_publish` refuses it and
@@ -3437,12 +3598,18 @@ impl RadioManager {
         // `io`, the reverse of what the prose claims. Reordering the appends is a wire-visible
         // change and belongs in its own commit; #339 holds that argument.
         //
+        // #181 appends the ledger fields (`lg_core`, then `lg`) AFTER `deaf`, so they are the two
+        // cheapest things on the record to lose — deliberate: a missing `lg=` costs an operator a
+        // ledger echo they can re-read from the topics, while a missing `apch=`/`ap=` costs them
+        // the #204/#217 coexist diagnosis. Absence of `lg*` therefore means "the record was full",
+        // not "the ledger is broken".
+        //
         // The line below is the MACHINE-CHECKED truth. `tools/check_shed_order.py` (run by
         // `tools/gate.sh`, so on every PR) parses the `room_for` sequence below and fails the gate
         // unless it equals this list exactly. Change the appends and you must change this line —
         // which is the point: the prose above rotted precisely because nothing could test it.
         //
-        // SHED-ORDER: sog, cfgq, cdeaf, cc, ap, cfg, io, deaf
+        // SHED-ORDER: sog, cfgq, cdeaf, cc, ap, cfg, io, deaf, lg_core, lg
         let mut shed = 0u8;
         {
             let mut room_for = |rec: &mut alloc::string::String, field: alloc::string::String| {
@@ -3582,6 +3749,35 @@ impl RadioManager {
                     &mut rec,
                     alloc::format!("|deaf={}|ddrops={}", deaf_n, self.diag.ddrops),
                 );
+            }
+            // ── #181 ledger readout: OFFERED LAST, therefore SHED FIRST. That ordering is a
+            // deliberate priority call, not an accident of where the code was appended.
+            //
+            // `room_for` appends while the budget lasts, so append position IS shed priority: the
+            // LAST field offered is the FIRST to disappear. The full order in this block is
+            //
+            //     sog → cfgq → cdeaf → cc/degraded → ap → cfg → io → [deaf] → lgt/lgn/lgok/lgk → lgan/…
+            //     └──────────── survives longest ────────────┘        └─ shed first (this) ─┘
+            //
+            // and the ledger sits at the end because everything ahead of it is load-bearing for a
+            // diagnosis that already cost real days: `cdeaf`/`cc`/`ap` are the crown-deaf and
+            // co-channel signals behind the #204/#217 OTA-deafness root cause, and losing those to
+            // make room for provenance would trade a fleet-blocking diagnostic for a nice-to-have.
+            // Mesh-ledger observability is the newest and least operationally urgent field in the
+            // record; if exactly one thing must go, it is this. Anything added later must justify
+            // being shed AFTER the ledger, or be appended before it.
+            //
+            // ⚠️ THESE FIELDS CAN VANISH SILENTLY. A DIAG record with no `lgt=` does NOT mean the
+            // ledger is inactive — the chain is appended unconditionally above, so it is running
+            // whether or not it is reported. Read `|shed=<n>`: present ⇒ n field(s) were dropped for
+            // budget and the ledger was first in line; absent ⇒ nothing was shed and the record is
+            // complete. Do not infer ledger state from the absence of these keys (the same
+            // absence-is-ambiguous trap `cc=` is three-valued to avoid).
+            //
+            // `lgok=0` is the value worth alerting on: this node's own chain failed to self-verify.
+            room_for(&mut rec, lg_core);
+            if let Some(lg) = lg_crown {
+                room_for(&mut rec, lg);
             }
         }
         // Loud, and it costs 6 B of the budget it is reporting on — worth it: a reader that cannot see
@@ -4944,7 +5140,20 @@ impl RadioManager {
                 // Copy the source MAC out FIRST (Copy) so the `recv.data()` borrow in the
                 // parse below doesn't collide with the identity-guard MAC compare.
                 let src_mac = recv.info.src_address;
-                if let Some(Frame::Stat { src, value }) = parse_frame(recv.data()) {
+                // #190: strip the group-MAC trailer before parsing — a v345 leaf's STAT now carries
+                // it, and `om::stat_build` would choke on the 9-byte tail. This confirm loop is a
+                // local PROGRESSION gate (a mis-verdict at worst mis-labels the HA card, never bricks
+                // — see the window comment above), so it soft-accepts un-MAC'd/bad frames regardless
+                // of MAC_ENFORCE; the main `service` path owns the enforce policy + the mo=/mf= counters.
+                let cdata = recv.data();
+                let cframe = match verify_group_mac(
+                    cdata,
+                    &[(crate::secrets::GROUP_KEY_EPOCH, &crate::secrets::GROUP_KEY)],
+                ) {
+                    MacVerdict::Ok { payload_len } => &cdata[..payload_len],
+                    MacVerdict::Fail => cdata,
+                };
+                if let Some(Frame::Stat { src, value }) = parse_frame(cframe) {
                     if src == leaf_id {
                         if let Some(b) = om::stat_build(value) {
                             last_build = Some(b); // keep the latest — the settled state wins
@@ -5544,8 +5753,36 @@ impl RadioManager {
 
     /// Low-level send helper: fire one frame and wait for the TX callback so we
     /// don't overrun the single in-flight ESP-NOW send slot.
+    ///
+    /// #190 (Fork B / B1): this is the SINGLE TX choke every `broadcast_*`/relay helper funnels
+    /// through, so the group-MAC auth trailer is appended HERE — once — for every SMOLv1 frame.
+    /// The gate `starts_with(b"SMOLv1 ")` is load-bearing: `send_to` ALSO carries the #25 WLED
+    /// WiZmote frame to a THIRD-PARTY WLED controller, which must NOT receive a trailer. The frame
+    /// builders reserve `MAC_TRAILER_LEN` out of the MTU (`UP2_INNER_MAX`, `OBS_VALUE_MAX`), so the
+    /// fit check never fails for a real frame; if it ever did, we send raw rather than exceed the
+    /// MTU. The OTA-mesh sends (OTAM/OTAD/OTAN) bypass `send_to` entirely and carry their own
+    /// ed25519 signature, so they are (intentionally) untouched by the group MAC.
     fn send_to(&mut self, dst: &[u8; 6], data: &[u8]) {
-        match self.esp_now.send(dst, data) {
+        let mut buf = [0u8; ESP_NOW_MTU];
+        // #190: append the group-MAC trailer only when `should_group_mac` says so — a pure decision
+        // (host-tested) that EXCLUDES the OTA family (OTAM/OTAD/OTAN/LDBG). Those frames are
+        // consumed by `parse_ota_frame`/`parse_ldbg` BEFORE the RX verify-then-strip, so a trailer
+        // would never be removed → a MAC'd OTAN is dropped (bitmap over-cap) and a MAC'd partial
+        // OTAD chunk corrupts the image (finalize-SHA mismatch). Non-SMOLv1 (WLED) + over-MTU
+        // frames are likewise sent verbatim.
+        let out: &[u8] = if should_group_mac(data) {
+            buf[..data.len()].copy_from_slice(data);
+            let n = append_group_mac(
+                &mut buf,
+                data.len(),
+                &crate::secrets::GROUP_KEY,
+                crate::secrets::GROUP_KEY_EPOCH,
+            );
+            &buf[..n]
+        } else {
+            data
+        };
+        match self.esp_now.send(dst, out) {
             Ok(waiter) => {
                 let _ = waiter.wait();
             }
@@ -5626,7 +5863,35 @@ impl RadioManager {
                 continue;
             }
 
-            match parse_frame(recv.data()) {
+            // #190 (Fork B / B1) VERIFY-THEN-PARSE: check the group-MAC and STRIP its trailer before
+            // the parser runs. OTA frames were consumed above (their own ed25519 gate) and our own
+            // frames were dropped at the self-MAC filter, so everything here is a peer SMOLv1 frame.
+            // OBSERVE (MAC_ENFORCE=false): SOFT-ACCEPT — parse regardless, but count ok/fail so the
+            // rollout is measurable (design §7.1). ENFORCE: DROP a frame that fails the MAC before it
+            // reaches the parser. A group-key/epoch mishap manifests as leaf HELLO-drop → owner-churn,
+            // NOT a crown-deaf-shed (design §7.3) — `mac_fail` is the telemetry that tells the two
+            // apart, so it must be counted SEPARATELY from RF-deafness signals.
+            let raw = recv.data();
+            let payload: &[u8] = match verify_group_mac(
+                raw,
+                // Accepted (epoch, key) set. Rotation: add `(GROUP_KEY_EPOCH + 1, &GROUP_KEY_NEXT)`
+                // as a second pair for the one-release overlap window (design §4.1), then drop the old.
+                &[(crate::secrets::GROUP_KEY_EPOCH, &crate::secrets::GROUP_KEY)],
+            ) {
+                MacVerdict::Ok { payload_len } => {
+                    self.diag.mac_ok = self.diag.mac_ok.saturating_add(1);
+                    &raw[..payload_len]
+                }
+                MacVerdict::Fail => {
+                    self.diag.mac_fail = self.diag.mac_fail.saturating_add(1);
+                    if MAC_ENFORCE {
+                        continue; // enforce: an un-MAC'd / bad-MAC frame never reaches the parser
+                    }
+                    raw // observe: soft-accept — a legacy un-MAC'd frame parses verbatim (no trailer)
+                }
+            };
+
+            match parse_frame(payload) {
                 Some(Frame::Snk(f)) => {
                     // An MMO-snake frame proves the peer is audible → counts
                     // toward the LED "detected" state exactly like HELLO/BEACON.

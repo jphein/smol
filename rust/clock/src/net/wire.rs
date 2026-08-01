@@ -238,11 +238,13 @@ pub fn synth_origin_mac(origin: u8) -> [u8; 6] {
 pub const ESP_NOW_MTU: usize = 250;
 /// UP2 envelope overhead: prefix `"SMOLv1 UP2 "` (11) + header `"OOO MMMMM H "` (12) = 23 B.
 pub const UP2_OVERHEAD: usize = UP2_PREFIX.len() + 12;
-/// Max inner frame a latched leaf may wrap so UP2 fits [`ESP_NOW_MTU`]: 250 − 23 = 227.
-/// `encode_up2` CLAMPS the inner to this + never emits > MTU. For a prefix-tolerant inner
-/// (DIAG/SCAN are `key=val`), clamping truncates the TAIL fields — the record still parses; the
-/// tail that falls off (cfg=/io=/dlseq=/dfwd=, appended last) matters less than the record arriving.
-pub const UP2_INNER_MAX: usize = ESP_NOW_MTU - UP2_OVERHEAD;
+/// Max inner frame a latched leaf may wrap so UP2 fits [`ESP_NOW_MTU`] AFTER the #190 group-MAC
+/// auth trailer is appended at the send choke: 250 − 23 − 9 = 218. `encode_up2` CLAMPS the inner
+/// to this + never emits > MTU; `send_to` then appends [`MAC_TRAILER_LEN`] so the on-wire frame is
+/// ≤ [`ESP_NOW_MTU`]. For a prefix-tolerant inner (DIAG/SCAN are `key=val`), clamping truncates the
+/// TAIL fields — the record still parses; the tail that falls off (cfg=/io=/dlseq=/dfwd=, appended
+/// last) matters less than the record arriving. (Pre-#190 this was `MTU − UP2_OVERHEAD` = 227.)
+pub const UP2_INNER_MAX: usize = ESP_NOW_MTU - UP2_OVERHEAD - MAC_TRAILER_LEN;
 
 /// Encode a UP2 envelope: `"SMOLv1 UP2 " + "OOO MMMMM H " + <inner>`; returns total length (≤ MTU).
 /// `env_msgid` is the envelope's own per-origin rolling counter (flood dedup). The inner is CLAMPED
@@ -339,4 +341,149 @@ pub fn parse_dl<'a>(prefix: &[u8], data: &'a [u8]) -> Option<(u32, &'a [u8])> {
     }
     let seq = parse_u10(&rest[0..10])?;
     Some((seq, &rest[11..]))
+}
+
+// ---- #190 group HMAC-SHA256 transport auth (Fork B / B1) -------------------
+//
+// An app-layer authentication trailer appended to EVERY SMOLv1 broadcast/unicast frame at the send
+// choke and verified-then-stripped before the parser runs on RX. Keyed by a fleet-shared 32-byte
+// `GROUP_KEY` (`secrets.rs`, git-ignored). This is AUTHENTICITY, not confidentiality — the payload
+// stays plaintext (design §4.3). The ESP-NOW hardware CANNOT encrypt broadcast (#36), so this
+// software MAC is the reshaped #190 transport rung. It reuses the same `sha2` already in the OTA
+// path — no `esp-hal`/`esp-wifi` deps, so this stays the pure/host-testable codec module
+// (`experiments/mac_verify` `#[path]`-includes it, mirroring `flood`/`etx`).
+//
+// Wire layout (trailer, appended after the frame): `… frame … | key-epoch(1 B) | tag(MAC_TAG_LEN)`
+//   tag = truncate(HMAC-SHA256(GROUP_KEY[epoch], frame_bytes ‖ epoch), MAC_TAG_LEN)
+// The epoch byte is COVERED by the MAC (so a flipped epoch fails), and it also selects the key on
+// verify, enabling OTA-able rotation via a two-epoch overlap window (design §4.1/§6).
+
+/// Truncated group-MAC tag length (bytes). 64-bit = online-forgery-only (no offline attack; HMAC
+/// key strength is unaffected by output truncation), 2⁻⁶⁴ per attempt ≈ 10¹¹ yr at ESP-NOW frame
+/// rates (design §4.1). Uniform fleet-wide for B1; the low-rate-frame 12-B variant is a documented
+/// future refinement, not needed for the outsider threat model.
+pub const MAC_TAG_LEN: usize = 8;
+
+/// Total group-MAC trailer overhead reserved out of [`ESP_NOW_MTU`]: `key-epoch(1) + tag`.
+pub const MAC_TRAILER_LEN: usize = 1 + MAC_TAG_LEN;
+
+/// SHA-256 HMAC block size (bytes).
+const HMAC_BLOCK: usize = 64;
+
+/// HMAC-SHA256 over `msg` keyed by `key` → the full 32-byte tag. Hand-rolled on top of `sha2`
+/// (no `hmac`/`digest` crate dependency) — RFC 2104 construction, verified against RFC 4231 KATs in
+/// `experiments/mac_verify`. Pure + `no_std` + no alloc. Keys longer than the block are hashed
+/// first (RFC 2104); smol's 32-byte `GROUP_KEY` takes the short-key path.
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut k0 = [0u8; HMAC_BLOCK];
+    if key.len() > HMAC_BLOCK {
+        let d = Sha256::digest(key);
+        k0[..32].copy_from_slice(&d);
+    } else {
+        k0[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; HMAC_BLOCK];
+    let mut opad = [0x5cu8; HMAC_BLOCK];
+    for i in 0..HMAC_BLOCK {
+        ipad[i] ^= k0[i];
+        opad[i] ^= k0[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(&ipad[..]);
+    inner.update(msg);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(&opad[..]);
+    outer.update(&inner_digest[..]);
+    let mut tag = [0u8; 32];
+    tag.copy_from_slice(&outer.finalize());
+    tag
+}
+
+/// Constant-time byte-slice equality (folds all bytes into one accumulator — no early return on the
+/// first mismatch, so a network attacker learns nothing from tag-compare timing).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// Append the group-MAC trailer to `buf[..len]` (the built frame) IN PLACE; returns the new total
+/// length (`len + MAC_TRAILER_LEN`). Writes `epoch` at `buf[len]`, then `truncate(HMAC(key, buf[..=len]), MAC_TAG_LEN)`
+/// after it. The caller MUST guarantee `buf.len() >= len + MAC_TRAILER_LEN` (asserted); the frame
+/// builders reserve this out of the MTU (`UP2_INNER_MAX`, `OBS_VALUE_MAX`) so it always holds.
+pub fn append_group_mac(buf: &mut [u8], len: usize, key: &[u8; 32], epoch: u8) -> usize {
+    debug_assert!(buf.len() >= len + MAC_TRAILER_LEN, "buf too small for MAC trailer");
+    buf[len] = epoch;
+    let tag = hmac_sha256(&key[..], &buf[..len + 1]);
+    buf[len + 1..len + 1 + MAC_TAG_LEN].copy_from_slice(&tag[..MAC_TAG_LEN]);
+    len + 1 + MAC_TAG_LEN
+}
+
+/// Outcome of [`verify_group_mac`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MacVerdict {
+    /// A valid trailer verified against one of the accepted keys. `payload_len` is the frame length
+    /// WITHOUT the trailer — parse `data[..payload_len]`.
+    Ok { payload_len: usize },
+    /// No accepted key verified the trailer: absent/truncated (legacy un-MAC'd frame), wrong key,
+    /// wrong/unknown epoch, or a forgery. The caller counts this (`mac_fail`) and — depending on the
+    /// observe-vs-enforce policy — either soft-accepts the raw frame or drops it (design §7.1).
+    Fail,
+}
+
+/// Verify a frame's group-MAC trailer against the accepted `(epoch, key)` set (the current key, plus
+/// optionally the next epoch's key during a rotation overlap window — design §4.1). Constant-time
+/// tag comparison. On success returns the payload length (trailer stripped). Verify-then-parse: the
+/// caller runs `parse_frame` only on `data[..payload_len]`, so a bad/absent MAC never reaches the
+/// parser under the enforce policy (design §7.3).
+pub fn verify_group_mac(data: &[u8], keys: &[(u8, &[u8; 32])]) -> MacVerdict {
+    if data.len() < MAC_TRAILER_LEN {
+        return MacVerdict::Fail;
+    }
+    let payload_len = data.len() - MAC_TRAILER_LEN;
+    let epoch = data[payload_len];
+    let tag = &data[payload_len + 1..]; // exactly MAC_TAG_LEN bytes
+    for &(ep, key) in keys {
+        if ep != epoch {
+            continue;
+        }
+        // Recompute over the frame bytes PLUS the epoch byte — exactly what `append_group_mac` covered.
+        let full = hmac_sha256(&key[..], &data[..payload_len + 1]);
+        if ct_eq(&full[..MAC_TAG_LEN], tag) {
+            return MacVerdict::Ok { payload_len };
+        }
+    }
+    MacVerdict::Fail
+}
+
+/// True iff `frame` is an **OTA-family** frame — one the receiver consumes at the `parse_ota_frame`
+/// dispatch (OTAM/OTAD/OTAN) or the relay-drain `parse_ldbg` capture (LDBG), BOTH of which run
+/// BEFORE the group-MAC [`verify_group_mac`]-then-strip in `service()`. Such a frame must therefore
+/// NEVER carry the trailer: it would arrive at those parsers with 9 un-strippable trailing bytes
+/// (a MAC'd OTAN's bitmap overflows its cap → dropped → the OTA window never advances; a MAC'd
+/// partial-chunk OTAD corrupts the reassembled image → finalize-SHA mismatch). `SMOLv1 OTA*` covers
+/// OTAM/OTAD/OTAN (and any future `OTAx`) structurally; `LDBG ` is the receive-diagnostic beacon.
+/// (The #237 arbitration frames `ODEL`/`ODON` are exempt by construction — they send via
+/// `send_arb_raw`, never `send_to` — so they need no entry here.)
+pub fn is_ota_family(frame: &[u8]) -> bool {
+    frame.starts_with(b"SMOLv1 OTA") || frame.starts_with(b"SMOLv1 LDBG ")
+}
+
+/// The send-choke TX decision: `true` ⇒ append the group-MAC trailer, `false` ⇒ send `frame`
+/// verbatim. Verbatim when the frame is (a) not a SMOLv1 frame (e.g. the #25 WLED WiZmote emit —
+/// a trailer would corrupt a third-party receiver), (b) an [`is_ota_family`] frame (bypasses the
+/// verify-then-strip by design), or (c) too large to fit the trailer under [`ESP_NOW_MTU`] (never
+/// emit > MTU). Pure so the exact `send_to` decision is host-tested (`experiments/mac_verify`) and
+/// the OTA-exemption cannot silently regress.
+pub fn should_group_mac(frame: &[u8]) -> bool {
+    frame.starts_with(b"SMOLv1 ")
+        && !is_ota_family(frame)
+        && frame.len() + MAC_TRAILER_LEN <= ESP_NOW_MTU
 }
