@@ -134,8 +134,8 @@ impl RelayCursor {
         }
         let budget = if prime { CFG_RELAY_MAX_BURST } else { CFG_RELAY_PER_TICK };
         let n = count.min(budget);
-        for k in 0..n {
-            out[k] = (self.next + k) % count;
+        for (k, slot) in out.iter_mut().enumerate().take(n) {
+            *slot = (self.next + k) % count;
         }
         self.next = (self.next + n) % count;
         n
