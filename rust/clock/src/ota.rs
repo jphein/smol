@@ -1127,7 +1127,7 @@ fn set_slot_new(target: AppPartitionSubType) -> Option<()> {
 }
 
 /// #226 FIRST-BOOT OTADATA INIT: a freshly USB-flashed board has BLANK `otadata` (both
-/// select-entries erased → `current_slot()` == `Slot::None`). The ESP-IDF ROM then boots
+/// select-entries erased → `current_app_partition()` == `AppPartitionSubType::Factory`). The ROM boots
 /// `ota_0` (there is no factory partition in `partitions-ota.csv`), but the ota-select record
 /// stays absent, so `boot_slot()` reports 255 ("unprovisioned") and luna's rollback automation
 /// would see a spurious 255→N jump on the first real OTA. This writes a VALID select record for
@@ -1135,14 +1135,15 @@ fn set_slot_new(target: AppPartitionSubType) -> Option<()> {
 ///
 /// Provably correct + safe:
 /// - A blank otadata ALWAYS ROM-falls-back to `ota_0` (no factory partition), so the running
-///   slot is `Slot0` — we merely formalize a state that is already physically true (no slot
+///   slot is `Ota0` — we merely formalize a state that is already physically true (no slot
 ///   change, no reboot).
 /// - `Valid` (not `New`) so `otadata_unconfirmed()` stays false — a USB flash is not an OTA under
 ///   self-test, so it must not arm the #40 K-counter / leaf self-test.
-/// - ONE-TIME: only fires while `current_slot()` is blank; the write makes it non-blank, so every
+/// - ONE-TIME: only fires while `current_app_partition()` reports `Factory`; the write makes it
+///   non-blank, so every
 ///   later boot is a no-op (no repeated flash wear).
 /// - VERIFY-AFTER-WRITE + FAIL-SAFE: any partition/flash error → no-op, and the `inactive_slot()`
-///   `Slot::None => Slot1` net still targets a subsequent OTA correctly even if this never ran.
+///   `Factory => Ota1` net still targets a subsequent OTA correctly even if this never ran.
 ///
 /// Call ONCE at earliest boot, BEFORE `capture_boot_diag` (so `boot_slot` reads 0, not 255) and
 /// BEFORE the #40 unconfirmed-boot block. Boot-critical partition write → HW-canary gated.
@@ -1169,14 +1170,14 @@ pub fn init_otadata_if_blank() {
         || ota.set_current_ota_state(OtaImageState::Valid).is_err()
     {
         log::error!(
-            "smol #226: otadata first-boot init write failed — staying blank (inactive_slot None=>Slot1 net still protects OTA)"
+            "smol #226: otadata first-boot init write failed — staying blank (inactive_slot Factory=>Ota1 net still protects OTA)"
         );
         return;
     }
     // Verify-after-write (boot-critical): confirm the record now resolves to Slot0.
     match ota.current_app_partition() {
         Ok(AppPartitionSubType::Ota0) => {
-            log::info!("smol #226: otadata first-boot init — blank → Slot0/Valid")
+            log::info!("smol #226: otadata first-boot init — blank → Ota0/Valid")
         }
         other => log::error!(
             "smol #226: otadata init verify FAILED (got {other:?}) — inactive_slot net still protects OTA"
