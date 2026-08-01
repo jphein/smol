@@ -773,7 +773,7 @@ fn main() -> ! {
         net::try_time_sync(
             net::WifiPeripherals {
                 timg0: peripherals.TIMG0,
-                rng: peripherals.RNG,
+                sw_int: peripherals.SW_INTERRUPT,
                 wifi: peripherals.WIFI,
             },
             &mut batt_cache,
@@ -827,7 +827,7 @@ fn main() -> ! {
         net::mode::start(
             net::WifiPeripherals {
                 timg0: peripherals.TIMG0,
-                rng: peripherals.RNG,
+                sw_int: peripherals.SW_INTERRUPT,
                 wifi: peripherals.WIFI,
             },
             // This unit's short id (see NODE_ID) — embedded in HELLO/ACK/BEACON/TIME

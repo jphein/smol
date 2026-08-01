@@ -43,18 +43,19 @@
 extern crate alloc;
 
 use esp_hal::{
+    interrupt::software::SoftwareInterruptControl,
     rng::Rng,
     time::Instant,
     timer::timg::TimerGroup,
 };
-use esp_wifi::{
+use embassy_futures::block_on;
+use esp_radio::{
     esp_now::{EspNow, EspNowWifiInterface, PeerInfo, BROADCAST_ADDRESS},
-    wifi::{WifiController, WifiMode},
-    EspWifiController,
+    wifi::{scan::ScanConfig, sta::StationConfig, Config, WifiController},
 };
 
 use crate::led::LedState;
-use crate::net::WifiPeripherals;
+use crate::net::{SmolWifiDevice, WifiPeripherals};
 // #13: the relay-family wire codec + ASCII field helpers live in the PURE, host-testable
 // `net::wire` module (extracted from here, byte-identical). Glob-imported so every call site
 // below (encode_relay, parse_relay[2], *relayack*, encode_dl, write_u5/u10, parse_id/u5/u10,
@@ -327,12 +328,12 @@ const SCAN_SSID_MAX: usize = 12;
 /// stripped (they're free-form → keep the record parseable); BSSIDs are truncated to 3 octets
 /// (PUBLIC-repo topic — a full BSSID is a privacy leak). `|none` when the scan found nothing.
 /// Panic-free (heap `String`); the caller bounds it to `RELAY_VALUE_MAX` at broadcast/publish.
-fn format_scan_record(aps: &[esp_wifi::wifi::AccessPointInfo]) -> alloc::string::String {
+fn format_scan_record(aps: &[esp_radio::wifi::ap::AccessPointInfo]) -> alloc::string::String {
     use core::fmt::Write;
     let mut s = alloc::string::String::from("SCAN");
     for ap in aps.iter().take(SCAN_MAX_APS) {
         let mut ssid = alloc::string::String::new();
-        for c in ap.ssid.chars().take(SCAN_SSID_MAX) {
+        for c in ap.ssid.as_str().chars().take(SCAN_SSID_MAX) {
             ssid.push(if c == '|' || c == ',' { '_' } else { c });
         }
         let b = ap.bssid;
@@ -1923,7 +1924,7 @@ pub struct RadioManager {
     /// and is available again for periodic relay flushes (`flush_telemetry`). The
     /// smoltcp stack is built/dropped inside each burst, so between bursts this is
     /// just an idle handle that doesn't contend with ESP-NOW on ch6.
-    sta: Option<esp_wifi::wifi::WifiDevice<'static>>,
+    sta: Option<SmolWifiDevice>,
     /// Kept for the SNTP ephemeral-port seed during the burst.
     rng: Rng,
     mode: Mode,
@@ -2204,17 +2205,24 @@ impl RadioManager {
         super::init_heap();
 
         let timg0 = TimerGroup::new(p.timg0);
-        let rng = Rng::new(p.rng);
-        // esp-wifi's `init` takes the RNG by value; `Rng` is a `Copy` handle
-        // (not the entropy itself), so we keep our own copy for the SNTP
-        // ephemeral-port seed while also handing one to `init`.
-        let ctrl: EspWifiController<'static> = esp_wifi::init(timg0.timer0, rng).ok()?;
-        let ctrl: &'static EspWifiController<'static> =
-            alloc::boxed::Box::leak(alloc::boxed::Box::new(ctrl));
-
-        let (mut controller, interfaces) = esp_wifi::wifi::new(ctrl, p.wifi).ok()?;
-        controller.set_mode(WifiMode::Sta).ok()?;
-        controller.start().ok()?;
+        let sw = SoftwareInterruptControl::new(p.sw_int);
+        // #233: start the esp-rtos scheduler that backs esp-radio's os-adapter BEFORE
+        // wifi::new (NON-embassy: start() pins THIS context as the main task and returns).
+        esp_rtos::start(timg0.timer0, sw.software_interrupt0);
+        // `Rng` is a `Copy` handle (not entropy itself); kept for the SNTP ephemeral-port seed.
+        let rng = Rng::new();
+        // 0.18: WIFI is 'static → wifi::new returns an owned 'static controller + interfaces
+        // (no EspWifiController Box::leak). STA mode derives from the Config::Station set in
+        // associate(); the old explicit set_mode(WifiMode::Sta) is gone in 0.18.
+        let (mut controller, interfaces) =
+            esp_radio::wifi::new(p.wifi, super::radio_controller_config()).ok()?;
+        // #233: esp-radio 0.18 has no controller.start(); `set_config` is what STARTS the
+        // WiFi driver. ESP-NOW rides the STA interface and needs the driver started even on a
+        // leaf that never associates, so start it here in STA mode with an empty config.
+        // associate() later re-configs with real creds + connect_async().
+        controller
+            .set_config(&Config::Station(StationConfig::default()))
+            .ok()?;
         // #139: assert PowerSaveMode::None at RADIO INIT — the esp-wifi/IDF default is
         // WIFI_PS_MIN_MODEM (the STA sleeps between DTIMs; the AP then buffers UNICAST at DTIM and
         // drops it on marginal links → the re-ARP-after-reply / forwarded-NTP-never-arrives /
@@ -2222,21 +2230,22 @@ impl RadioManager {
         // (which resets ps to the default), and the post-is_connected() sites stay belt-and-
         // suspenders. Shared by every espnow association (NTP/MQTT/OTA/re-election). See nebula
         // finding 2 (scratch/smol-ha-batt/nebula-c3-wifi-research.md).
-        let _ = controller.set_power_saving(esp_wifi::config::PowerSaveMode::None);
+        let _ = controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
         crate::net::assert_max_tx_power(); // #141: 8.5 dBm clamp, right after driver start
 
         // #68/#76 SELF-MAC: capture our STA MAC (ESP-NOW rides the STA interface) so service()
         // can DROP frames from our own address. The esp-wifi RX queue can deliver our own
         // broadcasts back to us; with no self-filter the gateway rosters ITSELF (constant-RSSI,
         // age-0, flags-3 self-entry — roster anomaly #1) and wastes an eviction-immune slot.
-        let self_mac = interfaces.sta.mac_address();
+        let self_mac = interfaces.station.mac_address();
 
         Some(Self {
             controller,
             self_mac,
             esp_now: interfaces.esp_now,
             // Keep the STA device alive for the NTP burst; dropped afterward.
-            sta: Some(interfaces.sta),
+            // #233: wrapped in the smoltcp phy::Device shim (net::radio_dev).
+            sta: Some(SmolWifiDevice::new(interfaces.station)),
             rng,
             mode: Mode::WifiSta,
             id,
@@ -2705,7 +2714,7 @@ impl RadioManager {
             Mode::EspNow => {
                 // TIME-SHARE: relinquish the AP association so nothing else
                 // steers the channel, then pin the fixed ESP-NOW channel.
-                let _ = self.controller.disconnect();
+                let _ = block_on(self.controller.disconnect_async());
                 // Keep the MAC/PHY powered (do NOT stop the controller) so the
                 // esp_now handle stays valid; just retune the channel.
                 self.esp_now
@@ -2720,14 +2729,14 @@ impl RadioManager {
                 // COEXIST: come back to the AP. Re-associating retunes the PHY
                 // to the AP's channel automatically; ESP-NOW then coexists on
                 // that channel. (Caller must have valid credentials set.)
-                let _ = self.controller.connect();
+                let _ = block_on(self.controller.connect_async());
                 // #139: connect() resets power-save to the WIFI_PS_MIN_MODEM default, so the
                 // association/auth handshake that follows would otherwise run under modem-sleep
                 // (unicast-deaf window). Re-assert None NOW — before the handshake completes — not
                 // only after the downstream is_connected() gates (MQTT flush / OTA fetch).
                 let _ = self
                     .controller
-                    .set_power_saving(esp_wifi::config::PowerSaveMode::None);
+                    .set_power_saving(esp_radio::wifi::PowerSaveMode::None);
                 crate::net::assert_max_tx_power(); // #141
                 log::info!("smol: radio -> WiFi STA (coexist)");
             }
@@ -3054,7 +3063,14 @@ impl RadioManager {
         // scan_n = scan_with_config_sync_max(Default, N): a synchronous full-band scan capped at N
         // results. We cap generously then keep the strongest few, so a busy band still yields the
         // most-relevant APs.
-        let record = match self.controller.scan_n(16) {
+        let record = match block_on(
+            self.controller
+                // #233 REGRESSION FIX: esp-radio 0.18's scan_async(ScanConfig::default()) has
+                // max=None and returns EVERY AP in range as a heap Vec — the old esp-wifi
+                // scan_n(16) capped at 16. In a dense RF environment the unbounded Vec is an
+                // OOM-panic risk (alloc failure = rst=panic); .with_max(16) restores the bound.
+                .scan_async(&ScanConfig::default().with_max(16)),
+        ) {
             Ok(mut aps) => {
                 // Strongest RSSI first (descending → Reverse of the ascending key).
                 aps.sort_by_key(|a| core::cmp::Reverse(a.signal_strength));
@@ -3103,7 +3119,14 @@ impl RadioManager {
         };
         // Full scan (needs co-channel AND off-channel visibility so `select_crown_ap` can decide
         // co-channel vs the strand fallback in ONE pass). Filter to our SSID; feed the pure selector.
-        let decision = match self.controller.scan_n(16) {
+        let decision = match block_on(
+            self.controller
+                // #233 REGRESSION FIX: esp-radio 0.18's scan_async(ScanConfig::default()) has
+                // max=None and returns EVERY AP in range as a heap Vec — the old esp-wifi
+                // scan_n(16) capped at 16. In a dense RF environment the unbounded Vec is an
+                // OOM-panic risk (alloc failure = rst=panic); .with_max(16) restores the bound.
+                .scan_async(&ScanConfig::default().with_max(16)),
+        ) {
             Ok(aps) => {
                 let mut views: alloc::vec::Vec<ApView> = alloc::vec::Vec::new();
                 for a in aps.iter() {
@@ -3139,19 +3162,21 @@ impl RadioManager {
             | CrownApDecision::OffChannelFallback { bssid, ch } => (Some(bssid), Some(ch)),
             CrownApDecision::NoAp => (None, None),
         };
-        let _ = self.controller.disconnect();
-        let _ = self
-            .controller
-            .set_configuration(&esp_wifi::wifi::Configuration::Client(
-                esp_wifi::wifi::ClientConfiguration {
-                    ssid: net.ssid.into(),
-                    password: net.pass.into(),
-                    bssid,
-                    channel: chan,
-                    ..Default::default()
-                },
-            ));
-        let _ = self.controller.connect();
+        let _ = block_on(self.controller.disconnect_async());
+        // #233: StationConfig has private fields — build via BuilderLite setters. 0.18's
+        // with_bssid/with_channel take the INNER value (wrapping in Some), so only call them
+        // when we actually have a bssid / channel; otherwise leave the defaults (None).
+        let mut sta_cfg = StationConfig::default()
+            .with_ssid(net.ssid)
+            .with_password(net.pass.into());
+        if let Some(b) = bssid {
+            sta_cfg = sta_cfg.with_bssid(b);
+        }
+        if let Some(c) = chan {
+            sta_cfg = sta_cfg.with_channel(c);
+        }
+        let _ = self.controller.set_config(&Config::Station(sta_cfg));
+        let _ = block_on(self.controller.connect_async());
         // Track the resulting channel so `off-channel` (!= ESP_NOW_FIXED_CHANNEL) is detectable
         // pre-fetch without a live controller query (0 = NoAp → still off-channel → retry next arm).
         self.my_ap_channel = match decision {
@@ -4470,7 +4495,7 @@ impl RadioManager {
         use crate::ota_mesh::{
             self as om, LeafOtaOutcome, CHUNK_PAYLOAD, WINDOW_BYTES, WINDOW_CHUNKS,
         };
-        use esp_bootloader_esp_idf::ota::Slot;
+        use esp_bootloader_esp_idf::partitions::AppPartitionSubType as Slot;
         // #237: a GATEWAY-fetch serve needs the crown role (it does the WiFi fetch); a HOLDER
         // active-slot serve is authorized by the crown's ODEL (term/session + serve-time
         // readback-sha verified by the caller), so it does NOT require is_gateway.
@@ -4501,10 +4526,10 @@ impl RadioManager {
             let _ = self.switch(Mode::EspNow); // ch6 (the flush left us in WifiSta)
             let mut s = 0u16;
             while s < 40 {
-                if !matches!(self.controller.is_connected(), Ok(true)) {
+                if !self.controller.is_connected() {
                     break;
                 }
-                let _ = self.controller.disconnect();
+                let _ = block_on(self.controller.disconnect_async());
                 s = s.saturating_add(1);
                 if tick() {
                     return LeafOtaOutcome::Aborted;
@@ -4513,7 +4538,7 @@ impl RadioManager {
             let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
             if !self.esp_now.peer_exists(&BROADCAST_ADDRESS) {
                 let _ = self.esp_now.add_peer(PeerInfo {
-                    interface: EspNowWifiInterface::Sta,
+                    interface: EspNowWifiInterface::Station,
                     peer_address: BROADCAST_ADDRESS,
                     lmk: None,
                     channel: None,
@@ -4615,7 +4640,7 @@ impl RadioManager {
         // below proves whether the send now succeeds.
         if !self.esp_now.peer_exists(&BROADCAST_ADDRESS) {
             let _ = self.esp_now.add_peer(PeerInfo {
-                interface: EspNowWifiInterface::Sta,
+                interface: EspNowWifiInterface::Station,
                 peer_address: BROADCAST_ADDRESS,
                 lmk: None,
                 channel: None,
@@ -4631,10 +4656,10 @@ impl RadioManager {
         // the STA held on — settle>0 confirms this WAS the off-channel egress.
         let mut settle: u16 = 0;
         while settle < 40 {
-            if !matches!(self.controller.is_connected(), Ok(true)) {
+            if !self.controller.is_connected() {
                 break;
             }
-            let _ = self.controller.disconnect();
+            let _ = block_on(self.controller.disconnect_async());
             settle = settle.saturating_add(1);
             if tick() {
                 return LeafOtaOutcome::Aborted;
@@ -6264,7 +6289,7 @@ impl RadioManager {
             }
         }
         let _ = self.esp_now.add_peer(PeerInfo {
-            interface: EspNowWifiInterface::Sta,
+            interface: EspNowWifiInterface::Station,
             peer_address: mac,
             lmk: None,
             channel: None,

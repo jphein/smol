@@ -558,7 +558,7 @@ pub fn stat_build(value: &[u8]) -> Option<u32> {
 // with otadata untouched (the good slot boots; a hard brick ⇒ USB recovery, §4).
 // ===========================================================================
 
-use esp_bootloader_esp_idf::ota::Slot;
+use esp_bootloader_esp_idf::partitions::AppPartitionSubType as Slot;
 
 /// Emit a gap-NAK if a window stays incomplete this long since the last NAK (ms).
 const LEAF_IDLE_NAK_MS: u64 = 500;
