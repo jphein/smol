@@ -1267,10 +1267,16 @@ static mut MQTT_JSON: JsonScratch = JsonScratch::new();
 /// the label cannot drift from the silicon it describes — a wrong `model` now needs a wrong
 /// TARGET, which fails to link long before it can lie on a dashboard.
 ///
-/// THE FLEET HAS THREE TARGETS, NOT TWO (JP, 2026-07-31): the C3 OLED board ($2.76), the
-/// screenless C3 SuperMini ($1), and the Waveshare ESP32-C6 touch watch (its firmware lives in
-/// its own repo, but it is a smol fleet target all the same — this crate's C6 arm exists for
-/// exactly that hardware). The two C3 boards run ONE image and differ only at runtime: a missing
+/// THE FLEET HAS FOUR TARGETS (JP, 2026-08-01; was three on 07-31, two before that): the C3
+/// OLED board ($2.76), the screenless C3 SuperMini ($1), the Waveshare ESP32-C6 touch watch
+/// (own repo, a smol target all the same — this crate's C6 arm exists for exactly that
+/// hardware), and the ESP32-S3 2.8" touchscreen that runs Ember (ember.realm.watch, the
+/// hearth voice satellite — today an ESPHome device). The S3 is XTENSA, not RISC-V, so no
+/// cfg arm here can even compile for it yet; its label (`smol ESP32-S3 Ember`, presumably
+/// via `target_arch = "xtensa"`) lands with the multi-chip de-pin (#331 tracks the path:
+/// fleet-membership first — SMOLv1 over an ESPHome component — full firmware target after
+/// smol-core). Recorded here because this comment IS the taxonomy of record.
+/// The two C3 boards run ONE image and differ only at runtime: a missing
 /// OLED NACKs the display init and the board carries on headless (see the tolerance block in
 /// `main.rs`). So the C3 model string cannot be a single compile-time constant without lying
 /// about half the fleet — `model` is the first field anyone checks, and "OLED" on a screenless
