@@ -167,8 +167,29 @@ impl core::fmt::Write for Line {
     }
 }
 
-/// ASCII-safe left-truncate to `n` bytes (magical nouns are ASCII, so a byte
-/// boundary is a char boundary — never panics).
+/// Left-truncate to **at most `n` bytes**, never splitting a UTF-8 character.
+///
+/// This is the fleet's one byte-budget truncator: `bench.rs` calls it rather than keeping its own
+/// copy, and the watch's `crates/rssi` carries the identical implementation (#274).
+///
+/// **Why the boundary walk, when the corpus is ASCII.** The previous version was
+/// `&s[..s.len().min(n)]`, documented as safe because "magical nouns are ASCII, so a byte boundary
+/// is a char boundary". That invariant was true but *unenforced* — held only by the wordlist's
+/// contents and by [`crate::ota`]'s `!url.is_ascii()` rejection of announce URLs. Nothing in the
+/// type system stopped a future caller from rendering a peer- or operator-supplied string here, and
+/// the panic would have arrived as a reboot on whichever board first displayed it. A truncator that
+/// cannot panic for *any* input costs three lines and removes the invariant from the list of things
+/// a reviewer must remember. See `net::names::write_short`, which already reasoned this way.
+///
+/// Walking backwards (rather than forwards) keeps the result within the caller's budget: a
+/// character straddling `n` is dropped, never half-emitted.
 pub fn clip(s: &str, n: usize) -> &str {
-    &s[..s.len().min(n)]
+    if s.len() <= n {
+        return s;
+    }
+    let mut end = n;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }

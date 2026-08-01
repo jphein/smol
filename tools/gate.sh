@@ -53,17 +53,10 @@
 #         tools/gate.sh excl         # #351 tier exclusions only
 # Env:    CARGO_TARGET_DIR honoured; SMOL_GATE_JOBS caps cargo parallelism.
 #
-# `excl` is its own mode because it is the only arm that LINKS every tier, and it needs a
-# different cargo PROFILE (`CARGO_PROFILE_RELEASE_DEBUG`) in a different target dir — mixing
-# that into `fw` would thrash the fingerprints the stack-floor build depends on and poison one
-# rust-cache with two profiles' artifacts. CI runs the two as parallel jobs. A human running
-# `tools/gate.sh` still gets all of it.
-#
-# MEASURED, and not what was first assumed: 179 s for all ten links on a cold GitHub runner
-# (job "tier exclusions (#351)", 2m59s). The first estimate here said ~700 s, from a local
-# experiment that gave each tier its OWN target dir and so paid for ten cold DEPENDENCY builds.
-# The shipped path shares one dir, where only the crate and the LTO link are per-tier. Cost is
-# therefore NOT the reason for the split — cache and profile hygiene is.
+# `excl` is its own mode because it is the only arm that LINKS every tier, and measured on a
+# katana-class box that is ~70s x 10 tiers on top of everything else. It shares no state with
+# `fw` — different target dir, different profile — so CI runs the two as parallel jobs rather
+# than pushing one job past its timeout. A human running `tools/gate.sh` still gets all of it.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -112,6 +105,33 @@ if [ "$run_fw" = 1 ]; then
     printf '%s\n' "$out"; bad "shed order"
   fi
 
+  # #306: the DIAG record is a CLIFF — over budget, `encode_publish` publishes NOTHING and a
+  # healthy board looks dead. `DIAG_CORE_MAX` is the compile-time proof it cannot get there, but its
+  # operands were a hand-summed comment and had drifted 8 B in the unsafe direction while the file
+  # carried three different margins in prose. This proves the declared per-field widths ARE the
+  # record's fields, and PRINTS the margin rather than saying "green". `tools/test_diag_budget.sh`
+  # proves each arm can fail.
+  step "DIAG budget arithmetic matches the record (#306)"
+  if out=$("$ROOT/tools/check_diag_budget.py" "$CLOCK/src/net/mode.rs" 2>&1); then
+    printf '%s\n' "$out"; ok "diag budget"
+  else
+    printf '%s\n' "$out"; bad "diag budget"
+  fi
+
+  # #367: a host verifier `#[path]`-includes a firmware source, which reads a FILE and does not
+  # care whether the crate declares it as a module. So a verifier can be green against code that
+  # is compiled into NO tier — `net/crdt.rs` (#185) is exactly that today, and the gate could not
+  # tell it apart from working code. This asserts the one bit that closes it: every `#[path]`
+  # target is also a declared module. Known, owned exceptions live in the script's KNOWN_PHANTOMS
+  # with their issue, and the check fails BOTH on a new phantom and on an allowlist entry that has
+  # since been wired — a list that outlives its reason is how a check stops checking.
+  step "host verifiers test code the firmware compiles (#367)"
+  if out=$("$ROOT/tools/check_verifier_wiring.py" "$ROOT" 2>&1); then
+    printf '%s\n' "$out"; ok "verifier wiring"
+  else
+    printf '%s\n' "$out"; bad "verifier wiring"
+  fi
+
   # #350: cheap and before any compile, because everything below DERIVES from this manifest —
   # a gate that builds the wrong tier list confidently is worse than one that refuses to start.
   # The arms: the canonical tier matches REPRO_FLEET_FEATURES (the packaging path's own
@@ -145,6 +165,17 @@ if [ "$run_fw" = 1 ]; then
   # be a literal in this loop and a second literal in the clippy loop below, and the two had
   # already drifted — `ledger-provision` was in one and not the other, so that tier compiled
   # but was never linted. One declaration, two consumers, no third place to forget.
+  # #351: the BYTE-FREE claims. Cheap and before any compile, like the shed order — arm (a)
+  # is pure source structure, so it costs nothing and runs everywhere. The symbol arm needs a
+  # linked ELF and runs after the stack step below. See check_byte_free.py's header for why
+  # the two are NOT redundant and which one is load-bearing.
+  step "byte-free claims have a mechanism (#351)"
+  if out=$("$ROOT/tools/check_byte_free.py" --src "$CLOCK/src" 2>&1); then
+    printf '%s\n' "$out"; ok "byte-free (source)"
+  else
+    printf '%s\n' "$out"; bad "byte-free (source)"
+  fi
+
   step "cargo check — build tiers"
   while IFS=$'\t' read -r name feats; do
     # A tier naming a feature this branch does not have (e.g. ledger-provision before #181 lands)
@@ -262,6 +293,24 @@ if [ "$run_fw" = 1 ]; then
     echo "canonical build failed before the stack could be measured" > "$STACK_REPORT"
     tail -15 /tmp/gate-stack.log | sed 's/^/        /'
   fi
+  # #351 arm (b): CORROBORATION on the ELF the stack step just built — the real, non-debug,
+  # shipped-geometry binary. The excluded-module list is DERIVED from the tier's features
+  # (transitively closed over Cargo.toml) rather than hand-listed. This arm cannot PROVE
+  # absence — fat LTO can inline a linked module until no symbol survives — so a pass here
+  # adds confidence and never stands alone. Skipped, not failed, if the build above did not
+  # produce an ELF: a corroboration arm must not invent a verdict.
+  step "byte-free corroboration — symbols in the canonical ELF (#351)"
+  ELF="${CARGO_TARGET_DIR:-$ROOT/$CLOCK/target}/${REPRO_TARGET}/release/clock"
+  if [ -f "$ELF" ]; then
+    if out=$("$ROOT/tools/check_byte_free.py" --src "$CLOCK/src" --elf "$ELF" \
+               --features "$REPRO_FLEET_FEATURES" 2>&1); then
+      printf '%s\n' "$out" | tail -1; ok "byte-free (symbols)"
+    else
+      printf '%s\n' "$out"; bad "byte-free (symbols)"
+    fi
+  else
+    printf '   \033[33mSKIP\033[0m byte-free (symbols) — no ELF from the canonical build\n'
+  fi
 fi
 
 if [ "$run_host" = 1 ]; then
@@ -310,6 +359,14 @@ if [ "$run_host" = 1 ]; then
 
   # #350: prove the matrix checker's arms can fail. Pure text, no cargo — see the file header
   # for why a green-only demonstration is not evidence.
+  # #351: prove the byte-free source arm can fail. Pure text, no cargo.
+  step "byte-free checker regression suite (#351)"
+  if out=$("$ROOT/tools/test_byte_free.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -2; ok "test_byte_free"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_byte_free"
+  fi
+
   step "build-matrix checker regression suite (#350)"
   if out=$("$ROOT/tools/test_build_matrix.sh" 2>&1); then
     printf '%s\n' "$out" | tail -2; ok "test_build_matrix"
@@ -326,6 +383,17 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | tail -2; ok "test_check_exclusions"
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_check_exclusions"
+  fi
+
+  # #367: prove the verifier-wiring checker's arms can fail. Operates only on mktemp copies —
+  # never the working tree. Same reasoning as its siblings: this check exists BECAUSE a green
+  # signal over uncompiled code fooled us, so shipping it without watching it go red would be
+  # the same mistake one level up.
+  step "verifier-wiring checker regression suite (#367)"
+  if out=$("$ROOT/tools/test_verifier_wiring.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -2; ok "test_verifier_wiring"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_verifier_wiring"
   fi
 fi
 

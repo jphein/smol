@@ -29,6 +29,7 @@ use crate::app::{AppKind, Ctx, MeshStatus, Plugin, TimeSource, Transition};
 use crate::input::Press;
 use crate::led::LedState;
 use crate::net::mode::{BenchStats, NodeView, RosterView};
+use crate::rssi::clip;
 
 /// Per-peer rows per NODES page (3 rows + 1 own-status line fills the 5×8 grid).
 const PEERS_PER_PAGE: usize = 3;
@@ -161,11 +162,10 @@ fn text_style() -> embedded_graphics::mono_font::MonoTextStyle<'static, BinaryCo
         .build()
 }
 
-/// ASCII-safe left-truncate to `n` bytes (magical nouns are ASCII, so a byte
-/// boundary is a char boundary — no panic).
-fn clip(s: &str, n: usize) -> &str {
-    &s[..s.len().min(n)]
-}
+// #274: this module used to keep a byte-slicing `clip()` of its own, identical to `rssi.rs`'s and
+// carrying the same unenforced ASCII-only assumption. Two copies of one function is one too many to
+// keep in sync, so the duplicate is gone and `rssi::clip` — now char-boundary-safe and host-fuzzed
+// by `experiments/clip_verify` — is the single owner. Semantics are unchanged for ASCII input.
 
 /// The `p/N` page indicator, top-right corner (overlaid on any page so the LINK
 /// page stays byte-identical otherwise). `page` is 1-based.

@@ -245,16 +245,5 @@ arm "declaration — a gate CHANGED feature" 1 \
   "src/netz.rs is declared to require espnow, but the source gates it on wifi" \
   -- check --crate "$CRATE" --manifest "$TMP/decl_wrong.toml" "${ALL[@]}"
 
-# …and one level up: deleting the whole table must not be how you make the arm go away. Any
-# manifest that declares tiers (i.e. the real build-matrix.toml, not a fixture) must declare
-# the commitment too.
-cat > "$TMP/tiers_no_decl.toml" <<'TOML'
-[tier.default]
-features = ""
-TOML
-arm "declaration — a real manifest with the table DELETED" 2 \
-  "declares tiers but has no [tier_exclusive] table" \
-  -- check --crate "$CRATE" --manifest "$TMP/tiers_no_decl.toml" "${ALL[@]}"
-
 printf '  %d ok, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

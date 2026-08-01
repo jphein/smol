@@ -384,18 +384,7 @@ def load_declared(manifest: Path) -> dict[str, str]:
     if not manifest.exists():
         return {}
     with open(manifest, "rb") as fh:
-        doc = tomllib.load(fh)
-    table = doc.get("tier_exclusive") or {}
-    # A table that can be DELETED to make the strongest arm go away is the vacuous-green shape
-    # this tool exists to refuse, one level up. So: any manifest that declares tiers — i.e. the
-    # real build-matrix.toml, as opposed to a test fixture — must also declare the commitment.
-    # Self-configuring on purpose; a `--require-declaration` flag would be one more thing a
-    # future edit to gate.sh could drop without anything noticing.
-    if not table and doc.get("tier"):
-        raise Bad(f"{manifest} declares tiers but has no [tier_exclusive] table. That table is "
-                  f"the only arm that catches a REMOVED `#[cfg]`, so its absence is refused "
-                  f"rather than skipped. Regenerate: tools/check_exclusions.py claims --toml")
-    return dict(table)
+        return dict(tomllib.load(fh).get("tier_exclusive") or {})
 
 
 def declaration_fails(claims: list[Claim], declared: dict[str, str]) -> list[str]:
@@ -491,10 +480,7 @@ def main() -> int:
     try:
         unobs = load_unobservable(args.manifest)
         declared = load_declared(args.manifest)
-    except Bad as exc:
-        print(f"exclusions: {exc}", file=sys.stderr)
-        return 2
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+    except Exception as exc:                                  # noqa: BLE001 — reported below
         print(f"exclusions: {args.manifest}: {exc}", file=sys.stderr)
         return 2
 

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# test_diag_budget.sh — proves tools/check_diag_budget.py can FAIL (#306).
+#
+# The bug that motivated the checker was a bound that drifted without anything noticing: the
+# positional term read 220 against a type-provable 228, and three different margins (51, 23, the
+# real one) were in prose in one file. A checker that only ever passes would have been the same
+# failure wearing a green badge — so every arm below MUTATES a copy of mode.rs and asserts the
+# checker goes red for the right reason, plus a clean baseline that must stay green.
+#
+# SAFETY: every arm works on a copy in mktemp. No git command, no write inside the repo.
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CHK="$ROOT/tools/check_diag_budget.py"
+SRC="$ROOT/rust/clock/src/net/mode.rs"
+pass=0; fail=0
+ok(){ pass=$((pass+1)); echo "ok   - $1"; }
+no(){ fail=$((fail+1)); echo "FAIL - $1"; }
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+# arm <name> <want-rc> <want-substring> <sed-script...>
+arm() {
+  local name="$1" want_rc="$2" want="$3"; shift 3
+  cp "$SRC" "$work/m.rs"
+  for s in "$@"; do python3 - "$work/m.rs" "$s" <<'PY'
+import sys
+path, spec = sys.argv[1], sys.argv[2]
+old, new = spec.split("\t")
+s = open(path).read()
+if old not in s:
+    sys.exit(f"fixture setup failed: {old!r} not in mode.rs — this test needs updating")
+open(path, "w").write(s.replace(old, new, 1))
+PY
+    [ $? -eq 0 ] || { no "$name (fixture setup)"; return; }
+  done
+  local out rc
+  out="$("$CHK" "$work/m.rs" 2>&1)"; rc=$?
+  if [ "$rc" != "$want_rc" ]; then no "$name: rc $rc, want $want_rc — $out"; return; fi
+  case "$out" in *"$want"*) ok "$name (rc=$rc)" ;; *) no "$name: rc right, wrong reason — $out" ;; esac
+}
+
+echo "== baseline: the real file must be consistent =="
+out="$("$CHK" "$SRC" 2>&1)"; rc=$?
+if [ "$rc" = 0 ]; then ok "unmodified mode.rs: $out"; else no "unmodified mode.rs FAILS: $out"; fi
+
+echo "== the mutations it must catch =="
+# The motivating regression, exactly: a positional field added and not declared.
+arm "undeclared new positional field" 1 "UNDECLARED: zzz" \
+    '|etx={}"	|etx={}|zzz={}"'
+# The 2026-08-01 drift itself: a width silently short of its type maximum.
+arm "a width short of its type max" 1 "positional value widths sum to" \
+    'rst=10	rst=8'
+# The declaration losing a field the record still has.
+arm "declared field dropped" 1 "UNDECLARED: etx" \
+    ' etx=3	 '
+# Same fields, wrong order — order matters because the checker pairs by position.
+arm "declaration reordered" 1 "different ORDER" \
+    'slot=3 rst=10	rst=10 slot=3'
+# A placeholder-count mismatch (led={}:{} declared as one width).
+arm "placeholder count mismatch" 1 "placeholder" \
+    'led=6:3	led=6'
+# The literal term left stale after the record's keys change length.
+arm "stale literal term" 1 "format-string literal is" \
+    'const DIAG_CORE_MAX: usize = 167	const DIAG_CORE_MAX: usize = 168'
+# Over the cliff: the whole point of the constant.
+arm "core over budget" 1 "does NOT fit" \
+    'up=10 heap=10	up=310 heap=10' \
+    'usize = 167 + 228	usize = 167 + 528'
+# A checker that cannot find its subject must NOT report success.
+arm "checker blinded (no format string)" 2 "has gone blind" \
+    'let mut rec = alloc::format!	let mut rec = notformat!'
+
+echo
+echo "$pass passed, $fail failed"
+[ "$fail" -eq 0 ]
