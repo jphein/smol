@@ -582,10 +582,26 @@ mqtt:
     # WHY: they were hand-written per node id, so a board only appeared in the dashboard if
     # somebody had typed a stanza for it. ids 50/51/122 were on the mesh with nothing drawn
     # while dead families for 7/9 kept rendering, and the file could not know an id exists.
-    # The entity_ids and unique_ids are UNCHANGED (`sensor.smol_<id>_heap_free`,
-    # `smol_<id>_heap_free_mirror`, …) — firmware reproduces them exactly, so history,
-    # `build_control_room.py` and the cross-node consumers below all keep working, and every
-    # board gets the full set instead of the four that were typed out.
+    # The **unique_ids** are unchanged (`smol_<id>_heap_free_mirror`, …) — firmware reproduces
+    # those exactly, and that is what preserves history: a discovery config whose unique_id
+    # matches an existing registry row LANDS ON that row and inherits its entity_id.
+    #
+    # The **entity_ids** are NOT unchanged, and an earlier version of this comment claimed they
+    # were. `object_id` does not pin an entity_id — HA ignores it and composes the id from the
+    # device name instead (#322). So a field only keeps `sensor.smol_<id>_heap_free` where a row
+    # under that unique_id already existed; anywhere it did not, the id comes out
+    # device-composed: `sensor.smol_5_obsidian_aegis_heap_free`.
+    #
+    # Measured on the live fleet 2026-08-01 (entity registry, 312 firmware-published rows):
+    # object_id honoured 127/312 overall, and **0/117 for ids 50/51/122** — the three boards
+    # that never had a hand-written stanza here, so they had no row to inherit. id5 is 2/43
+    # because its old rows used a different scheme (`smol5_heap_free_luna`) that the firmware's
+    # `_mirror` unique_ids do not match. id8 is the mixed case, 40/59.
+    #
+    # The cross-node consumers below and `build_control_room.py` keep working anyway — but
+    # because that generator resolves telemetry ids from the REGISTRY (see its comment at
+    # :166), not because the convention held. Do not address these by convention; #322 carries
+    # the fix. Every board does now get the full set instead of the four that were typed out.
     #
     # A field ABSENT from the record now reads HA `unknown` rather than `0`. That is the
     # point, not a regression: `blrev=`/`brst=` are absent-until-measured, a leaf's record is

@@ -111,9 +111,14 @@ def ota_progress_card(nid, sigil):
 # ---------- #70/#74 device alarm: self-hides when clean, shows the rollback/abnormal-reset story ----------
 # Shown ONLY when ota_outcome is bad (rolled-back / *-failed) OR reset_reason is abnormal (panic/wdt/
 # brownout/glitch) — the "what just happened to this board" surface #70 exists for. display:none when clean.
-def device_card(nid, sigil):
-    I=str(nid); oo=f"sensor.smol_{nid}_ota_outcome"; rr=f"sensor.smol_{nid}_reset_reason"
-    sl=f"sensor.smol_{nid}_boot_slot"; up=f"sensor.smol_{nid}_uptime"; hp=f"sensor.smol_{nid}_heap_free"
+def device_card(nid, sigil, fw=None):
+    # `fw` is the node's resolved-entity map (resolve_fw). The f-string forms are kept only as a
+    # fallback for a caller that has no registry to hand; on the live fleet they are wrong for
+    # every board except id8 (#322), so passing fw is the supported path.
+    fw=fw or {}
+    F=lambda f: fw.get(f) or f"sensor.smol_{nid}_{f}"
+    I=str(nid); oo=F("ota_outcome"); rr=F("reset_reason")
+    sl=F("boot_slot"); up=F("uptime"); hp=F("heap_free")
     pre=("{% set oo=states('"+oo+"') %}{% set rr=states('"+rr+"') %}"
          "{% set bad_o=oo in ['rolled-back','relay-failed','fetch-failed','mac-unknown'] %}"
          "{% set bad_r=rr in ['panic','wdt','brownout','glitch'] %}{% set act=bad_o or bad_r %}"
@@ -173,10 +178,21 @@ def node_card(nid, meta, present, span=4):
     up=meta["fw"].get("uplink") or f"sensor.smol_{nid}_uplink"
     E_T=meta["fw"].get("temp") or f"sensor.smol_{nid}_temp"
     E_V=meta["fw"].get("voltage") or f"sensor.smol_{nid}_voltage"
+    # R(field) — the registry-resolved id for a firmware-published field, or None when this
+    # device does not own it. Every DIAG row below goes through here (#309/#322); an f-string
+    # is wrong for most of the fleet and, worse, can name a husk that still answers get_states.
+    R=lambda f: meta["fw"].get(f)
     # RSSI pip LIVE (re-evaluates on takeover): gateway → its WiFi-uplink dBm (#64, falls to
     # 'WiFi' until the first burst publishes it); leaf → mesh-bond dBm.
+    # NOT resolvable: `rssi` is hand-written in smol_mesh.yaml for ids 7/8/9 only and is not in
+    # DIAG_DISCOVERY, so the f-string is the only form there is — and it means a leaf outside
+    # that trio (50, 51, …) shows '—' rather than its bond dBm. The number does exist, in the
+    # crown's retained PEERS roster (read_roster) which --check already prints as `bond -39 dBm`;
+    # wiring it through to this pip needs the roster passed into node_card. Left alone here on
+    # purpose: it is the same hand-maintained-id-list bug as #316, not part of #322's fix.
+    E_R=f"sensor.smol_{nid}_rssi"
     rssi_pip=(" · {% if gw %}{% set u=states('"+up+"') %}{% if u not in na %}{{ u }} dBm ↑{% else %}WiFi{% endif %}"
-              "{% else %}{{ states('sensor.smol_"+I+"_rssi') if states('sensor.smol_"+I+"_rssi') not in na else '—' }} dBm{% endif %}")
+              "{% else %}{{ states('"+E_R+"') if states('"+E_R+"') not in na else '—' }} dBm{% endif %}")
     # LIVE gateway signal = the MESH-WIDE elected owner, not a per-id peers entity. The old
     # `sensor.smol_<id>_peers` form only exists for 7/8/9, so when the crown moved to id50 no
     # node could report itself as gateway at all. `smol/mesh/channel` is one fixed topic every
@@ -220,7 +236,8 @@ def node_card(nid, meta, present, span=4):
                 "text-shadow:0 0 7px rgba(91,255,154,.55)}.secondary{color:var(--primary-color);opacity:.7;font-size:10px}")}}}
     OP="opacity:{% if "+on+" %}1{% else %}.6{% endif %}"
     def prow(lst,eid,nm,icon=None):
-        if eid in present:
+        # eid is None when the registry could not resolve the field (#322) — drop the row.
+        if eid and eid in present:
             r={"entity":eid,"name":nm}
             if icon: r["icon"]=icon
             lst.append(r)
@@ -294,22 +311,22 @@ def node_card(nid, meta, present, span=4):
     #      (self-hides when clean) → invisible in normal operation (JP: "not dynamic enough
     #      with data"). Now live on every box; prow() skips whatever a given node lacks. ----
     vit=[{"type":"section","label":"telemetry · live"}]
-    prow(vit,f"sensor.smol_{nid}_heap_free","heap free","mdi:memory")
-    prow(vit,f"sensor.smol_{nid}_heap_min","heap min (worst)","mdi:memory-arrow-down")
-    prow(vit,f"sensor.smol_{nid}_uptime","uptime","mdi:timer-outline")
-    prow(vit,f"sensor.smol_{nid}_boot_count","boot count","mdi:counter")
-    prow(vit,f"sensor.smol_{nid}_boot_slot","OTA slot (running)","mdi:swap-horizontal-bold")
-    prow(vit,f"sensor.smol_{nid}_reset_reason","last reset","mdi:restart-alert")
+    prow(vit,R("heap_free"),"heap free","mdi:memory")
+    prow(vit,R("heap_min"),"heap min (worst)","mdi:memory-arrow-down")
+    prow(vit,R("uptime"),"uptime","mdi:timer-outline")
+    prow(vit,R("boot_count"),"boot count","mdi:counter")
+    prow(vit,R("boot_slot"),"OTA slot (running)","mdi:swap-horizontal-bold")
+    prow(vit,R("reset_reason"),"last reset","mdi:restart-alert")
     for e,nm,ic in [("mesh_rx","mesh rx","mdi:arrow-down-bold-box"),("mesh_tx","mesh tx","mdi:arrow-up-bold-box"),
                     ("mesh_loss","mesh loss","mdi:alert-circle-outline")]:
-        prow(vit,f"sensor.smol_{nid}_{e}",nm,ic)
+        prow(vit,R(e),nm,ic)
     telemetry={"type":"entities","show_header_toggle":False,"entities":vit,"card_mod":{"style":JOIN}}
     # per-node heap history (24h) — the live trend, seamless in the stack (#dynamic-data + history).
     heap_hist=None
-    if f"sensor.smol_{nid}_heap_free" in present:
+    if R("heap_free") and R("heap_free") in present:
         heap_hist={"type":"history-graph","hours_to_show":24,
-                   "entities":[{"entity":f"sensor.smol_{nid}_heap_free","name":"heap free"}]
-                              +([{"entity":f"sensor.smol_{nid}_heap_min","name":"heap min"}] if f"sensor.smol_{nid}_heap_min" in present else []),
+                   "entities":[{"entity":R("heap_free"),"name":"heap free"}]
+                              +([{"entity":R("heap_min"),"name":"heap min"}] if (R("heap_min") and R("heap_min") in present) else []),
                    "card_mod":{"style":"ha-card{border-radius:0;border-top:none;border-bottom:none;margin-top:-1px;"+OP+"}"}}
     # An `entities` card whose rows all got skipped still renders its section HEADINGS — an
     # empty "telemetry · live" strip. Nodes discovered purely over MQTT (id50/51/122…) have no
@@ -318,18 +335,23 @@ def node_card(nid, meta, present, span=4):
     def nonempty(card):
         if not card or card.get("type")!="entities": return card
         return card if any(isinstance(e,dict) and e.get("entity") for e in card.get("entities",[])) else None
-    # …and say WHY the box is thin, rather than leaving JP to wonder if it's broken. This is the
-    # per-id YAML gap, not a dead node: the rich diag sensors are hand-written per id, so a
-    # newly-discovered board only surfaces what firmware MQTT-discovery gives it.
-    thin=not any(f"sensor.smol_{nid}_{k}" in present for k in ("heap_free","uptime","boot_slot"))
+    # …and say WHY the box is thin, rather than leaving JP to wonder if it's broken.
+    #
+    # This note used to read "the richer diag rows are hand-written per id in smol_mesh.yaml and
+    # this board has none yet". That stopped being true when #309 moved the DIAG family into
+    # firmware discovery, and the note then actively misled: ids 50/51/122 each had a full set
+    # of 39 live entities in HA and still rendered thin with a message blaming a YAML file that
+    # no longer held them. The box was thin because this generator addressed them by f-string
+    # while HA had named them after the device (#322) — a resolution bug, not a missing stanza.
+    thin=not any(R(k) and R(k) in present for k in ("heap_free","uptime","boot_slot"))
     note=({"type":"markdown","content":
-           f"_{esc(meta['name'])} is discovered over MQTT only — the richer diag rows "
-           f"(heap · uptime · slot · mesh counters) are hand-written per id in "
-           f"`ha/packages/smol_mesh.yaml` and this board has none yet._",
+           f"_{esc(meta['name'])} has published no diag rows yet — heap · uptime · slot · mesh "
+           f"counters arrive over firmware MQTT discovery (`DIAG_DISCOVERY`) once the board "
+           f"sends its first full record._",
            "card_mod":{"style":"ha-card{border-radius:0;border-top:none;border-bottom:none;margin-top:-1px;"
                        "font-size:11px;opacity:.62;"+OP+"}"}} if thin else None)
     ota=ota_progress_card(nid,meta['name'])   # #40 relay progress bar + phase chip — self-hides (display:none) when idle
-    dev=device_card(nid,meta['name'])         # #70/#74 rollback / abnormal-reset alarm — self-hides when clean
+    dev=device_card(nid,meta['name'],meta["fw"])  # #70/#74 rollback / abnormal-reset alarm — self-hides when clean
     plug=plugin_chips(nid,present)  # #55 plugin-visibility toggle chips
     if headless:
         # #headless board: no OLED / screen-mode / plugin controls to show — telemetry-first box.
@@ -599,10 +621,18 @@ def mesh_overview_md(nodes, dormant, present):
     rows=["", "| sigil | link | build | slot | last reset | OTA |", "|:--|:--:|:--:|:--:|:--:|:--:|"]
     for n in nodes:
         I=str(n["id"]); tag="♛ " if n["gate"] else ""
+        # #322: resolved, not guessed — the f-string form named a husk for id5 and nothing at
+        # all for id50/51/122, so slot/reset/OTA read '—' across most of this table.
+        # `build` stays an f-string: it is a hand-written package sensor, not a DIAG field.
+        E_SL=n["fw"].get("boot_slot")    or f"sensor.smol_{I}_boot_slot"
+        E_RR=n["fw"].get("reset_reason") or f"sensor.smol_{I}_reset_reason"
+        E_OO=n["fw"].get("ota_outcome")  or f"sensor.smol_{I}_ota_outcome"
         rows.append(
             "{% set on="+n["onx"]+" %}"
-            "{% set b=states('sensor.smol_"+I+"_build') %}{% set sl=states('sensor.smol_"+I+"_boot_slot') %}"
-            "{% set rr=states('sensor.smol_"+I+"_reset_reason') %}{% set oo=states('sensor.smol_"+I+"_ota_outcome') %}"
+            "{% set b=states('sensor.smol_"+I+"_build') %}"
+            "{% set sl=states('"+E_SL+"') %}"
+            "{% set rr=states('"+E_RR+"') %}"
+            "{% set oo=states('"+E_OO+"') %}"
             "{% set st=states('sensor.smol_ota_staged') %}"
             "| "+tag+"**"+esc(n["name"])+"** <small>id"+I+"</small> "
             "| {{ '🟢' if on else '⛔' }} "
@@ -619,8 +649,11 @@ def mesh_overview_md(nodes, dormant, present):
 # ---------- vitals history — heap-free + uptime across the WHOLE fleet, 24h (JP: history graphs) ----------
 def vitals_history_cards(nodes, present):
     def graph(field, title, accent):
-        ents=[{"entity":f"sensor.smol_{n['id']}_{field}","name":n["name"]}
-              for n in nodes if f"sensor.smol_{n['id']}_{field}" in present]
+        # #322: registry-resolved per node. By f-string these graphs plotted id8 and a husk for
+        # id5, and silently omitted every board provisioned after device grouping — a
+        # "whole-fleet" graph that showed one node.
+        ents=[{"entity":n["fw"][field],"name":n["name"]}
+              for n in nodes if n["fw"].get(field) and n["fw"][field] in present]
         if not ents: return None
         return {"type":"history-graph","title":title,"hours_to_show":24,"entities":ents,
                 "view_layout":{"grid-column":"span 6"},"card_mod":{"style":accent_top(accent)}}
@@ -816,6 +849,19 @@ def sigil_of(dev_name, nid):
 # id5/13/42/50/51/122/236 got `sensor.smol_50_ember_temp`. An f-string is therefore wrong for
 # most of the fleet — the entity id has to be looked up.
 HEARTBEAT=("status","temp","voltage","uplink")   # carry expire_after → genuine liveness
+# #309/#322 — the rich DIAG family, now firmware-published (`DIAG_DISCOVERY`) rather than
+# hand-written per id in smol_mesh.yaml. It has to be resolved for exactly the same reason
+# HEARTBEAT does, and for a while it was not: these were still addressed by f-string, which is
+# how id5's box came to be wired to six husks and id50/51/122 rendered "thin" while HA held a
+# full set of 39 live entities for each of them. Measured 2026-08-01 on the live fleet: the
+# `sensor.smol_<id>_<field>` convention holds for 127/312 firmware rows, and for 0/117 of the
+# rows belonging to ids 50/51/122.
+# Every name here is a real `DIAG_DISCOVERY` object_id (wifi.rs:1510 publishes 39 of them), so a
+# None from resolve_fw means "this board has not sent that field yet", never "wrong field name".
+# `build` and `rssi` are deliberately ABSENT: they are hand-written package sensors with no
+# device, so they can never resolve and must keep their f-string form — see their call sites.
+DIAG=("heap_free","heap_min","uptime","boot_count","boot_slot","reset_reason",
+      "mesh_rx","mesh_tx","mesh_loss","ota_outcome")
 # The name infix is `*`, not `?` — ANY number of slug segments, including none.
 # `?` allowed at most one, which was right only while the firmware published a bare
 # noun. Since 018ed6c discovery emits `smol <id> <adj> <noun>`, so a registry entry
@@ -824,11 +870,27 @@ HEARTBEAT=("status","temp","voltage","uplink")   # carry expire_after → genuin
 # board read DORMANT while it was talking. A whole-fleet blackout from one quantifier.
 # `*` still matches both legacy forms (`smol_9_status`, `smol_9_herald_status`), and the
 # leading `_` on each segment keeps nid=9 from ever matching `smol_90_…`.
+def _pick(nid, own, f):
+    """Resolve ONE field to the entity_id the device really owns, or None.
+
+    Prefer the exact conventional id when this device owns it. Two reasons, and the second is
+    the one that bites: (1) it keeps the recorder history for the boards whose rows pre-date
+    device grouping — id8's `sensor.smol_8_heap_free` is years of graph, and the composed form
+    would start empty; (2) `sorted()` alone picks alphabetically, so which form won was an
+    accident of the sigil's first letter rather than a decision.
+
+    `own` holds only DEVICE-ATTACHED rows, so an exact hit here means firmware really published
+    it — not a husk. That distinction is the whole fix: `present` (from get_states) DOES contain
+    husks, so an f-string fallback would happily re-wire a card to a dead `restored: true` row
+    that renders as 'unavailable'. Unresolved therefore returns None and the caller drops the
+    row, rather than guessing."""
+    exact=f"sensor.smol_{nid}_{f}"
+    if exact in own: return exact
+    pat=re.compile(rf"^sensor\.smol_{nid}(?:_[a-z0-9]+)*_{f}$")
+    return next((e for e in sorted(own) if pat.match(e)), None)
+
 def resolve_fw(nid, own):
-    out={}
-    for f in HEARTBEAT:
-        pat=re.compile(rf"^sensor\.smol_{nid}(?:_[a-z0-9]+)*_{f}$")
-        out[f]=next((e for e in sorted(own) if pat.match(e)), None)
+    out={f:_pick(nid,own,f) for f in HEARTBEAT+DIAG}
     out["update"]=next((e for e in sorted(own) if re.match(rf"^update\.smol_{nid}(?:_[a-z0-9]+)*_update$",e)), None)
     return out
 
