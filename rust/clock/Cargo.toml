@@ -137,7 +137,8 @@ esp-bootloader-esp-idf = { version = "=0.2.0", optional = true, features = ["esp
 # whereas `sha2` is peripheral-free + move-friendly. Cost is ~4 KB flash — still negligible,
 # and the slot has room again: #300's Bard model took the canonical image from ~590 KB to
 # 1,432,400 B (70.5% of a 0x1F0000 / 2,031,616 B slot), and #347 took the Bard back off the
-# fleet tier, measuring 1,155,600 B — 56.9%, 1.76x headroom, ~855 KiB spare (2026-08-01).
+# fleet tier, measuring 1,155,648 B — 56.9%, 1.76x headroom, ~855 KiB spare (2026-08-01;
+# #348 re-derived this from 1,155,600 — three trees through repro_build_bin all gave ...648).
 # Recompute rather than trusting this line: slot / actual image size; `ota_publish.sh`
 # hard-gates size <= 0x1F0000, so an overflow fails the publish, not a board.
 # Hashing is bound by the ~1.2 MB HTTP download, not the digest, so there is still no
@@ -233,7 +234,29 @@ cast = ["espnow"]
 # ── bard (#300): on-device tiny-LLM storyteller ─────────────────────────────
 # Radio-free: rides `hw` only, so it can ship in every tier incl. `default`.
 # Pulls no alloc — the core is static-buffer only (spec §5).
+# ⚠️ SINCE #348 this feature is PREDICATED on the chip's declared memory budget
+# (src/budget.rs): `--features bard` is a COMPILE ERROR on the C3, because the model's
+# 39,072 B of DRAM does not fit the 32,352 B a C3 has left after the radio stack and the
+# stack floor. That is #347's decision made permanent — it was one word in
+# tools/repro_build.sh that anyone could re-add. The feature STAYS here: the S3 and C6
+# have the DRAM to carry it as an ordinary smol feature (OpenWrt's `DEFAULT := n` — the
+# definition stays, the default flips), and `bard` still gets a CI tier.
 bard = ["hw", "dep:libm"]
+
+# ── #348 budget waiver ───────────────────────────────────────────────────────
+# Declares "this build is NOT the C3 fleet image, so the fleet baseline the budget was
+# measured against does not apply" — which is the honest reason a build may exceed it, and
+# the only one. Two in-tree users, both deliberate:
+#   * tools/gate.sh's `bard` tier, which exists to keep the Bard compiled + linted for the
+#     bigger chips (#347). Without this the tier that keeps a feature alive would be the
+#     thing the guard kills.
+#   * a future Bard-only / S3 image (#347 Phase 3), which carries no radio stack and so has
+#     a different baseline entirely.
+# It is NOT an "ignore the guard" switch: `repro_build_bin` REFUSES to package a build that
+# names it, so a waived image cannot become a published OTA artifact. (OpenWrt keeps the
+# same split — `sysupgrade -F` is a documented escape hatch, and it is separate from the
+# gate that decides suitability.)
+off-fleet = []
 
 # #300 BENCH ONLY — stack high-water measurement (src/bard/stack_paint.rs). Paints the unused
 # stack with a sentinel at boot and reports how deep the story actually went, turning "14240 B

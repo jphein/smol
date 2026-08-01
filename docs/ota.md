@@ -338,8 +338,13 @@ ota_1,    app,  ota_1, 0x210000, 0x1F0000   # 1.938 MB slot
 ```
 
 **Slot occupancy, measured 2026-08-01 (post-#347).** The canonical fleet image is
-`espnow,cast,io` and comes out at a **measured 1,155,600 B — 56.9 % of a `0x1F0000`
-(2,031,616 B) slot, 1.76× headroom, ~855 KiB spare.** #347 took the Bard's ~281 KB model blob
+`espnow,cast,io` and comes out at a **measured 1,155,648 B — 56.9 % of a `0x1F0000`
+(2,031,616 B) slot, 1.76× headroom, ~855 KiB spare.**
+<!-- #348: was 1,155,600 here. Re-derived through `repro_build_bin` on three trees (this
+     branch, main @ 8b74dd8, and a detached worktree at 1efb8b5 — the commit this paragraph
+     cites); all three gave 1,155,648 B. 48 B, no percentage moves, which is why it survived
+     — and it was about to be copied into src/budget.rs as a measurement. -->
+ #347 took the Bard's ~281 KB model blob
 out of `.rodata`, which is where the 1,432,400 B / 70.5 % / 1.42× figure recorded here between
 #300 and #347 came from.
 

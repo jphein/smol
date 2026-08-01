@@ -81,8 +81,14 @@ if [ "$run_fw" = 1 ]; then
   # and C6. The tier is `bard` PLUS the fleet list rather than `bard` alone, because the build that
   # has to keep working on a bigger chip is the COMBINED one. `bard` is named first so the
   # feature-not-on-this-branch SKIP below tests for `bard` and not for `espnow`.
+  # #348: the bard tier now also carries `off-fleet`. That feature is the DECLARATION that this
+  # build is not the C3 fleet image — which is precisely what this tier is — and without it the
+  # #348 budget predicate refuses to compile the Bard on a C3, killing the tier that exists to
+  # keep it alive. Drop `off-fleet` here and you will see the guard fire; that is the check
+  # working, not the tier breaking. `repro_build_bin` refuses to PACKAGE anything naming it, so
+  # this cannot leak into a shipped image.
   step "cargo check — build tiers"
-  for tier in "default:" "wifi:wifi" "espnow:espnow" "fleet:$REPRO_FLEET_FEATURES" "bard:bard,$REPRO_FLEET_FEATURES" "ledger-provision:ledger-provision"; do
+  for tier in "default:" "wifi:wifi" "espnow:espnow" "fleet:$REPRO_FLEET_FEATURES" "bard:bard,off-fleet,$REPRO_FLEET_FEATURES" "ledger-provision:ledger-provision"; do
     name="${tier%%:*}"; feats="${tier#*:}"
     # A tier naming a feature this branch does not have (e.g. ledger-provision before #181 lands)
     # is SKIPPED, not failed — the gate must work on both sides of that merge.
@@ -103,7 +109,7 @@ if [ "$run_fw" = 1 ]; then
   # gate can cover what ONBOARDING has claimed all along. A tier that only gets `cargo check` has
   # its new warnings invisible — which is how the findings accumulated unnoticed in the first place.
   step "cargo clippy -D warnings — every tier"
-  for tier in "default:" "wifi:wifi" "espnow:espnow" "canonical:$REPRO_FLEET_FEATURES" "bard:bard,$REPRO_FLEET_FEATURES"; do
+  for tier in "default:" "wifi:wifi" "espnow:espnow" "canonical:$REPRO_FLEET_FEATURES" "bard:bard,off-fleet,$REPRO_FLEET_FEATURES"; do
     name="${tier%%:*}"; feats="${tier#*:}"
     args=(--release "${JOBS[@]}"); [ -n "$feats" ] && args+=(--features "$feats")
     if (cd "$CLOCK" && cargo clippy "${args[@]}" -- -D warnings) >/tmp/gate-clippy-$name.log 2>&1; then
