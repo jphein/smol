@@ -239,6 +239,11 @@ if [ -n "$EXPECT_BIN" ]; then
   ESIZE="$(stat -c%s "$EXPECT_BIN")"
   if [ "$ESIZE" != "$SIZE" ]; then
     echo "MISMATCH ✗  size $ESIZE != $SIZE — different image, masking cannot apply" >&2
+    # Dev and release version stamps differ in LENGTH, so a dev-flashed board's image
+    # size-mismatches a release rebuild here and reads as "different image" — which is
+    # confidently wrong guidance if the only difference is the stamp flavor.
+    echo "            (dev and release stamps differ in size — if the target image came" >&2
+    echo "            from a dev flash, re-run with --dev)" >&2
     exit 3
   fi
   if cmp -s "$WORK/a.bin" "$EXPECT_BIN"; then

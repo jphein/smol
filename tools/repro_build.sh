@@ -129,12 +129,21 @@ repro_build_bin() {
     export SMOL_GIT_HASH="$hash" SMOL_BUILD_NUMBER="$number" SOURCE_DATE_EPOCH="$sde"
     [ -n "$node_id" ] && export SMOL_NODE_ID="$node_id"
     # #326: see the upstream-bug note above — without this, the pinned epoch cannot reach
-    # a warm build. `-f` makes an unmatched glob (fresh dir: nothing to delete) a no-op.
-    # cwd is the crate dir here, so the in-tree default is plain `target` ($clock may be
-    # a relative path and would double up after the cd).
+    # a warm build. MECHANISM (measured, nebula-triage review): the frozen stamp itself
+    # lives TARGET-side, in <triple>/release/build/esp-bootloader-esp-idf-*/output — but
+    # deleting the cached value is not what makes this work. Removing the HOST-side
+    # build-script artifacts + fingerprint INVALIDATES THE PRODUCER, forcing the script to
+    # re-run, which rewrites that output (proven: host-side-only purge flipped a warm
+    # stamp). The target-side globs are included as defense in depth and so that a reader
+    # who greps for where the stamp lives finds the glob that covers it — do not "optimise"
+    # either pair away on the grounds the stamp isn't in it. `-f` makes an unmatched glob
+    # (fresh dir) a no-op. cwd is the crate dir here, so the in-tree default is plain
+    # `target` ($clock may be relative and would double up after the cd).
     local _t="${CARGO_TARGET_DIR:-target}"
     rm -rf "$_t"/release/build/esp-bootloader-esp-idf-* \
-           "$_t"/release/.fingerprint/esp-bootloader-esp-idf-*
+           "$_t"/release/.fingerprint/esp-bootloader-esp-idf-* \
+           "$_t/${REPRO_TARGET}"/release/build/esp-bootloader-esp-idf-* \
+           "$_t/${REPRO_TARGET}"/release/.fingerprint/esp-bootloader-esp-idf-*
     # #119: the canonical fleet image is espnow + cast (#26 WLED-cast + the #74 crown
     # display-mirror) + io (#72 registry — inert until a G config binds pins, and the
     # dollhouse's dashboard-only pin-binding depends on it being resident). Changing this
