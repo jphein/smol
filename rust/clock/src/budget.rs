@@ -165,6 +165,9 @@ impl ChipBudget {
 /// | esp-wifi 0.15 (blocking; `main` today) | 114,648 B | measured 2026-08-01 on `a5b1312`+`1efb8b5`, `repro_build_bin` |
 /// | esp-radio 0.18 (async; #233/#335) | **106,560 B** | measured 2026-08-01 on `spike/233-stack-measure` @ `2b98fba` |
 ///
+/// Both figures carry a ~40 B per-tree term from the git-ignored provisioning files — see the
+/// note on `baseline_image_bytes` below. It is four orders of magnitude below the margins here.
+///
 /// The declared budget takes the **minimum**, for the same reason `stack_floor_bytes` is a
 /// floor over runtime paths rather than the number one run happened to produce: a capability
 /// that is only true on the configuration you happen to be building today stops being a
@@ -194,12 +197,27 @@ pub const ESP32C3: ChipBudget = ChipBudget {
     // Canonical `espnow,cast,io` image (56.9% of slot), from `repro_build_bin` — the packaging
     // path, not a plain cargo build.
     //
-    // ⚠️ 1,155,648, NOT the 1,155,600 in docs/ota.md and rust/clock/Cargo.toml. Re-derived
-    // 2026-08-01 rather than copied, precisely because this file turns prose into data: built
-    // three times — this branch, clean `main` @ 8b74dd8, and a detached worktree at 1efb8b5
-    // (the exact commit those docs cite) — and all three produced 1,155,648 B. The docs figure
-    // is 48 B light. It changes no percentage and no verdict, which is exactly why it survived;
-    // it would have been inherited here as a "measurement" had it not been re-taken.
+    // ⚠️ THIS NUMBER IS NOT BYTE-STABLE ACROSS TREES, and neither is `free_dram_bytes`. Both
+    // depend on `src/board.rs` and `src/secrets.rs`, which are GIT-IGNORED and provisioned
+    // per-tree (`tools/ci_provision.sh` generates them from the `.example` templates). Their
+    // string literals and constants land in `.rodata`/`.data`, and `.stack` is whatever DRAM is
+    // left over, so both move. Measured 2026-08-01, same commit, same packaging path:
+    //
+    //   | provisioning                      | image     | .stack  |
+    //   |-----------------------------------|-----------|---------|
+    //   | this workstation's board/secrets  | 1,155,648 | 114,648 |
+    //   | ci_provision.sh templates, local  | 1,155,776 | 114,640 |
+    //   | GitHub Actions runner             |         — | 114,608 |
+    //
+    // So the spread is ~128 B of image and ~40 B of stack. docs/ota.md's 1,155,600 is inside
+    // that band and is not an error — it is a different tree, which is worth knowing before
+    // someone "corrects" one of these figures to match another (this file nearly did).
+    //
+    // It changes nothing here: the verdicts below turn on 6,720 B and 588,576 B, three to four
+    // orders of magnitude above the noise. But a byte-exact constant that is not byte-stable is
+    // false precision, so treat this as a REFERENCE measurement +/- ~200 B, and never as a
+    // reproducibility check — `verify_image.sh` is what proves an image reproducible, and it
+    // compares two builds of the SAME tree.
     baseline_image_bytes: 1_155_648,
 };
 

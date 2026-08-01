@@ -137,8 +137,10 @@ esp-bootloader-esp-idf = { version = "=0.2.0", optional = true, features = ["esp
 # whereas `sha2` is peripheral-free + move-friendly. Cost is ~4 KB flash — still negligible,
 # and the slot has room again: #300's Bard model took the canonical image from ~590 KB to
 # 1,432,400 B (70.5% of a 0x1F0000 / 2,031,616 B slot), and #347 took the Bard back off the
-# fleet tier, measuring 1,155,648 B — 56.9%, 1.76x headroom, ~855 KiB spare (2026-08-01;
-# #348 re-derived this from 1,155,600 — three trees through repro_build_bin all gave ...648).
+# fleet tier, measuring ~1,155,700 B — 56.9%, 1.76x headroom, ~855 KiB spare (2026-08-01).
+# #348: that last figure is TREE-DEPENDENT to ~128 B — the git-ignored board.rs/secrets.rs are
+# provisioned per tree and their literals sit in .rodata/.data (1,155,648 here vs 1,155,776 with
+# the ci_provision.sh templates). Don't reconcile it against another doc's copy; recompute.
 # Recompute rather than trusting this line: slot / actual image size; `ota_publish.sh`
 # hard-gates size <= 0x1F0000, so an overflow fails the publish, not a board.
 # Hashing is bound by the ~1.2 MB HTTP download, not the digest, so there is still no
