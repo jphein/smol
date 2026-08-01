@@ -3429,6 +3429,20 @@ impl RadioManager {
         // board or any leaf; `cfg` — config-drift echo, valuable but reconstructible from the command
         // topics HA already holds; `ap` — the live association, whose channel the protected `apch=`
         // approximates. Nothing here is lost while there is room for it.
+        //
+        // ⚠️ The ranking in that paragraph is a statement of what we would least MIND losing. It is
+        // NOT the order things are actually lost in, and the two disagree today (#339): `room_for`
+        // appends while the budget lasts, so APPEND POSITION IS SHED PRIORITY — the LAST field
+        // offered is the FIRST dropped. `cc` is appended 4th and therefore outlives `ap`, `cfg` and
+        // `io`, the reverse of what the prose claims. Reordering the appends is a wire-visible
+        // change and belongs in its own commit; #339 holds that argument.
+        //
+        // The line below is the MACHINE-CHECKED truth. `tools/check_shed_order.py` (run by
+        // `tools/gate.sh`, so on every PR) parses the `room_for` sequence below and fails the gate
+        // unless it equals this list exactly. Change the appends and you must change this line —
+        // which is the point: the prose above rotted precisely because nothing could test it.
+        //
+        // SHED-ORDER: sog, cfgq, cdeaf, cc, ap, cfg, io, deaf
         let mut shed = 0u8;
         {
             let mut room_for = |rec: &mut alloc::string::String, field: alloc::string::String| {
