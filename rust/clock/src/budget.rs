@@ -153,6 +153,71 @@ impl ChipBudget {
 // trusting the comment; a number copied forward untested is how the stack floor once ended
 // up at 12,288 B.
 
+/// **The C3 stack floor — ONE definition, two languages.**
+///
+/// The minimum linked `.stack` region an image may ship with. Both consumers read *this*:
+///
+///   * the compile-time budget, via [`ESP32C3`]`.stack_floor_bytes`;
+///   * the packaging gate, because **`tools/repro_build.sh` parses the line below**
+///     (`repro_stack_floor`) instead of carrying its own copy.
+///
+/// Until #348-followup they were two constants — 73,728 in the gate, 74,208 here — for one
+/// concept, and the gate's was the stale one. Two numbers for one quantity is the drift this
+/// project keeps getting bitten by; #338 collapsed the feature list the same way.
+///
+/// ## ⚠️ Contract with the shell parser — do not reformat this declaration
+///
+/// `repro_stack_floor` matches a line beginning `pub const ESP32C3_STACK_FLOOR_BYTES: u32 =`
+/// and reads the integer up to the `;`, stripping `_`. So: keep it on ONE line, keep the
+/// literal a plain decimal, and put any comment on its own line above. The parser **fails
+/// closed** — if it cannot read a number, `repro_stack_check` refuses to measure rather than
+/// falling back to a default, because a gate that silently substitutes its own number for the
+/// one you edited is worse than no gate. (`REPRO_STACK_FLOOR` still overrides, for experiments.)
+///
+/// ## Derivation — 4/3 × the highest peak on record
+///
+/// **74,208 = 4/3 × 55,656 B**, and it is exact, not rounded.
+///
+/// | peak | where | note |
+/// |---:|---|---|
+/// | 54,856 B | T13 bench, #300 (id8) | the origin of the old 73,728 (4/3, rounded up to 72 KiB) |
+/// | 54,960 B | T13 final-geometry, #300 | same bench, marginally higher |
+/// | 55,440 B | #302 (id8), 5 byte-identical reports | endless-narration window; does not creep |
+/// | **55,656 B** | **#335 (id5), crown duty, 10/10 byte-identical** | **highest on record — this one** |
+///
+/// The #335 run (2026-08-01) is the strongest evidence in the set: a different board under
+/// live crown duty, ten byte-identical reports, and both instrument-falsification checks
+/// passed. It came in **+216 B above #302 and +800 B above T13** — the old floor was derived
+/// from the *lowest* of the four and was knowably 480 B too low.
+///
+/// **Re-derive this when the peak moves**, with `--features stack-paint` under live radio;
+/// idle numbers are meaningless. A floor copied forward untested is how the last one ended up
+/// at 12,288 B. And note every peak on record was measured **with the Bard narrating**, so for
+/// a Bard-free image this floor is an upper bound on what is required, not a target.
+pub const ESP32C3_STACK_FLOOR_BYTES: u32 = 74_208;
+
+/// The input to that derivation: the highest stack high-water ever **measured on hardware** for
+/// this chip — #335, 2026-08-01, id5 under crown duty, 10/10 byte-identical reports, both
+/// instrument-falsification checks passed.
+///
+/// It is a const rather than a sentence so the floor can be checked against it (below) instead
+/// of merely described by it. When a stack-paint run measures a higher peak, change **this**
+/// first; the assertion will then tell you the floor is stale rather than leaving you to notice.
+pub const ESP32C3_MEASURED_PEAK_BYTES: u32 = 55_656;
+
+/// The floor must be at least 4/3 of the highest measured peak. `>=` rather than `==` because a
+/// peak that is not divisible by 3 must round **up** — today it is exact (55,656 × 4 / 3 =
+/// 74,208). This is what stops the two constants drifting apart the way the floor drifted from
+/// its own derivation before #348: the old 73,728 was 4/3 × 54,856, and stayed put through two
+/// higher measurements.
+const _: () = assert!(
+    ESP32C3_STACK_FLOOR_BYTES >= ESP32C3_MEASURED_PEAK_BYTES * 4 / 3,
+    "the C3 stack floor is below 4/3 of the highest measured stack peak (src/budget.rs). \
+     Either a higher peak was recorded without re-deriving the floor — raise \
+     ESP32C3_STACK_FLOOR_BYTES to at least peak * 4/3, rounding UP — or the floor was lowered \
+     without a measurement to justify it, which is how it once ended up at 12,288 B."
+);
+
 /// ESP32-C3 — the pinned fleet chip (RV32IMC, 4 MB flash, 400 KB SRAM).
 ///
 /// ## `free_dram_bytes` is the WORST supported radio stack, deliberately
@@ -176,14 +241,7 @@ impl ChipBudget {
 /// choice is that a feature needing between 32,352 B and 40,920 B is refused here while
 /// still fitting on `main`. That is the direction to be wrong in, and #233 closes the gap.
 ///
-/// ## `stack_floor_bytes` is 74,208, not the 73,728 in the gate
-///
-/// 73,728 (`REPRO_STACK_FLOOR`) is 72 KiB — 4/3 × a 54,856 B peak, rounded up. 74,208 is
-/// 4/3 × the later, higher 55,656 B peak (#302), which is the most recent measurement and
-/// is quoted as the re-derived floor in both `tools/repro_build.sh` and #335. This takes the
-/// higher of the two; the 480 B difference does not change any verdict here, and the
-/// packaging gate keeps its own constant (changing it would move what ships, which is not
-/// this issue's business).
+/// ## `stack_floor_bytes` — see [`ESP32C3_STACK_FLOOR_BYTES`], which the shell gate parses
 ///
 /// ⚠️ **Slack is not headroom.** The floor is 4/3 × a *measured runtime peak*, and the peak
 /// on record was measured with the Bard narrating. A Bard-free peak can only be lower, but
@@ -191,7 +249,7 @@ impl ChipBudget {
 pub const ESP32C3: ChipBudget = ChipBudget {
     chip: "esp32c3",
     free_dram_bytes: 106_560,
-    stack_floor_bytes: 74_208,
+    stack_floor_bytes: ESP32C3_STACK_FLOOR_BYTES,
     // partitions-ota.csv: ota_0/ota_1 are 0x1F0000 each. `ota_publish.sh` hard-gates on this.
     app_slot_bytes: 0x001F_0000,
     // Canonical `espnow,cast,io` image (56.9% of slot), from `repro_build_bin` — the packaging

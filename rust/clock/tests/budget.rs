@@ -16,11 +16,38 @@
 
 #![cfg(feature = "hostsim")]
 
-use clock::budget::{cost, ChipBudget, FeatureCost, ESP32C3};
+use clock::budget::{
+    cost, ChipBudget, FeatureCost, ESP32C3, ESP32C3_MEASURED_PEAK_BYTES,
+    ESP32C3_STACK_FLOOR_BYTES,
+};
 
 /// The published #335 shortfall. If this test starts failing, either a measurement in
 /// `budget.rs` moved (fine — update it *with* its provenance) or someone rounded something.
 const PUBLISHED_SHORTFALL: u32 = 6_720;
+
+/// The floor is 4/3 of the highest measured peak, and the budget uses that same constant — the
+/// one `tools/repro_build.sh` parses. Before #348's follow-up there were two floors for one
+/// concept (73,728 in the shell, 74,208 here) and the shell's was derived from the *lowest* of
+/// four recorded peaks. There is now one, and this pins it to its input.
+#[test]
+fn the_floor_is_four_thirds_of_the_highest_measured_peak() {
+    assert_eq!(ESP32C3_MEASURED_PEAK_BYTES, 55_656, "#335, id5, 10/10 reports");
+    assert_eq!(ESP32C3_STACK_FLOOR_BYTES, 74_208);
+    assert_eq!(ESP32C3_STACK_FLOOR_BYTES, ESP32C3_MEASURED_PEAK_BYTES * 4 / 3);
+    // And the chip row must not carry a second, independent copy of it.
+    assert_eq!(ESP32C3.stack_floor_bytes, ESP32C3_STACK_FLOOR_BYTES);
+}
+
+/// The old floor was 4/3 of T13's 54,856 B — the lowest peak on record — and stayed put while
+/// two higher ones were measured. This is the regression that guards the direction of the fix.
+#[test]
+fn the_floor_is_no_longer_the_stale_73728() {
+    assert!(
+        ESP32C3_STACK_FLOOR_BYTES > 73_728,
+        "the floor must not fall back to the T13-derived value once a higher peak is on record"
+    );
+    assert_eq!(ESP32C3_STACK_FLOOR_BYTES - 73_728, 480);
+}
 
 #[test]
 fn c3_dram_headroom_is_the_measured_leftover() {

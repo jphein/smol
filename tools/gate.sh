@@ -13,7 +13,8 @@
 #      canonical+bard, which is off the fleet image since #347 but still a supported build)
 #   2. cargo clippy --release -D warnings on EVERY tier (#343 — was canonical-only)
 #   3. the host experiments/*_verify suites
-#   4. the #300 stack floor — the canonical ELF's .stack region vs the 73,728 B floor
+#   4. the #300 stack floor — the canonical ELF's .stack region vs the floor declared in
+#      rust/clock/src/budget.rs (#348: one definition, parsed by repro_stack_floor)
 #
 # WHAT IT DOES NOT COVER — read this before trusting a green run:
 #   * `mesh-test`: needs a per-board `DEAF_MACS` that only a real board.rs has.
@@ -123,7 +124,11 @@ if [ "$run_fw" = 1 ]; then
 
   # #300 stack floor, measured with the SAME function the packaging path uses (repro_stack_check).
   # Built with repro_cargo_args so the ELF matches the shipped one's geometry.
-  step "stack floor — canonical ELF vs ${REPRO_STACK_FLOOR:-73728} B"
+  # #348: the title reads the floor from the same single definition repro_stack_check will use —
+  # it was a third hardcoded copy of 73728, which would have gone on announcing the old number
+  # while the gate enforced a new one. "unreadable" here is not a failure; repro_stack_check
+  # fails closed on it a few lines down, with the diagnostic.
+  step "stack floor — canonical ELF vs ${REPRO_STACK_FLOOR:-$(repro_stack_floor || echo unreadable)} B"
   if repro_cargo_args "$CLOCK" 2>/dev/null && \
      (cd "$CLOCK" && cargo build --release "${JOBS[@]}" --features "$REPRO_FLEET_FEATURES" "${REPRO_CARGO_ARGS[@]}") \
        >/tmp/gate-stack.log 2>&1; then

@@ -83,12 +83,26 @@ repro_cargo_args() {
 # and put `__stack_chk_guard` outside the stack region, where the canary cannot detect the overflow
 # it exists to catch. Refuse to package an image that thin.
 #
-# The floor is DERIVED, not chosen: the T13 bench measured a 54,856 B high-water with the stack-paint
-# build (WiFi burst + crown duty + three stories), and 54,856 x 4/3 = 73,141, rounded up to 72 KiB =
-# 73,728. The 4/3 is a third again on top of the worst path we have actually observed — enough to
-# absorb a deeper interrupt nesting or a future radio change without being so generous that the gate
-# stops biting. Re-measure with stack-paint if either the radio stack or the bard's buffers move; a
-# floor copied forward untested is how the last one ended up at 12,288.
+# The floor is DERIVED, not chosen — and since #348 it is derived in exactly ONE place.
+#
+# It used to be the literal 73,728 here: 4/3 x the T13 bench's 54,856 B high-water, rounded up to
+# 72 KiB. That number was the LOWEST of the four peaks now on record, and #335 measured a higher
+# one on hardware (55,656 B, id5 under crown duty, 10/10 byte-identical reports) — so the gate was
+# knowably 480 B too low, while rust/clock/src/budget.rs already carried the re-derived 74,208.
+# Two constants for one concept, disagreeing. `repro_stack_floor` (below) now PARSES the Rust
+# declaration instead, the way #338 collapsed the fleet feature list to one variable.
+#
+# Direction of the dependency, deliberately: the Rust const is the definition and this script
+# reads it, not the reverse. `budget.rs` is moving to `smol-core` (#347 Phase 2) to be shared by
+# smol, the esp32c6-watch and the Bard device — a tools/ script in THIS repo cannot be the source
+# of truth for a crate three firmwares depend on, and a build.rs that shelled out to read it would
+# not move with the crate.
+#
+# The 4/3 is a third again on top of the worst path we have actually observed — enough to absorb a
+# deeper interrupt nesting or a future radio change without being so generous that the gate stops
+# biting. Re-measure with stack-paint if either the radio stack or the bard's buffers move; a floor
+# copied forward untested is how the last one ended up at 12,288. Full derivation + the table of
+# every peak on record lives on ESP32C3_STACK_FLOOR_BYTES in budget.rs.
 #
 # ⚠️ The floor bounds the linked REGION, which is all an ELF can show. It cannot see runtime
 # high-water: a struct that lives in a stack-resident `RadioManager` costs real stack and moves this
@@ -99,9 +113,40 @@ repro_cargo_args() {
 # #338: extracted from `repro_build_bin` so CI measures with the SAME code the packaging path uses.
 # A CI copy of this arithmetic would be a second definition free to drift from the one that actually
 # gates shipping — which is the exact failure this issue exists to remove.
+# Repo root, resolved from this script's own location so the functions below work from any cwd
+# (gate.sh sources this from $ROOT, ota_publish.sh from the crate dir, agents from anywhere).
+REPRO_ROOT="${REPRO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)}"
+
+# #348: echo the C3 stack floor by PARSING its single definition in Rust. Returns non-zero and
+# echoes nothing if the declaration cannot be read, so callers can fail closed — see the contract
+# documented on ESP32C3_STACK_FLOOR_BYTES (one line, plain decimal, comments on their own line).
+# The awk takes everything between `=` and `;` and strips spaces/underscores, so a trailing
+# comment on the line cannot be swallowed into the number; the digits-only test is the backstop.
+repro_stack_floor() {
+  local src="${REPRO_BUDGET_RS:-$REPRO_ROOT/rust/clock/src/budget.rs}" v
+  [ -f "$src" ] || return 1
+  v=$(awk '/^pub const ESP32C3_STACK_FLOOR_BYTES: u32 =/ {
+             split($0, a, "="); split(a[2], b, ";"); gsub(/[ _]/, "", b[1]); print b[1]; exit
+           }' "$src" 2>/dev/null)
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$v"
+}
+
 # repro_stack_check <elf>
 repro_stack_check() {
-  local elf="$1" stack_floor="${REPRO_STACK_FLOOR:-73728}"
+  local elf="$1" stack_floor="${REPRO_STACK_FLOOR:-$(repro_stack_floor)}"
+  # FAIL CLOSED on an unreadable declaration, for the same reason as the unreadable-ELF branch
+  # below: a gate that quietly falls back to a built-in default would measure against a number
+  # nobody edited, which is precisely the drift #348 removed. Better to refuse and be fixed.
+  case "$stack_floor" in
+    ''|*[!0-9]*)
+      echo "FATAL: could not read ESP32C3_STACK_FLOOR_BYTES from ${REPRO_BUDGET_RS:-$REPRO_ROOT/rust/clock/src/budget.rs}" >&2
+      echo "       — refusing to measure the stack against a guessed floor. Check that the" >&2
+      echo "       declaration is one line of plain decimal (see its doc comment), or set" >&2
+      echo "       REPRO_STACK_FLOOR explicitly if you are deliberately overriding it." >&2
+      return 1
+      ;;
+  esac
   local ss se
   ss=$(readelf -sW "$elf" 2>/dev/null | awk '$8=="_stack_start"{print $2; exit}')
   se=$(readelf -sW "$elf" 2>/dev/null | awk '$8=="_stack_end"{print $2; exit}')
