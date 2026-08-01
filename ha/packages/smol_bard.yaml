@@ -401,11 +401,19 @@ template:
         # fleet because of its own bug. Node-vs-node needs no copy and still catches a partial
         # fan-out, because the missed node is exactly the one holding a different value.
         state: >-
+          {#- Same `never` guard as the tale judge below — see its comment for the full reasoning.
+              delivery does not currently show the bug only because all six ids have a retained
+              `config/delivery`, so its accumulator fires on the first subscribe. It is the same
+              latent defect: after an HA restart with the retained topics cleared, or on a fresh
+              instance, this would read "no fleet discovered" too. Fixed in both, not just the one
+              that happened to expose it. -#}
+          {%- set never = state_attr('sensor.smol_bard_delivery_nodes', 'fleet') is none -%}
           {%- set m = state_attr('sensor.smol_bard_delivery_nodes', 'nodes') or {} -%}
           {%- set f = state_attr('sensor.smol_bard_delivery_nodes', 'fleet') or [] -%}
           {%- set silent = (f | map('string') | list) | reject('in', m.keys() | map('string') | list) | list -%}
           {%- set spread = m.values() | unique | list -%}
-          {%- if f | count == 0 -%}no fleet discovered
+          {%- if never -%}nothing reported
+          {%- elif f | count == 0 -%}no fleet discovered
           {%- elif m | count == 0 -%}nothing reported
           {%- elif spread | count > 1 -%}{{ m | count }}/{{ f | count }} DISAGREE
           {%- elif silent | count > 0 -%}{{ m | count }}/{{ f | count }} agree · {{ silent | join(',') }} silent
@@ -501,11 +509,23 @@ template:
         # fleet because of its own bug. Node-vs-node needs no copy and still catches a partial
         # fan-out, because the missed node is exactly the one holding a different value.
         state: >-
+          {#- `never` separates "the accumulator has NOT ONCE fired" from "it fired and found no
+              fleet". The accumulator is a TRIGGER sensor, so `fleet` does not exist until a first
+              message arrives — and `or []` collapsed that into `f | count == 0`, which prints
+              "no fleet discovered". Measured live the minute this deployed: tale read
+              `no fleet discovered` while the fleet was six healthy boards, purely because no tale
+              has EVER been published to `smol/+/config/tale`. That is a false alarm on the most
+              alarming branch available — it names an HA discovery failure, the one thing here
+              somebody would drop everything to chase. An ABSENT attribute means nothing has
+              reported yet; only a fleet that was actually COMPUTED and came back empty is a
+              discovery problem. -#}
+          {%- set never = state_attr('sensor.smol_bard_tale_nodes', 'fleet') is none -%}
           {%- set m = state_attr('sensor.smol_bard_tale_nodes', 'nodes') or {} -%}
           {%- set f = state_attr('sensor.smol_bard_tale_nodes', 'fleet') or [] -%}
           {%- set silent = (f | map('string') | list) | reject('in', m.keys() | map('string') | list) | list -%}
           {%- set spread = m.values() | unique | list -%}
-          {%- if f | count == 0 -%}no fleet discovered
+          {%- if never -%}nothing reported
+          {%- elif f | count == 0 -%}no fleet discovered
           {%- elif m | count == 0 -%}nothing reported
           {%- elif spread | count > 1 -%}{{ m | count }}/{{ f | count }} DISAGREE
           {%- elif silent | count > 0 -%}{{ m | count }}/{{ f | count }} agree · {{ silent | join(',') }} silent
