@@ -61,8 +61,10 @@ pub const MAX_VOCAB: usize = 512;
 /// So ~55 KB of stack is the real requirement, and the 14,240 B that `SEQ_CAP=160` left would
 /// have been overrun by nearly 4×. No cache depth alone fixes that: the DRAM had to come from
 /// the esp-wifi heap as well (128 → 96 KiB, `net::init_heap`, JP's call 2026-07-27 — see the
-/// comment there). Together they buy back ~62 KB of stack against a 73,728 B floor that
-/// `tools/repro_build.sh` now enforces from the measured peak (54,856 × 4/3).
+/// comment there). Together they buy back ~62 KB of stack against the floor that
+/// `tools/repro_build.sh` enforces from the measured peak (peak × 4/3). That floor was 73,728
+/// when this was written and is **74,208** since #348's follow-up re-derived it from #335's
+/// higher 55,656 B peak; it is declared once, as `budget::ESP32C3_STACK_FLOOR_BYTES`.
 ///
 /// The trade JP chose was FLEET-WIDE SHORT STORIES — and #302 then made the length question moot:
 /// with a ring cache a tale runs as long as the reader wants, so 80 buys the model three or four

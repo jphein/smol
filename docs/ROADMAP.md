@@ -64,15 +64,22 @@ formula are a bug in this document** — check them together.
 > **157,472 B** · `.data` **13,588 B** · `.stack` **114,648 B** · esp-wifi heap **96 KiB**.
 >
 > **`tools/repro_build.sh` hard-fails a release build when the stack region drops below
-> 73,728 B** — so there is now **40,920 B of slack** before a new static allocation *breaks the
+> 74,208 B** — so there is now **40,440 B of slack** before a new static allocation *breaks the
 > build*. That is 18× the 2,232 B this block recorded before #347, and it is the whole reason
 > the Embassy re-platform (#233/#335) went from not-fitting to fitting.
 >
 > ⚠️ **Slack is not headroom.** The floor is derived from a *measured runtime peak* (peak × 4/3),
-> and the peak on record — **55,440 B** (#302) — was measured **with the Bard narrating**. A
-> Bard-free peak can only be lower, but nobody has measured it, so the real margin is *at least*
-> this and the floor is *at most* right. Re-run the stack-paint build before spending this slack
-> on anything large.
+> and the highest peak on record — **55,656 B** (#335, id5 under crown duty, 10/10 byte-identical
+> reports, 2026-08-01) — was measured **with the Bard narrating**. A Bard-free peak can only be
+> lower, but nobody has measured it, so the real margin is *at least* this and the floor is *at
+> most* right. Re-run the stack-paint build before spending this slack on anything large.
+>
+> 📌 **The floor moved 73,728 → 74,208 (#348 follow-up), and there is now only one of it.** The old
+> value was 4/3 × T13's 54,856 B — the *lowest* of the four peaks on record — so it was knowably
+> 480 B too low once #335 measured 55,656 on hardware. It also existed twice, as a shell literal
+> in `repro_build.sh` and a Rust const in `budget.rs`, disagreeing. The single definition is now
+> `ESP32C3_STACK_FLOOR_BYTES` in `rust/clock/src/budget.rs`; the shell gate parses it
+> (`repro_stack_floor`) and **fails closed** if it cannot. Change it there, once.
 >
 > The Bard's DRAM (`.bss` +37,832 B, `.data` +1,232 B) and its ~281 KB of `.rodata` are what
 > moved. The `bard` feature still exists and `tools/gate.sh` still builds a `bard` tier — it is
