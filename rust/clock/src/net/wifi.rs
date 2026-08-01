@@ -1384,13 +1384,36 @@ const fn discovery_topic_max() -> usize {
 #[cfg(feature = "wifi")]
 const DISCOVERY_CFG_MAX: usize = 215 + 14 + 7 + 90 + 51 + 15 + 17 + 5 + 8;
 
-/// Same bound for the ONE config that also carries the device extras (`status`: shortest
-/// template, no `extra` — which is why it was chosen to carry them). The extras term is
-/// [`DEVICE_EXTRAS_MAX`] — the longest variant this target can pick at runtime — not a sample.
+/// Same bound for the telemetry-family config that carries the device extras (`status`:
+/// shortest template, no `extra` — which is why it was chosen to carry them). The extras term
+/// is [`DEVICE_EXTRAS_MAX`] — the longest variant this target can pick at runtime — not a
+/// sample. NOTE the extras ride TWO configs since #325: this one and the gateway's own
+/// `uplink` config, bounded separately by [`DISCOVERY_CFG_MAX_UPLINK`]. If you add a third
+/// carrier, give it its own bound — a config without an assert is invisible-when-over.
 ///   215 literal + 12 field⨯2 + 6 name + 73 template + 0 extra + extras-max + 15 id⨯5 + 17 name + 5 build + 8 forge
 #[cfg(feature = "wifi")]
 const DISCOVERY_CFG_MAX_WITH_EXTRAS: usize =
     215 + 12 + 6 + 73 + DEVICE_EXTRAS_MAX + 15 + 17 + 5 + 8;
+
+/// #325: worst case of the gateway's own `uplink` discovery config — the SECOND carrier of
+/// the device extras. Same term style as the bounds above; each term is a type- or
+/// fixed-set-maximum, so this is a bound, not a sample. Independently derived twice
+/// (measured 372 B for the longest C3 variant; the terms below sum to the same 372).
+///   269 format-string literal (extras parameterised out)
+///    15 `id` ⨯5 at u8 max width (3)     17 longest adjective (9) + longest noun (8)
+///   extras-max ([`DEVICE_EXTRAS_MAX`])   5 build number (5 digits) + 8 longest FORGE noun
+/// ⚠️ If you lengthen the uplink format string or a corpus word, update the literal term —
+/// the assert below is what turns "silently never created in HA" into a build break.
+#[cfg(feature = "wifi")]
+const DISCOVERY_CFG_MAX_UPLINK: usize = 269 + 15 + 17 + DEVICE_EXTRAS_MAX + 5 + 8;
+
+#[cfg(feature = "wifi")]
+const _: () = assert!(
+    DISCOVERY_CFG_MAX_UPLINK <= DISCOVERY_BUDGET,
+    "the uplink discovery config no longer fits one MQTT publish — the entity would SILENTLY \
+     never be created (encode_publish returns None). Shrink the device block or the extras \
+     variant strings; do NOT raise the pkt buffer without re-deriving every bound."
+);
 
 #[cfg(feature = "wifi")]
 const _: () = assert!(
