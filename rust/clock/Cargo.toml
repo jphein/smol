@@ -62,19 +62,19 @@ sigil-names = { path = "../sigil-names", default-features = false }
 # `unstable` is required for I2C/SPI/RNG and is also a hard requirement of
 # esp-wifi. `esp32c3` selects the chip. `rt` + `exception-handler` come from
 # the default features (runtime + fault handler).
-esp-hal = { version = "=1.0.0-rc.0", features = ["esp32c3", "unstable"], optional = true }
+esp-hal = { version = "1.1", features = ["esp32c3", "unstable"], optional = true }
 # NOTE: esp-hal's default features already install the exception handler, so
 # esp-backtrace only provides the panic handler + backtrace printing here.
 # Enabling esp-backtrace's `exception-handler` too causes a duplicate
 # `ExceptionHandler` symbol and an LTO bitcode-load failure at link time.
-esp-backtrace = { version = "=0.17.0", features = ["esp32c3", "panic-handler", "println"], optional = true }
+esp-backtrace = { version = "0.19", features = ["esp32c3", "panic-handler", "println"], optional = true }
 # Force the USB Serial/JTAG backend explicitly. This board's console is the
 # native USB Serial/JTAG link (/dev/ttyACM0); esp-println's default `auto`
 # backend only routes to USB-JTAG when it detects host SOF packets at the
 # instant it writes, which proved unreliable during the busy WiFi burst and
 # left app logs going to the (unwired) UART0. `jtag-serial` pins the output to
 # USB-JTAG so boot/WiFi/NTP/ESP-NOW logs always appear on /dev/ttyACM0.
-esp-println = { version = "=0.15.0", default-features = false, optional = true, features = [
+esp-println = { version = "0.17", default-features = false, optional = true, features = [
     "esp32c3",
     "log-04",
     "jtag-serial",
@@ -98,22 +98,39 @@ libm = { version = "0.2", optional = true, default-features = false }
 ssd1306 = { version = "=0.10.0", optional = true }
 embedded-graphics = "=0.8.2"
 
-# --- WiFi / NTP (Phase 2, feature = "wifi") ------------------------------
-# esp-alloc pinned to 0.8.x to satisfy esp-wifi 0.15.1's `^0.8.0` requirement.
-esp-alloc = { version = "=0.8.0", optional = true }
-esp-wifi-sys = { version = "=0.7.1", optional = true, default-features = false }
-esp-wifi = { version = "=0.15.0", optional = true, default-features = false, features = [
+# --- WiFi / NTP + radio (Phase 2, feature = "wifi") ----------------------
+esp-alloc = { version = "0.10", optional = true }
+# #233: the preemption scheduler that backs esp-radio's `esp_radio_preempt_*` os-adapter
+# hooks. In the old stack this was esp-wifi's in-crate `builtin-scheduler`; in the 0.18
+# stack it moved OUT to esp-rtos. We enable ONLY its `esp-radio` + `esp-alloc` drivers
+# (NOT `embassy`) — smol stays a blocking superloop, and `esp_rtos::start()` turns main()
+# into the scheduler's pinned main task, so the existing blocking code runs as-is.
+esp-rtos = { version = "0.3", optional = true, features = [
+    "esp32c3",
+    "esp-radio",
+    "esp-alloc",
+    "log-04",
+] }
+# esp-wifi RENAMED → esp-radio in 0.18. `unstable` unlocks the raw rx/tx tokens
+# (our smoltcp shim) + the `esp_now` interface. `default-features = false` drops
+# esp-radio's default `esp-alloc` so we re-add it explicitly.
+esp-radio = { version = "0.18", optional = true, default-features = false, features = [
     "esp32c3",
     "wifi",
     "esp-alloc",
-    "smoltcp",
-    # esp-wifi needs a preemption scheduler backing its `esp_wifi_preempt_*`
-    # os-adapter hooks. `builtin-scheduler` is normally in esp-wifi's default
-    # feature set, but we set `default-features = false`, so we must re-add it
-    # explicitly (otherwise: `undefined symbol: esp_wifi_preempt_*` at link).
-    "builtin-scheduler",
+    "unstable",
+    "log-04",
 ] }
-smoltcp = { version = "=0.12.0", optional = true, default-features = false, features = [
+# #141 TX-power clamp + AP-info readback use raw esp-idf bindings. esp-radio's
+# `sys` module is pub(crate), so we depend on the per-chip bindings crate directly
+# and alias it to `esp_wifi_sys` — net.rs keeps `esp_wifi_sys::include::…` verbatim.
+esp-wifi-sys = { package = "esp-wifi-sys-esp32c3", version = "0.2", optional = true, default-features = false }
+# #233: esp-radio 0.18 made connect/disconnect/scan ASYNC-only (no blocking variants).
+# smol is a synchronous superloop, so we drive those futures to completion with
+# embassy-futures' busy-loop `block_on` (no executor needed; the esp-rtos scheduler
+# preempts the busy loop to run the radio task that posts the completion events).
+embassy-futures = { version = "0.1", optional = true }
+smoltcp = { version = "0.13", optional = true, default-features = false, features = [
     "medium-ethernet",
     "proto-ipv4",
     "proto-dhcpv4",
@@ -129,8 +146,8 @@ smoltcp = { version = "=0.12.0", optional = true, default-features = false, feat
 # rom.rs references an unresolved `esp_rom_sys` (md5/crc pulled by the chip
 # feature). esp-storage gives XIP-safe flash writes (FlashStorage auto-detects
 # 4 MB); esp-bootloader-esp-idf gives the otadata slot/state API + esp_app_desc!.
-esp-storage = { version = "=0.7.0", optional = true, features = ["esp32c3"] }
-esp-bootloader-esp-idf = { version = "=0.2.0", optional = true, features = ["esp32c3"] }
+esp-storage = { version = "0.9", optional = true, features = ["esp32c3"] }
+esp-bootloader-esp-idf = { version = "0.5", optional = true, features = ["esp32c3"] }
 # Software SHA-256 for the OTA image integrity gate. Chosen over the HW `esp_hal::sha`
 # peripheral deliberately: the HW path needs the SHA peripheral threaded through boot
 # into the OTA burst + a self-referential `ShaDigest` (borrows the `Sha` beside it),
@@ -196,9 +213,11 @@ io = ["espnow"]
 wifi = [
     "hw", # #152: every firmware tier carries the bare-metal crates (byte-identical to before)
     "dep:esp-alloc",
-    "dep:esp-wifi",
+    "dep:esp-rtos",
+    "dep:esp-radio",
     "dep:esp-wifi-sys",
     "dep:smoltcp",
+    "dep:embassy-futures",
     "dep:esp-storage",
     "dep:esp-bootloader-esp-idf",
     "dep:sha2",
@@ -208,7 +227,13 @@ wifi = [
 
 # Phase 3: ESP-NOW peer messaging + WiFi<->ESP-NOW switching.
 # Builds on `wifi` (shares the radio init path) and turns on esp-wifi/esp-now.
-espnow = ["wifi", "esp-wifi/esp-now", "dep:ed25519-compact"]
+# NOTE (#233): we deliberately do NOT enable esp-radio's `coex` feature. `coex` is the
+# cross-radio (WiFi+BLE) coexistence arbiter and esp-radio's build script HARD-ERRORS if
+# `coex` is set without `ble`. smol's WiFi<->ESP-NOW coexistence (#40/#23) is SAME-RADIO
+# channel management (both live in the WiFi domain), not cross-radio arbitration — the old
+# esp-wifi 0.15 build never enabled coex either. Pulling BLE in would also wedge the C3 in
+# ROM (btdm init busy-wait — see the "native BLE refuted on C3" finding). So: esp-now only.
+espnow = ["wifi", "esp-radio/esp-now", "dep:ed25519-compact"]
 
 # #25 WLED WiZmote-emit: smol impersonates a WLED "linked remote" (13-B WiZmote
 # ESP-NOW broadcast). Needs the ESP-NOW broadcast path + RadioManager, so it builds
