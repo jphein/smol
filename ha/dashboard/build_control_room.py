@@ -1329,9 +1329,18 @@ def report_dead_rows(view, st, extras=()):
     TWO KINDS, and the second nearly escaped. "Absent" is the easy one: no such entity id.
     "Orphan" is an entity that still EXISTS in `get_states` but only as an entity-registry
     husk — HA keeps any entity carrying a `unique_id` after its integration stops providing it.
-    Retiring ids 7/9 deleted 56 `input_*` helpers outright but left 110 sensors behind exactly
+    Retiring ids 7/9 deleted 56 `input_*` helpers outright but left **116** entities behind exactly
     like this, all `unavailable`. A membership test alone calls those healthy, so the check
     would have been blind to precisely the corpses it exists to find (morpheus-yaml's catch).
+
+    That number used to read "110 sensors" here and was wrong twice (#319, measured 2026-08-01):
+    102 of them are sensors, and 110 is not the total — it is what a `smol_<digits>` selector
+    finds, which misses six id7/id9 automations named `smol_nodemgr_id7_*` /
+    `smol_ota_install_staged_to_id7_retained`, where the id sits later in the name. 110 + 6 = 116.
+    Not two measurements of different things: one selector narrower than the set it described,
+    which is the same defect as auditing a diff for `- name:` and missing a bare `- delay:`.
+    112 of the 116 were removed 2026-08-01; the remaining 4 are wired by the `smol-telemetry`
+    view, which nothing audits (see the `prev` lookup below — it resolves ONE view by path).
 
     `restored: True` is the discriminator, and it is exact: all 110 husks carry it, while a LIVE
     board's momentarily-`unavailable` sensor (`sensor.smol_8_nexus_uplink`) does not. So this

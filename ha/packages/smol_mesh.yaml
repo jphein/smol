@@ -546,83 +546,33 @@ mqtt:
       expire_after: 90
       icon: "mdi:lan-connect"
 
-    # --- COEXIST: per-board WiFi-uplink AP channel (crown-channel-health, the OTA-liveness signal).
-    # Only the elected crown associates to an uplink AP, so `ap=<ch>:<rssi>:<bssid>` appears ONLY in
-    # the crown's smol/<id>/diag (leaves omit it). State = AP channel (int) or 'none' when absent;
-    # rssi (signed dBm) + bssid ride as attributes. The template sensor `smol coexist health` below
-    # coalesces these (whichever board reports a real channel IS the crown) and compares to the
-    # elected mesh channel — a mismatch = the ch1-AP-vs-ch6-mesh coexist trap that silently kills OTA.
-    - name: "smol 8 ap channel"
-      unique_id: smol_8_ap_channel_mirror
-      state_topic: "smol/8/diag"
-      entity_category: diagnostic
-      icon: "mdi:access-point-network"
-      value_template: >-
-        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ p[0] if (ns.v and p[0]) else 'none' }}
-      json_attributes_topic: "smol/8/diag"
-      json_attributes_template: >-
-        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ {'rssi': (p[1] | int(0)) if p | length >= 2 else 0, 'bssid': (p[2] if p | length >= 3 else ''), 'raw': ns.v} | tojson }}
-      expire_after: 90
-    - name: "smol 5 ap channel"
-      unique_id: smol_5_ap_channel_mirror
-      state_topic: "smol/5/diag"
-      entity_category: diagnostic
-      icon: "mdi:access-point-network"
-      value_template: >-
-        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ p[0] if (ns.v and p[0]) else 'none' }}
-      json_attributes_topic: "smol/5/diag"
-      json_attributes_template: >-
-        {% set ns = namespace(v='') %}{% for kv in value.split('|') %}{% if kv.startswith('ap=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}{% set p = ns.v.split(':') %}{{ {'rssi': (p[1] | int(0)) if p | length >= 2 else 0, 'bssid': (p[2] if p | length >= 3 else ''), 'raw': ns.v} | tojson }}
-      expire_after: 90
+    # --- COEXIST / AP channel: the two hand-written `ap channel` stanzas that used to live here
+    # (ids 8 and 5) ARE GONE — #315. They were the last hand-maintained id list feeding the OTA
+    # coexist signal, and they had already stopped being read.
+    #
+    # WHY THEY WERE WRONG. `sensor.smol_coexist_health` is load-bearing: off-channel is a PROVEN OTA
+    # blocker (co-channel moved 48 KB, off-channel moved 0). It used to compare
+    # `sensor.smol_<id>_ap_channel` for a literal list of candidate ids — 5/7/8/9, then 5/8 after the
+    # id7/id9 retirement — against the elected mesh channel. So its correctness depended on WHICH
+    # BOARD WON THE LAST ELECTION: with the crown at id50/id51/id122 it read `unknown`, and `unknown`
+    # is indistinguishable from "no data yet". A health signal that goes blind by election, silently,
+    # is worse than one that is simply broken.
+    #
+    # WHAT REPLACED THEM, and it is strictly better than a fleet-templated version of the same
+    # stanza: the sensor is now an MQTT trigger on `smol/+/diag`, gated to the ELECTED crown, reading
+    # the firmware's OWN verdict `cc=<0|1>` — computed on the board where the AP channel and the mesh
+    # channel both actually live. Its `crown_ap_channel` / `ap_rssi` / `co_channel` attributes all
+    # come from that same `trigger.payload`, so nothing needed these mirrors any more.
+    #
+    # Verified live 2026-08-01 with the crown at id8: `sensor.smol_coexist_health = healthy`,
+    # `crown_ap_channel = 6`, from a 374 B crown record carrying `cc=1|ap=6:-48:…`. Leaf records are
+    # explicitly CUT before `cc=` (`cut=132` on id5, `cut=120` on id50) — which is why only the crown
+    # reports it, and why gating on the crown is the correct scope rather than a limitation.
+    #
+    # Per-board AP-channel belief still exists fleet-wide if anything ever needs it, and from firmware
+    # discovery rather than by hand: `sensor.smol_<id>_<sigil>_ap_channel_believed` (`apch=`), present
+    # for all five live boards. Do NOT re-add a per-id `ap channel` stanza here.
 
-    # =====================================================================
-    # #309: the per-field DIAG entities THAT USED TO LIVE HERE ARE GONE — the firmware
-    # publishes them as retained MQTT discovery configs now (net/wifi.rs `DIAG_DISCOVERY`).
-    #
-    # WHY: they were hand-written per node id, so a board only appeared in the dashboard if
-    # somebody had typed a stanza for it. ids 50/51/122 were on the mesh with nothing drawn
-    # while dead families for 7/9 kept rendering, and the file could not know an id exists.
-    # The **unique_ids** are unchanged (`smol_<id>_heap_free_mirror`, …) — firmware reproduces
-    # those exactly, and that is what preserves history: a discovery config whose unique_id
-    # matches an existing registry row LANDS ON that row and inherits its entity_id.
-    #
-    # The **entity_ids** are NOT unchanged, and an earlier version of this comment claimed they
-    # were. `object_id` does not pin an entity_id — HA ignores it and composes the id from the
-    # device name instead (#322). So a field only keeps `sensor.smol_<id>_heap_free` where a row
-    # under that unique_id already existed; anywhere it did not, the id comes out
-    # device-composed: `sensor.smol_5_obsidian_aegis_heap_free`.
-    #
-    # Measured on the live fleet 2026-08-01 (entity registry, 312 firmware-published rows):
-    # object_id honoured 127/312 overall, and **0/117 for ids 50/51/122** — the three boards
-    # that never had a hand-written stanza here, so they had no row to inherit. id5 is 2/43
-    # because its old rows used a different scheme (`smol5_heap_free_luna`) that the firmware's
-    # `_mirror` unique_ids do not match. id8 is the mixed case, 40/59.
-    #
-    # The cross-node consumers below and `build_control_room.py` keep working anyway — but
-    # because that generator resolves telemetry ids from the REGISTRY (see its comment at
-    # :166), not because the convention held. Do not address these by convention; #322 carries
-    # the fix. Every board does now get the full set instead of the four that were typed out.
-    #
-    # A field ABSENT from the record now reads HA `unknown` rather than `0`. That is the
-    # point, not a regression: `blrev=`/`brst=` are absent-until-measured, a leaf's record is
-    # cut at 232 B, and the C6 watches stop at `dfwd=`. A `0` for "no answer yet" was a lie
-    # that looked like data.
-    #
-    # STILL HAND-WRITTEN HERE, deliberately — a discovery config cannot express these:
-    #   * `ap channel` — splits `ap=<ch>:<rssi>:<bssid>` into state + json_attributes, and
-    #     `sensor.smol_coexist_health` reads those attributes. `apch=` (what coexist BELIEVES)
-    #     is firmware-published and is the more useful signal.
-    #   * `NTP fresh` — a DERIVED label over two keys (`tage=`+`tsrc=` → fresh/aging/stale/
-    #     no-sync), not a field mirror. `time_sync_age` + `time_source` are published raw.
-    # DELETED WITHOUT A REPLACEMENT (one only): `time offset` / `toff=`, which NO producer has
-    # ever emitted — `set_diag_extra`'s own doc says "toff deferred" — so it had always
-    # rendered a fabricated `0`.
-    #
-    # `cfg=` CONTRACT (pinned, fw #74 stage-2 — still needed by the config-drift comparator in
-    # the template: section below): `cfg=<screen>:<page>,<led>,<mask4hexU>,<units>`, e.g.
-    # `Grid:1,status,0000,F24` — screen = the LIVE rendered screen, mask = #55's %04X hex,
-    # units = temp+clock (e.g. F24).
-    # =====================================================================
     # --- #194/#31 NTP freshness (per-node) — parsed from `tage=`(s since last time-sync) + `tsrc=` in
     # smol/<id>/diag. State: fresh(<300s) / aging(<3600s) / stale(>=3600s) / no-sync (thresholds = #187
     # SYNC_FRESH_S 300 / SYNC_STALE_S 3600). ⚠ HONEST: boots sync once then age climbs — reads
