@@ -1,0 +1,5 @@
+# Cargo fixture with no features, so the #350 feature-coverage arm is inert for cases that
+# target a different arm. Cases that exercise coverage name _cargo_ok.toml via `# CARGO:`.
+[package]
+name = "fixture"
+[features]

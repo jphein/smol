@@ -1,0 +1,10 @@
+# EXPECT: canonical tier drift
+[meta]
+canonical_chip = "esp32c3"
+canonical_tier = "fleet"
+[chip.esp32c3]
+target = "riscv32imc-unknown-none-elf"
+builds = true
+ships = true
+[tier.fleet]
+features = "espnow,cast,io,bard"

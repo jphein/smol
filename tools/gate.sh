@@ -9,15 +9,25 @@
 # ONBOARDING.md points AT this file rather than restating the commands, so the two cannot drift.
 #
 # WHAT IT COVERS
-#   1. cargo check --release across the build tiers (default / wifi / espnow / canonical fleet /
-#      canonical+bard, which is off the fleet image since #347 but still a supported build)
-#   2. cargo clippy --release -D warnings on EVERY tier (#343 — was canonical-only)
+#   0. #350 the build-matrix declarations — the canonical tier matches REPRO_FLEET_FEATURES, every
+#      buildable chip has a #348 ChipBudget (and vice versa), nothing ships that nothing builds,
+#      and the matrix is one-axis-at-a-time rather than a cross product
+#   1. cargo check --release across the build tiers — DERIVED from tools/build-matrix.toml, not
+#      listed here (#350). Adding a chip or a tier is a data change in one file.
+#   2. cargo clippy --release -D warnings on EVERY tier (#343 — was canonical-only), from the
+#      same manifest, so the two lists cannot disagree the way they had already started to
 #   3. the host experiments/*_verify suites
 #   4. the #300 stack floor — the canonical ELF's .stack region vs the floor declared in
-#      rust/clock/src/budget.rs (#348: one definition, parsed by repro_stack_floor)
+#      rust/clock/src/budget.rs (#348: one definition, parsed by repro_stack_floor). The number
+#      is deliberately NOT repeated in this file, in build-matrix.toml, or anywhere else.
+#   5. the crate's own tests/*.rs suites via cargo test (#350) — bard / budget / input. Nothing
+#      ran these before: 57 tests, including the Bard's bit-for-bit golden, that no gate executed
+#   6. tools/test_build_matrix.sh — proof that (0)'s arms can actually fail
 #
 # WHAT IT DOES NOT COVER — read this before trusting a green run:
-#   * `mesh-test`: needs a per-board `DEAF_MACS` that only a real board.rs has.
+#   * `mesh-test`: cannot RUN — it needs a per-board `DEAF_MACS` that only a real board.rs has.
+#     It does now COMPILE, as a tier (#350). "Cannot run" had been silently widened to "cannot
+#     build", which is how it went uncompiled for months.
 #   * espflash `save-image` packaging: not run (no espflash in CI). The stack number does not depend
 #     on it — it is read from the ELF — but image PACKAGING is therefore unproven here.
 #   * Anything requiring hardware: OTA, radio, election, the stack-paint HIGH-WATER measurement.
@@ -72,6 +82,19 @@ if [ "$run_fw" = 1 ]; then
     printf '%s\n' "$out"; bad "shed order"
   fi
 
+  # #350: cheap and before any compile, because everything below DERIVES from this manifest —
+  # a gate that builds the wrong tier list confidently is worse than one that refuses to start.
+  # The arms: the canonical tier matches REPRO_FLEET_FEATURES (the packaging path's own
+  # definition); every buildable chip has a #348 ChipBudget and every ChipBudget has a chip row;
+  # nothing ships that nothing builds; the emitted matrix is one-axis-at-a-time, not a cross
+  # product. `tools/test_build_matrix.sh` (host half) proves each of those can fail.
+  step "build matrix declarations (#350)"
+  if out=$("$ROOT/tools/build_matrix.py" check 2>&1); then
+    printf '%s\n' "$out"; ok "build matrix"
+  else
+    printf '%s\n' "$out"; bad "build matrix"
+  fi
+
   # The tiers. `default` is the always-green baseline; `wifi`/`espnow` are the documented rungs;
   # the canonical fleet tier is what actually ships. A feature added to Cargo.toml and NOT added
   # here is a code path nothing compiles — the `ledger-provision` case that motivated this issue.
@@ -88,9 +111,12 @@ if [ "$run_fw" = 1 ]; then
   # keep it alive. Drop `off-fleet` here and you will see the guard fire; that is the check
   # working, not the tier breaking. `repro_build_bin` refuses to PACKAGE anything naming it, so
   # this cannot leak into a shipped image.
+  # #350: the tier list is DERIVED from tools/build-matrix.toml, not written here. It used to
+  # be a literal in this loop and a second literal in the clippy loop below, and the two had
+  # already drifted — `ledger-provision` was in one and not the other, so that tier compiled
+  # but was never linted. One declaration, two consumers, no third place to forget.
   step "cargo check — build tiers"
-  for tier in "default:" "wifi:wifi" "espnow:espnow" "fleet:$REPRO_FLEET_FEATURES" "bard:bard,off-fleet,$REPRO_FLEET_FEATURES" "ledger-provision:ledger-provision"; do
-    name="${tier%%:*}"; feats="${tier#*:}"
+  while IFS=$'\t' read -r name feats; do
     # A tier naming a feature this branch does not have (e.g. ledger-provision before #181 lands)
     # is SKIPPED, not failed — the gate must work on both sides of that merge.
     if [ -n "$feats" ] && ! grep -qE "^${feats%%,*} *=" "$CLOCK/Cargo.toml"; then
@@ -102,16 +128,23 @@ if [ "$run_fw" = 1 ]; then
     else
       bad "check $name"; tail -15 /tmp/gate-$name.log | sed 's/^/        /'
     fi
-  done
+  done < <("$ROOT/tools/build_matrix.py" emit --for check)
 
   # `-D warnings` on EVERY tier, not just the canonical one. Until #343 this ran on the canonical
   # tier alone because `default`/`wifi` carried dead-code findings (symbols whose only callers are
   # espnow-gated); those now carry item-scoped `#[allow(dead_code)]` with a cited reason, so the
   # gate can cover what ONBOARDING has claimed all along. A tier that only gets `cargo check` has
   # its new warnings invisible — which is how the findings accumulated unnoticed in the first place.
+  # #350: derived from the same manifest as the check loop, so "every tier" is now literally
+  # true instead of "every tier someone remembered to add here". The fleet tier is named
+  # `fleet` in both loops now — it was `canonical` here and `fleet` above, which is why the
+  # two lists could disagree without looking like they did. Log path moves with the name:
+  # /tmp/gate-clippy-fleet.log, was /tmp/gate-clippy-canonical.log.
   step "cargo clippy -D warnings — every tier"
-  for tier in "default:" "wifi:wifi" "espnow:espnow" "canonical:$REPRO_FLEET_FEATURES" "bard:bard,off-fleet,$REPRO_FLEET_FEATURES"; do
-    name="${tier%%:*}"; feats="${tier#*:}"
+  while IFS=$'\t' read -r name feats; do
+    if [ -n "$feats" ] && ! grep -qE "^${feats%%,*} *=" "$CLOCK/Cargo.toml"; then
+      printf '   \033[33mSKIP\033[0m %-16s (feature not in Cargo.toml on this branch)\n' "$name"; continue
+    fi
     args=(--release "${JOBS[@]}"); [ -n "$feats" ] && args+=(--features "$feats")
     if (cd "$CLOCK" && cargo clippy "${args[@]}" -- -D warnings) >/tmp/gate-clippy-$name.log 2>&1; then
       ok "clippy $name"
@@ -120,7 +153,7 @@ if [ "$run_fw" = 1 ]; then
       grep -E "^(error|warning)" /tmp/gate-clippy-$name.log | grep -v "could not compile" \
         | sort -u | sed 's/^/        /' | head -12
     fi
-  done
+  done < <("$ROOT/tools/build_matrix.py" emit --for clippy)
 
   # #300 stack floor, measured with the SAME function the packaging path uses (repro_stack_check).
   # Built with repro_cargo_args so the ELF matches the shipped one's geometry.
@@ -164,6 +197,43 @@ if [ "$run_host" = 1 ]; then
       bad "$n"; tail -10 /tmp/gate-$n.log | sed 's/^/        /'
     fi
   done
+
+  # #350: the crate's OWN test suites — `rust/clock/tests/*.rs`. Found while wiring the matrix:
+  # NOTHING in tools/ or .github/ ran `cargo test`, so `tests/bard.rs` (the Bard's bit-for-bit
+  # golden against an independent reference), `tests/input.rs`, and #348's brand-new
+  # `tests/budget.rs` were three suites no gate executed. #348's PR reported "8/8 host tests"
+  # from a manual run — which is exactly how a suite stops being evidence.
+  #
+  # `--no-default-features` is LOAD-BEARING, not tidiness: the default features pull the
+  # bare-metal stack, and `portable-atomic`'s `unsafe-assume-single-core` then leaks into the
+  # HOST build and hard-errors ("not supported yet on this architecture"). Drop the flag and
+  # this arm fails on a healthy tree.
+  #
+  # Discovered by GLOB for the same reason the loop above is: a list would stop covering what
+  # is added after it.
+  step "crate host test suites (cargo test)"
+  HOST_TRIPLE="${SMOL_HOST_TRIPLE:-$(rustc -vV | sed -n 's/^host: //p')}"
+  for t in "$ROOT/$CLOCK"/tests/*.rs; do
+    [ -f "$t" ] || continue
+    n=$(basename "$t" .rs)
+    if (cd "$ROOT/$CLOCK" && cargo test --no-default-features --features hostsim \
+          --target "$HOST_TRIPLE" --test "$n" "${JOBS[@]}") >/tmp/gate-test-$n.log 2>&1; then
+      # Print the count rather than a bare PASS: "8 passed" is checkable, "ok" is not, and a
+      # suite that silently starts running ZERO tests still says ok.
+      ok "test $n — $(grep -Eo '[0-9]+ passed' /tmp/gate-test-$n.log | tail -1)"
+    else
+      bad "test $n"; tail -12 /tmp/gate-test-$n.log | sed 's/^/        /'
+    fi
+  done
+
+  # #350: prove the matrix checker's arms can fail. Pure text, no cargo — see the file header
+  # for why a green-only demonstration is not evidence.
+  step "build-matrix checker regression suite (#350)"
+  if out=$("$ROOT/tools/test_build_matrix.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -2; ok "test_build_matrix"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_build_matrix"
+  fi
 fi
 
 step "summary"

@@ -104,4 +104,32 @@ jobs:
             echo "⚠️ This bounds the linked **region**, not runtime high-water. A struct in a"
             echo "stack-resident \`RadioManager\` can cost ~1.8 KB of real stack while moving this"
             echo "number by ~32 B. Green here is not evidence of runtime headroom."
+            echo ""
+            echo "⚠️ It is also **tree-dependent** and must not be compared byte-for-byte against a"
+            echo "number from another tree: \`board.rs\`/\`secrets.rs\` are git-ignored and provisioned"
+            echo "per tree, their literals land in \`.rodata\`/\`.data\`, and \`.stack\` is the leftover."
+            echo "Same commit measures ~114,648 on a dev box and ~114,608 here (#348)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # #350: what this run actually covered, from the manifest rather than from this file.
+      #
+      # NOT a `strategy.matrix` fan-out yet, deliberately. Exactly one chip has `builds = true`
+      # today (`esp-hal` is pinned to `esp32c3` and `.cargo/config.toml` pins the target), so a
+      # fan-out would be one job wearing a matrix costume — and a permanently-red S3 arm would
+      # teach everyone to ignore the gate, which is worse than not having it. The manifest is
+      # already the single declaration; when #331 flips a second chip to `builds = true`, this
+      # step's `include` becomes `strategy.matrix` and nothing else moves. Printing it now keeps
+      # the emitter exercised and makes the coverage claim checkable by a reader.
+      - name: Build matrix → job summary
+        if: always()
+        run: |
+          {
+            echo "### Build matrix (derived from \`tools/build-matrix.toml\`)"
+            echo '```'
+            tools/build_matrix.py check || true
+            echo '```'
+            echo "Jobs this manifest declares:"
+            echo '```json'
+            tools/build_matrix.py ci-matrix | python3 -m json.tool
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

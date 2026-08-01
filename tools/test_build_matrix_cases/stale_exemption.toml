@@ -1,0 +1,18 @@
+# CARGO: _cargo_ok.toml
+# EXPECT: both exempted and covered
+[meta]
+canonical_chip = "esp32c3"
+canonical_tier = "fleet"
+[chip.esp32c3]
+target = "riscv32imc-unknown-none-elf"
+builds = true
+ships = true
+[tier.fleet]
+features = "espnow,cast,io"
+[tier.wled]
+features = "wled,${canonical}"
+[exempt]
+default = "the default tier is this feature set"
+hw = "implied"
+wifi = "covered transitively"
+wled = "STALE: a tier covers this now"

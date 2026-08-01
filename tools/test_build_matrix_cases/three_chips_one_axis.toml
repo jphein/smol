@@ -1,0 +1,33 @@
+# EXPECT-OK
+# EXPECT-JOBS: 8
+# BUDGET: _budget_three.rs
+# Three buildable chips x six tiers would be 18 jobs if the axes were crossed. One axis at
+# a time gives 3 (chips x canonical tier) + 5 (canonical chip x the other tiers) = 8. If
+# someone rewrites matrix() to cross-multiply, THIS is the case that goes red.
+[meta]
+canonical_chip = "esp32c3"
+canonical_tier = "fleet"
+[chip.esp32c3]
+target = "riscv32imc-unknown-none-elf"
+builds = true
+ships = true
+[chip.esp32s3]
+target = "xtensa-esp32s3-none-elf"
+builds = true
+ships = false
+[chip.esp32c6]
+target = "riscv32imac-unknown-none-elf"
+builds = true
+ships = false
+[tier.default]
+features = ""
+[tier.wifi]
+features = "wifi"
+[tier.espnow]
+features = "espnow"
+[tier.fleet]
+features = "espnow,cast,io"
+[tier.bard]
+features = "bard,off-fleet,${canonical}"
+[tier.ledger-provision]
+features = "ledger-provision"
