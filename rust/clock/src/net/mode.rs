@@ -651,6 +651,10 @@ struct DiagCounters {
     /// Lowest free-heap reading observed since boot (leak/pressure watermark). `u32::MAX` until
     /// the first sample so `min()` latches the true low-water on the first `diag_sample_heap`.
     heap_min: u32,
+    /// #367: scans DEFERRED because free heap was below `budget::SCAN_HEAP_FLOOR_BYTES`
+    /// (monotonic, saturating). Non-zero means the unbounded `scan_async` collect is genuinely
+    /// pressing on this board's heap — the signal that the latent bug became live here.
+    scan_skip: u16,
     /// BOOT-button SHORT-press count (monotonic, wraps). HA fires a `press` event on each change.
     btn: u16,
     /// BOOT-button LONG-press count (monotonic, wraps). HA fires a `long-press` event on change.
@@ -710,6 +714,7 @@ impl DiagCounters {
     const fn new() -> Self {
         Self {
             heap_min: u32::MAX,
+            scan_skip: 0,
             btn: 0,
             btnl: 0,
             flush_ok: 0,
@@ -3172,6 +3177,14 @@ impl RadioManager {
             log::info!("smol #71: scan skipped — mesh-OTA session active (coexist)");
             return;
         }
+        // #367 HEAP GATE: `scan_async` collects one AccessPointInfo per visible AP and the bound
+        // cannot be restored in esp-radio 0.18 (see the call site). Returning here DEFERS — it
+        // touches no state, so the caller's normal cadence retries on a later tick once heap
+        // recovers. Deliberately placed after the OTA gate: both are "not now", and OTA is the
+        // cheaper test.
+        if !self.scan_heap_ok() {
+            return;
+        }
         let ch_before = self.current_channel();
         // scan_n = scan_with_config_sync_max(Default, N): a synchronous full-band scan capped at N
         // results. We cap generously then keep the strongest few, so a busy band still yields the
@@ -3243,6 +3256,12 @@ impl RadioManager {
     /// re-measures downstream on the next flush; #155 channel-follow re-advertises the new channel.
     /// ⚠️ HW-CANARY-GATED: the scan + reassociate radio path — and whether ESP-NOW coexist follows
     /// the new STA channel — cannot be verified without hardware (same discipline as `run_scan`/OTA).
+    /// #367: deliberately NOT heap-gated, unlike `run_scan`. This returns a `CrownApDecision`, and
+    /// the only "skip" value available is `NoAp` — which the caller cannot distinguish from "no
+    /// usable AP exists" and would act on by shedding the crown. Trading a possible allocation
+    /// spike for a spurious crown shed is a bad trade: the shed is certain, the spike is not.
+    /// If this path ever needs guarding, give the decision an explicit `Deferred` variant first —
+    /// do NOT reuse `NoAp`.
     fn reassoc_ch6_prefer(&mut self) -> crate::net::coexist::CrownApDecision {
         use crate::net::coexist::{select_crown_ap, ApView, CrownApDecision};
         // COEXIST hard gate: never leave the mesh channel mid mesh-OTA transfer (mirrors run_scan).
@@ -3381,6 +3400,34 @@ impl RadioManager {
             let ctx = CrownCtx { reassoc_exhausted: true, better_successor_cc: false };
             self.crown_state = crown_next_state(CrownState::Shed, decision, self.shed_reclaims, ctx);
         }
+    }
+
+    /// #367: may a scan start right now? `false` ⇒ free heap is below
+    /// [`crate::budget::SCAN_HEAP_FLOOR_BYTES`], so `scan_async`'s unbounded per-AP collect could
+    /// exhaust the heap and panic-reboot (the bound cannot be restored in esp-radio 0.18 — see the
+    /// note at the call site).
+    ///
+    /// **DEFER, NEVER ABANDON.** Callers must leave whatever drives the retry untouched so the
+    /// scan happens on a later tick. A skipped-and-forgotten scan on the #269 recovery path would
+    /// convert "reboot" into "stranded, silently, while still looking alive" — which is worse,
+    /// because a reboot at least re-enters discovery.
+    ///
+    /// Trips are COUNTED (`diag.scan_skip`) so this is observable in the dense environment where
+    /// it fires. A guard that degrades silently is indistinguishable from dead code, and we would
+    /// have no way to tell whether it ever protected anything.
+    fn scan_heap_ok(&mut self) -> bool {
+        let free = esp_alloc::HEAP.free() as u32;
+        if free < crate::budget::SCAN_HEAP_FLOOR_BYTES {
+            self.diag.scan_skip = self.diag.scan_skip.saturating_add(1);
+            log::warn!(
+                "smol #367: scan DEFERRED — free heap {} B < floor {} B (skips={})",
+                free,
+                crate::budget::SCAN_HEAP_FLOOR_BYTES,
+                self.diag.scan_skip
+            );
+            return false;
+        }
+        true
     }
 
     /// #70: sample the live free-heap and lower the min-heap watermark. Cheap (one `HEAP.free()`);
