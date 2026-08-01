@@ -1,0 +1,31 @@
+# #349 host-test harness for the PURE image-target guard (net/target.rs) — the structured
+# `TargetId` embedded in every OTA-capable image and the checker a board runs over an incoming
+# one before it commits. Runs OFF-target (std) via `cargo run`; `#[path]`-includes the real
+# net/target.rs (no drift), exactly like sth_verify / flood_verify / ota_http_verify.
+#
+# The point of this harness is NOT that the guard accepts a matching image. WLED ships a guard
+# of the same shape whose minimum-version half CANNOT FIRE (the descriptor is instantiated with
+# a literal `1` where the constant belongs, and the check reads `> 1`) — and a test that only
+# exercises the happy path would have passed on that code too. So every assertion below that
+# matters is a REFUSAL, one per rejection reason, plus a scan over a synthetic ~600 KB image.
+#
+# Discovered automatically by tools/gate.sh's `experiments/*_verify` glob → runs in CI on every
+# branch push. No dependencies: the module under test is pure.
+[package]
+name = "target_guard_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "target_guard_verify"
+path = "src/main.rs"
+# DECLARED, never enabled. net/target.rs cfg-gates its firmware-only half (the `SELF` identity
+# built from `env!("SMOL_CHIP_ID")`) behind `wifi`; naming the feature here satisfies cargo's
+# check-cfg without turning it on, so the host build stays the pure core and the harness compiles
+# warning-clean. Enabling it would need the build.rs env stamp, which off-target has no business
+# having.
+[features]
+wifi = []
+[dependencies]
+[profile.dev]
+opt-level = 0

@@ -602,19 +602,35 @@ impl ImageWriter {
         true
     }
 
-    /// Flush the tail, then the INTEGRITY GATE: written byte-count == announced size
-    /// AND running SHA-256 == announced hash. `true` ⇒ the whole image landed intact
-    /// and [`activate`] is safe. otadata is still untouched here.
-    pub fn finalize(mut self, expected_size: u32, expected_sha: &[u8; 32]) -> bool {
+    /// Flush the tail, then the two gates that stand between a downloaded image and
+    /// `activate`:
+    ///
+    /// 1. **Integrity** — written byte-count == announced size AND a READBACK SHA-256 of
+    ///    `slot[..size]` == the signed hash.
+    /// 2. **#349 Suitability** — the target descriptor embedded in those same readback bytes
+    ///    says this image is for a board like this one.
+    ///
+    /// `Ok(())` ⇒ the image landed intact AND belongs here, and [`activate`] is safe.
+    /// otadata is untouched throughout, so either failure discards with the good slot active.
+    ///
+    /// The suitability scan rides the integrity readback deliberately: a #267-resumed fetch
+    /// never re-feeds the prefix already on flash, so scanning the incoming STREAM would miss a
+    /// descriptor in the skipped bytes and refuse a good image as `tgt-absent`. Reading the
+    /// slot back is burst-count invariant — it sees exactly the bytes that would boot.
+    pub fn finalize(
+        mut self,
+        expected_size: u32,
+        expected_sha: &[u8; 32],
+    ) -> Result<(), FinalizeFail> {
         use embedded_storage::nor_flash::ReadNorFlash;
         use sha2::Digest;
         if !self.flush_stage() {
             ota_resume_clear();
-            return false;
+            return Err(FinalizeFail::Integrity);
         }
         if self.written != expected_size {
             ota_resume_clear();
-            return false;
+            return Err(FinalizeFail::Integrity);
         }
         // #267/#40: READBACK-SHA over `slot[..size]` — the exact bytes that will boot — instead of a
         // streaming hash. Burst-count invariant, so a fetch resumed across N bursts verifies
@@ -623,6 +639,9 @@ impl ImageWriter {
         // are read legally but not hashed), mirroring `LeafImageWriter::finalize`.
         let buf = unsafe { &mut *core::ptr::addr_of_mut!(OTA_READBACK) };
         let mut hasher = sha2::Sha256::new();
+        // #349: one pass, two consumers — the SHA and the target-descriptor scan see the
+        // identical bytes, so the identity we judge is provably the identity we hashed.
+        let mut scan = crate::net::target::DescScan::new();
         let mut off = 0u32;
         let mut read_ok = true;
         while off < expected_size {
@@ -633,11 +652,29 @@ impl ImageWriter {
                 break;
             }
             hasher.update(&buf[..want as usize]);
+            scan.feed(&buf[..want as usize]);
             off += want;
         }
         ota_resume_clear(); // fetch terminal (success OR fail) → a fresh attempt starts from 0
-        read_ok && hasher.finalize().as_slice() == &expected_sha[..]
+        if !read_ok || hasher.finalize().as_slice() != &expected_sha[..] {
+            return Err(FinalizeFail::Integrity);
+        }
+        // Integrity FIRST, suitability second: a corrupt image's "descriptor" is meaningless,
+        // so a mismatch reported here is always a mismatch of an image we know is intact.
+        scan.verdict(crate::net::target::SELF).map_err(FinalizeFail::Target)
     }
+}
+
+/// Why a finished download was not activated. Split so the retained `smol/<id>/ota/diag`
+/// record can say WHICH gate refused: a bad transfer and an image built for someone else are
+/// different operator problems, and before #349 both would have surfaced as `at=verify`.
+#[cfg(feature = "espnow")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FinalizeFail {
+    /// Size mismatch, flash read error, or SHA-256 mismatch.
+    Integrity,
+    /// #349: intact, authentic — and not for this board.
+    Target(crate::net::target::TargetReject),
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,29 +1357,41 @@ impl LeafImageWriter {
         true
     }
 
-    /// The INTEGRITY GATE: exact size match AND a READBACK SHA-256 of `slot[..size]`
-    /// (the exact bytes that will boot) == the signed sha. `true` ⇒ [`activate`] is
-    /// safe. otadata is still untouched here — a failure discards with the good slot
-    /// active. The caller has ALREADY verified the ed25519 sig over the manifest.
-    pub fn finalize(self, expected_size: u32, expected_sha: &[u8; 32]) -> bool {
+    /// The INTEGRITY GATE (exact size match AND a READBACK SHA-256 of `slot[..size]` — the
+    /// exact bytes that will boot — == the signed sha), plus the #349 SUITABILITY gate over
+    /// those same bytes. `Ok(())` ⇒ [`activate`] is safe. otadata is still untouched here — a
+    /// failure discards with the good slot active. The caller has ALREADY verified the ed25519
+    /// sig over the manifest.
+    ///
+    /// A leaf takes its image from a mesh peer rather than from the staged URL, so it is the
+    /// path MOST able to receive an image intended for someone else: the relaying crown picks
+    /// the recipient. The guard therefore has to live here too, and it is the same guard —
+    /// three consumers implementing three subtly different checks is the failure this type was
+    /// designed to prevent.
+    pub fn finalize(
+        self,
+        expected_size: u32,
+        expected_sha: &[u8; 32],
+    ) -> Result<(), FinalizeFail> {
         use embedded_storage::nor_flash::ReadNorFlash;
         use sha2::Digest;
         if self.written != expected_size {
-            return false;
+            return Err(FinalizeFail::Integrity);
         }
         let mut flash = FlashStorage::new();
         let mut ptbuf = [0u8; PT_SCRATCH];
         let pt = match read_partition_table(&mut flash, &mut ptbuf) {
             Ok(pt) => pt,
-            Err(_) => return false,
+            Err(_) => return Err(FinalizeFail::Integrity),
         };
         let app = match pt.find_partition(PartitionType::App(self.sub)) {
             Ok(Some(p)) => p,
-            _ => return false,
+            _ => return Err(FinalizeFail::Integrity),
         };
         let mut region = app.as_embedded_storage(&mut flash);
         let buf = unsafe { &mut *core::ptr::addr_of_mut!(OTA_READBACK) };
         let mut hasher = sha2::Sha256::new();
+        let mut scan = crate::net::target::DescScan::new();
         let mut off = 0u32;
         while off < expected_size {
             let want = core::cmp::min(buf.len() as u32, expected_size - off);
@@ -1350,12 +1399,16 @@ impl LeafImageWriter {
             // non-word-aligned tail still reads legally — extra bytes are not hashed).
             let read_len = (want.div_ceil(4) * 4) as usize;
             if region.read(off, &mut buf[..read_len]).is_err() {
-                return false;
+                return Err(FinalizeFail::Integrity);
             }
             hasher.update(&buf[..want as usize]);
+            scan.feed(&buf[..want as usize]);
             off += want;
         }
-        hasher.finalize().as_slice() == &expected_sha[..]
+        if hasher.finalize().as_slice() != &expected_sha[..] {
+            return Err(FinalizeFail::Integrity);
+        }
+        scan.verdict(crate::net::target::SELF).map_err(FinalizeFail::Target)
     }
 }
 

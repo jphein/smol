@@ -2502,9 +2502,25 @@ mod ota_fail {
     pub const DEADLINE: u32 = 10; // global OTA_FETCH_BUDGET elapsed mid-download
     pub const VERIFY: u32 = 11; // download completed but the size/SHA-256/ed25519 gate rejected it
     pub const RECYCLE: u32 = 12; // the socket never returned to a connectable state between chunks
+    /// #349: first code of the SUITABILITY band — the image is intact and authentic, and it is
+    /// not for this board. `TARGET_BASE + TargetReject::code()`, so the `at=` label IS the
+    /// reason (`tgt-chip`, `tgt-bench`, …) with no second mapping table to drift.
+    ///
+    /// This band exists because folding a suitability refusal into `VERIFY` would have made the
+    /// two most different OTA failures indistinguishable on the wire: "the bytes are damaged"
+    /// and "the bytes are perfect, but they are someone else's". Release images are
+    /// serial-silent, so an operator's only account of a refusal is this label.
+    pub const TARGET_BASE: u32 = 13;
 
     /// Short, stable label for the retained diag payload (kept terse — the MQTT packet is capped).
     pub fn label(fp: u32) -> &'static str {
+        // #349 suitability band, delegated to the reject type itself so this function can never
+        // disagree with it about what a code means.
+        if fp >= TARGET_BASE {
+            if let Some(r) = crate::net::target::TargetReject::from_code((fp - TARGET_BASE) as u8) {
+                return r.label();
+            }
+        }
         match fp {
             ASSOC => "assoc",
             DHCP => "dhcp",
@@ -5484,6 +5500,19 @@ pub fn run_ota_fetch(
         port,
         path
     );
+    // #349: a genuine runtime READ of the embedded target descriptor. Two jobs, both
+    // load-bearing. (a) It is the reference that stops `--gc-sections` from discarding the very
+    // bytes every peer reads to identify our images — `#[used]` alone guards compiler DCE, not
+    // linker GC. (b) It re-decodes them and compares against `SELF`, so a descriptor that is
+    // present but wrong is announced HERE rather than being discovered by a peer refusing our
+    // build. A gate whose own inputs are never checked is the failure mode this whole issue is
+    // about; this is that check.
+    if !crate::net::target::self_desc_present() {
+        log::error!(
+            "smol #349: this image's OWN target descriptor is missing or does not decode to SELF \
+             — peers will report tgt-absent for builds from this commit (build problem, not a fleet one)"
+        );
+    }
 
     let mut iface = create_interface(device);
     let mut sockets_storage: [SocketStorage; 2] = Default::default();
@@ -5989,9 +6018,12 @@ pub fn run_ota_fetch(
     // `splitn(5)` a require-off flag would only fail-OPEN on a bad 5-field sig, pointless;
     // the "deliver #32 UNSIGNED" rollout is a publish-format choice — a 4-field announce
     // pre-#32 boards parse — not a board flag.)
-    if writer.finalize(announce.size, &announce.sha256)
-        && crate::ota::verify_signature(announce.signed_msg(), announce.sig())
-    {
+    // #349: `finalize` now returns WHICH gate refused — integrity, or suitability (the image is
+    // intact and authentic but built for a different board). Both still leave otadata untouched,
+    // so the good slot boots either way; they are separated only so the retained diag can name
+    // the real problem.
+    let outcome = writer.finalize(announce.size, &announce.sha256);
+    if outcome.is_ok() && crate::ota::verify_signature(announce.signed_msg(), announce.sig()) {
         // #188 follow-up: publish ONE final progress line at `done == total`, so the retained topic
         // describes the most recent OUTCOME rather than the most recent FAILURE.
         //
@@ -6030,6 +6062,25 @@ pub fn run_ota_fetch(
         log::info!("smol OTA: image VERIFIED (SHA-256 + ed25519) — activating the new slot");
         crate::ota::activate(target, announce.build, false); // self-OTA → confirm via DHCP
         false // reached only if the otadata write failed
+    } else if let Err(crate::ota::FinalizeFail::Target(why)) = outcome {
+        // #349: the download completed, the bytes are intact — and the image is not for this
+        // board. `smol/ota/staged` is retained FLEET-WIDE, so every board sees every
+        // announcement; with the fleet spanning C3-OLED / C3-SuperMini / C6 / S3 this is the
+        // ordinary way a board meets an image it must not install, not an exotic one. Reported
+        // at its own `at=tgt-*` code rather than as `verify`, because "someone staged the wrong
+        // image" and "the transfer corrupted" want completely different operator responses.
+        *fail = Some((
+            chunk_n,
+            chunk_n,
+            chunk_retries,
+            stall,
+            ota_fail::TARGET_BASE + why.code() as u32,
+        ));
+        log::error!(
+            "smol #349: image REFUSED — intact and authentic, but not for this board ({}) — discarded (good slot intact)",
+            why.label()
+        );
+        false
     } else {
         // #139-followup: the download COMPLETED but the integrity/authenticity gate rejected it
         // (corrupt/truncated/bad-sig). Record K=N (all chunks fetched) + at=verify so the fleet diag

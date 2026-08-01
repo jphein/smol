@@ -1058,6 +1058,84 @@ the gateway treats last-window exhaustion as a *confirm*, not a failure.
 LDBG names *why* a `relay-failed` had `otan=0` (a leaf that heard no OTAM = an RX problem, not a
 dead leaf). It surfaces on the retained `smol/<leaf>/ota/relaydiag` topic.
 
+## Image target descriptor — what an image is FOR (#349)
+
+Not a frame: a **16-byte record embedded in the firmware image itself**, so a board can decide
+whether an image it has just downloaded is *for a board like it*. The OTA chain already proves
+the image is **authentic** (ed25519 over `build|size|sha256`) and **intact** (readback SHA-256);
+this is the missing third property, **suitability**. `smol/ota/staged` is retained fleet-wide, so
+every board sees every announcement — with the fleet spanning C3-OLED / C3-SuperMini / C6 / S3
+that stops being theoretical.
+
+Cross-*chip* is already caught by the second-stage bootloader (`esp_image_header_t.chip_id`) —
+but only by boot-looping into rollback. A cross-*tier* image passes every check smol had **and
+boots**.
+
+**Layout** — little-endian, 16 bytes, found by a **linear scan for the magic** (no fixed offset:
+where `.rodata` lands is a linker detail). Source: `rust/clock/src/net/target.rs`.
+
+| off | bytes | field | meaning |
+|---|---|---|---|
+| 0 | 4 | magic | `"SMLT"` (`0x53 0x4D 0x4C 0x54`) |
+| 4 | 1 | desc_version | descriptor FORMAT version (currently **1**) |
+| 5 | 1 | chip | `1`=ESP32-C3 `2`=ESP32-C6 `3`=ESP32-S3; `0`=unknown. Derived by `build.rs` **from the target triple**, so it cannot misreport |
+| 6 | 2 | features | LE capability bitset: `1<<0` wifi · `1<<1` espnow · `1<<2` io · `1<<3` cast · `1<<4` wled · `1<<5` bard · `1<<6` mesh-test · `1<<7` coexist-soak · `1<<8` stack-paint |
+| 8 | 1 | compat | the persistent-state (NVS record) layout this image writes |
+| 9 | 1 | min_from_compat | the **oldest** running `compat` this image will install over |
+| 10 | 2 | reserved | 0 (inside the checksum) |
+| 12 | 4 | checksum | LE FNV-1a/32 over bytes 0..12 |
+
+The checksum is what lets a 4-byte magic be trusted after a scan over ~600 KB of arbitrary
+bytes — a real 1,156,864 B fleet image contains **two** `SMLT` occurrences and only **one** that
+checksums (the other is the scanner's own constant), so scanning resumes past a failed candidate.
+
+**The five refusals** (`net::target::decide`, in order). All are DATA compared against DATA;
+nothing names a board, and a new legitimate cross-flash is a bitset, never a branch:
+
+| reason | token | rule |
+|---|---|---|
+| unreadable | `tgt-descver` | `image.desc_version > 1` — cannot read its fields, so cannot judge it |
+| wrong silicon | `tgt-chip` | `image.chip != running.chip` |
+| state too old | `tgt-compat` | `running.compat < image.min_from_compat` |
+| strands the board | `tgt-featloss` | image drops a feature in `wifi\|espnow` that this board has. **espnow counts**: `run_ota_fetch` is `cfg(espnow)`, so a wifi-only image can never self-update again |
+| bench tier | `tgt-bench` | image carries a `mesh-test`/`coexist-soak`/`stack-paint` bit this board does not itself run |
+| no descriptor | `tgt-absent` | no valid record anywhere in the image — fails **closed** |
+
+**Where it is checked.** In `ImageWriter::finalize` / `LeafImageWriter::finalize`, over the
+**slot readback** that already computes the integrity SHA — one pass, two consumers, so the
+identity judged is provably the identity hashed. Scanning the incoming *stream* instead would
+break on a #267-resumed fetch, which skips a prefix already on flash. `otadata` is untouched at
+that point, so a refusal costs a download and nothing else.
+
+**Where it surfaces.** Self-fetch → retained `smol/<id>/ota/diag` as `at=<token>` (fail-point
+codes `13 + reason`, alongside the existing `assoc`/`stall`/`verify`). Leaf mesh-OTA → the LDBG
+`verdict` byte as `8 + reason` (`8` absent … `13` bench), i.e. `smol/<leaf>/ota/relaydiag`'s
+`V<n>`. Release images are serial-silent, so these are the only account of a refusal.
+
+**For a non-Rust fleet member** (#331 Phase 1 keeps Ember on ESPHome) the emittable form is:
+
+```c
+struct __attribute__((packed)) smol_target_desc_t {
+  uint32_t magic;         // 0x544C4D53  ("SMLT" little-endian)
+  uint8_t  desc_version;  // 1
+  uint8_t  chip;          // 1=C3 2=C6 3=S3
+  uint16_t features;      // bitset above
+  uint8_t  compat;
+  uint8_t  min_from_compat;
+  uint16_t reserved;      // 0
+  uint32_t checksum;      // FNV-1a/32 over the first 12 bytes
+};
+```
+
+**Not in here, on purpose:** the board **variant** (OLED vs SuperMini). That is detected at
+runtime (`crate::headless()`); a variant that is not a build artifact needs no OTA guard, no CI
+job, and no row in a table.
+
+**Not yet done** (device-side refusal landed first): the staged manifest still carries no target
+tuple, so a board refuses *after* downloading rather than before; `smol/ota/staged` is still one
+fleet-wide topic; and there is no publisher-side `--force-target-mismatch` escape hatch. Today's
+escape hatch is a USB flash.
+
 ## MQTT burst — the LAN transport that retires the UDP collector
 
 **What changed (v2 pivot).** v1 shipped a Python **collector** on disks that took
