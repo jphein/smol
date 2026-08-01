@@ -410,10 +410,23 @@ template:
           {%- elif spread | count > 1 -%}{{ m | count }}/{{ f | count }} DISAGREE
           {%- elif silent | count > 0 -%}{{ m | count }}/{{ f | count }} agree · {{ silent | join(',') }} silent
           {%- else -%}{{ m | count }}/{{ f | count }} agree{%- endif -%}
+        # Derived from the SOURCE attributes, never from this sensor's own state. Reading
+        # `states('sensor.smol_bard_delivery_agreement')` here was a SELF-REFERENCE: `icon` renders
+        # in the same pass as `state`, so it saw the PREVIOUS value and the icon lagged one render
+        # behind the number printed beside it — worst at exactly the moment it matters, the render
+        # where agreement first breaks. A template reading its own entity can also trip HA's
+        # loop detection and log noise for it.
+        #
+        # No string-matching on the state either, which is what made the self-reference tempting.
+        # The three cases reduce to COUNTS, because `nodes` is intersected with `fleet` on every
+        # render (so its keys are always a subset): `silent > 0` is exactly `m|count < f|count`.
+        # Cheaper than the string form it replaces, and it cannot drift out of step with the
+        # wording of `state:`.
         icon: >-
-          {%- set s = states('sensor.smol_bard_delivery_agreement') -%}
-          {%- if 'DISAGREE' in s -%}mdi:sync-alert
-          {%- elif 'silent' in s or 'nothing' in s or 'no fleet' in s -%}mdi:sync-circle
+          {%- set m = state_attr('sensor.smol_bard_delivery_nodes', 'nodes') or {} -%}
+          {%- set f = state_attr('sensor.smol_bard_delivery_nodes', 'fleet') or [] -%}
+          {%- if m.values() | unique | list | count > 1 -%}mdi:sync-alert
+          {%- elif f | count == 0 or m | count == 0 or (m | count) < (f | count) -%}mdi:sync-circle
           {%- else -%}mdi:sync{%- endif -%}
         attributes:
           silent: >-
@@ -497,10 +510,16 @@ template:
           {%- elif spread | count > 1 -%}{{ m | count }}/{{ f | count }} DISAGREE
           {%- elif silent | count > 0 -%}{{ m | count }}/{{ f | count }} agree · {{ silent | join(',') }} silent
           {%- else -%}{{ m | count }}/{{ f | count }} agree{%- endif -%}
+        # Same fix as the delivery judge above, same reason — see its comment. This one mattered
+        # slightly more: `tale` currently has NO retained messages fleet-wide, so its state sits at
+        # `nothing reported`, and a self-referencing icon starting from `unknown` would render
+        # `mdi:sync` ("all agree") on the very first pass — the most reassuring icon available for
+        # the emptiest possible state.
         icon: >-
-          {%- set s = states('sensor.smol_bard_tale_agreement') -%}
-          {%- if 'DISAGREE' in s -%}mdi:sync-alert
-          {%- elif 'silent' in s or 'nothing' in s or 'no fleet' in s -%}mdi:sync-circle
+          {%- set m = state_attr('sensor.smol_bard_tale_nodes', 'nodes') or {} -%}
+          {%- set f = state_attr('sensor.smol_bard_tale_nodes', 'fleet') or [] -%}
+          {%- if m.values() | unique | list | count > 1 -%}mdi:sync-alert
+          {%- elif f | count == 0 or m | count == 0 or (m | count) < (f | count) -%}mdi:sync-circle
           {%- else -%}mdi:sync{%- endif -%}
         attributes:
           silent: >-
