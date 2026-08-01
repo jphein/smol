@@ -1835,8 +1835,26 @@ automation:
       - platform: time_pattern
         minutes: "/5"
     action:
+      # #332 — this read ["7", "8", "9"]. ids 7 and 9 are RETIRED, and with the /5-min heartbeat
+      # above that republished retained config for two nonexistent boards every five minutes
+      # (lucid caught it clock-aligned at 07:50/07:55/08:00 while characterising #324 contamination).
+      #
+      # Measured on the broker 2026-08-01, and it is the exact inverse of what it looks like:
+      #   smol/7/config/custom = "unavailable"   (retained)
+      #   smol/9/config/custom = "unavailable"   (retained)
+      #   smol/8/config/custom = <nothing retained>
+      # The payload is `states('sensor.smol_<id>_custom_lay')`. Only id8 ever had that compose
+      # sensor (:705); 7 and 9 are #319 registry HUSKS still reading `unavailable`, so the literal
+      # string "unavailable" is what got written. id8's renders '' — a zero-length payload, which
+      # MQTT treats as a retained DELETE. So this automation was CLEARING the real board's config
+      # and writing garbage to the two retired ones, five minutes apart, indefinitely.
+      #
+      # ["8"] and NOT a fleet-discovery template (cf. #316): the payload comes from a hand-written
+      # per-id compose sensor, and only id8 has one. Templating over the discovered fleet would
+      # publish "unavailable" to all six boards — strictly worse. Enumerate the fleet here only
+      # once the compose sensors are generated per node, which is #45's own residual.
       - repeat:
-          for_each: ["7", "8", "9"]
+          for_each: ["8"]
           sequence:
             # #160: a node with an ACTIVE notification (input_text.smol_<id>_notify_wire set) owns
             # config/custom — skip it here so the heartbeat/start republish never WIPES the message.
@@ -1872,8 +1890,16 @@ automation:
       - platform: homeassistant
         event: start
     action:
+      # #332 sweep — same hardcoded ["7", "8", "9"] as #45 above, same retired ids. This one has NO
+      # time_pattern (state-change + HA start only), so it is not the 5-minute republisher lucid
+      # measured; it still wrote retained residue to both retired boards, confirmed on the broker:
+      #   smol/7/config/plugins = "0000"   smol/9/config/plugins = "0000"   (smol/8 = "00FF")
+      # `0000` because the mask is built from `is_state('input_boolean.smol_<id>_plugin_*', 'on')`
+      # and only id8 has those helpers — every bit reads false, so a retired board was told to hide
+      # every plugin. Same reason as above for ["8"] rather than a fleet template: the mask has no
+      # source for a node without the helpers.
       - repeat:
-          for_each: ["7", "8", "9"]
+          for_each: ["8"]
           sequence:
             - variables:
                 n: "{{ repeat.item }}"
