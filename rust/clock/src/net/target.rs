@@ -113,6 +113,21 @@ pub const CHIP_ESP32C3: u8 = 1;
 pub const CHIP_ESP32C6: u8 = 2;
 pub const CHIP_ESP32S3: u8 = 3;
 
+/// The chip's operator-facing name — the same spelling `budget.rs` and `build.rs` use, and the
+/// segment a per-chip MQTT topic is built from (`smol/ota/staged/esp32c3`).
+///
+/// One table, because these names are now load-bearing in three places (topic routing, the
+/// `SMOL_CHIP` build override, and #348's `ChipBudget.chip`). #348 says outright that **#349
+/// owns chip identity**; this is that owner.
+pub fn chip_name(chip: u8) -> &'static str {
+    match chip {
+        CHIP_ESP32C3 => "esp32c3",
+        CHIP_ESP32C6 => "esp32c6",
+        CHIP_ESP32S3 => "esp32s3",
+        _ => "unknown",
+    }
+}
+
 // --- feature axis ----------------------------------------------------------------------
 // One bit per WIRE-VISIBLE capability. A bitset rather than a "tier" label is the direct
 // repair of WLED's opaque `release_name`: the checker can ask "does this image keep the
@@ -331,6 +346,117 @@ pub fn decode(rec: &[u8]) -> Option<TargetId> {
         compat: rec[8],
         min_from_compat: rec[9],
     })
+}
+
+// ---------------------------------------------------------------------------------------
+// Hex form — the SAME 16 bytes, for the signed OTA manifest
+// ---------------------------------------------------------------------------------------
+
+/// Hex length of a descriptor carried as a manifest field.
+pub const DESC_HEX_LEN: usize = DESC_LEN * 2;
+
+/// Serialise a [`TargetId`] as the lowercase-hex form used in the `OTA2|` manifest.
+///
+/// **This is deliberately the identical 16 bytes as the embedded descriptor, magic and all** —
+/// not a second, tidier encoding of the same facts. One encoding means the publisher can lift
+/// the record verbatim out of the image it just built and paste it into the manifest, which
+/// makes "the manifest says one thing and the image says another" structurally impossible
+/// rather than merely unlikely. (WLED derives its artifact FILENAME from the same define that
+/// makes the embedded string, for exactly this reason; the 4 magic bytes are the small price.)
+pub fn encode_hex(t: &TargetId) -> [u8; DESC_HEX_LEN] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let raw = t.encode();
+    let mut out = [0u8; DESC_HEX_LEN];
+    let mut i = 0;
+    while i < DESC_LEN {
+        out[i * 2] = HEX[(raw[i] >> 4) as usize];
+        out[i * 2 + 1] = HEX[(raw[i] & 0x0f) as usize];
+        i += 1;
+    }
+    out
+}
+
+/// Parse the hex manifest field back into a [`TargetId`]. `None` on wrong length, a non-hex
+/// character, a bad magic, or a bad checksum — the same fail-closed rules as [`decode`], so a
+/// mangled manifest field can never be read as a permissive target.
+pub fn decode_hex(s: &str) -> Option<TargetId> {
+    let b = s.as_bytes();
+    if b.len() != DESC_HEX_LEN {
+        return None;
+    }
+    let mut raw = [0u8; DESC_LEN];
+    let mut i = 0;
+    while i < DESC_LEN {
+        raw[i] = (hexval(b[i * 2])? << 4) | hexval(b[i * 2 + 1])?;
+        i += 1;
+    }
+    decode(&raw)
+}
+
+fn hexval(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The signed manifest M — the string the ed25519 signature covers
+// ---------------------------------------------------------------------------------------
+
+/// The fields of a signed OTA manifest M, in either generation:
+///
+/// * `build|size|sha256hex`             — #32 legacy, `target: None`
+/// * `build|size|sha256hex|targethex`   — #349
+///
+/// This lives HERE, in the pure module, rather than beside the flash writer, for one reason:
+/// **M is the exact string the signature covers, and it is also the compatibility boundary that
+/// decides whether an un-upgraded fleet gets stranded.** That is not something to leave provable
+/// only on hardware. `experiments/target_guard_verify` exercises both generations, including the
+/// legacy form a pre-#349 publisher emits, so "old lines still parse" is a test rather than a
+/// belief. `ota.rs` wraps this; there is one definition.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Manifest {
+    pub build: u32,
+    pub size: u32,
+    pub sha256: [u8; 32],
+    pub target: Option<TargetId>,
+}
+
+/// Parse M. Fail-closed on anything malformed.
+///
+/// Strictness that does the work: `splitn(4)` folds any 5th field into the target slot, where
+/// [`decode_hex`]'s exact-length + magic + checksum checks reject it; on the 3-field form the
+/// exact-64 sha check rejects a trailing tail the same way. A present-but-unparseable target
+/// fails the WHOLE manifest rather than degrading to `None` — a corrupted target must never be
+/// read as a permissive one.
+pub fn parse_manifest_str(m: &str) -> Option<Manifest> {
+    let mut it = m.splitn(4, '|');
+    let build: u32 = it.next()?.parse().ok()?;
+    let size: u32 = it.next()?.parse().ok()?;
+    let sha256 = parse_sha256_hex(it.next()?)?;
+    let target = match it.next() {
+        Some(t) => Some(decode_hex(t)?),
+        None => None,
+    };
+    Some(Manifest { build, size, sha256, target })
+}
+
+/// Exactly 64 lowercase/uppercase hex chars → 32 bytes. `None` on any other length.
+fn parse_sha256_hex(hex: &str) -> Option<[u8; 32]> {
+    let b = hex.as_bytes();
+    if b.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = (hexval(b[i * 2])? << 4) | hexval(b[i * 2 + 1])?;
+        i += 1;
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------------------

@@ -319,6 +319,60 @@ SIZE="$(stat -c%s "$BIN")"
 SHA="$(sha256sum "$BIN" | cut -d' ' -f1)"
 [ "$SIZE" -le "$SLOT_MAX" ] || die "image $SIZE B > slot $SLOT_MAX B (0x1F0000) — WILL NOT FIT, aborting"
 
+# ---- #349: read the TARGET DESCRIPTOR out of the image we are about to publish ----------
+# The descriptor is a 16-byte record (magic "SMLT" + fields + FNV-1a/32 checksum) that the
+# firmware embeds in itself; see rust/clock/src/net/target.rs and docs/protocol.md.
+#
+# It is EXTRACTED FROM THE BINARY, never recomputed from the build flags. That is the whole
+# point: the manifest's target and the image's target are then the same 16 bytes by
+# construction, so they cannot disagree. Deriving it a second way here would be exactly WLED's
+# bug — their descriptor is instantiated with a literal where the constant belongs, and the two
+# silently drifted apart.
+#
+# A real image contains TWO "SMLT" occurrences and only ONE that checksums (the other is the
+# firmware's own scanner constant), so the checksum is what selects the record — matching the
+# device-side scanner byte for byte.
+read_target_desc() { # <bin> → "<hexdesc> <chipname>" on stdout, non-zero if absent/ambiguous
+  python3 - "$1" <<'PY'
+import re, sys
+CHIPS = {1: "esp32c3", 2: "esp32c6", 3: "esp32s3"}
+data = open(sys.argv[1], "rb").read()
+def fnv(b):
+    h = 0x811c9dc5
+    for x in b:
+        h ^= x
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return h
+found = []
+for m in re.finditer(re.escape(b"SMLT"), data):
+    rec = data[m.start():m.start() + 16]
+    if len(rec) == 16 and int.from_bytes(rec[12:16], "little") == fnv(rec[:12]):
+        found.append(rec)
+uniq = {r.hex() for r in found}
+if not uniq:
+    sys.stderr.write("no valid #349 target descriptor in the image\n"); sys.exit(1)
+if len(uniq) > 1:
+    sys.stderr.write("MULTIPLE conflicting target descriptors in the image: %s\n" % sorted(uniq)); sys.exit(1)
+rec = found[0]
+chip = CHIPS.get(rec[5])
+if chip is None:
+    sys.stderr.write("image declares unknown chip id %d\n" % rec[5]); sys.exit(1)
+print("%s %s" % (rec.hex(), chip))
+PY
+}
+if _desc_out="$(read_target_desc "$BIN")"; then
+  TARGET_HEX="${_desc_out%% *}"; TARGET_CHIP="${_desc_out##* }"
+  echo "target  ${TARGET_CHIP}  desc ${TARGET_HEX}"
+else
+  # Pre-#349 image (or --bin of an old artifact): stage LEGACY-ONLY. Refusing here would block
+  # staging a rollback build, and the device-side descriptor check already fails such an image
+  # closed if it ever reaches a board that expects one.
+  TARGET_HEX=""; TARGET_CHIP=""
+  echo "WARNING: #349 — no target descriptor in this image; staging the LEGACY line only." >&2
+  echo "         Boards route by chip on smol/ota/staged/<chip>; this build will only be seen" >&2
+  echo "         on the fleet-wide smol/ota/staged topic." >&2
+fi
+
 # ---- host on the LAN image server (VLAN11, same subnet as boards) ------------
 # Resolve the remote dir absolutely — scp's SFTP protocol does NOT expand remote $HOME.
 [ -n "$OTA_REMOTE_DIR" ] || OTA_REMOTE_DIR="$(ssh "$OTA_HOST_SSH" 'printf %s "$HOME/smol-ota/ota"')"
@@ -338,19 +392,51 @@ _msgf="$(mktemp)"; _keyf="$(mktemp -p /dev/shm 2>/dev/null || mktemp)"
 # EXIT trap here would otherwise silently drop the one mqtt_cfg installed and leave the
 # credential dir behind on every stage.
 trap 'shred -u "$_msgf" "$_keyf" 2>/dev/null; _mqtt_cfg_cleanup' EXIT INT TERM
-printf '%s' "${BUILD}|${SIZE}|${SHA}" > "$_msgf"
 bw get notes "$SMOL_OTA_SIGNING_KEY_ITEM" > "$_keyf" 2>/dev/null \
   || { shred -u "$_msgf" "$_keyf" 2>/dev/null; die "bw: couldn't read signing key '$SMOL_OTA_SIGNING_KEY_ITEM' (locked?)"; }
-SIG="$(openssl pkeyutl -sign -rawin -inkey "$_keyf" -in "$_msgf" | xxd -p -c 64)"
+# #349: the key is now used for up to TWO signatures (legacy M and OTA2 M), so it stays in
+# /dev/shm across both and is shredded once, immediately after. The trap above still covers an
+# interrupt in that (slightly longer, still sub-second) window.
+sign_msg() { # <message> → 128-hex ed25519 signature on stdout; dies on any failure
+  local _m="$1" _s
+  printf '%s' "$_m" > "$_msgf"   # printf, NOT echo: M is exact wire bytes, no trailing newline
+  _s="$(openssl pkeyutl -sign -rawin -inkey "$_keyf" -in "$_msgf" | xxd -p -c 64)"
+  case "$_s" in *[!0-9a-f]*|"") die "ed25519 signing failed (empty/non-hex sig — openssl >=3.0 + valid key?)";; esac
+  [ "${#_s}" -eq 128 ] || die "ed25519 sig wrong length ${#_s} (want 128 hex)"
+  printf '%s' "$_s"
+}
+SIG="$(sign_msg "${BUILD}|${SIZE}|${SHA}")"
+# #349 OTA2 M puts the target INSIDE the signed bytes — an unauthenticated target field could be
+# stripped or rewritten by anyone with broker write access, and a suitability check on
+# unauthenticated data is theatre.
+SIG2=""
+[ -n "$TARGET_HEX" ] && SIG2="$(sign_msg "${BUILD}|${SIZE}|${SHA}|${TARGET_HEX}")"
 shred -u "$_msgf" "$_keyf" 2>/dev/null
-case "$SIG" in *[!0-9a-f]*|"") die "ed25519 signing failed (empty/non-hex sig — openssl >=3.0 + valid key?)";; esac
-[ "${#SIG}" -eq 128 ] || die "ed25519 sig wrong length ${#SIG} (want 128 hex)"
 
 # 6-field SIGNED announce (was 4-field unsigned): url stays LAST (may contain no '|').
 LINE="OTA|${BUILD}|${SIZE}|${SHA}|${SIG}|${URL}"
 
-# ---- publish: stage the retained line (arms every board's native Update) -----
+# ---- publish: DUAL-STAGE (#349) ---------------------------------------------
+# The legacy fleet-wide line is published UNCHANGED, and it is what makes this a safe
+# migration rather than a flag day:
+#
+#   * Firmware older than #349 only knows `smol/ota/staged` and only parses `OTA|` — it keeps
+#     working, untouched. (It cannot parse `OTA2|` at all: its `strip_prefix("OTA|")` fails on
+#     "OTA2|", so it ignores the new line cleanly rather than mis-slicing it.)
+#   * Firmware with #349 subscribes BOTH topics and prefers whichever build is newer, so it
+#     picks up the per-chip line automatically.
+#
+# Retiring `smol/ota/staged` is therefore the ONE step that needs a ROLLED fleet — not a merged
+# main. Do not remove it here until every board reports a build carrying the OTA2 parser.
 pub_retained "smol/ota/staged" "$LINE"
 echo "staged  smol/ota/staged  <-  build $BUILD ($HASH) ${SIZE}B sha ${SHA:0:12}… sig ${SIG:0:12}… @ $URL"
-echo "done. Every board's native HA Update entity now shows build $BUILD as available."
+if [ -n "$TARGET_HEX" ]; then
+  LINE2="OTA2|${BUILD}|${SIZE}|${SHA}|${TARGET_HEX}|${SIG2}|${URL}"
+  pub_retained "smol/ota/staged/${TARGET_CHIP}" "$LINE2"
+  echo "staged  smol/ota/staged/${TARGET_CHIP}  <-  OTA2 build $BUILD target ${TARGET_HEX}"
+  echo "done. ${TARGET_CHIP} boards see build $BUILD on their per-chip topic; every board still"
+  echo "      sees it fleet-wide. Boards on other silicon will not be armed by the per-chip line."
+else
+  echo "done. Every board's native HA Update entity now shows build $BUILD as available."
+fi
 echo "      Install per-node from HA (the Update entity's Install button) or: ota_publish.sh install <id>"
