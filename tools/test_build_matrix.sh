@@ -20,6 +20,7 @@
 #   # EXPECT-OK                    must pass
 #   # EXPECT-JOBS: <n>             the emitted matrix must have exactly n jobs
 #   # BUDGET: <file>               use this budget fixture instead of _budget_ok.rs
+#   # CARGO: <file>                use this Cargo.toml fixture instead of _cargo_empty.toml
 #
 # Exit 0 all cases behaved; 1 otherwise.
 set -uo pipefail
@@ -35,8 +36,15 @@ oops() { printf '   \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail + 1)); }
 
 for case_file in "$CASES"/*.toml; do
   name="$(basename "$case_file" .toml)"
+  # `_`-prefixed files are SHARED FIXTURES (a stub Cargo.toml, a stub budget.rs), not cases.
+  # They live here rather than in a subdirectory so a case and the thing it points at are
+  # visible together; the prefix is what keeps them out of the case glob.
+  case "$name" in _*) continue ;; esac
+
   budget="$CASES/$(sed -n 's/^# BUDGET: *//p' "$case_file" | head -1)"
   [ -f "$budget" ] || budget="$CASES/_budget_ok.rs"
+  cargo="$CASES/$(sed -n 's/^# CARGO: *//p' "$case_file" | head -1)"
+  [ -f "$cargo" ] || cargo="$CASES/_cargo_empty.toml"
 
   want_fail="$(sed -n 's/^# EXPECT: *//p' "$case_file" | head -1)"
   want_bad="$(sed -n 's/^# EXPECT-MALFORMED: *//p' "$case_file" | head -1)"
@@ -50,7 +58,7 @@ for case_file in "$CASES"/*.toml; do
     continue
   fi
 
-  out="$("$BM" check --manifest "$case_file" --repro "$REPRO" --budget "$budget" 2>&1)"
+  out="$("$BM" check --manifest "$case_file" --repro "$REPRO" --budget "$budget" --cargo "$cargo" 2>&1)"
   rc=$?
 
   if [ -n "$want_bad" ]; then

@@ -28,6 +28,7 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_MANIFEST = HERE / "build-matrix.toml"
 DEFAULT_REPRO = HERE / "repro_build.sh"
 DEFAULT_BUDGET = HERE.parent / "rust" / "clock" / "src" / "budget.rs"
+DEFAULT_CARGO = HERE.parent / "rust" / "clock" / "Cargo.toml"
 
 
 # ── loading ───────────────────────────────────────────────────────────────────
@@ -81,6 +82,7 @@ def load(path: Path) -> dict:
                 raise Bad(f"chip {name!r} declares no `{field}`")
 
     return {"meta": meta, "chips": chips, "tiers": tiers,
+            "exempt": doc.get("exempt") or {},
             "canonical_chip": canon_chip, "canonical_tier": canon_tier}
 
 
@@ -157,6 +159,16 @@ def budget_chips(path: Path) -> set[str]:
     return {c for c in found if c != "host"}
 
 
+def cargo_features(path: Path) -> set[str]:
+    """Feature names from `[features]`. Parsed as TOML, not scraped — Cargo.toml IS TOML, so
+    there is no excuse for a regex here (unlike budget.rs, which is Rust and has one)."""
+    try:
+        with open(path, "rb") as fh:
+            return set((tomllib.load(fh).get("features") or {}))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise Bad(f"{path}: cannot read [features] — {exc}")
+
+
 def check(doc: dict, repro: Path, budget: Path) -> list[str]:
     fails: list[str] = []
     chips, tiers = doc["chips"], doc["tiers"]
@@ -199,7 +211,30 @@ def check(doc: dict, repro: Path, budget: Path) -> list[str]:
         except Bad as exc:
             fails.append(str(exc))
 
-    # 4. the emitted matrix is not a cross product.
+    # 4. every cargo feature is covered by a tier, or exempted with a reason.
+    #
+    # `tools/gate.sh` carried this as an aspiration in a comment — "any feature listed in
+    # Cargo.toml's [features] that is not covered below should be added" — and prose cannot
+    # be tested, so it wasn't: `wled`, `coexist-soak` and `mesh-test` were all in Cargo.toml
+    # with no tier, and `stack-paint` had stopped compiling entirely without anyone noticing.
+    # An omission is fine; an UNDECLARED omission is not.
+    cargo_toml = doc.get("_cargo_toml")
+    if cargo_toml and cargo_toml.exists():
+        feats = cargo_features(cargo_toml)
+        covered = {f for spec in tiers.values()
+                   for f in spec["features"].split(",") if f}
+        exempt = set(doc.get("exempt") or {})
+        for gap in sorted(feats - covered - exempt):
+            fails.append(
+                f"feature {gap!r} is in Cargo.toml but no tier builds it and it is not in "
+                f"[exempt] — a code path nothing compiles (#338)")
+        for stale in sorted(exempt & covered):
+            fails.append(f"feature {stale!r} is both exempted and covered by a tier — "
+                         f"drop the [exempt] entry so the reason cannot go stale")
+        for ghost in sorted(exempt - feats):
+            fails.append(f"[exempt] names {ghost!r}, which is not a feature in Cargo.toml")
+
+    # 5. the emitted matrix is not a cross product.
     n = len(matrix(doc))
     buildable = sum(1 for c in chips.values() if c["builds"])
     if buildable and n > buildable + len(tiers):
@@ -217,6 +252,7 @@ def main() -> int:
     ap.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     ap.add_argument("--repro", type=Path, default=DEFAULT_REPRO)
     ap.add_argument("--budget", type=Path, default=DEFAULT_BUDGET)
+    ap.add_argument("--cargo", type=Path, default=DEFAULT_CARGO)
     ap.add_argument("--for", dest="phase", choices=("check", "clippy"), default="check",
                     help="emit: which gate phase's tier list to produce")
     ap.add_argument("--builds", action="store_true", help="chips: only buildable ones")
@@ -247,6 +283,7 @@ def main() -> int:
         print(json.dumps({"include": matrix(doc)}, separators=(",", ":")))
         return 0
 
+    doc["_cargo_toml"] = args.cargo
     fails = check(doc, args.repro, args.budget)
     jobs = matrix(doc)
     builds = [c for c, s in doc["chips"].items() if s["builds"]]

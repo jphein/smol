@@ -271,7 +271,15 @@ off-fleet = []
 # should be enough" into a measured number. Deliberately NOT in the canonical fleet list in
 # tools/repro_build.sh: it writes the whole free stack at boot, which is a diagnostic cost no
 # shipped image should pay.
-stack-paint = ["bard"]
+#
+# #350: `off-fleet` is part of the feature, not something each call site has to remember. This
+# build is BY DEFINITION not the fleet image — see the paragraph above — so it must carry #348's
+# waiver or the budget predicate refuses to compile it. Without this, `--features stack-paint`
+# fails outright with "`bard` does not fit this chip's declared DRAM budget", which took the
+# bench instrument that MEASURES the high-water the stack floor is derived from and made it
+# unbuildable. Nothing noticed, because no tier compiled it. Declaring the waiver here means the
+# next person to reach for the instrument finds it working.
+stack-paint = ["bard", "off-fleet"]
 
 # COEXIST SOAK (issue #23 PART 1 — the gating experiment, NOT for production).
 # The gateway stays WiFi-associated after boot (no switch to ESP-NOW time-share),

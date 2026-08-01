@@ -113,3 +113,42 @@ features = "bard,off-fleet,${canonical}"
 [tier.ledger-provision]
 # #181/#266. A deliberate USB-touch provisioning build, never shipped.
 features = "ledger-provision"
+
+# ── the three that nothing was compiling ──────────────────────────────────────
+# Found by the `feature coverage` arm below when it was first written: `wled`, `coexist-soak`
+# and `mesh-test` were in Cargo.toml with no tier anywhere, i.e. code paths CI never built —
+# the exact `ledger-provision` case that motivated #338, still live in the file that fixed it.
+# All three compile; they were simply never asked to.
+
+[tier.wled]
+# #26 smol Cast — the display streamed to a WLED matrix as realtime UDP pixels.
+features = "wled,${canonical}"
+
+[tier.coexist-soak]
+# #23/#204 bench soak for the WiFi <-> ESP-NOW co-channel window.
+features = "coexist-soak,${canonical}"
+
+[tier.mesh-test]
+# #13 routed-flood bench harness. It cannot RUN in CI — it needs a per-board `DEAF_MACS` that
+# only a real board.rs has — but it can and must COMPILE. "Cannot run" was silently treated as
+# "cannot build", which is how it stopped being compiled at all.
+features = "mesh-test,${canonical}"
+
+[tier.stack-paint]
+# #300 bench instrument: paints the free stack with a sentinel and reports the true high-water —
+# the measurement the whole stack floor is derived from. It carries `off-fleet` via its own
+# Cargo.toml declaration (#350), because a build that exists to measure is by definition not the
+# fleet image.
+features = "stack-paint,${canonical}"
+
+# ── features with NO tier, declared so the omission is a decision ─────────────
+# The coverage arm requires every feature in Cargo.toml to be either covered by a tier above or
+# listed here with a reason. An undeclared gap is a gate failure — the aspiration that used to
+# live in a gate.sh comment ("any feature not covered below should be added"), made checkable.
+[exempt]
+default  = "the `default` tier IS this feature set"
+hw       = "implied by every firmware tier; a tier for it alone would build nothing new"
+hostsim  = "host-only, and covered by the `cargo test` arm in tools/gate.sh"
+# `off-fleet` deliberately has NO entry here: the bard tier names it, so it is covered, and the
+# checker rejects a feature that is both exempted and covered — an exemption whose reason has
+# quietly stopped applying is worse than none. It caught this exact case when first written.

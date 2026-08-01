@@ -1,0 +1,10 @@
+[package]
+name = "fixture"
+[features]
+default = []
+hw = []
+wifi = []
+espnow = []
+cast = []
+io = []
+wled = []
