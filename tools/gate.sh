@@ -115,6 +115,17 @@ if [ "$run_fw" = 1 ]; then
   # be a literal in this loop and a second literal in the clippy loop below, and the two had
   # already drifted — `ledger-provision` was in one and not the other, so that tier compiled
   # but was never linted. One declaration, two consumers, no third place to forget.
+  # #351: the BYTE-FREE claims. Cheap and before any compile, like the shed order — arm (a)
+  # is pure source structure, so it costs nothing and runs everywhere. The symbol arm needs a
+  # linked ELF and runs after the stack step below. See check_byte_free.py's header for why
+  # the two are NOT redundant and which one is load-bearing.
+  step "byte-free claims have a mechanism (#351)"
+  if out=$("$ROOT/tools/check_byte_free.py" --src "$CLOCK/src" 2>&1); then
+    printf '%s\n' "$out"; ok "byte-free (source)"
+  else
+    printf '%s\n' "$out"; bad "byte-free (source)"
+  fi
+
   step "cargo check — build tiers"
   while IFS=$'\t' read -r name feats; do
     # A tier naming a feature this branch does not have (e.g. ledger-provision before #181 lands)
@@ -180,6 +191,24 @@ if [ "$run_fw" = 1 ]; then
     echo "canonical build failed before the stack could be measured" > "$STACK_REPORT"
     tail -15 /tmp/gate-stack.log | sed 's/^/        /'
   fi
+  # #351 arm (b): CORROBORATION on the ELF the stack step just built — the real, non-debug,
+  # shipped-geometry binary. The excluded-module list is DERIVED from the tier's features
+  # (transitively closed over Cargo.toml) rather than hand-listed. This arm cannot PROVE
+  # absence — fat LTO can inline a linked module until no symbol survives — so a pass here
+  # adds confidence and never stands alone. Skipped, not failed, if the build above did not
+  # produce an ELF: a corroboration arm must not invent a verdict.
+  step "byte-free corroboration — symbols in the canonical ELF (#351)"
+  ELF="${CARGO_TARGET_DIR:-$ROOT/$CLOCK/target}/${REPRO_TARGET}/release/clock"
+  if [ -f "$ELF" ]; then
+    if out=$("$ROOT/tools/check_byte_free.py" --src "$CLOCK/src" --elf "$ELF" \
+               --features "$REPRO_FLEET_FEATURES" 2>&1); then
+      printf '%s\n' "$out" | tail -1; ok "byte-free (symbols)"
+    else
+      printf '%s\n' "$out"; bad "byte-free (symbols)"
+    fi
+  else
+    printf '   \033[33mSKIP\033[0m byte-free (symbols) — no ELF from the canonical build\n'
+  fi
 fi
 
 if [ "$run_host" = 1 ]; then
@@ -228,6 +257,14 @@ if [ "$run_host" = 1 ]; then
 
   # #350: prove the matrix checker's arms can fail. Pure text, no cargo — see the file header
   # for why a green-only demonstration is not evidence.
+  # #351: prove the byte-free source arm can fail. Pure text, no cargo.
+  step "byte-free checker regression suite (#351)"
+  if out=$("$ROOT/tools/test_byte_free.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -2; ok "test_byte_free"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_byte_free"
+  fi
+
   step "build-matrix checker regression suite (#350)"
   if out=$("$ROOT/tools/test_build_matrix.sh" 2>&1); then
     printf '%s\n' "$out" | tail -2; ok "test_build_matrix"
