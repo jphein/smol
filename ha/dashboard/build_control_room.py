@@ -248,11 +248,24 @@ def node_card(nid, meta, present, span=4):
     prow(top,f"input_select.smol_{nid}_led","LED (status / on / off)","mdi:led-on")            # #48
     prow(top,f"input_text.smol_{nid}_custom","Custom lines (‹sa› text, | per line)","mdi:card-text")  # #45 · edit when screen=Custom
     prow(top,f"input_text.smol_{nid}_tale","Story opening (Bard)","mdi:feather")               # #303 · empty = this node's own protagonist
-    prow(top,f"sensor.smol_{nid}_tale","  ↳ in use","mdi:book-open-variant")                   # #303 readback of the retained prompt
     prow(top,f"input_number.smol_{nid}_bard_speed","Typewriter (ms/char)","mdi:speedometer")    # #302 reveal clock, NOT the generation clock
     prow(top,f"input_select.smol_{nid}_bard_mode","Delivery (inf / page)","mdi:book-open-page-variant")  # #302 endless vs one screenful
     prow(top,f"input_select.smol_{nid}_bard_font","Text size","mdi:format-size")                # #302 bigger text = fewer chars on the glass
-    prow(top,f"sensor.smol_{nid}_delivery","  ↳ in use","mdi:play-speed")                       # #302 readback of the retained <ms>:<mode>
+    # The two "↳ in use" readback rows that sat here — `sensor.smol_<id>_{tale,delivery}` — are GONE
+    # with #320, which replaced the per-id mirrors with ONE fleet-wide readback per topic family
+    # (`sensor.smol_bard_{tale,delivery}_agreement`, plus the `_nodes` accumulators holding the
+    # per-node map). Two per-id entities out, a fleet agreement sensor in, exactly as #320 scoped.
+    #
+    # These rows only ever existed for id8 — the mirrors were hand-written for that one id — so they
+    # were also a live instance of the #308/#309 hand-maintained-id-list bug: every other node's box
+    # silently had no readback at all. The fleet sensor covers all six, and it reports AGREEMENT
+    # rather than one node's value, which is the thing worth showing.
+    #
+    # Deleting the rows here is the other half of removing the entities: the merge preserves cards
+    # it does not recognise, so leaving them wired left `vertical-stack|node8` pointing at two
+    # `restored: true` husks and turned DEAD ROWS red the moment smol_bard.yaml deployed.
+    # The fleet readback belongs at fleet level, not per node — see the Bard section of the
+    # scaffold rather than adding a per-id row back here.
     prow(top,f"input_button.smol_{nid}_apply",f"Apply → id{nid}","mdi:send")
     prow(top,f"input_button.smol_{nid}_reset","Reset to board default","mdi:backup-restore")
     rb=f"input_button.smol_{nid}_reboot"                                                       # #52 tap-guarded reboot
