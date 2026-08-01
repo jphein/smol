@@ -35,7 +35,7 @@ use esp_hal::{
     time::{Duration, Instant},
     timer::timg::TimerGroup,
 };
-use esp_radio::wifi::{sta::StationConfig, Config};
+use esp_radio::wifi::{sta::{ScanMethod, StationConfig}, Config};
 
 use crate::net::SmolWifiDevice;
 // #233: esp-radio 0.18's connect/disconnect are async-only; drive them to completion
@@ -759,7 +759,15 @@ impl NtpMachine {
             #[allow(unused_mut)]
             let mut sta_cfg = StationConfig::default()
                 .with_ssid(net.ssid)
-                .with_password(net.pass.into());
+                .with_password(net.pass.into())
+                // #337/#233: carry the 2026-07-20 ALL-CHANNEL SCAN fix forward. It used to be the
+                // build-env knob ESP_WIFI_CONFIG_SCAN_METHOD=1, which esp-radio 0.18 deleted; the
+                // 0.18 equivalent is this runtime StationConfig field, and its default is
+                // `Fast` — i.e. the exact WIFI_FAST_SCAN behaviour that was the #204/#217 root
+                // cause (stop at the FIRST matching-SSID AP → associate to a WEAK ch1 AP over the
+                // STRONG ch6 one → off-channel → OTA-deaf). Scan every channel, then take the
+                // strongest. Prerequisite for the best-gateway election's co_channel/ap_rssi inputs.
+                .with_scan_method(ScanMethod::AllChannels);
             // COEXIST SOAK (#23 PART 1): pin association to ch1. (0.18 with_channel takes u8,
             // wrapping it in Some internally.)
             #[cfg(feature = "coexist-soak")]
