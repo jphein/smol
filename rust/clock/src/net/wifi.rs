@@ -1094,6 +1094,7 @@ pub fn run_ntp_burst(
     let mqtt_deadline = Instant::now() + MQTT_SESSION_BUDGET;
     let mqtt_port = 49152 + (rng.random() % 16384) as u16;
     let mut _leaf_seen_boot = false; // #40 #1: boot burst is not a gateway relay → never set
+    let mut _leaf_flip_boot = false; // #329 B1: boot burst runs no #111 flip sweep (stat_cache=None)
     let mut _ntp_gw_own = GwOwnCfg::new(); // #48: boot/NTP burst never captures gateway-own cfg (cfg_cache=None)
     let mut _ntp_reset_req = ResetReq::new(); // #52: boot/NTP burst subscribes no cmd/reset (cfg_cache=None)
     let mut _ntp_scan_req = ScanReq::new(); // #71: boot/NTP burst subscribes no cmd/scan (cfg_cache=None)
@@ -1119,6 +1120,7 @@ pub fn run_ntp_burst(
         &mut _ntp_reset_req,
         install_requested,
         &mut _leaf_seen_boot, // #40 #1: boot burst sees no leaf installs
+        &mut _leaf_flip_boot, // #329 B1: boot burst runs no flip sweep (stat_cache=None)
         0, // #329 F2: boot burst is not a gateway relay (cfg_cache=None) → no armdiag published
         &[], // #27: boot NTP+downlink burst publishes no peers (no roster yet)
         &[], // #50: boot burst publishes no live-screen status
@@ -2580,6 +2582,11 @@ fn mqtt_session(
     // image). The gateway flush latches `leaf_ota_pending` on this so its OWN self-OTA is
     // suppressed the moment a leaf install exists, closing the self-OTA-first race.
     leaf_install_seen: &mut bool,
+    // #329 B1: set true iff the #111 version-flip sweep below CONFIRMED a leaf reached the staged
+    // build this burst. The caller clears `leaf_ota_pending` on it — see the sweep for the safety
+    // argument, and `RadioManager` for the ordering requirement (this must be applied AFTER the
+    // install-seen latch, which is necessarily set in the same flush).
+    leaf_flip_confirmed: &mut bool,
     // #329 F2: the crown's OWN self-install SUPPRESSION latches, snapshotted by the caller
     // before its disjoint `&mut self.*` borrows. Bit 0 = `leaf_ota_pending`, bit 1 =
     // `leaf_installs_outstanding` — the SAME bit meaning as `sog` in
@@ -3386,6 +3393,11 @@ fn mqtt_session(
     // extras are re-seen next burst (retained), so an 8-slot cap never loses an order.
     let mut armed_installs = [0u8; RESET_REQ_MAX];
     let mut armed_n = 0usize;
+    // #329 D3: true iff the staged announce drained this burst was refused as `NotNewer`, i.e.
+    // this board is ALREADY at or above it. That makes our own retained install SATISFIED rather
+    // than refused, which the clear below distinguishes. Stays false when no staged line arrived
+    // (unknown ⇒ preserve the order, same fail-safe direction as every other gate here).
+    let mut staged_satisfied = false;
     loop {
         if tick() {
             break; // #20 abort during downlink wait → fall through to clean DISCONNECT
@@ -3462,12 +3474,29 @@ fn mqtt_session(
                                             crate::ota::BUILD_NUMBER
                                         );
                                         *ota_offer = Some(a);
+                                        // #329 D3: keep the verdict a faithful mirror of the LAST
+                                        // gate result, so a passing staged line can never leave a
+                                        // stale `satisfied` behind from an earlier one this burst.
+                                        staged_satisfied = false;
                                     }
-                                    Err(why) => log::info!(
-                                        "smol OTA: staged build {} not newer/ineligible ({:?})",
-                                        a.build,
-                                        why
-                                    ),
+                                    Err(why) => {
+                                        // #329 D3: distinguish SATISFIED from REFUSED. `NotNewer`
+                                        // means this board is already AT or ABOVE the staged build
+                                        // — the order has been FULFILLED — whereas
+                                        // BadUrl/HostNotAllowed/BadSize mean the staging itself is
+                                        // unusable. #147 preserves the retained order across the
+                                        // latter (a bad staging must not burn an operator's order);
+                                        // it never meant to preserve it across the former. The
+                                        // verdict is carried out of `gate()` rather than
+                                        // re-derived at the clear site, so the monotonicity rule
+                                        // has exactly one home.
+                                        staged_satisfied = why == crate::ota::Reject::NotNewer;
+                                        log::info!(
+                                            "smol OTA: staged build {} not newer/ineligible ({:?})",
+                                            a.build,
+                                            why
+                                        )
+                                    }
                                 }
                             }
                             None => log::warn!("smol OTA: malformed staged line ignored"),
@@ -4030,6 +4059,37 @@ fn mqtt_session(
                 if pending_leaf == Some(lid) {
                     pending_leaf = None; // don't re-arm a leaf that already completed
                 }
+                // #329 B1: this same edge also BOUNDS `leaf_ota_pending`. Today that latch is
+                // cleared in exactly one place — `record_leaf_ota` under `if clear`
+                // (mode.rs:4257) — and a POST-HANDOFF transient (`RelayFailed`/`Timeout` with
+                // `reached_leaf()==true`) deliberately sets `clear=false`, because the RETAINED
+                // ORDER must survive for a retry. That is right for the order and wrong for the
+                // suppression: one bool is doing two jobs whose lifetimes differ, so a single
+                // failed relay outcome can hold the crown's OWN install for its entire tenure
+                // even though the leaf installed perfectly. That is the id5 wedge in #329 — three
+                // leaves updated, the crown refused its own order all night, and only a panic
+                // reboot cleared it.
+                //
+                // WHY THIS IS SAFE WITHOUT A TIMEOUT, and the reason it is a proof rather than a
+                // tuned constant: the predicate guarding this branch is "a leaf has REPORTED a
+                // build >= the staged build, from a STAT fresher than STAT_FRESH_MS". A leaf that
+                // is mid-OTA has not flipped — it is still running its OLD image and its STAT
+                // still carries the OLD build (parsed above from the last '|' segment), so this
+                // edge CANNOT fire inside the window the latch protects. It fires only after the
+                // leaf has demonstrably finished. That is strictly stronger than "not mid-OTA",
+                // so no live relay can be disrupted by it: there is no interval in which the
+                // predicate is true and the protection is still needed.
+                //
+                // What the latch protects, for the record, is two ONE-flush windows: the #40 #1
+                // see->arm race (mode.rs:5361) and the #3 terminal->next-flush gap
+                // (mode.rs:5370). Neither wants an unbounded hold; the unboundedness was an
+                // artefact, not a requirement.
+                //
+                // SCOPE: latch only. The retained order is already cleared just above by #111's
+                // own rule, and `leaf_ota_mac` is left alone — that is relay-session state with a
+                // different owner (`record_leaf_ota`), and re-homing a leaf is not this edge's
+                // business.
+                *leaf_flip_confirmed = true;
                 break 'flip; // ≤1 clear/burst
             }
         }
@@ -4668,10 +4728,19 @@ fn mqtt_session(
         // running build's honest stamp (with `+dev.<hash>` for a canary) when up-to-date,
         // else the update TARGET's sigil name ("v<latest> <Word>").
         let mut sjson = MqttScratch::new();
+        // #329 D3 (half 2): `in_progress` means "a fetch WILL happen", not "an order exists".
+        // It was `*install_requested` alone, which is true for an order that can never be acted
+        // on — one refused as `NotNewer` (nothing to fetch) or held by the self-install gate
+        // (`leaf_ota_pending` / `leaf_installs_outstanding`, see the armdiag). HA renders that as
+        // a permanently "installing" Update entity on a board that finished minutes ago; #329
+        // recorded 553 s of it. AND-ing with `ota_offer.is_some()` — the thing `main` actually
+        // fetches via `take_ota_offer` — makes an unsatisfiable order render honestly as idle.
+        // A genuine install is unaffected: the offer is Some exactly while a newer build is
+        // staged and gated OK, and goes None after the reboot when installed == latest.
         let _ = write!(
             sjson,
             "{{\"installed_version\":\"{}\",\"latest_version\":\"{}\",\"in_progress\":{},\"title\":\"",
-            installed, latest, *install_requested
+            installed, latest, *install_requested && ota_offer.is_some()
         );
         if latest == installed {
             crate::net::names::write_version(&mut sjson);
@@ -4701,7 +4770,21 @@ fn mqtt_session(
         // must PRESERVE the order — the same never-clear semantics #135/#134 give pre-relay failures
         // (`reached_leaf()==false`) — so the next good staging (or the next crown) still installs.
         // `ota_offer.is_some()` ⟹ `staged_raw.is_some()`, so the boot-race guard above is unchanged.
-        if *install_requested && ota_offer.is_some() {
+        //
+        // #329 D3 (half 1): ALSO clear when the order is SATISFIED. #147's preservation rule is
+        // about a staging this board cannot use (bad url / host / size) — that must not burn an
+        // operator's order. `NotNewer` is the opposite case: the board is already at or above the
+        // staged build, so the order has been FULFILLED and there is nothing left to preserve it
+        // for. Left retained it is re-caught every flush forever (wifi.rs, the `cmd_topic` arm),
+        // re-setting `install_requested`, and `main` burns the arm each loop with nothing to
+        // fetch — a permanently retained order plus, before half 2 above, a permanently
+        // "installing" tile. The verdict comes from `gate()` via `staged_satisfied`, so
+        // BadUrl/HostNotAllowed/BadSize keep preserving exactly as #147 intends.
+        //
+        // NB this publish is fire-and-forget (`let _ = tcp_send`), so a dropped clear still
+        // leaves the order retained and reproduces the loop from a single arm. Half 2 is what
+        // makes that benign; this half is what stops it recurring.
+        if *install_requested && (ota_offer.is_some() || staged_satisfied) {
             if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, cmd_topic.as_bytes(), &[], true) {
                 let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
             }
@@ -4818,6 +4901,9 @@ pub fn run_mqtt_burst(
     install_requested: &mut bool,
     // #40 #1: set true iff a retained leaf `install` (for another node) is seen this burst.
     leaf_install_seen: &mut bool,
+    // #329 B1: set true iff the #111 version-flip sweep confirmed a leaf reached the staged build
+    // this burst — the caller clears `leaf_ota_pending` on it (see `mqtt_session`).
+    leaf_flip_confirmed: &mut bool,
     // #329 F2: the caller's snapshot of its OWN self-install suppression latches — bit 0 =
     // `leaf_ota_pending`, bit 1 = `leaf_installs_outstanding`. Forwarded verbatim to
     // `mqtt_session`, which publishes them in the gateway armdiag (see there). `0` off-gateway.
@@ -5038,6 +5124,7 @@ pub fn run_mqtt_burst(
         reset_req, // #52: forward the remote-reboot command capture
         install_requested,
         leaf_install_seen, // #40 #1: forward the leaf-install-seen latch
+        leaf_flip_confirmed, // #329 B1: forward the version-flip confirmation (bounds the latch)
         gate_latches, // #329 F2: forward the self-install gate latches for the armdiag
         peers, // #27: forward the caller's serialized roster to publish retained
         status, // #50: forward the live STAT|screen:page for smol/<id>/status
