@@ -96,10 +96,17 @@ repro_build_bin() {
   # ambient epoch, not its commit time, which made its sha irreproducible from the recipe
   # "commit + flags". An image's identity must be a function of the commit, never of the
   # operator's shell history.
-  local sde
-  sde="$(git -C "$clock" show -s --format=%ct "$hash" 2>/dev/null || true)"
-  [ -n "$sde" ] || sde="${SOURCE_DATE_EPOCH:-}"
-  [ -n "$sde" ] || sde=1000000000
+  # REPRO_SDE_OVERRIDE (nebula-triage's design): the EXPLICIT, named escape for forensic
+  # reproduction of pre-fix stages — 915's stamp is operator-ambient, so its literal sha is
+  # only reproducible by supplying that epoch. Deliberately NOT plain SOURCE_DATE_EPOCH:
+  # ambient leakage of that var is the defect the flip above fixes, and an override you
+  # must name cannot leak in by accident.
+  local sde="${REPRO_SDE_OVERRIDE:-}"
+  if [ -z "$sde" ]; then
+    sde="$(git -C "$clock" show -s --format=%ct "$hash" 2>/dev/null || true)"
+    [ -n "$sde" ] || sde="${SOURCE_DATE_EPOCH:-}"
+    [ -n "$sde" ] || sde=1000000000
+  fi
   # #326 upstream bug, two halves (esp-bootloader-esp-idf 0.2.0 build.rs): (1) it parses
   # SOURCE_DATE_EPOCH — a SECONDS value by spec — with Timestamp::from_microsecond(), so
   # every shipped image claims 1970-01-01 (epoch/10^6 ≈ 1785 s); cosmetic here since we
