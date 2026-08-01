@@ -19,9 +19,29 @@
 # never touched — a real credential is never overwritten by a placeholder. The trap otherwise
 # re-arms every single time a feature adds a secret.
 #
+# #363 — the diff runs BOTH WAYS now, because only one way was ever checked. Symbols the example
+# declares and the file lacks BREAK THE BUILD, so #359 catches them. Symbols the FILE declares and
+# the example does not are invisible to every check and to CI — `board.rs` is git-ignored, CI
+# generates it from the example alone, so a developer's copy is a strictly different file that
+# provisioning can only ever ADD to. It never prunes and never even mentions the difference, so the
+# gap grows monotonically for the life of the checkout.
+#
+# That is not cosmetic: `clippy -D warnings` promotes an orphaned local constant into a HARD GATE
+# FAILURE that CI is structurally incapable of reproducing. Observed on the `fleet` tier — three
+# `WEATHER_*` constants that live only in local `board.rs` files and are declared in NO example and
+# referenced in NO source. The developer sees "constant is never used" pointing at a file they did
+# not write, on a tier CI calls green.
+#
+# So extras are REPORTED, LOUDLY, on every run — never removed and never fatal. Not removed because
+# the non-destructive promise above is the whole reason people are willing to run the gate locally,
+# and a developer's board.rs is theirs. Not fatal because this script cannot tell a dead symbol from
+# a live one (that is clippy's job, and it is already doing it) — it can only say "CI does not have
+# this line," which is exactly the sentence that turns a baffling lint into a one-line diagnosis.
+#
 # Usage: tools/ci_provision.sh [--check] [clock_dir]     (default clock_dir: rust/clock)
 #   --check   report only; make NO change; exit 3 if any file is missing symbols the example
 #             declares. For a gate that wants to fail loudly instead of self-healing.
+#             Extra symbols are reported in BOTH modes and change no exit code.
 set -euo pipefail
 
 mode=apply
@@ -29,7 +49,7 @@ args=()
 for a in "$@"; do
   case "$a" in
     --check) mode=check ;;
-    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,44p' "$0"; exit 0 ;;
     *) args+=("$a") ;;
   esac
 done
@@ -40,8 +60,12 @@ src="$clock/src"
 # Symbol-level top-up. Parses the .example for top-level item declarations (const / static / fn /
 # const fn / struct / enum / union / trait / type / mod), carrying each item's attributes and
 # doc-comment header, and appends only the ones the target does not already declare.
+#
+# #363: the same parser now runs over the TARGET too, so the diff is symmetric. Extras (target has,
+# example lacks) are reported and nothing else — see the header.
 #   argv: <example> <target> <apply|check>
-#   stdout: one missing symbol name per line;  exit 0 = nothing missing, 3 = something was missing
+#   stdout: "MISSING <name>" / "EXTRA <name>", one per line
+#   exit:   0 = nothing missing, 3 = something was missing (extras NEVER change this)
 TOPUP_PY='
 import re, sys
 
@@ -64,43 +88,57 @@ def declares(text, name):
                      r"(?:const\s+fn|const|static|struct|enum|union|trait|type|mod|fn)\s+"
                      r"(?:mut\s+)?" + re.escape(name) + r"\b", text) is not None
 
-lines = open(example).read().splitlines(keepends=True)
-items, seen, i = [], set(), 0
-while i < len(lines):
-    m = START.match(lines[i].lstrip())
-    if not m:
-        i += 1
-        continue
-    name = next(g for g in m.groups() if g)
-    # back up over the contiguous attribute / doc-comment header (a blank line ends it)
-    j = i
-    while j > 0:
-        prev = lines[j - 1].strip()
-        if prev.startswith("#[") or (prev.startswith("//") and not prev.startswith("//!")):
-            j -= 1
-        else:
-            break
-    # forward to the end of the item: brackets balanced AND the line closes it
-    depth, k = 0, i
-    while k < len(lines):
-        c = code(lines[k])
-        depth += c.count("{") + c.count("[") + c.count("(")
-        depth -= c.count("}") + c.count("]") + c.count(")")
-        t = c.rstrip()
-        if depth <= 0 and (t.endswith(";") or t.endswith("}")):
-            break
-        k += 1
-    if name not in seen:
-        seen.add(name)
-        items.append((name, "".join(lines[j:k + 1])))
-    i = k + 1
+def parse(path):
+    """Top-level items in declaration order: [(name, source_text_with_header)]."""
+    lines = open(path).read().splitlines(keepends=True)
+    items, seen, i = [], set(), 0
+    while i < len(lines):
+        m = START.match(lines[i].lstrip())
+        if not m:
+            i += 1
+            continue
+        name = next(g for g in m.groups() if g)
+        # back up over the contiguous attribute / doc-comment header (a blank line ends it)
+        j = i
+        while j > 0:
+            prev = lines[j - 1].strip()
+            if prev.startswith("#[") or (prev.startswith("//") and not prev.startswith("//!")):
+                j -= 1
+            else:
+                break
+        # forward to the end of the item: brackets balanced AND the line closes it
+        depth, k = 0, i
+        while k < len(lines):
+            c = code(lines[k])
+            depth += c.count("{") + c.count("[") + c.count("(")
+            depth -= c.count("}") + c.count("]") + c.count(")")
+            t = c.rstrip()
+            if depth <= 0 and (t.endswith(";") or t.endswith("}")):
+                break
+            k += 1
+        if name not in seen:
+            seen.add(name)
+            items.append((name, "".join(lines[j:k + 1])))
+        i = k + 1
+    return items
 
+items = parse(example)
 tgt = open(target).read()
 missing = [(n, t) for n, t in items if not declares(tgt, n)]
+
+# #363, the other direction. Uses `declares()` against the EXAMPLE text — the same predicate the
+# missing-check uses — so the two directions cannot disagree about what "declared" means. A symbol
+# the example never mentions is one CI will never compile, because CI builds this file from the
+# example and nothing else.
+ex_text = open(example).read()
+extra = [n for n, _ in parse(target) if not declares(ex_text, n)]
+for n in extra:
+    print("EXTRA " + n)
+
 if not missing:
     sys.exit(0)
 for n, _ in missing:
-    print(n)
+    print("MISSING " + n)
 if mode == "apply":
     ex = example.rsplit("/", 1)[-1]
     with open(target, "a") as fh:
@@ -129,13 +167,31 @@ for f in secrets board; do
     echo "  $f.rs: present; no $f.rs.example to diff against"
   else
     set +e
-    miss="$(python3 -c "$TOPUP_PY" "$src/$f.rs.example" "$src/$f.rs" "$mode")"
+    out="$(python3 -c "$TOPUP_PY" "$src/$f.rs.example" "$src/$f.rs" "$mode")"
     rc=$?
     set -e
+    # Split the two directions. `sed -n` prints nothing and exits 0 when there is no match, so
+    # neither list can trip `set -e` the way a bare `grep` would.
+    miss="$(printf '%s\n' "$out" | sed -n 's/^MISSING //p')"
+    extra="$(printf '%s\n' "$out" | sed -n 's/^EXTRA //p')"
+
+    # #363: report drift regardless of the missing-symbol verdict, and BEFORE it, because the two
+    # answer different questions — "will this compile" vs "does CI see the same file I do". This
+    # runs from gate.sh:73, ahead of every tier, so the list is already on screen when a clippy
+    # dead-code error names one of these symbols.
+    if [ -n "$extra" ]; then
+      xnames="$(printf '%s\n' "$extra" | tr '\n' ' ')"
+      echo "  ℹ️  $f.rs: declares symbols $f.rs.example does NOT:$xnames"
+      echo "  ℹ️  $f.rs: CI builds this file from the example alone, so it never compiles those."
+      echo "  ℹ️  $f.rs: local-only. If clippy -D warnings calls one 'never used', that is why —"
+      echo "  ℹ️  $f.rs: the tier is red here and green in CI. Delete it, use it, or add it to the"
+      echo "  ℹ️  $f.rs: example. NOT an error: this script cannot tell a dead symbol from a live one."
+    fi
+
     if [ "$rc" = 0 ]; then
       echo "  $f.rs: present, complete against $f.rs.example"
     elif [ "$rc" = 3 ]; then
-      names="$(echo "$miss" | tr '\n' ' ')"
+      names="$(printf '%s\n' "$miss" | tr '\n' ' ')"
       if [ "$mode" = check ]; then
         echo "ci_provision: $src/$f.rs is MISSING symbols $f.rs.example declares: $names" >&2
         echo "ci_provision: fix — run 'tools/ci_provision.sh $clock' (tops them up), or copy them" >&2
