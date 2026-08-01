@@ -3035,8 +3035,14 @@ fn mqtt_session(
             // entity_category) so HA derives the clean entity_id `sensor.smol_<id>_uplink`
             // from object_id instead of the device-name-concatenated form. unique_id bumped
             // (_uplk) to force HA to re-derive the entity_id for the corrected config.
-            "{{\"unique_id\":\"smol{}_uplk\",\"object_id\":\"smol_{}_uplink\",\"has_entity_name\":true,\"name\":\"Uplink\",\"state_topic\":\"smol/{}/uplink\",\"unit_of_measurement\":\"dBm\",\"device_class\":\"signal_strength\",\"expire_after\":120,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {} {}\",\"model\":\"smol ESP32-C3\",\"manufacturer\":\"jphein\",\"sw_version\":\"v{} {}\"}}}}",
-            node_id, node_id, node_id, node_id, node_id, uadj, unoun, env!("BUILD_NUMBER"), crate::net::names::version_name().1
+            // #325: model/manufacturer via device_extras(), NOT inline — this config is
+            // self-only (the uplink sensor is the gateway's own), it is RETAINED, and it is
+            // published AFTER the status config in the same session, so a hardcoded model
+            // here deterministically WINS HA's device-block merge and overwrites the correct
+            // per-variant label the status config just published. Worst-case size with the
+            // longest extras variant measured 372 B vs the 448 B DISCOVERY_BUDGET.
+            "{{\"unique_id\":\"smol{}_uplk\",\"object_id\":\"smol_{}_uplink\",\"has_entity_name\":true,\"name\":\"Uplink\",\"state_topic\":\"smol/{}/uplink\",\"unit_of_measurement\":\"dBm\",\"device_class\":\"signal_strength\",\"expire_after\":120,\"device\":{{\"identifiers\":[\"smol{}\"],\"name\":\"smol {} {} {}\"{},\"sw_version\":\"v{} {}\"}}}}",
+            node_id, node_id, node_id, node_id, node_id, uadj, unoun, device_extras(), env!("BUILD_NUMBER"), crate::net::names::version_name().1
         );
         if let Some(n) =
             crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), json.as_bytes(), true)
