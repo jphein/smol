@@ -17,6 +17,13 @@
 
 #![no_std]
 
+// #348 per-chip memory budgets. The ONE module here that is NOT host-only: it is pure data
+// plus const-eval assertions (no code emitted), and compiling it in both targets means the
+// budget predicates are checked by a plain `cargo check` of either. It is also what lets
+// `tests/budget.rs` assert the arithmetic host-side without a cross-compile.
+// ⚠️ Moves to `smol-core` (#347 Phase 2) — see the module docs.
+pub mod budget;
+
 // Everything below is host-only. Under a firmware build (no `hostsim`) this lib is empty
 // and `main.rs` (the bin) carries the real modules.
 #[cfg(feature = "hostsim")]

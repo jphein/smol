@@ -95,6 +95,10 @@ mod app;
 // every tier; the 277 KB model is `.rodata` (XIP flash) and its scratch is `.bss`.
 #[cfg(feature = "bard")]
 mod bard;
+// #348 per-chip memory budgets as data, with the heavy features predicated on them. Pure
+// consts + const-eval assertions: it emits NO code and is unconditional so the predicates are
+// evaluated by every build, including `default`. ⚠️ Moves to `smol-core` (#347 Phase 2).
+mod budget;
 // #197 transient on-glass toast overlay — a general primitive (also the mesh-RPG substrate),
 // composited over the active screen from the render loop; never persisted.
 mod toast;

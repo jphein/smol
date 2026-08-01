@@ -133,6 +133,21 @@ repro_stack_check() {
 repro_build_bin() {
   local clock="$1" out="$2" hash="$3" number="$4" node_id="${5:-}"
   local espflash="${ESPFLASH:-$HOME/.cargo/bin/espflash}"
+  # #348: `off-fleet` is the cargo feature that WAIVES the per-chip memory budget
+  # (rust/clock/src/budget.rs). It exists so tools/gate.sh can keep compiling the Bard for the
+  # bigger chips, and so a future Bard-only image can be built at all — neither of which is
+  # the fleet image. This is where that stays true: a waived build must never become a
+  # published OTA artifact, because the budget it waived is the fleet's. Refuse at the
+  # PACKAGING boundary rather than trusting the caller's list, since this function is the one
+  # thing every publish path goes through.
+  case ",${REPRO_FLEET_FEATURES}," in
+    *,off-fleet,*)
+      echo "FATAL: REPRO_FLEET_FEATURES names 'off-fleet' — that feature waives the #348 chip" >&2
+      echo "       memory budget and is for non-fleet builds (CI tiers, a Bard-only image)." >&2
+      echo "       Refusing to package a fleet image that opted out of its own budget." >&2
+      return 1
+      ;;
+  esac
   # #218: no explicit number ⇒ use the COMMITTED ratchet (version.txt), NOT git-count.
   # The caller sets SMOL_RELEASE=1 for a real release (clean `vN Word` stamp); otherwise
   # build.rs marks it dev (`vN+dev.<hash> Word`) so a canary can't masquerade as the release.
@@ -210,6 +225,15 @@ repro_build_bin() {
     # one toolchain: canonical WITH bard = 67,488 B of stack, WITHOUT = 106,560 B, against a
     # re-derived floor of 74,208 B (4/3 x the 55,656 B measured high-water). With the bard in,
     # the #233 async re-platform does not fit at all — see #335.
+    #
+    # ⚠️ #348 attribution fix: those three figures are from `spike/233-stack-measure` @ 2b98fba
+    # (the esp-radio 0.18 ASYNC stack — the one the fleet is migrating onto), NOT from this
+    # branch. On main's blocking esp-wifi 0.15 the same tiers measure 75,568 / 114,648 against
+    # the 73,728 B constant below, which is what docs/ROADMAP.md records. Both are true; they
+    # are different radio stacks, and a reader who takes one for the other concludes the Bard
+    # has 1,840 B of room when on the stack that matters it is 6,720 B short.
+    # rust/clock/src/budget.rs declares the WORSE of the two and refuses `bard` at COMPILE
+    # time, so this list is no longer the only thing standing between the Bard and the fleet.
     #
     # ⚠️ The `bard` FEATURE STAYS IN Cargo.toml AND IS STILL GATED (tools/gate.sh builds a
     # `bard` tier). It is out of the C3 fleet image, not out of the project: the S3 and C6 have

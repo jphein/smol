@@ -78,6 +78,16 @@ formula are a bug in this document** — check them together.
 > moved. The `bard` feature still exists and `tools/gate.sh` still builds a `bard` tier — it is
 > off the C3's shared image, not out of the project. See #347.
 >
+> 🟢 **Since #348 this is enforced at COMPILE time, not just written here.**
+> `rust/clock/src/budget.rs` declares the C3's budget as data — flash and DRAM as separate
+> axes, OpenWrt-style — and `--features bard` is now an `E0080` compile error on the C3 rather
+> than an image that links and dies. **Update that file whenever you update this block:** the
+> two must agree, and the ELF wins over both. The budget declares the *worst* supported radio
+> stack (esp-radio 0.18's 106,560 B, not `main`'s 114,648 B) so it keeps biting across the #233
+> cutover, which is why its headroom reads 32,352 B where the slack above reads 40,920 B.
+> A build that deliberately is not the fleet image declares `off-fleet`; `repro_build_bin`
+> refuses to package anything that does.
+>
 > > 📌 **History, pre-#347 (the figures below describe the with-bard image and are superseded by
 > > the block above).** Corrected 2026-07-28 — this block previously disagreed with itself, and
 > > BOTH figures were
