@@ -313,18 +313,201 @@ automation:
                     qos: 1
                     payload: "{{ trigger.to_state.state }}"
 
-mqtt:
-  sensor:
-    # #302 delivery readback: what the node was actually told, as `<ms>:<mode>`.
-    - name: "smol 8 delivery"
-      unique_id: smol_8_delivery_mirror
-      state_topic: "smol/8/config/delivery"
-      icon: "mdi:play-speed"
-      value_template: "{{ value if value else '(default)' }}"
-    # #303 Bard story-prompt mirror: read back the retained prompt so the card shows what was
-    # commanded. '(default)' when empty = the node is using its built-in persona.
-    - name: "smol 8 tale"
-      unique_id: smol_8_tale_mirror
-      state_topic: "smol/8/config/tale"
-      icon: "mdi:feather"
-      value_template: "{{ value if value else '(default)' }}"
+# =====================================================================
+# #320 FLEET READBACK — replacing the last per-id mirrors in this file
+# =====================================================================
+# REPLACES `sensor.smol_8_delivery` / `sensor.smol_8_tale`: two hand-written mirrors of
+# `smol/8/config/*`, the last per-id stanzas here after the controls went fleet-wide. They were
+# #308/#309 in miniature — id8 got a readback, id50 and id51 got nothing, and the file could not
+# notice a board existed.
+#
+# ADDS the thing that actually justifies it. The fan-out warns when it reaches NOBODY
+# (`fleet | count == 0`). Nothing caught "reached 4 of 6": if two nodes' discovery entities are
+# absent during replay after a restart, the loop covers four, DISMISSES the warning, and the two
+# missed nodes keep their old value — silently and permanently, because nothing republishes these
+# topics on a timer. Only a readback sees that, because it reads what is RETAINED rather than what
+# HA believes it published. It also catches out-of-band writes (meshscope, the operator TUI,
+# `mosquitto_pub`).
+#
+# TWO ENTITIES PER TOPIC, ACCUMULATE AND JUDGE, and the split is not decoration. The merge has to
+# be carried across triggers via `this`, and `this` exists ONLY in `state:`/`attributes:` — NOT in
+# an `action:` block (probed on this instance: `this is defined` is False there). Computing the
+# merge in both `state:` and `attributes:` was the alternative and it duplicates the derivation.
+# So the accumulator's state is the last message (no merge needed) and the merge lives in exactly
+# one attribute; a plain template sensor then judges agreement from it. One definition, and each
+# entity does one job.
+# =====================================================================
+template:
+  # --- DELIVERY (pace:mode:font): ACCUMULATE. One job — carry the per-node map. -------------------------
+  - trigger:
+      - platform: mqtt
+        topic: "smol/+/config/delivery"
+    action:
+      # `this` is NOT available inside an action: block — probed on this instance, it is
+      # `this is defined == False` here while being defined in state:/attributes:. The first
+      # version of this file computed the merge here from `this.attributes`, which raised inside
+      # the variables step and made the whole entity SILENTLY never update: no log line, state
+      # stuck at `unknown`. So the action carries only what the trigger itself knows, and the
+      # merge lives in `attributes:` where `this` exists.
+      - variables:
+          nid: "{{ trigger.topic.split('/')[1] }}"
+          # Retain-clear arrives as a zero-length payload: "back to the node's own default". A real state, not a missing one, so it is recorded rather than skipped.
+          val: "{{ trigger.payload if trigger.payload else '(default)' }}"
+          fleet: >-
+            {%- set ns = namespace(ids=[]) -%}
+            {%- for e in states.sensor | map(attribute='entity_id') | select('search','^sensor\\.smol_\\d+(_[a-z0-9]+)*_status$') -%}
+              {%- set id = e.split('.')[1].split('_')[1] -%}
+              {%- if id not in ns.ids -%}{%- set ns.ids = ns.ids + [id] -%}{%- endif -%}
+            {%- endfor -%}
+            {{ ns.ids }}
+    sensor:
+      - name: "smol bard delivery nodes"
+        unique_id: smol_bard_delivery_nodes
+        icon: "mdi:play-speed"
+        # State is the LAST message, which needs no merge — so the merge exists exactly once, in
+        # the attribute below. Deriving the same thing in both templates was the alternative, and
+        # a duplicated derivation drifts the moment either copy is touched.
+        state: "{{ nid }}={{ val }}"
+        attributes:
+          # THE ONE COPY OF THE MERGE. `this` is the state BEFORE this update, so this reads the
+          # previous map, adds the node that just spoke, and then INTERSECTS WITH THE DISCOVERED
+          # FLEET. That intersection is the whole constraint: an unbounded map would be the husk
+          # problem in attribute form — a retired board's entry sitting there forever, reachable
+          # by no cleanup and invisible to DEAD ROWS, which looks for absent ENTITIES and an
+          # attribute key is not one. The id7/id9 retirement left 110 registry husks; this must
+          # not add a private, unauditable version of them. A retired id drops out on the next
+          # message from anybody.
+          nodes: >-
+            {#- BOTH SIDES FORCED TO STRING, and this is not defensive noise. HA applies
+                native-type coercion to `variables:` in an action block, so `nid` arrives as the
+                NUMBER 50 while the discovered fleet is a list of STRINGS — probed on this
+                instance: `nid is number` True, `fleet[0] is string` True. So `nid in fleet` was
+                False for every node, selectattr filtered the whole map away, and this attribute
+                rendered `{}` forever while the state line looked perfectly correct. It failed
+                silently and it looked like it worked. -#}
+            {%- set k = nid | string -%}
+            {%- set fl = fleet | map('string') | list -%}
+            {%- set prev = (this.attributes.get('nodes', {}) if this is not none else {}) -%}
+            {{ dict((prev | combine({k: val})).items() | selectattr('0', 'in', fl) | list) }}
+          fleet: "{{ fleet }}"
+
+  # --- DELIVERY (pace:mode:font): JUDGE. Reads the map above; owns no state of its own. ------------------
+  - sensor:
+      - name: "smol bard delivery agreement"
+        unique_id: smol_bard_delivery_agreement
+        # Compares the nodes to EACH OTHER, never to what HA commanded. Reconstructing "expected"
+        # would mean a second copy of the publish automation's compose template, and that copy
+        # would drift the moment either was touched — the readback would then disagree with the
+        # fleet because of its own bug. Node-vs-node needs no copy and still catches a partial
+        # fan-out, because the missed node is exactly the one holding a different value.
+        state: >-
+          {%- set m = state_attr('sensor.smol_bard_delivery_nodes', 'nodes') or {} -%}
+          {%- set f = state_attr('sensor.smol_bard_delivery_nodes', 'fleet') or [] -%}
+          {%- set silent = (f | map('string') | list) | reject('in', m.keys() | map('string') | list) | list -%}
+          {%- set spread = m.values() | unique | list -%}
+          {%- if f | count == 0 -%}no fleet discovered
+          {%- elif m | count == 0 -%}nothing reported
+          {%- elif spread | count > 1 -%}{{ m | count }}/{{ f | count }} DISAGREE
+          {%- elif silent | count > 0 -%}{{ m | count }}/{{ f | count }} agree · {{ silent | join(',') }} silent
+          {%- else -%}{{ m | count }}/{{ f | count }} agree{%- endif -%}
+        icon: >-
+          {%- set s = states('sensor.smol_bard_delivery_agreement') -%}
+          {%- if 'DISAGREE' in s -%}mdi:sync-alert
+          {%- elif 'silent' in s or 'nothing' in s or 'no fleet' in s -%}mdi:sync-circle
+          {%- else -%}mdi:sync{%- endif -%}
+        attributes:
+          silent: >-
+            {%- set m = state_attr('sensor.smol_bard_delivery_nodes', 'nodes') or {} -%}
+            {{ (state_attr('sensor.smol_bard_delivery_nodes', 'fleet') or []) | map('string') | list
+                 | reject('in', m.keys() | map('string') | list) | list }}
+          values: >-
+            {{ (state_attr('sensor.smol_bard_delivery_nodes', 'nodes') or {}).values() | unique | list }}
+          note: >-
+            DISAGREE shortly after a control change means the fan-out missed somebody — the partial-fan-out case the `count == 0` notification cannot see. `silent` means a discovered node has never published this topic at all.
+
+  # --- TALE (story prompt): ACCUMULATE. One job — carry the per-node map. -------------------------
+  - trigger:
+      - platform: mqtt
+        topic: "smol/+/config/tale"
+    action:
+      # `this` is NOT available inside an action: block — probed on this instance, it is
+      # `this is defined == False` here while being defined in state:/attributes:. The first
+      # version of this file computed the merge here from `this.attributes`, which raised inside
+      # the variables step and made the whole entity SILENTLY never update: no log line, state
+      # stuck at `unknown`. So the action carries only what the trigger itself knows, and the
+      # merge lives in `attributes:` where `this` exists.
+      - variables:
+          nid: "{{ trigger.topic.split('/')[1] }}"
+          # Empty tale = retain-clear = the node falls back to its built-in persona prompt. That is the DEFAULT and by far the commonest value, so it is named rather than blank.
+          val: "{{ trigger.payload if trigger.payload else '(persona)' }}"
+          fleet: >-
+            {%- set ns = namespace(ids=[]) -%}
+            {%- for e in states.sensor | map(attribute='entity_id') | select('search','^sensor\\.smol_\\d+(_[a-z0-9]+)*_status$') -%}
+              {%- set id = e.split('.')[1].split('_')[1] -%}
+              {%- if id not in ns.ids -%}{%- set ns.ids = ns.ids + [id] -%}{%- endif -%}
+            {%- endfor -%}
+            {{ ns.ids }}
+    sensor:
+      - name: "smol bard tale nodes"
+        unique_id: smol_bard_tale_nodes
+        icon: "mdi:feather"
+        # State is the LAST message, which needs no merge — so the merge exists exactly once, in
+        # the attribute below. Deriving the same thing in both templates was the alternative, and
+        # a duplicated derivation drifts the moment either copy is touched.
+        state: "{{ nid }}={{ val }}"
+        attributes:
+          # THE ONE COPY OF THE MERGE. `this` is the state BEFORE this update, so this reads the
+          # previous map, adds the node that just spoke, and then INTERSECTS WITH THE DISCOVERED
+          # FLEET. That intersection is the whole constraint: an unbounded map would be the husk
+          # problem in attribute form — a retired board's entry sitting there forever, reachable
+          # by no cleanup and invisible to DEAD ROWS, which looks for absent ENTITIES and an
+          # attribute key is not one. The id7/id9 retirement left 110 registry husks; this must
+          # not add a private, unauditable version of them. A retired id drops out on the next
+          # message from anybody.
+          nodes: >-
+            {#- BOTH SIDES FORCED TO STRING, and this is not defensive noise. HA applies
+                native-type coercion to `variables:` in an action block, so `nid` arrives as the
+                NUMBER 50 while the discovered fleet is a list of STRINGS — probed on this
+                instance: `nid is number` True, `fleet[0] is string` True. So `nid in fleet` was
+                False for every node, selectattr filtered the whole map away, and this attribute
+                rendered `{}` forever while the state line looked perfectly correct. It failed
+                silently and it looked like it worked. -#}
+            {%- set k = nid | string -%}
+            {%- set fl = fleet | map('string') | list -%}
+            {%- set prev = (this.attributes.get('nodes', {}) if this is not none else {}) -%}
+            {{ dict((prev | combine({k: val})).items() | selectattr('0', 'in', fl) | list) }}
+          fleet: "{{ fleet }}"
+
+  # --- TALE (story prompt): JUDGE. Reads the map above; owns no state of its own. ------------------
+  - sensor:
+      - name: "smol bard tale agreement"
+        unique_id: smol_bard_tale_agreement
+        # Compares the nodes to EACH OTHER, never to what HA commanded. Reconstructing "expected"
+        # would mean a second copy of the publish automation's compose template, and that copy
+        # would drift the moment either was touched — the readback would then disagree with the
+        # fleet because of its own bug. Node-vs-node needs no copy and still catches a partial
+        # fan-out, because the missed node is exactly the one holding a different value.
+        state: >-
+          {%- set m = state_attr('sensor.smol_bard_tale_nodes', 'nodes') or {} -%}
+          {%- set f = state_attr('sensor.smol_bard_tale_nodes', 'fleet') or [] -%}
+          {%- set silent = (f | map('string') | list) | reject('in', m.keys() | map('string') | list) | list -%}
+          {%- set spread = m.values() | unique | list -%}
+          {%- if f | count == 0 -%}no fleet discovered
+          {%- elif m | count == 0 -%}nothing reported
+          {%- elif spread | count > 1 -%}{{ m | count }}/{{ f | count }} DISAGREE
+          {%- elif silent | count > 0 -%}{{ m | count }}/{{ f | count }} agree · {{ silent | join(',') }} silent
+          {%- else -%}{{ m | count }}/{{ f | count }} agree{%- endif -%}
+        icon: >-
+          {%- set s = states('sensor.smol_bard_tale_agreement') -%}
+          {%- if 'DISAGREE' in s -%}mdi:sync-alert
+          {%- elif 'silent' in s or 'nothing' in s or 'no fleet' in s -%}mdi:sync-circle
+          {%- else -%}mdi:sync{%- endif -%}
+        attributes:
+          silent: >-
+            {%- set m = state_attr('sensor.smol_bard_tale_nodes', 'nodes') or {} -%}
+            {{ (state_attr('sensor.smol_bard_tale_nodes', 'fleet') or []) | map('string') | list
+                 | reject('in', m.keys() | map('string') | list) | list }}
+          values: >-
+            {{ (state_attr('sensor.smol_bard_tale_nodes', 'nodes') or {}).values() | unique | list }}
+          note: >-
+            A prompt is fleet-wide now, so DISAGREE means a node missed the last publish. Note the firmware may REFUSE a prompt it cannot tokenise and keep its previous one — that refusal is logged on the node, not here, so a persistent single-board disagreement is worth reading its log for "story prompt REFUSED".
