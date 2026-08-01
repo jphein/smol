@@ -157,8 +157,11 @@ pub mod wled;
 // #26 smol Cast: stream the gateway's OLED image to a network WLED matrix as
 // realtime UDP pixels. `cast = ["wifi"]`. `cast` is the PURE packer + shadow
 // framebuffer (host-testable, no HAL deps); `cast_oled` is the DrawTarget tee that
-// feeds it (needs ssd1306). Absent from every non-cast build → the default / wifi /
-// espnow / wled profiles are byte-free of it.
+// feeds it (needs ssd1306). Absent from every non-cast build → the default / wifi / espnow
+// tiers are byte-free of it, and #351's tools/check_exclusions.py proves that per tier from
+// the DWARF line table rather than leaving it as this sentence. (The `wled` TIER is NOT on
+// that list: since #350 it is `wled,${canonical}`, and the canonical fleet features include
+// `cast`. The old wording named a feature combination nothing builds.)
 #[cfg(feature = "cast")]
 pub mod cast;
 #[cfg(feature = "cast")]

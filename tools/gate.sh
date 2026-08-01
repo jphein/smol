@@ -23,6 +23,12 @@
 #   5. the crate's own tests/*.rs suites via cargo test (#350) — bard / budget / input. Nothing
 #      ran these before: 57 tests, including the Bard's bit-for-bit golden, that no gate executed
 #   6. tools/test_build_matrix.sh — proof that (0)'s arms can actually fail
+#   7. #351 the BYTE-FREE tier claims — each tier is LINKED and its DWARF line table is asked
+#      which source files contributed code, so "the default build is BYTE-FREE of it" is a
+#      measurement instead of a comment. Claims are derived from the `#[cfg(feature = …)]` on
+#      each `mod`, walked from src/main.rs; no second list.
+#   8. tools/test_check_exclusions.sh — proof that (7)'s arms can actually fail, including the
+#      vacuous-green one (an ELF with no DWARF has an empty file set and every absence "holds")
 #
 # WHAT IT DOES NOT COVER — read this before trusting a green run:
 #   * `mesh-test`: cannot RUN — it needs a per-board `DEAF_MACS` that only a real board.rs has.
@@ -34,11 +40,21 @@
 #     ⚠️ The stack check bounds the linked REGION, not runtime high-water. A struct living in a
 #     stack-resident RadioManager can cost ~1.8 KB of real stack and move the region by ~32 B. A
 #     green stack line is NOT evidence of runtime headroom (see repro_stack_check's comment).
+#   * #351 proves no CODE from an excluded module survived. A module of pure `const`/`static`
+#     items lands in .rodata with no line-table rows and is invisible to it — `src/secrets.rs`
+#     is exactly that, and is declared in build-matrix.toml's [unobservable] for the reason.
+#     "BYTE-FREE" is therefore verified for executable bytes, not literally every byte.
 #
 # Usage:  tools/gate.sh              # everything
 #         tools/gate.sh host         # host suites only (no riscv toolchain needed)
 #         tools/gate.sh fw           # tiers + clippy + stack only
+#         tools/gate.sh excl         # #351 tier exclusions only
 # Env:    CARGO_TARGET_DIR honoured; SMOL_GATE_JOBS caps cargo parallelism.
+#
+# `excl` is its own mode because it is the only arm that LINKS every tier, and measured on a
+# katana-class box that is ~70s x 10 tiers on top of everything else. It shares no state with
+# `fw` — different target dir, different profile — so CI runs the two as parallel jobs rather
+# than pushing one job past its timeout. A human running `tools/gate.sh` still gets all of it.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -46,12 +62,13 @@ ROOT="$PWD"
 CLOCK="rust/clock"
 WHAT="${1:-all}"
 FAILED=()
-run_fw=1; run_host=1
+run_fw=1; run_host=1; run_excl=1
 case "$WHAT" in
-  host) run_fw=0 ;;
-  fw)   run_host=0 ;;
+  host) run_fw=0; run_excl=0 ;;
+  fw)   run_host=0; run_excl=0 ;;
+  excl) run_host=0; run_fw=0 ;;
   all)  ;;
-  *) echo "usage: tools/gate.sh [all|host|fw]" >&2; exit 2 ;;
+  *) echo "usage: tools/gate.sh [all|host|fw|excl]" >&2; exit 2 ;;
 esac
 
 # shellcheck source=/dev/null
@@ -68,10 +85,14 @@ step() { printf '\n\033[1m── %s\033[0m\n' "$1"; }
 ok()   { printf '   \033[32mPASS\033[0m %s\n' "$1"; }
 bad()  { printf '   \033[31mFAIL\033[0m %s\n' "$1"; FAILED+=("$1"); }
 
-if [ "$run_fw" = 1 ]; then
+# Both firmware halves need `board.rs`/`secrets.rs`, so this runs for either — `excl` on its
+# own in CI would otherwise fail on the missing files rather than on anything it measures.
+if [ "$run_fw" = 1 ] || [ "$run_excl" = 1 ]; then
   step "provisioning (git-ignored; existing files untouched)"
   "$ROOT/tools/ci_provision.sh" "$CLOCK" || { echo "provisioning failed" >&2; exit 1; }
+fi
 
+if [ "$run_fw" = 1 ]; then
   # Cheap and first, so a source-consistency error is not buried behind ten minutes of LTO.
   # #339: the prose describing the DIAG shed order had drifted from the appends it described, in a
   # direction that would send an operator to the wrong fields. Prose cannot be tested; this can.
@@ -154,7 +175,59 @@ if [ "$run_fw" = 1 ]; then
         | sort -u | sed 's/^/        /' | head -12
     fi
   done < <("$ROOT/tools/build_matrix.py" emit --for clippy)
+fi
 
+if [ "$run_excl" = 1 ]; then
+  # #351 the BYTE-FREE claims. Cargo.toml, net.rs and main.rs all assert that a lower tier
+  # contains none of a higher tier's code ("the default build is BYTE-FREE of it (symbol-
+  # absence provable)"), and until now nothing checked a single one of them — the same
+  # species of comment as this file's old "any feature not covered below should be added",
+  # which #350 found to be false for three features at once.
+  #
+  # The claims are DERIVED from the `#[cfg(feature = …)]` on each `mod` declaration, walked
+  # transitively from src/main.rs, so there is no second hand-written list to drift. The
+  # tiers come from the same manifest as the two loops above.
+  #
+  # This arm LINKS each tier, which the check/clippy loops do not, because the property is
+  # about what survives into the binary. Two consequences worth knowing before reading a
+  # green line:
+  #   * it needs DWARF, and `[profile.release]` sets `debug = false`, so the builds carry
+  #     CARGO_PROFILE_RELEASE_DEBUG=line-tables-only. Debug info is not an optimisation
+  #     input — MEASURED on this tree, .text/.rodata/.bss/.stack come out the same SIZE with
+  #     and without it — and it lands only in non-ALLOC sections, so no shipped byte moves.
+  #     The checker REFUSES an ELF with no DWARF rather than reading an empty file set and
+  #     calling it clean.
+  #   * a separate CARGO_TARGET_DIR, so it cannot invalidate the fingerprints the stack-floor
+  #     build below depends on. The ELF is copied out after each tier because the next tier
+  #     overwrites it.
+  step "tier exclusions — the BYTE-FREE claims (#351)"
+  EXCL="${SMOL_GATE_EXCL_DIR:-/tmp/gate-exclusions}"
+  mkdir -p "$EXCL/elf"
+  EXCL_ARGS=()
+  while IFS=$'\t' read -r name feats; do
+    if [ -n "$feats" ] && ! grep -qE "^${feats%%,*} *=" "$CLOCK/Cargo.toml"; then
+      printf '   \033[33mSKIP\033[0m %-16s (feature not in Cargo.toml on this branch)\n' "$name"; continue
+    fi
+    args=(--release --bin clock "${JOBS[@]}"); [ -n "$feats" ] && args+=(--features "$feats")
+    if (cd "$CLOCK" && CARGO_TARGET_DIR="$EXCL/target" \
+          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build "${args[@]}") \
+          >/tmp/gate-excl-$name.log 2>&1; then
+      cp "$EXCL/target/$REPRO_TARGET/release/clock" "$EXCL/elf/$name"
+      EXCL_ARGS+=(--elf "$name=$feats=$EXCL/elf/$name")
+    else
+      bad "exclusions build $name"; tail -15 /tmp/gate-excl-$name.log | sed 's/^/        /'
+    fi
+  done < <("$ROOT/tools/build_matrix.py" emit --for check)
+  if [ ${#EXCL_ARGS[@]} -eq 0 ]; then
+    bad "tier exclusions (nothing built — no tier could be measured)"
+  elif out=$("$ROOT/tools/check_exclusions.py" check "${EXCL_ARGS[@]}" 2>&1); then
+    printf '%s\n' "$out"; ok "tier exclusions"
+  else
+    printf '%s\n' "$out"; bad "tier exclusions"
+  fi
+fi
+
+if [ "$run_fw" = 1 ]; then
   # #300 stack floor, measured with the SAME function the packaging path uses (repro_stack_check).
   # Built with repro_cargo_args so the ELF matches the shipped one's geometry.
   # #348: the title reads the floor from the same single definition repro_stack_check will use —
@@ -233,6 +306,17 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | tail -2; ok "test_build_matrix"
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_build_matrix"
+  fi
+
+  # #351: the same discipline for the exclusion checker, and it matters more here. An ABSENCE
+  # check's passing state and its broken state print the same green — "no violations found"
+  # and "nothing found at all" are indistinguishable from the outside. Pure text, no cargo,
+  # so it runs in the host half where a cross toolchain is not available.
+  step "exclusion checker regression suite (#351)"
+  if out=$("$ROOT/tools/test_check_exclusions.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -2; ok "test_check_exclusions"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_check_exclusions"
   fi
 fi
 

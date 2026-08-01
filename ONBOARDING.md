@@ -149,6 +149,14 @@ Full toolchain + gotchas: **[`docs/BUILDING.md`](docs/BUILDING.md)**. TL;DR for 
    The `default` build must also stay behaviourally unaffected (prove via cfg-gating, **not** ELF
    byte-equality — `build.rs` stamps a per-commit git hash, so the default ELF changes every commit
    by design).
+
+   **Since #351 the "BYTE-FREE" claims are checked, not asserted.** `tools/check_exclusions.py`
+   links every tier and reads the DWARF line table to ask which source files actually contributed
+   code; a module the tier's features exclude must contribute none. The claims are **derived from
+   the `#[cfg(feature = …)]` on each `mod`**, walked from `src/main.rs` — so you gate a module and
+   the gate covers it, with no list to update. Two things to know: it proves no *executable* bytes
+   (a consts-only module is invisible — declare it in `build-matrix.toml`'s `[unobservable]` with a
+   reason), and a module no tier ever builds is reported **UNPROVEN**, not passing.
 3. **Version identity:** `build.rs` embeds `BUILD_HASH` + `BUILD_NUMBER` →
    `names.rs::version_name()`, a forge-realm sigil name. The number is the OTA monotonicity gate;
    the name is the boot-splash reveal. Two things to get right:

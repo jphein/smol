@@ -152,3 +152,20 @@ hostsim  = "host-only, and covered by the `cargo test` arm in tools/gate.sh"
 # `off-fleet` deliberately has NO entry here: the bard tier names it, so it is covered, and the
 # checker rejects a feature that is both exempted and covered — an exemption whose reason has
 # quietly stopped applying is worse than none. It caught this exact case when first written.
+
+# ── modules #351's exclusion check cannot SEE, declared so the blind spot is a decision ───────
+# `tools/check_exclusions.py` proves a module contributed no code to a tier that excludes it, by
+# asking the tier's DWARF line table which source files its instructions came from. A module of
+# pure `const`/`static` items emits no instructions, therefore no line-table rows, therefore
+# nothing to find — and an absence check that cannot detect presence proves nothing at all. So
+# the checker REFUSES to pass a claim it never observed anywhere, and an honest blind spot has to
+# be written down here with its reason.
+#
+# Same discipline as [exempt] above, including the stale case: a module listed here that IS
+# observed fails the gate, because a reason that has quietly stopped applying reads as a
+# considered decision and is worse than no entry.
+[unobservable]
+"src/secrets.rs" = """\
+consts only (WIFI_NETWORK / MQTT_* / WLED_CAST_*) — 0 fn / 0 impl in both secrets.rs and \
+secrets.rs.example, so it emits .rodata and no line rows. It is also git-ignored and \
+provisioned per tree, so its contents are not a property of the commit at all."""
