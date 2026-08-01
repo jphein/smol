@@ -1,0 +1,18 @@
+# #274 host guard for the fleet's byte-budget truncator (`rssi.rs::clip`). The firmware crate is
+# no_std/riscv32imc and can't host-test, so this `#[path]`-includes the REAL rssi.rs (no drift) and
+# asserts clip() never panics for ANY input at ANY budget — the property the old
+# `&s[..s.len().min(n)]` held only by convention, because the noun corpus happened to be ASCII.
+# Exhaustive over every prefix length of a multibyte corpus, so a future non-ASCII string reaching
+# a screen cannot reboot a board. Permanent guard.
+[package]
+name = "clip_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "clip_verify"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 0
