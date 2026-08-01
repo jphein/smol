@@ -53,10 +53,17 @@
 #         tools/gate.sh excl         # #351 tier exclusions only
 # Env:    CARGO_TARGET_DIR honoured; SMOL_GATE_JOBS caps cargo parallelism.
 #
-# `excl` is its own mode because it is the only arm that LINKS every tier, and measured on a
-# katana-class box that is ~70s x 10 tiers on top of everything else. It shares no state with
-# `fw` — different target dir, different profile — so CI runs the two as parallel jobs rather
-# than pushing one job past its timeout. A human running `tools/gate.sh` still gets all of it.
+# `excl` is its own mode because it is the only arm that LINKS every tier, and it needs a
+# different cargo PROFILE (`CARGO_PROFILE_RELEASE_DEBUG`) in a different target dir — mixing
+# that into `fw` would thrash the fingerprints the stack-floor build depends on and poison one
+# rust-cache with two profiles' artifacts. CI runs the two as parallel jobs. A human running
+# `tools/gate.sh` still gets all of it.
+#
+# MEASURED, and not what was first assumed: 179 s for all ten links on a cold GitHub runner
+# (job "tier exclusions (#351)", 2m59s). The first estimate here said ~700 s, from a local
+# experiment that gave each tier its OWN target dir and so paid for ten cold DEPENDENCY builds.
+# The shipped path shares one dir, where only the crate and the LTO link are per-tier. Cost is
+# therefore NOT the reason for the split — cache and profile hygiene is.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
