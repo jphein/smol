@@ -2397,11 +2397,24 @@ impl RadioManager {
         now: u64,
         tick: &mut dyn FnMut() -> bool,
     ) -> bool {
-        // #51 speed-up: owner HELLOs every 2 s, so 15 s silence ≈ 7 missed HELLOs = gone
-        // (a live owner that merely roamed is re-locked by leaf_scan_tick's 6 s re-scan long
-        // before this). Retry every 10 s — MUST be < RSSI_BUCKET_STEP_MS (15 s) so a weaker
-        // board gets a burst (reads the winner's retained MC → adopts) before its claim window.
-        const REELECT_SILENCE_MS: u64 = 15_000; // owner HELLO gone this long → recover
+        // #324: the silence gate MUST clear the worst-case flush (invariant 2 of the 07-14
+        // timing derivation, scratch/smol-ha-batt/122-b1-derivation.md §2). It was a bare
+        // 15_000 — EQUAL to RELAY_FLUSH_BUDGET — so a crown whose re-assoc flush ran to the
+        // budget edge was HELLO-silent for exactly this gate, and every leaf then ran a
+        // recovery burst it didn't need. The burst is not free: it re-associates
+        // (`switch(Mode::WifiSta)` below), which is the measured ~14 s leaf app-freeze
+        // (`brst=14088:13949:r`), paid fleet-wide for an owner that was never dead. The #136
+        // floor already stops the TAKEOVER in that window; this stops the burst itself.
+        // Derived, not written, same as #136: budget + 2 missed HELLOs (~2 s cadence) + 1 s
+        // slack = 20 s, so a future budget tune cannot silently re-create the equality.
+        // Cost: genuinely-dead-crown detection slows 15 s → 20 s — still well inside
+        // RECOVERY_STALE_MS (35 s) and the #136 takeover floor (45 s).
+        // (#51's original reasoning — a merely-roamed live owner is re-locked by
+        // leaf_scan_tick's 6 s re-scan long before this gate — still holds at 20 s.)
+        const REELECT_SILENCE_MS: u64 =
+            crate::net::wifi::RELAY_FLUSH_BUDGET.as_secs() * 1000 + 2 * 2_000 + 1_000;
+        // Retry every 10 s — MUST be < RSSI_BUCKET_STEP_MS (15 s) so a weaker board gets a
+        // burst (reads the winner's retained MC → adopts) before its own claim window.
         const REELECT_RETRY_MS: u64 = 10_000; // min gap between recovery bursts
         if self.relay.is_gateway {
             return false; // a gateway re-decides on its own flush; only leaves recover here

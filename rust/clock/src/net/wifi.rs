@@ -429,7 +429,7 @@ const SYNC_BUDGET: Duration = Duration::from_secs(30);
 /// below the old 30 s spin. Tradeoff unchanged: longer budget = longer worst-case
 /// display/input freeze per attempt during an outage.
 #[cfg(feature = "espnow")]
-pub(crate) const RELAY_FLUSH_BUDGET: Duration = Duration::from_secs(15); // #136: read by the leaf-reelect floor
+pub(crate) const RELAY_FLUSH_BUDGET: Duration = Duration::from_secs(15); // read by the #136 takeover floor AND the #324 re-elect silence gate
 
 // -------------------------------------------------------------------------
 // Peripheral bundle handed over from `main` (single esp_hal::init()).
