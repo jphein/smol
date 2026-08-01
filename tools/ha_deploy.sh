@@ -18,6 +18,11 @@
 #   ./tools/ha_deploy.sh push --all      # every differing package (required if >1)
 #   ./tools/ha_deploy.sh push --from-worktree   # push uncommitted state on purpose
 #   ./tools/ha_deploy.sh push --dry-run
+#
+# `push` RE-CHECKS THE DASHBOARD AFTERWARDS (#333). A push adds and removes entities; the Lovelace
+# view wires entities by id, so a removal turns its card into a dead row — and every pre-flight gate
+# is green at that moment because the entity still exists. It warns, never fails: the push already
+# succeeded, and the actionable output is the entity list, not the exit status.
 #   ./tools/ha_deploy.sh push --assets [path...]  # the theme/www pairs — a SEPARATE batch from
 #                                        packages, so the two classes never ride together
 #
@@ -729,6 +734,64 @@ cmd_push() {
   fi
   echo
   echo "pushed ${#changed[@]} package(s). Backups on the VM: *.bak-deploy-$stamp"
+
+  # --- #333 GAP 2: re-check the DASHBOARD *after* the push, not only before -------------------
+  # A package push adds and REMOVES entities (the push report above prints exactly which). The
+  # Lovelace view wires entities by id, so removing one silently turns its card into a dead row —
+  # and every pre-flight gate is green at that moment BECAUSE THE ENTITY STILL EXISTS. The deploy
+  # is what creates the breakage, so a check that only ever runs beforehand is structurally unable
+  # to see it.
+  #
+  # That is not hypothetical. 2026-08-01: #320 removed `sensor.smol_8_{delivery,tale}`, and
+  # `vertical-stack|node8` was still wired to both. `--check` had passed cleanly minutes earlier.
+  # Two "Entity not found" rows shipped to JP's dashboard and were found only because someone
+  # happened to re-run the check afterwards.
+  #
+  # Run automatically rather than documented as a step, because "remember to re-check after
+  # deploying" is precisely the discipline that failed the first time. WARNS, never fails: the push
+  # already succeeded and rolling HA back over a dashboard row would be wildly disproportionate —
+  # the actionable output is the entity list, not the exit status. Skipped when the generator or a
+  # token is unavailable, and its own failure is reported rather than swallowed.
+  local dash_rc=0
+  if [ -z "${HA_TOKEN:-}" ] && command -v bw >/dev/null 2>&1; then
+    HA_TOKEN="$(timeout 40 bw get password ha-llat 2>/dev/null)" || true
+  fi
+  if [ ! -f "$REPO_DIR/ha/dashboard/build_control_room.py" ]; then
+    note "post-deploy dashboard check SKIPPED (generator not found)"
+  elif [ -z "${HA_TOKEN:-}" ]; then
+    note "post-deploy dashboard check SKIPPED (no HA_TOKEN; run: HA_TOKEN=… $0 push …)"
+  else
+    echo
+    echo "  post-deploy dashboard check (#333) — did this push kill any card's rows?"
+    # ONE invocation. Running it twice (once for text, once for status) would spend a second
+    # websocket round trip and, worse, could report a verdict from a different read than the lines
+    # printed above it — a check disagreeing with its own output is not a check.
+    local dash_out=""
+    dash_out="$(HA_TOKEN="$HA_TOKEN" timeout 180 python3 \
+      "$REPO_DIR/ha/dashboard/build_control_room.py" --check 2>&1)" || dash_rc=$?
+    printf '%s\n' "$dash_out" | sed -n '/^LIVE-ONLY/p;/^DEAD ROWS/p;/^  ⚠/p;/^    - /p' | sed 's/^/    /'
+    # DEAD ROWS is read from the OUTPUT, not from the exit code, and that distinction matters:
+    # `report_check` returns `1 if extras else (3 if dead else 0)`, so ANY live-only drift MASKS the
+    # dead-rows status. Keying this warning off `$dash_rc == 3` alone would mean that on an instance
+    # with pre-existing LIVE-ONLY drift — which is the normal state whenever a back-port is pending —
+    # a push that killed a card's rows would print "pre-existing drift" and say nothing about the
+    # rows it just broke. The exit code answers "what should I fix FIRST", which is a narrower
+    # question than "did this push break anything", and confusing the two is the whole of #333.
+    local dead_line
+    dead_line="$(printf '%s\n' "$dash_out" | sed -n 's/^DEAD ROWS · \([0-9][0-9]*\).*/\1/p' | head -1)"
+    if [ "${dead_line:-0}" -gt 0 ] 2>/dev/null; then
+      echo "  ⚠ DEAD ROWS ($dead_line) — an entity a dashboard card wires is missing from HA." >&2
+      echo "    A push that REMOVES entities is the usual cause; the list is above. Fix the card or" >&2
+      echo "    the generator, then re-run: python3 ha/dashboard/build_control_room.py --check" >&2
+    elif [ "$dash_rc" -eq 0 ]; then
+      note "dashboard still clean (LIVE-ONLY 0 · DEAD ROWS 0)"
+    fi
+    case "$dash_rc" in
+      0|3) : ;;   # 3 is already covered by the DEAD ROWS branch above
+      1) note "dashboard also reports LIVE-ONLY drift (see #305 — back-port vs retire is a decision)" ;;
+      *) echo "  ⚠ post-deploy dashboard check could not run (exit $dash_rc) — run it by hand." >&2 ;;
+    esac
+  fi
 }
 
 case "${1:-status}" in
