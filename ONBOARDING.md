@@ -127,11 +127,26 @@ Full toolchain + gotchas: **[`docs/BUILDING.md`](docs/BUILDING.md)**. TL;DR for 
    `DEFAULT_APP`, `DEFAULT_PAGE`) and `cp src/secrets.rs.example src/secrets.rs` (WiFi/MQTT creds —
    **placeholders in the example; never commit real values**). Per-board flashes edit only these
    ignored files, so every board stamps the same clean commit hash.
-2. **Build tiers:** `cargo build --release` (default, always-green) · `--features wifi` · `--features
-   espnow` (the fleet build). **Gate discipline:** every change must pass `build` + `clippy -D
-   warnings` across **all three** tiers, and the `default` build must stay behaviourally unaffected
-   (prove via cfg-gating, **not** ELF byte-equality — `build.rs` stamps a per-commit git hash, so the
-   default ELF changes every commit by design).
+2. **Build tiers and the gate: `tools/gate.sh`.** Run it before you push; CI (`.github/workflows/
+   fw-gate.yml`) runs the *same script*, so there is nothing here to fall out of step with it.
+   `tools/gate.sh` (or `host` / `fw` for one half) covers: `cargo check` across the tiers — default
+   (always-green) · `wifi` · `espnow` · the canonical fleet tier · any feature it finds in
+   `Cargo.toml` — plus `clippy -D warnings` on the canonical tier, the host `experiments/*_verify`
+   suites, and the #300 **stack floor** (printed on every PR).
+
+   **This list deliberately lives in the script, not here.** Until #338 it lived only in prose, and
+   the prose was wrong without anyone noticing: `main` sat red on its own `-D warnings` rule, and a
+   feature was added with no matrix to add it to. Add a tier to `gate.sh`, not to this paragraph.
+
+   **Known gaps** (`gate.sh` states them too): `clippy -D` runs on the canonical tier only —
+   `default`/`wifi` carry pre-existing dead-code findings and get `cargo check` alone; `mesh-test`
+   needs a real board's `DEAF_MACS`; image packaging and anything needing hardware are out of scope.
+   The stack check bounds the linked **region**, *not* runtime high-water — green there is not
+   evidence of headroom.
+
+   The `default` build must also stay behaviourally unaffected (prove via cfg-gating, **not** ELF
+   byte-equality — `build.rs` stamps a per-commit git hash, so the default ELF changes every commit
+   by design).
 3. **Version identity:** `build.rs` embeds `BUILD_HASH` + `BUILD_NUMBER` →
    `names.rs::version_name()`, a forge-realm sigil name. The number is the OTA monotonicity gate;
    the name is the boot-splash reveal. Two things to get right:
