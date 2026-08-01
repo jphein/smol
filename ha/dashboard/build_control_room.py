@@ -1221,12 +1221,11 @@ GEN_OWNED = re.compile(r"^vertical-stack\|node\d+$")
 #     HAVE REVERTED THAT MAPPING, which is why "the repo cannot reproduce it" was the wrong
 #     conclusion to act on unread.
 #
-# ⚠️ CLEAR BOTH ENTRIES once a real run has removed them and LIVE-ONLY reads 0 — an entry left
-# here is a standing licence to delete a card someone re-adds on purpose.
-RETIRE_LIVE = {
-    "entities|Nexus · overrides & IO",
-    "vertical-stack|sha:19daffe159d0",
-}
+#   Both removed by the real run of 2026-08-01 (live 31 cards → 30, LIVE-ONLY 0, DEAD ROWS 0,
+#   --check exit 0), so the entries are cleared the same day, as the rule above requires.
+#   Confirmed on glass afterwards: `Eldritch Jewel · overrides & IO` carries all five rows, and
+#   the power/solar card now reads the real EPEver/i3/clamp entities instead of four blanks.
+RETIRE_LIVE = set()
 
 
 def classify(cfg, view):
