@@ -13,14 +13,37 @@ name: fw gate
 
 on:
   pull_request:
+  # #345: EVERY branch, not just main. With `branches: [main]` a commit pushed to a feature branch
+  # whose PR had already closed triggered NOTHING — no `pull_request` event (the PR is closed) and
+  # no `push` event (not main) — so it was silently ungated. That is not hypothetical: it happened
+  # to this workflow's own follow-up commit within an hour of it landing (#341 squash-merged while
+  # `ec16fe3` was in flight; the commit sat on a closed branch with zero CI and was only rescued
+  # because the same work had been opened as a second PR).
+  #
+  # `'**'` is branches-only by design — it does NOT match tags. A release tag should not spend
+  # forty minutes re-running a gate that already passed on the commit it points at.
   push:
-    branches: [main]
+    branches: ['**']
   workflow_dispatch:
 
-# A force-push supersedes its own in-flight run; main runs are never cancelled.
+# Keyed on the BRANCH, deliberately, so the `push` and `pull_request` events for the same branch
+# land in ONE group and dedupe instead of double-running: `github.head_ref` is the PR's source
+# branch and is empty for a push, where `github.ref_name` supplies the same name. Keying on
+# `github.ref` (the previous form) could not dedupe them — a PR's ref is `refs/pull/N/merge` and a
+# push's is the branch, so they were always distinct groups.
+#
+# `main` gets its OWN group and NEVER cancels: a branch push cannot reach `fw-gate-main`, and
+# cancel-in-progress is false there, so an in-flight main gate always runs to completion. Over-
+# running is the cheap failure here; a main gate cancelled by unrelated branch activity is not.
+# (Two independent guarantees on purpose — either alone would do.)
+#
+# SECURITY: `github.head_ref` is attacker-controlled (a fork can name a branch anything), so it must
+# never reach a `run:` shell or a checkout `ref:`. Here it is used ONLY as part of a concurrency
+# GROUP NAME — an opaque scheduling label that is never evaluated — which is the form GitHub's own
+# docs recommend. These two lines are the only interpolations in this file; keep it that way.
 concurrency:
-  group: fw-gate-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: fw-gate-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
 
 env:
   CARGO_TERM_COLOR: always
