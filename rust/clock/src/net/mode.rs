@@ -2499,6 +2499,7 @@ impl RadioManager {
         let mut _notify_req = crate::net::wifi::NotifyReq::new(); // #197: recovery burst issues no toasts
         let mut install_requested = false;
         let mut _leaf_install_seen = false; // #40 #1: a leaf's recovery burst is not a gateway relay
+        let mut _leaf_flip_confirmed = false; // #329 B1: no flip sweep off-gateway (stat_cache=None)
         let reached = match self.sta.as_mut() {
             None => false,
             Some(sta) => {
@@ -2518,6 +2519,7 @@ impl RadioManager {
                     &mut _reset_req,
                     &mut install_requested,
                     &mut _leaf_install_seen, // #40 #1: leaf recovery burst — never a gateway relay
+                    &mut _leaf_flip_confirmed, // #329 B1: no flip sweep off-gateway (stat_cache=None)
                     0, // #329 F2: recovery burst is not a gateway relay (cfg_cache=None) → no armdiag
                     &[], // #27: election-only recovery burst publishes no peers (leaf/v1)
             &[], // #50: recovery burst publishes no live-screen status
@@ -5085,6 +5087,9 @@ impl RadioManager {
         let mut install_requested = false;
         // #40 #1: set iff this flush SEES a retained leaf install (pre-arm) → latch pending below.
         let mut leaf_install_seen = false;
+        // #329 B1: set by the burst's #111 version-flip sweep when a leaf is confirmed to have
+        // reached the staged build. Applied below, AFTER the install-seen latch — see there.
+        let mut leaf_flip_confirmed = false;
         // #70/#49: build the gateway's OWN DIAG record BEFORE the burst borrow (it takes `&mut self`
         // — the run_mqtt_burst call below already holds disjoint field borrows). Published retained
         // as `smol/<id>/diag`, and cached leaf diags are republished alongside via `diag_cache`.
@@ -5139,6 +5144,7 @@ impl RadioManager {
                     &mut reset_req, // #52: capture remote-reboot commands (one-shot relay below)
                     &mut install_requested,
                     &mut leaf_install_seen, // #40 #1: latch pending on install-SEEN (below)
+                    &mut leaf_flip_confirmed, // #329 B1: clear the pending latch on a confirmed flip
                     gate_latches, // #329 F2: publish the self-install gate latches in the armdiag
                     peers, // #27: gateway publishes its roster as retained smol/<id>/peers
                     status, // #50: gateway publishes its live screen as smol/<id>/status
@@ -5360,6 +5366,22 @@ impl RadioManager {
         // `record_leaf_ota` (retained install goes away → not seen next flush).
         if leaf_install_seen {
             self.leaf_ota_pending = true;
+        }
+        // #329 B1: BOUND that latch — a leaf CONFIRMED at the staged build (the #111 version-flip
+        // sweep) releases the crown's own self-install. The safety argument lives at the sweep
+        // (wifi.rs, `leaf_flip_confirmed`): a mid-OTA leaf still reports its OLD build, so the
+        // predicate structurally cannot fire inside the window the latch protects.
+        //
+        // THE ORDERING IS LOAD-BEARING — this MUST stay after the install-seen latch above.
+        // The sweep only considers ids in `armed_installs`, which is filled in the very branch
+        // that sets `leaf_install_seen` (wifi.rs:3853-3858), so a confirmed flip ALWAYS arrives in
+        // a flush that also saw the order. Applied before the latch above, this would be
+        // overwritten to `true` every time and the clear would never happen at all — and the next
+        // flush cannot rescue it, because by then the order is gone (cleared by #111 in the same
+        // burst), so neither the flip edge nor the seen-latch fires and the bool just sits there.
+        // A no-op that looks like a fix is worse than no fix; keep these two adjacent and ordered.
+        if leaf_flip_confirmed {
+            self.leaf_ota_pending = false;
         }
         // #3 (self-OTA-first, multi-leaf gap): the flush is the AUTHORITY on "any leaf still has a
         // retained install." Latch it separately from the per-session `leaf_ota_pending` so the

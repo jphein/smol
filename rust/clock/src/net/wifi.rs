@@ -1094,6 +1094,7 @@ pub fn run_ntp_burst(
     let mqtt_deadline = Instant::now() + MQTT_SESSION_BUDGET;
     let mqtt_port = 49152 + (rng.random() % 16384) as u16;
     let mut _leaf_seen_boot = false; // #40 #1: boot burst is not a gateway relay → never set
+    let mut _leaf_flip_boot = false; // #329 B1: boot burst runs no #111 flip sweep (stat_cache=None)
     let mut _ntp_gw_own = GwOwnCfg::new(); // #48: boot/NTP burst never captures gateway-own cfg (cfg_cache=None)
     let mut _ntp_reset_req = ResetReq::new(); // #52: boot/NTP burst subscribes no cmd/reset (cfg_cache=None)
     let mut _ntp_scan_req = ScanReq::new(); // #71: boot/NTP burst subscribes no cmd/scan (cfg_cache=None)
@@ -1119,6 +1120,7 @@ pub fn run_ntp_burst(
         &mut _ntp_reset_req,
         install_requested,
         &mut _leaf_seen_boot, // #40 #1: boot burst sees no leaf installs
+        &mut _leaf_flip_boot, // #329 B1: boot burst runs no flip sweep (stat_cache=None)
         0, // #329 F2: boot burst is not a gateway relay (cfg_cache=None) → no armdiag published
         &[], // #27: boot NTP+downlink burst publishes no peers (no roster yet)
         &[], // #50: boot burst publishes no live-screen status
@@ -2580,6 +2582,11 @@ fn mqtt_session(
     // image). The gateway flush latches `leaf_ota_pending` on this so its OWN self-OTA is
     // suppressed the moment a leaf install exists, closing the self-OTA-first race.
     leaf_install_seen: &mut bool,
+    // #329 B1: set true iff the #111 version-flip sweep below CONFIRMED a leaf reached the staged
+    // build this burst. The caller clears `leaf_ota_pending` on it — see the sweep for the safety
+    // argument, and `RadioManager` for the ordering requirement (this must be applied AFTER the
+    // install-seen latch, which is necessarily set in the same flush).
+    leaf_flip_confirmed: &mut bool,
     // #329 F2: the crown's OWN self-install SUPPRESSION latches, snapshotted by the caller
     // before its disjoint `&mut self.*` borrows. Bit 0 = `leaf_ota_pending`, bit 1 =
     // `leaf_installs_outstanding` — the SAME bit meaning as `sog` in
@@ -4030,6 +4037,37 @@ fn mqtt_session(
                 if pending_leaf == Some(lid) {
                     pending_leaf = None; // don't re-arm a leaf that already completed
                 }
+                // #329 B1: this same edge also BOUNDS `leaf_ota_pending`. Today that latch is
+                // cleared in exactly one place — `record_leaf_ota` under `if clear`
+                // (mode.rs:4257) — and a POST-HANDOFF transient (`RelayFailed`/`Timeout` with
+                // `reached_leaf()==true`) deliberately sets `clear=false`, because the RETAINED
+                // ORDER must survive for a retry. That is right for the order and wrong for the
+                // suppression: one bool is doing two jobs whose lifetimes differ, so a single
+                // failed relay outcome can hold the crown's OWN install for its entire tenure
+                // even though the leaf installed perfectly. That is the id5 wedge in #329 — three
+                // leaves updated, the crown refused its own order all night, and only a panic
+                // reboot cleared it.
+                //
+                // WHY THIS IS SAFE WITHOUT A TIMEOUT, and the reason it is a proof rather than a
+                // tuned constant: the predicate guarding this branch is "a leaf has REPORTED a
+                // build >= the staged build, from a STAT fresher than STAT_FRESH_MS". A leaf that
+                // is mid-OTA has not flipped — it is still running its OLD image and its STAT
+                // still carries the OLD build (parsed above from the last '|' segment), so this
+                // edge CANNOT fire inside the window the latch protects. It fires only after the
+                // leaf has demonstrably finished. That is strictly stronger than "not mid-OTA",
+                // so no live relay can be disrupted by it: there is no interval in which the
+                // predicate is true and the protection is still needed.
+                //
+                // What the latch protects, for the record, is two ONE-flush windows: the #40 #1
+                // see->arm race (mode.rs:5361) and the #3 terminal->next-flush gap
+                // (mode.rs:5370). Neither wants an unbounded hold; the unboundedness was an
+                // artefact, not a requirement.
+                //
+                // SCOPE: latch only. The retained order is already cleared just above by #111's
+                // own rule, and `leaf_ota_mac` is left alone — that is relay-session state with a
+                // different owner (`record_leaf_ota`), and re-homing a leaf is not this edge's
+                // business.
+                *leaf_flip_confirmed = true;
                 break 'flip; // ≤1 clear/burst
             }
         }
@@ -4818,6 +4856,9 @@ pub fn run_mqtt_burst(
     install_requested: &mut bool,
     // #40 #1: set true iff a retained leaf `install` (for another node) is seen this burst.
     leaf_install_seen: &mut bool,
+    // #329 B1: set true iff the #111 version-flip sweep confirmed a leaf reached the staged build
+    // this burst — the caller clears `leaf_ota_pending` on it (see `mqtt_session`).
+    leaf_flip_confirmed: &mut bool,
     // #329 F2: the caller's snapshot of its OWN self-install suppression latches — bit 0 =
     // `leaf_ota_pending`, bit 1 = `leaf_installs_outstanding`. Forwarded verbatim to
     // `mqtt_session`, which publishes them in the gateway armdiag (see there). `0` off-gateway.
@@ -5038,6 +5079,7 @@ pub fn run_mqtt_burst(
         reset_req, // #52: forward the remote-reboot command capture
         install_requested,
         leaf_install_seen, // #40 #1: forward the leaf-install-seen latch
+        leaf_flip_confirmed, // #329 B1: forward the version-flip confirmation (bounds the latch)
         gate_latches, // #329 F2: forward the self-install gate latches for the armdiag
         peers, // #27: forward the caller's serialized roster to publish retained
         status, // #50: forward the live STAT|screen:page for smol/<id>/status
