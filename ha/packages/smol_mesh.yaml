@@ -1674,11 +1674,9 @@ automation:
   - id: smol_nodemgr_set_all
     alias: "smol nodemgr: SET ALL default screen"
     description: >-
-      On the Apply-to-all button, fan the set-all screen+page out to every per-node
-      topic — no broadcast topic (ruling #3 / design §2.1). Each per-node retained value is
-      overwritten. ⚠️ "EVERY" MEANS EVERY ID WRITTEN BELOW, which since the id7/id9 retirement
-      is id8 alone — so "set all" does NOT reach id5/id50/id51. A fan-out over a hand-written
-      topic list cannot notice the fleet changed; #309 is the fix, not another publish step.
+      On the Apply-to-all button, fan the set-all screen+page out to every per-node topic — no
+      broadcast topic (ruling #3 / design §2.1). Each per-node retained value is overwritten.
+      "EVERY" now means every id DISCOVERED AT RUN TIME, not a list typed into this file (#316).
     mode: single
     trigger:
       - platform: state
@@ -1686,13 +1684,88 @@ automation:
     condition:
       - condition: template
         value_template: "{{ trigger.from_state is not none and trigger.from_state.state != 'unavailable' }}"
+    # #316 — this fanned out over a HAND-WRITTEN topic list: `smol/7`, `smol/8`, `smol/9`. After the
+    # id7/id9 retirement removed the two dead publishes, a button labelled "all" reached exactly ONE
+    # board, id8. It never touched id5, id50, id51 or id122.
+    #
+    # That is a correctness bug, not a cosmetic one, because under-delivery is INDISTINGUISHABLE from
+    # a board ignoring the command: press "all", watch one screen change, and the reasonable
+    # conclusion is "the others are offline" or "the CFG relay dropped it" — both real failure modes
+    # on this fleet, both chased before. The button manufactured a symptom that mimics two genuine
+    # bugs.
+    #
+    # The retire commit put a warning in this automation's own `description:` instead. That was the
+    # right thing to do at the time and it was still not a fix: nobody reads an automation's
+    # description before pressing a button labelled "all". The label is the contract; the description
+    # is a footnote behind two clicks in Settings.
+    #
+    # Fleet discovery + the empty-fleet guard are deliberately the SAME idiom as smol_bard.yaml's
+    # delivery/tale fan-outs, not a second dialect — one shape to learn, and a fix to the shape
+    # reaches every user of it. `*` not `?` in the infix quantifier: the live `_status` entities are
+    # `sensor.smol_5_aegis_status` / `_50_ember_status` / `_51_sigil_status` beside the bare
+    # `sensor.smol_8_status`, and `?` (at most one segment) missed most of the fleet — the exact
+    # quantifier bug that caused a whole-fleet blackout in build_control_room.py's resolve_fw.
+    #
+    # Dormant boards are INCLUDED on purpose: the publish is retained, so a sleeping board picks the
+    # value up when it wakes. Same call, and same reasoning, as smol_bard.yaml:143.
     action:
-      - service: mqtt.publish
-        data:
-          topic: "smol/8/config/default_screen"
-          retain: true
-          qos: 0
-          payload: "{{ states('input_select.smol_all_screen') }}:{{ states('input_select.smol_all_page') }}"
+      - variables:
+          fleet: >-
+            {%- set ns = namespace(ids=[]) -%}
+            {%- for e in states.sensor | map(attribute='entity_id') | select('search','^sensor\\.smol_\\d+(_[a-z0-9]+)*_status$') -%}
+              {%- set id = e.split('.')[1].split('_')[1] -%}
+              {%- if id not in ns.ids -%}{%- set ns.ids = ns.ids + [id] -%}{%- endif -%}
+            {%- endfor -%}
+            {{ ns.ids }}
+          # Built ONCE, outside the loop, so every node gets the identical value — building it per
+          # iteration re-reads the helpers and could straddle an operator's second change, which
+          # would leave the fleet DISAGREEING as the direct result of a control meant to unify it.
+          # Both fields defaulted anyway: `unknown:unknown` is refused by the firmware, so the
+          # operator would press "all" and have nothing happen — the same class of silent no-op this
+          # issue is about. Defaults MATCH each helper's own `initial:` (Menu / "0", lines 262+267);
+          # inventing different ones here would make the button disagree with the control it reads.
+          value: >-
+            {%- set na = ['unknown', 'unavailable', 'none', ''] -%}
+            {%- set s_raw = states('input_select.smol_all_screen') -%}
+            {%- set p_raw = states('input_select.smol_all_page') -%}
+            {%- set s = 'Menu' if s_raw in na else s_raw -%}
+            {%- set p = '0' if p_raw in na else p_raw -%}
+            {{ s }}:{{ p }}
+      - choose:
+          # An empty fleet reaching zero nodes and reporting SUCCESS is the disease this whole
+          # campaign is about. `fleet` comes from MQTT-discovery entities, and after an HA restart
+          # there is a window before the retained discovery configs replay — a button pressed in that
+          # window silently reaches nobody. Say so, loudly. notification_id is per control so it
+          # cannot cross-clear smol_bard.yaml's warnings.
+          - conditions: "{{ fleet | count == 0 }}"
+            sequence:
+              - service: persistent_notification.create
+                data:
+                  notification_id: smol_fanout_empty_set_all
+                  title: "smol: Apply-to-all reached NO nodes"
+                  message: >-
+                    The set-all screen+page button was pressed, but no smol node was discovered at
+                    that moment, so nothing was published. This is usually the window just after an
+                    HA restart, before the retained MQTT discovery configs replay. Press it again
+                    once the fleet is back and this notice will clear itself.
+        default:
+          # Clears the warning once a fan-out reaches somebody, so a stale notice cannot outlive the
+          # condition it described.
+          - service: persistent_notification.dismiss
+            data:
+              notification_id: smol_fanout_empty_set_all
+          - repeat:
+              for_each: "{{ fleet }}"
+              sequence:
+                # qos deliberately left at 0, as it has always been for this topic: the bug here is
+                # REACH, and quietly changing the delivery guarantee too would blur what this fix
+                # proved. Revisit alongside smol_bard.yaml's qos-1 config publishes.
+                - service: mqtt.publish
+                  data:
+                    topic: "smol/{{ repeat.item }}/config/default_screen"
+                    retain: true
+                    qos: 0
+                    payload: "{{ value }}"
   - id: smol_ota_install_id8
     alias: "smol OTA: install staged to id8 (retained)"
     description: >-
