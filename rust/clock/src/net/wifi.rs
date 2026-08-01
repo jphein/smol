@@ -1267,13 +1267,48 @@ static mut MQTT_JSON: JsonScratch = JsonScratch::new();
 /// the label cannot drift from the silicon it describes — a wrong `model` now needs a wrong
 /// TARGET, which fails to link long before it can lie on a dashboard.
 ///
-/// Deliberately not a runtime chip probe: this is a compile-time constant that must live in
-/// `.rodata` and be splice-able into the config JSON without allocation, and the target already
-/// carries the answer.
+/// THE FLEET HAS THREE TARGETS, NOT TWO (JP, 2026-07-31): the C3 OLED board ($2.76), the
+/// screenless C3 SuperMini ($1), and the Waveshare ESP32-C6 touch watch (its firmware lives in
+/// its own repo, but it is a smol fleet target all the same — this crate's C6 arm exists for
+/// exactly that hardware). The two C3 boards run ONE image and differ only at runtime: a missing
+/// OLED NACKs the display init and the board carries on headless (see the tolerance block in
+/// `main.rs`). So the C3 model string cannot be a single compile-time constant without lying
+/// about half the fleet — `model` is the first field anyone checks, and "OLED" on a screenless
+/// board sends someone hunting for a panel that was never soldered. Both C3 variants stay
+/// `.rodata` constants; only the CHOICE between them is runtime, off the same NACK fact the
+/// firmware already records. The budget below is derived from the LONGEST variant, so the
+/// runtime choice can never invalidate the compile-time fit proof.
 #[cfg(all(feature = "wifi", target_feature = "a"))]
-const DEVICE_EXTRAS: &str = ",\"model\":\"smol ESP32-C6\",\"manufacturer\":\"jphein\"";
+const DEVICE_EXTRAS_WATCH: &str = ",\"model\":\"smol ESP32-C6 Watch\",\"manufacturer\":\"jphein\"";
 #[cfg(all(feature = "wifi", not(target_feature = "a")))]
-const DEVICE_EXTRAS: &str = ",\"model\":\"smol ESP32-C3\",\"manufacturer\":\"jphein\"";
+const DEVICE_EXTRAS_OLED: &str = ",\"model\":\"smol ESP32-C3 OLED\",\"manufacturer\":\"jphein\"";
+#[cfg(all(feature = "wifi", not(target_feature = "a")))]
+const DEVICE_EXTRAS_HEADLESS: &str =
+    ",\"model\":\"smol ESP32-C3 SuperMini\",\"manufacturer\":\"jphein\"";
+
+/// The device-block extras for THIS board. cfg-twins like `node_id()`: the C6 arm is the watch
+/// by definition (the only C6 hardware in the fleet); the C3 arm asks whether the OLED answered
+/// at boot. `crate::headless()` is written once on the single-threaded boot path before the net
+/// loop exists, so this read needs no synchronisation.
+#[cfg(all(feature = "wifi", target_feature = "a"))]
+fn device_extras() -> &'static str {
+    DEVICE_EXTRAS_WATCH
+}
+#[cfg(all(feature = "wifi", not(target_feature = "a")))]
+fn device_extras() -> &'static str {
+    if crate::headless() { DEVICE_EXTRAS_HEADLESS } else { DEVICE_EXTRAS_OLED }
+}
+
+/// Longest extras variant THIS target can emit — the budget must fit the worst case, not the
+/// variant that happened to be measured. Derived from the strings themselves so a reworded
+/// label re-derives the fit proof instead of silently outgrowing a copied literal.
+#[cfg(all(feature = "wifi", target_feature = "a"))]
+const DEVICE_EXTRAS_MAX: usize = DEVICE_EXTRAS_WATCH.len();
+#[cfg(all(feature = "wifi", not(target_feature = "a")))]
+const DEVICE_EXTRAS_MAX: usize = {
+    let (a, b) = (DEVICE_EXTRAS_OLED.len(), DEVICE_EXTRAS_HEADLESS.len());
+    if a > b { a } else { b }
+};
 
 /// Payload bytes ONE HA discovery PUBLISH can carry: the 512 B `pkt` buffer, less the PUBLISH
 /// fixed header (1), the remaining-length varint (2 for any payload in 128..16383), the 2 B
@@ -1349,11 +1384,13 @@ const fn discovery_topic_max() -> usize {
 #[cfg(feature = "wifi")]
 const DISCOVERY_CFG_MAX: usize = 215 + 14 + 7 + 90 + 51 + 15 + 17 + 5 + 8;
 
-/// Same bound for the ONE config that also carries [`DEVICE_EXTRAS`] (`status`: shortest
-/// template, no `extra` — which is why it was chosen to carry them).
-///   215 literal + 12 field⨯2 + 6 name + 73 template + 0 extra + 48 extras + 15 id⨯5 + 17 name + 5 build + 8 forge
+/// Same bound for the ONE config that also carries the device extras (`status`: shortest
+/// template, no `extra` — which is why it was chosen to carry them). The extras term is
+/// [`DEVICE_EXTRAS_MAX`] — the longest variant this target can pick at runtime — not a sample.
+///   215 literal + 12 field⨯2 + 6 name + 73 template + 0 extra + extras-max + 15 id⨯5 + 17 name + 5 build + 8 forge
 #[cfg(feature = "wifi")]
-const DISCOVERY_CFG_MAX_WITH_EXTRAS: usize = 215 + 12 + 6 + 73 + 48 + 15 + 17 + 5 + 8;
+const DISCOVERY_CFG_MAX_WITH_EXTRAS: usize =
+    215 + 12 + 6 + 73 + DEVICE_EXTRAS_MAX + 15 + 17 + 5 + 8;
 
 #[cfg(feature = "wifi")]
 const _: () = assert!(
@@ -1366,8 +1403,9 @@ const _: () = assert!(
 #[cfg(feature = "wifi")]
 const _: () = assert!(
     DISCOVERY_CFG_MAX_WITH_EXTRAS <= DISCOVERY_BUDGET,
-    "the discovery config carrying DEVICE_EXTRAS no longer fits one MQTT publish — move the \
-     extras to a config with a shorter template, or drop a device field."
+    "the discovery config carrying the device extras no longer fits one MQTT publish (checked \
+     against the LONGEST runtime variant) — move the extras to a config with a shorter \
+     template, or drop a device field."
 );
 
 /// #309: the DIAG record's fields, as HA entities — `(key, name, component, extra_json)`.
@@ -2923,7 +2961,7 @@ fn mqtt_session(
                 "status", "Status",
                 "{% set p = value.split(' ') %}{{ p[2:]|join(' ') if p|length>2 else '' }}",
                 "",
-                DEVICE_EXTRAS,
+                device_extras(),
             ),
         ];
         for (field, name, tmpl, extra, dev_extra) in cfgs {

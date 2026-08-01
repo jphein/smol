@@ -213,6 +213,25 @@ pub(crate) fn node_id() -> u8 {
     NODE_ID
 }
 
+/// #40-style IDENTITY, hardware-variant axis: did the OLED answer on I2C at boot? The fleet
+/// runs ONE C3 image on TWO boards — the OLED board and the screenless SuperMini — and the
+/// only place the hardware states which one it is, is the display-init NACK (see the HEADLESS
+/// tolerance block below in `main`). Recorded once so the HA discovery `model` can name the
+/// actual board (`wifi::device_extras()`) instead of calling half the fleet "OLED".
+/// Same `static mut` discipline as `NODE_ID_CACHE`: rv32imc has no atomics, but this is
+/// written ONCE on the single-threaded boot path before the net loop exists, then read-only —
+/// no ISR ever touches it. wifi-gated so the default build stays byte-free of it (#44).
+#[cfg(feature = "wifi")]
+static mut HEADLESS: bool = false;
+
+/// True on a board whose OLED never answered (a SuperMini, or a dead panel — the firmware
+/// cannot tell those apart, and does not claim to).
+#[cfg(feature = "wifi")]
+pub(crate) fn headless() -> bool {
+    // SAFETY: written only during single-threaded boot, before any caller of this fn runs.
+    unsafe { *core::ptr::addr_of!(HEADLESS) }
+}
+
 /// See the `not(wifi)` twin above. rv32imc has no atomics, so the one-time-init cache is a
 /// `static mut` — alias-safe because it is read/written ONLY from the single-threaded boot
 /// path + main loop (no ISR touches it), the same discipline as the OTA scratch statics.
@@ -643,6 +662,13 @@ fn main() -> ! {
     // NACK per flush attempt. (Cast still works headless — the tee mirrors the RAM
     // buffer, which draws fill regardless of the panel.)
     if display.init().is_err() {
+        // The NACK is also the board's identity statement (OLED board vs screenless
+        // SuperMini) — record it for the HA discovery `model` (see `headless()`).
+        #[cfg(feature = "wifi")]
+        // SAFETY: single-threaded boot path; every reader runs strictly later.
+        unsafe {
+            *core::ptr::addr_of_mut!(HEADLESS) = true;
+        }
         log::warn!("smol: no OLED responded on I2C — running HEADLESS (renders buffered, flushes no-op)");
     }
 
