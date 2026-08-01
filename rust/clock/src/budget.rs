@@ -386,3 +386,59 @@ const _: () = assert!(
      fields and separate verdicts. Shrink the model, use a chip with a larger slot, or \
      re-cut the partition table (which is an OTA-compatibility change, not a build change)."
 );
+
+// ── #367: scan heap floor ──────────────────────────────────────────────────────────────────────
+
+/// Size of one `esp_radio::wifi::ap::AccessPointInfo`, **measured on this target** (compile-time
+/// probe: `const _: [(); 0] = [(); size_of::<AccessPointInfo>()]`, whose error reports the size).
+/// A const rather than a sentence so the derivation below can be checked, not merely believed.
+pub const SCAN_AP_INFO_BYTES: u32 = 47;
+
+/// Reference environment density. **UNMEASURED** — three instruments failed on 2026-08-01 (fleet
+/// on-demand scan returned nothing in 95 s; katana's WiFi is RF-killed with the driver
+/// unavailable; gatekeeper is a wired firewall with no radio). 150 is a reasoned stand-in for a
+/// dense house, NOT an observation. A real `bss_total` from a retained `smol/<id>/scan` record
+/// replaces this and becomes the check on the whole derivation.
+pub const SCAN_REF_BSSIDS: u32 = 150;
+
+/// Peak heap the scan itself can occupy, derived — see #367.
+///
+/// `scan_async` collects internally and `ScanResults` implements **only** `next()` (no
+/// `size_hint`, no `ExactSizeIterator`), so `collect()` cannot pre-allocate and the `Vec` grows by
+/// DOUBLING. Two consequences, and the second is the one that gets rescaled wrongly later:
+///
+/// 1. Final capacity is the power of two ≥ N — for 150 BSSIDs that is **256**, not 150.
+/// 2. Across the final realloc the OLD and NEW buffers are both live, so the transient is
+///    `(cap/2 + cap) × 47 B` = `1.5 × cap × 47 B`.
+///
+/// ⇒ `(128 + 256) × 47` = **18,048 B**.
+///
+/// ⚠️ **This is a STEP FUNCTION, not a curve. Do not rescale it linearly.** 150 and 250 BSSIDs
+/// cost exactly the same (both fit capacity 256). The next cliff is at **257** BSSIDs → capacity
+/// 512 → `(256 + 512) × 47` = 36,096 B, which is 2× this value in one step. A maintainer who
+/// resizes the heap and scales this proportionally will land in the wrong place.
+pub const SCAN_PEAK_BYTES: u32 = (128 + 256) * SCAN_AP_INFO_BYTES; // 18,048
+
+/// Free heap required before starting a scan (#367).
+///
+/// `= 2 × SCAN_PEAK_BYTES`. **The factor of 2 is an honest safety factor, NOT an enumeration** —
+/// stated plainly because the difference matters to anyone re-deriving it:
+///
+/// * The main superloop contributes **nothing**. The scan is awaited under
+///   `embassy_futures::block_on` with **no executor** (0 embassy-executor in the lockfile;
+///   `esp-rtos` without its `embassy` feature), so MQTT, DIAG, OTA and relay — all main-loop work
+///   — are parked for the duration. That part IS enumerated, and it is zero.
+/// * What could NOT be bounded from source is esp-radio's own demand-driven RX pool
+///   (`dynamic_rx 40` / `static_rx 16`, set in `net::radio_controller_config()`). How many of
+///   those are live during a scan await is driver-internal and traffic-dependent.
+///
+/// So: enumeration closed the main loop and failed on the driver, and the factor covers the gap.
+/// It happens to equal the 257-BSSID cliff (36,096 B) — **coincidence, not derivation.** If the
+/// RX pool is ever bounded properly, replace the factor with the sum and say so here.
+pub const SCAN_HEAP_FLOOR_BYTES: u32 = 2 * SCAN_PEAK_BYTES; // 36,096
+
+const _: () = assert!(
+    SCAN_HEAP_FLOOR_BYTES > SCAN_PEAK_BYTES,
+    "the scan heap floor must exceed the scan's own peak, or the guard cannot protect anything \
+     (src/budget.rs, #367)."
+);
