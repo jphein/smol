@@ -38,6 +38,22 @@ fn c3_fleet() -> TargetId {
     }
 }
 
+/// The legacy (pre-#349) firmware's announce entry point, transcribed exactly: `ota.rs` did
+/// `s.strip_prefix("OTA|")?` and nothing else before splitting fields.
+fn legacy_prefix(s: &str) -> Option<&str> {
+    s.strip_prefix("OTA|")
+}
+
+/// The #349 firmware's dispatch: versioned by PREFIX, never by guessing at field shapes.
+/// Returns `(has_target, rest_after_prefix)`.
+fn new_prefix(s: &str) -> Option<(bool, &str)> {
+    if let Some(r) = s.strip_prefix("OTA2|") {
+        Some((true, r))
+    } else {
+        s.strip_prefix("OTA|").map(|r| (false, r))
+    }
+}
+
 fn check(name: &str, got: Result<(), TargetReject>, want: Result<(), TargetReject>) {
     assert_eq!(got, want, "{name}: guard returned {got:?}, expected {want:?}");
     match want {
@@ -257,7 +273,97 @@ fn main() {
     println!("  ok      {} reasons round-trip through their ordinals", TargetReject::COUNT);
 
     // ---------------------------------------------------------------------------------
-    // 6. OPTIONAL: the same scanner over a REAL flashed image.
+    // 6. The MANIFEST — both generations. This is the stranding-risk surface: if the new
+    //    parser stopped accepting the legacy form, every board that has not yet been rolled
+    //    would silently stop seeing updates, and the only symptom would be a fleet that
+    //    quietly stays on an old build. So the legacy form is asserted, not assumed.
+    // ---------------------------------------------------------------------------------
+    println!("manifest");
+    let sha_hex = "a".repeat(64);
+    let tgt_hex = core::str::from_utf8(&encode_hex(&me)).unwrap().to_string();
+
+    // #32 legacy M — target None, and that must NOT read as "suitable for anyone".
+    let legacy = parse_manifest_str(&format!("905|1156864|{sha_hex}")).expect("legacy M rejected");
+    assert_eq!(legacy.build, 905);
+    assert_eq!(legacy.size, 1_156_864);
+    assert_eq!(legacy.target, None, "legacy M must yield NO target, not a permissive one");
+    println!("  ok      legacy `build|size|sha` still parses, target=None");
+
+    // #349 M — target present and equal to what we encoded.
+    let v2 = parse_manifest_str(&format!("905|1156864|{sha_hex}|{tgt_hex}")).expect("OTA2 M rejected");
+    assert_eq!(v2.target, Some(me), "OTA2 M did not round-trip the target");
+    assert_eq!((v2.build, v2.size), (905, 1_156_864));
+    println!("  ok      OTA2 `build|size|sha|target` parses, target round-trips");
+
+    // Hex codec edges. A corrupted target must fail the WHOLE manifest, never degrade to None.
+    assert_eq!(decode_hex(&tgt_hex[..30]), None, "short target hex decoded");
+    assert_eq!(decode_hex(&format!("{}zz", &tgt_hex[..30])), None, "non-hex target decoded");
+    let mut bad = tgt_hex.clone();
+    bad.replace_range(12..13, if &bad[12..13] == "0" { "1" } else { "0" });
+    assert_eq!(decode_hex(&bad), None, "checksum-broken target hex decoded");
+    assert_eq!(
+        parse_manifest_str(&format!("905|1156864|{sha_hex}|{bad}")),
+        None,
+        "a manifest with a CORRUPT target parsed anyway — it must fail closed, not fall back to None",
+    );
+    println!("  ok      corrupt target hex fails the whole manifest (never degrades to None)");
+
+    // Trailing-junk / short-field fail-closed.
+    assert_eq!(parse_manifest_str(&format!("905|1156864|{}", &sha_hex[..62])), None);
+    assert_eq!(parse_manifest_str(&format!("905|1156864|{sha_hex}|{tgt_hex}|extra")), None);
+    assert_eq!(parse_manifest_str("905|notanumber|"), None);
+    println!("  ok      short sha / 5th field / bad integer all fail closed");
+
+    // M must fit the signed-message buffer the firmware allocates. Worst case is two 10-digit
+    // u32s; if this ever exceeds SIGNED_MSG_MAX the OTAM frame silently truncates.
+    let worst = format!("{}|{}|{}|{}", u32::MAX, u32::MAX, sha_hex, tgt_hex);
+    assert!(parse_manifest_str(&worst).is_some(), "worst-case M does not parse");
+    println!("  ok      worst-case M is {} B (firmware SIGNED_MSG_MAX must be >= this)", worst.len());
+    assert!(worst.len() <= 128, "worst-case M ({} B) exceeds SIGNED_MSG_MAX=128", worst.len());
+
+    // ---------------------------------------------------------------------------------
+    // 6b. THE NO-STRANDING CLAIM, as a test.
+    //
+    //     The entire migration rests on one sentence: "firmware older than #349 ignores an
+    //     `OTA2|` line cleanly instead of mis-parsing it." That is a claim about
+    //     `str::strip_prefix("OTA|")`, and asserting it in a comment is how it would silently
+    //     stop being true. So here is the legacy parser's first step, verbatim, run against
+    //     both lines. If this ever fails, publishing OTA2 would strand every un-rolled board —
+    //     the exact failure this whole design is sequenced to avoid.
+    // ---------------------------------------------------------------------------------
+    println!("no-stranding");
+    let url = "http://10.0.0.1:8087/ota/smol-905.bin";
+    let sig_hex = "b".repeat(128);
+    let legacy_line = format!("OTA|905|1156864|{sha_hex}|{sig_hex}|{url}");
+    let v2_line = format!("OTA2|905|1156864|{sha_hex}|{tgt_hex}|{sig_hex}|{url}");
+
+    // The legacy firmware's ONLY entry point into announce parsing.
+    assert!(legacy_prefix(&legacy_line).is_some(), "legacy fw stopped accepting its own format");
+    assert!(
+        legacy_prefix(&v2_line).is_none(),
+        "PRE-#349 FIRMWARE WOULD MIS-PARSE AN OTA2 LINE — publishing it would strand the fleet",
+    );
+    println!("  ok      pre-#349 fw accepts `OTA|`, cleanly REJECTS `OTA2|` (no mis-slice)");
+
+    // And the new firmware's dispatch accepts both — which is what makes dual-publish work.
+    assert_eq!(new_prefix(&legacy_line).map(|(t, _)| t), Some(false));
+    assert_eq!(new_prefix(&v2_line).map(|(t, _)| t), Some(true));
+    println!("  ok      #349 fw accepts BOTH, and tells them apart by prefix (not by shape)");
+
+    // The OTA2 line's signed prefix must be exactly the M we sign — reconstructed from the
+    // wire bytes, since that is how the firmware rebuilds it before verifying.
+    let (_, rest) = new_prefix(&v2_line).unwrap();
+    let m_expect = format!("905|1156864|{sha_hex}|{tgt_hex}");
+    assert!(rest.starts_with(&m_expect), "M is not a contiguous prefix of the OTA2 payload");
+    assert_eq!(
+        parse_manifest_str(&rest[..m_expect.len()]).and_then(|m| m.target),
+        Some(me),
+        "the signed prefix of the wire line does not parse back to the target",
+    );
+    println!("  ok      M is a contiguous prefix of the wire line and re-parses to the target");
+
+    // ---------------------------------------------------------------------------------
+    // 7. OPTIONAL: the same scanner over a REAL flashed image.
     //
     //    Everything above runs on bytes this file made up. `SMOL_TARGET_VERIFY_BIN=<path>`
     //    points it at an actual `espflash save-image` artifact instead, which is the only way
