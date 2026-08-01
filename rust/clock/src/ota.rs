@@ -903,7 +903,9 @@ fn encode_ledger_key(seed: &[u8; 32]) -> [u8; LEDGER_KEY_REC_LEN] {
 #[cfg(feature = "espnow")]
 fn read_ledger_key_nvs() -> Option<[u8; 32]> {
     use embedded_storage::nor_flash::ReadNorFlash;
-    let mut flash = FlashStorage::new();
+    // #233: esp-storage 0.9 — handle comes from the shared `flash()` steal helper. Sequential
+    // and dropped on return; `resolve_ledger_key` runs once at boot, never during an OTA.
+    let mut flash = flash();
     let mut buf = [0u8; PT_SCRATCH];
     let pt = read_partition_table(&mut flash, &mut buf).ok()?;
     let nvs = pt
@@ -922,7 +924,9 @@ fn read_ledger_key_nvs() -> Option<[u8; 32]> {
 #[cfg(feature = "ledger-provision")]
 fn provision_ledger_key_nvs(seed: &[u8; 32]) -> bool {
     use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
-    let mut flash = FlashStorage::new();
+    // #233: esp-storage 0.9 — see `flash()`. Runs only on a `ledger-provision` build at boot,
+    // strictly after the read above has dropped its handle: never two live at once.
+    let mut flash = flash();
     let mut buf = [0u8; PT_SCRATCH];
     let Ok(pt) = read_partition_table(&mut flash, &mut buf) else {
         return false;
@@ -931,7 +935,7 @@ fn provision_ledger_key_nvs(seed: &[u8; 32]) -> bool {
         return false;
     };
     let mut region = nvs.as_embedded_storage(&mut flash);
-    let sector = <FlashStorage as NorFlash>::ERASE_SIZE as u32;
+    let sector = <FlashStorage<'_> as NorFlash>::ERASE_SIZE as u32;
     // Refuse unless the WHOLE target sector is erased — never overwrite an existing key.
     let mut chunk = [0u8; 64];
     let mut off = LEDGER_KEY_OFFSET;
