@@ -105,23 +105,28 @@ pub mod wire;
 #[cfg(feature = "espnow")]
 pub mod coexist;
 
-// #278 fleet channel election — PURE (no esp-hal/esp-radio, no alloc), ported VERBATIM from the
-// esp32c6-watch's `crates/mesh-elect` and host-tested by `experiments/mesh_elect_verify`, which
-// runs the donor's OWN 39-test suite against this exact file (`#[path]`-include, like `coexist`).
-// Byte-identical wire + identical scoring in both repos is the whole point: the watch holds
-// `ELECT_ENFORCE = false` until smol speaks this, because two watches are a quorum that could
-// otherwise agree to leave ch6 and strand the C3 fleet (#278, #335).
+// #278 the `SMOLv1 ELECT` frame + epoch/anti-flap core — PURE (no esp-hal/esp-radio, no alloc),
+// host-tested by `experiments/mesh_elect_verify` (`#[path]`-include, like `coexist`), which runs
+// the esp32c6-watch donor's own tests against this exact file: 10 of them (8 wire + 2 consensus).
+// The wire codec is byte-identical to the donor's and that is the load-bearing part — the watch
+// holds `ELECT_ENFORCE = false` until smol speaks this frame, because two watches are a quorum
+// that could otherwise agree to leave ch6 and strand the C3 fleet (#278, #335).
+//
+// PARTIAL port, not verbatim: the donor's `Elector` (channel VOTE) is deliberately absent. Per
+// #269 the mesh channel DERIVES from the elected gateway's AP channel — a consequence, not a
+// vote — so 29 of the donor's 39 tests exercised machinery smol does not have and were dropped
+// with it. They live upstream, which still owns the election; re-port rather than reconstruct.
 //
 // Distinct from `election` (which node is GATEWAY) and from `coexist` (which AP do *I* join, given
-// a channel). This one decides WHICH CHANNEL the fleet meets on — the value `coexist` takes as its
-// `mesh_ch` argument and that smol currently hardcodes as `ESP_NOW_FIXED_CHANNEL`.
+// a channel). This module carries and ORDERS the channel the fleet meets on — the value `coexist`
+// takes as its `mesh_ch` argument and that smol still hardcodes as `ESP_NOW_FIXED_CHANNEL`.
 //
 // ⚠️ TEMPORARY, and it must not outlive the next PR: nothing in the firmware calls this yet, so
-// `-D warnings` would fail on dead_code. This is stage 1 of 2 — the pure core + its 39-test
-// cross-repo contract land first so they are reviewable on their own; stage 2 adds the
-// `Frame::Elect` dispatch arm in `mode::parse_frame`, an `Elector` on `RadioManager` (+232 B of
-// .bss — re-measure the stack floor), and the honour path behind a default-off flag. DELETE this
-// allow in that PR; if it is still here afterwards, the wiring silently never happened.
+// `-D warnings` would fail on dead_code. This is stage 1 of 2 — the frame + its cross-repo test
+// contract land first so they are reviewable on their own; stage 2 adds the `Frame::Elect`
+// dispatch arm in `mode::parse_frame`, the announce/honour paths behind a default-off flag, and
+// re-measures the stack floor for whatever state lands on `RadioManager`. DELETE this allow in
+// that PR; if it is still here afterwards, the wiring silently never happened.
 #[allow(dead_code)]
 #[cfg(feature = "espnow")]
 pub mod mesh_elect;
