@@ -136,12 +136,23 @@ jobs:
 
   # #351 — the BYTE-FREE claims, checked instead of asserted.
   #
-  # A SEPARATE JOB, not another step in `firmware`, for one measured reason: this arm LINKS every
-  # tier (the check/clippy loops only compile), which on a dev box is ~70s x 10 on top of a
-  # `firmware` job already budgeted at 45 minutes. Bolting it on would have made the timeout the
-  # thing that fails, and a gate that times out gets deleted. The two jobs share no state — a
-  # different target dir and a different profile (`CARGO_PROFILE_RELEASE_DEBUG`) — so running them
-  # in parallel costs wall-clock nothing.
+  # A SEPARATE JOB, not another step in `firmware`, because it builds with a different cargo
+  # PROFILE (`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`) in a different target dir. Folding it
+  # in would thrash the fingerprints the stack-floor build depends on and put two profiles'
+  # artifacts in one rust-cache; hence its own `key: excl`.
+  #
+  # NOT for cost, and the first version of this comment was wrong to say so. MEASURED here: 2m59s
+  # for all ten links on a COLD cache. The ~700 s it cited came from a local experiment that gave
+  # every tier its own target dir and so paid for ten cold DEPENDENCY builds — not the shipped
+  # path, which shares one dir and pays only the crate plus the LTO link per tier.
+  #
+  # ⚠️ WHAT THIS JOB'S GREEN MEANS. It links a DEBUG-INSTRUMENTED build, which is not the shipped
+  # image: `line-tables-only` moves 464,180 of 1,027,816 ALLOC bytes and grows .text by 46 B,
+  # against a control pair differing by 3 bytes of build stamp (tools/measure_debuginfo_delta.sh).
+  # A size change means codegen differs, so inlining moved — and inlining is what line-table
+  # attribution rides on. This arm is CORROBORATION; the proof is the [tier_exclusive] source
+  # check inside `tools/gate.sh excl`, which costs nothing and is LTO-proof. A refusal here is a
+  # true alarm worth 3 minutes of CI. Its silence is weaker evidence than it looks.
   exclusions:
     name: tier exclusions (#351)
     runs-on: ubuntu-latest

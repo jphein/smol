@@ -23,12 +23,17 @@
 #   5. the crate's own tests/*.rs suites via cargo test (#350) — bard / budget / input. Nothing
 #      ran these before: 57 tests, including the Bard's bit-for-bit golden, that no gate executed
 #   6. tools/test_build_matrix.sh — proof that (0)'s arms can actually fail
-#   7. #351 the BYTE-FREE tier claims, in two arms. (a) build-matrix.toml's [tier_exclusive]
-#      must still agree with the `#[cfg(feature = …)]` in the source, both directions — this
-#      catches the regression (b) structurally cannot, where deleting a gate deletes the claim
-#      along with it. (b) each tier is LINKED and its DWARF line table is asked which source
-#      files contributed code, so "the default build is BYTE-FREE of it" is a measurement
-#      instead of a comment.
+#   7. #351 the BYTE-FREE tier claims, in two DELIBERATELY ASYMMETRIC arms. Read the asymmetry
+#      before deleting either as a duplicate of the other:
+#      (a) THE PROOF. build-matrix.toml's [tier_exclusive] must still agree with the
+#          `#[cfg(feature = …)]` in the source, both directions. Zero build cost, LTO-proof, and
+#          it catches the regression (b) structurally cannot — deleting a gate deletes the
+#          derived claim along with it, which is exactly what a planted leak demonstrated:
+#          src/net/target.rs entered the default tier (11 crate files → 12) and (b) said
+#          "0 leaked".
+#      (b) CORROBORATION ONLY, and unsound in the false-pass direction. Each tier is LINKED and
+#          its DWARF line table is asked which source files contributed code. See the caveat
+#          block below for why this is not the proof.
 #   8. tools/test_check_exclusions.sh — proof that (7)'s arms can actually fail, including the
 #      vacuous-green one (an ELF with no DWARF has an empty file set and every absence "holds")
 #
@@ -42,10 +47,29 @@
 #     ⚠️ The stack check bounds the linked REGION, not runtime high-water. A struct living in a
 #     stack-resident RadioManager can cost ~1.8 KB of real stack and move the region by ~32 B. A
 #     green stack line is NOT evidence of runtime headroom (see repro_stack_check's comment).
-#   * #351 proves no CODE from an excluded module survived. A module of pure `const`/`static`
-#     items lands in .rodata with no line-table rows and is invisible to it — `src/secrets.rs`
-#     is exactly that, and is declared in build-matrix.toml's [unobservable] for the reason.
-#     "BYTE-FREE" is therefore verified for executable bytes, not literally every byte.
+#   * #351 arm (b) DOES NOT MEASURE THE SHIPPED BINARY, and this is the caveat to read before
+#     trusting its silence. It builds with `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`, and
+#     that flag CHANGES THE IMAGE. Measured with an n/d/n sandwich on the fleet tier (harness:
+#     tools/measure_debuginfo_delta.sh):
+#         control  (no-debug vs no-debug):        3 of 1,027,770 ALLOC bytes differ
+#                                                 all 3 in .flash.appdesc (the build stamp);
+#                                                 every section same ADDRESS and same SIZE
+#         treatment (no-debug vs line-tables):  464,180 of 1,027,816 differ  — and .text
+#                                                 grew 871,618 -> 871,664 B  (+46)
+#     The control is what makes that attributable: the tree holds still, so the delta is the
+#     flag. And the SIZE change is the part that matters more than the 45% — byte churn at
+#     constant size would be layout, harmless to a "which modules are present" verdict, whereas
+#     a size change means CODEGEN differs, so inlining moved. Inlining is what line-table
+#     attribution rides on. Arm (b) is therefore UNSOUND IN THE FALSE-PASS DIRECTION: when it
+#     REFUSES, that is a true alarm worth having; when it is silent, it has proved less than it
+#     appears to. Arm (a) is the load-bearing one. (An earlier version of this file claimed the
+#     ALLOC sections came out byte-identical. That was measured on the pre-#233 tree, where the
+#     SIZES happened to match, and it did not survive the dependency wave — a measurement
+#     carried across a codegen-relevant boundary without being re-taken.)
+#   * Even setting that aside, arm (b) proves no CODE from an excluded module survived. A module
+#     of pure `const`/`static` items lands in .rodata with no line-table rows and is invisible to
+#     it — `src/secrets.rs` is exactly that, and is declared in build-matrix.toml's
+#     [unobservable] for the reason. "BYTE-FREE" is verified for executable bytes, not every byte.
 #
 # Usage:  tools/gate.sh              # everything
 #         tools/gate.sh host         # host suites only (no riscv toolchain needed)
@@ -53,10 +77,16 @@
 #         tools/gate.sh excl         # #351 tier exclusions only
 # Env:    CARGO_TARGET_DIR honoured; SMOL_GATE_JOBS caps cargo parallelism.
 #
-# `excl` is its own mode because it is the only arm that LINKS every tier, and measured on a
-# katana-class box that is ~70s x 10 tiers on top of everything else. It shares no state with
-# `fw` — different target dir, different profile — so CI runs the two as parallel jobs rather
-# than pushing one job past its timeout. A human running `tools/gate.sh` still gets all of it.
+# `excl` is its own mode because it is the only arm that LINKS every tier, and because it builds
+# with a different cargo PROFILE (`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`) in a different
+# target dir — folding that into `fw` would thrash the fingerprints the stack-floor build depends
+# on and put two profiles' artifacts in one rust-cache. CI runs the two as parallel jobs. A human
+# running `tools/gate.sh` still gets all of it.
+#
+# COST, measured rather than assumed: 179 s for all ten links on a cold GitHub runner. An earlier
+# version of this comment said ~700 s and cited it as the reason for the split; that number came
+# from a local experiment giving each tier its OWN target dir, so it paid for ten cold DEPENDENCY
+# builds. The shipped path shares one dir and pays only the crate plus the LTO link per tier.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -228,19 +258,21 @@ if [ "$run_excl" = 1 ]; then
   # transitively from src/main.rs, so there is no second hand-written list to drift. The
   # tiers come from the same manifest as the two loops above.
   #
-  # This arm LINKS each tier, which the check/clippy loops do not, because the property is
-  # about what survives into the binary. Two consequences worth knowing before reading a
-  # green line:
-  #   * it needs DWARF, and `[profile.release]` sets `debug = false`, so the builds carry
-  #     CARGO_PROFILE_RELEASE_DEBUG=line-tables-only. Debug info is not an optimisation
-  #     input — MEASURED on this tree, .text/.rodata/.bss/.stack come out the same SIZE with
-  #     and without it — and it lands only in non-ALLOC sections, so no shipped byte moves.
-  #     The checker REFUSES an ELF with no DWARF rather than reading an empty file set and
-  #     calling it clean.
+  # This arm LINKS each tier, which the check/clippy loops do not, because the property is about
+  # what survives into the binary. Three things to know before reading a green line:
+  #   * ⚠️ IT IS NOT THE SHIPPED BINARY. It needs DWARF, and `[profile.release]` sets
+  #     `debug = false`, so the builds carry CARGO_PROFILE_RELEASE_DEBUG=line-tables-only — and
+  #     that flag CHANGES THE IMAGE: 464,180 of 1,027,816 ALLOC bytes differ and .text grows
+  #     +46 B (871,618 -> 871,664), against a control pair differing by 3 bytes of build stamp.
+  #     A size change means codegen differs, so inlining moved, and inlining is what line-table
+  #     attribution rides on. Hence: CORROBORATION, not proof — see the file header. A refusal
+  #     here is a true alarm; silence proves less than it looks like it does.
+  #   * it REFUSES an ELF with no DWARF rather than reading an empty file set and calling it
+  #     clean. That is the vacuous-green trap and it is the default state of a smol build.
   #   * a separate CARGO_TARGET_DIR, so it cannot invalidate the fingerprints the stack-floor
   #     build below depends on. The ELF is copied out after each tier because the next tier
   #     overwrites it.
-  step "tier exclusions — the BYTE-FREE claims (#351)"
+  step "tier exclusions — corroboration on a debug-instrumented build (#351)"
   EXCL="${SMOL_GATE_EXCL_DIR:-/tmp/gate-exclusions}"
   mkdir -p "$EXCL/elf"
   EXCL_ARGS=()
