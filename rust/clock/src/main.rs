@@ -109,6 +109,12 @@ mod clock;
 // #282 SIGIL screen — the node's identity nameplate (fantasy name + version sigil). Its own
 // navigable plugin + menu row; compiled in EVERY build (identity needs no radio, like About).
 mod sigil;
+// #274 follow-up: the two display-text truncators, named for their unit (`clip_bytes` /
+// `clip_chars`). PURE — host-tested verbatim by `experiments/clip_verify`. `wifi`-gated because
+// the consumers span tiers: batt/grid are wifi, bench/rssi/ota_screen are espnow. The previous
+// shared home (rssi.rs) is espnow-only, which is why batt/grid could not share it.
+#[cfg(feature = "wifi")]
+mod textclip;
 // BENCH mode (ESP-NOW link stats + mesh roster). ESP-NOW-only.
 #[cfg(feature = "espnow")]
 mod bench;

@@ -29,7 +29,7 @@ use crate::app::{AppKind, Ctx, MeshStatus, Plugin, TimeSource, Transition};
 use crate::input::Press;
 use crate::led::LedState;
 use crate::net::mode::{BenchStats, NodeView, RosterView};
-use crate::rssi::clip;
+use crate::textclip::clip_bytes;
 
 /// Per-peer rows per NODES page (3 rows + 1 own-status line fills the 5×8 grid).
 const PEERS_PER_PAGE: usize = 3;
@@ -230,7 +230,7 @@ where
     let noun = short.as_str();
 
     let mut left = Line::new();
-    let _ = write!(left, "{} ", clip(noun, 6));
+    let _ = write!(left, "{} ", clip_bytes(noun, 6));
     match mesh.source {
         TimeSource::NtpRoot => {
             let _ = write!(left, "root");
