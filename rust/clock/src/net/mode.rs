@@ -2168,7 +2168,7 @@ pub struct RadioManager {
     elect_announcer: mesh_elect::Announcer,
     /// #278/#269 LEAF half: the best channel decision heard so far, plus its freshness.
     ///
-    /// Maintained REGARDLESS of `mesh_elect::FOLLOW_ENABLED` — observing and acting are separate,
+    /// Maintained REGARDLESS of `crate::net::election::FOLLOW_ENABLED` — observing and acting are separate,
     /// and observing is the whole value of the observe-only landing: the fleet reports what it
     /// *would* have done, against a real crown, before anything moves.
     elect_follower: mesh_elect::Follower,
@@ -3001,7 +3001,7 @@ impl RadioManager {
     /// early-returns on the first line).
     ///
     /// Announcing is ON by default; only *acting* on an announcement is behind
-    /// `mesh_elect::FOLLOW_ENABLED`. That asymmetry is the point of the observe-only landing — a
+    /// `crate::net::election::FOLLOW_ENABLED`. That asymmetry is the point of the observe-only landing — a
     /// frame nobody emits cannot be proven on hardware, and #278's flip criterion is evidence from
     /// a real fleet, not a code review.
     pub fn elect_tick(&mut self, now: u64) {
@@ -3040,7 +3040,7 @@ impl RadioManager {
     fn scan_plan(&self) -> ([u8; mesh_elect::RECOVERY_MAX], usize) {
         mesh_elect::recovery_ladder(
             self.elect_follower.decision().channel,
-            mesh_elect::FOLLOW_ENABLED,
+            crate::net::election::FOLLOW_ENABLED,
         )
     }
 
@@ -4214,7 +4214,7 @@ impl RadioManager {
                     (self.elect_announcer.epoch(), self.elect_announcer.channel(), 'a')
                 } else {
                     let d = self.elect_follower.decision();
-                    (d.epoch, d.channel, if mesh_elect::FOLLOW_ENABLED { 'f' } else { 'o' })
+                    (d.epoch, d.channel, if crate::net::election::FOLLOW_ENABLED { 'f' } else { 'o' })
                 };
                 room_for(
                     &mut rec,
@@ -6568,7 +6568,7 @@ impl RadioManager {
                             // An active OTA session holds its channel too — the precedent is
                             // `leaf_scan_tick`'s `#3b` hold, for the same reason (hopping
                             // mid-transfer drops chunks).
-                            let may_move = mesh_elect::FOLLOW_ENABLED
+                            let may_move = crate::net::election::FOLLOW_ENABLED
                                 && !self.relay.is_gateway
                                 && !self.ota_leaf.is_active();
                             if may_move {

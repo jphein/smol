@@ -5,8 +5,7 @@
 
 use crate::mesh_elect::{
     recovery_ladder, wire, Announcer, Decision, Follow, Follower, GroupMacSink, Phase, SealedElect,
-    ANNOUNCE_BURST, ANNOUNCE_GAP_MS, ANNOUNCE_IDLE_MS, COMMON_AP_CHANNELS, FOLLOW_ENABLED,
-    LEGACY_CANDIDATES, N_CHANNELS, PROBATION_MS, RENDEZVOUS_CHANNEL, SETTLE_MS,
+    ANNOUNCE_BURST, ANNOUNCE_GAP_MS, ANNOUNCE_IDLE_MS, COMMON_AP_CHANNELS, LEGACY_CANDIDATES, N_CHANNELS, PROBATION_MS, RENDEZVOUS_CHANNEL, SETTLE_MS,
 };
 
 fn frame(node_id: u8, epoch: u32, channel: u8, gateway: u8) -> wire::ElectFrame {
@@ -208,7 +207,8 @@ pub fn the_ladder_is_the_legacy_plan_while_following_is_off() {
         assert_eq!(n, LEGACY_CANDIDATES.len(), "legacy plan length (last_known={last_known})");
         assert_eq!(&plan[..n], &LEGACY_CANDIDATES[..], "byte-identical to `leaf_scan_tick`'s CANDIDATES");
     }
-    assert!(!FOLLOW_ENABLED, "and the shipped default IS off — see #278's flip criterion");
+    // (that the shipped default IS off is asserted in `election_verify`, where the flag lives —
+    // it sits beside the MetricWeights it selects, for the cfg reason in its own doc comment.)
 }
 
 /// Best guess first, and never spend a 1500 ms dwell proving the same channel twice.
