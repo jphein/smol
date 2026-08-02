@@ -34,9 +34,6 @@ pub struct FitnessInputs {
     pub co_channel: bool,
     /// Live RSSI-to-AP (dBm, signed; weaker = more negative). Bucketed by [`rssi_score`].
     pub ap_rssi: i8,
-    /// The board holds real (NTP-authoritative) time, not a free-running clock — a better gateway
-    /// can serve TIME frames. `synced_at != 0` upstream.
-    pub ntp_holder: bool,
     /// Monotonic ms since boot (the loop clock == uptime). A longer-lived board is a more stable
     /// crown; also the STATELESS deferral clock for the cold-boot empty-MC claim.
     pub uptime_ms: u64,
@@ -48,24 +45,29 @@ pub struct FitnessInputs {
 pub struct MetricWeights {
     pub co_channel: u8,
     pub rssi: u8,
-    pub ntp: u8,
     pub uptime: u8,
 }
 
 impl MetricWeights {
     /// The SHIPPED default (JP: "elect the BEST gateway" ⇒ best-gateway is the default behavior,
     /// team-lead decision 2026-07-20). CO-CHANNEL-DOMINANT: `co_channel` (100) alone outranks the
-    /// maximum of every other signal combined (`rssi` 10·2 + `ntp` 5 + `uptime` 1·2 = 27), so a
-    /// co-channel board ALWAYS beats a stronger OFF-channel board (the id5 ch1-vs-ch6 bug). Absent /
-    /// empty / malformed config falls back to THIS (not to legacy) — best-gateway is on by default.
-    pub const DEFAULT: Self = Self { co_channel: 100, rssi: 10, ntp: 5, uptime: 1 };
+    /// maximum of every other signal combined (`rssi` 10·2 + `uptime` 1·2 = 22), so a co-channel
+    /// board ALWAYS beats a stronger OFF-channel board (the id5 ch1-vs-ch6 bug). Absent / empty /
+    /// malformed config falls back to THIS (not to legacy) — best-gateway is on by default.
+    ///
+    /// ⚠️ #269 will REBALANCE these. Under channel-follows-the-crown, `co_channel` stops being a
+    /// disease-fix and becomes a channel-change SUPPRESSOR: it would rank a board sitting where the
+    /// mesh already is above a better-internet board elsewhere, by a margin nothing can bridge —
+    /// blocking the migration #269 exists to enable. The fix is to re-scale it from dominant to a
+    /// hysteresis MARGIN, which is also the anti-flap term. Not done here: this commit only removes
+    /// the dead `ntp` input, so the two changes stay separately attributable on a live fleet.
+    pub const DEFAULT: Self = Self { co_channel: 100, rssi: 10, uptime: 1 };
 
     /// Theoretical maximum fitness for these weights — the deficit reference in [`elect_backoff_ms`],
     /// making the tiering scale-invariant to the weight magnitudes. `const` for use at call sites.
     pub const fn max_fitness(&self) -> u16 {
         self.co_channel as u16
             + self.rssi as u16 * RSSI_SCORE_MAX
-            + self.ntp as u16
             + self.uptime as u16 * UPTIME_SCORE_MAX
     }
 }
@@ -126,7 +128,6 @@ fn uptime_score(uptime_ms: u64) -> u16 {
 pub fn gateway_fitness(i: &FitnessInputs, w: &MetricWeights) -> u16 {
     (w.co_channel as u16) * (i.co_channel as u16)
         + (w.rssi as u16) * rssi_score(i.ap_rssi)
-        + (w.ntp as u16) * (i.ntp_holder as u16)
         + (w.uptime as u16) * uptime_score(i.uptime_ms)
 }
 
@@ -253,7 +254,19 @@ pub fn parse_elect_config(payload: &[u8]) -> ElectConfig {
             match key {
                 b'c' | b'C' => w.co_channel = v,
                 b'r' | b'R' => w.rssi = v,
-                b'n' | b'N' => w.ntp = v,
+                // #269: `n` (ntp) was removed as a fitness input — see `gateway_fitness`.
+                //
+                // This arm is a TOMBSTONE, and it is load-bearing beyond compatibility.
+                // Functionally it matches the `_` fallthrough (both ignore the key), so its whole
+                // value is what it TELLS a future reader: `n` is RESERVED, not available. Without
+                // it, someone reintroduces `n` for a new meaning and every stale retained
+                // `c…r…n…u…` payload still sitting in the broker silently re-weights their new
+                // feature — a live-config landmine with no compile-time trace. An explicit
+                // tombstone prevents key REUSE; a fallthrough invites it.
+                //
+                // It also keeps the older promise: a pre-#269 retained payload still parses, and
+                // its `n` is consumed and DISCARDED rather than shifting the remaining weights.
+                b'n' | b'N' => {}
                 b'u' | b'U' => w.uptime = v,
                 _ => {}
             }
