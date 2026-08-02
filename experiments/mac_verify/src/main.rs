@@ -148,6 +148,35 @@ fn main() {
         assert!(should_group_mac(tag), "ordinary SMOLv1 frame IS MAC'd: {:?}", core::str::from_utf8(tag));
     }
     assert!(!should_group_mac(b"\x91\x0b\x00..wled-wizmote.."), "non-SMOLv1 (WLED) sent verbatim");
+    // --- 7b. #278 ELECT MUST be MAC'd, and this is the one shape the send-path gate cannot see ---
+    // `tools/check_elect_send_path.py` proves ELECT can only travel via `send_to`. It says nothing
+    // about whether `send_to` still appends the trailer for THIS frame — a change to
+    // `should_group_mac` (a new exemption, a tightened MTU bound) would strip the authentication
+    // with the send path untouched and every arm of that checker still green.
+    //
+    // That matters more here than for any other frame. A leaf cannot verify a channel announcement
+    // before acting on it: a scan drops the association (`coex_background_scan` is hardcoded false),
+    // so checking costs the leaf the very thing it would need if the announcement were a lie. An
+    // unauthenticated ELECT is a remote "everybody move to channel N" fleet-stranding primitive.
+    //
+    // Asserted at the REAL length, not a stub prefix, because the MTU arm of `should_group_mac` is
+    // length-sensitive and a 13 B prefix would pass a bound the 61 B record might not: 61 + 9 = 70,
+    // comfortably inside the 250 B cap, with the arithmetic on the page rather than assumed.
+    const ELECT_LEN: usize = 61;
+    let elect_frame = {
+        let mut f = Vec::from(&b"SMOLv1 ELECT "[..]);
+        f.resize(ELECT_LEN, b'0');
+        f
+    };
+    assert_eq!(elect_frame.len(), ELECT_LEN, "the fixed-width ELECT record");
+    assert!(!is_ota_family(&elect_frame), "ELECT is not OTA-family — it must NOT be exempt");
+    assert!(should_group_mac(&elect_frame), "ELECT MUST carry the group-MAC trailer (#278)");
+    assert!(
+        elect_frame.len() + MAC_TRAILER_LEN <= ESP_NOW_MTU,
+        "ELECT + trailer fits the MTU: {} + {} <= {}",
+        elect_frame.len(), MAC_TRAILER_LEN, ESP_NOW_MTU
+    );
+
     // An over-MTU SMOLv1 frame is sent verbatim (never emit > MTU): ceiling+1 with a real prefix.
     let mut over = Vec::from(&b"SMOLv1 DIAG 007"[..]);
     over.resize(ESP_NOW_MTU - MAC_TRAILER_LEN + 1, b'x');
