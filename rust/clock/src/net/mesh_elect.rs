@@ -65,6 +65,23 @@
 //! deliberately bypass it via `send_arb_raw`; routing ELECT that way would convert a
 //! safe channel hop into a remote fleet-partition attack.
 //!
+//! # Prior art: this is CSA with an ESP-NOW carrier, not a novel design
+//!
+//! 802.11 already has the announce-then-move mechanism and a name for it: the **Channel Switch
+//! Announcement** element, carried in beacons. ESP-WIFI-MESH migrates its mesh channel exactly
+//! this way — CSA elements propagated by the root, announced by the node that noticed, *then* the
+//! move. smol's ELECT frame is the same mechanism on a different carrier, which is why the
+//! announce-before-AND-after ordering below is not a guess.
+//!
+//! ESP-WIFI-MESH also **requires** the mesh and the router to share a channel. That is
+//! independent validation of #269's premise: co-channel by construction rather than by repair is
+//! how a shipping ESP mesh does it.
+//!
+//! ⚠️ And the same source documents the honest limit — the migration is **not atomic**: IDF states
+//! there will be *"a temporary channel discrepancy"* while nodes converge. A production system with
+//! this exact architecture ships with a documented disagreement window, which is why the
+//! migration-window guard in `net::mode`'s `note_crown_ap` is kept rather than deleted.
+//!
 //! # Recovery ladder for a leaf that missed the announcement
 //!
 //! esp-radio 0.18 exposes all-channels or exactly one channel — never a subset
