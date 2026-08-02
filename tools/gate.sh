@@ -275,6 +275,14 @@ if [ "$run_excl" = 1 ]; then
   step "tier exclusions — corroboration on a debug-instrumented build (#351)"
   EXCL="${SMOL_GATE_EXCL_DIR:-/tmp/gate-exclusions}"
   mkdir -p "$EXCL/elf"
+  # Concurrent gates sharing the default $EXCL wipe each other's build tree mid-compile and
+  # report failures that have nothing to do with the code (seen 2026-08-02: "Blocking waiting
+  # for file lock" then "couldn't create a temp dir" — the OTHER gate deleted the dir). The
+  # dir stays FIXED so warm rebuilds stay warm; an flock serializes users instead. A second
+  # gate blocks here until the first finishes — slower, never corrupted. Private-dir runs
+  # (SMOL_GATE_EXCL_DIR=...) take their own lock and don't contend.
+  exec 9>"$EXCL.lock"
+  flock 9 || { bad "tier exclusions (could not take $EXCL.lock)"; exit 1; }
   EXCL_ARGS=()
   while IFS=$'\t' read -r name feats; do
     if [ -n "$feats" ] && ! grep -qE "^${feats%%,*} *=" "$CLOCK/Cargo.toml"; then
