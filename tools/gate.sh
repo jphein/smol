@@ -273,7 +273,12 @@ if [ "$run_excl" = 1 ]; then
   #     build below depends on. The ELF is copied out after each tier because the next tier
   #     overwrites it.
   step "tier exclusions — corroboration on a debug-instrumented build (#351)"
-  EXCL="${SMOL_GATE_EXCL_DIR:-/tmp/gate-exclusions}"
+  # Keyed PER WORKTREE: a shared dir cross-pollutes even SERIALLY — a stale tier ELF carries
+  # comp_dir from whichever worktree built it last, and check_exclusions then fails a healthy
+  # tree (seen 2026-08-02: lucid chased a spurious comp_dir failure to exactly this). Per-
+  # worktree dirs keep rebuilds warm per checkout, kill cross-worktree pollution AND remove
+  # cross-worktree lock contention; the flock below still serializes same-worktree runs.
+  EXCL="${SMOL_GATE_EXCL_DIR:-/tmp/gate-exclusions-$(printf %s "$ROOT" | cksum | cut -d' ' -f1)}"
   mkdir -p "$EXCL/elf"
   # Concurrent gates sharing the default $EXCL wipe each other's build tree mid-compile and
   # report failures that have nothing to do with the code (seen 2026-08-02: "Blocking waiting
