@@ -103,7 +103,7 @@ const MESH_PEERS_TOPIC: &[u8] = b"smol/mesh/peers";
 const MESH_CHANNEL_HINT_TOPIC: &[u8] = b"smol/mesh/channel_hint";
 
 /// #gateway-election OPERATOR LEVER: the retained best-gateway METRIC. Payload = keyed weights
-/// `c<n>r<n>n<n>u<n>` (co-channel / rssi / ntp / uptime), the literal `legacy` (escape hatch → the
+/// `c<n>r<n>n<n>u<n>` (co-channel / rssi / ntp-ACCEPTED-AND-IGNORED / uptime), the literal `legacy` (→
 /// historical lowest-id + RSSI election), or empty (retain-clear → the on-by-default co-channel-
 /// dominant metric). Read in-burst by [`mqtt_session`] into `elect.elect_cfg` — the election consumes
 /// it in the SAME burst it claims in, so (unlike the CFG-relay family) no relay round-trip is needed.
@@ -193,9 +193,6 @@ pub struct MeshElect {
     /// (`ESP_NOW_FIXED_CHANNEL`) — the DOMINANT default-weighted fitness signal (an off-channel crown
     /// is OTA-deaf regardless of RSSI, #217). Seeded by the caller from `self.my_ap_channel`.
     pub co_channel: bool,
-    /// Best-gateway election: this board holds NTP-authoritative time (`synced_at != 0`) — a better
-    /// gateway can serve TIME frames. Seeded by the caller (0-weight-equivalent while uniformly false).
-    pub ntp_holder: bool,
     /// #gateway-election LAYER 2: the fixed mesh channel (`ESP_NOW_FIXED_CHANNEL`), seeded by the
     /// caller. Lets the resolver detect an OFF-channel owner (retained MC `<ch>` known and != this)
     /// so a CO-CHANNEL board seizes the wrong (off-channel, OTA-deaf) crown IMMEDIATELY instead of
@@ -257,7 +254,6 @@ impl MeshElect {
             flush_incapable: false, // #146: seeded by the caller from the flush-fail abdication latch
             channel_hint: None, // #155: seeded by the caller from the retained smol/mesh/channel_hint
             co_channel: false, // best-gateway: seeded by the caller from my_ap_channel == mesh
-            ntp_holder: false, // best-gateway: seeded by the caller from synced_at != 0
             mesh_channel: 0, // LAYER 2: seeded by the caller (ESP_NOW_FIXED_CHANNEL); 0 → override off
             co_channel_known: false, // best-gateway: false at boot (channel unknown) → claim fast
             // best-gateway is ON by default (team-lead 2026-07-20); the retained smol/mesh/elect topic
@@ -281,7 +277,6 @@ impl MeshElect {
         crate::net::election::FitnessInputs {
             co_channel: self.co_channel,
             ap_rssi: self.my_rssi,
-            ntp_holder: self.ntp_holder,
             uptime_ms: self.now_ms,
         }
     }
@@ -3520,10 +3515,21 @@ fn mqtt_session(
                                 log::info!("smol: #gateway-election metric = LEGACY (lowest-id, retained)")
                             }
                             crate::net::election::ElectConfig::BestGateway(w) => log::info!(
-                                "smol: #gateway-election metric = best-gateway c{} r{} n{} u{} (retained)",
+                                // #269: `n` prints as a literal 0, and that is not a compatibility
+                                // courtesy — it is ACCURATE. The effective weight of the ntp input
+                                // is zero permanently, by construction, so 0 IS the applied state.
+                                //
+                                // INVARIANT worth preserving if this line ever changes: this
+                                // readback reports the APPLIED weights, never the SENT ones. An
+                                // operator who sends `n50` reads back `n0` and learns immediately
+                                // that their knob did nothing. Echoing `n50` would claim an
+                                // application that never happened; dropping the slot would tell
+                                // them nothing at all. Keeping the `c<n>r<n>n<n>u<n>` shape they
+                                // can still send makes the gap between typed and applied visible
+                                // at a glance.
+                                "smol: #gateway-election metric = best-gateway c{} r{} n0 u{} (retained)",
                                 w.co_channel,
                                 w.rssi,
-                                w.ntp,
                                 w.uptime
                             ),
                         }

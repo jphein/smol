@@ -2586,12 +2586,12 @@ impl RadioManager {
         elect.my_channel = self.learned_channel; // #29: seed the MC record's <ch> (0 until learned)
         // #gateway-election: seed the best-gateway fitness signals. co_channel (my AP == the fixed
         // mesh channel) is the DOMINANT default-weighted input; co_channel_known fail-opens the
-        // empty-MC deferral until the channel is learned. ntp_holder is v1-stubbed false (uniform →
-        // zero ordering effect; wire from `my_synced_at` in a follow-up).
+        // empty-MC deferral until the channel is learned. (#269 removed the `ntp_holder` input —
+        // it was never wireable into a signal: `my_synced_at` is set by mesh ADOPTION so it is
+        // uniformly true, and own-NTP is gateway-only so it is pure incumbency.)
         elect.co_channel = self.my_ap_channel == ESP_NOW_FIXED_CHANNEL;
         elect.co_channel_known = self.my_ap_channel != 0;
         elect.mesh_channel = ESP_NOW_FIXED_CHANNEL; // LAYER 2: detect an off-channel owner in the MC
-        elect.ntp_holder = false;
         elect.seen_owner = self.mc_seen_owner;
         elect.seen_seq = self.mc_seen_seq;
         elect.seen_ms = self.mc_seen_ms;
@@ -5496,11 +5496,10 @@ impl RadioManager {
         elect.my_channel = self.learned_channel; // #29: seed the MC record's <ch> (0 until learned)
         // #gateway-election: seed the best-gateway fitness signals (see maybe_leaf_reelect). On the
         // flush path my_ap_channel is known (a running gateway is associated), so the deferral +
-        // fitness backoff are fully active. ntp_holder v1-stubbed false (follow-up).
+        // fitness backoff are fully active. (#269 removed `ntp_holder` — see maybe_leaf_reelect.)
         elect.co_channel = self.my_ap_channel == ESP_NOW_FIXED_CHANNEL;
         elect.co_channel_known = self.my_ap_channel != 0;
         elect.mesh_channel = ESP_NOW_FIXED_CHANNEL; // LAYER 2: detect an off-channel owner in the MC
-        elect.ntp_holder = false;
         // #gateway-election all-nodes-WiFi DEBUG: a NON-gateway node only reaches this flush because
         // its debug flag is set. It must NEVER claim the crown (that would let every debug node fight
         // for ownership) — suppress the claim exactly like the #146 flush-incapable guard, so the
