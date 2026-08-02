@@ -29,6 +29,13 @@
 //! * **Board VARIANT is deliberately absent.** OLED vs SuperMini is detected at runtime
 //!   (`crate::headless()`), and a variant that is not a build artifact needs no OTA guard, no
 //!   CI job and no row in a table. Keep it that way; do not add a variant field here.
+//!   Since #352 the variant has a home of its own — [`super::profile::BoardProfile`] — and the
+//!   two are ORTHOGONAL BY CONSTRUCTION, not by convention: a `TargetId` must be decidable from
+//!   an IMAGE ALONE, because that is the entire suitability guard, and a board variant can only
+//!   be learned by probing hardware. Anyone tempted to "unify" them should note that the merge
+//!   does not merely blur a boundary, it deletes [`decide`]'s ability to run. The one field they
+//!   share is `chip`, and `profile` **borrows** [`SELF_CHIP`] from here rather than re-deriving
+//!   it — re-deriving it (from `cfg(target_feature = "a")`) was the bug #352 removed.
 //! * **It is a WIRE type with a C++-emittable subset** (#331 Phase 1 keeps the stationary Ember
 //!   on ESPHome, so a non-Rust fleet member has to be able to emit this). See [`Desc`] below.
 //!

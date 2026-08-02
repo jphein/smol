@@ -147,6 +147,17 @@ pub mod ledger_link;
 #[cfg(feature = "wifi")]
 pub mod target;
 
+// #352 board VARIANT identity — what this board IS (chip + did the OLED answer at boot), and
+// the single owner of the Home Assistant `model` label. ORTHOGONAL to `target` above and it must
+// stay that way: `TargetId` must be decidable from an IMAGE alone (that is the whole #349
+// suitability guard), and a board variant can only be discovered by probing hardware. They
+// compose — `profile` borrows `target::SELF_CHIP` rather than re-deriving the chip, which is
+// exactly the defect #352 fixed. PURE (no HAL), so `experiments/profile_verify` `#[path]`-includes
+// it and covers every chip on the host, including the S3 this tree cannot yet build.
+// `wifi`-gated to match its sole consumer, `wifi::device_extras`.
+#[cfg(feature = "wifi")]
+pub mod profile;
+
 // #25 WLED WiZmote-emit (smol as a WLED "linked remote"). `wled = ["espnow"]`, so
 // this is present only in a wled build; the default/wifi/espnow builds are byte-free
 // of it (the module is `#![cfg(feature = "wled")]`). Referenced by `app` (the
@@ -157,8 +168,11 @@ pub mod wled;
 // #26 smol Cast: stream the gateway's OLED image to a network WLED matrix as
 // realtime UDP pixels. `cast = ["wifi"]`. `cast` is the PURE packer + shadow
 // framebuffer (host-testable, no HAL deps); `cast_oled` is the DrawTarget tee that
-// feeds it (needs ssd1306). Absent from every non-cast build → the default / wifi /
-// espnow / wled profiles are byte-free of it.
+// feeds it (needs ssd1306). Absent from every non-cast build → the default / wifi / espnow
+// tiers are byte-free of it, and #351's tools/check_exclusions.py proves that per tier from
+// the DWARF line table rather than leaving it as this sentence. (The `wled` TIER is NOT on
+// that list: since #350 it is `wled,${canonical}`, and the canonical fleet features include
+// `cast`. The old wording named a feature combination nothing builds.)
 #[cfg(feature = "cast")]
 pub mod cast;
 #[cfg(feature = "cast")]

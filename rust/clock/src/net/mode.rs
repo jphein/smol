@@ -666,6 +666,10 @@ struct DiagCounters {
     /// Lowest free-heap reading observed since boot (leak/pressure watermark). `u32::MAX` until
     /// the first sample so `min()` latches the true low-water on the first `diag_sample_heap`.
     heap_min: u32,
+    /// #367: scans DEFERRED because free heap was below `budget::SCAN_HEAP_FLOOR_BYTES`
+    /// (monotonic, saturating). Non-zero means the unbounded `scan_async` collect is genuinely
+    /// pressing on this board's heap — the signal that the latent bug became live here.
+    scan_skip: u16,
     /// BOOT-button SHORT-press count (monotonic, wraps). HA fires a `press` event on each change.
     btn: u16,
     /// BOOT-button LONG-press count (monotonic, wraps). HA fires a `long-press` event on change.
@@ -725,6 +729,7 @@ impl DiagCounters {
     const fn new() -> Self {
         Self {
             heap_min: u32::MAX,
+            scan_skip: 0,
             btn: 0,
             btnl: 0,
             flush_ok: 0,
@@ -3187,21 +3192,59 @@ impl RadioManager {
             log::info!("smol #71: scan skipped — mesh-OTA session active (coexist)");
             return;
         }
+        // #367 HEAP GATE: `scan_async` collects one AccessPointInfo per visible AP and the bound
+        // cannot be restored in esp-radio 0.18 (see the call site). Returning here DEFERS — it
+        // touches no state, so the caller's normal cadence retries on a later tick once heap
+        // recovers. Deliberately placed after the OTA gate: both are "not now", and OTA is the
+        // cheaper test.
+        if !self.scan_heap_ok() {
+            return;
+        }
         let ch_before = self.current_channel();
         // scan_n = scan_with_config_sync_max(Default, N): a synchronous full-band scan capped at N
         // results. We cap generously then keep the strongest few, so a busy band still yields the
         // most-relevant APs.
         let record = match block_on(
             self.controller
-                // #233 REGRESSION FIX: esp-radio 0.18's scan_async(ScanConfig::default()) has
-                // max=None and returns EVERY AP in range as a heap Vec — the old esp-wifi
-                // scan_n(16) capped at 16. In a dense RF environment the unbounded Vec is an
-                // OOM-panic risk (alloc failure = rst=panic); .with_max(16) restores the bound.
+                // ⚠️ #367: `.with_max(16)` DOES NOT BOUND THE ALLOCATION. It is accepted and
+                // silently DISCARDED by esp-radio 0.18. Kept only because it is the documented
+                // intent and costs nothing if a future version starts honouring it.
+                //
+                // Why it does nothing (esp-radio-0.18.0, verified in source):
+                //   - `scan_async` collects internally at `wifi/mod.rs:2828` via
+                //     `ScanResults::new(self)?.collect::<Vec<_>>()`.
+                //   - `ScanResults::new(_controller)` (`wifi/scan.rs:138`) takes the CONTROLLER
+                //     only — the `ScanConfig` never reaches it. It sets `remaining = bss_total`
+                //     (the full driver AP count) and the iterator walks every one.
+                //   - So one `AccessPointInfo` is heap-allocated per AP the radio can see.
+                // Upstream: esp-hal#5583 (opened 2026-05-19, closed 2026-05-28) — the fix is NOT
+                // in 0.18.0. A matched-set bump is the real fix (#233's thesis: never piecemeal).
+                //
+                // DO NOT "fix" this with either obvious repair — both are dead ends:
+                //   1. `.take(16)` on the RETURNED value cannot help: `scan_async` returns an
+                //      already-collected `Vec`, so the allocation happened inside the callee
+                //      before we see a byte. It bounds our copy, never the peak.
+                //   2. Driving the scan ourselves to use the public `ScanResults` iterator is
+                //      UNREACHABLE: `wifi_start_scan` is `pub(crate)` (`wifi/mod.rs:1090`) and
+                //      `EVENT_CHANNEL` is private. `scan_async` is the crate's ONLY public scan
+                //      entry point.
+                //
+                // Measured magnitude (so the risk is sized, not feared): `AccessPointInfo` is
+                // 47 B on this target; the heap is 96 KB (`net.rs`). 150 BSSIDs ≈ 7 KB steady,
+                // ~14 KB if the Vec doubles while growing. Real, density-dependent, and invisible
+                // on a 3-AP bench — but not the tens-of-KB spike an earlier estimate suggested.
                 .scan_async(&ScanConfig::default().with_max(16)),
         ) {
             Ok(mut aps) => {
                 // Strongest RSSI first (descending → Reverse of the ascending key).
                 aps.sort_by_key(|a| core::cmp::Reverse(a.signal_strength));
+                // #367 RETAINED-COPY BOUND — deliberately NOT an OOM guard. The peak allocation
+                // already happened inside `scan_async` (see the note above); this cannot undo it.
+                // What it DOES do is bound everything downstream of here — the record we format,
+                // publish and relay — to the 16 strongest, which is the behaviour the old
+                // esp-wifi `scan_n(16)` gave callers. Truncating AFTER the sort keeps the
+                // strongest 16 rather than an arbitrary 16.
+                aps.truncate(16);
                 format_scan_record(&aps)
             }
             Err(_) => alloc::string::String::from("SCAN|err"),
@@ -3228,6 +3271,12 @@ impl RadioManager {
     /// re-measures downstream on the next flush; #155 channel-follow re-advertises the new channel.
     /// ⚠️ HW-CANARY-GATED: the scan + reassociate radio path — and whether ESP-NOW coexist follows
     /// the new STA channel — cannot be verified without hardware (same discipline as `run_scan`/OTA).
+    /// #367: deliberately NOT heap-gated, unlike `run_scan`. This returns a `CrownApDecision`, and
+    /// the only "skip" value available is `NoAp` — which the caller cannot distinguish from "no
+    /// usable AP exists" and would act on by shedding the crown. Trading a possible allocation
+    /// spike for a spurious crown shed is a bad trade: the shed is certain, the spike is not.
+    /// If this path ever needs guarding, give the decision an explicit `Deferred` variant first —
+    /// do NOT reuse `NoAp`.
     fn reassoc_ch6_prefer(&mut self) -> crate::net::coexist::CrownApDecision {
         use crate::net::coexist::{select_crown_ap, ApView, CrownApDecision};
         // COEXIST hard gate: never leave the mesh channel mid mesh-OTA transfer (mirrors run_scan).
@@ -3249,13 +3298,41 @@ impl RadioManager {
         // co-channel vs the strand fallback in ONE pass). Filter to our SSID; feed the pure selector.
         let decision = match block_on(
             self.controller
-                // #233 REGRESSION FIX: esp-radio 0.18's scan_async(ScanConfig::default()) has
-                // max=None and returns EVERY AP in range as a heap Vec — the old esp-wifi
-                // scan_n(16) capped at 16. In a dense RF environment the unbounded Vec is an
-                // OOM-panic risk (alloc failure = rst=panic); .with_max(16) restores the bound.
+                // ⚠️ #367: `.with_max(16)` DOES NOT BOUND THE ALLOCATION. It is accepted and
+                // silently DISCARDED by esp-radio 0.18. Kept only because it is the documented
+                // intent and costs nothing if a future version starts honouring it.
+                //
+                // Why it does nothing (esp-radio-0.18.0, verified in source):
+                //   - `scan_async` collects internally at `wifi/mod.rs:2828` via
+                //     `ScanResults::new(self)?.collect::<Vec<_>>()`.
+                //   - `ScanResults::new(_controller)` (`wifi/scan.rs:138`) takes the CONTROLLER
+                //     only — the `ScanConfig` never reaches it. It sets `remaining = bss_total`
+                //     (the full driver AP count) and the iterator walks every one.
+                //   - So one `AccessPointInfo` is heap-allocated per AP the radio can see.
+                // Upstream: esp-hal#5583 (opened 2026-05-19, closed 2026-05-28) — the fix is NOT
+                // in 0.18.0. A matched-set bump is the real fix (#233's thesis: never piecemeal).
+                //
+                // DO NOT "fix" this with either obvious repair — both are dead ends:
+                //   1. `.take(16)` on the RETURNED value cannot help: `scan_async` returns an
+                //      already-collected `Vec`, so the allocation happened inside the callee
+                //      before we see a byte. It bounds our copy, never the peak.
+                //   2. Driving the scan ourselves to use the public `ScanResults` iterator is
+                //      UNREACHABLE: `wifi_start_scan` is `pub(crate)` (`wifi/mod.rs:1090`) and
+                //      `EVENT_CHANNEL` is private. `scan_async` is the crate's ONLY public scan
+                //      entry point.
+                //
+                // Measured magnitude (so the risk is sized, not feared): `AccessPointInfo` is
+                // 47 B on this target; the heap is 96 KB (`net.rs`). 150 BSSIDs ≈ 7 KB steady,
+                // ~14 KB if the Vec doubles while growing. Real, density-dependent, and invisible
+                // on a 3-AP bench — but not the tens-of-KB spike an earlier estimate suggested.
                 .scan_async(&ScanConfig::default().with_max(16)),
         ) {
             Ok(aps) => {
+                // #367: NO `truncate` here, unlike the scan-record path above — deliberate.
+                // `select_crown_ap` takes a `max_by_key` over these views, so dropping any entry
+                // risks discarding the very AP it exists to find. `views` is already bounded far
+                // below the raw AP count by the SSID filter below (only our own network), so an
+                // arbitrary cap would trade correctness for memory we do not need back here.
                 let mut views: alloc::vec::Vec<ApView> = alloc::vec::Vec::new();
                 for a in aps.iter() {
                     if a.ssid.as_str() == net.ssid {
@@ -3338,6 +3415,34 @@ impl RadioManager {
             let ctx = CrownCtx { reassoc_exhausted: true, better_successor_cc: false };
             self.crown_state = crown_next_state(CrownState::Shed, decision, self.shed_reclaims, ctx);
         }
+    }
+
+    /// #367: may a scan start right now? `false` ⇒ free heap is below
+    /// [`crate::budget::SCAN_HEAP_FLOOR_BYTES`], so `scan_async`'s unbounded per-AP collect could
+    /// exhaust the heap and panic-reboot (the bound cannot be restored in esp-radio 0.18 — see the
+    /// note at the call site).
+    ///
+    /// **DEFER, NEVER ABANDON.** Callers must leave whatever drives the retry untouched so the
+    /// scan happens on a later tick. A skipped-and-forgotten scan on the #269 recovery path would
+    /// convert "reboot" into "stranded, silently, while still looking alive" — which is worse,
+    /// because a reboot at least re-enters discovery.
+    ///
+    /// Trips are COUNTED (`diag.scan_skip`) so this is observable in the dense environment where
+    /// it fires. A guard that degrades silently is indistinguishable from dead code, and we would
+    /// have no way to tell whether it ever protected anything.
+    fn scan_heap_ok(&mut self) -> bool {
+        let free = esp_alloc::HEAP.free() as u32;
+        if free < crate::budget::SCAN_HEAP_FLOOR_BYTES {
+            self.diag.scan_skip = self.diag.scan_skip.saturating_add(1);
+            log::warn!(
+                "smol #367: scan DEFERRED — free heap {} B < floor {} B (skips={})",
+                free,
+                crate::budget::SCAN_HEAP_FLOOR_BYTES,
+                self.diag.scan_skip
+            );
+            return false;
+        }
+        true
     }
 
     /// #70: sample the live free-heap and lower the min-heap watermark. Cheap (one `HEAP.free()`);
