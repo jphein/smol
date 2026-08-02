@@ -6239,6 +6239,22 @@ impl RadioManager {
     /// Low-level send helper: fire one frame and wait for the TX callback so we
     /// don't overrun the single in-flight ESP-NOW send slot.
     ///
+    /// RAW-SEND-SITES: send_to:1, send_arb_raw:1, run_leaf_ota_relay:3
+    ///
+    /// Every function permitted to call `esp_now.send` directly, with its call COUNT, checked in
+    /// both directions by `tools/check_elect_send_path.py`. Counts and not just names, because
+    /// adding a fourth send inside `run_leaf_ota_relay` would otherwise slip through a name-only
+    /// allowlist — and an already-listed function is exactly where a new send is easiest to add.
+    ///
+    /// Why the list is short and must stay short: this method is the choke that appends #190's
+    /// group-MAC trailer, so every entry here is, by construction, a way for a frame to reach the
+    /// air UNAUTHENTICATED. That is correct and deliberate for the OTA family (`send_arb_raw`'s
+    /// ODEL/ODON and `run_leaf_ota_relay`'s OTAM broadcasts are consumed before the RX
+    /// verify-then-strip, so a trailer would corrupt them, and they carry their own ed25519
+    /// signature instead). It would be catastrophic for `SMOLv1 ELECT `, which a leaf cannot
+    /// verify before acting on. A new entry is therefore a security decision and belongs in a
+    /// diff, not in someone's afternoon.
+    ///
     /// #190 (Fork B / B1): this is the SINGLE TX choke every `broadcast_*`/relay helper funnels
     /// through, so the group-MAC auth trailer is appended HERE — once — for every SMOLv1 frame.
     /// The gate `starts_with(b"SMOLv1 ")` is load-bearing: `send_to` ALSO carries the #25 WLED

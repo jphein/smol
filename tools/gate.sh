@@ -162,6 +162,21 @@ if [ "$run_fw" = 1 ]; then
     printf '%s\n' "$out"; bad "verifier wiring"
   fi
 
+  # #278/#269: the `SMOLv1 ELECT` frame can RETUNE a leaf's radio, and a leaf cannot verify an
+  # announcement before acting on it — esp-radio 0.18 hardcodes `coex_background_scan: false`, so
+  # checking costs the association it would need if the announcement were false. An unauthenticated
+  # ELECT is therefore a remote fleet-stranding primitive, and #190's group-MAC trailer is appended
+  # only on the `send_to` path. Stage 1 wrote that down as prose. This reads source STRUCTURE
+  # instead: one sink impl, routed to `send_to`; a sealed frame with no byte accessor; one encoder
+  # call site; one spelling of the prefix; and every raw `esp_now.send` declared WITH ITS COUNT.
+  # `tools/test_check_elect_send_path.sh` proves all of those can fail, plus three fail-closed arms.
+  step "ELECT reaches the air only authenticated (#278)"
+  if out=$("$ROOT/tools/check_elect_send_path.py" "$ROOT" 2>&1); then
+    printf '%s\n' "$out"; ok "elect send path"
+  else
+    printf '%s\n' "$out"; bad "elect send path"
+  fi
+
   # #350: cheap and before any compile, because everything below DERIVES from this manifest —
   # a gate that builds the wrong tier list confidently is worse than one that refuses to start.
   # The arms: the canonical tier matches REPRO_FLEET_FEATURES (the packaging path's own
@@ -428,6 +443,19 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | tail -2; ok "test_check_exclusions"
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_check_exclusions"
+  fi
+
+  # #278: same discipline for the ELECT send-path checker, and for the same reason as #351 —
+  # every one of its arms is an ABSENCE check ("no second impl", "no stray encoder call", "no
+  # undeclared raw send"), and an absence check that has quietly stopped covering anything prints
+  # exactly the green an intact one does. Each arm mutates a COPY of the firmware tree into a shape
+  # that was enumerated as "satisfies the type system and still strands the fleet", and asserts the
+  # checker goes red for the RIGHT REASON. Three further arms delete an anchor and require exit 2.
+  step "ELECT send-path checker regression suite (#278)"
+  if out=$("$ROOT/tools/test_check_elect_send_path.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -2; ok "test_check_elect_send_path"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_check_elect_send_path"
   fi
 
   # The merge guard's own self-test. One line, and it is the difference between "the guard HAS a
