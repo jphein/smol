@@ -64,9 +64,13 @@ arm "placeholder count mismatch" 1 "placeholder" \
 arm "stale literal term" 1 "format-string literal is" \
     'const DIAG_CORE_MAX: usize = 167	const DIAG_CORE_MAX: usize = 168'
 # Over the cliff: the whole point of the constant.
+# Both halves move together so the ONLY thing that can fail is the budget: +300 on a declared width
+# and +300 on the term it sums to. The literal `167 + 237` is the live constant's own text — when it
+# changes, this arm reports "fixture setup failed" rather than silently testing nothing. It has
+# already done that once, on the #323 bump that took the term 228 -> 237.
 arm "core over budget" 1 "does NOT fit" \
     'up=10 heap=10	up=310 heap=10' \
-    'usize = 167 + 228	usize = 167 + 528'
+    'usize = 167 + 237	usize = 167 + 537'
 # A checker that cannot find its subject must NOT report success.
 arm "checker blinded (no format string)" 2 "has gone blind" \
     'let mut rec = alloc::format!	let mut rec = notformat!'
