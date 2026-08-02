@@ -56,6 +56,12 @@ use esp_radio::{
 
 use crate::led::LedState;
 use crate::net::{SmolWifiDevice, WifiPeripherals};
+// #278/#269: the ELECT frame + the announce/follow machinery. Imported as a MODULE rather than
+// glob-imported: its names (`weight`, `Decision`, `Phase`, `Follow`) are generic enough to collide
+// with this file's vocabulary, and `mesh_elect::` at the call site is what tells a reader that the
+// thing being handled is the CHANNEL plane, not the gateway election in `net::election`. Those two
+// are separate concerns that share the word "elect" (see `net::mesh_elect`'s header).
+use crate::net::mesh_elect;
 // #13: the relay-family wire codec + ASCII field helpers live in the PURE, host-testable
 // `net::wire` module (extracted from here, byte-identical). Glob-imported so every call site
 // below (encode_relay, parse_relay[2], *relayack*, encode_dl, write_u5/u10, parse_id/u5/u10,
@@ -656,6 +662,14 @@ enum Frame<'a> {
     /// #57 Mesh Familiar: a decoded FAM frame (heartbeat / handoff / call). Scalar-only
     /// (no borrow) — buffered into the [`FamInbox`] for [`RadioManager::fam_tick`] to ingest.
     Fam(FamFrame),
+    /// #278/#269: the crown's `SMOLv1 ELECT` announcement of the mesh rendezvous channel — a
+    /// decoded, fully length- and digit-checked [`mesh_elect::wire::ElectFrame`]. Scalar-only
+    /// (the fixed 61 B record is copied out by the parser, so nothing borrows the RX buffer).
+    ///
+    /// This is an ANNOUNCEMENT of a derived value, not a ballot: nothing here votes. See
+    /// `net::mesh_elect`'s header for why the channel is a consequence of the gateway election
+    /// rather than an election of its own.
+    Elect(mesh_elect::wire::ElectFrame),
 }
 
 /// #70/#49 observability: a node's own live diag counters, folded into the retained DIAG record
@@ -2148,6 +2162,16 @@ pub struct RadioManager {
     /// still HELLO-scans when it is 0/stale/absent (the proven fallback). Sourced from `rx_control`,
     /// NOT the deliberately-sidestepped `esp_wifi_get_channel`.
     learned_channel: u8,
+    /// #278/#269 CROWN half: the announce schedule for the mesh channel. Only a gateway ever
+    /// advances it (a leaf carries an idle one — 16 B is not worth a `cfg` split that would then
+    /// need re-testing per tier). Pure state; the radio work is in [`RadioManager::elect_tick`].
+    elect_announcer: mesh_elect::Announcer,
+    /// #278/#269 LEAF half: the best channel decision heard so far, plus its freshness.
+    ///
+    /// Maintained REGARDLESS of `mesh_elect::FOLLOW_ENABLED` — observing and acting are separate,
+    /// and observing is the whole value of the observe-only landing: the fleet reports what it
+    /// *would* have done, against a real crown, before anything moves.
+    elect_follower: mesh_elect::Follower,
     /// #13 MESH-TEST rig ONLY: MACs this board pretends it cannot hear. `service()` drops any
     /// inbound frame from a listed source before it touches the roster/parse — a deterministic,
     /// reproducible stand-in for physical RF attenuation that forces a 2-hop topology. Seeded
@@ -2399,6 +2423,8 @@ impl RadioManager {
             scan_locked: false,
             scan_idx: 0,
             learned_channel: 0, // #29: unknown until the first frame is heard
+            elect_announcer: mesh_elect::Announcer::new(), // #278: idle until a channel is known
+            elect_follower: mesh_elect::Follower::new(),   // #278: bootstrap decision until heard
             #[cfg(feature = "mesh-test")]
             deaf: crate::board::DEAF_MACS, // #13 rig: baked per-board deaf-list (empty in prod)
 
@@ -2447,7 +2473,12 @@ impl RadioManager {
     /// roam), it unlocks + resumes scanning. Gateways never scan (they ride their AP
     /// channel via the live association).
     pub fn leaf_scan_tick(&mut self, now: u64) {
-        const CANDIDATES: [u8; 3] = [1, 6, 11]; // JP's roam plan
+        // #278: the probe plan is now RANKED and seeded from the last announcement we accepted —
+        // best guess first, then the rendezvous, then the common APs, then the rest of the band.
+        // With `FOLLOW_ENABLED` off it returns `[1, 6, 11]` verbatim (host-asserted, not claimed),
+        // so this hop loop is byte-identical to the historical blind scan until the flag flips.
+        let (plan, plan_len) = self.scan_plan();
+        let candidates = &plan[..plan_len];
         const DWELL_MS: u64 = 1500; // listen this long per candidate before hopping
         const SCAN_SILENCE_MS: u64 = 6000; // owner silence → assume roam → re-scan
         if self.relay.is_gateway {
@@ -2472,6 +2503,22 @@ impl RadioManager {
             self.scan_locked = false;
             log::info!("smol: leaf lost gateway id{} — re-scanning", self.elected_owner);
         }
+        // #278 PROBATION: the same unlock, for the failure mode a monotonic epoch invites. A node
+        // that persists a high epoch out-ranks every later announcement forever, so a fleet that
+        // adopted it can be wedged onto a dead channel with no way back — `supersedes` is doing
+        // exactly what it was asked to. Probation is the exit: once the adopted epoch has gone
+        // quiet past `PROBATION_MS` we stop treating it as authoritative and walk the ladder again.
+        //
+        // Deliberately a SEPARATE arm from the owner-silence one above, on a separate clock: an
+        // owner can be alive and HELLOing on a channel whose ELECT epoch is long dead, and a dead
+        // epoch can outlive several owners. Folding them would let either mask the other.
+        if self.scan_locked && self.elect_follower.probation_expired(now) {
+            self.scan_locked = false;
+            log::info!(
+                "smol #278: ELECT epoch {} silent past probation — re-scanning from the ladder",
+                self.elect_follower.decision().epoch
+            );
+        }
         if self.scan_locked {
             return;
         }
@@ -2482,7 +2529,7 @@ impl RadioManager {
         // leaf behaves like today's blind scan. `poll` returns Some only on an actual change, so we
         // re-tune the radio exactly as sparsely as the round-robin did (never mid-dwell).
         if self.relay.latch.latched() {
-            if let Some(ch) = self.relay.park.poll(now, &CANDIDATES) {
+            if let Some(ch) = self.relay.park.poll(now, candidates) {
                 let _ = self.esp_now.set_channel(ch);
                 log::info!(
                     "smol #126: latched-leaf channel {} ({})",
@@ -2496,8 +2543,14 @@ impl RadioManager {
         // latch re-bootstraps from a clean hunt.
         self.relay.park.reset();
         if now.saturating_sub(self.last_scan_hop_ms) >= DWELL_MS {
-            self.scan_idx = (self.scan_idx + 1) % CANDIDATES.len();
-            let ch = CANDIDATES[self.scan_idx];
+            // `plan_len` is never 0 (the ladder always yields at least the rendezvous), but modulo
+            // a zero length would panic, and a panic in the leaf recovery path bricks membership
+            // for a board that is already lost. Guard it rather than reason about it.
+            if candidates.is_empty() {
+                return;
+            }
+            self.scan_idx = (self.scan_idx + 1) % candidates.len();
+            let ch = candidates[self.scan_idx];
             let _ = self.esp_now.set_channel(ch);
             self.last_scan_hop_ms = now;
         }
@@ -2883,6 +2936,112 @@ impl RadioManager {
         let mut msg = [0u8; 16];
         let len = encode_id_frame(HELLO_PREFIX, self.id, &mut msg);
         self.send_to(&BROADCAST_ADDRESS, &msg[..len]);
+    }
+
+    // ── #278/#269 the ELECT announcement path ─────────────────────────────────────────────────
+
+    /// The mesh channel as a DERIVED value (#269): wherever this crown's single radio actually is.
+    ///
+    /// Preference order is "measured, then commanded, then historical", which is the order of how
+    /// much each one can be wrong by. `learned_channel` is `rx_control`'s view — what peers are
+    /// genuinely reaching us on. `my_ap_channel` is what we last *asked* the STA for, true a moment
+    /// sooner but a moment less reliable. `ESP_NOW_FIXED_CHANNEL` is the historical constant, and
+    /// falling back to it means a crown that has heard nothing announces the rendezvous, which is
+    /// exactly where a fleet with no other information should meet.
+    fn elect_channel(&self) -> u8 {
+        for ch in [self.learned_channel, self.my_ap_channel] {
+            if mesh_elect::ch_index(ch).is_some() {
+                return ch;
+            }
+        }
+        ESP_NOW_FIXED_CHANNEL
+    }
+
+    /// Broadcast one `SMOLv1 ELECT` announcement of the current decision.
+    ///
+    /// The `w[13]` weight vector is filled in HONESTLY, which here means mostly zeros. smol does not
+    /// run per-channel scans on the announce path (that would cost the association — see the module
+    /// header), so the only channel we can truthfully weigh is the one our own AP is on. Every other
+    /// slot is a measured zero, not a guess. The watch still runs its own election over these
+    /// observations in observe-only mode, and feeding it invented numbers would be worse than
+    /// feeding it few.
+    fn broadcast_elect(&mut self) {
+        // Same abdication rule as HELLO: a demoted ex-crown must not keep asserting a channel
+        // decision any more than it keeps asserting its presence.
+        if self.silent_until_relock {
+            return;
+        }
+        let mut w = [0u8; mesh_elect::N_CHANNELS];
+        if let Some(ix) = mesh_elect::ch_index(self.my_ap_channel) {
+            // `weight` saturates at both ends and returns 0 below USABLE_MIN_DBM, so an unusable AP
+            // contributes nothing rather than a small lie.
+            w[ix] = mesh_elect::weight(self.my_rssi_to_ap) as u8;
+        }
+        let d = self.elect_announcer.decision(self.id);
+        let f = mesh_elect::wire::ElectFrame {
+            node_id: self.id,
+            epoch: d.epoch,
+            channel: d.channel,
+            gateway: d.gateway,
+            w,
+        };
+        let Some(sealed) = mesh_elect::SealedElect::seal(&f) else {
+            // Unreachable via `Announcer::decide`, which range-checks before it ever stores a
+            // channel. Refuse loudly rather than silently: an out-of-range announcement acted on by
+            // a following fleet tunes every leaf to nothing.
+            log::warn!("smol #278: refusing to announce ch{} — out of range", d.channel);
+            return;
+        };
+        // The ONLY way a sealed frame reaches the air. `emit` consumes it, and `SealedElect` has no
+        // byte accessor, so there is no second path to take by accident.
+        sealed.emit(self, &BROADCAST_ADDRESS);
+    }
+
+    /// Drive the crown's announcement schedule. Call every subtick from `main` (cheap: a leaf
+    /// early-returns on the first line).
+    ///
+    /// Announcing is ON by default; only *acting* on an announcement is behind
+    /// `mesh_elect::FOLLOW_ENABLED`. That asymmetry is the point of the observe-only landing — a
+    /// frame nobody emits cannot be proven on hardware, and #278's flip criterion is evidence from
+    /// a real fleet, not a code review.
+    pub fn elect_tick(&mut self, now: u64) {
+        if !self.relay.is_gateway {
+            return; // the mesh channel is the CROWN's channel; a leaf has nothing to announce
+        }
+        let ch = self.elect_channel();
+        // SETTLE-gated, unlike the reassoc path below: this reads an OBSERVED value every subtick,
+        // and an AP that oscillates would otherwise burn one epoch per oscillation. Since epoch is
+        // the total order, that would not merely be noisy — every announcement would out-rank the
+        // last and `supersedes` would stop meaning anything.
+        if self.elect_announcer.observe_channel(ch, now) {
+            log::info!(
+                "smol #278: mesh channel decision → ch{} epoch {} (announcing before the move)",
+                ch,
+                self.elect_announcer.epoch()
+            );
+        }
+        // The pre/post BURSTS around an actual retune are fired inline by `reassoc_ch6_prefer`,
+        // which is the only place that knows a move is about to happen and is still reachable on
+        // the old channel. This tick covers the steady state: one repeat per beacon interval, so a
+        // leaf that boots, wakes, or finally lands on the right channel learns the current decision
+        // without waiting for a migration that may never come.
+        if self.elect_announcer.due(now) || self.elect_announcer.beacon_due(now) {
+            self.broadcast_elect();
+        }
+    }
+
+    /// The ordered channel-probe plan a leaf walks to re-find the mesh, seeded from the last
+    /// announcement it accepted.
+    ///
+    /// Single source of truth for BOTH `leaf_scan_tick` (which hops it) and `current_channel`
+    /// (which reports where in it we are). Those two carried separate `[1, 6, 11]` literals joined
+    /// by a `// must match the scan plan above` comment — a prose contract between two constants,
+    /// which is the shape that rots. Now there is one plan and no claim to keep true.
+    fn scan_plan(&self) -> ([u8; mesh_elect::RECOVERY_MAX], usize) {
+        mesh_elect::recovery_ladder(
+            self.elect_follower.decision().channel,
+            mesh_elect::FOLLOW_ENABLED,
+        )
     }
 
     /// #164: advance every peer's link-quality (ETX) register by one HELLO interval. Call once
@@ -3367,6 +3526,35 @@ impl RadioManager {
             | CrownApDecision::OffChannelFallback { bssid, ch } => (Some(bssid), Some(ch)),
             CrownApDecision::NoAp => (None, None),
         };
+        // #278/#269 ANNOUNCE BEFORE THE MOVE. This is the last instant the crown is still reachable
+        // by the fleet it is about to leave: `disconnect_async` is on the next line. 802.11 solves
+        // this with a Channel Switch Announcement in the beacon and ESP-WIFI-MESH propagates CSA
+        // elements the same way; this is that mechanism on an ESP-NOW carrier.
+        //
+        // Inline and blocking, mirroring `run_crown_delegate`'s ODEL burst — the in-repo precedent
+        // for "unacked frames that must not be missed, fired immediately before a disruptive
+        // action". A tick-driven burst cannot work here: the reassociation below is synchronous, so
+        // the main loop will not run again until the move is already over.
+        //
+        // Cost is `ANNOUNCE_BURST × ANNOUNCE_GAP_MS` = 600 ms, on a path that already blocks for a
+        // 16-AP `scan_async` plus a disconnect and a connect. It is NOT gated on FOLLOW_ENABLED:
+        // announcing is safe for a fleet that ignores announcements, and a frame nobody emits
+        // cannot be proven on hardware — which is what #278's flip criterion asks for.
+        if let Some(new_ch) = chan {
+            if self.elect_announcer.decide(new_ch, now_ms()) {
+                log::warn!(
+                    "smol #278: crown moving to ch{} — announcing epoch {} before the switch",
+                    new_ch,
+                    self.elect_announcer.epoch()
+                );
+                while !self.elect_announcer.clear_to_move() {
+                    let t = now_ms();
+                    if self.elect_announcer.due(t) {
+                        self.broadcast_elect();
+                    }
+                }
+            }
+        }
         let _ = block_on(self.controller.disconnect_async());
         // #233: StationConfig has private fields — build via BuilderLite setters. 0.18's
         // with_bssid/with_channel take the INNER value (wrapping in Some), so only call them
@@ -3394,6 +3582,25 @@ impl RadioManager {
             self.my_ap_channel,
             ESP_NOW_FIXED_CHANNEL
         );
+        // #278/#269 ANNOUNCE AFTER THE MOVE, from the new channel, at the SAME epoch.
+        //
+        // Announcing only before would strand anyone who was asleep or parked on another channel;
+        // announcing only after guarantees a window where the crown is deaf to its own fleet. Both,
+        // asymmetric, is the shape ESP-WIFI-MESH ships — and IDF is explicit that even then the
+        // migration is not atomic ("a temporary channel discrepancy"), which is why the
+        // migration-window guard in `note_crown_ap` stays.
+        //
+        // Same epoch on both bursts is stronger than ordering them: a pre-move frame that arrives
+        // late is byte-identical to a post-move one, so there is nothing for it to override.
+        if matches!(self.elect_announcer.phase(), mesh_elect::Phase::Pre) {
+            self.elect_announcer.moved(now_ms());
+            while !self.elect_announcer.settled() {
+                let t = now_ms();
+                if self.elect_announcer.due(t) {
+                    self.broadcast_elect();
+                }
+            }
+        }
         decision
     }
 
@@ -3842,7 +4049,7 @@ impl RadioManager {
         // unless it equals this list exactly. Change the appends and you must change this line —
         // which is the point: the prose above rotted precisely because nothing could test it.
         //
-        // SHED-ORDER: sog, cfgq, cdeaf, cc, ap, cfg, io, deaf, lg_core, lg
+        // SHED-ORDER: sog, cfgq, cdeaf, cc, ap, cfg, io, deaf, elect, lg_core, lg
         let mut shed = 0u8;
         {
             let mut room_for = |rec: &mut alloc::string::String, field: alloc::string::String| {
@@ -3981,6 +4188,44 @@ impl RadioManager {
                 room_for(
                     &mut rec,
                     alloc::format!("|deaf={}|ddrops={}", deaf_n, self.diag.ddrops),
+                );
+            }
+            // #278/#269 ELECT observability — the deliverable of the observe-only landing, and the
+            // only way the canary roll can see it. `ESP_LOG` is baked at build time, so a release
+            // image is serial-SILENT: the `WOULD follow …` line in `service` exists for a debug
+            // build and is invisible on the fleet. If it is not in DIAG, it did not happen.
+            //
+            //   `elect=<epoch>c<ch>n<accepted>m<moves><mode>`   e.g. `elect=3c11n42m1o`
+            //
+            // `mode` is `a` on the announcing crown, `o` observe-only on a leaf, `f` following.
+            // `m` is the number that matters: `n` only proves the 2 s beacon works (a leaf on the
+            // wrong channel hears nothing at all, so in the steady state every leaf is co-channel
+            // and every announcement is a `Confirmed`), whereas `m` counts announcements naming a
+            // DIFFERENT channel — i.e. the crown's PRE-move burst being caught, which is the one
+            // hard part of the design and the thing that must be measured before anything acts.
+            //
+            // Offered BEFORE the ledger, per the instruction that block's comment leaves for
+            // exactly this case: a field added later must justify shedding after the ledger or be
+            // appended before it. During a channel-migration roll this is the most operationally
+            // urgent field in the record and the ledger is explicitly the least, so it goes ahead
+            // of it — and behind every #204/#217 coexist field, which keep their priority.
+            {
+                let (ep, ch, mode) = if self.relay.is_gateway {
+                    (self.elect_announcer.epoch(), self.elect_announcer.channel(), 'a')
+                } else {
+                    let d = self.elect_follower.decision();
+                    (d.epoch, d.channel, if mesh_elect::FOLLOW_ENABLED { 'f' } else { 'o' })
+                };
+                room_for(
+                    &mut rec,
+                    alloc::format!(
+                        "|elect={}c{}n{}m{}{}",
+                        ep,
+                        ch,
+                        self.elect_follower.accepted(),
+                        self.elect_follower.moves(),
+                        mode
+                    ),
                 );
             }
             // ── #181 ledger readout: OFFERED LAST, therefore SHED FIRST. That ordering is a
@@ -4231,13 +4476,21 @@ impl RadioManager {
     /// 0 until the first frame). `0` ⇒ advisory-only: HA/leaves treat the `<ch>` field as absent
     /// and fall back (no roam-flag / HELLO-scan), so this never ships a false positive.
     fn current_channel(&self) -> u8 {
-        const CANDIDATES: [u8; 3] = [1, 6, 11]; // must match the scan plan above
         if self.relay.is_gateway {
             self.learned_channel // #29: real gateway channel from rx_control (0 until learned)
         } else if !self.scan_locked {
             0
         } else {
-            CANDIDATES[self.scan_idx % CANDIDATES.len()]
+            // #278: reads the SAME plan `leaf_scan_tick` hops. This used to be a second `[1, 6, 11]`
+            // literal held in agreement by a `// must match the scan plan above` comment — a prose
+            // contract between two constants, which is the shape that rots. There is now one plan
+            // and nothing to keep true.
+            let (plan, plan_len) = self.scan_plan();
+            if plan_len == 0 {
+                0 // advisory-only field; 0 means "absent" to every consumer
+            } else {
+                plan[self.scan_idx % plan_len]
+            }
         }
     }
 
@@ -6269,6 +6522,62 @@ impl RadioManager {
                     self.ensure_peer(src, now);
                     label = Some(alloc::format!("bench seq {}", seq));
                 }
+                Some(Frame::Elect(f)) => {
+                    // The announcement arrives on the AUTHENTICATED path: `service` verifies and
+                    // strips the #190 group-MAC before `parse_frame` ever sees these bytes, so a
+                    // forged "everybody move to channel N" never reaches this arm.
+                    //
+                    // Treat it as crown liveness too — it is a crown-only frame, so hearing one is
+                    // the same evidence a HELLO is, and a leaf that hears ELECT but is between
+                    // HELLOs should not be re-electing.
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, Some(f.node_id), rssi, now);
+                    // `learned_channel` was set from THIS frame's `rx_control` a few lines above,
+                    // so it is the most accurate answer to "what channel am I on" available here —
+                    // more so than `current_channel`, which reports a leaf's *planned* rung.
+                    let mine = self.learned_channel;
+                    let verdict = self.elect_follower.observe(&f, now, mine);
+                    match verdict {
+                        mesh_elect::Follow::Stale => {
+                            // Not newer. Deliberately silent and deliberately not counted as
+                            // liveness for probation — a replayed old frame must not look like a
+                            // crown that is still talking.
+                        }
+                        mesh_elect::Follow::Confirmed => {
+                            label = Some(alloc::format!("elect e{} ch{}", f.epoch, f.channel));
+                        }
+                        mesh_elect::Follow::Move(ch) => {
+                            // A crown does not follow: it IS the channel authority, and a gateway
+                            // retuning away from its own AP would strand the fleet it is serving.
+                            // An active OTA session holds its channel too — the precedent is
+                            // `leaf_scan_tick`'s `#3b` hold, for the same reason (hopping
+                            // mid-transfer drops chunks).
+                            let may_move = mesh_elect::FOLLOW_ENABLED
+                                && !self.relay.is_gateway
+                                && !self.ota_leaf.is_active();
+                            if may_move {
+                                let _ = self.esp_now.set_channel(ch);
+                                // Re-acquire on the new channel: the owner we were locked to is by
+                                // definition not where we were listening any more.
+                                self.scan_locked = false;
+                                self.last_scan_hop_ms = now;
+                                log::info!(
+                                    "smol #278: following crown id{} to ch{} (epoch {})",
+                                    f.gateway, ch, f.epoch
+                                );
+                            } else {
+                                // The observe-only report. This line IS the deliverable of the
+                                // default-off landing: it says what the board would have done,
+                                // from a real fleet, before any board moves.
+                                log::info!(
+                                    "smol #278: observe-only — WOULD follow crown id{} to ch{} (epoch {}, from ch{})",
+                                    f.gateway, ch, f.epoch, mine
+                                );
+                            }
+                            label = Some(alloc::format!("elect e{} ->ch{}", f.epoch, ch));
+                        }
+                    }
+                }
                 Some(Frame::Time { id, unix, synced_at }) => {
                     // Buffer the FRESHEST offer (highest synced_at) seen since
                     // `main` last took one, so a burst of frames collapses to the
@@ -6944,6 +7253,31 @@ fn encode_time(id: u8, unix: u32, synced_at: u32, out: &mut [u8]) -> usize {
 }
 
 /// Parse an inbound payload into a [`Frame`], or `None` if it isn't ours.
+/// #278/#269 SECURITY BOUNDARY — the one route an ELECT announcement may take to the air.
+///
+/// A leaf cannot verify a channel announcement before acting on it: `coex_background_scan` is
+/// hardcoded `false` in esp-radio 0.18, so peeking at another channel costs the very association it
+/// would need if the announcement turned out to be a lie. It must TRUST the frame. That makes an
+/// unauthenticated ELECT a remote fleet-stranding primitive — "everybody move to channel N", with no
+/// cheap way for a leaf to detect it — so #190's group-MAC trailer is not a bonus here, it is the
+/// thing that makes trusting the frame safe.
+///
+/// [`Self::send_to`] is the choke that appends that trailer (`should_group_mac` admits any
+/// non-OTA-family `SMOLv1 ` frame that fits the MTU, and `SMOLv1 ELECT ` is 61 B + 9 B = 70 B).
+/// `send_arb_raw` deliberately does NOT append it — correct for the #237 OTA arbitration frames it
+/// exists for, catastrophic for this one.
+///
+/// ⚠️ THE REGRESSION THIS INVITES, named so it is not discovered later: this body is one line, and
+/// the one-line edit that breaks the fleet ("just use the other sender") compiles clean, passes every
+/// test, and looks like a simplification. `tools/check_elect_send_path.py` reads this impl and fails
+/// if it names any sender but `send_to`, or if a second implementation appears. Do not delete that
+/// check because this comment exists — the comment is what failed last time.
+impl mesh_elect::GroupMacSink for RadioManager {
+    fn send_group_mac(&mut self, dst: &[u8; 6], frame: &[u8]) {
+        self.send_to(dst, frame);
+    }
+}
+
 fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
     // MMO-snake frames are the hot path in the game; try them first. `parse_snk`
     // validates prefix/length/ver itself and degrades on unknown ver.
@@ -7048,6 +7382,14 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
         // record (to end-of-frame; empty = none). Twin of the DIAG arm.
         let src = parse_id(rest)?;
         return Some(Frame::Scan { src, value: &rest[3..] });
+    }
+    // #278/#269: the crown's channel announcement. `mesh_elect::wire::parse` owns the whole
+    // decode — exact length, every field digit-checked, channel range-checked at the boundary —
+    // because this frame is the one that can RETUNE a leaf's radio, and a leaf cannot verify an
+    // announcement before acting on it. Deliberately last: it is the rarest frame (one crown, one
+    // per beacon interval) and every arm above is a cheaper prefix match.
+    if let Some(f) = mesh_elect::wire::parse(data) {
+        return Some(Frame::Elect(f));
     }
     None
 }

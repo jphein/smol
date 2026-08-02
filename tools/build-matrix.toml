@@ -165,25 +165,11 @@ hostsim  = "host-only, and covered by the `cargo test` arm in tools/gate.sh"
 # observed fails the gate, because a reason that has quietly stopped applying reads as a
 # considered decision and is worse than no entry.
 [unobservable]
-# ⚠️ TEMPORARY — stage 2 of #278 MUST delete this entry, and the gate is what will notice.
-# `net/mesh_elect.rs` is the ELECT frame + epoch/anti-flap core, ported ahead of its wiring so it
-# could be reviewed on its own. Nothing calls it yet (it carries a matching dated
-# `#[allow(dead_code)]` at its `pub mod` declaration), so the linker strips it and it emits no
-# observable code in ANY tier — which is exactly what this gate flagged: its absence from the
-# non-espnow tiers proves nothing while it is absent from espnow too.
-#
-# This is the `crdt.rs` shape (#371) caught BEFORE it landed rather than by a later audit, and the
-# reason the check works is that it reads SOURCE STRUCTURE: a symbol-absence check has nothing to
-# complain about in a module that emits no symbols.
-#
-# When stage 2 adds the `Frame::Elect` dispatch arm and the announce/honour paths, the module
-# starts emitting code, this claim becomes false, and the gate fails until the entry is removed.
-# That is the intended sequence — do not pre-emptively delete it, and do not let it survive.
-"src/net/mesh_elect.rs" = """\
-unwired pending stage 2 of #278 — declared and cfg-gated on espnow, but no caller exists yet, so \
-it contributes no executable code to any tier and its exclusion elsewhere is unprovable. Paired \
-with the dated `#[allow(dead_code)]` on `pub mod mesh_elect;` in net.rs; BOTH must be deleted by \
-the PR that wires it, and both fail loudly if they are not."""
+# (`src/net/mesh_elect.rs` was here through stage 1 of #278 and is deliberately gone. Stage 2 added
+# the `Frame::Elect` dispatch arm and the announce/follow paths, so the module now emits observable
+# code in the espnow tier and the entry's claim became FALSE — the gate failed on it, which is the
+# designed sequence working. Removed together with the paired `#[allow(dead_code)]` in net.rs; the
+# two-sided marker is why neither could be dropped quietly.)
 
 "src/secrets.rs" = """\
 consts only (WIFI_NETWORK / MQTT_* / WLED_CAST_*) — 0 fn / 0 impl in both secrets.rs and \
