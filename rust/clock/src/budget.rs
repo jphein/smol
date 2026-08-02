@@ -394,12 +394,28 @@ const _: () = assert!(
 /// A const rather than a sentence so the derivation below can be checked, not merely believed.
 pub const SCAN_AP_INFO_BYTES: u32 = 47;
 
-/// Reference environment density. **UNMEASURED** — three instruments failed on 2026-08-01 (fleet
-/// on-demand scan returned nothing in 95 s; katana's WiFi is RF-killed with the driver
-/// unavailable; gatekeeper is a wired firewall with no radio). 150 is a reasoned stand-in for a
-/// dense house, NOT an observation. A real `bss_total` from a retained `smol/<id>/scan` record
-/// replaces this and becomes the check on the whole derivation.
-pub const SCAN_REF_BSSIDS: u32 = 150;
+/// Largest AP count the scan guard is sized to absorb.
+///
+/// **This is bounded by the FLEET, not chosen from the environment** — and that inversion is the
+/// whole correction. The first version of this file picked 150 (a guess at residential density)
+/// and derived a 36,096 B floor from it. Retained DIAG then showed the fleet's *steady* free heap:
+///
+/// ```text
+/// id8  heap=42,104  hmin=36,976   (crown)
+/// id5  heap=27,732  hmin=24,296
+/// id50 heap=29,332  hmin=29,332
+/// id51 heap=42,056  hmin= 3,732   <- min-ever, and the reason this guard exists
+/// ```
+/// *(retained DIAG, 2026-08-02 ~01:35 PDT, C3 fleet of 4, flush-time snapshots. The two C6
+/// watches report `hmin=0` — the field is unimplemented there — and are excluded.)*
+///
+/// A floor of 36,096 B **exceeds the steady free heap of id5 and id50**, so those boards would
+/// have skipped every scan forever: defer → skip → defer, a permanent scan-disabler dressed as a
+/// safety guard. So the floor must sit BELOW the fleet's minimum steady free heap (27,732 B), and
+/// that ceiling is what bounds the density we can cover — not the other way round.
+///
+/// 128 is the largest power-of-two capacity whose peak leaves a 1.5x margin under such a floor.
+pub const SCAN_REF_BSSIDS: u32 = 128;
 
 /// Peak heap the scan itself can occupy, derived — see #367.
 ///
@@ -407,38 +423,56 @@ pub const SCAN_REF_BSSIDS: u32 = 150;
 /// `size_hint`, no `ExactSizeIterator`), so `collect()` cannot pre-allocate and the `Vec` grows by
 /// DOUBLING. Two consequences, and the second is the one that gets rescaled wrongly later:
 ///
-/// 1. Final capacity is the power of two ≥ N — for 150 BSSIDs that is **256**, not 150.
+/// 1. Final capacity is the power of two >= N — for 128 BSSIDs that is exactly 128.
 /// 2. Across the final realloc the OLD and NEW buffers are both live, so the transient is
-///    `(cap/2 + cap) × 47 B` = `1.5 × cap × 47 B`.
+///    `(cap/2 + cap) x 47 B` = `1.5 x cap x 47 B`.
 ///
-/// ⇒ `(128 + 256) × 47` = **18,048 B**.
+/// => `(64 + 128) x 47` = **9,024 B**.
 ///
-/// ⚠️ **This is a STEP FUNCTION, not a curve. Do not rescale it linearly.** 150 and 250 BSSIDs
-/// cost exactly the same (both fit capacity 256). The next cliff is at **257** BSSIDs → capacity
-/// 512 → `(256 + 512) × 47` = 36,096 B, which is 2× this value in one step. A maintainer who
-/// resizes the heap and scales this proportionally will land in the wrong place.
-pub const SCAN_PEAK_BYTES: u32 = (128 + 256) * SCAN_AP_INFO_BYTES; // 18,048
+/// ⚠️ **STEP FUNCTION, not a curve. Do not rescale it linearly.** Every N in 65..=128 costs the
+/// same. The next cliff is **129** BSSIDs → capacity 256 → `(128 + 256) x 47` = 18,048 B, double
+/// in one step — which is ABOVE the floor below, so a genuinely denser environment will start
+/// deferring scans rather than risking the heap. That is the intended failure direction, and
+/// `diag.scan_skip` is how it becomes visible instead of silent.
+pub const SCAN_PEAK_BYTES: u32 = (64 + 128) * SCAN_AP_INFO_BYTES; // 9,024
 
-/// Free heap required before starting a scan (#367).
+/// Free heap required before starting a scan (#367). `= 1.5 x SCAN_PEAK_BYTES`.
 ///
-/// `= 2 × SCAN_PEAK_BYTES`. **The factor of 2 is an honest safety factor, NOT an enumeration** —
-/// stated plainly because the difference matters to anyone re-deriving it:
+/// The 0.5x margin is an **honest safety factor, NOT an enumeration**, and the distinction is what
+/// a re-deriver needs:
 ///
-/// * The main superloop contributes **nothing**. The scan is awaited under
-///   `embassy_futures::block_on` with **no executor** (0 embassy-executor in the lockfile;
-///   `esp-rtos` without its `embassy` feature), so MQTT, DIAG, OTA and relay — all main-loop work
-///   — are parked for the duration. That part IS enumerated, and it is zero.
-/// * What could NOT be bounded from source is esp-radio's own demand-driven RX pool
-///   (`dynamic_rx 40` / `static_rx 16`, set in `net::radio_controller_config()`). How many of
-///   those are live during a scan await is driver-internal and traffic-dependent.
+/// * The main superloop contributes **nothing**, and that half IS enumerated: the scan is awaited
+///   under `embassy_futures::block_on` with **no executor** (0 embassy-executor in the lockfile;
+///   `esp-rtos` without its `embassy` feature), so MQTT, DIAG, OTA and relay are parked throughout.
+/// * What could **not** be bounded from source is esp-radio's demand-driven RX pool
+///   (`dynamic_rx 40` / `static_rx 16`, set in `net::radio_controller_config()`). The margin covers
+///   that gap and nothing else.
 ///
-/// So: enumeration closed the main loop and failed on the driver, and the factor covers the gap.
-/// It happens to equal the 257-BSSID cliff (36,096 B) — **coincidence, not derivation.** If the
-/// RX pool is ever bounded properly, replace the factor with the sum and say so here.
-pub const SCAN_HEAP_FLOOR_BYTES: u32 = 2 * SCAN_PEAK_BYTES; // 36,096
+/// Sanity against the live fleet above: **13,536 B sits 14,196 B below id5's steady free heap**, so
+/// every healthy board still scans — and **3.6x above id51's 3,732 B min-ever**, so the guard does
+/// engage under the real pressure that made it necessary. A floor that never fires and a floor that
+/// always fires are the same bug; this one discriminates.
+pub const SCAN_HEAP_FLOOR_BYTES: u32 = SCAN_PEAK_BYTES + SCAN_PEAK_BYTES / 2; // 13,536
 
 const _: () = assert!(
     SCAN_HEAP_FLOOR_BYTES > SCAN_PEAK_BYTES,
     "the scan heap floor must exceed the scan's own peak, or the guard cannot protect anything \
      (src/budget.rs, #367)."
+);
+
+/// The fleet's minimum observed STEADY free heap (id5, see [`SCAN_REF_BSSIDS`]). Recorded as a
+/// const so the constraint below is machine-checked rather than trusted: a floor above this is a
+/// permanent scan-disabler, which is exactly the defect this file shipped once already.
+///
+/// ⚠️ Timestamped + scoped, per the rule a negative result taught us: retained DIAG, 2026-08-02,
+/// C3 fleet of 4. It is NOT a standing property. If the fleet grows, or a feature lands that eats
+/// heap, re-measure — and note this asserts against the value observed THEN, not against live heap.
+pub const FLEET_MIN_STEADY_FREE_HEAP_BYTES: u32 = 27_732;
+
+const _: () = assert!(
+    SCAN_HEAP_FLOOR_BYTES < FLEET_MIN_STEADY_FREE_HEAP_BYTES,
+    "the scan heap floor is at or above the lowest steady free heap ever observed on the fleet \
+     (src/budget.rs, #367) — boards at that level would defer EVERY scan forever, which is a \
+     scan-disabler wearing a guard's clothes. Lower the floor, or re-measure the fleet and update \
+     FLEET_MIN_STEADY_FREE_HEAP_BYTES with a fresh timestamp."
 );
