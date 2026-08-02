@@ -1,0 +1,17 @@
+# Host guard for the ported fleet channel-election core (net/mesh_elect.rs). The firmware crate is
+# no_std/riscv32imc and can't host-test, so this `#[path]`-includes the REAL mesh_elect.rs (no
+# drift) and runs the esp32c6-watch donor's OWN 39-test suite verbatim — consensus properties
+# (permutation invariance, lexicographic count-then-signal scoring, epoch/probation, quorum,
+# staleness reclamation, hostile-field rejection) plus the byte-exact wire codec. Because both
+# repos must agree on the elected channel, these tests are the cross-repo contract: if smol and the
+# watch ever disagree here, the mesh partitions. Permanent guard.
+[package]
+name = "mesh_elect_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "mesh_elect_verify"
+path = "src/main.rs"
+[profile.dev]
+opt-level = 0

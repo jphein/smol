@@ -105,6 +105,27 @@ pub mod wire;
 #[cfg(feature = "espnow")]
 pub mod coexist;
 
+// #278 fleet channel election — PURE (no esp-hal/esp-radio, no alloc), ported VERBATIM from the
+// esp32c6-watch's `crates/mesh-elect` and host-tested by `experiments/mesh_elect_verify`, which
+// runs the donor's OWN 39-test suite against this exact file (`#[path]`-include, like `coexist`).
+// Byte-identical wire + identical scoring in both repos is the whole point: the watch holds
+// `ELECT_ENFORCE = false` until smol speaks this, because two watches are a quorum that could
+// otherwise agree to leave ch6 and strand the C3 fleet (#278, #335).
+//
+// Distinct from `election` (which node is GATEWAY) and from `coexist` (which AP do *I* join, given
+// a channel). This one decides WHICH CHANNEL the fleet meets on — the value `coexist` takes as its
+// `mesh_ch` argument and that smol currently hardcodes as `ESP_NOW_FIXED_CHANNEL`.
+//
+// ⚠️ TEMPORARY, and it must not outlive the next PR: nothing in the firmware calls this yet, so
+// `-D warnings` would fail on dead_code. This is stage 1 of 2 — the pure core + its 39-test
+// cross-repo contract land first so they are reviewable on their own; stage 2 adds the
+// `Frame::Elect` dispatch arm in `mode::parse_frame`, an `Elector` on `RadioManager` (+232 B of
+// .bss — re-measure the stack floor), and the honour path behind a default-off flag. DELETE this
+// allow in that PR; if it is still here afterwards, the wiring silently never happened.
+#[allow(dead_code)]
+#[cfg(feature = "espnow")]
+pub mod mesh_elect;
+
 // Configurable best-gateway election — PURE (no esp-hal/esp-wifi, no alloc), host-tested verbatim by
 // `experiments/election_verify` (#[path]-include, like `coexist`). Seeded by `wifi`'s MeshElect
 // resolver + `mode`'s flush/recovery paths; gated to `wifi` (where MeshElect lives — every election
