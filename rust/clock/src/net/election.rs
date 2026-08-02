@@ -49,19 +49,72 @@ pub struct MetricWeights {
 }
 
 impl MetricWeights {
-    /// The SHIPPED default (JP: "elect the BEST gateway" ⇒ best-gateway is the default behavior,
-    /// team-lead decision 2026-07-20). CO-CHANNEL-DOMINANT: `co_channel` (100) alone outranks the
-    /// maximum of every other signal combined (`rssi` 10·2 + `uptime` 1·2 = 22), so a co-channel
-    /// board ALWAYS beats a stronger OFF-channel board (the id5 ch1-vs-ch6 bug). Absent / empty /
-    /// malformed config falls back to THIS (not to legacy) — best-gateway is on by default.
+    /// CO-CHANNEL-DOMINANT — the #217 rung-3 / id5 disease fix, and the shipped default while
+    /// leaves cannot follow a crown to a new channel. `co_channel` (100) alone outranks the maximum
+    /// of every other signal combined (`rssi` 10·2 + `uptime` 1·2 = 22), so a co-channel board
+    /// ALWAYS beats a stronger OFF-channel board. An off-channel crown is OTA-deaf on a fleet
+    /// pinned to ch6, so this is not a preference — it is a veto, and it has to be.
     ///
-    /// ⚠️ #269 will REBALANCE these. Under channel-follows-the-crown, `co_channel` stops being a
-    /// disease-fix and becomes a channel-change SUPPRESSOR: it would rank a board sitting where the
-    /// mesh already is above a better-internet board elsewhere, by a margin nothing can bridge —
-    /// blocking the migration #269 exists to enable. The fix is to re-scale it from dominant to a
-    /// hysteresis MARGIN, which is also the anti-flap term. Not done here: this commit only removes
-    /// the dead `ntp` input, so the two changes stay separately attributable on a live fleet.
-    pub const DEFAULT: Self = Self { co_channel: 100, rssi: 10, uptime: 1 };
+    /// The veto is delivered by BACKOFF TIER, which is why the magnitude matters and not just the
+    /// ordering: `elect_backoff_ms` normalises the fitness deficit to `MAX_ELECT_TIERS` (2), so with
+    /// `max_fitness` 122 one tier spans ≈ 61 points. `co_channel: 100` pushes any off-channel board
+    /// past a whole tier boundary while a co-channel board's worst deficit is 22 — separation is
+    /// GUARANTEED, not merely likely. Keep that in mind before tuning this down.
+    pub const DOMINANT: Self = Self { co_channel: 100, rssi: 10, uptime: 1 };
+
+    /// CO-CHANNEL AS A HYSTERESIS MARGIN — valid only where leaves can follow a channel migration.
+    ///
+    /// **1. Why 10, derived rather than chosen.** `rssi_score` buckets at −65/−78 dBm weighted 10,
+    /// so ONE BUCKET = 10 points, and one bucket is exactly the jitter amplitude of a board parked
+    /// on a bucket boundary. Setting the margin equal to one bucket makes a one-bucket challenger
+    /// TIE (jitter cannot move the fleet) and a two-bucket challenger WIN (a real gain migrates
+    /// it). It is the floor below which flap returns. Everything after this is context.
+    ///
+    /// **2. Calibration anchor, stated as a DIVERGENCE and not a convergence.** batman-adv exposes
+    /// the same knob as `gw_sel_class`, defaulting to 20 of ~255 TQ ≈ **8%** of its metric range.
+    /// Ours is 10 of a `max_fitness` of 32 ≈ **31%** — roughly 4× stickier. That is deliberate and
+    /// defensible rather than a coincidence to be pleased about: a batman-adv gateway switch makes
+    /// clients re-pick, while a smol channel migration makes **every leaf follow or strand**.
+    /// Higher disruption earns a higher bar.
+    ///
+    /// **3. No claim is made about how batman-adv arrived at 20.** There is no source for it, and a
+    /// wrong reason underneath a right conclusion is the most durable kind of error.
+    ///
+    /// **4. The worked unit error, named so it is not repeated.** `10/122 = 8.2%` looks like a
+    /// beautiful match for batman's 8% and is wrong: 122 is the PRE-re-scale `max_fitness`, which
+    /// still contains the `co_channel: 100` being removed. Post-re-scale the max is **32**.
+    ///
+    /// ⚠️ Margin-to-RANGE is the misleading comparison whenever ranges compress; margin-to-NOISE is
+    /// the invariant, and ours is 1× noise by construction. Do not shave below it — the disruption
+    /// asymmetry forbids a sub-noise margin. It does not demand a super-noise one.
+    ///
+    /// ⚠️ AND THE RE-SCALE CHANGES THE MECHANISM, not only the number — this is the part a reader
+    /// tuning it must not miss. With `max_fitness` 32, one backoff tier spans ≈ 16 points, so a
+    /// 10-point margin is **SUB-TIER**: unlike `DOMINANT`, it does NOT guarantee tier separation,
+    /// and two boards within one tier are resolved by the `node_id·200 ms` sub-tier tiebreak
+    /// instead. So `co_channel` here is a genuine *preference*, not a veto. The anti-flap
+    /// protection for a channel MIGRATION lives elsewhere and deliberately so — `SETTLE_MS` and
+    /// `margin_for` in `net::mesh_elect`, which govern the channel decision rather than the gateway
+    /// one (they are two different elections; see that module's header). Claiming this weight is
+    /// "the anti-flap floor" for the migration would be a comment describing behaviour the binary
+    /// does not have.
+    pub const FOLLOWING: Self = Self { co_channel: 10, rssi: 10, uptime: 1 };
+
+    /// The shipped weights, selected by whether leaves can FOLLOW a channel migration.
+    ///
+    /// This signature is the coupling, and it is a signature rather than a comment on purpose. The
+    /// re-scale and the follow capability cannot ship apart: re-scaling first re-arms exactly the
+    /// disease #217 fixed (a stronger off-channel board wins the crown and a ch6-pinned fleet
+    /// cannot follow it), and a note saying "don't ship these separately" is the kind of guarantee
+    /// this codebase has repeatedly watched fail. There is no way to obtain weights without stating
+    /// which world you are in.
+    pub const fn default_for(follow: bool) -> Self {
+        if follow {
+            Self::FOLLOWING
+        } else {
+            Self::DOMINANT
+        }
+    }
 
     /// Theoretical maximum fitness for these weights — the deficit reference in [`elect_backoff_ms`],
     /// making the tiering scale-invariant to the weight magnitudes. `const` for use at call sites.
@@ -82,6 +135,109 @@ pub enum ElectConfig {
     /// literal payload `legacy` to `smol/mesh/elect`. A genuine 1:1 rollback (no fitness math).
     Legacy,
 }
+
+/// #278/#269 MASTER SWITCH: may a leaf ACT on a `SMOLv1 ELECT` channel announcement?
+///
+/// Default OFF. A leaf still parses, epoch-orders and reports every announcement — observing and
+/// acting are separate, and the observe-only landing is what lets the fleet be measured before it
+/// is moved. #278's closing checklist gates the watch's `ELECT_ENFORCE` on the smol roll showing
+/// ONE clean channel migration first; this is the smol half of that ordering.
+///
+/// ⚠️ It lives HERE, in the gateway-election module, rather than in `net::mesh_elect` where the
+/// following actually happens — and the reason is worth stating because the obvious placement is
+/// the wrong one. `mesh_elect` is `espnow`-gated while `election` is `wifi`-gated, and `espnow`
+/// implies `wifi`, so `election` is visible to strictly more of the tree; a flag in `mesh_elect`
+/// could not be read by `net::wifi`'s config parser at all on a wifi-only build. Putting it beside
+/// the weights it selects also makes the coupling impossible to miss: the same `bool` chooses
+/// `DOMINANT` vs `FOLLOWING` and enables the follow path. Every pure function takes it as a
+/// PARAMETER rather than reading this const, so both host verifiers can exercise both states.
+///
+/// A plain `const` and not a Cargo feature, deliberately: a default-off feature adds an axis to the
+/// build matrix and a fresh exclusions surface, and — worse — the shipped fleet image would then
+/// not CONTAIN the follow path, so the canary roll could not exercise the thing it exists to prove.
+pub const FOLLOW_ENABLED: bool = false;
+
+/// The largest lever weight for which co-channel dominance is still EXPRESSIBLE in a `u8`.
+///
+/// Derived, not chosen: dominance needs `co_channel > rssi·2 + uptime·2`, and `co_channel` is a
+/// `u8`, so the floor `2r + 2u + 1` must fit in 255 ⇒ `r + u ≤ 127`. Capping each at 63 satisfies
+/// that with room (126 ≤ 127). Above this the operator lever could ask for a weighting in which no
+/// legal `co_channel` value dominates at all, and [`parse_elect_config`] would be clamping toward
+/// an invariant it could never reach.
+pub const DOMINANCE_LEVER_CAP: u8 = 63;
+
+/// The smallest `co_channel` for which co-channel capability outranks EVERYTHING else combined.
+#[must_use]
+pub const fn dominance_floor(w: &MetricWeights) -> u8 {
+    let need = w.rssi as u16 * RSSI_SCORE_MAX + w.uptime as u16 * UPTIME_SCORE_MAX + 1;
+    if need > u8::MAX as u16 {
+        u8::MAX
+    } else {
+        need as u8
+    }
+}
+
+/// Does `co_channel` alone strictly outrank the maximum of every other signal combined?
+///
+/// ONE predicate, used in three places — the compile-time assertion on [`MetricWeights::DOMINANT`],
+/// the runtime clamp in [`parse_elect_config`], and the host test. The lever is a SECOND WRITER of
+/// these weights, so an invariant enforced only at compile time binds only half the writers; and
+/// three separate spellings of the same rule is how two of them drift.
+#[must_use]
+pub const fn co_channel_dominates(w: &MetricWeights) -> bool {
+    (w.co_channel as u16) > w.rssi as u16 * RSSI_SCORE_MAX + w.uptime as u16 * UPTIME_SCORE_MAX
+}
+
+/// THE id5 INVARIANT, stated so that it holds in BOTH flag states.
+///
+/// The id5 bug is not "an off-channel board won the crown" — it is "an off-channel crown STRANDS a
+/// fleet that cannot follow it". The stranding is the harm, and inability to follow is its
+/// precondition. So the same predicate covers both worlds: with following OFF the fleet cannot
+/// follow, and only co-channel dominance prevents the harm; with following ON the precondition is
+/// gone and a stronger off-channel gateway is a migration rather than a stranding — which is the
+/// entire point of #269.
+///
+/// Writing the two states as one predicate is what lets `election_verify` assert the id5 case in
+/// both, rather than asserting one thing here and a different thing there and hoping the pair still
+/// means something.
+/// `#[allow(dead_code)]`: this predicate is a STATEMENT of the invariant, not a runtime branch —
+/// the firmware enforces it (the clamp, the const assert) rather than querying it, so nothing calls
+/// it outside a `const` block, which does not count as a use. Deleting it is not an option: it is
+/// the single spelling of the id5 rule that `experiments/election_verify` asserts in BOTH flag
+/// states, and the whole reason the two states can be checked against one property instead of two
+/// unrelated ones. Same shape and same reasoning as `refuse_leaf_lock_off_channel` below.
+#[allow(dead_code)]
+#[must_use]
+pub const fn off_channel_crown_can_strand(w: &MetricWeights, follow: bool) -> bool {
+    !follow && !co_channel_dominates(w)
+}
+
+/// The disease fix, asserted at compile time rather than described. If someone tunes `DOMINANT`
+/// such that a strong off-channel board can out-score a co-channel one, the build stops — which is
+/// the half of the invariant a `const` can carry. The other half (the runtime lever) is
+/// [`parse_elect_config`]'s clamp, because a compile-time assert binds only one of the two writers.
+const _DOMINANT_ACTUALLY_DOMINATES: () = {
+    assert!(co_channel_dominates(&MetricWeights::DOMINANT));
+    assert!(!off_channel_crown_can_strand(&MetricWeights::DOMINANT, false));
+    // And the cap really does keep the floor ATTAINABLE — the arithmetic, not the intent. Written
+    // through `dominance_floor` rather than by re-deriving `2r + 2u + 1` here, so the two cannot
+    // drift apart: if the floor ever saturated, the clamp in `parse_elect_config` would be reaching
+    // for a dominance that no legal `co_channel` value could reach, and would look enforced while
+    // being unenforceable.
+    let at_cap = MetricWeights {
+        co_channel: 0,
+        rssi: DOMINANCE_LEVER_CAP,
+        uptime: DOMINANCE_LEVER_CAP,
+    };
+    let floor = dominance_floor(&at_cap);
+    assert!(floor < u8::MAX, "the floor saturated — DOMINANCE_LEVER_CAP is too high");
+    let clamped_at_cap = MetricWeights {
+        co_channel: floor,
+        rssi: DOMINANCE_LEVER_CAP,
+        uptime: DOMINANCE_LEVER_CAP,
+    };
+    assert!(co_channel_dominates(&clamped_at_cap));
+};
 
 /// Max RSSI bucket value (`rssi_score` ∈ 0..=2).
 const RSSI_SCORE_MAX: u16 = 2;
@@ -219,24 +375,51 @@ pub fn legacy_recovery_backoff_ms(rssi: i8, node_id: u8) -> u64 {
 }
 
 /// Parse the retained `smol/mesh/elect` payload → policy. Panic-free (checked UTF-8, no indexing):
-///   * empty / whitespace / non-UTF-8 / no recognized token ⇒ `BestGateway(DEFAULT)` — best-gateway
-///     is ON by default, and the retain-clear restores it (team-lead decision).
+///   * empty / whitespace / non-UTF-8 / no recognized token ⇒ `BestGateway(default_for(follow))` —
+///     best-gateway is ON by default, and the retain-clear restores it (team-lead decision).
 ///   * `legacy` (case-insensitive) ⇒ `Legacy` (the escape hatch).
-///   * keyed weights `c<n>r<n>n<n>u<n>` (any order, any subset; missing keys inherit `DEFAULT`;
+///   * keyed weights `c<n>r<n>n<n>u<n>` (any order, any subset; missing keys inherit the default;
 ///     values clamp to 255; unknown letters + their digits are ignored) ⇒ `BestGateway(weights)`.
-///     e.g. `c100r10n5u1` = the default; `c0r100` = RSSI-dominant with co-channel off.
-pub fn parse_elect_config(payload: &[u8]) -> ElectConfig {
+///     e.g. `c100r10n5u1` = the following-off default; `c0r100` = RSSI-dominant, co-channel off.
+///
+/// # The clamp: an invariant must bind EVERY writer, not just the compile-time one
+///
+/// This topic is a SECOND WRITER of the weights, and it can re-arm the id5 disease with no code
+/// change at all — `c10r10` demotes co-channel dominance from a retained MQTT payload, and nothing
+/// in the firmware would notice. A `const` assertion on [`MetricWeights::DOMINANT`] binds the
+/// compile-time writer and says nothing whatever about this one.
+///
+/// So while following is off, the parsed weights are clamped back to dominance before they are
+/// returned. Note it is derived from the PARSED weights rather than being a literal: the lever
+/// writes `r` and `u` too, so a hardcoded floor of 22 would be silently invalidated the first time
+/// someone raised `r`. The `r`/`u` cap at [`DOMINANCE_LEVER_CAP`] closes the remaining hole —
+/// without it a payload like `c255r200` asks for a weighting in which NO legal `co_channel` value
+/// dominates, and the clamp would be reaching for an invariant it could never attain.
+///
+/// The result is a property that holds for every possible payload rather than for the ones that
+/// happened to be tested: with `follow == false`, [`co_channel_dominates`] is true of whatever
+/// comes back. `election_verify` asserts exactly that, over a sweep rather than a handful of cases.
+///
+/// # Readback reports APPLIED state
+///
+/// `net::wifi`'s readback logs the weights this function RETURNS, so an operator who publishes
+/// `c10r10` reads back the clamped values and learns immediately that their knob was overruled and
+/// by how much. That is the same rule the `n0` slot already follows: a readback reports what was
+/// applied, never what was sent. Echoing the request would claim an application that never
+/// happened.
+pub fn parse_elect_config(payload: &[u8], follow: bool) -> ElectConfig {
+    let default = MetricWeights::default_for(follow);
     let s = match core::str::from_utf8(payload) {
         Ok(s) => s.trim(),
-        Err(_) => return ElectConfig::BestGateway(MetricWeights::DEFAULT),
+        Err(_) => return ElectConfig::BestGateway(default),
     };
     if s.is_empty() {
-        return ElectConfig::BestGateway(MetricWeights::DEFAULT);
+        return ElectConfig::BestGateway(default);
     }
     if s.eq_ignore_ascii_case("legacy") {
         return ElectConfig::Legacy;
     }
-    let mut w = MetricWeights::DEFAULT;
+    let mut w = default;
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -271,6 +454,22 @@ pub fn parse_elect_config(payload: &[u8]) -> ElectConfig {
                 _ => {}
             }
         }
+    }
+    if !follow {
+        // Cap first, so the floor below is always attainable, then raise `c` to it. Order matters:
+        // clamping `c` against an unreachable floor would leave dominance broken while looking like
+        // it had been enforced.
+        if w.rssi > DOMINANCE_LEVER_CAP {
+            w.rssi = DOMINANCE_LEVER_CAP;
+        }
+        if w.uptime > DOMINANCE_LEVER_CAP {
+            w.uptime = DOMINANCE_LEVER_CAP;
+        }
+        let floor = dominance_floor(&w);
+        if w.co_channel < floor {
+            w.co_channel = floor;
+        }
+        debug_assert!(co_channel_dominates(&w));
     }
     ElectConfig::BestGateway(w)
 }

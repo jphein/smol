@@ -476,22 +476,16 @@ pub mod wire {
 // Keeping the split at a single line rather than interleaving is the whole reason a re-sync stays
 // mechanical: diff the top half, ignore the bottom. Add smol-only code HERE, never above.
 
-/// Master switch for **acting** on an announcement. Default OFF, and the default is the entire
-/// point: with it off a leaf still parses, orders and reports every ELECT frame it hears, but never
-/// retunes. That is the same observe-only posture the watch is holding (#278), so both ends of the
-/// pair land in a state where the frame is proven on real hardware before either end moves a
-/// fleet.
-///
-/// It is a plain `const` and not a Cargo feature ON PURPOSE. A default-off feature would add an
-/// axis to the build matrix, a `[tier_exclusive]` row and an exclusions-gate surface, and — worse —
-/// it would make the shipped fleet image *not contain* the follow path, so the canary roll could
-/// not exercise what it is meant to prove. A const keeps every tier's binary identical and makes
-/// the flip a one-line diff a reviewer can see.
-///
-/// ⚠️ Flip criterion is NOT "the code looks right": #278's closing checklist gates the watch's
-/// `ELECT_ENFORCE` on the smol roll showing ONE clean channel migration first. This flag is the
-/// smol half of that ordering.
-pub const FOLLOW_ENABLED: bool = false;
+// The master switch for ACTING on an announcement is `net::election::FOLLOW_ENABLED`, not here.
+//
+// It looks like it belongs in this module, and it does conceptually — but `mesh_elect` is
+// `espnow`-gated while `election` is `wifi`-gated, and `espnow` implies `wifi`, so a flag declared
+// here would be invisible to `net::wifi`'s config parser on a wifi-only build. It also has to sit
+// beside the `MetricWeights` it selects, because the same bool choosing DOMINANT vs FOLLOWING and
+// enabling the follow path IS the structural coupling those two changes needed.
+//
+// Nothing in this file reads it: every function below takes `follow` as a PARAMETER, which is also
+// what lets the host verifier exercise both states without a cfg.
 
 /// Member count carried on every announcement-derived [`Decision`].
 ///

@@ -259,7 +259,9 @@ impl MeshElect {
             // best-gateway is ON by default (team-lead 2026-07-20); the retained smol/mesh/elect topic
             // re-weights or selects `legacy`. Absent/empty/garbage config keeps THIS default.
             elect_cfg: crate::net::election::ElectConfig::BestGateway(
-                crate::net::election::MetricWeights::DEFAULT,
+                crate::net::election::MetricWeights::default_for(
+                    crate::net::election::FOLLOW_ENABLED,
+                ),
             ),
             i_am_owner: false,
             owner_id: my_id,
@@ -3509,7 +3511,10 @@ fn mqtt_session(
                         // election record. Empty/garbage → BestGateway(DEFAULT) (on-by-default);
                         // `legacy` → the escape hatch. The recovery-backoff + empty-MC-deferral arms
                         // dispatch on it. Consumed in THIS burst (no CFG-relay round-trip).
-                        elect.elect_cfg = crate::net::election::parse_elect_config(payload);
+                        elect.elect_cfg = crate::net::election::parse_elect_config(
+                            payload,
+                            crate::net::election::FOLLOW_ENABLED,
+                        );
                         match elect.elect_cfg {
                             crate::net::election::ElectConfig::Legacy => {
                                 log::info!("smol: #gateway-election metric = LEGACY (lowest-id, retained)")
