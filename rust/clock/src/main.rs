@@ -222,6 +222,11 @@ pub(crate) fn node_id() -> u8 {
 /// only place the hardware states which one it is, is the display-init NACK (see the HEADLESS
 /// tolerance block below in `main`). Recorded once so the HA discovery `model` can name the
 /// actual board (`wifi::device_extras()`) instead of calling half the fleet "OLED".
+///
+/// #352: this bool is the RUNTIME half of [`net::profile::BoardProfile`] — the compile-time half
+/// is `net::target::SELF_CHIP`, and the two meet in exactly one place, `wifi::device_extras()`.
+/// If you need "which board is this?" anywhere else, build a `BoardProfile` there rather than
+/// reading this flag and re-deciding: the second decision is how the label drifts.
 /// Same `static mut` discipline as `NODE_ID_CACHE`: rv32imc has no atomics, but this is
 /// written ONCE on the single-threaded boot path before the net loop exists, then read-only —
 /// no ISR ever touches it. wifi-gated so the default build stays byte-free of it (#44).

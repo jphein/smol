@@ -1309,59 +1309,51 @@ static mut MQTT_JSON: JsonScratch = JsonScratch::new();
 /// reliable discriminator left was a DIAG format literal in another repo
 /// (`slot=ota_0` + `rst=unknown`) — ugly, and it depends on a string that repo is free to change.
 ///
-/// The two chips are distinguishable at COMPILE TIME with no new dependency and no runtime cost:
-/// the C6 is `riscv32imac` (the `a` atomics extension), the C3 is `riscv32imc` (no atomics). So
-/// the label cannot drift from the silicon it describes — a wrong `model` now needs a wrong
-/// TARGET, which fails to link long before it can lie on a dashboard.
-///
 /// THE FLEET HAS FOUR TARGETS (JP, 2026-08-01; was three on 07-31, two before that): the C3
 /// OLED board ($2.76), the screenless C3 SuperMini ($1), the Waveshare ESP32-C6 touch watch
-/// (own repo, a smol target all the same — this crate's C6 arm exists for exactly that
-/// hardware), and the ESP32-S3 2.8" touchscreen that runs Ember (ember.realm.watch, the
-/// hearth voice satellite — today an ESPHome device). The S3 is XTENSA, not RISC-V, so no
-/// cfg arm here can even compile for it yet; its label (`smol ESP32-S3 Ember`, presumably
-/// via `target_arch = "xtensa"`) lands with the multi-chip de-pin (#331 tracks the path:
-/// fleet-membership first — SMOLv1 over an ESPHome component — full firmware target after
-/// smol-core). Recorded here because this comment IS the taxonomy of record.
-/// The two C3 boards run ONE image and differ only at runtime: a missing
-/// OLED NACKs the display init and the board carries on headless (see the tolerance block in
+/// (own repo, a smol target all the same), and the ESP32-S3 2.8" touchscreen that runs Ember
+/// (ember.realm.watch, the hearth voice satellite — today an ESPHome device; #331 tracks the
+/// path: fleet-membership first over an ESPHome component, full firmware target after
+/// smol-core). The two C3 boards run ONE image and differ only at runtime: a missing OLED
+/// NACKs the display init and the board carries on headless (see the tolerance block in
 /// `main.rs`). So the C3 model string cannot be a single compile-time constant without lying
-/// about half the fleet — `model` is the first field anyone checks, and "OLED" on a screenless
-/// board sends someone hunting for a panel that was never soldered. Both C3 variants stay
-/// `.rodata` constants; only the CHOICE between them is runtime, off the same NACK fact the
-/// firmware already records. The budget below is derived from the LONGEST variant, so the
-/// runtime choice can never invalidate the compile-time fit proof.
-#[cfg(all(feature = "wifi", target_feature = "a"))]
-const DEVICE_EXTRAS_WATCH: &str = ",\"model\":\"smol ESP32-C6 Watch\",\"manufacturer\":\"jphein\"";
-#[cfg(all(feature = "wifi", not(target_feature = "a")))]
-const DEVICE_EXTRAS_OLED: &str = ",\"model\":\"smol ESP32-C3 OLED\",\"manufacturer\":\"jphein\"";
-#[cfg(all(feature = "wifi", not(target_feature = "a")))]
-const DEVICE_EXTRAS_HEADLESS: &str =
-    ",\"model\":\"smol ESP32-C3 SuperMini\",\"manufacturer\":\"jphein\"";
-
-/// The device-block extras for THIS board. cfg-twins like `node_id()`: the C6 arm is the watch
-/// by definition (the only C6 hardware in the fleet); the C3 arm asks whether the OLED answered
-/// at boot. `crate::headless()` is written once on the single-threaded boot path before the net
-/// loop exists, so this read needs no synchronisation.
-#[cfg(all(feature = "wifi", target_feature = "a"))]
+/// about half the fleet — "OLED" on a screenless board sends someone hunting for a panel that
+/// was never soldered.
+///
+/// #352: the labels themselves, and the taxonomy above, now live in ONE place —
+/// [`crate::net::profile`]. This function is the seam that hands it the runtime half.
+///
+/// ⚠️ WHAT CHANGED AND WHY, because the previous mechanism looked fine and was not. The label
+/// used to be chosen by `#[cfg(target_feature = "a")]` / `not(...)` — the RISC-V atomics
+/// extension, true on the C6's `riscv32imac`, false on the C3's `riscv32imc`. That is not a
+/// chip discriminant; it is a negation that means "C3" only while exactly two chips exist.
+/// Xtensa has no `a` feature, so an S3 build would take the `not(...)` arm and announce itself
+/// as `smol ESP32-C3 OLED`. The comment that used to sit here predicted the opposite failure —
+/// "no cfg arm here can even compile for it yet" — but the default arm compiles perfectly and
+/// picks the wrong silicon's label, which is the difference between a build break someone must
+/// fix and a dashboard lie nobody notices. That mattered: the paragraph above records two C6
+/// watches being identified as C3 fleet nodes, twice, from exactly this field.
+///
+/// The chip is now a VALUE, `net::target::SELF_CHIP`, which `build.rs` parses three ways from
+/// the target triple and which already carries a const-assert that it is not `CHIP_UNKNOWN`.
+/// One derivation, positive rather than negated, and `profile.rs` is pure — so
+/// `experiments/profile_verify` covers every chip on the host, including the S3 this tree
+/// cannot yet compile for.
+#[cfg(feature = "wifi")]
 fn device_extras() -> &'static str {
-    DEVICE_EXTRAS_WATCH
-}
-#[cfg(all(feature = "wifi", not(target_feature = "a")))]
-fn device_extras() -> &'static str {
-    if crate::headless() { DEVICE_EXTRAS_HEADLESS } else { DEVICE_EXTRAS_OLED }
+    // `crate::headless()` is written once on the single-threaded boot path before the net loop
+    // exists, so this read needs no synchronisation.
+    super::profile::for_self(!crate::headless()).ha_device_extras()
 }
 
 /// Longest extras variant THIS target can emit — the budget must fit the worst case, not the
-/// variant that happened to be measured. Derived from the strings themselves so a reworded
-/// label re-derives the fit proof instead of silently outgrowing a copied literal.
-#[cfg(all(feature = "wifi", target_feature = "a"))]
-const DEVICE_EXTRAS_MAX: usize = DEVICE_EXTRAS_WATCH.len();
-#[cfg(all(feature = "wifi", not(target_feature = "a")))]
-const DEVICE_EXTRAS_MAX: usize = {
-    let (a, b) = (DEVICE_EXTRAS_OLED.len(), DEVICE_EXTRAS_HEADLESS.len());
-    if a > b { a } else { b }
-};
+/// variant that happened to be measured. Still derived from the strings themselves (see
+/// [`crate::net::profile::SELF_EXTRAS_MAX`]) so a reworded label re-derives the fit proof
+/// instead of silently outgrowing a copied literal; now derived over the PROFILE SET rather
+/// than over a list of named constants, so a variant added to the match is covered without
+/// anyone remembering to extend a second expression.
+#[cfg(feature = "wifi")]
+const DEVICE_EXTRAS_MAX: usize = super::profile::SELF_EXTRAS_MAX;
 
 /// Payload bytes ONE HA discovery PUBLISH can carry: the 512 B `pkt` buffer, less the PUBLISH
 /// fixed header (1), the remaining-length varint (2 for any payload in 128..16383), the 2 B

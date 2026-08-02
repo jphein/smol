@@ -1,0 +1,36 @@
+# #352 host-test harness for the PURE board-variant mapping (net/profile.rs) — the single owner
+# of the Home Assistant `model` label. Runs OFF-target (std) via `cargo run`; `#[path]`-includes
+# the real net/profile.rs AND net/target.rs (no drift), exactly like target_guard_verify.
+#
+# THE REASON THIS HARNESS EXISTS is the bug #352 fixed. The label used to be picked by
+# `cfg(target_feature = "a")` — a RISC-V atomics probe standing in for "is this a C6". Xtensa has
+# no such feature, so an ESP32-S3 build would have taken the `not(...)` arm and announced itself
+# as `smol ESP32-C3 OLED`. Nothing could have caught that, because the S3 does not build from this
+# tree at all (esp-hal is pinned to esp32c3) and a cfg cannot be tested for a target you cannot
+# compile. Making the mapping a pure function of (chip, has_display) makes the S3 case an ordinary
+# host assertion, TODAY, years before the silicon lands.
+#
+# Discovered automatically by tools/gate.sh's `experiments/*_verify` glob → runs in CI on every
+# branch push. No dependencies: the module under test is pure.
+[package]
+name = "profile_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "profile_verify"
+path = "src/main.rs"
+
+# DECLARED, never enabled — same contract as target_guard_verify. Both net/profile.rs and
+# net/target.rs cfg-gate their firmware-only halves (`SELF_CHIP`, `for_self`, `SELF_EXTRAS_MAX`)
+# behind `wifi`, because those are built from build.rs's `env!("SMOL_CHIP_ID")` stamp which
+# off-target has no business having. Naming the feature satisfies cargo's check-cfg without
+# turning it on, so the host build stays the pure core and compiles warning-clean.
+[features]
+wifi = []
+
+[dependencies]
+
+[profile.dev]
+opt-level = 0
