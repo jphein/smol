@@ -3461,6 +3461,20 @@ impl RadioManager {
             // The call is "rare enough that a new wire field is not worth it" — a JUDGEMENT, not a
             // structural guarantee. Re-derive it, do not inherit it.
             //
+            // And the judgement has precedent on its side, which is a better rationale than
+            // "optimization deferred": the two shipping systems with this architecture DISAGREE on
+            // eager replacement, and the closest cousin says never. ESP-WIFI-MESH will not yield
+            // while the root is alive AT ALL — even RSSI degraded to near-disconnection does not
+            // trigger a switch; healing comes from children detecting root DEATH, not from the root
+            // grading itself. batman-adv does allow replacement, but only past a tuned margin
+            // (`gw_sel_class`, default 20 of ~255 TQ ≈ 8%). NEITHER does a raw comparison. Both
+            // price incumbent stability above optimality — so declining to add a wire field for a
+            // yield-while-alive optimization is the conservative reading of both, not a shortcut.
+            //
+            // Corollary for the incumbent-retention bar when it lands: it must mean "cannot do the
+            // job" (the #146 flush-incapable latch shape, matching ESP-MESH's "breaks down"), NOT
+            // "slower than ideal". An eager bar re-imports the flap this whole design avoids.
+            //
             // The disposition rests on a design that DOES NOT EXIST YET, so it is pinned by the
             // `const _` rot-detector above `note_crown_ap` rather than left to prose: #269 removes
             // `ESP_NOW_FIXED_CHANNEL`, and when it does, that assertion stops compiling and drags
