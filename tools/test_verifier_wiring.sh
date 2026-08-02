@@ -41,6 +41,22 @@ case_run() { # <name> <want-exit> <mutator-fn>
 
 noop() { :; }
 
+# Assert a PATTERN in the output, not just an exit code. Needed for HOST-ONLY, which is a
+# reportable state rather than a failure — exit 0 alone would not prove it was noticed.
+case_grep() { # <name> <want-exit> <pattern> <mutator-fn>
+  local name="$1" want="$2" pat="$3" fn="$4" d out rc
+  d="$(mkcopy)"
+  "$fn" "$d"
+  out="$(python3 "$d/tools/check_verifier_wiring.py" "$d" 2>&1)"; rc=$?
+  rm -rf "$d"
+  if [ "$rc" -eq "$want" ] && printf '%s' "$out" | grep -q "$pat"; then
+    printf '  \033[32mPASS\033[0m %s (exit %d, matched %s)\n' "$name" "$rc" "$pat"; PASS=$((PASS+1))
+  else
+    printf '  \033[31mFAIL\033[0m %s — wanted exit %d + /%s/, got exit %d\n' "$name" "$want" "$pat" "$rc"
+    printf '%s\n' "$out" | sed 's/^/        /'; FAIL=$((FAIL+1))
+  fi
+}
+
 # A new phantom: drop a module declaration that a verifier includes. This is the exact shape of
 # the #185 defect, reproduced on a module that is currently wired.
 drop_decl() { sed -i 's/^pub mod etx;/\/\/ removed by test/' "$1/rust/clock/src/net.rs"; }
@@ -55,6 +71,15 @@ p.write_text(t.replace('KNOWN_PHANTOMS = {', 'KNOWN_PHANTOMS = {\n    "rust/cloc
 PY
 }
 
+# THE TWO-ROOT TRAP (#351/#366). Move a module out of the firmware root and into the hostsim
+# library root. A name-keyed checker sees "etx is declared somewhere" and says SOUND; the truth is
+# that the firmware no longer contains it. This is the exact shortcut that produced five false
+# negatives on app/clock/input/sensors/snake, reproduced here so this tool cannot regress into it.
+lib_only() {
+  sed -i 's/^pub mod etx;/\/\/ moved to lib.rs by test/' "$1/rust/clock/src/net.rs"
+  printf '\n#[cfg(feature = "hostsim")]\n#[path = "net/etx.rs"]\npub mod etx;\n' >> "$1/rust/clock/src/lib.rs"
+}
+
 # A verifier pointing at a file that does not exist — a rename that missed the harness.
 dangling_include() { rm -f "$1/rust/clock/src/net/etx.rs"; }
 
@@ -62,6 +87,7 @@ echo "#367 verifier-wiring check — proving each arm can fail"
 case_run "clean tree passes (crdt tracked)"        0 noop
 case_run "a NEW phantom fails"                     1 drop_decl
 case_run "a STALE allowlist entry fails"           1 stale_entry
+case_grep "lib.rs-only module reads HOST-ONLY, not SOUND" 0 "HOST-ONLY" lib_only
 case_run "a dangling #[path] target is an error"   2 dangling_include
 
 echo
