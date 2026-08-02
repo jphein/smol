@@ -4209,6 +4209,19 @@ impl RadioManager {
             // appended before it. During a channel-migration roll this is the most operationally
             // urgent field in the record and the ledger is explicitly the least, so it goes ahead
             // of it — and behind every #204/#217 coexist field, which keep their priority.
+            //
+            // ⚠️ THIS FIELD CAN VANISH SILENTLY, and here the ambiguity is INVERTED — which is worse
+            // than the #183 ledger case and is the reason it is spelled out separately. A missing
+            // `lgt=` merely means "provenance unavailable". A missing `elect=` reads to a canary
+            // watcher as "this board never heard the crown" — the exact opposite of the truth,
+            // because absence means the record was over budget and this field was shed, NOT that
+            // `n` is 0. The two states are indistinguishable from the field alone.
+            //
+            // Read `|shed=<n>`: present ⇒ n field(s) were dropped for budget and this was among the
+            // first in line; absent ⇒ nothing was shed and `elect=`'s absence would be a genuine
+            // bug. Never conclude "the announcement path is dead" from a missing key — that is a
+            // conclusion the record cannot support, and on a roll it is the conclusion that would
+            // stop a good migration.
             {
                 let (ep, ch, mode) = if self.relay.is_gateway {
                     (self.elect_announcer.epoch(), self.elect_announcer.channel(), 'a')
