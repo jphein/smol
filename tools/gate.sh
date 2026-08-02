@@ -417,6 +417,16 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_check_exclusions"
   fi
 
+  # The merge guard's own self-test. One line, and it is the difference between "the guard HAS a
+  # self-test" and "the self-test RUNS" — the distinction this gate exists to enforce everywhere
+  # else. No network: it drives the decision function with synthetic SHAs.
+  step "merge guard self-test (tools/merge_pr.sh)"
+  if out=$(SELFTEST=1 "$ROOT/tools/merge_pr.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "merge_pr self-test"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "merge_pr self-test"
+  fi
+
   # #367: prove the verifier-wiring checker's arms can fail. Operates only on mktemp copies —
   # never the working tree. Same reasoning as its siblings: this check exists BECAUSE a green
   # signal over uncompiled code fooled us, so shipping it without watching it go red would be
