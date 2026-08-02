@@ -3409,18 +3409,34 @@ impl RadioManager {
         // failure mode #371 catalogues, with the sign flipped (an intention DROPPED on the strength
         // of a future guarantee).
         //
-        // So the dependency is encoded as something that FAILS rather than rots. #269's whole point
-        // is that the mesh channel stops being a compile-time constant; the moment
-        // `ESP_NOW_FIXED_CHANNEL` is removed or made non-const, this assertion stops compiling and
-        // drags the next reader here to re-decide `better_successor_cc` on the design that actually
-        // shipped. Deleting this assertion to "fix the build" is deleting the point of it.
+        // So the dependency is encoded as something that FAILS rather than rots — but read the
+        // coverage note below before trusting it, because it is PARTIAL and silence here is NOT
+        // proof that the disposition still holds.
+        //
+        // FIRES on two shapes: `ESP_NOW_FIXED_CHANNEL` removed (unresolved name), or made non-const
+        // (illegal in a const expression). Either way the build stops here and the message says what
+        // is being re-decided.
+        //
+        // ⚠️ DOES NOT FIRE on the most likely shape: the const KEPT, still non-zero, REPURPOSED from
+        // "the mesh channel" to "the rendezvous default". That is precisely what the reference
+        // design does — the watch keeps `mesh_elect::RENDEZVOUS_CHANNEL` and `MESH_CHANNEL` as
+        // consts, documented as "the RENDEZVOUS default … not a pin" — and it is what smol's own
+        // port does too (`net::mesh_elect::RENDEZVOUS_CHANNEL`, tier 2 of the recovery ladder). In
+        // that world the elected channel becomes a runtime value BESIDE this const, this assertion
+        // stays true forever, and it never fires in the case it exists to catch.
+        //
+        // A compile-time assert cannot detect "the constant survived but its MEANING changed";
+        // meaning is not a compile-time property. The complementary trigger is therefore human: a
+        // closing-checklist item on #269 itself, which cannot be closed without someone reading it.
+        // Keep both. Do not read a green build as evidence this decision was re-made.
         const _: () = assert!(
             ESP_NOW_FIXED_CHANNEL != 0,
             "smol #269: the mesh channel is no longer a compile-time constant — re-derive \
              `better_successor_cc` in `note_crown_ap` (net/mode.rs) against the design that landed. \
              Its `false` was justified by 'co-channel by construction makes this path rare', which \
-             is a judgement about #269, not a structural guarantee. Do not delete this assertion \
-             without making that decision."
+             is a judgement about #269, not a structural guarantee. NOTE this assert only covers \
+             removal/non-const, NOT the const being kept and repurposed as the rendezvous default — \
+             see the #269 closing checklist. Do not delete it without making that decision."
         );
         use crate::net::coexist::{crown_next_state, CrownApDecision, CrownCtx, CrownState};
         if matches!(decision, CrownApDecision::CoChannel { .. }) {
