@@ -121,13 +121,15 @@ pub mod coexist;
 // a channel). This module carries and ORDERS the channel the fleet meets on — the value `coexist`
 // takes as its `mesh_ch` argument and that smol still hardcodes as `ESP_NOW_FIXED_CHANNEL`.
 //
-// ⚠️ TEMPORARY, and it must not outlive the next PR: nothing in the firmware calls this yet, so
-// `-D warnings` would fail on dead_code. This is stage 1 of 2 — the frame + its cross-repo test
-// contract land first so they are reviewable on their own; stage 2 adds the `Frame::Elect`
-// dispatch arm in `mode::parse_frame`, the announce/honour paths behind a default-off flag, and
-// re-measures the stack floor for whatever state lands on `RadioManager`. DELETE this allow in
-// that PR; if it is still here afterwards, the wiring silently never happened.
-#[allow(dead_code)]
+// WIRED (stage 2, #278): `mode::parse_frame` dispatches `Frame::Elect`, the crown announces via
+// `RadioManager::elect_tick` and the pre/post bursts in `reassoc_ch6_prefer`, and a leaf tracks
+// every announcement in its `Follower`. The stage-1 `#[allow(dead_code)]` is gone, together with
+// the matching `[unobservable]` entry in `tools/build-matrix.toml` — the module now emits real
+// code in the espnow tier, so that entry's claim became false and the gate said so.
+//
+// ACTING on an announcement is behind `mesh_elect::FOLLOW_ENABLED`, default OFF. Observing is not:
+// a leaf parses, orders and reports every ELECT frame regardless, which is what lets the fleet be
+// measured before it is moved (#278's flip criterion is evidence, not review).
 #[cfg(feature = "espnow")]
 pub mod mesh_elect;
 

@@ -32,9 +32,25 @@
 //! |---|---|
 //! | [`wire`] | the frame itself — now an ANNOUNCEMENT of a derived value, not a ballot |
 //! | [`Decision`] + `supersedes` | orders announcements by epoch; rejects stale/replayed ones |
-//! | [`SETTLE_MS`], [`MARGIN_FLOOR`], [`PROBATION_MS`], [`margin_for`] | anti-flap: a challenger must hold its advantage before the fleet moves |
+//! | [`SETTLE_MS`], [`PROBATION_MS`] | anti-flap, and both are WIRED: `Announcer::observe_channel` makes a new channel hold for `SETTLE_MS` before it costs an epoch, and `Follower::probation_expired` is the exit from a wedged high epoch |
+//! | [`MARGIN_FLOOR`], [`margin_for`], [`OBS_STALE_MS`] | retained but **NOT wired** — see below |
 //! | [`RENDEZVOUS_CHANNEL`] | tier 2 of the recovery ladder below |
 //! | [`weight`], [`USABLE_MIN_DBM`] | still populate the frame's `w[13]` honestly — see below |
+//!
+//! ## `MARGIN_FLOOR` / `margin_for` / `OBS_STALE_MS` are retained but NOT wired — deliberately
+//!
+//! Stage 1 listed these alongside `SETTLE_MS` as "anti-flap: a challenger must hold its advantage".
+//! That was aspirational and stage 2 corrected it rather than letting it stand, because a comment
+//! describing behaviour the binary does not have is this codebase's most common defect shape: it
+//! never fails, it just quietly under-delivers.
+//!
+//! The honest statement: all three operate on a **summed weight across peer observations** — the
+//! `Tally`/`Ingest` machinery that was deliberately removed with the `Elector`. `margin_for` takes
+//! an `incumbent_sum` smol never computes; `OBS_STALE_MS` ages observations smol never accumulates.
+//! They are kept because this file is a cross-repo contract and the donor still owns the election:
+//! deleting them would make the next re-sync a merge instead of a diff, and the upstream tests that
+//! pin them run against this exact file. They carry item-scoped `#[allow(dead_code)]` saying so,
+//! rather than a module-wide allow that would also hide a genuinely unwired new feature.
 //!
 //! ## The `w[13]` vector is still filled in, deliberately
 //!
@@ -84,18 +100,26 @@
 //!
 //! # Recovery ladder for a leaf that missed the announcement
 //!
-//! esp-radio 0.18 exposes all-channels or exactly one channel — never a subset
-//! (`channel_bitmap` is hardcoded to 0). A full sweep costs **130-260 ms**
-//! (13 x `Active{min:10,max:20}`); a single-channel probe costs ~10-20 ms. So
-//! recovery is an ordered ladder with early exit, not one expensive sweep:
+//! An ordered ladder with early exit, not one expensive sweep. See [`recovery_ladder`], which is
+//! the implementation and holds the real cost model:
 //!
 //! ```text
 //! 0. heard the announcement        ~0
-//! 1. last-known mesh channel       ~10-20 ms
-//! 2. RENDEZVOUS_CHANNEL (6)        ~10-20 ms
-//! 3. common AP channels (1, 11)    ~10-20 ms each
-//! 4. full sweep                    130-260 ms
+//! 1. last-known mesh channel
+//! 2. RENDEZVOUS_CHANNEL (6)
+//! 3. common AP channels (1, 11)
+//! 4. the rest of the band, ascending
 //! ```
+//!
+//! ⚠️ Stage 1 costed these rungs at 10-20 ms each and a full sweep at 130-260 ms. Those are
+//! `esp-radio`'s **`scan_async`** dwell times and they are the WRONG model for smol, which recovers
+//! by retuning the ESP-NOW PHY and listening for `DWELL_MS` (1500 ms) rather than by scanning. The
+//! numbers are re-derived on [`recovery_ladder`] instead of repeated here — one place to be right.
+//!
+//! What DOES carry over from esp-radio 0.18 is the constraint behind the ladder's shape: it exposes
+//! all-channels or exactly one channel, never a subset (`channel_bitmap` is hardcoded to 0). There
+//! is no "probe these four" primitive to reach for, so a ranked sequence with early exit is not a
+//! design preference, it is the only shape available.
 //!
 //! # What this module does NOT decide
 //!
@@ -139,6 +163,11 @@ pub const WEIGHT_CEIL_DBM: i8 = -35;
 /// this is ~30 missed frames.
 ///
 /// **Must exceed [`SETTLE_MS`] and [`PROBATION_MS`]** — see [`_WINDOW_ORDERING`].
+/// `#[allow(dead_code)]`: operates on a summed weight across peer observations, which smol
+/// does not accumulate (the `Tally`/`Ingest` machinery was cut with the `Elector`). Retained as
+/// the donor's contract surface — see the module header. Item-scoped, so a genuinely unwired
+/// NEW feature still trips `-D warnings` instead of hiding behind a module-wide allow.
+#[allow(dead_code)]
 pub const OBS_STALE_MS: u64 = 60_000;
 
 /// A challenger must hold its lead this long before we spend an epoch on it.
@@ -148,6 +177,11 @@ pub const SETTLE_MS: u64 = 30_000;
 
 /// Floor for the margin a challenger must beat the incumbent by (in summed
 /// weight). See [`margin_for`].
+/// `#[allow(dead_code)]`: operates on a summed weight across peer observations, which smol
+/// does not accumulate (the `Tally`/`Ingest` machinery was cut with the `Elector`). Retained as
+/// the donor's contract surface — see the module header. Item-scoped, so a genuinely unwired
+/// NEW feature still trips `-D warnings` instead of hiding behind a module-wide allow.
+#[allow(dead_code)]
 pub const MARGIN_FLOOR: u32 = 12;
 
 /// After adopting someone else's higher-epoch decision, how long we tolerate
@@ -203,6 +237,11 @@ pub const fn weight(rssi_dbm: i8) -> u32 {
 /// the incumbent keeps the hysteresis meaningful at any fleet size, with a floor
 /// so it is never trivial when scores are small.
 #[must_use]
+/// `#[allow(dead_code)]`: operates on a summed weight across peer observations, which smol
+/// does not accumulate (the `Tally`/`Ingest` machinery was cut with the `Elector`). Retained as
+/// the donor's contract surface — see the module header. Item-scoped, so a genuinely unwired
+/// NEW feature still trips `-D warnings` instead of hiding behind a module-wide allow.
+#[allow(dead_code)]
 pub const fn margin_for(incumbent_sum: u32) -> u32 {
     let scaled = incumbent_sum / 8;
     if scaled > MARGIN_FLOOR {
@@ -421,5 +460,493 @@ pub mod wire {
             gateway,
             w,
         })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// SMOL-ONLY WIRING — everything below has NO counterpart in the donor crate.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Everything ABOVE this banner is the vendored cross-repo contract (see the lint-policy note at the
+// top): it must stay byte-diffable against `esp32c6-watch:crates/mesh-elect` so a future re-sync
+// shows only intended divergence. Everything BELOW is smol's own wiring — the announce schedule,
+// the leaf follow state, the recovery ladder, and the send-path seal — and the watch has no
+// equivalent because it is the *observer* in this pairing, not the announcer.
+//
+// Keeping the split at a single line rather than interleaving is the whole reason a re-sync stays
+// mechanical: diff the top half, ignore the bottom. Add smol-only code HERE, never above.
+
+/// Master switch for **acting** on an announcement. Default OFF, and the default is the entire
+/// point: with it off a leaf still parses, orders and reports every ELECT frame it hears, but never
+/// retunes. That is the same observe-only posture the watch is holding (#278), so both ends of the
+/// pair land in a state where the frame is proven on real hardware before either end moves a
+/// fleet.
+///
+/// It is a plain `const` and not a Cargo feature ON PURPOSE. A default-off feature would add an
+/// axis to the build matrix, a `[tier_exclusive]` row and an exclusions-gate surface, and — worse —
+/// it would make the shipped fleet image *not contain* the follow path, so the canary roll could
+/// not exercise what it is meant to prove. A const keeps every tier's binary identical and makes
+/// the flip a one-line diff a reviewer can see.
+///
+/// ⚠️ Flip criterion is NOT "the code looks right": #278's closing checklist gates the watch's
+/// `ELECT_ENFORCE` on the smol roll showing ONE clean channel migration first. This flag is the
+/// smol half of that ordering.
+pub const FOLLOW_ENABLED: bool = false;
+
+/// Member count carried on every announcement-derived [`Decision`].
+///
+/// [`Decision::supersedes`] breaks an epoch tie by member count, because the donor merges
+/// *partitions* that each ran their own election. smol has exactly one announcer — the crown — so
+/// there is no headcount to compare and the arm never discriminates. Pinning it to a constant says
+/// that plainly instead of inventing a number: epoch orders announcements, and the lower-channel
+/// tiebreak resolves the (already pathological) two-crowns-same-epoch case.
+pub const ANNOUNCER_MEMBERS: u8 = 1;
+
+/// Frames per announcement burst. Anchored to the existing `ODEL_BURST` (`net::mode`, #237): the
+/// repeat count smol already uses when a decision must not be missed and the transport will not
+/// acknowledge it. Reusing the number rather than inventing one keeps the two bursts comparable
+/// when someone tunes either.
+pub const ANNOUNCE_BURST: u8 = 6;
+
+/// Spacing between frames of a burst. Anchored to `PREARM_GAP_MS`/`WAKE_GAP_MS` (`net::mode`), the
+/// gap smol already uses for a repeated *broadcast* that a leaf must not miss (the OTAM wake-burst
+/// — the same problem shape: unacked, one in-flight slot, receiver may be busy).
+///
+/// ⚠️ What a burst does and does NOT buy, because the difference decides whether the recovery
+/// ladder below is optional: `ANNOUNCE_BURST × ANNOUNCE_GAP_MS` is 600 ms of coverage against
+/// *collision and queue loss*. It buys nothing at all for a leaf parked on a different channel —
+/// that leaf is deaf for a full `DWELL_MS` (1500 ms) and would miss every frame of the burst. Leaves
+/// in that state are recovered by [`recovery_ladder`], never by repeats. Raising the burst count to
+/// "cover" a parked leaf would be airtime spent on a case it cannot reach.
+pub const ANNOUNCE_GAP_MS: u64 = 120;
+
+/// Steady-state repeat interval, once a burst has drained. Anchored to smol's HELLO cadence
+/// (`main`'s ~2 s "I'm here" advertisement): ELECT is the channel-plane twin of HELLO — one says
+/// *who* is here, the other says *where the fleet meets* — so they beat at the same rate and a
+/// reader tuning one finds the other.
+///
+/// Airtime is not a concern at this rate and the arithmetic should be on the page rather than
+/// assumed: 61 B + the 9 B group-MAC trailer = 70 B every 2 s, from the single crown. That is
+/// ~280 bit/s of a 1 Mbit/s basic rate.
+pub const ANNOUNCE_IDLE_MS: u64 = 2_000;
+
+/// Where a burst is in the announce-then-move sequence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Phase {
+    /// Nothing to say.
+    Idle,
+    /// Announcing the new channel while still reachable on the OLD one.
+    Pre,
+    /// Announcing from the NEW channel, for leaves that were asleep or parked.
+    Post,
+}
+
+/// The crown's announcement schedule: announce, move, announce again.
+///
+/// This is CSA's shape (see the prior-art section in the module header) — announce the switch
+/// before performing it, then re-announce from the far side. Announcing only *after* guarantees a
+/// window where the crown is deaf to its own fleet; announcing only *before* strands whoever was
+/// asleep. Both bursts carry the SAME epoch, which is stronger than ordering them: a pre-move frame
+/// arriving late is byte-identical to the post-move one, so there is nothing for it to override.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Announcer {
+    epoch: u32,
+    channel: u8,
+    phase: Phase,
+    left: u8,
+    last_ms: u64,
+    /// Settle gate for [`Self::observe_channel`]: a candidate channel and when we first saw it.
+    /// `(0, _)` = nothing pending.
+    pending: (u8, u64),
+}
+
+impl Default for Announcer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Announcer {
+    /// Boot state: nothing decided, nothing to announce.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { epoch: 0, channel: 0, phase: Phase::Idle, left: 0, last_ms: 0, pending: (0, 0) }
+    }
+
+    /// Feed an OBSERVED channel — one read off the radio every tick, which can therefore flap.
+    /// Commits through [`Self::decide`] only once the new value has held for [`SETTLE_MS`].
+    /// Returns true on the tick it commits.
+    ///
+    /// This is the anti-flap half the donor's constants were kept for. Without it a crown whose AP
+    /// oscillates between two channels burns an epoch per oscillation, and since epoch is the total
+    /// order every announcement out-ranks the last — so a flapping AP would not merely be noisy, it
+    /// would make `supersedes` meaningless and drag a following fleet back and forth. Flapping costs
+    /// an association and tears the mesh down; a suboptimal-but-stable channel does not.
+    ///
+    /// The FIRST channel commits immediately (`self.channel == 0`): there is no incumbent to protect
+    /// and no flap to suppress, and making a booting crown sit silent for [`SETTLE_MS`] before
+    /// saying where the fleet meets would be a self-inflicted 30 s hole in exactly the window when
+    /// leaves are looking hardest.
+    pub fn observe_channel(&mut self, channel: u8, now_ms: u64) -> bool {
+        if ch_index(channel).is_none() || channel == self.channel {
+            self.pending = (0, 0); // back on the committed channel → the candidate is withdrawn
+            return false;
+        }
+        if self.channel == 0 {
+            return self.decide(channel, now_ms); // cold start: nothing to protect
+        }
+        if self.pending.0 != channel {
+            self.pending = (channel, now_ms); // a new candidate starts its own clock
+            return false;
+        }
+        if now_ms.saturating_sub(self.pending.1) < SETTLE_MS {
+            return false;
+        }
+        self.pending = (0, 0);
+        self.decide(channel, now_ms)
+    }
+
+    /// The epoch currently being announced.
+    #[must_use]
+    pub const fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// The channel currently being announced (0 = nothing decided yet).
+    #[must_use]
+    pub const fn channel(&self) -> u8 {
+        self.channel
+    }
+
+    #[must_use]
+    pub const fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// A new channel decision: bump the epoch and arm the PRE-move burst. Returns `false` (and
+    /// changes nothing) for an out-of-range channel or a channel we are already announcing, so a
+    /// caller may drive this straight from an observed value without debouncing it — a re-decision
+    /// on the same channel would otherwise burn an epoch per call and defeat `supersedes`.
+    pub fn decide(&mut self, channel: u8, now_ms: u64) -> bool {
+        if ch_index(channel).is_none() || channel == self.channel {
+            return false;
+        }
+        self.epoch = self.epoch.saturating_add(1);
+        self.channel = channel;
+        self.phase = Phase::Pre;
+        self.left = ANNOUNCE_BURST;
+        // Back-date so the first frame of the burst goes out on the very next tick rather than
+        // waiting a gap — the pre-move window is the one where the crown is still reachable.
+        self.last_ms = now_ms.saturating_sub(ANNOUNCE_GAP_MS);
+        true
+    }
+
+    /// True when one frame of the current burst should go out NOW; consumes that repeat.
+    pub fn due(&mut self, now_ms: u64) -> bool {
+        if self.phase == Phase::Idle || self.left == 0 {
+            return false;
+        }
+        if now_ms.saturating_sub(self.last_ms) < ANNOUNCE_GAP_MS {
+            return false;
+        }
+        self.left -= 1;
+        self.last_ms = now_ms;
+        true
+    }
+
+    /// True when a steady-state repeat should go out — the burst has drained and
+    /// [`ANNOUNCE_IDLE_MS`] has passed. Consumes the slot.
+    ///
+    /// The bursts cover a migration; this covers everything else. A leaf that boots, wakes, or
+    /// finally lands on the right channel learns the current decision within one interval instead of
+    /// waiting for the next migration, which on a stable fleet may never come. It is also what makes
+    /// the frame observable at all on a fleet that is not migrating — which is the entire value of
+    /// the observe-only landing, and therefore not optional.
+    pub fn beacon_due(&mut self, now_ms: u64) -> bool {
+        if self.phase == Phase::Idle || self.left > 0 {
+            return false; // idle has nothing to say; a live burst is already saying it
+        }
+        if now_ms.saturating_sub(self.last_ms) < ANNOUNCE_IDLE_MS {
+            return false;
+        }
+        self.last_ms = now_ms;
+        true
+    }
+
+    /// True once the PRE-move burst has drained — the caller may now retune. Kept as a question the
+    /// caller asks rather than a callback, so the move stays where the radio is owned.
+    #[must_use]
+    pub const fn clear_to_move(&self) -> bool {
+        matches!(self.phase, Phase::Pre) && self.left == 0
+    }
+
+    /// Arm the POST-move burst, at the SAME epoch. Call immediately after the retune.
+    pub fn moved(&mut self, now_ms: u64) {
+        self.phase = Phase::Post;
+        self.left = ANNOUNCE_BURST;
+        self.last_ms = now_ms.saturating_sub(ANNOUNCE_GAP_MS);
+    }
+
+    /// True once the POST burst has drained too — the migration is over.
+    #[must_use]
+    pub const fn settled(&self) -> bool {
+        matches!(self.phase, Phase::Post) && self.left == 0
+    }
+
+    /// The decision this announcer is broadcasting, for the frame builder.
+    #[must_use]
+    pub const fn decision(&self, gateway: u8) -> Decision {
+        Decision { channel: self.channel, epoch: self.epoch, gateway }
+    }
+}
+
+/// What a leaf should do with an inbound announcement.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Follow {
+    /// Stale, replayed, or simply not newer — ignore it. Costs nothing and, importantly, does not
+    /// reset the probation clock: a replayed old frame must not look like liveness.
+    Stale,
+    /// Accepted, and it names the channel we are already on. Nothing to do but note we heard it.
+    Confirmed,
+    /// Accepted, and the fleet is moving. The caller retunes to this channel — IFF
+    /// [`FOLLOW_ENABLED`].
+    Move(u8),
+}
+
+/// A leaf's view of the announced channel decision.
+///
+/// Deliberately records what it heard even when [`FOLLOW_ENABLED`] is false. Observation and action
+/// are separate concerns: the observe-only landing is worth having precisely because it lets the
+/// fleet report what it *would* have done — over DIAG, on real hardware, against a real crown —
+/// before anything moves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Follower {
+    decision: Decision,
+    /// When we last accepted an announcement (0 = never). Drives [`Self::probation_expired`].
+    heard_ms: u64,
+    /// Announcements accepted since boot — a monotonic observability counter, so "did this board
+    /// ever hear the crown" is answerable from a DIAG record instead of a serial console.
+    accepted: u16,
+    /// Accepted announcements that named a DIFFERENT channel than the one we were on — i.e. the
+    /// ones a following leaf would have acted on.
+    ///
+    /// This is the number the canary roll actually needs, and it is not the same as `accepted`.
+    /// In the steady state every leaf is by definition co-channel with the crown (ESP-NOW is
+    /// per-channel — a leaf on another channel hears nothing at all), so `accepted` only ever
+    /// proves the beacon works. `moves` is non-zero exactly when a leaf caught the crown's
+    /// PRE-move burst, which is the one hard-to-hit part of the whole design and the thing
+    /// observe-only exists to measure before anything is allowed to act on it.
+    moves: u16,
+}
+
+impl Default for Follower {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Follower {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { decision: Decision::bootstrap(), heard_ms: 0, accepted: 0, moves: 0 }
+    }
+
+    #[must_use]
+    pub const fn decision(&self) -> Decision {
+        self.decision
+    }
+
+    #[must_use]
+    pub const fn accepted(&self) -> u16 {
+        self.accepted
+    }
+
+    /// See [`Self::moves`] — the count a canary roll reads.
+    #[must_use]
+    pub const fn moves(&self) -> u16 {
+        self.moves
+    }
+
+    /// Ingest one parsed frame. `my_channel` is the channel we are on right now (0 = unknown).
+    ///
+    /// Ordering is [`Decision::supersedes`] verbatim — the donor's total order, so both repos agree
+    /// on which of two announcements wins. Note the boot edge it implies: [`Decision::bootstrap`]
+    /// sits at epoch 0 on [`RENDEZVOUS_CHANNEL`], so an epoch-0 announcement for a LOWER channel
+    /// number supersedes it on the channel tiebreak. That is the donor's rule and it is harmless
+    /// here (a real crown's first `decide` lands on epoch 1), but it is a rule, not an accident, so
+    /// it is written down rather than discovered.
+    pub fn observe(&mut self, f: &wire::ElectFrame, now_ms: u64, my_channel: u8) -> Follow {
+        let d = Decision { channel: f.channel, epoch: f.epoch, gateway: f.gateway };
+        if !d.supersedes(ANNOUNCER_MEMBERS, &self.decision, ANNOUNCER_MEMBERS) {
+            return Follow::Stale;
+        }
+        self.decision = d;
+        self.heard_ms = now_ms;
+        self.accepted = self.accepted.saturating_add(1);
+        if d.channel == my_channel {
+            Follow::Confirmed
+        } else {
+            self.moves = self.moves.saturating_add(1);
+            Follow::Move(d.channel)
+        }
+    }
+
+    /// Has the adopted epoch gone quiet for longer than [`PROBATION_MS`]?
+    ///
+    /// This is the answer to the failure mode a monotonic epoch invites: one node with a high
+    /// persisted epoch can otherwise wedge the entire fleet onto a dead channel permanently, and no
+    /// later announcement can ever out-rank it. After probation the leaf stops treating the adopted
+    /// decision as authoritative and falls back to the [`recovery_ladder`].
+    #[must_use]
+    pub fn probation_expired(&self, now_ms: u64) -> bool {
+        self.heard_ms != 0 && now_ms.saturating_sub(self.heard_ms) > PROBATION_MS
+    }
+}
+
+/// Channels a consumer AP is most likely to sit on, after the rendezvous. 1/6/11 are the three
+/// non-overlapping 2.4 GHz allocations and the only ones most routers auto-select; 6 is already
+/// [`RENDEZVOUS_CHANNEL`], so these are the remaining two.
+pub const COMMON_AP_CHANNELS: [u8; 2] = [1, 11];
+
+/// Upper bound on a ladder: every channel in the band, at most once.
+pub const RECOVERY_MAX: usize = N_CHANNELS;
+
+/// The historical blind-scan plan (`net::mode::leaf_scan_tick`'s `CANDIDATES`, "JP's roam plan").
+/// Named here so [`recovery_ladder`] can *return* it verbatim when following is off — which turns
+/// "the flag changes nothing on a live fleet" from a claim into something a host test asserts.
+pub const LEGACY_CANDIDATES: [u8; 3] = [1, 6, 11];
+
+/// The ordered channel-probe plan for a leaf that has to re-find the mesh, best guess first.
+///
+/// # Cost model — re-derived for smol, NOT inherited
+///
+/// The design record costs this ladder at 10–20 ms per rung and 130–260 ms for a full sweep. Those
+/// numbers are `esp-radio`'s **`scan_async`** dwell times, and smol's leaf recovery does not scan:
+/// `leaf_scan_tick` retunes the ESP-NOW PHY and *listens* for the crown's HELLO for `DWELL_MS`
+/// (1500 ms) before hopping. So the real cost of a rung here is `DWELL_MS`, ~100× the scan figure,
+/// and the real budget is 13 × 1500 ms ≈ 19.5 s to exhaust the band.
+///
+/// That is a much better trade than it looks, and the ranking is what makes it one. Today's plan
+/// probes three channels forever; a crown that moved to ch3 is simply never found. This finds it,
+/// and puts the *likely* answers first: a leaf that still remembers the last channel is back in one
+/// rung, where today it may cycle up to three. Slower worst case, faster common case, and a
+/// reachable band instead of an unreachable one.
+///
+/// (It also does not cost the association, which is the other reason not to reach for a scan: a
+/// scan drops it — `coex_background_scan` is hardcoded false — and a leaf mid-recovery is exactly
+/// who cannot afford that.)
+///
+/// # Rungs
+///
+/// Tier 0 of the design ladder ("heard the announcement") is not a rung: this list is what a leaf
+/// walks *because* tier 0 did not happen. Rungs here are the remaining tiers, in order:
+///
+/// | rung | tier | why |
+/// |---|---|---|
+/// | 0 | 1 | `last_known` — where the mesh was when we last heard it |
+/// | 1 | 2 | [`RENDEZVOUS_CHANNEL`] — the one recovery that cannot fail for timing reasons |
+/// | 2,3 | 3 | [`COMMON_AP_CHANNELS`] — where a consumer AP probably landed |
+/// | 4.. | 4 | the rest of the band ascending — the sweep, degraded into rungs |
+///
+/// Duplicates are dropped, so a leaf whose `last_known` is already the rendezvous does not spend
+/// `DWELL_MS` proving it twice. `last_known == 0` ("never knew one") simply starts at rung 1.
+///
+/// With `follow` false this returns [`LEGACY_CANDIDATES`] unchanged — byte-for-byte today's
+/// behaviour. The ladder is only reachable in a world where the channel can actually move, and
+/// shipping a live behaviour change alongside a flag that is supposed to change nothing is how a
+/// canary roll stops being able to attribute what it sees.
+#[must_use]
+pub fn recovery_ladder(last_known: u8, follow: bool) -> ([u8; RECOVERY_MAX], usize) {
+    let mut out = [0u8; RECOVERY_MAX];
+    let mut n = 0;
+
+    if !follow {
+        for (i, &ch) in LEGACY_CANDIDATES.iter().enumerate() {
+            out[i] = ch;
+            n += 1;
+        }
+        return (out, n);
+    }
+
+    let push = |ch: u8, out: &mut [u8; RECOVERY_MAX], n: &mut usize| {
+        if ch_index(ch).is_none() {
+            return; // 0 = never knew one, or a corrupt value that must not be tuned to
+        }
+        if out[..*n].contains(&ch) {
+            return;
+        }
+        out[*n] = ch;
+        *n += 1;
+    };
+
+    push(last_known, &mut out, &mut n);
+    push(RENDEZVOUS_CHANNEL, &mut out, &mut n);
+    for &ch in COMMON_AP_CHANNELS.iter() {
+        push(ch, &mut out, &mut n);
+    }
+    for ch in 1..=(N_CHANNELS as u8) {
+        push(ch, &mut out, &mut n);
+    }
+    (out, n)
+}
+
+// ── The send path is a SECURITY boundary, so it is a TYPE, not a comment ───────────────────────
+//
+// The module header states the invariant: ELECT must go out via `send_to`, which appends #190's
+// group-MAC trailer, and never via `send_arb_raw`, which does not. A leaf cannot verify an
+// announcement before acting on it — checking costs it the association it would need if the
+// announcement were false — so an unauthenticated ELECT is a remote fleet-stranding primitive.
+//
+// A comment is not a mechanism. Stage A wrote that invariant down in prose and it would have
+// survived any refactor that violated it, silently. So the encoded frame is now a type whose bytes
+// have NO accessor: the only thing you can do with a `SealedElect` is hand it to a `GroupMacSink`,
+// and the only implementation of that trait routes to `send_to`.
+//
+// ⚠️ What this does NOT catch, enumerated rather than assumed — every one of these is covered by
+// `tools/check_elect_send_path.py`, which reads source structure, and NONE of them is covered by
+// the type system alone:
+//   1. Someone rewrites the one-line `GroupMacSink` impl body to call `send_arb_raw`. This is the
+//      LIKELIEST shape by a distance: it is a one-line edit in the direction of "make it compile".
+//   2. Someone adds a SECOND `GroupMacSink` impl that sends raw.
+//   3. Someone calls `wire::encode` directly into a local buffer and sends that, bypassing the seal.
+//   4. Someone hand-builds the frame from the `SMOLv1 ELECT ` literal without touching `encode`.
+//   5. Someone adds a new raw `esp_now.send` call site.
+//   6. Someone changes `should_group_mac` so ELECT stops being MAC'd — the trailer disappears with
+//      the send path untouched. (Pinned by an ELECT case in `experiments/mac_verify`.)
+
+/// A sink that appends the #190 group-MAC trailer to what it sends.
+///
+/// The name is the contract. An implementation that does not append the trailer satisfies the
+/// compiler and breaks the fleet, which is why the single implementation is also checked by
+/// `tools/check_elect_send_path.py` rather than trusted.
+pub trait GroupMacSink {
+    /// Send `frame` to `dst`, appending the group-MAC trailer.
+    fn send_group_mac(&mut self, dst: &[u8; 6], frame: &[u8]);
+}
+
+/// An encoded ELECT frame that can only leave via a [`GroupMacSink`].
+///
+/// The buffer is private and there is no accessor, no `Deref`, no `as_bytes`. [`Self::emit`]
+/// consumes `self`, so a frame cannot be sealed once and sent twice down different paths either.
+pub struct SealedElect {
+    buf: [u8; wire::ELECT_LEN],
+}
+
+impl SealedElect {
+    /// Encode `f`. `None` for an out-of-range channel — the same rejection [`wire::encode`] makes,
+    /// surfaced here so a malformed decision can never reach the air.
+    #[must_use]
+    pub fn seal(f: &wire::ElectFrame) -> Option<Self> {
+        let mut buf = [0u8; wire::ELECT_LEN];
+        let n = wire::encode(f, &mut buf)?;
+        // `encode` writes a fixed-width record or nothing; a short write would mean the layout
+        // constants disagree with the writer, which is a bug, not an input error.
+        debug_assert_eq!(n, wire::ELECT_LEN);
+        Some(Self { buf })
+    }
+
+    /// Hand the frame to the authenticated send path. Consumes `self`.
+    pub fn emit<S: GroupMacSink + ?Sized>(self, sink: &mut S, dst: &[u8; 6]) {
+        sink.send_group_mac(dst, &self.buf);
     }
 }

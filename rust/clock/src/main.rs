@@ -1077,9 +1077,15 @@ fn main() -> ! {
                     ota::boot_confirm(false); // flips to the good slot + resets — never returns
                 }
             }
-            // #23 stage 2: a LEAF scans 1/6/11 for the elected gateway's HELLO and
-            // locks onto its channel (a no-op on the gateway, which rides its AP ch).
+            // #23 stage 2: a LEAF scans the ranked recovery ladder for the elected gateway's
+            // HELLO and locks onto its channel (a no-op on the gateway, which rides its AP ch).
+            // #278: the ladder is `[1, 6, 11]` verbatim until `mesh_elect::FOLLOW_ENABLED` flips.
             r.leaf_scan_tick(now);
+            // #278/#269: the CROWN announces the mesh rendezvous channel — one repeat per beacon
+            // interval in the steady state, bursts around an actual migration (fired inline by the
+            // reassoc path, which is the only place that knows a move is imminent). Mirror image of
+            // `leaf_scan_tick`: this early-returns on a leaf, that one on a gateway.
+            r.elect_tick(now);
             // #23 fix (oracle #1): a LEAF whose owner has gone silent for a PROLONGED
             // period re-opens the broker election — the ONLY runtime path that takes
             // over a DEAD lowest-id owner (leaves never flush). Cheap: early-returns
