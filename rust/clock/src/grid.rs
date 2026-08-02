@@ -46,6 +46,7 @@ use embedded_graphics::{
     text::{Baseline, Text},
 };
 
+use crate::textclip::clip_chars;
 use crate::app::{AppKind, Ctx, Plugin, Transition};
 use crate::input::Press;
 
@@ -266,13 +267,13 @@ fn render(ctx: &mut Ctx, age_s: Option<u64>, page: u8) {
         let lines = ctx.grid.payload().strip_prefix("GRID|").unwrap_or("");
         for (i, seg) in lines.split('|').take(3).enumerate() {
             let y = 12 + i as i32 * 9;
-            Text::with_baseline(clip(seg, LINE_CHARS), Point::new(2, y), small, Baseline::Top)
+            Text::with_baseline(clip_chars(seg, LINE_CHARS), Point::new(2, y), small, Baseline::Top)
                 .draw(ctx.display)
                 .ok();
         }
     } else {
         // JP's "just the power, whole window": the TOTAL as a big centred number.
-        let total = clip(ctx.grid.total(), 7); // ≤ 7 glyphs @ 10 px advance fits 72 px
+        let total = clip_chars(ctx.grid.total(), 7); // ≤ 7 glyphs @ 10 px advance fits 72 px
         let w = total.chars().count() as i32 * 10;
         let x = ((72 - w) / 2).max(1); // centre like the CLOCK (10 px/char)
         Text::with_baseline(total, Point::new(x, 11), big, Baseline::Top)
@@ -287,14 +288,6 @@ fn render(ctx: &mut Ctx, age_s: Option<u64>, page: u8) {
     ctx.display.flush().ok();
 }
 
-/// Clip `s` to at most `max` characters on a UTF-8 boundary (protocol is ASCII,
-/// but this is boundary-safe regardless — never panics on a byte-slice).
-fn clip(s: &str, max: usize) -> &str {
-    match s.char_indices().nth(max) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
-    }
-}
 
 /// Write a compact fetch age (`45s` / `12m` / `3h`) into `out`. Bounded to ≤ 4
 /// glyphs so it always fits beside the title (48 px..72 px = 24 px = 4 chars).

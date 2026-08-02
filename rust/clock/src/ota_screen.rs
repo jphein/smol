@@ -40,7 +40,8 @@ use embedded_graphics::{
 
 use crate::app::Oled;
 use crate::net::names::{name_for_seed, FORGE};
-use crate::rssi::{clip, Line};
+use crate::rssi::Line;
+use crate::textclip::clip_bytes;
 
 /// Panel geometry (matches the other screens).
 const PANEL_W: i32 = 72;
@@ -233,7 +234,7 @@ pub fn draw(display: &mut Oled, v: &OtaView) {
     let (adj, noun) = name_for_seed(v.build, &FORGE);
     let mut hero = Line::new();
     let _ = write!(hero, "{} {}", adj, noun);
-    Text::with_baseline(clip(hero.as_str(), 12), Point::new(0, 0), style_6x10(), Baseline::Top)
+    Text::with_baseline(clip_bytes(hero.as_str(), 12), Point::new(0, 0), style_6x10(), Baseline::Top)
         .draw(display)
         .ok();
 
@@ -262,7 +263,7 @@ pub fn draw(display: &mut Oled, v: &OtaView) {
             let _ = write!(src, "from {}", host);
         }
     }
-    Text::with_baseline(clip(src.as_str(), 14), Point::new(0, 11), style_5x8(), Baseline::Top)
+    Text::with_baseline(clip_bytes(src.as_str(), 14), Point::new(0, 11), style_5x8(), Baseline::Top)
         .draw(display)
         .ok();
 
@@ -276,7 +277,7 @@ pub fn draw(display: &mut Oled, v: &OtaView) {
             let _ = write!(stat, "v{} {}/{}K", v.build, v.done / 1024, v.total / 1024);
         }
     }
-    Text::with_baseline(clip(stat.as_str(), 14), Point::new(0, 20), style_5x8(), Baseline::Top)
+    Text::with_baseline(clip_bytes(stat.as_str(), 14), Point::new(0, 20), style_5x8(), Baseline::Top)
         .draw(display)
         .ok();
 
