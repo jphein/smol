@@ -3402,6 +3402,26 @@ impl RadioManager {
     /// `Normal`; otherwise it increments reclaims and walks the guard from `Shed`, latching
     /// `Degraded` at `SHED_RECLAIM_MAX` (serve off-channel, OTA off, MQTT/mesh alive, never crownless).
     fn note_crown_ap(&mut self, decision: crate::net::coexist::CrownApDecision) {
+        // ── #269 ROT-DETECTOR (deliberate, do not "simplify") ──────────────────────────────────
+        // The `better_successor_cc: false` disposition below is justified by a design that has NOT
+        // LANDED: #269's channel-follows-the-crown derivation. If #269 ships differently, or is
+        // deferred, that justification silently evaporates and nothing would say so — the exact
+        // failure mode #371 catalogues, with the sign flipped (an intention DROPPED on the strength
+        // of a future guarantee).
+        //
+        // So the dependency is encoded as something that FAILS rather than rots. #269's whole point
+        // is that the mesh channel stops being a compile-time constant; the moment
+        // `ESP_NOW_FIXED_CHANNEL` is removed or made non-const, this assertion stops compiling and
+        // drags the next reader here to re-decide `better_successor_cc` on the design that actually
+        // shipped. Deleting this assertion to "fix the build" is deleting the point of it.
+        const _: () = assert!(
+            ESP_NOW_FIXED_CHANNEL != 0,
+            "smol #269: the mesh channel is no longer a compile-time constant — re-derive \
+             `better_successor_cc` in `note_crown_ap` (net/mode.rs) against the design that landed. \
+             Its `false` was justified by 'co-channel by construction makes this path rare', which \
+             is a judgement about #269, not a structural guarantee. Do not delete this assertion \
+             without making that decision."
+        );
         use crate::net::coexist::{crown_next_state, CrownApDecision, CrownCtx, CrownState};
         if matches!(decision, CrownApDecision::CoChannel { .. }) {
             self.shed_reclaims = 0;
@@ -3409,9 +3429,26 @@ impl RadioManager {
         } else {
             self.shed_reclaims = self.shed_reclaims.saturating_add(1);
             // The reassoc already TRIED and failed to reach co-channel, so evaluate from `Shed` with
-            // `reassoc_exhausted`. `better_successor_cc` (yield to a cc=1 peer) is a follow-up that
-            // needs the HELLO `cc` bit; Tier-1 stays crown-in-place, which holds the never-crownless
+            // `reassoc_exhausted`. Tier-1 stays crown-in-place, which holds the never-crownless
             // invariant (safety) — yielding is an optimization, not a safety requirement.
+            //
+            // `better_successor_cc` (yield to a cc=1 peer) stays FALSE, and the reason changed in
+            // #269 — do not read the old "needs the HELLO `cc` bit" note as a TODO inviting a wire
+            // change. Under #269 the mesh channel DERIVES from the elected crown's AP channel, so
+            // a crown is co-channel by construction and this failure path becomes rare.
+            //
+            // ⚠️ RARE IS NOT UNREACHABLE, and the distinction is the whole disposition. This branch
+            // exists precisely for the case where that construction FAILED — no usable AP in range,
+            // the AP changed channel or died, the crown at range edge, or the mid-migration window
+            // before the fleet has adopted the new channel. It therefore fires exactly when the
+            // fleet is already degraded, which is the worst moment to have removed a recovery.
+            // The call is "rare enough that a new wire field is not worth it" — a JUDGEMENT, not a
+            // structural guarantee. Re-derive it, do not inherit it.
+            //
+            // The disposition rests on a design that DOES NOT EXIST YET, so it is pinned by the
+            // `const _` rot-detector above `note_crown_ap` rather than left to prose: #269 removes
+            // `ESP_NOW_FIXED_CHANNEL`, and when it does, that assertion stops compiling and drags
+            // the next reader to exactly this decision.
             let ctx = CrownCtx { reassoc_exhausted: true, better_successor_cc: false };
             self.crown_state = crown_next_state(CrownState::Shed, decision, self.shed_reclaims, ctx);
         }
