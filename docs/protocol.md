@@ -489,7 +489,7 @@ caches it (`diag_cache`) and republishes it retained to `smol/<id>/diag`.
 `fwd`/`dedup`/`ttl`/`hop`/`dlseq`/`dfwd` tail + the `mesh-test` `deaf`/`ddrops`):**
 
 ```
-DIAG|slot=<bootslot>|rst=<reset-reason>|boot=<bootcount>|ota=<outcome>|up=<sec>|heap=<free>
+DIAG|slot=<bootslot>|rst=<reset-reason>|boot=<bootcount>|ota=<outcome[:build]>|up=<sec>|heap=<free>
     |hmin=<heap-min>|btn=<short>|btnl=<long>|fok=<flush-ok>|ffl=<flush-fail>|vok=<verify-ok>
     |vfl=<verify-fail>|loss=<pct>|rtt=<ms>|rx=<n>|tx=<n>|led=<mode>:<on|off>|tage=<sec-since-sync>
     |tsrc=<ntp|mesh|none>|net=0:ok|brk=<baked|ovr|fb>|otah=<slot|ovr>
@@ -581,6 +581,7 @@ changes, and see the truncation warning.
 | Field | Meaning | Since |
 |---|---|---|
 | `slot`/`rst`/`boot`/`ota` | boot slot · reset reason · boot count · last-OTA outcome | #70 |
+| `ota` values | `none` · `confirmed:<build>` · `rolled-back`. **#323: `confirmed` carries the build it vouches for.** The scope was always real (firmware refuses the token unless the recorded build is the running one) but was invisible on the wire, so `confirmed`-for-912 and `confirmed`-for-913 were the same string — which made `ota_verify.sh`'s `none\|rolled-back → confirmed` transition test fail on a *successful* OTA, the normal state of every board from its second consecutive OTA (the token is `rtc_fast` and only a power cycle clears it). A **bare `confirmed` stays valid input** — it is what a pre-#323 image emits — so a parser must accept both and split on `:`. `rolled-back` deliberately gained **no** suffix: it describes the image rolled away FROM, and its reader is the good slot, a different build by construction. | #323 |
 | `up`/`heap`/`hmin` | uptime s · free heap · heap low-water | #70/#49 |
 | `btn`/`btnl` | BOOT short-/long-press counters (HA fires events on change) | #49 |
 | `fok`/`ffl` | gateway MQTT bursts to CONNACK vs failed (leaf-side 0) | #49 |

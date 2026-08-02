@@ -1,0 +1,9 @@
+1	smol/8/ota/state	{"installed_version":"912","latest_version":"913","in_progress":true,"title":"v913"}
+1	smol/8/diag	DIAG|slot=0|rst=sw|boot=268|ota=confirmed|up=4000|heap=41968|tsrc=mesh|hop=1|cut=111
+1	smol/mesh/channel	MC|5|6|1
+@1	0	smol/8/ota/progress	1277952|1450320|self
+@2	0	smol/8/ota/diag	relay-failed retry=1 src=gw
+@6	0	smol/8/ota/progress	1450320|1450320|self
+@7	0	smol/8/ota/state	{"installed_version":"913","latest_version":"913","in_progress":false,"title":"v913"}
+@7	0	smol/8/diag	DIAG|slot=1|rst=sw|boot=269|ota=confirmed:912|up=56|heap=41968|tsrc=mesh|hop=1|cut=111
+@9	0	smol/8/ota/progress	1277952|1450320|self

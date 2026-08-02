@@ -297,7 +297,7 @@ const DIAG_BUDGET: usize = 512 - 4 - "smol/255/diag".len();
 /// (run in `tools/gate.sh` beside `check_shed_order.py`, same principle: put the fact where a
 /// machine checks it). `tools/test_diag_budget.sh` proves that checker can fail.
 ///
-/// DIAG-WIDTHS: slot=3 rst=10 boot=10 ota=11 up=10 heap=10 hmin=10 btn=5 btnl=5 fok=10 ffl=10
+/// DIAG-WIDTHS: slot=3 rst=10 boot=10 ota=20 up=10 heap=10 hmin=10 btn=5 btnl=5 fok=10 ffl=10
 /// DIAG-WIDTHS: vok=5 vfl=5 loss=3 rtt=10 rx=10 tx=10 led=6:3 tage=10 tsrc=4 net=1:2 brk=5 otah=4
 /// DIAG-WIDTHS: fwd=10 dedup=10 ttl=10 hop=3 dlseq=10 dfwd=10 etx=3
 ///
@@ -325,7 +325,7 @@ const DIAG_BUDGET: usize = 512 - 4 - "smol/255/diag".len();
 /// 33 B on a leaf and 86 B on the crown — both past the remaining margin, which is exactly why they
 /// must be sheddable and not protected).
 #[cfg(feature = "espnow")]
-const DIAG_CORE_MAX: usize = 167 + 228 + 69;
+const DIAG_CORE_MAX: usize = 167 + 237 + 69;
 
 #[cfg(feature = "espnow")]
 const _: () = assert!(
@@ -3451,7 +3451,9 @@ impl RadioManager {
         // u32 seconds is 136 years of uptime — 10 B of provable headroom for no information at all.
         let up_s = (now_ms() / 1000).min(u32::MAX as u64) as u32;
         let d = crate::ota::boot_diag();
-        let ota = crate::ota::ota_outcome_token(); // live — boot_confirm sets it after capture
+        // #323: the token now carries its build (`confirmed:<build>`), so it is an owned String
+        // rather than a &'static str. Read LIVE — boot_confirm sets it after capture.
+        let ota = crate::ota::ota_outcome_token();
         let heap = esp_alloc::HEAP.free();
         let (vok, vfl) = self.ota_leaf.verify_counts();
         let loss = self.bench.loss_pct();

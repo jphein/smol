@@ -92,7 +92,9 @@
 #                          reset_reason_token() (ota.rs:1761) emits NO `ota` token — an OTA reboot
 #                          is a SOFTWARE reset and reads `rst=sw`.
 #        boot=<n>          boot counter, increments every boot.
-#        ota=<none|confirmed|rolled-back>   ota_outcome_token(); rtc_fast persistent (see above).
+#        ota=<none|confirmed[:<build>]|rolled-back>  ota_outcome_token(); rtc_fast persistent (see
+#                                            above). #323: `confirmed` carries the build it vouches
+#                                            for; a bare `confirmed` is a pre-#323 image.
 #        cc=<0|1|2>        #217 coexist health. THREE-VALUED since 6a62946 (2026-07-28):
 #                          1 = associated AND co-channel · 0 = associated AND off-channel
 #                          2 = NOT ASSOCIATED (nothing to conclude).
@@ -626,7 +628,7 @@ while :; do
   # Residual, stated rather than hidden: if we never observe a baseline (no retained diag lands), the
   # operands are `unknown` and PASS is REFUSED. That is the fail-closed direction — this harness
   # would rather under-report a real OTA than certify one it did not watch happen.
-  A=0; B=0; C=0; D=0; E=0
+  A=0; B=0; C=0; D=0; E=0; d_scope=""
   [ -n "$st_first" ] && [ "$st_first" != "$TARGET" ] && [ "$st_live" = "$TARGET" ] && A=1
   [ -n "$slot_first" ] && [ -n "$slot_live" ] && [ "$slot_first" != "$slot_live" ] && B=1
   # EXACTLY ONE boot, not merely an increase. `-gt` was defeated by a real attack: the gateway stops
@@ -681,9 +683,25 @@ while :; do
   # `confirmed` satisfies D. The guarantee there degrades from "the token transitioned under
   # observation" to "the token reads confirmed AND a single-boot in-window slot flip to TARGET
   # occurred" — which still blocks every known attack, but rests on B/C/E rather than on D.
-  # A firmware `ota=confirmed:<build>` would make the scope readable on the wire instead of implied;
-  # worth asking for, not worth waiting for.
-  [ "$ota_live" = "confirmed" ] && D=1
+  # #323 SHIPPED that: the firmware now emits `confirmed:<build>`, so the scope is READ rather than
+  # implied, and this conjunct can do what the relaxation could not — check that the build the token
+  # vouches for is the build we are verifying. `confirmed:<other>` is a new FAIL that was previously
+  # invisible (it serialised identically to a correct one). A bare `confirmed` stays valid input: it
+  # is what a pre-#323 image emits, and refusing it would turn a firmware-age difference into a
+  # verification failure. `rolled-back` deliberately gained no suffix (its reader is the good slot,
+  # a different build by construction), so nothing below changes for it.
+  #
+  # `case`, not a `grep -q` pipeline: a `grep -q` verdict is measurably unreliable under `pipefail`
+  # (it exits on first match, the writer takes EPIPE, and pipefail reports the WRITER's status).
+  case "$ota_live" in
+    confirmed)            D=1; d_scope="scope IMPLIED (pre-#323 image — the token carries no build)" ;;
+    confirmed:"$TARGET")  D=1; d_scope="scope READ FROM THE WIRE (#323): vouches for $TARGET" ;;
+    confirmed:*)          D=0; d_scope="SCOPE MISMATCH: the token vouches for build ${ota_live#confirmed:}, not the target $TARGET" ;;
+    *)                    D=0; d_scope="" ;;
+  esac
+  if [ "$D" = 0 ] && [ -n "$d_scope" ]; then
+    add FAIL 20 OTA-SCOPE "$d_scope. The board confirmed a DIFFERENT build than the one this run staged — before #323 this was unreadable, because confirmed-for-X and confirmed-for-Y were the same string on the wire."
+  fi
   # E requires an OBSERVED live rst — an ABSENT rst must not read as "not a USB flash". `rst=` is an
   # early positional field, so truncation (which eats the tail) never removes it; demanding it is
   # safe as well as fail-closed.
@@ -780,8 +798,8 @@ printf '    [%s] A state flip   %s → %s   (target v%s)\n'  "$(y $A)" "${st_fir
 printf '    [%s] B slot flip    %s → %s\n'                 "$(y $B)" "${slot_first:-unknown}" "${slot_live:-unknown}"
 printf '    [%s] C boot incr    %s → %s   (delta %s, want EXACTLY %s = 1 OTA boot + 2 per observed rollback episode, %s seen)\n' \
   "$(y $C)" "${boot_first:-unknown}" "${boot_live:-unknown}" "${boot_delta:-unknown}" "$boot_want" "$rollbacks"
-printf '    [%s] D ota token    %s → %s   (want live=confirmed; build-scoped in firmware since c5a2f47)\n' \
-  "$(y $D)" "${ota_first:-unknown}" "${ota_live:-unknown}"
+printf '    [%s] D ota token    %s → %s   (want live=confirmed[:%s]%s)\n' \
+  "$(y $D)" "${ota_first:-unknown}" "${ota_live:-unknown}" "$TARGET" "${d_scope:+ — $d_scope}"
 printf '    [%s] E not usb      rst=%s\n'                  "$(y $E)" "${rst_live:-unknown}"
 printf '    [%s] F boot in-window  up=%ss (elapsed %ss + %ss slack) — defeats a cache-lagged ota= flip\n' \
   "$(y $F)" "${up_live:-unknown}" "$((now-start))" "$((SETTLE + 2*POLL + 30))"

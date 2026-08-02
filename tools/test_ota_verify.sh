@@ -452,8 +452,30 @@ run live_id8_913_reconstructed 8 913 30
 verdict_is PASS; rc_is 0
 proof A yes; proof B yes; proof C yes; proof D yes; proof E yes; proof F yes
 has  "D passes on the fleet's normal confirmed→confirmed" "D ota token    confirmed → confirmed"
-has  "and cites where the guarantee now lives"            "build-scoped in firmware since c5a2f47"
+# #323 moved the guarantee from "build-scoped in firmware, trust it" to "build-scoped ON THE WIRE,
+# read it", so the D line now cites the target it checked against instead of the commit that made
+# the claim credible. A bare `confirmed` (this fixture, a pre-#323 image) must still PASS — refusing
+# it would turn a firmware-age difference into a verification failure.
+has  "and says the scope was implied, not read"           "scope IMPLIED (pre-#323 image"
 hasnt "no death-point on a completed transfer"            "[FAIL   ] DEATH-POINT"
+# #323 · the capability the 9 bytes bought: a `confirmed` that vouches for a DIFFERENT build. Before
+# #323 this was structurally invisible — confirmed-for-912 and confirmed-for-913 were the same six
+# characters, so the harness could only trust the firmware's internal scoping. Now D reads it.
+echo
+echo "═══ #323 · ota=confirmed:<build> — the scope is READ, not trusted ═══"
+run scoped_confirmed_match 8 913 30
+verdict_is PASS; rc_is 0
+proof D yes
+has  "D reads the build off the wire"      "scope READ FROM THE WIRE (#323): vouches for 913"
+run scoped_confirmed_mismatch 8 913 30
+proof D NO
+has  "a token vouching for another build is refused" "SCOPE MISMATCH"
+has  "and names both builds"                         "vouches for build 912, not the target 913"
+# NOT a `hasnt` on the D marker: `y()` emits `yes`/`NO `, so a `hasnt "[ok ] D ota token"` would be
+# unfalsifiable — it asserts the absence of a string this tool never prints. `proof D NO` above is
+# the real check on the marker; this asserts the consequence, which is the point of the conjunct.
+verdict_is FAIL; rc_is 1
+
 # Oracle's Q1/Q2 — a rollback-then-recover is a legitimate success, and the rollback must leave a trace.
 run rollback_then_recover 8 907 8
 verdict_is PASS; rc_is 0

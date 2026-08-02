@@ -2489,26 +2489,51 @@ pub fn mark_ota_outcome(rolled_back: bool) {
 
 /// The last OTA outcome token for the DIAG `ota=` field. `none` until an OTA confirm/rollback
 /// happened this power-cycle (magic-gated: uninitialised RTC RAM ⇒ `none`).
+///
+/// #323: `confirmed` CARRIES ITS BUILD — `confirmed:<build>`. The scope was already real internally
+/// (the arm below refuses the token unless the recorded build is the running one), but the emitted
+/// string could not express it: `confirmed`-for-912 and `confirmed`-for-913 were the same six
+/// characters, so the build scope was invisible to every reader. That cost a real false NEGATIVE —
+/// `ota_verify.sh`'s D conjunct wanted `none|rolled-back → confirmed` as a TRANSITION and saw
+/// `confirmed → confirmed` across a genuinely successful 912→913 install, because `OTA_OUTCOME`
+/// lives in `rtc_fast` and only a power cycle clears it. That is the normal state of every board
+/// from its SECOND consecutive OTA onward.
+///
+/// The pairing was inferable — `confirmed` plus the retained `installed_version` on
+/// `smol/<id>/ota/state` says the same thing — but that is a TWO-TOPIC read, and this fleet has
+/// been burned repeatedly by pairing a stale retained value with a fresh one. One self-consistent
+/// field cannot be mis-paired. It costs 9 B of type-provable width (`confirmed:` + u32) against
+/// 31 B of machine-checked margin; see `DIAG_CORE_MAX`'s `ota=20` DIAG-WIDTHS entry, which the
+/// gate now holds to this decision. It returns an owned `String` (one small allocation per ~10 s
+/// diag cadence) rather than a `&'static str`, matching `diag_record`'s own heap-String discipline —
+/// there is no `heapless` dependency in this crate to borrow a stack buffer from.
+///
+/// The bare tokens stay valid input for every consumer: `none` and `rolled-back` are UNCHANGED, and
+/// a reader that wants the verdict alone splits on `:` (HA's `ota_outcome` sensor is a plain string
+/// passthrough, and its rollback alert triggers on `rolled-back`, which never gained a suffix).
 #[cfg(feature = "espnow")]
-pub fn ota_outcome_token() -> &'static str {
+pub fn ota_outcome_token() -> alloc::string::String {
+    use alloc::borrow::ToOwned as _;
     unsafe {
         let m = core::ptr::addr_of!(OTA_OUTCOME).read();
         if m[0] != OTA_OUTCOME_MAGIC {
-            return "none";
+            return "none".to_owned();
         }
         match m[1] {
             // `confirmed` is an assertion about the RUNNING image, so it is build-SCOPED: a verdict
-            // recorded for another build cannot vouch for this one. That is the fix — the token now
-            // means "THIS build was confirmed" and a reader can check it against
-            // `installed_version`, so the claim is verifiable instead of trusted.
-            1 if m[2] == BUILD_NUMBER => "confirmed",
-            1 => "none", // a stale vouch from a previous image — say nothing rather than lie
+            // recorded for another build cannot vouch for this one. The token means "THIS build was
+            // confirmed" — and now SAYS which, so a reader verifies the scope instead of trusting
+            // it. `write!` into a 24 B buffer cannot fail for "confirmed:" + a u32 (20 B max), but
+            // fall back to the bare token rather than an empty field if it ever did.
+            1 if m[2] == BUILD_NUMBER => alloc::format!("confirmed:{}", BUILD_NUMBER),
+            1 => "none".to_owned(), // a stale vouch from a previous image — say nothing, not a lie
             // `rolled-back` is deliberately NOT scoped, and the asymmetry is the point: it describes
             // the image we rolled AWAY from, and its intended reader is the GOOD slot — i.e. a
             // DIFFERENT build by construction. Scoping it would suppress the one signal it exists to
-            // deliver (#70: the good-slot boot reports `rolled-back`).
-            2 => "rolled-back",
-            _ => "none",
+            // deliver (#70: the good-slot boot reports `rolled-back`), and #323's own proposal to
+            // scope it too is declined for that reason.
+            2 => "rolled-back".to_owned(),
+            _ => "none".to_owned(),
         }
     }
 }
