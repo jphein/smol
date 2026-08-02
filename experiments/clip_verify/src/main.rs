@@ -6,10 +6,13 @@
 //! "magical nouns are ASCII". True, but unenforced — the corpus held the invariant, not the code.
 //! The panic would have surfaced as a reboot on whichever board first rendered a non-ASCII string.
 
+#[path = "../../../rust/clock/src/textclip.rs"]
+mod textclip;
+// Still included for `Line` — the buffer that feeds clip_bytes at every real call site.
 #[path = "../../../rust/clock/src/rssi.rs"]
 mod rssi;
 
-use rssi::clip;
+use textclip::{clip_bytes as clip, clip_chars};
 
 /// Every prefix length of `s`, including 0 and past the end. If any budget panics, the harness dies
 /// with the byte index that did it, which is the number you need to debug it.
@@ -73,6 +76,33 @@ fn main() {
         }
     }
 
+    // ---- clip_chars: the OTHER unit, and the #274-follow-up rename's core promise -----------
+    // batt.rs / grid.rs budget in GLYPHS (LINE_CHARS), not bytes. That function moved here under
+    // its own name; it must behave exactly as it did in those files, or their line layout shifts.
+    assert_eq!(clip_chars("café", 4), "café", "4 CHARS is the whole word (4 chars, 5 bytes)");
+    assert_eq!(clip_chars("café", 3), "caf");
+    assert_eq!(clip_chars("🐉🔥", 1), "🐉", "one char, not one byte");
+    assert_eq!(clip_chars("", 3), "");
+    for s in ["café", "Ωμέγα", "🐉🔥", "a\u{00e9}\u{20ac}\u{1f409}z", ""] {
+        for n in 0..=s.chars().count() + 3 {
+            let out = clip_chars(s, n);
+            assert!(s.starts_with(out), "clip_chars({s:?}, {n}) is not a prefix");
+            assert!(out.chars().count() <= n, "clip_chars({s:?}, {n}) kept too many chars");
+        }
+    }
+
+    // THE RENAME'S GUARANTEE. On ASCII the two units coincide, so every call site that moved
+    // between names must render identically — that is what makes "no semantic change" a checked
+    // claim rather than an assurance. Compared against the pre-#274 byte expression, which is
+    // also what batt/grid's char version reduced to on ASCII.
+    for s in ["Ember", "Molten Engine", "smol", "", "v905 12/48", "from 10.0.0.1"] {
+        for n in 0..=s.len() + 4 {
+            let expect = &s[..s.len().min(n)];
+            assert_eq!(clip(s, n), expect, "clip_bytes changed for {s:?}@{n} — screens reflow");
+            assert_eq!(clip_chars(s, n), expect, "clip_chars changed for {s:?}@{n} — screens reflow");
+        }
+    }
+
     // ---- the Line buffer that feeds clip() at every real call site --------------------------
     // ota_screen.rs builds a Line, then clips it. Line truncates at 24 bytes on write, which can
     // itself tear a multibyte char; as_str() is from_utf8(..).unwrap_or(""), so clip() receives
@@ -90,5 +120,6 @@ fn main() {
     sweep(s, "Line-truncated emoji run");
 
     println!("clip_verify: OK — no budget panics across multibyte, emoji, mixed-width and Line-torn input;");
-    println!("             ASCII truncation byte-identical to the pre-#274 implementation.");
+    println!("             clip_bytes AND clip_chars byte-identical to the pre-#274 implementation");
+    println!("             on all-ASCII input, so the #274-follow-up rename is provably inert.");
 }
