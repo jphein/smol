@@ -117,6 +117,27 @@ step() { printf '\n\033[1m── %s\033[0m\n' "$1"; }
 ok()   { printf '   \033[32mPASS\033[0m %s\n' "$1"; }
 bad()  { printf '   \033[31mFAIL\033[0m %s\n' "$1"; FAILED+=("$1"); }
 
+# #384 the VENDORED realm-sigil binding still matches upstream. Unconditional and first: it is
+# nearly free, and every tier links these words, so drift here invalidates whatever the later arms
+# measure.
+#
+# This arm exists because the CHECKER ALREADY EXISTED AND NOTHING RAN IT. `sigil_vendor.sh --check`
+# was written carefully — manifest fails closed, upstream diff skips loudly when the sibling repo is
+# absent so CI can always run it — and `grep -rn sigil_vendor .github/workflows/ tools/gate.sh`
+# returned nothing. On 2026-08-15 the vendored copy was found stale by realm-sigil `1528f3a`, the
+# u64-seed fix for a REAL divergence (a >8 hex-char hash overflowed u32, so rust and go named the
+# same commit differently). `--check` had been reporting that correctly, exit 1 and all, to an
+# audience of zero.
+#
+# Which is this file's own opening argument, one level out: a checker nobody invokes is the same
+# shape as prose. It has already stopped running.
+step "vendored realm-sigil matches upstream (#384)"
+if out=$("$ROOT/tools/sigil_vendor.sh" --check 2>&1); then
+  printf '%s\n' "$out" | tail -2; ok "sigil vendor"
+else
+  printf '%s\n' "$out" | sed 's/^/        /'; bad "sigil vendor"
+fi
+
 # Both firmware halves need `board.rs`/`secrets.rs`, so this runs for either — `excl` on its
 # own in CI would otherwise fail on the missing files rather than on anything it measures.
 if [ "$run_fw" = 1 ] || [ "$run_excl" = 1 ]; then

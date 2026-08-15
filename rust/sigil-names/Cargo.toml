@@ -34,8 +34,15 @@ path = "src/lib.rs"
 # Node identity + creatures only. smol must NEVER enable `divergent-themed-realms`: its version names
 # come from the deliberately-pinned FORGE table in `clock/src/net/names.rs`, because version names are
 # historical record (v345 is "Furnace" in commits, memories and speech) and the upstream themed
-# corpora have moved. `fleet` and `creature` are the namespaces that cannot diverge — they exist in
-# no other binding, so nothing else can produce a conflicting name.
+# corpora have moved. `fleet` and `creature` are the namespaces smol takes.
+#
+# ⚠️ They were described here as the namespaces "that cannot diverge — they exist in no other
+# binding, so nothing else can produce a conflicting name". **That stopped being true on
+# 2026-07-29**, when realm-sigil's `sync-words.sh --all` wrote both into the go, python and js
+# embeds. Both exist in all four bindings now and can drift like any other realm. What protects
+# them is upstream's generated content check plus the #384 gate arm that makes this vendored copy
+# prove it still matches — not a structural immunity, which has expired. The reason to take them
+# is what they NAME: a board, a familiar.
 default = []
 
 # DECLARED BUT NEVER ENABLED, and it has to be declared to stay that way.

@@ -86,6 +86,13 @@ extern crate std;
 mod realms;
 mod reserved;
 
+/// The realms a consumer may reach, and **the list changes shape with the feature**: by default it
+/// is the identity realms only (`creature`, `fleet`); with `divergent-themed-realms` it is all nine.
+///
+/// It is filtered rather than complete because it is a *reachability* surface, not an inventory —
+/// `REALMS.iter().find(|r| r.name == "forge")` is a name lookup wearing a different hat, and it
+/// used to hand out `&FORGE` in a build where [`realm_by_name`] and `FORGE` itself were both
+/// refused. One crate cannot enforce two different answers to "may I have a themed realm?".
 pub use realms::REALMS;
 pub use reserved::RESERVED;
 
@@ -146,11 +153,36 @@ pub const fn name_for_id(id: u8, realm: &Realm) -> (&'static str, &'static str) 
     name_for_seed(seed_from_id(id), realm)
 }
 
-/// `(adjective, noun)` from a hex string — parity with Go's `GenerateName(hash, realm)` and
-/// Python's `generate_name`. Non-hex characters are skipped, matching Go's tolerant `parseHex`;
-/// `"dev"` therefore yields seed 0, as it does in Python.
+/// `(adjective, noun)` from a hex string — parity with Go's `GenerateName(hash, realm)`. Non-hex
+/// characters are skipped, matching Go's tolerant `parseHex`.
+///
+/// ⚠️ **Parity holds over hex input, and NOT over anything else.** Measured 2026-08-14 across all
+/// nine realms × 163 hex inputs (u32 edges, >8-char seeds, lengths 1–16, real build hashes): rust,
+/// go and js are byte-identical on every case. Python agrees there too — but the three tolerant
+/// bindings and Python part company the moment the input is not hex:
+///
+/// | input   | rust / go / js        | python                        |
+/// |---------|-----------------------|-------------------------------|
+/// | `"dev"` | seed 222 (`d`,`e`)    | seed 0 — special-cased literal|
+/// | `""`    | seed 0                | **raises** `ValueError`       |
+///
+/// So an unstamped build named through this crate and through `realm_sigil.generate_name` gets two
+/// different names. Consumers should publish no sigil at all for an unstamped build rather than
+/// pick one (hearthd does exactly that); see realm-sigil issue #9.
+///
+/// This doc previously read *"`\"dev\"` therefore yields seed 0, as it does in Python"* — which was
+/// wrong about this crate in the same breath as it was right about Python, while the test three
+/// screens down asserted `parse_hex("dev") == 0xde`. A parity claim with no stated input domain is
+/// how that survives.
 pub const fn name_for_hex(hash: &str, realm: &Realm) -> (&'static str, &'static str) {
-    name_for_seed(parse_hex(hash) as u32, realm)
+    // Full u64 seed, matching Go's GenerateName exactly. The prior `as u32`
+    // truncation only agreed with Go for <=8-hex-char seeds (which fit in 32
+    // bits); a 12-char build hash overflows u32 and diverged — Go "Molten
+    // Smelter" vs Rust "Tempered Bellows" for the same commit.
+    let seed = parse_hex(hash);
+    let a = (seed % realm.adjectives.len() as u64) as usize;
+    let n = ((seed >> 8) % realm.nouns.len() as u64) as usize;
+    (realm.adjectives[a], realm.nouns[n])
 }
 
 /// Tolerant hex parse, mirroring Go's `parseHex`: accumulate hex digits, ignore anything else.
@@ -358,8 +390,15 @@ const fn ascii_lower(b: u8) -> u8 {
 pub const FLEET: &Realm = &realms::FLEET;
 
 /// The creature realm — a THIRD namespace, for entities that are neither boards nor builds
-/// (smol's familiar). Ungated for the same reason as [`FLEET`]: it exists in no other binding, so
-/// nothing can contradict a name it produces.
+/// (smol's familiar). Ungated for the same reason as [`FLEET`]: it names a *thing*, and the gate
+/// exists to keep *build* names behind a declaration.
+///
+/// ⚠️ It was ungated on a stronger claim — "it exists in no other binding, so nothing can
+/// contradict a name it produces" — and **that claim expired on 2026-07-29**, when
+/// `sync-words.sh --all` wrote `creature` and `fleet` into go/python/js. Both now exist in all four
+/// bindings and can drift like any other realm; the generator's content check is what catches it,
+/// not their absence elsewhere. Nothing re-examines a decision when its premise moves, so the
+/// premise is written next to it here.
 ///
 /// **Deliberately 24×24, and deliberately NOT a power of two.** The 32-lock on `FLEET` exists only
 /// to make a *256-element* space injective; a creature seeds from an arbitrary `u32`, so its domain
@@ -436,6 +475,20 @@ mod tests {
             );
         }
         assert_eq!(seen.len(), 256);
+    }
+
+    /// Regression for the u32-truncation bug. `forge` has 13 adjectives / 14
+    /// nouns (non-power-of-2), so the HIGH bits of a >8-char hash affect the
+    /// modulo — truncating the seed to u32 gave "Tempered Bellows" where Go/JS
+    /// give "Molten Smelter" for the same commit. Power-of-2 realms (FLEET=32)
+    /// hid it, because the modulo there only touches the low bits u32 preserves.
+    #[cfg(feature = "divergent-themed-realms")]
+    #[test]
+    fn hex_seed_uses_full_u64_matching_go() {
+        let forge = realm_by_name("forge");
+        assert_eq!(name_for_hex("a7af54e4b004", forge), ("Molten", "Smelter"));
+        // 8-char seeds fit in u32 and were already correct — must stay so:
+        assert_eq!(name_for_hex("34b12f9a", forge), ("Sparking", "Smithy"));
     }
 
     #[test]
@@ -523,7 +576,7 @@ mod tests {
                 .nouns
                 .iter()
                 .filter(|n| themed.nouns.iter().any(|t| t.eq_ignore_ascii_case(n)))
-                .map(|n| *n)
+                .copied()
                 .collect();
             let actual_lower: std::vec::Vec<std::string::String> =
                 actual.iter().map(|s| s.to_ascii_lowercase()).collect();
@@ -562,20 +615,30 @@ mod tests {
 
     /// ALGORITHM parity with Go, isolated from corpus drift.
     ///
-    /// This matters because a plain four-way comparison of `generate_name("9e3779b1", "fantasy")`
-    /// currently DISAGREES: Go, Python and JS all say `Blazing Jewel`, this crate says
-    /// `Draconic Monolith`. That is **not** an algorithm difference — it is corpus staleness.
-    /// go/python/js ship generated embeds frozen on 2026-04-05 (20 adj / 20 nouns), while
-    /// `words/realms.json` was cut over to lexicon on 2026-05-07 (28 / 25) and this crate is
-    /// generated from the current file. Same arithmetic, different table.
+    /// The four bindings **agree** as of the 2026-07-29 `sync-words.sh --all`:
+    /// `generate_name("9e3779b1", "fantasy")` is `Draconic Monolith · 9e3779b1` in go, python, js
+    /// and rust alike, verified by running each. Before that sync they disagreed — go/python/js
+    /// shipped embeds frozen on 2026-04-05 (20 adj / 20 nouns) while `words/realms.json` had been
+    /// cut over to lexicon on 2026-05-07 (28 / 25) — and this crate reported `Draconic Monolith`
+    /// where the others said `Blazing Jewel`.
     ///
-    /// So the parity worth testing is: *given the same words, do we compute the same index?* This
-    /// pins the 2026-04-05 fantasy corpus as a fixture and asserts we reproduce Go's live output
-    /// on it — including the u32 edges where JS used to return `undefined`.
+    /// That was never an algorithm difference; it was corpus staleness. Which is exactly why this
+    /// test is written the way it is, and why it stays that way now the corpora match: it pins the
+    /// 2026-04-05 fantasy corpus as an explicit **fixture** and asserts we reproduce Go's output on
+    /// it — including the u32 edges where JS used to return `undefined`. Testing the live corpus
+    /// instead would conflate two independent questions, and would pass for the wrong reason on any
+    /// day the tables happen to match.
     ///
-    /// ⚠️ `FLEET` is unaffected by the drift and cannot diverge: it does not exist in the stale
-    /// embeds at all, so no other binding can produce a conflicting node name. Node identity is
-    /// safe; only the themed (version-name) realms differ across bindings today.
+    /// So: *given the same words, do we compute the same index?* That question is worth asking
+    /// whether or not today's tables agree, and it is the one thing a future partial sync cannot
+    /// invalidate.
+    ///
+    /// ⚠️ `FLEET` could not diverge *at the time this was written*: it existed in no other binding,
+    /// so nothing could produce a conflicting node name, and identity was safe even while the
+    /// version-name realms disagreed. **That stopped being true on 2026-07-29** — the `--all` sync
+    /// that converged the corpora also published `fleet` and `creature` into go/python/js. Identity
+    /// now rests on the same derived content check as everything else, which is a weaker guarantee
+    /// than the structural one it replaced.
     #[test]
     fn algorithm_matches_go_given_the_same_corpus() {
         const STALE_FANTASY: Realm = Realm {
@@ -620,13 +683,72 @@ mod tests {
         assert_eq!(realm_by_name("fleet").name, "fleet");
     }
 
-    /// The DEFAULT build must expose exactly one realm — `fleet` — so a consumer cannot reach a
-    /// corpus-divergent themed realm without naming the hazard in its Cargo.toml. This is the
-    /// guard, and it is the reason the divergence is unrepresentable rather than documented.
+    /// The default build must expose only the IDENTITY realms, so no consumer acquires a themed
+    /// *build* name without naming the hazard in its Cargo.toml.
+    ///
+    /// This assertion has been wrong in both directions, which is why it is worth reading before
+    /// editing. It asserted `["creature", "fleet"]` until 2026-07-29, when `--all` converged every
+    /// binding and the *divergent* set went to zero; the generator selected on divergence, so the
+    /// default list widened to all nine and this test was updated to match. But the criterion had
+    /// quietly changed underneath it — divergence is not the same question as identity-vs-build —
+    /// and the widened list handed out `&FORGE` to callers that `lib.rs` refused to give `FORGE`.
+    /// The generator now selects identity realms explicitly; see `sync-words.sh`.
+    ///
+    /// A realm *missing* from this list has either gone corpus-divergent from the Go embed or lost
+    /// its place in `IDENTITY_REALMS`. Confirm which before updating the expectation.
     #[cfg(not(feature = "divergent-themed-realms"))]
     #[test]
-    fn default_build_exposes_only_the_non_divergent_realm() {
+    fn default_build_exposes_only_identity_realms() {
         let names: std::vec::Vec<&str> = REALMS.iter().map(|r| r.name).collect();
-        assert_eq!(names, ["creature", "fleet"], "only non-divergent realms may be reachable by default");
+        assert_eq!(
+            names,
+            ["creature", "fleet"],
+            "the default build must expose the identity realms and nothing else"
+        );
+    }
+
+    /// **The gate must actually gate.** Every other guarantee in this crate is enforced by a `const`
+    /// assertion or an enumeration; this one was enforced by three separate `#[cfg]`s agreeing with
+    /// each other, and they did not.
+    ///
+    /// `realm_by_name` was gated and `pub use realms::{FANTASY, FORGE, …}` was gated, so `FORGE`
+    /// looked unreachable by default — while the ungated `REALMS` re-export carried a pointer to
+    /// the very same static. The expression below is not hypothetical: run from a downstream crate
+    /// with default features on 2026-08-14 it printed `Molten Smelter`, a forge *build* name
+    /// obtained without the feature that exists to make a reviewer see it.
+    ///
+    /// So assert the property directly, in the shape a consumer would actually write it.
+    #[cfg(not(feature = "divergent-themed-realms"))]
+    #[test]
+    fn no_themed_realm_is_reachable_without_the_feature() {
+        for themed in [
+            "fantasy", "forge", "oracle", "signal", "stellar", "tarot", "void",
+        ] {
+            assert!(
+                REALMS.iter().all(|r| r.name != themed),
+                "`{themed}` is reachable by default via REALMS — the gate is bypassed. A consumer \
+                 can obtain a build-provenance name without declaring `divergent-themed-realms`, \
+                 which is the mistake the feature exists to make unrepresentable."
+            );
+        }
+    }
+
+    /// The mirror of the above: with the feature on, every realm IS reachable — so the test pair
+    /// distinguishes "gated" from "deleted". A gate that removed the realms entirely would pass the
+    /// default-build test for the wrong reason.
+    #[cfg(feature = "divergent-themed-realms")]
+    #[test]
+    fn every_realm_is_reachable_with_the_feature() {
+        let names: std::vec::Vec<&str> = REALMS.iter().map(|r| r.name).collect();
+        assert_eq!(
+            names,
+            [
+                "creature", "fantasy", "fleet", "forge", "oracle", "signal", "stellar", "tarot",
+                "void"
+            ],
+            "enabling the feature must expose the whole corpus"
+        );
+        // And the name lookup the gate protects reaches them too.
+        assert_eq!(realm_by_name("forge").name, "forge");
     }
 }

@@ -65,11 +65,12 @@ pub static CREATURE: Realm = Realm {
 
 /// The `fantasy` realm — 28 adjectives / 25 nouns.
 ///
-/// ⚠️ CORPUS-DIVERGENT from the go/python/js bindings, hence the feature gate. Those three
-/// ship embeds frozen 2026-04-05, while this table is generated from `words/realms.json` as
-/// cut over to lexicon on 2026-05-07. Same arithmetic, different words: `9e3779b1` is
-/// `Blazing Jewel` there and `Draconic Monolith` here. A project consuming two bindings would
-/// get two different version names for one commit, so this realm is OFF by default.
+/// Gated: this realm names a **build**, not a thing. Its words currently agree with the
+/// go/python/js embeds, but that agreement is a maintained property rather than a structural
+/// one, so reaching it requires writing `divergent-themed-realms` into a Cargo.toml where a
+/// reviewer sees it. The static is not merely hidden — it is not emitted at all without the
+/// feature, so a default build carries none of these words in `.rodata`, which matters to the
+/// firmware consumers this binding exists for.
 #[cfg(feature = "divergent-themed-realms")]
 pub static FANTASY: Realm = Realm {
     name: "fantasy",
@@ -207,11 +208,12 @@ pub static FLEET: Realm = Realm {
 
 /// The `forge` realm — 14 adjectives / 14 nouns.
 ///
-/// ⚠️ CORPUS-DIVERGENT from the go/python/js bindings, hence the feature gate. Those three
-/// ship embeds frozen 2026-04-05, while this table is generated from `words/realms.json` as
-/// cut over to lexicon on 2026-05-07. Same arithmetic, different words: `9e3779b1` is
-/// `Blazing Jewel` there and `Draconic Monolith` here. A project consuming two bindings would
-/// get two different version names for one commit, so this realm is OFF by default.
+/// Gated: this realm names a **build**, not a thing. Its words currently agree with the
+/// go/python/js embeds, but that agreement is a maintained property rather than a structural
+/// one, so reaching it requires writing `divergent-themed-realms` into a Cargo.toml where a
+/// reviewer sees it. The static is not merely hidden — it is not emitted at all without the
+/// feature, so a default build carries none of these words in `.rodata`, which matters to the
+/// firmware consumers this binding exists for.
 #[cfg(feature = "divergent-themed-realms")]
 pub static FORGE: Realm = Realm {
     name: "forge",
@@ -251,11 +253,12 @@ pub static FORGE: Realm = Realm {
 
 /// The `oracle` realm — 14 adjectives / 14 nouns.
 ///
-/// ⚠️ CORPUS-DIVERGENT from the go/python/js bindings, hence the feature gate. Those three
-/// ship embeds frozen 2026-04-05, while this table is generated from `words/realms.json` as
-/// cut over to lexicon on 2026-05-07. Same arithmetic, different words: `9e3779b1` is
-/// `Blazing Jewel` there and `Draconic Monolith` here. A project consuming two bindings would
-/// get two different version names for one commit, so this realm is OFF by default.
+/// Gated: this realm names a **build**, not a thing. Its words currently agree with the
+/// go/python/js embeds, but that agreement is a maintained property rather than a structural
+/// one, so reaching it requires writing `divergent-themed-realms` into a Cargo.toml where a
+/// reviewer sees it. The static is not merely hidden — it is not emitted at all without the
+/// feature, so a default build carries none of these words in `.rodata`, which matters to the
+/// firmware consumers this binding exists for.
 #[cfg(feature = "divergent-themed-realms")]
 pub static ORACLE: Realm = Realm {
     name: "oracle",
@@ -295,11 +298,12 @@ pub static ORACLE: Realm = Realm {
 
 /// The `signal` realm — 30 adjectives / 30 nouns.
 ///
-/// ⚠️ CORPUS-DIVERGENT from the go/python/js bindings, hence the feature gate. Those three
-/// ship embeds frozen 2026-04-05, while this table is generated from `words/realms.json` as
-/// cut over to lexicon on 2026-05-07. Same arithmetic, different words: `9e3779b1` is
-/// `Blazing Jewel` there and `Draconic Monolith` here. A project consuming two bindings would
-/// get two different version names for one commit, so this realm is OFF by default.
+/// Gated: this realm names a **build**, not a thing. Its words currently agree with the
+/// go/python/js embeds, but that agreement is a maintained property rather than a structural
+/// one, so reaching it requires writing `divergent-themed-realms` into a Cargo.toml where a
+/// reviewer sees it. The static is not merely hidden — it is not emitted at all without the
+/// feature, so a default build carries none of these words in `.rodata`, which matters to the
+/// firmware consumers this binding exists for.
 #[cfg(feature = "divergent-themed-realms")]
 pub static SIGNAL: Realm = Realm {
     name: "signal",
@@ -371,11 +375,12 @@ pub static SIGNAL: Realm = Realm {
 
 /// The `stellar` realm — 14 adjectives / 14 nouns.
 ///
-/// ⚠️ CORPUS-DIVERGENT from the go/python/js bindings, hence the feature gate. Those three
-/// ship embeds frozen 2026-04-05, while this table is generated from `words/realms.json` as
-/// cut over to lexicon on 2026-05-07. Same arithmetic, different words: `9e3779b1` is
-/// `Blazing Jewel` there and `Draconic Monolith` here. A project consuming two bindings would
-/// get two different version names for one commit, so this realm is OFF by default.
+/// Gated: this realm names a **build**, not a thing. Its words currently agree with the
+/// go/python/js embeds, but that agreement is a maintained property rather than a structural
+/// one, so reaching it requires writing `divergent-themed-realms` into a Cargo.toml where a
+/// reviewer sees it. The static is not merely hidden — it is not emitted at all without the
+/// feature, so a default build carries none of these words in `.rodata`, which matters to the
+/// firmware consumers this binding exists for.
 #[cfg(feature = "divergent-themed-realms")]
 pub static STELLAR: Realm = Realm {
     name: "stellar",
@@ -415,11 +420,12 @@ pub static STELLAR: Realm = Realm {
 
 /// The `tarot` realm — 14 adjectives / 14 nouns.
 ///
-/// ⚠️ CORPUS-DIVERGENT from the go/python/js bindings, hence the feature gate. Those three
-/// ship embeds frozen 2026-04-05, while this table is generated from `words/realms.json` as
-/// cut over to lexicon on 2026-05-07. Same arithmetic, different words: `9e3779b1` is
-/// `Blazing Jewel` there and `Draconic Monolith` here. A project consuming two bindings would
-/// get two different version names for one commit, so this realm is OFF by default.
+/// Gated: this realm names a **build**, not a thing. Its words currently agree with the
+/// go/python/js embeds, but that agreement is a maintained property rather than a structural
+/// one, so reaching it requires writing `divergent-themed-realms` into a Cargo.toml where a
+/// reviewer sees it. The static is not merely hidden — it is not emitted at all without the
+/// feature, so a default build carries none of these words in `.rodata`, which matters to the
+/// firmware consumers this binding exists for.
 #[cfg(feature = "divergent-themed-realms")]
 pub static TAROT: Realm = Realm {
     name: "tarot",
@@ -459,11 +465,12 @@ pub static TAROT: Realm = Realm {
 
 /// The `void` realm — 14 adjectives / 14 nouns.
 ///
-/// ⚠️ CORPUS-DIVERGENT from the go/python/js bindings, hence the feature gate. Those three
-/// ship embeds frozen 2026-04-05, while this table is generated from `words/realms.json` as
-/// cut over to lexicon on 2026-05-07. Same arithmetic, different words: `9e3779b1` is
-/// `Blazing Jewel` there and `Draconic Monolith` here. A project consuming two bindings would
-/// get two different version names for one commit, so this realm is OFF by default.
+/// Gated: this realm names a **build**, not a thing. Its words currently agree with the
+/// go/python/js embeds, but that agreement is a maintained property rather than a structural
+/// one, so reaching it requires writing `divergent-themed-realms` into a Cargo.toml where a
+/// reviewer sees it. The static is not merely hidden — it is not emitted at all without the
+/// feature, so a default build carries none of these words in `.rodata`, which matters to the
+/// firmware consumers this binding exists for.
 #[cfg(feature = "divergent-themed-realms")]
 pub static VOID: Realm = Realm {
     name: "void",
@@ -501,8 +508,9 @@ pub static VOID: Realm = Realm {
     ],
 };
 
-/// Every realm, sorted by name. Themed realms are corpus-divergent from the other
-/// bindings, so this list only contains them when `divergent-themed-realms` is enabled.
+/// EVERY realm, sorted by name — the identity realms plus the themed, build-provenance
+/// ones. Reachable only with `divergent-themed-realms`; the default list below is the
+/// identity subset.
 #[cfg(feature = "divergent-themed-realms")]
 pub static REALMS: &[&Realm] = &[
     &CREATURE,
@@ -516,8 +524,16 @@ pub static REALMS: &[&Realm] = &[
     &VOID,
 ];
 
-/// Without `divergent-themed-realms`, only the realms that exist in NO other binding are
-/// handed out — they cannot diverge, so nothing else can contradict a name they produce.
+/// Without `divergent-themed-realms`, only the IDENTITY realms are handed out — the ones
+/// naming a *thing* (a board, a familiar) rather than a *build*. A themed realm reached
+/// from here would be a version name acquired without the Cargo.toml declaration that
+/// makes the hazard visible to a reviewer, which is the entire point of the gate.
+///
+/// ⚠️ NOT "realms that exist in no other binding". That was the criterion until
+/// 2026-07-29, when `--all` wrote `fleet` and `creature` into go/python/js — every realm
+/// now exists in all four bindings, so these two can diverge like any other. What keeps
+/// them default is what they NAME; the derived content check below still gates them if
+/// their words drift from the Go embed.
 #[cfg(not(feature = "divergent-themed-realms"))]
 pub static REALMS: &[&Realm] = &[
     &CREATURE,
@@ -529,9 +545,10 @@ pub static REALMS: &[&Realm] = &[
 ///
 /// ⚠️ Only available with `divergent-themed-realms`. A name-based lookup is exactly how a
 /// mixed-language project would silently acquire a divergent version name — it asks for
-/// "fantasy" in two languages and gets two different answers. Without the feature there is
-/// no way to reach a divergent realm at all, so the mistake is unrepresentable rather than
-/// documented. Use [`FLEET`](crate::FLEET) directly for node identity.
+/// "fantasy" in two languages and gets two different answers. Without the feature no themed
+/// realm is reachable at all — not through this function and not through `REALMS` — so the
+/// mistake is unrepresentable rather than documented. Use [`FLEET`](crate::FLEET) directly
+/// for node identity.
 #[cfg(feature = "divergent-themed-realms")]
 pub const fn realm_by_name(name: &str) -> &'static Realm {
     let mut i = 0;
