@@ -330,6 +330,16 @@ hal-cpu-reset-unindexed  = "esp-hal API-fact marker (hal-* namespace) selected b
 # designed sequence working. Removed together with the paired `#[allow(dead_code)]` in net.rs; the
 # two-sided marker is why neither could be dropped quietly.)
 
+# #398: the FIRST CI-unbuildable exclusives — chip-gated on esp32s3, whose tiers cannot
+# build on CI runners (xtensa toolchain absent; see [chip.esp32s3] blocked_on). Observed
+# LOCALLY instead: tools/check_chips.sh compiles both on the pinned espup 1.95.0.0
+# toolchain (familiar/katana), and both have run on real hardware (unit
+# 14:C1:9F:D1:C8:10 — the board draws through s3_oled). When #413 puts the xtensa
+# toolchain in CI (per-target releases), these two graduate back to observed and the
+# gate will FAIL on these entries — the designed stale-claim sequence; delete them then.
+"src/board_s3.rs" = "esp32s3 tiers cannot build on CI (no espup); observed locally via check_chips.sh + on hardware — graduates when #413 lands xtensa in CI"
+"src/s3_oled.rs" = "esp32s3 tiers cannot build on CI (no espup); observed locally via check_chips.sh + on hardware — graduates when #413 lands xtensa in CI"
+
 "src/secrets.rs" = """\
 consts only (WIFI_NETWORK / MQTT_* / WLED_CAST_*) — 0 fn / 0 impl in both secrets.rs and \
 secrets.rs.example, so it emits .rodata and no line rows. It is also git-ignored and \
@@ -357,10 +367,6 @@ provisioned per tree, so its contents are not a property of the commit at all.""
 # Regenerate with: tools/check_exclusions.py claims --toml
 [tier_exclusive]
 "src/textclip.rs" = "wifi"
-# #398: the S3's board truth + display backend — chip-exclusive, not tier-exclusive in the
-# usual sense; the gate keys on the cfg feature either way, and `esp32s3` is the honest key.
-"src/board_s3.rs" = "esp32s3"
-"src/s3_oled.rs" = "esp32s3"
 "src/net/otagate.rs" = "espnow"
 "src/bard/delivery.rs" = "bard"
 "src/bard/mod.rs" = "bard"
