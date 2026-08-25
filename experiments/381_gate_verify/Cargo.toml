@@ -1,0 +1,15 @@
+# #381 host guard for the crown SELF-OTA gate (net/otagate.rs). The firmware crate is
+# no_std/riscv32imc and cannot host-test, so this `#[path]`-includes the REAL otagate.rs (no drift)
+# and asserts the truth table: the #40 "gateway updates itself LAST" order still holds for a
+# healthy relay, a permanently-deaf leaf's armed install loses its veto over BOTH gates, and the
+# threshold is where it says it is. Permanent guard for #381.
+[package]
+name = "self_ota_gate_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[[bin]]
+name = "self_ota_gate_verify"
+path = "src/main.rs"
+[profile.dev]
+opt-level = 0
