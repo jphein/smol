@@ -4059,9 +4059,10 @@ impl RadioManager {
                     shed = shed.saturating_add(1);
                 }
             };
-            // #33 WHY a crown did not self-install, as one octal digit: bit 0 = `leaf_ota_pending`,
-            // bit 1 = `leaf_installs_outstanding`, bit 2 = an install already ARMED in RAM. `1` bits
-            // in 0/1 are suppressing.
+            // #33 WHY a crown did not self-install, as one hex digit: bit 0 = `leaf_ota_pending`,
+            // bit 1 = `leaf_installs_outstanding`, bit 2 = an install already ARMED in RAM,
+            // bit 3 = #381 the armed leaf install has LOST its veto (pre-relay stall). `1` bits in
+            // 0/1 are suppressing — UNLESS bit 3 is set, which overrides both.
             //
             // `main`'s gate is `!leaf_ota_pending && !leaf_installs_outstanding &&
             // take_install_request()`, and the `&&` short-circuits BEFORE the take — so a suppressed
@@ -4072,14 +4073,28 @@ impl RadioManager {
             // means armed and waiting on nothing — i.e. it will fire; `sog=6` means armed but held by
             // an outstanding leaf install.
             //
+            // #381 adds bit 3, and it exists because the FIX is as invisible as the bug was. Once a
+            // deaf leaf's install loses its veto the crown installs with bits 0/1 STILL SET, so
+            // without bit 3 the record would say "held" at the exact moment the crown stopped being
+            // held — the same read-it-backwards trap in the other direction. `sog=f` is the #381
+            // state: armed, both legacy gates set, veto expired, installing anyway.
+            //
             // In the DIAG record rather than the armdiag because `diag_record` already has `&mut self`
             // — the armdiag is built inside `mqtt_session`, which takes disjoint field borrows and
             // would need the value threaded through three signatures and three call sites for the same
             // 7 bytes. Sheddable, so it can never push the record over the publish cliff.
-            let sog = (self.leaf_ota_pending as u8)
-                | ((self.leaf_installs_outstanding as u8) << 1)
-                | ((self.install_requested as u8) << 2);
-            room_for(&mut rec, alloc::format!("|sog={}", sog));
+            // Read through the ACCESSORS, not the raw fields. #381 moved the gate decision out of
+            // `main` into `crown_may_self_install`, which left `leaf_ota_pending()` with no callers
+            // — and a `sog` digit built from raw fields could then drift from the gate it claims to
+            // explain without anything noticing. Same accessors, same answer, and the dead-code
+            // warning stops being a thing to silence.
+            let sog = (self.leaf_ota_pending() as u8)
+                | ((self.leaf_installs_outstanding() as u8) << 1)
+                | ((self.install_requested as u8) << 2)
+                | ((self.leaf_veto_expired() as u8) << 3);
+            // Hex since #381's bit 3 took the value past 7; 0-f is still ONE character, so the
+            // field's width (and its place in the #306 budget) is unchanged.
+            room_for(&mut rec, alloc::format!("|sog={:x}", sog));
             // #21/#56 CROWN-ONLY: the keyed-CFG relay cache as `<used>/<cap>:<dropped>`.
             //
             // This exists because the 2026-07-28 investigation added a drop counter and then could
@@ -4947,6 +4962,14 @@ impl RadioManager {
             self.leaf_ota_fetch_retries = self.leaf_ota_fetch_retries.saturating_add(1);
             (false, self.leaf_ota_fetch_retries)
         } else {
+            // #381: a relay that REACHED the leaf proves the crown's relay path is working right
+            // now, so the pre-relay stall count is stale — reset it. `leaf_ota_fetch_retries` is a
+            // single counter shared across leaves and it releases a single shared gate, so without
+            // this a stale count from deaf leaf A would read as "stalled" while a healthy relay to
+            // leaf B was mid-flight, and the crown would reboot into its own install underneath it.
+            // With it, the counter means "consecutive pre-relay failures with NO successful handoff
+            // in between" — which is the only condition under which holding the crown buys nothing.
+            self.leaf_ota_fetch_retries = 0;
             self.leaf_ota_retries = self.leaf_ota_retries.saturating_add(1);
             let n = self.leaf_ota_retries;
             let exhausted = self.leaf_ota_retries >= LEAF_OTA_MAX_RETRIES;
@@ -4981,6 +5004,29 @@ impl RadioManager {
     /// (`do_install`) on `!leaf_ota_pending()` so a relay is never interrupted.
     pub fn leaf_ota_pending(&self) -> bool {
         self.leaf_ota_pending
+    }
+
+    /// #381: may the crown run its OWN pending install? The whole `do_install` gate, in one call,
+    /// decided by the pure [`crate::net::otagate`] policy (host-tested by
+    /// `experiments/381_gate_verify`).
+    ///
+    /// Supersedes `main` AND-ing `!leaf_ota_pending() && !leaf_installs_outstanding()` inline. Both
+    /// accessors are kept — they still feed the `sog=` DIAG digit — but the DECISION now lives in
+    /// one place, because the bug this fixes was that a permanently-deaf leaf pinned both gates on
+    /// forever and the crown's skip was indistinguishable from being up to date.
+    pub fn crown_may_self_install(&self) -> bool {
+        crate::net::otagate::crown_may_self_install(
+            self.leaf_ota_pending,
+            self.leaf_installs_outstanding,
+            self.leaf_ota_fetch_retries,
+        )
+    }
+
+    /// #381: has the armed leaf install lost its veto over the crown's self-OTA (i.e. did
+    /// [`Self::crown_may_self_install`] return true *despite* a gate being set)? Read only for the
+    /// `sog=` DIAG bit 3, so an operator seeing bits 0/1 set can tell "held" from "released".
+    pub fn leaf_veto_expired(&self) -> bool {
+        crate::net::otagate::leaf_veto_expired(self.leaf_ota_fetch_retries)
     }
 
     /// #3: is ANY leaf still holding a retained OTA install, as of the last TRUSTED gateway flush?

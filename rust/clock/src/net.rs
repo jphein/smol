@@ -105,6 +105,15 @@ pub mod wire;
 #[cfg(feature = "espnow")]
 pub mod coexist;
 
+// #381 crown SELF-OTA gating: the pure "may the crown update itself yet" decision, extracted from
+// `main`'s `do_install` after a permanently-deaf leaf's armed install was found pinning BOTH gates
+// on indefinitely — the crown SKIPS its own install, which is indistinguishable from being up to
+// date, so a roll reports success with the crown on the old build. PURE (no esp-hal/esp-radio, no
+// alloc), host-tested by `experiments/381_gate_verify` (`#[path]`-include, like `coexist`);
+// espnow-gated because the relay is the only thing that can arm the gates.
+#[cfg(feature = "espnow")]
+pub mod otagate;
+
 // #278 the `SMOLv1 ELECT` frame + epoch/anti-flap core — PURE (no esp-hal/esp-radio, no alloc),
 // host-tested by `experiments/mesh_elect_verify` (`#[path]`-include, like `coexist`), which runs
 // the esp32c6-watch donor's own tests against this exact file: 10 of them (8 wire + 2 consensus).

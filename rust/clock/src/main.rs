@@ -1260,8 +1260,15 @@ fn main() -> ! {
             // next leaf lets the gateway self-OTA first, starving the second leaf + inverting the
             // order. Both gates short-circuit BEFORE `take_install_request()` so the gateway's own
             // install command is PRESERVED (fires last, once every leaf's install has cleared).
-            let do_install = !r.leaf_ota_pending()
-                && !r.leaf_installs_outstanding()
+            // #381: both gates above are pinned ON forever by a permanently-deaf leaf — the RAM
+            // latch because `MacUnknown` never produces a terminal outcome, the retained one
+            // because a leaf that never installs never clears its install. The crown then SKIPS
+            // its own update, which is the same quiet non-event as being up to date, so a roll
+            // reports success with the crown on the old build (observed: id5 at `retry=35+` for
+            // deaf id50). The decision moved into `net::otagate` — an armed install that has
+            // repeatedly failed BEFORE ever reaching a leaf loses its veto, while the retained
+            // install and the uncapped pre-relay retry are untouched (#134 / #111 preserved).
+            let do_install = r.crown_may_self_install()
                 && (crate::ota::OTA_AUTO_INSTALL || r.take_install_request());
             if do_install {
                 if let Some(announce) = r.take_ota_offer() {

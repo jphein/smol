@@ -357,6 +357,7 @@ provisioned per tree, so its contents are not a property of the commit at all.""
 # Regenerate with: tools/check_exclusions.py claims --toml
 [tier_exclusive]
 "src/textclip.rs" = "wifi"
+"src/net/otagate.rs" = "espnow"
 "src/bard/delivery.rs" = "bard"
 "src/bard/mod.rs" = "bard"
 "src/bard/nano_llm.rs" = "bard"
