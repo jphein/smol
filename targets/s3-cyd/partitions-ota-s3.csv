@@ -34,4 +34,10 @@ otadata,    data, ota,       0xf000,   0x2000,
 phy_init,   data, phy,       0x11000,  0x1000,
 ota_0,      app,  ota_0,     0x20000,  0x600000,
 ota_1,      app,  ota_1,     0x620000, 0x600000,
-reserved,   data, undefined, 0xC20000, 0x3E0000,
+# wconfig (2026-08-25, the watch-GUI flavor's config record): subtype MUST be spiffs —
+# the watch firmware self-locates config by scanning for the FIRST data/spiffs entry, so
+# this line's existence IS the discovery mechanism. Written by its provision.py
+# (--config-offset 0xC20000 --node-id 162 --chip esp32s3). Carved from the reserved
+# tail's head, which existed precisely so this could happen without a migration.
+wconfig,    data, spiffs,    0xC20000, 0x10000,
+reserved,   data, undefined, 0xC30000, 0x3D0000,
