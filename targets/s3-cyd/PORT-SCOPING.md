@@ -81,6 +81,10 @@ mesh LED. **Coordinate a listen window with smol-d8 before transmitting** — st
 frames contaminate any #391 capture in flight (the C5's window was logged in theirs).
 Send spike frames **without** the #190 trailer: observe-mode soft-accepts and *counts*
 them, which is itself evidence. Confirm id50 is powered/audible with smol-d8 first.
+Fold into the same bench trip (a human is present anyway): the **panel-orientation
+eyeball** — the one unwitnessed display fact on this unit (paint a known-corner marker,
+glance at the glass) — and optionally the **four-corner touch tap** that settles the
+placeholder TOUCH_SWAP/INVERT transform in `board-staging/board_es3c28p.rs`.
 
 M4 network facts (glass-verified at the C5's M4): the board joins `jplovescl` (VLAN 8)
 → broker is the HA VM's **same-subnet leg `10.0.8.111:1883`** — cross-VLAN legs
