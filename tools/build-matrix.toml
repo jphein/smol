@@ -106,6 +106,19 @@ checks     = true
 # absent `toolchain` means the default (rust-toolchain.toml's `stable`).
 toolchain  = "esp"
 build_std  = "core,alloc"
+# ⚠️ TOOLCHAIN-BUG WORKAROUND, not a preference — this row REVERTS when upstream fixes it.
+# The shipping profile (opt-level = "s", lto = "fat") crashes the Xtensa LLVM backend on this
+# chip's fleet-tier codegen:
+#     rustc-LLVM ERROR: Incomplete scavenging after 2nd pass
+# (opt = "z" crashes the same scavenger differently; 2 and 3 both link; matrix + upstream draft:
+# targets/s3-cyd/BUDGET-PREP.md §6.1 and docs/upstream/xtensa-fat-lto-scavenger.md.) Threaded as
+# CARGO_PROFILE_RELEASE_OPT_LEVEL for THIS CHIP ONLY — the global profile is shared with the C3
+# and every C3 measurement on record (stack floors, #32 symbol sizes, byte-reproducibility)
+# depends on it staying untouched.
+# ⚠️ FIRST-FLASH CAVEAT, for whoever flashes the first S3 fleet image: a compiler that
+# demonstrably mishandled this code at opt="s" merely LINKING at opt=2 is escape, not proof of
+# correct codegen. Treat that flash as unproven silicon — not routine bring-up.
+opt_level  = "2"
 # `builds = false` is about CI, not about this tree. Xtensa is a Tier-3 target needing espup's `esp`
 # channel (Xtensa Rust 1.95.0.0, pinned byte-identical on katana and familiar) plus
 # `. ~/export-esp.sh` and a per-invocation `CARGO_UNSTABLE_BUILD_STD=core,alloc`. GitHub runners

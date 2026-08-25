@@ -313,7 +313,14 @@ def main() -> int:
         # same rule `emit` follows for tiers.
         #
         # Fields, tab-separated:
-        #   chip · target · expect(check|fail) · toolchain · build_std · features
+        #   chip · target · expect(check|fail) · toolchain · build_std · opt_level · features
+        #
+        # `opt_level` (#398): a per-chip release-profile override, threaded as
+        # CARGO_PROFILE_RELEASE_OPT_LEVEL by the consumer. Exists for toolchain-bug workarounds
+        # (the S3's fat-LTO Xtensa crash) — the global profile is shared with the canonical chip
+        # and must never carry a per-chip deviation. Inert for `cargo check` (no codegen), carried
+        # anyway so every consumer of this record — including future build rungs — gets it from
+        # ONE place.
         #
         # ⚠️ EMPTY OPTIONAL FIELDS ARE WRITTEN AS "-", NOT LEFT EMPTY, and that is not cosmetic.
         # `emit` gets away with bare tabs because it has TWO fields and only the last can be empty.
@@ -336,6 +343,7 @@ def main() -> int:
             print("\t".join((name, spec["target"], expect,
                              opt(spec.get("toolchain")),
                              opt(spec.get("build_std")),
+                             opt(spec.get("opt_level")),
                              canon_features)))
         return 0
 

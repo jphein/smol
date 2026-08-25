@@ -49,7 +49,7 @@ pass=0 fail=0 skip=0 verified=0
 # after paying for it).
 cd "$CRATE" || { echo "no crate dir at $CRATE" >&2; exit 2; }
 
-while IFS=$'\t' read -r chip target expect toolchain build_std features; do
+while IFS=$'\t' read -r chip target expect toolchain build_std opt_level features; do
     [ -n "$chip" ] || continue
     # `-` is the manifest's sentinel for "this optional field is empty". It exists because a tab is
     # an IFS *whitespace* character, so bash collapses consecutive tabs and every field after an
@@ -57,6 +57,7 @@ while IFS=$'\t' read -r chip target expect toolchain build_std features; do
     # Translate back to empty here, once, so the rest of the loop reads naturally.
     [ "$toolchain" = "-" ] && toolchain=""
     [ "$build_std" = "-" ] && build_std=""
+    [ "$opt_level" = "-" ] && opt_level=""
     if [ ${#want[@]} -gt 0 ]; then
         found=0
         for w in "${want[@]}"; do [ "$w" = "$chip" ] && found=1; done
@@ -95,13 +96,19 @@ while IFS=$'\t' read -r chip target expect toolchain build_std features; do
     # `[unstable] build-std` is GLOBAL, and a config key would hand it to the riscv builds too.
     # That is the 2026-07-20 regression that leaked portable-atomic/unsafe-assume-single-core into
     # the HOST build and broke every cold C3 build. Env-scoped means a C3 check cannot inherit it.
+    # `opt_level` (#398): a per-chip release-profile override — a TOOLCHAIN-BUG workaround seam,
+    # env-scoped for the same reason build-std is: a config key would hand it to every chip, and
+    # the global profile is what all the C3's recorded measurements were taken against. Inert for
+    # `cargo check` (dev profile, no codegen); threaded so the invocation this script models is
+    # the SAME one a future build rung will make, sourced from ONE manifest field.
+    run_env=(SMOL_CHIP="$chip")
+    [ -n "$opt_level" ] && run_env+=(CARGO_PROFILE_RELEASE_OPT_LEVEL="$opt_level")
     if [ -n "$build_std" ]; then
         # shellcheck disable=SC1090
         [ -f "$HOME/export-esp.sh" ] && . "$HOME/export-esp.sh" >/dev/null 2>&1
-        CARGO_UNSTABLE_BUILD_STD="$build_std" SMOL_CHIP="$chip" cargo "${args[@]}" >"$log" 2>&1
-    else
-        SMOL_CHIP="$chip" cargo "${args[@]}" >"$log" 2>&1
+        run_env+=(CARGO_UNSTABLE_BUILD_STD="$build_std")
     fi
+    env "${run_env[@]}" cargo "${args[@]}" >"$log" 2>&1
     rc=$?
 
     verified=$((verified + 1))
