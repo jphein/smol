@@ -34,6 +34,20 @@ the first Xtensa silicon.
   (#396), never a feature.
 - Identity: node id **162** in NVS (`SMOL_NODE_ID=162` at provisioning — the factory
   default is 7 and a fresh board lands there). OTA never touches NVS.
+- Fleet name: **`eldritch-insignia`** (sigil MAC-derived via the `sigil-id` crate — never
+  by hand; two hand-derivations of the C5's sigil were both wrong). Row landed in
+  `esp32c6-watch` `feat/cyd-c5-target` @ `ba46f74` with the dual-contract test; the
+  watch session cherry-picks to main + reflashes when M3 is imminent (ping them first —
+  until then live watches don't know this name). ⚠️ Speech collision, not protocol:
+  `eldritch-insignia` shares its adjective with `eldritch-lantern` (JP's primary watch) —
+  full sigils and MQTT topics are unambiguous, but "the eldritch one" now means two
+  devices; never identify a board by adjective when debugging by ear.
+- ⚠️ **The MAC-fold id for this unit is 150 — it must stay out of every allocation table
+  forever.** The firmware honours `config id != 42` over the fold (42 = the
+  never-explicitly-chosen sentinel), so provisioning 162 is one config write; but if 150
+  were ever allocated to another board, an unprovisioned unit of this board would
+  collide with it. The watch repo's test enforces 150 stays unmapped; allocation lists
+  live elsewhere — hence this line.
 - The spike (`spike/`) is **throwaway by design**: it proves milestones and produces the
   measured numbers phase 2 needs (ChipBudget row, stack floor). It is not the product.
 
