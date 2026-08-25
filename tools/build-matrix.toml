@@ -367,6 +367,11 @@ provisioned per tree, so its contents are not a property of the commit at all.""
 # Regenerate with: tools/check_exclusions.py claims --toml
 [tier_exclusive]
 "src/textclip.rs" = "wifi"
+# #398: chip-exclusive (esp32s3). The gate's contract is BOTH sections: this DECLARATION
+# (so removing the cfg-gate later cannot go unnoticed) plus the [unobservable] excuse
+# below (CI cannot build xtensa to observe them). Learned across three CI rounds.
+"src/board_s3.rs" = "esp32s3"
+"src/s3_oled.rs" = "esp32s3"
 "src/net/otagate.rs" = "espnow"
 "src/bard/delivery.rs" = "bard"
 "src/bard/mod.rs" = "bard"
