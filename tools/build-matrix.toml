@@ -123,7 +123,7 @@ opt_level  = "2"
 # channel (Xtensa Rust 1.95.0.0, pinned byte-identical on katana and familiar) plus
 # `. ~/export-esp.sh` and a per-invocation `CARGO_UNSTABLE_BUILD_STD=core,alloc`. GitHub runners
 # have none of it, and a permanently-red arm teaches everyone to ignore the gate (#343).
-blocked_on = "xtensa toolchain (espup `esp` channel + export-esp.sh) is not on CI runners; the manifest and target pins are DONE (#347 Part 2)"
+blocked_on = "ONLY the CI-runner toolchain remains (espup `esp` channel + export-esp.sh are not on GitHub runners): the manifest/target pins (#347 Part 2), the linkall+opt_level workaround (#408/#409), the display arm, AND the measured ChipBudget row (budget.rs ESP32S3_CYD, 2026-08-25) are all DONE — the chip builds, boots, meshes and draws on real hardware; only CI cannot compile it yet"
 # When the toolchain question is answered, flipping `builds` to true is a ONE-WORD data change and
 # the matrix, the CI jobs and the tier coverage all follow. That is the entire point of this file.
 # `ships` stays false after that: OpenWrt's DEFAULT := n. Buildable is not shipped.

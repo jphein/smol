@@ -38,6 +38,17 @@ pub fn untouched_bytes(painted: &[u32]) -> usize {
 mod device {
     use super::{untouched_bytes, MARGIN, SENTINEL};
 
+    // ⛔ #398: THIS INSTRUMENT IS INVALID ON THE S3, measured three ways on real
+    // hardware (2026-08-25): (1) 59,504 of 72,004 B read "used" one statement after
+    // paint(), at boot — something in the boot path writes deep inside `.stack` on this
+    // chip; (2) re-painting after esp_hal::init crashed the box into a 99-boot
+    // exception loop — whatever writes there is LIVE; (3) the plausible fix was tested
+    // and disproven: `_stack_end_cpu0`/`_stack_start_cpu0` ALIAS the whole-region
+    // symbols (readelf), so a CPU-slice rebinding changes nothing. The S3's ChipBudget
+    // floor therefore uses the observed-sufficient-region semantics instead
+    // (src/budget.rs ESP32S3_CYD), and porting this instrument to Xtensa — identifying
+    // the writer first — is follow-up on #398. Numbers this module prints on an S3 are
+    // artifacts; the C3's derivation history is unaffected.
     unsafe extern "C" {
         /// Low address of the stack region (it grows DOWN from `_stack_start`).
         static _stack_end: u8;

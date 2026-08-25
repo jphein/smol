@@ -643,6 +643,18 @@ async fn run() -> ! {
 
     esp_println::logger::init_logger_from_env();
     log::info!("smol booting: unified firmware (menu: Clock / Snake / Bench)");
+    // #398 instrument sanity probe (stack-paint builds): expect ≈0 at boot on a chip
+    // where the instrument is valid. On the S3 it reads ~59.5 KB HERE — the proof the
+    // instrument is invalid there (boot-era machinery writes inside .stack; see the
+    // block note in src/bard/stack_paint.rs for the three measurements, including the
+    // disproven CPU-slice hypothesis). Kept as the cheapest validity check for any
+    // future chip: a big number on THIS line means don't trust any later one.
+    #[cfg(feature = "stack-paint")]
+    log::info!(
+        "smol #398 probe: high-water at boot (expect ~0) = {} of {} B",
+        bard::stack_paint::high_water(),
+        bard::stack_paint::region_bytes(),
+    );
 
     // Identity + provenance, both DERIVED (never on the wire): the node's FLEET
     // name from NODE_ID, and the firmware's FORGE version name seeded from the git
