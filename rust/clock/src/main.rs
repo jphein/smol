@@ -75,7 +75,7 @@ extern "Rust" fn custom_halt() -> ! {
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
-    i2c::master::{Config as I2cConfig, I2c},
+    i2c::master::{BusTimeout, Config as I2cConfig, I2c, SoftwareTimeout},
     main,
     time::Instant,
     time::Rate,
@@ -651,7 +651,18 @@ fn main() -> ! {
     // --- I2C bus to the OLED -------------------------------------------------
     let i2c = I2c::new(
         peripherals.I2C0,
-        I2cConfig::default().with_frequency(Rate::from_khz(400)),
+        // esp-hal rc.0→1.1 semantic drift (#387): the I2C `Config` default lost its per-byte
+        // software SCL timeout (now `SoftwareTimeout::None`), and the blocking wait loop only
+        // exits via a deadline — a stuck or clock-stretched OLED SCL would wedge the per-tick
+        // flush forever → WDT → boot-loop. Restore a bounded timeout: a HW bus-cycle cap + a
+        // ~1 ms/byte software cap so the already-`.ok()`-tolerated flush drops a frame instead
+        // of hanging. (Headless boards NACK the OLED — an error path, not a hang — unchanged.)
+        I2cConfig::default()
+            .with_frequency(Rate::from_khz(400))
+            .with_timeout(BusTimeout::BusCycles(24))
+            .with_software_timeout(SoftwareTimeout::PerByte(
+                esp_hal::time::Duration::from_millis(1),
+            )),
     )
     .expect("I2C init")
     .with_sda(peripherals.GPIO5)
