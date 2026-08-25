@@ -51,6 +51,13 @@ SINK_TRAIT = "GroupMacSink"
 # separately — this is the deny-list of everything that skips the trailer.
 FORBIDDEN_SENDERS = ("send_arb_raw", "esp_now.send", "esp_now .send")
 DECL = re.compile(r"RAW-SEND-SITES:\s*([A-Za-z0-9_:,\s]+?)\s*(?:\*/|\n|$)")
+# #397 STEP B2: the roster must count BOTH send forms. `send_async` is a raw egress path exactly as
+# much as `send` is — it reaches `esp_now_send` through `SendFuture::poll` — and the old pattern
+# (`send\s*\(`) does not match `send_async(` at all. So bounding the two OTA-announce sites moved
+# them OUT of this checker's sight while leaving them on the air: the count fell 5 -> 3 and the
+# fail-closed arm fired, which is the gate doing its job and is why this pattern is widened in the
+# same commit as the behaviour change rather than after it.
+RAW_SEND_RE = re.compile(r"esp_now\s*\.\s*send(?:_async)?\s*\(")
 
 
 def fail(msg, *extra):
@@ -62,6 +69,84 @@ def fail(msg, *extra):
 def rust_sources(src: Path):
     return sorted(p for p in src.rglob("*.rs") if p.is_file())
 
+
+def strip_comments(text: str) -> str:
+    """Blank every comment, PRESERVING length and newlines so offsets and line numbers still map.
+
+    Not a nicety — it is load-bearing, and this checker was blind to it until #397 STEP B. A doc
+    comment written to EXPLAIN a raw send spelled it in `receiver.method(` form; arm 6 counted the
+    prose as a real call site and attributed it to whatever fn preceded the comment. A checker whose
+    verdict can be flipped by documentation about the thing it checks is worse than no checker,
+    because the same blindness runs the other way: comment out a real send and the count is still
+    satisfied — a false GREEN on an ABSENCE check, which is the one direction that matters here.
+
+    Shared implementation with `check_station_consumers.py`, where the identical defect was found
+    the same day (2026-08-25) by the same route — writing prose about the invariant. Two independent
+    instances in one day is a property of the template, not an accident; the sweep across the other
+    checkers built to this shape is tracked as #426.
+
+    Handles `//`, `/* */` (nested, as Rust allows), ordinary strings, char literals and raw strings
+    (`r"..."`, `r#"..."#`), because a `//` inside a string literal is not a comment and blanking it
+    would corrupt the code view.
+    """
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        # raw string: r"..." / r#"..."# / r##"..."##
+        if c == "r" and i + 1 < n and text[i + 1] in '"#':
+            j = i + 1
+            hashes = 0
+            while j < n and text[j] == "#":
+                hashes += 1
+                j += 1
+            if j < n and text[j] == '"':
+                close = '"' + "#" * hashes
+                end = text.find(close, j + 1)
+                i = n if end < 0 else end + len(close)
+                continue
+        if c == '"' or c == "'":
+            quote = c
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == quote:
+                    j += 1
+                    break
+                if text[j] == "\n" and quote == "'":
+                    break  # not a char literal after all (e.g. a lifetime)
+                j += 1
+            i = j
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            depth, j = 0, i
+            while j < n:
+                if text.startswith("/*", j):
+                    depth += 1
+                    j += 2
+                elif text.startswith("*/", j):
+                    depth -= 1
+                    j += 2
+                    if depth == 0:
+                        break
+                else:
+                    j += 1
+            for k in range(i, min(j, n)):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j
+            continue
+        i += 1
+    return "".join(out)
 
 def enclosing_fn(text: str, idx: int):
     """Name of the nearest `fn` declared at or above `idx`. None if there isn't one."""
@@ -94,6 +179,17 @@ def main() -> int:
         fail(f"no firmware source tree at {src}")
         return 2
     files = {p: p.read_text(encoding="utf-8") for p in rust_sources(src)}
+    # #397 STEP B2: two views. `files` is RAW and only the DECL regex reads it, because the
+    # RAW-SEND-SITES roster deliberately lives in a doc comment. Every structural scan below reads
+    # `code`, which has comments blanked with offsets preserved.
+    #
+    # This was not a hypothetical: writing a doc comment that spelled a raw send in
+    # `receiver.method(` form tripped arm 6 and attributed the send to whatever fn preceded the
+    # comment. The false RED is the mild half — the same blindness yields a false GREEN, because a
+    # real send can be commented out and the count still satisfied. An absence check that
+    # documentation can move is not a check. (Identical defect found the same day in
+    # check_station_consumers.py, whose implementation this is; tracked repo-wide as #426.)
+    code = {q: strip_comments(t) for q, t in files.items()}
     if not files:
         fail(f"parsed ZERO rust sources under {src}")
         return 2
@@ -103,7 +199,7 @@ def main() -> int:
 
     # ── arms 1 + 2: the sink impl(s) ──────────────────────────────────────────────────────────
     impls = []
-    for path, text in files.items():
+    for path, text in code.items():
         for m in re.finditer(rf"impl\s+(?:[\w:]+::)?{SINK_TRAIT}\s+for\s+(\w+)", text):
             body = block_after(text, m.end())
             if body is None:
@@ -145,7 +241,7 @@ def main() -> int:
 
     # ── arm 3: SealedElect exposes no way to get at the bytes ─────────────────────────────────
     sealed_impls = 0
-    for path, text in files.items():
+    for path, text in code.items():
         for m in re.finditer(r"impl\s+SealedElect\s*\{", text):
             sealed_impls += 1
             body = block_after(text, m.end() - 1)
@@ -173,7 +269,7 @@ def main() -> int:
 
     # ── arm 4: exactly one firmware call site of the encoder, and it is the seal ───────────────
     encode_sites = []
-    for path, text in files.items():
+    for path, text in code.items():
         for m in re.finditer(r"\bwire::encode\s*\(|(?<![\w:])encode\s*\(\s*f\s*,", text):
             fn = enclosing_fn(text, m.start())
             encode_sites.append((path.relative_to(root), fn))
@@ -197,7 +293,7 @@ def main() -> int:
 
     # ── arm 5: the frame prefix is written exactly once ───────────────────────────────────────
     literal_sites = []
-    for path, text in files.items():
+    for path, text in code.items():
         for m in re.finditer(re.escape(ELECT_LITERAL), text):
             literal_sites.append((path.relative_to(root), text.count("\n", 0, m.start()) + 1))
     if not literal_sites:
@@ -240,8 +336,8 @@ def main() -> int:
         declared[name] = int(count)
 
     actual = {}
-    for path, text in files.items():
-        for m in re.finditer(r"esp_now\s*\.\s*send\s*\(", text):
+    for path, text in code.items():
+        for m in re.finditer(RAW_SEND_RE, text):
             fn = enclosing_fn(text, m.start())
             if fn is None:
                 fail(f"an `esp_now.send` in {path.relative_to(root)} is not inside any fn")
@@ -249,7 +345,7 @@ def main() -> int:
             actual[fn] = actual.get(fn, 0) + 1
     if not actual:
         fail(
-            "found ZERO raw `esp_now.send` call sites — including the `send_to` choke itself.",
+            "found ZERO raw `esp_now.send`/`send_async` call sites — including the `send_to` choke itself.",
             "That cannot be right; the pattern must have changed, so this arm is blind.",
         )
         return 2

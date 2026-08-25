@@ -2154,6 +2154,18 @@ pub struct RelayDiag {
     /// `otam_ok>0` while leaf stays H0 ⇒ frame egresses but the leaf's RX drops it (deeper).
     pub otam_tx: u16,
     pub otam_ok: u16,
+    /// #397 STEP B2: announces whose outcome is NOT evidence either way — the send outlived the
+    /// 30 ms bound, or its success may have been a previously-abandoned send's completion (esp-radio
+    /// carries no generation on its status globals). Added because bounding the send introduced a
+    /// third possible outcome, and PHASE3-PLAN §3.2(ii) is explicit that folding a timeout into
+    /// either `otam_ok` or "not ok" corrupts the only evidence smol has that the announce egressed.
+    ///
+    /// READ IT WITH THE OTHER TWO: `otam_tx = otam_ok + otam_to + (confirmed failures)`. So
+    /// `otam_ok=0, otam_to=0, otam_tx>0` still means "every send confirmed-failed" (the original
+    /// peer-table/TX-state diagnosis), whereas `otam_ok=0, otam_to=otam_tx` is the NEW reading:
+    /// the sends are not completing inside the bound at all, which is a radio/timing story rather
+    /// than a send-path one. Those two used to be indistinguishable.
+    pub otam_to: u16,
     /// #3b CHANNEL-diag: iterations spent waiting for the WiFi STA to release the PHY after the
     /// fetch, before pinning ch6. `settle>0` ⇒ the STA WAS still holding the AP channel post-fetch
     /// (confirms the OTAM was egressing off-channel → the leaf H0 cause); `settle=0` ⇒ STA already
@@ -4210,8 +4222,13 @@ fn mqtt_session(
         let mut rval = MqttScratch::new();
         // Gateway RX evidence + the leaf's own LDBG self-report. `leaf=none` ⇒ no LDBG captured
         // (old leaf fw / leaf off-air during the relay); else `H<heard>V<verdict>N<sent>`.
-        let _ = write!(rval, "rx={} otan={} last_wb={}/{} otam_tx={}/{} settle={} leaf=",
-            d.rx_any, d.otan_valid, d.last_wb, d.total, d.otam_tx, d.otam_ok, d.settle);
+        // #397 STEP B2: `otam_to` is appended as its OWN key rather than widening `otam_tx=N/M`
+        // into `N/M/T`. Additive keeps every existing consumer working — the HA control-room card
+        // reads this topic, docs/protocol.md documents the format, and live-vs-repo drift is a
+        // standing problem here, so a format CHANGE would need all three to move together for no
+        // gain. The packet has room: this record is ~60 B against the ~490 B publish cap.
+        let _ = write!(rval, "rx={} otan={} last_wb={}/{} otam_tx={}/{} otam_to={} settle={} leaf=",
+            d.rx_any, d.otan_valid, d.last_wb, d.total, d.otam_tx, d.otam_ok, d.otam_to, d.settle);
         if d.leaf_verdict == 255 {
             let _ = write!(rval, "none");
         } else {
