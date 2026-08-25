@@ -39,7 +39,7 @@ currently tuned to. Two consequences drive every design choice below:
   and low-power, but there is **no WiFi while in ESP-NOW mode**.
 
 **smol's default is TIME-SHARE:** a WiFi burst at boot (associate → DHCP → SNTP),
-then the radio is pinned to **ch 6** for the mesh. The [relay bridge](#relay--relayack--espnow--internet-telemetry)
+then the radio is pinned to **ch 6** for the mesh. The [relay bridge](#relay--relayack--esp-now--internet-telemetry)
 resurrects a COEXIST/WiFi-return flush — and **the mesh is deaf during that burst**
 (single radio). Everything in steady state rides ch 6.
 
@@ -88,12 +88,12 @@ Every SMOLv1 frame stays well under 250 B — *including* its group-MAC trailer,
   far-future `synced_at` hijacks every mesh clock; a forged RELAYACK stalls a leaf).
   **#190 added a truncated group-MAC trailer** to every non-OTA `SMOLv1 ` frame; it is
   currently in **OBSERVE** mode, so those injection paths are *measured but still open*.
-  See [the group-MAC trailer](#the-group-mac-trailer-190--every-byte-count-below-omits-it).
+  See [the group-MAC trailer](#the-group-mac-trailer-190--every-byte-count-above-omits-it).
 - **Every byte count in this document is PRE-TRAILER.** The `Bytes` column below and
   each frame's own layout table describe the frame as the encoder builds it. `send_to`
   then appends **9 more bytes** to nearly all of them. A reader sizing a buffer, and
   especially anyone implementing SMOLv1 outside this repo, needs both numbers —
-  again, see [the group-MAC trailer](#the-group-mac-trailer-190--every-byte-count-below-omits-it).
+  again, see [the group-MAC trailer](#the-group-mac-trailer-190--every-byte-count-above-omits-it).
 
 ---
 
@@ -109,8 +109,8 @@ Every SMOLv1 frame stays well under 250 B — *including* its group-MAC trailer,
 | [GRID](#grid--ha-grid-power-snapshot-16) | `SMOLv1 GRID ` | ≤108 | broadcast | on-recv + periodic | espnow | 🟡 |
 | [BATT2](#batt2--grid2--downlink-freshness-13-stage-b) | `SMOLv1 BATT2 ` | ≤120 | broadcast | on-change + strict-newer re-flood | espnow | 🟢 |
 | [GRID2](#batt2--grid2--downlink-freshness-13-stage-b) | `SMOLv1 GRID2 ` | ≤120 | broadcast | on-change + strict-newer re-flood | espnow | 🟢 |
-| [RELAY](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAY ` | ≤91 | broadcast | ~15 s (leaf) | espnow | 🟢 |
-| [RELAYACK](#relay--relayack--espnow--internet-telemetry) | `SMOLv1 RELAYACK ` | 25 | unicast | reactive | espnow | 🟢 |
+| [RELAY](#relay--relayack--esp-now--internet-telemetry) | `SMOLv1 RELAY ` | ≤91 | broadcast | ~15 s (leaf) | espnow | 🟢 |
+| [RELAYACK](#relay--relayack--esp-now--internet-telemetry) | `SMOLv1 RELAYACK ` | 25 | unicast | reactive | espnow | 🟢 |
 | [UP2](#up2--relayack2--routed-multi-hop-uplink-13124) | `SMOLv1 UP2 ` | ≤250 (23 B envelope + ≤227 inner) | broadcast (flood) | ~15 s (stranded leaf) | espnow | 🟡 |
 | [RELAYACK2](#up2--relayack2--routed-multi-hop-uplink-13124) | `SMOLv1 RELAYACK2 ` | 32 | broadcast (flood) | reactive | espnow | 🟢 |
 | ~~RELAY2~~ | ~~`SMOLv1 RELAY2 `~~ | — | — | — | — | ⛔ **RETIRED** — replaced by `UP2` (#124). No longer emitted or parsed; see [below](#up2--relayack2--routed-multi-hop-uplink-13124). |
@@ -539,6 +539,46 @@ bytes 5–7 are now reserved-zero (same layout, so a pre-#142 v2 record still pa
   record silently never persist (HW-canary find 2026-07-12 — the edge-trigger fired, then
   verify-after-write aborted every apply). Source: `ota.rs` `NetCfg`/`encode_net_cfg`/`parse_net_cfg`.
 
+## STAT — leaf render-state uplink (#50b)
+
+**Purpose.** A **leaf** has no MQTT, so it cannot tell Home Assistant what is on its
+screen. It broadcasts its own live render-state as a `SMOLv1 STAT` frame; the
+**gateway** caches it (`stat_cache`) and republishes it retained to
+`smol/<id>/status`. Uplink twin of [`CFG`](#cfg--keyed-per-node-config-channel-56),
+which is the downlink.
+
+**Layout (≤79 B).**
+
+| Field | Bytes | Encoding | Meaning |
+|---|---|---|---|
+| tag | 12 | `b"SMOLv1 STAT "` | namespace |
+| `id` | 3 | ASCII `NNN` | the **SENDER's** id — *not* a target (this is the mirror-image of CFG) |
+| `value` | ≤64 | bytes, verbatim | the live render-state, `<AppKind>:<page>` (empty = none) |
+
+`value` is truncated to `CFG_VALUE_MAX` (**64 B**), so the frame is at most
+`12 + 3 + 64 = 79 B` — plus the [9 B group-MAC trailer](#the-group-mac-trailer-190--every-byte-count-above-omits-it) on the air.
+
+**Cadence.** ~10 s, broadcast. `main` gates the call on `!is_gateway` — a gateway
+publishes its own status over MQTT directly and never emits STAT.
+**Rule.** Fire-and-forget. **Single-hop**: the gateway caches a leaf STAT and never
+re-broadcasts it, so there is no flood and no loop. It is also passed to
+`relay_wrap_observability`, so a stranded leaf's STAT can ride the multi-hop uplink.
+
+**Tag disambiguation, and why it is in the source as a comment.** STAT diverges from
+[`SNK`](#snk--mmo-mesh-snake) at **byte 8** (`'T'` vs `'N'`) and from
+[`DIAG`](#diag--retained-per-node-health-record-704974100) at **byte 7** (`'S'` vs
+`'D'`), so `strip_prefix` can never confuse the three. Anyone adding a `SMOLv1 S…`
+tag must re-check that property.
+
+**Flag.** espnow. **Status.** 🟢 **hardware-verified** — the retained
+`smol/<id>/status` topic is populated by leaves on the bench fleet.
+**Security.** Unauthenticated in OBSERVE mode (see the
+[group-MAC trailer](#the-group-mac-trailer-190--every-byte-count-above-omits-it)).
+Low blast radius by construction: the worst case is a wrong screen **string** on a
+status topic — never code execution — and it self-corrects on the next cadence.
+**Source.** `net/mode.rs` `STAT_PREFIX` (`:258`), `RadioManager::broadcast_stat`;
+gateway side `stat_cache` → `net/wifi.rs` retained republish.
+
 ## DIAG — retained per-node health record (#70/#49/#74/#100)
 
 **Purpose.** One retained record per node makes a silent rollback / a failed network switch /
@@ -770,7 +810,7 @@ non-blocking cold-ARP first-round nit remains — see [relay.md](relay.md#the-fl
 > was wrong.
 
 **Purpose.** Carry a **stranded** leaf's traffic home when it is out of direct ESP-NOW range of the
-elected gateway — the single-hop [RELAY](#relay--relayack--espnow--internet-telemetry) above can't.
+elected gateway — the single-hop [RELAY](#relay--relayack--esp-now--internet-telemetry) above can't.
 #13 adds **Meshtastic-lineage managed flood**: a hop-limit (`H`) + an `(origin, msgid)` seen-set + a
 forward path, rooted at the #76-elected owner and **table-free** (so it rides roam/re-election for
 free). A leaf only ever emits `UP2` **after it escalates** (see the latch below); in the ordinary
@@ -1063,6 +1103,88 @@ reconstructs a Weasley-clock pointer ("@ &lt;holder&gt;") from the last beat it 
   seed/birth (same creature, same age). Migration is human-verified on glass.
 - **Flag.** espnow. **Status.** 🟢 **merged + on-glass** (#57, PR #99). Source: `familiar/mod.rs`
   (`FAM_PREFIX`, `encode_fam`/`parse_fam`); state machine in `net/mode.rs` (`fam_tick`).
+
+---
+
+## ELECT — the mesh rendezvous-channel announcement (#278/#269)
+
+**Purpose.** Every other frame here says *who* is on the mesh. ELECT says **where the mesh
+meets**: the crown announces which channel is the rendezvous, so a fleet can migrate off a
+bad channel instead of being pinned to `ESP_NOW_FIXED_CHANNEL` forever. It is the
+channel-plane twin of [`HELLO`](#hello--led-handshake), and it beats at the same rate for
+exactly that reason.
+
+**Layout (61 B, always — a frame of any other length is not an ELECT frame).**
+
+```text
+"SMOLv1 ELECT " <id:3> ' ' <epoch:10> ' ' <ch:2> ' ' <gw:3> ' ' <w:26>
+ └── 13 ──────┘                                                 └ 13×2 ┘
+```
+
+| Field | Bytes | Encoding | Meaning |
+|---|---|---|---|
+| tag | 13 | `b"SMOLv1 ELECT "` | namespace; byte 7 = `'E'`, unused by any other tag (`H A B T G C S D R U F`) |
+| `id` | 3 | ASCII `NNN` | announcing crown's node id |
+| ` ` | 1 | space | |
+| `epoch` | 10 | ASCII (full u32) | decision epoch — **higher epoch wins** |
+| ` ` | 1 | space | |
+| `ch` | 2 | ASCII `CC` | announced rendezvous channel (1–13) |
+| ` ` | 1 | space | |
+| `gw` | 3 | ASCII `NNN` | id of the gateway the decision names |
+| ` ` | 1 | space | |
+| `w` | 26 | 13 × 2 ASCII | per-channel weight vector, one zero-padded 2-digit value per 2.4 GHz channel |
+
+Plus the [9 B group-MAC trailer](#the-group-mac-trailer-190--every-byte-count-above-omits-it)
+→ **70 B on the air**, ~280 bit/s from the single crown at the idle rate.
+
+**Fixed width is a security property here, not a convenience.** Because smol elects a
+*channel* rather than a BSSID, the candidate set is a constant — the 13 channels of the
+2.4 GHz band. So the frame has no length field, no repetition and no bound to enforce: a
+malformed or hostile frame is simply **not 61 bytes**, or fails a digit check. There is
+nothing for an attacker to grow.
+
+**The weight vector is honestly mostly zeros.** smol does not run per-channel scans on the
+announce path — that would cost the association — so the only channel it can truthfully
+weigh is the one its own AP is on. Every other slot is a **measured zero, not a guess**, and
+`weight()` returns 0 below `USABLE_MIN_DBM` (−82 dBm) so an unusable AP contributes nothing
+rather than a small lie.
+
+**Cadence.** A burst of `ANNOUNCE_BURST` = **6** frames spaced `ANNOUNCE_GAP_MS` = **120 ms**,
+then steady-state `ANNOUNCE_IDLE_MS` = **2 s**. The burst buys ~600 ms of coverage against
+collision and queue loss; it buys **nothing** for a leaf parked on another channel, which is
+deaf for a full `DWELL_MS` (1500 ms) and would miss every frame of it. Those leaves are
+recovered by the recovery ladder, never by repeats.
+
+**Who sends.** Crown only — `elect_tick` early-returns on a leaf, because the mesh channel
+*is* the crown's channel. A demoted ex-crown under `silent_until_relock` stops announcing, the
+same abdication rule HELLO follows.
+
+**⚠️ ANNOUNCING is on; ACTING on an announcement is not.** Following is gated behind
+`net::election::FOLLOW_ENABLED`, deliberately: a frame nobody emits cannot be proven on
+hardware, so #278 landed the emitter first and made the flip criterion *evidence from a real
+fleet*, not a code review. Read `elect=` in the [DIAG record](#diag--retained-per-node-health-record-704974100)
+to see what a board heard — and note that a **missing** `elect=` means the record went over
+budget and the field was shed, **never** "this board never heard the crown".
+
+**🔒 ELECT is the one SMOLv1 frame that is authenticated by design.** An unauthenticated
+channel announcement is a remote fleet-stranding primitive — *"everybody move to channel N"*
+with no way back — so it must carry the group MAC. The send path is a **design invariant, not
+a style note**: `SealedElect` has no byte accessor, its only exit is `emit`, and the only
+`GroupMacSink` implementation routes to `send_to` (the choke that appends the trailer).
+`tools/check_elect_send_path.py` machine-checks the shapes the type system cannot.
+
+**Key constants** (`net/mesh_elect.rs`): `N_CHANNELS` 13 · `RENDEZVOUS_CHANNEL` 6 ·
+`SETTLE_MS` 30 s · `PROBATION_MS` 45 s · `MARGIN_FLOOR` 12 · `OBS_STALE_MS` 60 s ·
+`USABLE_MIN_DBM` −82 dBm · `WEIGHT_CEIL_DBM` −35 dBm.
+
+**Flag.** espnow. **Status.** 🟡 **compile-verified** — the frame, the epoch/anti-flap core
+and the send-path invariant are merged and host-tested verbatim by
+`experiments/election_verify`, and `tools/check_elect_send_path.py` gates the emitter. The
+**follow** path is observe-only and its on-fleet evidence is #278's open flip criterion, so
+this row is deliberately not 🟢: nothing in this section was captured off the wire.
+**Source.** `net/mesh_elect.rs` (`wire::ELECT_PREFIX`, `ELECT_LEN`, `encode`/`parse`,
+`SealedElect`); announce path `net/mode.rs::broadcast_elect` (`:2960`) + `elect_tick`;
+follow gate `net/election.rs::FOLLOW_ENABLED`.
 
 ---
 
