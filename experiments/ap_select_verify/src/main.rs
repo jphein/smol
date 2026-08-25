@@ -90,6 +90,27 @@ fn main() {
     assert_eq!(crown_next_state(CrownState::Degraded, off, 9, succ), CrownState::Shed, "degraded yields to a cc=1 successor");
     assert_eq!(crown_next_state(CrownState::Degraded, off, 9, no_ctx), CrownState::Degraded, "degraded + no co-channel + no successor → STAY (never crownless)");
 
+    // ---- #335 Deferred: an UNANSWERED question moves NOTHING -------------------------------
+    // The whole point of the variant. `NoAp` and `OffChannelFallback` are findings the ladder is
+    // entitled to act on; a deferral is not a finding, and before #335 it had no way to say so —
+    // both skip-shaped returns in `reassoc_ch6_prefer` spelled themselves `NoAp`, so a mesh-OTA
+    // relay and a failed scan each fed the shed ladder evidence they did not have.
+    //
+    // Neutrality is asserted from EVERY state and under EVERY ctx that would otherwise move it,
+    // because "it happens not to move right now" and "it cannot move" are different claims and
+    // only the second is the invariant.
+    let defer = CrownApDecision::Deferred;
+    assert_eq!(crown_next_state(CrownState::Normal, defer, 0, no_ctx), CrownState::Normal, "deferred: normal stays normal");
+    assert_eq!(crown_next_state(CrownState::Normal, defer, 0, exhausted), CrownState::Normal, "DEFERRED MUST NOT SHED: exhausted+deferred is NOT off-channel evidence");
+    assert_eq!(crown_next_state(CrownState::Shed, defer, SHED_RECLAIM_MAX, no_ctx), CrownState::Shed, "DEFERRED MUST NOT ESCALATE: reclaims>=MAX but nothing was measured");
+    assert_eq!(crown_next_state(CrownState::Shed, defer, 0, no_ctx), CrownState::Shed, "deferred: shed stays shed");
+    assert_eq!(crown_next_state(CrownState::Degraded, defer, 9, succ), CrownState::Degraded, "DEFERRED MUST NOT YIELD: a successor claim is not acted on without a scan");
+    assert_eq!(crown_next_state(CrownState::Degraded, defer, 9, no_ctx), CrownState::Degraded, "deferred: degraded stays degraded");
+    // And it must not RECOVER either — neutral is neutral in both directions. A deferral is not
+    // evidence that a co-channel AP appeared, so it cannot promote a shed crown back to Normal.
+    assert_eq!(crown_next_state(CrownState::Shed, defer, 0, no_ctx), CrownState::Shed, "deferred does not promote: shed !-> normal without a co-channel finding");
+    assert_eq!(crown_next_state(CrownState::Degraded, defer, 0, no_ctx), CrownState::Degraded, "deferred does not promote: degraded !-> normal without a co-channel finding");
+
     // ---- OTA-enable gate ------------------------------------------------------------------
     assert!(ota_enabled(CrownState::Normal), "OTA only when normal");
     assert!(!ota_enabled(CrownState::Degraded), "OTA disabled when degraded");
