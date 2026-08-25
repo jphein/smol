@@ -1,0 +1,121 @@
+# PORT-SCOPING — ES3C28P (s3-cyd, node id 162) as a full smol target
+
+Pattern of record: `~/Projects/cyd-c5/PORT-SCOPING.md` (the #388 C5 precedent), adapted
+to Xtensa. Decisions carry their conditions; when a premise moves, the decision is
+re-examined, not inherited.
+
+## Goal
+
+Make the ES3C28P a **full smol fleet target**: first a fleet *member* from a spike image
+(the #331/#388 two-phase pattern, phase 1), then a first-class chip target of the one
+smol binary (phase 2). JP's directive of record (2026-08-24): *"jam everything together
+into the smol project with multiple targets"* — this board is the sixth roster entry and
+the first Xtensa silicon.
+
+## Verdicts (evidence beside each)
+
+| question | verdict | evidence |
+|---|---|---|
+| Which physical board? | **A new blank ES3C28P, `14:C1:9F:D1:C8:10`, node id 162** — *not* the Ember satellites (#331, id 160), *not* emberburrito's terminal (id 161) | JP 2026-08-24 ("new and blank", "same one we use in emberburrito"); passive bus-diff 23:03; `docs/protocol.md` id block |
+| Does smol's stack run on this silicon? | **YES — proven, executor ON.** burrito-fw ships esp-hal 1.1.1 / esp-radio 0.18.0 / esp-rtos 0.3.0 (embassy) / esp-bootloader 0.5.0 on this exact board — smol main's post-#233 matched set, with the executor smol itself still holds behind canary PR #391 | `burrito-fw/Cargo.toml`, verified independently 2026-08-24 |
+| Xtensa toolchain? | **katana-only** (espup 0.17.1, Rust `esp` 1.95.0.0, has produced S3 binaries). familiar **cannot** build xtensa today (no espup, no `esp` channel — its `channel="esp"` failure looks like a rustup error, not a missing target). Standing exception to build-on-familiar. | toolchain recon 2026-08-24, both hosts probed read-only |
+| Does `wifi + esp-now` compile for esp32s3? | **UNKNOWN — the spike's `radio` feature exists to answer it.** burrito-fw proves `wifi`; the combination is unproven (a per-feature support matrix is not a per-combination one). No 802.15.4 on S3, so the `ieee802154`+`wifi` build-panic hazard doesn't apply. | esp-radio 0.18.0 feature docs; #388's lesson |
+| Chip identity in smol's build? | **Already solved.** `xtensa-esp32s3` is an unambiguous triple → chip id 3, no `SMOL_CHIP` needed (unlike the C5/C6 riscv32imac collision). `chip_name()` → `"esp32s3"`, BoardProfile arm + profile_verify case exist. | `rust/clock/build.rs` (6f900a6), `net/profile.rs` (fd7cca7) |
+| HA model label? | **BLOCKED-BY-DESIGN on smol#396** — every S3 announces as `"smol ESP32-S3 Ember"` today; the variant axis (leaning NVS product field beside the node id) is smol-d8's lane. Until then the spike hand-writes a **distinct** model string. | #396; profile.rs `(CHIP_ESP32S3, _)` arm |
+| Group-MAC trailer? | Phase-1 spike may join un-MAC'd today (`MAC_ENFORCE = false`) but **dies silently at the enforce flip** — a known expiry, accepted for the spike, mandatory for phase 2 (free via `wire.rs` + the real `GROUP_KEY`). Match SMOLv1 replies on the 14 B **prefix** — on-air frames carry +9 B. | `docs/protocol.md` §MAC_ENFORCE; #388's M3 trap |
+| ESP-NOW channel? | Mesh is ch 6 (`ESP_NOW_FIXED_CHANNEL`). A board that must *also* hold a WiFi association needs its AP co-channel — network topology, not firmware. The spike's M3 runs ESP-NOW-only (no association), so it dodges this until M4/phase 2. | protocol.md single-radio rule; `smol-ota-crown-offchannel-blocker` |
+| Workspace shape for phase 2? | **A riscv32 crate and an xtensa crate cannot share a cargo workspace** (esp-hal takes one chip feature; cargo unifies workspace features). Proven pattern: chip-agnostic zero-dep `*-core` crates consumed by path, each its own `[workspace]` (burrito-fw's osk-core/swype). Relayed to the feat/347-depin lane 2026-08-24. | `burrito-fw/Cargo.toml` comment + tree structure |
+| Board variants as cargo features? | **NEVER** — #352's standing rule (closed, decided). The variant axis stays runtime (#396). | smol#352 |
+
+## Architecture
+
+- **One codebase → one image per CHIP → runtime board profiles** (the cyd-c5/JP rule).
+  The S3 image is a *chip* target; ES3C28P-vs-any-future-S3-board is a runtime/NVS axis
+  (#396), never a feature.
+- Identity: node id **162** in NVS (`SMOL_NODE_ID=162` at provisioning — the factory
+  default is 7 and a fresh board lands there). OTA never touches NVS.
+- The spike (`spike/`) is **throwaway by design**: it proves milestones and produces the
+  measured numbers phase 2 needs (ChipBudget row, stack floor). It is not the product.
+
+## Phases
+
+### Phase 0 — tree-side identity (smol repo) — ✅ ALREADY LANDED
+Chip const, `chip_name()`, unambiguous triple mapping, BoardProfile arm, profile_verify
+case, id-block row (162). Landed via 6f900a6 + fd7cca7 + the 2026-08-24 protocol.md
+id-block generalization. Remaining tree-side identity work is #396 (smol-d8's lane).
+
+### Phase 1 — bring-up spike, four falsifiable milestones (this directory's lane)
+| M | proves | status |
+|---|---|---|
+| **M1** | esp-hal 1.1.1 boots on *this unit*; PSRAM octal 8 MiB mapped; ILI9341V paints (MADCTL 0x28); backlight; button | spike drafted, unflashed |
+| **M2** | WiFi STA associates (2.4 GHz only — no band trap on S3), DHCP lease | not started |
+| **M3** | ESP-NOW round-trip: `SMOLv1 HELLO 162` broadcast heard by a live C3 fleet witness (roster flip = the proof), ACK matched on 14 B prefix | blocked on the `radio` compile verdict |
+
+M3 hard rule (from the C6 watch session, a full day lost to it): **esp-radio 0.18's
+`SendWaiter::wait()` is an unbounded, non-yielding spin — and its `Drop` runs the same
+spin** — so one lost TX completion pins the CPU forever and presents as a frozen board.
+**Bound every ESP-NOW send** (`select(send_async(..), Timer)`; the watch uses
+`TX_WAIT_MS = 30` in `esp32c6-watch/src/net/smol_mesh.rs::send_bounded`). smol's own
+`send_to` carries the same raw `wait()` — logged fleet-side as a phase-2/3 fix item.
+| **M4** | MQTT + retained HA discovery under id 162, distinct model string, `expire_after` set; telemetry on `smol/162/telemetry` (bare line) | not started |
+
+M1–M2 are *de-risked* (burrito-fw proves the board class) but still run on this unit —
+per-unit verification is the point of a spike. **Do not duplicate morpheus-burrito's
+work**: id-161 membership for the emberburrito terminal lives in the emberburrito repo.
+
+### Phase 2 — full smol firmware target (rides other lanes; this dir contributes numbers)
+Ordered by dependency:
+1. **feat/347-depin** lands the per-chip build arms (morpheus-depin's lane) — phase 2
+   builds on its PR, never competes with it. The xtensa workspace constraint (above) is
+   input to that design.
+2. **smol#396** variant axis — hard prerequisite of the S3 arm being *used* (two S3
+   products + this dev board would otherwise collide in HA).
+3. **Measured ChipBudget row** — `budget.rs` `compile_error!`s on any non-riscv32 target
+   until an S3 row with MEASURED numbers exists. Produce it the way the C6 row was
+   (`scratch/convergence/c6-budget-row-from-watch-session.md`): readelf -SW sections,
+   espflash save-image size, stack high-water under live radio.
+4. **`[chip.esp32s3] builds = true`** in `tools/build-matrix.toml` — a one-word change,
+   but it and the ChipBudget row must land **together**: `build_matrix.py check` compares
+   the two rosters and goes red on either side alone (mechanical, not convention). The
+   row's `blocked_on` string is already half-stale — update it when flipping.
+5. `esp_app_desc!()` + partition table + `tools/verify_image.sh` confirming the #349
+   descriptor reads `chip = 3` — checked, never assumed.
+6. Group key: a phase-2 image reuses `wire.rs` and gets the #190 trailer free **only if
+   built with the real `secrets.rs`** — a spike-provisioned example key joins today and
+   falls off the mesh at the enforce flip.
+7. smol-core (#347 phase 2) gains this target as consumer #4.
+
+## Operational rules (in force now)
+
+- **Flashing:** `spike/flash.sh` only — serial-pinned to `14:C1:9F:D1:C8:10`,
+  refuse-by-default, deny-list carrying all five sibling ES3C28Ps + the C6 watches +
+  every never-flash device; no `--baud` (L8); never kill a port holder; no override flag.
+  **`cargo-espflash` stays uninstalled on katana** — installing it silently bypasses every
+  runner guard on this machine (re-verified absent 2026-08-24).
+- **Identity is passive:** `udevadm ID_SERIAL_SHORT` only. Opening the port resets the
+  target. `espflash board-info` is a deliberate, logged act, not an identification step.
+- **Builds are LOCAL (katana)** — the standing exception to build-on-familiar, because the
+  espup toolchain exists only here. Condition attached: if espup is ever installed on
+  familiar, pin the toolchain version deliberately (version-skew between hosts surfaces as
+  irreproducible binaries) and retire this rule in writing.
+- **Shell setup, both halves or nothing works:**
+  `export PATH="$HOME/.cargo/bin:$PATH" && source ~/export-esp.sh`
+  (missing first half = `cargo: command not found`; missing second = a "linker
+  xtensa-esp32s3-elf-gcc not found" that impersonates a broken toolchain).
+- **Release builds only** (the esp-hal PSRAM path requires it).
+- **Never copy `emberburrito/burrito-fw/wifi.local.toml`** into this tree — it holds a
+  live admin-VLAN credential. WiFi creds arrive via env at build time (Vaultwarden →
+  env, the cyd-c5 `build-remote.sh` convention), never on disk here.
+- **Lanes (agreed 2026-08-24 with smol-d8):** this directory is the s3-cyd session's;
+  `rust/clock` + `docs/protocol.md` changes route through smol-d8; id-161 membership is
+  morpheus-burrito's (emberburrito repo); per-chip Cargo arms are morpheus-depin's
+  (feat/347-depin).
+
+## Status — dated
+
+- **2026-08-24 23:0x** — Directory created (JP's scaffold). Board plugged in, identified
+  `14:C1:9F:D1:C8:10` (⚠️ same-batch near-miss with reliquary's sealed `…C3:C8`). Recon
+  complete (three reports under `~/.claude/projects/-home-jp/scratch/s3-cyd-target/`).
+  BOARD.md + this file written. Spike M1 drafting in flight; `radio` compile verdict
+  pending. smol#396 filed (smol-d8). **Target issue: smol#398** (this directory's work
+  of record — update its checkboxes as milestones land).
