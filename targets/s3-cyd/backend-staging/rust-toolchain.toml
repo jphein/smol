@@ -1,0 +1,14 @@
+[toolchain]
+# The espup-installed Xtensa fork — mainline rustup has no `xtensa-esp32s3-none-elf`.
+#
+# ⚠️ THE TWO-DISGUISE TRAP (full version in ../spike/rust-toolchain.toml). Every shell
+# building this crate needs BOTH, in this order:
+#
+#     export PATH="$HOME/.cargo/bin:$PATH" && source ~/export-esp.sh
+#
+#   1. ``linker `xtensa-esp32s3-elf-gcc` not found`` -> you did not source
+#      ~/export-esp.sh in THIS shell. Not a broken toolchain. Do not reinstall espup.
+#   2. Errors deep inside `xtensa_lx` / unresolvable `core` -> cargo silently fell back
+#      to stable, because rust-toolchain.toml resolves BY DIRECTORY. `cd` into the crate;
+#      confirm the output says `Checking s3-backend-staging`.
+channel = "esp"

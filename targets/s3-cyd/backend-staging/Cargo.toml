@@ -1,0 +1,37 @@
+[package]
+name = "s3-backend-staging"
+version = "0.1.0"
+edition = "2021"
+description = "Staging crate: the S3 (ES3C28P) 4th app::Oled backend, proven to compile for xtensa before rust/clock intake"
+
+# INTENTIONALLY its own cargo workspace root — the same reason burrito-fw states at
+# `emberburrito/burrito-fw/Cargo.toml:14-17`: esp-hal accepts exactly ONE chip feature and
+# cargo unifies features across workspace members, so an esp32s3 crate cannot share a
+# workspace with a host crate or with an esp32c3 one.
+[workspace]
+
+[dependencies]
+# Pins MOVE TOGETHER with the spike (`../spike/Cargo.toml`) — this crate exists to prove
+# these exact versions compose, so a drift here would prove the wrong thing.
+esp-hal = { version = "1.1.1", features = ["esp32s3", "unstable"] }
+
+# `=0.10.0`, not caret. burrito-fw pins it exactly because its `madctl_of()` re-implements
+# mipidsi's `pub(crate)` MemoryMapping::from_orientation; a 0.10.x patch changing that
+# mapping would silently invalidate the copy. We inherit the pin so the orientation this
+# crate builds is the orientation proven on glass.
+mipidsi = "=0.10.0"
+
+# smol's exact pin (`rust/clock/Cargo.toml:98`). oled-scale pins the same; a mismatch here
+# would mean two `DrawTarget` traits and the drop-in property would silently die.
+embedded-graphics = "=0.8.2"
+
+embedded-hal-bus = "0.3.0"
+
+# The scaling backend, host-tested (23/23) and already proven to build for this target.
+oled-scale = { path = "../oled-scale" }
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = true

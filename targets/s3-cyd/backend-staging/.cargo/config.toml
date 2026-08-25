@@ -1,0 +1,21 @@
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+# ⛔ NO `runner` — DELIBERATELY, and this is the watch-port convention
+# (`cyd-c5/watch-port/.cargo/config.toml`).
+#
+# This is a LIBRARY staging crate. It produces types and proves they compose; it must
+# never be able to write to hardware. The board and its serial-pinned flash guard belong
+# to the spike (`../spike/flash.sh`, ALLOW_SERIAL 14:C1:9F:D1:C8:10). Adding a runner here
+# would make a stray `cargo run` flash a board another lane is holding — and this bench
+# carries four LIVE ember.realm.watch family services of the SAME MODEL.
+#
+# There is nothing to run here anyway: no `main`, no bin target. That is the point.
+
+[target.xtensa-esp32s3-none-elf]
+rustflags = ["-C", "link-arg=-Tlinkall.x", "-C", "force-frame-pointers"]
+
+[unstable]
+# The esp toolchain ships NO prebuilt `core` for this target; `rust-src` comes from
+# `espup install`.
+build-std = ["core", "alloc"]
