@@ -3629,16 +3629,28 @@ impl RadioManager {
     /// ⚠️ HW-CANARY-GATED: the scan + reassociate radio path — and whether ESP-NOW coexist follows
     /// the new STA channel — cannot be verified without hardware (same discipline as `run_scan`/OTA).
     /// #367: deliberately NOT heap-gated, unlike `run_scan`. This returns a `CrownApDecision`, and
-    /// the only "skip" value available is `NoAp` — which the caller cannot distinguish from "no
-    /// usable AP exists" and would act on by shedding the crown. Trading a possible allocation
-    /// spike for a spurious crown shed is a bad trade: the shed is certain, the spike is not.
-    /// If this path ever needs guarding, give the decision an explicit `Deferred` variant first —
-    /// do NOT reuse `NoAp`.
+    /// at the time the only "skip" value available was `NoAp` — which the caller cannot distinguish
+    /// from "no usable AP exists" and would act on by shedding the crown. Trading a possible
+    /// allocation spike for a spurious crown shed was a bad trade: the shed is certain, the spike
+    /// is not. That note ended: *"If this path ever needs guarding, give the decision an explicit
+    /// `Deferred` variant first — do NOT reuse `NoAp`."*
+    ///
+    /// ✅ **#335 DISCHARGED IT.** [`CrownApDecision::Deferred`] exists, `crown_next_state` treats it
+    /// as a no-op, and the two skip-shaped returns in this function now use it. So the precondition
+    /// #367 named is satisfied and **heap-gating this path is unblocked** — but deliberately NOT
+    /// done here, because that is a behaviour change with its own risk budget and this commit is a
+    /// vocabulary change. Whoever takes it: the gate is `may_scan`, and its "DEFER, NEVER ABANDON"
+    /// contract is now expressible in the return type.
     fn reassoc_ch6_prefer(&mut self) -> crate::net::coexist::CrownApDecision {
         use crate::net::coexist::{select_crown_ap, ApView, CrownApDecision};
         // COEXIST hard gate: never leave the mesh channel mid mesh-OTA transfer (mirrors run_scan).
+        // #335: `Deferred`, not `NoAp`. This is a DECLINED LOOK — no scan ran — and it returns
+        // EARLY, before the stay-put guard below, so whatever it says reaches `crown_next_state`
+        // unfiltered. As `NoAp` that was the shed ladder being fed "there is no AP" by a gate whose
+        // only claim is "not right now", for the whole duration of every mesh-OTA relay. The retry
+        // is untouched (the caller re-enters on a later tick), which is `Deferred`'s contract.
         if self.ota_leaf.is_active() {
-            return CrownApDecision::NoAp;
+            return CrownApDecision::Deferred;
         }
         let net = &crate::secrets::WIFI_NETWORK;
         // #217 rung-3: incumbent view for the ≥6 dB hysteresis (live rssi via `rssi()` — nebula
@@ -3698,7 +3710,10 @@ impl RadioManager {
                 }
                 select_crown_ap(&views, ESP_NOW_FIXED_CHANNEL, cur)
             }
-            Err(_) => CrownApDecision::NoAp,
+            // #335: a scan that FAILED is not a scan that found nothing. As `NoAp` this spent a
+            // radio error as evidence about the RF environment; `Deferred` says only that the
+            // question went unanswered, and the next tick asks again.
+            Err(_) => CrownApDecision::Deferred,
         };
         // #gateway-election issue 2: a transient scan that MISSED our co-channel incumbent must NOT
         // reassociate us to a WORSE off-channel AP. HW bug: after a fetch-leg-deaf fail, this reassoc
@@ -3722,7 +3737,10 @@ impl RadioManager {
         let (bssid, chan): (Option<[u8; 6]>, Option<u8>) = match decision {
             CrownApDecision::CoChannel { bssid, ch }
             | CrownApDecision::OffChannelFallback { bssid, ch } => (Some(bssid), Some(ch)),
-            CrownApDecision::NoAp => (None, None),
+            // Nothing to pin in either case, for different reasons: `NoAp` looked and found none,
+            // `Deferred` never looked. Named separately rather than merged so the distinction
+            // survives the next edit.
+            CrownApDecision::NoAp | CrownApDecision::Deferred => (None, None),
         };
         // #278/#269 ANNOUNCE BEFORE THE MOVE. This is the last instant the crown is still reachable
         // by the fleet it is about to leave: `disconnect_async` is on the next line. 802.11 solves
@@ -3773,6 +3791,16 @@ impl RadioManager {
         self.my_ap_channel = match decision {
             CrownApDecision::CoChannel { ch, .. } | CrownApDecision::OffChannelFallback { ch, .. } => ch,
             CrownApDecision::NoAp => 0,
+            // #335: KEEP THE PREVIOUS BELIEF. `0` here would mean "we know we are off-channel",
+            // and a deferral knows nothing — writing 0 would erase a still-valid channel on the
+            // strength of a scan that never ran, and `my_ap_channel` gates the stay-put guard
+            // above, so the erasure would disarm the very protection that stops a transient miss
+            // downgrading a healthy co-channel crown.
+            //
+            // This arm was found by the COMPILER, not by review: removing the `_` wildcards in
+            // `crown_next_state` surfaced a third consumer of this enum that a wildcard here had
+            // been quietly absorbing. That is the argument for exhaustive matches, in one commit.
+            CrownApDecision::Deferred => self.my_ap_channel,
         };
         log::warn!(
             "smol #217r3: crown reassoc → co_channel={} ap_ch={} mesh_ch={}",
