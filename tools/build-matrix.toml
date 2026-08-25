@@ -123,7 +123,7 @@ opt_level  = "2"
 # channel (Xtensa Rust 1.95.0.0, pinned byte-identical on katana and familiar) plus
 # `. ~/export-esp.sh` and a per-invocation `CARGO_UNSTABLE_BUILD_STD=core,alloc`. GitHub runners
 # have none of it, and a permanently-red arm teaches everyone to ignore the gate (#343).
-blocked_on = "xtensa toolchain (espup `esp` channel + export-esp.sh) is not on CI runners; the manifest and target pins are DONE (#347 Part 2)"
+blocked_on = "ONLY the CI-runner toolchain remains (espup `esp` channel + export-esp.sh are not on GitHub runners): the manifest/target pins (#347 Part 2), the linkall+opt_level workaround (#408/#409), the display arm, AND the measured ChipBudget row (budget.rs ESP32S3_CYD, 2026-08-25) are all DONE — the chip builds, boots, meshes and draws on real hardware; only CI cannot compile it yet"
 # When the toolchain question is answered, flipping `builds` to true is a ONE-WORD data change and
 # the matrix, the CI jobs and the tier coverage all follow. That is the entire point of this file.
 # `ships` stays false after that: OpenWrt's DEFAULT := n. Buildable is not shipped.
@@ -330,6 +330,16 @@ hal-cpu-reset-unindexed  = "esp-hal API-fact marker (hal-* namespace) selected b
 # designed sequence working. Removed together with the paired `#[allow(dead_code)]` in net.rs; the
 # two-sided marker is why neither could be dropped quietly.)
 
+# #398: the FIRST CI-unbuildable exclusives — chip-gated on esp32s3, whose tiers cannot
+# build on CI runners (xtensa toolchain absent; see [chip.esp32s3] blocked_on). Observed
+# LOCALLY instead: tools/check_chips.sh compiles both on the pinned espup 1.95.0.0
+# toolchain (familiar/katana), and both have run on real hardware (unit
+# 14:C1:9F:D1:C8:10 — the board draws through s3_oled). When #413 puts the xtensa
+# toolchain in CI (per-target releases), these two graduate back to observed and the
+# gate will FAIL on these entries — the designed stale-claim sequence; delete them then.
+"src/board_s3.rs" = "esp32s3 tiers cannot build on CI (no espup); observed locally via check_chips.sh + on hardware — graduates when #413 lands xtensa in CI"
+"src/s3_oled.rs" = "esp32s3 tiers cannot build on CI (no espup); observed locally via check_chips.sh + on hardware — graduates when #413 lands xtensa in CI"
+
 "src/secrets.rs" = """\
 consts only (WIFI_NETWORK / MQTT_* / WLED_CAST_*) — 0 fn / 0 impl in both secrets.rs and \
 secrets.rs.example, so it emits .rodata and no line rows. It is also git-ignored and \
@@ -357,6 +367,11 @@ provisioned per tree, so its contents are not a property of the commit at all.""
 # Regenerate with: tools/check_exclusions.py claims --toml
 [tier_exclusive]
 "src/textclip.rs" = "wifi"
+# #398: chip-exclusive (esp32s3). The gate's contract is BOTH sections: this DECLARATION
+# (so removing the cfg-gate later cannot go unnoticed) plus the [unobservable] excuse
+# below (CI cannot build xtensa to observe them). Learned across three CI rounds.
+"src/board_s3.rs" = "esp32s3"
+"src/s3_oled.rs" = "esp32s3"
 "src/net/otagate.rs" = "espnow"
 "src/bard/delivery.rs" = "bard"
 "src/bard/mod.rs" = "bard"

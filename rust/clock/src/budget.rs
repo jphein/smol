@@ -425,6 +425,38 @@ pub const CHIP: ChipBudget = ESP32C3;
 #[cfg(all(target_os = "none", feature = "esp32c6"))]
 pub const CHIP: ChipBudget = ESP32C6_WATCH;
 
+/// The S3 (ES3C28P, #398) — measured on unit `14:C1:9F:D1:C8:10` ("eldritch-insignia",
+/// node 162), 2026-08-25, the day smol first ran on Xtensa silicon.
+///
+/// **`stack_floor_bytes` is an OBSERVED-SUFFICIENT line, not a high-water derivation,
+/// and the difference is a measured fact about the instrument:** `stack-paint` is
+/// INVALID on this chip as written. Its sentinel is trampled by boot-era machinery that
+/// shares the `.stack` region (59,504 B read "used" one statement after painting, at
+/// boot, before anything deep ran), and re-painting after init crashed the box into a
+/// 99-boot exception loop. The `_stack_*_cpu0` symbols alias the whole-region ones
+/// (readelf-verified), so a CPU-slice port is NOT the fix — understanding what actually
+/// writes there is, and that is follow-up work on #398. Until then, the floor is the
+/// C6's own semantics (`ESP32C6_WATCH_EMPIRICAL_BOOT_LINE_BYTES`): **72,004 B is the
+/// `.stack` region of the heaviest-stack tier ever run on this unit** (`stack-paint` =
+/// bard + canonical: narration + mesh relay + MQTT + the 4× display), which ran clean —
+/// the smallest region PROVEN sufficient, not the smallest that works.
+///
+/// `free_dram_bytes` = the fleet image's `.stack` section (readelf, ELF sha256
+/// `5fd23661885a10b1…`, opt-level 2 per the [chip.esp32s3] toolchain-bug workaround —
+/// opt-level moves sections, so the profile is part of this row's provenance).
+/// `app_slot_bytes`/`baseline_image_bytes`: `targets/s3-cyd/partitions-ota-s3.csv`,
+/// espflash save-image against that CSV = 1,028,656 B (16.35% of the slot).
+pub const ESP32S3_CYD: ChipBudget = ChipBudget {
+    chip: "esp32s3",
+    free_dram_bytes: 116_940,
+    stack_floor_bytes: 72_004,
+    app_slot_bytes: 0x0060_0000,
+    baseline_image_bytes: 1_028_656,
+};
+
+#[cfg(all(target_os = "none", feature = "esp32s3"))]
+pub const CHIP: ChipBudget = ESP32S3_CYD;
+
 /// A chip whose budget has never been measured, on a bare-metal target.
 ///
 /// **A poison row, not a permissive default.** Every field is chosen so that any question asked
@@ -440,7 +472,7 @@ pub const CHIP: ChipBudget = ESP32C6_WATCH;
 /// ⚠️ `tools/build_matrix.py::budget_chips()` skips this row by name when it cross-checks the
 /// chip roster against `tools/build-matrix.toml`. It is not a fleet target; it is the absence
 /// of one, given a shape.
-#[cfg(all(target_os = "none", not(any(feature = "esp32c3", feature = "esp32c6"))))]
+#[cfg(all(target_os = "none", not(any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3"))))]
 pub const UNMEASURED: ChipBudget = ChipBudget {
     chip: "unmeasured",
     free_dram_bytes: 0,
@@ -449,7 +481,7 @@ pub const UNMEASURED: ChipBudget = ChipBudget {
     baseline_image_bytes: 0,
 };
 
-#[cfg(all(target_os = "none", not(any(feature = "esp32c3", feature = "esp32c6"))))]
+#[cfg(all(target_os = "none", not(any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3"))))]
 pub const CHIP: ChipBudget = UNMEASURED;
 
 /// Whether [`CHIP`] carries MEASURED numbers, as a value rather than as a cfg incantation.
@@ -459,7 +491,7 @@ pub const CHIP: ChipBudget = UNMEASURED;
 /// somewhere else is exactly the two-statements-of-one-fact rot that `build_matrix.py` exists to
 /// catch between this file and the build matrix.
 #[cfg(target_os = "none")]
-pub const CHIP_MEASURED: bool = cfg!(any(feature = "esp32c3", feature = "esp32c6"));
+pub const CHIP_MEASURED: bool = cfg!(any(feature = "esp32c3", feature = "esp32c6", feature = "esp32s3"));
 
 /// A bare-metal build must name its chip. Distinct from "named it and it has no row" — that is
 /// [`UNMEASURED`] and it only bites the budget-predicated features. This is the build not saying

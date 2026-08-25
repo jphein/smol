@@ -225,6 +225,12 @@ impl Gesture {
 }
 
 /// Debounced BOOT button with short-tap / long-press classification./// Debounced BOOT button with short-tap / long-press classification.
+/// The chip's BOOT-button pin type — see [`Button::new`].
+#[cfg(all(feature = "hw", not(feature = "esp32s3")))]
+type BootPin<'d> = esp_hal::peripherals::GPIO9<'d>;
+#[cfg(all(feature = "hw", feature = "esp32s3"))]
+type BootPin<'d> = esp_hal::peripherals::GPIO0<'d>;
+
 #[cfg(feature = "hw")]
 pub struct Button {
     pin: Input<'static>,
@@ -233,9 +239,13 @@ pub struct Button {
 
 #[cfg(feature = "hw")]
 impl Button {
-    /// Wrap GPIO9 as a pulled-up active-low input. `main` owns `esp_hal::init()`
+    /// Wrap the BOOT pin as a pulled-up active-low input. `main` owns `esp_hal::init()`
     /// and the pin singleton and passes it in, so the HAL is initialised once.
-    pub fn new(pin: esp_hal::peripherals::GPIO9<'static>) -> Self {
+    ///
+    /// The PIN is a chip fact: GPIO9 on the C3 boards, GPIO0 on the S3/ES3C28P (#398 —
+    /// where GPIO9 is the battery ADC). Both are that chip's boot-strapping pin with the
+    /// same pulled-up active-low behaviour, so only the type changes.
+    pub fn new(pin: BootPin<'static>) -> Self {
         let input = Input::new(pin, InputConfig::default().with_pull(Pull::Up));
         Self {
             pin: input,

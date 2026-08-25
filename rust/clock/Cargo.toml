@@ -123,6 +123,12 @@ libm = { version = "0.2", optional = true, default-features = false }
 # firmware AND the #152 host/wasm emulator draw through it.
 ssd1306 = { version = "=0.10.0", optional = true }
 embedded-graphics = "=0.8.2"
+# #398 S3 display arm: the ILI9341V driver + the SPI device wrapper. Optional, pulled
+# ONLY by the esp32s3 chip arm — no other chip's dependency graph changes by one byte.
+# mipidsi is EXACT-pinned: s3_oled's ORIENTATION reasoning is tied to 0.10's MADCTL
+# mapping (the 0x28/0x68 story at board_s3::MADCTL_LANDSCAPE).
+mipidsi = { version = "=0.10.0", optional = true }
+embedded-hal-bus = { version = "0.3.0", optional = true }
 
 # --- WiFi / NTP + radio (Phase 2, feature = "wifi") ----------------------
 esp-alloc = { version = "0.10", optional = true }
@@ -326,6 +332,10 @@ esp32s3 = [
     "esp-wifi-sys?/esp32s3",
     "has-psram", "has-reset-glitch-split",
     "hal-cpu-reset-unindexed",
+    # #398 display arm: the S3's panel stack rides the CHIP arm (the chip implies the
+    # board class today; when a second S3 board exists, #396's variant axis — runtime,
+    # never a feature — still won't move these: they are chip-level driver deps).
+    "dep:mipidsi", "dep:embedded-hal-bus",
     # NO `has-tsens`. This arm CARRIED it in the first draft of this commit, from a datasheet-shaped
     # assumption that the big chip has at least what the little one has. A per-chip `cargo check` on
     # familiar's xtensa toolchain said otherwise: `esp_hal::tsens` is unresolved for

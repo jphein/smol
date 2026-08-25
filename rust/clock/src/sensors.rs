@@ -25,8 +25,15 @@
 #[cfg(feature = "hw")]
 use esp_hal::{
     analog::adc::{Adc, AdcConfig, AdcPin, Attenuation},
-    peripherals::{ADC1, GPIO4},
+    peripherals::ADC1,
 };
+// The battery ADC pin is a CHIP fact: GPIO4 on the C3 boards; GPIO9 on the S3/ES3C28P
+// (onboard 2:1 divider — GPIO4 there is the codec's I2S MCLK). One alias, so the struct
+// and both constructors stay chip-agnostic. See BATT_ADC_GPIO.
+#[cfg(all(feature = "hw", not(feature = "esp32s3")))]
+use esp_hal::peripherals::GPIO4 as BattGpio;
+#[cfg(all(feature = "hw", feature = "esp32s3"))]
+use esp_hal::peripherals::GPIO9 as BattGpio;
 // `has-tsens` is a MEASURED capability, not an assumption: C3 ✓ C6 ✓ C5 ✗ S3 ✗ (the biggest
 // chip lacks the sensor the smallest one has — see the table at `has-tsens` in Cargo.toml).
 // On a chip without it there is no die temperature, and `Reading.chip_c` says so with `None`
@@ -48,7 +55,12 @@ use esp_hal::{
 ///
 /// This is documentation only; the pin is bound as `peripherals.GPIO4` in
 /// [`Sensors::new`]. Keep this const and that binding in sync.
+#[cfg(not(feature = "esp32s3"))]
 pub const BATT_ADC_GPIO: u8 = 4;
+/// #398 S3: the ES3C28P's BAT_ADC net is GPIO9, through the board's own 2:1 divider
+/// (board_s3::PIN_BAT_ADC — which matches [`BATT_DIVIDER`] exactly). Floats with no cell.
+#[cfg(feature = "esp32s3")]
+pub const BATT_ADC_GPIO: u8 = 9;
 
 /// External resistor-divider ratio on [`BATT_ADC_GPIO`]: `Vbatt / Vpin`.
 ///
@@ -93,7 +105,7 @@ pub struct Sensors<'d> {
     #[cfg(feature = "has-tsens")]
     tsens: TemperatureSensor<'d>,
     adc: Adc<'d, ADC1<'d>, esp_hal::Blocking>,
-    batt_pin: AdcPin<GPIO4<'d>, ADC1<'d>>,
+    batt_pin: AdcPin<BattGpio<'d>, ADC1<'d>>,
 }
 
 /// #152 host-emulator stub: a `Sensors` with the SAME `read()` surface but no HAL — it
@@ -127,7 +139,7 @@ impl<'d> Sensors<'d> {
     /// (On a no-tsens chip there IS no `TSENS` singleton to pass — hence the
     /// cfg'd second constructor below, and a cfg'd call site in `main`.)
     #[cfg(feature = "has-tsens")]
-    pub fn new(tsens: TSENS<'d>, adc1: ADC1<'d>, gpio4: GPIO4<'d>) -> Self {
+    pub fn new(tsens: TSENS<'d>, adc1: ADC1<'d>, gpio4: BattGpio<'d>) -> Self {
         // Temperature sensor: default config (XTAL clock). `new` powers it up;
         // caller should allow a few hundred µs before the first read to settle.
         let tsens = TemperatureSensor::new(tsens, TsensConfig::default())
@@ -151,7 +163,7 @@ impl<'d> Sensors<'d> {
     /// (`has-tsens` absent: C5, S3). Same struct, same `read()` surface; the
     /// temperature is simply never there to read.
     #[cfg(not(feature = "has-tsens"))]
-    pub fn new(adc1: ADC1<'d>, gpio4: GPIO4<'d>) -> Self {
+    pub fn new(adc1: ADC1<'d>, gpio4: BattGpio<'d>) -> Self {
         let mut adc_config = AdcConfig::new();
         let batt_pin = adc_config.enable_pin(gpio4, Attenuation::_11dB);
         let adc = Adc::new(adc1, adc_config);

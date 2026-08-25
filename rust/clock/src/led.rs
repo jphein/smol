@@ -39,7 +39,13 @@ use esp_hal::gpio::{Level, Output};
 /// Everything else in this module works in *logical* on/off; this const is the
 /// single place that maps logical->physical, so re-targeting a board with the
 /// opposite wiring is a one-line change.
+#[cfg(not(feature = "esp32s3"))]
 pub const LED_ACTIVE_LOW: bool = true;
+/// #398 S3: nominal ACTIVE-HIGH — but on the ES3C28P this drives the WS2812's DIN
+/// (GPIO42), which ignores plain levels entirely (it wants the RMT protocol), so no
+/// light shows either way. The state machine still runs; the RMT driver is follow-up.
+#[cfg(feature = "esp32s3")]
+pub const LED_ACTIVE_LOW: bool = false;
 
 // --- Blink half-periods (milliseconds) -----------------------------------
 // A "half-period" is how long the LED stays on, then off, per blink. The blink

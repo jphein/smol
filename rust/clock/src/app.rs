@@ -16,13 +16,13 @@ use crate::input::Press;
 // Only the plain (hw, non-cast) `Oled` alias below names these; under `feature = "cast"`
 // the alias is `CastOled`, and under `feature = "hostsim"` (#152) it is the canvas
 // display, so these ssd1306 imports would be unused / unavailable there.
-#[cfg(all(feature = "hw", not(feature = "cast")))]
+#[cfg(all(feature = "hw", not(feature = "cast"), not(feature = "esp32s3")))]
 use ssd1306::mode::BufferedGraphicsMode;
-#[cfg(all(feature = "hw", not(feature = "cast")))]
+#[cfg(all(feature = "hw", not(feature = "cast"), not(feature = "esp32s3")))]
 use ssd1306::prelude::I2CInterface;
-#[cfg(all(feature = "hw", not(feature = "cast")))]
+#[cfg(all(feature = "hw", not(feature = "cast"), not(feature = "esp32s3")))]
 use ssd1306::size::DisplaySize72x40;
-#[cfg(all(feature = "hw", not(feature = "cast")))]
+#[cfg(all(feature = "hw", not(feature = "cast"), not(feature = "esp32s3")))]
 use ssd1306::Ssd1306;
 
 /// The one concrete OLED type in the firmware. `Ctx` holds this CONCRETELY (not a
@@ -30,12 +30,20 @@ use ssd1306::Ssd1306;
 /// and `flush` lives on `Ssd1306`, not the `DrawTarget` trait. The generic draw
 /// helpers (`draw_clock`, …) still take `&mut impl DrawTarget`; a plugin passes
 /// `ctx.display` (which coerces) and flushes it itself.
-#[cfg(all(feature = "hw", not(feature = "cast")))]
+#[cfg(all(feature = "hw", not(feature = "cast"), not(feature = "esp32s3")))]
 pub type Oled = Ssd1306<
     I2CInterface<esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>>,
     DisplaySize72x40,
     BufferedGraphicsMode<DisplaySize72x40>,
 >;
+
+/// #398: the S3 (ES3C28P) backend — the FOURTH repetition of this alias, not new
+/// architecture. Logical 72×40 exactly like the other three (every screen renders
+/// unchanged — the #152 "zero forked render code" gate, applied again); the 4× scaling
+/// to the 320×240 panel happens entirely below this seam, at flush. See `s3_oled.rs`
+/// for why it stores 360 bytes and not a 92 KB image.
+#[cfg(all(feature = "hw", not(feature = "cast"), feature = "esp32s3"))]
+pub type Oled = crate::s3_oled::S3Oled;
 
 /// #152 host emulator: under `feature = "hostsim"` the one concrete `Oled` becomes a
 /// canvas-backed 72×40 framebuffer that impls the SAME `DrawTarget<Color = BinaryColor>`

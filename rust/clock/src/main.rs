@@ -83,13 +83,11 @@ extern "Rust" fn custom_halt() -> ! {
     esp_hal::system::software_reset()
 }
 
-use esp_hal::{
-    clock::CpuClock,
-    delay::Delay,
-    i2c::master::{BusTimeout, Config as I2cConfig, I2c, SoftwareTimeout},
-    time::Instant,
-    time::Rate,
-};
+use esp_hal::{clock::CpuClock, delay::Delay, time::Instant, time::Rate};
+// The OLED I2C stack is the C3-family panel path; the S3 (#398) drives an SPI ILI9341V
+// through `s3_oled` instead, so these imports are chip-cfg'd with their consumer.
+#[cfg(not(feature = "esp32s3"))]
+use esp_hal::i2c::master::{BusTimeout, Config as I2cConfig, I2c, SoftwareTimeout};
 // #335 P1.2: the bare-metal `#[main]` entry survives ONLY on the no-radio tier. Under `wifi` the
 // entry is `#[esp_rtos::main]`, which emits its own `#[esp_hal::main] fn main()` wrapper — naming
 // `main` here as well would be an unused import there.
@@ -103,17 +101,24 @@ use esp_hal::{interrupt::software::SoftwareInterruptControl, timer::timg::TimerG
 // type has to be nameable at this scope even though P1.2 itself does not spawn anything.
 #[cfg(feature = "wifi")]
 use embassy_executor::Spawner;
+#[cfg(not(feature = "esp32s3"))]
 use ssd1306::{prelude::*, size::DisplaySize72x40, I2CDisplayInterface, Ssd1306};
 // `DisplayConfig::init` inits the PLAIN Ssd1306 (non-cast builds). Under `feature =
 // "cast"` the display is the `CastOled` tee, whose inherent `init()` forwards to the
 // inner panel (it imports `DisplayConfig` itself), so `main` no longer names the trait.
-#[cfg(not(feature = "cast"))]
+#[cfg(all(not(feature = "cast"), not(feature = "esp32s3")))]
 use ssd1306::mode::DisplayConfig;
 
 // App-plugin framework (issue #7): the `Oled` alias, `Ctx`, `Plugin` trait,
 // `AppKind`/`App` enum + centralized dispatch, and the `REGISTRY` that
 // auto-builds the menu. The dispatch keystone every screen plugs into.
 mod app;
+// #398: the S3 (ES3C28P) board truth + display backend. Chip-cfg'd MODULES, not board
+// features (#352's standing rule) — `esp32s3` is a CHIP feature, which is the allowed axis.
+#[cfg(feature = "esp32s3")]
+mod board_s3;
+#[cfg(feature = "esp32s3")]
+mod s3_oled;
 // #300 The Bard — on-device tiny-LLM storyteller. Radio-free (rides `hw`), so it can ship in
 // every tier; the 277 KB model is `.rodata` (XIP flash) and its scratch is `.bss`.
 #[cfg(feature = "bard")]
@@ -558,6 +563,7 @@ const FLUSH_DEFER_CAP_MS: u64 = 120_000;
 #[cfg(feature = "espnow")]
 const REBOOT_DEBOUNCE_MS: u64 = 10_000;
 
+#[cfg(not(feature = "esp32s3"))] // C3 OLED only; the S3's orientation lives in s3_oled
 /// OLED panel rotation. The pocket-watch case hangs from the USB-C end, so the
 /// display is physically upside-down and must be rotated 180° to read upright.
 ///
@@ -637,6 +643,18 @@ async fn run() -> ! {
 
     esp_println::logger::init_logger_from_env();
     log::info!("smol booting: unified firmware (menu: Clock / Snake / Bench)");
+    // #398 instrument sanity probe (stack-paint builds): expect ≈0 at boot on a chip
+    // where the instrument is valid. On the S3 it reads ~59.5 KB HERE — the proof the
+    // instrument is invalid there (boot-era machinery writes inside .stack; see the
+    // block note in src/bard/stack_paint.rs for the three measurements, including the
+    // disproven CPU-slice hypothesis). Kept as the cheapest validity check for any
+    // future chip: a big number on THIS line means don't trust any later one.
+    #[cfg(feature = "stack-paint")]
+    log::info!(
+        "smol #398 probe: high-water at boot (expect ~0) = {} of {} B",
+        bard::stack_paint::high_water(),
+        bard::stack_paint::region_bytes(),
+    );
 
     // Identity + provenance, both DERIVED (never on the wire): the node's FLEET
     // name from NODE_ID, and the firmware's FORGE version name seeded from the git
@@ -698,7 +716,8 @@ async fn run() -> ! {
     #[cfg(feature = "espnow")]
     ota::capture_boot_diag();
 
-    // --- I2C bus to the OLED -------------------------------------------------
+    // --- Panel bring-up (chip-cfg'd: I2C SSD1306 on the C3s; SPI ILI9341V on the S3) ---
+    #[cfg(not(feature = "esp32s3"))]
     let i2c = I2c::new(
         peripherals.I2C0,
         // esp-hal rc.0→1.1 semantic drift (#387): the I2C `Config` default lost its per-byte
@@ -719,10 +738,31 @@ async fn run() -> ! {
     .with_scl(peripherals.GPIO6);
 
     // --- SSD1306 display -----------------------------------------------------
-    let interface = I2CDisplayInterface::new(i2c);
-    // Rotated 180° (case hangs from the USB-C end) — see DISPLAY_ROTATION.
-    let raw_display = Ssd1306::new(interface, DisplaySize72x40, DISPLAY_ROTATION)
-        .into_buffered_graphics_mode();
+    #[cfg(not(feature = "esp32s3"))]
+    let raw_display = {
+        let interface = I2CDisplayInterface::new(i2c);
+        // Rotated 180° (case hangs from the USB-C end) — see DISPLAY_ROTATION.
+        Ssd1306::new(interface, DisplaySize72x40, DISPLAY_ROTATION).into_buffered_graphics_mode()
+    };
+    // #398 S3: ILI9341V over SPI2, every value from `board_s3` (lineage: burrito-fw on
+    // this glass → backend-staging's type proof → here). No reset pin — LCD_RST is bonded
+    // to CHIP_PU/EN on this board. The backlight goes ON only after the first paint, below.
+    #[cfg(feature = "esp32s3")]
+    let raw_display = {
+        let panel = s3_oled::build_panel(
+            peripherals.SPI2,
+            peripherals.GPIO12,
+            peripherals.GPIO11,
+            peripherals.GPIO10,
+            peripherals.GPIO46,
+            Delay::new(),
+        );
+        let mut d = s3_oled::S3Oled::new(panel);
+        // The 62% of the panel outside the 288×160 image: a deliberate black frame
+        // instead of power-on GRAM garbage. Once, at boot — never per frame.
+        d.paint_letterbox(embedded_graphics::pixelcolor::Rgb565::new(0, 0, 0)).ok();
+        d
+    };
     // #26 cast: wrap the panel in the DrawTarget tee so every draw is mirrored into a
     // shadow framebuffer for the WLED pixel-stream. Byte-identical `Oled` (plain
     // Ssd1306) in every non-cast build — see `app::Oled`.
@@ -737,6 +777,9 @@ async fn run() -> ! {
     // radio/mesh/MQTT stack runs unaffected. The only per-cycle cost is one fast I2C
     // NACK per flush attempt. (Cast still works headless — the tee mirrors the RAM
     // buffer, which draws fill regardless of the panel.)
+    // (#398 S3 note: S3Oled::init() cannot fail — SPI is write-only, absence is
+    // undetectable, and the board class is single-variant WITH a panel — so this branch
+    // is compile-time dead there and HEADLESS stays false, which is the truth.)
     if display.init().is_err() {
         // The NACK is also the board's identity statement (OLED board vs screenless
         // SuperMini) — record it for the HA discovery `model` (see `headless()`).
@@ -760,21 +803,42 @@ async fn run() -> ! {
     draw_splash(&mut display, my_noun, env!("BUILD_NUMBER"), v_noun);
     display.flush().ok();
 
+    // #398 S3: backlight ON only now — after the first full paint — so the panel appears
+    // already-lit instead of fading up from GRAM garbage (burrito-fw's proven ordering).
+    // GPIO45 is also the VDD_SPI strap: safe, R32 hard-wires the strap low at reset (see
+    // board_s3::PIN_LCD_BACKLIGHT). Held for 'main — dropping the Output releases the pin.
+    #[cfg(feature = "esp32s3")]
+    let _backlight = esp_hal::gpio::Output::new(
+        peripherals.GPIO45,
+        esp_hal::gpio::Level::High,
+        esp_hal::gpio::OutputConfig::default(),
+    );
+
     // #335 P1.3: still constructed on every tier, but only the no-radio tier still *uses* it —
     // `subtick` (below `run`) is what the two pacing sites call now. `Delay` is a unit struct, so
     // holding one the wifi build never reads costs nothing and keeps the two call sites identical.
     let delay = Delay::new();
 
-    // --- BOOT button on GPIO9 (debounced short/long) -------------------------
+    // --- BOOT button (debounced short/long); the pin is a chip fact ------------
+    #[cfg(not(feature = "esp32s3"))]
     let mut button = Button::new(peripherals.GPIO9);
+    // #398 S3: BOOT is GPIO0 on the ES3C28P — the board's ENTIRE hardware input budget
+    // (board_s3::PIN_BOOT_BUTTON). GPIO9 there is the battery ADC.
+    #[cfg(feature = "esp32s3")]
+    let mut button = Button::new(peripherals.GPIO0);
 
     // --- On-board sensors (battery ADC on GPIO4; die temp where the silicon has one) ---
     // `peripherals.TSENS` does not EXIST on a no-tsens chip (C5/S3), so the call site is
     // cfg'd on the capability, matching the two constructors in sensors.rs.
     #[cfg(feature = "has-tsens")]
     let mut sensors = sensors::Sensors::new(peripherals.TSENS, peripherals.ADC1, peripherals.GPIO4);
-    #[cfg(not(feature = "has-tsens"))]
+    #[cfg(all(not(feature = "has-tsens"), not(feature = "esp32s3")))]
     let mut sensors = sensors::Sensors::new(peripherals.ADC1, peripherals.GPIO4);
+    // #398 S3: the ES3C28P's battery ADC is GPIO9 (onboard 2:1 divider — matching
+    // sensors::BATT_DIVIDER exactly); GPIO4 on this chip is the codec's I2S MCLK.
+    // Floats and reads noise with no cell fitted — a board fact, not a bug.
+    #[cfg(all(not(feature = "has-tsens"), feature = "esp32s3"))]
+    let mut sensors = sensors::Sensors::new(peripherals.ADC1, peripherals.GPIO9);
     log::info!(
         "smol: sensors up — battery ADC on GPIO{} ({}:1 divider); die-temp: {}",
         sensors::BATT_ADC_GPIO,
@@ -792,12 +856,25 @@ async fn run() -> ! {
     #[cfg(feature = "io")]
     let mut io_pins = {
         use esp_hal::gpio::Flex;
+        #[cfg(not(feature = "esp32s3"))]
         let mut m = io::PinMap::new([
             Flex::new(peripherals.GPIO0),
             Flex::new(peripherals.GPIO1),
             Flex::new(peripherals.GPIO3),
             Flex::new(peripherals.GPIO7),
             Flex::new(peripherals.GPIO10),
+        ]);
+        // #398 S3: the C3's pool pins are all CLAIMED on the ES3C28P (0=BOOT, 1=amp
+        // enable ACTIVE-LOW, 7=I2S WS, 10=LCD chip-select — binding that one fights the
+        // display for its own bus). Pool from board_s3::FREE_GPIOS instead — which is
+        // INFERRED-not-schematic-verified (its own caveat): meter before wiring hardware.
+        #[cfg(feature = "esp32s3")]
+        let mut m = io::PinMap::new([
+            Flex::new(peripherals.GPIO21),
+            Flex::new(peripherals.GPIO38),
+            Flex::new(peripherals.GPIO39),
+            Flex::new(peripherals.GPIO40),
+            Flex::new(peripherals.GPIO41),
         ]);
         io::boot_selftest(&mut m);
         m
@@ -893,9 +970,20 @@ async fn run() -> ! {
 
     // Phase 3: blue status LED on GPIO8, created at logical-OFF (GPIO8 is a
     // strapping pin) then fast-blinked during the WiFi/NTP burst inside start().
-    #[cfg(feature = "espnow")]
+    #[cfg(all(feature = "espnow", not(feature = "esp32s3")))]
     let mut led = led::Led::new(esp_hal::gpio::Output::new(
         peripherals.GPIO8,
+        led::Led::off_level(),
+        esp_hal::gpio::OutputConfig::default(),
+    ));
+    // #398 S3: there is no simple status LED on the ES3C28P — GPIO42 is the WS2812's DIN,
+    // which ignores plain GPIO levels (it wants the RMT protocol), so this drive renders
+    // NOTHING visible. Wired anyway so the peer-state machine runs unchanged; the real
+    // WS2812/RMT driver (~50 lines, esp-hal-smartled is version-incompatible) is follow-up
+    // work on #398. GPIO8 on this chip is I2S playback data — not touched.
+    #[cfg(all(feature = "espnow", feature = "esp32s3"))]
+    let mut led = led::Led::new(esp_hal::gpio::Output::new(
+        peripherals.GPIO42,
         led::Led::off_level(),
         esp_hal::gpio::OutputConfig::default(),
     ));
