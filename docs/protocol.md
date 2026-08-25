@@ -43,10 +43,17 @@ then the radio is pinned to **ch 6** for the mesh. The [relay bridge](#relay--re
 resurrects a COEXIST/WiFi-return flush — and **the mesh is deaf during that burst**
 (single radio). Everything in steady state rides ch 6.
 
-Verified ESP-NOW limits (from `esp-wifi 0.15.0` source — see `nebula-espnow-gateway.md`):
-**250 B** max payload/frame, RX queue **10 frames deep (drops oldest)**,
-**synchronous one-in-flight TX** (`send()` → `waiter.wait()`). Every SMOLv1 frame
-stays well under 250 B.
+Verified ESP-NOW limits: **250 B** max payload/frame, RX queue **10 frames deep
+(drops oldest)**, **synchronous one-in-flight TX** (`send()` → `waiter.wait()`).
+Every SMOLv1 frame stays well under 250 B — *including* its group-MAC trailer, which
+`should_group_mac` refuses to append if it would push the frame over.
+
+> **Re-verified 2026-08-24 against `esp-radio 0.18.0`**, the crate smol pins today:
+> `ESP_NOW_MAX_DATA_LEN = 250` and `RECEIVE_QUEUE_SIZE = 10`, with `pop_front()` on
+> overflow — hence "drops oldest". These numbers were originally read out of
+> `esp-wifi 0.15.0` (see `nebula-espnow-gateway.md`); `esp-wifi` was **renamed to
+> `esp-radio`** at 0.16.0, so that attribution named a crate the tree no longer
+> depends on. The values are unchanged; only the source is restated.
 
 ---
 
@@ -76,11 +83,17 @@ stays well under 250 B.
   an OTA target (`tools/ota_publish.sh install 42` refuses), never be counted as a
   fleet member, and its ghost must never be read as a resurrection. Contrast `13`,
   a genuinely retired identity that is **not** expected to recur.
-- **Security.** ESP-NOW here is **unauthenticated and unencrypted** — any device
-  on the channel can inject any frame (a bogus far-future `synced_at` can hijack
-  every mesh clock; a forged RELAYACK can stall a leaf). Acceptable for a hobby
-  mesh on a private fixed channel; harden with a signed payload or an ESP-NOW LMK
-  if it ever matters. Documented, not defended.
+- **Security.** ESP-NOW here is **unencrypted**, and until #190 it was also
+  unauthenticated — any device on the channel could inject any frame (a bogus
+  far-future `synced_at` hijacks every mesh clock; a forged RELAYACK stalls a leaf).
+  **#190 added a truncated group-MAC trailer** to every non-OTA `SMOLv1 ` frame; it is
+  currently in **OBSERVE** mode, so those injection paths are *measured but still open*.
+  See [the group-MAC trailer](#the-group-mac-trailer-190--every-byte-count-below-omits-it).
+- **Every byte count in this document is PRE-TRAILER.** The `Bytes` column below and
+  each frame's own layout table describe the frame as the encoder builds it. `send_to`
+  then appends **9 more bytes** to nearly all of them. A reader sizing a buffer, and
+  especially anyone implementing SMOLv1 outside this repo, needs both numbers —
+  again, see [the group-MAC trailer](#the-group-mac-trailer-190--every-byte-count-below-omits-it).
 
 ---
 
@@ -110,6 +123,8 @@ stays well under 250 B.
 | [DIAG](#diag--retained-per-node-health-record-704974100) | `SMOLv1 DIAG ` | ≤250 | leaf→broadcast | ~10 s | espnow | 🟢 |
 | [SCAN](#scan--on-demand-wifi-scan-uplink-71) | `SMOLv1 SCAN ` | ≤250 | leaf→broadcast | on-demand (#71) | espnow | 🟢 |
 | [FAM](#fam--the-mesh-familiar-57) | `SMOLv1 FAM ` | 29 | holder broadcast | ~1.5 s (holder only) | espnow | 🟢 |
+| [ELECT](#elect--the-mesh-rendezvous-channel-announcement-278269) | `SMOLv1 ELECT ` | **61** (fixed) | crown broadcast | burst ×6 @120 ms, then ~2 s | espnow | 🟡 |
+| [STAT](#stat--leaf-render-state-uplink-50b) | `SMOLv1 STAT ` | ≤79 | leaf→broadcast | ~10 s (leaf only) | espnow | 🟢 |
 
 > **The battery downlink is two hops.** The [`SMOLv1 BATT`](#batt--ha-battery-snapshot)
 > frame above is the *mesh* hop (gateway → leaves). It's **fed** by an
@@ -117,6 +132,51 @@ stays well under 250 B.
 > LAN (gateway ↔ Home Assistant's Mosquitto broker) — plain TCP, not a mesh frame,
 > so that transport is documented in its own section below, where the old UDP
 > collector egress used to live. (v2 pivot: MQTT-native, retiring the collector.)
+
+---
+
+## The group-MAC trailer (#190) — every byte count above omits it
+
+**Read this before implementing any frame.** Every `Bytes` figure in the table above, and
+every per-frame layout table below, is the frame **as the encoder builds it**. On the air,
+`send_to` appends a **9-byte authentication trailer** to nearly all of them.
+
+**Admission rule** (`wire.rs::should_group_mac`) — a frame gets the trailer iff all three hold:
+
+1. it starts with `b"SMOLv1 "`,
+2. it is **not** OTA-family (those carry their own ed25519 gate), and
+3. `frame.len() + 9 <= 250` (it still fits the ESP-NOW payload cap).
+
+**Trailer layout (9 B), appended after the frame:**
+
+| Field | Bytes | Meaning |
+|---|---|---|
+| `key_epoch` | 1 | selects the group key; **covered by the MAC**, so a flipped epoch fails |
+| `tag` | 8 | `truncate(HMAC-SHA256(GROUP_KEY[epoch], frame_bytes ‖ key_epoch), 8)` |
+
+Truncating to 64 bits makes forgery **online-only** (truncation does not weaken the HMAC key),
+i.e. ~2⁻⁶⁴ per attempt. The epoch byte enables key rotation over a two-release overlap window:
+add `(epoch+1, NEW_KEY)` to the accepted set, ship, then drop the old.
+
+**⚠️ It is in OBSERVE mode today — and that is a dated trap, not a permanent state.**
+`mode.rs::MAC_ENFORCE` is **`false`**: the firmware appends the MAC on TX, verifies on RX,
+counts `mac_ok`/`mac_fail`, and **soft-accepts** frames that are un-MAC'd or fail the check, so
+a mixed fleet never partitions. When the observe soak shows `mac_fail ≈ 0` on a quiet fleet,
+`MAC_ENFORCE` flips to `true` and a failing frame is **dropped before the parser**.
+
+> **What that means for a non-Rust implementation** (#331's ESPHome component, the C5 spike):
+> a bare, un-MAC'd HELLO **works today and stops working at the flip**, with no warning and no
+> code change on either side. The failure mode then is leaf HELLO-drop → owner churn, *not*
+> crown deafness — `mac_fail` is the counter that tells those apart. **Implement the trailer
+> up front**, or accept a known expiry date. Either is fine; not knowing is not.
+
+**The group key is a secret.** `GROUP_KEY` / `GROUP_KEY_EPOCH` live in the gateway's
+git-ignored `secrets.rs` (see [BUILDING.md](BUILDING.md) → *Secrets*) and are deliberately
+absent from this doc. A non-Rust fleet member needs the same key provisioned by hand.
+
+**Source.** `net/wire.rs`: `MAC_TAG_LEN` (8), `MAC_TRAILER_LEN` (9), `should_group_mac`,
+`append_group_mac`, `verify_group_mac`; policy + counters in `net/mode.rs` (`MAC_ENFORCE`,
+the verify-then-parse arm). **Status.** 🟡 shipped in OBSERVE; ENFORCE not yet flipped.
 
 ---
 
