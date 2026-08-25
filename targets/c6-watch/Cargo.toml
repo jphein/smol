@@ -1,0 +1,276 @@
+[workspace]
+members = [".", "crates/*"]
+# The vendored Slint renderer fork is a [patch.crates-io] source, not a
+# workspace member — keeps `cargo test --workspace` (host crates) untouched.
+exclude = ["crates/i-slint-renderer-software"]
+
+[package]
+name = "esp32c6-watch"
+version = "0.12.1"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "esp32c6-watch"
+path = "./src/main.rs"
+
+[[bin]]
+name = "slint-demo"
+path = "./src/bin/slint_demo.rs"
+
+[features]
+# `debug-console` is OPT-IN (NOT default): it disables AOD light-sleep and reads
+# USB-Serial-JTAG RX to drive/measure the UI for agent tests — great for testing,
+# but battery-draining for a shipped build. Release cut = default (no console, AOD
+# on). Test builds add `--features debug-console`. See src/debug_console.rs +
+# tools/ui_test.py.
+# `tts` is ON by default as of 2026-07-29 (JP's call). Enabling the FEATURE does not
+# make the watch talk: the runtime default is `SpeakMode::OnDemand`
+# (config.rs:233), so it speaks only when asked from the notification card. `Auto`
+# is a separate, deliberate setting.
+default = ["tts"]
+debug-console = ["dep:embedded-io-async"]
+# `tts` (read notifications aloud) is now ON BY DEFAULT — see `default` above.
+#
+# THE ROM REASON IT WAS OFF IS OBSOLETE — it was the whole justification and it is gone.
+# This used to read "the firmware is OUT OF ROM": the 4 MiB region esp-hal
+# hardcodes for the C6 had 6,952 B free at 9363d52 and this feature needs ~9.9 KB,
+# so it could not link. `build.rs::widen_rom_region` (#67) raised the region to the
+# 6 MiB `partitions.csv` already reserves per OTA slot, and ROM is now at
+# **51.2 % used, ~3.07 MB free** (measured 2026-07-29). The stated blocker no
+# longer exists.
+#
+# What it costs now, measured on familiar rather than estimated:
+#
+#   default      stack gap 80,592   margin +8,912
+#   tts          stack gap 80,264   margin +8,584   <- tts = 328 B of stack
+#   story        stack gap 75,000   margin +3,320
+#   story,tts    stack gap 74,904   margin +3,224
+#
+# So it was a 328 B question against ~8.6 KB of margin, not a link failure — and the
+# product concern turned out to be unfounded too: `SpeakMode::OnDemand` is the runtime
+# default, so a watch with this compiled in stays silent until someone taps the speaker
+# control or chooses `Auto`. The feature being present and the watch talking are two
+# different switches.
+#
+# Same discipline as audio_out::CHIME_ENABLED — gated behind one flag rather than
+# reverted, so it flips on in one line.
+# See docs/superpowers/specs/2026-07-27-tts-notify-readaloud-design.md.
+tts = ["dep:tts-proto"]
+# `heap-forensics` is OPT-IN and MUST NOT ship on. It adds a harvest sweep to
+# every `log_heap` call: take every free block the allocator will give, count the
+# bytes, hand them all back. That is the one measurement that separates "out of
+# contiguous memory" (ordinary fragmentation — `free()` is honest) from "`free()`
+# is reporting holes that have been LOST" (heap corruption — the `Bad free?`
+# class documented in src/ui/slint_shell.rs). See `harvest_free` in src/main.rs.
+#
+# Off by default because at peak the sweep really does drain the heap down to its
+# 16 KB reserve, and the esp-rtos threads allocate concurrently with it — a
+# shipped build would be trading a diagnostic for a chance of starving the WiFi
+# blob's `malloc`. Diagnostic runs only: `--features heap-forensics`.
+heap-forensics = []
+# `heap-hooks` is the ATTRIBUTION counterpart to `heap-forensics`, and is a
+# deliberately separate flag because the two cost wildly different things.
+# `heap-forensics` perturbs what it measures (it drains the pool to a 16 KB
+# reserve) and must never ship on. This one only counts: it installs esp-alloc's
+# `_esp_alloc_alloc`/`_esp_alloc_dealloc` hooks and adds 64 B of `.bss` plus a
+# few relaxed atomic adds per allocation. Folding it into `heap-forensics` would
+# saddle a cheap, safe instrument with a never-enable constraint it has not
+# earned.
+#
+# It answers the two questions source-reading could not close on #75: the WiFi/
+# BLE blob split (every blob `malloc` funnels through the hooked
+# `HEAP.alloc_caps`, so the closed stack is finally visible), and Slint's
+# dependency-node count (a node is exactly 16 B, so the `<=16` bucket delta
+# across scene construction IS the count). `internal-heap-stats` rides along for
+# `max_usage` — a measured high-water mark, which is the one number the static
+# census could only estimate.
+#
+# Diagnostic runs: `--features heap-hooks`. See src/heap_hooks.rs.
+heap-hooks = ["esp-alloc/alloc-hooks", "esp-alloc/internal-heap-stats"]
+# `story` (the Endless LitRPG reader/player) is OPT-IN and OFF BY DEFAULT — but
+# for a different reason than `tts`: ROM is no longer the constraint. Measured
+# 2026-07-29 against the widened region (#67): **2,098,526 B free**, so size is
+# a non-issue. It ships off because this is JP's working watch and the shipped
+# default build stays byte-identical until the app has been on glass once. One
+# line to flip.
+#
+# What it costs, and why that is the number to watch instead: ~5 KB of `.bss` for
+# the retained models (asserted by a host test in `story-proto`) plus ~2 KB of
+# socket and PCM staging buffers, against a MEASURED stack-gap headroom of
+# 9,408 B (gap 81,088 vs the 71,680 B floor). `.bss` growth steals stack
+# silently, so `tools/preflight.sh` asserting the gap is the real gate — not a
+# successful link.
+#
+# See ~/Projects/endlesslitrpg/docs/superpowers/specs/2026-07-29-endless-litrpg-design.md §9.4.
+story = ["dep:story-proto"]
+
+# MEASUREMENT-ONLY, NEVER SHIP (#75). Substitutes a MAX_SLOT_VAL-length value with
+# `known: true` into all 17 equipment/appearance slots, to measure the CHAR page in
+# the state the daemon WILL produce once it sends equipment data.
+#
+# Why it must exist: the live ledger sends every slot null, and `story.slint:517`
+# renders an unknown slot as `"—"` — one glyph. So the 512 scene-pool rung is
+# UNREACHABLE against today's daemon, and the projected reclaimed floor after that
+# rung arms (~7,352 B, vs a measured 18,616 B today) cannot otherwise be tested.
+# Forcing the value alone does nothing; `known: true` is required or the `"—"`
+# branch renders.
+story-stub-slots = ["story"]
+
+[dependencies]
+esp-hal = { version = "~1.1.0", features = [
+    "esp32c6",
+    "unstable",
+    "log-04",
+] }
+
+esp-rtos = { version = "0.3.0", features = [
+    "esp-radio",
+    "esp-alloc",
+    "embassy",
+    "esp32c6",
+    "log-04",
+]}
+
+esp-radio = { version = "0.18.0", features = [
+    "esp32c6",
+    "wifi",
+    "ble",
+    "coex",
+    "esp-now",
+    "esp-alloc",
+    "unstable",
+    "log-04",
+] }
+
+embassy-net = { version = "0.9.1", features = [
+    "tcp",
+    "udp",
+    "dns",
+    "dhcpv4",
+    "medium-ethernet",
+    "log",
+] }
+embedded-io = "0.7"
+# debug-console only: async `Read` for esp-hal's UsbSerialJtag<Async>. The 0.7
+# line unifies with esp-hal's own `embedded-io-async-07` (enabled by its
+# `unstable` feature), so the trait we import is the one the HAL impls.
+embedded-io-async = { version = "0.7", optional = true }
+esp-storage = { version = "0.9.0", features = ["esp32c6"] }
+embedded-storage = "0.3"
+
+esp-bootloader-esp-idf = { version = "0.5.0", features = [
+    "log-04",
+    "esp32c6",
+] }
+log = "0.4.27"
+
+esp-println = { version = "0.17.0", features = [
+    "esp32c6",
+    "log-04",
+] }
+esp-backtrace = { version = "0.19.0", features = [
+    "esp32c6",
+    "panic-handler",
+    "println",
+    # custom-halt: reboot instead of hanging forever on panic (#75). Without it
+    # esp-backtrace ends in `loop {}` inside `interrupt_free`, which is exactly
+    # the "watch is bricked until you power-cycle it" experience. See
+    # `custom_halt` in src/main.rs.
+    "custom-halt",
+] }
+esp-alloc = "0.10.0"
+embassy-executor = { version = "0.10.0", features = [
+    "log",
+] }
+embassy-time = { version = "0.5.0", features = ["log"] }
+
+static_cell = "2.1.1"
+critical-section = "1.2.0"
+
+# BLE host stack (GATT server). 0.6.x is the newest release compatible with
+# esp-radio 0.18, whose BleConnector implements bt-hci 0.8's Transport trait
+# (trouble-host 0.7 moved to bt-hci 0.9).
+trouble-host = { version = "0.6.0", features = ["log"] }
+# The #[gatt_server] macro expands to code referencing `embassy_sync`, so it
+# must be a direct dependency; pin to the 0.7 line trouble-host 0.6 uses.
+embassy-sync = "0.7"
+
+embassy-futures = "0.1"
+embedded-graphics = "0.8.2"
+embedded-graphics-core = "0.4"
+embedded-hal = "1.0"
+embedded-hal-bus = "0.3.0"
+heapless = "0.9"
+u8g2-fonts = "0.8.0"
+
+# Local workspace crates (smol-port). Pure-logic, no_std, host-unit-tested.
+# #55: write-range guard math for GuardedFlash (the FlashMutex wrapper) —
+# refuses any flash write whose erase footprint hits the booted app slot.
+flash-guard = { path = "crates/flash-guard" }
+wled-wizmote = { path = "crates/wled-wizmote" }
+rssi = { path = "crates/rssi" }
+hunt = { path = "crates/hunt" }
+# Fleet-wide deterministic ESP-NOW channel + gateway election (2026-07-29). One
+# radio means choosing the AP IS choosing the mesh channel, so mesh partitions
+# are really AP-agreement failures. Pure `elect(observations) -> Decision` plus
+# the `SMOLv1 ELECT` wire codec, host-tested for convergence / tie-breaking /
+# hysteresis / partition merge — properties that cannot be observed on glass.
+# MUST stay byte-identical with smol's copy or the fleet partitions silently.
+mesh-elect = { path = "crates/mesh-elect" }
+# #58: pure-logic HA climate parse/encode (oracle-t9 CONFIRMED-CLEAN @5c0d04c) —
+# replaces src/net/climate_model_stub.rs.
+climate-model = { path = "crates/climate-model" }
+# #28: pure-logic mic sound-level DSP (rms_dbfs) — host-unit-tested. Drives the
+# SoundLevel meter from the shared mic capture (MIC_CH).
+mic-dsp = { path = "crates/mic-dsp" }
+# #34: pinned realm-sigil corpus + index math (vendored verbatim from smol) +
+# the MAC-seeded per-device identity derivations — host-unit-tested. Serves
+# both mesh peer names (src/net/names.rs re-export) and the device sigil
+# (src/net/sigil.rs).
+sigil-id = { path = "crates/sigil-id" }
+# Read-aloud protocol core: notification->speech composition, JSON request
+# encoding (escapes attacker-influenced MQTT text), bridge HTTP response
+# framing, 16 kHz chunk math. Host-unit-tested; feeds src/net/voice_tts.rs.
+tts-proto = { path = "crates/tts-proto", optional = true }
+story-proto = { path = "crates/story-proto", optional = true }
+
+# Slint UI toolkit (no_std MCU backend, software renderer) — used by the
+# `slint-demo` binary only.
+slint = { version = "1.17.1", default-features = false, features = [
+    "compat-1-2",
+    "unsafe-single-threaded",
+    "libm",
+    "renderer-software",
+] }
+
+[build-dependencies]
+slint-build = "1.17.1"
+# The same word tables the firmware uses for DEVICE names also name each BUILD
+# (`FORGE`), computed host-side in build.rs and passed in as a `rustc-env`
+# string. Depending on it here rather than re-copying the corpus is the whole
+# point of the crate: realm-sigil's Rust binding exists because smol hand-copied
+# its corpus twice and both copies drifted. Zero-dependency and `no_std`, so it
+# builds for the host as a build-dep and for riscv as a normal dep.
+sigil-id = { path = "crates/sigil-id" }
+
+# Vendored fork of Slint's software renderer with ONE local patch: even-grid
+# dirty-region alignment for the CO5300's CASET/RASET window restrictions
+# (issue #18 — Slint 1.17 has no LVGL-rounder equivalent). See the crate's
+# README for the divergence contract; grep `esp32c6-watch LOCAL PATCH`.
+[patch.crates-io]
+i-slint-renderer-software = { path = "crates/i-slint-renderer-software" }
+
+
+# For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
+[profile.dev]
+# The default debug profile is too slow and too big for resource-constrained devices.
+# Always build with some optimizations enabled.
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1       # LLVM can perform better optimizations using a single thread
+debug = 2               # prefer slower builds but better debugging experience
+lto = 'fat'
+opt-level = 's'

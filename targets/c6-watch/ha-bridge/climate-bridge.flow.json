@@ -1,0 +1,141 @@
+[
+  {
+    "id": "climate_bridge_tab",
+    "type": "tab",
+    "label": "Watch Climate Bridge",
+    "disabled": false,
+    "info": "Bridges the esp32c6-watch <-> HA climate.* entities over MQTT.\nWatch subscribes: watch/climate/<object_id>/state (retained JSON, HA-native strings)\nWatch publishes: watch/climate/<object_id>/set  ({\"set\":72} or {\"mode\":\"heat\"})\nThe command node is capability-aware: it translates auto<->heat_cool to whatever\neach device actually supports (Nest = heat_cool-only, minisplits = auto).\nWIRE ENCODING = HA-native strings (mode/action/modes); the watch's crates/climate-model\nmaps them to its internal enum/int for the UI. See ha-bridge/README.md."
+  },
+  {
+    "id": "mqtt_broker_watch",
+    "type": "mqtt-broker",
+    "name": "watch-mqtt (HA mosquitto)",
+    "broker": "10.0.6.11",
+    "port": "1883",
+    "clientid": "nodered-watch-climate-bridge",
+    "autoConnect": true,
+    "keepalive": "60",
+    "cleansession": true,
+    "birthTopic": "",
+    "closeTopic": "",
+    "willTopic": ""
+  },
+  {
+    "id": "ha_server_ref",
+    "type": "server",
+    "name": "Home Assistant",
+    "comment": "PLACEHOLDER — on import, open each HA node and re-select your existing Home Assistant server config."
+  },
+
+  {
+    "id": "state_changed_climate",
+    "type": "server-state-changed",
+    "z": "climate_bridge_tab",
+    "name": "climate.* changed",
+    "server": "ha_server_ref",
+    "entityId": "^climate\\..*$",
+    "entityIdType": "regex",
+    "outputInitially": true,
+    "stateType": "str",
+    "ifState": "",
+    "ifStateType": "str",
+    "outputOnlyOnStateChange": false,
+    "x": 170,
+    "y": 100,
+    "wires": [["fn_build_state", "fn_build_roster"]]
+  },
+  {
+    "id": "fn_build_state",
+    "type": "function",
+    "z": "climate_bridge_tab",
+    "name": "build climate state -> topic+payload (HA strings)",
+    "func": "// From HA state-change (or outputInitially seed) to the watch's retained state topic.\n// WIRE = HA-native strings: crates/climate-model parses mode/action/modes as strings\n// (HvacMode::from_ha) and maps to its own int enum for the UI. Do NOT pre-int-encode here.\nconst s = (msg.data && msg.data.new_state) ? msg.data.new_state\n        : (msg.payload && msg.payload.entity_id) ? msg.payload : null;\nif (!s || !s.entity_id || s.entity_id.indexOf('climate.') !== 0) return null;\nconst a = s.attributes || {};\nconst oid = s.entity_id.slice('climate.'.length);\n// cache this device's RAW HA hvac_modes so the command node can translate auto<->heat_cool\nflow.set('hamodes:' + oid, a.hvac_modes || []);\nconst out = {\n  name:   a.friendly_name || oid,\n  cur:    (a.current_temperature ?? null),\n  set:    (a.temperature ?? null),\n  mode:   s.state,                          // HA hvac_mode string: off|heat|cool|auto|heat_cool|dry|fan_only\n  action: (a.hvac_action || 'idle'),        // HA hvac_action string: idle|heating|cooling|drying|fan|off\n  min:    (a.min_temp ?? 45),\n  max:    (a.max_temp ?? 95),\n  step:   (a.target_temp_step ?? 1.0),\n  modes:  (a.hvac_modes || [])              // array of HA mode strings the device supports\n};\nreturn {\n  topic: 'watch/climate/' + oid + '/state',\n  payload: JSON.stringify(out),\n  qos: 0,\n  retain: true\n};\n",
+    "outputs": 1,
+    "x": 480,
+    "y": 100,
+    "wires": [["mqtt_out_state"]]
+  },
+  {
+    "id": "mqtt_out_state",
+    "type": "mqtt out",
+    "z": "climate_bridge_tab",
+    "name": "-> watch/climate/<id>/state (retained)",
+    "topic": "",
+    "qos": "0",
+    "retain": "true",
+    "broker": "mqtt_broker_watch",
+    "x": 850,
+    "y": 100,
+    "wires": []
+  },
+
+  {
+    "id": "fn_build_roster",
+    "type": "function",
+    "z": "climate_bridge_tab",
+    "name": "build climate roster -> topic+payload (retained)",
+    "func": "// oracle-t9 A4: publish the SET of climate object_ids as ONE retained roster the\n// watch can read without waiting on every per-entity state topic. Informational\n// in v1 (the watch/climate/+/state wildcard stays authoritative for rendering).\n// Fed off the same state-change stream; outputInitially seeds it at deploy.\nconst s = (msg.data && msg.data.new_state) ? msg.data.new_state\n        : (msg.payload && msg.payload.entity_id) ? msg.payload : null;\nif (!s || !s.entity_id || s.entity_id.indexOf('climate.') !== 0) return null;\nconst set = flow.get('roster') || {};\nset[s.entity_id.slice('climate.'.length)] = true;\nflow.set('roster', set);\n// Kept bounded (<=10 ids) — the watch treats a >~200 B roster as a protocol\n// error, and state topics remain authoritative, so truncation is harmless.\nconst bounded = Object.keys(set).sort().slice(0, 10);\nreturn { topic: 'watch/climate/roster', payload: JSON.stringify(bounded), qos: 0, retain: true };\n",
+    "outputs": 1,
+    "x": 480,
+    "y": 172,
+    "wires": [["mqtt_out_roster"]]
+  },
+  {
+    "id": "mqtt_out_roster",
+    "type": "mqtt out",
+    "z": "climate_bridge_tab",
+    "name": "-> watch/climate/roster (retained)",
+    "topic": "",
+    "qos": "0",
+    "retain": "true",
+    "broker": "mqtt_broker_watch",
+    "x": 850,
+    "y": 172,
+    "wires": []
+  },
+
+  {
+    "id": "mqtt_in_cmd",
+    "type": "mqtt in",
+    "z": "climate_bridge_tab",
+    "name": "watch/climate/+/set",
+    "topic": "watch/climate/+/set",
+    "qos": "0",
+    "broker": "mqtt_broker_watch",
+    "x": 160,
+    "y": 240,
+    "wires": [["fn_parse_cmd"]]
+  },
+  {
+    "id": "fn_parse_cmd",
+    "type": "function",
+    "z": "climate_bridge_tab",
+    "name": "parse cmd -> call-service (capability-aware)",
+    "func": "// topic: watch/climate/<oid>/set ; payload {\"set\":72} or {\"mode\":\"heat\"} (watch sends HA strings)\nconst parts = (msg.topic || '').split('/');\nconst oid = parts[2];\nif (!oid) return null;\nlet p;\ntry { p = (typeof msg.payload === 'string') ? JSON.parse(msg.payload) : msg.payload; }\ncatch (e) { node.warn('bad climate cmd payload: ' + msg.payload); return null; }\nconst entity_id = 'climate.' + oid;\nconst modeNames = ['off','heat','cool','auto','fan_only','dry'];\nif (p && p.set !== undefined && p.set !== null) {\n  const t = Number(p.set);\n  if (!isFinite(t)) return null;\n  msg.payload = { domain:'climate', service:'set_temperature', target:{ entity_id }, data:{ temperature: t } };\n  return msg;\n}\nif (p && p.mode !== undefined && p.mode !== null) {\n  let hm = (typeof p.mode === 'number') ? modeNames[p.mode] : String(p.mode);\n  if (!hm) return null;\n  // The watch folds heat_cool<->auto to one UI mode; translate to whatever THIS device supports\n  // (Nest = heat_cool-only, minisplits = auto). hamodes cached by the state node.\n  const supported = flow.get('hamodes:' + oid) || [];\n  if (hm === 'auto' && supported.indexOf('auto') === -1 && supported.indexOf('heat_cool') !== -1) hm = 'heat_cool';\n  else if (hm === 'heat_cool' && supported.indexOf('heat_cool') === -1 && supported.indexOf('auto') !== -1) hm = 'auto';\n  if (supported.length && supported.indexOf(hm) === -1) { node.warn('climate ' + oid + ': mode ' + hm + ' unsupported'); return null; }\n  msg.payload = { domain:'climate', service:'set_hvac_mode', target:{ entity_id }, data:{ hvac_mode: hm } };\n  return msg;\n}\nreturn null;\n",
+    "outputs": 1,
+    "x": 430,
+    "y": 240,
+    "wires": [["call_service"]]
+  },
+  {
+    "id": "call_service",
+    "type": "api-call-service",
+    "z": "climate_bridge_tab",
+    "name": "climate.set_* (from msg.payload)",
+    "server": "ha_server_ref",
+    "domain": "",
+    "service": "",
+    "areaId": [],
+    "deviceId": [],
+    "entityId": [],
+    "data": "",
+    "dataType": "jsonata",
+    "mergeContext": "",
+    "output_location": "",
+    "output_location_type": "none",
+    "comment": "Configure this node to read domain/service/target/data from msg.payload (leave domain+service blank, set data = msg.payload). See README.",
+    "x": 760,
+    "y": 240,
+    "wires": [[]]
+  }
+]
