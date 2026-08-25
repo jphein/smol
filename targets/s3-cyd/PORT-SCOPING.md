@@ -18,12 +18,12 @@ the first Xtensa silicon.
 |---|---|---|
 | Which physical board? | **A new blank ES3C28P, `14:C1:9F:D1:C8:10`, node id 162** — *not* the Ember satellites (#331, id 160), *not* emberburrito's terminal (id 161) | JP 2026-08-24 ("new and blank", "same one we use in emberburrito"); passive bus-diff 23:03; `docs/protocol.md` id block |
 | Does smol's stack run on this silicon? | **YES — proven, executor ON.** burrito-fw ships esp-hal **1.1.2 by lockfile** (its manifest/README say 1.1.1 — caret req, docs drifted) / esp-radio 0.18.0 / esp-rtos 0.3.0 (embassy) / esp-bootloader 0.5.0 on this exact board. smol main's lock is 1.1.1, so this spike (also locked 1.1.2) is one patch ahead of smol and level with the only build known to drive this panel — the right side for bring-up | `burrito-fw/Cargo.lock` + `spike/Cargo.lock`, checked 2026-08-24 |
-| Xtensa toolchain? | **BOTH hosts** as of 2026-08-24 ~23:20: JP directed xtensa builds onto familiar, retiring the katana-only exception. familiar's espup toolchain is **pinned to 1.95.0.0** — byte-parity with katana verified (rustc 95e5bda86 / GCC esp-15.2.0_20250920 / clang esp-20.1.1_20250829). **Condition on the pin: upgrade both hosts in one motion or not at all.** | `espup install -v 1.95.0.0 -t esp32s3` on familiar; parity re-read from both `~/export-esp.sh` |
+| Xtensa toolchain? | **BOTH hosts** as of 2026-08-24 ~23:20: JP directed xtensa builds onto familiar, retiring the katana-only exception. familiar's espup toolchain is **pinned to 1.95.0.0** — byte-parity with katana verified (rustc 95e5bda86 / GCC esp-15.2.0_20250920 / clang esp-20.1.1_20250829). **Condition on the pin: upgrade both hosts in one motion or not at all.** (1.95.0.0 is a *parity choice*, not a floor — the stack's actual MSRV is 1.88.0 per the tarballs.) | `espup install -v 1.95.0.0 -t esp32s3` on familiar; parity re-read from both `~/export-esp.sh` |
 | Does `wifi + esp-now` compile for esp32s3? | **YES — proven 2026-08-24 23:2x**: full release build+link on familiar with `--features radio` (esp-radio 0.18.0 `["esp32s3","wifi","esp-now","esp-alloc","unstable"]`), `radio_dev.rs`'s ESP-NOW API usage compiled in; `libesp_radio`/`libesp_wifi_sys_esp32s3`/`libesp_rtos` rlibs confirmed in the dep graph. `coex` deliberately NOT enabled (build-script hard-error without `ble`; smol's WiFi↔ESP-NOW coexistence is same-radio channel management). **M3 is unblocked.** | `spike/build-remote.sh --features radio`, 15.5 s |
 | Chip identity in smol's build? | **Already solved.** `xtensa-esp32s3` is an unambiguous triple → chip id 3, no `SMOL_CHIP` needed (unlike the C5/C6 riscv32imac collision). `chip_name()` → `"esp32s3"`, BoardProfile arm + profile_verify case exist. | `rust/clock/build.rs` (6f900a6), `net/profile.rs` (fd7cca7) |
 | HA model label? | **BLOCKED-BY-DESIGN on smol#396** — every S3 announces as `"smol ESP32-S3 Ember"` today; the variant axis (leaning NVS product field beside the node id) is smol-d8's lane. Until then the spike hand-writes a **distinct** model string. | #396; profile.rs `(CHIP_ESP32S3, _)` arm |
 | Group-MAC trailer? | Phase-1 spike may join un-MAC'd today (`MAC_ENFORCE = false`) but **dies silently at the enforce flip** — a known expiry, accepted for the spike, mandatory for phase 2 (free via `wire.rs` + the real `GROUP_KEY`). Match SMOLv1 replies on the 14 B **prefix** — on-air frames carry +9 B. | `docs/protocol.md` §MAC_ENFORCE; #388's M3 trap |
-| ESP-NOW channel? | Mesh is ch 6 (`ESP_NOW_FIXED_CHANNEL`). A board that must *also* hold a WiFi association needs its AP co-channel — network topology, not firmware. The spike's M3 runs ESP-NOW-only (no association), so it dodges this until M4/phase 2. | protocol.md single-radio rule; `smol-ota-crown-offchannel-blocker` |
+| ESP-NOW channel? | Mesh is ch 6 (`ESP_NOW_FIXED_CHANNEL`); **the fleet AP `jplovescl` is glass-verified on ch 1** (this board's own association log, 2026-08-25) — so M3-with-association is physically impossible today (single radio, STA channel wins) and the spike carries an **espnow-only mode** (skip associate, pin ch 6), same as the C5 spike's `SPIKE_ESPNOW_ONLY`. A phase-2 board that must hold WiFi *and* mesh needs the AP co-channel — network topology, JP's call, same geometry as the crown-offchannel saga. | own M2 log; protocol.md single-radio rule; `smol-ota-crown-offchannel-blocker` |
 | Workspace shape for phase 2? | **A riscv32 crate and an xtensa crate cannot share a cargo workspace** (esp-hal takes one chip feature; cargo unifies workspace features). Proven pattern: chip-agnostic zero-dep `*-core` crates consumed by path, each its own `[workspace]` (burrito-fw's osk-core/swype). Relayed to the feat/347-depin lane 2026-08-24. | `burrito-fw/Cargo.toml` comment + tree structure |
 | Board variants as cargo features? | **NEVER** — #352's standing rule (closed, decided). The variant axis stays runtime (#396). | smol#352 |
 
@@ -62,7 +62,7 @@ id-block generalization. Remaining tree-side identity work is #396 (smol-d8's la
 | M | proves | status |
 |---|---|---|
 | **M1** | esp-hal 1.1.x (lock: 1.1.2) boots on *this unit*; PSRAM octal 8 MiB mapped; ILI9341V paints (MADCTL 0x28); backlight; button | **flashed + running 2026-08-24 23:2x** (serial heartbeat live, node 162); display orientation awaiting JP's eyeball |
-| **M2** | WiFi STA associates (2.4 GHz only — no band trap on S3), DHCP lease | not started |
+| **M2** | WiFi STA associates (2.4 GHz only — no band trap on S3), DHCP lease | **half-proven on glass 2026-08-25 ~00:50**: associates to `jplovescl` (bssid `9e:5c:8e:cb:db:90`, **ch 1**, WPA2) — then OOM-panics pre-DHCP: esp-radio's RX `PacketBuffer` VecDeque ate the 64 KiB heap on the broadcast-heavy VLAN. Fix in flight (stack-poll cadence + RX cap + heap headroom). |
 | **M3** | ESP-NOW round-trip: `SMOLv1 HELLO 162` broadcast heard by a live C3 fleet witness (roster flip = the proof), ACK matched on 14 B prefix | **unblocked** — radio compiles (verdict above); needs bench time |
 
 M3 hard rule (from the C6 watch session, a full day lost to it): **esp-radio 0.18's
@@ -149,12 +149,17 @@ Ordered by dependency:
   AFFECT, not what they derive from; **never cite a library default from memory** — open
   the file or call it folklore; verify a fix against the anchored measurement BEFORE
   flashing; and state a number's scope conditions as explicitly as its provenance.
-- **PSRAM+DMA is per-chip, not per-family:** the S3 *has* `dma_can_access_psram`
-  (`DmaExtMemBKSize`) — the C5's "DMA staging must be internal" rule is C5-specific and
-  must not be inherited. burrito-fw's internal-SRAM staging was a measured *choice*
+- **PSRAM+DMA is per-chip, not per-family** (CORRECTED 2026-08-25 per cyd-c5-e2's
+  esp-metadata 0.4.0 verification): **both** the S3 and C5 have `dma_can_access_psram` —
+  never build "unlike the C5" reasoning on DMA reachability. The real S3-vs-C5 PSRAM
+  differences: the S3 adds octal-SPI support and a configurable ext-mem block size
+  (`DmaExtMemBKSize`); the C5 is quad-only, fixed block. What stands: DMA-to-PSRAM on
+  the S3 is possible, and burrito-fw's internal-SRAM staging was a measured *choice*
   (32-byte alignment cost), not a hardware impossibility. Paint arithmetic still rules:
   a 320×240 RGB565 full frame is ~27–30 ms on the wire at 40 MHz — dirty-rect
-  discipline is mandatory regardless.
+  discipline is mandatory regardless. Full per-chip flag table:
+  `~/.claude/projects/-home-jp/scratch/cyd-c5-smol-port/c5-vs-s3-divergence.md`
+  (three items there flagged unverified — check before trusting).
 - **Clippy must run BOTH invocations** — `cargo clippy --release` is structurally blind to
   `radio_dev.rs` (it's `cfg(feature = "radio")`), so a cheerful default pass has never
   looked at the radio module; `--features radio` found and fixed two real defects on its

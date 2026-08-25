@@ -15,8 +15,8 @@ Every fact below is **triple-sourced** unless marked otherwise: vendor
 | Board | LCDWIKI/QDtech **ES3C28P**, "Hosyond 2.8in ESP32-S3 Touchscreen", black PCB |
 | Module | **ESP32-S3 N16R8** — Xtensa LX7 dual-core, 2.4 GHz WiFi + BLE 5.0, **no 802.15.4** |
 | Flash | 16 MB |
-| PSRAM | **8 MB octal (OPI)** — measured on this board class: `8388608 bytes mapped at 0x3c020000` |
-| Chip revision | **unknown** — recorded nowhere; needs a deliberate `espflash board-info` (which RESETS the target) |
+| PSRAM | **8 MB octal (OPI)** — measured on this unit: `8388608 bytes`. ⚠️ The **mapping base is image-dependent, not a board constant**: burrito-fw saw `0x3c020000`, this spike sees `0x3c060000` (flash-mapped segments shift it). Assert the SIZE, never the address |
+| Chip revision | **v0.2** (efuse block rev **v1.4**, crystal **40 MHz**) — captured from this unit's first flash log 2026-08-25, closing a gap no repo had recorded |
 | USB | native USB-Serial/JTAG, `303a:1001`, CDC-ACM; `ID_SERIAL_SHORT` = base MAC |
 | This unit | **`14:C1:9F:D1:C8:10`**, smol node id **162** (`docs/protocol.md` id block) |
 | Target triple | `xtensa-esp32s3-none-elf` (Tier 3 — needs the espup toolchain + `build-std`) |
