@@ -18,6 +18,22 @@ fixes it, which is the reason to file at all.
 
 ---
 
+## Escalation addendum (2026-08-25 ~10:2x)
+
+- **Reproduces on the NEWEST fork release**: installed `1.98.0.0` as a separately-named
+  toolchain (`esp-test`, katana only — the fleet's `esp` pin untouched) and re-ran the
+  fleet-tier repro: **identical `Incomplete scavenging after 2nd pass` at opt=s + fat LTO.**
+  The bump path is dead for this member; the workaround row stands, and "affects latest"
+  belongs in the report when filed.
+- **The family has a THIRD member** (found by the esp32c6-watch lane's S3 seam, their
+  branch `feat/cyd-c5-target` @ a97a9d0): `LLVM ERROR: Cannot select:
+  XtensaISD::PCREL_WRAPPER TargetConstantPool [2 x float]` — triggered by a Slint scene
+  set's float constant pool, at opt 1, 2 AND 3 under fat LTO (thin hits the scavenger;
+  lto=off hits a spill crash). Unlike member 1 it has NO known opt-level escape. Their
+  repro: `tools/build-s3.sh` on that branch, no hardware needed. Whether 1.98 fixes THIS
+  member is untested as of this addendum — the `esp-test` toolchain exists on katana for
+  exactly that test.
+
 ## The report body (draft)
 
 **Title.** `LLVM ERROR: Incomplete scavenging after 2nd pass on xtensa-esp32s3-none-elf at
