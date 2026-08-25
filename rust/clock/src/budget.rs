@@ -519,9 +519,14 @@ pub const CHIP: ChipBudget = ESP32C6_WATCH;
 /// bard + canonical: narration + mesh relay + MQTT + the 4× display), which ran clean —
 /// the smallest region PROVEN sufficient, not the smallest that works.
 ///
-/// `free_dram_bytes` = the fleet image's `.stack` section (readelf, ELF sha256
-/// `5fd23661885a10b1…`, opt-level 2 per the [chip.esp32s3] toolchain-bug workaround —
-/// opt-level moves sections, so the profile is part of this row's provenance).
+/// `free_dram_bytes` = the fleet image's `.stack` section (readelf), **re-measured
+/// post-#391**: the Embassy executor costs ~20.3 KB of `.bss`, which the linker takes
+/// straight out of `.stack` — the original pre-executor measurement (116,940, sha
+/// `5fd23661…`) was correct for its base and stale one merge later, caught by depin3's
+/// reconciliation and re-derived independently (their 96,668 vs this 96,676 = per-tree
+/// provisioning variance). Provenance: main `4cf6841`, ELF sha256 `d5edc686…`,
+/// opt-level 2 per the [chip.esp32s3] toolchain-bug workaround — opt-level AND the
+/// executor era are both part of this number's conditions.
 /// `app_slot_bytes`/`baseline_image_bytes`: `targets/s3-cyd/partitions-ota-s3.csv`,
 /// espflash save-image against that CSV = 1,028,656 B (16.35% of the slot).
 /// The S3's floor, promoted from an inline literal to a named const (#413 phase 2).
@@ -551,7 +556,7 @@ pub const ESP32S3_STACK_FLOOR_PROVENANCE: FloorProvenance = FloorProvenance::Obs
 
 pub const ESP32S3_CYD: ChipBudget = ChipBudget {
     chip: "esp32s3",
-    free_dram_bytes: 116_940,
+    free_dram_bytes: 96_676,
     stack_floor_bytes: ESP32S3_STACK_FLOOR_BYTES,
     app_slot_bytes: 0x0060_0000,
     baseline_image_bytes: 1_028_656,
