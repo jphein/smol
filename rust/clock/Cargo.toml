@@ -580,6 +580,14 @@ overflow-checks = false
 # (0x1F0000). opt="z" collapses it 32× (~93 KB) → production image ~37% of slot. Per-PACKAGE
 # only: the global stays opt="s" (the radio blobs' required timing). Verify runs once per OTA
 # (~ms) on PUBLIC data, so size-over-speed here is free (constant-time not a concern).
+#
+# ⚠️ THE CONDITION MOVED (2026-08-25, #398): the hazard above is stated for opt="s"+fat-LTO,
+# and the S3 builds at opt-level 2 (a per-chip TOOLCHAIN-BUG workaround — see
+# tools/build-matrix.toml [chip.esp32s3]), which is OUTSIDE those stated conditions. Measured
+# at opt=2/fat on the S3: `double_scalarmult_vartime` = 43,475 B — this per-package opt="z" is
+# independent of the global and still in force, so the PROTECTION holds; but that measurement
+# is evidence the gate works, NOT a re-derivation of the premise. If opt-level ever changes
+# again (any chip), re-measure the symbol — do not inherit this paragraph.
 [profile.release.package.ed25519-compact]
 opt-level = "z"
 
