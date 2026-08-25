@@ -1,0 +1,37 @@
+# smol dual-OTA A/B partition table for the ES3C28P (ESP32-S3 N16R8, 16 MB) — #398, node id 162.
+#
+# ⚠️ DESIGNED, NOT YET FLASHED (2026-08-25). Every offset below is validated against espflash
+# 4.5.0 and against the chip's real boot behaviour (see targets/s3-cyd/PARTITIONS.md for the
+# evidence and the rationale for every row). No board has been flashed with it.
+#
+# Bootloader offset on this chip is 0x0 — the SAME as the C3, NOT the P4's 0x2000. Verified
+# three independent ways; PARTITIONS.md §1. That is why the low offsets below are byte-identical
+# to rust/clock/partitions-ota.csv and why `espflash erase-region 0xf000 0x2000` — the
+# otadata-only erase every smol flashing procedure depends on — transfers to this board VERBATIM.
+#
+# DO NOT "tidy" the offsets. Budget proof, every byte of 16 MiB accounted:
+#   bootloader 32K (0x0) + parttable 4K (0x8000)
+#   + nvs 24K + otadata 8K + phy 4K + align-gap 56K          =   128K
+#   + ota_0 6,144K + ota_1 6,144K + reserved 3,968K          = 16,256K
+#                                                              -------
+#                                                              16,384K = 16,777,216 B = 16.000 MiB
+#
+# INVARIANTS THAT ARE NOT STYLE:
+#   * otadata MUST be exactly 0x2000, or esp_bootloader_esp_idf::ota::Ota::new → InvalidPartition.
+#   * nvs sits BELOW otadata (0x9000..0xf000) so the otadata-only erase spares it and a
+#     provisioned node id survives a USB reflash. Identity lives in NVS; OTA never touches it.
+#   * app partitions must start on a 0x10000 boundary. Both do; the 56K gap at 0x12000 exists
+#     only to reach 0x20000 and is the same gap the C3 table carries.
+#
+# Slot size 0x600000 (6 MiB) is a DELIBERATE choice over 4 MiB, argued in PARTITIONS.md §2 —
+# the short version: the only other display-carrying smol-family target with a MEASURED image
+# is the C6 watch at 4,668,784 B, which a 4 MiB slot cannot hold. Do not shrink this without
+# reading that section; a partition change is a destructive one-way migration for every board.
+#
+# Name,     Type, SubType,   Offset,   Size,      Flags
+nvs,        data, nvs,       0x9000,   0x6000,
+otadata,    data, ota,       0xf000,   0x2000,
+phy_init,   data, phy,       0x11000,  0x1000,
+ota_0,      app,  ota_0,     0x20000,  0x600000,
+ota_1,      app,  ota_1,     0x620000, 0x600000,
+reserved,   data, undefined, 0xC20000, 0x3E0000,

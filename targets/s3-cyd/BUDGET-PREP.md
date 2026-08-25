@@ -513,3 +513,35 @@ document's author was rate-limited at the time:
   and the compiler said so. Do not inherit capability inferences; the compiler votes.
 - Both §3.5 publish-blockers (REPRO_TARGET scalar, single-chip stack-floor grep) were
   verified true and ride in PR #405's blocker list.
+
+---
+
+## §5 — ADDENDUM 2026-08-25 (nebula-smol): §1.6's gap is CLOSED
+
+§1.6 left `app_slot_bytes` unvalued because no S3 partition table existed and the bootloader
+offset was unconfirmed. Both are now settled in
+**[`PARTITIONS.md`](PARTITIONS.md)** + **[`partitions-ota-s3.csv`](partitions-ota-s3.csv)**.
+
+- **Bootloader offset = `0x0`, the same as the C3** — verified three independent ways
+  (espflash's chip table, espflash 4.5's merged-image bytes, and this board's own boot log,
+  whose `entry 0x403c8924` matches the merged header byte-for-byte). §1.6 said *"C3 is `0x0`;
+  C5/C6 are `0x2000`… the S3's must be confirmed"* — the confirmation is `0x0`, **and the C6
+  half of that sentence turns out to be wrong**: espflash puts the C6 at `0x0` too; the P4 is
+  the only `0x2000` in its table. (Inherited from #388 in good faith; PARTITIONS.md §1.4.)
+- **`app_slot_bytes = 6_291_456`** (`0x600000`). Verified: espflash parses the CSV and resolves
+  `ota_0` to exactly that, versus `4,128,768` (its 4 MB default) with no table.
+- **The whole low-offset block carries over unchanged**, so
+  **`espflash erase-region 0xf000 0x2000` is correct on this board verbatim** — no S3 variant of
+  the `smol-espflash-erase-before-reflash` lesson is needed.
+
+⚠️ **This does NOT become a `budget.rs` const.** §4's poison-row ruling governs: a partial row
+with one real field and three placeholders would answer `fits_flash` with fiction where
+`UNMEASURED` currently answers an honest *no*. `app_slot_bytes` is settled **in the document**
+because it is the only one of the four fields that is a *declaration* rather than a
+*measurement* — the other three are properties of a phase-2 link and run that do not exist yet.
+All four land together, or none do.
+
+Also closed while there: `docs/BUILDING.md:85`'s stated unknown — *"whether v4 flashes a current
+esp-hal 1.1 image"* — is **answered yes for the S3 radio tier** by tonight's M2 flash log
+(espflash 4.5.0 writing an esp-hal 1.1.2 image, board booted). The C3 case and the no-radio case
+are still open, and the `wifi`-gated `esp_app_desc!()` predicts the latter will be *refused*.
