@@ -130,6 +130,7 @@ esp-alloc = { version = "0.10", optional = true }
 esp-rtos = { version = "0.3", optional = true, features = [
     "esp-radio",
     "esp-alloc",
+    "embassy",
     "log-04",
 ] }
 # esp-wifi RENAMED → esp-radio in 0.18. `unstable` unlocks the raw rx/tx tokens
