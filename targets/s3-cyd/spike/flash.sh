@@ -41,6 +41,13 @@ set -euo pipefail
 # saying "OK — flashing" trains people to bypass it.
 PATH="$HOME/.cargo/bin:$PATH"
 
+# espflash stages merged images via mktemp, which honors TMPDIR. katana's /tmp is a
+# 16 GB tmpfs (RAM+swap — JP directive 2026-08-25: never put sizable files there); point
+# staging at the repo's gitignored tmp/ instead. Created on first need.
+TMPDIR="${TMPDIR:-$(cd "$(dirname "$0")/../../.." && pwd)/tmp}"
+mkdir -p "$TMPDIR"
+export TMPDIR
+
 # ===========================================================================
 # THE ALLOW LIST — exactly one entry, and it is EMPTY ON PURPOSE
 # ===========================================================================
