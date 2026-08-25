@@ -35,6 +35,12 @@
 
 set -euo pipefail
 
+# espflash lives in ~/.cargo/bin, which a non-login shell does not have on PATH
+# (the same two-disguise trap the build docs name). The guard must work when
+# invoked directly, not only through `cargo run` — a guard that errors AFTER
+# saying "OK — flashing" trains people to bypass it.
+PATH="$HOME/.cargo/bin:$PATH"
+
 # ===========================================================================
 # THE ALLOW LIST — exactly one entry, and it is EMPTY ON PURPOSE
 # ===========================================================================

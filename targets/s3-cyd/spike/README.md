@@ -11,7 +11,7 @@ looked at, and thrown away.
 
 | Milestone | Proves | Status |
 |---|---|---|
-| **M1** | boots · console · octal PSRAM maps · panel paints in the right orientation · button reads | **drafted, UNFLASHED** |
+| **M1** | boots · console · octal PSRAM maps · panel paints in the right orientation · button reads | **FLASHED 2026-08-24 23:2x, RUNNING** — first guarded flash succeeded; serial heartbeat verified live (`[s3-cyd] heartbeat N — node 162 alive`, counter consistent with uptime). Panel orientation awaiting a human eyeball on the glass |
 | M2 | WiFi STA joins (credentials via `option_env!`, never committed) | not started |
 | M3 | ESP-NOW hello/ack on the air (`--features radio`) | code drafted, **unflashed**. Compile verdict: **✅ `wifi` + `esp-now` DO build together on esp32s3** (see below) |
 | M4 | PSRAM framebuffer + a real smol screen | not started |

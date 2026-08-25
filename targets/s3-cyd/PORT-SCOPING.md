@@ -61,7 +61,7 @@ id-block generalization. Remaining tree-side identity work is #396 (smol-d8's la
 ### Phase 1 — bring-up spike, four falsifiable milestones (this directory's lane)
 | M | proves | status |
 |---|---|---|
-| **M1** | esp-hal 1.1.1 boots on *this unit*; PSRAM octal 8 MiB mapped; ILI9341V paints (MADCTL 0x28); backlight; button | spike drafted, unflashed |
+| **M1** | esp-hal 1.1.1 boots on *this unit*; PSRAM octal 8 MiB mapped; ILI9341V paints (MADCTL 0x28); backlight; button | **flashed + running 2026-08-24 23:2x** (serial heartbeat live, node 162); display orientation awaiting JP's eyeball |
 | **M2** | WiFi STA associates (2.4 GHz only — no band trap on S3), DHCP lease | not started |
 | **M3** | ESP-NOW round-trip: `SMOLv1 HELLO 162` broadcast heard by a live C3 fleet witness (roster flip = the proof), ACK matched on 14 B prefix | **unblocked** — radio compiles (verdict above); needs bench time |
 
