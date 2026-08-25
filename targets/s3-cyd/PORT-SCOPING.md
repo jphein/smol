@@ -240,7 +240,8 @@ Ordered by dependency:
   (`CARGO_PROFILE_RELEASE_OPT_LEVEL=2`, S3 only) — never the shared global profile,
   which every C3 measurement on record depends on. The #32 gate is measured intact at
   opt=2. **Landing state: linkall.x MERGED to main (#408 → `ba314ea`); the opt_level
-  seam is PR #409** (off current main; a transient mis-homing onto #408's already-merged
+  seam MERGED (#409, 2026-08-25 ~06:2x) — main now links the S3 fleet image end-to-end;
+  the only gate left on `builds = true` is the measured ChipBudget row (bench)** (off current main; a transient mis-homing onto #408's already-merged
   branch was unwound with the record corrected on the PR — lesson: check a PR's merge
   state before pushing to its branch). ⚠️ Standing caveat until silicon says otherwise: opt=2 linking where opt=s
   crashed is escape, not proven codegen — **the first S3 flash of the full image is
