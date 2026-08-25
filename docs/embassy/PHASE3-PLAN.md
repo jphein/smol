@@ -410,7 +410,7 @@ compile-time gate; all 21 can pass on an image that does nothing it exists to do
 
 | step | evidence | host-provable? |
 |---|---|---|
-| **G** | `check_station_consumers.py` exits 0 on main; **its regression suite proves each of the 4 arms can fail**; declared count = 2 | ✅ **fully host-provable** — pure text, no cargo, no board |
+| **G** | ✅ **LANDED.** `check_station_consumers.py` exits 0 on main (`2 station consumer(s) across 2 declared fn(s); 0 embassy_net::new site(s); 2 cfg guard(s) pinned`); the suite is **21 arms, 0 failed** — 9 hazard (one per enumerated bypass), 8 fail-closed (rc=2), 2 regression, 1 baseline. Declared count = **2** | ✅ **fully host-provable** — pure text, no cargo, no board |
 | **B** (sync form) | all **5** sites bounded incl. the `5250` discard; a fabricated lost-completion does not hang; `otam_to` counted separately | ⚠️ **mixed** — the bounding is host-reviewable, but "does not hang under a real lost completion" is **HW-gated** |
 | **T** | `brst` on the same board, same duty, **before vs after**; per `BurstKind` — the `f` and `r` rows are the ones that matter. Plus: `wifi` tier compiles *and* clippies (the 7th path), `.stack` ≥ `ESP32C3_STACK_FLOOR_BYTES` = 74,208, image ≤ 0x1F0000 | ⚠️ **compile gates host-provable; the `brst` number is HW-gated** |
 | **C** | `brst` again (the assoc-path spins are STEP C's territory); `reassoc_ch6_prefer` still applies **both** `with_bssid` and `with_channel` and still records `my_ap_channel` (#217r3/#269/#278); a scan timeout yields `NoAp` and does not wedge | ⚠️ **the #217r3 invariant is host-provable by inspection + the send-path checker; the ladder behaviour is HW-gated** |
@@ -419,9 +419,31 @@ compile-time gate; all 21 can pass on an image that does nothing it exists to do
 
 Rev-1 claimed "7,960 B of margin to an 80,000 B abort line". **There is no 80,000 B line** — it was a
 tripwire in a dispatch brief that got propagated into a design document as a repo constant. The only
-gate is `ESP32C3_STACK_FLOOR_BYTES = 74,208`. Real margin from P1.3's 87,960: **13,752 B**, and the
-floor is itself conservative because `ESP32C3_MEASURED_PEAK_BYTES = 55,656` was measured with the
-`RadioManager` frame on the stack, ~18.9 KB of which P1.3 moved into `.bss`.
+gate is `ESP32C3_STACK_FLOOR_BYTES = 74,208`.
+
+**⚠️ UPDATED 2026-08-25, and the direction is DOWN. The 87,960 / 13,752 B figures above were
+measured before #391 landed** — i.e. on Phase 1 rebased onto the *pre*-de-pin main. As merged
+(`ec3ee63`), the fleet tier measures:
+
+| | `.stack` |
+|---|---|
+| `origin/main` before #391, fleet tier, same seed | 106,472 B |
+| **as merged, fleet tier** | **86,208 B** |
+| `ESP32C3_STACK_FLOOR_BYTES` | 74,208 B |
+
+So the real margin is **12,000 B, not 13,752 B**, and the executor's cost is **20,264 B** of DRAM
+(`.bss` growth silently shrinking `.stack` — `[[smol-stack-is-not-headroom]]`). Independently
+confirmed: CI's own `gate.sh fw` line on #391's head reads `stack: 86208 B (floor 74208 B)`. Note
+the 8-byte tree-dependence this file warns about elsewhere — a `board.rs` provisioned by
+`tools/ci_provision.sh` reads 86,200 B against 86,208 B for a developer seed, so **never assert
+byte-equality on this number**; the inequality is the gate.
+
+The floor remains conservative for the reason stated: `ESP32C3_MEASURED_PEAK_BYTES = 55,656` was
+measured with the `RadioManager` frame on the stack, ~18.9 KB of which P1.3 moved into `.bss` — so
+the true post-P1.3 peak is *lower* than 55,656 and the 1.55× available/peak ratio implied by the
+numbers above is pessimistic. **That mitigation is an argument, not a measurement, and it is not a
+licence to spend the 12 KB.** Re-measure the peak with sentinel paint before treating the ratio as
+recovered.
 
 `StackResources<N>` + embassy-net buffers are a real cost to **schedule deliberately**. They are not
 a scarcity argument and this plan does not make one. (An invented threshold quoted beside three

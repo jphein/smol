@@ -280,6 +280,20 @@ if [ "$run_fw" = 1 ]; then
   # instead: one sink impl, routed to `send_to`; a sealed frame with no byte accessor; one encoder
   # call site; one spelling of the prefix; and every raw `esp_now.send` declared WITH ITS COUNT.
   # `tools/test_check_elect_send_path.sh` proves all of those can fail, plus three fail-closed arms.
+  # #335 STEP G. Same idiom, one invariant over: exactly ONE consumer of the STA transport is live
+  # per tier. `esp_radio::wifi::Interface` is `Copy`, so `embassy_net::new(station, ..)` does not
+  # consume it — a `Stack` can be live beside the `SmolWifiDevice` shim over the same interface, it
+  # COMPILES CLEAN, and then both pop `data_queue_rx()` (keyed by `InterfaceType` alone) and steal
+  # each other's frames with no error and nothing in a log. Placed here, beside the ELECT checker
+  # and before any compile, because it is pure text and because STEP T needs a green baseline to
+  # diff against. `tools/test_check_station_consumers.sh` proves all four arms can fail.
+  step "one live STA transport consumer per tier (#335 STEP G)"
+  if out=$("$ROOT/tools/check_station_consumers.py" "$ROOT" 2>&1); then
+    printf '%s\n' "$out"; ok "station consumers"
+  else
+    printf '%s\n' "$out"; bad "station consumers"
+  fi
+
   step "ELECT reaches the air only authenticated (#278)"
   if out=$("$ROOT/tools/check_elect_send_path.py" "$ROOT" 2>&1); then
     printf '%s\n' "$out"; ok "elect send path"
@@ -566,6 +580,20 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | tail -2; ok "test_check_elect_send_path"
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_check_elect_send_path"
+  fi
+
+  # #335 STEP G, same reasoning one invariant over: every arm of the station-consumer checker is an
+  # ABSENCE check ("no undeclared device", "no embassy_net::new yet", "no second constructor"), and
+  # an absence check that has quietly stopped covering anything prints exactly the green an intact
+  # one does. Two of the arms here are REGRESSION arms rather than hazard arms: the checker's first
+  # run counted its own doc comment's prose as a real call site, so both directions are pinned —
+  # prose naming the constructors must not turn a clean tree red, and commenting out a real site
+  # must not turn a dirty one green.
+  step "station-consumer checker regression suite (#335 STEP G)"
+  if out=$("$ROOT/tools/test_check_station_consumers.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -2; ok "test_check_station_consumers"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_check_station_consumers"
   fi
 
   # The merge guard's own self-test. One line, and it is the difference between "the guard HAS a
