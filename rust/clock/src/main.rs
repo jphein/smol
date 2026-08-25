@@ -123,6 +123,14 @@ mod s3_oled;
 // every tier; the 277 KB model is `.rodata` (XIP flash) and its scratch is `.bss`.
 #[cfg(feature = "bard")]
 mod bard;
+// #434 the stack instrument, declared at crate ROOT so it does not require `mod bard`. The file
+// still lives under `bard/` (see that module's note) — `#[path]` rather than a move keeps
+// `lib.rs`'s hostsim export and #367's verifier-wiring gate pointing at the same target. `paint`
+// is dependency-free, so `stack-paint-lite` = the FLEET composition + this, which is the only
+// composition whose high-water anyone actually wants.
+#[cfg(feature = "paint")]
+#[path = "bard/stack_paint.rs"]
+mod stack_paint;
 // #348 per-chip memory budgets as data, with the heavy features predicated on them. Pure
 // consts + const-eval assertions: it emits NO code and is unconditional so the predicates are
 // evaluated by every build, including `default`. ⚠️ Moves to `smol-core` (#347 Phase 2).
@@ -315,6 +323,12 @@ pub(crate) const TZ_OFFSET_SECONDS: i64 = -7 * 3600;
 /// responsive button polling, and a snappy Snake; the clock and OLED still only
 /// advance/redraw on their own schedules so the I²C bus isn't hammered.
 pub(crate) const SUBTICK_MS: u32 = 20;
+
+/// #434: how often the `paint` instrument reports its high-water. 10 s matches the coexist-soak
+/// report cadence, which is the other "read this off the bench serial" line in this loop — one
+/// cadence to learn rather than two. Only compiled with the instrument.
+#[cfg(feature = "paint")]
+pub(crate) const PAINT_REPORT_MS: u64 = 10_000;
 
 /// #70/#49 observability: LEAF DIAG-record broadcast cadence (ms). Deliberately slow — the diag
 /// signals are slow-moving, so a 60 s beat keeps mesh airtime negligible.
@@ -635,8 +649,8 @@ async fn run() -> ! {
     // the high-water report after a story covers the whole run. First statement in `main` on
     // purpose — even HAL init would otherwise go unmeasured. See src/bard/stack_paint.rs for why
     // writing below the live frame is sound.
-    #[cfg(feature = "stack-paint")]
-    bard::stack_paint::paint();
+    #[cfg(feature = "paint")]
+    stack_paint::paint();
 
     // --- Clocks & peripherals ------------------------------------------------
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
@@ -649,11 +663,11 @@ async fn run() -> ! {
     // block note in src/bard/stack_paint.rs for the three measurements, including the
     // disproven CPU-slice hypothesis). Kept as the cheapest validity check for any
     // future chip: a big number on THIS line means don't trust any later one.
-    #[cfg(feature = "stack-paint")]
+    #[cfg(feature = "paint")]
     log::info!(
         "smol #398 probe: high-water at boot (expect ~0) = {} of {} B",
-        bard::stack_paint::high_water(),
-        bard::stack_paint::region_bytes(),
+        stack_paint::high_water(),
+        stack_paint::region_bytes(),
     );
 
     // Identity + provenance, both DERIVED (never on the wire): the node's FLEET
@@ -1598,6 +1612,39 @@ async fn run() -> ! {
             {
                 let (dh, dv, dn) = r.ota_leaf_dbg();
                 r.broadcast_ldbg(dh, dv, dn);
+            }
+
+            // #434: THE LINE THE BENCH READS. A periodic high-water report, so a stack peak can
+            // be taken from a live duty cycle instead of from a story the Bard narrates — which is
+            // what tied the measurement to a composition that no longer boots.
+            //
+            // Tier-independent on purpose (no `espnow` guard): the instrument's whole point after
+            // #434 is that it can be pointed at ANY composition, and `stack-paint-lite` aims it at
+            // the fleet one.
+            //
+            // Two properties worth knowing before trusting a number off this line:
+            //   * it is CONSERVATIVE — `log::info!`'s own frame is live while `high_water()` runs,
+            //     so the report includes the cost of reporting. Over-reporting is the safe
+            //     direction for a floor derivation.
+            //   * `high_water()` stops at the first touched word (`position()`), so it costs
+            //     O(untouched), not O(region); at this cadence it is free.
+            //
+            // ⚠️ Release images are serial-SILENT — `ESP_LOG` is baked at build time. Build the
+            // bench image with `ESP_LOG=info` or this line exists and says nothing.
+            #[cfg(feature = "paint")]
+            if (now / PAINT_REPORT_MS) != ((now.saturating_sub(SUBTICK_MS as u64)) / PAINT_REPORT_MS)
+            {
+                let region = stack_paint::region_bytes();
+                let used = stack_paint::high_water();
+                log::info!(
+                    "smol #434 paint: high-water {} of {} B ({} B free, {}% used)",
+                    used,
+                    region,
+                    region.saturating_sub(used),
+                    // `checked_div` rather than a `region > 0` guard: clippy's manual_checked_ops
+                    // is right that the guard-then-divide form is the one that rots.
+                    used.saturating_mul(100).checked_div(region).unwrap_or(0),
+                );
             }
 
             // COEXIST SOAK (#23 PART 1): beacon 1/s (independent of the 2 s HELLO) so

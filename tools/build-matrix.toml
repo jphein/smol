@@ -267,7 +267,23 @@ features = "mesh-test,${canonical}"
 # the measurement the whole stack floor is derived from. It carries `off-fleet` via its own
 # Cargo.toml declaration (#350), because a build that exists to measure is by definition not the
 # fleet image.
+#
+# ⚠️ #434: THIS COMPOSITION NO LONGER BOOTS ON THE C3. `stack-paint` implies `bard`, and post-#391
+# bard's statics plus the executor's .bss shrink its linked `.stack` to 45,992 B against a
+# >= 51,008 B need — esp-hal's init guard panics before `main` (measured: an 88-reset loop on
+# id50). It still COMPILES, which is all this tier asserts, and it stays declared because it is the
+# right instrument for chips with room. For a C3 measurement use `stack-paint-lite`.
 features = "stack-paint,${canonical}"
+
+[tier.stack-paint-lite]
+# #434: the instrument on the FLEET composition — canonical features plus `paint`, nothing else.
+# This is the tier whose high-water anyone actually wants: it is the shipped feature set, so its
+# peak is the number the C3 stack floor should be derived from, and unlike `stack-paint` it BOOTS.
+#
+# It deliberately does NOT carry `off-fleet`. The waiver exists so heavy builds can skip #348's
+# budget predicate; a measurement taken under a waived budget is a measurement of a different
+# machine. Keeping the budget on is what makes this tier's number transferable to the fleet image.
+features = "stack-paint-lite,${canonical}"
 
 # ── features with NO tier, declared so the omission is a decision ─────────────
 # The coverage arm requires every feature in Cargo.toml to be either covered by a tier above or
@@ -277,6 +293,12 @@ features = "stack-paint,${canonical}"
 default  = "the `default` tier IS this feature set"
 hw       = "implied by every firmware tier; a tier for it alone would build nothing new"
 hostsim  = "host-only, and covered by the `cargo test` arm in tools/gate.sh"
+# #434: `paint` is the INSTRUMENT, and a composition is what you measure. Both compositions that
+# carry it ARE tiers — `stack-paint` (with bard, for chips with room) and `stack-paint-lite` (the
+# fleet feature set) — so the code path is compiled and clippy'd by two tiers, which is what this
+# check exists to guarantee. A `[tier.paint]` would build the instrument attached to nothing, which
+# is precisely the composition that has no measurement to give.
+paint    = "the instrument, not a composition — built by BOTH `stack-paint` and `stack-paint-lite`"
 
 # ── #347 Part 2: the chip axis is not a tier ──────────────────────────────────
 # A CHIP is the other axis of this very matrix — `[chip.*]` above — so a `[tier.esp32c5]` would
@@ -410,7 +432,7 @@ provisioned per tree, so its contents are not a property of the commit at all.""
 "src/bard/mod.rs" = "bard"
 "src/bard/nano_llm.rs" = "bard"
 "src/bard/persona.rs" = "bard"
-"src/bard/stack_paint.rs" = "bard+stack-paint"
+"src/bard/stack_paint.rs" = "paint"
 "src/bard/textflow.rs" = "bard"
 "src/bard/tokenizer.rs" = "bard"
 "src/batt.rs" = "wifi"

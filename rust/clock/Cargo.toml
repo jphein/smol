@@ -632,7 +632,35 @@ off-fleet = []
 # bench instrument that MEASURES the high-water the stack floor is derived from and made it
 # unbuildable. Nothing noticed, because no tier compiled it. Declaring the waiver here means the
 # next person to reach for the instrument finds it working.
-stack-paint = ["bard", "off-fleet"]
+stack-paint = ["paint", "bard", "off-fleet"]
+
+# ── #434: the INSTRUMENT, split from the COMPOSITIONS it is measured in ───────────────────────
+#
+# `paint` compiles the sentinel instrument and nothing else: `paint()`, `high_water()`, the boot
+# validity probe and the periodic report. It has no dependencies — the device half reads only the
+# `_stack_start`/`_stack_end` linker symbols — and it pulls in no other feature.
+#
+# WHY THIS SPLIT EXISTS, dated because the cost was paid on hardware. Until #434, `stack-paint`
+# implied `bard`, so the ONLY way to measure a stack high-water was to measure a composition
+# containing the 260K-parameter transformer. Post-#391 that composition **no longer boots on the
+# C3**: bard's statics plus the executor's 20,264 B of `.bss` shrink its linked `.stack` to
+# 45,992 B while the composition needs >= 51,008 B just to clear esp-hal's own init guard. The
+# bench attempt produced an 88-reset panic loop on id50 (`sp=0x3fcc1cc0, bottom=0x3fcc3058` — the
+# stack pointer 5,016 B BELOW the region floor before main), and took the USB port down with it.
+#
+# The deeper problem that made this worth a feature rather than a workaround: the instrument was
+# welded to a composition nobody wants to measure. `ESP32C3_MEASURED_PEAK_BYTES` — the number the
+# whole C3 stack floor is derived from — was taken on that same bard-inclusive build, so it is now
+# UNREPRODUCIBLE (see the provenance note in `src/budget.rs`). An instrument that can only be
+# pointed at one composition eventually cannot be pointed at anything.
+#
+# `stack-paint-lite` is therefore the composition STEP T actually needs: the fleet feature set plus
+# the instrument, and NOTHING else. Note what it deliberately does NOT carry: `off-fleet`. The
+# waiver exists so the Bard can be built for chips with room; a lite paint build must stay inside
+# the SAME #348 budget the fleet image obeys, because a measurement taken under a waived budget is
+# a measurement of a different machine. That is the whole point of the tier.
+paint = []
+stack-paint-lite = ["paint"]
 
 # COEXIST SOAK (issue #23 PART 1 — the gating experiment, NOT for production).
 # The gateway stays WiFi-associated after boot (no switch to ESP-NOW time-share),
