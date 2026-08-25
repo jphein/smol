@@ -1519,8 +1519,12 @@ const _: () = assert!(
 ///     `sensor.smol_coexist_health` reads those attributes. A single value_template cannot reproduce
 ///     them inside the packet budget, so that family STAYS hand-written. `apch=` (what coexist
 ///     BELIEVES) is published instead and is the more useful of the two.
-///   * `toff=` — the YAML parses it, but **no producer has ever emitted it** (`set_diag_extra`'s own
-///     doc says "toff deferred"), so its sensor has always rendered a fabricated `0`.
+///   * `toff=` — **no producer has ever emitted it** (`set_diag_extra`'s own doc says "toff
+///     deferred"), and as of #371's re-audit (2026-08-24) there is no consumer either: `grep -rn
+///     toff ha/` is empty, so the hand-written sensor that used to render a fabricated `0` is gone.
+///     Nothing is fabricating anything today. *(Checked against the REPO's `ha/`. Live-vs-repo HA
+///     drift is a recurring problem here, so if a `toff` entity still exists on the live instance,
+///     that is the drift, not this note.)*
 ///   * `net=` IS here, unlike the first draft: it is a frozen constant (`0:ok` since #142), but its
 ///     YAML family is being deleted and the rule is that nothing gets deleted without a replacement.
 ///   * `deaf=`/`ddrops=` (`mesh-test` rig only) and `io=` (`io` feature only) — a config for either

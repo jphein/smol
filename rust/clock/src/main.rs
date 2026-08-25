@@ -1884,7 +1884,8 @@ fn main() -> ! {
 
             // #48: pull the relayed LED-mode config (leaf) and update the held mode. Edge-safe:
             // a garbage/unknown value parses to None → keep the current mode (never a bad LED).
-            // On the gateway, its OWN led config is applied via the gateway-own path (deferred).
+            // On the gateway, its OWN led config is applied via the gateway-own path
+            // (`net/wifi.rs`: the own-id branch sets `gw_own.led`, and `service()` self-applies it).
             if let Some(o) = r.take_cfg_offer(crate::net::CFG_KEY_LED) {
                 if let Some(m) = led::LedMode::from_wire(core::str::from_utf8(&o.buf[..o.len]).unwrap_or("")) {
                     if m != led_mode {
