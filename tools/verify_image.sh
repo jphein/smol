@@ -85,7 +85,10 @@ HASH="$(git rev-parse --short=7 "$COMMIT")" || die "bad commit '$COMMIT'"
 if [ "$(git rev-parse "$COMMIT")" != "$(git rev-parse HEAD)" ]; then
   die "commit '$COMMIT' is not checked out (HEAD is $(git rev-parse --short=7 HEAD)) — \
 this tool builds the WORKING TREE and cannot verify a commit that isn't checked out. \
-git checkout $HASH here, re-run, then return to your branch."
+git checkout $HASH here, re-run, then return to your branch. \
+Or, to verify it from a WORKTREE without moving this tree's HEAD: \
+tools/repro_at_canonical.sh <worktree> <out.bin> (#327 — needs sudo for a bind mount, \
+which is why it is a separate opt-in tool and not a flag here)."
 fi
 # REFUSE a dirty crate (nebula-triage, #326 review — argued from a warning into a refusal):
 # a dirty tree corresponds to NO commit, so the `build N (hash)` label is simply false; the
