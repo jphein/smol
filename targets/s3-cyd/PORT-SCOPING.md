@@ -209,6 +209,15 @@ Ordered by dependency:
   BOARD.md + this file written. Spike M1 drafting in flight; `radio` compile verdict
   pending. smol#396 filed (smol-d8). **Target issue: smol#398** (this directory's work
   of record — update its checkboxes as milestones land).
+- **2026-08-25 ~01:00 — PR #407: smol COMPILES FOR THE S3.** Depin #405 merged; this
+  session took the S3 arm as agreed (worktree `smol-wt-s3arm`, branch `feat/398-s3-arm`):
+  the `has-tsens` fallback (`Reading.chip_c: Option<f32>` — no fabricated temperatures),
+  the new `hal-*` namespace (first tenant: `hal-cpu-reset-unindexed` for the S3's
+  SocResetReason spelling), `[chip.esp32s3] checks = true` — and the gate demanded the
+  C5's flip too (tsens was its last blocker; its GPIO9 stop-point disproven).
+  **`check_chips.sh`: 4 as declared, 0 wrong — C3/C5/C6/S3 all compile clean from one
+  tree, a first.** In review with smol-d8. Remaining to `builds = true`: a measured
+  ChipBudget row (radio-up soak on this unit) + the partition table (in flight).
 - **2026-08-24 23:2x** — JP: xtensa builds move to familiar. espup installed there,
   pinned 1.95.0.0 (parity verified); `spike/build-remote.sh` added. **First remote
   xtensa build green in 34.5 s; `--features radio` green in 15.5 s → `wifi + esp-now`
