@@ -675,14 +675,25 @@ impl NtpMachine {
     fn new(device: &mut SmolWifiDevice, sntp_src_port: u16) -> Self {
         let iface = create_interface(device);
 
-        // SAFETY: F2 precedent — boot-only, single-caller, main-thread, never re-entered
-        // (see the module note above), so these `static mut` borrows never alias.
+        // SAFETY: single-caller, main-thread, and the previous machine (if any) is dropped
+        // before a new one is built, so these `static mut` borrows never overlap in time.
+        // ⚠️ The original comment here said "boot-only … never re-entered" — that premise
+        // DIED when the hourly resync (`NTP_RESYNC_AGE_S`) started re-entering this
+        // constructor, and it took the fleet down hourly for weeks (#404): `SocketSet::new`
+        // does NOT clear pre-populated `SocketStorage` slots, so every re-entry found the
+        // previous incarnation's sockets still occupying the static array, spilled into the
+        // spare slot, and the NEXT incarnation's `udp` add panicked "full SocketSet" — one
+        // resync after every boot, which is why the crash wore the resync's clock.
         // Array→slice unsized coercion at the `let` type (NOT `(*ptr)[..]` indexing,
         // which trips the deny-by-default `dangerous_implicit_autorefs`). The referent
         // is a `static`, so the borrow is soundly `'static` and the machine holds the
         // resulting `SocketSet<'static>` across polls.
         let sock_storage: &'static mut [SocketStorage] =
             unsafe { &mut *core::ptr::addr_of_mut!(NTP_SOCK_STORAGE) };
+        // #404: clear the slots the last incarnation left behind — re-entry is normal now.
+        for slot in sock_storage.iter_mut() {
+            *slot = SocketStorage::EMPTY;
+        }
         let udp_rx_meta: &'static mut [udp::PacketMetadata] =
             unsafe { &mut *core::ptr::addr_of_mut!(NTP_UDP_RX_META) };
         let udp_rx_data: &'static mut [u8] =
