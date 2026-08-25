@@ -1105,7 +1105,7 @@ async def main():
             # The fleet explains the card counts: node boxes are per-node, so "built 33 / live 31"
             # is a node that joined since the last real run, not a mystery.
             report_fleet(nodes, dormant, roster)
-            return report_check(cfg, view, prev, extras, retired, retiring, st)
+            return report_check(cfg, view, prev, extras, retired, retiring, st, nodes)
         if prev:
             if retiring:
                 print(f"  REMOVED {len(retiring)} card(s) listed in RETIRE_LIVE:",
@@ -1429,8 +1429,8 @@ def _dead(sources, st):
     return out
 
 
-def audit_views(cfg, view, prev, extras, st):
-    """#340 — DEAD ROWS for the WHOLE DASHBOARD. Returns (dead, audited).
+def _audit_sources(cfg, view, prev, extras):
+    """#340 — the ONE walk over every view on the dashboard. Returns (sources, audited).
 
     THE THIRD FACE OF #333. The first two were about scope within one view (preserved cards were
     outside it; the check only ran before a change). This one is a level up: `classify()` resolves
@@ -1492,15 +1492,101 @@ def audit_views(cfg, view, prev, extras, st):
     n = len(cfg.get("views") or [])
     assert sum(1 for a in audited if a[3]) == n, \
         f"a view escaped the audit: {sum(1 for a in audited if a[3])} audited of {n}"
+    return sources, audited
+
+
+def audit_views(cfg, view, prev, extras, st):
+    """#340's contract, unchanged: (dead, audited). The walk itself moved to `_audit_sources`
+    so #356's UNCOVERED could ask the inverse question of the SAME walk — see `wired_entities`."""
+    sources, audited = _audit_sources(cfg, view, prev, extras)
     return _dead(sources, st), audited
 
 
-def report_check(cfg, view, prev, extras, retired, retiring, st):
-    """--check output. Exit code: 1 live-only drift · 3 dead rows · 0 clean.
+def wired_by_source(cfg, view, prev, extras):
+    """#356 — {source_tag: {entity, …}} for every card on the dashboard. Union it for 'wired'.
 
-    Precedence when both fire: 1. Live-only is the more structural failure — a card the repo
-    cannot rebuild at all outranks a card it can rebuild but which points somewhere dead. Both
-    sections always print, so the exit code chooses your first action without hiding the rest.
+    Deliberately built from `_audit_sources`, the same walk `audit_views` uses, rather than by a
+    second traversal. The rule this file keeps re-learning is that a second enumeration of one
+    fact drifts from the first: #340 was a confident answer about a subset, and #328 was a tag
+    list that quietly stopped describing the tags. UNCOVERED is the inverse of DEAD ROWS and it
+    must be asked against identical evidence, or the two can disagree about what is on the glass.
+
+    Kept PER SOURCE rather than pre-unioned because the two questions need different grain. The
+    dashboard-wide union answers "is this board anywhere at all", which is the invariant worth an
+    exit code. The per-view breakdown answers "which view is thin", which is what #356 was actually
+    about — `smol-telemetry` wiring a hardcoded 7/8/9 while the fleet moved on. The union alone
+    reports 0 for that, correctly and uselessly, because `smol-control` covers every node."""
+    sources, _ = _audit_sources(cfg, view, prev, extras)
+    out = {}
+    for tag, d in sources:
+        out.setdefault(tag, set()).update(d)
+    return out
+
+
+def nodes_covered_by(entities, nodes):
+    """How many of `nodes` have at least one entity in `entities`. Pure; see uncovered_nodes."""
+    entities = set(entities)
+    return sum(1 for m in nodes or ()
+               if (set(m.get("own") or []) | {e for e in (m.get("fw") or {}).values() if e})
+               & entities)
+
+
+def uncovered_nodes(nodes, wired):
+    """#356 — LIVE fleet members that no card anywhere on the dashboard wires. Returns {id: meta}.
+
+    THE INVERSE OF DEAD ROWS, and it needs its own question because neither existing check can
+    reach it. A dead row is a CARD WIRED TO NO NODE; this is a NODE WIRED TO NO CARD. `_dead`
+    starts from the cards and asks what is missing from HA, so a board with no card contributes
+    nothing to walk and is invisible by construction — the audit's coverage line can honestly read
+    'DEAD ROWS · 0' and '2 of 2 views' while a live board appears nowhere on the glass.
+
+    That is the observed defect, not a hypothetical: `smol-telemetry` builds its tiles from a
+    hardcoded id list (7/8/9), so when the fleet moved on, live boards simply had no row and
+    nothing said so for weeks. #340 made every view visible to the audit; this makes every live
+    NODE visible to it.
+
+    DORMANT NODES ARE NOT A FINDING. A retired board with no tile is the dashboard being correct,
+    and reporting it would make this check cry wolf on exactly the fleet churn it should tolerate.
+    Liveness comes from `discover_fleet`'s heartbeat rule (`meta['on']`), which is deliberately the
+    same rule the dashboard paints green with — so a node this reports as uncovered is never one
+    the glass shows as present, and vice versa.
+
+    TAKES THE CALLER'S LIVE LIST — it does NOT re-derive liveness, and that is the whole of the
+    contract. `main()` builds `nodes` from `live`, which is `meta['on']` PLUS every peer in the
+    current crown's roster PLUS the crown itself by definition, with a "nothing live → show
+    everything" fallback. Re-testing `meta['on']` here would quietly disagree with that: a C6 watch
+    the crown is hearing at −35 dBm has no hand-written heartbeat sensor, so raw `on` reads False
+    for it — the exact wrong-in-both-directions failure #312 removed from `discover_fleet`. One
+    definition of live, owned by the caller, and this asks only "is it on the glass".
+
+    Pure, and separate from the I/O, so the offline test can prove BOTH directions without an HA
+    instance — the same reason `scrub_foreign` is pure in the ha repo's deploy tool. A check whose
+    finding path never runs in a test is indistinguishable from one that cannot find anything."""
+    wired = set(wired)
+    out = {}
+    for meta in nodes or ():
+        ents = set(meta.get("own") or []) | {e for e in (meta.get("fw") or {}).values() if e}
+        if not (ents & wired):
+            out[meta["id"]] = meta
+    return dict(sorted(out.items()))
+
+
+def report_check(cfg, view, prev, extras, retired, retiring, st, nodes=None):
+    """--check output. Exit code: 1 live-only drift · 3 dead rows · 5 uncovered nodes · 0 clean.
+
+    Precedence when several fire: 1, then 3, then 5. Live-only is the most structural failure — a
+    card the repo cannot rebuild at all outranks a card it can rebuild but which points somewhere
+    dead, and both outrank a node the dashboard simply does not mention. The first two say the
+    dashboard is WRONG; the third says it is INCOMPLETE, which is real but never the thing to fix
+    first. Every section always prints, so the exit code chooses your first action without hiding
+    the rest.
+
+    #356 added 5 rather than folding uncovered nodes into 1 or 3, because the remediation is
+    somewhere else entirely: live-only means edit the scaffold, dead rows means repoint a card,
+    uncovered means a view (often one this repo does not build) never enumerated the fleet at all.
+    A shared code would send someone to the wrong file. `tools/ha_deploy.sh` learned this code in
+    the same change — its `case` had a `*)` arm reading "check could not run", and its own comment
+    warns that "mislabelling a real finding as 'couldn't check' is the worse direction of the two".
 
     SCOPE, and #340 changed exactly one thing about it. LIVE-ONLY / RETIRED / RETIRING are about
     the ONE view this repo generates — they compare a scaffold against its own output, and no other
@@ -1511,6 +1597,9 @@ def report_check(cfg, view, prev, extras, retired, retiring, st):
     decide whether a deploy broke a card. A second section it does not grep would have re-created
     #340 inside the consumer: a confident answer about a subset."""
     dead, audited = audit_views(cfg, view, prev, extras, st)   # #340: EVERY view, not just ours
+    by_src = wired_by_source(cfg, view, prev, extras)          # same walk, inverse question
+    wired = {e for ents in by_src.values() for e in ents}
+    uncovered = uncovered_nodes(nodes or (), wired)            # #356: EVERY live node, too
     # Coverage first, and as a list. "DEAD ROWS · 0" is only worth reading if you can see what was
     # looked at, and for two releases the honest rendering of that line was "0, in one of two views".
     on_dash = sum(1 for a in audited if a[3])
@@ -1609,7 +1698,48 @@ def report_check(cfg, view, prev, extras, retired, retiring, st):
         print(f"\nDEAD ROWS · 0 — every wired entity on all {on_dash} view(s) of '{DASH}' "
               f"exists and is actually provided.")
 
-    return 1 if extras else (3 if dead else 0)
+    # #356 — the inverse question. Printed as one `UNCOVERED · N` line for the same reason DEAD
+    # ROWS is: `tools/ha_deploy.sh` greps these headers out of the output, and a per-node section
+    # it does not grep would re-create #340 inside the consumer.
+    live_n = len(nodes or ())
+    if nodes is None:
+        print("\nUNCOVERED · not checked (no fleet passed to report_check)")
+    elif uncovered:
+        print(f"\nUNCOVERED · {len(uncovered)} LIVE node(s) that NO card on '{DASH}' wires "
+              f"— of {live_n} live in the fleet.")
+        print("  The inverse of DEAD ROWS: not a card pointing at nothing, but a board the")
+        print("  dashboard never mentions. Neither of the checks above can see this — they walk")
+        print("  the cards, and a node with no card contributes nothing to walk.")
+        for nid, meta in uncovered.items():
+            print(f"    - id{nid}  {meta.get('name') or '?'}  (fw {meta.get('sw') or '?'})")
+        print("\n  FIX: whichever view is meant to carry per-node tiles must ENUMERATE the fleet")
+        print("       rather than hardcode ids. `smol-telemetry` is built from ~/Projects/ha and")
+        print("       builds its tiles from a fixed id list, which is how this rots (#356): the")
+        print("       fleet moves, the list does not, and nothing says so.")
+        print("       Deriving the tiles the way this script does — discover_fleet() + sigil_of()")
+        print("       — makes both the ids and the names come from the firmware-authored registry,")
+        print("       which is the one source that cannot drift from the boards.")
+    elif live_n:
+        print(f"\nUNCOVERED · 0 — all {live_n} live node(s) are wired by at least one card on "
+              f"'{DASH}'.")
+    else:
+        print("\nUNCOVERED · 0 — no live nodes in the fleet to cover.")
+
+    # PER-SOURCE COVERAGE — informational, and deliberately NOT part of the exit code.
+    #
+    # UNCOVERED above is the invariant: a live board must appear SOMEWHERE. This is the finer
+    # question #356 actually asked — which view is thin. It cannot be a failure, because nothing
+    # in this repo states which views are SUPPOSED to carry per-node tiles: `smol-control` is
+    # generated per-node by design, while `smol-telemetry` is built in ~/Projects/ha and its
+    # intent lives there. Failing on a low number would be this script inventing another repo's
+    # requirements. Printing it makes the thinness visible, which is the whole of #356's
+    # complaint — "a dead-row audit cannot see this by construction".
+    if nodes:
+        print(f"\n  per-source node coverage (informational — of {live_n} live node(s)):")
+        for tag in sorted(by_src):
+            print(f"    {tag:<26} covers {nodes_covered_by(by_src[tag], nodes):>2}")
+
+    return 1 if extras else (3 if dead else (5 if uncovered else 0))
 
 
 def report_fleet(nodes, dormant, roster):
