@@ -1,6 +1,20 @@
 # Upstream report DRAFT — Xtensa fat-LTO register-scavenger crash
 
-**Status: DRAFT ONLY — NOT FILED. JP decides whether/where to post.**
+**Status: RESOLVED AS DUPLICATES — evidence contributed upstream (JP approved, 2026-08-25).**
+
+The dup search this draft mandated changed the disposition entirely:
+- **Member 3** (PCREL_WRAPPER constpool) = **esp-rs/rust#282** (open since 2026-08-01, same
+  node, same `[2 x float]` pool). Our evidence — reproduces-on-1.98, the three failure
+  shapes by LTO mode, the slint trigger recipe, the Rust-pushed-bool workaround — posted
+  as a comment there by the watch lane, plus a pointer to the CLOSED
+  espressif/llvm-project#127 (aggregate-constpool PCREL_WRAPPER): if its fix never
+  reached the rustc fork's LLVM, that may be the whole story.
+- **Member 1** (scavenger) = **espressif/llvm-project#134** ("Missing emergency spill
+  slot causes register scavenger ICE", open). The smol fleet-tier matrix contributed
+  there from this lane.
+- The standalone-repro-crate task dissolves unless #282's maintainers request one.
+
+The draft body below is retained as the internal record of the bracketing work.
 
 Two caveats govern this document (both from the discovering run, BUDGET-PREP §6.1, 2026-08-25):
 
