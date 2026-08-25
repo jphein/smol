@@ -322,12 +322,16 @@ Mosquitto runs on the HA VM, which is **quad-homed** (VLAN6 `10.0.6.108` / VLAN8
 them. **The cross-VLAN CONNACK gotcha is real**, so target the leg that answers
 from where the client lives:
 
+**The durable rule (2026-08-24): use the broker leg on YOUR OWN subnet — the DHCP lease is the
+ground truth for which one that is.** Cross-VLAN legs silently drop CONNACK (asymmetric return
+path); every ✅/❌ below is scoped to the VANTAGE it was measured from, not absolute.
+
 | Broker leg | Role | Notes |
 | --- | --- | --- |
-| **`10.0.11.110:1883`** (HA VM, VLAN11) | ✅ **firmware target** (boards) | same subnet as the boards; no inter-VLAN routing; CONNACK 3/3 verified from a VLAN11 source |
-| `10.0.6.108:1883` (HA VM, VLAN6) | ✅ **cross-VLAN-safe fallback** | answers even cross-VLAN (rc=0 verified); also the leg to use for **katana-side tests** (same subnet as katana) |
-| `10.0.8.111:1883` (HA VM, VLAN8) | ❌ never | TCP connects but CONNACK silently drops cross-VLAN (asymmetric return path — reproduced) |
-| `10.0.11.117:1883` (host **disks**) | ❌ never | a *different* Mosquitto (disks' own docker broker) — **not** the HA one |
+| **`10.0.8.111:1883`** (HA VM, VLAN8) | ✅ **firmware target** (boards) | the fleet moved to the `jplovescl`/VLAN8 iot SSID (#142-era; leases like 10.0.8.217 confirm) — same subnet, no routing; glass-verified 2026-08-24 by the C5's M4 (CONNACK rc=0, discovery + telemetry live) |
+| `10.0.6.108:1883` (HA VM, VLAN6) | ✅ **katana-side tests** | same subnet as katana; answers even cross-VLAN (rc=0 verified) |
+| `10.0.11.110:1883` (HA VM, VLAN11) | ⚠️ historical | was the firmware target while boards lived on VLAN11 (verified 2026-07-08, from a VLAN11 vantage). A VLAN8 board using it is on the cross-VLAN path this table warns about |
+| `10.0.11.117:1883` (host **disks**) | ❌ never (as HA broker) | a *different* Mosquitto (disks' own docker broker) — it is the **OTA image host**, not the HA broker |
 
 Proven live from katana (VLAN6): raw MQTT CONNECT to `10.0.6.108:1883` → CONNACK
 rc=0; to `10.0.8.111:1883` → hangs, no CONNACK. Retention is **broker-wide**, so a
