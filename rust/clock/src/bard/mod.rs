@@ -36,13 +36,13 @@
 pub mod delivery;
 pub mod nano_llm;
 pub mod persona;
-// #434: the stack instrument NO LONGER LIVES HERE. It was `pub mod stack_paint` inside this
-// module, which is what welded `stack-paint` to `bard` — and post-#391 that composition stopped
-// booting, taking the only way to measure a high-water with it. The file stays at
-// `bard/stack_paint.rs` (moving it would churn `lib.rs`'s `#[path]` and #367's verifier-wiring
-// gate for no gain); `main.rs` now declares it at CRATE ROOT under the dependency-free `paint`
-// feature, so the instrument and the transformer are independently selectable. This module reaches
-// it as `crate::stack_paint`.
+// #434: the stack instrument NO LONGER LIVES HERE — the file moved to `src/stack_paint.rs`. It
+// was `pub mod stack_paint` inside this module, which is what welded `stack-paint` to `bard`, and
+// post-#391 that composition stopped booting, taking the only way to measure a high-water with it.
+// The FILE had to move, not just the module declaration: this repo encodes tier ownership in the
+// path and `check_exclusions.py` enforces it, so a `#[path]` shim left the instrument "owned by
+// bard" and failed the gate the moment a bard-less tier compiled it. This module reaches it as
+// `crate::stack_paint`.
 pub mod textflow;
 pub mod tokenizer;
 

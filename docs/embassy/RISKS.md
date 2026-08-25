@@ -71,7 +71,7 @@ The gate's own header already says the quiet part (`tools/repro_build.sh:107–1
 **Phase 1 makes this worse in a way the wording does not yet cover.** `net_task`, `wifi_task` (and later `mqtt_task`) get their stacks from the embassy/esp-rtos task arena — **not** from `[_stack_end, _stack_start)`. So after the split:
 
 - the gate keeps measuring one stack out of three or four, and **passing** says even less than it does today;
-- `bard/stack_paint.rs` paints `[_stack_end, sp − MARGIN)` using the same two linker symbols (`stack_paint.rs:40–56`), so the `stack-paint` tier measures the **main task only** and is structurally blind to the new tasks;
+- `stack_paint.rs` paints `[_stack_end, sp − MARGIN)` using the same two linker symbols (`stack_paint.rs:40–56`), so the `stack-paint` tier measures the **main task only** and is structurally blind to the new tasks;
 - therefore `ESP32C3_MEASURED_PEAK_BYTES = 55_656` — the input the whole floor is derived from — **changes meaning** under Phase 1. It was "the deepest path in the program". It becomes "the deepest path in one of four tasks".
 
 **This is `[[stack-is-not-headroom]]` with a new failure surface, and nothing in the tree currently measures the new surface.**

@@ -123,13 +123,14 @@ mod s3_oled;
 // every tier; the 277 KB model is `.rodata` (XIP flash) and its scratch is `.bss`.
 #[cfg(feature = "bard")]
 mod bard;
-// #434 the stack instrument, declared at crate ROOT so it does not require `mod bard`. The file
-// still lives under `bard/` (see that module's note) — `#[path]` rather than a move keeps
-// `lib.rs`'s hostsim export and #367's verifier-wiring gate pointing at the same target. `paint`
-// is dependency-free, so `stack-paint-lite` = the FLEET composition + this, which is the only
-// composition whose high-water anyone actually wants.
+// #434 the stack instrument, at crate root because that is where it BELONGS: it depends on
+// nothing but two linker symbols, and living under `bard/` is what welded `stack-paint` to a
+// composition that (post-#391) no longer boots. The move is not cosmetic — this repo encodes tier
+// ownership in the PATH, and `tools/check_exclusions.py` enforces it: a file under `src/bard/`
+// contributing code while `bard` is OFF is a gate failure, which is exactly what a `#[path]`
+// shim earned on the first attempt. `paint` is dependency-free, so `stack-paint-lite` = the FLEET
+// composition + this, which is the only composition whose high-water anyone actually wants.
 #[cfg(feature = "paint")]
-#[path = "bard/stack_paint.rs"]
 mod stack_paint;
 // #348 per-chip memory budgets as data, with the heavy features predicated on them. Pure
 // consts + const-eval assertions: it emits NO code and is unconditional so the predicates are
@@ -647,7 +648,7 @@ fn main() -> ! {
 async fn run() -> ! {
     // #300 bench builds only: paint the free stack BEFORE anything grows a deep call chain, so
     // the high-water report after a story covers the whole run. First statement in `main` on
-    // purpose — even HAL init would otherwise go unmeasured. See src/bard/stack_paint.rs for why
+    // purpose — even HAL init would otherwise go unmeasured. See src/stack_paint.rs for why
     // writing below the live frame is sound.
     #[cfg(feature = "paint")]
     stack_paint::paint();
@@ -660,7 +661,7 @@ async fn run() -> ! {
     // #398 instrument sanity probe (stack-paint builds): expect ≈0 at boot on a chip
     // where the instrument is valid. On the S3 it reads ~59.5 KB HERE — the proof the
     // instrument is invalid there (boot-era machinery writes inside .stack; see the
-    // block note in src/bard/stack_paint.rs for the three measurements, including the
+    // block note in src/stack_paint.rs for the three measurements, including the
     // disproven CPU-slice hypothesis). Kept as the cheapest validity check for any
     // future chip: a big number on THIS line means don't trust any later one.
     #[cfg(feature = "paint")]
