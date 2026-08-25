@@ -206,9 +206,19 @@ jobs:
           # ⚠️ INFORMATIONAL ONLY, and knowingly incomplete: this reports .text/.rodata but drops
           # .data/.bss (a readelf -SW column-position quirk this one-liner does not handle). Left
           # as-is rather than half-fixed, because the S3 has NO stack-floor gate wired at all —
-          # `repro_stack_floor` greps the C3's constant BY NAME, so a non-C3 image would be measured
-          # against the C3's floor and report green. Both the parser and that false-pass are phase-2
-          # work (#413); fixing the parser here would suggest a gate exists when none does.
+          # `repro_stack_floor` greps the C3's constant BY NAME and `repro_stack_check` then applies
+          # it to whatever ELF it is handed, so the verdict is CHIP-BLIND.
+          #
+          # Direction of that error, stated precisely because an earlier version of this comment got
+          # it backwards: the C3's floor (74,208) is the HIGHEST of the three declared floors
+          # (C6 71,680 · S3 72,004), so applying it to a non-C3 image is STRICTER, not laxer. It
+          # cannot false-ACCEPT on today's roster; it can false-REJECT a valid S3 image whose
+          # `.stack` lands in [72,004, 74,208) — a 2,204 B window — and it will false-ACCEPT the
+          # day any chip's legitimate floor exceeds the C3's. Today's S3 fleet image measures
+          # 116,940 and clears both, so the current verdict is correct BY ARITHMETIC COINCIDENCE
+          # rather than by design. That is the defect: the answer is unrelated to the chip.
+          # Both the parser and the chip-blind lookup are phase-2 work (#413); fixing the parser
+          # here would suggest a gate exists when none does.
           echo "--- sections (informational, incomplete — see the note in this step)"
           readelf -SW "$elf" | awk '$2 ~ /^\.(text|rodata|data|bss)$/ {printf "%-10s %10d\n", $2, strtonum("0x" $6)}'
 
@@ -239,7 +249,9 @@ jobs:
             echo "\`build-matrix.toml\`: *a compiler that demonstrably mishandled this code at"
             echo "\`opt=\"s\"\` merely LINKING at opt=2 is escape, not proof of correct codegen.*"
             echo
-            echo "⚠️ No stack-floor check runs here — \`repro_stack_floor\` greps the **C3's** constant"
-            echo "by name, so a non-C3 image would be measured against the C3's floor and report"
-            echo "green. That false-pass is phase-2 work (#413)."
+            echo "⚠️ No stack-floor check runs here. \`repro_stack_floor\` greps the **C3's** constant by"
+            echo "name and applies it to any ELF, so the verdict is **chip-blind**. The C3's floor"
+            echo "(74,208) is the highest of the three, so it cannot false-accept on today's roster —"
+            echo "it can false-REJECT a valid S3 image in [72,004, 74,208), and today's correct answer"
+            echo "is arithmetic coincidence, not design. Phase-2 work (#413)."
           } >> "$GITHUB_STEP_SUMMARY"
