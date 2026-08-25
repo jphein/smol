@@ -363,37 +363,38 @@ input*. This keeps `select_crown_ap` pure and the payload small.
 - `SCAN_REQ: Signal<ScanRequest>` — carries the SSID filter and the reason (`Publish` for `run_scan`,
   `Reassoc` for `reassoc_ch6_prefer`). Distinguishing them matters: the two callers want different
   reductions from the same scan.
-- `SCAN_RES: Signal<ScanOutcome>` — an owned **`[ApView; 16]` + `len`**, carrying the
-  **SSID-filtered** views. `ApView` is `{ bssid: [u8;6], channel: u8, rssi: i8 }` in
-  `net/coexist.rs`, so 16 entries is ~192 B — cheap enough to pass by value through a `Signal` and
-  avoid sharing an allocation across the task boundary.
-
-  **Why 16 is lossless rather than an arbitrary cap, which matters:** the existing call already
-  passes `ScanConfig::default().with_max(16)`, so esp-radio caps the raw scan at 16 before smol sees
-  it. A 16-slot payload therefore cannot drop an AP the current code would have seen. It is not a
-  budget choice; it is the existing bound restated.
-
-  ⚠️ **DO NOT introduce a truncation policy here. #367 already decided this, deliberately, in the
-  opposite direction** — `mode.rs` carries the reasoning in-tree: *"#367: NO `truncate` here, unlike
-  the scan-record path above — deliberate. `select_crown_ap` takes a `max_by_key` over these views,
-  so dropping any entry risks discarding the very AP it exists to find."* An earlier draft of this
-  plan specced a bounded list with a `truncated` flag and would have regressed #367 while looking
-  like prudent engineering. **The SSID filter is the bound**, and it must stay *upstream* of the
-  signal — reduce inside `wifi_task`, after filtering, exactly as the sync path does today.
-- **The incumbent's RSSI must come from the task too, and this is easy to miss.**
+- `SCAN_RES` — **the AP LIST NEVER CROSSES THE TASK BOUNDARY.** Signal the *reduced result* per
+  consumer: a `CrownApDecision` (a `Copy` enum, ~8 B) for the reassoc path, and the formatted
+  record string (~150 B, bounded by construction) for #71. **Superseded spec — see Addendum A §A.4,
+  which replaces an earlier draft of this bullet.** A prior version specced an
+  `[ApView; 16] + len` payload on the stated grounds that `.with_max(16)` already bounded the scan.
+  **It does not** — esp-radio 0.18 accepts and silently discards it (`mode.rs` documents this at
+  length; upstream `esp-hal#5583`'s fix is not in 0.18). The list is genuinely unbounded, so a
+  16-slot payload would have been an arbitrary cap and #367's objection applies to it after all.
+  Addendum A carries the corrected design and the evidence.
+- **The incumbent's RSSI must come from the task, and this is easy to miss.**
   `select_crown_ap(aps, mesh_ch, current)` takes `current: Option<ApView>`, and `coexist.rs`
   specifies: *"use the live `get_rssi()` for its `rssi`, not a stale scan entry"*. `rssi()` is a
   **controller** call — so once STEP C moves the controller into `wifi_task`, the live incumbent RSSI
-  is only obtainable there. `ScanOutcome` must therefore carry **both** the filtered views **and**
-  the live incumbent `ApView`, or the selector silently starts hysteresis-latching against a stale
-  scan RSSI and #217's `HYST_MARGIN_DB` anti-flap stops working as measured.
-- **Timeout is mandatory, not optional.** A `with_timeout` around the response await, with the
-  timeout treated as `NoAp` — the value `select_crown_ap` already handles. A scan that never answers
-  must not wedge the caller, and this is exactly the class of window RISKS §R11 (timebase) can
-  silently break.
-- **`run_scan`'s reduction is NOT `reassoc`'s.** #71 publishes a record; the reassoc path needs only
-  the decision input. Reducing both to one shape is the temptation and it is how #71's record loses
-  fields nobody notices are gone.
+  is only obtainable there. Under Addendum A's design this resolves itself (the selector runs in the
+  task, beside the controller); under any design that ships the list out, the payload must carry the
+  live incumbent too, or the selector silently starts hysteresis-latching against a stale scan RSSI
+  and #217's `HYST_MARGIN_DB` anti-flap stops working as measured.
+- **Timeout is mandatory — and it MUST NOT be reported as `NoAp`.** A `with_timeout` around the
+  response await is required (a scan that never answers must not wedge the caller, and this is
+  exactly the class of window RISKS §R11 can silently break). ⚠️ **An earlier draft of this bullet
+  said to treat the timeout as `NoAp` because `select_crown_ap` "already handles" it. That is a
+  defect, and the tree forbids it explicitly** — `reassoc_ch6_prefer`'s doc comment: *"the only
+  'skip' value available is `NoAp` — which the caller cannot distinguish from 'no usable AP exists'
+  and would act on by shedding the crown… If this path ever needs guarding, give the decision an
+  explicit `Deferred` variant first — do NOT reuse `NoAp`."* `NoAp` feeds the shed→degraded ladder;
+  a timed-out scan would therefore demote a healthy crown. **`CrownApDecision` must gain a
+  `Deferred` variant, and it must land BEFORE the scan crosses a task boundary** — the async path
+  introduces a *second* "couldn't answer" source (response timeout) on top of the heap-gate skip
+  the same comment was written about.
+- **`run_scan`'s reduction is NOT `reassoc`'s** — and they are more disjoint than they look. #71
+  publishes a *band survey* across all SSIDs, strongest-5; reassoc filters to our own SSID and needs
+  the complete filtered set. Full field diff in Addendum A §A.2.
 
 ---
 
@@ -497,16 +498,13 @@ investigate*, not a result to bank.
 ## 7. Top-3 open design questions
 
 **Q1 — Does #278/#368's ranked ladder survive reduction to `ApView` inside `wifi_task`?**
-**Partly answered by the tree while writing this plan, and the remainder is now sharp.** Answered:
-the payload needs no truncation policy and no chosen `N` — `with_max(16)` is the existing bound and
-#367 explicitly forbids dropping entries (§4.2). Still open: **`ApView` keeps only
-`{bssid, channel, rssi}`, and it is the *reassoc* reduction.** `run_scan`'s consumer is #71's
-published scan record, which is a *different* reduction over the same scan and may read fields
-`ApView` does not carry (SSID string, auth mode, raw `signal_strength` before clamping — the sync
-path clamps to `i8`). **Needs:** the field set each of `run_scan`/#71, #278 and #368 actually reads,
-diffed against `ApView`, before one `ScanOutcome` shape is committed to. *This is the question that
-can silently degrade a shipped behaviour rather than break a build* — a scan record that still
-publishes, just with fewer fields, and a ladder that still ranks, just worse.
+**✅ ANSWERED — see Addendum A.** Short form: the question contained a false premise. #278/#368's
+ranked ladder is **not a scan consumer at all** (`scan_plan()` → `recovery_ladder(channel, follow)`
+is pure channel arithmetic over the last accepted announcement), so nothing about it constrains
+`ScanOutcome`. There are exactly **two** scan consumers, they read **disjoint** field sets, and the
+resolution is to signal each one's *reduced result* rather than any AP list. Addendum A also
+overturns two claims this plan previously made (§4.2's `with_max(16)` bound and its
+timeout-as-`NoAp`).
 
 **Q2 — Does STEP B's timeout mitigation belong in smol or upstream in esp-radio?**
 The watch's `send_bounded` is proven on hardware **and** violates `send_async`'s documented "must not
@@ -540,3 +538,141 @@ STEP C          controller: 13 refs + scan round-trip (#403 guard)
 
 `F`, `G` and `B` are all startable **now** and none depends on PR #391 merging. `T` is blocked on the
 two §5.2 measurements. `C` is blocked on `T`.
+
+---
+
+## Addendum A — Q1 resolved: the scan-consumer field diff, and `ScanOutcome`'s shape
+
+> Read-only investigation against `main` @ `e3a8f5d`. Every field claim below was read at its use
+> site, not inferred from a type. **This addendum overturns two claims made earlier in this same
+> document** (§4.2's payload spec and its timeout handling); both are corrected in place above
+> rather than left standing with a note, because a flagged caveat is not a contained one.
+
+### A.1 The question had a false premise: there are TWO scan consumers, not three
+
+**#278/#368's ranked ladder does not read scan results.** `RadioManager::scan_plan()` is:
+
+```
+recovery_ladder(self.elect_follower.decision().channel, election::FOLLOW_ENABLED)
+```
+
+and `mesh_elect::recovery_ladder(last_known: u8, follow: bool) -> ([u8; RECOVERY_MAX], usize)` is
+pure channel arithmetic over the **last accepted announcement's channel** — it never sees an AP.
+Corroborated structurally: `AccessPointInfo` appears in exactly two files, `net/mode.rs` and
+`budget.rs` (the latter only to record its measured 47 B size for #367's heap math). `ApView`
+appears in `net/coexist.rs` (definition), `net.rs` (a comment) and `net/mode.rs`.
+
+So the ladder places **no constraint** on `ScanOutcome`. That removes a third of Q1's stated
+uncertainty, and it means the reassoc reduction is free to be shaped for `select_crown_ap` alone.
+
+The two real consumers, both in `mode.rs`:
+
+| consumer | entry | called from | terminal value |
+|---|---|---|---|
+| **#71 band survey** | `run_scan` → `format_scan_record` | `main.rs:2164` | a `SCAN\|…` record string → `own_scan` (gateway publishes `smol/<id>/scan`) or `broadcast_scan` (relay) |
+| **#204/#217 reassoc** | `reassoc_ch6_prefer` → `select_crown_ap` | `mode.rs` ×3 (`4829`, `4883`, `5970`) | a `CrownApDecision` |
+
+### A.2 The field diff
+
+`esp_radio::wifi::ap::AccessPointInfo` (esp-radio 0.18, `wifi/ap.rs:17`) is the source of truth and
+the upper bound on any reduction:
+
+| `AccessPointInfo` field | type | #71 via `format_scan_record` | reassoc via `ApView` |
+|---|---|---|---|
+| `ssid` | `Ssid` | ✅ **`as_str()`, truncated to `SCAN_SSID_MAX = 12` chars, with `\|` and `,` replaced by `_`** | ⚠️ read as a **FILTER** (`a.ssid.as_str() == net.ssid`) — never carried into `ApView` |
+| `bssid` | `[u8; 6]` | ⚠️ **only bytes `[0..3]`** (the OUI), hex-formatted | ✅ **all 6 bytes** |
+| `channel` | `u8` | ✅ | ✅ |
+| `signal_strength` | `i8` | ✅ | ✅ as `ApView.rssi` (**no clamping** — scan entries are already `i8`; the `clamp(-127,0)` in `mode.rs` applies only to the *incumbent* built from `get_rssi()`) |
+| `secondary_channel` | `SecondaryChannel` | ❌ | ❌ |
+| `auth_method` | `Option<AuthenticationMethod>` | ❌ | ❌ |
+| `country` | `Option<CountryInfo>` (unstable) | ❌ | ❌ |
+
+**Union actually needed: `ssid` (string), full `bssid`, `channel`, `signal_strength`.** Three fields
+are read by nobody. One of Q1's specific worries is disposed of: **`auth_method` is unread**, so no
+reduction loses it.
+
+**Ordering and cardinality are as load-bearing as the fields, and this is where the two diverge
+irreconcilably:**
+
+| | #71 survey | reassoc |
+|---|---|---|
+| SSID scope | **ALL networks** — it is a band survey; that is the point of publishing it | **our SSID only** |
+| ordering | `sort_by_key(Reverse(signal_strength))` — **required**, the record is "the strongest APs" | irrelevant (`max_by_key` inside the selector) |
+| cardinality | `truncate(16)` then `.take(SCAN_MAX_APS = 5)` → **at most 5 reach the wire** | **complete filtered set — #367 forbids truncation** |
+| heap gate | `scan_heap_ok()` vs `SCAN_HEAP_FLOOR_BYTES`; a low-heap tick **defers** | **deliberately ungated** — `NoAp` would shed the crown |
+
+A single shared payload would have to carry all SSIDs at full cardinality to serve both — which is
+precisely the unbounded allocation #367 exists to bound. **The two reductions cannot share a
+payload. That is the finding.**
+
+### A.3 The correction that changes the design: `.with_max(16)` bounds NOTHING
+
+§4.2 previously justified a 16-slot payload as "the existing bound restated". It is not a bound.
+`mode.rs` documents this in ~40 lines at the call site, verified against esp-radio 0.18 source:
+
+- `scan_async` collects internally via `ScanResults::new(self)?.collect::<Vec<_>>()`;
+- `ScanResults::new(_controller)` takes the **controller only** — the `ScanConfig` never reaches it;
+  it sets `remaining = bss_total` (the full driver AP count) and walks every one;
+- so one `AccessPointInfo` (47 B) is heap-allocated **per AP the radio can see** — ~150 BSSIDs ≈ 7 KB
+  steady, ~14 KB while the `Vec` doubles;
+- upstream `esp-hal#5583` closed 2026-05-28; **the fix is not in 0.18.0**.
+
+`.with_max(16)` is accepted and silently discarded, kept only as documented intent. **I read the call
+and not the comment above it** — the same failure this document's own §0.2 policy was written to
+prevent, one field over. Consequence: the AP list is genuinely unbounded, so any fixed-size payload
+is an arbitrary cap, and #367's objection applies to it.
+
+### A.4 Recommendation: signal the REDUCED RESULT; the AP list never crosses the boundary
+
+Both consumers' reductions **terminate in a small, bounded value**. Send that, not the list:
+
+| signal | payload | size |
+|---|---|---|
+| `SCAN_RES_REASSOC` | `CrownApDecision` (`Copy` enum: `CoChannel{bssid,ch}` / `OffChannelFallback{bssid,ch}` / `NoAp` / **new** `Deferred`) | ~8 B |
+| `SCAN_RES_RECORD` | the formatted `SCAN\|…` record | ≤ ~150 B by construction (5 APs × (12 SSID + 6 OUI hex + ch + rssi)) |
+
+`wifi_task` owns the controller, so it runs the scan, then runs the reduction **in the task**:
+`select_crown_ap(&views, mesh_ch, current)` for a `Reassoc` request, `format_scan_record(&aps)` for a
+`Publish` request. `ScanRequest` carries what the task cannot know: the SSID to filter on, `mesh_ch`,
+and the request kind.
+
+Why this is the right shape rather than merely a smaller one:
+
+1. **The cardinality question dissolves.** `max_by_key` runs over the complete SSID-filtered set
+   inside the task, so #367 is satisfied *by construction* — there is no payload to bound and no
+   truncation policy to get wrong.
+2. **The field question dissolves too.** Each reduction reads `AccessPointInfo` directly, so neither
+   can lose a field to the other's shape. #71 keeps its SSID strings; reassoc keeps its full BSSIDs.
+3. **The live-incumbent problem solves itself.** `select_crown_ap`'s `current` needs a live
+   `get_rssi()`, which is a controller call — and the selector now runs beside the controller.
+4. **Purity and host-testability are preserved.** `select_crown_ap` stays pure in `net/coexist.rs`
+   with its existing `experiments/ap_select_verify` harness; `format_scan_record` stays a pure
+   formatter. Only the *call sites* move.
+5. **Routing stays with the caller.** The record's destination (`own_scan` if gateway, else
+   `broadcast_scan`) is a role decision, not a radio one, so signalling the finished string keeps
+   that judgement where it already lives.
+
+**Costs, stated rather than discovered:**
+
+- `wifi_task` gains two `mode.rs`-resident call sites' worth of logic. It must not gain the *policy* —
+  the OTA-active gate, the heap gate, and the `own_scan`/`broadcast_scan` routing all stay with the
+  caller. If policy migrates into the task, this design has failed and the reduction should move
+  back out.
+- The heap gate becomes **asymmetric across the boundary**, exactly as it is today: `Publish` may be
+  deferred on low heap, `Reassoc` may not. The request kind must carry that distinction, or the
+  ungated path silently acquires a gate that sheds crowns.
+- `alloc::string::String` in a `Signal` payload means an allocation crosses the boundary. Acceptable
+  (the tree has no `heapless` dependency — `ota.rs:2540` says so explicitly, and `alloc` is present
+  on every radio tier), but it is a real allocation on the OTA-adjacent path and should be sized
+  before it lands, not after.
+
+### A.5 Consequent plan changes
+
+1. **`CrownApDecision` gains `Deferred`, as a PRE-step to STEP C** — before any scan crosses a task
+   boundary. The async path adds a second "couldn't answer" source (response timeout) to the heap-skip
+   the tree's warning was written about, and `NoAp` feeds the shed ladder. Small, mechanical, and it
+   must not ride in the same commit as the boundary move.
+2. **§4.2's payload spec is superseded** by §A.4 (corrected in place above).
+3. **Q1 closes.** Its residual — "does #71 read fields `ApView` drops?" — resolves to **yes, the SSID
+   string, and bssid at a different width** — and §A.4 makes it moot by never forcing the two through
+   one shape.
