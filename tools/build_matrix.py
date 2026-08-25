@@ -142,7 +142,24 @@ def budget_chips(path: Path) -> set[str]:
     supposed to be comparing — the same discipline `repro_stack_check` uses when it cannot
     read an ELF. `chip: "host"` is skipped: it is the non-device fallback for host builds,
     not a fleet target.
+
+    `chip: "unmeasured"` is skipped for the same KIND of reason and it is worth being precise
+    about, because the two look alike and are not (#347 Part 2). `host` is a real build with no
+    device budget. `unmeasured` is a real DEVICE whose budget nobody has measured yet — the poison
+    row a declared chip selects until a hardware measurement exists, every field zero so that
+    `fits_dram`/`fits_flash` answer no and the budget-predicated features refuse to compile.
+
+    Neither is a fleet target, which is the only property this function is about: it compares the
+    chip ROSTER against `build-matrix.toml`, and a row that stands for "no chip" would demand a
+    `[chip.unmeasured]` section — a build job for the absence of a board.
+
+    ⚠️ Note what is deliberately NOT skipped: a chip that is declared with real numbers but is
+    not in the matrix still fails the check, in both directions. The skip list is for rows that
+    are not chips, never for chips that are inconvenient.
     """
+    # Rows that are not fleet targets. Kept as a named set rather than two inline `!=` tests so
+    # that adding a third one requires reading the docstring's rule for what belongs here.
+    NOT_A_FLEET_TARGET = {"host", "unmeasured"}
     text = path.read_text(encoding="utf-8")
     # `= ChipBudget {` is an INITIALISER. Anchoring on the `=` matters: a bare
     # `ChipBudget\s*\{` also matches `pub struct ChipBudget {` and `impl ChipBudget {`, which
@@ -156,7 +173,7 @@ def budget_chips(path: Path) -> set[str]:
         raise Bad(
             f"{path}: found {literals} `ChipBudget {{` literals but only {len(found)} "
             f"`chip:` fields — refusing to compare a roster I cannot fully read")
-    return {c for c in found if c != "host"}
+    return {c for c in found if c not in NOT_A_FLEET_TARGET}
 
 
 def cargo_features(path: Path) -> set[str]:

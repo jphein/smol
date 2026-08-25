@@ -4,6 +4,24 @@
 # script fragments (memory.x, esp32c3.x, linkall.x) via its build script and
 # the `link-arg` flags below wire them into the final link step.
 
+# #347: THE DEFAULT TARGET STAYS THE C3, AND THAT IS A DECISION.
+#
+# The chip de-pin could have deleted this line and required `--target` on every invocation. It
+# deliberately does not: `cargo build --release` with no flags has to remain the guaranteed-green
+# C3 fleet baseline, byte-for-byte, and a per-invocation flag that everyone must remember is a
+# worse guard than a default that is correct. The chip feature and the target triple are chosen
+# TOGETHER, per invocation — see the matrix in tools/build-matrix.toml — and the pairing is
+# enforced from the other end: `budget.rs` refuses a build with no chip feature or with two, and
+# `build.rs` refuses to stamp a chip id it cannot determine (#349).
+#
+# Non-C3 builds therefore pass BOTH halves explicitly:
+#
+#   C5:  cargo check --no-default-features --features esp32c5,<tier> \
+#          --target riscv32imac-unknown-none-elf
+#   C6:  cargo check --no-default-features --features esp32c6,<tier> \
+#          --target riscv32imac-unknown-none-elf
+#   S3:  cargo check --no-default-features --features esp32s3,<tier> \
+#          --target xtensa-esp32s3-none-elf          # + the xtensa toolchain, see below
 [build]
 target = "riscv32imc-unknown-none-elf"
 
@@ -33,6 +51,62 @@ rustflags = [
     "-C", "force-frame-pointers",
 ]
 
+# ── ESP32-C5 / ESP32-C6 (RV32IMAC) ──────────────────────────────────────────────────────────────
+# One section for two chips, because a target triple is an ISA and both chips ARE rv32imac. That
+# ambiguity is exactly what #349 is about: the triple cannot tell a C5 from a C6, so `build.rs`
+# maps it to CHIP_UNKNOWN and the chip FEATURE (plus `SMOL_CHIP` where a name is needed) is what
+# discriminates. Nothing here may imply either chip.
+#
+# No `runner`. Flashing is per-BOARD, not per-triple — it needs the right partition table and, on
+# this fleet, a MAC-guarded port (the USB port map reshuffles; identity is `ID_SERIAL_SHORT` via
+# passive udevadm, never `espflash board-info`, which resets the target). A `runner` here would be
+# a `cargo run` that flashes whichever ESP answered first. It gets added with the board, not with
+# the triple.
+[target.riscv32imac-unknown-none-elf]
+linker = "rust-lld"
+rustflags = [
+    "-C", "linker-flavor=ld.lld",
+    "-C", "link-arg=-Tlinkall.x",
+    "-C", "force-frame-pointers",
+]
+
+# ── ESP32-S3 (Xtensa LX7) ───────────────────────────────────────────────────────────────────────
+# ⚠️ NOT BUILDABLE WITH THE STOCK TOOLCHAIN. `xtensa-esp32s3-none-elf` is a TIER-3 target that
+# upstream rustc does not know: it needs the `esp` channel from espup (Xtensa Rust 1.95.0.0, pinned
+# byte-identical on katana and familiar — upgrade the two in lockstep or a "reproducible" build
+# stops being one). Every build shell must `. ~/export-esp.sh` first, which sets `LIBCLANG_PATH`
+# and prepends the xtensa GCC bin dir.
+#
+# ⚠️⚠️ AND THE TRAP THAT WOULD BREAK THE C3: THE S3 NEEDS `build-std`, AND IT MUST NOT GO IN THIS
+# FILE. There is no prebuilt `core` for this Tier-3 triple, so it must be compiled from source. But
+# cargo's `[unstable] build-std` is **GLOBAL, not per-target** — there is no
+# `[target.xtensa-…] build-std`. Adding it here would turn it on for the C3 too, and that is not a
+# hypothetical cost: it is the exact regression removed on 2026-07-20 (see the note below). build-std
+# forces resolver-1-style feature unification across the host/target boundary, which leaked
+# esp-hal's `portable-atomic/unsafe-assume-single-core` — a riscv-only cfg — into the HOST x86_64
+# build of portable-atomic, where its arch guard `compile_error!`s. That broke EVERY cold-cache C3
+# firmware build, and warm `target/` dirs hid it long enough to ship a release whose ELF only
+# linked because the cache was warm.
+#
+# So build-std is supplied PER INVOCATION, by the S3 wrapper only, as an environment override:
+#
+#   . ~/export-esp.sh
+#   CARGO_UNSTABLE_BUILD_STD=core,alloc \
+#     cargo check --no-default-features --features esp32s3,<tier> \
+#       --target xtensa-esp32s3-none-elf
+#
+# Env-scoped rather than file-scoped means a C3 build cannot inherit it by being in the same tree,
+# which is the property that matters — the 2026-07-20 failure was not that build-std was wrong for
+# the C3, it was that nothing stopped the C3 from getting it.
+[target.xtensa-esp32s3-none-elf]
+rustflags = [
+    "-C", "force-frame-pointers",
+    # No `linker`/`linker-flavor` override here, unlike the riscv targets. Those pin `rust-lld`
+    # because THIS MACHINE's `cc` is a non-compiler shim that must not be in the link path. The
+    # xtensa target has no LLD backend and links through the esp GCC driver that `export-esp.sh`
+    # puts on PATH — pinning `rust-lld` would break it. Same reason, opposite action.
+]
+
 # build-std REMOVED (2026-07-20, morpheus): riscv32imc-unknown-none-elf is a TIER-2 target with a
 # prebuilt core/alloc, so `-Zbuild-std` was unnecessary here. It was also actively HARMFUL: build-std
 # forces resolver-1-style feature unification across the host/target boundary, which leaked esp-hal's
@@ -42,6 +116,12 @@ rustflags = [
 # target/ was warm. Dropping build-std = prebuilt core (no host portable-atomic recompile) → fixed.
 # Verified: cold build of espnow,cast,io + default + wifi all green. REVISIT if a future esp-hal/
 # esp-wifi requires a from-source core (xtensa-only concern; N/A for the riscv C3).
+#
+# #347 UPDATE: that xtensa concern is now REAL — the S3 arm exists and does need a from-source core.
+# It is answered WITHOUT reopening this hole, by supplying build-std as a per-invocation env
+# override (`CARGO_UNSTABLE_BUILD_STD`) from the S3 wrapper instead of as a global config key. See
+# the `[target.xtensa-esp32s3-none-elf]` section above. Leave this block commented out: the fix for
+# "the S3 needs build-std" is never "so turn build-std on".
 # [unstable]
 # build-std = ["core", "alloc"]
 

@@ -61,12 +61,12 @@ sigil-names = { path = "../sigil-names", default-features = false }
 # `unstable` is required for I2C/SPI/RNG and is also a hard requirement of
 # esp-wifi. `esp32c3` selects the chip. `rt` + `exception-handler` come from
 # the default features (runtime + fault handler).
-esp-hal = { version = "1.1", features = ["esp32c3", "unstable"], optional = true }
+esp-hal = { version = "1.1", features = ["unstable"], optional = true }
 # NOTE: esp-hal's default features already install the exception handler, so
 # esp-backtrace only provides the panic handler + backtrace printing here.
 # Enabling esp-backtrace's `exception-handler` too causes a duplicate
 # `ExceptionHandler` symbol and an LTO bitcode-load failure at link time.
-esp-backtrace = { version = "0.19", features = ["esp32c3", "panic-handler", "println"], optional = true }
+esp-backtrace = { version = "0.19", features = ["panic-handler", "println"], optional = true }
 # Force the USB Serial/JTAG backend explicitly. This board's console is the
 # native USB Serial/JTAG link (/dev/ttyACM0); esp-println's default `auto`
 # backend only routes to USB-JTAG when it detects host SOF packets at the
@@ -74,7 +74,6 @@ esp-backtrace = { version = "0.19", features = ["esp32c3", "panic-handler", "pri
 # left app logs going to the (unwired) UART0. `jtag-serial` pins the output to
 # USB-JTAG so boot/WiFi/NTP/ESP-NOW logs always appear on /dev/ttyACM0.
 esp-println = { version = "0.17", default-features = false, optional = true, features = [
-    "esp32c3",
     "log-04",
     "jtag-serial",
     "colors",
@@ -105,7 +104,6 @@ esp-alloc = { version = "0.10", optional = true }
 # (NOT `embassy`) — smol stays a blocking superloop, and `esp_rtos::start()` turns main()
 # into the scheduler's pinned main task, so the existing blocking code runs as-is.
 esp-rtos = { version = "0.3", optional = true, features = [
-    "esp32c3",
     "esp-radio",
     "esp-alloc",
     "log-04",
@@ -114,7 +112,6 @@ esp-rtos = { version = "0.3", optional = true, features = [
 # (our smoltcp shim) + the `esp_now` interface. `default-features = false` drops
 # esp-radio's default `esp-alloc` so we re-add it explicitly.
 esp-radio = { version = "0.18", optional = true, default-features = false, features = [
-    "esp32c3",
     "wifi",
     "esp-alloc",
     "unstable",
@@ -123,7 +120,19 @@ esp-radio = { version = "0.18", optional = true, default-features = false, featu
 # #141 TX-power clamp + AP-info readback use raw esp-idf bindings. esp-radio's
 # `sys` module is pub(crate), so we depend on the per-chip bindings crate directly
 # and alias it to `esp_wifi_sys` — net.rs keeps `esp_wifi_sys::include::…` verbatim.
-esp-wifi-sys = { package = "esp-wifi-sys-esp32c3", version = "0.2", optional = true, default-features = false }
+#
+# #347: that alias used to be `package = "esp-wifi-sys-esp32c3"` — a hardcoded chip in a place a
+# feature CANNOT reach, because `esp-wifi-sys` is four separate PACKAGES rather than one package
+# with a chip feature, and cargo resolves `package =` before it knows any features. So the choice
+# moved into `rust/esp-wifi-sys-chip`, which owns all four aliases behind its own chip features.
+#
+# The KEY is still spelled `esp-wifi-sys`, so `esp_wifi_sys::include::…` in net.rs is unchanged
+# character for character. The dep stays optional and is pulled by `wifi` (the RADIO half); the chip
+# arm is forwarded by the chip feature with the WEAK form `esp-wifi-sys?/esp32cX` (the CHIP half).
+# That indirection is not taste — it is the only way to express `chip AND radio`, and getting it
+# wrong would link the Espressif blob archives into the `default` tier, which links none today.
+# Full derivation in rust/esp-wifi-sys-chip/src/lib.rs.
+esp-wifi-sys = { package = "esp-wifi-sys-chip", path = "../esp-wifi-sys-chip", optional = true, default-features = false }
 # #233: esp-radio 0.18 made connect/disconnect/scan ASYNC-only (no blocking variants).
 # smol is a synchronous superloop, so we drive those futures to completion with
 # embassy-futures' busy-loop `block_on` (no executor needed; the esp-rtos scheduler
@@ -145,8 +154,8 @@ smoltcp = { version = "0.13", optional = true, default-features = false, feature
 # rom.rs references an unresolved `esp_rom_sys` (md5/crc pulled by the chip
 # feature). esp-storage gives XIP-safe flash writes (FlashStorage auto-detects
 # 4 MB); esp-bootloader-esp-idf gives the otadata slot/state API + esp_app_desc!.
-esp-storage = { version = "0.9", optional = true, features = ["esp32c3"] }
-esp-bootloader-esp-idf = { version = "0.5", optional = true, features = ["esp32c3"] }
+esp-storage = { version = "0.9", optional = true, features = [] }
+esp-bootloader-esp-idf = { version = "0.5", optional = true, features = [] }
 # Software SHA-256 for the OTA image integrity gate. Chosen over the HW `esp_hal::sha`
 # peripheral deliberately: the HW path needs the SHA peripheral threaded through boot
 # into the OTA burst + a self-referential `ShaDigest` (borrows the `Sha` beside it),
@@ -177,11 +186,136 @@ ed25519-compact = { version = "2", default-features = false, optional = true }
 # (No extra top-level crate; the feature is toggled on esp-wifi below.)
 
 [features]
+# ── CHIP TARGETS (#347 / #331). EXACTLY ONE must be enabled. ───────────────────────────────────
+#
+# Every `esp-*` declaration above used to carry `features = ["esp32c3", …]`. A chip named in EIGHT
+# dependency declarations is not a target, it is a transplant: adding a second board meant editing
+# eight lists in lockstep and there was nothing to check that you had. Now the chip is named ONCE,
+# here, and fans out.
+#
+# ⚠️ THE INVARIANT THAT MAKES PER-CHIP ARMS LEGAL AT ALL:
+#
+#   esp-hal accepts exactly ONE chip feature, and cargo UNIFIES features across a workspace.
+#   Four arms in one manifest is nonetheless fine, because EVERY BUILD INVOCATION IS SINGLE-CHIP:
+#   the features and the target triple are chosen together, per invocation, and a build carrying
+#   two chip features is refused below rather than resolved.
+#
+#   What this manifest can therefore never do is build two chips AT ONCE, or share a cargo
+#   workspace graph with a crate compiled for a different chip. That is why `rust/sigil-names` and
+#   `rust/esp-wifi-sys-chip` declare their own `[workspace]` (see either file): a riscv crate and an
+#   xtensa crate in one graph would hand esp-hal two chips, and no amount of care in THIS file
+#   would help. Shared logic crosses that boundary as chip-agnostic, zero-dep, host-testable
+#   crates consumed BY PATH — the shape emberburrito proved on its own C3+S3 tree.
+#
+# ⚠️ WEAK (`?/`) FORWARDING IS LOAD-BEARING, NOT STYLE. `esp-hal?/esp32c3` means "if esp-hal ends up
+# enabled, turn on its esp32c3 feature". The plain form `esp-hal/esp32c3` would additionally ENABLE
+# the optional dependency — which would drag every bare-metal crate into the `hostsim` build and
+# destroy #152's host-emulator boundary, and would drag the radio + OTA crates into the `default`
+# tier. Every forward below is weak for that reason. The chip is a FACT about the build; it must not
+# be a reason for a crate to appear.
+#
+# A chip feature also supplies the board-independent CAPABILITY features for that silicon (see
+# below). Adding a fifth chip is: one arm here, one `ChipBudget` row in src/budget.rs, one
+# `[chip.*]` row in tools/build-matrix.toml. The checker asserts the last two agree.
+esp32c3 = [
+    "esp-hal?/esp32c3", "esp-backtrace?/esp32c3", "esp-println?/esp32c3",
+    "esp-rtos?/esp32c3", "esp-radio?/esp32c3",
+    "esp-storage?/esp32c3", "esp-bootloader-esp-idf?/esp32c3",
+    "esp-wifi-sys?/esp32c3",
+]
+esp32c5 = [
+    "esp-hal?/esp32c5", "esp-backtrace?/esp32c5", "esp-println?/esp32c5",
+    "esp-rtos?/esp32c5", "esp-radio?/esp32c5",
+    "esp-storage?/esp32c5", "esp-bootloader-esp-idf?/esp32c5",
+    "esp-wifi-sys?/esp32c5",
+    "has-ieee802154",
+]
+esp32c6 = [
+    "esp-hal?/esp32c6", "esp-backtrace?/esp32c6", "esp-println?/esp32c6",
+    "esp-rtos?/esp32c6", "esp-radio?/esp32c6",
+    "esp-storage?/esp32c6", "esp-bootloader-esp-idf?/esp32c6",
+    "esp-wifi-sys?/esp32c6",
+    "has-ieee802154",
+]
+esp32s3 = [
+    "esp-hal?/esp32s3", "esp-backtrace?/esp32s3", "esp-println?/esp32s3",
+    "esp-rtos?/esp32s3", "esp-radio?/esp32s3",
+    "esp-storage?/esp32s3", "esp-bootloader-esp-idf?/esp32s3",
+    "esp-wifi-sys?/esp32s3",
+    "has-psram",
+]
+
+# ── HARDWARE CAPABILITIES ──────────────────────────────────────────────────────────────────────
+#
+# Empty markers, existing to be `cfg`'d on. Chips select capabilities; code predicates on the
+# capability, never on the chip name — the OpenWrt model (`low_mem`, `small_flash`) that
+# src/budget.rs documents and that the esp32c6-watch's `has-pmu`/`has-imu`/`has-audio` seam
+# already runs in this house.
+#
+# ── WHERE smol DIVERGES FROM THE WATCH, AND WHY ────────────────────────────────────────────────
+#
+# The watch's seam is TWO layers: a `board-*` feature supplies the chip AND the capabilities, so
+# `board-waveshare-c6` and `board-cyd-c5` are the user-facing choice. smol has only the chip layer
+# and deliberately grows no `board-*` features. That is not a shortcut — the two repos put the
+# board/chip line in genuinely different places:
+#
+#   * The watch is ONE board per image. Its panel geometry is compile-time (Slint scenes are
+#     absolute-positioned per panel, so build.rs picks a different scene root per board), so a
+#     board IS a build.
+#   * smol is "fat image / thin runtime config" (#72). A board announces what it is at RUNTIME:
+#     `BoardProfile` (#352) is selected from `SELF_CHIP` plus an I2C display PROBE, node identity
+#     comes from a runtime id, and the #72 pin-map arrives over the air. Two smol boards on the
+#     same silicon run the SAME binary on purpose.
+#
+# So at smol the only thing that must be compile-time is what the SILICON fixes, and that is
+# exactly the chip feature and the capabilities it implies. A `board-*` layer here would compile in
+# a fact the runtime already discovers better, and would fork the fleet image per board — the one
+# property the OTA story depends on not doing.
+#
+# ⚠️ Correspondingly, DO NOT add capability features for things BoardProfile probes. `has-display`
+# would be exactly that mistake: it is a runtime I2C probe today (`BoardProfile::for_self(has_display)`),
+# and freezing it into the feature set would make one image per board variant.
+
+# 802.15.4 radio (Thread/Zigbee PHY): the C6 and the C5 have one, the C3 and S3 do not. Marker
+# only — it deliberately does NOT forward to `esp-radio/ieee802154`, and MUST NOT.
+#
+# ⚠️ `esp-radio`'s build script HARD-PANICS when `esp-now` and `ieee802154` are enabled together
+# (the same class of refusal as the `coex`-without-`ble` error documented on the `espnow` feature
+# below). smol's mesh IS ESP-NOW on every tier that has a radio, so a build that turned this marker
+# into the real esp-radio feature would fail at build-script time on the two chips that own the
+# capability — i.e. enabling a C6's headline feature would break the C6. The Zigbee-bridge role
+# (#331 / the NM-CYD-C5's 802.15.4 role) therefore needs a tier where the mesh transport is NOT
+# ESP-NOW, which is a protocol decision and not a feature-flag one. Until then this marker records
+# that the silicon has the radio, and nothing links it.
+has-ieee802154 = []
+
+# Octal/quad PSRAM (the S3's 8 MB). Marker only; the amount and mode are NOT expressible here.
+#
+# ⚠️ PSRAM mode is a RUNTIME `PsramConfig` field in esp-hal 1.1.x, NOT a cargo feature and NOT an
+# `ESP_HAL_CONFIG_*` env knob. A research doc in the emberburrito tree asserted both and was
+# disproven on hardware; write the mode in code where the config struct is built.
+#
+# ⚠️ AND THE ONE THAT SILENTLY CORRUPTS: `esp-radio`'s heap must NEVER live in PSRAM on the S3.
+# The radio blobs use atomics that do not work against PSRAM, and the failure is not a panic — it
+# is wrong data. `net::init_heap` must keep the radio heap in internal DRAM and add PSRAM as a
+# separate region if at all. Recorded at the feature that makes PSRAM reachable, because the
+# temptation ("8 MB of heap, why is the heap still 128 KiB") arrives with the feature.
+has-psram = []
+
 # Phase 1 only: clock on the OLED. `default` = `hw` so `cargo build --release` with no
 # flags is the guaranteed-green firmware baseline — BYTE-IDENTICAL to before the #152
 # split (the bare-metal crates were non-optional before; now they ride `hw`, which
 # `default` and every firmware tier pull, so the same deps + code compile).
-default = ["hw"]
+#
+# #347: `esp32c3` joins it, so `cargo build --release` with no flags is still a C3 image and still
+# byte-identical — the chip moved from eight dependency declarations into one feature, and feature
+# resolution is a set union, so the resolved set is unchanged. That equality is MEASURED, not
+# argued: section sizes + `nm` against the pre-#347 artifact, reported on the PR.
+#
+# ⚠️ Consequence worth knowing before you type it: because the chip rides `default`, building for
+# another chip needs `--no-default-features` and the tier spelled out, or you get TWO chip features
+# and the refusal in src/budget.rs. See the per-chip invocations in tools/build-matrix.toml.
+default = ["esp32c3", "hw"]
 
 # #152 host-emulator boundary. The bare-metal crates (esp-hal / esp-backtrace /
 # esp-println / ssd1306) are `optional` so a NON-hardware target (the `hostsim` wasm lib)

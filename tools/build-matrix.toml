@@ -59,23 +59,49 @@ builds = true
 ships  = true
 
 [chip.esp32s3]
-# JP's next fleet target. Not yet compilable from this tree: `esp-hal` is pinned with
-# `features = ["esp32c3"]`, `.cargo/config.toml` pins `build.target`, and xtensa needs the
-# esp Rust fork rather than the pinned upstream toolchain.
+# JP's next fleet target.
+#
+# #347 Part 2 REMOVED two of the three original blockers: `esp-hal` no longer hardcodes a chip
+# (the `esp32s3` feature supplies it) and `.cargo/config.toml` now declares this triple instead of
+# pinning only the C3's. What remains is a TOOLCHAIN fact, not a manifest one — which is why the
+# reason below was rewritten rather than left standing. A `blocked_on` whose stated cause has been
+# fixed reads as a considered decision and is the most expensive kind of stale comment.
 target     = "xtensa-esp32s3-none-elf"
 builds     = false
 ships      = false
-blocked_on = "#331 multi-target; needs the esp fork toolchain and a per-chip esp-hal feature"
-# When #331 lands, flipping `builds` to true is a ONE-WORD data change and the matrix,
-# the CI jobs and the tier coverage all follow. That is the entire point of this file.
+# `builds = false` is about CI, not about this tree. Xtensa is a Tier-3 target needing espup's `esp`
+# channel (Xtensa Rust 1.95.0.0, pinned byte-identical on katana and familiar) plus
+# `. ~/export-esp.sh` and a per-invocation `CARGO_UNSTABLE_BUILD_STD=core,alloc`. GitHub runners
+# have none of it, and a permanently-red arm teaches everyone to ignore the gate (#343).
+blocked_on = "xtensa toolchain (espup `esp` channel + export-esp.sh) is not on CI runners; the manifest and target pins are DONE (#347 Part 2)"
+# When the toolchain question is answered, flipping `builds` to true is a ONE-WORD data change and
+# the matrix, the CI jobs and the tier coverage all follow. That is the entire point of this file.
 # `ships` stays false after that: OpenWrt's DEFAULT := n. Buildable is not shipped.
 
 [chip.esp32c6]
-# The esp32c6-watch already runs this chip in its own repo (#347 Phase 2's third consumer).
+# The esp32c6-watch already runs this chip in its own repo (#347 Phase 2's third consumer), and
+# Part 1 landed its MEASURED ChipBudget row — which Part 2's per-feature lookup can now select.
 target     = "riscv32imac-unknown-none-elf"
 builds     = false
 ships      = false
-blocked_on = "#331 multi-target; esp-hal chip feature is pinned to esp32c3 in Cargo.toml"
+# The manifest pin is gone. What blocks a green CI arm is smol's own code, not the chip plumbing:
+# the ROM region. esp-hal generates a 4 MiB ROM region for the C6 and the measured row's 6 MB OTA
+# slots exist only because the watch's `widen_rom_region` build.rs hook rewrites it. smol does not
+# carry that hook, so a C6 image links against a 4 MiB ceiling while its budget claims 6 MB.
+blocked_on = "needs the watch's widen_rom_region build.rs hook (#67 there) before the 6MB-slot budget row is honest; manifest + target pins are DONE (#347 Part 2)"
+
+[chip.esp32c5]
+# The NM-CYD-C5 (#388), fifth fleet target and the intended Zigbee-bridge role. Shares
+# `riscv32imac` with the C6 — the triple CANNOT tell them apart, which is #349's whole subject;
+# the chip FEATURE is what discriminates now.
+target     = "riscv32imac-unknown-none-elf"
+builds     = false
+ships      = false
+# NO ChipBudget row, deliberately: nobody has measured this silicon, and `budget.rs` hands an
+# unmeasured chip a poison row rather than the C6's numbers. `builds = false` is therefore also
+# what keeps the roster check quiet — rule 1 of this file only demands a budget for a chip that
+# BUILDS. The board-specific code stop-points are recorded on #388.
+blocked_on = "#388 board code: TSENS (src/main.rs:708) and a hard-typed GPIO9 need C5 arms; no measured ChipBudget row yet"
 
 # ── TIERS ─────────────────────────────────────────────────────────────────────
 # `features` is passed verbatim to `--features` (empty string = default features only).
@@ -149,6 +175,37 @@ features = "stack-paint,${canonical}"
 default  = "the `default` tier IS this feature set"
 hw       = "implied by every firmware tier; a tier for it alone would build nothing new"
 hostsim  = "host-only, and covered by the `cargo test` arm in tools/gate.sh"
+
+# ── #347 Part 2: the chip axis is not a tier ──────────────────────────────────
+# A CHIP is the other axis of this very matrix — `[chip.*]` above — so a `[tier.esp32c5]` would
+# duplicate the roster in the table designed to stop the roster being duplicated, and would make
+# the cross product this file exists to refuse. Coverage of a chip feature is `builds = true` on
+# its `[chip.*]` row; that is where the "is anything compiling this?" question belongs, and it is
+# already checked in both directions against `budget.rs`.
+#
+# `esp32c3` is exempted for a second, stronger reason worth stating separately: it is carried by
+# `default`, so EVERY tier in this file builds it. It is the most-compiled feature in the tree.
+esp32c3 = "the chip axis, not a tier — carried by `default`, so every tier above already builds it"
+esp32c5 = "the chip axis, not a tier — coverage is `builds` on [chip.esp32c5]"
+esp32c6 = "the chip axis, not a tier — coverage is `builds` on [chip.esp32c6]"
+esp32s3 = "the chip axis, not a tier — coverage is `builds` on [chip.esp32s3]"
+
+# ── #347 Part 2: capability markers ───────────────────────────────────────────
+# Empty marker features, selected BY a chip feature, existing to be `cfg`'d on. They cannot have a
+# tier for the same reason as the chips (they are not an independent axis — no build chooses a
+# capability, the silicon does), and right now they gate no code at all.
+#
+# ⚠️ THAT IS THE HONEST WEAKNESS OF THESE TWO ENTRIES, so it is written down rather than smoothed
+# over. A marker nothing reads is indistinguishable from a marker that has quietly stopped being
+# read, and this file's own rule is that an exemption whose reason has expired is worse than none.
+# The reason has NOT expired — it has not yet started: both are declarations that the silicon has
+# a thing, made at the point where the constraint is documented (see the ⚠️ blocks at each feature
+# in rust/clock/Cargo.toml — the espnow⊕ieee802154 build-script panic, and esp-radio's heap never
+# going in PSRAM). When code starts predicating on them, these entries stay valid unchanged; what
+# would invalidate them is a `has-*` feature that pulls a real dependency, and that one needs a
+# tier.
+has-ieee802154 = "capability marker selected by esp32c5/esp32c6; gates no code yet and links nothing (see the mutual-exclusion note at its declaration)"
+has-psram      = "capability marker selected by esp32s3; gates no code yet and links nothing (PSRAM mode is a RUNTIME PsramConfig field, not a feature)"
 # `off-fleet` deliberately has NO entry here: the bard tier names it, so it is covered, and the
 # checker rejects a feature that is both exempted and covered — an exemption whose reason has
 # quietly stopped applying is worse than none. It caught this exact case when first written.
