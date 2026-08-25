@@ -270,6 +270,7 @@ esp32s3 = [
     "esp-storage?/esp32s3", "esp-bootloader-esp-idf?/esp32s3",
     "esp-wifi-sys?/esp32s3",
     "has-psram", "has-reset-glitch-split",
+    "hal-cpu-reset-unindexed",
     # NO `has-tsens`. This arm CARRIED it in the first draft of this commit, from a datasheet-shaped
     # assumption that the big chip has at least what the little one has. A per-chip `cargo check` on
     # familiar's xtensa toolchain said otherwise: `esp_hal::tsens` is unresolved for
@@ -387,6 +388,20 @@ has-tsens = []
 # caveat that reads as handled. `reset_reason_token()` is NOT chip-complete.
 has-reset-glitch-split = []
 has-reset-glitch-unified = []
+
+# ── HAL API FACTS — `hal-*`, a DIFFERENT namespace from `has-*`, on purpose ─────────────────────
+#
+# `has-*` means "the silicon has a thing". This namespace means "esp-hal spells a thing
+# differently for this chip" — no silicon difference at all. The first tenant is the S3's
+# CPU-scoped reset reasons: esp-hal drops the core index (`CpuSw`/`CpuMwdt0`/`CpuMwdt1`/
+# `CpuRtcWdt` where the C3/C5/C6 have `Cpu0*`), at IDENTICAL discriminants (0x0C/0x0B/0x11/0x0D).
+# `reset_reason_token()` in src/ota.rs predicates its match arms on this instead of on a chip
+# name. The namespace was deliberately NOT invented during the de-pin (#347 Part 2 left it as a
+# named decision, see the reset_reason_token doc) — it lands here, with the S3 arm that needs it
+# (#398/#331). Spending a `has-*` marker on a spelling would make that layer's one guarantee
+# unreliable; a chip-name cfg in ota.rs would re-pin what #347 just un-pinned. This is the third
+# door.
+hal-cpu-reset-unindexed = []
 
 # Phase 1 only: clock on the OLED. `default` = `hw` so `cargo build --release` with no
 # flags is the guaranteed-green firmware baseline — BYTE-IDENTICAL to before the #152

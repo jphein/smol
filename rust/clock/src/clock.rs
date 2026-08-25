@@ -95,9 +95,11 @@ pub(crate) fn draw_clock<D>(
     let reading = sensors.read();
     // #43: temperature unit (°F/°C) per the fleet-global config.
     let sensor_line = sensors::format_sensor_line(&reading, units.temp_f);
+    // `chip_c` is optional-by-silicon (no tsens on the C5/S3) — log the already-formatted
+    // line, which omits the field honestly, rather than inventing a number here.
     log::debug!(
-        "smol: chip {}C, batt {:.2}V (~{}%)",
-        reading.chip_c as i32,
+        "smol: sensors {} (batt {:.2}V ~{}%)",
+        sensor_line.as_str(),
         reading.batt_v,
         reading.batt_pct,
     );

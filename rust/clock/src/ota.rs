@@ -2077,17 +2077,14 @@ fn take_panic_mark() -> bool {
 /// those three, and it is predicated on a `has-reset-glitch-*` capability rather than on a chip
 /// name. This function compiles clean on all three.
 ///
-/// ⚠️ IT DOES NOT COMPILE ON THE S3, and that is a MEASURED, tracked stop-point rather than an
-/// oversight — `tools/build-matrix.toml`'s `[chip.esp32s3]` declares `checks = false` for it and
-/// `tools/check_chips.sh` asserts the failure, so this paragraph cannot quietly become false.
-/// esp-hal spells the four CPU-scoped reasons WITHOUT the core index on the S3, and the values are
-/// identical — `CpuSw`/`CpuMwdt0`/`CpuMwdt1`/`CpuRtcWdt` = 0x0C/0x0B/0x11/0x0D, exactly the C3's
-/// `Cpu0Sw`/`Cpu0Mwdt0`/`Cpu0Mwdt1`/`Cpu0RtcWdt`. So it is a pure esp-hal NAMING variance carrying
-/// no difference in silicon behaviour, which is why it deliberately did NOT get a `has-*` marker
-/// here: that namespace means "the silicon has a thing", and spending it on a spelling would make
-/// the layer's one guarantee unreliable. It needs a differently-named predicate (an esp-hal API
-/// fact, not a capability), and inventing that namespace is a decision worth making on its own
-/// rather than as a side effect of the de-pin. #347 Phase 3 / #331.
+/// The S3 (#398) compiles via the `hal-cpu-reset-unindexed` predicate: esp-hal spells the four
+/// CPU-scoped reasons WITHOUT the core index on the S3, at identical values — `CpuSw`/`CpuMwdt0`/
+/// `CpuMwdt1`/`CpuRtcWdt` = 0x0C/0x0B/0x11/0x0D, exactly the C3's `Cpu0Sw`/`Cpu0Mwdt0`/
+/// `Cpu0Mwdt1`/`Cpu0RtcWdt`. A pure esp-hal NAMING variance with no silicon difference, which is
+/// why it deliberately did NOT get a `has-*` marker (that namespace means "the silicon has a
+/// thing") — it got the `hal-*` namespace instead, invented for exactly this (see the block in
+/// Cargo.toml). The de-pin (#347 Part 2) left inventing that namespace as a named decision rather
+/// than a side effect; #398's S3 arm made it.
 ///
 /// Also NOT chip-complete: the C5's `CpuLockup` is unmapped and reports "other" (see Cargo.toml).
 #[cfg(feature = "espnow")]
@@ -2100,9 +2097,16 @@ pub fn reset_reason_token() -> &'static str {
     use esp_hal::rtc_cntl::SocResetReason as R;
     match esp_hal::system::reset_reason() {
         Some(R::ChipPowerOn) => "power-on",
+        // The CPU-scoped spellings differ per esp-hal, not per silicon: `Cpu0*` on the
+        // C3/C5/C6, unindexed `Cpu*` on the S3 — identical discriminants. Predicated on
+        // `hal-cpu-reset-unindexed` (see Cargo.toml), never on a chip name.
+        #[cfg(not(feature = "hal-cpu-reset-unindexed"))]
         Some(R::CoreSw) | Some(R::Cpu0Sw) => "sw",
+        #[cfg(feature = "hal-cpu-reset-unindexed")]
+        Some(R::CoreSw) | Some(R::CpuSw) => "sw",
         Some(R::CoreDeepSleep) => "deep-sleep",
         Some(R::SysBrownOut) => "brownout",
+        #[cfg(not(feature = "hal-cpu-reset-unindexed"))]
         Some(
             R::CoreMwdt0
             | R::CoreMwdt1
@@ -2110,6 +2114,17 @@ pub fn reset_reason_token() -> &'static str {
             | R::Cpu0Mwdt1
             | R::CoreRtcWdt
             | R::Cpu0RtcWdt
+            | R::SysRtcWdt
+            | R::SysSuperWdt,
+        ) => "wdt",
+        #[cfg(feature = "hal-cpu-reset-unindexed")]
+        Some(
+            R::CoreMwdt0
+            | R::CoreMwdt1
+            | R::CpuMwdt0
+            | R::CpuMwdt1
+            | R::CoreRtcWdt
+            | R::CpuRtcWdt
             | R::SysRtcWdt
             | R::SysSuperWdt,
         ) => "wdt",

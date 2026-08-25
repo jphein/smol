@@ -25,7 +25,15 @@
 #[cfg(feature = "hw")]
 use esp_hal::{
     analog::adc::{Adc, AdcConfig, AdcPin, Attenuation},
-    peripherals::{ADC1, GPIO4, TSENS},
+    peripherals::{ADC1, GPIO4},
+};
+// `has-tsens` is a MEASURED capability, not an assumption: C3 ✓ C6 ✓ C5 ✗ S3 ✗ (the biggest
+// chip lacks the sensor the smallest one has — see the table at `has-tsens` in Cargo.toml).
+// On a chip without it there is no die temperature, and `Reading.chip_c` says so with `None`
+// rather than fabricating a number.
+#[cfg(all(feature = "hw", feature = "has-tsens"))]
+use esp_hal::{
+    peripherals::TSENS,
     tsens::{Config as TsensConfig, TemperatureSensor},
 };
 
@@ -66,8 +74,10 @@ pub const BATT_FULL_V: f32 = 4.2;
 /// A single sensor sample.
 #[derive(Clone, Copy)]
 pub struct Reading {
-    /// Internal chip (die) temperature in °C. NOT ambient.
-    pub chip_c: f32,
+    /// Internal chip (die) temperature in °C. NOT ambient. `None` on silicon with no
+    /// die-temp sensor (`has-tsens` absent: the C5 and S3) — the honest answer, never a
+    /// fabricated number; `format_sensor_line` simply omits the temperature field.
+    pub chip_c: Option<f32>,
     /// Estimated battery voltage in volts (after applying [`BATT_DIVIDER`]).
     /// Meaningless unless a divider is actually wired to [`BATT_ADC_GPIO`].
     pub batt_v: f32,
@@ -80,6 +90,7 @@ pub struct Reading {
 /// [`Reading`] on demand.
 #[cfg(feature = "hw")]
 pub struct Sensors<'d> {
+    #[cfg(feature = "has-tsens")]
     tsens: TemperatureSensor<'d>,
     adc: Adc<'d, ADC1<'d>, esp_hal::Blocking>,
     batt_pin: AdcPin<GPIO4<'d>, ADC1<'d>>,
@@ -103,7 +114,7 @@ impl<'d> Sensors<'d> {
 
     /// A canned sample (24 °C die, 4.05 V ≈ 92 % 1S) — the emulator has no hardware.
     pub fn read(&mut self) -> Reading {
-        Reading { chip_c: 24.0, batt_v: 4.05, batt_pct: 92 }
+        Reading { chip_c: Some(24.0), batt_v: 4.05, batt_pct: 92 }
     }
 }
 
@@ -113,6 +124,9 @@ impl<'d> Sensors<'d> {
     ///
     /// `TSENS`, `ADC1` and `GPIO4` are peripheral singletons handed out by
     /// `esp_hal::init()`; `main` owns that call and passes them in here.
+    /// (On a no-tsens chip there IS no `TSENS` singleton to pass — hence the
+    /// cfg'd second constructor below, and a cfg'd call site in `main`.)
+    #[cfg(feature = "has-tsens")]
     pub fn new(tsens: TSENS<'d>, adc1: ADC1<'d>, gpio4: GPIO4<'d>) -> Self {
         // Temperature sensor: default config (XTAL clock). `new` powers it up;
         // caller should allow a few hundred µs before the first read to settle.
@@ -133,9 +147,25 @@ impl<'d> Sensors<'d> {
         }
     }
 
-    /// Take one temperature + one battery-voltage sample.
+    /// Battery ADC only — the constructor for silicon with no die-temp sensor
+    /// (`has-tsens` absent: C5, S3). Same struct, same `read()` surface; the
+    /// temperature is simply never there to read.
+    #[cfg(not(feature = "has-tsens"))]
+    pub fn new(adc1: ADC1<'d>, gpio4: GPIO4<'d>) -> Self {
+        let mut adc_config = AdcConfig::new();
+        let batt_pin = adc_config.enable_pin(gpio4, Attenuation::_11dB);
+        let adc = Adc::new(adc1, adc_config);
+
+        Self { adc, batt_pin }
+    }
+
+    /// Take one temperature (where the silicon has the sensor) + one
+    /// battery-voltage sample.
     pub fn read(&mut self) -> Reading {
-        let chip_c = self.tsens.get_temperature().to_celsius();
+        #[cfg(feature = "has-tsens")]
+        let chip_c = Some(self.tsens.get_temperature().to_celsius());
+        #[cfg(not(feature = "has-tsens"))]
+        let chip_c = None;
 
         // Blocking oneshot ADC read. `read_oneshot` is non-blocking (returns
         // WouldBlock while converting); `nb::block!` spins until the conversion
@@ -222,11 +252,21 @@ pub fn format_sensor_line(r: &Reading, temp_f: bool) -> LineBuf {
     let mut line = LineBuf::new();
     // #43: chip temp in °F (default) or °C per the fleet-global units, rounded to a whole
     // degree; volts to one decimal. e.g. "73F 3.9V" / "23C 3.9V".
-    if temp_f {
-        let f = r.chip_c * 9.0 / 5.0 + 32.0;
-        let _ = write!(line, "{}F {:.1}V", f as i32, r.batt_v);
-    } else {
-        let _ = write!(line, "{}C {:.1}V", r.chip_c as i32, r.batt_v);
+    //
+    // No die-temp sensor (`chip_c: None`, the C5/S3) → the field is OMITTED, e.g. "3.9V",
+    // never a fabricated 0°/NaN. Consumers of the wire format (#43 canonical °F telemetry)
+    // must treat the temperature field as optional-by-silicon.
+    match (r.chip_c, temp_f) {
+        (Some(c), true) => {
+            let f = c * 9.0 / 5.0 + 32.0;
+            let _ = write!(line, "{}F {:.1}V", f as i32, r.batt_v);
+        }
+        (Some(c), false) => {
+            let _ = write!(line, "{}C {:.1}V", c as i32, r.batt_v);
+        }
+        (None, _) => {
+            let _ = write!(line, "{:.1}V", r.batt_v);
+        }
     }
     line
 }

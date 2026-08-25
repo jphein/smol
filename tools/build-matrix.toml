@@ -93,17 +93,15 @@ checks = true
 target     = "xtensa-esp32s3-none-elf"
 builds     = false
 ships      = false
-# MEASURED on familiar's xtensa toolchain (espup `esp`, Xtensa Rust 1.95.0.0), canonical tier: the
-# whole dependency graph builds — `core` from source, esp-hal 1.1.1 for xtensa — and stops with 6
-# errors in smol's OWN code, in exactly two classes:
-#   * TSENS (2): `esp_hal::tsens` does not exist for the S3 — the same gap as the C5, needs the
-#     `has-tsens` fallback in sensors.rs/main.rs. NOTE this contradicted the roster's assumption
-#     that the biggest chip is a superset; see the `has-tsens` block in rust/clock/Cargo.toml.
-#   * `SocResetReason` CPU-scoped spelling (4): the S3 drops the core index — `CpuSw`/`CpuMwdt0`/
-#     `CpuMwdt1`/`CpuRtcWdt` where the C3 has `Cpu0*`, at IDENTICAL discriminants. A pure esp-hal
-#     naming variance with no silicon difference, so it deliberately got no `has-*` marker (that
-#     namespace means the silicon has a thing). See src/ota.rs's reset_reason_token().
-checks     = false
+# CHECKS PASS as of #398's S3 arm. The 6 errors this row used to catalogue fell in two moves:
+#   * TSENS (2): the `has-tsens` fallback landed — `sensors.rs` grew cfg'd constructors and
+#     `Reading.chip_c` became `Option<f32>` (a no-tsens chip omits the field, never fabricates).
+#     This was ALSO the C5's named blocker; if the C5 unexpectedly compiles now, this gate will
+#     say so and its row flips too.
+#   * `SocResetReason` CPU-scoped spelling (4): predicated on the new `hal-cpu-reset-unindexed`
+#     feature (the `hal-*` namespace = esp-hal API facts, distinct from `has-*` silicon facts —
+#     see the block in rust/clock/Cargo.toml). See src/ota.rs's reset_reason_token().
+checks     = true
 # The xtensa toolchain is a property of the CHIP, declared here so no script hardcodes it. Empty /
 # absent `toolchain` means the default (rust-toolchain.toml's `stable`).
 toolchain  = "esp"
@@ -150,19 +148,16 @@ ships      = false
 # unmeasured chip a poison row rather than the C6's numbers. `builds = false` is therefore also
 # what keeps the roster check quiet — rule 1 of this file only demands a budget for a chip that
 # BUILDS. The board-specific code stop-points are recorded on #388.
-blocked_on = "#388 board code: TSENS (src/sensors.rs:28 + src/main.rs:719) needs `has-tsens` arms; no measured ChipBudget row yet"
-# MEASURED, canonical tier, `SMOL_CHIP=esp32c5 ... --target riscv32imac-unknown-none-elf`: the full
-# dependency graph resolves and compiles, stopping with exactly 2 errors, both TSENS — the C5 has no
-# `esp_hal::tsens`. Down from 4: the glitch pair (src/ota.rs) is fixed and shared with the C6.
-#
-# ⚠️ TWO CORRECTIONS TO THIS ROW'S OWN PREVIOUS TEXT, both from running it rather than reading it:
-#   * TSENS in main.rs is at line **719**, not 708. A line number in a `blocked_on` is a promise
-#     that rots silently; this one was ~11 lines stale.
-#   * The "hard-typed GPIO9" is REMOVED from the claim. It did not appear. `cargo check` stops at
-#     the TSENS errors, so GPIO9 is UNCONFIRMED — not disproven, just never reached. It is listed
-#     on #388 as a suspected stop-point and must not be restated here as a measured one; the
-#     difference between "we saw this" and "we expect this" is the entire value of this field.
-checks     = false
+blocked_on = "no measured ChipBudget row yet (budget.rs hands an unmeasured chip the poison row); measure on hardware per #388, then flip `builds`"
+# CHECKS PASS as of #398's S3 arm — the `has-tsens` fallback it landed was ALSO this row's last
+# stop-point (sensors.rs cfg'd constructors + `Reading.chip_c: Option<f32>`), and the gate itself
+# demanded this flip: it ran the C5, found it COMPILING CLEAN against a `checks = false`
+# declaration, and refused the stale pessimism — exactly the failure-is-also-an-expectation
+# behaviour this file promises. Two prior suspicions resolved by that run: the TSENS errors are
+# gone (fixed, not moved), and the long-suspected "hard-typed GPIO9" stop-point never existed —
+# the compiler reached the end and found nothing (it had been UNCONFIRMED, never measured; now it
+# is disproven).
+checks     = true
 
 # ── TIERS ─────────────────────────────────────────────────────────────────────
 # `features` is passed verbatim to `--features` (empty string = default features only).
@@ -295,6 +290,11 @@ has-psram      = "capability marker selected by esp32s3; gates no code yet and l
 has-tsens                = "capability marker selected by esp32c3/esp32c6/esp32s3, read by src/sensors.rs; the silicon picks it, not a build, so the chip axis covers it — compiled by every tier via `default`->esp32c3 though the checker cannot see through the chip arm"
 has-reset-glitch-split   = "capability marker selected by esp32c3/esp32s3, read by src/ota.rs reset_reason_token(); same chip-axis reason — compiled by every tier via `default`->esp32c3"
 has-reset-glitch-unified = "capability marker selected by esp32c5 ALONE, read by src/ota.rs; genuinely uncompiled by this matrix because [chip.esp32c5] is builds=false — covered by tools/check_chips.sh until it flips"
+# `hal-*` is the third exemption story: not a silicon capability at all but an esp-hal API fact
+# (see the namespace charter in rust/clock/Cargo.toml). No build chooses a spelling — the HAL
+# does, per chip — so a `[tier.hal-cpu-reset-unindexed]` would mean "build an image that pretends
+# esp-hal names the S3's reset reasons the C3 way", which cannot compile by construction.
+hal-cpu-reset-unindexed  = "esp-hal API-fact marker (hal-* namespace) selected by esp32s3 ALONE, read by src/ota.rs reset_reason_token(); uncompiled by this matrix while [chip.esp32s3] is builds=false — covered by tools/check_chips.sh, same standing as has-reset-glitch-unified"
 # `off-fleet` deliberately has NO entry here: the bard tier names it, so it is covered, and the
 # checker rejects a feature that is both exempted and covered — an exemption whose reason has
 # quietly stopped applying is worse than none. It caught this exact case when first written.

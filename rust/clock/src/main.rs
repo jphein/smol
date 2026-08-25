@@ -158,7 +158,8 @@ mod finder;
 // (needs the radio) → zero code in default/wifi builds (default-build invariant).
 #[cfg(feature = "espnow")]
 mod familiar;
-// On-board sensors: chip die-temp (tsens) + battery ADC on GPIO4. Always on.
+// On-board sensors: battery ADC on GPIO4, always on; chip die-temp only where the
+// silicon has the sensor (`has-tsens` — measured C3 ✓ C6 ✓ C5 ✗ S3 ✗).
 mod sensors;
 // #72 IO/component registry (ESPHome inverted): the digital-`Flex` driver menu +
 // runtime pin-map for the free GPIOs (0/1/3/7/10), configured live over the #56
@@ -715,12 +716,18 @@ fn main() -> ! {
     // --- BOOT button on GPIO9 (debounced short/long) -------------------------
     let mut button = Button::new(peripherals.GPIO9);
 
-    // --- On-board sensors (chip temp + battery ADC on GPIO4) -----------------
+    // --- On-board sensors (battery ADC on GPIO4; die temp where the silicon has one) ---
+    // `peripherals.TSENS` does not EXIST on a no-tsens chip (C5/S3), so the call site is
+    // cfg'd on the capability, matching the two constructors in sensors.rs.
+    #[cfg(feature = "has-tsens")]
     let mut sensors = sensors::Sensors::new(peripherals.TSENS, peripherals.ADC1, peripherals.GPIO4);
+    #[cfg(not(feature = "has-tsens"))]
+    let mut sensors = sensors::Sensors::new(peripherals.ADC1, peripherals.GPIO4);
     log::info!(
-        "smol: sensors up — chip temp + battery ADC on GPIO{} ({}:1 divider)",
+        "smol: sensors up — battery ADC on GPIO{} ({}:1 divider); die-temp: {}",
         sensors::BATT_ADC_GPIO,
         sensors::BATT_DIVIDER as u32,
+        cfg!(feature = "has-tsens"),
     );
 
     // --- #72 IO registry: claim the free GPIOs as runtime-bindable Flex pins --
