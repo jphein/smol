@@ -76,8 +76,38 @@ canonical_tier = "fleet"
 # The implication ladder is checked by build_matrix.py: ships => builds => checks. You cannot ship
 # what nothing builds, and you cannot build what does not compile.
 
+# ── `config_markers`: WHAT `.cargo/config.toml` MUST SAY FOR THIS CHIP (#280) ────────────────
+# Literal strings that must appear INSIDE this chip's `[target.<triple>]` section of
+# `rust/clock/.cargo/config.toml`. `tools/assert_cargo_config.sh` asserts them before a build.
+#
+# WHY THIS IS DECLARED DATA AND NOT A CHECKSUM. The file is git-TRACKED, but `~/Projects/.stignore`
+# ignores `.cargo`, so the copy on a remote builder arrives OUT OF BAND — this repo's own build
+# instructions tell agents to "copy .cargo/config.toml if missing". A manual copy satisfies
+# "present" and never satisfies "current". On 2026-08-25 familiar's copy was found byte-current
+# except for the S3 arm's `-Tlinkall.x`, added that morning by #398. A checksum would need ground
+# truth from another host; markers need only what this manifest already knows.
+#
+# WHY THE SECTION SCOPE IS LOAD-BEARING. A whole-file grep for `-Tlinkall.x` PASSES on that exact
+# stale file, because the two riscv arms carry it and only the xtensa arm was missing it. The
+# assertion is therefore per-section, and a marker list that "works" under a file-wide grep is not
+# the same check at all.
+#
+# WHY THESE MARKERS. Each is load-bearing AND silent at `cargo check` time, which is the pairing
+# that makes a stale config expensive:
+#   `-Tlinkall.x`          esp-hal's linker script. `cargo check` never links, so its absence is
+#                          invisible until `ld` emits 129 undefined references (#398 measured
+#                          exactly that on the S3: with the line, 129 -> 0).
+#   force-frame-pointers   esp-backtrace needs them to unwind a panic. Absence costs nothing at
+#                          build time and everything at the moment you need a backtrace.
+#   linker-flavor=ld.lld   riscv ONLY. This machine's `cc` is a non-compiler shim, so the target
+#                          link must not route through it. DELIBERATELY ABSENT from the S3 list:
+#                          the xtensa target has no LLD backend and links through esp GCC, so
+#                          pinning rust-lld there would BREAK it. Same reason, opposite action —
+#                          which is precisely why this is per-chip data rather than one global list.
+
 [chip.esp32c3]
 target = "riscv32imc-unknown-none-elf"
+config_markers = ["-Tlinkall.x", "force-frame-pointers", "linker-flavor=ld.lld"]
 builds = true
 ships  = true
 checks = true
@@ -91,6 +121,7 @@ checks = true
 # reason below was rewritten rather than left standing. A `blocked_on` whose stated cause has been
 # fixed reads as a considered decision and is the most expensive kind of stale comment.
 target     = "xtensa-esp32s3-none-elf"
+config_markers = ["-Tlinkall.x", "force-frame-pointers"]
 builds     = false
 ships      = false
 # CHECKS PASS as of #398's S3 arm. The 6 errors this row used to catalogue fell in two moves:
@@ -132,6 +163,7 @@ blocked_on = "ONLY the CI-runner toolchain remains (espup `esp` channel + export
 # The esp32c6-watch already runs this chip in its own repo (#347 Phase 2's third consumer), and
 # Part 1 landed its MEASURED ChipBudget row — which Part 2's per-feature lookup can now select.
 target     = "riscv32imac-unknown-none-elf"
+config_markers = ["-Tlinkall.x", "force-frame-pointers", "linker-flavor=ld.lld"]
 builds     = false
 ships      = false
 # The manifest pin is gone. What blocks a green CI arm is smol's own code, not the chip plumbing:
@@ -155,6 +187,7 @@ checks     = true
 # `riscv32imac` with the C6 — the triple CANNOT tell them apart, which is #349's whole subject;
 # the chip FEATURE is what discriminates now.
 target     = "riscv32imac-unknown-none-elf"
+config_markers = ["-Tlinkall.x", "force-frame-pointers", "linker-flavor=ld.lld"]
 builds     = false
 ships      = false
 # NO ChipBudget row, deliberately: nobody has measured this silicon, and `budget.rs` hands an

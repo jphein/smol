@@ -275,7 +275,8 @@ def check(doc: dict, repro: Path, budget: Path) -> list[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("command", choices=("emit", "chips", "chip-checks", "ci-matrix", "check"))
+    ap.add_argument("command",
+                    choices=("emit", "chips", "chip-checks", "config-markers", "ci-matrix", "check"))
     ap.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     ap.add_argument("--repro", type=Path, default=DEFAULT_REPRO)
     ap.add_argument("--budget", type=Path, default=DEFAULT_BUDGET)
@@ -283,6 +284,7 @@ def main() -> int:
     ap.add_argument("--for", dest="phase", choices=("check", "clippy"), default="check",
                     help="emit: which gate phase's tier list to produce")
     ap.add_argument("--builds", action="store_true", help="chips: only buildable ones")
+    ap.add_argument("--chip", default=None, help="config-markers: restrict to one chip")
     args = ap.parse_args()
 
     try:
@@ -304,6 +306,29 @@ def main() -> int:
         for name, spec in doc["chips"].items():
             if not args.builds or spec["builds"]:
                 print(name)
+        return 0
+
+    if args.command == "config-markers":
+        # #280: `<target>\t<marker>` per line, for `tools/assert_cargo_config.sh`.
+        #
+        # A SEPARATE COMMAND rather than two more columns on `chip-checks`, deliberately. The
+        # guard has a second caller that wants nothing else from the row (the publish path, for
+        # #413), and widening a tab-separated contract to serve a consumer that needs one field
+        # is how the sentinel-and-shifting-fields bug in `check_chips.sh` was born.
+        #
+        # Chip filter is positional-free: pass `--chip`, or get every chip. An unknown chip is an
+        # ERROR, not an empty result — a guard handed a typo'd chip name must not report success
+        # by finding nothing to check.
+        chips = doc["chips"]
+        if args.chip:
+            if args.chip not in chips:
+                print(f"config-markers: unknown chip {args.chip!r} — "
+                      f"known: {', '.join(sorted(chips))}", file=sys.stderr)
+                return 2
+            chips = {args.chip: chips[args.chip]}
+        for name, spec in chips.items():
+            for marker in spec.get("config_markers") or []:
+                print(f"{spec['target']}\t{marker}")
         return 0
 
     if args.command == "chip-checks":
