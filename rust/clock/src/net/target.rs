@@ -62,7 +62,7 @@
 //! off  size  field            meaning
 //!  0    4    magic            "SMLT" (0x53 0x4D 0x4C 0x54)
 //!  4    1    desc_version     descriptor FORMAT version (this file: 1)
-//!  5    1    chip             CHIP_ESP32C3=1 / C6=2 / S3=3; 0 = unknown
+//!  5    1    chip             CHIP_ESP32C3=1 / C6=2 / S3=3 / C5=4; 0 = unknown
 //!  6    2    features         u16 capability bitset (FEAT_*)
 //!  8    1    compat           persistent-state (NVS) layout version this image writes
 //!  9    1    min_from_compat  the OLDEST running `compat` this image will install OVER
@@ -119,6 +119,7 @@ pub const CHIP_UNKNOWN: u8 = 0;
 pub const CHIP_ESP32C3: u8 = 1;
 pub const CHIP_ESP32C6: u8 = 2;
 pub const CHIP_ESP32S3: u8 = 3;
+pub const CHIP_ESP32C5: u8 = 4;
 
 /// The chip's operator-facing name — the same spelling `budget.rs` and `build.rs` use, and the
 /// segment a per-chip MQTT topic is built from (`smol/ota/staged/esp32c3`).
@@ -131,6 +132,7 @@ pub fn chip_name(chip: u8) -> &'static str {
         CHIP_ESP32C3 => "esp32c3",
         CHIP_ESP32C6 => "esp32c6",
         CHIP_ESP32S3 => "esp32s3",
+        CHIP_ESP32C5 => "esp32c5",
         _ => "unknown",
     }
 }
@@ -574,9 +576,12 @@ pub const NVS_COMPAT: u8 = 1;
 #[cfg(feature = "wifi")]
 pub const MIN_FROM_COMPAT: u8 = 0;
 
-/// Chip id stamped by `build.rs` from the target triple (riscv32imc → C3, riscv32imac → C6,
-/// xtensa-esp32s3 → S3). Derived rather than declared so a chip de-pin (#331/#348) cannot
-/// produce an image that misreports what it was built for.
+/// Chip id stamped by `build.rs` from the target triple (riscv32imc → C3, xtensa-esp32s3 →
+/// S3). Derived rather than declared so a chip de-pin (#331/#348) cannot produce an image
+/// that misreports what it was built for. `riscv32imac` is deliberately NOT mapped: the C5
+/// and the C6 share it, and a guessed chip id is a valid-looking value the suitability check
+/// would then trust — an ambiguous triple must fail the build (below) until `SMOL_CHIP`
+/// names the silicon.
 #[cfg(feature = "wifi")]
 pub const SELF_CHIP: u8 = parse_chip(env!("SMOL_CHIP_ID"));
 
@@ -681,7 +686,11 @@ const _: () = {
     assert!(d[9] == MIN_FROM_COMPAT, "encoded min_from_compat is not MIN_FROM_COMPAT");
     // A build must never ship claiming an unknown chip — that would make every peer's chip
     // check meaningless.
-    assert!(SELF_CHIP != CHIP_UNKNOWN, "build.rs could not determine the chip from the target");
+    assert!(
+        SELF_CHIP != CHIP_UNKNOWN,
+        "build.rs could not determine the chip from the target. If the triple is ambiguous \
+         (riscv32imac = C5 or C6), name the silicon: SMOL_CHIP=esp32c5 (or esp32c6) cargo build ..."
+    );
     // And the OTA-capable tiers must always claim the radio path they actually have.
     assert!(self_features() & FEAT_WIFI != 0);
 };

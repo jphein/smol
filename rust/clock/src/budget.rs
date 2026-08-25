@@ -289,10 +289,23 @@ pub const ESP32C3: ChipBudget = ChipBudget {
 /// friction.
 ///
 /// The selection is `target_arch`-shaped only because this crate pins exactly one bare-metal
-/// target today. **#349 owns chip identity**; when its `TargetId` lands, replace this cfg
-/// ladder with a lookup on that — it is one function and the data above does not move.
-#[cfg(all(target_os = "none", target_arch = "riscv32"))]
+/// target today. **#349 owns chip identity**; when the chip de-pin lands, replace this cfg
+/// ladder with a per-chip-feature lookup — it is one function and the data above does not
+/// move. The `not(target_feature = "a")` guard exists because `target_arch` alone is
+/// "riscv32" for the C3 (imc), the C6 AND the C5 (both imac) — without it a C5/C6 build
+/// would silently inherit the C3's measured numbers, which is precisely the guessed-budget
+/// failure this module's fail-closed rule forbids. The A (atomics) extension is what
+/// separates imac from imc at the cfg level.
+#[cfg(all(target_os = "none", target_arch = "riscv32", not(target_feature = "a")))]
 pub const CHIP: ChipBudget = ESP32C3;
+
+#[cfg(all(target_os = "none", target_arch = "riscv32", target_feature = "a"))]
+compile_error!(
+    "riscv32 WITH atomics = ESP32-C5 or ESP32-C6, and neither has a declared ChipBudget. \
+     Add a `ChipBudget` const with MEASURED numbers (build the canonical tier for the chip \
+     and read `.stack` / image size from the artifact) and extend the CHIP cfg ladder. Do \
+     not copy the C3's row: a guessed budget is worse than an absent one."
+);
 
 #[cfg(all(target_os = "none", not(target_arch = "riscv32")))]
 compile_error!(

@@ -6,9 +6,11 @@
 //!   * `BUILD_NUMBER` — monotonic build count (`git rev-list --count HEAD`) shown
 //!     as `v<N>`. Falls back to `"0"`.
 //!   * `SMOL_CHIP_ID` — (#349) the chip this image is built for, DERIVED from the target
-//!     triple (`riscv32imc`→C3, `riscv32imac`→C6, `xtensa-esp32s3`→S3). Consumed by
-//!     `net::target::SELF_CHIP` and embedded in the image's target descriptor so a board can
-//!     refuse an image built for other silicon. `SMOL_CHIP=<name>` overrides by name.
+//!     triple where that is unambiguous (`riscv32imc`→C3, `xtensa-esp32s3`→S3;
+//!     `riscv32imac` is C5 *or* C6 and maps to UNKNOWN = build failure on wifi tiers).
+//!     Consumed by `net::target::SELF_CHIP` and embedded in the image's target descriptor so
+//!     a board can refuse an image built for other silicon. `SMOL_CHIP=<name>` overrides by
+//!     name, and is REQUIRED for the ambiguous triples.
 //!   * `SMOL_NODE_ID` — (#42) OPTIONAL per-board id override, emitted ONLY when the
 //!     env var is set, so `SMOL_NODE_ID=8 cargo build` builds an id-8 image without
 //!     hand-editing `board.rs` (which reads it via `option_env!`, fallback = its own
@@ -87,17 +89,22 @@ fn chip_id() -> u8 {
             "esp32c3" => 1,
             "esp32c6" => 2,
             "esp32s3" => 3,
+            "esp32c5" => 4,
             _ => 0,
         };
     }
     let target = std::env::var("TARGET").unwrap_or_default();
-    // riscv32imc = C3; riscv32imac (the A extension) = C6; xtensa-esp32s3 = S3. Ordering
-    // matters: "riscv32imac" contains no "riscv32imc" substring, but match the longer/more
-    // specific arms first anyway so a future triple cannot alias onto the C3.
+    // riscv32imc = C3; xtensa-esp32s3 = S3. riscv32imac is AMBIGUOUS — the C5 and the C6
+    // share it — so it maps to 0 (CHIP_UNKNOWN) and the wifi-tier const assert fails the
+    // build until `SMOL_CHIP=<name>` says which silicon this image is for. A guessed id
+    // would be a valid-looking value the suitability check trusts: this exact shape once
+    // stamped a C5 build as a C6, which `decide()` would then have accepted cross-chip.
+    // Ordering matters: "riscv32imac" contains no "riscv32imc" substring, but match the
+    // longer/more specific arms first anyway so a future triple cannot alias onto the C3.
     if target.starts_with("xtensa-esp32s3") {
         3
     } else if target.starts_with("riscv32imac") {
-        2
+        0 // ambiguous (C5|C6) — require SMOL_CHIP, fail closed via the SELF_CHIP assert
     } else if target.starts_with("riscv32imc") {
         1
     } else {
