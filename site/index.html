@@ -848,13 +848,16 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <section id="get"><div class="wrap">
 <div class="sec-head reveal">
 <span class="kicker">09 &mdash; Get the firmware</span>
-<h2>Put it on a board.</h2>
-<p data-edit="get.intro">Prebuilt images are published on the <a href="https://github.com/jphein/smol/releases" target="_blank">releases page</a> &mdash; the mesh tier, with a SHA-256 beside it. You need a board, a USB cable, and <span class="mono">espflash</span>. Building from source is the same firmware and takes one <span class="mono">cargo</span> invocation; the repository README has the toolchain.</p>
+<h2>Put it on a bare board.</h2>
+<p data-edit="get.intro">Prebuilt images are on the <a href="https://github.com/jphein/smol/releases" target="_blank">releases page</a> &mdash; the canonical mesh tier as a merged 4&nbsp;MiB image, with a <span class="mono">SHA256SUMS</span> beside it. You need a board, a USB cable and <span class="mono">espflash</span>. The full story &mdash; nightlies versus versioned releases, the reproducible-build ceremony, and the flashing traps &mdash; is in <a href="https://github.com/jphein/smol/blob/main/docs/RELEASES.md" target="_blank">docs/RELEASES.md</a>.</p>
 </div>
 <div class="panel reveal">
-<pre class="mono" style="margin:0;padding:14px 16px;border:1px solid var(--line);border-radius:10px;background:var(--bg2);overflow-x:auto;font-size:.82rem">espflash flash --monitor smol-espnow.bin</pre>
-<p class="hint" style="text-align:left;line-height:1.75;margin:14px 0 0">Verify the SHA-256 against the release before flashing, and read the <span class="mono">Loaded app from offset</span> line afterwards &mdash; it names the slot that actually ran, which is the cheapest confirmation you flashed the thing you are about to debug.</p>
-<p class="hint" style="text-align:left;line-height:1.75;margin:10px 0 0"><b>Boards already on the mesh do not update this way.</b> They take signed firmware over the air, one canary board at a time. A USB flash to a board that has previously updated over the air can land in the slot the bootloader is not going to run &mdash; and it fails quietly, by running the old image. Downloads here are for a <em>new</em> board.</p>
+<p class="hint" style="text-align:left;line-height:1.75;margin:0 0 14px"><b style="color:var(--glow)">Read this first: published binaries carry placeholder credentials.</b> They are built from a clean checkout with throwaway values &mdash; good enough to compile, never good enough to ship. A board flashed from a download boots, drives the OLED and runs the menu, the games and the Bard. It will <em>not</em> join WiFi, reach a broker, or talk to an existing mesh. To do that you rebuild with your own <span class="mono">secrets.rs</span>. The baked mesh key is in a public binary, so it is public &mdash; a demo key, never a fleet key.</p>
+<pre class="mono" style="margin:0;padding:14px 16px;border:1px solid var(--line);border-radius:10px;background:var(--bg2);overflow-x:auto;font-size:.82rem">sha256sum -c SHA256SUMS
+espflash erase-region --port /dev/ttyACM0 0xf000 0x2000
+espflash write-bin --port /dev/ttyACM0 0x0 smol-esp32c3-fleet.bin</pre>
+<p class="hint" style="text-align:left;line-height:1.75;margin:14px 0 0">The middle line clears <span class="mono">otadata</span> and is not optional on a board that has ever taken an update over the air: the board is running from the other slot, so a plain flash succeeds and then <em>silently never runs</em>. It spares <span class="mono">nvs</span>, so a provisioned node id survives. Afterwards, read the <span class="mono">Loaded app from offset</span> line &mdash; it names the slot that actually ran.</p>
+<p class="hint" style="text-align:left;line-height:1.75;margin:10px 0 0"><b>Boards already on the mesh do not update this way.</b> They take ed25519-signed firmware over the air, one canary board at a time. Downloads here are for a board that does not have smol on it yet.</p>
 </div>
 </div></section>
 
