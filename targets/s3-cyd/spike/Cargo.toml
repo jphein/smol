@@ -188,6 +188,12 @@ esp-rtos = { version = "0.3.0", optional = true, features = [
 # ---------------------------------------------------------------------------
 default = []
 
+# The four-corner touch probe. **Stacks on nothing** — pure I2C + GPIO, no radio,
+# no allocator, no network stack. Independent of `wifi`/`radio` on purpose: the
+# transform it settles is a display fact, and making the operator bring up a radio
+# to tap a screen would be a reason not to bother.
+touch = []
+
 # M2 — the radio + network tier.
 wifi = [
     "dep:esp-radio",

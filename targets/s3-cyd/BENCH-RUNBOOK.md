@@ -388,9 +388,40 @@ border**. Glance at the glass.
 | Mirrored | **should be unreachable** — the compile-time `MY == MX` assert rejects `0x68`/`0xA8` | do not "fix" it at the call site; the assert is wrong and that is the news |
 
 **Four-corner touch tap** — settles the placeholder transform in
-`board-staging/board_es3c28p.rs:302-311`. Note the spike does not currently
-initialise touch, so this needs the M1 touch path or a scratch build; **if that is
-not to hand, skip it and say so** rather than recording an untested transform.
+`board-staging/board_es3c28p.rs:302-311`. **Now runnable** (`spike/src/touch.rs`):
+
+```bash
+./build-remote.sh --features touch
+cargo run --release --features touch          # no vault needed; touch is not wifi/radio
+```
+
+A `touch` build also paints a **16×16 orange dot at display (4,4) = logical
+top-left**. That dot is the *frame-free anchor*: with a finger on the dot, one
+glance settles orientation and transform together, with **no reference frame
+agreed in advance**. Do the orientation eyeball and this tap in the same build.
+
+**Procedure — ten seconds, once:**
+
+1. Tap the **orange dot**. Expect roughly:
+   ```
+   [touch] #1 raw=(…,…) mapped=(~0,~0) [transform: PLACEHOLDER retro-go swap_xy=1 invert_x=0 invert_y=1]
+   [touch]    corner guess: TOP-LEFT (screen is 320x240 landscape)
+   ```
+2. Tap the other three corners, clockwise. Four taps → four verbose lines.
+
+| what the log says | verdict |
+|---|---|
+| every `corner guess` matches the corner you actually tapped | **transform CONFIRMED** — clears the PLACEHOLDER on all three constants |
+| corners consistently swapped left↔right | `INVERT_X` is wrong |
+| consistently swapped top↔bottom | `INVERT_Y` is wrong |
+| x and y transposed | `SWAP_XY` is wrong |
+| `I2C read FAILED` / no lines at all | §7.10 — a wedged bus, not an untouched screen |
+
+**Record the four raw pairs verbatim.** They are the evidence; `mapped=` is the
+*opinion under test*, which is why the line labels itself PLACEHOLDER. Being
+capacitive there is no calibration span to measure — the transform is either right
+or visibly wrong, so four taps settle it outright.
+
 ⛔ **GPIO18 stays unconfigured** — driving it breaks the FT6336, and its absence is
 the trick, not an oversight.
 
@@ -532,6 +563,7 @@ Sanity bracket (§1.5 step 5): region size at which boot actually panics = _____
 | 7.6 | M3: espnow-only build associates anyway | ignore it | `SPIKE_ESPNOW_ONLY` is `cfg!`-gated on `radio` — a `wifi`-only build ignores it by design. Confirm `--features radio` |
 | 7.7 | Stack-paint won't link | force it with `-C opt-level` roulette | §6.1's mitigations are measured. Fat-LTO is an **upstream LLVM crash** — not something a bench session fixes |
 | 7.8 | Any measurement is "surprisingly clean" | record it | **audit the instrument before the system.** Three verification attempts in this project's history returned flattering zeros from commands that were erroring |
+| 7.10 | Touch: `I2C read FAILED`, or no `[touch]` lines at all | conclude the screen was not tapped | **a wedged bus and an untouched screen are different states and must not be confused** — that ambiguity cost burrito-fw a hardware window. The probe prints good-read counts alongside failures precisely so they are distinguishable. Check the chip-id line appeared at boot |
 | 7.9 | An expected line is simply absent from serial | assume it did not happen | `ESP_LOG` is compile-time and release images are quieter than you expect. Confirm the line exists in the build you flashed before concluding the event did not occur |
 
 ---

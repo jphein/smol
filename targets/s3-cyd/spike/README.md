@@ -24,6 +24,7 @@ allocator, no network stack.
 | build | tiers | what it adds |
 |---|---|---|
 | `cargo build --release` | M1 | bare metal: PSRAM, SPI2, panel, button, heartbeat |
+| `--features touch` | M1+probe | + FT6336U on I²C0, four-corner tap probe, corner marker. **Stacks on nothing** |
 | `--features wifi` | M1+M2+M4 | esp-radio · esp-rtos · esp-alloc · smoltcp · STA associate + DHCP + MQTT |
 | `--features radio` | M1+M2+M3 | + `esp-radio/esp-now`, the SMOLv1 hello/ack probe |
 | `SPIKE_ESPNOW_ONLY=1 … --features radio` | M1+M3 | radio up, channel pinned, **association skipped** |
@@ -94,6 +95,53 @@ One limitation stated rather than papered over: on the no-credentials path
 `set_config` is never called, and in esp-radio 0.18 `set_config` is what *starts*
 the controller. So a credential-less `--features radio` build proves compilation
 and boot, not the air.
+
+## The touch probe (`--features touch`)
+
+Exists to settle **one placeholder** and then be deleted. `board-staging/
+board_es3c28p.rs` carries `TOUCH_SWAP_XY` / `TOUCH_INVERT_X` / `TOUCH_INVERT_Y` as
+PLACEHOLDER-grade, transcribed from retro-go and never confirmed against a real
+finger under Rust.
+
+```bash
+./build-remote.sh --features touch && cargo run --release --features touch
+```
+
+Independent of `wifi`/`radio` on purpose: the transform is a *display* fact, and
+making an operator bring up a radio to tap a screen is a reason not to bother. No
+vault access needed — a `touch` build never fetches credentials.
+
+**Output** — raw and mapped on one line, with the transform's status *in the line*:
+
+```
+[touch] #1 raw=(118,31) mapped=(31,121) [transform: PLACEHOLDER retro-go swap_xy=1 invert_x=0 invert_y=1]
+[touch]    corner guess: TOP-LEFT (screen is 320x240 landscape)
+```
+
+The label is part of the evidence. Someone reading `mapped=(31,121)` in a bench
+log must be able to tell it is the output of an **unconfirmed** transform without
+opening the source — a number that looks authoritative and is not is worse than a
+number carrying an honest caveat.
+
+First four taps print in full (four corners, four verbose lines); after that the
+lines are terse. One line per finger-DOWN edge, not per poll.
+
+**The corner marker.** A `touch` build also paints a 16×16 **orange dot at display
+(4,4) = logical top-left**. With the dot on the glass and a finger on the dot, one
+glance answers both open questions at once — where the display thinks (0,0) is,
+and where the touch transform thinks the finger is. **No reference frame has to be
+agreed in advance**, which is what makes it better than "is red at the top?".
+Deliberately asymmetric and off-centre: a marker that looks the same under a mirror
+or a 180° rotation cannot distinguish the cases it exists to distinguish.
+
+⛔ **GPIO18 appears nowhere in `src/touch.rs`, and that is the trick.** Driving the
+FT6336's reset breaks it; left unconfigured the chip pulls RSTN high itself and
+reports id 100. Tested beats derived.
+
+⚠️ **Landmine L6 (codec-first I²C ordering) does NOT apply to this build** — there
+is no codec here, so touch owns I²C0 outright and there is no ordering to get
+wrong. **Do not carry this file's shape into phase 2**, where the codec exists and
+L6 governs again.
 
 ## M4 — MQTT + retained HA discovery
 

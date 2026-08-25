@@ -72,6 +72,8 @@ mod net;
 /// `net/radio_dev.rs` and cyd-c5's `radio_dev.rs` — do not repurpose it.
 #[cfg(feature = "wifi")]
 mod radio_dev;
+#[cfg(feature = "touch")]
+mod touch;
 
 use embedded_graphics::{
     pixelcolor::Rgb565,
@@ -317,6 +319,32 @@ fn main() -> ! {
         .draw(&mut display)
         .expect("border");
 
+    // ---- the corner marker (feature `touch`) -------------------------------
+    // A dot at LOGICAL TOP-LEFT, i.e. display coordinate (0,0) after ORIENTATION.
+    //
+    // This is the orientation eyeball's **frame-free anchor**, and the reason it
+    // beats "is red at the top?": with the dot on the glass and a finger on the
+    // dot, ONE GLANCE answers both open questions at once — where the display
+    // thinks (0,0) is, and where the touch transform thinks the finger is. No
+    // reference frame has to be agreed in advance, and no one has to remember
+    // which edge the ribbon cable is on.
+    //
+    // Deliberately NOT centred and NOT symmetric: a marker that looks the same
+    // under a mirror or a 180° rotation cannot distinguish the cases it exists to
+    // distinguish. Top-left is the one corner every rotation moves.
+    #[cfg(feature = "touch")]
+    {
+        const DOT: u32 = 16;
+        Rectangle::new(Point::new(4, 4), Size::new(DOT, DOT))
+            .into_styled(PrimitiveStyle::with_fill(Rgb565::CSS_ORANGE))
+            .draw(&mut display)
+            .expect("corner marker");
+        println!(
+            "[s3-cyd] corner marker: {}x{} ORANGE dot at display (4,4) = LOGICAL TOP-LEFT",
+            DOT, DOT
+        );
+    }
+
     // Backlight ON — only now, after a full frame is on the panel.
     backlight.set_high();
     println!("[s3-cyd] backlight on — colour test painted (R/G/B/W bars + magenta border)");
@@ -329,6 +357,13 @@ fn main() -> ! {
         peripherals.GPIO0,
         InputConfig::default().with_pull(Pull::Up),
     );
+
+    // ---- touch probe (feature `touch`) -------------------------------------
+    // Touch OWNS I2C0 in this build — there is no codec here, so landmine L6's
+    // codec-first ordering has nothing to order. See src/touch.rs; do not carry
+    // this shape into phase 2, where the codec exists and L6 governs again.
+    #[cfg(feature = "touch")]
+    let mut touch = touch::init(peripherals.I2C0, peripherals.GPIO16, peripherals.GPIO15);
 
     // ---- M2 network / M3 radio probe (feature-gated) ------------------------
     // Both off by default. ONE radio bring-up serves both tiers — `net::init`
@@ -343,6 +378,15 @@ fn main() -> ! {
     let mut tick: u32 = 0;
     let mut last_pressed = false;
     loop {
+        // Polled here rather than on an interrupt: GPIO17 (CTP_INT) exists, but
+        // for a four-tap procedure the loop rate is plenty and an ISR is state
+        // this probe does not need. (burrito-fw reached the same conclusion at
+        // 4 Hz for scrolling.)
+        #[cfg(feature = "touch")]
+        if let Some(t) = touch.as_mut() {
+            t.poll();
+        }
+
         // Active LOW: is_low() == pressed.
         let pressed = button.is_low();
         if pressed != last_pressed {
