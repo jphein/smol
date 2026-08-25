@@ -104,19 +104,39 @@ Ordered by dependency:
 2. **smol#396** variant axis — hard prerequisite of the S3 arm being *used* (two S3
    products + this dev board would otherwise collide in HA).
 3. **Measured ChipBudget row** — `budget.rs` `compile_error!`s on any non-riscv32 target
-   until an S3 row with MEASURED numbers exists. Produce it the way the C6 row was
-   (`scratch/convergence/c6-budget-row-from-watch-session.md`): readelf -SW sections,
-   espflash save-image size, stack high-water under live radio.
-4. **`[chip.esp32s3] builds = true`** in `tools/build-matrix.toml` — a one-word change,
-   but it and the ChipBudget row must land **together**: `build_matrix.py check` compares
-   the two rosters and goes red on either side alone (mechanical, not convention). The
-   row's `blocked_on` string is already half-stale — update it when flipping.
+   until an S3 row with MEASURED numbers exists. Full recipe + preliminary spike numbers:
+   **`BUDGET-PREP.md`** (methodology transposed from the C6 row; `.stack` 204,564 B on the
+   M3 spike tier — the S3 is unlikely to be DRAM-blocked; `stack_floor_bytes` and
+   `app_slot_bytes` deliberately unvalued — the floor needs stack-paint under live radio
+   post-de-pin, and **no S3 OTA partition CSV exists yet**).
+4. **`[chip.esp32s3] builds = true`** in `tools/build-matrix.toml` — CORRECTED 2026-08-25
+   (BUDGET-PREP §3.3, proven by running the checker against modified copies): the gate is
+   **asymmetric for the S3**. Because a `[chip.esp32s3]` row already exists
+   (`builds = false`), the ChipBudget const can land **first, alone, green** — the #352
+   arm-before-silicon precedent. Only the `builds = true` flip requires the const already
+   present (that direction goes red alone). The C5 is the opposite case (no row at all).
+   The row's `blocked_on` string is half-stale — update it when flipping. Adjacent items
+   NOT in that change set (flagged in BUDGET-PREP §3.5): `repro_build.sh:36`'s hardcoded
+   `REPRO_TARGET`, and `repro_stack_floor`'s single-chip grep.
 5. `esp_app_desc!()` + partition table + `tools/verify_image.sh` confirming the #349
    descriptor reads `chip = 3` — checked, never assumed.
 6. Group key: a phase-2 image reuses `wire.rs` and gets the #190 trailer free **only if
    built with the real `secrets.rs`** — a spike-provisioned example key joins today and
    falls off the mesh at the enforce flip.
 7. smol-core (#347 phase 2) gains this target as consumer #4.
+8. **Display: Path A then Path B** (survey + evidence: **`DISPLAY-PACKAGE.md`**). smol's
+   UI seam is one type alias (`app::Oled`) with three existing backends selected by
+   feature — a fourth is repetition, not architecture. **Path A (recommended first)**: a
+   BinaryColor→Rgb565 integer-scaling backend (72×40 at 4× = 288×160 centred) writing
+   into a burrito-style PixBuf, blitted with one `fill_contiguous` — touches ZERO of the
+   171 BinaryColor draw sites, needs no smol-core extraction, and every screen renders
+   unchanged (the #152 "zero forked render code" gate, third application). Path B
+   (native 320×240 + touch) is a UI project, not a backend project. A is not throwaway:
+   B retires exactly one adapter file. ⚠️ **Open strategic question for JP**: the watch
+   codebase already has the board-feature seam, a normative PanelDriver/TouchDriver
+   contract, and a 320×240 Slint slot — if the end goal is a rich colour-touch UI,
+   *which codebase owns that class of screen* is an unanswered architecture call that
+   should be made explicitly, not inherited from whichever port lands first.
 
 ## Operational rules (in force now)
 
