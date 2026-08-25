@@ -143,6 +143,15 @@
 #     whole window and one agent read another's out of `ps`. It now goes in a private config file.
 set -uo pipefail
 
+# ── Temp default: the REPO, not /tmp (JP directive 2026-08-25) ────────────────────────────────
+# katana's /tmp is a 16 GB tmpfs (RAM+swap). This harness's LOG is the wrong thing to keep there
+# for a second reason beyond size: the trap below deliberately PRESERVES the log on a non-PASS run
+# ("`rm -f` on exit destroyed the first real-fleet capture anyone had"), and a capture worth keeping
+# does not belong in a filesystem that evaporates on reboot. `$REPO/tmp` is git-ignored, on disk.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export TMPDIR="${TMPDIR:-$REPO/tmp}"
+mkdir -p "$TMPDIR" || { echo "ota_verify: cannot create $TMPDIR" >&2; exit 3; }
+
 ID="${1:?usage: ota_verify.sh <board_id> <target_build> [window_s]}"
 TARGET="${2:?target build number, e.g. 907}"
 # 600 s default, not 360: a real leaf OTA RETRIES. The measured 907→id8 run stalled, logged
@@ -232,7 +241,7 @@ if [ -n "$FIXTURE" ]; then
   # exercised. A harness whose tests cannot express its central concept is not tested.
   [ -f "$FIXTURE" ] || { echo "FATAL: fixture not found: $FIXTURE" >&2; exit 4; }
   BROKER="fixture($(basename "$FIXTURE"))"
-  LOG="$(mktemp "/tmp/ota_verify_fix_${ID}_XXXX.log")"
+  LOG="$(mktemp --tmpdir "ota_verify_fix_${ID}_XXXX.log")"
   (
     t0=$(date +%s)
     while IFS= read -r line; do
@@ -272,9 +281,17 @@ else
   # break other tooling and race every concurrent agent on this host. PW is never exported (so it
   # stays out of /proc/*/environ) and never printed.
   umask 077
+  # ⚠️ THIS ONE STAYS IN /tmp ON PURPOSE — the only deliberate /tmp use left in tools/.
+  # It holds a PLAINTEXT BROKER PASSWORD (`-P <pw>`, umask 077). /tmp being a tmpfs is a FEATURE
+  # here: the credential never touches a disk and cannot outlive a reboot. It is ~30 bytes, so it
+  # is nothing to do with the 2026-08-25 tmpfs exhaustion (13 GB of build artifacts), and the
+  # directive's own carve-out is for small text files. Note the two-layer cleanup below — an
+  # immediate `rm` once mosquitto_sub has read it, plus the EXIT trap — which the comment there
+  # explains exists so a kill -9 cannot strand the password. Moving this to the repo would write a
+  # password to disk inside a working tree, which is strictly worse.
   CFGDIR="$(mktemp -d "/tmp/ota_verify_cfg_${ID}_XXXX")"
   printf -- '-P %s\n' "$PW" > "$CFGDIR/mosquitto_sub"
-  LOG="$(mktemp "/tmp/ota_verify_${ID}_XXXX.log")"
+  LOG="$(mktemp --tmpdir "ota_verify_${ID}_XXXX.log")"
   XDG_CONFIG_HOME="$CFGDIR" mosquitto_sub -h "$BROKER" -p 1883 -u "$MQTT_USER" \
     -i "ota_verify_${ID}_$$" -F '%r\t%t\t%p' \
     -t "smol/$ID/ota/progress" -t "smol/$ID/ota/diag" -t "smol/$ID/ota/state" \

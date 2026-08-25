@@ -27,12 +27,18 @@
 #
 # Usage: tools/measure_debuginfo_delta.sh [worktree-root] [debug-value]
 #        debug-value defaults to line-tables-only (what gate.sh uses); try `1` or `2` to compare.
-# Cost: three full LTO builds of the fleet tier, ~3 min, into /tmp. Touches no tracked file.
+# Cost: three full LTO builds of the fleet tier, ~3 min, into the repo `tmp/`. Touches no tracked file.
 set -uo pipefail
 export PATH="$HOME/.cargo/bin:$PATH"
 WT="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
-O=/tmp/smol-debuginfo-delta
+# Temp output goes in the REPO, never /tmp (JP directive 2026-08-25): katana's /tmp is a 16 GB
+# tmpfs (RAM+swap), and this script is the heaviest offender in tools/ — THREE full LTO target
+# dirs of the fleet tier. Putting those in RAM is how 13 GB of tmpfs vanished on 2026-08-25.
+# `$WT/tmp` is git-ignored (tmp/.gitignore) and disk-backed.
+O="$WT/tmp/smol-debuginfo-delta"
 rm -rf "$O"; mkdir -p "$O"
+# Children (cargo, readelf) inherit this; cargo's own scratch then lands on disk too.
+export TMPDIR="$WT/tmp"
 build() { # build <name> <debugflag-or-empty>
   # `env`, not a bare VAR=x prefix: a prefix assembled by ${2:+...} expansion is a WORD, and
   # bash tries to execute it. First run died `CARGO_PROFILE_RELEASE_DEBUG=…: command not found`.
@@ -44,8 +50,11 @@ build() { # build <name> <debugflag-or-empty>
 build n1 ""
 build d  "${2:-line-tables-only}"
 build n2 ""
-python3 - <<'EOF'
-import subprocess, re, hashlib
+# `O` is EXPORTED into the python below rather than re-spelled there. The heredoc is quoted
+# (`<<'EOF'`) so the shell does not expand it, which is why the path used to appear twice as a
+# literal — two definitions of one path, free to drift, and the reason this fix touches python.
+O="$O" python3 - <<'EOF'
+import subprocess, re, hashlib, os
 def secs(p):
     out = subprocess.run(["readelf","-S","-W",p],capture_output=True,text=True).stdout
     r = {}
@@ -56,7 +65,8 @@ def secs(p):
         if "A" not in f or t == "NOBITS": continue
         r[n] = (int(a,16), int(o,16), int(s,16))
     return r
-P = {k: f"/tmp/smol-debuginfo-delta/t-{k}/riscv32imc-unknown-none-elf/release/clock" for k in ("n1","d","n2")}
+O = os.environ["O"]  # set by the shell above; single definition of the output root
+P = {k: f"{O}/t-{k}/riscv32imc-unknown-none-elf/release/clock" for k in ("n1","d","n2")}
 S = {k: secs(v) for k,v in P.items()}
 B = {k: open(v,'rb').read() for k,v in P.items()}
 def cmp(x,y,label):

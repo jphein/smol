@@ -40,6 +40,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CRATE="$ROOT/rust/clock"
 MATRIX="$ROOT/tools/build_matrix.py"
 
+# Per-chip logs go in the REPO, never /tmp (JP directive 2026-08-25 — katana's /tmp is a 16 GB
+# tmpfs, i.e. RAM). Git-ignored via tmp/.gitignore. Absolute, because this script `cd`s to $CRATE.
+CHIPS_TMP="$ROOT/tmp"
+mkdir -p "$CHIPS_TMP" || { echo "check_chips: cannot create $CHIPS_TMP" >&2; exit 2; }
+# The four cargo invocations below inherit this. On familiar, the documented usage above overrides
+# both this and CARGO_TARGET_DIR to /var/tmp/ftarget/* — that host's /tmp is a 512 MB tmpfs.
+export TMPDIR="$CHIPS_TMP"
+
 want=("$@")
 pass=0 fail=0 skip=0 verified=0
 
@@ -85,7 +93,7 @@ while IFS=$'\t' read -r chip target expect toolchain build_std opt_level feature
     args=(check --no-default-features --features "${chip},${features}" --target "$target")
     [ -n "$toolchain" ] && args=("+${toolchain}" "${args[@]}")
 
-    log="/tmp/check-chips-${chip}.log"
+    log="$CHIPS_TMP/check-chips-${chip}.log"
     printf '  .... %-9s %s (expect %s)\033[2K\r' "$chip" "$target" "$expect"
 
     # `SMOL_CHIP` is always passed: riscv32imac cannot tell a C5 from a C6, so build.rs maps that
