@@ -83,6 +83,14 @@ Every SMOLv1 frame stays well under 250 B — *including* its group-MAC trailer,
   an OTA target (`tools/ota_publish.sh install 42` refuses), never be counted as a
   fleet member, and its ghost must never be read as a resurrection. Contrast `13`,
   a genuinely retired identity that is **not** expected to recur.
+- **Allocated id blocks (#388 · 2026-08-24).** Beyond the C3 fleet's `1–99`:
+  `160–175` = S3 Ember (#331, first unit → `160`) · `176–191` = C5 CYD (#388, the
+  NM-CYD-C5 → `176`; it first spoke on the mesh under that id on 2026-08-24) ·
+  `192–223` = reserved for MAC-derived C6-watch ids (today's `122`/`236` stay put
+  until esp32c6-watch #34's derivation folds in) · `240–254` = bench/rig ids, never
+  fleet members, never OTA targets · `0`/`255` = never. The factory-default baked id
+  is **7** — always pass `SMOL_NODE_ID=<n>` when provisioning, or a fresh board
+  lands on 7.
 - **Security.** ESP-NOW here is **unencrypted**, and until #190 it was also
   unauthenticated — any device on the channel could inject any frame (a bogus
   far-future `synced_at` hijacks every mesh clock; a forged RELAYACK stalls a leaf).

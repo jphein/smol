@@ -29,7 +29,7 @@ mod target;
 mod profile;
 
 use profile::BoardProfile;
-use target::{CHIP_ESP32C3, CHIP_ESP32C6, CHIP_ESP32S3, CHIP_UNKNOWN};
+use target::{CHIP_ESP32C3, CHIP_ESP32C5, CHIP_ESP32C6, CHIP_ESP32S3, CHIP_UNKNOWN};
 
 /// Pull the `model` value out of the JSON fragment, so the assertions below talk about the
 /// field a dashboard shows rather than about a blob of escaped punctuation.
@@ -76,16 +76,27 @@ fn main() {
           s3.ha_device_extras() != c3_oled.ha_device_extras()
               && s3.ha_device_extras() != c3_bare.ha_device_extras());
 
+    // ── the C5 CYD (#388) ────────────────────────────────────────────────────────────────
+    // Same class of assertion as the S3's: the tree cannot build for this chip yet, and the
+    // C5 shares the C6's target triple, so the mapping answering correctly here is the host
+    // proof that a C5 image will not announce itself as the Watch (the 6f900a6 collision).
+    let c5 = BoardProfile::new(CHIP_ESP32C5, true);
+    check("C5 gets its OWN label", model_of(c5) == "smol ESP32-C5 CYD");
+    check("C5 does NOT inherit the C6's label (the shared-triple hazard)",
+          c5.ha_device_extras() != c6.ha_device_extras());
+    check("C5 is single-variant (the screen is part of the product)",
+          BoardProfile::new(CHIP_ESP32C5, false).ha_device_extras() == c5.ha_device_extras());
+
     // Every chip distinct from every other, so a future arm cannot be added as a copy-paste
     // that quietly duplicates a neighbour's label.
-    let all = [c3_oled, c3_bare, c6, s3];
+    let all = [c3_oled, c3_bare, c6, s3, c5];
     for (i, a) in all.iter().enumerate() {
         for b in all.iter().skip(i + 1) {
             assert!(a.ha_device_extras() != b.ha_device_extras(),
                     "two profiles share a label: {a:?} and {b:?}");
         }
     }
-    check("all four fleet targets have pairwise-distinct labels", true);
+    check("all five fleet targets have pairwise-distinct labels", true);
 
     // ── shape, because the fragment is spliced into JSON by hand ─────────────────────────
     for p in all {

@@ -97,6 +97,15 @@ impl BoardProfile {
             (target::CHIP_ESP32S3, _) => {
                 ",\"model\":\"smol ESP32-S3 Ember\",\"manufacturer\":\"jphein\""
             }
+            // #388: the NM-CYD-C5 (2.8" CYD, ESP32-C5). Single-variant like the C6/S3 — the
+            // screen is part of the product. 52 B, below every existing target's fragment, so
+            // it can never set SELF_EXTRAS_MAX. First heard on the mesh as peer 176 on
+            // 2026-08-24 (from its own spike firmware); this arm is what a SMOL image on that
+            // silicon will announce, and what the phase-1 spike's hand-published discovery
+            // block must match byte-for-byte.
+            (target::CHIP_ESP32C5, _) => {
+                ",\"model\":\"smol ESP32-C5 CYD\",\"manufacturer\":\"jphein\""
+            }
             // Unreachable in a firmware build — the assert below refuses it — but a `const fn`
             // match must be total. Deliberately the SHORTEST arm so it can never be the one
             // that sets the budget maximum, and deliberately not a plausible-looking label:
@@ -131,7 +140,8 @@ pub const fn for_self(has_display: bool) -> BoardProfile {
 const _: () = assert!(
     target::SELF_CHIP == target::CHIP_ESP32C3
         || target::SELF_CHIP == target::CHIP_ESP32C6
-        || target::SELF_CHIP == target::CHIP_ESP32S3,
+        || target::SELF_CHIP == target::CHIP_ESP32S3
+        || target::SELF_CHIP == target::CHIP_ESP32C5,
     "this chip has no BoardProfile label — add an arm to ha_device_extras() and a case to \
      experiments/profile_verify before building for it, or the board will announce itself to \
      Home Assistant as plain \"smol\""
