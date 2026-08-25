@@ -12,9 +12,88 @@ looked at, and thrown away.
 | Milestone | Proves | Status |
 |---|---|---|
 | **M1** | boots · console · octal PSRAM maps · panel paints in the right orientation · button reads | **FLASHED 2026-08-24 23:2x, RUNNING** — first guarded flash succeeded; serial heartbeat verified live (`[s3-cyd] heartbeat N — node 162 alive`, counter consistent with uptime). Panel orientation awaiting a human eyeball on the glass |
-| M2 | WiFi STA joins (credentials via `option_env!`, never committed) | not started |
-| M3 | ESP-NOW hello/ack on the air (`--features radio`) | code drafted, **unflashed**. Compile verdict: **✅ `wifi` + `esp-now` DO build together on esp32s3** (see below) |
+| M2 | WiFi STA associates + DHCP lease (credentials via `option_env!`, never committed) | **associate ✅ PROVEN on glass** (ch1, WPA2, aid 10909). DHCP unproven — first flash OOM-panicked before the lease; fixed, **awaiting reflash** |
+| M3 | ESP-NOW hello/ack on the air (`--features radio`) | code drafted, **unflashed**. Compiles ✅. Needs `SPIKE_ESPNOW_ONLY=1` — see below, the AP and the mesh are on different channels |
 | M4 | PSRAM framebuffer + a real smol screen | not started |
+
+## Feature tiers
+
+Each tier is a superset of the one below. **Default is M1 only** — no radio, no
+allocator, no network stack.
+
+| build | tiers | what it adds |
+|---|---|---|
+| `cargo build --release` | M1 | bare metal: PSRAM, SPI2, panel, button, heartbeat |
+| `--features wifi` | M1+M2 | esp-radio · esp-rtos · esp-alloc · smoltcp · STA associate + DHCP |
+| `--features radio` | M1+M2+M3 | + `esp-radio/esp-now`, the SMOLv1 hello/ack probe |
+| `SPIKE_ESPNOW_ONLY=1 … --features radio` | M1+M3 | radio up, channel pinned, **association skipped** |
+
+**`radio` stacks on `wifi` rather than being orthogonal, and upstream forces
+that**: esp-radio defines `esp-now = ["wifi", ...]`, so ESP-NOW cannot exist
+without WiFi. It is also true on the silicon — ESP-NOW *is* WiFi, same radio,
+same channel — which is the fact the whole coexistence story rests on.
+
+### ⚠️ M3 needs `SPIKE_ESPNOW_ONLY=1` — the channels do not line up
+
+```bash
+SPIKE_ESPNOW_ONLY=1 ./build-remote.sh --features radio     # channel 6 (default)
+```
+
+**One radio, one channel.** A STA association owns the radio's channel, and M2's
+flash glass-verified the AP on **channel 1** (`ssid jplovescl, bssid
+9e:5c:8e:cb:db:90, channel 1`). The smol mesh is on **channel 6**. An associated
+board therefore *cannot hear the mesh at all* — and the probe would report a dead
+mesh while every part of it worked correctly, which is exactly the failure this
+fleet once misread as a coexistence/physics problem.
+
+So `--features radio` alone associates and broadcasts into ch1, which is useful
+only if the mesh moves. `SPIKE_ESPNOW_ONLY=1` skips association and pins the
+channel (default 6, override with `SPIKE_ESPNOW_CHANNEL`).
+
+An earlier version of this README argued M3 should "run co-channel or not at all,
+rather than hide the single-radio constraint phase 2 has to face". **That was
+right about phase 2 and wrong about the probe.** Phase 2 does have to solve
+co-channel operation; M3's job is to prove ESP-NOW reaches the mesh *that
+exists*. Refusing to look until the network is rearranged is not rigour.
+
+The channel is validated at COMPILE time (`1..=14`, the whole legal 2.4 GHz
+space) — exercised in both directions: `SPIKE_ESPNOW_CHANNEL=99` and `=0` fail
+the build with a named message, `=14` passes. A bad channel would otherwise be a
+silent no-op on the air, indistinguishable from the dead-mesh symptom this mode
+exists to rule out.
+
+Verified by construction rather than by reading the manifest: `--features radio`
+compiles while referencing `interfaces.esp_now`, a field esp-radio gates behind
+`cfg(all(feature = "esp-now", feature = "unstable"))`; `--features wifi` compiles
+without it. (`cargo tree -e features | grep esp-now` does **not** show this —
+that grep comes back empty either way and is a blind instrument, not evidence.)
+
+## M2 — credentials
+
+The PSK is pulled from **Vaultwarden on katana at build time**, passed to the
+remote cargo as an environment variable over ssh, and baked in by `option_env!`.
+It is never written to disk on either host and never echoed into a log — only its
+length is printed.
+
+- Vault item: **`Homelab jplovescl WiFi (jplovescl SSID)`**
+- SSID: **`jplovescl`** — the FT-off IoT SSID (VLAN 8) the **smol fleet** lives on.
+- Convention and env var names (`SPIKE_WIFI_SSID` / `SPIKE_WIFI_PSK`) match
+  `cyd-c5/spike/build-remote.sh`, so one operator habit covers both spikes.
+
+⚠️ **Not emberburrito's SSID.** That board deliberately joins the *admin* VLAN,
+because it is a hearth terminal talking to `hearthd` on katana's own subnet —
+their product's network, not the fleet's. Never read `burrito-fw/wifi.local.toml`.
+
+**A build with no credentials still compiles, flashes and runs**, printing
+`no wifi credentials in this build` and leaving the M1 screens working. This is a
+deliberate divergence from cyd-c5, which uses `env!` and hard-fails the build —
+the person most likely to meet a locked vault is someone debugging something
+else. A default (M1) build never touches the vault at all.
+
+One limitation stated rather than papered over: on the no-credentials path
+`set_config` is never called, and in esp-radio 0.18 `set_config` is what *starts*
+the controller. So a credential-less `--features radio` build proves compilation
+and boot, not the air.
 
 ## The M3 compile verdict (answered 2026-08-24)
 
@@ -52,8 +131,9 @@ Two notes that came out of running it:
 - **Not the phase-2 smol image.** No mesh, no election, no OTA, no MQTT, no
   id-block. When the ladder is done, that work starts in a real crate; this one
   gets deleted.
-- **Not a place for credentials.** M1 has no radio at all. M2's WiFi will arrive
-  through `option_env!` at build time. Nothing goes in the tree.
+- **Not a place for credentials.** M1 has no radio at all; M2's PSK arrives via
+  `option_env!` at build time, from the vault. Nothing goes in the tree, and
+  nothing is written to disk on either build host.
 
 ## Build & flash
 
@@ -65,8 +145,15 @@ export PATH="$HOME/.cargo/bin:$PATH" && source ~/export-esp.sh
 cd /home/jp/Projects/smol/targets/s3-cyd/spike
 
 cargo check --release                      # M1
-cargo check --release --features radio     # M3 probe
+cargo check --release --features wifi      # M2
+cargo check --release --features radio     # M3 (includes M2)
 cargo run   --release                      # build + flash (goes through ./flash.sh)
+
+# preferred: build on familiar (24 cores, espup pinned to match katana),
+# ELF pulled back to the local target/ path so ./flash.sh finds it
+./build-remote.sh                          # M1
+./build-remote.sh --features wifi          # M2 — fetches the PSK from the vault
+./build-remote.sh --features radio         # M3
 ```
 
 **`--release` is mandatory, not a preference** — esp-hal's PSRAM init path only
@@ -132,8 +219,15 @@ because reading the source is not how anyone discovers a landmine.
 
 Plus two that only bite with the radio on:
 
-4. **The esp-radio heap must stay in internal RAM.** S3 atomics silently
-   misbehave in PSRAM, and the WiFi driver is full of them.
+4. **The esp-radio heap must stay in internal RAM, and at 96 KiB.** S3 atomics
+   silently misbehave in PSRAM, and the WiFi driver is full of them — so it
+   cannot move. It also cannot shrink: **M2's first flash panicked at 64 KiB**
+   with `memory allocation of 96 bytes failed`. The 96-byte request was the
+   victim, not the culprit — the heap was already exhausted by esp-radio's
+   demand-driven RX pool (`static_rx 16` / `dynamic_rx 40`). Those counts are
+   smol's #140 tuning, copied correctly; **what was not copied was the 96 KiB
+   heap they were sized against, nine lines above them in the same file.**
+   Take that pairing whole or not at all.
 5. **Never call `EspNowSender::send()` and let the `SendWaiter` live or die.**
    Both `wait()` and its `Drop` are unbounded non-yielding spins on a private
    atomic (`esp-radio-0.18.0/src/esp_now/mod.rs:590` and `:604`) — one lost TX
@@ -151,5 +245,8 @@ rust-toolchain.toml  channel = "esp" + the two-disguise trap
 flash.sh             THE FLASH GUARD — refuses by default
 build-remote.sh      build on familiar (espup pinned 1.95.0.0), pull the ELF back
 src/main.rs          M1: PSRAM, SPI2, ILI9341, colour test, GPIO0, heartbeat
-src/radio_dev.rs     M3: ESP-NOW probe, behind --features radio
+src/net.rs           M2: creds, radio bring-up, STA associate, smoltcp DHCP
+src/radio_dev.rs     smoltcp phy shim (SAME meaning as smol's + cyd-c5's file
+                     of this name — do not repurpose it)
+src/espnow_probe.rs  M3: ESP-NOW hello/ack probe, behind --features radio
 ```

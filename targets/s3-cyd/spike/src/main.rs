@@ -7,12 +7,15 @@
 //! four things that must be true before anything else is worth writing:
 //!
 //!   1. the chip boots and the console works (heartbeat log)
-//!   2. octal PSRAM maps (expect 8388608 B @ 0x3c020000)
+//!   2. octal PSRAM maps (expect 8388608 B — the SIZE, not the address)
 //!   3. the panel initialises and paints in the right orientation
 //!   4. the one hardware button reads
 //!
-//! No WiFi, no radio, no touch, no audio in M1. See `radio_dev.rs` (feature
-//! `radio`) for the M3 ESP-NOW probe.
+//! No WiFi, no radio, no touch, no audio in M1.
+//!
+//! Later tiers stack on top and are OFF by default:
+//!   * `--features wifi`  -> M2: `net.rs`, STA associate + smoltcp DHCP.
+//!   * `--features radio` -> M3: the above, plus `espnow_probe.rs`.
 //!
 //! ---------------------------------------------------------------------------
 //! BOARD FACTS ENCODED HERE — ground truth, not guesses
@@ -60,6 +63,12 @@
 #![no_main]
 
 #[cfg(feature = "radio")]
+mod espnow_probe;
+#[cfg(feature = "wifi")]
+mod net;
+/// smoltcp phy shim. Same filename, same meaning as smol main's
+/// `net/radio_dev.rs` and cyd-c5's `radio_dev.rs` — do not repurpose it.
+#[cfg(feature = "wifi")]
 mod radio_dev;
 
 use embedded_graphics::{
@@ -197,8 +206,42 @@ fn main() -> ! {
             psram_size / (1024 * 1024),
             psram_start
         );
-        println!("[s3-cyd]        (expected on an N16R8: 8388608 bytes @ 0x3c020000)");
+        // ⚠️ ASSERT THE SIZE, NEVER THE ADDRESS. The mapping base is
+        // IMAGE-dependent, not a board constant — flash-mapped segments shift
+        // it. burrito-fw sees 0x3c020000 on this same board class; this spike's
+        // M1 measured 0x3c060000. An "expected address" here would have turned a
+        // correct PSRAM init into a false alarm on the first flash of every new
+        // image. (Corrected 2026-08-24 after the M1 flash disproved it; the
+        // original line named 0x3c020000 as if it were a property of the board.)
+        println!("[s3-cyd]        (expect SIZE 8388608 on an N16R8; base address varies by image)");
     }
+
+    // ---- 📌 M4 IMPLEMENTER: what this 8 MiB can actually do ----------------
+    //
+    // **The S3 CAN DMA directly to and from PSRAM.** esp-hal sets the
+    // `dma_can_access_psram` cfg for this chip and exposes `ExternalBurstConfig`
+    // / `DmaExtMemBKSize` to configure the external-memory burst size. Verified by
+    // construction, not by reading a table: a reference to
+    // `esp_hal::dma::ExternalBurstConfig` compiles for `esp32s3` in this crate.
+    //
+    // ⚠️ DO NOT COPY THE C5's RULE HERE. The cyd-c5 spike requires DMA staging
+    // buffers to live in internal SRAM, and that is a **C5 hardware limit**, not a
+    // house style. Carrying it over would silently forfeit the single biggest
+    // advantage this board has over the rest of the fleet — 8 MiB of framebuffer.
+    //
+    // ⚠️ AND DO NOT READ burrito-fw's INTERNAL-SRAM ROW BANDS AS THE SAME LIMIT.
+    // They are a MEASURED CHOICE, not an impossibility: DMA out of PSRAM carries a
+    // 32-byte alignment requirement, and burrito-fw judged that keeping the band
+    // buffers internal was cheaper than aligning tile geometry to 32 B. That is a
+    // trade-off with numbers behind it, and the numbers may well come out the
+    // other way for a full-screen framebuffer, which is what M4 wants.
+    //
+    // So: PSRAM framebuffer is on the table for M4. Honour the 32-byte alignment
+    // (`ExternalBurstConfig`), and measure rather than inherit either precedent.
+    //
+    // (The heap is a different question with a different answer — the esp-radio
+    // heap must stay in INTERNAL RAM because S3 atomics misbehave in PSRAM. See
+    // net.rs. DMA and atomics are unrelated hazards; do not merge the two rules.)
 
     // ---- display ----------------------------------------------------------
     // Backlight starts LOW and stays low until the first full paint has landed,
@@ -250,7 +293,9 @@ fn main() -> ! {
     // What to look for on the glass:
     //   * bars in the order red / green / blue / white, TOP to BOTTOM
     //   * the thin border touching all four edges (proves the full 320x240 window)
-    //   * text-free, so a mirror is NOT detectable here — that is M2's job
+    //   * text-free, so a mirror is NOT detectable from this screen alone —
+    //     it needs glyphs, which no tier draws yet. JP's eyeball on the bars +
+    //     border is the M1 orientation check.
     const W: i32 = 320;
     const H: i32 = 240;
     let bars = [
@@ -283,10 +328,13 @@ fn main() -> ! {
         InputConfig::default().with_pull(Pull::Up),
     );
 
-    // ---- M3 radio probe (feature-gated) -------------------------------------
-    // Off by default. See radio_dev.rs for what this is actually testing.
+    // ---- M2 network / M3 radio probe (feature-gated) ------------------------
+    // Both off by default. ONE radio bring-up serves both tiers — `net::init`
+    // owns it, and `radio` stacks on `wifi` so the ordering is not optional.
+    #[cfg(feature = "wifi")]
+    let mut net = net::init(peripherals.TIMG0, peripherals.SW_INTERRUPT, peripherals.WIFI);
     #[cfg(feature = "radio")]
-    let mut radio = radio_dev::init(peripherals.TIMG0, peripherals.SW_INTERRUPT, peripherals.WIFI);
+    let mut radio = net.take_esp_now().map(espnow_probe::attach);
 
     // ---- heartbeat ----------------------------------------------------------
     println!("[s3-cyd] M1 complete — entering heartbeat loop. Press BOOT (GPIO0) to test input.");
@@ -300,11 +348,33 @@ fn main() -> ! {
             last_pressed = pressed;
         }
 
+        // The network stack is serviced FOR the whole heartbeat window rather
+        // than the loop sleeping through it — see net.rs. Sleeping here is what
+        // starved the RX path and turned an undersized heap into M2's panic.
+        #[cfg(feature = "wifi")]
+        net.tick(&delay, HEARTBEAT_MS as u64);
         #[cfg(feature = "radio")]
-        radio.tick(tick);
+        if let Some(r) = radio.as_mut() {
+            r.tick(tick);
+        }
 
+        // The heartbeat carries the link state so one line answers both "is the
+        // board alive?" and "what is the radio doing?" — and names WHICH leg is
+        // broken, because "no credentials", "cannot associate" and "associated,
+        // no lease" send you to three different places.
+        #[cfg(feature = "wifi")]
+        println!(
+            "[s3-cyd] heartbeat {} — node {} alive — {}",
+            tick,
+            NODE_ID,
+            net.state().label()
+        );
+        #[cfg(not(feature = "wifi"))]
         println!("[s3-cyd] heartbeat {} — node {} alive", tick, NODE_ID);
         tick = tick.wrapping_add(1);
+        // Only the radio-less build sleeps here; with `wifi` the window was
+        // already spent inside net.tick() polling the stack.
+        #[cfg(not(feature = "wifi"))]
         delay.delay_millis(HEARTBEAT_MS);
     }
 }
