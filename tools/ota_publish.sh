@@ -343,7 +343,19 @@ SHA="$(sha256sum "$BIN" | cut -d' ' -f1)"
 read_target_desc() { # <bin> → "<hexdesc> <chipname>" on stdout, non-zero if absent/ambiguous
   python3 - "$1" <<'PY'
 import re, sys
-CHIPS = {1: "esp32c3", 2: "esp32c6", 3: "esp32s3"}
+# #413: esp32c5 (id 4) WAS MISSING, and the consequence was not a crash. `CHIPS.get(4)` returned
+# None, this script exited 1, the caller's `if _desc_out=$(read_target_desc ...)` took the
+# pre-#349 branch, and a C5 image with a PERFECTLY VALID descriptor was reported as
+# "no target descriptor in this image" and staged LEGACY-ONLY — invisible to boards routing on
+# smol/ota/staged/<chip>. Fail-closed against publishing a wrong name, but MISATTRIBUTED: it sends
+# whoever debugs it into the firmware's descriptor emission when the bug is this dict.
+#
+# ⚠️ THIS IS THE FOURTH COPY OF THE CHIP ROSTER in the tree (tools/build-matrix.toml,
+# rust/clock/src/budget.rs, rust/clock/src/net/target.rs, here) and it was the one nothing
+# compared. `net/target.rs` is AUTHORITATIVE because the id is the #349 WIRE FORMAT, and
+# `build_matrix.py check` now asserts this map against it in BOTH directions — so this list going
+# short again is a gate failure rather than a mystery at staging time.
+CHIPS = {1: "esp32c3", 2: "esp32c6", 3: "esp32s3", 4: "esp32c5"}
 data = open(sys.argv[1], "rb").read()
 def fnv(b):
     h = 0x811c9dc5

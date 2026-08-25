@@ -33,7 +33,52 @@
 # whatever it was before — the default build is provably untouched (no cfg, no source edit).
 
 # The bare-metal target the fleet builds for (matches .cargo/config.toml `build.target`).
+#
+# ⚠️ #413 PHASE 2B: THIS IS NOW A DEFAULT, NOT A CONSTANT. It is the CANONICAL chip's target, kept
+# as a literal so every existing caller and every recorded C3 measurement is untouched — but it is
+# no longer the only value it can hold. `repro_chip_spec <chip>` re-points it (plus the toolchain,
+# build-std and opt-level that go with that chip) from `tools/build-matrix.toml`, which is the one
+# place the (chip → target, toolchain, build_std, opt_level, features) tuple lives.
+#
+# It stays a scalar-with-a-default rather than becoming a required argument because six consumers
+# read it and a required parameter would make every one of them a caller's problem at once. The
+# per-chip paths call `repro_chip_spec` first; the C3 path does not have to.
 REPRO_TARGET="riscv32imc-unknown-none-elf"
+# The chip that target belongs to. Same reasoning: a default the C3 path never has to think about.
+REPRO_CHIP="${REPRO_CHIP:-esp32c3}"
+# Set by `repro_chip_spec` for non-default chips; empty means "the pinned stable toolchain, no
+# build-std, the profile's own opt-level" — i.e. exactly what the C3 has always used.
+REPRO_TOOLCHAIN="" REPRO_BUILD_STD="" REPRO_OPT_LEVEL=""
+
+# repro_chip_spec <chip> — re-point REPRO_TARGET/CHIP/TOOLCHAIN/BUILD_STD/OPT_LEVEL at one chip.
+#
+# Reads `tools/build_matrix.py chip-checks`, which already emits the whole tuple and is what the
+# xtensa CI spike builds from. Deliberately NOT a second roster here: a publish path that carried
+# its own chip table would be the FIFTH copy of that roster in this repo, and the fourth
+# (`ota_publish.sh`'s id→name dict) was already silently short the C5 when #413 found it.
+#
+# Fields are tab-separated with `-` for empty. A tab is IFS *whitespace*, so bash collapses runs of
+# them and every field after an empty one shifts left — the sentinel is what survives that, and the
+# reason this reads `-` back to empty rather than trusting position alone.
+repro_chip_spec() {
+  local chip="${1:-}" line
+  case "$chip" in
+    '') echo "repro_chip_spec: a chip is required" >&2; return 1 ;;
+    *[!a-z0-9]*) echo "repro_chip_spec: implausible chip name '$chip'" >&2; return 1 ;;
+  esac
+  local matrix="$REPRO_ROOT/tools/build_matrix.py"
+  [ -x "$matrix" ] || { echo "repro_chip_spec: no $matrix" >&2; return 1; }
+  line="$("$matrix" chip-checks 2>/dev/null | awk -F'\t' -v c="$chip" '$1==c')"
+  [ -n "$line" ] || { echo "repro_chip_spec: '$chip' is not a declared chip in build-matrix.toml" >&2; return 1; }
+  local _c _t _e _tc _bs _ol _f
+  IFS=$'\t' read -r _c _t _e _tc _bs _ol _f <<<"$line"
+  [ "$_tc" = "-" ] && _tc=""
+  [ "$_bs" = "-" ] && _bs=""
+  [ "$_ol" = "-" ] && _ol=""
+  [ -n "$_t" ] || { echo "repro_chip_spec: '$chip' declares no target" >&2; return 1; }
+  REPRO_TARGET="$_t"; REPRO_CHIP="$_c"
+  REPRO_TOOLCHAIN="$_tc"; REPRO_BUILD_STD="$_bs"; REPRO_OPT_LEVEL="$_ol"
+}
 
 # #338: the CANONICAL fleet feature set, named once. `repro_build_bin` builds it and `tools/gate.sh`
 # gates it; before this was a variable the list lived only inside the build line below, so CI could
@@ -45,9 +90,19 @@ REPRO_FLEET_FEATURES="${REPRO_FLEET_FEATURES:-espnow,cast,io}"
 # the crate's rust-toolchain.toml, so this MUST be evaluated inside the crate dir (from home it
 # would return `stable`, not the pinned 1.96.1, and the remap prefix would miss the build-std
 # paths). Arg $1 = crate dir (default ".").
+# ⚠️ #413 2B: THE TOOLCHAIN MUST BE THE ONE THAT WILL ACTUALLY BUILD, and for a non-default chip
+# that is NOT what rust-toolchain.toml resolves to. `rustc --print sysroot` in the crate dir picks
+# up `channel = "stable"`; an S3 build runs on espup's `esp` fork, whose sysroot is a DIFFERENT
+# path. Remapping stable's sysroot while build-std compiles `core` out of the esp fork's would
+# leave the fork's absolute paths un-remapped in the image — reproducibility silently broken for
+# the S3 while the C3 stayed perfect, which is the worst shape this file has.
+#
+# So the toolchain travels into the sysroot query. `$REPRO_TOOLCHAIN` is empty for the C3, and
+# `rustc  --print sysroot` with an empty first word is exactly the old command.
 repro_sysroot() {
-  local crate_dir="${1:-.}"
-  ( cd "$crate_dir" 2>/dev/null && "${RUSTC:-rustc}" --print sysroot 2>/dev/null ) || true
+  local crate_dir="${1:-.}" tc="${2:-$REPRO_TOOLCHAIN}" args=()
+  [ -n "$tc" ] && args+=("+$tc")
+  ( cd "$crate_dir" 2>/dev/null && "${RUSTC:-rustc}" "${args[@]}" --print sysroot 2>/dev/null ) || true
 }
 
 # Echo the machine-specific --remap-path-prefix flags (space-separated). Fixed targets
@@ -57,7 +112,7 @@ repro_sysroot() {
 repro_remap_flags() {
   local reg sysroot
   reg="${CARGO_HOME:-$HOME/.cargo}/registry"
-  sysroot="$(repro_sysroot "${1:-.}")"
+  sysroot="$(repro_sysroot "${1:-.}" "${2:-$REPRO_TOOLCHAIN}")"
   [ -n "$sysroot" ] || { echo "repro_build: could not resolve rustc sysroot — cannot remap build-std paths" >&2; return 1; }
   printf -- '--remap-path-prefix=%s=/registry --remap-path-prefix=%s=/rust' "$reg" "$sysroot"
 }
@@ -70,7 +125,7 @@ repro_remap_flags() {
 repro_cargo_args() {
   local reg sysroot
   reg="${CARGO_HOME:-$HOME/.cargo}/registry"
-  sysroot="$(repro_sysroot "${1:-.}")"
+  sysroot="$(repro_sysroot "${1:-.}" "${2:-$REPRO_TOOLCHAIN}")"
   [ -n "$sysroot" ] || { echo "repro_build: could not resolve rustc sysroot — cannot remap build-std paths" >&2; return 1; }
   REPRO_CARGO_ARGS=(
     --config "target.${REPRO_TARGET}.rustflags=[\"--remap-path-prefix=${reg}=/registry\",\"--remap-path-prefix=${sysroot}=/rust\"]"
@@ -273,6 +328,34 @@ repro_build_bin() {
       return 1
       ;;
   esac
+
+  # #280 (lucid): refuse to build a chip whose `.cargo/config.toml` is STALE. The failure this
+  # prevents is specific and was observed on familiar: a config byte-current EXCEPT for the S3
+  # arm's `-C link-arg=-Tlinkall.x`, which `cargo check` cannot notice (check never links) and
+  # which then fails the LINK with 129 undefined references — reading as a broken toolchain
+  # rather than a stale file. The file is git-tracked but `.stignore` ignores `.cargo`, so a
+  # synced tree's copy arrives out of band and nothing keeps it current.
+  #
+  # BOTH non-zero states are fatal HERE, and that is a packaging-boundary judgement rather than
+  # the helper's default: `2` means "could not check" (unknown chip, or no `config_markers`
+  # declared for it), and an image whose build configuration could not be VERIFIED has no
+  # business becoming a published artifact — the same reasoning as the `off-fleet` refusal above.
+  # A chip with no declared markers is a manifest gap to close before publishing that chip, and
+  # failing here is what applies the pressure. Distinct messages so the operator knows which.
+  if [ -r "$REPRO_ROOT/tools/assert_cargo_config.sh" ]; then
+    # shellcheck source=tools/assert_cargo_config.sh
+    . "$REPRO_ROOT/tools/assert_cargo_config.sh"
+    assert_cargo_config "$REPRO_CHIP"
+    case $? in
+      0) : ;;
+      1) echo "FATAL: refusing to package — see the stale-config refusal above (#280)." >&2
+         return 1 ;;
+      *) echo "FATAL: could not VERIFY .cargo/config.toml for '$REPRO_CHIP' (#280). Not a stale" >&2
+         echo "       file — an unverifiable one, which at the packaging boundary is the same" >&2
+         echo "       answer: declare the chip's config_markers in tools/build-matrix.toml." >&2
+         return 1 ;;
+    esac
+  fi
   # #218: no explicit number ⇒ use the COMMITTED ratchet (version.txt), NOT git-count.
   # The caller sets SMOL_RELEASE=1 for a real release (clean `vN Word` stamp); otherwise
   # build.rs marks it dev (`vN+dev.<hash> Word`) so a canary can't masquerade as the release.
@@ -370,14 +453,62 @@ repro_build_bin() {
     # the with-bard lineage by definition. That is the second fork of this lineage (#300 was
     # the first); an image sha only means something relative to the list in force when it was
     # built, so a hash compared across this boundary will disagree and is SUPPOSED to.
-    cargo build --release --features "$REPRO_FLEET_FEATURES" "${REPRO_CARGO_ARGS[@]}"
+    # #413 2B: the chip's toolchain/build-std/opt-level, all PER-INVOCATION and never config keys.
+    #
+    # ⚠️ build-std as a `.cargo/config.toml` key is GLOBAL, and that is the 2026-07-20 regression
+    # that leaked portable-atomic/unsafe-assume-single-core into the HOST build and broke every
+    # cold C3 build. `opt_level` is the same shape for a different reason: the global release
+    # profile is shared with the C3, and every C3 number on record (stack floors, #32 symbol
+    # sizes, byte-reproducibility) was measured against it. Both stay in the environment of this
+    # one command.
+    #
+    # ⚠️ THE OPT-LEVEL IS PART OF THE #44 REPRODUCIBILITY IDENTITY. A per-chip profile override
+    # means the sha lineage is per (chip, PROFILE), not per chip: the S3 builds at opt-level 2 to
+    # dodge an Xtensa LLVM scavenger crash, opt-level moves sections, and two S3 images built at
+    # different opt-levels will differ and are SUPPOSED to. Compare shas only within one
+    # (chip, profile) pair.
+    local _cargo_env=() _toolchain_arg=()
+    [ -n "$REPRO_BUILD_STD" ] && _cargo_env+=("CARGO_UNSTABLE_BUILD_STD=$REPRO_BUILD_STD")
+    [ -n "$REPRO_OPT_LEVEL" ] && _cargo_env+=("CARGO_PROFILE_RELEASE_OPT_LEVEL=$REPRO_OPT_LEVEL")
+    [ -n "$REPRO_TOOLCHAIN" ] && _toolchain_arg=("+$REPRO_TOOLCHAIN")
+    # `env` with an empty array is a no-op prefix, so the C3 path runs the identical command it
+    # always did — which is what makes the byte-identical claim checkable rather than argued.
+    # ── THE FEATURE FORM IS BRANCHED, AND THE BRANCH IS FORCED BY MEASUREMENT ─────────────
+    # The canonical chip keeps its EXACT historical invocation — `--features <tier>` with default
+    # features ON, so `default`'s own chip feature supplies the chip. Non-canonical chips get the
+    # explicit form, because `default` carries the CANONICAL chip and would otherwise hand esp-hal
+    # two chips (or, before that, trip build.rs's #405 feature-vs-triple cross-check, which is
+    # exactly how this was caught: an S3 build died with "chip DISAGREEMENT: feature `esp32c3` but
+    # target triple xtensa-esp32s3-none-elf").
+    #
+    # ⚠️ DO NOT "SIMPLIFY" THIS INTO ONE PATH. The two forms are NOT byte-equivalent, measured:
+    #     --features espnow,cast,io                          -> 072679408c8b4ba1…
+    #     --no-default-features --features esp32c3,espnow,…   -> 2a3365610afea8ed…
+    # Same resolved feature SET, different resolved feature NAME set (`default`/`hw` versus an
+    # explicit `esp32c3`), and feature names feed the crate's `-Cmetadata`. The delta is almost
+    # certainly metadata-only — but the C3 image's byte-identity is a constraint of record, and
+    # "almost certainly" is not the standard. Branching keeps that identity BY CONSTRUCTION
+    # instead of by an equivalence argument that has already failed once.
+    local _canon _feat_args=()
+    _canon="$("$REPRO_ROOT/tools/build_matrix.py" canonical-chip 2>/dev/null || true)"
+    if [ -n "$_canon" ] && [ "$REPRO_CHIP" = "$_canon" ]; then
+      _feat_args=(--features "$REPRO_FLEET_FEATURES")
+    else
+      _feat_args=(--no-default-features --features "$REPRO_CHIP,$REPRO_FLEET_FEATURES")
+    fi
+    env "${_cargo_env[@]}" cargo "${_toolchain_arg[@]}" build --release \
+      --target "$REPRO_TARGET" "${_feat_args[@]}" "${REPRO_CARGO_ARGS[@]}"
   ) || return 1
   # Honor CARGO_TARGET_DIR (verify_image.sh --twice points each build at an isolated dir);
   # default to the in-tree target/ (ota_publish.sh's path) when unset.
   local tdir="${CARGO_TARGET_DIR:-$clock/target}"
-  # #413: the chip travels with the check. Phase 2A keeps REPRO_CHIP defaulting to esp32c3 —
-  # phase 2B derives it from the manifest alongside REPRO_TARGET, and the two must move together.
-  repro_stack_check "$tdir/${REPRO_TARGET}/release/clock" "${REPRO_CHIP:-esp32c3}" || return 1
-  "$espflash" save-image --chip esp32c3 \
+  # #413: the chip travels with the check, and since 2B it is the SAME chip `repro_chip_spec`
+  # resolved the target from — the two cannot disagree because one call sets both.
+  repro_stack_check "$tdir/${REPRO_TARGET}/release/clock" "$REPRO_CHIP" || return 1
+  # #413 2B: `--chip esp32c3` was HARDCODED here. It is the 7th single-chip site in this file and
+  # the only one a `REPRO_TARGET` grep could never find, because it is a different literal in a
+  # different flag — the [[literal-grep-proves-nothing-about-constructed-strings]] case, found by
+  # reading the function rather than searching it.
+  "$espflash" save-image --chip "$REPRO_CHIP" \
     "$tdir/${REPRO_TARGET}/release/clock" "$out" >/dev/null || return 1
 }

@@ -1,0 +1,20 @@
+# EXPECT: MISSING from ota_publish.sh
+# TARGET-RS: _target_rs_ok.rs
+# OTA-PUBLISH: _ota_publish_short.sh
+# The defect #413 found in the wild: the publisher does not know a chip the firmware stamps, so a
+# valid image for it is reported as having NO target descriptor and staged legacy-only.
+[meta]
+canonical_chip = "esp32c3"
+canonical_tier = "fleet"
+[chip.esp32c3]
+target = "riscv32imc-unknown-none-elf"
+builds = true
+checks = true
+ships = true
+[chip.esp32s3]
+target = "xtensa-esp32s3-none-elf"
+builds = false
+checks = false
+ships = false
+[tier.fleet]
+features = "espnow,cast,io"
