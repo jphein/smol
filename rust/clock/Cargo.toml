@@ -38,8 +38,10 @@ license = "MIT OR Apache-2.0"
 #
 #   esp-hal          1.1    (esp-radio requires ~1.1.0 — 1.2.0-rc.0 does NOT work)
 #   esp-radio        0.18   (the esp-wifi RENAME; carries esp32c5 too, see #388)
-#   esp-rtos         0.3    (owns the scheduler; the `embassy` executor feature
-#                            is enabled on the #335 phase-1 branch, not here)
+#   esp-rtos         0.3    (owns the scheduler; its `embassy` executor feature
+#                            is ON as of #335 Phase 1 — this note used to say
+#                            "on the phase-1 branch, not here", which stopped
+#                            being true when that branch landed)
 #   esp-alloc        0.10 · esp-storage 0.9 · esp-bootloader-esp-idf 0.5
 #
 # The set moves TOGETHER: esp-radio links against esp-hal internal APIs, so a
