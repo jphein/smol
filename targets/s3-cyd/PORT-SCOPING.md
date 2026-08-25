@@ -4,7 +4,19 @@ Pattern of record: `~/Projects/cyd-c5/PORT-SCOPING.md` (the #388 C5 precedent), 
 to Xtensa. Decisions carry their conditions; when a premise moves, the decision is
 re-examined, not inherited.
 
-## Goal — ✅ MET 2026-08-25 08:52 (M3 witnessed; JP C5-parity bar)
+## Goal — ✅ MET 2026-08-25 08:52 · EXTENDED GOAL ✅ MET ~13:5x (full target + C5 parity)
+
+**2026-08-25 afternoon — the full-target day:** smol's own firmware BOOTS, MESHES, DRAWS
+and NARRATES on this board (PR #411: the display arm — zero-buffer 4× backend — plus the
+measured ChipBudget row). JP-verified on glass ("working well" — the Bard told stories on
+the S3). The row's floor uses observed-sufficient semantics because **stack-paint is
+INVALID on xtensa** (three-way measured: 59.5 KB "used" at boot; a post-init re-paint =
+99-boot crash loop; the CPU-slice fix disproven by readelf — symbols alias). vs the C5:
+exceeded on every axis (the C5 has no budget row and has never run smol). vs the C6:
+matched on the row, exceeded on native-smol. `builds` stays false with ONE honest word
+remaining (CI runners lack espup — every non-C3 chip's shared standing). Remaining
+beyond the goal: #411 review (smol-d8), the cast-mirror bug, the WS2812 light, the
+stack-paint xtensa port, OTA A/B first roll.
 
 **ACCEPTANCE BAR (JP, 2026-08-25): full parity with the C5** — the complete spike
 ladder (M1–M4 witnessed) plus tree-side integration equal to the C5's. The S3 already
