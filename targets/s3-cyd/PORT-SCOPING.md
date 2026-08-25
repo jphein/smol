@@ -18,8 +18,8 @@ the first Xtensa silicon.
 |---|---|---|
 | Which physical board? | **A new blank ES3C28P, `14:C1:9F:D1:C8:10`, node id 162** — *not* the Ember satellites (#331, id 160), *not* emberburrito's terminal (id 161) | JP 2026-08-24 ("new and blank", "same one we use in emberburrito"); passive bus-diff 23:03; `docs/protocol.md` id block |
 | Does smol's stack run on this silicon? | **YES — proven, executor ON.** burrito-fw ships esp-hal 1.1.1 / esp-radio 0.18.0 / esp-rtos 0.3.0 (embassy) / esp-bootloader 0.5.0 on this exact board — smol main's post-#233 matched set, with the executor smol itself still holds behind canary PR #391 | `burrito-fw/Cargo.toml`, verified independently 2026-08-24 |
-| Xtensa toolchain? | **katana-only** (espup 0.17.1, Rust `esp` 1.95.0.0, has produced S3 binaries). familiar **cannot** build xtensa today (no espup, no `esp` channel — its `channel="esp"` failure looks like a rustup error, not a missing target). Standing exception to build-on-familiar. | toolchain recon 2026-08-24, both hosts probed read-only |
-| Does `wifi + esp-now` compile for esp32s3? | **UNKNOWN — the spike's `radio` feature exists to answer it.** burrito-fw proves `wifi`; the combination is unproven (a per-feature support matrix is not a per-combination one). No 802.15.4 on S3, so the `ieee802154`+`wifi` build-panic hazard doesn't apply. | esp-radio 0.18.0 feature docs; #388's lesson |
+| Xtensa toolchain? | **BOTH hosts** as of 2026-08-24 ~23:20: JP directed xtensa builds onto familiar, retiring the katana-only exception. familiar's espup toolchain is **pinned to 1.95.0.0** — byte-parity with katana verified (rustc 95e5bda86 / GCC esp-15.2.0_20250920 / clang esp-20.1.1_20250829). **Condition on the pin: upgrade both hosts in one motion or not at all.** | `espup install -v 1.95.0.0 -t esp32s3` on familiar; parity re-read from both `~/export-esp.sh` |
+| Does `wifi + esp-now` compile for esp32s3? | **YES — proven 2026-08-24 23:2x**: full release build+link on familiar with `--features radio` (esp-radio 0.18.0 `["esp32s3","wifi","esp-now","esp-alloc","unstable"]`), `radio_dev.rs`'s ESP-NOW API usage compiled in; `libesp_radio`/`libesp_wifi_sys_esp32s3`/`libesp_rtos` rlibs confirmed in the dep graph. `coex` deliberately NOT enabled (build-script hard-error without `ble`; smol's WiFi↔ESP-NOW coexistence is same-radio channel management). **M3 is unblocked.** | `spike/build-remote.sh --features radio`, 15.5 s |
 | Chip identity in smol's build? | **Already solved.** `xtensa-esp32s3` is an unambiguous triple → chip id 3, no `SMOL_CHIP` needed (unlike the C5/C6 riscv32imac collision). `chip_name()` → `"esp32s3"`, BoardProfile arm + profile_verify case exist. | `rust/clock/build.rs` (6f900a6), `net/profile.rs` (fd7cca7) |
 | HA model label? | **BLOCKED-BY-DESIGN on smol#396** — every S3 announces as `"smol ESP32-S3 Ember"` today; the variant axis (leaning NVS product field beside the node id) is smol-d8's lane. Until then the spike hand-writes a **distinct** model string. | #396; profile.rs `(CHIP_ESP32S3, _)` arm |
 | Group-MAC trailer? | Phase-1 spike may join un-MAC'd today (`MAC_ENFORCE = false`) but **dies silently at the enforce flip** — a known expiry, accepted for the spike, mandatory for phase 2 (free via `wire.rs` + the real `GROUP_KEY`). Match SMOLv1 replies on the 14 B **prefix** — on-air frames carry +9 B. | `docs/protocol.md` §MAC_ENFORCE; #388's M3 trap |
@@ -63,7 +63,7 @@ id-block generalization. Remaining tree-side identity work is #396 (smol-d8's la
 |---|---|---|
 | **M1** | esp-hal 1.1.1 boots on *this unit*; PSRAM octal 8 MiB mapped; ILI9341V paints (MADCTL 0x28); backlight; button | spike drafted, unflashed |
 | **M2** | WiFi STA associates (2.4 GHz only — no band trap on S3), DHCP lease | not started |
-| **M3** | ESP-NOW round-trip: `SMOLv1 HELLO 162` broadcast heard by a live C3 fleet witness (roster flip = the proof), ACK matched on 14 B prefix | blocked on the `radio` compile verdict |
+| **M3** | ESP-NOW round-trip: `SMOLv1 HELLO 162` broadcast heard by a live C3 fleet witness (roster flip = the proof), ACK matched on 14 B prefix | **unblocked** — radio compiles (verdict above); needs bench time |
 
 M3 hard rule (from the C6 watch session, a full day lost to it): **esp-radio 0.18's
 `SendWaiter::wait()` is an unbounded, non-yielding spin — and its `Drop` runs the same
@@ -108,10 +108,14 @@ Ordered by dependency:
   runner guard on this machine (re-verified absent 2026-08-24).
 - **Identity is passive:** `udevadm ID_SERIAL_SHORT` only. Opening the port resets the
   target. `espflash board-info` is a deliberate, logged act, not an identification step.
-- **Builds are LOCAL (katana)** — the standing exception to build-on-familiar, because the
-  espup toolchain exists only here. Condition attached: if espup is ever installed on
-  familiar, pin the toolchain version deliberately (version-skew between hosts surfaces as
-  irreproducible binaries) and retire this rule in writing.
+- **Builds go to familiar** via `spike/build-remote.sh` (JP directive 2026-08-24, retiring
+  the earlier katana-only exception *in writing, as its condition required*): espup was
+  installed on familiar the same night, **toolchain pinned to 1.95.0.0** for byte-parity
+  with katana — upgrade both hosts in one motion or not at all. Flashing stays local
+  (the board and the guard are on katana's bus). katana's toolchain remains valid for
+  local builds when familiar is asleep. ⚠️ familiar's `/tmp` is a 512 MB tmpfs — it
+  filled during the espup install and impersonated a compile error (same class as the
+  #363 gate lesson); anything staged remotely uses `TMPDIR=/var/tmp`.
 - **Shell setup, both halves or nothing works:**
   `export PATH="$HOME/.cargo/bin:$PATH" && source ~/export-esp.sh`
   (missing first half = `cargo: command not found`; missing second = a "linker
@@ -133,3 +137,8 @@ Ordered by dependency:
   BOARD.md + this file written. Spike M1 drafting in flight; `radio` compile verdict
   pending. smol#396 filed (smol-d8). **Target issue: smol#398** (this directory's work
   of record — update its checkboxes as milestones land).
+- **2026-08-24 23:2x** — JP: xtensa builds move to familiar. espup installed there,
+  pinned 1.95.0.0 (parity verified); `spike/build-remote.sh` added. **First remote
+  xtensa build green in 34.5 s; `--features radio` green in 15.5 s → `wifi + esp-now`
+  on esp32s3 is PROVEN at compile/link level. M3 unblocked**, needs bench time + a
+  fleet witness. Board sigil: `eldritch-insignia` (watch repo `ba46f74`).

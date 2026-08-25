@@ -1,0 +1,148 @@
+[package]
+name = "s3-cyd-spike"
+version = "0.1.0"
+edition = "2021"
+description = "Phase-1 bring-up spike for the ES3C28P (ESP32-S3 N16R8) as a smol fleet target — node id 162"
+
+# ---------------------------------------------------------------------------
+# INTENTIONALLY ITS OWN CARGO WORKSPACE ROOT. Do NOT add this crate to smol's
+# root workspace, and do not delete these two lines.
+#
+# esp-hal accepts EXACTLY ONE chip feature, and cargo unifies features across
+# workspace members. smol's `rust/clock` is `esp32c3` (riscv32imc); this crate is
+# `esp32s3` (xtensa). Put them in one workspace and cargo hands esp-hal both chip
+# features at once, which fails to build in a way that reads like a dependency
+# problem and is not.
+#
+# The same constraint is why the two crates ALSO cannot share a target triple, a
+# toolchain, or a Cargo.lock. Shared logic, when we get there, goes in a
+# chip-agnostic zero-dep `*-core` crate consumed by PATH — which is exactly the
+# shape emberburrito arrived at independently (burrito-fw + crates/osk-core).
+[workspace]
+
+[dependencies]
+# --- Core HAL (M1, always on) --------------------------------------------
+# The version set MOVES TOGETHER: esp-radio links against esp-hal's internal
+# APIs, so a lone bump that "passes semver" can still fail to compile or, worse,
+# silently change a private default (smol #387 — the I2C SCL timeout that
+# vanished that way). These are smol main's matched set, which is also what
+# emberburrito's burrito-fw runs on real ES3C28P hardware today.
+#
+# `unstable` is required for SPI/I2C/RNG *and* for the psram module, and is a
+# hard requirement of esp-radio besides. Non-negotiable.
+#
+# ⚠️ VERSION-vs-LOCK NOTE, recorded 2026-08-24 because a condition kept somewhere
+# else is a condition nobody re-checks when it moves:
+#
+# This is a CARET requirement, so `1.1.1` admits 1.1.2. Our Cargo.lock resolved to
+# **esp-hal 1.1.2**. That is DELIBERATE and it is the right side to land on:
+# burrito-fw's lock — the build actually proven on ES3C28P hardware — is ALSO
+# 1.1.2, despite its manifest and README both saying "1.1.1". (Its README table is
+# drifted; the lock is the artifact that decides.) smol main's lock is still
+# 1.1.1, so THIS SPIKE IS ONE PATCH AHEAD OF smol main and exactly level with the
+# only build known to drive this panel.
+#
+# If the panel or PSRAM misbehaves on glass, the HAL version is therefore NOT the
+# variable to suspect first — it matches the working reference. If you ever need
+# to pin, pin to burrito-fw's lock, not to smol main's.
+esp-hal = { version = "1.1.1", features = ["esp32s3", "unstable"] }
+
+# esp-hal's default features already install the exception handler, so
+# esp-backtrace provides ONLY the panic handler + backtrace printing here.
+# Enabling esp-backtrace's `exception-handler` too gives a duplicate
+# `ExceptionHandler` symbol and an LTO bitcode-load failure at link time (smol).
+esp-backtrace = { version = "0.19", features = ["esp32s3", "panic-handler", "println"] }
+
+# Pin the console to USB Serial/JTAG explicitly. This board's only console IS the
+# native USB-JTAG link; esp-println's default `auto` backend only routes there
+# when it detects host SOF packets at the instant it writes, which is unreliable
+# under radio load and silently sends logs to the (unwired) UART0 instead.
+esp-println = { version = "0.17", default-features = false, features = ["esp32s3", "jtag-serial"] }
+
+# REQUIRED, not optional: this provides `esp_app_desc!()`, and espflash 4.5
+# REFUSES to write an image that lacks the app descriptor. Leaving it out does
+# not fail the build — it fails the flash, after you have already waited for a
+# fat-LTO release link.
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
+
+esp-alloc = "0.10.0"
+
+# --- Display (M1) ---------------------------------------------------------
+# PINNED EXACTLY, not caret. The landscape MADCTL byte this board needs (0x28) is
+# derived from mipidsi's `pub(crate)` MemoryMapping::from_orientation. A 0.10.x
+# PATCH that changed that mapping would silently invalidate the derivation in
+# src/main.rs while everything still compiled. Bump deliberately, then re-verify
+# on glass. (burrito-fw #64 pins it for exactly this reason.)
+mipidsi = "=0.10.0"
+embedded-graphics = "0.8.1"
+embedded-hal-bus = "0.3.0"
+static_cell = "2"
+
+# --- Radio (M3 probe, feature-gated: `--features radio`) ------------------
+# ⚠️ THIS FEATURE EXISTS TO ANSWER A STATED UNKNOWN, NOT TO SHIP A CAPABILITY.
+#
+# THE UNKNOWN: does `wifi` + `esp-now` COMPILE TOGETHER on esp32s3 in esp-radio
+# 0.18? smol proves that pair on esp32c3 (its `espnow` feature = `["wifi",
+# "esp-radio/esp-now"]`) and burrito-fw proves `wifi` alone on esp32s3 — but
+# nothing in either tree proves the INTERSECTION. Until `cargo check --release
+# --features radio` is green, treat S3 ESP-NOW as unproven, not as inherited.
+#
+# NOT AN ISSUE HERE (stated so nobody re-derives it): the `ieee802154` panic
+# hazard does not apply to this target. The S3 has NO 802.15.4 radio at all —
+# that is C5/C6 silicon — so esp-radio's ieee802154 feature is not selectable and
+# cannot be pulled in transitively. The S3's radio hazard is a different one:
+# WiFi and BLE contend, which is what `coex` arbitrates.
+#
+# We deliberately do NOT enable `coex`. esp-radio's build script HARD-ERRORS if
+# `coex` is set without `ble`, and smol's WiFi<->ESP-NOW coexistence is SAME-radio
+# channel management (both live in the WiFi domain), not cross-radio arbitration.
+# So: esp-now only. (smol #233's note, and it transfers verbatim.)
+#
+# `default-features = false` drops esp-radio's default esp-alloc so we re-add it
+# explicitly — matching smol main rather than diverging by accident.
+esp-radio = { version = "0.18.0", optional = true, default-features = false, features = [
+    "esp32s3",
+    "wifi",
+    "esp-now",
+    "esp-alloc",
+    "unstable",
+] }
+
+# The preemption scheduler backing esp-radio's `esp_radio_preempt_*` os-adapter
+# hooks. In the pre-0.18 stack this lived inside esp-wifi as `builtin-scheduler`;
+# #233 moved it OUT to esp-rtos, which is why esp-radio cannot be used without it.
+#
+# We enable its `esp-radio` + `esp-alloc` drivers but NOT `embassy`: this spike is
+# a BLOCKING SUPERLOOP like smol main, not an embassy application like burrito-fw.
+# `esp_rtos::start()` turns main() into the scheduler's pinned main task, so the
+# straight-line code below runs as-is. (This is the one place the spike follows
+# smol rather than burrito-fw, and it is deliberate — the phase-2 image is a smol
+# node, and matching smol's execution model now avoids porting it twice.)
+esp-rtos = { version = "0.3.0", optional = true, features = [
+    "esp32s3",
+    "esp-radio",
+    "esp-alloc",
+] }
+
+[features]
+default = []
+# M3 only. See the esp-radio block above for what this is actually testing.
+radio = ["dep:esp-radio", "dep:esp-rtos"]
+
+[profile.release]
+# ⚠️ RELEASE IS MANDATORY, NOT A PREFERENCE.
+#
+# esp-hal's PSRAM init path must be built optimised — a debug build does not map
+# the octal PSRAM correctly, and the failure surfaces as `raw_parts()` returning
+# a size of 0 (or a mapped region that faults on first touch), which reads like a
+# hardware fault and is not. `cargo run` / `cargo check` in this crate: always
+# `--release`. (burrito-fw's README states this from its own hardware bring-up.)
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = 2
+
+[profile.dev]
+# Kept only so an accidental debug `cargo check` is not gratuitously slow. Do not
+# flash a debug build — see the release note above.
+opt-level = "s"

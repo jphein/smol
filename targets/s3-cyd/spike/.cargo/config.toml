@@ -1,0 +1,43 @@
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+# NOTE: there is deliberately NO `ESP_HAL_CONFIG_PSRAM_MODE` here, and no
+# `[env]` block at all. That build-time knob DOES NOT EXIST in esp-hal 1.1.x —
+# it is not in esp_config.yml, and esp-config REJECTS unknown ESP_HAL_CONFIG_*
+# keys, so adding it fails the build rather than being ignored. Octal PSRAM is a
+# RUNTIME field on this stack: `PsramConfig { mode: PsramMode::OctalSpi, .. }`
+# in src/main.rs. The intent is unchanged — never leave an N16R8 on
+# PsramMode::Auto — it just lives in code now.
+#
+# (An older research doc asserts both a `psram` cargo feature and this env var.
+# Both were re-verified WRONG against esp-hal 1.1.x on 2026-08-14. Do not
+# reintroduce either from a search summary.)
+
+[target.xtensa-esp32s3-none-elf]
+# ⛔ THE RUNNER IS THE FLASH GUARD, NOT espflash.
+#
+# `espflash flash` with no --port picks the FIRST ESP device on the bus. This
+# workstation's bus routinely carries live ember.realm.watch voice satellites
+# (SAME MODEL as this board, same MAC prefix), JP's C6 watches, and other
+# sessions' dev boards. A habitual `cargo run --release` must not be able to
+# overwrite any of them.
+#
+# flash.sh resolves the port BY SERIAL, refuses on absence / mismatch / multiple
+# matches, refuses --baud, and refuses if another process holds the port. There
+# is deliberately no override flag. Do NOT "simplify" this back to a bare
+# espflash invocation.
+#
+# ⚠️ THE CONDITION THIS GUARD RESTS ON: `runner` covers `cargo run`. It does NOT
+# cover a `cargo espflash …` subcommand — external cargo subcommands bypass
+# `runner` entirely. So the guard's effectiveness depends on a fact about the
+# WORKSTATION, not about this repo: `cargo-espflash` must not be installed.
+# Verified absent on katana 2026-08-24 (`~/.cargo/bin` holds `espflash` and
+# `cargo-flash`(probe-rs), not `cargo-espflash`). `cargo install cargo-espflash`
+# silently re-opens the hole and nothing here would notice.
+runner = "./flash.sh"
+rustflags = ["-C", "link-arg=-Tlinkall.x", "-C", "force-frame-pointers"]
+
+[unstable]
+# The esp toolchain ships NO prebuilt `core` for xtensa-esp32s3-none-elf, so it
+# has to be built from source. `rust-src` comes from `espup install`.
+build-std = ["core", "alloc"]
