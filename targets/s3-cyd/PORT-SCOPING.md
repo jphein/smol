@@ -233,8 +233,16 @@ Ordered by dependency:
   not two (the third found by the link probes, 2026-08-25): a measured ChipBudget row
   (radio-up soak on this unit) + the partition table (landed) + **the fat-LTO Xtensa
   LLVM crash** (BUDGET-PREP §6 blocker B — feature-dependent, fleet tier affected,
-  independently reproduced by two agents; escape matrix in progress, upstream report
-  drafted if none escapes; PR #408 carries the separate linkall.x one-liner).
+  independently reproduced by two agents; PR #408 carries the separate linkall.x
+  one-liner). **§6.1 UPDATE: blocker B is ESCAPABLE — `opt-level = 2` (or 3) under fat
+  LTO links; the size-optimising levels (s, z) are what provoke the scavenger crash.**
+  Application rule: per-chip `opt_level` via the matrix seam
+  (`CARGO_PROFILE_RELEASE_OPT_LEVEL=2`, S3 only) — never the shared global profile,
+  which every C3 measurement on record depends on. The #32 gate is measured intact at
+  opt=2. ⚠️ Standing caveat until silicon says otherwise: opt=2 linking where opt=s
+  crashed is escape, not proven codegen — **the first S3 flash of the full image is
+  unproven silicon, not routine bring-up** (runbook §7's audit-the-instrument rule
+  applies to the compiler itself).
 - **2026-08-24 23:2x** — JP: xtensa builds move to familiar. espup installed there,
   pinned 1.95.0.0 (parity verified); `spike/build-remote.sh` added. **First remote
   xtensa build green in 34.5 s; `--features radio` green in 15.5 s → `wifi + esp-now`
