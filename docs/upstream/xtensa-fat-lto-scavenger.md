@@ -30,9 +30,10 @@ fixes it, which is the reason to file at all.
   XtensaISD::PCREL_WRAPPER TargetConstantPool [2 x float]` — triggered by a Slint scene
   set's float constant pool, at opt 1, 2 AND 3 under fat LTO (thin hits the scavenger;
   lto=off hits a spill crash). Unlike member 1 it has NO known opt-level escape. Their
-  repro: `tools/build-s3.sh` on that branch, no hardware needed. Whether 1.98 fixes THIS
-  member is untested as of this addendum — the `esp-test` toolchain exists on katana for
-  exactly that test.
+  repro: `tools/build-s3.sh` on that branch, no hardware needed. **Member 3 also reproduces on 1.98.0.0** (watch-lane test, same branch, opt=2 fat LTO,
+  same LTO codegen stage). Both tested members fail on the newest release: **the
+  toolchain-bump path is dead for the whole family**, and "affects latest" holds for the
+  report across members.
 
 ## The report body (draft)
 
