@@ -1,0 +1,19 @@
+# smol-core — the shared fleet layer (#347 Phase 2), starting from intake item zero.
+#
+# RULE OF ADOPTION (recorded on #347, agreed by smol-d8 2026-08-24): the naming
+# layer is adopted FROM the watch's `sigil-id`, never re-derived — that crate's
+# FANTASY table is pinned forever because every device's name and per-device MQTT
+# OTA topic derive from it, and smol's own history (names.rs hand-copied twice,
+# both copies drifted) is the failure this prevents. This crate therefore
+# DEPENDS on the canonical implementation and re-exports it; it does not copy it.
+#
+# `no_std`, zero further deps — safe for every consumer including firmware.
+[package]
+name = "smol-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+
+[dependencies]
+# The one source of truth. Path is in-tree post-import (smol#402).
+sigil-id = { path = "../../targets/c6-watch/crates/sigil-id" }
