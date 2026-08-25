@@ -1658,8 +1658,9 @@ from `run_mqtt_burst` (`net/wifi.rs:674`); broker addr/creds in `secrets.rs`. HA
   show fetch-age, not data-age); and a boot where SNTP exhausts the budget starves the
   boot-MQTT downlink until the next flush (#15).
 - **ESP-NOW airtime/throughput/RX-reliability under COEXIST** are unmeasured on
-  hardware — reasoned from the `esp-wifi 0.15.0` API (see `nebula-espnow-gateway.md`),
-  not a bench run.
+  hardware — reasoned from the ESP-NOW API (see `nebula-espnow-gateway.md`, which read
+  `esp-wifi 0.15.0`; the tree now pins its renamed successor `esp-radio 0.18`), not a
+  bench run.
 - **The code is authoritative.** RELAY sizes/fields especially may move while the
   bridge lands — re-check `mode.rs` before depending on the exact bytes.
 
@@ -1672,5 +1673,5 @@ from `run_mqtt_burst` (`net/wifi.rs:674`); broker addr/creds in `secrets.rs`. HA
 - `collector/collector.py` — the v1 UDP relay collector, **retired** as of build 40 (see [relay.md](relay.md)); superseded by the MQTT burst above.
 - `scratch/smol-ha-batt/spec.md` (v2) — the MQTT-native architecture (uplink/downlink, discovery, retained) + role boundaries.
 - `mesh-time-sync-spec.md`, `relay-bridge-spec.md`, `mmo-snake-netcode.md`, `mmo-snake-design.md` — design specs (scratch).
-- `nebula-espnow-gateway.md` — verified ESP-NOW limits (esp-wifi 0.15.0) + the gateway feasibility verdict.
+- `nebula-espnow-gateway.md` — verified ESP-NOW limits (read from `esp-wifi 0.15.0`; re-verified unchanged against `esp-radio 0.18.0` on 2026-08-24) + the gateway feasibility verdict.
 - `lucid-hw-verify.md` / `board1-boot-ANNOTATED.md` — today's hardware boot capture.

@@ -42,8 +42,9 @@ arduino-cli lib install U8g2
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 rustup target add riscv32imc-unknown-none-elf     # C3 is a stock upstream RISC-V target
-# espflash v3 (v4 refuses esp-hal 1.0.0-rc.0 images — see gotchas):
-CC=gcc cargo install espflash --version "^3"
+# espflash — see the gotcha below before picking a version. The "^3" pin was for
+# esp-hal 1.0.0-rc.0 images, which this tree no longer builds (#233 → esp-hal 1.1).
+CC=gcc cargo install espflash --version "^3"   # ⚠️ this workstation currently runs 4.5.0
 ```
 
 ## Flashing
@@ -81,8 +82,8 @@ Feature tiers: default = Clock + Snake · `--features wifi` = + NTP · `--featur
   espflash erase-region 0xf000 0x2000   # otadata ONLY — spares `nvs`, so the node id survives
   ```
   **Check the `Loaded app from offset` line after every flash** — it names the slot that actually ran, and it is the only cheap confirmation you flashed the thing you are about to debug. *(Cost an hour on 2026-07-28; it had been living in operator memory and no `docs/` file.)*
-- **espflash v4 won't flash** esp-hal `1.0.0-rc.0` images (wants an ESP-IDF app descriptor). Use **espflash v3**. *(Untested for esp-hal 1.1 images such as the `dream/feat-embassy` branch — v4 may accept those; do not assume either way while recovering a board.)*
-- **`esp-wifi` pins to esp-hal internals:** it needs **`esp-hal = "=1.0.0-rc.0"`** exactly (newer rc.1/1.0 changed `Rng::new()` and break the build despite passing semver). Full working pin-set is in `rust/clock/Cargo.toml` + comments.
+- **espflash v3-vs-v4 — the ground has moved under this entry; read it before flashing.** The original finding stands as history: **espflash v4 won't flash esp-hal `1.0.0-rc.0` images** (it wants an ESP-IDF app descriptor), which is why the install line pins `^3`. But **this tree no longer builds 1.0.0-rc.0 images** — #233 / PR #361 moved it to esp-hal 1.1 — so the reason for the pin no longer describes what you are flashing, and **the workstation actually has espflash 4.5.0 installed** (`~/.cargo/bin/espflash`, checked 2026-08-24). Those two facts together mean the documented instruction and the installed reality disagree. **What is NOT known:** whether v4 flashes a current esp-hal 1.1 image successfully — that needs a board, and it has not been tried. So: **do not assume either way while recovering a board**, and if you settle it, record the answer here and fix the install line. *(Verified: the version numbers and which crate the tree pins. Unverified: v4-on-1.1 behaviour.)*
+- **`esp-radio` (was `esp-wifi`) pins to esp-hal internals** — the *reason* is permanent, the *numbers* are not. It links against esp-hal's internal APIs, so it constrains esp-hal to an exact minor line and **semver alone will not protect you**. Full working pin-set is always `rust/clock/Cargo.toml` + its comments; do not trust a version written in prose, here or anywhere else. *(Historical, kept because it explains the rule: pre-#233 this read "needs `esp-hal = "=1.0.0-rc.0"` exactly — newer rc.1/1.0 changed `Rng::new()` and break the build despite passing semver". That exact pin is dead — #233/PR #361 moved the tree to esp-hal 1.1 + esp-radio 0.18 — but the failure it describes is the one to expect from the next bump. Dated 2026-08-24.)*
 - **Rust serial logs go over USB-JTAG:** build with `ESP_LOG=info` (level is compile-time) and view with `espflash monitor` — plain `cat /dev/ttyACM0` won't show them, and the monitor needs a real TTY (fails under a pipe).
 - **`espflash monitor` reset mode matters on this native-USB C3:** `--before default-reset` (the UART-bridge DTR/RTS reset) **fails silently** — it drops the chip into download/stub mode, so you get the monitor banner and then nothing. Use **`--before usb-reset`** (the USB-JTAG-Serial peripheral reset) to actually reboot the app and catch its boot log. The firmware only logs at **boot + state changes**, so a silent idle board looks identical to a broken capture — you must catch the boot.
 - **Capture logs through a PTY, not a pipe:** espflash block-buffers when stdout isn't a terminal, so `espflash monitor | tee` stalls. Wrap it in a pseudo-terminal: `timeout <N> script -qec "espflash monitor --port <port> --before usb-reset" <capfile>`. Kill it by **exact** name only (`pgrep -x espflash` / `pkill -x espflash`) so you don't nuke unrelated processes.

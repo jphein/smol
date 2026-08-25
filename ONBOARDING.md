@@ -24,10 +24,19 @@ display data from) Home Assistant over MQTT. Single-core RISC-V @160 MHz, ~400 K
 
 ## 1. The firmware (`rust/clock/`, `no_std` esp-hal)
 
-**Dependency quartet (pinned EXACT — don't bump casually):** `esp-hal =1.0.0-rc.0`,
-`esp-wifi =0.15.0`, `smoltcp =0.12.0` (+ `esp-alloc`); OTA adds `esp-storage =0.7.0` +
-`esp-bootloader-esp-idf =0.2.0`. Target `riscv32imc-unknown-none-elf`, `build-std = [core, alloc]`.
-The pins are a matched set — a version bump is its own project (see `Cargo.toml` notes).
+**Dependency set (a MATCHED SET — don't bump casually):** `esp-hal 1.1`, `esp-radio 0.18`,
+`esp-rtos 0.3`, `esp-alloc 0.10`, `smoltcp 0.13`; OTA adds `esp-storage 0.9` +
+`esp-bootloader-esp-idf 0.5`. Target `riscv32imc-unknown-none-elf`,
+`build-std = [core, alloc]`. A version bump is its own project (see `Cargo.toml` notes) —
+`esp-radio` links against **esp-hal internals**, so it constrains esp-hal to an exact minor
+line and semver alone will not protect you.
+
+> **Renames to know, because the old names are all over older docs and scratch files:**
+> `esp-wifi` **→ `esp-radio`** at 0.16.0 (the C5 and later chips exist only under the new
+> name), and `esp-hal-embassy` **→ `esp-rtos`** (+ its `embassy` feature). This set landed in
+> #233 / PR #361; the pre-#233 quartet was `esp-hal =1.0.0-rc.0`, `esp-wifi =0.15.0`,
+> `esp-hal-embassy =0.9.0`, `esp-alloc =0.8.0`. *(Pins re-read from `rust/clock/Cargo.toml`
+> 2026-08-24.)*
 
 **The mental model — 3 feature tiers** (this is the thing to internalize):
 | Feature | Adds | Why it's tiered |
