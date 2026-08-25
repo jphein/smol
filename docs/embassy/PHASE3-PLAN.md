@@ -433,10 +433,19 @@ measured before #391 landed** — i.e. on Phase 1 rebased onto the *pre*-de-pin 
 
 So the real margin is **12,000 B, not 13,752 B**, and the executor's cost is **20,264 B** of DRAM
 (`.bss` growth silently shrinking `.stack` — `[[smol-stack-is-not-headroom]]`). Independently
-confirmed: CI's own `gate.sh fw` line on #391's head reads `stack: 86208 B (floor 74208 B)`. Note
-the 8-byte tree-dependence this file warns about elsewhere — a `board.rs` provisioned by
-`tools/ci_provision.sh` reads 86,200 B against 86,208 B for a developer seed, so **never assert
-byte-equality on this number**; the inequality is the gate.
+confirmed: CI's own `gate.sh fw` line on #391's head reads `stack: 86208 B (floor 74208 B)`.
+
+**The number varies by a few bytes between trees, so never assert byte-equality on it — the
+inequality is the gate.** Observed range, four runs: 86,208 B (familiar, developer seed) · 86,200 B
+(familiar, `tools/ci_provision.sh`) · 86,208 B (GitHub CI, which also runs `ci_provision.sh`) ·
+86,208 B (GitHub CI, #391's head). Note what that does NOT say: the delta is *not* "provisioned vs
+developer seed", which is what a single familiar-vs-CI comparison first suggested and which CI then
+contradicted. `secrets.rs`/`board.rs` are git-ignored and provisioned per tree — and
+`ci_provision.sh` substitutes a *fresh random* group key each run — so their literals land in
+`.data`/`.rodata` at slightly different sizes and `.stack` is whatever DRAM is left. That is the
+tree-dependence this file already warns about under "what this file deliberately does not contain";
+attributing it to a specific cause from one observation is how a caveat becomes folklore
+(`[[flagged-caveat-is-not-contained]]`).
 
 The floor remains conservative for the reason stated: `ESP32C3_MEASURED_PEAK_BYTES = 55,656` was
 measured with the `RadioManager` frame on the stack, ~18.9 KB of which P1.3 moved into `.bss` — so
