@@ -4,7 +4,7 @@ Pattern of record: `~/Projects/cyd-c5/PORT-SCOPING.md` (the #388 C5 precedent), 
 to Xtensa. Decisions carry their conditions; when a premise moves, the decision is
 re-examined, not inherited.
 
-## Goal
+## Goal — ✅ MET 2026-08-25 08:52 (M3 witnessed; JP C5-parity bar)
 
 **ACCEPTANCE BAR (JP, 2026-08-25): full parity with the C5** — the complete spike
 ladder (M1–M4 witnessed) plus tree-side integration equal to the C5's. The S3 already
@@ -70,7 +70,7 @@ id-block generalization. Remaining tree-side identity work is #396 (smol-d8's la
 | **M1** | esp-hal 1.1.x (lock: 1.1.2) boots on *this unit*; PSRAM octal 8 MiB mapped; ILI9341V paints (MADCTL 0x28); backlight; button | ✅ **CLOSED 2026-08-25 ~08:2x** — orientation human-verified by JP: **readable landscape**, MADCTL 0x28 confirmed on glass. |
 | **M2** | WiFi STA associates (2.4 GHz only — no band trap on S3), DHCP lease | ✅ **PROVEN 2026-08-25 ~07:5x**: lease `10.0.8.214/24`. The OOM verdict settled by the 64K isolation flash: **the drain cadence was the killer** — 64 KiB with continuous drain runs stably (~8.3 KB free, flat over 8+ min, three identical samples); the 96 K default is margin, not correctness. Board now runs the 96 K image (fresh-boot verified). |
 | **M4** | MQTT + retained discovery + telemetry as `smol_162` | ✅ **PROVEN on glass AND wire 2026-08-25**: CONNACK rc=0 on the same-subnet leg `10.0.8.111`, retained discovery byte-checked (model "smol ESP32-S3 CYD"), telemetry FLIPPING (beat monotone, heap field live) — HA device `smol 162 cyd`. Fourth silicon family with live fleet presence. |
-| **M3** | ESP-NOW round-trip: `SMOLv1 HELLO 162` broadcast heard by a live C3 fleet witness (roster flip = the proof), ACK matched on 14 B prefix | **staged, HOLDING for the GO** (2026-08-25 ~08:00): the espnow-only ELF is pre-built and hashed; smol-d8 holds the window because id50 is currently the #404 panic-repro canary (a HELLO would add a roster entry while roster size is a suspect variable — the contamination rule working as designed). GO comes with a clean witness. |
+| **M3** | ESP-NOW round-trip: `SMOLv1 HELLO 162` broadcast heard by a live C3 fleet witness (roster flip = the proof), ACK matched on 14 B prefix | ✅ **WITNESSED 2026-08-25 08:52**: 36 tx → **36/36 ACKs** (23 B on air each); id50's roster flipped to `162,-50,1,6,0`, held, aged out cleanly; `mf=` 0→37 vs 36 (one honest stray); LED on/off on cue. First window transmitted zero frames (dropped-WifiController bug, fixed ab72461 — Drop deinits the driver); the second was perfect. *(prior: staged, HOLDING for the GO (2026-08-25 ~08:00): the espnow-only ELF is pre-built and hashed; smol-d8 holds the window because id50 is currently the #404 panic-repro canary (a HELLO would add a roster entry while roster size is a suspect variable — the contamination rule working as designed). GO comes with a clean witness. |
 
 M3 hard rule (from the C6 watch session, a full day lost to it): **esp-radio 0.18's
 `SendWaiter::wait()` is an unbounded, non-yielding spin — and its `Drop` runs the same
