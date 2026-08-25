@@ -142,11 +142,22 @@ while IFS= read -r line; do
       file-exists)
         [ -e "$REPO_ROOT/$a1" ] && ok "$label" || bad "$label  [missing from the tree]" ;;
       grep-absent)
-        if [ ! -d "$REPO_ROOT/$a2" ] && [ ! -f "$REPO_ROOT/$a2" ]; then
-          bad "$label  [search path '$a2' does not exist — a vacuous pass is not a pass]"
-        elif grep -rq -- "$a1" "$REPO_ROOT/$a2" 2>/dev/null; then
-          bad "$label  [still present under $a2]"
-        else ok "$label"; fi ;;
+        # #426 — ASK ABOUT CODE, NOT PROSE. This used to `grep -rq` the raw source, and it cost a
+        # real false RED: `grep-absent ELECT_ENFORCE rust/clock/src` failed #148 because the symbol
+        # survives as PROSE in `net.rs:121` and `net/election.rs:143` describing the WATCH's flag.
+        # The claim was true; the check was reading comments. A grep cannot tell a live symbol from
+        # a sentence about one.
+        #
+        # Delegated to `tools/rust_comments.py --grep` rather than re-implemented in awk here: one
+        # implementation of comment-stripping, two callers, one of them across a process boundary.
+        # A second copy in shell is the duplication that module exists to end.
+        #   rc 0 = present in CODE · 1 = absent from code · 2 = could not check (never "absent")
+        python3 "$REPO_ROOT/tools/rust_comments.py" --grep "$a1" "$REPO_ROOT/$a2" >/dev/null 2>&1
+        case $? in
+          0) bad "$label  [still present in CODE under $a2]" ;;
+          1) ok "$label" ;;
+          *) bad "$label  [could not check '$a2' — a vacuous pass is not a pass]" ;;
+        esac ;;
       *)
         bad "$label  [UNKNOWN check kind '$kind' — a check nobody can evaluate is not a check]" ;;
     esac

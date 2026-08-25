@@ -58,6 +58,8 @@ Exit:   0 clean (sound / host-only / tracked phantoms) · 1 untracked PHANTOM or
 import re
 import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from rust_comments import strip_comments  # noqa: E402  (#426)
 
 # Phantoms that are KNOWN and TRACKED. An entry is a promise that someone owns the decision, so
 # each one must name the issue that owns it — an unexplained entry is just a way to make red go
@@ -104,7 +106,13 @@ def reachable_from(root: Path, crate_src: Path):
             continue
         seen.add(f)
         out.add(f.resolve())
-        lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        # #426 — STRIP FIRST. `MOD_DECL` anchors with `^\s*`, so a `//` comment can never match
+        # it; a BLOCK comment puts the decl at line-start and the anchor stops helping. Proved:
+        # `pub mod mesh_elect;` inside `/* */` made this report the verifier SOUND — i.e. that
+        # the firmware compiles a module it does not — which is a false GREEN on an ABSENCE
+        # check, the one direction that matters here.
+        lines = strip_comments(
+            f.read_text(encoding="utf-8", errors="replace")).splitlines()
         for i, line in enumerate(lines):
             m = MOD_DECL.match(line)
             if not m:
@@ -160,7 +168,9 @@ def main() -> int:
 
     rows, phantoms, missing_files = [], [], []
     for main_rs in sorted(experiments.rglob("*.rs")):
-        text = main_rs.read_text(encoding="utf-8", errors="replace")
+        # #426 — same reasoning one level over: a commented-out `#[path = "…"]` must not be
+        # read as a live include, or a verifier gets credited with coverage it does not have.
+        text = strip_comments(main_rs.read_text(encoding="utf-8", errors="replace"))
         verifier = main_rs.relative_to(experiments).parts[0]
         for rel in PATH_ATTR.findall(text):
             target = (main_rs.parent / rel).resolve()

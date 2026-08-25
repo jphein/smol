@@ -604,6 +604,20 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_config_markers"
   fi
 
+  # #426: prove the comment-blind sweep took, in BOTH directions. Three checkers were counting
+  # matches inside comments; three others read their DECLARATIONS from comments on purpose, so an
+  # over-eager strip would leave those green forever with nothing to check. The "still sees its
+  # declarations" arms sit beside the "no longer sees prose" ones for exactly that reason.
+  #
+  # Every probe uses a BLOCK comment. `//` is safe everywhere — the checkers anchor with `^\s*` —
+  # so a line-comment probe passes against the UNFIXED code too and proves nothing. Pure text.
+  step "comment-blind checker sweep regression suite (#426)"
+  if out=$("$ROOT/tools/test_comment_blind.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -2; ok "test_comment_blind"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_comment_blind"
+  fi
+
   step "build-matrix checker regression suite (#350)"
   if out=$("$ROOT/tools/test_build_matrix.sh" 2>&1); then
     printf '%s\n' "$out" | tail -2; ok "test_build_matrix"
