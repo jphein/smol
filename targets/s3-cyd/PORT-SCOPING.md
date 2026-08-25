@@ -84,7 +84,11 @@ them, which is itself evidence. Confirm id50 is powered/audible with smol-d8 fir
 
 M4 network facts (glass-verified at the C5's M4): the board joins `jplovescl` (VLAN 8)
 → broker is the HA VM's **same-subnet leg `10.0.8.111:1883`** — cross-VLAN legs
-silently drop CONNACK (smol `ha/README` broker table). WiFi vault item:
+silently drop CONNACK (**`/home/jp/Projects/smol/ha/README.md:327-341`** — full path
+because three sessions each meant a different file by "ha/README"; note that table's
+verdict column is written from a VLAN11 vantage and its "boards are on VLAN11" line is
+stale since the jplovescl move — the invariant is *the leg on the client's own subnet*,
+with the DHCP lease as ground truth). WiFi vault item:
 `"Homelab jplovescl WiFi (jplovescl SSID)"`; MQTT user `jp`, whose password is
 *currently* the same secret as the PSK — carries a rotation caveat in
 `build-remote.sh`, mirrored from the C5's script. Note the C5 (peer 176) is
@@ -98,11 +102,16 @@ work**: id-161 membership for the emberburrito terminal lives in the emberburrit
 
 ### Phase 2 — full smol firmware target (rides other lanes; this dir contributes numbers)
 Ordered by dependency:
-1. **feat/347-depin** lands the per-chip build arms (morpheus-depin's lane) — phase 2
-   builds on its PR, never competes with it. The xtensa workspace constraint (above) is
-   input to that design.
-2. **smol#396** variant axis — hard prerequisite of the S3 arm being *used* (two S3
-   products + this dev board would otherwise collide in HA).
+1. **feat/347-depin** lands the per-chip build arms (morpheus-depin3's lane) — PRs when
+   the single-naming mechanism + all four chip arms are declared and resolve-checked
+   (esp32c5 and esp32s3 cargo-checked). Deep S3 bring-up is explicitly NOT in its scope.
+   **DECIDED 2026-08-25 (smol-d8): this session takes the S3 arm implementation** — in a
+   worktree on top of feat/347-depin, PR'd through smol-d8, never straight to main.
+2. **smol#396** variant axis — **shape FROZEN 2026-08-25**: an NVS variant/product byte
+   provisioned beside `SMOL_NODE_ID` (no runtime probe can exist — identical hardware),
+   protocol.md's table as the human record. Implementation lands with smol-d8's
+   profile.rs lane after depin's PR. **Rule for anything written here meanwhile: leave
+   the seam, do not read the byte yet.**
 3. **Measured ChipBudget row** — `budget.rs` `compile_error!`s on any non-riscv32 target
    until an S3 row with MEASURED numbers exists. Full recipe + preliminary spike numbers:
    **`BUDGET-PREP.md`** (methodology transposed from the C6 row; `.stack` 204,564 B on the
