@@ -132,6 +132,7 @@ fn main() {
              c3_oled.ha_device_extras().len(), c3_bare.ha_device_extras().len());
     println!("  C6 extras     = {} B", c6.ha_device_extras().len());
     println!("  S3 extras     = {} B", s3.ha_device_extras().len());
+    println!("  C5 extras     = {} B", c5.ha_device_extras().len());
 
     println!("\nprofile_verify: {n} checks passed");
 }

@@ -1306,9 +1306,11 @@ static mut MQTT_JSON: JsonScratch = JsonScratch::new();
 /// reliable discriminator left was a DIAG format literal in another repo
 /// (`slot=ota_0` + `rst=unknown`) — ugly, and it depends on a string that repo is free to change.
 ///
-/// THE FLEET HAS FOUR TARGETS (JP, 2026-08-01; was three on 07-31, two before that): the C3
-/// OLED board ($2.76), the screenless C3 SuperMini ($1), the Waveshare ESP32-C6 touch watch
-/// (own repo, a smol target all the same), and the ESP32-S3 2.8" touchscreen that runs Ember
+/// THE FLEET HAS FIVE TARGETS (JP, 2026-08-24; four on 08-01, three on 07-31, two before): the
+/// C3 OLED board ($2.76), the screenless C3 SuperMini ($1), the Waveshare ESP32-C6 touch watch
+/// (own repo, a smol target all the same — converging in-tree, #347), the NM-CYD-C5 (#388,
+/// first non-C3 silicon heard on the mesh, 2026-08-24),
+/// and the ESP32-S3 2.8" touchscreen that runs Ember
 /// (ember.realm.watch, the hearth voice satellite — today an ESPHome device; #331 tracks the
 /// path: fleet-membership first over an ESPHome component, full firmware target after
 /// smol-core). The two C3 boards run ONE image and differ only at runtime: a missing OLED
