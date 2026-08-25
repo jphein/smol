@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>smol · a fingertip game console</title>
+<title>smol · a platform that fits in 400 KB</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%23070b0c'/><g fill='%237df9ff'><rect x='3' y='7' width='2' height='2'/><rect x='5' y='7' width='2' height='2'/><rect x='7' y='7' width='2' height='2'/><rect x='7' y='5' width='2' height='2'/><rect x='9' y='5' width='2' height='2'/></g><rect x='11' y='9' width='2' height='2' fill='%23ffb454'/></svg>" />
 <meta name="theme-color" content="#070b0c" media="(prefers-color-scheme: dark)" />
 <meta name="theme-color" content="#e9efee" media="(prefers-color-scheme: light)" />
-<meta name="description" content="A whole game console, a self-updating ESP-NOW mesh, and a 260K-parameter transformer writing children's stories — all on a $3 ESP32-C3 with a 0.42″ OLED. One no_std Rust firmware, signed over-the-air updates that reach even the WiFi-less nodes over the mesh, and a creature that hops from board to board." />
+<meta name="description" content="smol is a no_std Rust platform for cheap ESP32 boards: one binary, a static plugin registry behind a single button, and apps that range from a clock to a 260K-parameter transformer. Signed mesh OTA, gateway election and remote config come with it. Six boards, four chip families." />
 <!-- Open Graph / Twitter — so a shared link renders as a card, not a bare URL.
      og:url and og:image MUST stay absolute: crawlers do not resolve relative paths.
      The card is a real 1200×630 raster (crawlers reject SVG); its source and the
@@ -17,8 +17,8 @@
 <meta property="og:type" content="website" />
 <meta property="og:site_name" content="smol" />
 <meta property="og:url" content="https://jphein.github.io/smol/" />
-<meta property="og:title" content="smol — a $3 chip that writes you a story" />
-<meta property="og:description" content="A fingertip game console, a mesh that updates itself with signed firmware — even the WiFi-less nodes, over the air — and a real 260K-parameter transformer composing children's stories on the chip. No cloud. One no_std Rust binary on a $3 ESP32-C3." />
+<meta property="og:title" content="smol — one binary, many apps, many chips" />
+<meta property="og:description" content="One no_std Rust binary. A static plugin registry behind one button. Apps from a clock to a transformer that writes stories on-device. Signed firmware over the mesh — even to the WiFi-less nodes. Six boards across four chip families." />
 <meta property="og:image" content="https://jphein.github.io/smol/assets/og-card.png" />
 <meta property="og:image:secure_url" content="https://jphein.github.io/smol/assets/og-card.png" />
 <meta property="og:image:type" content="image/png" />
@@ -26,8 +26,8 @@
 <meta property="og:image:height" content="630" />
 <meta property="og:image:alt" content="The smol wordmark beside a scaled-up 72×40 OLED showing a story the board wrote itself: “Once upon a time, there was a little owl named Jack. Jack loved to play with his toys.” — at 202 ms per token." />
 <meta name="twitter:card" content="summary_large_image" />
-<meta name="twitter:title" content="smol — a $3 chip that writes you a story" />
-<meta name="twitter:description" content="A real 260K-parameter transformer composing children's stories on a $3 ESP32-C3, on a 72×40 OLED, with no WiFi and no cloud — inside a mesh that updates itself over the air." />
+<meta name="twitter:title" content="smol — one binary, many apps, many chips" />
+<meta name="twitter:description" content="One binary, many apps, many chips: a no_std Rust platform for $1–$3 ESP32 boards, with signed mesh OTA and every knob reconfigurable from Home Assistant without a reflash." />
 <meta name="twitter:image" content="https://jphein.github.io/smol/assets/og-card.png" />
 <!-- self-hosted webfonts (no Google-Fonts CDN → no visitor-IP disclosure); see fonts/fonts.css -->
 <link rel="stylesheet" href="fonts/fonts.css" />
@@ -434,10 +434,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <header>
   <div class="wrap bar">
     <div class="brand">smol<span class="dot">▚</span><span class="cursor"></span></div>
-    <nav>
-      <a href="#vitals">vitals</a><a href="#bard">the bard</a><a href="#games">games</a><a href="#builds">apps</a>
-      <a href="#mission">mission control</a><a href="#roadmap">roadmap</a><a href="#dollhouse">dollhouse</a><a href="#research">research</a><a href="#board">board</a><a href="#influences">influences</a><a href="#pocketwatch">watch</a><a href="#case">case</a>
-    </nav>
+    <nav> <a href="#platform">platform</a><a href="#targets">targets</a><a href="#vitals">vitals</a><a href="#bard">the bard</a><a href="#games">games</a><a href="#builds">apps</a><a href="#surface">config</a><a href="#fleet">fleet</a><a href="#get">get it</a><a href="#mission">mission control</a><a href="#roadmap">roadmap</a><a href="#research">research</a><a href="#influences">influences</a><a href="#case">case</a> </nav>
     <div class="live" id="live"><span class="led"></span><span id="liveTxt">connecting…</span></div>
   </div>
 </header>
@@ -451,8 +448,8 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
     <span class="kicker">ESP32-C3 · 72×40 OLED · no_std Rust</span>
     <!-- Visitors read content.json, NOT these defaults (app.js overwrites any data-edit
          key present there). Kept in step on purpose so the two don't contradict. -->
-    <h1 class="h1" data-edit="hero.title">A $3 chip that writes you a <em>story</em>.</h1>
-    <p class="lead" data-edit="hero.sub">A real 260K-parameter transformer, composing children’s tales on an ESP32-C3 — no WiFi, no cloud, no gateway. And that is only the newest trick: smol is a fleet of $1–$3 boards running one <b>no_std</b> Rust binary, talking directly over ESP-NOW with no router in the middle, updating themselves with signed firmware over the air — even the WiFi-less ones, over the mesh — and hosting a living creature that hops from board to board when you pull the power.</p>
+    <h1 class="h1" data-edit="hero.title">One binary. Many apps. <em>Many chips.</em></h1>
+    <p class="lead" data-edit="hero.sub">smol is a <b>platform</b> for very small computers. One <b>no_std</b> Rust binary carries a whole registry of apps — a clock, a mesh-wide multiplayer snake, a roster radar, a living creature, and a 260K-parameter transformer that writes children’s stories with no WiFi and no cloud — and you move between them with the one button the board has. Underneath, the fleet services come free with the platform: boards find each other over ESP-NOW with no router in the middle, elect a gateway, publish themselves into Home Assistant, take every setting back from it without a reflash, and update themselves with signed firmware over the air — even the WiFi-less ones, over the mesh. It started on a $3 chip. It now runs on four families of silicon.</p>
     <div class="chips">
       <span class="chip">RISC-V <b>160MHz</b></span>
       <span class="chip"><b>72×40</b> 1-bit OLED</span>
@@ -485,10 +482,27 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
   </div>
 </div></div>
 
+<!-- PLATFORM -->
+<section id="platform"><div class="wrap">
+<div class="sec-head reveal">
+<span class="kicker">01 &mdash; The platform</span>
+<h2>One binary carries all of it.</h2>
+<p data-edit="platform.intro">smol is not an app with some features bolted on; it is a small platform, and everything else on this page is something running <em>on</em> it. There is exactly one firmware image. Inside it, every screen is a <b>plugin</b> — its own state struct implementing one trait — and a single table wires them into the menu you reach with the board&rsquo;s one button. There is no allocator, no <span class="mono">Box&lt;dyn&gt;</span>, no vtable, and no dynamic loading: the whole registry is resolved when the binary is built, so a plugin costs you flash and nothing else. Which plugins are present is a <b>build tier</b>, not a runtime setting &mdash; and the tiers stack, so the cheapest board and the fleet gateway run the same code paths with a different slice compiled in.</p>
+</div>
+<div class="specs reveal">
+<div class="spec"><span class="n">&#9671;</span><div class="lbl">Static dispatch</div><div class="val">Enum-delegation: one centralized <span class="mono">match</span> hands each hook to the live plugin. Every call inlines &mdash; no vtables, no function pointers.</div></div>
+<div class="spec"><span class="n">&#9671;</span><div class="lbl">A union, not a sum</div><div class="val">Only one screen is ever live, so the active plugin&rsquo;s state is a tagged union sized to the largest variant &mdash; less RAM than keeping every app&rsquo;s state side by side.</div></div>
+<div class="spec"><span class="n">&#9671;</span><div class="lbl">The menu builds itself</div><div class="val">A <span class="mono">&amp;&#39;static [AppDesc]</span> table is the registry. Add a variant, a module and a row &mdash; the BOOT-button menu picks it up.</div></div>
+<div class="spec"><span class="n">&#9671;</span><div class="lbl">Hardware is borrowed</div><div class="val">One display, one radio, one sensor block, handed to a plugin per call. A plugin never owns the hardware, so two apps can never fight over it.</div></div>
+<div class="spec"><span class="n">&#9671;</span><div class="lbl">Tiers, not toggles</div><div class="val"><span class="mono">default</span> is the clock and the games with no radio at all; <span class="mono">wifi</span> adds the network and the whole OTA stack; <span class="mono">espnow</span> adds the mesh. Each tier contains the one below it.</div></div>
+<div class="spec"><span class="n">&#9671;</span><div class="lbl">A very small core</div><div class="val">Boot, an always-on mesh background block, and a dispatch core of about a dozen lines. Everything a person actually looks at is a plugin.</div></div>
+</div>
+</div></section>
+
 <!-- TARGETS -->
 <section id="targets"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">00 — The targets</span>
+    <span class="kicker">02 &mdash; The targets</span>
     <h2>One fleet, many kinds of silicon.</h2>
     <p data-edit="targets.intro">smol began as one binary on one $3 chip. The roster now spans six boards across four chip families — some on the mesh today, some converging toward it. Badges are honest: 🟢 hardware-verified on the mesh · 🟡 heard on the mesh, target scoped · ⚪ scoped, not yet built.</p>
   </div>
@@ -505,7 +519,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- VITALS -->
 <section id="vitals"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">01 — Vitals</span>
+    <span class="kicker">03 &mdash; Vitals</span>
     <h2>Read straight off the silicon.</h2>
     <p data-edit="vitals.intro">Every number below was pulled from the chip over USB with esptool — not a datasheet guess. This is exactly what we're working with.</p>
     <p class="mono" style="font-size:.78rem;margin-top:10px"><a href="https://www.aliexpress.us/item/3256807156068355.html" target="_blank" style="color:var(--glow)">▚ the exact board — ESP32-C3 SuperMini + 0.42″ OLED on AliExpress ↗</a></p>
@@ -523,9 +537,9 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- THE BARD -->
 <section id="bard"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">02 — The Bard</span>
+    <span class="kicker">04 &mdash; The Bard</span>
     <h2>The board writes you a story.</h2>
-    <p data-edit="bard.intro">Press the button and a <b>real transformer</b> starts composing — 260,000 parameters, int8, from the same llama2.c/TinyStories lineage the big toy models come from — on a chip with <b>400 KB of RAM and no floating-point unit</b>. The weights never load: the model is <b>executed in place from flash</b>, memory-mapped, so all 283 KB of it costs zero bytes of RAM. There is <b>no WiFi, no cloud and no gateway</b> in the loop — a board alone in a drawer can tell a tale. Every node gets its own protagonist, so id8 tells owl stories and its neighbour tells dragon ones.</p>
+    <p data-edit="bard.intro">The Bard is the app that proves the platform: it is a plugin like any other, it shows up in the same one-button menu as the clock, and it is the reason the rest of this page is not a toy claim. Press the button and a <b>real transformer</b> starts composing — 260,000 parameters, int8, from the same llama2.c/TinyStories lineage the big toy models come from — on a chip with <b>400 KB of RAM and no floating-point unit</b>. The weights never load: the model is <b>executed in place from flash</b>, memory-mapped, so all 283 KB of it costs zero bytes of RAM. There is <b>no WiFi, no cloud and no gateway</b> in the loop — a board alone in a drawer can tell a tale. Every node gets its own protagonist, so id8 tells owl stories and its neighbour tells dragon ones.</p>
   </div>
 
   <div class="bard-grid reveal">
@@ -591,9 +605,9 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- GAMES -->
 <section id="games"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">03 — Games</span>
+    <span class="kicker">05 &mdash; Games</span>
     <h2>A game console you can lose in your pocket.</h2>
-    <p class="games-intro" data-edit="games.intro">smol is one <b>no_std</b> Rust binary with a BOOT-button menu — a fistful of games sharing the glass with a clock and live telemetry. The headline act is mesh multiplayer: a shared world every board roams at once, over an ESP-NOW mesh, no server in sight. The Block Digger up top is running its actual render logic in your browser — that's the kind of thing that fits.</p>
+    <p class="games-intro" data-edit="games.intro">The games are plugins in the same registry as everything else — a fistful of them sharing the glass with a clock, a story engine and live telemetry, all in the one binary. The headline act is mesh multiplayer: a shared world every board roams at once, over an ESP-NOW mesh, no server in sight. The Block Digger up top is running its actual render logic in your browser — that's the kind of thing that fits.</p>
   </div>
 
   <!-- FLAGSHIP: World Snake MMO -->
@@ -756,9 +770,9 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- APPS / MODES GALLERY -->
 <section id="builds"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">04 — Apps</span>
+    <span class="kicker">06 &mdash; Apps</span>
     <h2>Everything else it runs.</h2>
-    <p data-edit="apps.intro">The games live in their own section now — this is everything else smol runs, all folded into the same one-binary BOOT-button menu. The ESP-NOW mesh carries the time (boards agree on the clock — newest NTP sync wins) and gives every board a magical realm name; a live benchmark watches the link; and an MQTT-native Home Assistant bridge mirrors battery, state-of-charge and grid readings on the glass. Each card links to its source.</p>
+    <p data-edit="apps.intro">This is the rest of the registry. Every card is a plugin in the same binary, reached from the same button — no installs, no downloads, no second image. Some need no radio at all and run on a board with nothing but a battery; others are compiled in only at the mesh tier because they consume the roster. What decides is the build tier, not a setting. Each card links to its source.</p>
   </div>
   <div class="apps-grid reveal">
     <a class="app-card" href="https://github.com/jphein/smol/issues/57" target="_blank">
@@ -796,10 +810,58 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
   </div>
 </div></section>
 
+<!-- CONFIG SURFACE -->
+<section id="surface"><div class="wrap">
+<div class="sec-head reveal">
+<span class="kicker">07 &mdash; The config surface</span>
+<h2>Every knob, without a reflash.</h2>
+<p data-edit="surface.intro">A platform you have to re-flash to adjust is not much of a platform. smol boards take their settings over the air, from Home Assistant, on a keyed config channel (<a href="https://github.com/jphein/smol/issues/56" target="_blank">#56</a>) &mdash; one retained MQTT message per knob, relayed on to the boards that have no WiFi of their own. Parsing is strict and panic-free by design: a malformed or unknown value is ignored and the board keeps what it had, because the failure mode of a config channel must never be a brick. Identity is the deliberate exception &mdash; a node&rsquo;s id lives in NVS and OTA never touches it, which is exactly what lets one image serve the whole fleet.</p>
+</div>
+<div class="specs reveal">
+<div class="spec"><span class="n">S</span><div class="lbl">Default screen</div><div class="val">Which plugin a board boots into, and on which page. Set it from HA; it survives the next update.</div></div>
+<div class="spec"><span class="n">L</span><div class="lbl">LED &amp; units</div><div class="val">Peer-state LED mode and &deg;C/&deg;F, per node, live.</div></div>
+<div class="spec"><span class="n">P</span><div class="lbl">Plugin visibility</div><div class="val">Which apps appear in that board&rsquo;s menu at all &mdash; the registry is compiled in, but the menu is yours.</div></div>
+<div class="spec"><span class="n">Y</span><div class="lbl">Custom screen</div><div class="val">Arbitrary text and entity values pushed onto the glass. The fleet uses it to ask a human to power-cycle a specific board.</div></div>
+<div class="spec"><span class="n">G g</span><div class="lbl">The IO registry</div><div class="val">ESPHome inverted (<a href="https://github.com/jphein/smol/issues/72" target="_blank">#72</a>): every digital driver is already in the image, and a runtime pin-map chooses which one binds to which GPIO at boot. Buttons, sensors, relays and LEDs, re-wired without a rebuild. Digital only so far.</div></div>
+<div class="spec"><span class="n">B O</span><div class="lbl">Broker &amp; OTA host</div><div class="val">Re-point a board at a different broker or update server, persisted in NVS, with a fallback that re-arms itself if the override stops answering.</div></div>
+</div>
+</div></section>
+
+<!-- FLEET SERVICES -->
+<section id="fleet"><div class="wrap">
+<div class="sec-head reveal">
+<span class="kicker">08 &mdash; Fleet services</span>
+<h2>What you get for free by joining.</h2>
+<p data-edit="fleet.intro">The interesting part of a platform is rarely the API; it is what a program gets simply by being on it. A board that joins the smol mesh inherits a set of services it never has to implement: it is discovered, named, timed, watched, and updated. None of that is app code. All of it is the reason an app on a $1 board can be three hundred lines long.</p>
+</div>
+<div class="specs reveal">
+<div class="spec"><span class="n">&#128274;</span><div class="lbl">Signed OTA, over the mesh</div><div class="val">Firmware is ed25519-signed and hash-verified into an A/B slot. A board with no WiFi at all is updated <em>through</em> the mesh by the gateway (<a href="https://github.com/jphein/smol/issues/40" target="_blank">#40</a>), one canary board at a time &mdash; never broadcast to the fleet.</div></div>
+<div class="spec"><span class="n">&#9819;</span><div class="lbl">Gateway election</div><div class="val">Boards elect the best-connected node as gateway and re-elect when it stops answering. The fleet is never left without one, even when the only candidate is a poor one.</div></div>
+<div class="spec"><span class="n">&#9201;</span><div class="lbl">Mesh time</div><div class="val">The newest authoritative NTP sync wins and propagates. A board that has never seen the internet still knows what time it is.</div></div>
+<div class="spec"><span class="n">&#128225;</span><div class="lbl">Discovery</div><div class="val">Each node publishes its own Home Assistant discovery config, so it arrives as native entities with no YAML written by hand.</div></div>
+<div class="spec"><span class="n">&#9878;</span><div class="lbl">Observability</div><div class="val">A retained per-node health record &mdash; boot slot, reset reason, heap floor, link quality, update outcome &mdash; so a silent rollback is visible instead of mysterious.</div></div>
+<div class="spec"><span class="n">&#9733;</span><div class="lbl">Identity</div><div class="val">Every board is given a name from a fixed corpus, derived the same way on every node, so logs and dashboards agree on what to call it.</div></div>
+</div>
+</div></section>
+
+<!-- GET THE FIRMWARE -->
+<section id="get"><div class="wrap">
+<div class="sec-head reveal">
+<span class="kicker">09 &mdash; Get the firmware</span>
+<h2>Put it on a board.</h2>
+<p data-edit="get.intro">Prebuilt images are published on the <a href="https://github.com/jphein/smol/releases" target="_blank">releases page</a> &mdash; the mesh tier, with a SHA-256 beside it. You need a board, a USB cable, and <span class="mono">espflash</span>. Building from source is the same firmware and takes one <span class="mono">cargo</span> invocation; the repository README has the toolchain.</p>
+</div>
+<div class="panel reveal">
+<pre class="mono" style="margin:0;padding:14px 16px;border:1px solid var(--line);border-radius:10px;background:var(--bg2);overflow-x:auto;font-size:.82rem">espflash flash --monitor smol-espnow.bin</pre>
+<p class="hint" style="text-align:left;line-height:1.75;margin:14px 0 0">Verify the SHA-256 against the release before flashing, and read the <span class="mono">Loaded app from offset</span> line afterwards &mdash; it names the slot that actually ran, which is the cheapest confirmation you flashed the thing you are about to debug.</p>
+<p class="hint" style="text-align:left;line-height:1.75;margin:10px 0 0"><b>Boards already on the mesh do not update this way.</b> They take signed firmware over the air, one canary board at a time. A USB flash to a board that has previously updated over the air can land in the slot the bootloader is not going to run &mdash; and it fails quietly, by running the old image. Downloads here are for a <em>new</em> board.</p>
+</div>
+</div></section>
+
 <!-- MISSION CONTROL -->
 <section id="mission"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">05 — Mission Control</span>
+    <span class="kicker">10 &mdash; Mission Control</span>
     <h2>How smol got built.</h2>
     <p class="mono" style="font-size:.72rem;color:var(--faint);margin-bottom:14px">◇ The build ledger —
       54 tasks and 35 agents, archived as of <b>2026-07-07</b>. A record, not a live feed: the panels
@@ -823,7 +885,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- ROADMAP -->
 <section id="roadmap" class="road"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">06 — Roadmap</span>
+    <span class="kicker">11 &mdash; Roadmap</span>
     <h2>Where smol goes next.</h2>
     <p class="body" data-edit="roadmap.intro">Ideas we're kicking around. Edit this list as the project grows — it's your design doc.</p>
   </div>
@@ -873,7 +935,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- RESEARCH -->
 <section id="research"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">07 — Research</span>
+    <span class="kicker">12 &mdash; Research</span>
     <h2>What the agents found.</h2>
     <p data-edit="research.intro">A fleet of agents scouted the ESP32-C3 landscape while smol came together. The full reports live in the repo — here's the map.</p>
   </div>
@@ -894,7 +956,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- BUILT FOR THIS BOARD -->
 <section id="board" class="road"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">08 — Built for this board</span>
+    <span class="kicker">13 &mdash; Built for this board</span>
     <h2>You're not alone.</h2>
     <p class="body" data-edit="board.intro">Projects that run on this exact ESP32-C3 + 0.42″ OLED (72×40). A couple need their art re-drawn for the tiny screen — noted inline.</p>
   </div>
@@ -922,7 +984,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- INFLUENCES / PRIOR ART -->
 <section id="influences" class="road"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">09 — Influences</span>
+    <span class="kicker">14 &mdash; Influences</span>
     <h2>Standing on shoulders.</h2>
     <p class="body" data-edit="influences.intro">smol didn't appear from nowhere. Its ESP-NOW → MQTT → Home Assistant plumbing is <b>commodity</b> — a well-trodden pattern many have built. What's actually novel is the <b>whole</b>: a no_std Rust game-console mesh on $3 boards, a deliberate single-radio burst time-share, and a retained-payload → mesh-rebroadcast downlink to display-only leaves. Below are the projects that shaped it, grouped by the thread each runs in — credited honestly, with what smol borrows and where it diverges. A few handed over portable ideas; most gave lineage, identity and nerve rather than code.</p>
   </div>
@@ -964,7 +1026,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- POCKET WATCH -->
 <section id="pocketwatch"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">10 — Pocket Watch</span>
+    <span class="kicker">15 &mdash; Pocket Watch</span>
     <h2>We designed smol a pocket watch.</h2>
     <p data-edit="pw.intro">No printable pocket-watch case existed for this board, so an agent generated one from scratch — a parametric round shell in the classic orientation: the chain bail and a removable crown-style USB-C cover stack at the top, with the OLED window, BOOT/RESET plunger bores and two clear-PLA LED light-pipes below. Inside: pockets for the board + a 502030 LiPo, a TP4056 charge slot, and a press-fit back lid. Three printable parts — body, lid, crown — and the OLED is rotated 180° in firmware so it reads upright when hung. These are live renders of the actual STL.</p>
   </div>
@@ -992,7 +1054,7 @@ body.editing .toolbar{opacity:1;transform:none;pointer-events:auto}
 <!-- PRINT A CASE -->
 <section id="case" class="road"><div class="wrap">
   <div class="sec-head reveal">
-    <span class="kicker">11 — Print a case</span>
+    <span class="kicker">16 &mdash; Print a case</span>
     <h2>Give smol a shell.</h2>
     <p class="body" data-edit="case.intro">Exact-fit 3D-printable cases for the 0.42″ OLED SuperMini. No dedicated handheld shell exists yet — so for a pocket player, start from an editable one and add a button perch at GPIO9. Board is ~24.8×20.45 mm, USB-C on the short edge opposite the OLED. Full ranked list in <a href="https://github.com/jphein/smol/blob/main/docs/cases.md" target="_blank" style="color:var(--glow)">docs/cases.md</a>.</p>
   </div>
