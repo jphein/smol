@@ -97,6 +97,14 @@ radio-minimal one". Two of that sentence's three cost drivers are gone:
 threaded through one signature, and `try_time_sync`'s body reshaped from `&mut SmolWifiDevice` to
 `&Stack` alongside the other six. It does **not** grow the atomic commit by a second bring-up.
 
+**And to forestall the obvious §3.2 objection:** a shared `bring_up_stack` makes `StackResources<N>`
+`wifi`-gated, which looks like exactly the too-loose gating §3.2 warns about. It is not, and the
+reason is the rule §3.2 arrives at — *gate a static at its consumer's reachability*. Post-T the
+espnow tier is a **genuine consumer** of that stack: pairs 1-6 are all espnow, and they are the bulk
+of the transport. The `wifi` gate is therefore correct rather than merely convenient, and the fleet
+tier pays for something it uses on every burst. (Contrast the shape §3.2 actually warns about: a
+static reachable from *one tier's entry point only*, gated at the feature. That is not this.)
+
 ### 3.2 ⚠️ The mandatory clause — and a reclamation that DOES NOT EXIST (I tested it; it failed)
 
 > **A correction I am flagging loudly because I nearly shipped it.** The first draft of this section
@@ -167,7 +175,7 @@ needing an experiment at all if T is scoped to not disturb them.**
 
 | carrier | §2.4's post-hoc step | **pre-commit disposition** |
 |---|---|---|
-| **(a) retained `MC\|owner\|ch\|seq`** | clear it, re-observe a flip to a NEW value | **Make it inert by scoping.** The risk is conditional: "*IF* the election work adopts the reference's free-running→resolve-stamped seq change". T does not need that change. **Decide here that T does not touch election seq semantics**, and carrier (a) has nothing to cross the seam. Enforce it as a review assertion: T's diff touches no `mc_pub_seq` / `mc_seen_seq` producer. Cheaper and stronger than an experiment on a retained topic that has defeated hardware verification four times (`[[smol-retained-mqtt-ghosts]]`). |
+| **(a) retained `MC\|owner\|ch\|seq`** | clear it, re-observe a flip to a NEW value | **✅ RULED — inert by construction. T does not touch election seq semantics** (team-lead ruling, 2026-08-25). The risk was conditional on adopting the reference's free-running→resolve-stamped `seq` change; declining it leaves carrier (a) nothing to cross the seam. Enforced as a review assertion: **T's diff contains no `mc_pub_seq` / `mc_seen_seq` producer.** Two independent grounds, and the second is the stronger one: it is cheaper than an experiment on a retained topic that has defeated hardware verification four times (`[[smol-retained-mqtt-ghosts]]`) — *and* it is the correct **ownership boundary**, because JP's dynamic-channel directive (#269) puts election-semantics change in future `FOLLOW_ENABLED` work. T declining it is not T being careful; it is that campaign's change, not this one's. |
 | **(b) NVS `broker_fallback`** | read back, clear net-cfg on the canary if divergent | **Provable statically, before the commit.** The hazard is the async rewrite changing *when* the flag is set. Enumerate `write_net_cfg` call sites on main, record the count and their enclosing fns in T's PR body, and assert T does not move or add one. Mechanically checkable today; if it must move, that is a design decision to surface, not a diff to notice later. |
 | **(c) otadata** | check `Loaded app from offset` after every flash | **Genuinely procedural — stays post-hoc, and that is correct.** Reverting code does not revert boards. Not a precondition; it is a per-flash checklist item (`[[smol-espflash-otadata-trap]]`), and it belongs in the roll runbook rather than in T's gate. |
 
@@ -209,37 +217,73 @@ rev-1.
 
 ## 6. Open, and owned
 
-1. **The real peak — the sentinel-paint number.** ⏳ *Team lead is running it: `stack-paint` fleet
-   image from current main (= P1.3 + B1 + B2), id50, ~10 min live crown duty, `probe-rs attach` +
-   count intact sentinel. **Gates T's merge, not T's scoping.*** It lands here as the measured peak
-   and replaces §5.1's pessimistic-ratio *argument*. Until then, the honest position stated for the
-   record: `.stack` is unchanged by B1/B2 (86,200 B, A/B'd), so the **floor gate** is safe; the
-   **peak** is not measured, and a `select` frame is transient stack the region size cannot see.
-   **Nothing in T should spend the 12 KB until this number exists** — and §3.2 confirms 12,000 B
-   is all there is; there is no reclamation behind it.
+1. **The real peak — and the instrument had to be rebuilt first (#434).** The bench run was
+   attempted and **the measurement apparatus did not survive it.** `stack-paint` implied `bard`, so
+   the only measurable composition contained the 260K-parameter transformer — and post-#391 that
+   composition no longer boots on the C3: its linked `.stack` is **45,992 B** against a
+   **>= 51,008 B** need at esp-hal's init guard (an 88-reset panic loop on id50, stack pointer
+   5,016 B below the region floor before `main`). See #434.
+
+   Two consequences this document has to carry:
+   - **`ESP32C3_MEASURED_PEAK_BYTES = 55,656` is currently UNREPRODUCIBLE.** It was taken on that
+     same bard-inclusive composition. The floor still *protects* — it is peak x 4/3 and the margin
+     does not depend on how the peak was obtained — but the value has moved from *derived and
+     re-measurable* to *derived from a composition that cannot run*. `budget.rs` now says so at the
+     constant.
+   - **A prerequisite appeared ahead of the whole order below:** `stack-paint-lite` (the `paint`
+     instrument on the FLEET feature set, no `bard`, no `off-fleet`). Measured: its `.stack` is
+     **byte-identical** to the fleet tier's (86,200 B), so the instrument costs zero DRAM and its
+     peak is a peak for the shipped image rather than for a near-miss of it.
+
+   **Still gates T's merge, not T's scoping.** Until a lite run exists, the honest position for the
+   record is unchanged: `.stack` is unmoved by B1/B2 (86,200 B, A/B'd), so the **floor gate** is
+   safe; the **peak** is not measured, and a `select` frame is transient stack the region size
+   cannot see. **Nothing in T should spend the 12 KB until that number exists** — §3.2 confirms
+   12,000 B is all there is, with no reclamation behind it.
 2. **`StackResources<N>` sizing.** Not guessed here. `N` is a design input (socket count) and its
    footprint must be *measured* per tier — the instrument §3.2 shows is the only one that catches a
    static gated more loosely than its consumer. Measure it in a throwaway build before T, so T's own
    delta is readable against a known baseline rather than discovered inside a 2,000-line commit.
 3. **RISKS §R6's two ELECT spins** (~600 ms non-yielding) freeze `net_task` under the executor.
    §2.3 requires converting them to `Timer::after().await`. Scoping note: that is a *behavioural*
-   change to election timing, and it is inside T's atomic commit by necessity — worth calling out as
-   the one part of T that changes fleet timing rather than transport plumbing.
+   change to election **timing**, and it is inside T's atomic commit by necessity — the one part of
+   T that changes fleet behaviour rather than transport plumbing.
+
+   **This is compatible with §4(a)'s ruling and the distinction is worth stating precisely:** timing
+   is not seq semantics. T may change *when* an election step happens; it may not change what a
+   `seq` *means*. The review assertion in §4(a) (no `mc_pub_seq`/`mc_seen_seq` producer in T's diff)
+   is what keeps those apart mechanically rather than by intent.
+
+   **Consequent acceptance signal, because timing intersects the H1/H2 canary territory:** a bench
+   **election-canary observation post-flash** — claim/defer timing against a live crown, same rig as
+   the #198 rounds. A transport change that silently moved election timing would otherwise show up
+   as a fleet-behaviour surprise rather than as a T finding, and the sub-second H1/H2 results on the
+   233 fleet are the baseline it should be read against.
 
 ---
 
 ## 7. Recommended order
 
 ```
-1. paint    sentinel high-water on P1.3+B1+B2                          team lead, bench · gates T merge
-2. pre-step CrownApDecision::Deferred (Addendum A.5)                   own commit
-3. pre-step static enumeration of write_net_cfg call sites (§4b)        recorded in T's PR body
-4. measure  StackResources<N> footprint, per tier, throwaway build      before T · sizes the commit
-5. STEP T   7 pairs / 2 tiers / 1 commit, pair 7 CONVERTED              the big one
+0. instrument  stack-paint-lite — decouple paint from bard (#434)         DONE, PR #438
+1. paint       sentinel high-water on the LITE tier, P1.3+B1+B2         team lead, bench · gates T merge
+2. pre-step    CrownApDecision::Deferred (Addendum A.5)                 own commit
+3. pre-step    static enumeration of write_net_cfg call sites (§4b)     recorded in T's PR body
+4. measure     StackResources<N> footprint, per tier, throwaway build   before T · sizes the commit
+5. STEP T      7 pairs / 2 tiers / 1 commit, pair 7 CONVERTED           the big one
 ```
 
-2, 3 and 4 are startable now and none depends on the paint number. 1 gates 5's *merge*. Nothing here
-needs a decision that has not been taken except `N` in §6.2.
+Item 0 did not exist when this document was first written — it appeared because the bench run
+discovered the instrument was unusable (§6.1). It is the prerequisite for item 1, not a parallel
+task. 2, 3 and 4 are startable now and none depends on the paint number; 1 gates 5's *merge*.
+Nothing here needs a decision that has not been taken except `N` in §6.2.
+
+**Acceptance signals for T, collected** (they are scattered above by topic, so here they are in one
+place): the STEP G roster reaching zero `SmolWifiDevice::new` sites and one `embassy_net::new`
+(§5) · `otam_ok` vs `otam_to` read on the canary before and after, which separates "T broke egress"
+from "T made the path slower" (§5) · a per-tier `.stack` A/B, the only instrument that catches a
+static gated more loosely than its consumer (§3.2) · and a **bench election-canary observation
+post-flash**, because §6.3 changes election timing inside the atomic commit (§6.3).
 
 *(A "reclaim 3,584 B" step stood at the head of this list until it was measured and refuted — §3.2.
 The margin is 12,000 B and that is the whole budget.)*
