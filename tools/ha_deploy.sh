@@ -352,6 +352,13 @@ cmd_dash() { # read-only; prints the generator's report, returns 0 in sync / 1 d
        echo "    into ha/dashboard/smol-control-scaffold.yaml (see #305 for how)." ;;
     3) echo "  → DEAD ROWS: the dashboard is reproducible but wired to entities HA does not have."
        echo "    Repoint or gate them — the card renders 'Entity not found' as it stands." ;;
+    # #356 — the inverse of 3: not a card pointing at nothing, but a live board no card mentions.
+    # Given its own arm for the reason the comment above insists on: the remediation is in a
+    # different file (usually a view this repo does not build), so folding it into 1 or 3 would
+    # send someone to edit a scaffold that has never contained the card.
+    5) echo "  → UNCOVERED NODES: a live board appears on NO card. The dashboard is not wrong,"
+       echo "    it is incomplete — a view is hardcoding node ids instead of enumerating the"
+       echo "    fleet (see #356). The list is above." ;;
     *) echo "  → check could not run (exit $rc); the dashboard is UNVERIFIED, not proven clean." ;;
   esac
   return "$rc"
@@ -769,7 +776,7 @@ cmd_push() {
     local dash_out=""
     dash_out="$(HA_TOKEN="$HA_TOKEN" timeout 180 python3 \
       "$REPO_DIR/ha/dashboard/build_control_room.py" --check 2>&1)" || dash_rc=$?
-    printf '%s\n' "$dash_out" | sed -n '/^LIVE-ONLY/p;/^DEAD ROWS/p;/^  ⚠/p;/^    - /p' | sed 's/^/    /'
+    printf '%s\n' "$dash_out" | sed -n '/^LIVE-ONLY/p;/^DEAD ROWS/p;/^UNCOVERED/p;/^  ⚠/p;/^    - /p' | sed 's/^/    /'
     # #340: that count is DASHBOARD-WIDE — every view, not just `smol-control` — so this warning
     # now covers rows on views this repo does not generate (a push that deletes an entity can kill
     # a card on any of them). The generator deliberately keeps it as ONE `DEAD ROWS · N` line so
@@ -794,6 +801,10 @@ cmd_push() {
     case "$dash_rc" in
       0|3) : ;;   # 3 is already covered by the DEAD ROWS branch above
       1) note "dashboard also reports LIVE-ONLY drift (see #305 — back-port vs retire is a decision)" ;;
+      # #356: a real finding, not a failure to run. Deliberately a `note` and not a ⚠ — an
+      # uncovered node is a pre-existing coverage gap, not damage this push just did, and the
+      # post-deploy question here is "did this push break anything".
+      5) note "dashboard also reports UNCOVERED live node(s) with no card at all (#356)" ;;
       *) echo "  ⚠ post-deploy dashboard check could not run (exit $dash_rc) — run it by hand." >&2 ;;
     esac
   fi
