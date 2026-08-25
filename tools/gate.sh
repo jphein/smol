@@ -188,7 +188,14 @@ if [ "$run_fw" = 1 ] || [ "$run_excl" = 1 ]; then
     extras="$("$ROOT/tools/ci_provision.sh" --list-extras "$CLOCK" 2>/dev/null)"
     if [ -n "$extras" ]; then
       step "pristine provisioning mirror (#363)"
-      MIRROR="${SMOL_GATE_MIRROR:-${TMPDIR:-/tmp}/smol-gate-pristine-$(printf '%s' "$ROOT" | cksum | cut -d' ' -f1)}"
+      # `/var/tmp`, NOT `/tmp` and NOT `$TMPDIR`. The mirror is a build root: cargo puts a release
+      # target dir under it, which is GBs, and `/tmp` is a small tmpfs on at least one machine this
+      # repo is built on (familiar: 512 MB). Filling a tmpfs surfaces as a compile error that looks
+      # like a code problem — the misattribution this file exists to prevent, and an expensive one
+      # because the gate is what you reach for when you already distrust something else. `/var/tmp`
+      # is the conventional home for large, longer-lived temp data and is not a tmpfs by default.
+      # Override with SMOL_GATE_MIRROR when you want it somewhere specific.
+      MIRROR="${SMOL_GATE_MIRROR:-/var/tmp/smol-gate-pristine-$(printf '%s' "$ROOT" | cksum | cut -d' ' -f1)}"
       n=$(printf '%s\n' "$extras" | wc -l)
       printf '   your provisioning declares %s symbol(s) the examples do not:\n' "$n"
       printf '%s\n' "$extras" | sed 's/^/       /'
@@ -199,6 +206,16 @@ if [ "$run_fw" = 1 ] || [ "$run_excl" = 1 ]; then
       # `rsync --delete` so a file deleted in the checkout cannot linger in the mirror and keep a
       # stale tier green. `--exclude` the target dirs (rebuilt in place) and the two git-ignored
       # provisioning files, which the provisioner then creates from the examples.
+      # Say so if the mirror's filesystem cannot hold a release build. Cheap, and it converts the
+      # failure JP named — "a full /tmp disguises itself as a compile error" — into one line that
+      # names the actual cause. A WARNING, not a refusal: the space needed depends on which arms
+      # run, and a gate that refuses to start on a guess is worse than one that tells you what it
+      # is about to do. If it does fill up, this line is already on screen above the wreckage.
+      avail_kb=$(df -Pk "$(dirname "$MIRROR")" 2>/dev/null | awk 'NR==2{print $4}')
+      case "$avail_kb" in
+        ''|*[!0-9]*) ;;
+        *) [ "$avail_kb" -lt 4194304 ] && printf '   \033[33mNOTE\033[0m %s has %s MB free — a release target dir wants GBs.\n         If a tier fails with something that makes no sense, suspect this first,\n         or point SMOL_GATE_MIRROR somewhere roomier.\n' "$(dirname "$MIRROR")" "$((avail_kb / 1024))" ;;
+      esac
       # rsync does not create nested destination parents (only the final component), so make them
       # first — without this the very first run of a fresh mirror fails on `mkdir "…/rust/clock"`.
       if mkdir -p "$MIRROR/$CLOCK" "$MIRROR/rust/sigil-names" \
