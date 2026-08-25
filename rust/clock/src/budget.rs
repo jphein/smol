@@ -264,6 +264,29 @@ pub const ESP32C3_STACK_FLOOR_PROVENANCE: FloorProvenance = FloorProvenance::Der
 /// It is a const rather than a sentence so the floor can be checked against it (below) instead
 /// of merely described by it. When a stack-paint run measures a higher peak, change **this**
 /// first; the assertion will then tell you the floor is stale rather than leaving you to notice.
+///
+/// ⚠️ **PROVENANCE ROTTED, 2026-08-25 (#434). This number is no longer reproducible.**
+///
+/// It was measured on the `stack-paint` composition — which, because `stack-paint` implied `bard`,
+/// means it was measured on a build containing the 260K-parameter transformer. **That composition
+/// no longer boots on the C3.** Post-#391 bard's statics plus the executor's 20,264 B of `.bss`
+/// shrink its linked `.stack` to 45,992 B, while it needs >= 51,008 B to clear esp-hal's init
+/// guard; a bench attempt produced an 88-reset panic loop on id50 with the stack pointer 5,016 B
+/// below the region floor before `main`.
+///
+/// What that does and does NOT mean, kept apart on purpose:
+///   * It does **not** invalidate the floor. `ESP32C3_STACK_FLOOR_BYTES` = this x 4/3 still
+///     protects, and the margin it buys is unaffected by how the number was obtained.
+///   * It **does** mean this value has moved from *derived and re-measurable* to *derived from a
+///     composition that cannot run*. Nobody can re-take it, confirm it, or watch it drift — and a
+///     number that cannot be re-measured is a number that will eventually be wrong without saying
+///     so. That is the failure this comment exists to prevent.
+///
+/// **Replacing it:** #434 adds `stack-paint-lite` (the `paint` instrument on the FLEET feature
+/// set, no `bard`, no `off-fleet`), which boots and which measures the composition the fleet
+/// actually ships. A peak from that tier is the honest successor to this constant. When that run
+/// happens, replace this value and this note together — and record the tier it came from, because
+/// that is the field whose absence caused this.
 pub const ESP32C3_MEASURED_PEAK_BYTES: u32 = 55_656;
 
 /// The floor must be at least 4/3 of the highest measured peak. `>=` rather than `==` because a

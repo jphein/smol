@@ -36,11 +36,13 @@
 pub mod delivery;
 pub mod nano_llm;
 pub mod persona;
-// Bench-only stack measurement. Gated on the feature in the FIRMWARE tree: with `stack-paint`
-// off nothing calls it, and an uncompiled module beats nine `dead_code` allows. The host lib
-// exports the same file separately (lib.rs) so its pure scanner stays testable regardless.
-#[cfg(feature = "stack-paint")]
-pub mod stack_paint;
+// #434: the stack instrument NO LONGER LIVES HERE — the file moved to `src/stack_paint.rs`. It
+// was `pub mod stack_paint` inside this module, which is what welded `stack-paint` to `bard`, and
+// post-#391 that composition stopped booting, taking the only way to measure a high-water with it.
+// The FILE had to move, not just the module declaration: this repo encodes tier ownership in the
+// path and `check_exclusions.py` enforces it, so a `#[path]` shim left the instrument "owned by
+// bard" and failed the gate the moment a bard-less tier compiled it. This module reaches it as
+// `crate::stack_paint`.
 pub mod textflow;
 pub mod tokenizer;
 
@@ -632,8 +634,8 @@ impl BardApp {
         // ring leak stack as it wraps? — is about elapsed narration, not about tales.
         #[cfg(feature = "stack-paint")]
         {
-            let region = stack_paint::region_bytes();
-            let used = stack_paint::high_water();
+            let region = crate::stack_paint::region_bytes();
+            let used = crate::stack_paint::high_water();
             // checked_div, not a zero test: a region of 0 means the linker symbols were nonsense,
             // and reporting 0% is the honest answer rather than dividing.
             let pct = (used * 100).checked_div(region).unwrap_or(0);
