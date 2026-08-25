@@ -92,7 +92,12 @@ Every SMOLv1 frame stays well under 250 B — *including* its group-MAC trailer,
   NM-CYD-C5 → `176`; it first spoke on the mesh under that id on 2026-08-24) ·
   `192–223` = reserved for MAC-derived C6-watch ids (today's `122`/`236` stay put
   until esp32c6-watch #34's derivation folds in) · `240–254` = bench/rig ids, never
-  fleet members, never OTA targets · `0`/`255` = never. The factory-default baked id
+  fleet members, never OTA targets · `0`/`255` = never · **`150` = never-allocate**: it is
+  the MAC-FOLD of the s3-cyd dev board (`14:C1:9F:D1:C8:10`) — an unprovisioned unit of that
+  board lands on 150 via the watch-lineage fold, so a node allocated there would collide
+  with the ghost (same hazard class as the `42` sentinel and the `7` factory default; the
+  watch repo's test asserts 150 stays unmapped — esp32c6-watch `ba46f74`). The
+  factory-default baked id
   is **7** — always pass `SMOL_NODE_ID=<n>` when provisioning, or a fresh board
   lands on 7.
 - **Security.** ESP-NOW here is **unencrypted**, and until #190 it was also
