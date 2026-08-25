@@ -57,8 +57,13 @@ assert_cargo_config() {
         return 1
     fi
 
-    local markers rc=0
-    markers="$("$matrix" config-markers --chip "$chip" 2>&1)" || {
+    # SMOL_BUILD_MATRIX lets a test drive this from a FIXTURE manifest. Without it the
+    # manifest-gap arm below (a chip declaring no markers) could only be exercised by editing the
+    # real manifest, i.e. never — and an arm that never runs in a test is indistinguishable from
+    # one that cannot fire, which is the whole reason this file exists.
+    local markers rc=0 mflag=()
+    [ -n "${SMOL_BUILD_MATRIX:-}" ] && mflag=(--manifest "$SMOL_BUILD_MATRIX")
+    markers="$("$matrix" config-markers "${mflag[@]}" --chip "$chip" 2>&1)" || {
         echo "assert_cargo_config: $markers" >&2; return 2; }
     # A chip with no declared markers is a MANIFEST gap, not a pass. Reporting green here would
     # make "nobody wrote the markers yet" indistinguishable from "the config is correct" — the
