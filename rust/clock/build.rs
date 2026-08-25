@@ -5,12 +5,15 @@
 //!     name (`net::names::version_name`). Falls back to `"dev"`.
 //!   * `BUILD_NUMBER` — monotonic build count (`git rev-list --count HEAD`) shown
 //!     as `v<N>`. Falls back to `"0"`.
-//!   * `SMOL_CHIP_ID` — (#349) the chip this image is built for, DERIVED from the target
-//!     triple where that is unambiguous (`riscv32imc`→C3, `xtensa-esp32s3`→S3;
-//!     `riscv32imac` is C5 *or* C6 and maps to UNKNOWN = build failure on wifi tiers).
+//!   * `SMOL_CHIP_ID` — (#349, reworked by #347 Part 2) the chip this image is built for,
+//!     derived from the CHIP FEATURE (`esp32c3` / `esp32c5` / `esp32c6` / `esp32s3`), which is
+//!     unambiguous and which `budget.rs` already refuses to leave unset or doubled. The target
+//!     triple and `SMOL_CHIP` are kept as CROSS-CHECKS: either may be absent, neither may
+//!     contradict the feature, and a disagreement fails the build. `SMOL_CHIP` is therefore no
+//!     longer REQUIRED for `riscv32imac` (the C5/C6 triple the feature now discriminates) — it
+//!     remains available for naming silicon whose triple this tree does not map.
 //!     Consumed by `net::target::SELF_CHIP` and embedded in the image's target descriptor so
-//!     a board can refuse an image built for other silicon. `SMOL_CHIP=<name>` overrides by
-//!     name, and is REQUIRED for the ambiguous triples.
+//!     a board can refuse an image built for other silicon.
 //!   * `SMOL_NODE_ID` — (#42) OPTIONAL per-board id override, emitted ONLY when the
 //!     env var is set, so `SMOL_NODE_ID=8 cargo build` builds an id-8 image without
 //!     hand-editing `board.rs` (which reads it via `option_env!`, fallback = its own
@@ -75,40 +78,122 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SMOL_NODE_ID");
 }
 
-/// #349: map the build's target triple to the `net::target::CHIP_*` id embedded in the image
-/// descriptor. `SMOL_CHIP` overrides it by NAME (not by number) for a chip whose triple this
-/// mapping does not yet know — an explicit, greppable act rather than a silent default.
+/// The four `net::target::CHIP_*` ids, as (feature name, id). ONE list, used by all three
+/// sources below, so a fifth chip cannot be taught to two of them and forgotten in the third.
+const CHIPS: [(&str, u8); 4] = [("esp32c3", 1), ("esp32c6", 2), ("esp32s3", 3), ("esp32c5", 4)];
+
+/// #349 + #347 Part 2: the `net::target::CHIP_*` id embedded in the image descriptor.
 ///
-/// `0` (CHIP_UNKNOWN) is returned when the triple is unrecognised, and `net/target.rs` has a
-/// `const _: () = assert!(SELF_CHIP != CHIP_UNKNOWN)` — so an unmapped chip fails the BUILD
-/// instead of shipping an image that claims to be for nothing in particular. That assert only
-/// exists on `wifi` tiers (the ones that can be OTA'd), so a host/hostsim build is unaffected.
+/// ── WHAT CHANGED IN PART 2, AND WHY IT IS A CORRECTNESS FIX ────────────────────────────────
+/// This used to read the TARGET TRIPLE, with `SMOL_CHIP` as an unchecked override. That was the
+/// best available answer when the chip was spelled across eight dependency declarations and
+/// nothing in cargo's world knew it. It is no longer: since bd26db1 the build carries a CHIP
+/// FEATURE, `budget.rs` compile_errors unless EXACTLY ONE is enabled, and a build script can read
+/// features from the environment. So the feature is now the authority, and it is a strictly better
+/// one than the triple in both directions:
+///
+///   * It is UNAMBIGUOUS where the triple is not. `riscv32imac` is the C5 *and* the C6, so the
+///     triple path had to return CHIP_UNKNOWN and lean on `SMOL_CHIP` — meaning every C5/C6 build
+///     needed an env var carrying information the build already had. Forgetting it failed the
+///     build, correctly but confusingly, over a fact that was never actually missing.
+///   * It CANNOT SILENTLY DISAGREE. The old override was applied without ever being compared to
+///     anything, so `--features esp32c6` with `SMOL_CHIP=esp32c5` stamped a C5 id onto a C6 image
+///     — a valid-looking value that `net::target::decide()` would then trust to accept a
+///     cross-chip OTA. That is the exact failure #349 exists to prevent, still reachable through
+///     #349's own escape hatch. Now a disagreement is a hard build failure.
+///
+/// `SMOL_CHIP` is KEPT, for the case that justified it: naming silicon whose triple this mapping
+/// does not know. It just may no longer contradict the feature.
+///
+/// `0` (CHIP_UNKNOWN) still means "nothing here knows", and `net/target.rs`'s
+/// `const _: () = assert!(SELF_CHIP != CHIP_UNKNOWN)` fails the build rather than shipping an
+/// image that claims to be for nothing in particular. That assert exists only on `wifi` tiers, so
+/// host/hostsim builds — which have no chip feature and want none — are unaffected.
 fn chip_id() -> u8 {
-    if let Ok(name) = std::env::var("SMOL_CHIP") {
-        return match name.trim() {
-            "esp32c3" => 1,
-            "esp32c6" => 2,
-            "esp32s3" => 3,
-            "esp32c5" => 4,
-            _ => 0,
-        };
+    // Features reach a build script as `CARGO_FEATURE_<NAME>`, uppercased with `-` -> `_`.
+    let from_feature: Vec<(&str, u8)> = CHIPS
+        .iter()
+        .filter(|(name, _)| {
+            std::env::var(format!("CARGO_FEATURE_{}", name.to_uppercase())).is_ok()
+        })
+        .copied()
+        .collect();
+
+    // TWO chip features: deliberately NOT this function's error to report. `budget.rs` already
+    // refuses it with a message that names the likely cause (`--features esp32c5` without
+    // `--no-default-features`, so `default`'s esp32c3 makes a second chip) and the exact fix.
+    // Panicking here would preempt that with something worse, since a build script's panic is
+    // the first failure the user sees. Emit UNKNOWN and let the good diagnostic win.
+    if from_feature.len() > 1 {
+        return 0;
     }
+
+    let from_triple = triple_chip();
+    let from_env = std::env::var("SMOL_CHIP").ok().map(|v| v.trim().to_string());
+    if let Some(name) = from_env.as_deref() {
+        if !name.is_empty() && !CHIPS.iter().any(|(n, _)| *n == name) {
+            // Previously an unrecognised name fell through to 0, which failed the build later
+            // with the SELF_CHIP assert — a message about an unknown chip id that says nothing
+            // about the typo that caused it. Fail here, naming the value and the valid set.
+            panic!(
+                "SMOL_CHIP={name:?} is not a chip this tree knows. Valid: {}. \
+                 (It overrides the chip NAME for silicon whose triple is ambiguous; it does not \
+                 need setting when a chip feature is enabled.)",
+                CHIPS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(" / ")
+            );
+        }
+    }
+
+    if let Some((feat_name, feat_id)) = from_feature.first().copied() {
+        // The feature is the authority. Both other sources are now CROSS-CHECKS: each may be
+        // absent or ambiguous, but neither may contradict it.
+        if let Some(env_name) = from_env.as_deref().filter(|s| !s.is_empty()) {
+            assert!(
+                env_name == feat_name,
+                "chip DISAGREEMENT: the build enables feature `{feat_name}` but SMOL_CHIP says \
+                 `{env_name}`. One of them is wrong and guessing which would stamp an image with \
+                 silicon it was not built for — which is how an OTA gets accepted cross-chip \
+                 (#349). Drop SMOL_CHIP (the feature already names the chip) or fix the feature."
+            );
+        }
+        if let Some((triple_name, triple_id)) = from_triple {
+            assert!(
+                triple_id == feat_id,
+                "chip DISAGREEMENT: feature `{feat_name}` but target triple {:?} is {triple_name}. \
+                 The features and the target are chosen TOGETHER, per invocation — see the \
+                 per-chip invocations in tools/build-matrix.toml, or run tools/check_chips.sh.",
+                std::env::var("TARGET").unwrap_or_default()
+            );
+        }
+        return feat_id;
+    }
+
+    // No chip feature. Either a host/hostsim build (no descriptor is emitted on those tiers) or
+    // a bare-metal build that budget.rs is about to refuse. Honour SMOL_CHIP, else the triple.
+    if let Some(name) = from_env.as_deref().filter(|s| !s.is_empty()) {
+        return CHIPS.iter().find(|(n, _)| *n == name).map(|(_, id)| *id).unwrap_or(0);
+    }
+    from_triple.map(|(_, id)| id).unwrap_or(0)
+}
+
+/// The triple -> chip mapping, as a CROSS-CHECK rather than the primary source. `None` means the
+/// triple cannot name a chip: `riscv32imac` is shared by the C5 and the C6, and a host/wasm triple
+/// is not a chip at all. Both are legitimately unknowable here, which is why this returns Option
+/// instead of the old `0` — "ambiguous" and "definitely nothing" were the same value before, and
+/// only one of them should silence a cross-check.
+///
+/// Ordering matters: "riscv32imac" does not contain "riscv32imc" as a prefix-substring, but the
+/// more specific arms are matched first anyway so a future triple cannot alias onto the C3.
+fn triple_chip() -> Option<(&'static str, u8)> {
     let target = std::env::var("TARGET").unwrap_or_default();
-    // riscv32imc = C3; xtensa-esp32s3 = S3. riscv32imac is AMBIGUOUS — the C5 and the C6
-    // share it — so it maps to 0 (CHIP_UNKNOWN) and the wifi-tier const assert fails the
-    // build until `SMOL_CHIP=<name>` says which silicon this image is for. A guessed id
-    // would be a valid-looking value the suitability check trusts: this exact shape once
-    // stamped a C5 build as a C6, which `decide()` would then have accepted cross-chip.
-    // Ordering matters: "riscv32imac" contains no "riscv32imc" substring, but match the
-    // longer/more specific arms first anyway so a future triple cannot alias onto the C3.
     if target.starts_with("xtensa-esp32s3") {
-        3
+        Some(("esp32s3", 3))
     } else if target.starts_with("riscv32imac") {
-        0 // ambiguous (C5|C6) — require SMOL_CHIP, fail closed via the SELF_CHIP assert
+        None // C5 or C6 — the feature discriminates; nothing here can.
     } else if target.starts_with("riscv32imc") {
-        1
+        Some(("esp32c3", 1))
     } else {
-        0 // host/wasm (hostsim, web-emu) — no descriptor is emitted on those tiers anyway
+        None // host/wasm (hostsim, web-emu)
     }
 }
 
