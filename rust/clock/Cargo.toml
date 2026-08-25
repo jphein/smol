@@ -246,27 +246,36 @@ esp32c3 = [
     "esp-rtos?/esp32c3", "esp-radio?/esp32c3",
     "esp-storage?/esp32c3", "esp-bootloader-esp-idf?/esp32c3",
     "esp-wifi-sys?/esp32c3",
+    "has-tsens", "has-reset-glitch-split",
 ]
 esp32c5 = [
     "esp-hal?/esp32c5", "esp-backtrace?/esp32c5", "esp-println?/esp32c5",
     "esp-rtos?/esp32c5", "esp-radio?/esp32c5",
     "esp-storage?/esp32c5", "esp-bootloader-esp-idf?/esp32c5",
     "esp-wifi-sys?/esp32c5",
-    "has-ieee802154",
+    "has-ieee802154", "has-reset-glitch-unified",
 ]
 esp32c6 = [
     "esp-hal?/esp32c6", "esp-backtrace?/esp32c6", "esp-println?/esp32c6",
     "esp-rtos?/esp32c6", "esp-radio?/esp32c6",
     "esp-storage?/esp32c6", "esp-bootloader-esp-idf?/esp32c6",
     "esp-wifi-sys?/esp32c6",
-    "has-ieee802154",
+    "has-ieee802154", "has-tsens",
+    # NO glitch marker: the C6 is the chip that reports no glitch reason AT ALL. See
+    # `has-reset-glitch-split` below — the absence is the measured fact, not an omission.
 ]
 esp32s3 = [
     "esp-hal?/esp32s3", "esp-backtrace?/esp32s3", "esp-println?/esp32s3",
     "esp-rtos?/esp32s3", "esp-radio?/esp32s3",
     "esp-storage?/esp32s3", "esp-bootloader-esp-idf?/esp32s3",
     "esp-wifi-sys?/esp32s3",
-    "has-psram",
+    "has-psram", "has-reset-glitch-split",
+    # NO `has-tsens`. This arm CARRIED it in the first draft of this commit, from a datasheet-shaped
+    # assumption that the big chip has at least what the little one has. A per-chip `cargo check` on
+    # familiar's xtensa toolchain said otherwise: `esp_hal::tsens` is unresolved for
+    # xtensa-esp32s3-none-elf on esp-hal 1.1.1, exactly as on the C5. Left as a comment rather than
+    # silently corrected, because "the superset chip has the peripheral" is the specific wrong
+    # instinct this whole layer exists to stop anyone acting on. MEASURE the chip.
 ]
 
 # ── HARDWARE CAPABILITIES ──────────────────────────────────────────────────────────────────────
@@ -325,6 +334,59 @@ has-ieee802154 = []
 # separate region if at all. Recorded at the feature that makes PSRAM reachable, because the
 # temptation ("8 MB of heap, why is the heap still 128 KiB") arrives with the feature.
 has-psram = []
+
+# ── The two markers that GATE REAL CODE (#347 Part 2) ──────────────────────────────────────────
+#
+# Worth stating plainly, because the four above are declarations and these two are not: everything
+# from `has-ieee802154` up records a fact and links nothing. The markers below are read by
+# `src/ota.rs` and `src/sensors.rs`, and they are the reason the has-* layer is a mechanism rather
+# than a vocabulary. They were derived from a MEASURED per-chip `cargo check`, not from a datasheet
+# reading — see the tables in each block.
+
+# Internal temperature sensor (`esp_hal::tsens` + `peripherals::TSENS`).
+#
+# esp-hal gates the whole module behind `#[cfg(soc_has_tsens)]`, so on a chip without it the C3's
+# `src/sensors.rs` imports are not a type error but an UNRESOLVED IMPORT — the module does not
+# exist. MEASURED on esp-hal 1.1.1, one `cargo check` per chip: **C3 ✓, C6 ✓, C5 ✗, S3 ✗**.
+#
+# The S3 being a ✗ is the entry worth reading twice: it is the biggest chip of the four and it does
+# not expose the sensor the smallest one does. Half of this table is counter-intuitive, which is the
+# argument for the table.
+#
+# ⚠️ The C5 is the odd one out, and this marker does NOT yet make the C5 compile. `sensors.rs`,
+# `main.rs`'s `peripherals.TSENS` wiring and the `Sensors::new` signature still assume the sensor
+# exists unconditionally; giving them `#[cfg(feature = "has-tsens")]` arms plus a no-sensor
+# fallback is #388's board-bring-up work, tracked in tools/build-matrix.toml's [chip.esp32c5]
+# `blocked_on`. What this marker does is make that work a matter of ADDING cfg arms against a
+# predicate that already exists and is already correct on the other three chips — rather than
+# inventing the predicate at the same time as the fallback, which is how a bring-up ends up
+# spelling `#[cfg(feature = "esp32c5")]` in a sensors module and re-pinning the chip #347 just
+# un-pinned. Declared ahead of its consumer ON PURPOSE, and that is the exception to the rule
+# above, not a new default.
+has-tsens = []
+
+# Glitch-detector reset reporting, in the SoC's `SocResetReason` enum. THREE shapes, not two, which
+# is why this is a pair of markers and not one boolean — MEASURED against esp-hal 1.1.1's
+# per-chip `rtc_cntl/rtc/*.rs`:
+#
+#   | chip           | variants                                          | marker          |
+#   |----------------|---------------------------------------------------|-----------------|
+#   | C3, S3         | `SysClkGlitch` = 0x13 AND `CorePwrGlitch` = 0x17  | -split          |
+#   | C5             | `PowerGlitch`  = 0x19 only                        | -unified        |
+#   | C6             | **none at all**                                   | *neither*       |
+#
+# A chip selecting NEITHER is a legal, meaningful state: `src/ota.rs`'s match arm compiles out and
+# a glitch reset falls through the existing `Some(_) => "other"`. That is honest — the C6 does not
+# distinguish it in hardware, so there is nothing for the token to report. This is exactly why the
+# predicate is a capability and not `cfg(feature = "esp32c6")`: "has no glitch detector" is a fact
+# about silicon that a future fifth chip may share, and it should not have to be re-discovered.
+#
+# ⚠️ DEFERRED, NOT DONE: the C5 also has `CpuLockup` = 0x1A, which the C3 lacks and which nothing
+# maps — it falls to "other". Correct but lossy, and it needs its own marker. Left undone because
+# there is no C5 board to read a DIAG off yet (#388); recorded here so it is a task rather than a
+# caveat that reads as handled. `reset_reason_token()` is NOT chip-complete.
+has-reset-glitch-split = []
+has-reset-glitch-unified = []
 
 # Phase 1 only: clock on the OLED. `default` = `hw` so `cargo build --release` with no
 # flags is the guaranteed-green firmware baseline — BYTE-IDENTICAL to before the #152

@@ -5,10 +5,12 @@ canonical_tier = "fleet"
 [chip.esp32c3]
 target = "riscv32imc-unknown-none-elf"
 builds = true
+checks = true
 ships = true
 [chip.esp32s3]
 target = "xtensa-esp32s3-none-elf"
 builds = true
+checks = true
 ships = false
 [tier.fleet]
 features = "espnow,cast,io"
