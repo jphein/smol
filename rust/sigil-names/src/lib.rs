@@ -683,72 +683,80 @@ mod tests {
         assert_eq!(realm_by_name("fleet").name, "fleet");
     }
 
-    /// The default build must expose only the IDENTITY realms, so no consumer acquires a themed
-    /// *build* name without naming the hazard in its Cargo.toml.
-    ///
-    /// This assertion has been wrong in both directions, which is why it is worth reading before
-    /// editing. It asserted `["creature", "fleet"]` until 2026-07-29, when `--all` converged every
-    /// binding and the *divergent* set went to zero; the generator selected on divergence, so the
-    /// default list widened to all nine and this test was updated to match. But the criterion had
-    /// quietly changed underneath it — divergence is not the same question as identity-vs-build —
-    /// and the widened list handed out `&FORGE` to callers that `lib.rs` refused to give `FORGE`.
-    /// The generator now selects identity realms explicitly; see `sync-words.sh`.
-    ///
-    /// A realm *missing* from this list has either gone corpus-divergent from the Go embed or lost
-    /// its place in `IDENTITY_REALMS`. Confirm which before updating the expectation.
-    #[cfg(not(feature = "divergent-themed-realms"))]
-    #[test]
-    fn default_build_exposes_only_identity_realms() {
-        let names: std::vec::Vec<&str> = REALMS.iter().map(|r| r.name).collect();
-        assert_eq!(
-            names,
-            ["creature", "fleet"],
-            "the default build must expose the identity realms and nothing else"
-        );
-    }
-
-    /// **The gate must actually gate.** Every other guarantee in this crate is enforced by a `const`
-    /// assertion or an enumeration; this one was enforced by three separate `#[cfg]`s agreeing with
-    /// each other, and they did not.
+    /// **The gate must actually gate — and this test must be impossible to skip by choosing a
+    /// feature set.**
     ///
     /// `realm_by_name` was gated and `pub use realms::{FANTASY, FORGE, …}` was gated, so `FORGE`
     /// looked unreachable by default — while the ungated `REALMS` re-export carried a pointer to
-    /// the very same static. The expression below is not hypothetical: run from a downstream crate
-    /// with default features on 2026-08-14 it printed `Molten Smelter`, a forge *build* name
-    /// obtained without the feature that exists to make a reviewer see it.
+    /// the very same static. Not hypothetical: from a downstream crate with default features on
+    /// 2026-08-14 that printed `Molten Smelter`, a forge *build* name obtained without the feature
+    /// that exists to make a reviewer see it.
     ///
-    /// So assert the property directly, in the shape a consumer would actually write it.
-    #[cfg(not(feature = "divergent-themed-realms"))]
+    /// ## Why `cfg!(…)` and not `#[cfg(…)]`
+    ///
+    /// This was first written as a **pair** of attribute-gated tests — one for each configuration.
+    /// That is the obvious shape and it is wrong, because an attribute-gated test does not exist in
+    /// the other configuration, and a test that does not exist cannot fail:
+    ///
+    /// ```text
+    /// cargo test --all-features             → gate test ABSENT from the binary, exit 0
+    /// cargo test no_themed_realm --all-features
+    ///                                       → running 0 tests ... ok. 0 passed; 12 filtered out
+    ///                                          EXIT 0
+    /// ```
+    ///
+    /// `--all-features` is the instinct of anyone trying to be thorough, and it was precisely the
+    /// invocation that deleted the guard against the bug this crate had just fixed — reported as a
+    /// green "12 passed" by a reviewer who had done nothing wrong. A filter that matches nothing is
+    /// indistinguishable from a filter whose tests all pass.
+    ///
+    /// `cfg!` is an *expression*: the test is compiled into **every** configuration and branches at
+    /// run time. So no feature selection can remove it, and one invocation proves the property for
+    /// whichever configuration it was built in. Both halves are asserted here — that the feature
+    /// EXPOSES the themed realms is as load-bearing as that its absence hides them, since a gate
+    /// which simply deleted them would satisfy the negative half for the wrong reason.
+    ///
+    /// (Found by oracle-verify, who noticed their own passing run had not executed this test.)
     #[test]
-    fn no_themed_realm_is_reachable_without_the_feature() {
-        for themed in [
+    fn the_gate_gates_in_whichever_configuration_this_was_built() {
+        const THEMED: [&str; 7] = [
             "fantasy", "forge", "oracle", "signal", "stellar", "tarot", "void",
-        ] {
+        ];
+        let names: std::vec::Vec<&str> = REALMS.iter().map(|r| r.name).collect();
+
+        // True in every configuration: identity realms name *things* and are never gated.
+        for identity in ["creature", "fleet"] {
             assert!(
-                REALMS.iter().all(|r| r.name != themed),
-                "`{themed}` is reachable by default via REALMS — the gate is bypassed. A consumer \
-                 can obtain a build-provenance name without declaring `divergent-themed-realms`, \
-                 which is the mistake the feature exists to make unrepresentable."
+                names.contains(&identity),
+                "identity realm `{identity}` must be reachable in EVERY configuration — it names a \
+                 board or a familiar, and no feature flag governs that"
             );
         }
-    }
 
-    /// The mirror of the above: with the feature on, every realm IS reachable — so the test pair
-    /// distinguishes "gated" from "deleted". A gate that removed the realms entirely would pass the
-    /// default-build test for the wrong reason.
-    #[cfg(feature = "divergent-themed-realms")]
-    #[test]
-    fn every_realm_is_reachable_with_the_feature() {
-        let names: std::vec::Vec<&str> = REALMS.iter().map(|r| r.name).collect();
-        assert_eq!(
-            names,
-            [
-                "creature", "fantasy", "fleet", "forge", "oracle", "signal", "stellar", "tarot",
-                "void"
-            ],
-            "enabling the feature must expose the whole corpus"
-        );
-        // And the name lookup the gate protects reaches them too.
-        assert_eq!(realm_by_name("forge").name, "forge");
+        if cfg!(feature = "divergent-themed-realms") {
+            for themed in THEMED {
+                assert!(
+                    names.contains(&themed),
+                    "`{themed}` is unreachable WITH the feature enabled — the gate is not gating, \
+                     it is deleting. Enabling the flag must expose the whole corpus."
+                );
+            }
+            assert_eq!(names.len(), 9, "the full corpus is nine realms: {names:?}");
+        } else {
+            for themed in THEMED {
+                assert!(
+                    !names.contains(&themed),
+                    "`{themed}` is reachable by default via REALMS — the gate is bypassed. A \
+                     consumer can obtain a build-provenance name without declaring \
+                     `divergent-themed-realms`, which is the mistake the feature exists to make \
+                     unrepresentable."
+                );
+            }
+            assert_eq!(
+                names,
+                ["creature", "fleet"],
+                "the default build must expose the identity realms and nothing else"
+            );
+        }
     }
 }
