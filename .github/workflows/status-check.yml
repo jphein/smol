@@ -1,0 +1,72 @@
+# #148 — re-test the status doc's machine-checkable claims, on a schedule.
+#
+# #148 is the project status issue. It has now been rewritten twice after going stale, and each
+# revision opened by observing that the previous one had rotted. The cause was structural, not
+# anyone's diligence: nothing made the document FAIL. This is the thing that makes it fail.
+#
+# DELIBERATELY THIN, for the same reason `fw-gate.yml` is: the logic lives in
+# `tools/status_check.sh`, which anyone can run verbatim. And the CLAIMS live in neither — they
+# are `<!-- check: … -->` annotations in #148's own body, so there is exactly one statement of
+# each fact. A copy here, or in the script, would be the drift this exists to catch.
+#
+# WHY A CRON AND NOT A GATE ARM.
+#
+# The doc lives in a GitHub ISSUE, not in the repo, so no push or PR can change it — a
+# per-commit gate would re-check an unchanged document hundreds of times and still miss the
+# edit that mattered, because that edit happens in the issue tracker. Doc rot also runs on a
+# scale of weeks, which is what this samples. It additionally needs network + `gh`, which
+# `tools/gate.sh` deliberately does not require of a developer running it offline.
+#
+# The failures are written to the JOB SUMMARY, not just the log. A scheduled red X that nobody
+# opens is the same shape as the prose it replaced.
+name: status doc check
+
+on:
+  schedule:
+    # Mondays 16:05 UTC (~09:05 PDT) — a working morning, so a failure is seen the day it lands
+    # rather than accumulating over a weekend.
+    - cron: '5 16 * * 1'
+  # Always available by hand: after rewriting #148, run this before trusting the rewrite.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  status-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        # `branch-absent` asks origin, and `file-exists` / `grep-absent` read the tree, so this
+        # needs a real checkout — but no history.
+        with: { fetch-depth: 1 }
+
+      - name: re-test #148's annotations
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+          tools/status_check.sh 2>&1 | tee "$RUNNER_TEMP/status-check.log"
+        continue-on-error: true
+
+      - name: report
+        env:
+          # Via env, not inline `${{ }}` in the script body. This one is a GitHub-controlled
+          # enum ('success'/'failure') so it cannot carry an injection, but the habit is what
+          # keeps the next edit safe when someone reaches for an issue title here.
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+        run: |
+          {
+            echo "## #148 status-doc check"
+            echo
+            echo '```'
+            sed 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/status-check.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$CHECK_OUTCOME" != success ]; then
+            echo "::error::#148 contains claims that are no longer true — see the job summary."
+            exit 1
+          fi
