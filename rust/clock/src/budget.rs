@@ -239,10 +239,30 @@ pub enum FloorProvenance {
 /// passed. It came in **+216 B above #302 and +800 B above T13** — the old floor was derived
 /// from the *lowest* of the four and was knowably 480 B too low.
 ///
-/// **Re-derive this when the peak moves**, with `--features stack-paint` under live radio;
-/// idle numbers are meaningless. A floor copied forward untested is how the last one ended up
-/// at 12,288 B. And note every peak on record was measured **with the Bard narrating**, so for
-/// a Bard-free image this floor is an upper bound on what is required, not a target.
+/// **Re-derive this when the peak moves**, with the paint instrument under live radio; idle numbers
+/// are meaningless. A floor copied forward untested is how the last one ended up at 12,288 B.
+///
+/// ## ⚠️ 2026-08-25 — THE "BARD IS THE DEEPEST PATH" PREMISE IS REFUTED BY MEASUREMENT
+///
+/// This block used to end: *"every peak on record was measured with the Bard narrating, so for a
+/// Bard-free image this floor is an upper bound on what is required, not a target."* That was true
+/// when written and is now **false**, and the sentence is kept above the correction because a
+/// reader who remembers it needs to meet the refutation, not its absence.
+///
+/// A `stack-paint-lite` run on the **Bard-FREE fleet composition**, under mere **LEAF** duty,
+/// measured **67,400 B** — **11,744 B ABOVE** the 55,656 B Bard-narrating crown peak in the table,
+/// and it is a LOWER bound (crown duty adds the OTA-fetch chains). The reason is dating: **all four
+/// peaks in that table predate #391.** The esp-rtos executor put a new floor under every call chain
+/// and is now the dominant term, not Bard narration. So 55,656 is not merely unreproducible — it is
+/// **superseded and low**.
+///
+/// ⚠️ **The constants below are deliberately UNCHANGED, and that is a decision, not an oversight.**
+/// Writing `ESP32C3_MEASURED_PEAK_BYTES = 67_400` would break the assert below (`74,208 >= 89,867`
+/// is false, so the crate stops compiling), and raising the floor to satisfy it would break the
+/// packaging gate (`region 85,096 >= floor 89,867` is false, so nothing publishes) — two red gates
+/// on firmware that runs. Updating a ship-gating constant from a LOWER BOUND is also the wrong
+/// direction of error. The crown-duty leg decides it. Full working, with the options and their
+/// numbers, in `docs/embassy/T-SCOPE.md` §6.1.
 pub const ESP32C3_STACK_FLOOR_BYTES: u32 = 74_208;
 
 /// The C3's floor is [`FloorProvenance::Derived`] — the strong form, and the only one on the fleet.
