@@ -65,6 +65,8 @@
 #[cfg(feature = "radio")]
 mod espnow_probe;
 #[cfg(feature = "wifi")]
+mod mqtt;
+#[cfg(feature = "wifi")]
 mod net;
 /// smoltcp phy shim. Same filename, same meaning as smol main's
 /// `net/radio_dev.rs` and cyd-c5's `radio_dev.rs` — do not repurpose it.
@@ -363,12 +365,23 @@ fn main() -> ! {
         // broken, because "no credentials", "cannot associate" and "associated,
         // no lease" send you to three different places.
         #[cfg(feature = "wifi")]
-        println!(
-            "[s3-cyd] heartbeat {} — node {} alive — {}",
-            tick,
-            NODE_ID,
-            net.state().label()
-        );
+        match net.mqtt_state() {
+            // Both legs on one line: the link answers "can it talk?", MQTT
+            // answers "is anyone listening?" — and they fail independently.
+            Some(m) => println!(
+                "[s3-cyd] heartbeat {} — node {} alive — {} | {}",
+                tick,
+                NODE_ID,
+                net.state().label(),
+                m.label()
+            ),
+            None => println!(
+                "[s3-cyd] heartbeat {} — node {} alive — {}",
+                tick,
+                NODE_ID,
+                net.state().label()
+            ),
+        }
         #[cfg(not(feature = "wifi"))]
         println!("[s3-cyd] heartbeat {} — node {} alive", tick, NODE_ID);
         tick = tick.wrapping_add(1);

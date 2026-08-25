@@ -43,6 +43,22 @@ rsync -a --delete --exclude target/ "$HERE/" "$REMOTE:$RDIR/"
 # Only fetched when a tier that can use it is being built. A default (M1) build
 # touches the vault not at all, so `bw` never needs unlocking to rebuild M1.
 WIFI_ENV=""
+
+# ---------------------------------------------------------------------------
+# SPIKE_HEAP_KB — forwarded for EVERY build, and outside the case on purpose.
+# ---------------------------------------------------------------------------
+# ⚠️ THIS LINE IS THE EXPERIMENT. It was missing once, and the failure mode is
+# the worst kind: `SPIKE_HEAP_KB=64 ./build-remote.sh --features wifi` set the
+# variable in KATANA's shell, never passed it over ssh, and familiar happily
+# rebuilt nothing (cargo saw no change) and shipped the DEFAULT 96 KiB image.
+# The ELF was pulled, the command exited 0, and flashing it would have "proved"
+# that 64 KiB works — using a binary that was not 64 KiB.
+#
+# The tell was a 0.14 s build time where a recompile was expected. If you ever
+# see this script finish suspiciously fast after changing a knob, suspect THIS
+# line before you believe the result.
+[ -n "${SPIKE_HEAP_KB:-}" ] && WIFI_ENV="SPIKE_HEAP_KB=$SPIKE_HEAP_KB"
+
 case "${*:-}" in
     *wifi*|*radio*)
         # `bw` prompts / fails loudly if the vault is locked. That is deliberate:
@@ -50,7 +66,10 @@ case "${*:-}" in
         # that boots, says "no wifi credentials", and looks like a firmware bug.
         PSK="$(bw get password "Homelab jplovescl WiFi (jplovescl SSID)")"
         [ -n "$PSK" ] || { echo "build-remote: empty PSK from vault — refusing" >&2; exit 1; }
-        WIFI_ENV="SPIKE_WIFI_SSID=jplovescl SPIKE_WIFI_PSK=$(printf %q "$PSK")"
+        # APPEND, never assign: SPIKE_HEAP_KB may already be in WIFI_ENV, and a
+        # bare `=` here silently dropped it (caught 2026-08-25 — the isolation
+        # build kept shipping the default heap). Every addition below appends.
+        WIFI_ENV="$WIFI_ENV SPIKE_WIFI_SSID=jplovescl SPIKE_WIFI_PSK=$(printf %q "$PSK")"
 
         # MQTT creds for M4 (HA mosquitto; currently the same secret value as the
         # WiFi PSK — if either rotates independently, give mosquitto its own vault item)

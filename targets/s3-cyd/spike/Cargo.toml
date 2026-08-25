@@ -135,6 +135,7 @@ esp-radio = { version = "0.18.0", optional = true, default-features = false, fea
 smoltcp = { version = "0.13", optional = true, default-features = false, features = [
     "proto-ipv4",
     "socket-dhcpv4",
+    "socket-tcp",     # M4's MQTT session
     "medium-ethernet",
 ] }
 

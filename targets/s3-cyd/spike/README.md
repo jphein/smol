@@ -14,7 +14,7 @@ looked at, and thrown away.
 | **M1** | boots · console · octal PSRAM maps · panel paints in the right orientation · button reads | **FLASHED 2026-08-24 23:2x, RUNNING** — first guarded flash succeeded; serial heartbeat verified live (`[s3-cyd] heartbeat N — node 162 alive`, counter consistent with uptime). Panel orientation awaiting a human eyeball on the glass |
 | M2 | WiFi STA associates + DHCP lease (credentials via `option_env!`, never committed) | **associate ✅ PROVEN on glass** (ch1, WPA2, aid 10909). DHCP unproven — first flash OOM-panicked before the lease; fixed, **awaiting reflash** |
 | M3 | ESP-NOW hello/ack on the air (`--features radio`) | code drafted, **unflashed**. Compiles ✅. Needs `SPIKE_ESPNOW_ONLY=1` — see below, the AP and the mesh are on different channels |
-| M4 | PSRAM framebuffer + a real smol screen | not started |
+| M4 | MQTT + retained HA discovery as node 162 | **code complete, UNFLASHED** — rides `--features wifi`; 10/10 gates |
 
 ## Feature tiers
 
@@ -24,7 +24,7 @@ allocator, no network stack.
 | build | tiers | what it adds |
 |---|---|---|
 | `cargo build --release` | M1 | bare metal: PSRAM, SPI2, panel, button, heartbeat |
-| `--features wifi` | M1+M2 | esp-radio · esp-rtos · esp-alloc · smoltcp · STA associate + DHCP |
+| `--features wifi` | M1+M2+M4 | esp-radio · esp-rtos · esp-alloc · smoltcp · STA associate + DHCP + MQTT |
 | `--features radio` | M1+M2+M3 | + `esp-radio/esp-now`, the SMOLv1 hello/ack probe |
 | `SPIKE_ESPNOW_ONLY=1 … --features radio` | M1+M3 | radio up, channel pinned, **association skipped** |
 
@@ -94,6 +94,51 @@ One limitation stated rather than papered over: on the no-credentials path
 `set_config` is never called, and in esp-radio 0.18 `set_config` is what *starts*
 the controller. So a credential-less `--features radio` build proves compilation
 and boot, not the air.
+
+## M4 — MQTT + retained HA discovery
+
+Rides `--features wifi` (an association and a lease). It does **not** need
+`radio`: MQTT is TCP over the STA interface, unrelated to ESP-NOW.
+
+| | |
+|---|---|
+| Broker | `10.0.8.111:1883` — the HA VM's **VLAN8** leg, the lease's own subnet |
+| Discovery (retained) | `homeassistant/sensor/smol_162/telemetry/config` |
+| Telemetry | `smol/162/telemetry`, every 15 s, QoS 0, not retained |
+| Payload | `up=<secs>s heap=<bytes>B beat=<n>` — bare, no id prefix (the topic carries it) |
+| Model string | `smol ESP32-S3 CYD` — hand-written, **distinct** from the Ember label per **#396**'s interim rule; #396 owns the final string |
+
+**Why that payload.** This spike has no sensors module — no temperature, no
+battery read, no AP-info readback (that needs `esp-wifi-sys`, which M2 does not
+depend on). Publishing a field we don't measure would be worse than publishing
+fewer: *a plausible zero is harder to disbelieve than an absent field.* Uptime and
+free heap are both things this build genuinely knows, and both are what a bring-up
+rung actually wants — uptime proves it isn't silently rebooting, and **free heap is
+the direct readout of the M2 OOM's blast radius.** If that number trends down over
+an hour, the RX-pool question was not settled after all.
+
+### Every network wait is bounded — a deliberate divergence from cyd-c5
+
+The C5 spike waits for TCP-writable and for CONNACK in `loop { … }` with no
+deadline, and `panic!`s on a bad CONNACK. On the failure this code is *most*
+likely to meet — the wrong broker leg, where CONNACK never arrives — that spins
+forever and the board stops heart-beating, which reads as a crash rather than a
+misconfiguration.
+
+Here every wait carries a deadline and every failure is a logged state
+transition. **The no-CONNACK case prints the diagnosis**, because the signature is
+specific and otherwise costs an afternoon:
+
+```
+[mqtt] ⚠️ NO CONNACK in 5000 ms, but TCP OPENED.
+[mqtt]    That is the WRONG-BROKER-LEG signature: a cross-VLAN leg
+[mqtt]    completes the handshake and silently drops the CONNACK.
+[mqtt]    10.0.8.x -> 10.0.8.111 | 10.0.11.x -> 10.0.11.110 | 10.0.6.x -> 10.0.6.108
+```
+
+Same rule as `espnow_probe::send_bounded`: different hazard (a silent hang rather
+than a CPU spin), identical discipline — **the heartbeat is the liveness signal
+and nothing may take it hostage.**
 
 ## The M3 compile verdict (answered 2026-08-24)
 
@@ -169,6 +214,37 @@ for the second disguise this trap wears.
 `cargo run` does **not** invoke espflash directly — `.cargo/config.toml` sets
 `runner = "./flash.sh"`, which resolves the port **by serial** and **refuses by
 default**.
+
+### Build-time knobs
+
+| env | default | what |
+|---|---|---|
+| `SPIKE_ESPNOW_ONLY=1` | off | skip association, pin a channel (M3) |
+| `SPIKE_ESPNOW_CHANNEL` | `6` | channel to pin; validated `1..=14` at compile time |
+| `SPIKE_HEAP_KB` | `96` | esp-radio heap. **`=64` reproduces the M2 OOM's original heap** — see below |
+
+**The heap knob exists to keep an unproven fix from hiding.** M2's OOM was fixed
+by two simultaneous changes (96 KiB heap *and* a continuous RX drain), and the
+C5's counter-example differs from our failing build in *both* variables — so
+neither datum isolates the cause. One flash settles it:
+
+```bash
+SPIKE_HEAP_KB=64 ./build-remote.sh --features wifi
+```
+
+DHCP completing at 64 KiB means the **cadence** was the fix and 96 KiB is margin;
+still OOM-ing means the **heap** was load-bearing. The default stays 96 KiB
+because a build meant to work should match smol's known-good pairing — but
+headroom must not be allowed to launder an untested hypothesis.
+
+### Diagnostics
+
+The xtensa esp fork ships nightly features, so esp-radio's raw WiFi-driver
+logging (`print-logs-from-driver`) **works on the S3** — it is unavailable on the
+C5. Useful for watching RX arrival rates while chasing the OOM question above.
+**Diagnostic builds only; never the committed default.**
+
+## ⛔ The flash guard, continued
 
 **ARMED 2026-08-24** — `ALLOW_SERIAL = 14:C1:9F:D1:C8:10` (smol node id 162),
 confirmed against the live bus at `/dev/ttyACM3`. The refuse-if-empty branch is

@@ -41,7 +41,7 @@ use smoltcp::{
 };
 use static_cell::StaticCell;
 
-use crate::radio_dev::SmolWifiDevice;
+use crate::{mqtt, radio_dev::SmolWifiDevice};
 
 // ------------------------------------------------------------ credentials ----
 
@@ -99,6 +99,42 @@ const fn const_is_one(s: Option<&str>) -> bool {
         None => false,
     }
 }
+
+/// esp-radio heap size in KiB. `SPIKE_HEAP_KB`, default **96** (smol's
+/// known-good pairing with the #140 RX tuning). Exists so the
+/// cadence-vs-heap experiment described in `init` is one build away rather than
+/// an argument. Internal RAM either way — see landmine L3.
+pub const HEAP_KB: u32 = const_u32(option_env!("SPIKE_HEAP_KB"), 96);
+const HEAP_BYTES: usize = HEAP_KB as usize * 1024;
+
+const fn const_u32(s: Option<&str>, default: u32) -> u32 {
+    match s {
+        None => default,
+        Some(v) => {
+            let b = v.as_bytes();
+            if b.is_empty() || b.len() > 4 {
+                return default;
+            }
+            let mut acc: u32 = 0;
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] < b'0' || b[i] > b'9' {
+                    return default;
+                }
+                acc = acc * 10 + (b[i] - b'0') as u32;
+                i += 1;
+            }
+            acc
+        }
+    }
+}
+
+// A heap too small to hold the RX ceiling is the bug we just shipped; a heap
+// larger than the S3's internal DRAM will not link. Bound both ends.
+const _: () = assert!(
+    HEAP_KB >= 32 && HEAP_KB <= 192,
+    "SPIKE_HEAP_KB must be 32..=192 KiB (internal DRAM; see the M2 OOM note in net::init)"
+);
 
 /// Channel to pin in espnow-only mode. `SPIKE_ESPNOW_CHANNEL`, default **6** —
 /// `ESP_NOW_FIXED_CHANNEL`, the smol mesh channel.
@@ -178,9 +214,14 @@ const BACKOFF_MAX_MS: u64 = 15_000;
 /// for if the heartbeat ever needs protecting again — but raise the heap first.
 const STACK_POLL_STEP_MS: u64 = 1;
 
-/// smoltcp needs somewhere to put its socket set. One socket (DHCP) is all M2
-/// wants; sized at 2 so adding a probe socket later is not a re-layout.
+/// smoltcp's socket set: DHCP (M2) + one TCP socket (M4's MQTT session).
 static SOCKETS: StaticCell<[SocketStorage<'static>; 2]> = StaticCell::new();
+
+/// MQTT's TCP buffers. Static rather than heap because the heap belongs to
+/// esp-radio — see the OOM note in `init`; adding a 4 KiB heap consumer to the
+/// pool that just ran out would be an unforced error.
+static TCP_RX: StaticCell<[u8; 1536]> = StaticCell::new();
+static TCP_TX: StaticCell<[u8; 1536]> = StaticCell::new();
 
 // ------------------------------------------------------------------- state ---
 
@@ -232,6 +273,8 @@ struct Live {
     dhcp: smoltcp::iface::SocketHandle,
     backoff_ms: u64,
     next_attempt: HalInstant,
+    /// M4. Idle until a lease exists; `tick` only drives it in `Link::Up`.
+    mqtt: mqtt::Client,
 }
 
 /// smoltcp's clock, from the HAL's.
@@ -310,6 +353,41 @@ pub fn init(
     // an enumeration. Matching smol's known-good PAIRING is therefore the honest
     // fix; inventing arithmetic to justify a smaller number would not be.
     //
+    // ---------------------------------------------------------------------
+    // ⚠️ VERDICT REVISED 2026-08-25 — I CANNOT ISOLATE THIS FROM EVIDENCE ALONE
+    // ---------------------------------------------------------------------
+    // My first verdict called the heap the root cause and the drain cadence a
+    // contributing factor. The C5 session's data does not support that ordering,
+    // and the honest answer is that **the two are not separable from what we
+    // observed.**
+    //
+    // Their M2/M4 ran DHCP+MQTT on the SAME VLAN8 broadcast environment with the
+    // SAME #140 tuning and never OOM'd. They differ from the failing build in
+    // BOTH variables at once: 96 KiB heap AND a continuous ~10 ms drain. One
+    // observation, two differences — that isolates nothing.
+    //
+    // Both mechanisms are real and they compound:
+    //   * Total RX demand is CEILINGED by construction (16 static + 40 dynamic).
+    //     If that ceiling plus everything else exceeds the heap, a broadcast-heavy
+    //     VLAN reaches it whatever the cadence. -> heap matters.
+    //   * But dynamic buffers are allocated ON DEMAND. Draining every 10 ms may
+    //     steady-state at a handful; leaving 950 ms gaps walks demand toward the
+    //     cap. -> cadence decides whether the ceiling is ever approached.
+    //
+    // **THE EXPERIMENT THAT WOULD SETTLE IT** (one flash, and the reason this is
+    // a knob instead of a literal): build with the cadence fix and the ORIGINAL
+    // heap —
+    //
+    //     SPIKE_HEAP_KB=64 ./build-remote.sh --features wifi
+    //
+    // If DHCP completes at 64 KiB, the cadence was the fix and 96 KiB is margin.
+    // If it still OOMs, the heap was load-bearing and cadence was amplification.
+    // Either way the answer is one flash, not an argument.
+    //
+    // The DEFAULT is 96 KiB regardless — matching smol's known-good pairing is
+    // right for a build meant to work, and the knob exists so headroom cannot
+    // silently mask an unproven fix. Do not remove it before the experiment runs.
+    //
     // ⛔ STILL INTERNAL RAM. DO NOT MOVE THIS HEAP TO PSRAM (landmine L3).
     // esp-alloc's docs: on ESP32/S2/**S3** atomics DO NOT WORK CORRECTLY in
     // PSRAM, and the allocator must not serve `Atomic*` — *directly or
@@ -318,7 +396,7 @@ pub fn init(
     // would fail at the allocation site; atomics would just quietly stop being
     // atomic inside the radio. The S3 has 512 KB internal, so 96 KiB is
     // affordable — and it is the one number here with a known-good precedent.
-    esp_alloc::heap_allocator!(size: 96 * 1024);
+    esp_alloc::heap_allocator!(size: HEAP_BYTES);
 
     // ---- scheduler ---------------------------------------------------------
     // MUST precede the radio. Pre-0.18 this lived inside esp-wifi as
@@ -452,6 +530,10 @@ pub fn init(
 
     let mut sockets = SocketSet::new(&mut SOCKETS.init([SocketStorage::EMPTY; 2])[..]);
     let dhcp = sockets.add(dhcpv4::Socket::new());
+    let tcp = sockets.add(smoltcp::socket::tcp::Socket::new(
+        smoltcp::socket::tcp::SocketBuffer::new(&mut TCP_RX.init([0; 1536])[..]),
+        smoltcp::socket::tcp::SocketBuffer::new(&mut TCP_TX.init([0; 1536])[..]),
+    ));
 
     Net {
         live: Some(Live {
@@ -463,6 +545,7 @@ pub fn init(
             backoff_ms: BACKOFF_MIN_MS,
             // First attempt immediately.
             next_attempt: HalInstant::now(),
+            mqtt: mqtt::Client::new(tcp),
         }),
         state: Link::Backoff,
         #[cfg(feature = "radio")]
@@ -475,6 +558,11 @@ pub fn init(
 impl Net {
     pub fn state(&self) -> Link {
         self.state
+    }
+
+    /// M4's state, for the heartbeat line. `None` before a lease exists.
+    pub fn mqtt_state(&self) -> Option<mqtt::Mqtt> {
+        self.live.as_ref().map(|l| l.mqtt.state())
     }
 
     /// Hand the ESP-NOW half to the M3 probe. Callable once; subsequent calls
@@ -539,6 +627,21 @@ impl Net {
 
             if self.state == Link::Dhcp && live.take_lease() {
                 self.state = Link::Up;
+            }
+
+            // M4 rides the lease. Driven INSIDE the service loop rather than
+            // once per heartbeat so its own bounded waits get a polled stack
+            // underneath them — a CONNACK cannot arrive through a stack nobody
+            // is turning.
+            if self.state == Link::Up {
+                let Live {
+                    iface,
+                    device,
+                    sockets,
+                    mqtt,
+                    ..
+                } = live;
+                mqtt.tick(iface, device, sockets, delay);
             }
 
             // A short step rather than a hot spin: the radio task needs the core
