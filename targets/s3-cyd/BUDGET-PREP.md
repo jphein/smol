@@ -826,3 +826,226 @@ be, but I did not build them.
 carry the example literals. `tools/build-matrix.toml` already documents that the same commit
 measures differently across trees for exactly this reason — a few hundred bytes, and it changes
 none of the verdicts above.
+
+---
+
+## §6.1 — BLOCKER B IS ESCAPABLE INSIDE FAT LTO, 2026-08-25 (nebula-smol)
+
+Follow-through on §6.2's own suggestion. Same pristine tree (`/var/tmp/ftarget/s3link-src`, main
+`5c3a9a0` + blocker A's one-line fix), canonical tier `esp32s3,espnow,cast,io`, one cargo at a
+time, one knob changed per run from the shipping profile (`opt-level = "s"`, `lto = "fat"`,
+`codegen-units = 1`).
+
+> ### Verdict
+> **`opt-level = 2` links under fat LTO. So does `opt-level = 3`.** The two *size*-optimising
+> levels (`"s"`, `"z"`) are the ones that break, and `codegen-units` does not rescue `"s"` — it
+> replaces one failure with a different one. **Blocker B has a one-knob escape that keeps fat LTO,
+> keeps `codegen-units = 1`, and stays inside esp-radio's own recommended set.**
+
+### 6.1.1 The matrix
+
+| variant | opt | lto | cu | verdict | failure |
+|---|---|---|---|---|---|
+| **shipping** (§6.2) | `s` | fat | 1 | ❌ | `rustc-LLVM ERROR: Incomplete scavenging after 2nd pass` — in `clock` (bin) |
+| cu2 | `s` | fat | 2 | ❌ | **identical** error, identical crate |
+| cu4 | `s` | fat | 4 | ❌ | **different class**: `error: invalid operand for instruction` — `<inline asm>:231:18`, `rsr a3, LBEG`, in a *dependency* |
+| cu16 | `s` | fat | 16 | ❌ | identical to cu4 |
+| optz | `z` | fat | 1 | ❌ | **different message, different crate**: `Error while trying to spill A8 from class AR: Cannot scavenge register without an emergency spill slot!` — in `compiler_builtins` (build-std) |
+| **opt2** | **`2`** | **fat** | **1** | ✅ | **LINKS — 1,448,016 B ELF** |
+| **opt3** | **`3`** | **fat** | **1** | ✅ | **LINKS — 1,518,996 B ELF** |
+| *(reference, §6.2)* | `s` | **thin** | 1 | ✅ | LINKS — 1,610,828 B ELF |
+
+**Reading the failures as a family.** `Incomplete scavenging after 2nd pass` and `Cannot scavenge
+register without an emergency spill slot` are two messages from the **same LLVM machinery** — the
+register scavenger inside PrologEpilogInserter, unable to find a free register (or an emergency
+spill slot) to materialise a large frame offset. `"s"` and `"z"` both provoke it; `2` and `3` do
+not. That is consistent with the size-optimising levels producing fewer, larger, more
+register-starved functions. *(Mechanism inferred from the message; not proven for this build.)*
+
+⚠️ **`codegen-units > 2` is not a partial win — it is a second, unrelated bug.** At cu=4 and cu=16
+the build never reaches the scavenger: it dies assembling `rsr a3, LBEG` (the Xtensa Loop-option
+special register) inside inline asm, in a dependency compiled long before `clock`. So the honest
+reading of the `cu` row is **"cu does not help, and above 2 it makes the tree unbuildable for a
+different reason"** — not "cu 4/16 also hit blocker B". Do not merge those rows.
+
+*(Why raising `codegen-units` changes an inline-asm outcome at all is unexplained here. Plausibly
+per-CGU subtarget-feature propagation, but I did not verify it and it is out of scope — the row
+is recorded as an observation, not a diagnosis.)*
+
+### 6.1.2 The winner, measured — `opt-level = 2`, fat LTO, cu = 1
+
+Frozen before measuring, per §1.2:
+
+| | |
+|---|---|
+| file | `canon-opt2-fat.elf` |
+| sha256 | `87c4e37ac5787f49354b084e14e1c8d135371018a66b319c6efc9d3b0f3b671c` |
+| ELF | 1,448,016 B |
+| profile | `opt-level = 2` · `lto = "fat"` · `codegen-units = 1` — **one knob from shipping** |
+
+| section | bytes | hex |
+|---|---:|---|
+| `.rwdata_dummy` | 44,032 | `0xac00` |
+| `.data` | 21,120 | `0x5280` |
+| `.data.wifi` | 496 | `0x1f0` |
+| `.bss` | 155,076 | `0x25dc4` |
+| **`.stack`** | **121,036** | `0x1d8cc` |
+| `.rodata` | 71,276 | `0x1166c` |
+| `.rodata.wifi` | 29,704 | `0x7408` |
+| `.text` | 872,045 | `0xd4e6d` |
+| `.rwtext` / `.rwtext.wifi` | 10,884 / 32,124 | |
+| `.vectors` | 1,024 | |
+| `.flash.appdesc` | 256 | `0x100` |
+
+✅ `.stack` runs `0x3fcbde34 .. 0x3fcdb700` — **ends exactly at `dram_seg`'s end**, third
+independent confirmation of §1.3's derivation (spike, thin-LTO image, and now this one).
+
+**Image, through our own partition table:**
+
+```
+espflash save-image --chip esp32s3 --flash-size 16mb \
+  --partition-table targets/s3-cyd/partitions-ota-s3.csv canon-opt2-fat.elf
+App/part. size:    1,039,040/6,291,456 bytes, 16.52%
+```
+
+**#349 descriptor** (decoded, checksum recomputed with `target.rs`'s own FNV-1a/32):
+
+```
+@0x17dc  ver=1  chip=3 (esp32s3)  feats=0x000f (WIFI|ESPNOW|IO|CAST)  compat=1  ->  VALID ✅
+```
+
+*(A second `SMLT` at `0x19e3c` is again the `MAGIC` constant in `.rodata` — checksum rejects it,
+as §6.5 described. Two images, same behaviour.)*
+
+### 6.1.3 ✅ The #32 build gate survives `opt-level = 2` — checked, not assumed
+
+This was the deviation most likely to do damage, so it was measured directly rather than argued.
+#32's recorded failure mode is that `ed25519-compact`'s `double_scalarmult_vartime` *"inlines/
+unrolls under opt="s"+fat-LTO into a single ~1 MB function → total ed25519 symbols ~1.19 MB"*,
+and the fix is a **per-package** `[profile.release.package.ed25519-compact] opt-level = "z"`.
+
+In this ELF:
+
+| symbol | size |
+|---|---:|
+| `…ed25519_compact…GeP2::double_scalarmult_vartime` | **43,475 B** |
+| `…sha512::State::blocks` | 13,475 B |
+| `…edwards25519::ge_scalarmult_base` | 10,061 B |
+
+**43 KB, not ~1 MB.** The per-package override is independent of the global `opt-level`, so it is
+still in force and still doing its job. The gate's *protection* is intact.
+
+⚠️ **But its recorded PREMISE is now conditional in a way the comment does not say.** The comment
+in `rust/clock/Cargo.toml` states the hazard as a property of *"opt="s"+fat-LTO"*. An S3 image
+built at `opt-level = 2` is outside those stated conditions, so the sentence no longer describes
+the build it is protecting. Per the repo's own rule about conditions that move: **if `opt-level`
+becomes per-chip, that comment needs the condition written next to it and a re-measure on the new
+level** — the number above is evidence the protection holds, not evidence the premise was
+re-derived.
+
+### 6.1.4 ⚠️ How this must be applied — per-chip, NEVER a global profile edit
+
+**Do not change `[profile.release] opt-level` in `rust/clock/Cargo.toml`.** That profile is shared
+by the C3, and changing it would:
+
+* invalidate **every C3 measurement on record** — the stack floor's 55,656 B peak, the 106,464 B
+  region, `baseline_image_bytes`, the `#32` symbol sizes;
+* break **byte-reproducibility** and therefore the `repro_build` ceremony and the OTA ratchet;
+* change the shipping fleet image to work around a bug on a chip that is not in the fleet.
+
+**The tree already has the right seam.** `tools/build-matrix.toml`'s `[chip.*]` rows carry
+per-chip build facts — `toolchain = "esp"` and `build_std = "core,alloc"` exist precisely because
+the S3 needs them and the C3 must not get them. An `opt_level` (or a general per-chip profile-env)
+field is the same shape, and `check_chips.sh` already threads those fields into the invocation.
+Supplied as `CARGO_PROFILE_RELEASE_OPT_LEVEL=2` for the S3 only, **the C3 stays byte-identical**
+— which is exactly how `build-std` was kept out of the riscv builds after the 2026-07-20
+portable-atomic regression.
+
+**Two things that then need saying out loud in the row:** it is a *workaround for a toolchain
+bug*, with the LLVM error quoted so nobody "tidies" it away; and it is a **deviation from the
+canonical profile**, so an S3 image is not comparable byte-for-byte with a C3 one.
+
+### 6.1.5 Where this leaves `baseline_image_bytes`
+
+**Closer, but still not settled.** `1,039,040 B` comes from a fat-LTO, `codegen-units = 1`,
+correctly-linked canonical-tier image — far better evidence than §6's thin-LTO number. It is a
+**candidate**, and it is the first one worth writing down.
+
+It is not final because:
+1. `opt-level = 2` is **not yet a decision** — it is a measured escape awaiting review (§6.1.4).
+   At `opt-level = 3` the ELF is 1,518,996 B, so the field genuinely moves with the choice.
+2. Blocker A's fix is **not in the repo** — the build that produced this used a patched throwaway
+   tree.
+3. It was built with `ci_provision.sh` placeholders, worth a few hundred bytes.
+
+➡️ **Record it as: `baseline_image_bytes ≈ 1,039,040 B @ opt=2/fat/cu=1, candidate, pending the
+opt-level decision.`** Per §4's poison-row law it still does **not** go into a `budget.rs` const —
+`free_dram_bytes` and `stack_floor_bytes` remain unmeasured, and all four fields land together.
+
+🔶 **DRAM shape, still not a verdict:** `.stack` 121,036 B, i.e. 1.63× the *C3's* floor. The S3
+has no floor of its own (§1.5), that comparison is against the wrong chip's number (§6.7), and a
+linked region has never been evidence of a runnable image (#300). **Encouraging, not sufficient.**
+
+### 6.1.6 Upstream-report skeleton — DRAFT ONLY, do not file
+
+Recorded because the crash is real and reproducible even though smol now has a way around it.
+**Nobody should file this without checking the repo's issue policy and searching for duplicates
+first** — neither was done here (no network access was used for this section).
+
+> **Where.** Best guess: **`esp-rs/rust`** (the Espressif Rust fork) as the first stop, since the
+> failing compiler is its `esp` channel; expect triage onward to **`espressif/llvm-project`** if
+> confirmed as a backend bug. ⚠️ **Unverified** — confirm which repo accepts codegen bugs before
+> filing, and check whether this is already known.
+>
+> **Title.** `LLVM ERROR: Incomplete scavenging after 2nd pass on xtensa-esp32s3-none-elf at opt-level=s with fat LTO`
+>
+> **Environment.** Xtensa Rust fork **1.95.0.0** (`cargo 1.95.0-nightly (f2d3ce0bd 2026-03-21)`),
+> espup-installed `esp` toolchain, host x86_64-linux. Target `xtensa-esp32s3-none-elf`,
+> `-Zbuild-std=core,alloc`. esp-hal 1.1.2 / esp-radio 0.18.0 / esp-rtos 0.3.0.
+>
+> **Reproduce.** A large `no_std` binary crate; `-C opt-level=s -C lto=fat -C codegen-units=1`.
+> Fails during codegen of the final binary.
+>
+> **Observed matrix** (the useful part of the report — it brackets the trigger):
+>
+> | opt | lto | cu | result |
+> |---|---|---|---|
+> | s | fat | 1 | `Incomplete scavenging after 2nd pass` |
+> | s | fat | 2 | same |
+> | z | fat | 1 | `Error while trying to spill A8 from class AR: Cannot scavenge register without an emergency spill slot!` (in `compiler_builtins`) |
+> | 2 | fat | 1 | **OK** |
+> | 3 | fat | 1 | **OK** |
+> | s | thin | 1 | **OK** |
+>
+> So: size-optimising levels + fat LTO only. Both messages come from the register scavenger.
+>
+> **Separately worth reporting** (different bug, same matrix run): at `codegen-units = 4` and `16`
+> the build fails earlier with `error: invalid operand for instruction` on `rsr a3, LBEG` in
+> inline asm from a dependency — an assembler/subtarget-feature issue, not a scavenger one.
+>
+> **Not yet done, and should be before filing:** reduce to a minimal reproducer. The current one
+> is "a whole firmware", which is not a bug report. `cargo-bisect-rustc` is unlikely to apply
+> (the fork is not a rustc channel), so bracketing by esp-hal version may be the practical
+> substitute.
+
+### 6.1.7 Honesty ledger for §6.1
+
+**✅ Verified — ran all seven builds:** every row of the matrix, its exit status, and its first
+error line; that opt2 and opt3 link and produce ELFs; opt2's frozen hash and full section table;
+its `.stack` ending at `dram_seg`'s end; its image size through `partitions-ota-s3.csv`; its
+`#349` descriptor decoding to `chip = 3` with an independently recomputed valid checksum;
+`double_scalarmult_vartime` at 43,475 B.
+
+**🔶 Inferred:** that both LLVM messages come from the same register-scavenger machinery (standard
+reading of the messages, not proven here); that `"s"`/`"z"` provoke it by producing larger, more
+register-starved functions; that `esp-rs/rust` is the right upstream repo. The cu=4/16 inline-asm
+failure is **observed but not diagnosed**.
+
+**❌ Not established:** whether `opt-level = 2` produces a *correct* image — nothing has been
+flashed, and a codegen bug that disappears at another optimisation level is exactly the class
+where "it links" is weakest evidence. **The first S3 flash should be treated as unproven silicon,
+not as a normal bring-up.** Also untested: `opt-level = 2` combined with `codegen-units = 2`;
+whether the C5/C6 (riscv, `lto = "fat"`, opt `"s"`) are affected at all — they are a different
+backend and almost certainly not, but I did not build them.
+
+**⚠️ Provisioning:** `ci_provision.sh` placeholders, as §6.9.
