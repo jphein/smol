@@ -78,3 +78,7 @@ experiments/*/Cargo.lock
 # Stamped at publish time by tools/stamp_site_version.py, from the commit being published.
 # Never commit it: a checked-in version file is a hand-maintained one, i.e. wrong.
 site/version.json
+
+# Scratch for tooling that needs a temp dir (JP directive 2026-08-25: katana's /tmp is a 16 GB
+# tmpfs, i.e. RAM — build/test scratch must be disk-backed). `tools/test_*.sh` default TMPDIR here.
+/tmp/

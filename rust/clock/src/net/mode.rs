@@ -2335,6 +2335,34 @@ pub fn now_ms() -> u64 {
 impl RadioManager {
     /// Initialise the radio once. Starts in `WifiSta` mode so the caller can do
     /// an NTP burst before switching to ESP-NOW.
+    ///
+    /// STATION-CONSUMER-SITES: mode.rs::RadioManager::new:1, wifi.rs::try_time_sync:1
+    /// STATION-STACK-SITES: none
+    /// STATION-CONSUMER-GUARD: wifi.rs::try_time_sync | net.rs | pub use wifi::try_time_sync; | all(feature = "wifi", not(feature = "espnow"))
+    /// STATION-CONSUMER-GUARD: mode.rs::RadioManager::new | net.rs | pub mod mode; | feature = "espnow"
+    ///
+    /// #335 STEP G. Every function that constructs a consumer of the STA transport, with its
+    /// COUNT, checked in both directions by `tools/check_station_consumers.py`. There are two,
+    /// they are in different files, and that is exactly what made this dangerous enough to need
+    /// a gate — so the roster is ONE declaration, file-qualified, rather than a per-file note
+    /// that can be half-updated.
+    ///
+    /// WHY A GATE AND NOT A COMMENT: `esp_radio::wifi::Interface` is `Copy`. So
+    /// `embassy_net::new(interfaces.station, ..)` does NOT consume the handle, and a `Stack` can
+    /// be live beside a `SmolWifiDevice` over the same interface. It compiles clean, and then both
+    /// pop `data_queue_rx()` — which is keyed by `InterfaceType` alone — so frames are stolen
+    /// nondeterministically. No error, no panic. `STATION-STACK-SITES` is declared EMPTY on
+    /// purpose: the first `embassy_net::new` to land must update this roster deliberately (STEP T,
+    /// moving every consumer in one commit) instead of inheriting a silent pass.
+    ///
+    /// ⚠️ THE GUARDS ARE NOT ON THESE FUNCTIONS. Neither `try_time_sync` nor `RadioManager::new`
+    /// carries a `#[cfg]`, and `mod wifi` is compiled on EVERY radio tier — so on an espnow tier
+    /// both call sites are *compiled*. What makes them mutually exclusive is REACHABILITY, one
+    /// level up in `net.rs`: the `try_time_sync` re-export and `pub mod mode` are the real gates.
+    /// Hence each `STATION-CONSUMER-GUARD` names the gate FILE and the gated ITEM, pipe-separated
+    /// (a cfg predicate contains commas and `=`, never a pipe). The checker compares those cfg
+    /// strings LITERALLY and fails closed on any edit; it does not attempt cfg algebra, so it
+    /// detects "a guard moved" and makes no claim beyond that.
     pub fn new(p: WifiPeripherals, id: u8) -> Option<Self> {
         // esp-wifi needs a heap; use the single shared region (see net::init_heap).
         super::init_heap();
