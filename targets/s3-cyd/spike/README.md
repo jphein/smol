@@ -149,6 +149,7 @@ Cargo.toml           own workspace root (xtensa/riscv cannot share one)
 rust-toolchain.toml  channel = "esp" + the two-disguise trap
 .cargo/config.toml   target, build-std, runner = ./flash.sh
 flash.sh             THE FLASH GUARD — refuses by default
+build-remote.sh      build on familiar (espup pinned 1.95.0.0), pull the ELF back
 src/main.rs          M1: PSRAM, SPI2, ILI9341, colour test, GPIO0, heartbeat
 src/radio_dev.rs     M3: ESP-NOW probe, behind --features radio
 ```
