@@ -1,0 +1,24 @@
+[package]
+name = "oled-scale"
+version = "0.1.0"
+edition = "2021"
+description = "BinaryColor 72x40 -> RGB565 integer-scaling DrawTarget with dirty-rect tracking (smol#398 Path A)"
+
+# INTENTIONALLY its own cargo workspace root, and a path-dependency consumer never
+# a member. Same reason burrito-fw states at `emberburrito/burrito-fw/Cargo.toml:14-17`:
+# esp-hal accepts exactly one chip feature and cargo UNIFIES features across workspace
+# members, so a host crate and an esp32s3 crate cannot coexist in one workspace. The
+# eventual S3 firmware crate depends on this by path; cargo only absorbs path deps that
+# live INSIDE the workspace root's directory, and this one declares its own, so it stays
+# independent.
+[workspace]
+
+[dependencies]
+# EXACTLY smol's pin (`rust/clock/Cargo.toml:98` -> `embedded-graphics = "=0.8.2"`).
+# Not a caret: this crate's whole purpose is to be byte-compatible with the DrawTarget
+# that smol's 171 BinaryColor draw sites already target. A different minor version means
+# a different `DrawTarget` trait definition and the drop-in property silently dies.
+embedded-graphics = "=0.8.2"
+
+[profile.release]
+opt-level = "s"
