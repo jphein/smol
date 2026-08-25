@@ -22,6 +22,11 @@ mkcopy() {
   cp -r "$ROOT/rust/clock/src" "$d/rust/clock/src"
   cp -r "$ROOT/experiments/." "$d/experiments/"
   cp "$CHECK" "$d/tools/"
+  # #426 — the checker now imports `tools/rust_comments.py` (one strip_comments, not six copies),
+  # so the FIXTURE TREE has to carry it too. Staging a tool without its dependency made every arm
+  # fail with `ModuleNotFoundError` — a harness that copies a subset of what the real invocation
+  # needs is testing a program that does not exist.
+  cp "$ROOT/tools/rust_comments.py" "$d/tools/"
   printf '%s' "$d"
 }
 

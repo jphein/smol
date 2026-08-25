@@ -61,6 +61,8 @@ import subprocess
 import tomllib
 import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from rust_comments import strip_comments  # noqa: E402  (#426)
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_SRC = HERE.parent / "rust" / "clock" / "src"
@@ -138,8 +140,20 @@ def check_source(src: Path) -> list[str]:
     files = rs_files(src)
     gates_by_file = {}
     for p in files:
-        lines = p.read_text(encoding="utf-8").splitlines()
-        gates_by_file[p] = (lines, file_gate(lines), mod_gates(lines))
+        # #426 — TWO VIEWS OF ONE FILE, and the split is the whole fix.
+        #
+        # The GATES are code: `mod_gates` was proved to read a `#[cfg(feature = "bard")] pub mod
+        # mesh_elect;` sitting inside a `/* */` block and record `bard` as that module's gate,
+        # when the real decl five lines away says `espnow`. A checker that mis-attributes a gate
+        # is not merely noisy — every byte-free verdict downstream of it is about the wrong tier.
+        #
+        # The CLAIMS are prose, deliberately: `byte-free` assertions live in comments, and the
+        # proximity rule ("a claim must sit within CLAIM_WINDOW lines of a cfg gate") is checked
+        # against the RAW text. Stripping there would delete the very thing being audited and
+        # leave this checker reporting zero claims, cheerfully, forever.
+        raw = p.read_text(encoding="utf-8").splitlines()
+        code = strip_comments("\n".join(raw)).splitlines()
+        gates_by_file[p] = (raw, file_gate(code), mod_gates(code))
 
     # Every `mod` gate in the crate, by module name — a claim inside `net/cast.rs` is backed
     # by `#[cfg(feature = "cast")] pub mod cast;` in `net.rs`, i.e. by a gate in ANOTHER FILE.

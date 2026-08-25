@@ -38,6 +38,9 @@ Usage: tools/check_diag_budget.py [path/to/mode.rs]   (exit 0 consistent, 1 drif
 """
 import re
 import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from rust_comments import strip_comments  # noqa: E402  (#426)
 
 FMT = re.compile(r'let mut rec = alloc::format!\(\s*\n\s*"(.*?)",\n', re.S)
 DECL = re.compile(r"DIAG-WIDTHS:\s*(.+)")
@@ -76,7 +79,16 @@ def main() -> int:
         print(f"FATAL: {e}", file=sys.stderr)
         return 2
 
-    mf, mc, mb = FMT.search(src), CORE.search(src), BUDGET.search(src)
+    # #426 — TWO VIEWS. The DECLARATIONS (`DIAG-WIDTHS:` / `DIAG-TAIL:`) live in COMMENTS by
+    # design and are read from `src`; the CODE they are checked against is read from `code`.
+    # Proved necessary: a `/* … rec.push_str("|probe=") … */` written to EXPLAIN the record made
+    # this checker fail with `appended unconditionally but UNDECLARED: probe` — a doc comment
+    # about the invariant breaking the gate that guards it.
+    #
+    # Stripping the WHOLE file would be the opposite mistake: the declarations would vanish and
+    # this checker would have nothing left to check.
+    code = strip_comments(src)
+    mf, mc, mb = FMT.search(code), CORE.search(code), BUDGET.search(code)
     for name, m in (("the DIAG format string", mf), ("DIAG_CORE_MAX", mc), ("DIAG_BUDGET", mb)):
         if not m:
             print(f"FATAL: could not find {name} in {path} — this checker has gone blind, fix it.",
@@ -138,7 +150,12 @@ def main() -> int:
         print(f"FATAL: no DIAG-TAIL: declaration found in {path}.", file=sys.stderr)
         return 2
     try:
-        region = src[src.index(TAIL_START):src.index(TAIL_END, src.index(TAIL_START))]
+        # The markers are found in RAW (`TAIL_START` is itself comment text) and the slice is
+        # taken from CODE. That is exactly why `strip_comments` preserves length and offsets:
+        # an index located in one view is valid in the other, so the two never disagree about
+        # where the protected tail begins.
+        _s = src.index(TAIL_START)
+        region = code[_s:src.index(TAIL_END, _s)]
     except ValueError:
         print(f"FATAL: could not delimit the PROTECTED tail in {path} — this checker has gone "
               "blind, fix it.", file=sys.stderr)

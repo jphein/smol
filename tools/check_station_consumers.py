@@ -54,6 +54,8 @@ Usage: tools/check_station_consumers.py [repo-root]   (exit 0 ok, 1 violation, 2
 import re
 import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from rust_comments import strip_comments  # noqa: E402  (#426 — one implementation, imported)
 
 # The constructor whose call sites ARE the roster.
 DEVICE_CTOR = "SmolWifiDevice::new"
@@ -82,79 +84,9 @@ def rust_sources(src: Path):
     return sorted(p for p in src.rglob("*.rs") if p.is_file())
 
 
-def strip_comments(text: str) -> str:
-    """Blank every comment, PRESERVING length and newlines so offsets and line numbers still map.
-
-    Not a nicety — it is load-bearing, and the first run of this script proved it. The roster's own
-    doc comment explains the hazard using the words `embassy_net::new(interfaces.station, ..)`, and
-    an unstripped scan counted that PROSE as a real call site and failed the gate. A checker whose
-    verdict can be flipped by documentation about the thing it checks is worse than no checker: the
-    same mechanism that produces a false RED here could be used to produce a false GREEN elsewhere
-    (comment out a real site, or bury a roster-shaped string in a comment).
-
-    Handles `//`, `/* */` (nested, as Rust allows), ordinary strings, char literals and raw strings
-    (`r"..."`, `r#"..."#`), because a `//` inside a string literal is not a comment and blanking it
-    would corrupt the code view.
-    """
-    out = list(text)
-    i, n = 0, len(text)
-    while i < n:
-        c = text[i]
-        # raw string: r"..." / r#"..."# / r##"..."##
-        if c == "r" and i + 1 < n and text[i + 1] in '"#':
-            j = i + 1
-            hashes = 0
-            while j < n and text[j] == "#":
-                hashes += 1
-                j += 1
-            if j < n and text[j] == '"':
-                close = '"' + "#" * hashes
-                end = text.find(close, j + 1)
-                i = n if end < 0 else end + len(close)
-                continue
-        if c == '"' or c == "'":
-            quote = c
-            j = i + 1
-            while j < n:
-                if text[j] == "\\":
-                    j += 2
-                    continue
-                if text[j] == quote:
-                    j += 1
-                    break
-                if text[j] == "\n" and quote == "'":
-                    break  # not a char literal after all (e.g. a lifetime)
-                j += 1
-            i = j
-            continue
-        if c == "/" and i + 1 < n and text[i + 1] == "/":
-            j = text.find("\n", i)
-            j = n if j < 0 else j
-            for k in range(i, j):
-                out[k] = " "
-            i = j
-            continue
-        if c == "/" and i + 1 < n and text[i + 1] == "*":
-            depth, j = 0, i
-            while j < n:
-                if text.startswith("/*", j):
-                    depth += 1
-                    j += 2
-                elif text.startswith("*/", j):
-                    depth -= 1
-                    j += 2
-                    if depth == 0:
-                        break
-                else:
-                    j += 1
-            for k in range(i, min(j, n)):
-                if out[k] != "\n":
-                    out[k] = " "
-            i = j
-            continue
-        i += 1
-    return "".join(out)
-
+# strip_comments moved to tools/rust_comments.py (#426). It was duplicated verbatim into
+# check_elect_send_path.py the same day, and the sweep would have made it six copies — so the
+# fix for "a checker counts its own prose" stopped being a thing each checker owns a copy of.
 
 def enclosing_fn(text: str, idx: int):
     """Name of the nearest `fn` declared at or above `idx`. None if there isn't one."""
