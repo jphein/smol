@@ -34,6 +34,17 @@ fixes it, which is the reason to file at all.
   same LTO codegen stage). Both tested members fail on the newest release: **the
   toolchain-bump path is dead for the whole family**, and "affects latest" holds for the
   report across members.
+- **Member 3 is BISECTED to a minimal-repro recipe** (watch lane, component-granularity
+  bisection after expression-rewrite rule-outs were shown invalid — slint can normalize
+  rewrites back; branch a57a801): the trigger is **any float arithmetic in the property
+  bindings of a component with a float-valued in-out property, two-way-bound from two
+  instantiation sites**. Stubbing the one component links the full 22-page scene;
+  restoring it minus its one float binding links; an int-mediated rewrite of the same
+  compare crashes again with a fresh `[2 x float]` constpool. Float-free bindings are
+  safe; float→length bindings without the two-way/in-out shape never trigger it. This
+  weakens the "no minimal reproducer" caveat from *no recipe* to *recipe exists, the
+  standalone crate remains to be built from it*. Engineering workaround identified (push
+  the bool from Rust so bindings carry no floats) — not yet landed.
 
 ## The report body (draft)
 
