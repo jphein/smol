@@ -1,0 +1,20 @@
+# EXPECT: net/target.rs says
+# TARGET-RS: _target_rs_ok.rs
+# OTA-PUBLISH: _ota_publish_conflict.sh
+# The other direction: same id, different NAME. The publisher would announce a chip the firmware
+# cannot stamp — caught because the arm compares both ways rather than just checking presence.
+[meta]
+canonical_chip = "esp32c3"
+canonical_tier = "fleet"
+[chip.esp32c3]
+target = "riscv32imc-unknown-none-elf"
+builds = true
+checks = true
+ships = true
+[chip.esp32s3]
+target = "xtensa-esp32s3-none-elf"
+builds = false
+checks = false
+ships = false
+[tier.fleet]
+features = "espnow,cast,io"

@@ -21,6 +21,8 @@
 #   # EXPECT-JOBS: <n>             the emitted matrix must have exactly n jobs
 #   # BUDGET: <file>               use this budget fixture instead of _budget_ok.rs
 #   # CARGO: <file>                use this Cargo.toml fixture instead of _cargo_empty.toml
+#   # TARGET-RS: <file>            use this net/target.rs fixture (#413 id<->name roster arm)
+#   # OTA-PUBLISH: <file>          use this ota_publish.sh fixture (#413 id<->name roster arm)
 #
 # Exit 0 all cases behaved; 1 otherwise.
 set -uo pipefail
@@ -44,6 +46,10 @@ for case_file in "$CASES"/*.toml; do
   budget="$CASES/$(sed -n 's/^# BUDGET: *//p' "$case_file" | head -1)"
   [ -f "$budget" ] || budget="$CASES/_budget_ok.rs"
   cargo="$CASES/$(sed -n 's/^# CARGO: *//p' "$case_file" | head -1)"
+  targetrs="$CASES/$(sed -n 's/^# TARGET-RS: *//p' "$case_file" | head -1)"
+  [ -f "$targetrs" ] || targetrs="$HERE/../rust/clock/src/net/target.rs"
+  otapub="$CASES/$(sed -n 's/^# OTA-PUBLISH: *//p' "$case_file" | head -1)"
+  [ -f "$otapub" ] || otapub="$HERE/ota_publish.sh"
   [ -f "$cargo" ] || cargo="$CASES/_cargo_empty.toml"
 
   want_fail="$(sed -n 's/^# EXPECT: *//p' "$case_file" | head -1)"
@@ -58,7 +64,8 @@ for case_file in "$CASES"/*.toml; do
     continue
   fi
 
-  out="$("$BM" check --manifest "$case_file" --repro "$REPRO" --budget "$budget" --cargo "$cargo" 2>&1)"
+  out="$("$BM" check --manifest "$case_file" --repro "$REPRO" --budget "$budget" --cargo "$cargo" \
+         --target-rs "$targetrs" --ota-publish "$otapub" 2>&1)"
   rc=$?
 
   if [ -n "$want_bad" ]; then

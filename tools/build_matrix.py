@@ -29,6 +29,11 @@ DEFAULT_MANIFEST = HERE / "build-matrix.toml"
 DEFAULT_REPRO = HERE / "repro_build.sh"
 DEFAULT_BUDGET = HERE.parent / "rust" / "clock" / "src" / "budget.rs"
 DEFAULT_CARGO = HERE.parent / "rust" / "clock" / "Cargo.toml"
+# #413: the two halves of the chip id<->name map. `net/target.rs` is AUTHORITATIVE — the id is the
+# #349 wire format the device reads out of an image's target descriptor — and `ota_publish.sh`
+# carries a python copy so it can name the chip it is about to stage.
+DEFAULT_TARGET_RS = HERE.parent / "rust" / "clock" / "src" / "net" / "target.rs"
+DEFAULT_OTA_PUBLISH = HERE / "ota_publish.sh"
 
 
 # ── loading ───────────────────────────────────────────────────────────────────
@@ -136,6 +141,44 @@ def repro_fleet_features(path: Path) -> str:
     return m.group(1)
 
 
+def chip_ids_from_firmware(path: Path) -> dict[int, str]:
+    """`CHIP_ESP32C3: u8 = 1;` -> {1: "esp32c3"}. The AUTHORITATIVE map: the id is #349's wire
+    format, so the firmware that stamps it defines it.
+
+    Guarded the way `budget_chips` is: if the count of `CHIP_*` declarations does not match the
+    count of ids parsed, refuse rather than compare a roster we cannot fully read. A regex over
+    Rust is acceptable here (the precedent is `budget_chips`), a SILENT partial parse is not.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    decls = re.findall(r"^pub const CHIP_(ESP32[A-Z0-9]+): u8 = (\d+);", text, re.M)
+    # `CHIP_UNKNOWN` is deliberately excluded by the pattern: 0 is "no chip", not a chip.
+    literal_count = len(re.findall(r"^pub const CHIP_ESP32[A-Z0-9]+: u8 =", text, re.M))
+    if literal_count != len(decls):
+        raise Bad(f"{path}: found {literal_count} CHIP_ESP32* declarations but parsed "
+                  f"{len(decls)} ids — refusing to compare a roster I cannot fully read")
+    if not decls:
+        raise Bad(f"{path}: no CHIP_ESP32* declarations found — anchor lost, failing closed")
+    return {int(n): name.lower() for name, n in decls}
+
+
+def chip_ids_from_publisher(path: Path) -> dict[int, str]:
+    """The `CHIPS = {1: "esp32c3", ...}` dict inside `ota_publish.sh`'s embedded python.
+
+    Parsed rather than imported because it lives in a heredoc. Same fail-closed guard: the entry
+    count must match, or we are comparing against a partial read.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    m = re.search(r"^CHIPS = \{(.*?)\}", text, re.M | re.S)
+    if not m:
+        raise Bad(f"{path}: no `CHIPS = {{...}}` map found — anchor lost, failing closed")
+    body = m.group(1)
+    pairs = re.findall(r"(\d+)\s*:\s*\"([a-z0-9]+)\"", body)
+    if len(pairs) != body.count(":"):
+        raise Bad(f"{path}: CHIPS has {body.count(':')} entries but {len(pairs)} parsed — "
+                  f"refusing to compare a map I cannot fully read")
+    return {int(n): name for n, name in pairs}
+
+
 def budget_chips(path: Path) -> set[str]:
     """Chip ids declared as `ChipBudget` consts.
 
@@ -238,6 +281,32 @@ def check(doc: dict, repro: Path, budget: Path) -> list[str]:
         except Bad as exc:
             fails.append(str(exc))
 
+    # 3b. #413: the chip id<->name map agrees between the FIRMWARE (authoritative — the id is
+    #     #349's wire format) and the PUBLISHER's copy. This is the FOURTH copy of the chip roster
+    #     in the tree and the one nothing compared, which is how `ota_publish.sh` came to be
+    #     silently short esp32c5 (id 4). The consequence was not a crash: a valid C5 descriptor
+    #     was reported as ABSENT and the image staged legacy-only, sending anyone debugging it
+    #     into the firmware's descriptor emission. Checked in BOTH directions, so neither side can
+    #     grow or lose a chip alone.
+    try:
+        fw = chip_ids_from_firmware(doc.get("_target_rs") or DEFAULT_TARGET_RS)
+        pub = chip_ids_from_publisher(doc.get("_ota_publish") or DEFAULT_OTA_PUBLISH)
+        for cid, name in sorted(fw.items()):
+            if cid not in pub:
+                fails.append(f"chip id {cid} ({name}) is declared in net/target.rs but MISSING "
+                             f"from ota_publish.sh's CHIPS — a valid {name} image would be "
+                             f"reported as having no target descriptor and staged legacy-only")
+            elif pub[cid] != name:
+                fails.append(f"chip id {cid}: net/target.rs says {name!r}, "
+                             f"ota_publish.sh says {pub[cid]!r}")
+        for cid, name in sorted(pub.items()):
+            if cid not in fw:
+                fails.append(f"chip id {cid} ({name}) is in ota_publish.sh's CHIPS but has no "
+                             f"CHIP_* constant in net/target.rs — the publisher would name a chip "
+                             f"the firmware cannot stamp")
+    except Bad as exc:
+        fails.append(str(exc))
+
     # 4. every cargo feature is covered by a tier, or exempted with a reason.
     #
     # `tools/gate.sh` carried this as an aspiration in a comment — "any feature listed in
@@ -282,6 +351,10 @@ def main() -> int:
     ap.add_argument("--repro", type=Path, default=DEFAULT_REPRO)
     ap.add_argument("--budget", type=Path, default=DEFAULT_BUDGET)
     ap.add_argument("--cargo", type=Path, default=DEFAULT_CARGO)
+    # #413: fixture hooks for the id<->name roster arm, mirroring --budget/--cargo so the
+    # regression suite can craft a SHORT roster instead of sabotaging the real files.
+    ap.add_argument("--target-rs", type=Path, default=DEFAULT_TARGET_RS)
+    ap.add_argument("--ota-publish", type=Path, default=DEFAULT_OTA_PUBLISH)
     ap.add_argument("--for", dest="phase", choices=("check", "clippy"), default="check",
                     help="emit: which gate phase's tier list to produce")
     ap.add_argument("--builds", action="store_true", help="chips: only buildable ones")
@@ -386,6 +459,8 @@ def main() -> int:
         return 0
 
     doc["_cargo_toml"] = args.cargo
+    doc["_target_rs"] = args.target_rs
+    doc["_ota_publish"] = args.ota_publish
     fails = check(doc, args.repro, args.budget)
     jobs = matrix(doc)
     builds = [c for c, s in doc["chips"].items() if s["builds"]]
