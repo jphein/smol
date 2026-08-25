@@ -545,3 +545,284 @@ Also closed while there: `docs/BUILDING.md:85`'s stated unknown — *"whether v4
 esp-hal 1.1 image"* — is **answered yes for the S3 radio tier** by tonight's M2 flash log
 (espflash 4.5.0 writing an esp-hal 1.1.2 image, board booted). The C3 case and the no-radio case
 are still open, and the `wifi`-gated `esp_app_desc!()` predicts the latter will be *refused*.
+
+---
+
+## §6 — THE LINK ATTEMPT, 2026-08-25 (nebula-smol): it does NOT link, for two independent reasons
+
+The rung above `checks`. Ran boardless on familiar against a **pristine rsync of main `5c3a9a0`**
+into `/var/tmp/ftarget/s3link-src`, provisioned by `tools/ci_provision.sh` (throwaway CI values).
+
+> ### Verdict in one line
+> **`cargo build --release` for the canonical tier FAILS — two independent blockers, neither of
+> them smol's source code.** Zero `error[E…]` diagnostics were produced by either. One is a
+> **one-line config omission** (verified fix below); the other is an **Xtensa LLVM backend crash
+> under `lto = "fat"`** that `lto = "thin"` walks around. With both worked around, the canonical
+> tier links, produces a flashable image, and its **#349 descriptor reads `chip = 3` with a valid
+> checksum** — closing #398's unchecked box.
+
+### 6.0 ⚠️ An infrastructure finding that had to be dealt with first
+
+`~/Projects/smol` on familiar — the Syncthing mirror every offloaded cargo invocation uses —
+has a **`rust/clock/.cargo/config.toml` frozen at 2026-07-20 20:31**, while its sibling
+directories updated today (`05:46`). It still carries the `[env] ESP_WIFI_CONFIG_*` block that
+`b2537c4` (#233) removed, and has **neither the `riscv32imac` nor the `xtensa` target section**.
+There is no `.stignore` in the folder root, so the cause is upstream of the tree.
+
+**Why this mattered before a single byte was compiled:** `cargo check` never links, so #405/#407's
+evidence is unaffected and remains valid. **A `build` is the first thing that would touch those
+sections** — and a C5/C6 build from that mirror would silently lose `linker = "rust-lld"` and
+`-Tlinkall.x` too. Rather than edit a synced tree, everything below was built from a **pristine
+copy**, the `tools/gate.sh` #363 pattern. *(Flagged, not fixed — outside this lane.)*
+
+### 6.1 Blocker A — `.cargo/config.toml`'s xtensa arm has no linker script. **129 undefined references.**
+
+The **default** tier (`esp32s3,hw`) compiles and reaches `ld`, which emits **129 undefined
+references** and zero source errors:
+
+```
+undefined reference to `_bss_start' / `_bss_end' / `_data_start' / `_sidata' / `_init_start'
+undefined reference to `_stack_start_cpu0' / `_stack_end_cpu0' / `__stack_chk_guard'
+undefined reference to `_rtc_fast_bss_start' … `_rtc_slow_persistent_end'
+undefined reference to `__exception' / `NMI' / `level4_interrupt' / `Software0' / `Timer0' …
+undefined reference to `AES' `GPIO' `SPI2' `UART0' `WIFI_MAC' `DMA_IN_CH0' … (the S3 vector table)
+```
+
+Those are **linker-script symbols** — `stack.x` defines `_stack_start`/`__stack_chk_guard`,
+`esp32s3.x` `PROVIDE`s the interrupt vector defaults. They are all missing at once because the
+script is never included. Compare the arms on `main`:
+
+```toml
+[target.riscv32imc-unknown-none-elf]      [target.xtensa-esp32s3-none-elf]
+rustflags = [                              rustflags = [
+    "-C", "linker-flavor=ld.lld",              "-C", "force-frame-pointers",
+    "-C", "link-arg=-Tlinkall.x",   ← MISSING  # (comment explains the absent `linker` pin,
+    "-C", "force-frame-pointers",              #  which IS correct — xtensa has no LLD backend)
+]                                          ]
+```
+
+The section's comment correctly explains why there is no `linker`/`linker-flavor` pin. **It says
+nothing about `-Tlinkall.x`, and that omission looks unintentional** — every other firmware target
+in the file carries it.
+
+**✅ Fix verified in the throwaway tree** (inserting one line, `"-C", "link-arg=-Tlinkall.x",`):
+
+| default tier | undefined refs | result |
+|---|---:|---|
+| as `main` configures it | **129** | link fails |
+| **+ `-Tlinkall.x`** | **0** | **links — 293,192 B ELF, `Finished in 30.41s`** |
+
+**NOT APPLIED to the repo** (lane discipline). It is a one-line change to
+`rust/clock/.cargo/config.toml` and it is the whole of Blocker A.
+
+> **Why `checks` could not have caught this**, stated because it is the interesting part:
+> `cargo check` does not link. The `checks` rung is honest about its scope — the script's own
+> header says *"It does NOT link… a green run here says nothing about"* the `builds` rung. This
+> is that sentence being paid out: four chips check clean and the S3's link was never once
+> attempted. The rung did its job; the gap was real and one rung up.
+
+### 6.2 Blocker B — `rustc-LLVM ERROR: Incomplete scavenging after 2nd pass`, and it is `lto = "fat"`
+
+The **canonical** tier (`espnow,cast,io`) never reaches the linker at all. The entire dependency
+graph and smol's own `libclock` rlib build; codegen of the final binary then crashes:
+
+```
+rustc-LLVM ERROR: Incomplete scavenging after 2nd pass
+error: could not compile `clock` (bin "clock")
+```
+
+Exactly **one** error, **zero** source diagnostics. This is the Xtensa backend's register
+scavenger failing to find a spare register (LLVM's PrologEpilogInserter), the classic symptom of
+an over-large stack frame in a very large function.
+
+**It is independent of Blocker A** — verified by re-running with `-Tlinkall.x` applied: identical
+crash. And it is **specific to fat LTO**:
+
+| canonical tier | result |
+|---|---|
+| `lto = "fat"` (the profile `rust/clock/Cargo.toml` declares) | ❌ `Incomplete scavenging after 2nd pass` |
+| **`lto = "thin"`** (`CARGO_PROFILE_RELEASE_LTO=thin`, nothing else changed) | ✅ **links — 1,610,828 B ELF, 44.31s** |
+
+⚠️ **`lto = "thin"` is NOT a fix, and must not be adopted casually.** Two reasons, both in the
+profile's own comments: esp-radio *"strongly recommends"* LTO for the timing-sensitive radio
+blobs, and the **`#32 build gate`** — a per-package `opt-level = "z"` for `ed25519-compact` whose
+entire premise is *"under opt=s + fat-LTO, `double_scalarmult_vartime` inlines into a single
+~1 MB function"*. Change the LTO mode and that gate's measured premise no longer describes the
+build. A thin-LTO image is off-contract on both axes.
+
+**It is a diagnostic, and it is a good one:** it localises the bug to fat-LTO codegen rather than
+to smol, esp-hal, or the linker, and it produced the first linked canonical-tier S3 artifact.
+
+### 6.3 What was measured once both blockers were worked around
+
+Two frozen ELFs (own-rule: copy + hash before measuring):
+
+| | `default-fat.elf` | `canon-thin.elf` |
+|---|---|---|
+| tier | `esp32s3,hw` | `esp32s3,espnow,cast,io` |
+| LTO | **fat** (on-profile) | **thin** (⚠️ OFF-PROFILE) |
+| sha256[0:20] | `e48a5deb5d96f1b6639d` | `5ac68841dc421a18b1f5` |
+| ELF | 293,192 B | 1,610,828 B |
+
+| section | default-fat | canon-thin |
+|---|---:|---:|
+| `.rwdata_dummy` | 6,100 | 42,504 |
+| `.data` | 6,844 | 24,664 |
+| `.data.wifi` | 0 | 496 |
+| `.bss` | 100 | 155,100 |
+| **`.stack`** | **328,716** | **118,996** |
+| `.rodata` | 22,512 | 114,324 |
+| `.rodata.wifi` | 0 | 29,704 |
+| `.text` | 66,771 | 820,045 |
+| `.rwtext` + `.rwtext.wifi` | 5,076 + 0 | 9,356 + 32,124 |
+| `.flash.appdesc` | **absent** | 256 |
+
+✅ **§1.3's memory-map derivation is confirmed on a real smol image, not just the spike:** both
+`.stack` sections end at exactly `0x3FCDB700` = `dram_seg`'s end. The `.stack`-is-the-leftover
+rule holds.
+
+**Preliminary DRAM read, and it is encouraging:** the canonical tier links with **118,996 B** of
+`.stack` — above the C3's 74,208 B floor with ~1.6× margin, and that is *with* thin LTO's
+larger code. ⚠️ **This is not a verdict.** Fat LTO will change `.bss`/`.data`, the S3 has no
+measured floor of its own (§1.5), and a linked region has never been evidence of a runnable
+image (#300). **It is a shape, not a number.**
+
+### 6.4 ✅ The `esp_app_desc` prediction — TESTED, and it was right
+
+PARTITIONS.md §5 recorded this as *"predicted, not tried"*. It is now tried:
+
+| tier | descriptor in ELF | `espflash save-image` |
+|---|---|---|
+| **default (no radio)** | **absent** | ❌ **rc=1 — refused**: *"You may need to add the `esp_bootloader_esp_idf::esp_app_desc!()` macro to your application"* |
+| canonical (radio) | present (256 B) | ✅ rc=0 |
+
+`esp_app_desc!()` is `wifi`-gated in `main.rs`, so the no-radio tier emits none and espflash 4.5
+hard-requires one (`docs/RELEASES.md:129-130`). **A default-tier S3 image can be built but cannot
+be packaged.** Worth knowing before someone reaches for the default tier as "the simple one".
+
+### 6.5 ✅ #398's unchecked box — the #349 descriptor, CHECKED not assumed
+
+`espflash save-image --chip esp32s3 --flash-size 16mb --partition-table targets/s3-cyd/partitions-ota-s3.csv`
+→ **1,032,112 B image, 16.40% of the 6,291,456 B slot** — the first end-to-end use of
+`partitions-ota-s3.csv` with a real smol image, and espflash resolved the slot from it.
+
+Scanning that image for the `SMLT` magic and decoding all 16 bytes, checksum recomputed with
+`target.rs`'s own FNV-1a/32:
+
+```
+@0x9dd8  raw=534d4c5401030f00010000006353d769
+  desc_version = 1
+  chip         = 3  ->  esp32s3          ✅  #398's box
+  features     = 0x000f -> WIFI|ESPNOW|IO|CAST   (exactly the canonical tier; espnow ⇒ wifi)
+  compat = 1 · min_from_compat = 0 · reserved = 0
+  checksum     = 0x69d75363 ; recomputed 0x69d75363  ->  VALID ✅
+```
+
+⚠️ **Caveat that keeps this honest:** the image was built with **thin LTO** (§6.2). The
+descriptor's *content* is a compile-time constant and is unaffected by the LTO mode, so
+`chip = 3` is a real result. The image it was read out of is not the shippable one.
+
+**A second `SMLT` at `0x25110` is a false positive — and it corroborates the design.** Its context
+is `…MenuBattGridHunt` **SMLT** `…slot…`: the `MAGIC` constant itself, sitting in `.rodata` among
+smol's string literals. Its checksum recomputes to `0x1c590e69` against a stored `0x746f6c73`
+(ASCII `"slot"`) → rejected. `DescScan::feed_byte`'s comment names this exact case — *"a magic
+that only matched by accident (**the scanner's own immediate**, say) fails here and scanning
+continues"* — and here it is, in a real image, doing precisely that. **The hypothetical in the
+comment is now an observed fact.**
+
+*(One narrow gap noticed while reading it, not a finding: after a failed 16-byte candidate the
+scanner resets `n = 0` and discards those bytes, so a genuine descriptor whose magic began inside
+the failed candidate's 12-byte tail would be missed. It needs two `SMLT` within 12 bytes. Noted
+for completeness, not raised as a defect.)*
+
+### 6.6 The poison row — OBSERVED, not inferred
+
+§4 recorded the ruling; this is the behaviour.
+
+**On the canonical tier it is inert, as designed.** `CHIP`'s only consumers are the `bard`
+predicates, and the canonical tier has no `bard` — smol's entire library compiled for the S3 with
+`UNMEASURED` selected, and the build died in LLVM, not in `budget.rs`.
+
+**On a budget-predicated tier it refuses, and says the right thing first.** `--features
+esp32s3,bard,espnow,cast,io` (deliberately **without** `off-fleet`) produces three
+`error[E0080]`s, and the *dedicated* one fires first:
+
+> ``error[E0080]: evaluation panicked: `bard` is budget-predicated, and THIS CHIP HAS NO MEASURED
+> ChipBudget row (src/budget.rs). The verdict is refused for want of data, NOT because the feature
+> is too big — do not read the DRAM/FLASH messages below as applying here, and do not shrink the
+> model to satisfy a budget nobody has measured.`` — `src/budget.rs:611`
+
+The DRAM and FLASH asserts then also fire (all-zero row ⇒ `fits_*` false for every cost), exactly
+as the poison row's doc predicts — and the first message pre-emptively tells you to disregard
+them. **The design works as written.** Adding `off-fleet` waives all three and the tier checks
+clean (rc=0), which is the `bard` tier's declared behaviour.
+
+🐛 **One stale sentence found inside those messages.** The DRAM assert advises: *"build it for a
+chip whose row has the room (#331 — **the S3 and C6 do**)"*. The S3 has **no row at all** — the
+assert three lines above literally says so. Two statements in one file contradict each other, and
+the reader has just been told the first one is the authoritative one. *(Not fixed — `rust/clock`
+is not my lane. `budget.rs:~636`.)*
+
+### 6.7 The stack-floor gate on a non-C3 — what fires
+
+`repro_stack_floor()` greps for **one hardcoded chip name**:
+
+```awk
+/^pub const ESP32C3_STACK_FLOOR_BYTES: u32 =/ { ... }
+```
+
+It fails closed when it cannot read *that* line — but on an S3 build it reads it perfectly well
+and hands `repro_stack_check` **the C3's floor (74,208 B)**. The S3's linked `.stack` is
+118,996 B, so the gate would print `stack: 118996 B (floor 74208 B)` and **pass**.
+
+⚠️ **That green is meaningless**, and it is worse than a red: the number it compared against
+belongs to different silicon. This is the §3.5 blocker confirmed by running it rather than reading
+it — the gate does not fail closed on the *chip* axis, only on the *readability* axis. Any S3
+publish path needs a per-chip floor lookup before this gate means anything.
+
+### 6.8 Error inventory — the work order
+
+In the #407 catalogue format that made the last round tractable. **Note the shape has changed:
+zero source errors. Both items are build-system/toolchain, not smol's code.**
+
+| # | class | tier | error | status |
+|---|---|---|---|---|
+| **A** | **config** | default *and* canonical | 129 × `undefined reference` (linker-script + vector-table symbols) — `.cargo/config.toml`'s xtensa arm lacks `-C link-arg=-Tlinkall.x` | **root-caused; fix verified in a throwaway tree; ONE LINE; not applied** |
+| **B** | **toolchain (LLVM)** | canonical only | `rustc-LLVM ERROR: Incomplete scavenging after 2nd pass` — Xtensa register scavenger, fat-LTO codegen of `bin "clock"` | **characterised: `lto=thin` links, `lto=fat` does not. No smol-side fix known.** |
+
+**Suggested next steps, in order of cost:**
+1. Apply A (one line) and re-run — it unblocks the default tier immediately and is needed
+   regardless of B.
+2. For B, bisect the pressure rather than the code: try `codegen-units > 1` under fat LTO, and
+   `opt-level = "z"` globally, before concluding the profile must change. If fat LTO proves
+   unusable on Xtensa, that is a **`builds`-rung blocker to record in `[chip.esp32s3]`** and
+   probably an upstream (`esp-rs` / LLVM Xtensa) report — the crash is in the backend, not in
+   anything smol can edit.
+3. Only then is `baseline_image_bytes` measurable, because it must come from an **on-profile**
+   (fat-LTO) canonical image. **1,032,112 B is NOT that number** — it is thin-LTO's.
+
+### 6.9 Honesty ledger for §6
+
+**✅ Verified — ran it:** the two failures and their exact messages; that A's fix works (129 → 0);
+that B is LTO-specific and independent of A; both ELFs' sections (frozen + hashed); the
+`espflash` refusal of the descriptor-less default tier; the canonical image size against the
+designed slot; the descriptor's `chip = 3` with an independently recomputed checksum; the second
+`SMLT`'s origin and rejection; all three poison-row asserts and their order; that `off-fleet`
+waives them; that `repro_stack_floor` hands an S3 build the C3's number; familiar's stale mirror
+config (mtime + content).
+
+**🔶 Inferred:** that "Incomplete scavenging" means a register-scavenger failure on a large stack
+frame — that is the standard reading of the LLVM message, not something I proved for this build.
+That the missing `-Tlinkall.x` was unintentional rather than a deliberate choice with an
+unwritten reason.
+
+**❌ Not established:** the canonical tier has **never linked on-profile**, so no number here is a
+candidate `baseline_image_bytes` or `free_dram_bytes`. Nothing was flashed. Whether `codegen-units`
+or `opt-level` also move B is untested. Whether the C3/C5/C6 builds are affected by the same
+missing-link-arg class was not checked — their arms *do* carry `-Tlinkall.x`, so they should not
+be, but I did not build them.
+
+**⚠️ Provisioning note:** built with `ci_provision.sh` throwaway values, so `.rodata`/`.data`
+carry the example literals. `tools/build-matrix.toml` already documents that the same commit
+measures differently across trees for exactly this reason — a few hundred bytes, and it changes
+none of the verdicts above.
