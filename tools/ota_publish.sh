@@ -33,6 +33,14 @@ set -euo pipefail
 # ---- config (matches the deployed image host + broker legs) -----------------
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLOCK="$REPO/rust/clock"
+# Staged images and any scratch land in the REPO, never /tmp (JP directive 2026-08-25) — katana's
+# /tmp is a 16 GB tmpfs (RAM+swap), and a staged image is ~1.2 MB that an operator may well want to
+# still exist after the shell that made it. `$REPO/tmp` is git-ignored (tmp/.gitignore) and on disk.
+# NOTE: `die` is defined further down, so this uses a plain exit — the config block runs before
+# the helpers exist.
+SMOL_TMP="$REPO/tmp"
+mkdir -p "$SMOL_TMP" || { echo "ota_publish: cannot create $SMOL_TMP" >&2; exit 1; }
+export TMPDIR="$SMOL_TMP"
 ESPFLASH="${ESPFLASH:-$HOME/.cargo/bin/espflash}"
 # #44: reproducible-build helpers — the release build below goes through repro_build_bin so
 # the announced sha256 is a stable, verifiable (commit) identity (see tools/verify_image.sh).
@@ -302,7 +310,7 @@ BUILD="$(choose_build "$COUNT" "$STAGED" "$BUILD_OVERRIDE")"
 # above: ONE reproducible image, one sha per commit for the whole fleet.
 if [ -z "$BIN" ]; then
   echo "building reproducible espnow release @ $HASH (build $BUILD) ..."
-  BIN="/tmp/smol-${BUILD}.bin"
+  BIN="$SMOL_TMP/smol-${BUILD}.bin"
   # #326: staging IS the release act, so stamp it as one HERE rather than hoping the
   # operator remembered `export SMOL_RELEASE=1`. Before this line the release-vs-dev stamp
   # of a STAGED image depended on the operator's shell: repro_build.sh's comment said "the

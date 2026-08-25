@@ -93,6 +93,21 @@ cd "$(dirname "$0")/.."
 ROOT="$PWD"
 CLOCK="rust/clock"
 
+# ── Temp artifacts live in the REPO, not in /tmp (JP directive 2026-08-25) ─────────────────────
+# katana's `/tmp` is a 16 GB **tmpfs** — RAM+swap, not disk. This gate alone writes a log per tier
+# per arm (checks, clippy, exclusions, host bins, test suites), and on 2026-08-25 accumulated temp
+# artifacts filled 13 GB of that tmpfs and starved the machine. Logs are small; the rule is not
+# about this gate's own footprint but about having ONE place per project where temp output goes, so
+# nobody has to audit which script was the greedy one.
+#
+# `$ROOT/tmp` is git-ignored (`tmp/.gitignore` = `*` + `!.gitignore`) and is created on first need.
+# Overridable so CI (whose `/tmp` is ordinary disk) or a caller with a scratch volume can redirect.
+GATE_TMP="${SMOL_GATE_TMP:-$ROOT/tmp}"
+mkdir -p "$GATE_TMP" || { echo "gate: cannot create $GATE_TMP" >&2; exit 2; }
+# `mktemp` and every child process honour TMPDIR, so this covers the tools this script CALLS as
+# well as its own redirects — which is the point: the callees are where the big artifacts appear.
+export TMPDIR="$GATE_TMP"
+
 # #363 — the root the COMPILING arms build from. `$ROOT` (i.e. your checkout) unless the pristine
 # mirror below is engaged, in which case the tiers are built from a copy whose git-ignored
 # provisioning matches what CI generates. Source-READING arms (shed order, DIAG budget, byte-free
@@ -118,7 +133,7 @@ JOBS=()
 [ -n "${SMOL_GATE_JOBS:-}" ] && JOBS=(-j "$SMOL_GATE_JOBS")
 
 # Where the stack verdict is left for a caller (CI lifts it into the PR job summary).
-STACK_REPORT="${SMOL_GATE_STACK_REPORT:-/tmp/gate-stack-report}"
+STACK_REPORT="${SMOL_GATE_STACK_REPORT:-$GATE_TMP/gate-stack-report}"
 rm -f "$STACK_REPORT"
 
 step() { printf '\n\033[1m── %s\033[0m\n' "$1"; }
@@ -339,10 +354,10 @@ if [ "$run_fw" = 1 ]; then
       printf '   \033[33mSKIP\033[0m %-16s (feature not in Cargo.toml on this branch)\n' "$name"; continue
     fi
     args=(--release "${JOBS[@]}"); [ -n "$feats" ] && args+=(--features "$feats")
-    if (cd "$BUILD_ROOT/$CLOCK" && cargo check "${args[@]}") >/tmp/gate-$name.log 2>&1; then
+    if (cd "$BUILD_ROOT/$CLOCK" && cargo check "${args[@]}") >"$GATE_TMP/gate-$name.log" 2>&1; then
       ok "check $name"
     else
-      bad "check $name"; tail -15 /tmp/gate-$name.log | sed 's/^/        /'
+      bad "check $name"; tail -15 "$GATE_TMP/gate-$name.log" | sed 's/^/        /'
     fi
   done < <("$ROOT/tools/build_matrix.py" emit --for check)
 
@@ -355,18 +370,19 @@ if [ "$run_fw" = 1 ]; then
   # true instead of "every tier someone remembered to add here". The fleet tier is named
   # `fleet` in both loops now — it was `canonical` here and `fleet` above, which is why the
   # two lists could disagree without looking like they did. Log path moves with the name:
-  # /tmp/gate-clippy-fleet.log, was /tmp/gate-clippy-canonical.log.
+  # $GATE_TMP/gate-clippy-fleet.log, was $GATE_TMP/gate-clippy-canonical.log (and both were
+  # under /tmp until the 2026-08-25 tmpfs directive — see the GATE_TMP block at the top).
   step "cargo clippy -D warnings — every tier"
   while IFS=$'\t' read -r name feats; do
     if [ -n "$feats" ] && ! grep -qE "^${feats%%,*} *=" "$BUILD_ROOT/$CLOCK/Cargo.toml"; then
       printf '   \033[33mSKIP\033[0m %-16s (feature not in Cargo.toml on this branch)\n' "$name"; continue
     fi
     args=(--release "${JOBS[@]}"); [ -n "$feats" ] && args+=(--features "$feats")
-    if (cd "$BUILD_ROOT/$CLOCK" && cargo clippy "${args[@]}" -- -D warnings) >/tmp/gate-clippy-$name.log 2>&1; then
+    if (cd "$BUILD_ROOT/$CLOCK" && cargo clippy "${args[@]}" -- -D warnings) >"$GATE_TMP/gate-clippy-$name.log" 2>&1; then
       ok "clippy $name"
     else
       bad "clippy $name"
-      grep -E "^(error|warning)" /tmp/gate-clippy-$name.log | grep -v "could not compile" \
+      grep -E "^(error|warning)" "$GATE_TMP/gate-clippy-$name.log" | grep -v "could not compile" \
         | sort -u | sed 's/^/        /' | head -12
     fi
   done < <("$ROOT/tools/build_matrix.py" emit --for clippy)
@@ -403,7 +419,7 @@ if [ "$run_excl" = 1 ]; then
   # tree (seen 2026-08-02: lucid chased a spurious comp_dir failure to exactly this). Per-
   # worktree dirs keep rebuilds warm per checkout, kill cross-worktree pollution AND remove
   # cross-worktree lock contention; the flock below still serializes same-worktree runs.
-  EXCL="${SMOL_GATE_EXCL_DIR:-/tmp/gate-exclusions-$(printf %s "$ROOT" | cksum | cut -d' ' -f1)}"
+  EXCL="${SMOL_GATE_EXCL_DIR:-$GATE_TMP/gate-exclusions-$(printf %s "$ROOT" | cksum | cut -d' ' -f1)}"
   mkdir -p "$EXCL/elf"
   # Concurrent gates sharing the default $EXCL wipe each other's build tree mid-compile and
   # report failures that have nothing to do with the code (seen 2026-08-02: "Blocking waiting
@@ -421,11 +437,11 @@ if [ "$run_excl" = 1 ]; then
     args=(--release --bin clock "${JOBS[@]}"); [ -n "$feats" ] && args+=(--features "$feats")
     if (cd "$BUILD_ROOT/$CLOCK" && CARGO_TARGET_DIR="$EXCL/target" \
           CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build "${args[@]}") \
-          >/tmp/gate-excl-$name.log 2>&1; then
+          >"$GATE_TMP/gate-excl-$name.log" 2>&1; then
       cp "$EXCL/target/$REPRO_TARGET/release/clock" "$EXCL/elf/$name"
       EXCL_ARGS+=(--elf "$name=$feats=$EXCL/elf/$name")
     else
-      bad "exclusions build $name"; tail -15 /tmp/gate-excl-$name.log | sed 's/^/        /'
+      bad "exclusions build $name"; tail -15 "$GATE_TMP/gate-excl-$name.log" | sed 's/^/        /'
     fi
   done < <("$ROOT/tools/build_matrix.py" emit --for check)
   if [ ${#EXCL_ARGS[@]} -eq 0 ]; then
@@ -447,7 +463,7 @@ if [ "$run_fw" = 1 ]; then
   step "stack floor — canonical ELF vs ${REPRO_STACK_FLOOR:-$(repro_stack_floor || echo unreadable)} B"
   if repro_cargo_args "$BUILD_ROOT/$CLOCK" 2>/dev/null && \
      (cd "$BUILD_ROOT/$CLOCK" && cargo build --release "${JOBS[@]}" --features "$REPRO_FLEET_FEATURES" "${REPRO_CARGO_ARGS[@]}") \
-       >/tmp/gate-stack.log 2>&1; then
+       >"$GATE_TMP/gate-stack.log" 2>&1; then
     ELF="${CARGO_TARGET_DIR:-$BUILD_ROOT/$CLOCK/target}/${REPRO_TARGET}/release/clock"
     # Capture the verdict to a file as well as the console: CI lifts it into the job summary so the
     # number is visible without opening logs. Written on FAILURE too — "the stack broke the floor"
@@ -461,7 +477,7 @@ if [ "$run_fw" = 1 ]; then
   else
     bad "stack floor (canonical build failed)"
     echo "canonical build failed before the stack could be measured" > "$STACK_REPORT"
-    tail -15 /tmp/gate-stack.log | sed 's/^/        /'
+    tail -15 "$GATE_TMP/gate-stack.log" | sed 's/^/        /'
   fi
   # #351 arm (b): CORROBORATION on the ELF the stack step just built — the real, non-debug,
   # shipped-geometry binary. The excluded-module list is DERIVED from the tier's features
@@ -492,10 +508,10 @@ if [ "$run_host" = 1 ]; then
     [ -f "$d/Cargo.toml" ] || continue
     n=$(basename "$d")
     case "$n" in *_verify|relay_compat) ;; *) continue ;; esac
-    if (cd "$d" && cargo run --release -q "${JOBS[@]}") >/tmp/gate-$n.log 2>&1; then
+    if (cd "$d" && cargo run --release -q "${JOBS[@]}") >"$GATE_TMP/gate-$n.log" 2>&1; then
       ok "$n"
     else
-      bad "$n"; tail -10 /tmp/gate-$n.log | sed 's/^/        /'
+      bad "$n"; tail -10 "$GATE_TMP/gate-$n.log" | sed 's/^/        /'
     fi
   done
 
@@ -518,12 +534,12 @@ if [ "$run_host" = 1 ]; then
     [ -f "$t" ] || continue
     n=$(basename "$t" .rs)
     if (cd "$ROOT/$CLOCK" && cargo test --no-default-features --features hostsim \
-          --target "$HOST_TRIPLE" --test "$n" "${JOBS[@]}") >/tmp/gate-test-$n.log 2>&1; then
+          --target "$HOST_TRIPLE" --test "$n" "${JOBS[@]}") >"$GATE_TMP/gate-test-$n.log" 2>&1; then
       # Print the count rather than a bare PASS: "8 passed" is checkable, "ok" is not, and a
       # suite that silently starts running ZERO tests still says ok.
-      ok "test $n — $(grep -Eo '[0-9]+ passed' /tmp/gate-test-$n.log | tail -1)"
+      ok "test $n — $(grep -Eo '[0-9]+ passed' "$GATE_TMP/gate-test-$n.log" | tail -1)"
     else
-      bad "test $n"; tail -12 /tmp/gate-test-$n.log | sed 's/^/        /'
+      bad "test $n"; tail -12 "$GATE_TMP/gate-test-$n.log" | sed 's/^/        /'
     fi
   done
 

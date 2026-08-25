@@ -49,6 +49,13 @@ env:
   CARGO_TERM_COLOR: always
   # Keep a runner's memory in bounds: these are LTO release builds of an embedded crate.
   SMOL_GATE_JOBS: 2
+  # Where gate.sh leaves the stack verdict, declared ONCE so the arm that WRITES it and the summary
+  # step that READS it cannot drift. They were two independent `/tmp/gate-stack-report` literals in
+  # two files until 2026-08-25 — and when `tools/gate.sh`'s default moved out of `/tmp` (JP's tmpfs
+  # directive: katana's /tmp is a 16 GB RAM-backed tmpfs), a workflow still reading the old literal
+  # would have reported "stack number unavailable" on every run while every gate stayed green. Set
+  # explicitly rather than relying on the script's default, so this file states what it reads.
+  SMOL_GATE_STACK_REPORT: ${{ github.workspace }}/tmp/gate-stack-report
 
 jobs:
   # Split so a Rust-only breakage is distinguishable at a glance from a host-logic regression,
@@ -95,8 +102,8 @@ jobs:
         run: |
           {
             echo "### Canonical image stack"
-            if [ -s /tmp/gate-stack-report ]; then
-              echo '```'; cat /tmp/gate-stack-report; echo '```'
+            if [ -s "$SMOL_GATE_STACK_REPORT" ]; then
+              echo '```'; cat "$SMOL_GATE_STACK_REPORT"; echo '```'
             else
               echo "_stack number unavailable — the canonical build did not reach the check._"
             fi
