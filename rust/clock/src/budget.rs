@@ -633,7 +633,8 @@ const _: () = assert!(
      (.bss + .data) is larger than free_dram_bytes - stack_floor_bytes, so the linker would \
      take the difference out of the runtime stack and shrink it below the floor SILENTLY — \
      the image would link and then die on hardware (#300, #335, #347). \
-     Options: build it for a chip whose row has the room (#331 — the S3 and C6 do); shrink \
+     Options: build it for a chip with a declared row that has the room (the C6's is measured; \
+     the S3 has NO row yet — #398 — despite what an older revision of this message claimed); shrink \
      the cost (`SEQ_CAP` in src/bard/nano_llm.rs is the lever) and re-measure BOTH the cost \
      and the budget; or, if this build is deliberately not the C3 fleet image, add the \
      `off-fleet` feature — which tools/repro_build.sh then refuses to package."

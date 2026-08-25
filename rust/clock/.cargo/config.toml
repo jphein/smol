@@ -101,6 +101,11 @@ rustflags = [
 [target.xtensa-esp32s3-none-elf]
 rustflags = [
     "-C", "force-frame-pointers",
+    # The linker script, same as both riscv arms. Its absence was found by the first LINK ever
+    # attempted for this target (#398's probe, 2026-08-25): `checks` passes without it — cargo
+    # check never links — and then `ld` emits 129 undefined references (_bss_start, __exception,
+    # the whole S3 vector table), every one a linkall.x symbol. With the line: 129 → 0.
+    "-C", "link-arg=-Tlinkall.x",
     # No `linker`/`linker-flavor` override here, unlike the riscv targets. Those pin `rust-lld`
     # because THIS MACHINE's `cc` is a non-compiler shim that must not be in the link path. The
     # xtensa target has no LLD backend and links through the esp GCC driver that `export-esp.sh`
