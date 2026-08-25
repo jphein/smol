@@ -49,6 +49,11 @@ use esp_hal::{
     time::Instant,
 };
 use embassy_futures::block_on;
+// #397 STEP B2: the bounded announce send. `select` races the send future against a deadline;
+// `Timer` is the deadline. Both are available on every radio tier because #391 turned on
+// esp-rtos's `embassy` feature (which supplies embassy-time's driver) and `espnow` implies `wifi`.
+use embassy_futures::select::{select, Either};
+use embassy_time::{Duration as EmbassyDuration, Timer};
 use esp_radio::{
     esp_now::{EspNow, EspNowWifiInterface, PeerInfo, BROADCAST_ADDRESS},
     wifi::{scan::ScanConfig, sta::StationConfig, Config, WifiController},
@@ -2383,6 +2388,119 @@ pub fn now_ms() -> u64 {
 #[inline]
 fn abandon_tx(waiter: esp_radio::esp_now::SendWaiter<'_>) {
     core::mem::forget(waiter);
+}
+
+/// #397 / #335 STEP B (part 2 of 2): how long an OTA-announce send may take before we stop
+/// believing its completion. The watch's proven value (`smol_mesh.rs:182`, `TX_WAIT_MS = 30`),
+/// which fixed real UI deaf-windows on hardware.
+///
+/// Not tunable per site on purpose: the two announce sites are the same send of the same frame
+/// under the same radio conditions, and two deadlines would be two behaviours to reason about.
+#[cfg(feature = "espnow")]
+const TX_WAIT: EmbassyDuration = EmbassyDuration::from_millis(30);
+
+/// #397 STEP B2: set when a send's completion was still outstanding at `TX_WAIT`, i.e. we walked
+/// away from a callback that may still land.
+///
+/// ── WHY A FLAG AND NOT A DRAIN (PHASE3-PLAN §3.3 amended) ─────────────────────────────────────
+/// §3.3 spec'd this flag as a trigger to "bounded-drain `ESP_NOW_SEND_CB_INVOKED` before issuing".
+/// That is both impossible (the flag is private to esp-radio) and unnecessary: esp-radio already
+/// clears it immediately before every send, on both paths — `mod.rs:560` (sync) and `mod.rs:964`
+/// (`SendFuture::poll`'s first poll). A stale completion landing *before* the next send is already
+/// erased.
+///
+/// What is left is the case no drain could fix: a completion landing *after* the next send has
+/// cleared the flag and issued, so that send reads the PREVIOUS send's `ESP_NOW_SEND_STATUS` as its
+/// own. Fixing that needs a generation counter inside esp-radio (§3.3 considered and rejected it as
+/// upstream). So instead of pretending to prevent it, this flag makes it VISIBLE: the next
+/// evidence-bearing send records its result as untrusted rather than as proof of egress.
+///
+/// ── WHY IT IS SET ONLY ON TIMEOUT, WHICH IS A SENSITIVITY DECISION ────────────────────────────
+/// `abandon_tx`'s three sites also walk away from completions, and in principle one of those could
+/// land late too. They deliberately do NOT set this flag. Setting it there would mean the
+/// pre-announce site — which fires every 120 ms during the same relay — tainted essentially every
+/// announce, and a taint that is always on carries no information: the instrument would report
+/// "untrusted" forever and §3.2(ii)'s evidence would be lost to the mitigation rather than to the
+/// bug. A timeout is the case we can actually DETECT (a completion provably later than `TX_WAIT`),
+/// and it is the case §3.3 names. The `abandon_tx` residual stays what B1 recorded it as: real,
+/// un-observable from here, and bounded by esp-radio's clear-before-send.
+/// ── WHY `portable_atomic` AND NOT `core::sync::atomic` ────────────────────────────────────────
+/// `riscv32imc` has **no atomic read-modify-write instructions** (no `A` extension), so core's
+/// `AtomicBool` on this target offers only `load`/`store` — `swap` does not exist and the build
+/// fails with "no method named `swap` found for struct `Atomic<T>`". A take-and-clear needs RMW.
+/// `portable-atomic` polyfills it (a critical section under `unsafe-assume-single-core`, which
+/// esp-sync/esp-radio-rtos-driver already enable in this graph), and #391 added the explicit
+/// `portable-atomic` dep line for exactly this: "so the code Phase 1 writes can name the crate".
+/// Load-then-store would also work here — only the superloop task touches this flag, the ESP-NOW
+/// callback touches esp-radio's own globals — but a non-atomic take-and-clear is a trap for the next
+/// reader once P1.4/P1.5 spawn tasks, and the polyfill costs nothing this graph is not already paying.
+#[cfg(feature = "espnow")]
+static TX_ABANDONED: portable_atomic::AtomicBool = portable_atomic::AtomicBool::new(false);
+
+/// #397 STEP B2: the outcome of a bounded announce send. Three states, not two, because
+/// PHASE3-PLAN §3.2(ii) is explicit that under a bounded scheme **a timeout is neither a success
+/// nor a confirmed failure**, and collapsing it into either corrupts the only evidence smol has
+/// that the OTA announce reached the air (`[[suspect-the-instrument-first]]`).
+#[cfg(feature = "espnow")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TxOutcome {
+    /// The callback landed inside `TX_WAIT` and reported success, with no outstanding completion
+    /// that could have been misattributed. The only outcome that counts as proof of egress.
+    Confirmed,
+    /// The callback reported failure inside the deadline. A confirmed NON-egress: honest evidence,
+    /// just negative — so it inflates neither counter.
+    Failed,
+    /// Either the deadline passed with no callback, or a callback arrived while a previous send's
+    /// completion was still outstanding (so it may have been that one's). Not egress evidence
+    /// either way.
+    Unproven,
+}
+
+impl RadioManager {
+    /// #397 STEP B2: broadcast one OTA announce, bounded at [`TX_WAIT`].
+    ///
+    /// Replaces `esp_now.send(..)` + `waiter.wait()` at the two sites whose result feeds `otam_ok`.
+    /// The sync waiter cannot be bounded from outside esp-radio at all — both `wait()` and `Drop`
+    /// spin on a private static (see `abandon_tx`) — so the outcome is obtained the only way that
+    /// admits a deadline: race the async send against a timer.
+    ///
+    /// Dropping the loser is safe here, and that is a load-bearing detail rather than an
+    /// assumption: `SendFuture` has **no `Drop` impl** in esp-radio 0.18 (only `SendWaiter` and
+    /// `EspNowRc` do), so the abandoned future does not spin the way an abandoned waiter would.
+    /// What it *does* violate is `send_async`'s doc contract ("the returned future must not be
+    /// dropped before it's ready to avoid getting wrong status for sendings") — which is exactly
+    /// what [`TX_ABANDONED`] exists to surface rather than hide.
+    #[cfg(feature = "espnow")]
+    fn tx_announce_bounded(&mut self, frame: &[u8]) -> TxOutcome {
+        use portable_atomic::Ordering;
+        // Take-and-clear: a taint describes the NEXT reading, once.
+        let tainted = TX_ABANDONED.swap(false, Ordering::AcqRel);
+        // Bind the address first — `&BROADCAST_ADDRESS` inside the future-building expression
+        // would be a temporary whose lifetime ends before `block_on` consumes the future.
+        let dst = BROADCAST_ADDRESS;
+        let outcome = {
+            let fut = self.esp_now.send_async(&dst, frame);
+            block_on(select(fut, Timer::after(TX_WAIT)))
+        };
+        match outcome {
+            Either::First(Ok(())) => {
+                if tainted {
+                    // The completion we just read may belong to the send we abandoned earlier:
+                    // esp-radio's globals carry no generation, so the two are indistinguishable.
+                    TxOutcome::Unproven
+                } else {
+                    TxOutcome::Confirmed
+                }
+            }
+            Either::First(Err(_)) => TxOutcome::Failed,
+            Either::Second(()) => {
+                // We are walking away from an in-flight completion. Say so, so the NEXT reading
+                // knows not to trust itself.
+                TX_ABANDONED.store(true, Ordering::Release);
+                TxOutcome::Unproven
+            }
+        }
+    }
 }
 
 impl RadioManager {
@@ -5506,6 +5624,12 @@ impl RadioManager {
         // #3b OTAM TX-diag: broadcast sends attempted vs returned-Ok (queued + TX-callback ok).
         let mut otam_tx: u16 = 0;
         let mut otam_ok: u16 = 0;
+        // #397 STEP B2 / §3.2(ii): the THIRD counter. `otam_tx` counts attempts and `otam_ok`
+        // counts PROVEN egress; this counts attempts whose outcome is not evidence either way —
+        // a send that outlived TX_WAIT, or one whose success may have been a previous send's
+        // completion (see TX_ABANDONED). Without it a timeout would have to be miscounted as a
+        // failure, and `otam_ok=0 while otam_tx>0` would stop meaning what its doc comment says.
+        let mut otam_to: u16 = 0;
 
         // #3b WAKE-BURST: the leaf lost the gateway during the off-ch6 fetch and is now hopping
         // [1,6,11] (on ch6 only ~⅓ of the time) and/or re-electing over WiFi — so a single OTAM
@@ -5533,10 +5657,13 @@ impl RadioManager {
             if t.saturating_sub(last_wake_ms) >= WAKE_GAP_MS {
                 let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
                 otam_tx = otam_tx.saturating_add(1);
-                if let Ok(waiter) = self.esp_now.send(&BROADCAST_ADDRESS, &otam[..otam_len]) {
-                    if waiter.wait().is_ok() {
-                        otam_ok = otam_ok.saturating_add(1);
-                    }
+                // #397 STEP B2: bounded. `waiter.wait()` here was an unbounded spin on a
+                // completion that may never come; a timeout is now counted as `otam_to` rather
+                // than silently folded into "not ok" (§3.2(ii)).
+                match self.tx_announce_bounded(&otam[..otam_len]) {
+                    TxOutcome::Confirmed => otam_ok = otam_ok.saturating_add(1),
+                    TxOutcome::Unproven => otam_to = otam_to.saturating_add(1),
+                    TxOutcome::Failed => {}
                 }
                 last_wake_ms = t;
             }
@@ -5581,7 +5708,7 @@ impl RadioManager {
                 self.leaf_relay_rx = Some(crate::net::wifi::RelayDiag {
                     leaf_id, rx_any, otan_valid, last_wb: wb as u16, total: total as u16,
                     leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
-                    otam_tx, otam_ok,
+                    otam_tx, otam_ok, otam_to,
                     settle,
                     leaf_ch: ldbg_ch,
                 });
@@ -5613,10 +5740,11 @@ impl RadioManager {
                     // (send_to swallows it) to prove egress.
                     let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
                     otam_tx = otam_tx.saturating_add(1);
-                    if let Ok(waiter) = self.esp_now.send(&BROADCAST_ADDRESS, &otam[..otam_len]) {
-                        if waiter.wait().is_ok() {
-                            otam_ok = otam_ok.saturating_add(1);
-                        }
+                    // #397 STEP B2: bounded — see the wake-phase twin above.
+                    match self.tx_announce_bounded(&otam[..otam_len]) {
+                        TxOutcome::Confirmed => otam_ok = otam_ok.saturating_add(1),
+                        TxOutcome::Unproven => otam_to = otam_to.saturating_add(1),
+                        TxOutcome::Failed => {}
                     }
                 }
                 for i in 0..wlen_chunks as usize {
@@ -5702,7 +5830,7 @@ impl RadioManager {
                     self.leaf_relay_rx = Some(crate::net::wifi::RelayDiag {
                         leaf_id, rx_any, otan_valid, last_wb: wb as u16, total: total as u16,
                         leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
-                        otam_tx, otam_ok, settle, leaf_ch: ldbg_ch,
+                        otam_tx, otam_ok, otam_to, settle, leaf_ch: ldbg_ch,
                     });
                     return LeafOtaOutcome::RelayFailed;
                 }
@@ -5714,7 +5842,7 @@ impl RadioManager {
         self.leaf_relay_rx = Some(crate::net::wifi::RelayDiag {
             leaf_id, rx_any, otan_valid, last_wb: total as u16, total: total as u16,
             leaf_heard: ldbg_heard, leaf_verdict: ldbg_verdict, leaf_sent: ldbg_sent,
-            otam_tx, otam_ok, settle,
+            otam_tx, otam_ok, otam_to, settle,
             leaf_ch: ldbg_ch,
         });
 
@@ -6383,12 +6511,37 @@ impl RadioManager {
     /// Low-level send helper: fire one frame and wait for the TX callback so we
     /// don't overrun the single in-flight ESP-NOW send slot.
     ///
-    /// RAW-SEND-SITES: send_to:1, send_arb_raw:1, run_leaf_ota_relay:3
+    /// RAW-SEND-SITES: send_to:1, send_arb_raw:1, run_leaf_ota_relay:1, tx_announce_bounded:1
     ///
-    /// Every function permitted to call `esp_now.send` directly, with its call COUNT, checked in
-    /// both directions by `tools/check_elect_send_path.py`. Counts and not just names, because
-    /// adding a fourth send inside `run_leaf_ota_relay` would otherwise slip through a name-only
-    /// allowlist — and an already-listed function is exactly where a new send is easiest to add.
+    /// Every function permitted to reach the ESP-NOW driver directly, with its call COUNT, checked
+    /// in both directions by `tools/check_elect_send_path.py`. Counts and not just names, because
+    /// adding another send inside an already-listed function is exactly where a new send is easiest
+    /// to add and a name-only allowlist would not notice.
+    ///
+    /// ── RESHAPED BY #397 STEP B2, AND THE INVARIANT RE-DERIVED ────────────────────────────────
+    /// Was `run_leaf_ota_relay:3` (5 sites / 3 fns); now `run_leaf_ota_relay:1` +
+    /// `tx_announce_bounded:1` (4 sites / 4 fns). Two things changed and BOTH are roster-visible:
+    /// the two OTA-announce sends moved into one shared helper, and that helper reaches the driver
+    /// via `send_async` — a form the old checker pattern (`send\s*\(`) did not match at all. Left
+    /// alone, bounding those sends would have moved them out of this checker's sight while leaving
+    /// them on the air; the count fell 5 -> 3 and the fail-closed arm fired instead, which is the
+    /// gate working. The checker now counts `send` and `send_async` alike.
+    ///
+    /// **Does the new site widen ELECT's egress surface? No — enumerated, not asserted:**
+    ///   1. `tx_announce_bounded` is PRIVATE (`fn`, not `pub fn`) and has exactly two callers, both
+    ///      in `run_leaf_ota_relay`, both passing `&otam[..otam_len]` — an OTAM announce frame.
+    ///   2. For an ELECT frame to reach it, something would have to obtain `SealedElect`'s bytes.
+    ///      It has no byte accessor and no `pub` field (arm 3 asserts exactly that), so the only
+    ///      way out of a seal is to hand it to a `GroupMacSink`.
+    ///   3. There is one `GroupMacSink` impl and its body routes to `send_to` (arms 1 and 2). So
+    ///      sealed ELECT bytes reach `send_to` or they reach nothing.
+    ///   4. `wire::encode` has one call site, inside `SealedElect::seal` (arm 4), and the frame
+    ///      prefix is written once (arm 5) — so a frame cannot be hand-built to skirt 2-3 either.
+    ///
+    /// The new site is therefore reachable only by OTAM, and it is declared, so a future caller
+    /// changes the roster rather than slipping past it. What this roster does NOT do — for the new
+    /// site or for the pre-existing `send_arb_raw` — is bound what a CALLER may pass; that is what
+    /// arms 1-5 are for, and it is why they are five arms and not a comment.
     ///
     /// Why the list is short and must stay short: this method is the choke that appends #190's
     /// group-MAC trailer, so every entry here is, by construction, a way for a frame to reach the

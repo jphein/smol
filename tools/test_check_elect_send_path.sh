@@ -32,6 +32,21 @@ seed() {
   cp -r "$ROOT/rust/clock/src" "$work/tree/rust/clock/src"
 }
 
+# patch1 <abs-file> <old>TAB<new> — for arms that assert rc=0 and so cannot use `arm`.
+# Deliberately NOT a refactor of `arm` below: `arm` drives the twelve pre-existing arms of a
+# SECURITY gate, and this addition has no business changing how those are executed.
+patch1() {
+  python3 - "$1" "$2" <<'PYEOF'
+import sys
+path, spec = sys.argv[1], sys.argv[2]
+old, new = spec.split("\t")
+s = open(path).read()
+if old not in s:
+    sys.exit(f"fixture setup failed: {old!r} not found — this test needs updating")
+open(path, "w").write(s.replace(old, new, 1))
+PYEOF
+}
+
 # arm <name> <want-rc> <want-substring> <file-rel-to-src> <old>TAB<new>
 arm() {
   local name="$1" want_rc="$2" want="$3" file="$4" spec="$5"
@@ -95,6 +110,30 @@ arm "prefix literal renamed away" 2 "appears NOWHERE" net/mesh_elect.rs \
   "$(printf 'b"SMOLv1 ELECT "\tb"SMOLv1 ELECTX"')"
 arm "declaration deleted" 2 "no \`RAW-SEND-SITES:\` declaration" net/mode.rs \
   "$(printf 'RAW-SEND-SITES:\tRAW-SEND-SITES-WAS-HERE:')"
+
+# ── #397 STEP B2: the `send_async` form, and comment-blindness ────────────────────────────────
+# Arm 6 was widened to count `send_async` because bounding the two OTA-announce sends moved them to
+# that form. A widened pattern is worth exactly as much as its proof of failure: if `send_async` is
+# counted only in the passing direction, the widening is a claim rather than a check.
+echo "== arm 6c: the send_async form is counted too (#397 STEP B2) =="
+arm "undeclared send_async site" 1 "arm 6 (raw-sends)" net/mode.rs \
+  "$(printf 'pub fn crown_term(&self) -> u16 {\tpub fn leak_async(&mut self) {\n        let _ = self.esp_now.send_async(&BROADCAST_ADDRESS, b"x");\n    }\n\n    pub fn crown_term(&self) -> u16 {')"
+arm "extra send_async in a declared fn" 1 "arm 6 (raw-sends)" net/mode.rs \
+  "$(printf 'let fut = self.esp_now.send_async(&dst, frame);\tlet _ = self.esp_now.send_async(&dst, frame);\n            let fut = self.esp_now.send_async(&dst, frame);')"
+
+# Both directions of the comment-stripping fix, because a checker that documentation can move is
+# worse than none — and the FALSE-GREEN direction is the one that matters on an absence check.
+echo "== regression: comments must not move the verdict, either way (#426) =="
+seed
+if patch1 "$work/tree/rust/clock/src/net/mode.rs" \
+  "$(printf 'pub fn crown_term(&self) -> u16 {\t// prose: self.esp_now.send(&x, y) and self.esp_now.send_async(&x, y)\n    /* and a block comment: esp_now.send(a, b); */\n    pub fn crown_term(&self) -> u16 {')"; then
+  out="$("$CHK" "$work/tree" 2>&1)"; rc=$?
+  if [ "$rc" = 0 ]; then ok "prose naming both send forms stays green (rc=0)"
+  else no "PROSE FLIPPED THE VERDICT: rc $rc — $out"; fi
+else no "prose regression (fixture setup)"; fi
+# The false-GREEN direction: commenting a real send out must not satisfy the roster.
+arm "commenting out a real send is caught" 1 "arm 6 (raw-sends)" net/mode.rs \
+  "$(printf 'match self.esp_now.send(dst, out) {\tmatch NOTHING { // self.esp_now.send(dst, out) {')"
 
 echo
 echo "$pass passed, $fail failed"
