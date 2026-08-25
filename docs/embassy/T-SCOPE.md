@@ -263,11 +263,88 @@ rev-1.
      **byte-identical** to the fleet tier's (86,200 B), so the instrument costs zero DRAM and its
      peak is a peak for the shipped image rather than for a near-miss of it.
 
-   **Still gates T's merge, not T's scoping.** Until a lite run exists, the honest position for the
-   record is unchanged: `.stack` is unmoved by B1/B2 (86,200 B, A/B'd), so the **floor gate** is
-   safe; the **peak** is not measured, and a `select` frame is transient stack the region size
-   cannot see. **Nothing in T should spend the 12 KB until that number exists** — §3.2 confirms
-   12,000 B is all there is, with no reclamation behind it.
+   ### ✅ THE LEAF NUMBER IS IN — and it refutes a premise `budget.rs` states about itself
+
+   **high-water 67,400 B of an 85,096 B region (79% used, 17,696 B free).** 85 samples over ~14 min
+   of real leaf duty (re-election bursts and relay emits visible in the log), stable plateau
+   67,368 → 67,400, **not saturated**.
+
+   **Labels, per §5.1, because they are what make the number usable:** LITE/fleet composition ·
+   **LEAF duty only** (id8 held the crown; the crown leg needs JP's unplug and has not happened) ·
+   real-seeds image, region 85,096 B against the 86,200 B provisioned variant (known seed delta) ·
+   **the #398 boot probe was NOT captured** (attached post-boot). That last one is a real gap in the
+   validity argument, carried by the plateau signature, the instrument's C3 history, and the
+   zero-DRAM A/B — stated, not smoothed.
+
+   **It is a LOWER BOUND.** Crown duty adds pairs 4 and 5 (the OTA fetch, which carries a 4,096 B
+   `OTA_TCP_RX` and the deepest chains in the tree) plus gateway MQTT. The real fleet peak is
+   >= 67,400.
+
+   #### The premise that just expired
+
+   `budget.rs` says, at the floor's own derivation:
+
+   > *"every peak on record was measured **with the Bard narrating**, so for a Bard-free image this
+   > floor is an upper bound on what is required, not a target."*
+
+   **Measurement says the opposite.** The Bard-FREE fleet composition, under mere LEAF duty, peaks
+   **11,744 B ABOVE** the Bard-narrating crown peak (67,400 vs 55,656 — 1.21x). The premise was true
+   when written and expired on 2026-08-25: **all four recorded peaks (T13/#300, #302, #335) predate
+   #391.** The executor put a new floor under every call chain, and it — not Bard narration — is now
+   the dominant term. So 55,656 is not merely *unreproducible* (§the budget.rs note); it is
+   **superseded and low**.
+
+   #### The floor formula, worked through `budget.rs`'s own rules
+
+   The rule is `floor = ceil(peak x 4/3)`, compile-asserted, and the packaging gate is
+   `region >= floor`. Applying it to the new peak:
+
+   | | value |
+   |---|---|
+   | required floor at the new peak | `ceil(67,400 x 4/3)` = **89,867 B** |
+   | actual region (real seeds) | 85,096 B — **short by 4,771 B** |
+   | headroom actually present | 17,696 B = **1.263x** (policy wants 1.333x) |
+
+   The sharper form, which is the one to reason from: **at 4/3, an 85,096 B region can afford a peak
+   of 63,822 B. Leaf duty measures 67,400. The image is 3,578 B past its own policy — at a lower
+   bound.** Robust to the seed delta: the 86,200 B variant affords 64,650 and is still 2,750 B over.
+
+   #### Why the constant is NOT being updated here
+
+   Naively writing `ESP32C3_MEASURED_PEAK_BYTES = 67_400` fails in two places, and the second is the
+   real message:
+
+   1. the const assert `floor >= peak x 4/3` becomes `74,208 >= 89,867` → **the crate stops
+      compiling**;
+   2. raising the floor to 89,867 to satisfy it makes the packaging gate `region >= floor` read
+      `85,096 >= 89,867` → **nothing publishes.**
+
+   Two red gates on firmware that demonstrably runs. And updating a **ship-gating constant from a
+   lower bound** is the wrong direction of error regardless. So: the number is recorded here with
+   its labels, `budget.rs` gets a note that its premise is refuted, and **no constant moves until
+   the crown number exists.**
+
+   #### What the crown number now decides
+
+   It stopped being a nicety. It decides whether the fleet image is inside or outside its own
+   stack policy, and by how much — which is a JP/lead call, not a scoping one. Laying out the
+   options with numbers rather than picking one:
+
+   - **(a) grow the region.** The executor's 20,264 B of DRAM is **96.7% one object**: the embassy
+     task arena, `__embassy_main::POOL` = **19,600 B** (`.bss`, measured). It is sized by the
+     largest task future, and `run()` is the entire superloop as one `async fn`. That is the
+     single biggest lever in the image — and see §6.2, because **T adds `net_task` to that same
+     pool.**
+   - **(b) re-derive the multiplier, with a stated rationale.** 4/3 was calibrated when the
+     measurement was less representative (bench composition, narration workload). A
+     fleet-composition, real-duty peak arguably needs less compensation — but leaf-duty undercuts
+     that argument, so this cannot be settled before the crown leg.
+   - **(c) accept a documented lower ratio.** Legitimate, but it must be written down as a decision
+     with its reason, not arrived at by leaving the constant stale — which is precisely how the
+     previous floor ended up 480 B too low.
+
+   **Nothing in T should spend margin until the crown number exists.** §3.2 confirms 12,000 B (or
+   17,696 B against the real-seeds region) is all there is, with no reclamation behind it.
 2. **`StackResources<N>` sizing — ✅ MEASURED** (order-item 4, done; throwaway const-eval probe on
    the fleet tier, embassy-net 0.9.1 with smol's own feature set `tcp,udp,dhcpv4,medium-ethernet`):
 
@@ -283,9 +360,16 @@ rev-1.
 
    ⚠️ **`StackResources` is NOT T's memory cost, and must not be quoted as if it were.** It is the
    socket *bookkeeping*. The bring-up also needs per-socket rx/tx **buffers** (caller-provided, and
-   in this tree historically 512 B each), the `Stack`/`Runner`, and `net_task`'s own stack — none of
-   which is in the table above. What the table gives is one term, measured, so the others can be
-   added to something real instead of to an estimate.
+   in this tree historically 512 B each), the `Stack`/`Runner`, and `net_task` — none of which is in
+   the table above. What the table gives is one term, measured, so the others can be added to
+   something real instead of to an estimate.
+
+   **And `net_task`'s cost has a known home, which §6.1 found:** a spawned task's future lives in
+   the embassy task arena, `__embassy_main::POOL`, **already 19,600 B** of `.bss` for `run()` alone.
+   T does not merely add a stack — **it enlarges that arena by the size of `net_task`'s future**, in
+   the same `.bss` that shrinks `.stack`. Measure the POOL delta per tier in the same A/B as the
+   `.stack` delta; it is the term most likely to be missed, because nothing in the source names a
+   size.
 
    **The offsetting question T must answer (a question, not a claim):** the smoltcp-era NTP statics
    measured in §3.2 — 3,584 B — belong to `NtpMachine`, which T replaces. Whether T retires them,
