@@ -130,18 +130,24 @@ fn chip_id() -> u8 {
 
     let from_triple = triple_chip();
     let from_env = std::env::var("SMOL_CHIP").ok().map(|v| v.trim().to_string());
-    if let Some(name) = from_env.as_deref() {
-        if !name.is_empty() && !CHIPS.iter().any(|(n, _)| *n == name) {
-            // Previously an unrecognised name fell through to 0, which failed the build later
-            // with the SELF_CHIP assert — a message about an unknown chip id that says nothing
-            // about the typo that caused it. Fail here, naming the value and the valid set.
-            panic!(
-                "SMOL_CHIP={name:?} is not a chip this tree knows. Valid: {}. \
-                 (It overrides the chip NAME for silicon whose triple is ambiguous; it does not \
-                 need setting when a chip feature is enabled.)",
-                CHIPS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(" / ")
-            );
-        }
+    // #335 P1.0 (edition 2024): collapsed into a let-chain. src/main.rs defers its 38 sites behind
+    // a crate-level `allow`, but that allow cannot reach here — build.rs is a SEPARATE crate, and
+    // this is the one site in it. Nothing Phase 1 rewrites lives in this file, so there is no
+    // revertibility argument for deferring a two-line collapse; the edition bump is what makes the
+    // let-chain legal in the first place.
+    if let Some(name) = from_env.as_deref()
+        && !name.is_empty()
+        && !CHIPS.iter().any(|(n, _)| *n == name)
+    {
+        // Previously an unrecognised name fell through to 0, which failed the build later
+        // with the SELF_CHIP assert — a message about an unknown chip id that says nothing
+        // about the typo that caused it. Fail here, naming the value and the valid set.
+        panic!(
+            "SMOL_CHIP={name:?} is not a chip this tree knows. Valid: {}. \
+             (It overrides the chip NAME for silicon whose triple is ambiguous; it does not \
+             need setting when a chip feature is enabled.)",
+            CHIPS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(" / ")
+        );
     }
 
     if let Some((feat_name, feat_id)) = from_feature.first().copied() {

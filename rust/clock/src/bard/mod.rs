@@ -12,6 +12,27 @@
 //! This file is the firmware root of the bard tree; `lib.rs` reaches the same three source
 //! files directly via `#[path]` for host tests, so nothing here may be needed by them.
 
+// #335 P1.0 (edition 2024): `unsafe_op_in_unsafe_fn` goes warn-by-default in 2024 — an `unsafe fn`
+// body is no longer implicitly an unsafe block. That is 34 sites across the 9 `unsafe fn`s below,
+// and it is why `clippy -D warnings` went red on the `bard` and `stack-paint` tiers (and ONLY those
+// two: this file is the only one in the tree with that shape). Note the tiers still `cargo check`
+// clean — the lint is a warning, so only the `-D warnings` gate sees it.
+//
+// Allowed at module scope rather than wrapped, for the same reason main.rs defers its 38
+// `collapsible_if` sites: an edition bump should not arrive as a 34-site reflow of a module this
+// phase does not otherwise touch. Two things make that call stronger here than there — every one
+// of these fns is a `static mut` singleton accessor whose SAFETY contract is already stated at the
+// fn level (so per-op marking adds no information a reader lacks), and this is the #300 nano-LLM
+// whose acceptance test is BIT-EXACT against an independent reference implementation. A mechanical
+// 34-site edit through that is a real risk of perturbing a golden result, against no behavioural
+// gain whatsoever.
+//
+// ⚠️ The cost, stated so it is not discovered later: new unsafe ops added inside these fns get no
+// lint. Keep writing explicit `unsafe {}` blocks in new code here anyway.
+// TODO(#335 follow-up): wrap the 34 sites and drop this allow — same cleanup commit as main.rs's
+// `collapsible_if` collapse, which has the same shape and the same reason for waiting.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 pub mod delivery;
 pub mod nano_llm;
 pub mod persona;

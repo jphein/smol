@@ -43,10 +43,10 @@
 extern crate alloc;
 
 use esp_hal::{
-    interrupt::software::SoftwareInterruptControl,
+    // #335 P1.2: SoftwareInterruptControl / TimerGroup are gone from this module —
+    // `esp_rtos::start` and the peripherals it consumes moved to `main`.
     rng::Rng,
     time::Instant,
-    timer::timg::TimerGroup,
 };
 use embassy_futures::block_on;
 use esp_radio::{
@@ -2339,11 +2339,10 @@ impl RadioManager {
         // esp-wifi needs a heap; use the single shared region (see net::init_heap).
         super::init_heap();
 
-        let timg0 = TimerGroup::new(p.timg0);
-        let sw = SoftwareInterruptControl::new(p.sw_int);
-        // #233: start the esp-rtos scheduler that backs esp-radio's os-adapter BEFORE
-        // wifi::new (NON-embassy: start() pins THIS context as the main task and returns).
-        esp_rtos::start(timg0.timer0, sw.software_interrupt0);
+        // #233/#335 P1.2: the esp-rtos scheduler that backs esp-radio's os-adapter must be running
+        // BEFORE wifi::new. It is — `main` calls `esp_rtos::start` once, immediately before
+        // dispatching here, which is the same instant in boot at which this function used to
+        // call it itself.
         // `Rng` is a `Copy` handle (not entropy itself); kept for the SNTP ephemeral-port seed.
         let rng = Rng::new();
         // 0.18: WIFI is 'static → wifi::new returns an owned 'static controller + interfaces

@@ -16,6 +16,10 @@
 //!     emulator drives the `Plugin`s directly and synthesizes `Press` from the keyboard).
 
 #![no_std]
+// #335 P1.0: same edition-2024 let-chain lint as main.rs:39 — see the rationale there. The two
+// crate roots share source files (toast.rs, familiar/), so the allow has to be on both or the
+// hostsim tier reports what the firmware tier suppresses.
+#![allow(clippy::collapsible_if)]
 
 // #348 per-chip memory budgets. The ONE module here that is NOT host-only: it is pure data
 // plus const-eval assertions (no code emitted), and compiling it in both targets means the

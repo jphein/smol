@@ -651,7 +651,8 @@ pub const SELF: TargetId = TargetId {
 /// The bytes are `SELF.encode()` — computed, never transcribed.
 #[cfg(feature = "wifi")]
 #[used]
-#[no_mangle]
+// edition 2024: `no_mangle` is now an unsafe attribute (symbol-name control).
+#[unsafe(no_mangle)]
 pub static SMOL_TARGET_DESC: [u8; DESC_LEN] = SELF.encode();
 
 /// Reads the embedded descriptor back and confirms it decodes to [`SELF`]. Called once on the

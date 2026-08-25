@@ -36,6 +36,16 @@
 
 #![no_std]
 #![no_main]
+// #335 P1.0 (edition 2024): let-chains are stable in 2024, so `collapsible_if` can now suggest
+// folding `if a { if let Some(b) = c { … } }` into a single let-chain. It is NOT a pre-existing
+// baseline lint — at edition 2021 clippy could not make the suggestion and the tree was clean.
+// The bump therefore opens 38 fresh sites across 10 files, 23 of them in the two largest files
+// (mode.rs 7.5k lines, wifi.rs 6.2k). Collapsing them here would bury a 4-line edition change in
+// a 38-site reflow of exactly the files Phase 1 P1.2–P1.5 rewrite, and would make this step
+// non-revertible in practice. Allowed crate-wide so the `clippy -D warnings` gate stays green on
+// every tier; the collapse is a separate mechanical cleanup with no Embassy content.
+// TODO(#335 follow-up): collapse the 38 nested ifs and drop this allow.
+#![allow(clippy::collapsible_if)]
 
 // Phase 3 (espnow) stores inbound ESP-NOW messages as owned Strings for display.
 #[cfg(feature = "espnow")]
@@ -62,7 +72,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 // bootloader auto-reverts too, if it was built with rollback enabled). rc.0 puts
 // `software_reset` in `esp_hal::system`, NOT `esp_hal::reset` (spike-verified).
 #[cfg(feature = "wifi")]
-#[no_mangle]
+// edition 2024: `no_mangle` is now an unsafe attribute (symbol-name control).
+#[unsafe(no_mangle)]
 extern "Rust" fn custom_halt() -> ! {
     // #70 observability: record that THIS reset was a PANIC before we reboot. A panic halts
     // here → software_reset, which the SoC logs as a plain `CoreSw` (same as an intentional
@@ -76,10 +87,22 @@ use esp_hal::{
     clock::CpuClock,
     delay::Delay,
     i2c::master::{BusTimeout, Config as I2cConfig, I2c, SoftwareTimeout},
-    main,
     time::Instant,
     time::Rate,
 };
+// #335 P1.2: the bare-metal `#[main]` entry survives ONLY on the no-radio tier. Under `wifi` the
+// entry is `#[esp_rtos::main]`, which emits its own `#[esp_hal::main] fn main()` wrapper — naming
+// `main` here as well would be an unused import there.
+#[cfg(not(feature = "wifi"))]
+use esp_hal::main;
+// #335 P1.2: the scheduler's two peripherals. Hoisted here from net/wifi.rs and net/mode.rs, which
+// each used to derive them from the `WifiPeripherals` bundle and call `esp_rtos::start` themselves.
+#[cfg(feature = "wifi")]
+use esp_hal::{interrupt::software::SoftwareInterruptControl, timer::timg::TimerGroup};
+// #335 P1.2: `#[esp_rtos::main]` expands to `async fn __embassy_main(spawner: Spawner)`, so the
+// type has to be nameable at this scope even though P1.2 itself does not spawn anything.
+#[cfg(feature = "wifi")]
+use embassy_executor::Spawner;
 use ssd1306::{prelude::*, size::DisplaySize72x40, I2CDisplayInterface, Ssd1306};
 // `DisplayConfig::init` inits the PLAIN Ssd1306 (non-cast builds). Under `feature =
 // "cast"` the display is the `CastOled` tee, whose inherent `init()` forwards to the
@@ -574,8 +597,34 @@ fn millis() -> u64 {
     Instant::now().duration_since_epoch().as_millis()
 }
 
+// -----------------------------------------------------------------------------
+// #335 P1.2 — the entry point, split by tier.
+//
+// The superloop body below is ONE `async fn run()`, unchanged and un-reindented; only how it gets
+// polled differs. Under `wifi`, `#[esp_rtos::main]` builds the esp-rtos thread-mode embassy
+// executor on the main thread and spawns `run()` as its first task — that is what makes a `spawner`
+// available (P1.4) and lets P1.3's `Timer::after` yield to sibling tasks instead of spinning.
+// Without `wifi` there is no esp-rtos (it is `wifi`-gated on this tree, unlike the reference's D1
+// "executor-first" call — see Cargo.toml), so the no-radio build keeps the bare-metal `#[main]` and
+// drives the same future with `block_on`. That future contains no `.await` on this tier, so the
+// poll loop runs it straight through; the two entries are 3 lines each and the body has no fork.
+//
+// ⚠️ `#[esp_rtos::main]` does NOT start the scheduler — it only creates the executor. The single
+// `esp_rtos::start` still has to be called by hand, and lives in `run()` at the radio bring-up
+// (see there for why it is placed exactly where the old two calls used to fire).
+#[cfg(feature = "wifi")]
+#[esp_rtos::main]
+async fn main(_spawner: Spawner) -> ! {
+    run().await
+}
+
+#[cfg(not(feature = "wifi"))]
 #[main]
 fn main() -> ! {
+    embassy_futures::block_on(run())
+}
+
+async fn run() -> ! {
     // #300 bench builds only: paint the free stack BEFORE anything grows a deep call chain, so
     // the high-water report after a story covers the whole run. First statement in `main` on
     // purpose — even HAL init would otherwise go unmeasured. See src/bard/stack_paint.rs for why
@@ -711,6 +760,9 @@ fn main() -> ! {
     draw_splash(&mut display, my_noun, env!("BUILD_NUMBER"), v_noun);
     display.flush().ok();
 
+    // #335 P1.3: still constructed on every tier, but only the no-radio tier still *uses* it —
+    // `subtick` (below `run`) is what the two pacing sites call now. `Delay` is a unit struct, so
+    // holding one the wifi build never reads costs nothing and keeps the two call sites identical.
     let delay = Delay::new();
 
     // --- BOOT button on GPIO9 (debounced short/long) -------------------------
@@ -782,6 +834,32 @@ fn main() -> ! {
     let mut grid_cache = grid::GridCache::new();
 
     // --- Radio bring-up (feature-dependent) ----------------------------------
+    // #335 P1.2: the ONE `esp_rtos::start`. It used to be called from two places —
+    // `net/wifi.rs::try_time_sync` and `net/mode.rs::RadioManager::new` — which are the
+    // mutually-exclusive first statements of the two branches immediately below, each deriving
+    // TIMG0 + SW_INTERRUPT from the `WifiPeripherals` bundle it was handed. Both are gone, and
+    // the bundle no longer carries those two peripherals, so the hoist cannot be half-done: a
+    // leftover call site would fail to compile for want of a peripheral to start with.
+    //
+    // Placed HERE, immediately before the branch, rather than at the top of boot next to
+    // `esp_hal::init`, deliberately. This is where the calls fired before, so the hoist changes
+    // WHERE the call is written and not WHEN it runs — the #226 otadata init and the #40
+    // unconfirmed-boot bookkeeping above still complete on a bare-metal context with no scheduler
+    // and no timer driver, exactly as they do on v917. RISKS §R7 is about Phase 1 disturbing the
+    // rollback path by reordering boot; keeping the instant unchanged is how we decline that risk
+    // instead of arguing about it. (RISKS §R11's TIMG0 double-ownership question is unchanged
+    // too: the same timer, claimed at the same moment, by the same call.)
+    //
+    // NON-embassy semantics still hold for the caller: `start` converts THIS context into the
+    // pinned main task and returns, so everything below keeps running as written. What is new is
+    // that "this context" is now an executor task rather than the bare `#[main]` stack.
+    #[cfg(feature = "wifi")]
+    {
+        let timg0 = TimerGroup::new(peripherals.TIMG0);
+        let sw = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+        esp_rtos::start(timg0.timer0, sw.software_interrupt0);
+    }
+
     // Each branch yields `synced` (Option<u32> Unix time at boot). Phase 3 also
     // brings up the blue LED + the live ESP-NOW `radio`.
     #[cfg(not(feature = "wifi"))]
@@ -804,11 +882,9 @@ fn main() -> ! {
             }
         };
         net::try_time_sync(
-            net::WifiPeripherals {
-                timg0: peripherals.TIMG0,
-                sw_int: peripherals.SW_INTERRUPT,
-                wifi: peripherals.WIFI,
-            },
+            // #335 P1.2: TIMG0 + SW_INTERRUPT no longer travel in this bundle — the
+            // scheduler they fed is started once, above.
+            net::WifiPeripherals { wifi: peripherals.WIFI },
             &mut batt_cache,
             &mut grid_cache,
             &mut boot_render,
@@ -858,11 +934,9 @@ fn main() -> ! {
             }
         };
         net::mode::start(
-            net::WifiPeripherals {
-                timg0: peripherals.TIMG0,
-                sw_int: peripherals.SW_INTERRUPT,
-                wifi: peripherals.WIFI,
-            },
+            // #335 P1.2: TIMG0 + SW_INTERRUPT no longer travel in this bundle — the
+            // scheduler they fed is started once, above.
+            net::WifiPeripherals { wifi: peripherals.WIFI },
             // This unit's short id (see NODE_ID) — embedded in HELLO/ACK/BEACON/TIME
             // frames + the single source of truth shared with the node's name. Runtime
             // `node_id()` (NVS, seeded from the baked const) so a shared OTA image never
@@ -1065,7 +1139,7 @@ fn main() -> ! {
     // burst above usually already blew past this (the splash was up throughout);
     // this only adds real wait in the default build, where bring-up is instant.
     while millis().saturating_sub(splash_start) < SPLASH_MIN_MS {
-        delay.delay_millis(SUBTICK_MS);
+        subtick(&delay).await;
     }
 
     log::info!("smol: entering menu");
@@ -2431,8 +2505,40 @@ fn main() -> ! {
         }
         was_toast = toast_now;
 
-        delay.delay_millis(SUBTICK_MS);
+        subtick(&delay).await;
     }
+}
+
+/// One superloop sub-tick: the ≤20 ms pause at the bottom of the mesh-serving loop, and the same
+/// pause while the boot splash is held (#335 P1.3, porting the reference's `45eea58` / DR-H2).
+///
+/// Under `wifi` this is `embassy_time::Timer::after(…).await`, and the await is the entire point:
+/// a blocking delay never yields, so the executor P1.2 just brought up would never switch to the
+/// tasks P1.4/P1.5 spawn. This is what makes the executor actually *run* something — the
+/// structural half of the deaf-window kill. Without `wifi` there is no time driver (esp-rtos is
+/// `wifi`-gated), so the no-radio tier keeps the blocking `Delay` and this fn simply never awaits.
+///
+/// Pinned to `SUBTICK_MS` = 20 ms, NOT the esp32c6-watch's ~400 ms clamp: the HELLO / TIME /
+/// beacon / diag detectors all look back exactly one `SUBTICK_MS` (see the `now / N !=
+/// (now - SUBTICK_MS) / N` edge tests through the loop), so a longer tick would step over their
+/// boundaries and drop the great majority of mesh broadcasts.
+///
+/// `button.poll` still runs at the TOP of every iteration, so input latency stays ≤20 ms and the
+/// 700 ms long-press gesture is unchanged (DR-M2). The reference deliberately did not add a
+/// `select(Timer, button_edge)` early-wake, and neither do we: it is a latency nicety, not
+/// correctness.
+#[cfg(feature = "wifi")]
+#[inline]
+async fn subtick(_delay: &Delay) {
+    embassy_time::Timer::after(embassy_time::Duration::from_millis(SUBTICK_MS as u64)).await;
+}
+
+/// No-radio tier: no esp-rtos, so no embassy time driver — keep the blocking delay. See the
+/// `wifi` twin above for why the two exist.
+#[cfg(not(feature = "wifi"))]
+#[inline]
+async fn subtick(delay: &Delay) {
+    delay.delay_millis(SUBTICK_MS);
 }
 
 // `draw_clock` moved to `clock.rs` (CLOCK plugin's private render helper, now
