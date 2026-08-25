@@ -73,6 +73,25 @@ spin** — so one lost TX completion pins the CPU forever and presents as a froz
 `send_to` carries the same raw `wait()` — logged fleet-side as a phase-2/3 fix item.
 | **M4** | MQTT + retained HA discovery under id 162, distinct model string, `expire_after` set; telemetry on `smol/162/telemetry` (bare line) | not started |
 
+M3 witness protocol (synced with the cyd-c5 session, whose M3/M4 are complete and
+glass-verified): witness = **id50** (`AC:A7:04:B9:77:14`), which at the C5's M3 ran the
+#391 executor canary and offers **three independent channels** — the `smol/50/peers`
+roster flip, the `mf=` MAC-observe counter (exact frame-count corroboration), and the
+mesh LED. **Coordinate a listen window with smol-d8 before transmitting** — stray HELLO
+frames contaminate any #391 capture in flight (the C5's window was logged in theirs).
+Send spike frames **without** the #190 trailer: observe-mode soft-accepts and *counts*
+them, which is itself evidence. Confirm id50 is powered/audible with smol-d8 first.
+
+M4 network facts (glass-verified at the C5's M4): the board joins `jplovescl` (VLAN 8)
+→ broker is the HA VM's **same-subnet leg `10.0.8.111:1883`** — cross-VLAN legs
+silently drop CONNACK (smol `ha/README` broker table). WiFi vault item:
+`"Homelab jplovescl WiFi (jplovescl SSID)"`; MQTT user `jp`, whose password is
+*currently* the same secret as the PSK — carries a rotation caveat in
+`build-remote.sh`, mirrored from the C5's script. Note the C5 (peer 176) is
+**temporarily off the mesh** — its board is running watch-port smoke builds — so its
+HA entity reads unavailable by design (`expire_after` working); don't read that as a
+discovery-contract failure when comparing against it.
+
 M1–M2 are *de-risked* (burrito-fw proves the board class) but still run on this unit —
 per-unit verification is the point of a spike. **Do not duplicate morpheus-burrito's
 work**: id-161 membership for the emberburrito terminal lives in the emberburrito repo.
@@ -121,6 +140,21 @@ Ordered by dependency:
   (missing first half = `cargo: command not found`; missing second = a "linker
   xtensa-esp32s3-elf-gcc not found" that impersonates a broken toolchain).
 - **Release builds only** (the esp-hal PSRAM path requires it).
+- **Bring-up method (the cyd-c5 `bringup-lessons` distillation — their four wrong turns
+  were ALL frame-of-reference or naming errors, none arithmetic):** establish one
+  **frame-free anchor measurement** early (finger-and-dot-in-one-glance, on-screen
+  markers in display coordinates — never "top-left" in prose) and reconcile every later
+  claim against it; make firmware **self-assert its calibration** (boot-time anchor test
+  printing PASS/FAIL) so correctness is checkable from the log; name flags for what they
+  AFFECT, not what they derive from; **never cite a library default from memory** — open
+  the file or call it folklore; verify a fix against the anchored measurement BEFORE
+  flashing; and state a number's scope conditions as explicitly as its provenance.
+- **PSRAM+DMA is per-chip, not per-family:** the S3 *has* `dma_can_access_psram`
+  (`DmaExtMemBKSize`) — the C5's "DMA staging must be internal" rule is C5-specific and
+  must not be inherited. burrito-fw's internal-SRAM staging was a measured *choice*
+  (32-byte alignment cost), not a hardware impossibility. Paint arithmetic still rules:
+  a 320×240 RGB565 full frame is ~27–30 ms on the wire at 40 MHz — dirty-rect
+  discipline is mandatory regardless.
 - **Clippy must run BOTH invocations** — `cargo clippy --release` is structurally blind to
   `radio_dev.rs` (it's `cfg(feature = "radio")`), so a cheerful default pass has never
   looked at the radio module; `--features radio` found and fixed two real defects on its
