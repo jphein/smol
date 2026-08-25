@@ -6,6 +6,18 @@ re-examined, not inherited.
 
 ## Goal — ✅ MET 2026-08-25 08:52 · EXTENDED GOAL ✅ MET ~13:5x (full target + C5 parity)
 
+**2026-08-25 16:5x — 🎬 THE GUI FLAVOR'S FIRST LIGHT, full package:** built from smol's
+own tree (#444: scene + FT6336U touch + multihop + mesh-OTA w/ per-arch ed25519), flashed
+through the guard onto the A/B table's FIRST real deployment (otadata init'd, 7 entries
+recognized, booted Ota0/Valid), provisioned via wconfig ([CFG] id162 → [SIGIL]
+eldritch-insignia by config; unprovisioned boot proved the MAC-fold path too — id 150,
+exactly as the never-allocate rule assumed). Boot narrative verbatim: [DISPLAY] OK ·
+[TOUCH] OK · [MESH] up as node id162. Image = 5,273,312 B = 83.8% of the 6 MiB slot —
+the 4-MiB alternative would have REJECTED it; the C6-measured-image sizing argument
+vindicated. Chip-id 0x0009 byte-confirmed. Port-shuffle law struck again pre-flash
+(ttyACM3 had become the CROWN — the passive re-verify caught it; the guard was immune).
+Remaining: JP's tap verdict → four-corner calibration → the cross-arch mesh-OTA closer.
+
 **2026-08-25 ~14:15 — BOTH FLAVORS ON MAIN in one hour:** #411 merged (the smol-native
 S3: display arm + measured budget row + the two-check matrix contract, documented for
 the next CI-unbuildable file) eleven minutes after #417 (the watch subtree's multi-board
