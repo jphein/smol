@@ -920,23 +920,115 @@ def resolve_fw(nid, own):
     out["update"]=next((e for e in sorted(own) if re.match(rf"^update\.smol_{nid}(?:_[a-z0-9]+)*_update$",e)), None)
     return out
 
+# #314 — 42 is NOT a node. It is the C6 watch's factory-default `watch_cfg.node_id`, remapped to a
+# MAC-derived id by esp32c6-watch #34, so any watch can publish as 42 during its pre-provisioning
+# window. `tools/ota_publish.sh` already refuses it as an OTA target and `docs/protocol.md` records
+# it as reserved. Enumeration used to exclude it only BY ACCIDENT — `smolwatch042` happened to fail
+# both the model prefix and the id regex — which is the same true-by-luck shape as #328's byte-7
+# claim. Widening the identifier match below would have quietly turned that accident into an
+# inclusion, so the invariant is now STATED here instead of depending on a spelling.
+SENTINEL_IDS={42:"C6 watch unset-config sentinel (#314) — never a node, never an OTA target"}
+
+# Identifier -> node id. `[_ ]?` because the registry spells it three ways across four targets:
+# `smol8` (C3), `smol_176` (C5 CYD), `smol_162` (S3 CYD). The old `smol(\d{1,3})` matched only the
+# first, and `smolwatch042` matches none of them — which is why the sentinel needs its own arm.
+_IDENT_RE=re.compile(r"smol[_ ]?(\d{1,3})$")
+
+# CLASSIFICATION, not acceptance. `smolwatch042` matches no acceptance pattern, so before this it
+# was rejected as "identifier does not resolve a node id" — true, unhelpful, and still leaving the
+# id42 invariant resting on a spelling accident rather than a statement (#314 item 2). This pulls a
+# trailing number out of ANY `smol…` identifier purely so the sentinel can be NAMED when refused.
+# It never admits anything: a loose hit that is not a sentinel still has to satisfy `_IDENT_RE`.
+_LOOSE_IDENT_RE=re.compile(r"smol[A-Za-z_ ]*?0*(\d{1,3})$")
+
+
 async def discover_fleet(ws, st):
-    """{id: meta} for every smol board the firmware has ever announced to HA."""
+    r"""({id: meta}, [rejected…]) for every smol board the firmware has announced to HA.
+
+    #425 — WHAT CHANGED AND WHY. Enumeration used to require BOTH `model.startswith("smol ")` AND
+    `fullmatch(r"smol(\d{1,3})")`. id176 has TWO device-registry entries and each was rejected by
+    the check the other would have passed: `smol_176` has a good model and an underscore the regex
+    refused; `smol176` matches the regex with an EMPTY model. So a board on the crown's roster,
+    owning 43 entities, was enumerated by nothing — it could not even appear as `dormant`.
+
+    id162 had the identical underscore problem and survived only because it happens to own a
+    SECOND, well-formed entry. Deleting that duplicate as tidy-up would have made it vanish exactly
+    like 176, from a change that looks like housekeeping.
+
+    Three fixes, and the third is the one that turns an instance into a class:
+      1. the separator is tolerated (`_IDENT_RE`);
+      2. the model is a SIGNAL, not a VETO — an identifier that resolves a node id is accepted even
+         with an odd model, because the model string is written by whichever firmware provisioned
+         the board and every new target has arrived with a different one;
+      3. every rejection is REPORTED with its reason. The defect was never really the regex — it
+         was that a candidate could be dropped in SILENCE. One printed line would have caught the
+         C5 on provisioning day.
+
+    MERGED BY NODE ID, not by device id. The old dict was keyed on `d["id"]` and flattened to
+    `out[nid]` at the end, so two devices sharing a node id COLLIDED — last one wins, taking only
+    its own entities. With duplicates live on 162 and 176 that silently decided which half of a
+    board's entities the dashboard could see."""
     devs=(await rpc(ws,{"type":"config/device_registry/list"}))["result"]
     ents=(await rpc(ws,{"type":"config/entity_registry/list"}))["result"]
-    fleet={}
+    fleet={}          # nid -> meta
+    dev_to_nid={}     # device_id -> nid, so entities from BOTH duplicates land on one node
+    rejected=[]
     for d in devs:
-        if not (d.get("model") or "").startswith(SIGIL_MODEL): continue
-        for ident in d.get("identifiers") or []:
-            tail=str(ident[-1]) if isinstance(ident,(list,tuple)) else str(ident)
-            m=re.fullmatch(r"smol(\d{1,3})",tail)
-            if not m: continue
-            nid=int(m.group(1))
-            fleet[d["id"]]={"id":nid,"name":sigil_of(d.get("name_by_user") or d.get("name"),nid),
-                            "sw":d.get("sw_version"),"own":[]}
-            break
+        model=(d.get("model") or "")
+        idents=[str(i[-1]) if isinstance(i,(list,tuple)) else str(i) for i in (d.get("identifiers") or [])]
+        # SENTINEL FIRST, and by the loose pattern, so id42 is refused by NAME however it is spelt
+        # — `smol42`, `smol_42`, `smolwatch042`. Before #425 the watch was excluded because its
+        # identifier happened to match nothing; widening the acceptance pattern would have turned
+        # that accident into an inclusion, which is why this arm exists rather than being implied.
+        loose=next((m for m in (_LOOSE_IDENT_RE.fullmatch(t) for t in idents) if m), None)
+        if loose and int(loose.group(1)) in SENTINEL_IDS:
+            rejected.append({"ident":loose.string,"model":model,"name":d.get("name"),
+                             "why":SENTINEL_IDS[int(loose.group(1))]})
+            continue
+        hit=next((m for m in (_IDENT_RE.fullmatch(t) for t in idents) if m), None)
+        if not hit:
+            # Not smol-shaped at all. Only worth reporting if it LOOKS like one — a registry full
+            # of unrelated integrations must not drown the report it exists to make readable.
+            if any(t.startswith("smol") for t in idents):
+                rejected.append({"ident":next(t for t in idents if t.startswith("smol")),
+                                 "model":model,"name":d.get("name"),
+                                 "why":"identifier does not resolve a node id"})
+            continue
+        nid=int(hit.group(1))
+        dev_to_nid[d["id"]]=nid
+        meta=fleet.setdefault(nid,{"id":nid,"name":None,"sw":None,"own":[],"models":[],"_names":[]})
+        if model: meta["models"].append(model)
+        # NAME IS CHOSEN AFTER the entity pass, not here — see below. Both duplicates carry a
+        # plausible name and picking the first one live-tested as a regression: id162 rendered as
+        # `cyd` (a hand-typed label on the `smol_162` entry) instead of `Argent Brazier` (the
+        # firmware-authored sigil on `smol162`). Registry order is not an authority.
+        meta["_names"].append((d["id"], sigil_of(d.get("name_by_user") or d.get("name"),nid)))
+        if d.get("sw_version") and not meta["sw"]: meta["sw"]=d.get("sw_version")
+        # A smol-shaped id with no smol-shaped model is ACCEPTED but SAID OUT LOUD: it is how
+        # id176's second entry looks, and the operator should know the registry is untidy there.
+        if model and not model.startswith(SIGIL_MODEL):
+            rejected.append({"ident":hit.string,"model":model,"name":d.get("name"),
+                             "why":f"ACCEPTED as id{nid}, but model is not '{SIGIL_MODEL}…' "
+                                   f"— registry duplicate or foreign provisioner"})
+    per_dev={}
     for e in ents:
-        if e.get("device_id") in fleet: fleet[e["device_id"]]["own"].append(e["entity_id"])
+        nid=dev_to_nid.get(e.get("device_id"))
+        if nid is None: continue
+        fleet[nid]["own"].append(e["entity_id"])
+        per_dev[e["device_id"]]=per_dev.get(e["device_id"],0)+1
+    # THE NAME COMES FROM THE DEVICE HA ACTUALLY POPULATES. With duplicate registry entries for one
+    # node, the entry carrying the entities is the one the firmware is really talking through, so
+    # its name is the firmware-authored sigil; the other is typically a hand-made placeholder. This
+    # is a fact about the registry rather than a guess about the strings: no parsing of what a name
+    # "looks like", which would be the sort of heuristic that goes wrong the first time a sigil word
+    # is lowercase. Ties keep registry order, and a node whose entries own nothing falls back to the
+    # first name rather than none.
+    for meta in fleet.values():
+        if not meta["_names"]: continue
+        best=max(meta["_names"], key=lambda dn: per_dev.get(dn[0],0))
+        named=[n for _,n in meta["_names"] if not n.startswith("unnamed")]
+        meta["name"]=best[1] if not best[1].startswith("unnamed") or not named else named[0]
+        del meta["_names"]
     out={}
     for meta in fleet.values():
         nid=meta["id"]; meta["fw"]=resolve_fw(nid,meta["own"])
@@ -962,7 +1054,7 @@ async def discover_fleet(ws, st):
         meta["on"]=any(st.get(meta["fw"][f],{}).get("state") not in NA
                        for f in HEARTBEAT if meta["fw"].get(f))
         meta.update(HW.get(nid,{})); out[nid]=meta
-    return out
+    return out,rejected
 
 async def read_roster(ws, timeout=8.0):
     """Retained `smol/+/peers` straight off the broker — the crown's real bond list.
@@ -1026,7 +1118,7 @@ async def main():
             return 2
         print(f"{'CHECK (read-only) · ' if CHECK else ''}dashboard: url_path={DASH!r} title={_me.get('title')!r}")
         st={s["entity_id"]:s for s in (await rpc(ws,{"type":"get_states"}))["result"]}; present=set(st)
-        fleet=await discover_fleet(ws,st)
+        fleet,rejected=await discover_fleet(ws,st)
         roster=await read_roster(ws)
         if not fleet: print("!! no smol devices in the registry — nothing to render"); return 2
         # The Seat is the ELECTED crown, from the mesh-wide (id-agnostic) `smol/mesh/channel`.
@@ -1104,7 +1196,7 @@ async def main():
         if CHECK:
             # The fleet explains the card counts: node boxes are per-node, so "built 33 / live 31"
             # is a node that joined since the last real run, not a mystery.
-            report_fleet(nodes, dormant, roster)
+            report_fleet(nodes, dormant, roster, rejected, fleet)
             return report_check(cfg, view, prev, extras, retired, retiring, st, nodes)
         if prev:
             if retiring:
@@ -1134,7 +1226,7 @@ async def main():
         nb=[c for c in vv["cards"] if GEN_OWNED.match(_ident(c))]
         print(f"SAVE ok · dashboard '{DASH}' · the Seat = {seat['name']} (id{seat_id})"
               f" · node span {NODE_SPAN}")
-        report_fleet(nodes, dormant, roster)
+        report_fleet(nodes, dormant, roster, rejected, fleet)
         print("  node boxes spliced into view grid:",len(nb),"· done:",done)
         print("  each box:",[c.get("type") for c in nb[0]["cards"]] if nb else "NONE")
         return 0
@@ -1742,7 +1834,31 @@ def report_check(cfg, view, prev, extras, retired, retiring, st, nodes=None):
     return 1 if extras else (3 if dead else (5 if uncovered else 0))
 
 
-def report_fleet(nodes, dormant, roster):
+def roster_orphans(roster, fleet):
+    """#425 — crown-roster peers that enumeration never produced. Returns {crown_id: [node_id…]}.
+
+    THE TOOL DETECTING A DEFECT ABOUT ITSELF, which is the only kind of check that survives its
+    author's assumptions. Every other audit here starts from the registry: `report_dead_rows` walks
+    cards, `uncovered_nodes` walks the fleet. All of them are downstream of enumeration, so a board
+    enumeration never produced is invisible to all of them at once — #421's `UNCOVERED · 0 — all 5
+    live node(s)` was TRUE and MISLEADING for exactly that reason, because 5 was the whole fleet it
+    could see and id176 was not in it.
+
+    The crown's roster is INDEPENDENT evidence: it comes off the broker (`smol/<crown>/peers`),
+    authored by the firmware, and it knows a board is on the mesh whatever the HA device registry
+    happens to say. So a peer id with no fleet entry is not an opinion — it is a board the mesh is
+    talking to and this script cannot see. That closes the first link of `enumerate → cover → wire`,
+    the one nothing was watching.
+
+    Pure, so the offline test can prove both directions without a broker."""
+    out={}
+    for cid,r in (roster or {}).items():
+        missing=[pid for pid in sorted((r or {}).get("peers") or {}) if pid not in (fleet or {})]
+        if missing: out[cid]=missing
+    return out
+
+
+def report_fleet(nodes, dormant, roster, rejected=(), fleet=None):
     print("  fleet (HA device registry, firmware-authored):")
     for n in nodes:
         b = n.get("bond"); bond = f" · bond {b['rssi']} dBm (age {b['age']}s)" if b else ""
@@ -1753,6 +1869,26 @@ def report_fleet(nodes, dormant, roster):
     if roster:
         for cid, r in sorted(roster.items()):
             print(f"  roster · crown id{cid} ch{r['ch']} → {sorted(r['peers'])}")
+
+    # #425 — REJECTED CANDIDATES. The defect was never really the regex; it was that a candidate
+    # could be dropped in SILENCE. One line here would have caught the C5 on provisioning day.
+    if rejected:
+        print(f"  registry candidates NOT enumerated ({len(rejected)}):")
+        for r in rejected:
+            print(f"    · {str(r['ident']):<16} model={r['model']!r:<26} {r['why']}")
+
+    # #425 — ROSTER CROSS-CHECK. Independent of the registry, so it can see what enumeration
+    # cannot. This is the arm that would have caught id176.
+    orphans = roster_orphans(roster, fleet if fleet is not None else {n["id"]: n for n in nodes})
+    if orphans:
+        total = sum(len(v) for v in orphans.values())
+        print(f"  ⚠ ROSTER ORPHANS · {total} peer(s) the crown is talking to that enumeration "
+              f"did NOT produce:")
+        for cid, ids in sorted(orphans.items()):
+            print(f"    · crown id{cid} lists {ids} — no device-registry entry resolved these")
+        print("    These boards are on the mesh and invisible to every check downstream of")
+        print("    enumeration (dead rows, UNCOVERED). Fix the registry entry or the identifier")
+        print("    spelling; see #425.")
 
 
 if __name__=="__main__":
