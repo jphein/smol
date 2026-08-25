@@ -16,19 +16,44 @@ never compiled" — which makes a passing verifier read as evidence of delivery 
 
 This check closes that gap with one machine-checked fact per verifier:
 
-    for each `#[path]` target under the firmware crate, does the crate declare it as a module?
+    is the `#[path]` target inside the module tree the FIRMWARE root compiles?
+
+PER-ROOT, AND THAT IS THE LOAD-BEARING WORD. The clock crate has TWO roots that declare
+overlapping files with different gating — `main.rs` (the firmware bin) and `lib.rs` (the
+`hostsim` library the web emulator builds). Asking "is this module NAME declared anywhere"
+conflates them, and #351's first checker did exactly that: it picked up `lib.rs`'s
+`#[cfg(feature = "hostsim")]` and reported `app`/`clock`/`input`/`sensors`/`snake` as excluded
+from a firmware image that plainly contains them. Five false negatives from one shortcut. This
+tool shipped with the same shortcut and was corrected the same way (#374), after reproducing the
+failure against its own merged code rather than reasoning about it.
 
 VERDICTS
-  SOUND    declared → compiled into at least one tier → the verifier tests shipped code.
-  PHANTOM  no declaration anywhere → the verifier certifies code the fleet never runs. FAILS.
+  SOUND      reachable from `main.rs` — the verifier tests firmware code.
+  HOST-ONLY  reachable only from `lib.rs` — real code, but it ships in the web emulator rather
+             than the firmware. Reported, never failed: a different claim, not a defect.
+  PHANTOM    reachable from NEITHER root — the verifier certifies code nothing compiles. FAILS,
+             unless listed in KNOWN_PHANTOMS with the issue that owns the decision.
 
-A declaration's `#[cfg(...)]` is reported so a reader can see which tiers carry it; a module
-gated to a feature no tier enables is a narrower question this check deliberately does not try to
-answer (it would need the tier matrix, which lives in gate.sh and moves). Reporting the cfg
-verbatim is honest; inferring reachability from it would be a guess dressed as a fact.
+WHY REACHABILITY AND NOT GATE-PARSING — the least powerful mechanism that answers the question
+is the one least able to be wrong about a healthy tree. The verdict here consults NO `cfg` at
+all, which makes three traps that bite gate-parsing tools on this crate unreachable BY
+CONSTRUCTION rather than by careful handling:
+
+  * `wifi.rs`'s `#![cfg_attr(not(espnow), allow(dead_code))]` is a LINT attribute, and a checker
+    grepping for cfg-shaped things near a module reads it as a gate;
+  * a module's gate can live in a DIFFERENT file — `net/cast.rs` is gated from `net.rs`, so
+    looking only in the module's own file concludes "ungated";
+  * feature membership is TRANSITIVE (`espnow` -> `wifi` -> `hw`), so direct membership
+    under-approximates and produced twelve false FAILs when #351 tried it.
+
+Each of those is a way to be wrong about a tree with nothing wrong in it. Reachability needs none
+of that modelling, so none of it can go wrong here. Where a fact genuinely does require the tier
+matrix — "declared, but behind a feature no tier enables" — this tool deliberately declines to
+answer rather than guess; that question belongs with #350, which owns the matrix.
 
 Usage:  tools/check_verifier_wiring.py [repo_root]
-Exit:   0 all sound · 1 at least one PHANTOM · 2 usage/IO error
+Exit:   0 clean (sound / host-only / tracked phantoms) · 1 untracked PHANTOM or a STALE
+        allowlist entry (one that is now reachable) · 2 usage / dangling #[path] target
 """
 import re
 import sys
