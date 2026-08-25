@@ -1789,6 +1789,11 @@ async fn main(_spawner: Spawner) -> ! {
     // the amp/codec borrows) to pick it up.
     #[cfg(feature = "story")]
     let mut story_play_req: Option<u16> = None;
+    // A pick that arrives while the roamer is still associating must WAIT, not
+    // vanish (the bug: `else if net.phase.ready()` had no else — the request
+    // was taken and dropped with zero feedback). This stamps the first retry
+    // so the wait is bounded rather than a stuck spinner.
+    let mut story_play_wait: Option<Instant> = None;
     // `?since=` paging cursor for the chapter list.
     #[cfg(feature = "story")]
     let mut story_since: u16 = 0;
@@ -2844,6 +2849,17 @@ async fn main(_spawner: Spawner) -> ! {
                 }
             }
         }
+
+        // Truth for the console's `state` command, published BEFORE any
+        // `continue` can skip it (2026-08-25): the old publish site lives in
+        // the shell arm, so on screen-off ticks — and in any state that never
+        // reaches the shell arm — `state` served values frozen at the last
+        // awake tick. Debugging trusted a lying instrument for hours: it said
+        // app=Story/screen=3 while the loop was somewhere else entirely. The
+        // full snapshot (page, radios) still publishes in the shell arm; this
+        // early write keeps the two LOAD-BEARING fields honest everywhere.
+        #[cfg(feature = "debug-console")]
+        debug_console::publish_app_screen(app_state, screen_state);
 
         // === Synthetic input injection (debug-console) ===
         // Drain ONE queued command and merge it into the SAME variables the real
@@ -4880,6 +4896,24 @@ async fn main(_spawner: Spawner) -> ! {
                 if app_state == AppState::Story {
                     use crate::net::{story_api, story_play};
                     use story_proto::model as smodel;
+                    // Tick-trace (2026-08-25): nav callbacks fired and set their
+                    // cells, yet pages never changed — prove whether this block
+                    // runs at all, at what cadence, and what the gates read.
+                    #[cfg(feature = "debug-console")]
+                    {
+                        static STORY_TICK: core::sync::atomic::AtomicU32 =
+                            core::sync::atomic::AtomicU32::new(0);
+                        let n = STORY_TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        if n % 8 == 0 {
+                            esp_println::println!(
+                                "[STORY-TICK] n={} ready={} need_list={} nav_cell={:?}",
+                                n,
+                                net.phase.ready(),
+                                story_need_list,
+                                shell.req.story_nav.get(),
+                            );
+                        }
+                    }
 
                     // ---- UI requests (cheap; no awaits) --------------------
                     if let Some(p) = shell.req.story_nav.take() {
@@ -5005,7 +5039,24 @@ async fn main(_spawner: Spawner) -> ! {
                         let total = row.as_ref().and_then(|r| r.total_bytes).unwrap_or(0);
                         if total == 0 {
                             shell.set_story_loading(false, "chapter has no audio");
+                        } else if !net.phase.ready() {
+                            // WiFi mid-associate (Hold::Story is up — raised on
+                            // open): requeue and show the spinner instead of
+                            // silently eating the tap. Bounded: past 15 s the
+                            // pick fails VISIBLY, matching the list's own
+                            // "WiFi not ready" honesty.
+                            let t0 = *story_play_wait.get_or_insert(now);
+                            if (now - t0).as_secs() >= 15 {
+                                story_play_wait = None;
+                                shell.set_story_loading(false, "WiFi not ready");
+                            } else {
+                                story_play_req = Some(chapter);
+                                shell.set_story_loading(true, "");
+                            }
+                            shell.request_redraw();
                         } else if net.phase.ready() {
+                            story_play_wait = None;
+                            shell.set_story_loading(false, "");
                             #[cfg(feature = "debug-console")]
                             debug_console::arm_exempt();
 
@@ -5311,6 +5362,19 @@ async fn main(_spawner: Spawner) -> ! {
                                 Err(e) => {
                                     println!("[STORY] play failed: {e}");
                                     shell.set_story_loading(false, e);
+                                    // The pre-queue paint pushed playing=true; without
+                                    // this, the shell's story_playing mirror sticks and
+                                    // the ping pulse never arms again.
+                                    shell.set_story_playback(
+                                        title.as_str(),
+                                        "",
+                                        0,
+                                        story_pos,
+                                        duration_ms,
+                                        0,
+                                        0,
+                                        false,
+                                    );
                                 }
                             }
                             shell.request_redraw();
@@ -5397,7 +5461,11 @@ async fn main(_spawner: Spawner) -> ! {
                                 charging,
                             );
                             shell.set_power(&power_stats);
-                            next_flush = now + Duration::from_secs(1);
+                            // 2 s, the SYSTEM-page precedent: at 1 Hz the page's
+                            // stat rows coalesce into a ~114-row repaint every
+                            // second — felt under the story overlay, where the
+                            // paint competes with the 48 ms audio DMA ring.
+                            next_flush = now + Duration::from_secs(2);
                         }
                     }
                     slint_shell::PAGE_MESH => {
@@ -6367,6 +6435,11 @@ async fn main(_spawner: Spawner) -> ! {
             ble: ble_on,
             mesh_peers: last_mesh_peers,
             modal: shell.modal_kind(),
+            story: shell.story_dbg(),
+            ip: match net.phase {
+                crate::net::net_task::WifiPhase::Up { ip } => ip,
+                _ => None,
+            },
         });
 
         // Track the arm we ran so the shell arm can detect a return from an app
