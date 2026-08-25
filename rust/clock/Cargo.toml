@@ -475,7 +475,17 @@ default = ["esp32c3", "hw"]
 # esp-println / ssd1306) are `optional` so a NON-hardware target (the `hostsim` wasm lib)
 # builds the pure game/render cores without them. `hw` re-bundles them; it is implied by
 # `default` + `wifi` (⊃ espnow/io/cast/wled), so no firmware build changes.
-hw = ["dep:esp-hal", "dep:esp-backtrace", "dep:esp-println", "dep:ssd1306"]
+hw = [
+    "dep:esp-hal", "dep:esp-backtrace", "dep:esp-println", "dep:ssd1306",
+    # #335 P1.2: `embassy-futures` moves up from `wifi`. main's superloop is now an
+    # `async fn run()`, and the no-radio `default`/`hw` build has no executor to drive it
+    # (esp-rtos is `wifi`-gated — see the executor deps above), so its entry point is
+    # `block_on(run())`. embassy-futures is a dependency-free no_std crate and `block_on` is
+    # a poll loop with a noop waker, which is exactly right for a tier whose `run()` contains
+    # no `.await` at all. It costs the default tier ~nothing and it is what lets ONE superloop
+    # body serve every tier instead of two copies that would drift.
+    "dep:embassy-futures",
+]
 
 # #152 web emulator: compile the crate's LIBRARY (src/lib.rs) exposing ONLY the pure
 # plugin/render cores (app contract + snake + clock + input Press + sensors/units host
@@ -510,9 +520,9 @@ wifi = [
     "dep:esp-radio",
     "dep:esp-wifi-sys",
     "dep:smoltcp",
-    "dep:embassy-futures",
-    # #335 Phase 1. `embassy-futures` above STAYS: `block_on` still drives every radio future
-    # through P1.4 (23 `self.controller` sites in mode.rs), and retiring it is Phase 3 work.
+    # #335 P1.2: `dep:embassy-futures` moved to `hw` (it now also drives the default tier's
+    # superloop). It is NOT retired — `block_on` still drives every radio future through P1.4
+    # (23 `self.controller` sites in mode.rs); retiring it is Phase 3 work.
     "dep:embassy-executor",
     "dep:embassy-time",
     "dep:static_cell",

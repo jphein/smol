@@ -29,11 +29,11 @@ extern crate alloc;
 use core::net::Ipv4Addr;
 
 use esp_hal::{
-    interrupt::software::SoftwareInterruptControl,
-    peripherals::{SW_INTERRUPT, TIMG0, WIFI},
+    // #335 P1.2: SoftwareInterruptControl / TimerGroup / SW_INTERRUPT / TIMG0 are gone from this
+    // module — `esp_rtos::start` and the peripherals it consumes moved to `main`.
+    peripherals::WIFI,
     rng::Rng,
     time::{Duration, Instant},
-    timer::timg::TimerGroup,
 };
 use esp_radio::wifi::{sta::{ScanMethod, StationConfig}, Config};
 
@@ -461,11 +461,12 @@ pub(crate) const RELAY_FLUSH_BUDGET: Duration = Duration::from_secs(15); // read
 // -------------------------------------------------------------------------
 
 pub struct WifiPeripherals {
-    pub timg0: TIMG0<'static>,
-    // #233: esp-radio 0.18's scheduler (esp-rtos) needs SW_INTERRUPT.software_interrupt0
-    // for context switches. The RNG peripheral is no longer threaded in — esp-hal 1.1's
-    // `Rng::new()` is arg-less and esp-radio pulls entropy internally.
-    pub sw_int: SW_INTERRUPT<'static>,
+    // #233: esp-radio 0.18's scheduler (esp-rtos) needs SW_INTERRUPT.software_interrupt0 for
+    // context switches, and TIMG0 for its timebase. #335 P1.2 moved BOTH out of this bundle:
+    // `esp_rtos::start` is now called once, by `main`, at the same instant in boot that the two
+    // radio-init paths used to call it. The RNG peripheral is not threaded in either — esp-hal
+    // 1.1's `Rng::new()` is arg-less and esp-radio pulls entropy internally. So the bundle is
+    // down to the one peripheral the radio itself consumes.
     pub wifi: WIFI<'static>,
 }
 
@@ -502,12 +503,9 @@ pub fn try_time_sync(
     super::init_heap();
 
     // --- Radio init (#233: esp-radio 0.18 + esp-rtos scheduler) ----------
-    let timg0 = TimerGroup::new(p.timg0);
-    let sw = SoftwareInterruptControl::new(p.sw_int);
-    // esp-radio's os-adapter needs the esp-rtos scheduler running BEFORE wifi::new.
-    // NON-embassy: start() converts THIS context into the pinned main task and returns,
-    // so the blocking superloop below runs unchanged while the radio task preempts in.
-    esp_rtos::start(timg0.timer0, sw.software_interrupt0);
+    // #335 P1.2: `esp_rtos::start` used to be the first statement here. esp-radio's os-adapter
+    // still needs the scheduler running BEFORE `wifi::new`, and it is — `main` starts it
+    // immediately before dispatching to this function, which is the same instant in boot.
     // `Rng` is a `Copy` handle; keep our own copy for the SNTP source-port seed.
     let rng = Rng::new();
     // In 0.18 the WIFI peripheral is 'static, so wifi::new returns an owned 'static
