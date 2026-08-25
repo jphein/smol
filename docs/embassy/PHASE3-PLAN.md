@@ -427,14 +427,32 @@ floor is itself conservative because `ESP32C3_MEASURED_PEAK_BYTES = 55,656` was 
 a scarcity argument and this plan does not make one. (An invented threshold quoted beside three
 genuinely measured section sizes reads as measured — `[[flagged-caveat-is-not-contained]]`.)
 
-### 5.2 Two blockers that gate STEP T's start, both needing a board
+### 5.2 The two board-gated items — both substantially discharged on 2026-08-25
 
 1. **RISKS §R11 — the timebase stopwatch.** A wrong TIMG0 wiring **compiles** and yields embassy
    timers at the wrong rate; the symptom is not a crash. Every `WIFI_CMD` timeout, every scan
    timeout in §4.2, and every #324/#136/#278 window depends on it. **One stopwatch against a 15 s
    budget on the P1.3 image.** Cheapest high-value measurement in the plan.
+
+   **⚠️ HALF-DISCHARGED (2026-08-25).** #391's HW gates measured MQTT publish cadence at **32–33 s
+   wall against a 32 s device interval, across multiple intervals** (posted on PR #391). That rules
+   out the failure this risk is really about — a timebase silently 2× or ½× — because a 2× error
+   would have shown as ~16 s or ~64 s, not 32–33 s. **What it does not do is bound the error
+   tightly:** a ~3% skew is inside that measurement's resolution and would still drift a 15 s #324
+   window by ~0.5 s. The stopwatch remains the tighter form and is still worth its five minutes, but
+   it is **no longer a hard blocker on STEP T** — it is a precision refinement. Downgraded from
+   *blocking* to *strongly recommended before the first #324-window-sensitive change*.
 2. **The #335 round-trip rollback canary** — forward leg, **reverse leg**, and forced-rollback leg,
    with §2.4's three carriers handled explicitly.
+
+   **⚠️ MOSTLY DISCHARGED (2026-08-25).** 917 → 918 → 920-retreat was confirmed **on glass**, so the
+   forward and reverse legs are real rather than argued. **Two gaps remain and they are exactly the
+   ones §2.4 exists for:** the three fleet-state carriers were only **partially** exercised (so the
+   retained-MC seq-semantics question, the NVS `broker_fallback` question, and the otadata
+   `Loaded app from offset` check are each still unproven *as a set*), and the stuck 921 leg is
+   **deliberately parked as PR #392's rig** rather than fixed here. **Verdict: the round-trip
+   mechanism is proven; the carrier handling is not.** STEP T should not treat §2.4's rollback steps
+   as pre-validated — they are still first-run procedures.
 
 Note `probe-rs run` and `espflash monitor` die exit-144 in the agent sandbox — **RTT/serial capture
 is a JP-run step** (`[[jp-bench-ping-when-physically-needed]]`). `probe-rs attach` and `espflash
@@ -531,13 +549,23 @@ it is the difference between "the `wifi` tier compiles" and "the `wifi` tier sti
 STEP F  (pre)   #404 forensics canary + DIAG panic counter        JP-run, board
 STEP G          check_station_consumers.py + regression suite     host-only, own PR
 STEP B          SendWaiter bounding, all 5 sites (#397)           independent, land early
-  ── R11 timebase stopwatch + #335 round-trip canary ──           BLOCKS T, both need a board
+  ── R11: half-discharged (32-33s wall vs 32s dev) ──             recommended, NOT blocking
+  ── round-trip: mechanism proven on glass; CARRIERS not ──       §2.4 steps are first-run
+  ── Q3 (try_time_sync) DECISION ──                               BLOCKS T — sizes the commit
 STEP T          transport: 7 pairs / 2 tiers / 1 commit           the big one
-STEP C          controller: 13 refs + scan round-trip (#403 guard)
+  ── CrownApDecision::Deferred (Addendum A.5) ──                  pre-step, own commit
+STEP C          controller: 13 refs + scan reduction (#403 guard)
 ```
 
-`F`, `G` and `B` are all startable **now** and none depends on PR #391 merging. `T` is blocked on the
-two §5.2 measurements. `C` is blocked on `T`.
+`F`, `G` and `B` are all startable **now** and none depends on PR #391 merging.
+
+**What actually blocks `T` has changed.** As of 2026-08-25 the two board measurements are no longer
+the gate (§5.2): R11 is half-discharged and downgraded to *recommended*, and the round-trip's
+mechanism is proven on glass — only its **carrier handling** is unproven, which §2.4 already treats
+as procedure rather than precondition. **The remaining hard blocker on `T` is Q3** — whether
+`try_time_sync` converts, is `#[cfg]`'d out, or keeps a cfg-gated sync NTP path — because that
+decision sizes the atomic commit and cannot be taken mid-flight. `C` is blocked on `T`, plus the
+`Deferred` pre-step.
 
 ---
 
