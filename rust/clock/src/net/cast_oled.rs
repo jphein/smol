@@ -25,19 +25,32 @@
 // `prelude::*` brings the traits (`DrawTarget`, `OriginDimensions`, `Dimensions`),
 // `Size`, `Point`, and `Pixel`; only `BinaryColor` is outside the prelude.
 use embedded_graphics::{pixelcolor::BinaryColor, prelude::*};
+#[cfg(not(feature = "esp32s3"))]
 use ssd1306::mode::{BufferedGraphicsMode, DisplayConfig};
+#[cfg(not(feature = "esp32s3"))]
 use ssd1306::prelude::I2CInterface;
+#[cfg(not(feature = "esp32s3"))]
 use ssd1306::size::DisplaySize72x40;
+#[cfg(not(feature = "esp32s3"))]
 use ssd1306::Ssd1306;
 
 use crate::net::cast::{Mirror, SRC_H, SRC_W};
 
 /// The concrete SSD1306 — byte-identical to the pre-cast `app::Oled` alias.
+#[cfg(not(feature = "esp32s3"))]
 type RawOled = Ssd1306<
     I2CInterface<esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>>,
     DisplaySize72x40,
     BufferedGraphicsMode<DisplaySize72x40>,
 >;
+
+/// #398: on the S3 the tee wraps [`crate::s3_oled::S3Oled`] instead. Everything below is
+/// UNCHANGED for both chips — S3Oled deliberately exposes the same inherent surface
+/// (`init`/`flush`/`set_pixel`) with ONE error type across draws and flush, exactly so
+/// this file's single `Err` projection keeps holding (see the note on S3Oled's
+/// `DrawTarget::Error`).
+#[cfg(feature = "esp32s3")]
+type RawOled = crate::s3_oled::S3Oled;
 
 /// The display's `DrawTarget`/flush error type (`display_interface::DisplayError`),
 /// named through the trait so this file needs no direct `display_interface` dep.

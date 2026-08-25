@@ -40,7 +40,13 @@ use esp_hal::gpio::{Flex, InputConfig, Level, OutputConfig, Pull};
 /// the exposed header is already claimed by an on-board peripheral or is a boot
 /// strapping / USB-serial pin — see [`RESERVED_PINS`]. Slot `i` of a [`PinMap`] owns
 /// the physical pin `FREE_PINS[i]`.
+#[cfg(not(feature = "esp32s3"))]
 pub const FREE_PINS: [u8; 5] = [0, 1, 3, 7, 10];
+/// #398 S3 (ES3C28P): the C3's pool pins are all claimed there (0=BOOT, 1=amp enable,
+/// 7=I2S WS, 10=LCD chip-select). These five come from board_s3::FREE_GPIOS, which is
+/// ⚠️ INFERRED-not-schematic-verified — meter a pin before committing hardware to it.
+#[cfg(feature = "esp32s3")]
+pub const FREE_PINS: [u8; 5] = [21, 38, 39, 40, 41];
 
 /// GPIOs that MUST NEVER be bound: a `G`-key descriptor naming one is rejected and
 /// surfaced in DIAG, never applied. Cited against their real claim sites (NOT
@@ -52,7 +58,18 @@ pub const FREE_PINS: [u8; 5] = [0, 1, 3, 7, 10];
 ///   * `9`     — BOOT button        (`main.rs` `Button::new(GPIO9)`; `input.rs`, strapping)
 ///   * `2`     — boot strapping pin (C3 boot-mode select; #72 pin-budget note)
 ///   * `20`,`21` — USB-serial UART  (log console; #72 pin-budget note)
+#[cfg(not(feature = "esp32s3"))]
 pub const RESERVED_PINS: [u8; 8] = [2, 4, 5, 6, 8, 9, 20, 21];
+/// #398 S3: everything the ES3C28P's peripherals claim (board_s3 has the per-pin story):
+/// 0 BOOT · 1 amp(ACTIVE-LOW) · 4–8 I2S/audio · 9 BAT_ADC · 10–13 LCD SPI ·
+/// 15–17 touch I2C/INT · **18 = the touch-reset NEVER-CONFIGURE pin** · 19/20 USB ·
+/// 33–37 octal PSRAM · 42 WS2812 · 45 backlight/strap · 46 LCD DC.
+#[cfg(feature = "esp32s3")]
+pub const RESERVED_PINS: [u8; 26] = [
+    0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20,
+    33, 34, 35, 36, 37, // octal PSRAM — ALL FIVE (a first draft dropped 36/37; count, don't trust)
+    42, 45, 46,
+];
 
 /// Number of runtime-bindable slots (= free pins). Fixed capacity → no alloc.
 pub const NPIN: usize = FREE_PINS.len();
