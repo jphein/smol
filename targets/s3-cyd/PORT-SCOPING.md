@@ -229,8 +229,12 @@ Ordered by dependency:
   SocResetReason spelling), `[chip.esp32s3] checks = true` — and the gate demanded the
   C5's flip too (tsens was its last blocker; its GPIO9 stop-point disproven).
   **`check_chips.sh`: 4 as declared, 0 wrong — C3/C5/C6/S3 all compile clean from one
-  tree, a first.** In review with smol-d8. Remaining to `builds = true`: a measured
-  ChipBudget row (radio-up soak on this unit) + the partition table (in flight).
+  tree, a first.** In review with smol-d8. Remaining to `builds = true` — THREE items,
+  not two (the third found by the link probes, 2026-08-25): a measured ChipBudget row
+  (radio-up soak on this unit) + the partition table (landed) + **the fat-LTO Xtensa
+  LLVM crash** (BUDGET-PREP §6 blocker B — feature-dependent, fleet tier affected,
+  independently reproduced by two agents; escape matrix in progress, upstream report
+  drafted if none escapes; PR #408 carries the separate linkall.x one-liner).
 - **2026-08-24 23:2x** — JP: xtensa builds move to familiar. espup installed there,
   pinned 1.95.0.0 (parity verified); `spike/build-remote.sh` added. **First remote
   xtensa build green in 34.5 s; `--features radio` green in 15.5 s → `wifi + esp-now`
