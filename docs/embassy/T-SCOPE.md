@@ -176,12 +176,40 @@ needing an experiment at all if T is scoped to not disturb them.**
 | carrier | §2.4's post-hoc step | **pre-commit disposition** |
 |---|---|---|
 | **(a) retained `MC\|owner\|ch\|seq`** | clear it, re-observe a flip to a NEW value | **✅ RULED — inert by construction. T does not touch election seq semantics** (team-lead ruling, 2026-08-25). The risk was conditional on adopting the reference's free-running→resolve-stamped `seq` change; declining it leaves carrier (a) nothing to cross the seam. Enforced as a review assertion: **T's diff contains no `mc_pub_seq` / `mc_seen_seq` producer.** Two independent grounds, and the second is the stronger one: it is cheaper than an experiment on a retained topic that has defeated hardware verification four times (`[[smol-retained-mqtt-ghosts]]`) — *and* it is the correct **ownership boundary**, because JP's dynamic-channel directive (#269) puts election-semantics change in future `FOLLOW_ENABLED` work. T declining it is not T being careful; it is that campaign's change, not this one's. |
-| **(b) NVS `broker_fallback`** | read back, clear net-cfg on the canary if divergent | **Provable statically, before the commit.** The hazard is the async rewrite changing *when* the flag is set. Enumerate `write_net_cfg` call sites on main, record the count and their enclosing fns in T's PR body, and assert T does not move or add one. Mechanically checkable today; if it must move, that is a design decision to surface, not a diff to notice later. |
+| **(b) NVS `broker_fallback`** | read back, clear net-cfg on the canary if divergent | **✅ ENUMERATED (order-item 3, done) — and the hazard is ONE call site, not "the transport layer".** See §4.1 below for the derivation and the resulting one-line assertion. |
 | **(c) otadata** | check `Loaded app from offset` after every flash | **Genuinely procedural — stays post-hoc, and that is correct.** Reverting code does not revert boards. Not a precondition; it is a per-flash checklist item (`[[smol-espflash-otadata-trap]]`), and it belongs in the roll runbook rather than in T's gate. |
 
 **Net effect:** the "carriers unproven as a set" blocker reduces to **one static enumeration (b) and
 one scoping commitment (a)**, both completable before a line of T is written. (c) was never a
 blocker, only a procedure.
+
+### 4.1 Carrier (b), enumerated — the hazard is one call site, and it is one T rewrites
+
+`write_net_cfg` has **three** call sites and one definition, on `origin/main`:
+
+| site | fn | trigger | in T's blast radius? |
+|---|---|---|---|
+| `main.rs:2281` | `run` | operator changes the broker override (retained MQTT config) | **no** — outside the transport; T does not touch `run`'s config handling |
+| `main.rs:2313` | `run` | operator changes the OTA host | **no** — same |
+| `net/wifi.rs:998` | `note_broker_connect` | `BROKER_FAIL_STREAK >= BROKER_FAIL_LIMIT` (=3) | **YES** |
+| `ota.rs:2330` | *(definition)* | — | — |
+
+And `note_broker_connect` has **exactly one caller**: `wifi.rs::run_mqtt_burst`, as
+`note_broker_connect(session_ok)` — which is **pairs 1 and 6** of §1's table, i.e. precisely the
+function T rewrites.
+
+So §2.4's "written from inside the transport layer" resolves to a single, checkable invariant:
+
+> **T ASSERTION (b):** `note_broker_connect` still has exactly one caller, in `run_mqtt_burst`,
+> invoked **once per burst**, with `session_ok` meaning *the MQTT session completed* — not *the TCP
+> connect succeeded*, and not *the task spawned*.
+
+**The failure this actually guards against**, which is worth naming because it is an easy and
+invisible mistake in an async rewrite: calling it **per retry** rather than **per burst**. That
+triples the streak rate against an unchanged `BROKER_FAIL_LIMIT = 3`, so transient broker flakiness
+starts latching `broker_fallback: true` into NVS — a flag that **persists across OTA by design** and
+that a reverted image then boots against. The carrier's danger was never the flag's existence; it is
+the counting rule behind it, and the counting rule lives inside the 2,000-line rewrite.
 
 ---
 
@@ -240,10 +268,30 @@ rev-1.
    safe; the **peak** is not measured, and a `select` frame is transient stack the region size
    cannot see. **Nothing in T should spend the 12 KB until that number exists** — §3.2 confirms
    12,000 B is all there is, with no reclamation behind it.
-2. **`StackResources<N>` sizing.** Not guessed here. `N` is a design input (socket count) and its
-   footprint must be *measured* per tier — the instrument §3.2 shows is the only one that catches a
-   static gated more loosely than its consumer. Measure it in a throwaway build before T, so T's own
-   delta is readable against a known baseline rather than discovered inside a 2,000-line commit.
+2. **`StackResources<N>` sizing — ✅ MEASURED** (order-item 4, done; throwaway const-eval probe on
+   the fleet tier, embassy-net 0.9.1 with smol's own feature set `tcp,udp,dhcpv4,medium-ethernet`):
+
+   | `N` | 2 | 3 | 4 | 6 | 8 |
+   |---|---|---|---|---|---|
+   | bytes | 1,152 | 1,504 | 1,856 | 2,560 | 3,264 |
+
+   Exactly linear across all five points: **`StackResources<N>` = 448 + 352·N bytes.** It is all
+   `MaybeUninit`, so it is pure `.bss` — DRAM only, no flash initializer.
+
+   Against the 12,000 B margin that is smaller than feared: `N=4` costs **1,856 B (15%)**, `N=8`
+   costs 3,264 B (27%). `N` is a real design input, not a budget crisis.
+
+   ⚠️ **`StackResources` is NOT T's memory cost, and must not be quoted as if it were.** It is the
+   socket *bookkeeping*. The bring-up also needs per-socket rx/tx **buffers** (caller-provided, and
+   in this tree historically 512 B each), the `Stack`/`Runner`, and `net_task`'s own stack — none of
+   which is in the table above. What the table gives is one term, measured, so the others can be
+   added to something real instead of to an estimate.
+
+   **The offsetting question T must answer (a question, not a claim):** the smoltcp-era NTP statics
+   measured in §3.2 — 3,584 B — belong to `NtpMachine`, which T replaces. Whether T retires them,
+   retains them, or partially overlaps them is a T decision with a *measurable* delta, and it is the
+   difference between T's net DRAM cost being additive and being roughly a wash. §3.2 is the
+   cautionary tale about answering that from inference; answer it with a per-tier `.stack` A/B.
 3. **RISKS §R6's two ELECT spins** (~600 ms non-yielding) freeze `net_task` under the executor.
    §2.3 requires converting them to `Timer::after().await`. Scoping note: that is a *behavioural*
    change to election **timing**, and it is inside T's atomic commit by necessity — the one part of
@@ -267,9 +315,9 @@ rev-1.
 ```
 0. instrument  stack-paint-lite — decouple paint from bard (#434)         DONE, PR #438
 1. paint       sentinel high-water on the LITE tier, P1.3+B1+B2         team lead, bench · gates T merge
-2. pre-step    CrownApDecision::Deferred (Addendum A.5)                 own commit
-3. pre-step    static enumeration of write_net_cfg call sites (§4b)     recorded in T's PR body
-4. measure     StackResources<N> footprint, per tier, throwaway build   before T · sizes the commit
+2. pre-step    CrownApDecision::Deferred (Addendum A.5)                 own commit · NOT STARTED
+3. pre-step    write_net_cfg enumeration (§4b)                          DONE — see §4.1
+4. measure     StackResources<N> footprint                              DONE — see §6.2
 5. STEP T      7 pairs / 2 tiers / 1 commit, pair 7 CONVERTED           the big one
 ```
 
