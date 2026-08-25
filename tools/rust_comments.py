@@ -23,11 +23,29 @@ Both directions are real and the cheap-looking one is not the dangerous one:
                ABSENCE check's whole job to notice that. `check_verifier_wiring` was proved to
                report a module SOUND — wired into main.rs — with its `mod` decl inside `/* */`.
 
-── `//` IS SAFE; `/* */` IS THE VECTOR ───────────────────────────────────────────────────────
-Every Rust-side checker anchors its patterns with `^\s*`, so a LINE comment can never match: the
-`//` sits where the anchor demands whitespace. A BLOCK comment puts the construct at line-start
-and the anchor stops helping. This is why the defect survived so long, and why probing with `//`
-— the obvious first attempt — returns a clean bill of health on every one of them.
+── WHICH COMMENT SYNTAX REACHES A CHECKER IS A PROPERTY OF ITS PATTERN, NOT OF THE CHECKER ────
+An earlier draft of this header said "`//` is safe everywhere — every Rust-side checker anchors
+with `^\s*`". morpheus-391 corrected it, and the counter-example is the checker it wrote:
+
+    RAW_SEND_RE = re.compile(r"esp_now\s*\.\s*send(?:_async)?\s*\(")   # UNANCHORED
+    DEVICE_CTOR = "SmolWifiDevice::new"                              # UNANCHORED substring
+
+Both match inside a `///` doc comment, and that is exactly how #397 STEP B1 tripped its own gate.
+So the honest statement is narrower:
+
+  * ANCHORED patterns (`^\s*(?:pub )?mod X;`, `^\s*#\[cfg(..)\]`) cannot match a LINE comment —
+    the `//` sits where the anchor demands whitespace. They CAN match inside a BLOCK comment,
+    which puts the construct at line-start and defeats the anchor. That is the vector that made
+    `check_verifier_wiring` report a module SOUND with its `mod` decl inside `/* */`.
+  * UNANCHORED patterns match in either kind of comment, with nothing to stop them.
+
+The moment someone adds an unanchored pattern to a checker that reasoned "my patterns are
+anchored, so I do not need stripping", `//` becomes a live vector again with no warning. That is
+the argument for stripping UNCONDITIONALLY here rather than per-checker reasoning about which
+comment syntax can reach which regex — the reasoning is correct today and silently expires.
+
+Practical consequence for anyone auditing a checker: probing with `//` alone can return a clean
+bill of health from an anchored-pattern checker that is still vulnerable to `/* */`. Probe both.
 
 ── SOME CHECKERS READ COMMENTS ON PURPOSE ────────────────────────────────────────────────────
 `check_shed_order` (SHED-ORDER:), `check_diag_budget` (DIAG-WIDTHS:/DIAG-TAIL:) and

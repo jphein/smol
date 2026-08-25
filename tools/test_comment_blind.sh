@@ -13,11 +13,16 @@
 #   false RED    prose about the invariant must not trip the gate
 #   false GREEN  a real site commented out must not still count
 #
-# ── `//` IS SAFE; `/* */` IS THE VECTOR ───────────────────────────────────────────────────────
-# Every Rust-side checker anchors with `^\s*`, so a LINE comment can never match. Probing with
-# `//` returns a clean bill of health on all of them, which is how this survived. Every probe
-# below therefore uses a BLOCK comment; a `//` probe would pass against the unfixed code too and
-# prove nothing.
+# ── PROBE BOTH COMMENT SYNTAXES — "// is safe" IS A PATTERN PROPERTY, NOT A CHECKER PROPERTY ──
+# An earlier draft of this file asserted `//` was safe everywhere because the checkers anchor with
+# `^\s*`. morpheus-391 corrected it: `check_elect_send_path`'s `RAW_SEND_RE` and
+# `check_station_consumers`'s `DEVICE_CTOR` are UNANCHORED and match inside a `///` doc comment —
+# which is how #397 STEP B1 tripped its own gate. Those two are safe only because they now strip.
+#
+# So: ANCHORED patterns are immune to `//` and vulnerable to `/* */` (which puts the construct at
+# line-start and defeats the anchor); UNANCHORED patterns are vulnerable to both. Probing with `//`
+# alone can therefore return a clean bill of health from a checker that is still broken — which is
+# what a first pass over these did. The block-comment probes below are the ones that bite.
 #
 # USAGE:  tools/test_comment_blind.sh        # exit 0 = every arm behaved
 set -uo pipefail
