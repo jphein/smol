@@ -16,7 +16,7 @@ why.
   name/MAC guide, and the gotchas that cost us time.
 - **[protocol.md](protocol.md)** — the canonical **SMOLv1** wire reference: every ESP-NOW frame
   byte-accurately (HELLO/ACK, BEACON, TIME, BATT/GRID, CFG, DIAG, SCAN, RELAY/RELAYACK,
-  RELAY2/RELAYACK2, BATT2/GRID2, SNK, FAM, the leaf mesh-OTA frames) plus the MQTT topic map —
+  UP2/RELAYACK2, BATT2/GRID2, SNK, FAM, the leaf mesh-OTA frames) plus the MQTT topic map —
   each carrying an honest per-frame verification badge. **The most reliably current doc in the
   repo; when another doc disagrees with it, protocol.md is usually the one that's right.**
 - **[ota.md](ota.md)** — OTA operator guide: stage/install, ed25519 signing, canary discipline,
