@@ -491,3 +491,25 @@ its SHA-256 before measuring**, and **never compare two numbers taken from a liv
 different moments.** This is `suspect-the-instrument-first` arriving on schedule, and the only
 reason it did not land in this document as a fabricated finding is that the two numbers
 disagreed loudly enough to be checked. A quieter discrepancy would have shipped.
+
+---
+
+## §4 — ADDENDUM 2026-08-25 ~00:15 (orchestrator, after depin PR #405 went up)
+
+Rulings from the depin lane that supersede parts of §3 — recorded here because this
+document's author was rate-limited at the time:
+
+- **§3.2's placeholder const was DECLINED, for a reason this document should have seen:**
+  `budget.rs` already hands an undeclared chip the UNMEASURED **poison row**, which
+  *refuses* budget-predicated features — a TODO-placeholder const would answer
+  `fits_dram` with fiction instead of refusing. §2.4's own "do not let one ship" is
+  honoured by never writing them. The sequencing insight survives in better form: PR
+  #405 adds a **`checks` rung** (`ships ⇒ builds ⇒ checks`, machine-enforced both
+  directions), and the S3's honest status is `checks = false` + 6 catalogued errors
+  (2 TSENS + 4 `Cpu0*`/`Cpu*` naming variance).
+- **§3.1's diff sketch is against a stale base** — its minus-lines quote a
+  `[chip.esp32s3]` comment `bd26db1` already rewrote. Rebase any use of it on PR #405.
+- **has-tsens measured truth: C3 ✓ C6 ✓ C5 ✗ S3 ✗** — the superset inference was wrong
+  and the compiler said so. Do not inherit capability inferences; the compiler votes.
+- Both §3.5 publish-blockers (REPRO_TARGET scalar, single-chip stack-floor grep) were
+  verified true and ride in PR #405's blocker list.
