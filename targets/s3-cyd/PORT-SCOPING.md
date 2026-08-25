@@ -6,6 +6,14 @@ re-examined, not inherited.
 
 ## Goal — ✅ MET 2026-08-25 08:52 · EXTENDED GOAL ✅ MET ~13:5x (full target + C5 parity)
 
+**2026-08-25 ~14:15 — BOTH FLAVORS ON MAIN in one hour:** #411 merged (the smol-native
+S3: display arm + measured budget row + the two-check matrix contract, documented for
+the next CI-unbuildable file) eleven minutes after #417 (the watch subtree's multi-board
+era: board seam, cyd scenes, the GUI S3 arm). smol's tree now holds the complete
+two-flavor s3-cyd story #413's per-target downloads want. GUI first-glass flash HOLDS on
+the watch lane's ILI9341V driver (the subtree's drivers/ has only the C6's co5300 —
+a GUI build today boots blind); they ping with the artifact + sha.
+
 **2026-08-25 afternoon — the full-target day:** smol's own firmware BOOTS, MESHES, DRAWS
 and NARRATES on this board (PR #411: the display arm — zero-buffer 4× backend — plus the
 measured ChipBudget row). JP-verified on glass ("working well" — the Bard told stories on
