@@ -209,6 +209,15 @@ Ordered by dependency:
   BOARD.md + this file written. Spike M1 drafting in flight; `radio` compile verdict
   pending. smol#396 filed (smol-d8). **Target issue: smol#398** (this directory's work
   of record — update its checkboxes as milestones land).
+- **2026-08-25 ~05:4x — #407 MERGED to main as `2a1d34a`** (PR shows CLOSED — GitHub
+  502'd mid-merge; correction comment on the PR makes the record unambiguous). Four
+  chips checking clean is now a property of MAIN. Same hour: partition table landed
+  (S3 bootloader **0x0** triple-verified — #388's C6-offset claim corrected on the
+  issue; 6 MiB A/B slots; `app_slot_bytes` document-only per the poison-row rule) and
+  `oled-scale` landed (23 host tests, tri-ISA cross-build). Remaining to `builds=true`:
+  the measured ChipBudget row — radio-up stack-paint soak, blocked only on the board's
+  physical return to the bus. M4 (MQTT+discovery) and the board-module staging draft in
+  implementation.
 - **2026-08-25 ~01:00 — PR #407: smol COMPILES FOR THE S3.** Depin #405 merged; this
   session took the S3 arm as agreed (worktree `smol-wt-s3arm`, branch `feat/398-s3-arm`):
   the `has-tsens` fallback (`Reading.chip_c: Option<f32>` — no fabricated temperatures),
