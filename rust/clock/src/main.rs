@@ -760,6 +760,9 @@ async fn run() -> ! {
     draw_splash(&mut display, my_noun, env!("BUILD_NUMBER"), v_noun);
     display.flush().ok();
 
+    // #335 P1.3: still constructed on every tier, but only the no-radio tier still *uses* it —
+    // `subtick` (below `run`) is what the two pacing sites call now. `Delay` is a unit struct, so
+    // holding one the wifi build never reads costs nothing and keeps the two call sites identical.
     let delay = Delay::new();
 
     // --- BOOT button on GPIO9 (debounced short/long) -------------------------
@@ -1136,7 +1139,7 @@ async fn run() -> ! {
     // burst above usually already blew past this (the splash was up throughout);
     // this only adds real wait in the default build, where bring-up is instant.
     while millis().saturating_sub(splash_start) < SPLASH_MIN_MS {
-        delay.delay_millis(SUBTICK_MS);
+        subtick(&delay).await;
     }
 
     log::info!("smol: entering menu");
@@ -2502,8 +2505,40 @@ async fn run() -> ! {
         }
         was_toast = toast_now;
 
-        delay.delay_millis(SUBTICK_MS);
+        subtick(&delay).await;
     }
+}
+
+/// One superloop sub-tick: the ≤20 ms pause at the bottom of the mesh-serving loop, and the same
+/// pause while the boot splash is held (#335 P1.3, porting the reference's `45eea58` / DR-H2).
+///
+/// Under `wifi` this is `embassy_time::Timer::after(…).await`, and the await is the entire point:
+/// a blocking delay never yields, so the executor P1.2 just brought up would never switch to the
+/// tasks P1.4/P1.5 spawn. This is what makes the executor actually *run* something — the
+/// structural half of the deaf-window kill. Without `wifi` there is no time driver (esp-rtos is
+/// `wifi`-gated), so the no-radio tier keeps the blocking `Delay` and this fn simply never awaits.
+///
+/// Pinned to `SUBTICK_MS` = 20 ms, NOT the esp32c6-watch's ~400 ms clamp: the HELLO / TIME /
+/// beacon / diag detectors all look back exactly one `SUBTICK_MS` (see the `now / N !=
+/// (now - SUBTICK_MS) / N` edge tests through the loop), so a longer tick would step over their
+/// boundaries and drop the great majority of mesh broadcasts.
+///
+/// `button.poll` still runs at the TOP of every iteration, so input latency stays ≤20 ms and the
+/// 700 ms long-press gesture is unchanged (DR-M2). The reference deliberately did not add a
+/// `select(Timer, button_edge)` early-wake, and neither do we: it is a latency nicety, not
+/// correctness.
+#[cfg(feature = "wifi")]
+#[inline]
+async fn subtick(_delay: &Delay) {
+    embassy_time::Timer::after(embassy_time::Duration::from_millis(SUBTICK_MS as u64)).await;
+}
+
+/// No-radio tier: no esp-rtos, so no embassy time driver — keep the blocking delay. See the
+/// `wifi` twin above for why the two exist.
+#[cfg(not(feature = "wifi"))]
+#[inline]
+async fn subtick(delay: &Delay) {
+    delay.delay_millis(SUBTICK_MS);
 }
 
 // `draw_clock` moved to `clock.rs` (CLOCK plugin's private render helper, now
