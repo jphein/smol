@@ -1,0 +1,203 @@
+# 413-espup-spike.yml — #413 PHASE 1, A SPIKE. Not a gate; not a release job.
+#
+# ── THE ONE QUESTION ─────────────────────────────────────────────────────────────────────────
+# `tools/build-matrix.toml`'s `[chip.esp32s3]` carries `checks = true` (smol's source compiles for
+# xtensa, proven in-tree by #398) and `builds = false`, whose stated reason is exactly one thing:
+#
+#     "xtensa toolchain (espup `esp` channel + export-esp.sh) is not on CI runners"
+#
+# That is an assumption nobody has tested. This workflow tests it and reports numbers:
+#
+#   1. does the S3 fleet tier build AT ALL on a GitHub runner
+#   2. cold vs cached wall-clock, per phase
+#   3. cache size (the thing most likely to make this impractical rather than impossible)
+#   4. runner-specific surprises
+#
+# ── WHAT THIS DELIBERATELY DOES NOT DO ───────────────────────────────────────────────────────
+# It does NOT flip `builds = true`, package an artifact, or touch the publish path. The matrix
+# promises that flip is a one-word data change; a spike that also flipped it would be claiming CI
+# coverage on the strength of one green run. Phase 2 designs the packaging AGAINST these numbers —
+# and it has two known single-chip blockers recorded on #413 (`repro_build.sh`'s `REPRO_TARGET`
+# scalar with 6 consumers, and `repro_stack_floor`'s C3-specific `awk` grep).
+#
+# ⚠️ AND THE CAVEAT THAT OUTRANKS A GREEN RUN, quoted from the manifest row itself: the S3's
+# `opt_level = "2"` is a TOOLCHAIN-BUG WORKAROUND (`rustc-LLVM ERROR: Incomplete scavenging after
+# 2nd pass` at the shipping opt="s"/fat-LTO). "A compiler that demonstrably mishandled this code at
+# opt='s' merely LINKING at opt=2 is escape, not proof of correct codegen." A green job here means
+# the toolchain can be provisioned — NOT that the resulting image is trustworthy silicon.
+#
+# Manual + branch-push only. This must never become a required check while it is a spike.
+name: 413 espup spike (S3 on a runner)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/413-espup-spike]
+
+permissions:
+  contents: read
+
+env:
+  # Pinned in LOCKSTEP with katana and familiar. Verified on familiar 2026-08-25:
+  #   rustc 1.95.0-nightly (95e5bda86 2026-04-15) (1.95.0.0)
+  # This is not a "latest is fine" case (JP's usual bias): a reproducible xtensa build requires the
+  # SAME fork everywhere, so this moves only when all three move together.
+  XTENSA_VERSION: 1.95.0.0
+  # espup itself is pinned too — it is the installer, and an installer that changes what it lays
+  # down is a silent change to the toolchain. 0.17.1 is what familiar used.
+  ESPUP_VERSION: 0.17.1
+
+jobs:
+  s3:
+    name: espup provision + S3 fleet-tier build
+    runs-on: ubuntu-latest
+    # Cold espup (~GB of download) plus build-std plus a fat-LTO link. Generous on purpose: a
+    # timeout here would be measured as "does not build", which is the wrong answer to record.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner facts (recorded — a spike's context is part of its result)
+        run: |
+          echo "runner: $(uname -srm)"; nproc; free -h | head -2
+          df -h / /mnt 2>/dev/null | tail -3
+          echo "stock rustc: $(rustc -vV | sed -n 's/^release: //p')"
+
+      # ── THE CACHE, which is the practicality question ────────────────────────────────────────
+      # Everything espup lays down lives under ~/.rustup/toolchains/esp — measured on familiar:
+      #   1.8 G total · xtensa-esp-elf (GCC) 790M · lib 601M · clang 335M · bin 89M
+      # There is NO ~/.espressif on a no_std install (verified), so this one path plus the export
+      # file is the whole footprint. That 1.8 G is the number that decides whether option 1 in #413
+      # is practical: GitHub's per-repo cache budget is 10 GB, and this would be a large slice of it
+      # shared with the existing fw/excl rust-caches.
+      #
+      # `-t esp32s3` should shrink it versus familiar's default `all` — one of the things to measure.
+      - name: Cache the esp toolchain
+        id: esp-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains/esp
+            ~/export-esp.sh
+          # Key on BOTH pins: a change to either must invalidate, or the job would silently keep
+          # using a toolchain the workflow no longer describes.
+          key: espup-${{ env.ESPUP_VERSION }}-xtensa-${{ env.XTENSA_VERSION }}-esp32s3-${{ runner.os }}
+
+      - name: Install espup + the esp toolchain (skipped on cache hit)
+        if: steps.esp-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          # Prebuilt binary, not `cargo install espup` — building the installer from source costs
+          # minutes and measures the wrong thing.
+          curl -fsSL -o /tmp/espup \
+            "https://github.com/esp-rs/espup/releases/download/v${ESPUP_VERSION}/espup-x86_64-unknown-linux-gnu"
+          chmod +x /tmp/espup
+          t1=$(date +%s); echo "ESPUP_DL_S=$((t1-t0))" >> "$GITHUB_ENV"
+          # `-t esp32s3` narrows the download (default is every Espressif target).
+          # NO `-s/--std`: that skips GCC, and smol is no_std — the linker comes from xtensa-esp-elf.
+          # `-f` writes the export file to the path export-esp.sh is expected at.
+          /tmp/espup install \
+            --toolchain-version "$XTENSA_VERSION" \
+            --targets esp32s3 \
+            --export-file "$HOME/export-esp.sh"
+          t2=$(date +%s); echo "ESPUP_INSTALL_S=$((t2-t1))" >> "$GITHUB_ENV"
+
+      # ── FAIL CLOSED on the pin ───────────────────────────────────────────────────────────────
+      # A cache restored from a stale key, or an espup that quietly installed something else, would
+      # otherwise produce a green build for the wrong toolchain — and the whole point of the pin is
+      # lockstep with katana/familiar. Assert the exact version rather than trusting the installer.
+      - name: Assert the toolchain is EXACTLY the pinned fork
+        run: |
+          set -euo pipefail
+          test -f "$HOME/export-esp.sh" || { echo "::error::no export-esp.sh — provisioning did not complete"; exit 1; }
+          . "$HOME/export-esp.sh"
+          rustup toolchain list | grep -qE '^esp( |-|$)' || { echo "::error::no 'esp' toolchain registered"; exit 1; }
+          got="$(rustc +esp -vV | sed -n 's/.*(\(1\.[0-9.]*\))$/\1/p' | tail -1)"
+          echo "xtensa rustc reports: $got (want $XTENSA_VERSION)"
+          [ "$got" = "$XTENSA_VERSION" ] || { echo "::error::xtensa toolchain is $got, expected $XTENSA_VERSION"; exit 1; }
+          echo "LIBCLANG_PATH=$LIBCLANG_PATH"
+          command -v xtensa-esp32s3-elf-gcc >/dev/null && echo "gcc: $(xtensa-esp32s3-elf-gcc --version | head -1)" || echo "note: no xtensa-esp32s3-elf-gcc on PATH (esp-elf multilib is the usual shape)"
+
+      - name: Cache size (the practicality number)
+        run: |
+          echo "ESP_CACHE_BYTES=$(du -sb "$HOME/.rustup/toolchains/esp" | cut -f1)" >> "$GITHUB_ENV"
+          du -sh "$HOME/.rustup/toolchains/esp"
+          du -sh "$HOME/.rustup/toolchains/esp"/* 2>/dev/null | sort -rh | head -8
+
+      # Separate from the esp cache: different content, different invalidation. `key: s3-spike` so
+      # it cannot collide with the fw/excl caches the real gate uses.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/clock
+          key: s3-spike
+
+      # board.rs and secrets.rs are git-ignored and provisioned per tree. gate.sh does this at :153;
+      # this spike runs no gate arm, so it must do it itself or the build fails on missing modules.
+      - name: Provision placeholder board.rs / secrets.rs
+        run: tools/ci_provision.sh rust/clock
+
+      # ── THE BUILD, with every parameter READ FROM THE MANIFEST ───────────────────────────────
+      # Not hardcoded: `build_matrix.py chip-checks` is the one place the (target, toolchain,
+      # build_std, opt_level, features) tuple lives, and a spike that retyped them would be
+      # measuring a build the matrix does not describe. Fields are tab-separated with `-` for empty
+      # (a tab is IFS whitespace, so bash collapses runs of them and shifts later fields left).
+      #
+      # ⚠️ build-std goes in the ENVIRONMENT, per invocation — NEVER a .cargo/config.toml key.
+      # `[unstable] build-std` is GLOBAL, and as a config key it leaked
+      # portable-atomic/unsafe-assume-single-core into the HOST build and broke every cold C3 build
+      # on 2026-07-20. Same for opt_level: the global release profile is shared with the C3 and
+      # every C3 measurement on record depends on it staying untouched.
+      #
+      # No SMOL_CHIP: since #405 build.rs derives the chip from the FEATURE and only cross-checks
+      # the triple, so the xtensa triple needs no override. Omitted deliberately — it also exercises
+      # that change on a runner.
+      - name: Build the S3 fleet tier (release, linked)
+        working-directory: rust/clock
+        run: |
+          set -euo pipefail
+          read -r chip target expect toolchain build_std opt_level features < <(
+            ../../tools/build_matrix.py chip-checks | awk -F'\t' '$1=="esp32s3"')
+          [ "$build_std" = "-" ] && build_std=""
+          [ "$opt_level" = "-" ] && opt_level=""
+          echo "manifest says: target=$target toolchain=$toolchain build_std=$build_std opt=$opt_level features=$features"
+          [ -n "$toolchain" ] || { echo "::error::manifest gives esp32s3 no toolchain"; exit 1; }
+
+          . "$HOME/export-esp.sh"
+          env_args=()
+          [ -n "$build_std" ] && env_args+=("CARGO_UNSTABLE_BUILD_STD=$build_std")
+          [ -n "$opt_level" ] && env_args+=("CARGO_PROFILE_RELEASE_OPT_LEVEL=$opt_level")
+
+          t0=$(date +%s)
+          env "${env_args[@]}" cargo "+$toolchain" build --release \
+            --no-default-features --features "esp32s3,$features" --target "$target"
+          t1=$(date +%s); echo "S3_BUILD_S=$((t1-t0))" >> "$GITHUB_ENV"
+
+          elf="target/$target/release/clock"
+          test -f "$elf" || { echo "::error::no ELF at $elf"; exit 1; }
+          echo "S3_ELF_BYTES=$(stat -c%s "$elf")" >> "$GITHUB_ENV"
+          echo "--- sections (informational; the S3 has no floor gate wired — phase 2)"
+          readelf -SW "$elf" | awk '$2 ~ /^\.(text|rodata|data|bss)$/ {printf "%-10s %10d\n", $2, strtonum("0x" $6)}'
+
+      - name: Spike result → job summary
+        if: always()
+        run: |
+          {
+            echo "## #413 phase 1 — espup on a GitHub runner"
+            echo
+            echo "| measure | value |"
+            echo "|---|---|"
+            echo "| cache | ${{ steps.esp-cache.outputs.cache-hit == 'true' && 'HIT (warm run)' || 'MISS (cold run)' }} |"
+            echo "| espup download | ${ESPUP_DL_S:-–} s |"
+            echo "| espup install | ${ESPUP_INSTALL_S:-–} s |"
+            echo "| esp toolchain on disk | ${ESP_CACHE_BYTES:-–} B |"
+            echo "| S3 fleet-tier build | ${S3_BUILD_S:-–} s |"
+            echo "| linked ELF | ${S3_ELF_BYTES:-–} B |"
+            echo
+            echo "Pins: espup \`${ESPUP_VERSION}\`, Xtensa Rust \`${XTENSA_VERSION}\` (lockstep with katana/familiar)."
+            echo
+            echo "⚠️ A green run here means the toolchain can be **provisioned**, not that the image is"
+            echo "trustworthy: the S3 builds at \`opt_level = 2\` to dodge an Xtensa LLVM scavenger"
+            echo "crash at the shipping \`opt=\"s\"\`, and linking at 2 is escape rather than proof of"
+            echo "correct codegen. \`builds = true\` is NOT flipped by this spike."
+          } >> "$GITHUB_STEP_SUMMARY"
