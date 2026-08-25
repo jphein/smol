@@ -6,6 +6,12 @@ re-examined, not inherited.
 
 ## Goal
 
+**ACCEPTANCE BAR (JP, 2026-08-25): full parity with the C5** — the complete spike
+ladder (M1–M4 witnessed) plus tree-side integration equal to the C5's. The S3 already
+exceeds the C5 tree-side (links, partition table, display chain staged), so **the goal
+closes when M3 is witnessed**. Path A/B display work continues as phase-2 backlog beyond
+the goal, not gating it.
+
 Make the ES3C28P a **full smol fleet target**: first a fleet *member* from a spike image
 (the #331/#388 two-phase pattern, phase 1), then a first-class chip target of the one
 smol binary (phase 2). JP's directive of record (2026-08-24): *"jam everything together
@@ -23,7 +29,7 @@ the first Xtensa silicon.
 | Chip identity in smol's build? | **Already solved.** `xtensa-esp32s3` is an unambiguous triple → chip id 3, no `SMOL_CHIP` needed (unlike the C5/C6 riscv32imac collision). `chip_name()` → `"esp32s3"`, BoardProfile arm + profile_verify case exist. | `rust/clock/build.rs` (6f900a6), `net/profile.rs` (fd7cca7) |
 | HA model label? | **BLOCKED-BY-DESIGN on smol#396** — every S3 announces as `"smol ESP32-S3 Ember"` today; the variant axis (leaning NVS product field beside the node id) is smol-d8's lane. Until then the spike hand-writes a **distinct** model string. | #396; profile.rs `(CHIP_ESP32S3, _)` arm |
 | Group-MAC trailer? | Phase-1 spike may join un-MAC'd today (`MAC_ENFORCE = false`) but **dies silently at the enforce flip** — a known expiry, accepted for the spike, mandatory for phase 2 (free via `wire.rs` + the real `GROUP_KEY`). Match SMOLv1 replies on the 14 B **prefix** — on-air frames carry +9 B. | `docs/protocol.md` §MAC_ENFORCE; #388's M3 trap |
-| ESP-NOW channel? | Mesh is ch 6 (`ESP_NOW_FIXED_CHANNEL`); **the fleet AP `jplovescl` is glass-verified on ch 1** (this board's own association log, 2026-08-25) — so M3-with-association is physically impossible today (single radio, STA channel wins) and the spike carries an **espnow-only mode** (skip associate, pin ch 6), same as the C5 spike's `SPIKE_ESPNOW_ONLY`. A phase-2 board that must hold WiFi *and* mesh needs the AP co-channel — network topology, JP's call, same geometry as the crown-offchannel saga. | own M2 log; protocol.md single-radio rule; `smol-ota-crown-offchannel-blocker` |
+| ESP-NOW channel? | Mesh is ch 6 (`ESP_NOW_FIXED_CHANNEL`); **the fleet AP `jplovescl` is glass-verified on ch 1** (this board's own association log, 2026-08-25) — so M3-with-association is physically impossible today (single radio, STA channel wins) and the spike carries an **espnow-only mode** (skip associate, pin ch 6), same as the C5 spike's `SPIKE_ESPNOW_ONLY`. **JP's ruling (2026-08-25): the mesh channel is DYNAMIC — the mesh chooses/follows the AP channel** (the standing dynamic-channel directive; the watch's consensus-election model is the reference). Fleet-architecture lane (#180 class), not this target's to solve — the S3 inherits the fleet's answer; espnow-only remains the correct spike mode meanwhile. | own M2 log; protocol.md single-radio rule; `smol-ota-crown-offchannel-blocker` |
 | Workspace shape for phase 2? | **A riscv32 crate and an xtensa crate cannot share a cargo workspace** (esp-hal takes one chip feature; cargo unifies workspace features). Proven pattern: chip-agnostic zero-dep `*-core` crates consumed by path, each its own `[workspace]` (burrito-fw's osk-core/swype). Relayed to the feat/347-depin lane 2026-08-24. | `burrito-fw/Cargo.toml` comment + tree structure |
 | Board variants as cargo features? | **NEVER** — #352's standing rule (closed, decided). The variant axis stays runtime (#396). | smol#352 |
 
@@ -61,7 +67,7 @@ id-block generalization. Remaining tree-side identity work is #396 (smol-d8's la
 ### Phase 1 — bring-up spike, four falsifiable milestones (this directory's lane)
 | M | proves | status |
 |---|---|---|
-| **M1** | esp-hal 1.1.x (lock: 1.1.2) boots on *this unit*; PSRAM octal 8 MiB mapped; ILI9341V paints (MADCTL 0x28); backlight; button | **flashed + running 2026-08-24 23:2x** (serial heartbeat live, node 162); display orientation awaiting JP's eyeball |
+| **M1** | esp-hal 1.1.x (lock: 1.1.2) boots on *this unit*; PSRAM octal 8 MiB mapped; ILI9341V paints (MADCTL 0x28); backlight; button | ✅ **CLOSED 2026-08-25 ~08:2x** — orientation human-verified by JP: **readable landscape**, MADCTL 0x28 confirmed on glass. |
 | **M2** | WiFi STA associates (2.4 GHz only — no band trap on S3), DHCP lease | ✅ **PROVEN 2026-08-25 ~07:5x**: lease `10.0.8.214/24`. The OOM verdict settled by the 64K isolation flash: **the drain cadence was the killer** — 64 KiB with continuous drain runs stably (~8.3 KB free, flat over 8+ min, three identical samples); the 96 K default is margin, not correctness. Board now runs the 96 K image (fresh-boot verified). |
 | **M4** | MQTT + retained discovery + telemetry as `smol_162` | ✅ **PROVEN on glass AND wire 2026-08-25**: CONNACK rc=0 on the same-subnet leg `10.0.8.111`, retained discovery byte-checked (model "smol ESP32-S3 CYD"), telemetry FLIPPING (beat monotone, heap field live) — HA device `smol 162 cyd`. Fourth silicon family with live fleet presence. |
 | **M3** | ESP-NOW round-trip: `SMOLv1 HELLO 162` broadcast heard by a live C3 fleet witness (roster flip = the proof), ACK matched on 14 B prefix | **staged, HOLDING for the GO** (2026-08-25 ~08:00): the espnow-only ELF is pre-built and hashed; smol-d8 holds the window because id50 is currently the #404 panic-repro canary (a HELLO would add a roster entry while roster size is a suspect variable — the contamination rule working as designed). GO comes with a clean witness. |
