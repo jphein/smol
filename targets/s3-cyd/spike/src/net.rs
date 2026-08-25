@@ -247,7 +247,12 @@ impl Link {
     pub fn label(self) -> &'static str {
         match self {
             Link::NoCredentials => "no wifi credentials in this build",
-            Link::EspNowOnly => "espnow-only - channel pinned, not associating",
+            // ⚠️ This used to read "espnow-only - channel pinned, not
+            // associating" — asserting a pin that had FAILED, on a line that
+            // never checked it. It actively misled the M3 bench read. The pin's
+            // real outcome is reported by the probe (`espnow_probe::label`),
+            // which measures it; this label now claims only what it knows.
+            Link::EspNowOnly => "espnow-only - not associating",
             Link::Backoff => "not associated - retrying",
             Link::Dhcp => "associated - waiting for DHCP",
             Link::Up => "up",
@@ -263,6 +268,38 @@ pub struct Net {
     /// `interfaces` is consumed to get the station device.
     #[cfg(feature = "radio")]
     esp_now: Option<esp_radio::esp_now::EspNow<'static>>,
+    /// ⛔ **THE FIELD THAT EXISTS SO THE RADIO STAYS UP.**
+    ///
+    /// On any path that returns without a [`Live`] — espnow-only, or no
+    /// credentials — the `WifiController` has nowhere to live, and a local that
+    /// goes out of scope is DROPPED. `WifiController::drop` calls
+    /// `wifi_deinit()` (esp-radio `wifi/mod.rs`, `impl Drop for WifiController`),
+    /// which tears the radio down again.
+    ///
+    /// **That is exactly what broke M3's first window** (2026-08-25): `init`
+    /// called `set_config` — which really does start the controller — then
+    /// returned `Net { live: None, .. }`, dropping the controller on the way out.
+    /// By the time `espnow_probe::attach` ran, the radio was deinitialised:
+    /// `set_channel(6)` returned `Error(Other(12289))` = `0x3001`, the
+    /// WIFI_NOT_INIT class, and every send failed `InterfaceMismatch`.
+    ///
+    /// The hazard was already written down — in `espnow_probe.rs`, which says
+    /// "net::init owns the WifiController and must keep it alive". It was
+    /// documented in the file that consumes the radio and violated in the file
+    /// that creates it.
+    ///
+    /// ## Why this carries `#[allow(dead_code)]`
+    ///
+    /// It is never READ, and clippy is right to say so. It is load-bearing by
+    /// **existing**: the value's lifetime is the point, and its `Drop` is the
+    /// hazard. This is the dead-code lint as a QUESTION, not a verdict — and the
+    /// answer is that the field's apparent uselessness IS the bug it prevents.
+    ///
+    /// ⛔ **Deleting this field to satisfy the lint reintroduces the M3 failure
+    /// verbatim**: zero frames transmitted, `set_channel` → `0x3001`, every send
+    /// `InterfaceMismatch`. The lint would go green and the radio would go down.
+    #[allow(dead_code)]
+    parked: Option<WifiController<'static>>,
 }
 
 struct Live {
@@ -455,13 +492,19 @@ pub fn init(
             // therefore proves compilation and boot, not the air. Said plainly
             // rather than papered over; the fix, if M3 ever needs it, is
             // cyd-c5's espnow-only mode.
-            println!("[net] ⚠️ no wifi credentials in this build — radio up, not associating");
+            println!("[net] ⚠️ no wifi credentials in this build — not associating");
             println!("[net]    (build with ./build-remote.sh, which pulls the PSK from the vault)");
+            // NOTE: `set_config` was never reached on this path, so the
+            // controller is initialised but NOT STARTED — ESP-NOW cannot
+            // transmit from here. Parked anyway: dropping it would additionally
+            // deinit the radio, and a half-up radio is easier to diagnose than a
+            // torn-down one.
             return Net {
                 live: None,
                 state: Link::NoCredentials,
                 #[cfg(feature = "radio")]
                 esp_now,
+                parked: Some(controller),
             };
         }
     };
@@ -492,15 +535,21 @@ pub fn init(
     // `espnow_probe::attach` — see there for why the ORDER matters.
     if ESPNOW_ONLY {
         println!(
-            "[net] ESPNOW-ONLY mode: skipping association, channel {} will be pinned",
+            "[net] ESPNOW-ONLY mode: controller STARTED in STA mode, association skipped"
+        );
+        println!(
+            "[net]    channel {} will be pinned by the probe — watch for the result line",
             ESPNOW_CHANNEL
         );
         println!("[net]    (the AP is on ch1 and the mesh on ch6 — one radio cannot do both)");
+        // `controller` is PARKED, not dropped. See `Net::parked` — dropping it
+        // here is the bug that made M3's first window transmit zero frames.
         return Net {
             live: None,
             state: Link::EspNowOnly,
             #[cfg(feature = "radio")]
             esp_now,
+            parked: Some(controller),
         };
     }
 
@@ -550,6 +599,8 @@ pub fn init(
         state: Link::Backoff,
         #[cfg(feature = "radio")]
         esp_now,
+        // The controller lives in `Live` on this path.
+        parked: None,
     }
 }
 

@@ -87,7 +87,24 @@ pub struct RadioProbe<'d> {
     _manager: EspNowManager<'d>,
     sender: EspNowSender<'d>,
     receiver: EspNowReceiver<'d>,
+    /// The MEASURED outcome of the channel pin. `None` = not attempted (we are
+    /// associated, so the STA owns the channel).
+    ///
+    /// Stored because the heartbeat must report what HAPPENED, not what was
+    /// intended — see [`RadioProbe::label`].
+    pinned: Option<Result<u8, ()>>,
+    /// Consecutive `send` failures. Reported once it crosses
+    /// [`TX_FAIL_LOUD_AFTER`], because a probe that fails silently is
+    /// indistinguishable from a quiet mesh.
+    tx_fail_streak: u32,
+    /// Frames that actually left. The denominator that makes "no ACKs" readable:
+    /// no ACKs after 0 sends says nothing; after 30 sends it says something.
+    tx_ok: u32,
 }
+
+/// Consecutive TX failures before the heartbeat line starts saying so.
+/// Small — one bad send is noise, three in a row is a broken radio.
+const TX_FAIL_LOUD_AFTER: u32 = 3;
 
 /// Wrap the `EspNow` handle that `net::init` produced.
 ///
@@ -105,22 +122,37 @@ pub fn attach(esp_now: EspNow<'static>) -> RadioProbe<'static> {
     // Only in espnow-only mode. With an association live, the STA owns the
     // channel and forcing a different one here would either be overridden or
     // break the association — one radio, one channel. See `net::ESPNOW_ONLY`.
-    if crate::net::ESPNOW_ONLY {
+    let pinned = if crate::net::ESPNOW_ONLY {
         match esp_now.set_channel(crate::net::ESPNOW_CHANNEL) {
-            Ok(()) => println!(
-                "[radio] channel pinned to {} (mesh channel; AP is on ch1)",
-                crate::net::ESPNOW_CHANNEL
-            ),
-            // Loud, not fatal: a probe that cannot reach the mesh should say so
-            // rather than broadcast into the wrong channel and report silence.
-            Err(e) => println!(
-                "[radio] ⚠️ set_channel({}) FAILED: {:?} — frames will go out on \
-                 whatever channel the radio is on, and the mesh will look dead",
-                crate::net::ESPNOW_CHANNEL,
-                e
-            ),
+            Ok(()) => {
+                println!(
+                    "[radio] channel pinned to {} (mesh channel; AP is on ch1)",
+                    crate::net::ESPNOW_CHANNEL
+                );
+                Some(Ok(crate::net::ESPNOW_CHANNEL))
+            }
+            // Loud, not fatal — and RECORDED, which is the half that was missing.
+            // M3's first window failed here with `Error(Other(12289))` = 0x3001,
+            // the WIFI_NOT_INIT class, because `net::init` had dropped the
+            // `WifiController` on its way out and deinitialised the radio. The
+            // heartbeat then cheerfully reported "channel pinned" for sixty
+            // seconds. See `net::Net::parked`.
+            Err(e) => {
+                println!(
+                    "[radio] ⚠️ set_channel({}) FAILED: {:?}",
+                    crate::net::ESPNOW_CHANNEL,
+                    e
+                );
+                println!("[radio]    THE MESH IS UNREACHABLE from this build — frames would go");
+                println!("[radio]    out on whatever channel the radio happens to be on.");
+                println!("[radio]    0x3001 (12289) = WIFI_NOT_INIT: the controller is not up.");
+                Some(Err(()))
+            }
         }
-    }
+    } else {
+        // Associated: the STA owns the channel and pinning would fight it.
+        None
+    };
 
     let (manager, sender, receiver) = esp_now.split();
     println!(
@@ -139,10 +171,30 @@ pub fn attach(esp_now: EspNow<'static>) -> RadioProbe<'static> {
         _manager: manager,
         sender,
         receiver,
+        pinned,
+        tx_fail_streak: 0,
+        tx_ok: 0,
     }
 }
 
 impl RadioProbe<'_> {
+    /// Status for the heartbeat line — **reports MEASURED state, never intent.**
+    ///
+    /// The line this replaces said "channel pinned" while the pin had failed,
+    /// for a whole M3 window. A status string that asserts a state it never
+    /// checked is worse than no status string: it does not merely fail to help,
+    /// it actively argues against the truth in front of you.
+    pub fn label(&self) -> &'static str {
+        if self.tx_fail_streak >= TX_FAIL_LOUD_AFTER {
+            return "radio: TX FAILING - no frames leaving";
+        }
+        match self.pinned {
+            Some(Ok(_)) => "radio: ch pinned, broadcasting",
+            Some(Err(())) => "radio: PIN FAILED - mesh unreachable",
+            None => "radio: broadcasting (associated, ch not pinned)",
+        }
+    }
+
     /// Called once per heartbeat tick from `main`'s superloop.
     ///
     /// Non-blocking by construction: `receive()` returns `Option`, and TX goes
@@ -178,14 +230,35 @@ impl RadioProbe<'_> {
             return;
         }
         match send_bounded(&mut self.sender, &BROADCAST_ADDRESS, HELLO) {
-            TxOutcome::Done => println!("[radio] tx hello ({} B) -> broadcast", HELLO.len()),
-            TxOutcome::Failed(e) => println!("[radio] tx FAILED: {:?}", e),
+            TxOutcome::Done => {
+                self.tx_fail_streak = 0;
+                self.tx_ok = self.tx_ok.saturating_add(1);
+                println!(
+                    "[radio] tx hello ({} B) -> broadcast (#{} sent)",
+                    HELLO.len(),
+                    self.tx_ok
+                );
+            }
+            TxOutcome::Failed(e) => {
+                self.tx_fail_streak = self.tx_fail_streak.saturating_add(1);
+                println!(
+                    "[radio] tx FAILED: {:?} (streak {}, {} sent OK since boot)",
+                    e, self.tx_fail_streak, self.tx_ok
+                );
+                if self.tx_fail_streak == TX_FAIL_LOUD_AFTER {
+                    println!("[radio]    InterfaceMismatch here means the STA interface does not");
+                    println!("[radio]    exist — the controller was never started, or was dropped.");
+                }
+            }
             // Log and carry on. An abandoned frame is a dropped packet on a
             // best-effort broadcast; a hung superloop is a dead board.
-            TxOutcome::TimedOut => println!(
-                "[radio] ⚠️ tx deadline ({} ms) — frame abandoned, radio may be wedged",
-                TX_WAIT_MS
-            ),
+            TxOutcome::TimedOut => {
+                self.tx_fail_streak = self.tx_fail_streak.saturating_add(1);
+                println!(
+                    "[radio] ⚠️ tx deadline ({} ms) — frame abandoned, radio may be wedged",
+                    TX_WAIT_MS
+                );
+            }
         }
     }
 }

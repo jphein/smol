@@ -403,35 +403,88 @@ fn main() -> ! {
         if let Some(r) = radio.as_mut() {
             r.tick(tick);
         }
+        // ---- the heartbeat line -------------------------------------------
+        //
+        // Every segment reports MEASURED state. That rule was bought at a bench
+        // window: this line used to assert "channel pinned" while the pin had
+        // failed, and it argued against the truth on the console for sixty
+        // seconds. A status string that claims a state it never checked is worse
+        // than none — it does not merely fail to help, it misleads.
+        //
+        // Segments, each independently falsifiable:
+        //   link  — can it talk?           (net::Link)
+        //   mqtt  — is anyone listening?   (mqtt::Mqtt)
+        //   radio — are frames leaving?    (espnow_probe measured pin + tx streak)
+        #[cfg(feature = "radio")]
+        let radio_part: &str = radio.as_ref().map(|r| r.label()).unwrap_or("radio: absent");
+        #[cfg(not(feature = "radio"))]
+        let radio_part: &str = "";
 
-        // The heartbeat carries the link state so one line answers both "is the
-        // board alive?" and "what is the radio doing?" — and names WHICH leg is
-        // broken, because "no credentials", "cannot associate" and "associated,
-        // no lease" send you to three different places.
         #[cfg(feature = "wifi")]
-        match net.mqtt_state() {
-            // Both legs on one line: the link answers "can it talk?", MQTT
-            // answers "is anyone listening?" — and they fail independently.
-            Some(m) => println!(
-                "[s3-cyd] heartbeat {} — node {} alive — {} | {}",
-                tick,
-                NODE_ID,
-                net.state().label(),
-                m.label()
-            ),
-            None => println!(
-                "[s3-cyd] heartbeat {} — node {} alive — {}",
-                tick,
-                NODE_ID,
-                net.state().label()
-            ),
+        {
+            let link = net.state().label();
+            let mqtt = net.mqtt_state().map(|m| m.label()).unwrap_or("");
+            print_heartbeat(tick, link, mqtt, radio_part);
         }
         #[cfg(not(feature = "wifi"))]
-        println!("[s3-cyd] heartbeat {} — node {} alive", tick, NODE_ID);
+        print_heartbeat(tick, "", "", radio_part);
         tick = tick.wrapping_add(1);
         // Only the radio-less build sleeps here; with `wifi` the window was
         // already spent inside net.tick() polling the stack.
         #[cfg(not(feature = "wifi"))]
         delay.delay_millis(HEARTBEAT_MS);
+    }
+}
+
+
+/// Print one heartbeat line, eliding segments this build does not have.
+///
+/// Centralised so the separator logic exists once. An empty segment is a build
+/// that lacks the feature — NOT a feature that is silent, which is why absent
+/// segments vanish rather than printing an empty status that would read as a
+/// measurement.
+fn print_heartbeat(tick: u32, link: &str, mqtt: &str, radio: &str) {
+    let mut line = HeartLine::new();
+    let _ = core::fmt::Write::write_fmt(
+        &mut line,
+        format_args!("[s3-cyd] heartbeat {} — node {} alive", tick, NODE_ID),
+    );
+    for seg in [link, mqtt, radio] {
+        if !seg.is_empty() {
+            let _ = core::fmt::Write::write_fmt(&mut line, format_args!(" — {}", seg));
+        }
+    }
+    println!("{}", line.as_str());
+}
+
+/// Fixed 160-byte formatter for the heartbeat. Truncates rather than failing:
+/// a clipped status line is worth more than a panic in the liveness signal.
+struct HeartLine {
+    buf: [u8; 160],
+    len: usize,
+}
+
+impl HeartLine {
+    fn new() -> Self {
+        Self {
+            buf: [0; 160],
+            len: 0,
+        }
+    }
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("[s3-cyd] heartbeat <unprintable>")
+    }
+}
+
+impl core::fmt::Write for HeartLine {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len == self.buf.len() {
+                break;
+            }
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+        Ok(())
     }
 }
