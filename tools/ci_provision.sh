@@ -38,10 +38,17 @@
 # a live one (that is clippy's job, and it is already doing it) — it can only say "CI does not have
 # this line," which is exactly the sentence that turns a baffling lint into a one-line diagnosis.
 #
-# Usage: tools/ci_provision.sh [--check] [clock_dir]     (default clock_dir: rust/clock)
+# Usage: tools/ci_provision.sh [--check|--list-extras] [clock_dir]  (default clock_dir: rust/clock)
 #   --check   report only; make NO change; exit 3 if any file is missing symbols the example
 #             declares. For a gate that wants to fail loudly instead of self-healing.
 #             Extra symbols are reported in BOTH modes and change no exit code.
+#   --list-extras
+#             MACHINE-READABLE half of the extras report above: one `<file>\t<SYMBOL>` line per
+#             local-only symbol, nothing else on stdout, no mutation, always exit 0. Added for
+#             #363 so `gate.sh` can ACT on the divergence instead of only printing it — the prose
+#             above tells a human why their tier is red; this tells the gate that the tree it is
+#             about to lint is not the tree CI lints. Empty output is the CI case (no local file,
+#             or a file the example fully accounts for) and means "nothing to reconcile".
 set -euo pipefail
 
 mode=apply
@@ -49,7 +56,8 @@ args=()
 for a in "$@"; do
   case "$a" in
     --check) mode=check ;;
-    -h|--help) sed -n '2,44p' "$0"; exit 0 ;;
+    --list-extras) mode=extras ;;
+    -h|--help) sed -n '2,52p' "$0"; exit 0 ;;
     *) args+=("$a") ;;
   esac
 done
@@ -152,6 +160,22 @@ if mode == "apply":
             fh.write("\n" + t.rstrip("\n") + "\n")
 sys.exit(3)
 '
+
+# #363 --list-extras: the machine-readable extras report. Deliberately its own loop and an early
+# exit, so it shares the PARSER with the human report (one definition of "declared") while sharing
+# none of the mutation path — a mode whose whole contract is "changes nothing" should not be able
+# to reach `cp` or the append. Runs the python in `check` mode for the same reason; its exit 3
+# (symbols missing) is not this mode's question, so the status is deliberately discarded.
+if [ "$mode" = extras ]; then
+  for f in secrets board; do
+    [ -f "$src/$f.rs" ] && [ -f "$src/$f.rs.example" ] || continue
+    set +e
+    out="$(python3 -c "$TOPUP_PY" "$src/$f.rs.example" "$src/$f.rs" check 2>/dev/null)"
+    set -e
+    printf '%s\n' "$out" | sed -n "s/^EXTRA /$f.rs\t/p"
+  done
+  exit 0
+fi
 
 topped_up=""
 for f in secrets board; do

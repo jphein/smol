@@ -92,6 +92,14 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 CLOCK="rust/clock"
+
+# #363 — the root the COMPILING arms build from. `$ROOT` (i.e. your checkout) unless the pristine
+# mirror below is engaged, in which case the tiers are built from a copy whose git-ignored
+# provisioning matches what CI generates. Source-READING arms (shed order, DIAG budget, byte-free
+# source scan, the verifier/ELECT checkers) keep using `$ROOT/$CLOCK`: they read TRACKED files,
+# which are byte-identical in both trees, and reading them from a mirror would only add a way for
+# the two to drift. Always defined, so a `host`-only run never trips `set -u`.
+BUILD_ROOT="$ROOT"
 WHAT="${1:-all}"
 FAILED=()
 run_fw=1; run_host=1; run_excl=1
@@ -143,6 +151,70 @@ fi
 if [ "$run_fw" = 1 ] || [ "$run_excl" = 1 ]; then
   step "provisioning (git-ignored; existing files untouched)"
   "$ROOT/tools/ci_provision.sh" "$CLOCK" || { echo "provisioning failed" >&2; exit 1; }
+
+  # #363 THE PRISTINE MIRROR — why this exists, because it is the whole point of the issue.
+  #
+  # `src/board.rs` and `src/secrets.rs` are GIT-IGNORED. CI generates them from the `.example`
+  # files and nothing else; a developer's are whatever their bench needs. So when this gate lints
+  # "the codebase" in a developer's checkout it is linting a file CI cannot see — and `clippy
+  # -D warnings` promotes any local-only constant into a HARD FAILURE on a tier CI calls green.
+  # Observed on `fleet`: three `WEATHER_*` constants, in no example and referenced by no source,
+  # failing the tier as "constant is never used".
+  #
+  # That is not a lint bug, it is a MEASUREMENT bug: the gate was reporting on two different
+  # inputs and calling both of them "the fleet tier". A gate that lints a file CI cannot see is
+  # measuring two different things, and the verdict it prints does not mean one thing.
+  #
+  # It cannot be fixed in `board.rs` — there is no committed copy to fix. Every checkout has a
+  # different one and none of them is in git. The divergence can therefore only be resolved
+  # HERE, by choosing which of the two files the gate is willing to have an opinion about. It
+  # chooses CI's, because CI's is the one derived from tracked content.
+  #
+  # ENGAGED ONLY WHEN IT CHANGES SOMETHING. If your provisioning declares nothing the examples do
+  # not — always true in CI, and true for any developer who has not added local symbols — this is
+  # a no-op and the tiers build from your tree exactly as before. So CI's build path, and its
+  # `Swatinem/rust-cache` keying, are untouched: no cold dependency rebuild is introduced.
+  #
+  # NON-DESTRUCTIVE, which is load-bearing (#338: a gate people avoid is the failure this whole
+  # file is about, and #359's promise is that real credentials survive running it). Your tree is
+  # never written — the mirror is a COPY, and `board.rs`/`secrets.rs` are excluded from it so the
+  # provisioner fills them from the examples. Deliberately NOT implemented by moving your file
+  # aside and restoring it in a trap: a harness EXIT trap has already destroyed uncommitted work
+  # in this repo once, and the file at risk here holds real fleet credentials.
+  #
+  # Stable path, so cargo's incremental state survives between runs (a mirror at a fresh path
+  # every time would rebuild the world and make the gate something you skip).
+  if [ -z "${SMOL_GATE_LOCAL_PROVISIONING:-}" ]; then
+    extras="$("$ROOT/tools/ci_provision.sh" --list-extras "$CLOCK" 2>/dev/null)"
+    if [ -n "$extras" ]; then
+      step "pristine provisioning mirror (#363)"
+      MIRROR="${SMOL_GATE_MIRROR:-${TMPDIR:-/tmp}/smol-gate-pristine-$(printf '%s' "$ROOT" | cksum | cut -d' ' -f1)}"
+      n=$(printf '%s\n' "$extras" | wc -l)
+      printf '   your provisioning declares %s symbol(s) the examples do not:\n' "$n"
+      printf '%s\n' "$extras" | sed 's/^/       /'
+      printf '   CI never compiles those, so linting your tree would answer a different question.\n'
+      printf '   Building the tiers from a mirror provisioned like CI instead: %s\n' "$MIRROR"
+      printf '   (SMOL_GATE_LOCAL_PROVISIONING=1 to lint YOUR files instead — useful when the\n'
+      printf '    local-only symbol is one you are actively wiring up.)\n'
+      # `rsync --delete` so a file deleted in the checkout cannot linger in the mirror and keep a
+      # stale tier green. `--exclude` the target dirs (rebuilt in place) and the two git-ignored
+      # provisioning files, which the provisioner then creates from the examples.
+      # rsync does not create nested destination parents (only the final component), so make them
+      # first — without this the very first run of a fresh mirror fails on `mkdir "…/rust/clock"`.
+      if mkdir -p "$MIRROR/$CLOCK" "$MIRROR/rust/sigil-names" \
+         && rsync -a --delete \
+            --exclude='target/' --exclude='src/board.rs' --exclude='src/secrets.rs' \
+            "$ROOT/$CLOCK/" "$MIRROR/$CLOCK/" \
+         && rsync -a --delete --exclude='target/' \
+            "$ROOT/rust/sigil-names/" "$MIRROR/rust/sigil-names/" \
+         && "$ROOT/tools/ci_provision.sh" "$MIRROR/$CLOCK" >/dev/null; then
+        BUILD_ROOT="$MIRROR"
+        ok "mirror provisioned (tiers below build from it, not from your tree)"
+      else
+        bad "mirror provisioning (#363) — falling back to linting your tree"
+      fi
+    fi
+  fi
 fi
 
 if [ "$run_fw" = 1 ]; then
@@ -246,11 +318,11 @@ if [ "$run_fw" = 1 ]; then
   while IFS=$'\t' read -r name feats; do
     # A tier naming a feature this branch does not have (e.g. ledger-provision before #181 lands)
     # is SKIPPED, not failed — the gate must work on both sides of that merge.
-    if [ -n "$feats" ] && ! grep -qE "^${feats%%,*} *=" "$CLOCK/Cargo.toml"; then
+    if [ -n "$feats" ] && ! grep -qE "^${feats%%,*} *=" "$BUILD_ROOT/$CLOCK/Cargo.toml"; then
       printf '   \033[33mSKIP\033[0m %-16s (feature not in Cargo.toml on this branch)\n' "$name"; continue
     fi
     args=(--release "${JOBS[@]}"); [ -n "$feats" ] && args+=(--features "$feats")
-    if (cd "$CLOCK" && cargo check "${args[@]}") >/tmp/gate-$name.log 2>&1; then
+    if (cd "$BUILD_ROOT/$CLOCK" && cargo check "${args[@]}") >/tmp/gate-$name.log 2>&1; then
       ok "check $name"
     else
       bad "check $name"; tail -15 /tmp/gate-$name.log | sed 's/^/        /'
@@ -269,11 +341,11 @@ if [ "$run_fw" = 1 ]; then
   # /tmp/gate-clippy-fleet.log, was /tmp/gate-clippy-canonical.log.
   step "cargo clippy -D warnings — every tier"
   while IFS=$'\t' read -r name feats; do
-    if [ -n "$feats" ] && ! grep -qE "^${feats%%,*} *=" "$CLOCK/Cargo.toml"; then
+    if [ -n "$feats" ] && ! grep -qE "^${feats%%,*} *=" "$BUILD_ROOT/$CLOCK/Cargo.toml"; then
       printf '   \033[33mSKIP\033[0m %-16s (feature not in Cargo.toml on this branch)\n' "$name"; continue
     fi
     args=(--release "${JOBS[@]}"); [ -n "$feats" ] && args+=(--features "$feats")
-    if (cd "$CLOCK" && cargo clippy "${args[@]}" -- -D warnings) >/tmp/gate-clippy-$name.log 2>&1; then
+    if (cd "$BUILD_ROOT/$CLOCK" && cargo clippy "${args[@]}" -- -D warnings) >/tmp/gate-clippy-$name.log 2>&1; then
       ok "clippy $name"
     else
       bad "clippy $name"
@@ -326,11 +398,11 @@ if [ "$run_excl" = 1 ]; then
   flock 9 || { bad "tier exclusions (could not take $EXCL.lock)"; exit 1; }
   EXCL_ARGS=()
   while IFS=$'\t' read -r name feats; do
-    if [ -n "$feats" ] && ! grep -qE "^${feats%%,*} *=" "$CLOCK/Cargo.toml"; then
+    if [ -n "$feats" ] && ! grep -qE "^${feats%%,*} *=" "$BUILD_ROOT/$CLOCK/Cargo.toml"; then
       printf '   \033[33mSKIP\033[0m %-16s (feature not in Cargo.toml on this branch)\n' "$name"; continue
     fi
     args=(--release --bin clock "${JOBS[@]}"); [ -n "$feats" ] && args+=(--features "$feats")
-    if (cd "$CLOCK" && CARGO_TARGET_DIR="$EXCL/target" \
+    if (cd "$BUILD_ROOT/$CLOCK" && CARGO_TARGET_DIR="$EXCL/target" \
           CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build "${args[@]}") \
           >/tmp/gate-excl-$name.log 2>&1; then
       cp "$EXCL/target/$REPRO_TARGET/release/clock" "$EXCL/elf/$name"
@@ -356,10 +428,10 @@ if [ "$run_fw" = 1 ]; then
   # while the gate enforced a new one. "unreadable" here is not a failure; repro_stack_check
   # fails closed on it a few lines down, with the diagnostic.
   step "stack floor — canonical ELF vs ${REPRO_STACK_FLOOR:-$(repro_stack_floor || echo unreadable)} B"
-  if repro_cargo_args "$CLOCK" 2>/dev/null && \
-     (cd "$CLOCK" && cargo build --release "${JOBS[@]}" --features "$REPRO_FLEET_FEATURES" "${REPRO_CARGO_ARGS[@]}") \
+  if repro_cargo_args "$BUILD_ROOT/$CLOCK" 2>/dev/null && \
+     (cd "$BUILD_ROOT/$CLOCK" && cargo build --release "${JOBS[@]}" --features "$REPRO_FLEET_FEATURES" "${REPRO_CARGO_ARGS[@]}") \
        >/tmp/gate-stack.log 2>&1; then
-    ELF="${CARGO_TARGET_DIR:-$ROOT/$CLOCK/target}/${REPRO_TARGET}/release/clock"
+    ELF="${CARGO_TARGET_DIR:-$BUILD_ROOT/$CLOCK/target}/${REPRO_TARGET}/release/clock"
     # Capture the verdict to a file as well as the console: CI lifts it into the job summary so the
     # number is visible without opening logs. Written on FAILURE too — "the stack broke the floor"
     # is the case a reader most needs surfaced, and a report that only exists when green would hide
@@ -381,7 +453,7 @@ if [ "$run_fw" = 1 ]; then
   # adds confidence and never stands alone. Skipped, not failed, if the build above did not
   # produce an ELF: a corroboration arm must not invent a verdict.
   step "byte-free corroboration — symbols in the canonical ELF (#351)"
-  ELF="${CARGO_TARGET_DIR:-$ROOT/$CLOCK/target}/${REPRO_TARGET}/release/clock"
+  ELF="${CARGO_TARGET_DIR:-$BUILD_ROOT/$CLOCK/target}/${REPRO_TARGET}/release/clock"
   if [ -f "$ELF" ]; then
     if out=$("$ROOT/tools/check_byte_free.py" --src "$CLOCK/src" --elf "$ELF" \
                --features "$REPRO_FLEET_FEATURES" 2>&1); then
@@ -498,6 +570,22 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | tail -2; ok "test_verifier_wiring"
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_verifier_wiring"
+  fi
+
+  # #363: the provisioner's own suite. It existed since #359 and NOTHING RAN IT — `grep -rn
+  # test_ci_provision tools/gate.sh .github/workflows/` returned nothing, while every one of its
+  # siblings above was wired. That is this file's opening argument yet again: a checker nobody
+  # invokes is the same shape as prose, and it has already stopped running.
+  #
+  # It earns the slot on its own merits now, not just for symmetry: gate.sh decides which tree to
+  # BUILD from based on `ci_provision.sh --list-extras`, so a silent regression in that one
+  # contract would quietly restore the two-verdict bug #363 exists to remove. Runs only in
+  # mktemp dirs; touches nothing in the working tree.
+  step "provisioning checker regression suite (#359/#363)"
+  if out=$("$ROOT/tools/test_ci_provision.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "test_ci_provision"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_ci_provision"
   fi
 fi
 

@@ -97,6 +97,32 @@ grep -v 'DEFAULT_PAGE' "$d/src/board.rs.example" > "$d/src/board.rs"
 grep -q 'pub const DEFAULT_PAGE' "$d/src/board.rs" && ok "DEFAULT_PAGE appended" || bad "DEFAULT_PAGE absent"
 rm -rf "$d"
 
+echo "== 5. #363 --list-extras: the machine-readable local-only report =="
+# gate.sh decides whether to build from a pristine mirror based ENTIRELY on this output, so the
+# contract is load-bearing in both directions: a false empty silently restores the two-verdict bug
+# this mode exists to fix, and a false non-empty sends every CI run through a pointless mirror.
+d="$(mkclock)"
+"$PROV" "$d" >/dev/null 2>&1
+# 5a. A tree provisioned from the examples has nothing CI cannot see. This is the CI case, and it
+#     is the one that must stay silent.
+out="$("$PROV" --list-extras "$d" 2>&1)"; rc=$?
+check "exit on a pristine tree" "$rc" "0"
+check "no extras on a pristine tree" "$out" ""
+# 5b. The real defect: a local-only symbol in no example and no source — exactly the shape of the
+#     WEATHER_* constants that failed the fleet tier locally while CI called it green (#363).
+printf '\npub const WEATHER_LAT: &str = "0.0";\n' >> "$d/src/board.rs"
+out="$("$PROV" --list-extras "$d" 2>/dev/null)"
+check "names the local-only symbol" "$out" "$(printf 'board.rs\tWEATHER_LAT')"
+# 5c. Reporting must not MUTATE — the mode gate.sh calls on every run has to be side-effect free,
+#     or running the gate would edit a developer's real credentials.
+before="$(cksum < "$d/src/board.rs") $(cksum < "$d/src/secrets.rs")"
+"$PROV" --list-extras "$d" >/dev/null 2>&1
+after="$(cksum < "$d/src/board.rs") $(cksum < "$d/src/secrets.rs")"
+check "--list-extras changes nothing" "$after" "$before"
+# 5d. An extra must never be confused for a MISSING symbol: it changes no exit code anywhere.
+"$PROV" --check "$d" >/dev/null 2>&1; check "--check still passes with an extra" "$?" "0"
+rm -rf "$d"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

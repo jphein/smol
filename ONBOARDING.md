@@ -150,6 +150,17 @@ Full toolchain + gotchas: **[`docs/BUILDING.md`](docs/BUILDING.md)**. TL;DR for 
    the prose was wrong without anyone noticing: `main` sat red on its own `-D warnings` rule, and a
    feature was added with no matrix to add it to. Add a tier to `gate.sh`, not to this paragraph.
 
+   **Your git-ignored `board.rs`/`secrets.rs` are not what the tiers get lint-checked against**
+   (#363). CI builds those two files from the `.example`s and nothing else, so a constant that
+   exists only in *your* copy is one CI never compiles — and `clippy -D warnings` turns an unused
+   one into a hard failure on a tier CI calls green. That is a measurement bug, not a lint bug: the
+   gate would be reporting on two different inputs and calling both "the fleet tier". So when your
+   provisioning declares symbols the examples do not, `gate.sh` builds the tiers from a **pristine
+   mirror** provisioned the way CI provisions, tells you which symbols triggered it, and leaves
+   your files untouched. It engages only when there is a divergence, so CI's path is unchanged.
+   Set `SMOL_GATE_LOCAL_PROVISIONING=1` to lint *your* files instead — the right call when the
+   local-only symbol is one you are actively wiring up.
+
    **Known gaps** (`gate.sh` states them too): `mesh-test` needs a real board's `DEAF_MACS`; image
    packaging and anything needing hardware are out of scope. The stack check bounds the linked
    **region**, *not* runtime high-water — green there is not evidence of headroom.
