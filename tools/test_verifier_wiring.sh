@@ -83,12 +83,34 @@ lib_only() {
 # A verifier pointing at a file that does not exist — a rename that missed the harness.
 dangling_include() { rm -f "$1/rust/clock/src/net/etx.rs"; }
 
+# THE `mod.rs` WALK TRUNCATION (#371 audit). rustc roots the children of `dir/mod.rs` at `dir/`;
+# the walk computed `dir/mod/`, which never exists, so it stopped dead at every `mod.rs`-style
+# directory module. `mesh_snake/snake_core.rs` is reachable — `main.rs:140 mod mesh_snake;` →
+# `mesh_snake/mod.rs:14 pub mod snake_core;` — so a verifier including it MUST read SOUND.
+#
+# PROVEN ABLE TO FAIL, not assumed: run against the pre-fix walk this exact case printed
+#   "PHANTOM — a green verifier over code NEITHER crate root compiles:
+#      zz_modrs_probe -> rust/clock/src/mesh_snake/snake_core.rs"
+# for a module the firmware demonstrably contains. Revert the "mod.rs" entry in the
+# `reachable_from` tuple and this arm goes red again.
+#
+# ⚠️ The pattern below is anchored to the PROBE's own row on purpose. Grepping for a bare "SOUND"
+# would pass on any tree that has one sound verifier anywhere — i.e. it would pass with this bug
+# fully present. An absence/positive check that cannot distinguish "my case worked" from "something
+# else worked" is the shape this whole suite exists to refuse.
+plant_modrs_verifier() {
+  mkdir -p "$1/experiments/zz_modrs_probe/src"
+  printf '#[path = "../../../rust/clock/src/mesh_snake/snake_core.rs"]\nmod probe;\nfn main() {}\n' \
+    > "$1/experiments/zz_modrs_probe/src/main.rs"
+}
+
 echo "#367 verifier-wiring check — proving each arm can fail"
 case_run "clean tree passes (crdt tracked)"        0 noop
 case_run "a NEW phantom fails"                     1 drop_decl
 case_run "a STALE allowlist entry fails"           1 stale_entry
 case_grep "lib.rs-only module reads HOST-ONLY, not SOUND" 0 "HOST-ONLY" lib_only
 case_run "a dangling #[path] target is an error"   2 dangling_include
+case_grep "a mod.rs-subtree target reads SOUND, not PHANTOM" 0 "zz_modrs_probe.*SOUND" plant_modrs_verifier
 
 echo
 if [ "$FAIL" -eq 0 ]; then

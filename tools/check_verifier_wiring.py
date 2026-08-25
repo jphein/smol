@@ -120,7 +120,22 @@ def reachable_from(root: Path, crate_src: Path):
             if override:
                 cands = [f.parent / override, crate_src / override]
             else:
-                base = f.parent if f.name in ("main.rs", "lib.rs") else f.parent / f.stem
+                # `mod.rs` belongs in this tuple with the crate roots, and leaving it out is not a
+                # style slip — it silently TRUNCATES the walk. rustc roots the children of
+                # `dir/mod.rs` at `dir/`, exactly as it roots `main.rs`'s children at `src/`;
+                # computing `dir/mod/` instead names a directory that never exists, so every
+                # `mod.rs`-style directory module and its whole subtree became invisible.
+                # MEASURED at the time of the fix (#371 audit): the main.rs walk saw 55 files
+                # where rustc compiles 62 — the six `bard/*` modules and `mesh_snake/snake_core.rs`,
+                # all of them under a `mod.rs`. `lib.rs` was 13 vs 13, which is why nothing showed.
+                #
+                # The dangerous direction was NOT the false PHANTOM (that fails closed and is
+                # merely noisy). It is the STALE-allowlist arm, which fails OPEN: a KNOWN_PHANTOMS
+                # entry under a `mod.rs` subtree could be wired up for real and "these are now
+                # reachable" would never fire — the allowlist would keep excusing shipping code.
+                # That is the same fail-open shape #374 was written to kill.
+                base = (f.parent if f.name in ("main.rs", "lib.rs", "mod.rs")
+                        else f.parent / f.stem)
                 cands = [base / f"{name}.rs", base / name / "mod.rs"]
             for c in cands:
                 if c.exists():
