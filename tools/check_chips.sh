@@ -39,6 +39,9 @@ set -uo pipefail   # NOT -e: a failing `cargo check` is DATA here, not an error 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CRATE="$ROOT/rust/clock"
 MATRIX="$ROOT/tools/build_matrix.py"
+# #280 — the stale-config guard. Sourced, because the publish path needs the same function.
+# shellcheck source=/dev/null
+. "$ROOT/tools/assert_cargo_config.sh"
 
 # Per-chip logs go in the REPO, never /tmp (JP directive 2026-08-25 — katana's /tmp is a 16 GB
 # tmpfs, i.e. RAM). Git-ignored via tmp/.gitignore. Absolute, because this script `cd`s to $CRATE.
@@ -92,6 +95,22 @@ while IFS=$'\t' read -r chip target expect toolchain build_std opt_level feature
     # so the default-features path would be the one never exercised against its explicit form.
     args=(check --no-default-features --features "${chip},${features}" --target "$target")
     [ -n "$toolchain" ] && args=("+${toolchain}" "${args[@]}")
+
+    # #280 — BEFORE the build, not after. This script's own header sends operators to familiar,
+    # and familiar is exactly where `.cargo/config.toml` arrives out of band and goes stale: on
+    # 2026-08-25 its copy was current except for the S3 arm's `-Tlinkall.x`. `cargo check` would
+    # not have noticed (check never links) — it is the LINK that emits 129 undefined references,
+    # long after this harness has reported the chip green.
+    #
+    # Counted as a FAIL, deliberately, not a SKIP. A skip is for "the toolchain is absent", which
+    # is not the chip's fault and not a defect; a stale config IS a defect and the tree is wrong
+    # until it is fixed. Blurring the two would put a real problem in the column this script
+    # already warns reads like a green tick.
+    if ! assert_cargo_config "$chip"; then
+        printf '  \033[31mFAIL\033[0m %-9s %s — .cargo/config.toml is stale for this chip (#280)\n' \
+               "$chip" "$target"
+        fail=$((fail + 1)); continue
+    fi
 
     log="$CHIPS_TMP/check-chips-${chip}.log"
     printf '  .... %-9s %s (expect %s)\033[2K\r' "$chip" "$target" "$expect"
