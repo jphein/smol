@@ -4632,7 +4632,7 @@ impl RadioManager {
         }
         if !was_latched && self.relay.latch.latched() {
             log::info!(
-                "smol #13: leaf escalated to multi-hop (RELAY2) — gateway unreachable, {} un-ACKed msgs",
+                "smol #13: leaf escalated to multi-hop (UP2) — gateway unreachable, {} un-ACKed msgs",
                 crate::net::flood::ESCALATE_STREAK
             );
         }

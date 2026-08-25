@@ -7,25 +7,24 @@ description = "smol: ESP32-C3 SuperMini + 0.42\" SSD1306 OLED clock with WiFi/NT
 license = "MIT OR Apache-2.0"
 
 # -----------------------------------------------------------------------------
-# Pinned, mutually-compatible crate versions.
+# Pinned, mutually-compatible crate versions — the #233 MATCHED SET (PR #361,
+# landed 2026-08-01):
 #
-# The esp-hal / esp-wifi / esp-hal-embassy / esp-alloc quartet is extremely
-# version-sensitive because esp-wifi links against esp-hal INTERNAL APIs, and
-# its Cargo `^1.0.0-rc.0` requirement is looser than what actually compiles.
+#   esp-hal          1.1    (esp-radio requires ~1.1.0 — 1.2.0-rc.0 does NOT work)
+#   esp-radio        0.18   (the esp-wifi RENAME; carries esp32c5 too, see #388)
+#   esp-rtos         0.3    (owns the scheduler; the `embassy` executor feature
+#                            is enabled on the #335 phase-1 branch, not here)
+#   esp-alloc        0.10 · esp-storage 0.9 · esp-bootloader-esp-idf 0.5
 #
-# THE KEY GOTCHA: esp-wifi 0.15.x calls `esp_hal::rng::Rng::new(peripherals.RNG)`
-# internally. In esp-hal 1.0.0-rc.1 and the 1.0.0 release, `Rng::new()` was
-# changed to take NO argument, which makes esp-wifi 0.15.x fail to compile
-# ("this function takes 0 arguments but 1 was supplied") even though Cargo's
-# semver check passes. We therefore pin esp-hal to the EXACT release esp-wifi
-# 0.15.x was built against: the 2025-07-16 cluster.
+# The set moves TOGETHER: esp-radio links against esp-hal internal APIs, so a
+# lone bump that "passes semver" can still fail to compile or — worse — change
+# a private default (that is how the I2C SCL timeout vanished, #387).
 #
-#   esp-hal          1.0.0-rc.0  (2025-07-16; Rng::new(RNG) still takes the peripheral)
-#   esp-wifi         0.15.0      (2025-07-16; requires esp-alloc ^0.8.0)
-#   esp-hal-embassy  0.9.0       (2025-07-16)
-#   esp-alloc        0.8.0
-#   esp-backtrace    0.17.0      (2025-07-16)
-#   esp-println      0.15.0      (2025-07-16)
+# HISTORICAL GOTCHA (pre-#233 cluster, kept dated because the NEXT bump will
+# look exactly like this): esp-wifi 0.15.x called `Rng::new(peripherals.RNG)`
+# internally; esp-hal 1.0.0-rc.1+ changed `Rng::new()` to take no argument, so
+# the pair compiled under Cargo's semver check and failed at build. Signature
+# arity was the only tell — grep the bumped API's call sites and BUILD it.
 #
 # ssd1306 0.10.0 + embedded-graphics 0.8 target embedded-hal 1.0, which esp-hal
 # 1.x implements, so the display stack composes cleanly with the HAL.
