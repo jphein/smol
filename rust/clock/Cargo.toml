@@ -1,7 +1,9 @@
 [package]
 name = "clock"
 version = "0.1.0"
-edition = "2021"
+# #335 P1.0: edition 2024 (needs rustc ≥ 1.85, so the 1.95 floor below clears it — including on
+# espup's Xtensa fork, which is the lowest toolchain in the matrix).
+edition = "2024"
 # LOWERED 1.96 -> 1.95 by #347 Part 2, because 1.96 was blocking a supported target and had no
 # reason to be there.
 #

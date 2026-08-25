@@ -36,6 +36,16 @@
 
 #![no_std]
 #![no_main]
+// #335 P1.0 (edition 2024): let-chains are stable in 2024, so `collapsible_if` can now suggest
+// folding `if a { if let Some(b) = c { … } }` into a single let-chain. It is NOT a pre-existing
+// baseline lint — at edition 2021 clippy could not make the suggestion and the tree was clean.
+// The bump therefore opens 38 fresh sites across 10 files, 23 of them in the two largest files
+// (mode.rs 7.5k lines, wifi.rs 6.2k). Collapsing them here would bury a 4-line edition change in
+// a 38-site reflow of exactly the files Phase 1 P1.2–P1.5 rewrite, and would make this step
+// non-revertible in practice. Allowed crate-wide so the `clippy -D warnings` gate stays green on
+// every tier; the collapse is a separate mechanical cleanup with no Embassy content.
+// TODO(#335 follow-up): collapse the 38 nested ifs and drop this allow.
+#![allow(clippy::collapsible_if)]
 
 // Phase 3 (espnow) stores inbound ESP-NOW messages as owned Strings for display.
 #[cfg(feature = "espnow")]
@@ -62,7 +72,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 // bootloader auto-reverts too, if it was built with rollback enabled). rc.0 puts
 // `software_reset` in `esp_hal::system`, NOT `esp_hal::reset` (spike-verified).
 #[cfg(feature = "wifi")]
-#[no_mangle]
+// edition 2024: `no_mangle` is now an unsafe attribute (symbol-name control).
+#[unsafe(no_mangle)]
 extern "Rust" fn custom_halt() -> ! {
     // #70 observability: record that THIS reset was a PANIC before we reboot. A panic halts
     // here → software_reset, which the SoC logs as a plain `CoreSw` (same as an intentional
