@@ -153,6 +153,55 @@ impl ChipBudget {
 // trusting the comment; a number copied forward untested is how the stack floor once ended
 // up at 12,288 B.
 
+/// **How a chip's declared stack floor was arrived at — the number's epistemic status, as DATA.**
+///
+/// #413 phase 2. The three floors on this fleet are three different KINDS of number, and until
+/// this enum existed that difference lived only in prose:
+///
+/// | chip | floor | how |
+/// |---|---|---|
+/// | C3 | 74,208 | [`Derived`](Self::Derived) — measured high-water × 4/3, compile-asserted |
+/// | C6 | 71,680 | [`BootAssert`](Self::BootAssert) — a firmware contract, sitting BELOW the empirical line |
+/// | S3 | 72,004 | [`ObservedSufficient`](Self::ObservedSufficient) — the smallest region proven clean, because the high-water instrument does not work on that chip |
+///
+/// ## Why this is an enum and not a doc comment
+///
+/// `tools/repro_build.sh` prints the provenance beside its verdict, so an operator reading
+/// `stack: 116940 B (floor 72004 B, observed-sufficient)` learns what the gate did and did not
+/// prove. A doc comment cannot reach the shell; a free-text string would rot back into prose. And
+/// an enum makes a fourth kind a **deliberate act in two places**: adding a variant here does not
+/// teach the shell, whose mapping is explicit and FAILS CLOSED on an unknown one. That is the
+/// intended friction — a new epistemic status should not be able to arrive by accident.
+///
+/// ## ⚠️ THE HARDENING RATCHET — the condition attached to this whole design
+///
+/// > when a chip gains a working high-water instrument, this gate HARDENS for that chip —
+/// > derived floors become REQUIRED and observed-sufficient/boot-assert refuse; permissive only
+/// > while measurement is impossible AND documented at the instrument (#398 follow-up for xtensa).
+///
+/// Today the packaging gate accepts every variant and merely reports it (#413 ruling). That
+/// permissiveness is **not a policy** — it is a consequence of `stack-paint` being invalid on
+/// xtensa, and it expires when that is fixed. What the gate protects against is silent `.stack`
+/// collapse from `.bss` growth, and an [`ObservedSufficient`](Self::ObservedSufficient) floor
+/// catches that perfectly well (the S3 sits at 116,940 against 72,004, so a ~40 KB regression
+/// trips it). What it does NOT do is certify an absolute safety margin — hence the ratchet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FloorProvenance {
+    /// Derived from the highest stack high-water ever MEASURED on hardware for this chip, with a
+    /// safety multiplier, and coupled to that measurement by a compile-time assertion. The strong
+    /// form: the floor cannot drift from its own derivation without the build failing.
+    Derived,
+    /// The smallest `.stack` region PROVEN sufficient by observation — a tier that ran clean — with
+    /// **no high-water number available**, because the measuring instrument does not work on this
+    /// chip. Weaker than [`Derived`](Self::Derived) in a specific way: it says "this much was
+    /// enough for what we ran", not "this much is enough".
+    ObservedSufficient,
+    /// A floor the FIRMWARE asserts at boot — a contract rather than a measurement. Note this one
+    /// can sit BELOW the empirically-established line (the C6 does, by ~1,320 B, and `budget.rs`
+    /// asserts that inversion as a fact to preserve), so it is permissive in a KNOWN direction.
+    BootAssert,
+}
+
 /// **The C3 stack floor — ONE definition, two languages.**
 ///
 /// The minimum linked `.stack` region an image may ship with. Both consumers read *this*:
@@ -195,6 +244,18 @@ impl ChipBudget {
 /// at 12,288 B. And note every peak on record was measured **with the Bard narrating**, so for
 /// a Bard-free image this floor is an upper bound on what is required, not a target.
 pub const ESP32C3_STACK_FLOOR_BYTES: u32 = 74_208;
+
+/// The C3's floor is [`FloorProvenance::Derived`] — the strong form, and the only one on the fleet.
+///
+/// It is `ESP32C3_MEASURED_PEAK_BYTES * 4 / 3` with the assertion below enforcing the coupling, so
+/// the number cannot drift from the measurement it came from without the build failing. **This is
+/// the shape the other two chips are missing**, and #413 phase 2 makes that absence visible rather
+/// than leaving it in prose: grep for `_MEASURED_PEAK_BYTES` and there is exactly one.
+///
+/// ⚠️ Same one-line shell-parser contract as the floor above — `tools/repro_build.sh` matches
+/// `pub const ESP32C3_STACK_FLOOR_PROVENANCE: FloorProvenance = FloorProvenance::` and reads the
+/// variant up to the `;`. Keep it on ONE line.
+pub const ESP32C3_STACK_FLOOR_PROVENANCE: FloorProvenance = FloorProvenance::Derived;
 
 /// The input to that derivation: the highest stack high-water ever **measured on hardware** for
 /// this chip — #335, 2026-08-01, id5 under crown duty, 10/10 byte-identical reports, both
@@ -362,10 +423,27 @@ const _: () = assert!(
 /// Flash headroom after `widen_rom_region` is 1,622,672 B. The C6 is the mirror image of the
 /// Bard's problem on the C3 (flash-comfortable, DRAM-tight) — which is why the two axes are
 /// separate fields and why a verdict that could not name the axis would be useless here.
+/// The C6's floor, promoted from an inline literal to a named const (#413 phase 2) so the shell
+/// gate can read it the same way it reads the C3's, and so the provenance below has somewhere to
+/// live that is not a paragraph.
+///
+/// 71,680 B is the watch firmware's **boot assert** — see `ESP32C6_WATCH_EMPIRICAL_BOOT_LINE_BYTES`
+/// and the assertion that pins the inversion: the declared floor sits ~1,320 B BELOW the line the
+/// hardware bracket actually established. Permissive in a known, signed direction.
+///
+/// ⚠️ One-line shell-parser contract, as the C3's.
+pub const ESP32C6_STACK_FLOOR_BYTES: u32 = 71_680;
+
+/// [`FloorProvenance::BootAssert`] — a contract the firmware enforces, not a measurement.
+///
+/// ⚠️ There is deliberately **no** `ESP32C6_MEASURED_PEAK_BYTES` and therefore no `4/3` assertion:
+/// the C6's number did not come from a high-water run. The missing assert is the point.
+pub const ESP32C6_STACK_FLOOR_PROVENANCE: FloorProvenance = FloorProvenance::BootAssert;
+
 pub const ESP32C6_WATCH: ChipBudget = ChipBudget {
     chip: "esp32c6",
     free_dram_bytes: 80_272,
-    stack_floor_bytes: 71_680,
+    stack_floor_bytes: ESP32C6_STACK_FLOOR_BYTES,
     // partitions.csv (the watch's, NOT smol's partitions-ota.csv): ota_0/ota_1 = 0x600000.
     // Requires the `widen_rom_region` build.rs hook — see the doc note above.
     app_slot_bytes: 0x0060_0000,
@@ -446,10 +524,35 @@ pub const CHIP: ChipBudget = ESP32C6_WATCH;
 /// opt-level moves sections, so the profile is part of this row's provenance).
 /// `app_slot_bytes`/`baseline_image_bytes`: `targets/s3-cyd/partitions-ota-s3.csv`,
 /// espflash save-image against that CSV = 1,028,656 B (16.35% of the slot).
+/// The S3's floor, promoted from an inline literal to a named const (#413 phase 2).
+///
+/// 72,004 B is the `.stack` region of the heaviest-stack tier ever run on this unit
+/// (`stack-paint` = bard + canonical: narration + mesh relay + MQTT + the 4× display), which ran
+/// clean — **the smallest region PROVEN sufficient, not the smallest that works.**
+///
+/// ⚠️ One-line shell-parser contract, as the C3's.
+pub const ESP32S3_STACK_FLOOR_BYTES: u32 = 72_004;
+
+/// [`FloorProvenance::ObservedSufficient`] — and this is the chip the whole enum exists for.
+///
+/// **There is no measured high-water for the S3, because `stack-paint` is INVALID on this chip as
+/// written**: its sentinel is trampled by boot-era machinery sharing the `.stack` region (59,504 B
+/// read "used" one statement after painting, at boot, before anything deep ran), and re-painting
+/// after init crashed the box into a 99-boot exception loop. The `_stack_*_cpu0` symbols alias the
+/// whole-region ones (readelf-verified), so a CPU-slice port is NOT the fix.
+///
+/// ⚠️ **THIS CONST IS THE RATCHET'S TRIGGER.** When the xtensa high-water instrument is fixed
+/// (#398 follow-up), the correct change is: measure the peak, add `ESP32S3_MEASURED_PEAK_BYTES`
+/// with the `4/3` assertion the C3 has, and flip this to [`FloorProvenance::Derived`] — at which
+/// point the packaging gate stops merely reporting the status and starts requiring it. Do NOT flip
+/// this constant to `Derived` on the strength of a clean run; `ObservedSufficient` already means
+/// "it ran clean". `Derived` means the instrument measured how close it came.
+pub const ESP32S3_STACK_FLOOR_PROVENANCE: FloorProvenance = FloorProvenance::ObservedSufficient;
+
 pub const ESP32S3_CYD: ChipBudget = ChipBudget {
     chip: "esp32s3",
     free_dram_bytes: 116_940,
-    stack_floor_bytes: 72_004,
+    stack_floor_bytes: ESP32S3_STACK_FLOOR_BYTES,
     app_slot_bytes: 0x0060_0000,
     baseline_image_bytes: 1_028_656,
 };

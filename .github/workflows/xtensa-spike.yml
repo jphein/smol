@@ -204,11 +204,20 @@ jobs:
           test -f "$elf" || { echo "::error::no ELF at $elf"; exit 1; }
           echo "S3_ELF_BYTES=$(stat -c%s "$elf")" >> "$GITHUB_ENV"
           # ⚠️ INFORMATIONAL ONLY, and knowingly incomplete: this reports .text/.rodata but drops
-          # .data/.bss (a readelf -SW column-position quirk this one-liner does not handle). Left
-          # as-is rather than half-fixed, because the S3 has NO stack-floor gate wired at all —
-          # `repro_stack_floor` greps the C3's constant BY NAME, so a non-C3 image would be measured
-          # against the C3's floor and report green. Both the parser and that false-pass are phase-2
-          # work (#413); fixing the parser here would suggest a gate exists when none does.
+          # .data/.bss (a readelf -SW column-position quirk this one-liner does not handle). Kept
+          # incomplete because this spike BUILDS and does not package, so no floor check runs here
+          # and a complete parser would imply a gate exists where none does. The proper parser is
+          # phase-2B work, together with wiring an S3 floor check into the publish path.
+          #
+          # The earlier note here said a chip-blind `repro_stack_floor` would make a non-C3 image
+          # "report green". THAT HAD THE DIRECTION BACKWARDS, and the correction was lost when #422
+          # squash-merged from a SHA that predated it — restated here so main carries the true
+          # version: the C3's floor (74,208) is the HIGHEST of the three (C6 71,680 · S3 72,004), so
+          # a chip-blind check was STRICTER than a non-C3 chip's own. It could false-REJECT a valid
+          # S3 image in [72,004, 74,208) — a 2,204 B window — and could never false-accept on that
+          # roster; today's S3 image measures 116,940 and clears both, so the verdict was correct by
+          # arithmetic coincidence. #413 phase 2A made the lookup per-chip and gave each floor its
+          # provenance, so this whole paragraph is now history rather than a live caveat.
           echo "--- sections (informational, incomplete — see the note in this step)"
           readelf -SW "$elf" | awk '$2 ~ /^\.(text|rodata|data|bss)$/ {printf "%-10s %10d\n", $2, strtonum("0x" $6)}'
 
@@ -239,7 +248,13 @@ jobs:
             echo "\`build-matrix.toml\`: *a compiler that demonstrably mishandled this code at"
             echo "\`opt=\"s\"\` merely LINKING at opt=2 is escape, not proof of correct codegen.*"
             echo
-            echo "⚠️ No stack-floor check runs here — \`repro_stack_floor\` greps the **C3's** constant"
-            echo "by name, so a non-C3 image would be measured against the C3's floor and report"
-            echo "green. That false-pass is phase-2 work (#413)."
+            echo "⚠️ No stack-floor check runs here — this spike builds, it does not package. But the"
+            echo "reason has CHANGED: \`repro_stack_floor\` is now per-chip (#413 phase 2A), so an S3"
+            echo "floor check is possible; wiring one into the publish path is phase 2B."
+            echo
+            echo "The old wording here claimed a chip-blind gate would \"report green\" for a non-C3"
+            echo "image. **That had the direction backwards** — the C3's floor (74,208) is the HIGHEST"
+            echo "of the three (C6 71,680 · S3 72,004), so a chip-blind check was STRICTER: it could"
+            echo "false-REJECT a valid S3 image in [72,004, 74,208), never false-accept, and today's"
+            echo "S3 image (116,940) cleared both floors — correct by arithmetic coincidence."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -122,25 +122,105 @@ REPRO_ROOT="${REPRO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null &
 # documented on ESP32C3_STACK_FLOOR_BYTES (one line, plain decimal, comments on their own line).
 # The awk takes everything between `=` and `;` and strips spaces/underscores, so a trailing
 # comment on the line cannot be swallowed into the number; the digits-only test is the backstop.
+# repro_stack_floor <chip>  →  prints "<bytes> <provenance-token>"
+#
+# ── #413 PHASE 2: THIS USED TO BE CHIP-BLIND, AND ITS CORRECTNESS WAS COINCIDENTAL ────────────
+# It read `ESP32C3_STACK_FLOOR_BYTES` by name and `repro_stack_check` applied that number to
+# whatever ELF it was handed. The direction of the resulting error is worth stating exactly,
+# because the obvious guess is wrong: the C3's floor (74,208) is the HIGHEST of the three declared
+# floors (C6 71,680 · S3 72,004), so a chip-blind check was STRICTER than a non-C3 chip's own
+# floor. It could not false-ACCEPT; it could false-REJECT a valid S3 image whose `.stack` landed in
+# [72,004, 74,208) — a 2,204 B window — and it would only false-accept once some chip's legitimate
+# floor exceeded the C3's. It happened to give the right answer for the S3 fleet image because that
+# image measures 116,940 and clears both numbers. Right answer, unrelated reason.
+#
+# ── AND THE PART THAT MADE THE FIX MORE THAN A PARAMETER ──────────────────────────────────────
+# The three floors are three different KINDS of number, so returning "whichever number the row
+# holds" would produce a gate that LOOKS uniform and MEANS three different things:
+#
+#   derived              C3 — measured high-water × 4/3, compile-asserted. The strong form.
+#   boot-assert          C6 — a firmware contract, sitting ~1,320 B BELOW the empirical line.
+#   observed-sufficient  S3 — the smallest region PROVEN clean, because `stack-paint` is INVALID
+#                             on xtensa (sentinel trampled by boot-era machinery; re-painting
+#                             crashed into a 99-boot loop). No high-water exists for that chip.
+#
+# So the provenance travels WITH the number and `repro_stack_check` prints it. An operator reading
+# `stack: 116940 B (floor 72004 B, observed-sufficient)` learns what the gate did and did not prove.
+#
+# ⚠️ THE HARDENING RATCHET (#413 ruling — the condition attached to this decision):
+#
+#     when a chip gains a working high-water instrument, this gate HARDENS for that chip —
+#     derived floors become REQUIRED and observed-sufficient/boot-assert refuse; permissive only
+#     while measurement is impossible AND documented at the instrument (#398 follow-up for xtensa).
+#
+# Today every provenance is accepted and merely reported. That is NOT a policy — it is a
+# consequence of a named instrument defect, and it expires when the defect is fixed. What this gate
+# protects against is silent `.stack` collapse from `.bss` growth, and an observed-sufficient floor
+# catches that perfectly well (the S3 sits 44,936 B above its floor, so a ~40 KB regression trips
+# it). What it does not do is certify an absolute margin.
 repro_stack_floor() {
-  local src="${REPRO_BUDGET_RS:-$REPRO_ROOT/rust/clock/src/budget.rs}" v
+  local chip="${1:-}"
+  case "$chip" in
+    '') echo "repro_stack_floor: a chip is required (esp32c3|esp32c6|esp32s3)" >&2; return 1 ;;
+    *[!a-z0-9]*) echo "repro_stack_floor: implausible chip name '$chip'" >&2; return 1 ;;
+  esac
+  local src="${REPRO_BUDGET_RS:-$REPRO_ROOT/rust/clock/src/budget.rs}" v p tok
   [ -f "$src" ] || return 1
-  v=$(awk '/^pub const ESP32C3_STACK_FLOOR_BYTES: u32 =/ {
+  # Uppercase the chip to get the const prefix. `esp32c3` → `ESP32C3_STACK_FLOOR_BYTES`, which is
+  # why #413 promoted the C6/S3 floors from inline literals to consts NAMED BY CHIP rather than by
+  # board (the rows are ESP32C6_WATCH / ESP32S3_CYD — board names would not map).
+  local pre; pre=$(printf '%s' "$chip" | tr 'a-z' 'A-Z')
+  v=$(awk -v k="^pub const ${pre}_STACK_FLOOR_BYTES: u32 =" '$0 ~ k {
              split($0, a, "="); split(a[2], b, ";"); gsub(/[ _]/, "", b[1]); print b[1]; exit
            }' "$src" 2>/dev/null)
   case "$v" in ''|*[!0-9]*) return 1 ;; esac
-  printf '%s' "$v"
+  # The provenance variant, read from the sibling const.
+  p=$(awk -v k="^pub const ${pre}_STACK_FLOOR_PROVENANCE: FloorProvenance =" '$0 ~ k {
+             n = split($0, a, "::"); split(a[n], b, ";"); gsub(/[ \t]/, "", b[1]); print b[1]; exit
+           }' "$src" 2>/dev/null)
+  # EXPLICIT mapping, FAILING CLOSED on anything unrecognised. This is the deliberate friction the
+  # enum's doc comment describes: adding a `FloorProvenance` variant in Rust does NOT teach this
+  # function, so a new epistemic status cannot arrive by accident — it fails here until someone
+  # decides, in writing, what the gate should do about it.
+  case "$p" in
+    Derived)            tok=derived ;;
+    ObservedSufficient) tok=observed-sufficient ;;
+    BootAssert)         tok=boot-assert ;;
+    '') echo "repro_stack_floor: no ${pre}_STACK_FLOOR_PROVENANCE in $src" >&2; return 1 ;;
+    *)  echo "repro_stack_floor: unknown FloorProvenance::$p — this gate must be taught what it means" >&2; return 1 ;;
+  esac
+  printf '%s %s' "$v" "$tok"
 }
 
 # repro_stack_check <elf>
+# repro_stack_check <elf> <chip>
+#
+# #413: the chip is now REQUIRED and is not defaulted to the C3. A default would restore exactly
+# the chip-blindness this change removes, and it would do so invisibly — the caller that forgot to
+# pass a chip would get a plausible verdict rather than an error.
 repro_stack_check() {
-  local elf="$1" stack_floor="${REPRO_STACK_FLOOR:-$(repro_stack_floor)}"
+  local elf="$1" chip="${2:-}" stack_floor prov
+  case "$chip" in
+    '') echo "FATAL: repro_stack_check needs a chip — refusing to measure an image against an" >&2
+        echo "       unspecified chip's floor. That was the #413 defect: the verdict was correct" >&2
+        echo "       only by arithmetic coincidence because the C3's floor happens to be the" >&2
+        echo "       highest of the three." >&2
+        return 1 ;;
+  esac
+  if [ -n "${REPRO_STACK_FLOOR:-}" ]; then
+    # Documented escape hatch, kept — but it is now LOUD. An operator-supplied number has no
+    # provenance in `budget.rs`, and calling it `derived` would be a lie, so it gets its own token.
+    stack_floor="$REPRO_STACK_FLOOR"; prov="operator-override"
+  else
+    local pair; pair="$(repro_stack_floor "$chip")" || pair=""
+    stack_floor="${pair%% *}"; prov="${pair##* }"
+  fi
   # FAIL CLOSED on an unreadable declaration, for the same reason as the unreadable-ELF branch
   # below: a gate that quietly falls back to a built-in default would measure against a number
   # nobody edited, which is precisely the drift #348 removed. Better to refuse and be fixed.
   case "$stack_floor" in
     ''|*[!0-9]*)
-      echo "FATAL: could not read ESP32C3_STACK_FLOOR_BYTES from ${REPRO_BUDGET_RS:-$REPRO_ROOT/rust/clock/src/budget.rs}" >&2
+      echo "FATAL: could not read the ${chip} stack floor + provenance from ${REPRO_BUDGET_RS:-$REPRO_ROOT/rust/clock/src/budget.rs}" >&2
       echo "       — refusing to measure the stack against a guessed floor. Check that the" >&2
       echo "       declaration is one line of plain decimal (see its doc comment), or set" >&2
       echo "       REPRO_STACK_FLOOR explicitly if you are deliberately overriding it." >&2
@@ -153,12 +233,12 @@ repro_stack_check() {
   if [ -n "$ss" ] && [ -n "$se" ]; then
     local stack_bytes=$(( 0x$ss - 0x$se ))
     if [ "$stack_bytes" -lt "$stack_floor" ]; then
-      echo "FATAL: runtime stack is ${stack_bytes} B, below the ${stack_floor} B floor." >&2
+      echo "FATAL: runtime stack is ${stack_bytes} B, below the ${chip} ${stack_floor} B floor (${prov})." >&2
       echo "       Something grew .bss. Shrink it (nano_llm::SEQ_CAP is the bard's lever) or" >&2
       echo "       reclaim DRAM elsewhere — do NOT ship this image." >&2
       return 1
     fi
-    echo "  stack: ${stack_bytes} B (floor ${stack_floor} B)"
+    echo "  stack: ${stack_bytes} B (floor ${stack_floor} B, ${prov})"
   else
     # FAIL CLOSED. This gate exists precisely because "it links" was not evidence of a runnable
     # image; a gate that waves through an unreadable ELF restores that blind spot exactly, and
@@ -295,7 +375,9 @@ repro_build_bin() {
   # Honor CARGO_TARGET_DIR (verify_image.sh --twice points each build at an isolated dir);
   # default to the in-tree target/ (ota_publish.sh's path) when unset.
   local tdir="${CARGO_TARGET_DIR:-$clock/target}"
-  repro_stack_check "$tdir/${REPRO_TARGET}/release/clock" || return 1
+  # #413: the chip travels with the check. Phase 2A keeps REPRO_CHIP defaulting to esp32c3 —
+  # phase 2B derives it from the manifest alongside REPRO_TARGET, and the two must move together.
+  repro_stack_check "$tdir/${REPRO_TARGET}/release/clock" "${REPRO_CHIP:-esp32c3}" || return 1
   "$espflash" save-image --chip esp32c3 \
     "$tdir/${REPRO_TARGET}/release/clock" "$out" >/dev/null || return 1
 }

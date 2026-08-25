@@ -22,7 +22,9 @@
 #      is deliberately NOT repeated in this file, in build-matrix.toml, or anywhere else.
 #   5. the crate's own tests/*.rs suites via cargo test (#350) — bard / budget / input. Nothing
 #      ran these before: 57 tests, including the Bard's bit-for-bit golden, that no gate executed
-#   6. tools/test_build_matrix.sh — proof that (0)'s arms can actually fail
+#   6. tools/test_build_matrix.sh — proof that (0)'s arms can actually fail, and
+#      tools/test_stack_floor.sh — proof the #413 per-chip floor lookup can fail (it replaced a
+#      gate that was green while chip-blind)
 #   7. #351 the BYTE-FREE tier claims, in two DELIBERATELY ASYMMETRIC arms. Read the asymmetry
 #      before deleting either as a duplicate of the other:
 #      (a) THE PROOF. build-matrix.toml's [tier_exclusive] must still agree with the
@@ -128,6 +130,12 @@ esac
 
 # shellcheck source=/dev/null
 . "$ROOT/tools/repro_build.sh"   # REPRO_TARGET, REPRO_FLEET_FEATURES, repro_cargo_args, repro_stack_check
+
+# #413: the stack arm measures the CANONICAL tier, so it must measure against the CANONICAL CHIP's
+# floor — `repro_stack_check` no longer defaults to the C3, deliberately. Read from the manifest
+# rather than written here, so there is no second copy of "the canonical chip is esp32c3".
+CANON_CHIP="$("$ROOT/tools/build_matrix.py" canonical-chip 2>/dev/null || true)"
+[ -n "$CANON_CHIP" ] || { echo "gate: could not resolve meta.canonical_chip from tools/build-matrix.toml" >&2; exit 2; }
 
 JOBS=()
 [ -n "${SMOL_GATE_JOBS:-}" ] && JOBS=(-j "$SMOL_GATE_JOBS")
@@ -474,7 +482,7 @@ if [ "$run_fw" = 1 ]; then
   # it was a third hardcoded copy of 73728, which would have gone on announcing the old number
   # while the gate enforced a new one. "unreadable" here is not a failure; repro_stack_check
   # fails closed on it a few lines down, with the diagnostic.
-  step "stack floor — canonical ELF vs ${REPRO_STACK_FLOOR:-$(repro_stack_floor || echo unreadable)} B"
+  step "stack floor — canonical ELF vs ${REPRO_STACK_FLOOR:-$(repro_stack_floor "$CANON_CHIP" || echo unreadable)} B"
   if repro_cargo_args "$BUILD_ROOT/$CLOCK" 2>/dev/null && \
      (cd "$BUILD_ROOT/$CLOCK" && cargo build --release "${JOBS[@]}" --features "$REPRO_FLEET_FEATURES" "${REPRO_CARGO_ARGS[@]}") \
        >"$GATE_TMP/gate-stack.log" 2>&1; then
@@ -483,7 +491,7 @@ if [ "$run_fw" = 1 ]; then
     # number is visible without opening logs. Written on FAILURE too — "the stack broke the floor"
     # is the case a reader most needs surfaced, and a report that only exists when green would hide
     # exactly that.
-    if out=$(repro_stack_check "$ELF" 2>&1); then
+    if out=$(repro_stack_check "$ELF" "$CANON_CHIP" 2>&1); then
       printf '%s\n' "$out"; printf '%s\n' "$out" > "$STACK_REPORT"; ok "stack floor"
     else
       printf '%s\n' "$out"; printf '%s\n' "$out" > "$STACK_REPORT"; bad "stack floor"
@@ -565,6 +573,19 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | tail -2; ok "test_byte_free"
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_byte_free"
+  fi
+
+  # #413: the per-chip stack-floor lookup, and the same "prove it can fail" discipline. This one
+  # earns it especially: the OLD chip-blind gate was GREEN throughout and its verdict happened to
+  # be right, because the C3's floor is the highest of the three so a chip-blind check was stricter
+  # than a non-C3 chip's own. Nothing in a passing run could have revealed that. The suite uses a
+  # `readelf` stub, so it can put a .stack inside the 2,204 B false-REJECT window no real image
+  # occupies. Pure text, no cargo, no ELF.
+  step "per-chip stack-floor regression suite (#413)"
+  if out=$("$ROOT/tools/test_stack_floor.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -2; ok "test_stack_floor"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_stack_floor"
   fi
 
   step "build-matrix checker regression suite (#350)"

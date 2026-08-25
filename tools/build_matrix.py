@@ -276,7 +276,8 @@ def check(doc: dict, repro: Path, budget: Path) -> list[str]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("command",
-                    choices=("emit", "chips", "chip-checks", "config-markers", "ci-matrix", "check"))
+                    choices=("emit", "chips", "chip-checks", "canonical-chip", "config-markers",
+                             "ci-matrix", "check"))
     ap.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     ap.add_argument("--repro", type=Path, default=DEFAULT_REPRO)
     ap.add_argument("--budget", type=Path, default=DEFAULT_BUDGET)
@@ -370,6 +371,14 @@ def main() -> int:
                              opt(spec.get("build_std")),
                              opt(spec.get("opt_level")),
                              canon_features)))
+        return 0
+
+    if args.command == "canonical-chip":
+        # #413: `tools/gate.sh` needs the chip whose floor its stack arm measures against, and
+        # since that arm builds the CANONICAL tier the answer is `meta.canonical_chip`. Emitted
+        # here rather than hardcoded there, for the same reason every other roster fact is: a
+        # second copy of "the canonical chip is esp32c3" would be free to drift from this one.
+        print(doc["canonical_chip"])
         return 0
 
     if args.command == "ci-matrix":
