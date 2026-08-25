@@ -1518,31 +1518,70 @@ broadcasts after it fetches the downlink.
 |---|---|---|---|
 | `smol/<id>/telemetry` | no | 0 | the **bare** telemetry line (sensor line + last peer/label) — the same string the RELAY carried, **no** legacy `NNN ` id prefix (the topic already carries the id). *(LOCKED — spec v2 "Pinned byte-layouts".)* |
 | `smol/display/batt` | **yes** | 0 | `BATT\|<l1>\|<l2>\|<l3>` — the display payload (≤ 3 lines, ≤ 12 ch each, ≤ 96 B, `--` on unavailable). Published by an **HA automation** (see [`ha/README.md`](../ha/README.md)), not by a node. |
-| `homeassistant/sensor/smol<id>/telemetry/config` | **yes** | 0 | HA MQTT-discovery JSON (below) — published by the **gateway** on each connect. |
+| `smol/<id>/status` | **yes** | 0 | the leaf's render-state, republished by the gateway from a [`SMOLv1 STAT`](#stat--leaf-render-state-uplink-50b) frame. |
+| `smol/<id>/diag` | **yes** | 0 | the [DIAG](#diag--retained-per-node-health-record-704974100) record, republished by the gateway. |
+| `smol/<id>/uplink` | no | 0 | the **gateway's own** uplink RSSI (dBm), #325. |
+| `homeassistant/…/config` | **yes** | 0 | HA MQTT-discovery JSON — **three families**, see *Discovery config* below. Published by the **gateway** on each connect. |
 
 *Wire detail (`mqtt.rs::encode_publish`):* each PUBLISH's fixed-header byte 0 is
 `0x30 | retain` — QoS 0, RETAIN bit (bit 0) set only on the gateway's **retained**
 publishes (the discovery configs); telemetry PUBLISHes are `0x30` (not retained). The
 `smol/display/batt` downlink is set retained by **HA**, not the gateway.
 
-**Discovery config (PINNED scheme — spec v2).** Retained JSON on
-`homeassistant/sensor/smol<id>/telemetry/config`, republished on every connect:
+**Discovery config.** Retained JSON, republished on every connect. The scheme below
+**supersedes the "pinned spec v2" single-config form** this section used to describe: that
+was one text sensor on `homeassistant/sensor/smol<id>/telemetry/config`, and it has not been
+what the firmware emits since #12 → #309 → #325 → #352.
+
+There are now **three families**, all retained and idempotent:
+
+| family | topic | count | carries the device extras? |
+|---|---|---|---|
+| telemetry (#12) | `homeassistant/sensor/smol<id>/<field>/config` | 3 — `temp`, `voltage`, `status` | **only `status`** |
+| gateway uplink (#325) | `homeassistant/sensor/smol<id>/uplink/config` | 1 (gateway's own) | **yes** |
+| DIAG (#309) | `homeassistant/<component>/smol<id>/<object_id>/config` | one per DIAG row | no |
+
+The three telemetry sensors all read the **same** `smol/<id>/telemetry` line and split it with
+a `value_template` (`temp` → `p[0]` less its `F`, `voltage` → `p[1]` less its `V`, `status` →
+the remainder). Shape of one, with the substituted fields marked:
 
 ```json
 {
-  "unique_id": "smol<id>_telemetry",
+  "unique_id": "smol<id>_<field>",
+  "object_id": "smol_<id>_<field>",
+  "has_entity_name": true,
+  "name": "<Field>",
   "state_topic": "smol/<id>/telemetry",
-  "name": "smol <id>",
-  "device": { "identifiers": ["smol<id>"], "name": "smol <id> <noun>" }
+  "value_template": "<jinja>",
+  "expire_after": 300,
+  "device": {
+    "identifiers": ["smol<id>"],
+    "name": "smol <id> <adjective> <noun>",
+    "model": "smol ESP32-C3 OLED",
+    "manufacturer": "jphein",
+    "sw_version": "v<build> <sigil-word>"
+  }
 }
 ```
 
-The entity `name` is `smol <id>`; the **`device.name` appends the node's magical
-realm noun** (e.g. `smol 7 Draconic`). Retained + idempotent → HA creates one
-registry-managed text sensor per known node, grouped under a `smol<id>` **device**,
-with **no HA config edits**.
-**Node removal:** publish an **empty** retained payload to the same config topic
-(ops-checklist item — see [`ha/README.md`](../ha/README.md)).
+**`model`/`manufacturer` are the [`BoardProfile`](../rust/clock/src/net/profile.rs) fragment
+(#352)** — one of `smol ESP32-C3 OLED` · `smol ESP32-C3 SuperMini` · `smol ESP32-C6 Watch` ·
+`smol ESP32-S3 Ember`, chosen at runtime from `(chip, has_display)`.
+
+⚠️ **They ride exactly ONE telemetry config (`status`), on purpose.** HA merges device blocks
+across discovery messages sharing `identifiers`, so they only need to arrive once — and
+repeating them in all three cost 3 × 48 B and pushed **29 of the 256 possible ids over the
+512 B packet buffer**. Over-budget is *not* truncation: `encode_publish` returns `None`, the
+config is never sent, and **the entity is silently never created**. `status` carries them
+because it has the shortest template and no `extra`, so it has the most room. See
+`DISCOVERY_BUDGET` and the `const` asserts around it.
+
+⚠️ **A gateway publishes discovery for every id whose telemetry it relays — including C6
+watches — so it must NOT attach its own device extras to those.** Doing so made a C3 crown
+declare `model: smol ESP32-C3` for a watch (2026-07-28). The extras are for *self* only.
+
+**Node removal:** publish an **empty** retained payload to the config topic — for **every**
+config the node has, not just one (ops-checklist item — see [`ha/README.md`](../ha/README.md)).
 
 **Downlink staleness (HA-side contract).** The HA automation re-renders the retained
 `smol/display/batt` payload on every source-entity change **and** on a 5-minute
