@@ -135,6 +135,56 @@ esp-rtos = { version = "0.3", optional = true, features = [
     "embassy",
     "log-04",
 ] }
+# --- #335 Phase 1 executor deps ------------------------------------------
+# These three are the executor itself, and they are gated on `wifi` rather than `hw` for one
+# reason: `esp-rtos` — which supplies embassy-time's time DRIVER — is `wifi`-gated on this tree
+# (the reference branch moved it to `hw` in its D1 "executor-first" decision; we did not, because
+# that also makes the no-radio `default` build allocating, superseding the #44 byte-minimal-default
+# invariant for no Phase-1 benefit). embassy-time without a driver is a link error the moment
+# anything calls `Timer::after`, so driver and consumer must share a gate. Consequence, recorded
+# here so P1.3 does not rediscover it: the `Delay` -> `Timer::after` swap in main.rs's splash and
+# superloop is `wifi`-cfg'd, and the `default` tier keeps `Delay`.
+embassy-executor = { version = "0.10", optional = true }
+# `log` mirrors the esp32c6-watch's config and this crate's `log-04` bridge; without it
+# embassy-time's internal diagnostics are silent.
+embassy-time = { version = "0.5", optional = true, features = ["log"] }
+static_cell = { version = "2.1", optional = true }
+# #335 P1.4: the async TCP/IP stack. esp-radio 0.18 exposes an embassy-net-driver `Driver` for
+# `interfaces.station`, so `embassy_net::new(station, …) -> (Stack, Runner)` + a `net_task` running
+# `runner.run().await` gives us a Stack alongside the existing hand-driven smoltcp gateway. Feature
+# list mirrors the watch minus `dns` — smol keeps a hardcoded broker IP (portmap §8).
+# The direct `smoltcp` dep below STAYS for Phase 1: main's `mqtt_session` (~2,000 lines, carrying
+# #21/#56/#153/#309/#324/#217/#188) still drives it, and PORT-SPEC §0.2 is explicit that deleting
+# that gateway is Phases 2-4, not this one. Measured, not assumed: embassy-net 0.9.1 wants the same
+# smoltcp 0.13, so `cargo tree` shows ONE smoltcp v0.13.1 on the espnow tier, not two — the async
+# stack and the hand-driven one share a crate.
+# ⚠️ Sharing it is not free, and this is the only measured cost of the whole step: embassy-net turns
+# on smoltcp's `async` feature (diffed — it is the ONE feature P1.1 adds to smoltcp), which puts a
+# `WakerRegistration` in every socket. That grows `wifi::NTP_SOCK_STORAGE` from 0x540 to 0x580 —
+# +64 B of `.data`, taken straight out of the `.stack` region — with no source change anywhere.
+# [[zero-conflicts-raises-risk]] in miniature: a manifest line that resized a shipping struct.
+embassy-net = { version = "0.9.1", optional = true, features = [
+    "tcp",
+    "udp",
+    "dhcpv4",
+    "medium-ethernet",
+    "log",
+] }
+# #335 P1.5 (declared now, consumed later): the Channel + Signal + CriticalSectionRawMutex behind
+# the DR-H1 mirror atomics and the WIFI_CMD queue.
+embassy-sync = { version = "0.7", optional = true }
+# rv32imc (the C3) has NO native atomics — unlike the C6 watch's rv32imac — so embassy-sync and
+# embassy-net reach for portable-atomic's polyfills. We take NO features, because there is nothing
+# left to ask for: `cargo tree -e features` shows portable-atomic v1.14.0 ALREADY in the device
+# graph with `unsafe-assume-single-core` on, enabled by esp-sync + esp-radio-rtos-driver. This dep
+# line therefore adds no version and no feature to the target build — it only makes the existing
+# edge explicit so the code Phase 1 writes can name the crate.
+# ⚠️ [[smol-portable-atomic-riscv-pin]]: this crate broke every cold firmware build once before,
+# via feature UNIFICATION leaking `unsafe-assume-single-core` into the HOST compile — a leak whose
+# vector was `-Zbuild-std`, not the dep line (see .cargo/config.toml:36-46, where build-std is
+# removed and must stay removed). `wifi`-gating keeps it out of `hostsim` entirely; the host tiers
+# are re-verified on every step of this phase, not assumed.
+portable-atomic = { version = "1", optional = true }
 # esp-wifi RENAMED → esp-radio in 0.18. `unstable` unlocks the raw rx/tx tokens
 # (our smoltcp shim) + the `esp_now` interface. `default-features = false` drops
 # esp-radio's default `esp-alloc` so we re-add it explicitly.
@@ -461,6 +511,14 @@ wifi = [
     "dep:esp-wifi-sys",
     "dep:smoltcp",
     "dep:embassy-futures",
+    # #335 Phase 1. `embassy-futures` above STAYS: `block_on` still drives every radio future
+    # through P1.4 (23 `self.controller` sites in mode.rs), and retiring it is Phase 3 work.
+    "dep:embassy-executor",
+    "dep:embassy-time",
+    "dep:static_cell",
+    "dep:embassy-net",
+    "dep:embassy-sync",
+    "dep:portable-atomic",
     "dep:esp-storage",
     "dep:esp-bootloader-esp-idf",
     "dep:sha2",
