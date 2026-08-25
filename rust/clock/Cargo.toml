@@ -2,7 +2,31 @@
 name = "clock"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.96"
+# LOWERED 1.96 -> 1.95 by #347 Part 2, because 1.96 was blocking a supported target and had no
+# reason to be there.
+#
+# It is a FLOOR, not a pin: the C3/C5/C6 builds and every gate run on `stable` (1.97.1 today, per
+# rust-toolchain.toml's ride-stable policy), and lowering a floor cannot change what they compile.
+# What it changes is the ONE toolchain that sits below it — espup's Xtensa fork, which is the only
+# rustc that can target `xtensa-esp32s3-none-elf` and is pinned at **1.95.0.0** (byte-identical on
+# katana and familiar; the two upgrade in lockstep or a reproducible build stops being one).
+#
+# So `1.96` was not describing a language requirement, it was silently declaring the S3 unsupported.
+# MEASURED, not assumed: with this line at 1.95 the S3 arm compiles `core` from source, builds
+# esp-hal 1.1.1 for xtensa, and reaches smol's OWN board code (6 errors in sensors.rs / ota.rs /
+# main.rs). Cargo refuses before any of that with `1.96`: "rustc 1.95.0-nightly is not supported...
+# clock@0.1.0 requires rustc 1.96".
+#
+# And 1.96 was never a reasoned choice — `git log -S` puts it in the crate's SCAFFOLD commit
+# (2ae697b), alongside the `1.96.1` toolchain pin that rust-toolchain.toml has since removed as "a
+# fossil from ONE familiar-side spurious-lint incident". This is the same fossil, one file over.
+# Per JP's standing rule that pins are exceptions carrying written reasons, a floor with no reason
+# that costs a target is exactly the kind that goes.
+#
+# ⚠️ RAISE IT AGAIN ONLY WITH A NAMED FEATURE. If something genuinely needs a newer language
+# feature, this line moves — but raising it above the Xtensa fork's version drops the S3, so say so
+# in the commit and update tools/build-matrix.toml's [chip.esp32s3] row in the same change.
+rust-version = "1.95"
 description = "smol: ESP32-C3 SuperMini + 0.42\" SSD1306 OLED clock with WiFi/NTP + ESP-NOW"
 license = "MIT OR Apache-2.0"
 
