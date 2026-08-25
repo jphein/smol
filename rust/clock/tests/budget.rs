@@ -18,7 +18,8 @@
 
 use clock::budget::{
     cost, ChipBudget, FeatureCost, ESP32C3, ESP32C3_MEASURED_PEAK_BYTES,
-    ESP32C3_STACK_FLOOR_BYTES,
+    ESP32C3_STACK_FLOOR_BYTES, ESP32C6_WATCH, ESP32C6_WATCH_EMPIRICAL_BOOT_LINE_BYTES,
+    ESP32C6_WATCH_HEADROOM_OVERSTATEMENT_BYTES,
 };
 
 /// The published #335 shortfall. If this test starts failing, either a measurement in
@@ -93,11 +94,134 @@ fn the_flash_axis_is_comfortable_and_says_so_separately() {
     assert_eq!(ESP32C3.flash_headroom() - cost::BARD.flash_bytes, 588_576);
 }
 
+// ── #347: the esp32c6-watch row ─────────────────────────────────────────────────────────
+//
+// Measured by the esp32c6-watch session at watch repo `a4a86a3`, 2026-08-24. These are the
+// tests the compile-time assertions cannot be, for two reasons: the C6 row is not reachable
+// from any `CHIP` selection yet (the cfg ladder still fails closed for riscv32+atomics until
+// the de-pin lands), and a const panic message cannot carry a computed number.
+//
+// ⚠️ ORIENTATION OF THE PREDICATE. It is `chip.fits_dram(&cost)`, NOT `cost.fits_dram(chip)`.
+// The handoff note wrote it the second way. It does not compile, so it could only ever have
+// been a typo — but the same inversion in prose ("does the feature fit the chip" read as
+// "does the chip fit the feature") is exactly how a budget gets applied backwards, so the
+// call is spelled out here rather than left to the reader.
+
+/// The DRAM cost of `story` was derived two independent ways from the same baseline, and they
+/// agree to the byte: the statics grew by what the stack region lost. This test is that
+/// cross-check, kept as arithmetic rather than as a table in a doc comment — if someone
+/// re-measures and updates only one of the two, this fails instead of quietly disagreeing.
+#[test]
+fn the_c6_story_cost_reconciles_from_both_directions() {
+    // .bss + .data: 291,772 − 286,380
+    assert_eq!(291_772u32 - 286_380, cost::STORY.dram_bytes);
+    // .stack region: 80,272 − 74,880 — the same 5,392 B, arrived at from the other side.
+    assert_eq!(
+        ESP32C6_WATCH.free_dram_bytes - 74_880,
+        cost::STORY.dram_bytes
+    );
+    // .text + .rodata: 4,595,074 − 4,559,532
+    assert_eq!(4_595_074u32 - 4_559_532, cost::STORY.flash_bytes);
+    // The IMAGE delta is 35,744, which is NOT the flash-section delta — 202 B of header and
+    // padding. Both are right for what they measure; pinning the gap stops a future
+    // "correction" of one to the other.
+    assert_eq!((4_704_528u32 - 4_668_784) - cost::STORY.flash_bytes, 202);
+}
+
+#[test]
+fn the_c6_headroom_is_the_measured_leftover() {
+    // 80,272 − 71,680.
+    assert_eq!(ESP32C6_WATCH.dram_headroom(), 8_592);
+    // 0x600000 (6,291,456 B, and only because the watch's widen_rom_region build.rs hook
+    // rewrites esp-hal's hardcoded 4 MiB ROM region) − 4,668,784 B.
+    assert_eq!(ESP32C6_WATCH.app_slot_bytes, 6_291_456);
+    assert_eq!(ESP32C6_WATCH.flash_headroom(), 1_622_672);
+}
+
+/// The yes-case, on real declared data rather than a fixture: `story` fits the C6 on both
+/// axes. Note this is the direction the const-assertions structurally cannot demonstrate.
+#[test]
+fn story_fits_the_c6_on_both_axes() {
+    assert!(ESP32C6_WATCH.fits(&cost::STORY));
+    assert!(ESP32C6_WATCH.fits_dram(&cost::STORY));
+    assert!(ESP32C6_WATCH.fits_flash(&cost::STORY));
+    assert_eq!(ESP32C6_WATCH.dram_shortfall(&cost::STORY), 0);
+    assert_eq!(ESP32C6_WATCH.flash_shortfall(&cost::STORY), 0);
+}
+
+/// **The caveat that must not get lost.** The declared floor (71,680) is the watch's boot
+/// assert; the hardware bracket walked 61,000 B = 5/5 panics and 73,000 B = 0/5. So
+/// `dram_headroom()` reports 1,320 B more room than has been proven to boot, and a feature
+/// landing within ~2 KB of fitting must be judged against the empirical line instead.
+///
+/// `story` clears BOTH, which is why it was safe to ship — and checking both is the point:
+/// a verdict that only cleared the optimistic bound would look identical here and differ on
+/// the next feature.
+#[test]
+fn the_c6_declared_floor_is_optimistic_by_a_known_1320_bytes() {
+    assert_eq!(ESP32C6_WATCH_HEADROOM_OVERSTATEMENT_BYTES, 1_320);
+    assert_eq!(
+        ESP32C6_WATCH_EMPIRICAL_BOOT_LINE_BYTES - ESP32C6_WATCH.stack_floor_bytes,
+        ESP32C6_WATCH_HEADROOM_OVERSTATEMENT_BYTES
+    );
+
+    // Judged against the EMPIRICAL line rather than the declared floor.
+    let empirical = ChipBudget {
+        stack_floor_bytes: ESP32C6_WATCH_EMPIRICAL_BOOT_LINE_BYTES,
+        ..ESP32C6_WATCH
+    };
+    assert_eq!(empirical.dram_headroom(), 7_272);
+    assert!(
+        empirical.fits_dram(&cost::STORY),
+        "story must clear the proven-clean line, not merely the declared floor"
+    );
+
+    // And the shipped story image's own stack region (74,880) sits above BOTH.
+    assert!(74_880 > ESP32C6_WATCH_EMPIRICAL_BOOT_LINE_BYTES);
+    assert!(74_880 > ESP32C6_WATCH.stack_floor_bytes);
+}
+
+/// The C6 and the C3 are scarce on OPPOSITE axes, and the model has to be able to say so.
+/// The C3 refuses the Bard on DRAM while sitting comfortable on flash; the C6 has 1.6 MB of
+/// flash headroom and only 8.6 KB of DRAM. A single conflated "does it fit" number would
+/// describe neither chip, which is why `ChipBudget` carries two fields (OpenWrt's `low_mem`
+/// vs `small_flash`) instead of one.
+#[test]
+fn the_two_chips_are_scarce_on_opposite_axes() {
+    assert!(ESP32C6_WATCH.flash_headroom() > ESP32C3.flash_headroom());
+    assert!(ESP32C6_WATCH.dram_headroom() < ESP32C3.dram_headroom());
+    // Concretely: the C6 has ~1.85x the flash room and ~0.27x the DRAM room.
+    assert_eq!(ESP32C3.dram_headroom(), 32_352);
+    assert_eq!(ESP32C6_WATCH.dram_headroom(), 8_592);
+}
+
+/// The Bard does not fit the C6 watch **as the watch is configured today** — and this is the
+/// test most likely to be misread, so it says what it means. `budget.rs` and #347 both note
+/// that "the S3 and C6 have the DRAM to carry the Bard"; that is a claim about the CHIP
+/// (512 KB SRAM), not about this ROW. The row is the watch's shipping image, which has already
+/// spent its DRAM on a TTS stack and a display — leaving 8,592 B, against the Bard's 39,072 B.
+///
+/// So a Bard-on-C6 build is a real possibility and this is not evidence against it. It is
+/// evidence that it needs its OWN measured baseline, taken from a Bard-shaped C6 image, and
+/// that reaching for this row would refuse it for the wrong reason.
+#[test]
+fn the_bard_does_not_fit_the_watch_row_and_that_is_a_statement_about_the_image() {
+    assert!(!ESP32C6_WATCH.fits_dram(&cost::BARD));
+    assert_eq!(ESP32C6_WATCH.dram_shortfall(&cost::BARD), 30_480);
+    // The flash axis, by contrast, is comfortable — 287,392 B inside 1,622,672 B.
+    assert!(ESP32C6_WATCH.fits_flash(&cost::BARD));
+}
+
 /// The predicate must be able to say YES. This fixture is a *hypothetical* chip — the C6 has
 /// 512 KB of SRAM and would clear this easily, but nobody has measured its baseline, and an
 /// unmeasured row does not belong in `budget.rs` (that is the #348 anti-lesson: a capability
 /// that is guessed is worse than one that is absent). So the yes-case is proven here, where
 /// the numbers are explicitly a fixture and cannot be mistaken for a declaration.
+///
+/// ⚠️ HISTORICAL NOTE (#347, 2026-08-24): the C6 now HAS a measured row — [`ESP32C6_WATCH`] —
+/// and `story_fits_the_c6_on_both_axes` proves the yes-case on real data. This fixture stays
+/// because the *reasoning* above is still the rule, and because the C6 row happens to refuse
+/// the Bard (see the test above), so it cannot replace this one.
 #[test]
 fn a_chip_with_room_accepts_the_bard() {
     let roomy = ChipBudget {

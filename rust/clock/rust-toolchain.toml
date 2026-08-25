@@ -6,8 +6,27 @@
 # Verified 2026-07-20: main is clean under stable 1.97.1 (clippy -D warnings, all tiers, 0 errors).
 # If a future `stable` introduces a -D-warnings regression, the 4-tier gate catches it → fix the lint
 # (don't re-pin); a genuinely-needed freeze must carry a written reason + revisit trigger here.
-# The RISC-V bare-metal target (ESP32-C3 = RV32IMC, stock rustc target, no Xtensa fork) is required.
+# The RISC-V bare-metal target (ESP32-C3 = RV32IMC, stock rustc target) is required.
+#
+# ── #347 Part 2: "no Xtensa fork" is NO LONGER TRUE, and this file cannot express the exception ──
+# That clause used to end the line above, and the S3 arm falsified it: `xtensa-esp32s3-none-elf` is
+# a Tier-3 target that ONLY espup's Xtensa fork can build, and that fork is pinned at 1.95.0.0 —
+# i.e. OLDER than `stable`, and a fork rather than a channel. Both halves of the ride-stable policy
+# fail for it at once, so it cannot be reconciled here; it has to be an explicit per-invocation
+# override, and the policy below stays the default it always was.
+#
+# S3 builds therefore say `cargo +esp` explicitly, plus `. ~/export-esp.sh` and
+# `CARGO_UNSTABLE_BUILD_STD=core,alloc` (see .cargo/config.toml's xtensa section for why build-std
+# must NOT be a config key). The riscv targets keep riding `stable` unchanged and are unaffected.
+#
+# ⚠️ `+esp` is required and NOT optional-with-a-fallback: without it this file resolves `stable`,
+# which has no xtensa backend, and the failure is an obscure `xtensa_lx` error rather than "wrong
+# toolchain". A `--manifest-path` from elsewhere does NOT pick this file up either (it resolves by
+# DIRECTORY), so an xtensa build launched from the repo root silently gets the wrong toolchain too.
+# Confirm the output says it is compiling for xtensa before believing a green result.
+#
+# `riscv32imac` (C5/C6) needs no exception at all — stock rustc, stable channel, just a target add.
 [toolchain]
 channel = "stable"
-targets = ["riscv32imc-unknown-none-elf"]
+targets = ["riscv32imc-unknown-none-elf", "riscv32imac-unknown-none-elf"]
 components = ["rust-src", "rustfmt", "clippy"]

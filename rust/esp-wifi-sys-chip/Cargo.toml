@@ -1,0 +1,56 @@
+[package]
+name = "esp-wifi-sys-chip"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "smol (#347): the ONE place a per-chip esp-wifi-sys PACKAGE alias is chosen."
+
+# ⚠️ OUTSIDE `rust/clock/`, AND declaring its own workspace, ON PURPOSE. Both are load-bearing —
+# see the `[workspace]` note below. This crate exists for exactly one reason, stated in src/lib.rs:
+# `esp-wifi-sys` is not one crate with a chip FEATURE, it is FOUR SEPARATE PACKAGES, and cargo
+# cannot make a `package =` alias conditional on a feature. So the choice has to happen somewhere,
+# and the only question is whether `clock` learns four crate names or one.
+
+# THE EMPTY WORKSPACE IS THE #347 BOUNDARY, DECLARED RATHER THAN INHERITED.
+#
+# esp-hal accepts exactly ONE chip feature, and cargo UNIFIES features across workspace members.
+# Therefore a riscv crate and an xtensa crate can never share a workspace graph — not "should not",
+# CANNOT: the unified feature set would hand esp-hal two chips and its build script would refuse.
+#
+# smol already satisfies that boundary, but only BY ACCIDENT OF DIRECTORY LAYOUT: `rust/clock` is
+# its own workspace root, and cargo absorbs path dependencies as members only when they live INSIDE
+# the root's directory. `../sigil-names` and `../esp-wifi-sys-chip` sit beside `clock`, not under it,
+# so they are not members. Verified, not assumed: `cargo metadata --no-deps` in rust/clock reports
+# exactly one workspace member.
+#
+# An invariant that holds because of where a directory sits is one `mv` away from not holding, and
+# the failure would surface as an incomprehensible esp-hal build-script error rather than as
+# "you moved a crate". emberburrito hit this on its C3+S3 tree and answered it the same way: every
+# such crate declares `[workspace]`, which pins it as its own root regardless of position. That is
+# the shape smol needs for a C3+S3 fleet, so it is written down here as a declaration.
+[workspace]
+
+[dependencies]
+# THE FOUR ALIASES. Each is optional and selected by the matching feature below; smol's chip
+# feature forwards to it with the WEAK syntax (`esp-wifi-sys?/esp32c3`), which is what makes this
+# crate the chip x radio AND that cargo's feature language cannot express on its own — see
+# src/lib.rs §"Why a shim and not four keys in clock".
+#
+# All four are version 0.2 and were confirmed to EXIST before being written down (`cargo search`,
+# 2026-08-24): -esp32c3, -esp32c5, -esp32c6, -esp32s3, all at 0.2.0. The C5 crate's crates.io
+# blurb reads "for ESP32-C6" — that is an upstream copy-paste in the DESCRIPTION field, not a
+# wrong-chip package; the package name is what selects the bindings.
+esp-wifi-sys-esp32c3 = { version = "0.2", default-features = false, optional = true }
+esp-wifi-sys-esp32c5 = { version = "0.2", default-features = false, optional = true }
+esp-wifi-sys-esp32c6 = { version = "0.2", default-features = false, optional = true }
+esp-wifi-sys-esp32s3 = { version = "0.2", default-features = false, optional = true }
+
+[features]
+# NO `default`. A default chip here would be a guess that compiles — the failure mode #349 spent a
+# commit removing from build.rs, where an ambiguous triple was resolved to a plausible-looking C6
+# id that the suitability check then trusted. `src/lib.rs` fails the build closed when no feature
+# is selected, with a message naming this file.
+esp32c3 = ["dep:esp-wifi-sys-esp32c3"]
+esp32c5 = ["dep:esp-wifi-sys-esp32c5"]
+esp32c6 = ["dep:esp-wifi-sys-esp32c6"]
+esp32s3 = ["dep:esp-wifi-sys-esp32s3"]

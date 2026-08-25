@@ -1,0 +1,24 @@
+# EXPECT: builds = true but checks = false
+# #347 Part 2 added the third rung to the ladder (ships => builds => checks), and a rung with no
+# case here is an unproven gate — which is the one thing this suite exists to prevent. The chip
+# below claims CI produces an artifact for silicon whose source is declared not to compile.
+#
+# Note the esp32s3 row is the LEGAL neighbour of that contradiction and is here on purpose:
+# builds = false with checks = true is the ESP32-C6's real state in tools/build-matrix.toml (it
+# compiles clean but cannot link a budget-honest image yet), so this fixture would also catch an
+# over-eager fix that collapsed the two fields back into one by rejecting that combination too.
+[meta]
+canonical_chip = "esp32c3"
+canonical_tier = "fleet"
+[chip.esp32c3]
+target = "riscv32imc-unknown-none-elf"
+builds = true
+checks = false
+ships = false
+[chip.esp32s3]
+target = "xtensa-esp32s3-none-elf"
+builds = false
+checks = true
+ships = false
+[tier.fleet]
+features = "espnow,cast,io"

@@ -77,7 +77,11 @@ def load(path: Path) -> dict:
             raise Bad(f"tier {name!r} has an unexpanded placeholder: {tier['features']!r}")
 
     for name, chip in chips.items():
-        for field in ("target", "builds", "ships"):
+        # `checks` (#347 Part 2) is REQUIRED like the other three, not defaulted. A default would
+        # have to be either `true` (claiming every new chip compiles — the optimistic lie) or
+        # `false` (claiming none do, so a chip that compiles goes unnoticed — the pessimistic one).
+        # There is no safe default for a measurement, so the manifest must state it.
+        for field in ("target", "builds", "ships", "checks"):
             if field not in chip:
                 raise Bad(f"chip {name!r} declares no `{field}`")
 
@@ -142,7 +146,24 @@ def budget_chips(path: Path) -> set[str]:
     supposed to be comparing — the same discipline `repro_stack_check` uses when it cannot
     read an ELF. `chip: "host"` is skipped: it is the non-device fallback for host builds,
     not a fleet target.
+
+    `chip: "unmeasured"` is skipped for the same KIND of reason and it is worth being precise
+    about, because the two look alike and are not (#347 Part 2). `host` is a real build with no
+    device budget. `unmeasured` is a real DEVICE whose budget nobody has measured yet — the poison
+    row a declared chip selects until a hardware measurement exists, every field zero so that
+    `fits_dram`/`fits_flash` answer no and the budget-predicated features refuse to compile.
+
+    Neither is a fleet target, which is the only property this function is about: it compares the
+    chip ROSTER against `build-matrix.toml`, and a row that stands for "no chip" would demand a
+    `[chip.unmeasured]` section — a build job for the absence of a board.
+
+    ⚠️ Note what is deliberately NOT skipped: a chip that is declared with real numbers but is
+    not in the matrix still fails the check, in both directions. The skip list is for rows that
+    are not chips, never for chips that are inconvenient.
     """
+    # Rows that are not fleet targets. Kept as a named set rather than two inline `!=` tests so
+    # that adding a third one requires reading the docstring's rule for what belongs here.
+    NOT_A_FLEET_TARGET = {"host", "unmeasured"}
     text = path.read_text(encoding="utf-8")
     # `= ChipBudget {` is an INITIALISER. Anchoring on the `=` matters: a bare
     # `ChipBudget\s*\{` also matches `pub struct ChipBudget {` and `impl ChipBudget {`, which
@@ -156,7 +177,7 @@ def budget_chips(path: Path) -> set[str]:
         raise Bad(
             f"{path}: found {literals} `ChipBudget {{` literals but only {len(found)} "
             f"`chip:` fields — refusing to compare a roster I cannot fully read")
-    return {c for c in found if c != "host"}
+    return {c for c in found if c not in NOT_A_FLEET_TARGET}
 
 
 def cargo_features(path: Path) -> set[str]:
@@ -173,10 +194,16 @@ def check(doc: dict, repro: Path, budget: Path) -> list[str]:
     fails: list[str] = []
     chips, tiers = doc["chips"], doc["tiers"]
 
-    # 1. ships => builds. You cannot publish what nothing compiles.
+    # 1. ships => builds => checks. You cannot publish what nothing builds, and you cannot
+    #    build what does not compile. #347 Part 2 added the third rung; the ladder is checked
+    #    one step at a time so the failure names the rung that broke rather than the whole chain.
     for name, spec in chips.items():
         if spec["ships"] and not spec["builds"]:
             fails.append(f"chip {name}: ships = true but builds = false")
+        if spec["builds"] and not spec["checks"]:
+            fails.append(
+                f"chip {name}: builds = true but checks = false — CI is declared to produce an "
+                f"artifact for a chip whose source is declared not to compile")
     for name, spec in tiers.items():
         if spec.get("ships") and name != doc["canonical_tier"]:
             # A shipped tier that is not the canonical one means two fleet images exist and
@@ -248,7 +275,7 @@ def check(doc: dict, repro: Path, budget: Path) -> list[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("command", choices=("emit", "chips", "ci-matrix", "check"))
+    ap.add_argument("command", choices=("emit", "chips", "chip-checks", "ci-matrix", "check"))
     ap.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     ap.add_argument("--repro", type=Path, default=DEFAULT_REPRO)
     ap.add_argument("--budget", type=Path, default=DEFAULT_BUDGET)
@@ -277,6 +304,39 @@ def main() -> int:
         for name, spec in doc["chips"].items():
             if not args.builds or spec["builds"]:
                 print(name)
+        return 0
+
+    if args.command == "chip-checks":
+        # #347 Part 2: one line per chip for `tools/check_chips.sh`, which runs the per-chip
+        # `cargo check` that `checks` declares the outcome of. Everything the invocation needs
+        # comes from here, so the harness hardcodes NO chip, NO triple and NO toolchain — the
+        # same rule `emit` follows for tiers.
+        #
+        # Fields, tab-separated:
+        #   chip · target · expect(check|fail) · toolchain · build_std · features
+        #
+        # ⚠️ EMPTY OPTIONAL FIELDS ARE WRITTEN AS "-", NOT LEFT EMPTY, and that is not cosmetic.
+        # `emit` gets away with bare tabs because it has TWO fields and only the last can be empty.
+        # This record has six with two optional ones in the MIDDLE, and a tab is an IFS *whitespace*
+        # character in bash — so `read -r a b c d e f` COLLAPSES a run of consecutive tabs and every
+        # field after the gap shifts left. Measured, not theorised: the first run of check_chips.sh
+        # read the C3's feature string as its toolchain name and tried `cargo +espnow,cast,io`.
+        # A sentinel is immune to it, greppable, and survives any reader's IFS.
+        SENTINEL = "-"
+        def opt(v: object) -> str:
+            s = str(v or "").strip()
+            return s if s else SENTINEL
+        #
+        # `features` is the CANONICAL TIER's, always. The per-chip axis crosses one tier only —
+        # rule 2 of the manifest, ONE AXIS AT A TIME — so this deliberately cannot be asked for
+        # a cross product of chips and tiers.
+        canon_features = doc["tiers"][doc["canonical_tier"]]["features"]
+        for name, spec in doc["chips"].items():
+            expect = "check" if spec["checks"] else "fail"
+            print("\t".join((name, spec["target"], expect,
+                             opt(spec.get("toolchain")),
+                             opt(spec.get("build_std")),
+                             canon_features)))
         return 0
 
     if args.command == "ci-matrix":

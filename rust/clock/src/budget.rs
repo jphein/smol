@@ -279,6 +279,99 @@ pub const ESP32C3: ChipBudget = ChipBudget {
     baseline_image_bytes: 1_155_648,
 };
 
+// ── ESP32-C6 (the esp32c6-watch) ────────────────────────────────────────────────────────
+//
+// Delivered by the esp32c6-watch session 2026-08-24, measured at watch repo `a4a86a3`
+// (clean tree, built via fambuild on familiar; sections from `readelf -SW`, image from
+// `espflash save-image --partition-table partitions.csv`).
+//
+// It is declared here but NOT yet selectable by the `CHIP` ladder below — `target_feature
+// = "a"` cannot tell a C5 from a C6, so the ladder still fails closed for riscv32+atomics
+// until #347's chip de-pin gives it per-chip features to switch on. A row that exists but
+// cannot be selected is the intended intermediate state: the measurement is banked and
+// host-checked (`tests/budget.rs`) without any build silently inheriting it.
+
+/// The empirical boot line for the watch, which sits **ABOVE** the declared floor.
+///
+/// `ESP32C6_WATCH.stack_floor_bytes` (71,680) is the watch's *boot assert* — the contract its
+/// firmware enforces. The bracket actually walked on hardware was **61,000 B = 5/5 boot
+/// panics, 73,000 B = 0/5**, so the true line lies in `(61_000, 73_000]` and this constant is
+/// the conservative upper end: the lowest stack region PROVEN clean, not the lowest that
+/// works.
+///
+/// Recorded as a const, not a sentence, because it makes [`ESP32C6_WATCH`]'s `dram_headroom()`
+/// **optimistic by a known amount** — see [`ESP32C6_WATCH_HEADROOM_OVERSTATEMENT_BYTES`]. A
+/// feature that lands within ~2 KB of fitting must be judged against this number, not against
+/// the declared floor.
+pub const ESP32C6_WATCH_EMPIRICAL_BOOT_LINE_BYTES: u32 = 73_000;
+
+/// By how much [`ChipBudget::dram_headroom`] overstates real safety on the watch: 1,320 B.
+///
+/// This is the C6's version of the trap the C3 row spent two issues learning — a floor that
+/// is a *declaration* rather than a *measurement* drifts from the hardware, and the drift is
+/// invisible until an image links and then dies at boot (#300). Here the drift is known and
+/// signed: the declared floor is the LOW one, so the guard is the permissive direction.
+pub const ESP32C6_WATCH_HEADROOM_OVERSTATEMENT_BYTES: u32 =
+    ESP32C6_WATCH_EMPIRICAL_BOOT_LINE_BYTES - ESP32C6_WATCH.stack_floor_bytes;
+
+/// The inversion above is a FACT to preserve, not a bug to silence. If someone raises the
+/// declared floor to meet the empirical line (the correct fix, once a fresh bracket justifies
+/// a specific number), this assertion fires and points at the two constants that must move
+/// together — the same coupling `ESP32C3_STACK_FLOOR_BYTES` has with its measured peak.
+const _: () = assert!(
+    ESP32C6_WATCH_EMPIRICAL_BOOT_LINE_BYTES > ESP32C6_WATCH.stack_floor_bytes,
+    "the C6 watch's empirical boot line is no longer above its declared stack floor \
+     (src/budget.rs). If the floor was RAISED to meet the line, that is the intended fix — \
+     delete this assertion and the overstatement const with it, and say in the commit which \
+     bracket run justified the new floor. If the LINE was lowered, a fresh 0/5 bracket must \
+     back it; a boot line moved without one is how a floor once ended up at 12,288 B."
+);
+
+/// ESP32-C6 as it ships on the **esp32c6-watch** (RV32IMAC, 512 KB SRAM, 6 MB OTA slots).
+///
+/// ## The baseline is the watch's SHIPPING default, not a stripped image
+///
+/// `free_dram_bytes` is `_stack_start - _bss_end` of the DEFAULT feature build — the same
+/// semantic as the C3 row's "the linked `.stack` region is the leftover DRAM". The watch's
+/// default features **include `tts`** (on by default since its repo's `7cfa270`), so this is
+/// what the board actually runs, not a minimum.
+///
+/// ## ⚠️ The floor is BELOW the observed clean line
+///
+/// 71,680 is the boot assert; the hardware bracket says ~73,000 (see
+/// [`ESP32C6_WATCH_EMPIRICAL_BOOT_LINE_BYTES`]). So `dram_headroom()` returns 8,592 B while
+/// only ~7,272 B is proven safe. Judge anything within 2 KB of fitting against the line.
+///
+/// ## ⚠️ `app_slot_bytes` is 6 MB only because a build.rs hook makes it so
+///
+/// The watch's `partitions.csv` gives `ota_0`/`ota_1` 0x600000 each, but esp-hal's generated
+/// `memory.x` hardcodes a 4 MiB ROM region. The watch's `build.rs` (`widen_rom_region`, its
+/// #67) rewrites it. **Without that hook an image this size does not LINK** — so convergence
+/// must carry the hook or inherit the 4 MiB ceiling, and this row would then be wrong by
+/// 2 MB on the flash axis. Carried as a note here because the number cannot defend itself.
+///
+/// ## ⚠️ Not byte-stable across trees — same class as the C3 row
+///
+/// The watch's `.cargo/config.toml` is git-ignored and holds per-tree WiFi/MQTT literals that
+/// land in `.rodata`/`.data`. Reference measurement ± a few hundred B. The verdicts below turn
+/// on thousands, so it changes nothing — but a byte-exact constant that is not byte-stable is
+/// false precision, and saying so is what stops someone "reconciling" it against another doc.
+///
+/// ## Scarcity axis: DRAM only
+///
+/// Flash headroom after `widen_rom_region` is 1,622,672 B. The C6 is the mirror image of the
+/// Bard's problem on the C3 (flash-comfortable, DRAM-tight) — which is why the two axes are
+/// separate fields and why a verdict that could not name the axis would be useless here.
+pub const ESP32C6_WATCH: ChipBudget = ChipBudget {
+    chip: "esp32c6",
+    free_dram_bytes: 80_272,
+    stack_floor_bytes: 71_680,
+    // partitions.csv (the watch's, NOT smol's partitions-ota.csv): ota_0/ota_1 = 0x600000.
+    // Requires the `widen_rom_region` build.rs hook — see the doc note above.
+    app_slot_bytes: 0x0060_0000,
+    baseline_image_bytes: 4_668_784,
+};
+
 /// The budget in force for the target being compiled.
 ///
 /// **Fail-closed by construction.** A bare-metal target with no declared budget is a
@@ -288,31 +381,133 @@ pub const ESP32C3: ChipBudget = ChipBudget {
 /// the compiler will demand its row here before it will build, which is the intended
 /// friction.
 ///
-/// The selection is `target_arch`-shaped only because this crate pins exactly one bare-metal
-/// target today. **#349 owns chip identity**; when the chip de-pin lands, replace this cfg
-/// ladder with a per-chip-feature lookup — it is one function and the data above does not
-/// move. The `not(target_feature = "a")` guard exists because `target_arch` alone is
-/// "riscv32" for the C3 (imc), the C6 AND the C5 (both imac) — without it a C5/C6 build
-/// would silently inherit the C3's measured numbers, which is precisely the guessed-budget
-/// failure this module's fail-closed rule forbids. The A (atomics) extension is what
-/// separates imac from imc at the cfg level.
-#[cfg(all(target_os = "none", target_arch = "riscv32", not(target_feature = "a")))]
+/// # The selection is now keyed on the CHIP FEATURE (#347 Part 2)
+///
+/// It used to be keyed on `target_arch` + `target_feature = "a"`, which was the best the tree
+/// could do while the chip was hardcoded in eight dependency declarations. That ladder could
+/// name the C3 (riscv32 without atomics) and could prove a build was "a C5 or a C6" — but not
+/// which, because the A extension is the only thing the target cfgs expose and both chips have
+/// it. So `riscv32imac` had to be a `compile_error!`, and the measured C6 row landed in Part 1
+/// unreachable by construction.
+///
+/// The chip feature discriminates exactly, so the ladder is a lookup and the C6 row is live.
+/// The data above did not move; only the selection did — which is what the old note promised
+/// and is worth confirming, because "replace the selection" is the kind of change that quietly
+/// becomes "adjust the numbers so it passes".
+///
+/// # Fail-closed, but at the RIGHT granularity — this is the part that changed shape
+///
+/// **Fail-closed by construction** still holds: no chip silently inherits another's measured
+/// numbers. But the old ladder enforced it by refusing to compile the CRATE, and that was
+/// stricter than the facts require and it blocked the de-pin's own acceptance.
+///
+/// `CHIP` has exactly two consumers, both `bard` predicates at the bottom of this file. So a
+/// chip with no measured row does not break the crate — it breaks only the features whose
+/// verdicts need a budget. Refusing the whole crate meant a C5 radio image, which asks nothing
+/// of this module, could not be compiled or even type-checked until someone produced a
+/// hardware measurement it had no use for. That is not caution, it is a measurement gate on the
+/// wrong build, and it is the reason "port smol to the C5" could not begin.
+///
+/// So an unmeasured chip now selects [`UNMEASURED`] — a poison row that fits nothing — and the
+/// refusal moved to a dedicated predicate beside the `bard` asserts, where it can say what is
+/// actually missing. Strictly stronger, not weaker: the old ladder could only refuse chips it
+/// could NAME, and would have handed a fifth riscv32imc chip the C3's row without a murmur.
+/// [`CHIP_MEASURED`] is the machine-checkable form of the distinction.
+#[cfg(all(target_os = "none", feature = "esp32c3"))]
 pub const CHIP: ChipBudget = ESP32C3;
 
-#[cfg(all(target_os = "none", target_arch = "riscv32", target_feature = "a"))]
+/// The C6 row measured in Part 1, finally reachable. See [`ESP32C6_WATCH`] — and note it is the
+/// esp32c6-**watch's** shipping image, whose DRAM is already spent on a TTS stack and a display.
+/// A smol C6 build is a different image and will want its own row; until it has one, this is a
+/// conservative stand-in on the DRAM axis and an OPTIMISTIC one on flash (6 MB slots exist only
+/// because the watch's `widen_rom_region` build.rs hook rewrites esp-hal's hardcoded 4 MiB ROM
+/// region — smol does not carry that hook yet, so its C6 ceiling is 4 MiB until it does).
+#[cfg(all(target_os = "none", feature = "esp32c6"))]
+pub const CHIP: ChipBudget = ESP32C6_WATCH;
+
+/// A chip whose budget has never been measured, on a bare-metal target.
+///
+/// **A poison row, not a permissive default.** Every field is chosen so that any question asked
+/// of it answers "no" and any number read off it is obviously wrong rather than plausibly
+/// right: zero free DRAM and a zero-byte app slot mean `fits_dram`/`fits_flash` are false for
+/// every cost, and `dram_headroom()`/`flash_headroom()` are 0.
+///
+/// The name is the other half of the design. `chip: "unmeasured"` reaching a log line or a
+/// dashboard reads as a bug immediately, which is the same discipline as
+/// `net::profile`'s deliberately-implausible fallback arm — a fallback that looks like a real
+/// device is how a fallback survives.
+///
+/// ⚠️ `tools/build_matrix.py::budget_chips()` skips this row by name when it cross-checks the
+/// chip roster against `tools/build-matrix.toml`. It is not a fleet target; it is the absence
+/// of one, given a shape.
+#[cfg(all(target_os = "none", not(any(feature = "esp32c3", feature = "esp32c6"))))]
+pub const UNMEASURED: ChipBudget = ChipBudget {
+    chip: "unmeasured",
+    free_dram_bytes: 0,
+    stack_floor_bytes: 0,
+    app_slot_bytes: 0,
+    baseline_image_bytes: 0,
+};
+
+#[cfg(all(target_os = "none", not(any(feature = "esp32c3", feature = "esp32c6"))))]
+pub const CHIP: ChipBudget = UNMEASURED;
+
+/// Whether [`CHIP`] carries MEASURED numbers, as a value rather than as a cfg incantation.
+///
+/// The point of exposing it is that "this chip has no budget" is a fact other code may need to
+/// branch on WITHOUT restating the roster — a second copy of `any(feature = "esp32c3", …)`
+/// somewhere else is exactly the two-statements-of-one-fact rot that `build_matrix.py` exists to
+/// catch between this file and the build matrix.
+#[cfg(target_os = "none")]
+pub const CHIP_MEASURED: bool = cfg!(any(feature = "esp32c3", feature = "esp32c6"));
+
+/// A bare-metal build must name its chip. Distinct from "named it and it has no row" — that is
+/// [`UNMEASURED`] and it only bites the budget-predicated features. This is the build not saying
+/// which silicon it is for AT ALL, which nothing downstream can recover from: `build.rs` cannot
+/// stamp `SMOL_CHIP_ID`, `net::target` cannot refuse a cross-chip OTA image, and `BoardProfile`
+/// cannot label the device.
+#[cfg(all(
+    target_os = "none",
+    not(any(
+        feature = "esp32c3",
+        feature = "esp32c5",
+        feature = "esp32c6",
+        feature = "esp32s3"
+    ))
+))]
 compile_error!(
-    "riscv32 WITH atomics = ESP32-C5 or ESP32-C6, and neither has a declared ChipBudget. \
-     Add a `ChipBudget` const with MEASURED numbers (build the canonical tier for the chip \
-     and read `.stack` / image size from the artifact) and extend the CHIP cfg ladder. Do \
-     not copy the C3's row: a guessed budget is worse than an absent one."
+    "no chip feature is enabled, so this firmware build does not say what silicon it is for. \
+     Enable exactly one of `esp32c3` / `esp32c5` / `esp32c6` / `esp32s3` (rust/clock/Cargo.toml). \
+     `default` carries `esp32c3`, so reaching this means `--no-default-features` was used with a \
+     tier but no chip — the per-chip invocations in tools/build-matrix.toml show the full form. \
+     NOTE this is NOT the 'chip has no measured budget' case: that one is UNMEASURED, it compiles \
+     fine, and it refuses only the features whose verdicts need a budget."
 );
 
-#[cfg(all(target_os = "none", not(target_arch = "riscv32")))]
+/// Two chip features at once. **This must be an error and not a precedence rule**, which is why
+/// there is no `else` arm anywhere above: with a silent winner, `--features esp32c5` — the
+/// natural thing to type, and wrong, because `default` already carries `esp32c3` — would build
+/// C3 numbers, C3 HAL bindings and a C3-stamped descriptor while the operator believed they had
+/// a C5. #349 removed that exact shape from `build.rs` (an ambiguous triple resolved to a
+/// plausible-looking C6 id that `decide()` then trusted); re-introducing it here would be the
+/// same bug one layer up.
+///
+/// esp-hal's own build script would also refuse two chips, eventually. It would do so without
+/// mentioning smol, the feature that caused it, or the `--no-default-features` that fixes it.
+#[cfg(any(
+    all(feature = "esp32c3", feature = "esp32c5"),
+    all(feature = "esp32c3", feature = "esp32c6"),
+    all(feature = "esp32c3", feature = "esp32s3"),
+    all(feature = "esp32c5", feature = "esp32c6"),
+    all(feature = "esp32c5", feature = "esp32s3"),
+    all(feature = "esp32c6", feature = "esp32s3")
+))]
 compile_error!(
-    "no ChipBudget is declared for this bare-metal target. Add a `ChipBudget` const in \
-     src/budget.rs with MEASURED numbers (build the canonical tier for the chip and read \
-     `.stack` / image size from the artifact) and extend the CHIP cfg ladder. Do not copy \
-     the C3's row: an undeclared capability that is guessed is worse than one that is absent."
+    "TWO OR MORE chip features are enabled, and a build is one chip. Almost always the cause is \
+     `--features esp32c5` (or c6/s3) WITHOUT `--no-default-features`: `default` carries \
+     `esp32c3`, so that adds a second chip rather than choosing one. The full form is \
+     `--no-default-features --features esp32c5,<tier>` — see tools/build-matrix.toml, which \
+     spells out the per-chip invocation for every declared chip."
 );
 
 /// Host builds (`hostsim`, the `tests/` suites, `web-emu`) link no firmware, so no device
@@ -355,6 +550,35 @@ pub mod cost {
         dram_bytes: 39_072,
         flash_bytes: 287_392,
     };
+
+    /// `story` — the esp32c6-watch's one predicated feature, and the **only cost row in this
+    /// file measured on a chip other than the C3**. Not a smol `[features]` entry today; it is
+    /// here as data because [`super::ESP32C6_WATCH`] is, and a budget with no cost to judge is
+    /// a guard that has never been watched saying yes.
+    ///
+    /// ELF-section deltas against the same watch baseline the chip row was measured from
+    /// (watch repo `a4a86a3`, 2026-08-24):
+    ///
+    /// | quantity | baseline | with `story` | delta |
+    /// |---|---:|---:|---:|
+    /// | `.bss` + `.data` | 286,380 | 291,772 | **+5,392** |
+    /// | `.stack` region | 80,272 | 74,880 | **−5,392** |
+    /// | `.text` + `.rodata` | 4,559,532 | 4,595,074 | **+35,542** |
+    /// | image | 4,668,784 | 4,704,528 | +35,744 |
+    ///
+    /// **Two independent derivations of the DRAM cost agree to the byte** — the statics grew by
+    /// exactly what the stack region lost. That is the same cross-check that made the Bard's
+    /// row trustworthy, and it is the evidence that `.stack` really is "whatever DRAM is left".
+    ///
+    /// ⚠️ `flash_bytes` is the **section** delta (35,542), not the **image** delta (35,744).
+    /// The 202 B difference is image header + padding, and the field is defined as
+    /// `.rodata + .text`. Both numbers are correct for what they measure; do not reconcile one
+    /// to the other.
+    pub const STORY: FeatureCost = FeatureCost {
+        feature: "story",
+        dram_bytes: 5_392,
+        flash_bytes: 35_542,
+    };
 }
 
 // ── The predicates ──────────────────────────────────────────────────────────────────────
@@ -370,6 +594,34 @@ pub mod cost {
 //
 // ⚠️ These are the only items in this file that do not move to `smol-core` verbatim — the
 // feature flags belong to whichever crate declares them.
+
+/// **The unmeasured-chip refusal (#347 Part 2).** Must come FIRST, because it is the one case
+/// where the two asserts below would fire with true arithmetic and a misleading explanation.
+///
+/// A budget-predicated feature on a chip with no [`ChipBudget`] row hits [`UNMEASURED`], whose
+/// every field is zero, so `fits_dram` is false and the DRAM assert fires — telling the reader to
+/// shrink `SEQ_CAP` and re-measure, against a chip whose budget does not exist. They would go
+/// tune a model to fit a number that was never measured. The fix is a measurement, and only this
+/// assert can say so.
+///
+/// This is the granularity change from the old cfg ladder made concrete: the refusal is here, on
+/// the feature that needs a budget, instead of on the crate. A C5 radio build asks nothing of this
+/// module and compiles; a C5 **Bard** build is refused, by name, with the measurement to take.
+#[cfg(all(target_os = "none", feature = "bard", not(feature = "off-fleet")))]
+const _: () = assert!(
+    CHIP_MEASURED,
+    "`bard` is budget-predicated, and THIS CHIP HAS NO MEASURED ChipBudget row (src/budget.rs). \
+     The verdict is refused for want of data, NOT because the feature is too big — do not read \
+     the DRAM/FLASH messages below as applying here, and do not shrink the model to satisfy a \
+     budget nobody has measured. \
+     To take the measurement: build the canonical tier for this chip, read `.stack` and the image \
+     size off the artifact (`readelf -SW`), and add a `ChipBudget` const with those numbers plus a \
+     `feature = \"<chip>\"` arm at the CHIP lookup above. Add the chip to tools/build-matrix.toml \
+     in the same commit — `build_matrix.py check` asserts the two rosters agree in both \
+     directions. \
+     Or, if this build is deliberately not a fleet image, add `off-fleet` (#348), which \
+     tools/repro_build.sh then refuses to package."
+);
 
 /// DRAM axis. Fires for `--features bard` on the C3: the Bard's 39,072 B against a
 /// 32,352 B headroom, **short by 6,720 B** — which reproduces #335's published shortfall

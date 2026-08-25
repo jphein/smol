@@ -4,6 +4,19 @@ version = "0.1.0"
 edition = "2021"
 description = "VENDORED copy of realm-sigil's Rust binding. src/ is byte-identical upstream; do not edit."
 
+# #347: DECLARED as its own workspace root, not merely positioned as one.
+#
+# esp-hal accepts exactly one chip feature and cargo unifies features across workspace members, so
+# a riscv crate and an xtensa crate cannot share a workspace graph. `rust/clock` is its own root and
+# absorbs path dependencies only from INSIDE its directory — this crate is beside `clock`, not under
+# it, so it was never a member (verified: `cargo metadata --no-deps` in rust/clock reports one
+# member). But that made a load-bearing invariant depend on where a directory sits, and the symptom
+# of breaking it is an esp-hal build-script error about two chips, which names neither this crate nor
+# the move that caused it. `[workspace]` pins the boundary regardless of position. Same line, same
+# reason, in rust/esp-wifi-sys-chip — the chip-AGNOSTIC crate and the chip-DEPENDENT one both have
+# to stay out of the firmware's feature-unification graph.
+[workspace]
+
 # ⚠️ VENDORED, NOT AUTHORED HERE. `src/lib.rs`, `src/realms.rs` and `src/reserved.rs` are
 # byte-identical copies of realm-sigil's `rust/src/`. Edit them THERE, regenerate with
 # `./sync-words.sh --only rust`, then re-vendor with `tools/sigil_vendor.sh --sync`.

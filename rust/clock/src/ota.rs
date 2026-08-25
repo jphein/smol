@@ -2070,7 +2070,26 @@ fn take_panic_mark() -> bool {
 
 /// The last reset reason as a short, stable token for the DIAG record. Reads (and clears) the
 /// panic marker first — a panic shows as `CoreSw` at the SoC level, so the marker recovers the
-/// `panic` distinction. Everything else maps the C3 `SocResetReason` set to a compact token.
+/// `panic` distinction. Everything else maps the SoC's `SocResetReason` set to a compact token.
+///
+/// #347 Part 2: this used to say "the C3 set", which was true and is the reason it is now not.
+/// Every variant named below exists on the C3, C5 and C6 alike; only the glitch arm varies between
+/// those three, and it is predicated on a `has-reset-glitch-*` capability rather than on a chip
+/// name. This function compiles clean on all three.
+///
+/// ⚠️ IT DOES NOT COMPILE ON THE S3, and that is a MEASURED, tracked stop-point rather than an
+/// oversight — `tools/build-matrix.toml`'s `[chip.esp32s3]` declares `checks = false` for it and
+/// `tools/check_chips.sh` asserts the failure, so this paragraph cannot quietly become false.
+/// esp-hal spells the four CPU-scoped reasons WITHOUT the core index on the S3, and the values are
+/// identical — `CpuSw`/`CpuMwdt0`/`CpuMwdt1`/`CpuRtcWdt` = 0x0C/0x0B/0x11/0x0D, exactly the C3's
+/// `Cpu0Sw`/`Cpu0Mwdt0`/`Cpu0Mwdt1`/`Cpu0RtcWdt`. So it is a pure esp-hal NAMING variance carrying
+/// no difference in silicon behaviour, which is why it deliberately did NOT get a `has-*` marker
+/// here: that namespace means "the silicon has a thing", and spending it on a spelling would make
+/// the layer's one guarantee unreliable. It needs a differently-named predicate (an esp-hal API
+/// fact, not a capability), and inventing that namespace is a decision worth making on its own
+/// rather than as a side effect of the de-pin. #347 Phase 3 / #331.
+///
+/// Also NOT chip-complete: the C5's `CpuLockup` is unmapped and reports "other" (see Cargo.toml).
 #[cfg(feature = "espnow")]
 pub fn reset_reason_token() -> &'static str {
     if take_panic_mark() {
@@ -2095,7 +2114,19 @@ pub fn reset_reason_token() -> &'static str {
             | R::SysSuperWdt,
         ) => "wdt",
         Some(R::CoreUsbUart | R::CoreUsbJtag) => "usb-jtag",
+        // #347 Part 2: the ONE arm in this match that is not common to all four chips. Every
+        // variant above resolves on the C3, C5, C6 and S3 alike (measured — a per-chip
+        // `cargo check` reported errors on this line and nowhere else); the glitch detectors
+        // come in three shapes and this arm has to be predicated. The capability, never the
+        // chip name — see the table at `has-reset-glitch-split` in Cargo.toml.
+        //
+        // A chip with NEITHER marker (the C6 reports no glitch reason at all) contributes no arm
+        // and its glitch resets — which the silicon does not distinguish — fall through to
+        // "other" below. That fall-through is the designed answer, not a gap.
+        #[cfg(feature = "has-reset-glitch-split")]
         Some(R::SysClkGlitch | R::CorePwrGlitch) => "glitch",
+        #[cfg(feature = "has-reset-glitch-unified")]
+        Some(R::PowerGlitch) => "glitch",
         Some(_) => "other",
         None => "unk",
     }
