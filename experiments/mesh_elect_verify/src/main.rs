@@ -18,6 +18,12 @@ mod wire_tests;
 // donor's own suite, the same split the source file itself carries.
 mod follow_tests;
 
+// #328, smol-only: the donor's `tag_does_not_collide_with_existing_frames` is verbatim and carries
+// the donor's tag list, which omits nine real smol tags while listing three watch-only ones. This
+// asserts the smol half of that cross-repo claim from smol's OWN prefixes, scanned from source so
+// the list cannot rot silently the way the donor's did.
+mod smol_wire_compat;
+
 fn main() {
     consensus::weight_saturates_and_floors();
     consensus::partition_merge_is_total_order();
@@ -44,5 +50,12 @@ fn main() {
     follow_tests::sealing_preserves_the_cross_repo_bytes();
     follow_tests::sealing_refuses_a_frame_that_would_strand_a_leaf();
 
-    println!("mesh_elect_verify: 23 checks passed (2 consensus + 8 wire + 13 follow/announce)");
+    smol_wire_compat::elect_tag_is_free_in_smol();
+    smol_wire_compat::no_smol_prefix_nests_with_elect();
+    smol_wire_compat::elect_parser_rejects_every_other_smol_frame();
+
+    println!(
+        "mesh_elect_verify: 26 checks passed \
+         (2 consensus + 8 wire + 13 follow/announce + 3 smol-side collision)"
+    );
 }
