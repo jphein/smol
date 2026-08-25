@@ -2332,6 +2332,59 @@ pub fn now_ms() -> u64 {
     Instant::now().duration_since_epoch().as_millis()
 }
 
+/// #397 / #335 STEP B (part 1 of 2): retire a `SendWaiter` **without** waiting for the TX-done
+/// callback. Three of smol's five raw-send sites call this; the other two need the outcome and are
+/// handled separately (see below).
+///
+/// ── THE HANG THIS REMOVES ─────────────────────────────────────────────────────────────────────
+/// `esp-radio-0.18.0/src/esp_now/mod.rs`:
+///   * `SendWaiter::wait()` (582-598) — `mem::forget(self)` then
+///     `while !ESP_NOW_SEND_CB_INVOKED.load(Acquire) {}`. A bare spin: no timeout, no yield.
+///   * `impl Drop for SendWaiter` (600-606) — **the same bare spin.**
+///
+/// So a lost TX-done completion does not fail, it pins the CPU until the watchdog resets the board.
+/// And because `Drop` spins too, *dropping* the waiter is not an escape — which is why the
+/// pre-announce site, which discarded the returned `Result` outright, was a hang wearing
+/// fire-and-forget's clothes.
+///
+/// ⚠️ Phrasing note, because it cost a gate run: this comment deliberately does NOT spell the raw
+/// send call in `receiver.method(` form. `tools/check_elect_send_path.py` counts that pattern
+/// WITHOUT stripping comments, so prose describing a send is counted as a send and attributed to
+/// whatever fn precedes it (here `now_ms`, which is how this was found). The checker gains a
+/// comment-stripping pass in STEP B part 2, where it is already being edited; until then, describe
+/// these call sites in words rather than in code.
+///
+/// `mem::forget` skips BOTH spins, and it is the only way out from outside the crate. `SendWaiter`
+/// is `PhantomData` — a ZST — so forgetting it leaks nothing; the only thing "leaked" is the
+/// obligation to observe the callback.
+///
+/// ── WHY NOT THE 30 ms POLL THE PLAN ASKED FOR ─────────────────────────────────────────────────
+/// PHASE3-PLAN §3.4 spec'd "`mem::forget` the waiter, then poll `ESP_NOW_SEND_CB_INVOKED` against a
+/// 30 ms deadline". **That cannot be written.** `ESP_NOW_SEND_CB_INVOKED` is a private static
+/// (`mod.rs:55` — no `pub`, no accessor), so nothing outside esp-radio can read it. There is no
+/// bounded *observation* of the sync path available to us at all: it is spin forever, or don't look.
+/// These three sites already threw the status away (`let _ = waiter.wait()`), so not looking costs
+/// exactly the information they were already discarding, and buys the removal of an unbounded spin.
+///
+/// ── WHAT THIS DELIBERATELY GIVES UP, STATED SO IT IS NOT REDISCOVERED ─────────────────────────
+/// `SendWaiter::Drop`'s spin exists to "prevent the lock on `EspNowSender` getting unlocked before a
+/// callback is invoked" — i.e. to stop a second send being issued while one is outstanding. We are
+/// knowingly declining that serialisation. Two things make it acceptable and one bounds the fallout:
+///   1. esp-radio itself clears the completion flag immediately before issuing each send
+///      (`mod.rs:560` sync, `mod.rs:964` async), so a stale callback that lands *before* the next
+///      send is erased rather than misread.
+///   2. These three sites never read a status, so a misattributed completion changes nothing here.
+///   3. It is NOT free for everyone: a late callback can still be misread by the *next* site that
+///      does read one. That is why the two OTA-announce sites (`otam_ok`) are excluded from this
+///      helper and get a bounded `send_async` + a third `otam_to` counter in STEP B part 2 — a
+///      timeout there is neither a success nor a confirmed failure, and collapsing it into either
+///      would corrupt the only evidence smol has that the announce reached the air.
+#[cfg(feature = "espnow")]
+#[inline]
+fn abandon_tx(waiter: esp_radio::esp_now::SendWaiter<'_>) {
+    core::mem::forget(waiter);
+}
+
 impl RadioManager {
     /// Initialise the radio once. Starts in `WifiSta` mode so the caller can do
     /// an NTP burst before switching to ESP-NOW.
@@ -5083,9 +5136,7 @@ impl RadioManager {
     pub fn send_arb_raw(&mut self, dst: [u8; 6], frame: &[u8]) {
         self.ensure_peer(dst, now_ms());
         match self.esp_now.send(&dst, frame) {
-            Ok(waiter) => {
-                let _ = waiter.wait();
-            }
+            Ok(waiter) => abandon_tx(waiter), // #397: see `abandon_tx`
             Err(e) => log::warn!("smol #237: arb-frame raw send failed: {:?}", e),
         }
     }
@@ -5320,7 +5371,14 @@ impl RadioManager {
                     let t = now_ms();
                     if t.saturating_sub(last) >= PREARM_GAP_MS {
                         let _ = self.esp_now.set_channel(ESP_NOW_FIXED_CHANNEL);
-                        let _ = self.esp_now.send(&BROADCAST_ADDRESS, &otam_pre[..pre_len]);
+                        // #397: this `let _ =` USED TO BE the worst of the five. Discarding the
+                        // `Result<SendWaiter>` drops the waiter immediately, and `Drop` carries the
+                        // SAME unbounded spin as `wait()` — so the site that reads as
+                        // fire-and-forget was a hang, and no `waiter.wait()` grep would ever find
+                        // it. Now the waiter is named and abandoned explicitly.
+                        if let Ok(waiter) = self.esp_now.send(&BROADCAST_ADDRESS, &otam_pre[..pre_len]) {
+                            abandon_tx(waiter);
+                        }
                         last = t;
                     }
                     if let Some(recv) = self.esp_now.receive() {
@@ -6370,9 +6428,7 @@ impl RadioManager {
             data
         };
         match self.esp_now.send(dst, out) {
-            Ok(waiter) => {
-                let _ = waiter.wait();
-            }
+            Ok(waiter) => abandon_tx(waiter), // #397: see `abandon_tx`
             Err(e) => log::warn!("smol: esp-now send failed: {:?}", e),
         }
     }

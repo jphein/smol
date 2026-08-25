@@ -303,12 +303,72 @@ before issuing. This keeps the egress counters honest and costs a few lines. **A
 considered and rejected for now:** an esp-radio generation counter — correct, but upstream, and it
 blocks a fix that is live on the fleet today.
 
+> **⚠️ AMENDED 2026-08-25 (STEP B part 1). The drain half of that mitigation is MOOT, and the
+> residual risk is narrower than written above.** Re-derived from
+> `esp-radio-0.18.0/src/esp_now/mod.rs`:
+>
+> **esp-radio already performs the drain itself, on every send, on both paths** — sync `send()` at
+> `mod.rs:560` and `SendFuture::poll`'s first poll at `mod.rs:964` each
+> `ESP_NOW_SEND_CB_INVOKED.store(false, Release)` *immediately before* calling `esp_now_send`. A
+> stale callback that lands **before** the next send is issued is therefore already erased, not
+> misread. The spec'd drain is both unnecessary and unwritable (the flag is private — see §3.4's
+> amendment).
+>
+> **The real residual race, stated exactly:** a callback from an abandoned send that lands *after*
+> our clear-and-issue sets the flag, so our send reads the **previous** send's
+> `ESP_NOW_SEND_STATUS` as its own. Not mitigable locally — that needs the generation counter
+> rejected above. It requires a completion arriving later than `TX_WAIT_MS`, which is uncommon in
+> general and is *precisely* the congestion case this whole step targets, so it is not dismissible
+> either. It lands on the two §3.2(ii) evidence sites.
+>
+> **`TX_ABANDONED` survives, repurposed from DRAIN to TAINT** — the same few lines, better spent:
+> set it whenever any site abandons a send; on entry to an evidence site, if it is set, record the
+> outcome as `otam_to` (untrusted) rather than `otam_ok`, and clear it. A late callback then cannot
+> inflate `otam_ok`. This is what actually protects the instrument §3.2(ii) exists to protect, and it
+> keeps the rule that a timeout is *neither a success nor a confirmed failure*.
+>
+> Confirmed as originally written: `SendFuture` has **no `Drop` impl** (only `SendWaiter` and
+> `EspNowRc` do), so dropping it does not spin. The async path genuinely escapes the hang.
+
 ### 3.4 Two forms, because the stack changes underneath it
 
 - **On today's superloop (land now):** `mem::forget` the waiter to skip *both* spins, then poll
   `ESP_NOW_SEND_CB_INVOKED` against a 30 ms deadline. `mem::forget` is not an optimisation here —
   it is the only way out, because `Drop` spins too. Must cover the `5250` discard site.
 - **Under the executor (STEP T/C):** the watch's `select` form, plus §3.3's mitigation.
+
+> **⚠️ AMENDED 2026-08-25 (STEP B part 1). Both bullets above are wrong, in different ways, and the
+> two forms have collapsed into one.** The plan outranks nothing it cannot compile.
+>
+> **Finding 1 — the "land now" form cannot be written.** `ESP_NOW_SEND_CB_INVOKED` is a **private**
+> static (`esp-radio-0.18.0/src/esp_now/mod.rs:55` — no `pub`, no accessor, no getter anywhere in
+> the crate). Nothing outside esp-radio can poll it. There is **no bounded observation of the sync
+> path available at all**: the choice is spin forever, or do not look. The `mem::forget` half is
+> right and is the only way out of the two spins; the 30 ms poll beside it was never implementable.
+>
+> **Finding 2 — #391 made the second bullet the *available* one.** That bullet defers the `select`
+> form to "under the executor". We have been under the executor since #391 landed
+> `#[esp_rtos::main]` and esp-rtos's `embassy` feature; `espnow = ["wifi", …]`, so embassy-time
+> reaches all five sites, and `mode.rs` already drives ~23 controller futures through
+> `embassy_futures::block_on`. So `block_on(select(send_async(..), Timer::after(..)))` works **today**
+> inside the existing synchronous fns, with no signature changes. The form this plan deferred is the
+> only form that can land.
+>
+> **Consequent split, as executed (JP's team-lead ruling: one concern per PR).**
+>
+> | | sites | treatment |
+> |---|---|---|
+> | **B part 1** (this amendment's PR) | `send_arb_raw`, relay pre-announce, `send_to` | `abandon_tx` = `mem::forget`, read nothing. Zero spin, no timer, no `SendFuture`, **no gate churn**. These three already discarded the status, so not looking costs exactly what they were already throwing away. |
+> | **B part 2** | the two `otam_ok` announce sites | `block_on(select(send_async, Timer 30 ms))` → `otam_to` on timeout, plus §3.3's amended `TX_ABANDONED`-as-taint. Carries a deliberate `check_elect_send_path.py` + `RAW-SEND-SITES` update as a **co-headline**, because `send_async(` does not match that checker's `esp_now.send(` pattern and the invariant it guards is a security one. |
+>
+> **A checker defect found by writing this amendment's own code comment, recorded because it will
+> bite again:** `check_elect_send_path.py` counts `esp_now.send(` **without stripping comments**, so
+> prose *describing* a send is counted as a send and attributed to whatever fn precedes it. A doc
+> comment in `abandon_tx` tripped the gate and blamed `now_ms`. Part 1 works around it by describing
+> the call sites in words; **part 2 gives that checker the same comment-stripping pass
+> `check_station_consumers.py` already has** (where the identical bug was found the same day — a
+> checker whose verdict documentation can flip is worse than none, because the same mechanism yields
+> a false GREEN by commenting a real site out).
 
 ---
 
