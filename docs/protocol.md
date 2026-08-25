@@ -180,6 +180,90 @@ the verify-then-parse arm). **Status.** 🟡 shipped in OBSERVE; ENFORCE not yet
 
 ---
 
+## SMOLv1 for non-Rust fleet members
+
+Not every fleet member runs smol's firmware. The **C6 watch** joined from its own codebase;
+**#331**'s S3 Ember is to join as an ESPHome external component in C++; the **C5 CYD** joins
+from a minimal Rust image that is not this crate. This section is the **normative subset** for
+all of them, so an implementer does not have to read the other ~1,300 lines and guess which
+frames are load-bearing.
+
+The design goal is that **fleet membership is cheap**. It is: two frames and 30 bytes of wire
+format.
+
+### Tier 1 — MUST. This *is* membership.
+
+| frame | bytes | cast | cadence |
+|---|---|---|---|
+| [HELLO](#hello--led-handshake) | 16 = 13 B tag + 3 B ASCII id | broadcast | ~2 s |
+| [ACK](#ack--led-handshake) | 14 = 11 B tag + 3 B ASCII id | **unicast** to the HELLO's source MAC | reactive |
+
+Rules: on RX of a HELLO → mark the peer `Detected`, register it as a unicast peer if new, and
+reply with a **unicast ACK echoing the sender's id**. On RX of an ACK whose id is *yours* →
+`Connected`. ACKs addressed to other ids are peer-to-peer chatter; ignore them. Decay peers
+`Connected → Detected → Idle` using `PEER_STALE_MS` = **3000 ms** on monotonic-ms timestamps.
+
+> ⚠️ **Do not alter the HELLO/ACK wire format** — it is the hardware-verified LED path. Get
+> these two byte-exact or nothing else will work.
+
+### Tier 2 — SHOULD. Useful, but each carries a caveat.
+
+- **[DIAG](#diag--retained-per-node-health-record-704974100)** — a partial record is fine and
+  better than none. It is a pipe-delimited key set, not a fixed struct, and the Home Assistant
+  entity table keys off the fields that are present.
+- **[TIME](#time--mesh-time-sync)** — **implement the authority rule exactly or do not send
+  it at all.** Adopt a peer's time **iff `peer.synced_at > my.synced_at`** (strictly greater),
+  and on adopt **inherit the peer's `synced_at`, not `now`**. Equal → ignore. That is what
+  makes `A→B→C→A` non-inflating.
+  > A mains-powered, NTP-synced member will usually be the *authority* here, and the frame is
+  > unauthenticated in OBSERVE mode — so a wrong `synced_at` does not degrade one node, it
+  > **hijacks every clock in the mesh**. Listening without transmitting is always safe;
+  > transmitting with the wrong rule is not. If in doubt, listen only.
+- **[STAT](#stat--leaf-render-state-uplink-50b)** — only if the member has no MQTT of its own.
+  A member that publishes its own telemetry does not need it.
+
+### Tier 3 — DON'T, unless you know you need it
+
+`RELAY`/`RELAYACK`, `UP2`/`RELAYACK2`, `BATT`/`GRID`/`BATT2`/`GRID2`, `CFG`, `SNK`, `FAM`,
+`SCAN` and the leaf mesh-OTA family. The relay/uplink family exists to serve boards that
+**cannot reach the broker**; a mains-powered member on WiFi can, and publishes its own MQTT.
+Implementing RELAY there adds a redundant second path to the same destination plus a
+reassembly state machine to maintain.
+
+`ELECT` is **crown-only** — a member that will never be elected gateway must not announce a
+channel decision.
+
+⛔ **`RELAY2` is retired** (#124 replaced it with the `UP2` envelope; it is gone from the
+firmware). It is still findable in older prose — do not implement it.
+
+### Three things that are not frames, and will bite
+
+1. **The [group-MAC trailer](#the-group-mac-trailer-190--every-byte-count-above-omits-it).**
+   A bare, un-MAC'd HELLO works **today** and stops working when `MAC_ENFORCE` flips. Decide
+   deliberately; the trailer needs the shared group key provisioned out of band.
+2. **The MQTT + discovery contract**, which is what actually makes the member *appear* — see
+   [MQTT burst](#mqtt-burst--the-lan-transport-that-retires-the-udp-collector). Publish
+   `smol/<id>/telemetry` (**bare** line, no `NNN ` prefix — the topic carries the id) and the
+   retained discovery config. **A discovery config that does not fit one MQTT publish is
+   dropped silently and the entity is simply never created**; the firmware guards that with
+   compile-time asserts that a C++ or YAML implementation does not inherit, so **write a test
+   that measures your own longest config**.
+3. **The node id.** It is a `u8` rendered as 3-digit zero-padded ASCII on every frame, so the
+   space is 0–255. Get one assigned; do not pick one. **`42` is not a node** — it is the C6
+   watch's unset-config sentinel and it recurs by design (see
+   [Reserved node ids](#shared-conventions)).
+
+### The single-radio precondition — check it before promising a date
+
+A member with one 2.4 GHz radio that must **stay associated to WiFi** (a voice satellite, a
+display that fetches assets) can only run ESP-NOW in the **COEXIST** arm — mesh channel ==
+its AP's channel. **So its ESP-NOW works only if its AP is on the mesh channel**
+(`ESP_NOW_FIXED_CHANNEL` = 6). If the AP is elsewhere, the member loses either its uplink or
+the mesh; no firmware can resolve it. This is a **network-topology precondition, not a bug** —
+see [the single-radio constraint](#the-single-radio-constraint-read-this-first).
+
+---
+
 ## HELLO — LED handshake
 
 **Purpose.** Periodic "I'm here" advertisement. Hearing any HELLO proves a peer
