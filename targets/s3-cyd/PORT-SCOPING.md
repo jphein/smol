@@ -17,7 +17,7 @@ the first Xtensa silicon.
 | question | verdict | evidence |
 |---|---|---|
 | Which physical board? | **A new blank ES3C28P, `14:C1:9F:D1:C8:10`, node id 162** — *not* the Ember satellites (#331, id 160), *not* emberburrito's terminal (id 161) | JP 2026-08-24 ("new and blank", "same one we use in emberburrito"); passive bus-diff 23:03; `docs/protocol.md` id block |
-| Does smol's stack run on this silicon? | **YES — proven, executor ON.** burrito-fw ships esp-hal 1.1.1 / esp-radio 0.18.0 / esp-rtos 0.3.0 (embassy) / esp-bootloader 0.5.0 on this exact board — smol main's post-#233 matched set, with the executor smol itself still holds behind canary PR #391 | `burrito-fw/Cargo.toml`, verified independently 2026-08-24 |
+| Does smol's stack run on this silicon? | **YES — proven, executor ON.** burrito-fw ships esp-hal **1.1.2 by lockfile** (its manifest/README say 1.1.1 — caret req, docs drifted) / esp-radio 0.18.0 / esp-rtos 0.3.0 (embassy) / esp-bootloader 0.5.0 on this exact board. smol main's lock is 1.1.1, so this spike (also locked 1.1.2) is one patch ahead of smol and level with the only build known to drive this panel — the right side for bring-up | `burrito-fw/Cargo.lock` + `spike/Cargo.lock`, checked 2026-08-24 |
 | Xtensa toolchain? | **BOTH hosts** as of 2026-08-24 ~23:20: JP directed xtensa builds onto familiar, retiring the katana-only exception. familiar's espup toolchain is **pinned to 1.95.0.0** — byte-parity with katana verified (rustc 95e5bda86 / GCC esp-15.2.0_20250920 / clang esp-20.1.1_20250829). **Condition on the pin: upgrade both hosts in one motion or not at all.** | `espup install -v 1.95.0.0 -t esp32s3` on familiar; parity re-read from both `~/export-esp.sh` |
 | Does `wifi + esp-now` compile for esp32s3? | **YES — proven 2026-08-24 23:2x**: full release build+link on familiar with `--features radio` (esp-radio 0.18.0 `["esp32s3","wifi","esp-now","esp-alloc","unstable"]`), `radio_dev.rs`'s ESP-NOW API usage compiled in; `libesp_radio`/`libesp_wifi_sys_esp32s3`/`libesp_rtos` rlibs confirmed in the dep graph. `coex` deliberately NOT enabled (build-script hard-error without `ble`; smol's WiFi↔ESP-NOW coexistence is same-radio channel management). **M3 is unblocked.** | `spike/build-remote.sh --features radio`, 15.5 s |
 | Chip identity in smol's build? | **Already solved.** `xtensa-esp32s3` is an unambiguous triple → chip id 3, no `SMOL_CHIP` needed (unlike the C5/C6 riscv32imac collision). `chip_name()` → `"esp32s3"`, BoardProfile arm + profile_verify case exist. | `rust/clock/build.rs` (6f900a6), `net/profile.rs` (fd7cca7) |
@@ -61,7 +61,7 @@ id-block generalization. Remaining tree-side identity work is #396 (smol-d8's la
 ### Phase 1 — bring-up spike, four falsifiable milestones (this directory's lane)
 | M | proves | status |
 |---|---|---|
-| **M1** | esp-hal 1.1.1 boots on *this unit*; PSRAM octal 8 MiB mapped; ILI9341V paints (MADCTL 0x28); backlight; button | **flashed + running 2026-08-24 23:2x** (serial heartbeat live, node 162); display orientation awaiting JP's eyeball |
+| **M1** | esp-hal 1.1.x (lock: 1.1.2) boots on *this unit*; PSRAM octal 8 MiB mapped; ILI9341V paints (MADCTL 0x28); backlight; button | **flashed + running 2026-08-24 23:2x** (serial heartbeat live, node 162); display orientation awaiting JP's eyeball |
 | **M2** | WiFi STA associates (2.4 GHz only — no band trap on S3), DHCP lease | not started |
 | **M3** | ESP-NOW round-trip: `SMOLv1 HELLO 162` broadcast heard by a live C3 fleet witness (roster flip = the proof), ACK matched on 14 B prefix | **unblocked** — radio compiles (verdict above); needs bench time |
 
@@ -121,6 +121,10 @@ Ordered by dependency:
   (missing first half = `cargo: command not found`; missing second = a "linker
   xtensa-esp32s3-elf-gcc not found" that impersonates a broken toolchain).
 - **Release builds only** (the esp-hal PSRAM path requires it).
+- **Clippy must run BOTH invocations** — `cargo clippy --release` is structurally blind to
+  `radio_dev.rs` (it's `cfg(feature = "radio")`), so a cheerful default pass has never
+  looked at the radio module; `--features radio` found and fixed two real defects on its
+  first run. Any gate on this crate runs both or it isn't a gate.
 - **Never copy `emberburrito/burrito-fw/wifi.local.toml`** into this tree — it holds a
   live admin-VLAN credential. WiFi creds arrive via env at build time (Vaultwarden →
   env, the cyd-c5 `build-remote.sh` convention), never on disk here.
