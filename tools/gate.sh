@@ -588,6 +588,22 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_stack_floor"
   fi
 
+  # #280: prove the stale-config guard's arms can fail. This one is here because the guard SHIPPED
+  # with only a by-hand demonstration, and the reviewer named the hole precisely: familiar's
+  # `.cargo/config.toml` is currently NOT stale, so a green run there proves nothing about catching
+  # anything. The failing state is a FIXTURE — the real 2026-08-25 drift, reconstructed — so the
+  # refusal path runs on every gate rather than when the world happens to be broken.
+  #
+  # Its fourth arm is the one to keep: it asserts that a whole-file grep PASSES on that same
+  # fixture, which is what makes the section scope load-bearing rather than stylistic. Anyone who
+  # "simplifies" the guard to a file-wide grep fails there. Pure text, no cargo.
+  step "stale-config marker guard regression suite (#280)"
+  if out=$("$ROOT/tools/test_config_markers.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -2; ok "test_config_markers"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_config_markers"
+  fi
+
   step "build-matrix checker regression suite (#350)"
   if out=$("$ROOT/tools/test_build_matrix.sh" 2>&1); then
     printf '%s\n' "$out" | tail -2; ok "test_build_matrix"
