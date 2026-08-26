@@ -121,14 +121,21 @@ pub const VIEW_ROWS: u16 = SCREEN_H_PX / CELL_PX;
 // --- SMOLv1 SNK wire frame (netcode spec §1) -------------------------------
 /// ASCII, sniffer-greppable frame prefix. Exactly 11 bytes.
 pub const SNK_PREFIX: &[u8; 11] = b"SMOLv1 SNK ";
-/// Version 1 frame: 18 B core, no score byte (leaderboard score == length).
+/// Version 1 frame: 18 B core, no score byte — the leaderboard score IS the length.
+///
+/// #232: there is exactly ONE version on the wire. A `ver = 2` frame carrying an explicit
+/// `score` byte at `[18]` was defined here and never emitted by anything — `with_score`, the
+/// only thing that ever set it, had zero callers in either firmware. Dropped rather than left
+/// as a reserved slot, because a reserved-but-unreachable wire field reads as a shipped
+/// capability to the next person who finds it (#371).
+///
+/// Re-adding it is cheap and needs no flag day: a v1 parser handed a 19 B frame passes the
+/// length check, matches the prefix, ignores byte 18, and reads `score = length` — which is
+/// correct until score actually diverges from length. That graceful degradation is why the
+/// forward-compatibility argument for keeping it was weaker than it looked.
 pub const SNK_VER: u8 = 1;
-/// Version 2 frame: 18 B core + 1 B explicit `score` (leaderboard feature).
-pub const SNK_VER_SCORE: u8 = 2;
-/// Total on-wire length of a v1 frame: 11 B prefix + 7 B binary core.
+/// Total on-wire length of a frame: 11 B prefix + 7 B binary core.
 pub const SNK_FRAME_LEN: usize = 18;
-/// Total on-wire length of a v2 frame: v1 core + 1 B score.
-pub const SNK_FRAME_LEN_V2: usize = 19;
 
 // --- flags byte bit layout (design v2: powers + leaderboard) ---------------
 // Named masks so a re-carve (e.g. design v2 splitting off a respawn bit) is a
@@ -573,20 +580,22 @@ impl Camera {
 //   [15]     head_x u8       world cell X (0..=255)
 //   [16]     head_y u8       world cell Y (0..=255)
 //   [17]     length u8       live segment count (body is dead-reckoned, not sent)
-//   [18]     score  u8       ONLY in ver ≥ 2 (SNK_FRAME_LEN_V2 = 19); v1 implies score == length
+//
+// The frame ends at [17]. #232 dropped a never-emitted `[18] score` byte; score == length.
 //
 // Coordinates are u8 (world ≤256/axis). The core stores cells as u16 for
 // dimension-generality; encode narrows to u8, lossless for any world ≤256.
 //
 // Forward-compat policy: parse DEGRADES, it does not reject on version. Any
 // frame with the SNK prefix and ≥ 18 B decodes its stable 18 B core regardless
-// of `ver`; the `score` byte is read only when ver ≥ 2 and ≥ 19 B are present,
-// else `score = length`. So old firmware keeps understanding newer frames
-// (reads the fields it knows, ignores trailing additions), and an unknown
-// power id decodes as its numeric value rather than erroring.
+// of `ver`, and TRAILING BYTES ARE IGNORED rather than rejected. So old firmware
+// keeps understanding newer frames (reads the fields it knows, ignores trailing
+// additions), and an unknown power id decodes as its numeric value rather than
+// erroring. #232 is what makes this policy load-bearing rather than decorative:
+// dropping the `[18]` byte is safe precisely BECAUSE a longer frame still parses.
 
-/// A decoded SMOLv1 SNK frame. Mirrors the on-wire fields 1:1 (with `score`
-/// synthesized from `length` for v1 frames).
+/// A decoded SMOLv1 SNK frame. Mirrors the on-wire fields 1:1, except `score`,
+/// which is derived — see the field.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SnkFrame {
     pub ver: u8,
@@ -598,7 +607,9 @@ pub struct SnkFrame {
     pub power: u8,
     pub head: Cell,
     pub length: u8,
-    /// Leaderboard score. v1 wire: implied == `length`. v2 wire: explicit byte.
+    /// Leaderboard score. NOT a wire field — always derived as `== length` (#232 removed the
+    /// never-emitted explicit `[18]` byte). Kept as a field because the leaderboard reads it,
+    /// so a future scoring model that diverges from length has one place to change.
     pub score: u8,
 }
 
@@ -626,14 +637,6 @@ impl SnkFrame {
         self
     }
 
-    /// Promote to a v2 frame carrying an explicit `score`.
-    #[inline]
-    pub fn with_score(mut self, score: u8) -> Self {
-        self.ver = SNK_VER_SCORE;
-        self.score = score;
-        self
-    }
-
     /// The active power id (0 = none). Getter mirroring [`SnkFrame::power`].
     #[inline]
     pub const fn power(&self) -> u8 {
@@ -649,14 +652,14 @@ impl SnkFrame {
             | ((self.power & FLAG_POWER_MASK) << FLAG_POWER_SHIFT)
     }
 
-    /// On-wire length for this frame's version (18 for v1, 19 for v2+).
+    /// On-wire length of this frame: always [`SNK_FRAME_LEN`].
+    ///
+    /// #232: kept as a function rather than inlined at the one call site, because it is the
+    /// single place a future versioned frame would reintroduce a length that varies. It is NOT
+    /// a claim that the length varies today — there is one version on the wire.
     #[inline]
     pub const fn wire_len(&self) -> usize {
-        if self.ver >= SNK_VER_SCORE {
-            SNK_FRAME_LEN_V2
-        } else {
-            SNK_FRAME_LEN
-        }
+        SNK_FRAME_LEN
     }
 }
 
@@ -687,17 +690,17 @@ pub fn encode_snk(f: &SnkFrame, out: &mut [u8]) -> Option<usize> {
     out[15] = (f.head.x & 0xff) as u8;
     out[16] = (f.head.y & 0xff) as u8;
     out[17] = f.length;
-    if n == SNK_FRAME_LEN_V2 {
-        out[18] = f.score;
-    }
     Some(n)
 }
 
 /// Parse a SMOLv1 SNK frame, or `None` only if it is too short (< 18 B) or has
 /// the wrong prefix (every foreign SMOLv1 tag — HELLO/ACK/BEACON/TIME/RELAY —
 /// is rejected here). **Version-degrading, not version-rejecting:** the stable
-/// 18 B core decodes for any `ver ≥ 1`; the `score` byte is read only when
-/// `ver ≥ SNK_VER_SCORE` and ≥ 19 B are present, otherwise `score = length`.
+/// 18 B core decodes for any `ver ≥ 1`, and trailing bytes beyond `[17]` are
+/// IGNORED rather than rejected — so a longer future frame from a newer peer
+/// still parses here, it simply contributes nothing beyond the core. That
+/// tolerance is what makes #232's removal of the `[18] score` byte safe without
+/// a flag day. `score` is always `length`.
 /// Total, rejects garbage, never panics.
 pub fn parse_snk(buf: &[u8]) -> Option<SnkFrame> {
     if buf.len() < SNK_FRAME_LEN {
@@ -712,12 +715,11 @@ pub fn parse_snk(buf: &[u8]) -> Option<SnkFrame> {
     }
     let (alive, heading, power) = unpack_flags(buf[14]);
     let length = buf[17];
-    // score: explicit in v2+ when the byte is present, else implied == length.
-    let score = if ver >= SNK_VER_SCORE && buf.len() >= SNK_FRAME_LEN_V2 {
-        buf[18]
-    } else {
-        length
-    };
+    // #232 (the LIVE half of this removal): this was `if ver >= SNK_VER_SCORE && buf.len() >= 19`
+    // — not dead code but an ALWAYS-FALSE branch on the per-frame hot path, since `parse_snk` is
+    // tried first for every ESP-NOW frame and nothing in either firmware ever emitted ver = 2.
+    // Score is definitionally the live segment count.
+    let score = length;
     Some(SnkFrame {
         ver,
         id: buf[12],
