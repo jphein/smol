@@ -442,8 +442,12 @@ Nothing here needs a decision that has not been taken except `N` in §6.2.
 place): the STEP G roster reaching zero `SmolWifiDevice::new` sites and one `embassy_net::new`
 (§5) · `otam_ok` vs `otam_to` read on the canary before and after, which separates "T broke egress"
 from "T made the path slower" (§5) · a per-tier `.stack` A/B, the only instrument that catches a
-static gated more loosely than its consumer (§3.2) · and a **bench election-canary observation
-post-flash**, because §6.3 changes election timing inside the atomic commit (§6.3).
+static gated more loosely than its consumer (§3.2) · **the MC-publish guard survives the rewrite,
+asserted by the arm and not by reading the diff** (#403 — `check_elect_send_path.py` arm 7: a
+declared `MC-PUBLISH-SITES` roster counted both directions, plus each site's channel argument being
+the `NonZeroU8`-bound `pub_ch`; both announce sites live inside the body T replaces, so a review
+promise was never the right instrument) · and a **bench election-canary observation post-flash**,
+because §6.3 changes election timing inside the atomic commit (§6.3).
 
 *(A "reclaim 3,584 B" step stood at the head of this list until it was measured and refuted — §3.2.
 The margin is 12,000 B and that is the whole budget.)*
