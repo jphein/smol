@@ -334,3 +334,22 @@ Ordered by dependency:
   MQTT_USER/PASS from the watch repo's gitignored .cargo/config.toml — never the C6's
   broker value.** #413 note: broker-in-provisioning (SWCFG) would retire this per-target
   compile-time divergence. Board on 448d; JP's tap is the only gate left.
+- **2026-08-26 ~05:2x — DISPLAY GATE CLOSED; TOUCH ROOT-CAUSED + FIX ON GLASS; JP GOAL SET.**
+  JP goal (verbatim intent): *"S3 board works perfectly and has all the features of the
+  esp32c6-watch and the cyd-c5 that the hardware allows; it is a full target of smol"* —
+  with a full-auto directive. (1) **GUI render: JP-verified clean** — watch `928d35d`
+  one-liner: ili9341 `set_addr_window` never re-armed RAMWR, so every strip after the
+  first wrote via RAMWR_CONT at a stale GRAM pointer ("chunks displaced/torn"); the C5
+  (st7789, arms correctly) rendering clean on the same stack was the discriminator.
+  (2) **Touch root cause (mine, branch fix/s3-ft6336-active-mode @ e2efaad, flashed
+  sha 0955b59a)**: init put the FT6336U INTO Monitor power mode — emberburrito measured
+  Monitor as DEAF on this panel class (and the chip re-enters it alone); plus main.rs
+  gates polls on the INT LEVEL while the part defaults to pulse INT. Fix: S3-gated
+  Active + stay-active + level-INT (0xA5/0x86/0xA4 = 0x00, all read-backs took on
+  hardware), 64-poll reconcile backstop, 40 budgeted raw+mapped samples = the
+  four-corner calibration evidence, free, at JP's next tap. (3) **Time**: correct this
+  boot; the earlier complaint = the prior boot's failed burst + a structural deadlock
+  (announce gated on ntp_synced; NTP retries only while associated; association only
+  during bursts) — watch lane owns the robustness fix. (4) Merge train requested:
+  #446/#447/#448 + 928d35d to smol main; touch branch joins after JP's tap verdict.
+  ⚠️ Standing serial capture holds the port (tmp/gtouch-standing.pid) — kill before flashing.
