@@ -125,13 +125,18 @@ says `artifact = true` adds a download** — there is no workflow list to edit a
 that knows the roster. A manifest that says `artifact = false` **must say why in the file**, and
 those reasons are the honest current state of the matrix:
 
-| target | chip | artifact | why |
-|---|---|---|---|
-| `c3` | esp32c3 | ✅ | the canonical fleet image |
-| `c3-oled` | esp32c3 | ✅ *alias* | `alias_of = "c3"` — **one image, two boards**; the script resolves it and does not build twice |
-| `s3-cyd` | esp32s3 | ✅ | Xtensa; needs the espup `esp` toolchain provisioned in the job |
-| `c5-cyd` | esp32c5 | ❌ | the C5 fleet image is **CHECK-proven, not LINK-proven**. "It links" would itself not be proof — it needs a measured budget row too |
-| `c6-watch` | esp32c6 | ❌ | a different flavor with its own workspace and build system; wiring it in is the next #413 step |
+A folder declares up to **two** downloads, because smol has two firmware flavors and one board
+ships both. `artifact` is the `rust/clock` **fleet** image; `gui_artifact` + `gui_board` is the
+`targets/c6-watch` **GUI** image (phase 3.1). They are independent, which is why they are
+separate keys rather than one flag:
+
+| target | chip | fleet | GUI | notes |
+|---|---|---|---|---|
+| `c3` | esp32c3 | ✅ | — | the canonical fleet image |
+| `c3-oled` | esp32c3 | ✅ *alias* | — | `alias_of = "c3"` — **one image, two boards**; resolved, not built twice |
+| `s3-cyd` | esp32s3 | ✅ | ✅ | **the only board shipping both flavors** — the case that forced the two axes apart. Xtensa: both need the espup `esp` toolchain |
+| `c6-watch` | esp32c6 | ❌ | ✅ | no fleet image — `rust/clock` `cargo check`s clean for the C6 but cannot LINK one without the watch's `widen_rom_region` hook |
+| `c5-cyd` | esp32c5 | ❌ | ✅ | **has a download while its fleet arm is still checks-only.** The C5 fleet image is CHECK-proven, not LINK-proven, and needs a measured budget row too |
 
 ### Three properties every per-target artifact carries
 
@@ -166,7 +171,50 @@ reader with no repo context can act on:
   `tools/build-matrix.toml` — and a different opt-level legitimately produces a different, equally
   correct image. Comparing an S3 sha against a C3 sha proves nothing.
 
+### The GUI flavor inverts two of those rules — deliberately
+
+The `targets/c6-watch` images (`smol-watch-c6`, `smol-c5-cyd-gui`, `smol-s3-cyd-gui`) are a
+different program from the fleet images, and two of the properties above flip:
+
+**1. Credentials are ABSENT, not placeheld.** The fleet bakes a *published placeholder* key so
+the artifact stays byte-reproducible. The GUI images carry **nothing** — no SSID, no broker
+credentials. This is the watch lane's ruling of record, from its own CI: *"Fake placeholders
+were considered and REJECTED — they would bake a bogus DEFAULT SSID/broker into the released
+artifact, which is worse than empty."* The firmware reads these with `option_env!` at compile
+time, so with none set its own defaults apply: an empty SSID, and the compiled-in
+`192.168.1.10:1883` broker literal, which is the honest public value rather than anyone's real
+broker. WiFi and node id are then set **on the device** (the Settings app, or
+`tools/provision.py`); the broker alone cannot be, because it is compile-time — point it at
+your own by rebuilding.
+
+That property is **gated, not asserted**. `tools/ci_provision_gui.sh` writes the build config
+(the real one is gitignored and holds live credentials, so a `git archive` tree has none),
+refuses to overwrite an existing one, and asserts no `option_env!` key reached it — with a
+`CI_PROVISION_GUI_SELFTEST` mode that plants a key to prove the assertion can fail, run in CI
+*before* the build that depends on it. Then `release_targets.sh` checks the **artifact**: it
+requires the public default broker literal to be *present* in the image, because if a real
+broker had been compiled in, the default would be dead code and LTO would drop it. A positive
+control, not a hunt for secrets you refuse to enumerate — that kind of grep passes when it is
+broken.
+
+**2. They are NOT byte-reproducible, and this is measured.** Two cold builds of one commit, on
+one machine, at the same canonical path, with `SOURCE_DATE_EPOCH` pinned, came out **identical
+in size and different in 654,632 bytes** — five clusters, including a ~1 MB span across the
+code region. The cause is **open**: a megabyte of scattered codegen difference is not something
+a path remap would fix, so the fleet's determinism recipe does not transfer to this flavor and
+nobody should assume it does. A remap is also deliberately *absent* for an independent reason —
+it changes `.rodata` string lengths and hence the memory layout, and the watch's #65 established
+that on this chip an 8-byte layout shift moved a crash from 0% to 100%; the release build keeps
+the layout the bench builds were tested at. **A GUI artifact's identity is its git hash plus the
+sha256 of the published file — do not compare it against a rebuild.**
+
+Two smaller consequences: the GUI `.bin` is a full **16 MB** (a merged flash image spans the
+whole part; the firmware is a few MB and the rest is padding), and **no `.elf` is published** —
+the watch builds with `debug = 2`, which makes one ~80 MB against the fleet tier's 2 MB.
+
 ### 🔑 Re-key before you trust your mesh (#394)
+
+*(Fleet images only — the GUI images have no key to re-key; see above.)*
 
 Published images carry the **published placeholder group key** — on purpose, because a random
 per-build key would destroy the byte-reproducibility that makes a sha an identity. The consequence

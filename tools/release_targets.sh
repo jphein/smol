@@ -298,6 +298,24 @@ for m in "${MANIFESTS[@]}"; do
   # nightly every night for three boards (~250 MB/run). The per-target convention #453
   # established ships `.bin` + `NOTES.md` and no ELF at all, so this matches it. Anyone needing
   # symbols builds at this git hash: the invocation is in this file and takes ~2 minutes.
+  # ── THE CREDENTIAL GATE, ON THE ARTIFACT ITSELF ─────────────────────────────
+  # ci_provision_gui.sh guarantees the config carried no credential keys. This checks the thing
+  # that actually ships, which is a different claim, and it is a POSITIVE control rather than a
+  # "grep for secrets" — searching an image for values you already refuse to enumerate is a test
+  # that passes when it is broken.
+  #
+  # The predicate: src/net/mqtt_ha.rs is `match option_env!("MQTT_BROKER") { Some(v) => v, None
+  # => "192.168.1.10:1883" }`, resolved at compile time. If a broker HAD been baked in, the
+  # default literal would be dead code and LTO would drop it. So the default's PRESENCE is
+  # evidence the build fell back — i.e. that no broker was compiled in. Measured on all three
+  # boards: present in each, and zero hits for real credentials/LAN addresses.
+  if ! strings -a "$bin" | grep -qF '192.168.1.10:1883'; then
+    echo "FAIL: $aname — the public default broker literal is ABSENT from the image." >&2
+    echo "  That means option_env!(\"MQTT_BROKER\") resolved to something at compile time," >&2
+    echo "  i.e. a REAL broker may be baked into an artifact about to be published. Refusing." >&2
+    rm -f "$bin"; failed=$((failed+1)); continue
+  fi
+
   sha="$(sha256sum "$bin" | cut -c1-64)"
 
   cat > "$bin.NOTES.md" <<NOTES
