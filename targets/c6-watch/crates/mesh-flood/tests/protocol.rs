@@ -97,3 +97,38 @@ fn hmac_sha256_rfc4231_case2() {
     ];
     assert_eq!(tag, expected);
 }
+
+#[test]
+fn etx_cost_tracks_delivery_not_strength() {
+    use mesh_flood::etx::LinkQuality;
+    let mut good = LinkQuality::default();
+    let mut flaky = LinkQuality::default();
+    for i in 0..64 {
+        good.tick(true);
+        flaky.tick(i % 3 != 0); // ~2/3 delivery
+    }
+    assert!(
+        good.cost() < flaky.cost(),
+        "a reliable link costs less than a flaky one ({} vs {})",
+        good.cost(),
+        flaky.cost()
+    );
+}
+
+#[test]
+fn cfgsched_round_robin_never_starves_the_tail() {
+    use mesh_flood::cfgsched::{RelayCursor, CFG_RELAY_MAX_BURST};
+    let mut c = RelayCursor::new();
+    let cache_len = 7; // more entries than one burst
+    let mut hit = [0u32; 7];
+    for _ in 0..16 {
+        let mut out = [0usize; CFG_RELAY_MAX_BURST];
+        let n = c.take(cache_len, &mut out);
+        for &idx in &out[..n] {
+            hit[idx] += 1;
+        }
+    }
+    let (min, max) = (hit.iter().min().unwrap(), hit.iter().max().unwrap());
+    assert!(*min > 0, "every entry was relayed at least once (no tail starvation)");
+    assert!(max - min <= 1, "round-robin stays fair: {hit:?}");
+}

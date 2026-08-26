@@ -795,6 +795,39 @@ pub type FlashMutex = embassy_sync::mutex::Mutex<
 /// Persist the config record through the shared flash mutex. Returns whether
 /// the save happened (offset known + write OK); callers own their log lines so
 /// the per-site messages stay grep-identical to the pre-mutex code.
+/// Send one cast frame's cells to a WLED matrix as DNRGB UDP packets
+/// (feature `cast`). Bounded, fire-and-forget: a dropped packet is one stale
+/// LED for one frame, not worth a retransmit. The socket is built per call —
+/// casts are a bench/demo activity, not a hot path.
+#[cfg(feature = "cast")]
+async fn cast_send(stack: embassy_net::Stack<'static>, ip: [u8; 4], cells: &[u16]) {
+    use embassy_net::udp::{PacketMetadata, UdpSocket};
+    use embassy_net::IpEndpoint;
+    let mut rx_meta = [PacketMetadata::EMPTY; 2];
+    let mut rx_buf = [0u8; 64];
+    let mut tx_meta = [PacketMetadata::EMPTY; 4];
+    let mut tx_buf = [0u8; 512];
+    let mut sock = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
+    if sock.bind(0).is_err() {
+        return;
+    }
+    let dst = IpEndpoint::new(
+        embassy_net::IpAddress::v4(ip[0], ip[1], ip[2], ip[3]),
+        cast_core::WLED_PORT,
+    );
+    let mut pkt = [0u8; 512];
+    let mut start = 0usize;
+    while start < cells.len() {
+        let (n, consumed) =
+            cast_core::encode_dnrgb(cells, start, cast_core::DEFAULT_TIMEOUT_S, &mut pkt);
+        if n == 0 {
+            break;
+        }
+        let _ = sock.send_to(&pkt[..n], dst).await;
+        start += consumed;
+    }
+}
+
 async fn cfg_save(
     flash: &'static FlashMutex,
     offset: Option<u32>,
@@ -977,8 +1010,20 @@ async fn main(_spawner: Spawner) -> ! {
     // successful link has never been evidence of a runnable image). 96 KB
     // moves the freed 64 KB into the stack region: 8,960 + 65,536 = ~74.5 KB,
     // in the band the C6 boots from. Still a placeholder; still measure.
-    #[cfg(not(feature = "board-waveshare-c6"))]
+    #[cfg(all(not(feature = "board-waveshare-c6"), not(feature = "board-esp32s3-cyd")))]
         esp_alloc::heap_allocator!(size: 96 * 1024);
+    // ESP32-S3 CYD: internal SRAM CANNOT host the full ui/cyd scene + services
+    // (hardware-proven, s3-cyd 2026-08-25: the scene exhausts a 96 KB internal
+    // pool mid-render → `allocation of 96 bytes failed` → reboot loop → the
+    // garbled partial frames; a 224 KB internal pool LINK-FAILS 34,884 B past
+    // dram_seg's end before .stack gets a byte). So the internal pool stays
+    // MODEST — boot + radio allocations (which request the Internal capability
+    // and therefore never spill to PSRAM, where atomics silently break) — and
+    // the 8 MB octal PSRAM carries Slint's bulk. PSRAM is a REQUIREMENT here,
+    // not an optimization. The PSRAM region is added AFTER this internal pool
+    // (below, post-init) so internal-first ordering holds.
+    #[cfg(feature = "board-esp32s3-cyd")]
+        esp_alloc::heap_allocator!(size: 64 * 1024);
     // ROM-reclaimed region (dram2_seg). Second pool so nothing goes to waste; it
     // sits ABOVE the stack ceiling and is independent of _bss_end, so its size has
     // ZERO effect on the stack.
@@ -1001,6 +1046,42 @@ async fn main(_spawner: Spawner) -> ! {
     // Rust allocation that the main pool cannot satisfy is retried here. It is the
     // fallback that decides whether a 4 KB renderer request panics (#75).
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
+
+    // ESP32-S3 CYD: bring up the 8 MB octal PSRAM and register it as a heap
+    // region AFTER the internal pools. Internal-first ordering is load-bearing
+    // (s3-cyd L3): esp-radio requests the Internal capability for its RX/PP
+    // heaps, so they never land in PSRAM (where atomics silently break); every
+    // ordinary Rust allocation the internal pools cannot satisfy — Slint's
+    // scene bulk — falls through to here. OctalSpi mode is EXPLICIT (Auto is a
+    // board landmine, board_es3c28p.rs L2); size auto-detects. Without this the
+    // full ui/cyd scene reboot-loops on internal-heap exhaustion.
+    #[cfg(feature = "board-esp32s3-cyd")]
+    {
+        use esp_hal::psram::{Psram, PsramConfig, PsramMode, PsramSize};
+        let psram = Psram::new(
+            peripherals.PSRAM,
+            PsramConfig {
+                mode: PsramMode::OctalSpi,
+                size: PsramSize::AutoDetect,
+                ..Default::default()
+            },
+        );
+        let (start, size) = psram.raw_parts();
+        if size > 0 {
+            unsafe {
+                esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
+                    start,
+                    size,
+                    esp_alloc::MemoryCapability::External.into(),
+                ));
+            }
+            println!("[PSRAM] octal, {} KB mapped as External heap", size / 1024);
+        } else {
+            println!("[PSRAM] init reported 0 bytes - scene will exhaust internal heap");
+        }
+        // The Psram guard owns the peripheral for the program's life.
+        core::mem::forget(psram);
+    }
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt =
@@ -3078,6 +3159,16 @@ async fn main(_spawner: Spawner) -> ! {
                         fb = None;
                         app_state = AppState::Watchface;
                     }
+                    #[cfg(feature = "cast")]
+                    debug_console::Inject::Cast { ip, w, h, on } => {
+                        if on {
+                            let ok = shell.cast_start(ip, w as usize, h as usize);
+                            println!("[CAST] start {ip:?} {w}x{h} -> {}", if ok { "ok" } else { "declined (heap/dims)" });
+                        } else {
+                            shell.cast_stop();
+                            println!("[CAST] stopped");
+                        }
+                    }
                 }
                 true
             } else {
@@ -3608,6 +3699,17 @@ async fn main(_spawner: Spawner) -> ! {
                         let gw = mesh_ota.session.gateway_mac();
                         crate::net::smol_mesh::SmolMesh::ensure_unicast_peer(&mut esp_now, gw);
                         crate::net::smol_mesh::send_bounded(&mut esp_now, &gw, &nak[..n]).await;
+                    }
+                }
+                // #36 cast pump: drain the latest sampled scene frame to the
+                // WLED matrix. Needs a live IPv4 (the cast target is on the
+                // LAN); no-op otherwise. One call site, off the render clock.
+                #[cfg(feature = "cast")]
+                if shell.cast_active() {
+                    if let crate::net::net_task::WifiPhase::Up { ip: Some(_) } = net.phase {
+                        if let Some((wled, cells)) = shell.cast_take_frame() {
+                            cast_send(stack, wled, cells).await;
+                        }
                     }
                 }
                 while let Some(rx) = esp_now.receive() {
