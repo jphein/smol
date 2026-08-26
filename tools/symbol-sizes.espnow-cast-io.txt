@@ -1,0 +1,41 @@
+# tools/symbol-sizes.espnow-cast-io.txt — #390 writable-static size baseline.
+# GENERATED: tools/check_symbol_sizes.py --tier espnow-cast-io --elf <elf> --bless
+#
+# Every line is a static of >=256 B in .data*/.bss*. A dependency bump that
+# resizes one of these shows up HERE as a diff line, which is the whole point:
+# the #390 instance (NTP_SOCK_STORAGE 1344->1408 via a smoltcp feature) had no
+# source diff and no compiler complaint, so review had nothing to look at.
+#
+# Do NOT hand-edit. Re-bless, and explain the delta in the commit message.
+# 29 symbols, 182066 bytes total.
+#
+# size	section	symbol
+960	.data	TxRxCxt
+2008	.bss	_RNvCs*_7esp_phy9PHY_STATE
+4096	.bss	_RNvNtCs*_5clock3ota12OTA_READBACK
+4096	.data	_RNvNtCs*_5clock3ota9OTA_STAGE
+14784	.bss	_RNvNtCs*_5clock8ota_mesh14OTA_WINDOW_BUF
+696	.data	_RNvNtCs*_8esp_rtos9scheduler9SCHEDULER
+424	.bss	_RNvNtNtCs*_5clock3net4cast10SCREEN_B64
+318	.bss	_RNvNtNtCs*_5clock3net4cast10SCREEN_BMP
+360	.bss	_RNvNtNtCs*_5clock3net4cast11CAST_MIRROR
+14784	.bss	_RNvNtNtCs*_5clock3net4mode13GW_OTA_WINDOW
+512	.bss	_RNvNtNtCs*_5clock3net4wifi10NTP_TCP_RX
+512	.bss	_RNvNtNtCs*_5clock3net4wifi10NTP_TCP_TX
+512	.bss	_RNvNtNtCs*_5clock3net4wifi15NTP_UDP_RX_DATA
+512	.bss	_RNvNtNtCs*_5clock3net4wifi15NTP_UDP_TX_DATA
+1408	.data	_RNvNtNtCs*_5clock3net4wifi16NTP_SOCK_STORAGE
+512	.bss	_RNvNtNtCs*_5clock3net4wifi8MQTT_ACC
+516	.bss	_RNvNtNtCs*_5clock3net4wifi9MQTT_JSON
+98304	.bss	_RNvNvNtCs*_5clock3net9init_heap4HEAP
+4096	.bss	_RNvNvNtCs*_5clock3ota18verify_active_slot10VERIFY_BUF
+19600	.bss	_RNvNvNtCs*_5clock6___main14___embassy_main4POOL
+4096	.bss	_RNvNvNtNtCs*_5clock3net4wifi13run_ota_fetch10OTA_TCP_RX
+592	.bss	gChmCxt
+284	.bss	gScanStruct
+816	.bss	gWpaSm
+3880	.bss	g_cnxMgr
+688	.bss	g_ic
+544	.bss	g_pm
+848	.data	phy_param
+1308	.bss	s_wifi_nvs
