@@ -1,10 +1,14 @@
 //! Build script: embed the firmware VERSION IDENTITY for `env!()`.
 //!
 //! Emits two compile-time env vars the crate reads via `env!`:
-//!   * `BUILD_HASH`   — git short hash (e.g. `"e4f5a6b"`); seeds the sigil version
-//!     name (`net::names::version_name`). Falls back to `"dev"`.
-//!   * `BUILD_NUMBER` — monotonic build count (`git rev-list --count HEAD`) shown
-//!     as `v<N>`. Falls back to `"0"`.
+//!   * `BUILD_HASH`   — git short hash (e.g. `"e4f5a6b"`). Falls back to `"nogit"` (#420),
+//!     which names the ABSENCE of an identity rather than standing in for one.
+//!   * `BUILD_NUMBER` — the COMMITTED RELEASE ratchet, read from `version.txt`; shown as
+//!     `v<N>`. Falls back to `"0"` only when that file is missing or empty — which in
+//!     practice never happens, since it is tracked. (This line used to say "monotonic build
+//!     count (`git rev-list --count HEAD`)"; #218 replaced the git count with the ratchet
+//!     because the count is BRANCH-relative. The sigil version NAME is seeded from this
+//!     NUMBER, not from the hash, which the old wording above also got wrong.)
 //!   * `SMOL_CHIP_ID` — (#349, reworked by #347 Part 2) the chip this image is built for,
 //!     derived from the CHIP FEATURE (`esp32c3` / `esp32c5` / `esp32c6` / `esp32s3`), which is
 //!     unambiguous and which `budget.rs` already refuses to leave unset or doubled. The target
@@ -23,17 +27,43 @@
 //! fallback constant.
 //!
 //! ⚠️ DEPLOY CONTRACT — the flash agent builds from a `git archive` tarball, which
-//! has **NO `.git` directory**, so the `git` commands here would fail and the
-//! build would silently become `"dev"/0`. Such builds MUST pass the identity
-//! explicitly from the known commit:
+//! has **NO `.git` directory**, so the `git` commands here would fail. Such builds MUST
+//! pass the identity explicitly from the known commit:
 //!     SMOL_GIT_HASH=<short> SMOL_BUILD_NUMBER=<n> cargo build --release …
 //! The env path (a) takes precedence exactly so archive builds are reproducible.
+//!
+//! #420 CORRECTION — this contract used to say such a build "would silently become
+//! `"dev"/0`". The NUMBER half was wrong, and the error mattered: `version.txt` is a
+//! TRACKED file, so it is present in every archive and every rsync mirror, and the number
+//! resolves to its contents (the last RELEASE number), never to `0`. MEASURED in a
+//! .git-less mirror of `main`:
+//!     BUILD_NUMBER=345   BUILD_HASH=dev   BUILD_DEV=1
+//! So `.git` presence is irrelevant to the number — a FULL checkout without
+//! `SMOL_BUILD_NUMBER` stamps 345 too. Two boards reporting "345" while running current
+//! code (id50, id162, 2026-08-25) were not showing a .git-less fallback; they were showing
+//! the release ratchet, and ~40 min of incident forensics went into a "345-era crown"
+//! theory that the number could never have supported.
+//!
+//! The real .git-less hole was the HASH: it degraded to the literal `"dev"`, which is
+//! IDENTICAL for every such build ever made, so it discriminates nothing at exactly the
+//! moment an operator needs it to. `BUILD_DEV=1` did fire — the image was honestly marked
+//! dev — but "dev + a constant" is an honest label with no identity inside it.
 
 use std::process::Command;
 
 fn main() {
-    let hash = env_or_git("SMOL_GIT_HASH", &["rev-parse", "--short=7", "HEAD"])
-        .unwrap_or_else(|| "dev".to_string());
+    // #420: keep the resolution result, because "could not establish an identity" is a
+    // DIFFERENT state from "the identity is X", and the two need different dispositions.
+    let hash_resolved = env_or_git("SMOL_GIT_HASH", &["rev-parse", "--short=7", "HEAD"]);
+    // `nogit` rather than `dev`: it names the ABSENCE instead of occupying the hash slot with
+    // something that reads like a value. Deliberately SHORTER than a real 7-char short hash —
+    // `net::names::write_version` writes the hash into a fixed buffer BEFORE the sigil noun
+    // (`v345+dev.<hash> Bellows`) with `let _ = write!`, so an over-long token would silently
+    // truncate the noun. Being shorter than the normal case makes overflow impossible by
+    // construction, rather than by measuring a capacity that could later change.
+    let hash = hash_resolved
+        .clone()
+        .unwrap_or_else(|| "nogit".to_string());
     // #218: the build NUMBER is a COMMITTED ratchet (`version.txt`), NOT `git rev-list
     // --count` — the count is BRANCH-relative, so a newer canary off a side branch stamps
     // a LOWER number than the deployed release and reads as a rollback on every dashboard.
@@ -45,6 +75,36 @@ fn main() {
     // `v<N>+dev.<hash>` so it can never masquerade as the release. The NUMERIC BUILD_NUMBER
     // is unchanged, so OTA monotonicity holds and a dev build compares as the floor.
     let is_release = std::env::var("SMOL_RELEASE").map(|v| v.trim() == "1").unwrap_or(false);
+
+    // #420 FAIL CLOSED: a build may be unidentifiable, or it may claim to be a release. It may
+    // not be both. `nogit` is an acceptable stamp for a local/mirror experiment precisely
+    // because the image says so; it is never acceptable on something asserting it IS the
+    // release, since that is an artifact that could be flashed or archived as authoritative
+    // with nothing inside it to say which commit it came from.
+    //
+    // This CANNOT fire on any sanctioned path, which is what makes it safe to fail closed
+    // rather than warn (verified, not assumed):
+    //   * `repro_build_bin` exports SMOL_GIT_HASH (tools/repro_build.sh:406) from a REQUIRED
+    //     parameter, and it is the single function every publish path goes through —
+    //     ota_publish.sh stage and repro_at_canonical.sh both call it;
+    //   * CI sets SMOL_RELEASE nowhere (`grep -rn SMOL_RELEASE .github/workflows/` is empty),
+    //     and an actions/checkout tree has a .git anyway;
+    //   * a developer's bare `cargo build`, and a mirror build, set no SMOL_RELEASE.
+    // The only way to reach this panic is to hand-export SMOL_RELEASE=1 in a tree with no
+    // resolvable commit — which is exactly the act that must not quietly succeed.
+    if is_release && hash_resolved.is_none() {
+        panic!(
+            "#420: SMOL_RELEASE=1 but no commit identity could be resolved (no SMOL_GIT_HASH, \
+             and `git rev-parse` failed — a mirror or archive tree has no .git).\n\
+             Refusing to stamp a RELEASE image that cannot name the commit it came from: it \
+             would report v{number} with hash `nogit`, indistinguishable from every other \
+             unidentified build.\n\
+             Fix: pass the identity explicitly, as the deploy contract requires —\n\
+             \x20   SMOL_GIT_HASH=<short7> SMOL_BUILD_NUMBER=<n> SMOL_RELEASE=1 cargo build --release …\n\
+             (tools/repro_build.sh's repro_build_bin already does this for every publish path; \
+             prefer it over a hand-rolled release build.)"
+        );
+    }
 
     println!("cargo:rustc-env=BUILD_HASH={hash}");
     println!("cargo:rustc-env=BUILD_NUMBER={number}");
