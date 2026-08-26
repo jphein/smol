@@ -10,5 +10,10 @@ stories); there is no separate build for this variant today.
   `rust/clock/src/main.rs` — the case hangs from the USB-C end)
 - **Firmware/images**: identical to `targets/c3` — this folder exists for
   OLED-variant artifacts (case STLs, panel notes) as they accrue.
+- **Downloads**: `target.toml` declares `alias_of = "c3"`, so
+  `tools/release_targets.sh` resolves it and does **not** build a second image.
+  Flash the `c3` artifact on this board; the release notes name both.
+- **The case**: `experiments/pocketwatch/` generates a round, chain-hung case for
+  exactly this variant — which is why the panel is rotated 180°.
 
-Status: shipping, mixed into the fleet alongside headless c3 boards.
+Status: 🟢 shipping, mixed into the fleet alongside headless c3 boards.
