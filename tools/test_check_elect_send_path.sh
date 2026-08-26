@@ -135,6 +135,65 @@ else no "prose regression (fixture setup)"; fi
 arm "commenting out a real send is caught" 1 "arm 6 (raw-sends)" net/mode.rs \
   "$(printf 'match self.esp_now.send(dst, out) {\tmatch NOTHING { // self.esp_now.send(dst, out) {')"
 
+# ── #403 arm 7: the MC crown announce publishes only a GUARDED channel ───────────────────────
+# The arm exists because the guard lives inside `mqtt_session` — the ~2,000-line body STEP T
+# (#335) rewrites in one atomic commit — and one lost `!= 0` among 2,000 rewritten lines is what
+# no reviewer catches. So every one of these arms is a way T could plausibly ship the regression:
+# a third announce site, an announce in a new function, a channel computed at the publish site,
+# and the binding degraded from a type back to a value. Each must be RED for its own reason.
+echo "== arm 7a: a THIRD announce site inside the declared fn (counts, not just names) =="
+arm "third MC announce site" 1 "arm 7 (mc-publish)" net/wifi.rs \
+  "$(printf 'let mut mcp = MqttScratch::new();\tlet mut mcp = MqttScratch::new();\n        let _ = write!(mcp, "MC|{}|{}|{}", node_id, pub_ch, newseq);')"
+
+echo "== arm 7b: an announce site in a NEW, undeclared fn =="
+arm "undeclared MC announce fn" 1 "arm 7 (mc-publish)" net/wifi.rs \
+  "$(printf 'fn mqtt_session(\tfn leak_mc_announce(elect: \&Elect, node_id: u8, seq: u32) {\n    let mut p = MqttScratch::new();\n    let _ = write!(p, "MC|{}|{}|{}", node_id, elect.my_channel, seq);\n}\n\nfn mqtt_session(')"
+
+echo "== arm 7c: the channel computed AT the publish site, bypassing the binding =="
+arm "channel is an expression" 1 "formats the channel as the expression" net/wifi.rs \
+  "$(printf '"MC|{}|{}|{}", node_id, pub_ch, newseq\t"MC|{}|{}|{}", node_id, elect.my_channel, newseq')"
+
+echo "== arm 7d: THE T regression — the guard degraded from a type back to a value =="
+arm "NonZeroU8 binding removed" 1 "NOT bound by" net/wifi.rs \
+  "$(printf 'let pub_ch = core::num::NonZeroU8::new(if\tlet pub_ch = Some(if')"
+
+echo "== arm 7e: fail-closed — the roster deleted must NOT read as success =="
+arm "MC roster deleted" 2 "no \`MC-PUBLISH-SITES:\` declaration" net/wifi.rs \
+  "$(printf 'MC-PUBLISH-SITES:\tMC-PUBLISH-SITES-WAS-HERE:')"
+
+echo "== arm 7f: fail-closed — the announce reshaped out of this arm's sight =="
+# Needs EVERY site rewritten, so it cannot use `arm` (one replacement). A partial reshape is a
+# different failure (a miscount, arm 7a's shape) and is already covered above.
+seed
+python3 - "$work/tree/rust/clock/src/net/wifi.rs" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old, new = '"MC|{}|{}|{}"', '"MC/{}/{}/{}"'
+n = s.count(old)
+if n < 2:
+    sys.exit(f"fixture setup failed: expected >=2 {old!r}, found {n} — this test needs updating")
+open(p, "w").write(s.replace(old, new))
+PY
+if [ $? -eq 0 ]; then
+  out="$("$CHK" "$work/tree" 2>&1)"; rc=$?
+  if [ "$rc" != 2 ]; then no "announce reshaped: rc $rc, want 2 — $out"
+  else case "$out" in *"ZERO MC announce sites"*) ok "announce reshaped fails CLOSED (rc=2)" ;;
+       *) no "announce reshaped: rc right, WRONG REASON — $out" ;; esac; fi
+else no "announce reshaped (fixture setup)"; fi
+
+echo "== arm 7g: comments must not move arm 7's verdict, either way (#426) =="
+seed
+if patch1 "$work/tree/rust/clock/src/net/wifi.rs" \
+  "$(printf 'fn mqtt_session(\t// prose: the announce is write!(mcp, "MC|{}|{}|{}", node_id, pub_ch, newseq)\n/* and in a block comment too: write!(p, "MC|{}|{}|{}", a, b, c); */\nfn mqtt_session(')"; then
+  out="$("$CHK" "$work/tree" 2>&1)"; rc=$?
+  if [ "$rc" = 0 ]; then ok "prose naming an MC announce stays green (rc=0)"
+  else no "PROSE FLIPPED THE VERDICT: rc $rc — $out"; fi
+else no "MC prose regression (fixture setup)"; fi
+# And the false-GREEN direction: commenting a real announce out must not satisfy the roster.
+arm "commenting out a real announce is caught" 1 "arm 7 (mc-publish)" net/wifi.rs \
+  "$(printf 'let _ = write!(mcp, "MC|{}|{}|{}", node_id, pub_ch, newseq);\t// let _ = write!(mcp, "MC|{}|{}|{}", node_id, pub_ch, newseq);')"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1
