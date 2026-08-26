@@ -1,0 +1,9 @@
+name = "s3-cyd"
+chip = "esp32s3"
+flavor = "fleet"                 # the rust/clock fleet arm (#398); the GUI flavor ships via targets/c6-watch (phase 3.1)
+source = "rust/clock"
+artifact = true
+artifact_name = "smol-s3-cyd"
+# Xtensa: needs the espup `esp` toolchain (pinned 1.95.0.0) provisioned in the job — see
+# .github/workflows/release-targets.yml. opt_level=2 is part of this chip's (chip, profile)
+# sha lineage (LLVM scavenger workaround, tools/build-matrix.toml [chip.esp32s3]).

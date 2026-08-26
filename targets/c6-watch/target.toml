@@ -1,0 +1,8 @@
+name = "c6-watch"
+chip = "esp32c6"
+flavor = "gui"                   # its own workspace (subtree of the watch repo) — NOT rust/clock
+source = "targets/c6-watch"
+artifact = false
+# WHY NO ARTIFACT YET (phase 3.1): this workspace builds via its own system (riscv32imac,
+# Slint, per-board features incl. board-esp32s3-cyd). Wiring it into the release job is the
+# next #413 step after the rust/clock targets ship; the manifest exists so the matrix knows it.

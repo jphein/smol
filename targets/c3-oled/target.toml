@@ -1,0 +1,7 @@
+# Same image as c3 — one firmware, two boards (the OLED is driven by the same fleet tier).
+name = "c3-oled"
+chip = "esp32c3"
+flavor = "fleet"
+source = "rust/clock"
+artifact = true
+alias_of = "c3"                  # do not build twice; the release notes say both boards use it

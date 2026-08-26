@@ -1,0 +1,8 @@
+# Machine-readable target manifest — read by tools/release_targets.sh (#413).
+# JP's rule: the targets/ folder IS the artifact matrix; adding a folder + manifest adds a download.
+name = "c3"
+chip = "esp32c3"
+flavor = "fleet"                 # rust/clock fleet tier (espnow,cast,io)
+source = "rust/clock"
+artifact = true
+artifact_name = "smol-c3"
