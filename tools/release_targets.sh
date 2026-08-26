@@ -309,7 +309,13 @@ for m in "${MANIFESTS[@]}"; do
   # default literal would be dead code and LTO would drop it. So the default's PRESENCE is
   # evidence the build fell back — i.e. that no broker was compiled in. Measured on all three
   # boards: present in each, and zero hits for real credentials/LAN addresses.
-  if ! strings -a "$bin" | grep -qF '192.168.1.10:1883'; then
+  # ⚠️ NOT `grep -q` HERE. Under `set -o pipefail`, `grep -q` exits on the first match, `strings`
+  # then dies of EPIPE, and pipefail reports the WRITER's death as a pipeline failure — so the
+  # check fails on exactly the images that PASS. That is not theoretical: this gate's first run
+  # refused all three GUI artifacts whose default literal had already been byte-proven present.
+  # `grep -c` consumes all input, so there is no early close and no EPIPE.
+  hits="$(strings -a "$bin" | grep -cF '192.168.1.10:1883' || true)"
+  if [ "${hits:-0}" -eq 0 ]; then
     echo "FAIL: $aname — the public default broker literal is ABSENT from the image." >&2
     echo "  That means option_env!(\"MQTT_BROKER\") resolved to something at compile time," >&2
     echo "  i.e. a REAL broker may be baked into an artifact about to be published. Refusing." >&2
