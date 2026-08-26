@@ -14,6 +14,10 @@
 #   ota_publish.sh stage      [<commit>] [--bin <file>] [--build N]  # build+host+publish smol/ota/staged (arms all boards; NO board fetches)
 #   ota_publish.sh install <id>                                      # publish INSTALL → smol/<id>/ota/install (headless per-node canary; the HA Update button is the GUI path). id42 is REFUSED (#314: C6 watch unset-config sentinel, not a node).
 # <commit> defaults to HEAD. --bin <file> skips the cargo build and hosts an existing .bin.
+# IDENTITY (#400): stage BUILDS THE WORKING TREE — it cannot build a commit's source. So a
+#   <commit> that is not HEAD is REFUSED (it would stamp that commit's identity onto these bytes),
+#   and DIRTY tracked build inputs under rust/clock are REFUSED unless you pass --dirty, which
+#   builds a DEV-stamped image (vN+dev.<hash>) since its sha is reproducible from no commit.
 # BUILD number (the staged-line monotonicity value the fw compares): stage RATCHETS it forward —
 #   build = max(`git rev-list --count`, <retained smol/ota/staged build> + 1) — so a prior canary
 #   pin (a --build N left ahead of the count) HEALS the fleet number forward automatically instead
@@ -81,7 +85,10 @@ ADDON="${ADDON:-<addon-slug>}"                  # supervisor addon slug carrying
 SMOL_OTA_SIGNING_KEY_ITEM="${SMOL_OTA_SIGNING_KEY_ITEM:-smol-ota-signing-ed25519}"  # Vaultwarden secureNote holding the ed25519 signing PEM (#32)
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
-usage(){ sed -n '2,23p' "${BASH_SOURCE[0]}"; exit "${1:-1}"; }
+# ⚠️ The line range is a DUPLICATED FACT about the header block's extent — edit the header and it
+# rots silently (help output truncates mid-sentence, and nobody reads help on the happy path).
+# test_ota_publish_guards.sh pins both ends so an edit that forgets this fails instead.
+usage(){ sed -n '2,27p' "${BASH_SOURCE[0]}"; exit "${1:-1}"; }
 
 MODE="${1:-}"; [ -n "$MODE" ] || usage 1
 
@@ -158,6 +165,79 @@ assert_ota_targetable(){ # <id> — returns 0, or prints the refusal and exits 2
       exit 22 ;;
   esac
   return 0
+}
+
+# ---- #400: the stamp must describe the bytes ---------------------------------
+# ROOT CAUSE, stated once: the STAMP is a function of a git ref (HASH/COUNT come from <commit>);
+# the BYTES are a function of the WORKING TREE (repro_build_bin builds $CLOCK). Nothing asserted
+# that those two describe the same source, so the tool whose job is identity could mint a false one.
+#
+# Observed live (the #335 round-trip canary): `stage 1a6349e` published an image stamped
+# `build 919 (1a6349e)` carrying the CURRENT tree's size (byte-identical to the HEAD build staged
+# minutes earlier), the current stack region (106,480 B — that era's code reads ~75K), and a #349
+# target descriptor July-28 code cannot emit. Honest-looking, false provenance.
+#
+# TWO refusals, because the filed instance is only the LOUD half of one defect:
+#   1. a non-HEAD <commit> — the tool cannot build a commit's source, so it must not claim to.
+#   2. DIRTY build inputs — `stage` with no argument, the path every caller in this repo actually
+#      uses, stamped HEAD's hash onto uncommitted bytes AND force-exported SMOL_RELEASE=1, so an
+#      uncommitted canary shipped stamped as a clean release. Fixing only (1) would have left (2)
+#      live on the common path — a guard on one branch and absent on its sibling.
+
+# stage_input_dirt — print the DIRTY TRACKED build inputs (empty output = clean).
+# THE SCOPE IS THE CHECK. Every input whose change alters the image bytes lives under rust/clock:
+# src/, build.rs, Cargo.toml, Cargo.lock, version.txt, rust-toolchain.toml, .cargo/config.toml.
+# A repo-wide check would refuse an unrelated docs or tools edit, and a gate that fires on innocent
+# states is a gate operators learn to route around (#338) — fatal for one guarding a publish.
+# --untracked-files=no is LOAD-BEARING, not tidiness: board.rs and secrets.rs are git-ignored BY
+# DESIGN (.gitignore:27,35) and are therefore permanently untracked, so counting untracked files
+# would make every tree dirty forever and the guard would refuse every stage there is.
+stage_input_dirt(){
+  git -C "${REPO:-.}" status --porcelain --untracked-files=no -- rust/clock
+}
+
+assert_stamp_is_head(){ # <commit> — returns 0, or prints the refusal and exits 22
+  local commit="$1" want have
+  if ! want="$(git -C "${REPO:-.}" rev-parse --verify --quiet "${commit}^{commit}")"; then
+    echo "REFUSED: '$commit' is not a commit in this repository. NOTHING WAS PUBLISHED." >&2
+    exit 22
+  fi
+  have="$(git -C "${REPO:-.}" rev-parse --verify --quiet 'HEAD^{commit}')" || {
+    echo "REFUSED: cannot resolve HEAD. NOTHING WAS PUBLISHED." >&2; exit 22; }
+  [ "$want" = "$have" ] && return 0
+  {
+    echo "REFUSED: stage cannot build '$commit' — it builds the WORKING TREE (#400)."
+    echo "  asked to stamp   $(git -C "${REPO:-.}" rev-parse --short=7 "$want")"
+    echo "  tree is actually $(git -C "${REPO:-.}" rev-parse --short=7 "$have")"
+    echo "  Stamping a commit's identity onto different bytes is what this refusal exists to stop:"
+    echo "  it yields an honest-LOOKING image with a FALSE provenance stamp, and the only reason the"
+    echo "  live instance was caught was an operator cross-checking the numbers by hand."
+    echo "  NOTHING WAS PUBLISHED."
+    echo "  Fix: check the commit out and stage from THERE, so the bytes match the stamp:"
+    echo "    git worktree add ../smol-stage '$commit' && cd ../smol-stage && tools/ota_publish.sh stage"
+    echo "  (a linked worktree has no tools/ota_publish.env of its own; the #128 resolver reads the"
+    echo "  main worktree's copy, so the broker config still resolves.)"
+  } >&2
+  exit 22
+}
+
+assert_stampable_inputs(){ # <allow_dirty:0|1> — returns 0, or prints the refusal and exits 22
+  local allow="$1" dirt
+  dirt="$(stage_input_dirt)"
+  [ -z "$dirt" ] && return 0
+  [ "$allow" = 1 ] && return 0
+  {
+    echo "REFUSED: the tracked build inputs under rust/clock differ from HEAD (#400)."
+    echo "$dirt" | sed 's/^/    /'
+    echo "  An image built now gets HEAD's identity stamped on source that is not HEAD, so the"
+    echo "  announced sha256 is reproducible from no commit and verify_image.sh cannot confirm it."
+    echo "  NOTHING WAS PUBLISHED."
+    echo "  Fix: commit (or stash) the change and re-stage."
+    echo "  Or, to canary uncommitted work on purpose:  --dirty"
+    echo "    That builds a DEV-stamped image (vN+dev.<hash>) rather than a clean release stamp,"
+    echo "    because the bytes answer to no commit — the stamp then says what the image IS."
+  } >&2
+  exit 22
 }
 
 pub_retained(){ # topic, payload  (payload may be empty = retain-delete)
@@ -263,15 +343,28 @@ fi
 
 [ "$MODE" = "stage" ] || usage 1
 shift 1
-COMMIT="HEAD"; BIN=""; BUILD_OVERRIDE=""
+COMMIT="HEAD"; BIN=""; BUILD_OVERRIDE=""; ALLOW_DIRTY=0
 while [ $# -gt 0 ]; do case "$1" in
   --bin) BIN="${2:?}"; shift 2;;
   --build) BUILD_OVERRIDE="${2:?}"; shift 2;;
+  --dirty) ALLOW_DIRTY=1; shift;;
   *) COMMIT="$1"; shift;;
 esac; done
 
 # ---- identity (matches build.rs deploy contract; archive builds have no .git) -
 cd "$REPO"
+# #400: refuse BEFORE the broker read and before the build — a stamp this tool cannot honour must
+# cost nothing to reject. This applies to the --bin path too: the <commit> argument's ONLY effect is
+# provenance, and with a prebuilt image we can verify that claim even less, so `stage <old> --bin
+# <current>` is the same mislabelling by a shorter route.
+assert_stamp_is_head "$COMMIT"
+# The dirty refusal is a claim about BYTES THIS TOOL IS ABOUT TO PRODUCE, so it is conditioned on
+# the build path: on --bin we neither build nor stamp, and refusing an operator's own prebuilt image
+# over the state of a tree it did not come from would be a gate firing on an innocent state.
+# Conditioned HERE rather than called inside the build branch so that BOTH refusals land before the
+# broker read and before any credential is sourced — a stamp this tool cannot honour must cost
+# nothing to reject, which is the same placement property #314's id42 refusal is tested for.
+[ -n "$BIN" ] || assert_stampable_inputs "$ALLOW_DIRTY"
 HASH="$(git rev-parse --short=7 "$COMMIT")"
 COUNT="$(git rev-list --count "$COMMIT")"
 # #128: --build N stays an explicit operator override (canary an UNCOMMITTED image with no
@@ -309,16 +402,33 @@ BUILD="$(choose_build "$COUNT" "$STAGED" "$BUILD_OVERRIDE")"
 # `verify_image.sh <commit>`. No node-id here is consistent with the fleet-shared design
 # above: ONE reproducible image, one sha per commit for the whole fleet.
 if [ -z "$BIN" ]; then
+  # #400: the dirty refusal already fired up at the identity block (before the broker read).
   echo "building reproducible espnow release @ $HASH (build $BUILD) ..."
   BIN="$SMOL_TMP/smol-${BUILD}.bin"
   # #326: staging IS the release act, so stamp it as one HERE rather than hoping the
   # operator remembered `export SMOL_RELEASE=1`. Before this line the release-vs-dev stamp
   # of a STAGED image depended on the operator's shell: repro_build.sh's comment said "the
   # caller sets SMOL_RELEASE=1" and no caller in the repo ever did — 913/915 shipped
-  # release-stamped only because operators exported it by hand. A canary of an uncommitted
-  # image still goes through --bin, which skips this build path entirely, so dev images
-  # cannot masquerade: this export never touches them.
-  SMOL_RELEASE=1 repro_build_bin "$CLOCK" "$BIN" "$HASH" "$BUILD" || die "reproducible build failed"
+  # release-stamped only because operators exported it by hand.
+  #
+  # #400 CORRECTION — this comment used to end: "A canary of an uncommitted image still goes
+  # through --bin, which skips this build path entirely, so dev images cannot masquerade: this
+  # export never touches them." That was FOLKLORE. Nothing routed uncommitted work to --bin, and
+  # nothing checked the tree, so `stage` on a dirty tree reached this line and force-stamped a
+  # CLEAN RELEASE onto uncommitted bytes — the precise masquerade the sentence denied, in the block
+  # whose job is honest release stamping. It is true now because assert_stampable_inputs makes it
+  # true: reaching here means either the inputs match HEAD, or --dirty was named and the stamp
+  # below is deliberately withheld.
+  if [ "$ALLOW_DIRTY" = 1 ] && [ -n "$(stage_input_dirt)" ]; then
+    # NO SMOL_RELEASE: build.rs then stamps `vN+dev.<hash>` (#218's honest-identity path), so the
+    # image reports on-glass and over DIAG that it is not a reproducible release. The stamp is the
+    # only part of this that survives into an incident three weeks from now.
+    echo "⚠️  #400: --dirty — building from UNCOMMITTED inputs; stamping DEV (vN+dev.$HASH), not a release."
+    echo "    The announced sha256 is reproducible from NO commit; verify_image.sh cannot confirm it."
+    repro_build_bin "$CLOCK" "$BIN" "$HASH" "$BUILD" || die "reproducible build failed"
+  else
+    SMOL_RELEASE=1 repro_build_bin "$CLOCK" "$BIN" "$HASH" "$BUILD" || die "reproducible build failed"
+  fi
 fi
 [ -f "$BIN" ] || die "no image at $BIN"
 
