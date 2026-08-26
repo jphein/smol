@@ -91,7 +91,10 @@ use crate::peripherals::es7210::Es7210;
 use crate::peripherals::die_temp::DieTemp;
 use crate::peripherals::imu::Qmi8658Imu;
 use crate::peripherals::mic_capture;
-use crate::peripherals::power::{Axp2101Power, PowerKey};
+use crate::peripherals::power::Axp2101Power;
+// PowerKey names are only referenced in has-pmu-gated PWRON-poll arms.
+#[cfg(feature = "has-pmu")]
+use crate::peripherals::power::PowerKey;
 use crate::peripherals::power_stats::{DisplayState, PowerStats, WifiMode};
 use crate::peripherals::rtc::{DateTime, Pcf85063aRtc};
 use crate::peripherals::touch::{Ft3168Touch, SwipeDirection};
@@ -994,6 +997,47 @@ async fn main(_spawner: Spawner) -> ! {
     // If you change it, `STACK_FLOOR`'s boot assert is the authority on whether
     // the result is safe — not this comment. Real fix still on the books: box
     // the session/voice socket buffers out of .bss so the pool can be restored.
+    // ESP32-S3 CYD — PSRAM REGISTERED FIRST (s3-cyd soak 2026-08-26, #446
+    // follow-up). The #446 fix (bigger internal pool) killed the crash loop
+    // but the board then went functionally dead: BOTH internal pools drained
+    // to ~0 B post-boot (main=8, recl=56) while PSRAM sat at 8.38 MB free, and
+    // radio's Internal-capability allocs then NO_MEM'd 7,372x (set_channel
+    // failed, association never completed). Cause: esp-alloc's capability-less
+    // global alloc (Slint's Box/Vec) walks regions in REGISTRATION ORDER and
+    // first-fits — with internal registered first, general/scene allocs ate
+    // internal and left nothing for the radio (which is Internal-only and
+    // cannot use PSRAM). The fix is ordering: register the 8 MB PSRAM FIRST, so
+    // capability-less allocations prefer it and the internal pools below are
+    // reserved for the radio's explicit Internal requests. OctalSpi EXPLICIT
+    // (Auto is board landmine L2); size auto-detects. Runs before any
+    // heap_allocator! so PSRAM is the head of the walk; the macros only
+    // register regions (no allocation) so ordering here is deterministic.
+    #[cfg(feature = "board-esp32s3-cyd")]
+    {
+        use esp_hal::psram::{Psram, PsramConfig, PsramMode, PsramSize};
+        let psram = Psram::new(
+            peripherals.PSRAM,
+            PsramConfig {
+                mode: PsramMode::OctalSpi,
+                size: PsramSize::AutoDetect,
+                ..Default::default()
+            },
+        );
+        let (start, size) = psram.raw_parts();
+        if size > 0 {
+            unsafe {
+                esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
+                    start,
+                    size,
+                    esp_alloc::MemoryCapability::External.into(),
+                ));
+            }
+            println!("[PSRAM] octal, {} KB mapped as External heap (registered FIRST)", size / 1024);
+        } else {
+            println!("[PSRAM] init reported 0 bytes - scene will exhaust internal heap");
+        }
+        core::mem::forget(psram);
+    }
     #[cfg(feature = "board-waveshare-c6")]
         esp_alloc::heap_allocator!(size: 186 * 1024);
     // C5 FIRST-LINK PLACEHOLDER, not a budget. The C6's 186 KB is a MEASURED
@@ -1019,11 +1063,25 @@ async fn main(_spawner: Spawner) -> ! {
     // dram_seg's end before .stack gets a byte). So the internal pool stays
     // MODEST — boot + radio allocations (which request the Internal capability
     // and therefore never spill to PSRAM, where atomics silently break) — and
-    // the 8 MB octal PSRAM carries Slint's bulk. PSRAM is a REQUIREMENT here,
-    // not an optimization. The PSRAM region is added AFTER this internal pool
-    // (below, post-init) so internal-first ordering holds.
+    // the 8 MB octal PSRAM (registered FIRST, above) carries Slint's bulk AND
+    // every other capability-less allocation, so these internal pools are the
+    // radio's reserve. PSRAM is a REQUIREMENT here, not an optimization.
+    // GROWN from the 64 KB C5-placeholder (s3-cyd second-first-light 2026-08-26):
+    // esp-radio 0.18's scan mallocs AP records from Internal-capable memory
+    // ONLY, and in a dense RF environment (many APs x 13 ch x 2 passes) a 64 KB
+    // internal pool ran dry mid-scan -> esp_wifi_scan_get_ap_record NO_MEM ->
+    // the driver's own uncatchable unwrap (fmt.rs:240) -> rst 0x3 crash-loop.
+    // The scene now lives in PSRAM, so internal SRAM is free to be generous.
+    // SIZED AGAINST THE STACK: the main pool shares the primary DRAM region
+    // with the downward stack (pool + stack <= ~185 KB here; 160 KB left only a
+    // 21 KB gap, a guaranteed boot crash). 96 KB main + 64 KB reclaimed =
+    // 160 KB Internal for radio+boot (+32 KB over the placeholder) while
+    // leaving the stack an ~89 KB band, comfortably over the 71,680 floor. If
+    // the dense-RF scan still NO_MEMs, the reclaimed pool (dram2_seg, ABOVE the
+    // stack — free of stack cost) is the next lever, or bias the scene harder
+    // to PSRAM. Verify the gap holds the floor after any change (STACK_FLOOR).
     #[cfg(feature = "board-esp32s3-cyd")]
-        esp_alloc::heap_allocator!(size: 64 * 1024);
+        esp_alloc::heap_allocator!(size: 96 * 1024);
     // ROM-reclaimed region (dram2_seg). Second pool so nothing goes to waste; it
     // sits ABOVE the stack ceiling and is independent of _bss_end, so its size has
     // ZERO effect on the stack.
@@ -1047,41 +1105,6 @@ async fn main(_spawner: Spawner) -> ! {
     // fallback that decides whether a 4 KB renderer request panics (#75).
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
 
-    // ESP32-S3 CYD: bring up the 8 MB octal PSRAM and register it as a heap
-    // region AFTER the internal pools. Internal-first ordering is load-bearing
-    // (s3-cyd L3): esp-radio requests the Internal capability for its RX/PP
-    // heaps, so they never land in PSRAM (where atomics silently break); every
-    // ordinary Rust allocation the internal pools cannot satisfy — Slint's
-    // scene bulk — falls through to here. OctalSpi mode is EXPLICIT (Auto is a
-    // board landmine, board_es3c28p.rs L2); size auto-detects. Without this the
-    // full ui/cyd scene reboot-loops on internal-heap exhaustion.
-    #[cfg(feature = "board-esp32s3-cyd")]
-    {
-        use esp_hal::psram::{Psram, PsramConfig, PsramMode, PsramSize};
-        let psram = Psram::new(
-            peripherals.PSRAM,
-            PsramConfig {
-                mode: PsramMode::OctalSpi,
-                size: PsramSize::AutoDetect,
-                ..Default::default()
-            },
-        );
-        let (start, size) = psram.raw_parts();
-        if size > 0 {
-            unsafe {
-                esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
-                    start,
-                    size,
-                    esp_alloc::MemoryCapability::External.into(),
-                ));
-            }
-            println!("[PSRAM] octal, {} KB mapped as External heap", size / 1024);
-        } else {
-            println!("[PSRAM] init reported 0 bytes - scene will exhaust internal heap");
-        }
-        // The Psram guard owns the peripheral for the program's life.
-        core::mem::forget(psram);
-    }
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt =
@@ -1502,6 +1525,9 @@ async fn main(_spawner: Spawner) -> ! {
     // Charger profile (issue #16): CV 4.1V / pre 50mA / CC 400mA / term 25mA —
     // vendor parity (board .cc:48-52). Field-masked RMW of regs 0x61-0x64 only;
     // rail enables are untouched (panel brown-out caution in power.rs header).
+    // has-pmu only: boards without an AXP2101 (the S3-CYD) have no charger to
+    // configure — the RMW would just NACK the empty I2C bus and log FAILED.
+    #[cfg(feature = "has-pmu")]
     if power.configure_charger().is_ok() {
         println!("[POWER] charger configured: CV 4.1V, pre 50mA, CC 400mA, term 25mA");
     } else {
@@ -1512,6 +1538,9 @@ async fn main(_spawner: Spawner) -> ! {
     // enable the short/long latches (0x41 RMW), clear stale ones (0x49 W1C).
     // The main loop polls the latch; ladder: 1.5s hold -> power menu, 4s hold
     // -> hardware poweroff (vendor failsafe, works even with firmware hung).
+    // has-pmu only: the PWRON latch lives in the AXP2101; the S3-CYD wakes on
+    // its boot key (HAS_BOOT_KEY) instead, polled separately below.
+    #[cfg(feature = "has-pmu")]
     if power.enable_pwron_events().is_ok() {
         println!("[POWER] PWRON events armed: IRQLEVEL 1.5s menu, 4s hw-off failsafe");
     } else {
@@ -3032,6 +3061,7 @@ async fn main(_spawner: Spawner) -> ! {
             if shell.power_menu_open() {
                 shell.set_vbus(power.is_vbus_in().unwrap_or(false));
             }
+            #[cfg(feature = "has-pmu")]
             match power.poll_power_key() {
                 Ok(Some(key)) if screen_state == 0 => {
                     println!("[PKEY] {:?} discarded (screen off, stale)", key);
@@ -5525,6 +5555,8 @@ async fn main(_spawner: Spawner) -> ! {
                             let requeue = &mut requeued;
                             let mut vol_during_play = || -> Option<(u8, bool)> {
                                 let mut act: Option<ButtonAction> = None;
+                                // has-pmu only: no AXP2101 PWRON on the S3-CYD.
+                                #[cfg(feature = "has-pmu")]
                                 if let Ok(Some(key)) = power.poll_power_key() {
                                     act = Some(match key {
                                         crate::peripherals::power::PowerKey::Long => pwron_long,
