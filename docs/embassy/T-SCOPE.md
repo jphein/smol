@@ -330,11 +330,12 @@ rev-1.
    stack policy, and by how much — which is a JP/lead call, not a scoping one. Laying out the
    options with numbers rather than picking one:
 
-   - **(a) grow the region.** The executor's 20,264 B of DRAM is **96.7% one object**: the embassy
-     task arena, `__embassy_main::POOL` = **19,600 B** (`.bss`, measured). It is sized by the
-     largest task future, and `run()` is the entire superloop as one `async fn`. That is the
-     single biggest lever in the image — and see §6.2, because **T adds `net_task` to that same
-     pool.**
+   - **(a) grow the region.** The executor's 20,264 B of DRAM is **96.7% one object**:
+     `__embassy_main::POOL` = **19,600 B** (`.bss`, measured), sized by `run()`'s future — the
+     entire superloop as one `async fn`. ⚠️ **This bullet called it "the embassy task arena" and
+     "the single biggest lever in the image". Both halves are corrected in §6.4; read that before
+     acting on this one.** It is not an arena (embassy-executor 0.10 gives every task its own
+     pool), and it is neither the biggest object nor a cheap one — it is 88% a single live struct.
    - **(b) re-derive the multiplier, with a stated rationale.** 4/3 was calibrated when the
      measurement was less representative (bench composition, narration workload). A
      fleet-composition, real-duty peak arguably needs less compensation — but leaf-duty undercuts
@@ -392,12 +393,14 @@ rev-1.
    the table above. What the table gives is one term, measured, so the others can be added to
    something real instead of to an estimate.
 
-   **And `net_task`'s cost has a known home, which §6.1 found:** a spawned task's future lives in
-   the embassy task arena, `__embassy_main::POOL`, **already 19,600 B** of `.bss` for `run()` alone.
-   T does not merely add a stack — **it enlarges that arena by the size of `net_task`'s future**, in
-   the same `.bss` that shrinks `.stack`. Measure the POOL delta per tier in the same A/B as the
-   `.stack` delta; it is the term most likely to be missed, because nothing in the source names a
-   size.
+   **`net_task`'s cost has a known home — but NOT the one this paragraph used to name.** ⚠️ The
+   original text said a spawned task's future "lives in the embassy task arena,
+   `__embassy_main::POOL`", so T "enlarges that arena", and prescribed "measure the POOL delta per
+   tier". **All three clauses are wrong, and the prescription was the dangerous one** — see §6.4.
+   There is no shared arena in this tree; `net_task` gets **its own** pool static, so
+   `__embassy_main::POOL` can be byte-identical across the A/B while `.bss` grows. The measurement
+   that still holds: **T adds `net_task`'s future to `.bss`, and nothing in the source names its
+   size.** Measure it as **total `.bss` / `_stack_end`**, never as one symbol.
 
    **The offsetting question T must answer (a question, not a claim):** the smoltcp-era NTP statics
    measured in §3.2 — 3,584 B — belong to `NtpMachine`, which T replaces. Whether T retires them,
@@ -419,6 +422,72 @@ rev-1.
    the #198 rounds. A transport change that silently moved election timing would otherwise show up
    as a fleet-behaviour surprise rather than as a T finding, and the sub-second H1/H2 results on the
    233 fleet are the baseline it should be read against.
+
+### 6.4 ⚠️ MEASURED CORRECTION — there is no arena, the POOL is not the lever, and the prescribed instrument would have LIED
+
+`-Zprint-type-sizes` on the fleet tier plus `readelf -sW` on the linked ELF, 2026-08-26. Three
+things §6.1/§6.2 and #440 assert are wrong. They are corrected here rather than edited away,
+because the reasoning that produced them is reusable and the errors are instructive.
+
+**(i) The region's arithmetic — the fact everything else follows from.** `.bss` addr `0x3fc8ddd0`
+\+ size `0x2b578` = **`0x3fcb9348` = `_stack_end`**. The stack region is DRAM *after* `.bss`, so
+**only DELETED bytes grow it.** Moving an object out of the POOL into a static is **net-zero**.
+Every "shrink the POOL" plan has to be a deletion plan or it is not a plan.
+
+**(ii) There is no shared task arena.** embassy-executor **0.10** expands `#[task]` to a
+**per-task** `TaskPool<Fut, N>` static; the dump shows
+`TaskPool<{async fn body of __main::____embassy_main_task_inner_function()}, 1>` = 19,600 and
+`TaskPoolHolder<19600, 8>`. (The arena model is real, but it belongs to embassy-executor's
+`task-arena-size-*` config, which this tree does not use.) So T does **not** enlarge
+`__embassy_main::POOL`; it adds a **separate** `net_task` pool.
+
+> **The prescription is the part that mattered.** "Measure the POOL delta per tier in the same A/B
+> as the `.stack` delta" would have read an **UNCHANGED symbol while `.bss` grew elsewhere** — a
+> green reading from a correct measurement of the wrong object. That is §5.1's own failure mode,
+> written into this document as an instruction. **The instrument is total `.bss` / `_stack_end`,
+> never one symbol.**
+
+**(iii) The POOL is 88% one LIVE struct, so it is the hardest 4.8 KB in the image, not the easiest.**
+
+| | bytes |
+|---|---|
+| `__embassy_main::POOL` | 19,600 (40 B header + future) |
+| `{async fn body of run()}` | 19,552 |
+| ` └─ net::mode::RadioManager` | **17,216** |
+| ` └─ everything else in `run()`` | 2,336 |
+
+No duplicate copy, no slack. The only POOL savings available are **deletions of live fleet
+capacity** inside `RadioManager` — `diag_cache` 2,920 · `scan_cache` 2,920 · `relay` 2,424 ·
+`ledger` 1,760 · `cfg_cache` 1,304 · `stat_cache` 1,304. Reaching 4,771 B means roughly halving
+the relay/diag cache depth: **a capability cut wearing a plumbing costume.**
+
+**(iv) 🪦 THE ATTRACTIVE WRONG ANSWER, buried here on purpose.** `net::init_heap` reserves
+`96 * 1024`, so `HEAP` is **98,304 B — 55% of all `.bss`, 5× the POOL**, and one constant away
+from closing the gap. **Do not.** `budget.rs`'s own #367 record has the fleet's DIAG:
+id51 **`hmin = 3,732 B`**. The heap has been within 3.7 KB of exhaustion, and trimming 4,771 B
+would have OOM'd that board. This is §3.2's shape exactly — two true facts (huge heap, small
+shortfall) joined by a story that no one measured.
+
+**What is actually left**, and both are T-shaped, which is why JP's direction survives its
+premise:
+- **Two OTA windows, 14,784 B each** — `net::mode::GW_OTA_WINDOW` and `ota_mesh::OTA_WINDOW_BUF`,
+  both carrying alias-safety comments asserting one-at-a-time use, GW's explicitly claiming a
+  gateway "never runs a leaf receive session". If that survives #40's leaf-relay path, one buffer
+  is **3× the shortfall with no capability cut**. *If* — pairs 4/5, RISKS §R12 brick-class, and
+  §3.2 is the standing warning against believing a comment. Proved by building it, never by
+  reading it. **Its own follow-up with its own canary; never a rider on T.**
+- **The term nobody had costed, and the only one that moves BOTH sides of the inequality:** the
+  MQTT burst path allocates its `SocketSet`, `tcp_rx` 512, `tcp_tx` 512 and `cast_tx` 512 **on the
+  stack**, and `run_ota_fetch` repeats the pattern. Those bytes are *inside* the measured 67,400
+  peak. T moves them into embassy-net's **static** resources, so the peak falls as the region
+  falls — and since `floor = ceil(peak × 4/3)`, **a byte moved off the stack closes 4/3 bytes of
+  the 4,771 B gap.**
+
+**RULING (team lead, 2026-08-26), superseding §6.1's "shrink the POOL":** JP ruled a *direction* —
+restore the ×4/3 relationship without weakening the factor — on a hypothesis this section refutes.
+The direction stands; the lever moves. **The shrink is sequenced INSIDE T** (which JP's ruling
+already permitted: "a named pre-T **or in-T** deliverable"), carried by T's own smoltcp retirement
+and stack→static move, and **bounded by the §7 inequality** so it is a plan rather than a hope.
 
 ---
 
@@ -448,6 +517,32 @@ declared `MC-PUBLISH-SITES` roster counted both directions, plus each site's cha
 the `NonZeroU8`-bound `pub_ch`; both announce sites live inside the body T replaces, so a review
 promise was never the right instrument) · and a **bench election-canary observation post-flash**,
 because §6.3 changes election timing inside the atomic commit (§6.3).
+
+### 7.1 🔴 THE BINDING INEQUALITY — T does not merge outside its own stack policy
+
+Ruled by the team lead on 2026-08-26 as the condition that makes §6.4's "fold the shrink into T"
+a **plan** rather than a hope. It is stated as an inequality with named operands, because the
+previous floor went stale precisely by being a decision nobody had to re-satisfy:
+
+> **`region ≥ ceil(measured_peak × 4/3)`**, where `measured_peak` is read by **`stack-paint-lite`
+> on the T image** (not inherited from the pre-T number), on **both tiers**, and `region` is
+> `_stack_start − _stack_end` of that same image.
+
+Today's operands, for the delta to be read against: peak **67,400** (the higher of the two labeled
+numbers; crown 67,368 and leaf 67,400 are the same number 32 B apart) · required floor **89,867** ·
+region **85,096** real-seeds / 86,200 provisioned · **shortfall ≈ 4,771 B**.
+
+Three things this deliberately does NOT allow, each of which is a way a green could be
+manufactured instead of earned:
+1. **No inherited peak.** T changes what is on the stack (§6.4's stack→static move is the whole
+   mechanism), so a peak measured before T describes a different program. Re-measure.
+2. **No single-symbol accounting.** Per §6.4(ii), `.bss` growth can hide entirely outside
+   `__embassy_main::POOL`. Read total `.bss` / `_stack_end`.
+3. **No moving the multiplier to fit.** ×4/3 stays; if the inequality fails, that is a finding to
+   report, and options (b)/(c) are a JP ruling — not a number to adjust until the gate goes green.
+
+If T's own numbers leave a residual gap, §6.4's OTA-window reclamation becomes its own follow-up
+**with its own canary**, never a rider on the atomic commit.
 
 *(A "reclaim 3,584 B" step stood at the head of this list until it was measured and refuted — §3.2.
 The margin is 12,000 B and that is the whole budget.)*
