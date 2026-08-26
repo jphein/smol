@@ -925,3 +925,33 @@ const _: () = assert!(
      scan-disabler wearing a guard's clothes. Lower the floor, or re-measure the fleet and update \
      FLEET_MIN_STEADY_FREE_HEAP_BYTES with a fresh timestamp."
 );
+
+// 🪦 ── A TOMBSTONE FOR THE ATTRACTIVE WRONG ANSWER: "just shrink the 96 KB heap" ────────────────
+//
+// Left here because the next person to need a few KB of DRAM will find this lever within about
+// ninety seconds and it looks free. It is not free, and the refutation is already in this file.
+//
+// The setup (all true, measured 2026-08-26 on the fleet tier): `net::init_heap` reserves
+// `96 * 1024`, so `HEAP` links as **98,304 B — 55% of the image's entire `.bss`**, five times the
+// 19,600 B embassy task pool and twenty times any other single object. The `.stack` region is DRAM
+// *after* `.bss` (`.bss` end == `_stack_end`, checked), so every byte cut from that reservation
+// becomes a byte of stack region. When the image was measured 4,771 B outside its own `peak x 4/3`
+// policy, one constant in one line closed the whole gap.
+//
+// **The refutation is the DIAG table above.** id51's watermark is `hmin = 3,732 B`. That is not a
+// steady-state figure — it is how close the fleet has already come to heap exhaustion, once, in
+// normal operation. Cutting 4,771 B would have put that board **below zero at its own observed
+// minimum**. FLEET_MIN_STEADY_FREE_HEAP_BYTES (27,732) is the number people quote here, and it is
+// the wrong one for this question: it is the minimum *steady* free heap, and heap sizing is
+// decided by the *transient* minimum, which is 7.4x smaller.
+//
+// Two general points, since the specific one is now settled:
+//   * A large static is not evidence of a large slack. `HEAP` is a RESERVATION whose whole purpose
+//     is to absorb peaks that never appear in a symbol table.
+//   * This is the exact shape of T-SCOPE §3.2's refuted reclamation — two true facts (a huge
+//     object, a small shortfall) joined by a causal story nobody measured. That one was caught by
+//     trying the change; this one was caught by reading a number already in the tree, which is
+//     cheaper, and is why the number is worth keeping next to the temptation.
+//
+// If a future fleet genuinely needs this lever: re-measure `hmin` across every board under OTA and
+// scan duty (the two heap peaks), and move the reservation only by the margin THAT shows.
