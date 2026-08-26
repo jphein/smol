@@ -704,6 +704,29 @@ if [ "$run_host" = 1 ]; then
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_ci_provision"
   fi
+
+  # #400: and the same argument a third time. An audit of `tools/test_*.sh` against this file found
+  # FOUR suites with no gate — so #314's id42-refusal test and the #128 ratchet test have never once
+  # been run by CI, and the safety properties they assert were being maintained on trust. Both of
+  # these guard tools/ota_publish.sh, which is the one script here that can arm the whole fleet.
+  #
+  # Deliberately NOT wired, with reasons, so the remainder is a declared gap and not an oversight:
+  #   • test_ota_verify.sh      — hermetic but slow (>2 min, replays canned MQTT logs). Not wired
+  #     because I did not watch it run to completion, and wiring a suite on the strength of its own
+  #     header comment is the inference this file exists to refuse. Worth a follow-up.
+  #   • test_ha_deploy_guard.sh — MUST NOT be wired. It commits with `git commit -am` by design and
+  #     is built for a scratch clone; running it in a checkout with work in it creates junk commits
+  #     (it has already done so here once). Its refusal to run in a working tree IS the guard.
+  # Both suites below are offline, cargo-free, and leave the working tree byte-unchanged (verified
+  # by running them and checking `git status --porcelain`, not by reading their headers).
+  step "OTA publish guards + ratchet regression suites (#314/#128/#400)"
+  for _t in test_ota_publish_guards test_ota_ratchet; do
+    if out=$("$ROOT/tools/$_t.sh" 2>&1); then
+      printf '%s\n' "$out" | tail -1; ok "$_t"
+    else
+      printf '%s\n' "$out" | sed 's/^/        /'; bad "$_t"
+    fi
+  done
 fi
 
 step "summary"
