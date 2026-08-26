@@ -40,12 +40,21 @@
 # of a reproducibility claim. The honest trade is stated on the artifact instead — see the NOTES
 # emitted by release_targets.sh.
 #
-# ── build-std IS A NO-OP HERE, AND OMITTING IT IS DELIBERATE ───────────────────
-# `.cargo/config.example.toml` carries `[unstable] build-std`, but rust-toolchain.toml pins
-# `stable`, where it does nothing: the build links the precompiled bare-metal core/alloc for the
-# target. The watch's own CI omits it and says why — a fresh cargo can hard-ERROR on the
-# unstable key. Omitted here for the same reason. (Same for Xtensa: espup's `esp` channel ships
-# precompiled xtensa-esp32s3-none-elf libs; tools/build-s3.sh passes no -Zbuild-std either.)
+# ── build-std: A NO-OP ON RISC-V, MANDATORY ON XTENSA ─────────────────────────
+# `.cargo/config.example.toml` carries `[unstable] build-std`, and the watch's own riscv CI
+# omits it, correctly, with the note that on the pinned `stable` toolchain it does nothing —
+# the build links the precompiled riscv32imac core/alloc — and that a fresh cargo can
+# hard-ERROR on the unstable key.
+#
+# ⚠️ THAT CLAIM IS TRUE FOR RISC-V AND FALSE FOR XTENSA, and generalising it broke the S3 arm
+# with `error[E0463]: can't find crate for 'core'`. MEASURED: espup's `esp` toolchain sysroot
+# contains ONLY `x86_64-unknown-linux-gnu` — it ships NO precompiled xtensa-esp32s3-none-elf
+# core at all, so core must be built from source. (It carries the `rust-src` component for
+# exactly this, and JP's own fambuild tree config has the key.) tools/build-s3.sh does not pass
+# -Zbuild-std because it inherits it from that config file rather than not needing it.
+#
+# So the key is emitted for xtensa targets and omitted for riscv ones — derived from the triple
+# rather than passed in, so a new board cannot get this wrong by forgetting an argument.
 #
 # Usage: ci_provision_gui.sh <gui-workspace-dir> <target-triple> [rustflags-toml-array]
 #   rustflags default: ["-C", "force-frame-pointers"]  (the C6/C5 arms' proven flags)
@@ -87,6 +96,17 @@ rustflags = $RUSTFLAGS_TOML
 [env]
 ESP_LOG = "info"
 EOF
+
+# Xtensa only — the esp toolchain ships no precompiled core for this triple. See the header.
+case "$TRIPLE" in
+  xtensa-*)
+    cat >> "$CFG" <<'EOF'
+
+[unstable]
+build-std = ["alloc", "core"]
+EOF
+    ;;
+esac
 
 # ── THE ASSERTION ─────────────────────────────────────────────────────────────
 # A comment claiming "no credentials" is not a guarantee; this is. Every key the firmware reads
