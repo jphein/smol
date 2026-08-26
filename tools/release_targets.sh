@@ -339,13 +339,21 @@ So, to actually use it:
 
 **Stack floor.** $(gui_stack_note "$chip" | tr '\n' ' ')
 
-**⚠️ Reproducibility — an honest limit, not a guarantee.** This image is **not** claimed
-byte-reproducible. The fleet images are, because there the reproducible build IS the tested
-build; here it is not. Byte-identity would need \`--remap-path-prefix\`, which changes
-\`.rodata\` string lengths and therefore the memory layout — and on this chip layout is not
-cosmetic (its #65 moved a crash from 0% to 100% with an 8-byte shift), so the release build
-deliberately keeps the layout the bench builds were tested at instead. **This artifact's
-identity is its git hash, \`$GITHASH\`, and the sha256 above for this exact file.**
+**⚠️ Reproducibility: this image is NOT byte-reproducible, and that is measured, not assumed.**
+The fleet images are reproducible; **this flavor is not, and the fleet's recipe does not fix
+it.** Two cold builds of one commit, on one machine, at the same canonical path, with
+\`SOURCE_DATE_EPOCH\` pinned, were compared: **identical in size, different in 654,632 bytes**,
+clustered in five regions — a 32-byte one in the app-descriptor area, and, decisively, a
+~1 MB span across the code region. Scattered codegen differences are not something a path
+remap would remove, so the honest statement is that the cause is **unidentified and open**,
+not that a flag is missing. (A remap was also deliberately *not* added for an independent
+reason: it changes \`.rodata\` string lengths and so the memory layout, and on this chip layout
+is not cosmetic — the watch's #65 moved a crash from 0% to 100% with an 8-byte shift. The
+release build keeps the layout the bench builds were tested at.)
+
+**So do not compare this file's sha256 against a rebuild and conclude anything.** Its identity
+is the git hash \`$GITHASH\` plus the sha256 above **for this exact published file** — verify
+the file you downloaded, not a build you made.
 NOTES
   echo "   $bin"
   echo "   sha256 $sha"
