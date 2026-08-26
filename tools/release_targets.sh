@@ -235,9 +235,9 @@ for m in "${MANIFESTS[@]}"; do
   # input rather than truncating it (deliberately — a silently different seed would break the
   # cross-tool name agreement the sigil exists to provide), so handing it this script's
   # 12-char $GITHASH returns None and the image ships stamped "no-git": precisely the unnamed
-  # build the mechanism exists to prevent. MEASURED, not reasoned: the first build on familiar
-  # printed `build sigil: no-git · 883aa0c9b56a (supplied)`. build.rs's own git path uses 7, so
-  # 7 it is. $GITHASH stays 12 for filenames and NOTES.
+  # build the mechanism exists to prevent. MEASURED, not reasoned: the first real build of this
+  # path printed `build sigil: no-git · 883aa0c9b56a (supplied)`. build.rs's own git path uses
+  # 7, so 7 it is. $GITHASH stays 12 for filenames and NOTES.
   wbh="${GITHASH:0:7}"
 
   # ⚠️ DO NOT SET CARGO_PROFILE_RELEASE_OPT_LEVEL ON THE RISCV ARMS. The workspace's own
