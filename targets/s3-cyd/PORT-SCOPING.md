@@ -319,3 +319,18 @@ Ordered by dependency:
   the CYD) are the watch lane's queued follow-up. #447 left on the board as id 162;
   JP's tap verdict is the next gate; final blessed build from merged main after #446/#447
   land. Loop evidence: scratch/s3-cyd-target/psram-fix-verdict.md + smol/tmp/g44*-*.log.
+- **2026-08-25 ~22:3x — GUI FLAVOR FULL STACK: `[MQTT] published` (rounds 4-5 of the soak loop).**
+  #448 soaked clean ×3 (PKEY spam 1,155→0; has-pmu gating proven). The MQTT tcp-connect
+  failure was then peeled in three layers: (1) MY recipe omission — the watch broker is
+  compile-time (`option_env!("MQTT_BROKER")`, placeholder 192.168.1.10) and clone builds
+  never set it; (2) a coex/channel-mismatch hypothesis, DISPROVEN when a co-channel ch6
+  burst also failed (c38bf74's off-channel widening rode along, still unexercised on HW);
+  (3) the real cause — **wrong broker LEG for the board's VLAN seat**: jplovescl lands
+  boards on VLAN8/iot (gatekeeper lease 10.0.8.214; crowns too), the C6-inherited
+  10.0.11.110 is in the family zone, and only :8087/:21324 cross iot→family. The whole
+  C3 fleet dials the HA VM's own VLAN8 leg **10.0.8.111:1883** (secrets.rs) — baking
+  that (byte-proven, sha b8fffe38) → WiFi ch6 + NTP + **MQTT published** + burst
+  complete. ⚠️ **s3-cyd build recipe of record: MQTT_BROKER=10.0.8.111:1883 +
+  MQTT_USER/PASS from the watch repo's gitignored .cargo/config.toml — never the C6's
+  broker value.** #413 note: broker-in-provisioning (SWCFG) would retire this per-target
+  compile-time divergence. Board on 448d; JP's tap is the only gate left.
