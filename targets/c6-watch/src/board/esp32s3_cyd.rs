@@ -120,3 +120,27 @@ pub const TOUCH_INVERT_Y: bool = true;
 /// confidence; confirm against a real S3 image at the bench (xxd bytes
 /// 12..14 of espflash save-image output) before trusting a refusal.
 pub const ESP_IMAGE_CHIP_ID: u16 = 0x0009;
+
+// === PSRAM heap soundness (verified from source 2026-08-25) ===
+// The main.rs octal-PSRAM fix is sound on both axes that could reboot-loop
+// this board a second time:
+//   1. MAPPING: the linked image carries esp_hal::psram::octal_spi_impl
+//      (nm-confirmed); `soc_has_psram` auto-enables for the S3, no feature.
+//   2. ATOMICS (board_es3c28p.rs L3 — radio heaps must never be PSRAM):
+//      esp-radio 0.18's malloc_internal + InternalMemory route to
+//      esp_alloc::InternalMemory, which requests the Internal capability, so
+//      esp-alloc's alloc_caps(Internal) skips the External PSRAM region and
+//      every radio buffer stays in SRAM regardless of registration order.
+//   3. EFFECTIVENESS (the decisive axis — would the fix be a no-op?): Slint's
+//      scene allocates via the GLOBAL allocator (Box/Vec), which esp-alloc
+//      serves through alloc_caps(EnumSet::empty()). The region filter is
+//      `capabilities.is_superset(empty)` — TRUE for every region — so the
+//      first-fit walk considers the External PSRAM region too, in registration
+//      order (add_region appends after the macro-registered internal pools).
+//      A scene buffer that overflows the 64 KB internal pool falls through to
+//      PSRAM. Confirmed in esp-alloc 0.10.0 source; without this the fix would
+//      register PSRAM that nothing ever uses.
+// Budget to watch, not a bug: internal heap is ~128 KB (64 main + 64
+// reclaimed), all Internal, feeding radio + boot; Slint's bulk goes External.
+// If radio ever exhausts internal it fails Internal-only (no PSRAM spill by
+// design) — widen the internal pool at PSRAM's expense then. Not expected.
