@@ -347,6 +347,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b7e4c2464d97fe331d41de9d5db0def0a96f4d823b8b32a2efd503578988973"
 
 [[package]]
+name = "bard-core"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
+
+[[package]]
 name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -602,6 +609,10 @@ dependencies = [
  "slab",
  "tracing",
 ]
+
+[[package]]
+name = "cast-core"
+version = "0.1.0"
 
 [[package]]
 name = "cc"
@@ -2194,6 +2205,7 @@ dependencies = [
 name = "esp32c6-watch"
 version = "0.12.1"
 dependencies = [
+ "cast-core",
  "climate-model",
  "critical-section",
  "embassy-executor",
@@ -3932,6 +3944,16 @@ name = "mesh-flood"
 version = "0.1.0"
 dependencies = [
  "sha2 0.11.0",
+]
+
+[[package]]
+name = "mesh-ledger"
+version = "0.1.0"
+dependencies = [
+ "ed25519-compact",
+ "ed25519-dalek",
+ "log",
+ "sha2 0.10.9",
 ]
 
 [[package]]
