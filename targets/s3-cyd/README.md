@@ -38,14 +38,59 @@ An eyeballed comparison *will* eventually confuse them; only a byte-exact serial
 identity. `spike/flash.sh` encodes this table as a deny-list and refuses by default.
 (Identified 2026-08-24 23:03 by passive bus-diff: sole new device, JP-plugged, JP-named.)
 
+## Two flavors, one board
+
+This is the only target that runs **both** of smol's firmwares, and parity is judged per flavor:
+
+- **smol-native (fleet)** — `rust/clock` with `--features esp32s3`. The apps, the SMOLv1 mesh,
+  the Bard, signed OTA, the measured `ESP32S3_CYD` budget row. Xtensa, so it needs the espup
+  `esp` toolchain and builds at `opt_level = 2` (an LLVM scavenger workaround declared in
+  `tools/build-matrix.toml` — and part of this chip's (chip, profile) sha lineage).
+- **watch-GUI** — the `board-esp32s3-cyd` arm of the [`targets/c6-watch`](../c6-watch/)
+  workspace: Slint, touch, the launcher, PSRAM-backed scenes.
+
 ## What's here
 
 | file | what it is |
 |---|---|
 | `BOARD.md` | the hardware truth: pin map (triple-sourced), landmines, power block, identity |
+| `PARITY.md` | **the feature-parity matrix** — verified-done vs. hardware-allows-but-not-yet vs. documented exclusions, against the C6 watch and the C5 CYD |
 | `PORT-SCOPING.md` | the decision log: verdicts with evidence, phases, operational rules, status |
+| `PARTITIONS.md` · `partitions-ota-s3.csv` | the A/B layout (two 6 MiB slots), flashed |
+| `DISPLAY-PACKAGE.md` · `BENCH-RUNBOOK.md` | the panel bring-up package and the bench procedure |
 | `spike/` | the phase-1 bring-up crate (four-milestone ladder, cyd-c5 pattern, throwaway) |
 
-## Status
+## Status — 🟢 glass-verified (2026-08-26)
 
-See the dated status section at the bottom of `PORT-SCOPING.md`.
+A human watched this board do all of it. **Verified on hardware, in the flavor noted:**
+
+| | flavor | |
+|---|---|---|
+| Boot + 8 MB octal PSRAM (registered **first**) | GUI | #445 / #447 |
+| Display render — ILI9341V, landscape | both | JP on glass |
+| Touch — FT6336U taps, swipes, wake-on-tap | GUI | JP on glass |
+| Mesh — SMOLv1 leaf id 162, relays, election on ch6 | both | 20/20 acks (GUI), 36/36 (native) |
+| WiFi + NTP + MQTT → Home Assistant | both | `[NTP] synced`, `[MQTT] published` |
+| Display idle-sleep + wake | GUI | JP witnessed |
+| Bard, games, cast-tap plumbing, sensors, budget row | native | #411 |
+| A/B partition table (6 MiB slots) | both | flashed |
+
+**Not yet, and named rather than implied:**
+
+- **CI cannot build this chip.** `[chip.esp32s3] builds = false` — the *only* remaining blocker
+  is the runner toolchain (espup's `esp` channel is not on GitHub runners). Everything else —
+  manifest pins, the `linkall.x` + `opt_level` workaround (#408/#409), the display arm, the
+  measured budget row — is done. `.github/workflows/xtensa-spike.yml` has shown a stock runner
+  provisioning and building it.
+- **No A/B OTA roll yet.** The software is de-risked (per-arch ed25519, ota-proto 19/19, table
+  flashed, `mesh-ota` compiled into both flavors) but no image has actually been rolled to this
+  board over the mesh. **That is the gate for "full fleet citizen".**
+- **Stack-floor provenance is `ObservedSufficient`, not `Derived`** — the stack-measuring
+  instrument is known-broken on this chip, so `ESP32S3_STACK_FLOOR_BYTES` is the largest region
+  proven to run clean in bench operation. Real protection, weaker provenance than the C3's.
+- **Audio, battery %, light-sleep, LEDC backlight dimming** — the hardware allows them and the
+  firmware does not do them yet. See `PARITY.md` for what each one needs.
+- **`[IMU] OK` on this board is a vacuous log line** — the ES3C28P has no IMU. IMU and PMU
+  features are *documented exclusions* here, not gaps.
+
+The dated running status lives at the bottom of `PORT-SCOPING.md`; `PARITY.md` is the matrix.
