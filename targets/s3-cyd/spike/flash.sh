@@ -208,6 +208,17 @@ printf '\033[1;32m[flash guard] OK: %s is %s — flashing.\033[0m\n' "$PORT" "$A
 extra=()
 [ -t 0 ] || extra+=(--non-interactive)
 
+# THE OTADATA TRAP (2026-08-26, cost an hour mid-OTA-campaign): a USB flash
+# writes ota_0, but if anything has ever flipped otadata (an OTA install, a
+# partial mesh-relay write), the bootloader keeps booting ota_1's OLD image —
+# the flash "succeeds and silently never runs". The fleet memory prescribed
+# this erase all along; this guard just never had it. Erase otadata (0xf000,
+# 0x2000) every time so a USB flash ALWAYS boots what it wrote. NVS (0x9000)
+# is untouched. Read `Loaded app from offset 0x20000` after every flash —
+# that line, not the "completed" banner, is the proof.
+espflash erase-region --port "$PORT" 0xf000 0x2000 >&2 \
+  || { printf '[flash guard] otadata erase FAILED — aborting before a silent wrong-slot boot.\n' >&2; exit 1; }
+
 # espflash prints `MAC address:` before writing — an INDEPENDENT second check.
 # It must read ${ALLOW_SERIAL}. If it does not, pull the cable.
 exec espflash flash --monitor --port "$PORT" "${extra[@]}" "$@"
