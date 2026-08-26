@@ -244,7 +244,16 @@ done
 # flashable image that would join the mesh.
 if [ "$mode" = apply ] && [ -f "$src/secrets.rs" ] && grep -q "GROUP_KEY" "$src/secrets.rs"; then
   if grep -qE 'GROUP_KEY: *\[u8; *32\] *= *\[0u8; *32\]' "$src/secrets.rs"; then
-    key=$(od -An -tu1 -N32 /dev/urandom | tr -s ' ' | tr ' ' '\n' | grep -E '^[0-9]+$' | paste -sd, -)
+    if [ "${CI_PROVISION_FIXED_KEY:-}" = "1" ]; then
+      # #413/#394 RELEASE MODE: a FIXED, PUBLISHED placeholder key — deterministic so the artifact
+      # is reproducible (#44 verify = rebuild-and-compare), publicly known BY DESIGN, and every
+      # artifact's release notes carry the re-key instructions (JP's #394 ruling: instructions,
+      # not a secret demo key). A placeholder-key image can mesh only with other placeholder-key
+      # images; it cannot join a re-keyed fleet. Non-zero so the all-zero compile guard keeps biting.
+      key="1,$(printf '0,%.0s' {1..30})0"
+    else
+      key=$(od -An -tu1 -N32 /dev/urandom | tr -s ' ' | tr ' ' '\n' | grep -E '^[0-9]+$' | paste -sd, -)
+    fi
     # Guarantee non-zero even in the (astronomically unlikely) all-zero draw — the point is the
     # guard, and a gate that can emit the value it exists to reject is not a gate.
     key="1,${key#*,}"

@@ -1,0 +1,8 @@
+name = "c5-cyd"
+chip = "esp32c5"
+flavor = "fleet"
+source = "rust/clock"
+artifact = false
+# WHY NO ARTIFACT YET: the C5 fleet image is CHECK-proven, not LINK-proven ([chip.esp32c5]
+# builds=false; "it links" is itself not proof — see budget.rs). Flip to true when a linked,
+# floor-gated C5 image exists. The board today runs the GUI flavor from targets/c6-watch.
