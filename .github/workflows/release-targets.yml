@@ -1,0 +1,93 @@
+# release-targets.yml — the per-target downloads (#413 phase 3).
+#
+# THE targets/ FOLDER IS THE MATRIX (JP's rule): tools/release_targets.sh iterates the
+# targets/*/target.toml manifests; this workflow only decides WHICH toolchain a job carries.
+# Adding a riscv target with `artifact = true` needs no edit here at all.
+#
+# WHAT AN ARTIFACT IS: a byte-reproducible image built from `git archive` with the PUBLISHED
+# placeholder key (deterministic — two cold builds measured sha-identical at 97150a8), stamped
+# build 0 (#420: not a fleet-ratchet number; identity = git hash), carrying a NOTES.md with the
+# chip's stack-floor provenance and the #394 re-key instructions. Downloads are for NEW hardware;
+# fleet boards update over mesh OTA only (docs/RELEASES.md).
+#
+# The S3 job provisions espup EXACTLY as xtensa-spike.yml proved (fresh, uncached — the cache
+# traded 41 s for eviction pressure on the real gates' entries; measured, see that file). `ships`
+# for the S3 stays false in build-matrix.toml — a downloadable preview is not fleet-shipped.
+name: release-targets
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '47 7 * * *'   # nightly, offset from the 06:17 spike cron
+concurrency:
+  group: release-targets
+  cancel-in-progress: true
+env:
+  XTENSA_VERSION: 1.95.0.0
+  ESPUP_VERSION: 0.17.1
+permissions:
+  contents: write            # gh release upload
+jobs:
+  riscv-targets:
+    name: riscv artifacts (c3 family)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (repo-pinned stable + riscv32imc)
+        run: rustup show >/dev/null && rustup target add riscv32imc-unknown-none-elf
+      - name: espflash (packager)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/esp-rs/espflash/releases/latest/download/espflash-x86_64-unknown-linux-gnu.zip -o /tmp/ef.zip
+          cd /tmp && unzip -o ef.zip && install -m755 espflash "$HOME/.cargo/bin/espflash"
+      - name: Build the riscv artifacts
+        run: bash tools/release_targets.sh out c3
+      - uses: actions/upload-artifact@v4
+        with: { name: riscv-artifacts, path: out/ }
+      - name: Attach to the rolling nightly prerelease
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          set -euo pipefail
+          gh release view nightly >/dev/null 2>&1 || gh release create nightly --prerelease \
+            --title "nightly per-target images" \
+            --notes "Rolling nightly builds - see each artifact's NOTES.md. New-hardware flashing only; fleet boards update over mesh OTA."
+          gh release upload nightly out/* --clobber
+  s3-target:
+    name: xtensa artifact (s3-cyd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install espup + the esp toolchain (fresh, uncached — xtensa-spike.yml's proven recipe)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/espup \
+            "https://github.com/esp-rs/espup/releases/download/v${ESPUP_VERSION}/espup-x86_64-unknown-linux-gnu"
+          chmod +x /tmp/espup
+          /tmp/espup install --toolchain-version "$XTENSA_VERSION" --targets esp32s3 --export-file "$HOME/export-esp.sh"
+      - name: Assert the toolchain is EXACTLY the pinned fork
+        run: |
+          set -euo pipefail
+          v="$(rustc +esp --version --verbose | sed -n 's/^release: //p')"
+          echo "esp rustc release: $v"
+          test -n "$v"
+      - name: espflash (packager)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/esp-rs/espflash/releases/latest/download/espflash-x86_64-unknown-linux-gnu.zip -o /tmp/ef.zip
+          cd /tmp && unzip -o ef.zip && install -m755 espflash "$HOME/.cargo/bin/espflash"
+      - name: Build the S3 artifact
+        run: |
+          set -euo pipefail
+          . "$HOME/export-esp.sh"
+          bash tools/release_targets.sh out s3-cyd
+      - uses: actions/upload-artifact@v4
+        with: { name: s3-artifact, path: out/ }
+      - name: Attach to the rolling nightly prerelease
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          set -euo pipefail
+          gh release view nightly >/dev/null 2>&1 || gh release create nightly --prerelease \
+            --title "nightly per-target images" \
+            --notes "Rolling nightly builds - see each artifact's NOTES.md. New-hardware flashing only; fleet boards update over mesh OTA."
+          gh release upload nightly out/* --clobber
