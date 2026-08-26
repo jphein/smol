@@ -558,6 +558,62 @@ if [ "$run_fw" = 1 ]; then
     # of skip that is not a vacuous pass — the condition is already reported by a neighbour.
     printf '   \033[33mSKIP\033[0m symbol sizes — no ELF from the canonical build\n'
   fi
+
+  # #420: identity honesty, exercised rather than asserted. Two boards reported build 345 while
+  # running current code and ~40 min of incident forensics went into a "345-era crown" theory the
+  # number could never have supported. The fix made the unresolvable-hash case say `nogit` instead
+  # of the constant `dev`, and made a build claiming SMOL_RELEASE=1 with no resolvable commit REFUSE.
+  # Neither behaviour was reachable by any existing arm, so it shipped demonstrated-by-hand — and a
+  # guard whose failing path nobody has watched is a guard nobody has watched fail.
+  #
+  # GIT_DIR=/nonexistent is the whole trick: `git rev-parse` then fails exactly as it does in a
+  # `git archive` export or an rsync mirror with no .git, which is what build.rs's env_or_git sees.
+  # It costs one env var — no tree copy. A copied tree would ALSO defeat the warm target dir,
+  # because cargo's unit hashes include the path (#327), so every dependency would rebuild.
+  #
+  # ⚠️ THIS ARM MUST STAY LAST IN THE fw BLOCK. It re-runs build.rs with a different BUILD_HASH,
+  # which changes the crate's fingerprint — so the canonical ELF the three arms above consume is
+  # stale afterwards. Ordering is load-bearing, not cosmetic.
+  step "identity honesty — an archive-like build says 'nogit', a release without identity REFUSES (#420)"
+  if repro_cargo_args "$BUILD_ROOT/$CLOCK" 2>/dev/null; then
+    _id_ok=1
+    # (a) claiming a RELEASE with no resolvable commit must FAIL, and say why.
+    if out=$( cd "$BUILD_ROOT/$CLOCK" && GIT_DIR=/nonexistent SMOL_RELEASE=1 \
+                cargo check --release "${JOBS[@]}" --features "$REPRO_FLEET_FEATURES" \
+                "${REPRO_CARGO_ARGS[@]}" 2>&1 ); then
+      echo "        a RELEASE build with no resolvable identity SUCCEEDED — the #420 refusal is gone"
+      _id_ok=0
+    else
+      case "$out" in
+        *"#420"*) printf '        refuses a release with no identity\n' ;;
+        *) echo "        build failed, but NOT with the #420 refusal — refusing to read an"
+           echo "        unrelated build error as proof the guard fired:"
+           printf '%s\n' "$out" | tail -5 | sed 's/^/          /'; _id_ok=0 ;;
+      esac
+    fi
+    # (b) the same tree, NOT claiming a release, must build and stamp the absence by name. This is
+    # the direction that matters for forensics: `dev` was identical for every such build ever made.
+    if out=$( cd "$BUILD_ROOT/$CLOCK" && GIT_DIR=/nonexistent \
+                cargo check --release "${JOBS[@]}" --features "$REPRO_FLEET_FEATURES" \
+                "${REPRO_CARGO_ARGS[@]}" 2>&1 ); then
+      _bs="${CARGO_TARGET_DIR:-$BUILD_ROOT/$CLOCK/target}/${REPRO_TARGET}/release/build"
+      if grep -qhs 'BUILD_HASH=nogit' "$_bs"/clock-*/output; then
+        printf '        stamps BUILD_HASH=nogit when the commit is unresolvable\n'
+      else
+        echo "        an unidentifiable build did NOT stamp 'nogit' — the fallback is back to"
+        echo "        something that reads like a value:"
+        grep -hs 'BUILD_HASH=' "$_bs"/clock-*/output | sort -u | sed 's/^/          /'
+        _id_ok=0
+      fi
+    else
+      echo "        a dev build with no resolvable identity failed to compile — 'nogit' is meant"
+      echo "        to be BUILDABLE; only the release claim refuses:"
+      printf '%s\n' "$out" | tail -5 | sed 's/^/          /'; _id_ok=0
+    fi
+    [ "$_id_ok" = 1 ] && ok "identity honesty" || bad "identity honesty"
+  else
+    bad "identity honesty (could not resolve cargo args)"
+  fi
 fi
 
 if [ "$run_host" = 1 ]; then
