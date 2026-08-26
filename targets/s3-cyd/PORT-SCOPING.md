@@ -365,3 +365,14 @@ Ordered by dependency:
   name the failure distinctly, fbe2fbc). v922-crown observations filed on #398. Audio phase-1
   branch builds clean on xtensa (feat/s3-audio); bench sequence next: battery+boot-pin+audio
   in one GUI flash pass.
+- **2026-08-26 ~07:3x — bench pass on feat/s3-bench (072845a): BOOT ✓, audio boot-verified, battery caught lying.**
+  One GUI flash (battery+audio+boot-pin, both arms build-green). (1) **BOOT on GPIO0
+  JP-verified** — the GUI's button had been sampling the battery divider (GPIO9) since
+  day one. (2) **Audio pipeline boot-verified to the last electrical step** (codec locked,
+  I2S TX task live, SFX staged); the acoustic first-listen awaits a speaker on the
+  connector — none attached to the bench unit. Option B's MCLK verdict stays open only
+  for the ear. (3) **Battery presence bug found BY the bench**: no cell attached, yet the
+  floating divider node read pin 2048 mV → "4096 mV / 92%" — square in the plausible-LiPo
+  band, worse than the honest 0% it replaced. Fix direction (watch lane): a brief internal
+  pulldown probe on GPIO9 before sampling (a real cell holds the node; a floating pin
+  collapses). feat/s3-batt-adc held from main until the probe lands.
