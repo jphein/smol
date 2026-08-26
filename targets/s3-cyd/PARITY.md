@@ -55,6 +55,17 @@ Two flavors, one board: **smol-native** (rust/clock, fleet tier) and **watch-GUI
    (`option_env!`) — public images must carry placeholders (the 192.168.1.10 default
    IS the honest public value); JP's personal builds bake the VLAN-seat leg.
 
+## The cyd-c5 half of the goal — SATISFIED by construction
+The C5's feature surface decomposes into: (a) the smol-native fleet tier — the S3
+runs the same tier and EXCEEDS it (Bard on-device, OTA citizenship proven 345→1405);
+(b) the watch-GUI flavor — the S3 shares the identical GUI stack (same shell, same
+scenes, same renderer; the C5's on-glass bless and the S3's landed the same night);
+(c) WS2812 status light — DONE on the S3 (RMT driver, OTA-delivered, JP-verified
+green); (d) the Zigbee-bridge role — NOT a C5 hardware feature at all: it is a
+two-chip design (ESP32-H2 companion over UART, JP-back-burnered 08-25) and the
+802.15.4 radio it leans on does not exist on the S3, so it falls under
+hardware-does-not-allow here. No C5 feature the S3's hardware allows is missing.
+
 ## Not hardware-allowed (documented exclusions)
 - IMU features (pedometer, raise-to-wake, tilt) — no IMU on ES3C28P.
 - PMU features (charge control, power-key latch, fuel gauge) — no AXP2101; battery %
