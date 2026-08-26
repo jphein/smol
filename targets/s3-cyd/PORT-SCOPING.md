@@ -353,3 +353,15 @@ Ordered by dependency:
   during bursts) — watch lane owns the robustness fix. (4) Merge train requested:
   #446/#447/#448 + 928d35d to smol main; touch branch joins after JP's tap verdict.
   ⚠️ Standing serial capture holds the port (tmp/gtouch-standing.pid) — kill before flashing.
+- **2026-08-26 ~07:1x — 🏁 OTA CITIZENSHIP CONFIRMED (gap 8 closed): 345→1405 over the air.**
+  `DIAG slot=1 rst=sw ota=confirmed:1405`; dual-path fetch (~40 s/1 MB); STAT live on 1405.
+  Three traps burned and fixed en route: (1) **flash.sh lacked the otadata erase** — after any
+  otadata flip a USB flash silently boots the stale slot (`slot=1` was the tell; guard now
+  erases 0xf000/0x2000 every flash, 3c35d12); (2) **SMOL_NODE_ID is a BUILD-time env** — the
+  recipe of record for ANY smol-native S3 image is `SMOL_NODE_ID=162` (+`SMOL_BUILD_NUMBER=<n>`
+  for staged payloads); images built without it join the mesh as factory id 7 and every
+  162-addressed relay misses; (3) the bw CLI had silently logged into the DEFAULT CLOUD server
+  (not vault.jphe.in) — 'Not found.' wore a 'locked?' costume through two die-sites (both now
+  name the failure distinctly, fbe2fbc). v922-crown observations filed on #398. Audio phase-1
+  branch builds clean on xtensa (feat/s3-audio); bench sequence next: battery+boot-pin+audio
+  in one GUI flash pass.

@@ -45,10 +45,11 @@ Two flavors, one board: **smol-native** (rust/clock, fleet tier) and **watch-GUI
 6. **LEDC backlight dimming (GPIO45)** — both flavors run the backlight as a bare
    GPIO today; the GUI's brightness slider is a threshold, not a dim.
 7. **Cast mirror blank on S3** — smol-native known bug (#398 follow-up).
-8. **A/B OTA first roll** — the cross-arch mesh-OTA closer: software fully de-risked
-   (ota-proto 19/19), table flashed, mesh-ota compiled in BOTH flavors. Needs a
-   serving window (smol-d8) + a moment when replacing the live bench image is OK.
-   THE gate for "full target of smol" fleet citizenship.
+8. ~~A/B OTA first roll~~ **DONE 2026-08-26 ~07:07**: id 162 took build 345→1405
+   over the air through the sanctioned pipeline — dual-path fetch (crown relay +
+   self), slot flip, `ota=confirmed:1405` (self-test passed, no rollback). The
+   fourth silicon family has OTA citizenship. Evidence + en-route findings
+   (flash.sh otadata guard, SMOL_NODE_ID build-time trap, v922 crown gaps) on #398.
 9. **#413 release packaging** — per-target downloads from smol GitHub (espup-in-CI vs
    off-CI builder; smol-d8/JP infra). ⚠️ The GUI flavor's broker/creds are compile-time
    (`option_env!`) — public images must carry placeholders (the 192.168.1.10 default
