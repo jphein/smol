@@ -302,7 +302,12 @@ if [ "$run_fw" = 1 ]; then
   # only on the `send_to` path. Stage 1 wrote that down as prose. This reads source STRUCTURE
   # instead: one sink impl, routed to `send_to`; a sealed frame with no byte accessor; one encoder
   # call site; one spelling of the prefix; and every raw `esp_now.send` declared WITH ITS COUNT.
-  # `tools/test_check_elect_send_path.sh` proves all of those can fail, plus three fail-closed arms.
+  # #403 added arm 7 in the same idiom, one invariant over: every MC crown announce is declared
+  # (`MC-PUBLISH-SITES`, counted both ways) AND formats the `NonZeroU8`-bound channel. An unknown
+  # channel published as the fleet's rendezvous stranded every relay-only leaf for 4 h; both sites
+  # live inside the ~2,000-line body #335 STEP T rewrites atomically, which is why the guard is a
+  # type and this arm counts rather than inspecting the sites it already knows.
+  # `tools/test_check_elect_send_path.sh` proves all of those can fail, plus five fail-closed arms.
   # #335 STEP G. Same idiom, one invariant over: exactly ONE consumer of the STA transport is live
   # per tier. `esp_radio::wifi::Interface` is `Copy`, so `embassy_net::new(station, ..)` does not
   # consume it — a `Stack` can be live beside the `SmolWifiDevice` shim over the same interface, it
