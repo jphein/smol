@@ -305,3 +305,17 @@ Ordered by dependency:
   RF here). Handed to the watch lane (debug-watch-network-gaps) with evidence at
   `~/.claude/projects/-home-jp/scratch/s3-cyd-target/psram-fix-verdict.md`. Board
   restored to stable smol-native (`tmp/smol-s3-162.elf`, slot 0x20000, smol_162 live).
+- **2026-08-25 ~21:4x — GUI FLAVOR STABLE: the three-round soak loop CONVERGED (#445→#446→#447).**
+  Round 1 (#445, PSRAM init): alloc crash fixed, uncovered esp-radio's internal
+  `esp_wifi_scan_get_ap_record` unwrap (131 boots/300 s). Round 2 (#446, internal
+  64→96 KB): crash dead (0 reboots), but internal DRAM drained to 8 B steady-state —
+  general/Slint allocs won internal via first-fit; set_channel ESP_ERR_NO_MEM ×7,372,
+  no association. Round 3 (#447, **PSRAM registered FIRST** so capability-less allocs
+  prefer PSRAM and the 160 KB internal pools become the radio's reserve): **CLEAN —
+  0 reboots/panics/NO_MEMs/POOL-WARNs over 302 s; mesh 20/20 relays acked, link
+  Connected to the crown, election stable ch6; radio reserve steady at 54,456 B free;
+  scene in PSRAM (~120 KB of 8.38 MB used).** WiFi burst completes; one transient
+  `[MQTT] failed: tcp connect` and the PKEY/charger I2C spam (watch-only PMU absent on
+  the CYD) are the watch lane's queued follow-up. #447 left on the board as id 162;
+  JP's tap verdict is the next gate; final blessed build from merged main after #446/#447
+  land. Loop evidence: scratch/s3-cyd-target/psram-fix-verdict.md + smol/tmp/g44*-*.log.
