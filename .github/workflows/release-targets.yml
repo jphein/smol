@@ -52,8 +52,43 @@ jobs:
             --title "nightly per-target images" \
             --notes "Rolling nightly builds - see each artifact's NOTES.md. New-hardware flashing only; fleet boards update over mesh OTA."
           gh release upload nightly out/* --clobber
+  riscv-gui-targets:
+    name: riscv GUI artifacts (c6-watch, c5-cyd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45          # Slint compiles the scene set from source; slower than a fleet image
+    steps:
+      - uses: actions/checkout@v4
+      # targets/c6-watch/rust-toolchain.toml pins `stable` + rust-src + riscv32imac, and rustup
+      # honours it on entry to that directory, so this is belt-and-braces rather than the
+      # mechanism. NOTE: no espup here — these two boards are RISC-V. The S3's GUI arm is
+      # Xtensa and is built by the s3-target job instead.
+      - name: Toolchain (riscv32imac for the GUI workspace)
+        run: rustup target add riscv32imac-unknown-none-elf
+      - name: espflash (packager)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/esp-rs/espflash/releases/latest/download/espflash-x86_64-unknown-linux-gnu.zip -o /tmp/ef.zip
+          cd /tmp && unzip -o ef.zip && install -m755 espflash "$HOME/.cargo/bin/espflash"
+      # The GUI workspace's .cargo/config.toml is gitignored and holds real credentials on a
+      # developer machine, so a checkout has none. tools/ci_provision_gui.sh writes a
+      # credentials-FREE one (absent, not placeheld) and asserts no credential key reached it.
+      # Prove that assertion can fail before trusting the build that depends on it.
+      - name: Sabotage-test the credential assertion
+        run: CI_PROVISION_GUI_SELFTEST=1 bash tools/ci_provision_gui.sh targets/c6-watch riscv32imac-unknown-none-elf
+      - name: Build the riscv GUI artifacts
+        run: bash tools/release_targets.sh out c6-watch c5-cyd
+      - uses: actions/upload-artifact@v4
+        with: { name: riscv-gui-artifacts, path: out/ }
+      - name: Attach to the rolling nightly prerelease
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          set -euo pipefail
+          gh release view nightly >/dev/null 2>&1 || gh release create nightly --prerelease \
+            --title "nightly per-target images" \
+            --notes "Rolling nightly builds - see each artifact's NOTES.md. New-hardware flashing only; fleet boards update over mesh OTA."
+          gh release upload nightly out/* --clobber
   s3-target:
-    name: xtensa artifact (s3-cyd)
+    name: "xtensa artifacts (s3-cyd: fleet + gui)"
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -76,7 +111,13 @@ jobs:
           set -euo pipefail
           curl -fsSL https://github.com/esp-rs/espflash/releases/latest/download/espflash-x86_64-unknown-linux-gnu.zip -o /tmp/ef.zip
           cd /tmp && unzip -o ef.zip && install -m755 espflash "$HOME/.cargo/bin/espflash"
-      - name: Build the S3 artifact
+      # Both S3 flavors ride THIS job, not the riscv ones: the GUI arm's board-esp32s3-cyd
+      # feature is Xtensa too, so it needs the same espup toolchain and the same sourced
+      # export-esp.sh (the GCC linker xtensa-esp32s3-elf-gcc must be on PATH — an unsourced
+      # shell fails with "linker not found", which reads like a broken toolchain).
+      # release_targets.sh builds both from the one manifest: `artifact` -> the fleet image,
+      # `gui_artifact` -> the GUI image.
+      - name: Build the S3 artifacts (fleet + gui)
         run: |
           set -euo pipefail
           . "$HOME/export-esp.sh"

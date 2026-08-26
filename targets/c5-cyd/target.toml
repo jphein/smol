@@ -3,6 +3,19 @@ chip = "esp32c5"
 flavor = "fleet"
 source = "rust/clock"
 artifact = false
-# WHY NO ARTIFACT YET: the C5 fleet image is CHECK-proven, not LINK-proven ([chip.esp32c5]
+# NO FLEET ARTIFACT: the C5 fleet image is CHECK-proven, not LINK-proven ([chip.esp32c5]
 # builds=false; "it links" is itself not proof — see budget.rs). Flip to true when a linked,
-# floor-gated C5 image exists. The board today runs the GUI flavor from targets/c6-watch.
+# floor-gated C5 image exists.
+
+gui_artifact = true
+gui_board = "board-cyd-c5"
+gui_artifact_name = "smol-c5-cyd-gui"
+# THIS is what the board actually runs today (#413 phase 3.1) — the board-cyd-c5 arm of the
+# targets/c6-watch workspace, riscv32imac, the 320x240 landscape scene set. So the C5 has a
+# download while its FLEET arm is still checks-only: the two axes are independent, which is
+# the whole reason they are separate keys.
+#
+# ⚠️ Its stack floor is NOT its own: src/main.rs hands every non-C6 board the C6's 71,680 B
+# assert and labels it "PROVISIONAL … a stand-in, not a fact (budgets are measured, never
+# inherited)". The NOTES.md on the artifact says so in those terms. Bracket it via the
+# radio-up soak before anyone reads that number as measured.
