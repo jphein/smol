@@ -184,13 +184,20 @@ compile-time, and no CFG frame or dashboard setting can change it.
 
 ### Status, stated plainly
 
-The mechanism is **in the tree and merged** — the manifests, `tools/release_targets.sh`, the
-chip-aware stack-floor gate (#413 phase 2A), and the publish path that builds any declared chip
-(phase 2B). What is **not** done: the release *job*. `.github/workflows/` carries no
-`release-targets.yml` yet, and the only published release remains `nightly-2026-08-24` with its
-three C3 assets. The S3's blocker is narrow and named — a GitHub runner has no espup `esp`
-toolchain — and `xtensa-spike.yml` has already shown a stock runner provisioning it and building
-the S3. Until that job exists, **per-target downloads are a capability, not a published fact.**
+**The check that does not go stale: look at the [releases page](https://github.com/jphein/smol/releases).**
+If the per-target `.bin` files described above are not attached to a release there, they have not
+been published, whatever this document or any issue says. That is deliberate — the sentence below
+is dated, and the releases page is not.
+
+As of **2026-08-26**, the only published release is `nightly-2026-08-24`, carrying three C3 assets
+and a `SHA256SUMS`. Everything this section describes — the manifests, `tools/release_targets.sh`,
+the chip-aware stack-floor gate (#413 phase 2A), the publish path that builds any declared chip
+(phase 2B), and the release workflow that runs them (phase 3) — is the mechanism, and the
+mechanism landing is **not** the same event as an artifact appearing. The S3's remaining blocker is
+narrow and named: a stock GitHub runner has no espup `esp` toolchain, which
+`.github/workflows/xtensa-spike.yml` has already shown can be provisioned in-job.
+
+**Until an artifact is on that page, per-target downloads are a capability, not a published fact.**
 
 ---
 
