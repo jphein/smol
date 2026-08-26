@@ -92,7 +92,20 @@ _MQTT_PW=""
 mqtt_pw(){
   [ -n "$_MQTT_PW" ] && { printf '%s' "$_MQTT_PW"; return 0; }
   local tok pw
-  tok="$(bw get password ha-llat 2>/dev/null)" || die "bw locked? couldn't read ha-llat"
+  # Keep bw's stderr: "Not found." (wrong server / missing item) and a locked
+  # vault are DIFFERENT failures that this die used to report as one — a fresh
+  # `bw login` that lands on the default cloud server (serverUrl bitwarden.com,
+  # not vault.jphe.in) produces exactly this, and on 2026-08-26 it cost an hour
+  # of unlock loops chasing "locked" while the truth was "wrong vault". Check
+  # `bw config server` when the message says Not found.
+  local _bwerr _bwmsg
+  _bwerr="$(mktemp)"
+  if ! tok="$(bw get password ha-llat 2>"$_bwerr")"; then
+    _bwmsg="$(head -c 200 "$_bwerr" | tr '\n' ' ')"
+    rm -f "$_bwerr"
+    die "couldn't read ha-llat — bw said: '${_bwmsg}' ('Not found.' = wrong server or missing item, NOT locked — check \`bw config server\`)"
+  fi
+  rm -f "$_bwerr"
   pw="$(HA_TOKEN="$tok" python3 "$HOME/Projects/ha/tools/ha_supervisor.py" GET "/addons/$ADDON/info" \
         | python3 -c "import sys,json;print(json.load(sys.stdin)['options']['mqtt_password'])")" \
      || die "couldn't source mqtt_password from addon $ADDON"
@@ -413,7 +426,7 @@ _msgf="$(mktemp)"; _keyf="$(mktemp -p /dev/shm 2>/dev/null || mktemp)"
 # credential dir behind on every stage.
 trap 'shred -u "$_msgf" "$_keyf" 2>/dev/null; _mqtt_cfg_cleanup' EXIT INT TERM
 bw get notes "$SMOL_OTA_SIGNING_KEY_ITEM" > "$_keyf" 2>/dev/null \
-  || { shred -u "$_msgf" "$_keyf" 2>/dev/null; die "bw: couldn't read signing key '$SMOL_OTA_SIGNING_KEY_ITEM' (locked?)"; }
+  || { shred -u "$_msgf" "$_keyf" 2>/dev/null; die "bw: couldn't read signing key '$SMOL_OTA_SIGNING_KEY_ITEM' — locked vault and 'Not found.' (wrong server/missing item) are DIFFERENT failures; check \`bw status\` + \`bw config server\` (2026-08-26: a default-cloud login wore this message for an hour)"; }
 # #349: the key is now used for up to TWO signatures (legacy M and OTA2 M), so it stays in
 # /dev/shm across both and is shredded once, immediately after. The trap above still covers an
 # interrupt in that (slightly longer, still sub-second) window.
