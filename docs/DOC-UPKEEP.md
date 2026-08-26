@@ -717,9 +717,13 @@ stale fact**. Both are §2's family, inside a tool rather than a document. Nobod
 2. **Anything shipped that no doc mentions?** Newest feature first; it is the most likely to be
    missing from `README.md` and completely absent from `site/`. (The Bard shipped and the site
    had zero mentions of it on the day it merged.)
-3. **ROADMAP §1/§2/§3 boundaries.** Has a §2 "in flight" item shipped? Has a §3 "ready to build"
-   item shipped? These decay silently and make the doc actively misleading — §3 once advertised
-   OTA and the node manager as unbuilt while §1 and the README described both as hardware-proven.
+3. **~~ROADMAP §1/§2/§3 boundaries.~~ RETIRED — the boundaries no longer exist.** This step used to
+   ask whether an "in flight" or "ready to build" item had shipped. Those sections decayed silently
+   and made the doc actively misleading (§3 once advertised OTA and the node manager as unbuilt while
+   §1 and the README called both hardware-proven), and by 2026-08-26 they were **703 commits stale**.
+   They now point at #148, whose claims `tools/status_check.sh` re-tests. **The upkeep step this
+   replaces:** confirm ROADMAP still carries no status list — if someone has re-added one, that is
+   the regression, not its contents being out of date.
 4. **Decision docket (§5).** Tick what resolved and record **how** — including decisions that
    went *differently* than recommended. Two had (D3 landed the stronger option; D5's physical
    long-press was never built — the accept gate is HA's Install command). A quietly-reversed
@@ -753,5 +757,6 @@ evidence the split shipped. **A nearby issue closing is never evidence for the c
 
 ---
 
-*Companion: [ROADMAP.md](ROADMAP.md) for status, [protocol.md](protocol.md) for the wire,
+*Companion: [#148](https://github.com/jphein/smol/issues/148) for status, [ROADMAP.md](ROADMAP.md)
+for the safety envelope + decision docket, [protocol.md](protocol.md) for the wire,
 [README.md](README.md) for the pitch.*

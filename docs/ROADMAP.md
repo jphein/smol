@@ -1,220 +1,101 @@
 # smol — roadmap + decision docket
 
-The steering doc: what's **shipped**, what's **in flight**, what's **spec'd** and ready to
-build, what's been **researched** (go/no-go), and the open decisions. Companion to the
-GitHub tracking issue [#24](https://github.com/jphein/smol/issues/24) (this is the
-in-repo narrative version; the issue is the living checklist).
+**What this document is:** the durable half of steering — conventions that outlive any wave, the
+**operational safety rules** (§3a), the **research results including the refutations** (§4), and the
+**decision docket with how each call resolved** (§5). Things that are expensive to learn and cheap
+to lose.
+
+**What it is NOT, any more: a status snapshot.** §1 and §2 used to list what had shipped and what was
+in flight, and on 2026-08-01 they were accurate. **703 commits later they were confidently wrong** —
+telling readers, among other things, to redo work that had already landed. That is not a discipline
+failure; it is structural. Nothing could make this file fail, so nothing did.
+
+Status now lives where it is machine-checked or actively filed against:
+**[#148](https://github.com/jphein/smol/issues/148)** (living status; `tools/status_check.sh`
+re-tests its checkable claims and exits non-zero),
+**[#24](https://github.com/jphein/smol/issues/24)** (living checklist), and the epics
+**[#335](https://github.com/jphein/smol/issues/335)** / **[#347](https://github.com/jphein/smol/issues/347)** /
+**[#413](https://github.com/jphein/smol/issues/413)**.
+
+> **If you are about to add a status list here, don't.** Put it in #148, where a checker can call it
+> a liar. A second copy is what produced the 703-commit drift above — and the file it drifted in is
+> the one README calls "start here."
 
 **Honesty rule:** *shipped* means hardware-verified on the bench fleet; nothing here is
 overstated. Verification legend: 🟢 hardware-verified · 🟡 compile/spec-verified, not fully
 exercised on hardware · ⚪ design only.
 
-**Current released build: v345 "Riveted Furnace."** The number is the committed ratchet in
-[`rust/clock/version.txt`](../rust/clock/version.txt) (`345`, set by release commit `315b5c8`),
-*not* `git rev-list --count HEAD` — that is only build.rs's fallback when neither the file nor
-`SMOL_BUILD_NUMBER` is set. The sigil word is derivable: `version_name_for()` in
+**The released build number is [`rust/clock/version.txt`](../rust/clock/version.txt) — read it
+there, not here.** This paragraph used to name the number and its sigil word ("v345 Riveted
+Furnace"). Both were correct, and both were a **second statement of a fact the tree already
+holds** — so the next release bump would have made this document wrong without touching it. The
+formula below is durable; the answer is not, so the answer is no longer written down. (#232's and
+#328's lesson applied to a doc: the fix for two statements of one fact is *one statement*, not a
+checker on the copy.)
+
+It is the committed ratchet in that file, *not* `git rev-list --count HEAD` — the count is only
+build.rs's fallback when neither the file nor `SMOL_BUILD_NUMBER` is set. ⚠️ And per **#420**, a
+build from a tree with no resolvable commit now stamps the hash `nogit` rather than a plausible
+constant, so a stamp of the form `v<N>+dev.nogit` means *"this image cannot name its own commit"* —
+not that it is build N.
+
+The sigil word is derivable: `version_name_for()` in
 `rust/clock/src/net/names.rs` maps `noun = FORGE.nouns[n % 20]`, `adj = FORGE.adjectives[(n / 20) % 20]`
 (⚠️ **20, not 32 — do not "fix" this.** The forge/**version** table stays pinned at 20×20 inside smol;
 only *node identity* moved to lexicon's 32×32 `fleet` group. Upstream's `forge` is a non-superset 14/14,
-so adopting it would rename **every past build** — and version names are historical record),
-so `345 → ("Riveted", "Furnace")`. **A build number and a sigil word that don't satisfy that
-formula are a bug in this document** — check them together.
+so adopting it would rename **every past build** — and version names are historical record).
+
+Worked example, kept because it is **arithmetic and therefore cannot rot**: `345 % 20 = 5` →
+`nouns[5] = "Furnace"`, and `345 / 20 = 17` → `adjectives[17] = "Riveted"`, so build 345 is
+*"Riveted Furnace"* — whether or not 345 is the current release. **Any build number and sigil word
+that do not satisfy the formula are a bug**, wherever you find the pair written down; that check now
+belongs at the sites that still name a specific build, not here, because this document no longer
+names one.
 
 > ⚠️ **Canary pins are not releases.** Bench builds get an arbitrary high `SMOL_BUILD_NUMBER`
-> (902, 903, **905**, 950 …) so they out-rank the fleet's monotonic OTA gate; #128 tracks the
-> pollution that causes. The Bard's on-glass evidence below is stamped **canary 905** — real
-> hardware, but a dev pin. **The Bard is on `main` and not yet in a numbered release**
-> (`version.txt` is still 345); the v346 wave is where it lands.
+> (902, 903, 905, 950 …) so they out-rank the fleet's monotonic OTA gate; #128 tracks the pollution
+> that causes, and `ota_publish.sh`'s ratchet heals the number forward rather than letting a pin
+> poison it. **A high build number is therefore evidence of a bench pin, not of a release** — the
+> two are told apart by the dev marker (`v<N>+dev.<hash>`, #218), never by the number being large.
+> Which specific pin is live is a status fact; ask the broker's retained `smol/ota/staged`, or #148.
 
 ---
 
 ## 1. 🟢 SHIPPED — on the fleet
 
-| What | Issue | Evidence |
-|---|---|---|
-| **MQTT-native display link** — collector retired; nodes ↔ HA directly over MQTT (retained downlink + discovery uplink) | #10/#11/#15 | Full leaf→gateway→MQTT→HA path proven across three bench boards; commits `96f44d5`, `bb5092a` |
-| **Batt screen + 6-segment SOC pages** — retained `smol/display/batt`; voltage overview + big per-battery SOC/charge detail pages (short-press to page) | #16/#17 | Both payloads cached on all three bench boards (July 2026); big pages render on glass; commits `96f44d5`/`f6d56d2`/`b7fd71a` |
-| **Grid screen** — retained `smol/display/grid` (yurt total + two phase clamps, watts) + `SMOLv1 GRID` mesh frame | #16 | Live HA mirror `sensor.smol_display_grid`; on-glass verified |
-| **Default screen at boot** — compile-time `DEFAULT_APP`/`DEFAULT_PAGE` one-shot (long-press always escapes) | #18 | Default build byte-identical (const-false DCE); verified |
-| **Per-board config file** — `NODE_ID`/`DEFAULT_APP`/`DEFAULT_PAGE` in a git-ignored `board.rs` (kills the per-board version-sigil "dirty" wart) | #19 | Committed `b7fd71a`; `board.rs.example` in tree |
-| **UI responsive during WiFi sync** — defer-while-interacting + long-press abort + "Syncing…" spinner | #20 | Review CLEAN; six build/clippy gates green; commit `0ce1ce9` |
-| **HA availability** — discovery `expire_after` so a node goes unavailable after several missed bursts | #12 (fw half) | Live in discovery JSON |
-| **Node manager — HA publish/GUI half** — Lovelace + `input_select`/automations publishing retained `smol/<id>/config/default_screen`; mirror sensors | #21 (HA half) | Deployed live to HA (config topics left empty until the firmware consumes them) |
-| **The Bard — on-device tiny-LLM storyteller** — a real 260K-param TinyStories transformer (int8, executed-in-place from flash) writes a fresh story per press, typewriter-style; per-node protagonist (id8 → owl); `Bard:0` settable over CFG-S so a node boots straight into composing | #300 | 🟢 on glass id8: 67-token story, **202 ms/tok**, stack high-water **72%** of region, canary heap low-watermark **24,136 B** free of 96 KiB; port proven **bit-for-bit** vs an independent reference (146/146 token ids, full text — `runq.c` was *disqualified* as a reference, so the golden is cross-implementation, not cross-port); PR #301, **canary** build 905 |
-| **Signed OTA — dual A/B + ed25519, and over the mesh to WiFi-less leaves** — the gateway fetches a signed image and relays it chunk-by-chunk over ESP-NOW (windowed-NAK); the leaf **verifies the signature before it writes a byte**, then flashes its inactive slot. One runtime-NVS-id image serves the whole fleet | #6/#40/#32 | 🟢 full ~1 MB images delivered over the mesh; verify-before-write on glass. **Canary-one-board is still mandatory** — the reason is in §3 |
-| **Routed multi-hop mesh** — a gateway-deaf leaf escalates to a hop-limited managed flood (hop-limit + `(origin, msgid, frag)` seen-set, table-free so it rides re-election for free); the ordinary all-hear case stays byte-identical to single-hop | #13 | 🟢 **first routed frame 2026-07-14** — a gateway-deaf smol delivered telemetry home through a neighbour. PR #123. Honest v1 limits: best-effort uplink ACK, channel-scan throughput cap (#126), observability-via-relay (#124) |
-| **Retire the burst — WiFi + ESP-NOW co-channel coexist** — the radio stays up through a WiFi sync, so the mesh never goes deaf; killed the ~15 s flush window and the boot assoc-freeze | #23 + #14/#76 | 🟢 zero mesh loss across dozens of sync windows on all three bench boards (July 2026); same-channel reassoc; fully-dark dead-owner takeover + split-brain co-boot; handover-standoff/seq-race heals (#114). **Live residuals:** bulk-unicast RX starvation on a crown (#204/#217, open) and cross-channel roam not yet forced (#35, open) |
-| **Keyed-CFG channel — the whole remote-config family** — one `SMOLv1 CFG <id><KEY><value>` frame carries every per-node knob over the mesh, all editable from the HA dashboard, no reflash: `S` screen · `L` LED · `U` units · `P` plugins · `Y` custom screen · `B` broker leg · `O` OTA-host allowlist · `R` reboot · `W` scan · `G`/`g` IO pin-map · `T` Bard prompt · `V` Bard delivery pace/mode | #56 + #21/#48/#43/#55/#45/#100/#52/#71/#72/#303/#302 | 🟢 byte-accurate wire in [protocol.md](protocol.md#cfg--keyed-per-node-config-channel-56); most keys apply live, `B` edge-triggers a reboot, `R`/`W` are one-shot and never cached. **`V` now has its bench run** — 160 → 120 ms/char applied *mid-narration* from HA with no restart (#302, §2), so it joins the list; `T` (#303) is merged + hardware-verified. For both, **the fleet is not rolled**. ⚠️ **`N` (WiFi-slot switch) is RETIRED** — #142 moved the fleet to single-network operation and a received `N` is now drained and ignored, so do not describe the slot switch or its "un-brickable auto-revert" as a live feature |
-| **Node manager — firmware consume half** — all three sub-tasks landed: CFG-`S` default-screen consume behind a strict panic-free allowlist parse; the mesh topology/RSSI roster to HA; retained `smol/<id>/status` = `STAT\|<screen>:<page>\|<build>` | #21/#74/#50 | 🟢 `net/wifi.rs` publishes `smol/<id>/status` for itself *and* on behalf of leaves; the dashboard consumes it (`ha/dashboard/README.md`). Unlocks live current-screen reflection **and** the running-build read OTA needs |
-| **The Mesh Familiar** — one creature inhabits the whole fleet and **hops to a neighbour when you unplug its board**; exactly-one-holder arbitration, migration on loss, orphan re-election | #57 | 🟢 human-verified on glass — pull the plug, watch it jump. PR #99 |
-| **World Snake (MMO) · Marauder's Watch · Treasure Hunt · smol Cast** — shared 256×256 toroidal world with treasure-powers; roster-RSSI peer locator; RSSI warmer/colder game; display streamed to a WLED matrix as realtime UDP pixels | #5/#58/#60/#26 | 🟢 flashed and running fleet-wide |
-| **Per-node observability + config-drift** — a retained DIAG record per node (uptime, boot-count, reset-reason, boot-slot, last-OTA outcome, heap, flush/verify counters, link quality, `net=`/`brk=`/`otah=`, the applied-config echo `cfg=`, bound-input counters `io=`) plus the gateway OLED as a live HA image | #70/#49/#74 | 🟢 a silent rollback or a drifted node is visible in HA at a glance |
-| **Registry-driven fleet discovery (HA)** — the Control Room reads HA's **device registry** instead of a hand-written node list; the firmware populates it via retained discovery configs (`identifiers:["smol<id>"]`, `name:"smol <id> <Noun>"`, `sw_version`), making it a **self-reported fleet manifest**. The sigil is *read* from the device name, never recomputed | `439fb95`/`642ad86` | 🟢 live. Fixes a real class of drift: the old `binary_sensor.smol_<id>_online` scan only found nodes a human had hand-written a family for, so it rendered **dead ids 7/9** and showed **nothing** for 50/51/122 — which were on the mesh. It was faithfully drawing a fleet that no longer existed |
-| **Reproducible builds** — the release image is byte-reproducible for a fixed commit (path-remap + `SOURCE_DATE_EPOCH`), so an image's sha256 is a verifiable identity | #44 | 🟢 verified; `tools/repro_build.sh` now also carries the #300 stack-floor gate (§2) |
-| **EPEver cloud-logger contained** (homelab infra) — the PE11 DIN converter was a hidden Hi-Flying cloud datalogger acting as a 2nd Modbus master; firewalled at the gateway | — | Bus corruption cut; the Batt SOC is sourced from the BMS, not EPEver |
+**Moved out of this document.** What has shipped is a *status* fact, and status facts rot: this
+section was last true on 2026-08-01 and the tree has moved 703 commits since. It also duplicated
+the tracker, and a roadmap that restates a tracked list is two statements of one fact — the one
+that is not machine-checked is the one that goes stale.
 
----
+Read instead:
+- **[#148](https://github.com/jphein/smol/issues/148)** — the living status issue. Its claims carry
+  `<!-- check: -->` annotations and `tools/status_check.sh` re-tests the machine-checkable ones and
+  exits non-zero, so it cannot rot silently the way this section did.
+- **[#24](https://github.com/jphein/smol/issues/24)** — the living checklist.
+- `git log --oneline --merges` and the closed-issue list — the primary sources both of the above
+  are derived from.
+
 
 ## 2. 🟡 IN FLIGHT / NEXT WAVE
 
-> ### ⚠️ DRAM budget — read this before adding any static buffer (post-#347)
-> DRAM is the binding constraint on the canonical tier, which since #347 is
-> `espnow,cast,io` — **the Bard is no longer in the fleet image.** Geometry **re-measured from
-> linker output 2026-08-01** (`readelf -SW`, release ELF, `_stack_start − _stack_end`): `.bss`
-> **157,472 B** · `.data` **13,588 B** · `.stack` **114,648 B** · esp-wifi heap **96 KiB**.
->
-> **`tools/repro_build.sh` hard-fails a release build when the stack region drops below
-> 74,208 B** — so there is now **40,440 B of slack** before a new static allocation *breaks the
-> build*. That is 18× the 2,232 B this block recorded before #347, and it is the whole reason
-> the Embassy re-platform (#233/#335) went from not-fitting to fitting.
->
-> ⚠️ **Slack is not headroom.** The floor is derived from a *measured runtime peak* (peak × 4/3),
-> and the highest peak on record — **55,656 B** (#335, id5 under crown duty, 10/10 byte-identical
-> reports, 2026-08-01) — was measured **with the Bard narrating**. A Bard-free peak can only be
-> lower, but nobody has measured it, so the real margin is *at least* this and the floor is *at
-> most* right. Re-run the stack-paint build before spending this slack on anything large.
->
-> 📌 **The floor moved 73,728 → 74,208 (#348 follow-up), and there is now only one of it.** The old
-> value was 4/3 × T13's 54,856 B — the *lowest* of the four peaks on record — so it was knowably
-> 480 B too low once #335 measured 55,656 on hardware. It also existed twice, as a shell literal
-> in `repro_build.sh` and a Rust const in `budget.rs`, disagreeing. The single definition is now
-> `ESP32C3_STACK_FLOOR_BYTES` in `rust/clock/src/budget.rs`; the shell gate parses it
-> (`repro_stack_floor`) and **fails closed** if it cannot. Change it there, once.
->
-> The Bard's DRAM (`.bss` +37,832 B, `.data` +1,232 B) and its ~281 KB of `.rodata` are what
-> moved. The `bard` feature still exists and `tools/gate.sh` still builds a `bard` tier — it is
-> off the C3's shared image, not out of the project. See #347.
->
-> 🟢 **Since #348 this is enforced at COMPILE time, not just written here.**
-> `rust/clock/src/budget.rs` declares the C3's budget as data — flash and DRAM as separate
-> axes, OpenWrt-style — and `--features bard` is now an `E0080` compile error on the C3 rather
-> than an image that links and dies. **Update that file whenever you update this block:** the
-> two must agree, and the ELF wins over both. The budget declares the *worst* supported radio
-> stack (esp-radio 0.18's 106,560 B, not `main`'s 114,648 B) so it keeps biting across the #233
-> cutover, which is why its headroom reads 32,352 B where the slack above reads 40,920 B.
-> A build that deliberately is not the fleet image declares `off-fleet`; `repro_build_bin`
-> refuses to package anything that does.
->
-> > 📌 **History, pre-#347 (the figures below describe the with-bard image and are superseded by
-> > the block above).** Corrected 2026-07-28 — this block previously disagreed with itself, and
-> > BOTH figures were
-> > wrong. It said `.stack` **76,128 B** (stale by 168 B) while its prose said the slack was
-> > *"~2,280 B"* and the header said *"~2,400 B"* — three numbers for one quantity. The measured truth
-> > is `.stack` **75,960 B** → **2,232 B**, which is *below* all three, so every previous estimate was
-> > optimistic. `.bss` was 72 B stale too. **Take the slack from `readelf`, never from this paragraph:**
-> > `readelf -sW <elf> | awk '$8=="_stack_start"||$8=="_stack_end"'`, exactly as the gate does. This is deliberate: the pre-gate image linked clean with 2,592 B of
-> stack and would have died on hardware (see the #300 spec amendments). Do **not** raise the floor
-> to make a build pass — it is derived from a measurement (peak × 4/3).
->
-> If a feature needs more than that slack, the levers, cheapest first: the **esp-wifi heap** in
-> `net::init_heap` (re-run #140's audit first), the **RX-buffer tuning** in `.cargo/config.toml`.
-> **`SEQ_CAP`** in `src/bard/nano_llm.rs` (80→64 frees ~5.8 KB; 80→48 frees ~11.5 KB) is no longer
-> a lever on the fleet image — it only moves a build that has `bard` on.
-> Re-measure with `--features stack-paint` under live radio — idle numbers are meaningless.
-> **#198/#233 (C6, 512 KB SRAM) dissolves the whole problem.**
->
-> > 🔴 **On the C3, Embassy is a DRAM CONSUMER, not a relief — and it does NOT fit alongside the Bard.**
-> > Three tiers measured 2026-07-28 (`readelf`, release ELFs; the no-bard tier built on `familiar`
-> > against a tree verified byte-identical to katana's):
-> >
-> > | tier | `.bss` | `.data` | `.stack` |
-> > |---|---|---|---|
-> > | `main` + bard | 195,296 B | 14,460 B | **75,952 B** |
-> > | `main` **no bard** | 157,464 B | 13,212 B | **115,032 B** |
-> > | `dream/feat-embassy` **no bard** | 213,200 B | 8,792 B | **56,888 B** |
-> >
-> > ✅ Method validated: `.bss+.data+.stack` = **285,708 B for both `main` tiers, exactly** — `.stack` is
-> > purely the leftover of a fixed pool. So: **the Bard costs 39,080 B** of stack, and **Embassy costs
-> > 58,144 B** (clean no-bard vs no-bard).
-> >
-> > **Projected `main`+bard+Embassy `.stack` ≈ 17,800–24,600 B** — against this floor (shortfall
-> > **≈49–56 KB**) and, decisively, against the **measured 54,960 B peak**: the image would link and
-> > **die on hardware.** Every lever above spent to its limit is **≈39.5 KB**, still ~10–16 KB short.
-> >
-> > **So `SEQ_CAP` is not the question and neither is any single lever.** Recommendation is a
-> > **platform transition**: async on the C6, the C3 fleet stays blocking. Full argument +
-> > the "drop the Bard on C3" option (numerically viable, ~56,888 B — JP's call) in
-> > [research/embassy-p2-mesh-relay.md](superpowers/research/embassy-p2-mesh-relay.md) §8.
-> >
-> > ⚠️ The floor is bard-derived and over-strict for no-bard builds — **irrelevant to the verdict**, which
-> > rests on stack-vs-peak, not stack-vs-floor.
->
-> **`SEQ_CAP` is cheaper than it was (#302, 2026-07-27):** it no longer caps a STORY at all, only
-> how far back the model can remember. The KV cache is a ring and the Bard narrates endlessly, so
-> turning the dial down shortens its MEMORY (prose holds together less well across sentences), never
-> the length of a tale. The DRAM half of #302 was therefore never needed and the slack is unchanged
-> at ~2,280 B: the whole feature cost **48 B** (`.bss` is byte-identical to pre-#302).
->
-> Practical consequence for the HW-held PRs (#190 HMAC, #181 ledger, #227 weather): each adds
-> static state and will now meet this gate. Budget the `.bss` delta before rebasing, not after.
+**Moved out of this document** — same reason as §1, more acutely: this was the fastest-moving
+section and therefore the most wrong. Current campaign state lives in the epics, which are
+maintained because work is filed against them:
 
+- **[#335](https://github.com/jphein/smol/issues/335)** — Embassy re-platform.
+- **[#347](https://github.com/jphein/smol/issues/347)** — extract the Bard to its own firmware/repo.
+- **[#413](https://github.com/jphein/smol/issues/413)** — per-target release artifacts.
+- **[#148](https://github.com/jphein/smol/issues/148)** — the high-leverage queue across all of them.
 
-*"In flight" below means **commits on `main` or an open PR** — not intent. Everything else is
-§3. (The #21 node-manager wave that used to sit here shipped 2026-07-10; it is now a §1 row.)*
+§5's decision entries still reference "§2"; read those references as "whatever the epics above say
+today", which is the point of replacing a snapshot with a pointer.
 
-- **The v346 release train** (PR #266) — three features held at the same bench gate, each
-  stacked so the next rebases on the last: **#190 group-HMAC-SHA256 transport auth** (PR #248),
-  **#181 mesh-ledger L1–L3 wiring** (PR #249, stacked on #190), **#227 weather-on-glass** (PR
-  #250, gateway Open-Meteo fetch → ESP-NOW relay → fleet weather screen). 🟡 cores landed and
-  host-tested; firmware wiring is HW-held. **All three add static state — budget the `.bss`
-  delta against the stack floor above *before* rebasing, not after.** v346 is also the train the
-  Bard lands on: `version.txt` is still 345.
-- **The Bard's follow-ups** (#300 shipped, §1). Three tiers, and they are genuinely different —
-  the Bard is moving fast enough that lumping them would overstate two of them:
-  - 🟢 **#303 — runtime story prompt over CFG-`T`, merged + hardware-verified, fleet NOT rolled.**
-    The opening is settable per node from the HA dashboard with no reflash (`3741e69`/`6bda2b0`;
-    key documented in [protocol.md](protocol.md#cfg--keyed-per-node-config-channel-56)).
-    Leaf-side validation against the model's own 512-token vocabulary is the part that *cannot*
-    live gateway-side — the tokenizer lives with the model.
-  - 🟢 **#302 — the endless story: ON GLASS.** A rolling KV window removes the terminal state so a
-    tale runs indefinitely, with `inf`/`page` delivery and typewriter pace over CFG-`V`. Measured on
-    id8 in endless mode, JP's own prompt running:
-    | measurement | value |
-    |---|---|
-    | generation, `inf` mode | **224–274 ms/token** avg, max 281 (reported every 64 tokens) |
-    | vs bounded stories (#300 T13) | 202 ms/tok → **10–35% slower**, as predicted: attention now always spans the full window |
-    | stack high-water | **55,440 of 75,248 B = 73%**, *byte-identical across all 5 reports* |
-    | live `V` change mid-tale | 160 → 120 ms/char applied **while narrating**, no restart |
-    | endless-ness | display mirror 75 s apart: 416/2048 px changed, entirely different prose |
-
-    **The leak test is the one that matters, and it is now measured rather than argued:** five
-    consecutive reports spanning many tale boundaries returned the *same* high-water byte for byte. A
-    sliding window that reused memory imperfectly would creep; this does not move at all. Host tests
-    21 → 36; `.bss` byte-identical to pre-#302 and the whole feature costs 48 B of `.data`.
-    ⚠️ **Two honest caveats.** (1) Quote the ms/tok as a **range** — the 224↔274 spread tracks whether
-    the radio is bursting during that window, not the model. (2) `inf` mode is **near-continuous
-    compute**, making it the fleet's **worst-case power draw** — now **measured**: 0.2 W at the 5 V
-    input on id8 during `inf` narration ⇒ ~40 mA ⇒ **~5 h** on a 250 mAh cell
-    ([power.md §4](power.md)), the first measured figure that section has ever had. Idle, `page` mode
-    and a never-associating leaf are still unmeasured. Practical consequence: **`page` and the pause
-    are the power lever** — `inf` pins the CPU, and pausing genuinely stops generation.
-  - ⚪ **#304** — a custom-trained, realm-flavored model as a weights-only swap. Design only.
-  > **The idea worth keeping in mind when writing about any of this:** only ~5 lines × ~15
-  > characters are on the glass at once, so **the screen is a window the story moves past, not a
-  > container for the story.** That is what makes an unbounded tale conceivable on a chip with
-  > 400 KB of RAM — the display was never the limit, the KV cache was.
-- **Embassy re-platform** (#198 spike, #233 upgrade wave, PR #247). Phases 0–3 are on `main`:
-  the esp-hal 1.1 / esp-rtos-executor / esp-radio source migration (`a0d3e5a`), `wifi_task` +
-  ch6-hold during the WiFi window (`0b3eb5d`, `03a09c4`), an undroppable STOP_REQ teardown
-  (`266dbf0`), a deaf-window measurement tracker (`eb50384`), and a non-gateway election-OBSERVE
-  burst (`ce0f34b`). 🟡 vertical-slice, not a fleet cutover. **This is the path that dissolves
-  the DRAM ceiling** — the C6 has 512 KB of SRAM.
-- **Crown coexist deafness** (#204, with #217 mitigations; PR #273). The one open pathology with
-  fleet-wide impact: a crown under bulk unicast RX goes downstream-deaf within ~1 ms of its own
-  transmit and never ACKs a response byte. **Characterised at the packet level and mitigated
-  from two sides** — proactive re-association off a weak/off-channel AP (#217 rung-3, PR #273)
-  and never fetching on a follower at all (#237 slice-1, shipped in v345) — but **not cured**.
-  It reproduces identically on the new esp-radio 0.18 stack, so the radio rewrite is not the fix.
-- **OTA robustness residuals** — #267 cross-burst fetch resume-from-offset (PR #272, commit
-  `01fc810`) and #195 a self-fetch consecutive-failure cap (PR #225, commit `4c315a2`), which
-  bounds how long a broken fetch can hammer the mesh-deaf window.
-
----
 
 ## 3. 🟡 SPEC'D / QUEUED — designed, not yet built
 
 > **OTA (#6) and the node manager (#21) used to live here as "ready to build." Both shipped
-> (2026-07-10 → 2026-07-12) and are now §1 rows.** What survives from that section is one
+> (2026-07-10 → 2026-07-12) and are tracked as shipped in #148/#24.** What survives from that section is one
 > operational rule that has *not* been superseded — §3a.
 
 ### 3a. ⚠️ The OTA safety envelope — still binding
@@ -231,27 +112,19 @@ reason is worth restating because it is easy to assume otherwise once a feature 
   the publish + verify harnesses; the operator guide is [ota.md](ota.md).
 
 ### 3b. Node manager — the remaining GUI cards
-The firmware and protocol halves shipped (§1: #21/#74/#50/#56). What is left is Lovelace work:
-the **mesh-topology card** (picture-elements v1 — see D9) and an **OTA panel** that expresses
-canary-then-rest rather than a single fleet button. The wire is documented in
+
+The firmware and protocol halves shipped. What remains is Lovelace work — the mesh-topology card
+(picture-elements v1, see **D9**) and an OTA panel that expresses canary-then-rest rather than a
+single fleet button. The wire is documented in
 [protocol.md](protocol.md#cfg--keyed-per-node-config-channel-56) and
 [home-assistant.md](home-assistant.md).
 
-### 3c. The queue — spec'd or scoped, awaiting a train
-- **#237 slices 2+** — peer-sourced leaf-mesh-OTA beyond slice-1: source inventory, crownless
-  self-serve, hands-off rolls (design §12, commit `41e44fb`).
-- **#161** a rich on-board mesh-OTA progress screen; **#188** live transfer progress to MQTT for
-  the visualizers.
-- **#126** latched-leaf channel parking (multi-hop throughput) · **#124** RELAY2/RELAYACK2 → a
-  single UP2 uplink envelope · **#165** best-relay selection via link ETX.
-- **#75** the dollhouse epic — per-room panels + tag-presence lighting, resting on the #72
-  runtime IO registry that already shipped.
-- **#152** a WASM web emulator running smol's real game code · **#158** meshscope (shipped as a
-  tool) and **#159** the Bevy observatory showpiece.
-- **#230** on-device WiFi provisioning (backport from esp32c6-watch) · **#229** the open decision
-  on whether the C6 watch is a companion device or a first-class fleet member.
+**The queue that used to follow here has moved to [#148](https://github.com/jphein/smol/issues/148)
+and [#24](https://github.com/jphein/smol/issues/24).** A hand-maintained queue beside a tracked one
+is how this document came to tell readers to redo settled work: #148's own audit found it listing
+"#233 merge (PR #247)" as pending when #233 had already landed by another route and #247 was closed
+unmerged.
 
----
 
 ## 4. ⚪ RESEARCHED — go/no-go (nothing built)
 
@@ -260,7 +133,7 @@ canary-then-rest rather than a single fleet button. The wire is documented in
   hardware limit. **#23 landed 2026-07-12** — the radio now stays up through a WiFi sync, the
   boot assoc-freeze is gone, and much of #20 did become moot (the syncing overlay itself was
   later retired by #153). 🟢 verified on all three bench boards (July 2026): zero mesh loss across dozens of sync
-  windows. Now a §1 row.
+  windows. Shipped; tracked in #148/#24.
   > **The honest residual — read this before assuming coexist is solved.** Ordinary mesh RX
   > while associated is reliable. **Bulk unicast RX on a crown is not:** a fetching crown goes
   > downstream-deaf within ~1 ms of its own transmit (#204). For months this was misread as
@@ -268,7 +141,8 @@ canary-then-rest rather than a single fleet button. The wire is documented in
   > — a **channel mismatch** (crown on a ch1 AP vs a ch6 mesh: co-channel pulled 48 KB where
   > off-channel pulled 0) and a genuine **unicast-RX starvation** under bulk inbound. The
   > channel half is fixed (#217 rung-3 co-channel-preferred crown AP selection); the starvation
-  > half is mitigated, not cured (§2).
+  > half is mitigated, not cured — #204 is the open issue, and it is the live reference now that
+  > §2 no longer carries a snapshot.
 - **4b. BLE beacon + presence (#22) — ❌ REFUTED on hardware, closed 2026-07-13.** The original
   recommendation (advertise-only iBeacon: cheap, room-level presence via fixed anchors) did not
   survive contact with the chip. **Native BLE wedges the C3's blocking runtime** — ROM busy-waits
@@ -313,7 +187,17 @@ canary-then-rest rather than a single fleet button. The wire is documented in
 
 Open decisions, ordered by leverage. **Recommendations, not decisions** — ticked as they
 resolve, with *how* they resolved, because a decision that quietly went the other way is worse
-than an open one. **Nine of twelve are now closed;** D6/D9/D11 are what's left.
+than an open one.
+
+This section **stays** in a document that just deleted its status sections, and the distinction is
+worth being explicit about: a checklist of what is done is regenerable from the tracker, but *why a
+call went the way it did* — and especially where it went **against** the recommendation, as **D5**
+did — is recoverable from nothing. That is the content worth keeping in-repo.
+
+Counts are deliberately not stated here. This preamble used to say "nine of twelve are now closed;
+D6/D9/D11 are what's left", which is a status claim about its own list — the same shape as §1, one
+level in. **The checkboxes are the count.** `grep -c '^- \[ \]'` if you need the number, and you will
+get today's rather than 2026-08-01's.
 
 - [x] **D1 — Coexist HW spike: retire the burst?** (§4a) · **RESOLVED — GO, and it shipped**
   (#23, 2026-07-12). The recommendation was right and it was the highest-leverage call in this

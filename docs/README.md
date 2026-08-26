@@ -10,10 +10,15 @@ The current roster is [`../targets/`](../targets/) and `tools/build-matrix.toml`
 memory budgets are `rust/clock/src/budget.rs`. Those three are the truth, and they are
 machine-checked against each other.
 
-- **[ROADMAP.md](ROADMAP.md)** — the steering doc: what's **shipped / in flight / spec'd /
-  researched**, plus the decision docket. **Start here for status.** The living GitHub checklist
-  is [#148](https://github.com/jphein/smol/issues/148); the original tracking issue
+- **[#148](https://github.com/jphein/smol/issues/148)** — **status lives here**, not in a file. It is
+  the living status issue, and `tools/status_check.sh` re-tests its machine-checkable claims and
+  exits non-zero, so it cannot go quietly stale. The original tracking issue
   [#24](https://github.com/jphein/smol/issues/24) closed 2026-07-12.
+- **[ROADMAP.md](ROADMAP.md)** — the **durable** half of steering: the OTA safety envelope, the
+  research results *including the refutations* (a hardware no-go is the least recoverable thing in
+  the repo), and the decision docket with *how* each call resolved. It used to carry
+  shipped/in-flight/spec'd lists too; those were a second copy of the tracker, drifted 703 commits,
+  and now point at #148.
 - **[DOC-UPKEEP.md](DOC-UPKEEP.md)** — how to keep all of this true: where each kind of truth
   lives, how to verify a claim, and the traps that have produced stale docs before.
 
