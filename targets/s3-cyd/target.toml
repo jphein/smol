@@ -1,9 +1,26 @@
 name = "s3-cyd"
 chip = "esp32s3"
-flavor = "fleet"                 # the rust/clock fleet arm (#398); the GUI flavor ships via targets/c6-watch (phase 3.1)
+flavor = "fleet"                 # the rust/clock fleet arm (#398)
 source = "rust/clock"
 artifact = true
 artifact_name = "smol-s3-cyd"
 # Xtensa: needs the espup `esp` toolchain (pinned 1.95.0.0) provisioned in the job — see
 # .github/workflows/release-targets.yml. opt_level=2 is part of this chip's (chip, profile)
 # sha lineage (LLVM scavenger workaround, tools/build-matrix.toml [chip.esp32s3]).
+
+gui_artifact = true
+gui_board = "board-esp32s3-cyd"
+gui_artifact_name = "smol-s3-cyd-gui"
+# THE ONLY BOARD WITH BOTH FLAVORS as a download (#413 phase 3.1) — which is precisely why the
+# fleet and GUI artifact axes had to become independent keys rather than one `artifact` flag.
+# Both are Xtensa, so both ride the espup job; the GUI arm additionally builds at
+# CARGO_PROFILE_RELEASE_OPT_LEVEL=2 for the same LLVM-scavenger reason the fleet arm does.
+#
+# The full cyd scene set LINKS here since `fdfe822` closed the Xtensa isel blocker; before it,
+# the arm could only build a cropped C6-scene fallback. ⚠️ The header comment in
+# targets/c6-watch/tools/build-s3.sh still describes that blocker as open — it is STALE (the
+# same script's body says the fallback is retired). That file is the watch lane's; flagged, not
+# edited here.
+#
+# ⚠️ Stack floor, like the C5's, is the C6's number standing in — "PROVISIONAL … not a fact"
+# (src/main.rs). Not to be read as measured for this board.
