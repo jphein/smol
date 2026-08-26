@@ -524,6 +524,40 @@ if [ "$run_fw" = 1 ]; then
   else
     printf '   \033[33mSKIP\033[0m byte-free (symbols) — no ELF from the canonical build\n'
   fi
+
+  # #390: the writable-static size baseline, on the SAME ELF the two arms above just used — no
+  # extra build. This generalises the #300 stack floor rather than duplicating it: the floor
+  # watches one derived aggregate (.stack) against a threshold, this watches the individual
+  # statics whose growth is what MOVES that aggregate. The floor says the roof came down; this
+  # says which box grew.
+  #
+  # It exists because #335 P1.1 added six dependency lines and changed no source, and smoltcp's
+  # `async` feature (unified in from embassy-net) grew net::wifi::NTP_SOCK_STORAGE by 64 B of
+  # .data taken out of the .stack region — invisible to code review (no source diff), to the
+  # compiler (no arity change), to repro_stack_check (0.06% of an aggregate), and to #351's
+  # checker (presence, not size). It was found by a hand `nm` A/B, which is not a process.
+  #
+  # The TIER NAME IS DERIVED from the feature set rather than written twice. That is deliberate
+  # beyond tidiness: change REPRO_FLEET_FEATURES and the baseline filename changes with it, so
+  # the checker reports "no baseline — a gap to close, not a pass" instead of silently comparing
+  # the new tier against the old tier's numbers.
+  step "writable-static sizes — canonical ELF vs the #390 baseline"
+  if [ -f "$ELF" ]; then
+    if out=$("$ROOT/tools/check_symbol_sizes.py" --tier "${REPRO_FLEET_FEATURES//,/-}" \
+               --elf "$ELF" 2>&1); then
+      printf '%s\n' "$out" | tail -1; ok "symbol sizes"
+    else
+      # Both 1 (drift) and 2 (could not check) are failures here, and the message distinguishes
+      # them. A resize is not automatically a bug — but it must not land unreviewed, which is the
+      # entire finding of #390.
+      printf '%s\n' "$out" | sed 's/^/        /'; bad "symbol sizes"
+    fi
+  else
+    # SKIP, not fail: the stack-floor arm above already failed loudly on a build that produced no
+    # ELF, so the gate is red regardless and a second red says nothing new. This is the one shape
+    # of skip that is not a vacuous pass — the condition is already reported by a neighbour.
+    printf '   \033[33mSKIP\033[0m symbol sizes — no ELF from the canonical build\n'
+  fi
 fi
 
 if [ "$run_host" = 1 ]; then
@@ -727,6 +761,20 @@ if [ "$run_host" = 1 ]; then
       printf '%s\n' "$out" | sed 's/^/        /'; bad "$_t"
     fi
   done
+
+  # #390: the offline half of the symbol-size guard. The fw arm runs the checker against a real
+  # ELF; this proves the PARSE/NORMALISE/COMPARE logic can fail, using a committed real slice of
+  # readelf output — no cargo, no ELF, no toolchain.
+  # The split is load-bearing in both directions: a readelf output-format change keeps THIS suite
+  # green and turns the fw arm red (only the fw arm sees real readelf), while a logic regression
+  # turns this suite red even on a machine that cannot build firmware at all. Neither arm alone
+  # covers both, which is why both exist.
+  step "symbol-size checker regression suite (#390)"
+  if out=$("$ROOT/tools/test_symbol_sizes.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "test_symbol_sizes"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_symbol_sizes"
+  fi
 fi
 
 step "summary"
