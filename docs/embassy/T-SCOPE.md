@@ -345,6 +345,34 @@ rev-1.
 
    **Nothing in T should spend margin until the crown number exists.** §3.2 confirms 12,000 B (or
    17,696 B against the real-seeds region) is all there is, with no reclamation behind it.
+
+   ### ✅ THE CROWN NUMBER IS IN (2026-08-26 05:17) — and the peak is DUTY-INDEPENDENT
+
+   **high-water 67,368 B of 85,096 B (79%, 17,728 B free), as the reigning crown** (JP power-cycled
+   id8's sibling; id50 held `MC|50` with gateway/relay lines live in the same capture window). The
+   plateau was already at 67,368 within ~3 minutes of a fresh boot.
+
+   **Crown 67,368 vs leaf 67,400 — 32 B apart, i.e. the same number.** The peak does not depend on
+   duty. That confirms §3.2/#440's dating analysis mechanically: the executor's floor under every
+   call chain — not workload — is the dominant term, and it is hit almost immediately.
+
+   **Labels, per §5.1:** short read windows (65 s reads of ~3-minute-old boots; a longer 5-minute
+   crown window was lost to a USB-replug power cycle — high-water dies with a reboot) · the #398
+   boot probe again not captured · **pairs 4/5 (the OTA fetch/serve chains, the deepest in the
+   tree) were NOT exercised in any window** — so 67.4 K remains a lower bound specifically for a
+   fleet-roll serving crown, and that is the one duty left unmeasured. Against that: the identical
+   plateau across three boots and two duties is strong evidence the common-path peak is ~67.4 K.
+
+   #### Verdict and ruling
+
+   At `floor = ceil(peak × 4/3)`: 67,368 × 4/3 = **89,824 > 85,096 (and > 86,200)**. **The fleet
+   image is outside its own ×4/3 policy as measured** — coverage is 1.263×, the policy wants
+   1.333×, shortfall ≈ 4.8 KB. **JP RULED (2026-08-26): fix direction = (a), SHRINK THE ARENA** —
+   the 19,600 B `__embassy_main::POOL` is the lever; the ×4/3 factor stays intact. That work is
+   now a named pre-T (or in-T) deliverable: shrink the pool enough that region ≥ 89,824 − savings,
+   re-measure, THEN update `ESP32C3_MEASURED_PEAK_BYTES` → 67,400 (the higher of the two labeled
+   numbers) and let the floor assert recompute. Do not update the constant before the arena work —
+   two red gates on running firmware, as #440 explains.
 2. **`StackResources<N>` sizing — ✅ MEASURED** (order-item 4, done; throwaway const-eval probe on
    the fleet tier, embassy-net 0.9.1 with smol's own feature set `tcp,udp,dhcpv4,medium-ethernet`):
 
