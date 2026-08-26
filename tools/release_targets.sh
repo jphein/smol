@@ -292,7 +292,12 @@ for m in "${MANIFESTS[@]}"; do
         "$elf" "$bin" >/dev/null; then
     echo "FAIL: $aname packaging" >&2; failed=$((failed+1)); continue
   fi
-  cp "$elf" "${bin%.bin}.elf"      # for probe-rs / readelf / symbol work, as the fleet tier ships
+  # NO .elf IS SHIPPED for the GUI flavor, and that is a measured decision rather than an
+  # oversight. The watch's [profile.release] carries `debug = 2`, so its ELF is 77-86 MB —
+  # against the fleet tier's 2 MB, a 43x outlier — and this would be re-uploaded to a rolling
+  # nightly every night for three boards (~250 MB/run). The per-target convention #453
+  # established ships `.bin` + `NOTES.md` and no ELF at all, so this matches it. Anyone needing
+  # symbols builds at this git hash: the invocation is in this file and takes ~2 minutes.
   sha="$(sha256sum "$bin" | cut -c1-64)"
 
   cat > "$bin.NOTES.md" <<NOTES
@@ -309,6 +314,10 @@ the \`rust/clock\` fleet image. Both speak the same SMOLv1 mesh; they are differ
 the watch's own A/B table (two 6 MiB slots) for a 16 MB part. If this board has ever taken an
 OTA, clear \`otadata\` first or the write lands in the slot the bootloader will not select:
 \`espflash erase-region --port <port> 0xd000 0x2000\`.
+
+*(The file is a full 16 MB because a merged image spans the whole flash; the firmware itself is
+a few MB and the rest is padding. No \`.elf\` is published for this flavor — the watch builds
+with \`debug = 2\`, which makes one ~80 MB. Rebuild at this git hash if you need symbols.)*
 
 **🔑 Credentials: there are none, and that is deliberate.** Unlike the fleet images, this
 artifact carries **no placeholder credentials at all** — not an empty placeholder, genuinely
