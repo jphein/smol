@@ -230,13 +230,54 @@ for m in "${MANIFESTS[@]}"; do
   # without `/.git`, which is exactly our situation — a `git archive` tree. Unset, the sigil
   # stamp would read "no-git"/"unknown"; set, the image names the commit it came from.
   sde="$(git -C "$ROOT" show -s --format=%ct HEAD)"
+
+  # ⚠️ WATCH_BUILD_HASH IS CAPPED AT 8 HEX CHARS. sigil-id::build_name_for_hash REFUSES longer
+  # input rather than truncating it (deliberately — a silently different seed would break the
+  # cross-tool name agreement the sigil exists to provide), so handing it this script's
+  # 12-char $GITHASH returns None and the image ships stamped "no-git": precisely the unnamed
+  # build the mechanism exists to prevent. MEASURED, not reasoned: the first build on familiar
+  # printed `build sigil: no-git · 883aa0c9b56a (supplied)`. build.rs's own git path uses 7, so
+  # 7 it is. $GITHASH stays 12 for filenames and NOTES.
+  wbh="${GITHASH:0:7}"
+
+  # ⚠️ DO NOT SET CARGO_PROFILE_RELEASE_OPT_LEVEL ON THE RISCV ARMS. The workspace's own
+  # [profile.release] is `opt-level = 's'` under fat LTO, and that is the profile every image
+  # anyone has flashed was built at. An earlier version of this script overrode it to 3 for the
+  # riscv boards and the C6 link FAILED — `.text will not fit in region ROM: overflowed by
+  # 70,178 bytes` — because speed-optimising a 4.67 MB size-optimised image pushes it past the
+  # 6 MiB slot. The override is Xtensa-ONLY and exists for one narrow reason: opt-level s/z
+  # crash the Xtensa LLVM scavenger under fat LTO (targets/s3-cyd/PORT-SCOPING.md §6.1), so the
+  # S3 is built at 2 instead. Overriding a shared profile "for consistency" is how a build that
+  # links stops linking.
+  declare -a optenv=()
+  [ "$chip" = "esp32s3" ] && optenv=(CARGO_PROFILE_RELEASE_OPT_LEVEL=2)
+
+  # FEATURE ARGS PER BOARD — each board's own proven invocation, not one generalised guess.
+  #
+  # The C6 is the DEFAULT board, and its default set is ["board-waveshare-c6", "tts"]. budget.rs
+  # is explicit that tts being on "is what the board actually runs, not a minimum", and the
+  # watch's own firmware.yml builds it as a bare `cargo build --release --bin esp32c6-watch`. So
+  # the C6 takes the defaults: passing --no-default-features here would silently drop tts and
+  # ship a layout nobody has flashed — the same mistake as overriding the opt-level, one axis
+  # over. Letting the defaults ride also means this script tracks them if the watch lane moves
+  # them, instead of pinning a copy that goes stale.
+  #
+  # The other two boards MUST deselect the default board feature (esp-hal accepts exactly one
+  # chip, and the board features are mutually exclusive), so they get the explicit form —
+  # byte-for-byte the invocation tools/build-s3.sh uses for the S3.
+  declare -a featargs=()
+  if [ "$gui_board" = "board-waveshare-c6" ]; then
+    featargs=()                                             # defaults: board-waveshare-c6 + tts
+  else
+    featargs=(--no-default-features --features "$gui_board")
+  fi
+
   elf="$GUI_WS/target/$triple/release/esp32c6-watch"
   rm -f "$elf"
   if ! ( cd "$GUI_WS" && \
-         SOURCE_DATE_EPOCH="$sde" WATCH_BUILD_HASH="$GITHASH" \
-         CARGO_PROFILE_RELEASE_OPT_LEVEL="$([ "$chip" = esp32s3 ] && echo 2 || echo 3)" \
-         cargo $cargo_tc build --release --no-default-features \
-               --features "$gui_board" --target "$triple" --bin esp32c6-watch ); then
+         env SOURCE_DATE_EPOCH="$sde" WATCH_BUILD_HASH="$wbh" "${optenv[@]}" \
+         cargo $cargo_tc build --release "${featargs[@]}" \
+               --target "$triple" --bin esp32c6-watch ); then
     echo "FAIL: $aname build" >&2; failed=$((failed+1)); continue
   fi
   [ -f "$elf" ] || { echo "FAIL: $aname produced no ELF at $elf" >&2; failed=$((failed+1)); continue; }
