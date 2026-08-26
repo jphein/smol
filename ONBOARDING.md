@@ -1,8 +1,8 @@
 # Onboarding — contributing to smol
 
 A cold-clone guide to the **architecture** this project runs on. For the *product* story read
-[`README.md`](README.md); for *current status* read [`docs/ROADMAP.md`](docs/ROADMAP.md) + the wave
-changelog. This file is the **map**: how the pieces fit and where to go next. It links the deep docs
+[`README.md`](README.md); for *current status* read **[#148](https://github.com/jphein/smol/issues/148)**
+(living, and machine-checked) + the wave changelog. This file is the **map**: how the pieces fit and where to go next. It links the deep docs
 rather than repeating them.
 
 **What smol is:** one `no_std` Rust binary that turns a **$3 ESP32-C3 SuperMini + 0.42″ (72×40)
@@ -204,8 +204,10 @@ Full toolchain + gotchas: **[`docs/BUILDING.md`](docs/BUILDING.md)**. TL;DR for 
 ---
 
 ## Where to read next
-- **Status / what's proven:** [`docs/ROADMAP.md`](docs/ROADMAP.md) + the wave changelog (honest
-  per-item maturity — don't assume "verified" without checking).
+- **Status / what's proven:** **[#148](https://github.com/jphein/smol/issues/148)** + the wave
+  changelog (honest per-item maturity — don't assume "verified" without checking). ROADMAP.md no
+  longer carries status; it keeps the safety envelope, the research refutations and the decision
+  docket.
 - **Wire protocol:** [`docs/protocol.md`](docs/protocol.md) · **Mesh/relay:** [`docs/relay.md`](docs/relay.md)
 - **HA:** [`docs/home-assistant.md`](docs/home-assistant.md) · **OTA:** [`docs/ota.md`](docs/ota.md)
 - **Build/flash:** [`docs/BUILDING.md`](docs/BUILDING.md) · **Play:** [`docs/mesh-snake.md`](docs/mesh-snake.md)

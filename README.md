@@ -76,7 +76,10 @@ This is where smol stops being a toy. The elected **gateway** briefly bursts ont
 - `docs/` — research + guides (below)
 
 ## Docs
-- **[docs/ROADMAP.md](docs/ROADMAP.md)** — status + steering (start here)
+- **[#148](https://github.com/jphein/smol/issues/148)** — current status + the high-leverage queue
+  (living, and machine-checked by `tools/status_check.sh`) · **start here**
+- **[docs/ROADMAP.md](docs/ROADMAP.md)** — the durable half of steering: the OTA safety envelope,
+  research results *including the refutations*, and the decision docket with how each call resolved
 - **[docs/DOC-UPKEEP.md](docs/DOC-UPKEEP.md)** — how these docs and the website are kept true: where truth lives, how to verify a claim, the traps
 - **[docs/BUILDING.md](docs/BUILDING.md)** — toolchain, flashing, pin map, the gotchas that cost us time
 - **[docs/protocol.md](docs/protocol.md)** — the SMOLv1 wire reference (every frame, byte-accurate, with verification badges) — including the allocated **node-id blocks** per board class
