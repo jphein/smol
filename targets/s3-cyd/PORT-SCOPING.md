@@ -291,3 +291,17 @@ Ordered by dependency:
   xtensa build green in 34.5 s; `--features radio` green in 15.5 s → `wifi + esp-now`
   on esp32s3 is PROVEN at compile/link level. M3 unblocked**, needs bench time + a
   fleet witness. Board sigil: `eldritch-insignia` (watch repo `ba46f74`).
+- **2026-08-25 ~20:3x — SECOND FIRST-LIGHT (GUI, #445): PSRAM fix PROVEN, new blocker found.**
+  Built board-esp32s3-cyd from main `72487d6` (sha `2e5af7b4…`, WSIGIL Wrought Ironheart),
+  flashed through the guard. `[PSRAM] octal, 8192 KB mapped as External heap` on serial;
+  full boot narrative (CFG → SIGIL 162 → MESH up); the alloc-panic signature is GONE —
+  the garbled-flashing/rebooting defect JP reported is root-cause-fixed. BUT the board
+  still crash-loops (131 boots/300 s, rst 0x3) on a **driver-internal** panic:
+  esp-radio 0.18.0 `fmt.rs:240` unwrap of `esp_wifi_scan_get_ap_record` — the WiFi
+  scan path (election/picker sweep), which smol-native never exercises (hence the
+  fleet image's stability on this same board). Both app call sites handle Err; the
+  unwrap is uncatchable. Leading hypothesis: Internal-DRAM exhaustion mid-scan (S3 arm
+  inherits the 64K+64K internal pool; esp-radio mallocs AP records Internal-only; dense
+  RF here). Handed to the watch lane (debug-watch-network-gaps) with evidence at
+  `~/.claude/projects/-home-jp/scratch/s3-cyd-target/psram-fix-verdict.md`. Board
+  restored to stable smol-native (`tmp/smol-s3-162.elf`, slot 0x20000, smol_162 live).
