@@ -775,6 +775,28 @@ if [ "$run_host" = 1 ]; then
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_symbol_sizes"
   fi
+
+  # #419: the board-fact seam. A constant in targets/*/src/board/*.rs is a STATEMENT ABOUT THE
+  # HARDWARE; one with zero code readers whose name is ALSO declared file-locally elsewhere means
+  # the board says X while the code quietly uses Y, and nothing fails, warns, or compiles
+  # differently. Latent in smol today — the arming event is a routine subtree refresh, which is
+  # exactly why this is a tripwire rather than a fix. This is the FIRST gate arm covering
+  # targets/, and it is text-only (no build, no toolchain), so it belongs in the host arm.
+  #
+  # Runs on the real tree, then its own regression suite. Both, because they fail on different
+  # things: the live run catches an actual refresh that arms the trap, and the suite catches the
+  # checker being weakened so that the live run stops being able to see it.
+  step "board-fact seam — declared constants with no readers (#419)"
+  if out=$("$ROOT/tools/check_board_consts.py" "$ROOT" 2>&1); then
+    printf '%s\n' "$out" | head -1; ok "board consts"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "board consts"
+  fi
+  if out=$("$ROOT/tools/test_board_consts.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "test_board_consts"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_board_consts"
+  fi
 fi
 
 step "summary"
