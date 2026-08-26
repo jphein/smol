@@ -991,17 +991,28 @@ async fn run() -> ! {
         led::Led::off_level(),
         esp_hal::gpio::OutputConfig::default(),
     ));
-    // #398 S3: there is no simple status LED on the ES3C28P — GPIO42 is the WS2812's DIN,
-    // which ignores plain GPIO levels (it wants the RMT protocol), so this drive renders
-    // NOTHING visible. Wired anyway so the peer-state machine runs unchanged; the real
-    // WS2812/RMT driver (~50 lines, esp-hal-smartled is version-incompatible) is follow-up
-    // work on #398. GPIO8 on this chip is I2S playback data — not touched.
+    // #398 S3: the ES3C28P's status light is the WS2812 pixel on GPIO42, which
+    // ignores plain GPIO levels — it wants the RMT wire protocol, so the Led
+    // wrapper drives it through an RMT TX channel (80 MHz tick clock, frames
+    // only on state CHANGE — the pixel latches). RMT setup failure degrades to
+    // a dark LED (`None` channel), never a boot failure: a status light must
+    // not be able to brick the node. GPIO8 on this chip is I2S data — untouched.
     #[cfg(all(feature = "espnow", feature = "esp32s3"))]
-    let mut led = led::Led::new(esp_hal::gpio::Output::new(
-        peripherals.GPIO42,
-        led::Led::off_level(),
-        esp_hal::gpio::OutputConfig::default(),
-    ));
+    let mut led = {
+        use esp_hal::rmt::{Rmt, TxChannelConfig, TxChannelCreator};
+        let channel = Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(80))
+            .ok()
+            .and_then(|rmt| {
+                rmt.channel0
+                    .configure_tx(&TxChannelConfig::default().with_clk_divider(1))
+                    .ok()
+            })
+            .map(|ch| ch.with_pin(peripherals.GPIO42));
+        if channel.is_none() {
+            esp_println::println!("[LED] WS2812 RMT setup failed - status light dark");
+        }
+        led::Led::new_ws2812(channel)
+    };
 
     #[cfg(feature = "espnow")]
     let (mut radio, synced) = {
