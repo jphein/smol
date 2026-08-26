@@ -74,6 +74,7 @@ A human watched this board do all of it. **Verified on hardware, in the flavor n
 | Display idle-sleep + wake | GUI | JP witnessed |
 | Bard, games, cast-tap plumbing, sensors, budget row | native | #411 |
 | A/B partition table (6 MiB slots) | both | flashed |
+| **Mesh OTA — 345 → 1405 over the air** | native | slot flip + `ota=confirmed:1405`, self-test passed, no rollback |
 
 **Not yet, and named rather than implied:**
 
@@ -82,9 +83,11 @@ A human watched this board do all of it. **Verified on hardware, in the flavor n
   manifest pins, the `linkall.x` + `opt_level` workaround (#408/#409), the display arm, the
   measured budget row — is done. `.github/workflows/xtensa-spike.yml` has shown a stock runner
   provisioning and building it.
-- **No A/B OTA roll yet.** The software is de-risked (per-arch ed25519, ota-proto 19/19, table
-  flashed, `mesh-ota` compiled into both flavors) but no image has actually been rolled to this
-  board over the mesh. **That is the gate for "full fleet citizen".**
+- ~~No A/B OTA roll yet.~~ **✅ OTA citizenship confirmed, 2026-08-26** — id 162 took build
+  **345 → 1405 over the air**: slot flip, `ota=confirmed:1405`, self-test passed, no rollback
+  (~40 s for 1 MB). **The fourth silicon family is a full fleet citizen**, and this is the first
+  cross-architecture OTA in smol's history. *(#398; three traps burned en route, incl. `flash.sh`
+  lacking an otadata erase — after any slot flip a USB flash silently boots the stale slot.)*
 - **Stack-floor provenance is `ObservedSufficient`, not `Derived`** — the stack-measuring
   instrument is known-broken on this chip, so `ESP32S3_STACK_FLOOR_BYTES` is the largest region
   proven to run clean in bench operation. Real protection, weaker provenance than the C3's.
