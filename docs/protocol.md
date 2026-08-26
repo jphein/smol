@@ -1149,14 +1149,30 @@ snake** and broadcasts an **absolute, stateless** head snapshot; peers
 | `head_y` | 1 | u8 | world cell Y (toroidal) |
 | `length` | 1 | u8 | segment count; **body dead-reckoned, not sent** |
 
-**Versioning (`ver`) + forward-compat.** The parser is **length-tolerant**: a frame with the `SNK`
-prefix and **≥ 18 B** decodes the stable 18 B v1 core regardless of any trailing bytes. A **v2 = 19 B**
-frame appends a `score` byte at `[18]` (`SNK_FRAME_LEN_V2`, defined on **both** the C3 fleet and the
-esp32c6-watch); **`ver = 1` implies `score == length`**, so a v1 receiver loses nothing. As of this
-writing **no board emits `ver = 2`** — the v2 slot is *reserved-but-inactive*. Who bumps `ver` to 2
-(and thus what a `score` that diverges from `length` means), or whether to drop the dead definition,
-is the open decision in **#232**. A conformant parser reads `[0..18)` unconditionally and reads
-`[18]` **only** when `ver ≥ 2` **and** the frame is ≥ 19 B.
+**Versioning (`ver`) + forward-compat.** There is exactly **one version on the wire: `ver = 1`, 18 B**,
+and **`score == length`** by definition. The parser is **length-tolerant**: a frame with the `SNK`
+prefix and **≥ 18 B** decodes the stable 18 B core regardless of any trailing bytes, which are
+**ignored, not rejected**.
+
+**#232 (decided): the v2 score byte is DROPPED, not reserved.** A `ver = 2` / 19 B frame appending a
+`score` byte at `[18]` was previously defined here and in both firmwares, and **nothing ever emitted
+it** — the single builder that set `ver = 2` had zero callers. It is now removed from the C3 fleet
+rather than left as a reserved slot, because a reserved-but-unreachable wire field reads as a shipped
+capability to the next implementer (the #371 pattern).
+
+Re-adding a score byte later needs **no flag day**, which is why keeping the reservation bought
+little: a parser built to this spec passes the length check on a 19 B frame, matches the prefix,
+ignores byte `[18]`, and reads `score = length` — correct until score actually diverges from length.
+So the cost of dropping is ~6 lines to re-add plus a mixed window where old boards show
+`score == length`; the cost of keeping was a wire slot nobody could reach.
+
+> **Cross-repo status.** The removal has landed for the **C3 fleet** (`rust/clock`). The
+> **esp32c6-watch** copy (`src/apps/world_snake.rs`) still defines the v2 constants and sizes its TX
+> buffer from the 19 B length; it likewise never emits `ver = 2`. That half belongs to the standalone
+> watch repo and reaches smol through a subtree refresh, so it is tracked there rather than patched
+> in `targets/c6-watch/`. **Interop is unaffected either way** by the tolerance described above.
+
+A conformant implementation writes `[0..18)` and reads `[0..18)`; byte `[18]` carries no meaning.
 
 **World / coords.** `u8` per axis → up to **256×256 toroidal** world (design may
 mask to 128/axis via `x & 0x7F`); world size is a game knob. `MAX_PEERS = 16`.
