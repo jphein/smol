@@ -1,8 +1,14 @@
 # smol — docs
 
-Docs for the **smol** ESP32-C3 fleet, gathered and written during the build. Every doc in
-`docs/` is indexed here; if you add one, add it here too — [DOC-UPKEEP.md](DOC-UPKEEP.md) says
-why.
+Docs for the **smol** fleet — born on the ESP32-C3 and now spanning five targets across four chip
+families — gathered and written during the build. Every doc in `docs/` is indexed here; if you add
+one, add it here too — [DOC-UPKEEP.md](DOC-UPKEEP.md) says why.
+
+⚠️ **Much of what follows was written when smol was one chip, and still reads that way.** Where a
+doc says "the C3" it is usually describing the reference board rather than asserting the roster.
+The current roster is [`../targets/`](../targets/) and `tools/build-matrix.toml`; the per-chip
+memory budgets are `rust/clock/src/budget.rs`. Those three are the truth, and they are
+machine-checked against each other.
 
 - **[ROADMAP.md](ROADMAP.md)** — the steering doc: what's **shipped / in flight / spec'd /
   researched**, plus the decision docket. **Start here for status.** The living GitHub checklist
@@ -19,6 +25,11 @@ why.
   UP2/RELAYACK2, BATT2/GRID2, SNK, FAM, the leaf mesh-OTA frames) plus the MQTT topic map —
   each carrying an honest per-frame verification badge. **The most reliably current doc in the
   repo; when another doc disagrees with it, protocol.md is usually the one that's right.**
+- **[RELEASES.md](RELEASES.md)** — what smol **publishes** and what each kind of artifact is *for*:
+  nightly prereleases vs versioned releases, the **per-target download matrix** (#413) and the
+  provenance each artifact carries, the placeholder-credential rule and how to **re-key**, and the
+  otadata trap that makes a successful flash silently never run. **Read before flashing a
+  download.**
 - **[ota.md](ota.md)** — OTA operator guide: stage/install, ed25519 signing, canary discipline,
   leaf mesh-OTA, reproducible builds.
 - **[home-assistant.md](home-assistant.md)** — the MQTT-native **Home Assistant** integration:
@@ -29,9 +40,19 @@ why.
 - **[mesh-snake.md](mesh-snake.md)** — how to play **World Snake**, the shared-world MMO:
   one-button controls, the six treasure-powers, the leaderboard, joining a mesh.
 
-The firmware itself lives in **`rust/clock/`** — one `no_std` esp-hal binary for the whole
+The **fleet** firmware lives in **`rust/clock/`** — one `no_std` esp-hal binary for the whole
 fleet: the apps, the ESP-NOW mesh (`src/net/`), the Familiar (`src/familiar/`), the Bard
-(`src/bard/`), OTA (`src/ota.rs` + `src/ota_mesh.rs`) and Cast (`src/net/cast.rs`).
+(`src/bard/`), OTA (`src/ota.rs` + `src/ota_mesh.rs`), Cast (`src/net/cast.rs`) and the per-chip
+memory budgets (`src/budget.rs`). The **GUI** firmware for the touch boards is a second workspace,
+`targets/c6-watch/` — a subtree of the [esp32c6-watch](https://github.com/jphein/esp32c6-watch)
+repo, speaking the same SMOLv1 frames, with its own docs under `targets/c6-watch/docs/`.
+
+## The async re-platform
+- **[embassy/](embassy/)** — the tracked record of the Embassy/`esp-rtos` migration (#335): the
+  Phase-1 port spec and exec log, the delta map, the risk register, the radio-ownership decision
+  with its adversarial review, `PHASE3-PLAN.md`, and **`T-SCOPE.md`** — STEP T argued in full
+  before any of its code is written. When a working copy under `scratch/` disagrees with this
+  directory, this directory is the record.
 
 ## Research — the C3 landscape
 - **[firmware-ideas.md](firmware-ideas.md)** — the broad survey of what you can flash on an
@@ -83,7 +104,8 @@ fleet: the apps, the ESP-NOW mesh (`src/net/`), the Familiar (`src/familiar/`), 
   amendments. Full rule in [DOC-UPKEEP.md](DOC-UPKEEP.md) §2 — it is how a stale `~3.3×` slot
   figure got "corrected" to a projected `~2.3×` when the measurement was `1.42×`.
 
-**Hardware:** ESP32-C3 SuperMini · 0.42″ SSD1306 OLED (72×40, I²C `0x3C`, SDA=GPIO5 /
+**Reference hardware** (the board most of these docs describe; the other four are in
+[`../targets/`](../targets/))**:** ESP32-C3 SuperMini · 0.42″ SSD1306 OLED (72×40, I²C `0x3C`, SDA=GPIO5 /
 SCL=GPIO6) · Bluetooth 5 LE (unused — see #22) · 4 MB flash · single-core RISC-V @160 MHz, no
 PSRAM.
 

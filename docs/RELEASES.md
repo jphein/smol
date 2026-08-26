@@ -111,6 +111,89 @@ rewrite the record of what shipped.
 
 ---
 
+## Per-target downloads (#413) — the manifests are the matrix
+
+smol is five targets across four chip families now, so "the release artifact" stopped being a
+single file. `tools/release_targets.sh` builds the download set **from the target manifests**:
+
+```
+targets/<name>/target.toml   →   name, chip, flavor, source, artifact = true|false
+```
+
+Iterating the manifests is the whole mechanism. **Adding a `targets/` folder with a manifest that
+says `artifact = true` adds a download** — there is no workflow list to edit and no second place
+that knows the roster. A manifest that says `artifact = false` **must say why in the file**, and
+those reasons are the honest current state of the matrix:
+
+| target | chip | artifact | why |
+|---|---|---|---|
+| `c3` | esp32c3 | ✅ | the canonical fleet image |
+| `c3-oled` | esp32c3 | ✅ *alias* | `alias_of = "c3"` — **one image, two boards**; the script resolves it and does not build twice |
+| `s3-cyd` | esp32s3 | ✅ | Xtensa; needs the espup `esp` toolchain provisioned in the job |
+| `c5-cyd` | esp32c5 | ❌ | the C5 fleet image is **CHECK-proven, not LINK-proven**. "It links" would itself not be proof — it needs a measured budget row too |
+| `c6-watch` | esp32c6 | ❌ | a different flavor with its own workspace and build system; wiring it in is the next #413 step |
+
+### Three properties every per-target artifact carries
+
+**1. It is built on the production path, not a parallel one.** Every artifact goes through the same
+`repro_chip_spec` + `repro_build_bin` calls the OTA publish path uses, from a `git archive` tree
+provisioned by `tools/ci_provision.sh`. A published image is **never** built from a tree carrying a
+real `secrets.rs` — the archive+provision step is what makes that structural rather than a habit.
+One provisioned tree is shared by every target in a run, deliberately: provisioning per-target
+would substitute a different random key per artifact, and the images would then differ **by key
+rather than by chip**.
+
+**2. The build stamp is `0`, and that is the honest value.** A download is not a fleet-ratchet
+build. Passing `SMOL_BUILD_NUMBER=0` explicitly stops a tree without the stage path's env
+injection from stamping `version.txt`'s stale number (#420). **The artifact's identity is its git
+hash**, which rides both the ELF and the release notes — not the number on the screen. It never
+needs to win a ratchet comparison, because fleet boards do not update from downloads.
+
+**3. Provenance rides the artifact.** Each `.bin` gets a `NOTES.md` beside it stating, in words a
+reader with no repo context can act on:
+
+- **the sha256, chip, flavor and git hash;**
+- **who the image is for** — new hardware joining a mesh, never a board already on one;
+- **its chip's stack-floor provenance**, spelled out rather than named. The three grades are not
+  interchangeable: `derived` (a floor computed from a measured on-hardware peak — the strongest
+  claim this project makes), `observed-sufficient` (⚠️ the measuring instrument is known-broken on
+  that chip, so the floor is the largest region *proven to run clean in bench operation* — real
+  protection, weaker provenance, and a regression that overruns it may not be caught before it
+  ships), and `boot-assert` (⚠️ a declaration by the firmware itself, the weakest in the fleet);
+- **the re-key instruction** (below);
+- **the sha-lineage rule**: image shas are comparable **only within one (chip, profile) pair**. The
+  S3 builds at a different opt-level — an LLVM scavenger workaround declared in
+  `tools/build-matrix.toml` — and a different opt-level legitimately produces a different, equally
+  correct image. Comparing an S3 sha against a C3 sha proves nothing.
+
+### 🔑 Re-key before you trust your mesh (#394)
+
+Published images carry the **published placeholder group key** — on purpose, because a random
+per-build key would destroy the byte-reproducibility that makes a sha an identity. The consequence
+is worth stating flatly:
+
+> **Placeholder-key boards can mesh only with other placeholder-key boards, and can never join a
+> re-keyed fleet.**
+
+To own your mesh: regenerate `GROUP_KEY` in `rust/clock/src/secrets.rs` (32 random bytes — start
+from `secrets.rs.example`), rebuild, reflash. That is a rebuild, not a reconfiguration: the key is
+compile-time, and no CFG frame or dashboard setting can change it.
+
+*(The GUI flavor has the same shape with a different mechanism — its broker and credentials are
+`option_env!` compile-time values, so its public images must carry placeholders too.)*
+
+### Status, stated plainly
+
+The mechanism is **in the tree and merged** — the manifests, `tools/release_targets.sh`, the
+chip-aware stack-floor gate (#413 phase 2A), and the publish path that builds any declared chip
+(phase 2B). What is **not** done: the release *job*. `.github/workflows/` carries no
+`release-targets.yml` yet, and the only published release remains `nightly-2026-08-24` with its
+three C3 assets. The S3's blocker is narrow and named — a GitHub runner has no espup `esp`
+toolchain — and `xtensa-spike.yml` has already shown a stock runner provisioning it and building
+the S3. Until that job exists, **per-target downloads are a capability, not a published fact.**
+
+---
+
 ## Artifacts, and why the `default` tier has no `.bin`
 
 `nightly-2026-08-24` publishes:
@@ -187,3 +270,6 @@ it. A future release that *has* been flashed should say so, and say on what.
 - [ota.md](ota.md) — the signed OTA path fleet boards actually use, including leaf mesh-OTA.
 - [protocol.md](protocol.md) — the wire contract, including the image target descriptor a board
   uses to refuse an image that is not for it.
+- [`../targets/`](../targets/) — the target roster itself. Each folder's `target.toml` is the
+  manifest this page's per-target section describes, and each `README.md` is that board's own
+  hardware truth.
