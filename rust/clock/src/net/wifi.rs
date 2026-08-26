@@ -4690,22 +4690,52 @@ fn mqtt_session(
         }
         (cs, _) => cs,
     };
-    if let Some(newseq) = claim_seq {
+    // #gateway-election LAYER 2: a CO-CHANNEL crown MUST advertise the MESH channel in its MC
+    // <ch> (not the possibly-still-0 learned ESP-NOW channel), so an OFF-channel board recognizes
+    // it as co-channel and YIELDS (yield_to_co_channel_owner) instead of re-claiming via lowest-id
+    // — THAT is what makes the seize STICK (id5 yields to id7 → no flap). A non-co-channel
+    // claimant keeps its real learned channel (#29 unchanged when co_channel is false/unknown).
+    //
+    // #403 — AN UNKNOWN CHANNEL IS NOT A CHANNEL. `my_channel` is legitimately 0 until a frame's
+    // rx_control is learned (:249), and #155's claim gate FAILS OPEN on that 0 by design, so a
+    // board that reboots off the panic path can become crown before it knows its channel and then
+    // announce `MC|<id>|0|<seq>` as fact. Measured consequence, not theory: every leaf whose only
+    // MQTT path is crown relay was stranded for 4 h (#403). The `!= 0` guard already existed on the
+    // `mesh_channel` branch and was simply absent from its sibling.
+    //
+    // The guard is a TYPE, at the COMPUTATION, and both of those are deliberate:
+    //   * at the computation, because there are TWO publish sites (this claim and #114 H2's
+    //     re-assert below) reading this one binding — a `!= 0` at one site leaves the other live,
+    //     which would reproduce this issue's own shape inside the fix for it;
+    //   * a type rather than an `if`, because STEP T (#335) rewrites this ~2,000-line function
+    //     wholesale. A type constraint survives a rewrite — T's new code must CONSTRUCT the value
+    //     and the constructor refuses 0 — whereas one lost `!= 0` among 2,000 rewritten lines is
+    //     exactly what no reviewer catches. `tools/check_elect_send_path.py`'s MC-PUBLISH-SITES arm
+    //     holds the structural half.
+    // #155's cold-start fail-open (:4681) is untouched ON PURPOSE: a board may still CLAIM without
+    // a learned channel; it may no longer ANNOUNCE that unknown channel as the fleet's rendezvous.
+    let pub_ch = core::num::NonZeroU8::new(if elect.co_channel && elect.mesh_channel != 0 {
+        elect.mesh_channel
+    } else {
+        elect.my_channel
+    });
+    if claim_seq.is_some() && pub_ch.is_none() {
+        // #403 reuses #51 A2's DISPOSITION (below) — not a provable owner ⇒ stay leaf, retry next
+        // burst — but NOT its message. A2 says "MC publish FAILED", which here would be false: we
+        // did not fail to publish, we DECLINED to, and an operator reading a publish failure hunts
+        // a broker/uplink fault that does not exist. Its own words also make the precondition
+        // WITNESSABLE for the first time: #403's trigger (a panic-path reboot that claims before
+        // learning a channel) is otherwise unobservable from outside, so "does this still happen?"
+        // had no instrument that could answer it.
+        elect.i_am_owner = false;
+        log::warn!("smol #403: channel unknown (my_ch=0) — declining MC announce, staying leaf");
+    }
+    if let (Some(newseq), Some(pub_ch)) = (claim_seq, pub_ch) {
         // Record my own ownership locally so my seq counts as "fresh" next read, then
         // publish the retained record (the liveness heartbeat other boards watch).
         elect.seen_owner = node_id;
         elect.seen_seq = newseq;
         elect.seen_ms = elect.now_ms;
-        // #gateway-election LAYER 2: a CO-CHANNEL crown MUST advertise the MESH channel in its MC
-        // <ch> (not the possibly-still-0 learned ESP-NOW channel), so an OFF-channel board recognizes
-        // it as co-channel and YIELDS (yield_to_co_channel_owner) instead of re-claiming via lowest-id
-        // — THAT is what makes the seize STICK (id5 yields to id7 → no flap). A non-co-channel
-        // claimant keeps its real learned channel (#29 unchanged when co_channel is false/unknown).
-        let pub_ch = if elect.co_channel && elect.mesh_channel != 0 {
-            elect.mesh_channel
-        } else {
-            elect.my_channel
-        };
         let mut mcp = MqttScratch::new();
         let _ = write!(mcp, "MC|{}|{}|{}", node_id, pub_ch, newseq); // #29/#gateway-election: co-channel crown advertises mesh ch
         // #51 A2 — CLAIM-AFTER-PUBLISH: only actually hold ownership if the retained MC
