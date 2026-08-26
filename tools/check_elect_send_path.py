@@ -30,6 +30,11 @@ because it was ENUMERATED as a way to satisfy the types and still ship the bug:
   6. raw-sends      a new raw `esp_now.send` call site appears. Declared IN THE SOURCE, checked in
                     BOTH directions with counts, so adding a send to an already-listed function
                     fails too.
+  7. mc-publish     #403: an MC crown announce formats a channel that is NOT the `NonZeroU8`-bound
+                    `pub_ch`. Same roster idiom as arm 6 — declared in the source, counted both
+                    ways — because #403's defect WAS a guard present on one branch and absent from
+                    its sibling. See the block above arm 7 for why this one is a type check rather
+                    than a `!= 0` check.
 
 It deliberately does NOT check that `send_to` appends the trailer — that is `should_group_mac`, and
 it is pinned by an ELECT case in `experiments/mac_verify` where the decision is pure and host-tested.
@@ -60,6 +65,19 @@ DECL = re.compile(r"RAW-SEND-SITES:\s*([A-Za-z0-9_:,\s]+?)\s*(?:\*/|\n|$)")
 # fail-closed arm fired, which is the gate doing its job and is why this pattern is widened in the
 # same commit as the behaviour change rather than after it.
 RAW_SEND_RE = re.compile(r"esp_now\s*\.\s*send(?:_async)?\s*\(")
+# ── arm 7 (#403) ──────────────────────────────────────────────────────────────────────────────
+# The crown announce's own format literal, spelled here so a change to the wire shape cannot
+# silently empty this arm (same reasoning as ELECT_LITERAL above).
+MC_FMT_LITERAL = '"MC|{}|{}|{}"'
+MC_DECL = re.compile(r"MC-PUBLISH-SITES:\s*([A-Za-z0-9_:,\s]+?)\s*(?:\*/|\n|$)")
+MC_WRITE_RE = re.compile(r"\bwrite!\s*\(")
+# `let pub_ch = core::num::NonZeroU8::new(…)` — the ONE computation both announce sites read.
+NZ_BIND_RE = re.compile(r"\blet\s+(?:mut\s+)?(\w+)\s*=\s*(?:core::num::)?NonZeroU8::new\s*\(")
+IDENT_RE = re.compile(r"^\w+$")
+# Position of the channel among a site's `write!` arguments: sink, format, node_id, CHANNEL, seq.
+# The wire shape is `MC|<id>|<ch>|<seq>`, so the channel is the second substitution.
+MC_CHANNEL_ARG = 3
+MC_ARG_COUNT = 5
 
 
 def fail(msg, *extra):
@@ -98,6 +116,49 @@ def block_after(text: str, start: int):
             depth -= 1
             if depth == 0:
                 return text[open_at : i + 1]
+    return None
+
+
+def call_args(text: str, macro_end: int):
+    """Top-level, comma-separated arguments of the call whose `(` opens at/after `macro_end`.
+
+    Returns a list of raw argument strings, or None if the parens are unbalanced. Quote-aware so a
+    format literal containing a comma cannot split an argument (none does today; the check should
+    not depend on that staying true).
+    """
+    open_at = text.find("(", macro_end)
+    if open_at < 0:
+        return None
+    depth, in_str, esc, args, cur = 0, False, False, [], []
+    for i in range(open_at, len(text)):
+        c = text[i]
+        if in_str:
+            cur.append(c)
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+            cur.append(c)
+            continue
+        if c in "([{":
+            depth += 1
+            if depth == 1:
+                continue
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append("".join(cur).strip())
+                return args
+        elif c == "," and depth == 1:
+            args.append("".join(cur).strip())
+            cur = []
+            continue
+        cur.append(c)
     return None
 
 
@@ -297,6 +358,122 @@ def main() -> int:
     else:
         total = sum(actual.values())
         notes.append(f"{total} raw send sites across {len(actual)} declared fns")
+
+    # ── arm 7: every MC crown announce formats the GUARDED channel (#403) ─────────────────────
+    # Why this is a TYPE check and not a `!= 0` check, because the difference is the whole point:
+    # `mqtt_session` is the ~2,000-line body STEP T (#335) rewrites in ONE atomic commit. Asserting
+    # that some `!= 0` token exists would pin a token and rot the moment T rewrites the expression
+    # around it — and would pass a rewrite that moved the check to one of the two sites. Asserting
+    # that each site's channel ARGUMENT is a binding produced by `NonZeroU8::new` survives the
+    # rewrite, because T's new code must construct the value through a constructor that refuses 0.
+    #
+    # And the COUNT is what catches the shape #403 actually was: `!= 0` written on one branch and
+    # absent from its sibling. A third announce site is invisible to any check that only inspects
+    # the sites it already knows about.
+    mc_sites = []
+    for path, text in code.items():
+        for m in MC_WRITE_RE.finditer(text):
+            args = call_args(text, m.end() - 1)
+            if args is None or len(args) < 2 or args[1] != MC_FMT_LITERAL:
+                continue
+            fn = enclosing_fn(text, m.start())
+            if fn is None:
+                fail(f"an MC announce in {path.relative_to(root)} is not inside any fn")
+                return 2
+            mc_sites.append((path, fn, args, text.count("\n", 0, m.start()) + 1))
+
+    mc_decl_text = None
+    for text in files.values():
+        m = MC_DECL.search(text)
+        if m:
+            mc_decl_text = m.group(1)
+            break
+    if mc_decl_text is None:
+        fail(
+            "no `MC-PUBLISH-SITES:` declaration found in the firmware source.",
+            "The roster of functions permitted to publish a retained crown announce must live",
+            "where a machine can check it — see arm 7 in this script's docstring.",
+        )
+        return 2
+    mc_declared = {}
+    for tok in re.split(r"[,\s]+", mc_decl_text):
+        if not tok:
+            continue
+        name, _, count = tok.partition(":")
+        if not count.isdigit():
+            fail(f"malformed MC-PUBLISH-SITES entry {tok!r} — expected `fn_name:count`.")
+            return 2
+        mc_declared[name] = int(count)
+
+    if not mc_sites:
+        fail(
+            f"found ZERO MC announce sites — the literal {MC_FMT_LITERAL} appears in no `write!`.",
+            "The announce was reshaped, renamed, or moved to another macro. This arm can no longer",
+            "see the crown's channel, so it refuses to pass: update it deliberately, with the",
+            "roster, in the commit that changes the announce.",
+        )
+        return 2
+
+    mc_actual = {}
+    for _p, fn, _a, _ln in mc_sites:
+        mc_actual[fn] = mc_actual.get(fn, 0) + 1
+    if mc_actual != mc_declared:
+        added = {k: v for k, v in mc_actual.items() if mc_declared.get(k) != v}
+        gone = {k: v for k, v in mc_declared.items() if k not in mc_actual}
+        if added:
+            bad.append(
+                "arm 7 (mc-publish): undeclared or miscounted MC announce sites: "
+                + ", ".join(f"{k}×{v} (declared {mc_declared.get(k, 0)})" for k, v in sorted(added.items()))
+                + ". #403 was a guard present on one publish branch and absent from its sibling; "
+                "an announce site nobody declared is that same shape, and the fleet's rendezvous "
+                "is what it publishes."
+            )
+        if gone:
+            bad.append(
+                "arm 7 (mc-publish): declared but ABSENT: "
+                + ", ".join(f"{k}×{v}" for k, v in sorted(gone.items()))
+                + ". A stale roster entry reads as a considered decision and is worse than none."
+            )
+
+    # The guarded-binding half. Collected per (file, fn) so a `NonZeroU8` bound in some OTHER
+    # function cannot satisfy a site here.
+    nz_binds = set()
+    for path, text in code.items():
+        for m in NZ_BIND_RE.finditer(text):
+            fn = enclosing_fn(text, m.start())
+            if fn is not None:
+                nz_binds.add((path, fn, m.group(1)))
+    for path, fn, args, ln in mc_sites:
+        rel = f"{path.relative_to(root)}:{ln}"
+        if len(args) != MC_ARG_COUNT:
+            fail(
+                f"the MC announce at {rel} has {len(args)} `write!` arguments, expected "
+                f"{MC_ARG_COUNT} (sink, format, id, channel, seq).",
+                "This arm reads the channel positionally, so a reshaped announce makes it blind.",
+                "Update arm 7 in the same commit that reshapes the wire format.",
+            )
+            return 2
+        chan = args[MC_CHANNEL_ARG]
+        if not IDENT_RE.match(chan):
+            bad.append(
+                f"arm 7 (mc-publish): the MC announce at {rel} formats the channel as the "
+                f"expression `{chan}` rather than a guarded binding. #403: a channel computed at "
+                "the publish site is a channel no type refused — `my_channel` is legitimately 0 "
+                "until learned, and announcing that 0 stranded the fleet for 4 h."
+            )
+        elif (path, fn, chan) not in nz_binds:
+            bad.append(
+                f"arm 7 (mc-publish): the MC announce at {rel} formats `{chan}`, which is NOT bound "
+                f"by `NonZeroU8::new` in `{fn}`. The guard is the TYPE, at the one `pub_ch` "
+                "computation both sites read — that is what survives STEP T's rewrite of this "
+                "function, where one lost `!= 0` among 2,000 rewritten lines is what no reviewer "
+                "catches."
+            )
+    if not any(b.startswith("arm 7") for b in bad):
+        notes.append(
+            f"{len(mc_sites)} MC announce site(s) across {len(mc_actual)} declared fn(s), "
+            "channel NonZeroU8-bound"
+        )
 
     if bad:
         print("FATAL: the ELECT send-path invariant is violated.", file=sys.stderr)

@@ -2632,6 +2632,17 @@ pub(crate) fn ota_fail_is_bulk_deaf(w: u32) -> bool {
 /// `telemetry` empty ⇒ downlink-only (the boot path). Returns whether we CONNECTED
 /// (CONNACK rc=0): that is the "flush delivered" signal for the caller's backoff —
 /// a downlink miss is NOT a failure (the cache simply keeps its prior value).
+///
+/// MC-PUBLISH-SITES: mqtt_session:2
+///
+/// Every function that formats a retained crown announce (`MC|<id>|<ch>|<seq>`), with its call
+/// COUNT, checked in BOTH directions by `tools/check_elect_send_path.py` (arm 7). Counts and not
+/// just names, because #403 *was* a guard present on one branch and absent from its sibling: a
+/// THIRD announce site — inside this function or a new one — is precisely what a name-only
+/// allowlist would wave through. The same arm asserts each site's channel argument is the
+/// `NonZeroU8`-bound value from the single `pub_ch` computation, so "the MC-publish guard survives
+/// STEP T's rewrite" is a red gate rather than a review promise. The two sites today are the #51
+/// claim publish and #114 H2's re-assert over a higher id.
 #[cfg(feature = "wifi")]
 #[allow(clippy::too_many_arguments)]
 fn mqtt_session(
