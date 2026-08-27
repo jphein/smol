@@ -74,6 +74,13 @@ hardware-does-not-allow here. No C5 feature the S3's hardware allows is missing.
 - has-die-temp — esp-hal 1.1.x exposes no TSENS reading on the S3 (smol-native #407
   ships the `Option<f32>` fallback for the same reason).
 
+## GUI flavor vs fleet node — superset ruling (#473, JP 2026-08-27)
+The GUI/watch flavor must be a SUPERSET of the smol fleet node ("all the features of
+the smol node, just added stuff"). Fleet features missing from the GUI flavor score
+as GAPS with issue links, never N/A-by-design. First confirmed instance: the GUI
+flavor does not render smol custom-screen pages (bench-ask convention unusable while
+the S3 runs the GUI image) — #473. Watch lane owns the sweep + fix.
+
 ## Watch-lane items in flight (theirs)
 - NTP re-sync deadlock (announce gated on ntp_synced; retry only while associated).
 - C5 swipe work (vesper's XPT2046 driver; invisible-shade dirty-propagation suspect —
