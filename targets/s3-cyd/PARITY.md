@@ -22,6 +22,14 @@ Two flavors, one board: **smol-native** (rust/clock, fleet tier) and **watch-GUI
 
 ## GAPS — hardware allows, firmware doesn't yet
 
+> **Each open gap below now has an issue** (filed 2026-08-27 from `docs/CAPABILITIES.md`, PR #474,
+> all `[matrix]`-prefixed): **1** → #476 (fleet audio path) · #477 (GUI audio-out first listen) ·
+> #478 (GUI audio-in, phase 2) · **2** → #479 · **3** → #480 · **4** → #481 · **6** → #482 ·
+> **7** → #483. Plus two this list did not have: #484 (the xtensa stack high-water instrument, which
+> is what pins the floor at `ObservedSufficient`) and #491 (the GUI flavor's missing WS2812 driver —
+> see gap 5). The matrix cell is each issue's acceptance test, so this list and the matrix cannot
+> drift apart without one of them failing its own check.
+
 1. **Audio (BIGGEST)** — ES8311 codec + mic (LMA2718B381) + 3 W amp are ON THIS BOARD
    and the codec init already ACKs (`[AUDIO] Codec OK` — same chip as the C6, shared
    I2C). But: `has-audio` is OFF in the S3 feature arm, and the I2S/amp wiring in
@@ -40,8 +48,19 @@ Two flavors, one board: **smol-native** (rust/clock, fleet tier) and **watch-GUI
    exists for touch). Hardware does NOT allow IMU features here — document, not port.
 4. **has-light-sleep** — off for S3. esp-hal S3 has rtc_cntl sleep (unlike the C5);
    worth enabling for AOD power. Needs a bench current check, not just a compile.
-5. **WS2812 status LED (GPIO42)** — smol-native parity with C3/C5 status light; RMT
-   driver. (#398 follow-up.)
+5. ~~WS2812 status LED (GPIO42)~~ **DONE — and this row was stale, not open**: the
+   smol-native driver is in the tree. `rust/clock/src/led.rs` carries a hand-written
+   WS2812 RMT frame encoder (26 pulse codes, 12.5 ns/tick at 80 MHz, GRB) and
+   `rust/clock/src/board_s3.rs` declares `PIN_WS2812 = 42`. Hand-written because
+   `esp-hal-smartled` 0.17 wants esp-hal ~1.0 and is incompatible with 1.1.x
+   (BOARD.md L-row for GPIO 42 says so). §"the cyd-c5 half" below already said DONE,
+   so **this file contradicted itself** — caught by the capability matrix
+   (`docs/CAPABILITIES.md`, PR #474) and struck here.
+   ⚠️ **Scope of the DONE: the smol-native flavor only.** The watch-GUI flavor
+   declares `WS2812_GPIO = 42` in `targets/c6-watch/src/board/esp32s3_cyd.rs` and
+   nothing in that tree reads it — tracked as **#491**, which also covers the fleet
+   LED's peer-state semantics (off → blink → solid, settable via CFG `L`) that the
+   GUI flavor has no counterpart for.
 6. **LEDC backlight dimming (GPIO45)** — both flavors run the backlight as a bare
    GPIO today; the GUI's brightness slider is a threshold, not a dim.
 7. **Cast mirror blank on S3** — smol-native known bug (#398 follow-up).
@@ -61,8 +80,15 @@ The C5's feature surface decomposes into: (a) the smol-native fleet tier — the
 runs the same tier and EXCEEDS it (Bard on-device, OTA citizenship proven 345→1405);
 (b) the watch-GUI flavor — the S3 shares the identical GUI stack (same shell, same
 scenes, same renderer; the C5's on-glass bless and the S3's landed the same night);
-(c) WS2812 status light — DONE on the S3 (RMT driver, OTA-delivered, JP-verified
-green); (d) the Zigbee-bridge role — NOT a C5 hardware feature at all: it is a
+(c) WS2812 status light — DONE on the S3's smol-native flavor (RMT driver,
+OTA-delivered, JP-verified green). ⚠️ **Corrected 2026-08-27**: this clause used to
+read as parity *against a C5 status light*, and the C5 does not have one to match —
+`targets/c6-watch/src/board/cyd_c5.rs` declares `WS2812_GPIO = 27` and **nothing in
+the GUI tree reads it**, so only the constant exists (#486 scopes the board, #491
+covers the missing GUI-flavor driver on both boards). The S3 therefore does not
+merely match the C5 here, it exceeds it — which does not change this section's
+verdict, but the old wording asserted a C5 capability nobody had verified;
+(d) the Zigbee-bridge role — NOT a C5 hardware feature at all: it is a
 two-chip design (ESP32-H2 companion over UART, JP-back-burnered 08-25) and the
 802.15.4 radio it leans on does not exist on the S3, so it falls under
 hardware-does-not-allow here. No C5 feature the S3's hardware allows is missing.

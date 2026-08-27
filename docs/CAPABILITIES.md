@@ -11,8 +11,11 @@ website carry compact views of it.
 > and reads as current forever. So four rules apply.
 >
 > 1. **The tree wins.** Where this file and the source disagree, the source is right and this file
->    is a bug. Six cells below already exist because the tree contradicted a prose doc — each is
->    marked *(tree wins)* with what the doc said.
+>    is a bug. Six cells below exist because the tree contradicted a prose doc — all six are listed
+>    under *"Where this file corrects a prose doc"*, and the two that were fixable inside this lane
+>    (`PARITY.md`'s self-contradicting gap 5, and its implied C5 status light) were **fixed at the
+>    source** rather than merely footnoted here. A correction that lives only in the matrix leaves the
+>    wrong claim in the place people actually read.
 > 2. **Every non-✅ cell states its reason, and every closable gap carries an issue.** A matrix of
 >    bare icons is unmaintainable, because nothing records *why* a cell is amber and therefore
 >    nothing can tell you when it stops being amber. The reason is the content; the icon is the
@@ -197,7 +200,7 @@ not speak.
 | **Display idle-sleep + wake** | — | 🔶 not a documented feature of the fleet flavor | 🔶 same | ✅ JP witnessed | ✅ AOD light-sleep | 🔶 shared source (#488) |
 | **Backlight dimming** | — | — | 🛠 LEDC on GPIO45 — run as a **bare GPIO** today (#482) | 🛠 same — and the GUI's brightness slider is a threshold, not a dim, so the control already exists and lies (#482) | ✅ brightness slider | 🛠 plain GPIO25, no PWM driver (#486) |
 | **Buttons / physical input** | 🔶 BOOT only — that *is* the whole UI: one button drives the app registry | 🔶 same | ✅ BOOT key (`HAS_BOOT_KEY`) | ✅ | ✅ BOOT/POWER short- and long-press, user-mappable from *Settings › Buttons*; the power button always wakes first, so a press in the dark can never fire an unseen action. AXP2101 4-s hardware failsafe intact | 🔶 shared source (#488) |
-| **Status LED** | ✅ onboard LED shows ESP-NOW peer state (off → blink = detected → solid = connected), settable via CFG `L` | ✅ | ✅ **WS2812 ×1 on GPIO42, GRB, driven over RMT directly** — `esp-hal-smartled` 0.17 wants esp-hal ~1.0 and is incompatible with 1.1.x, so `led.rs` encodes the frame itself *(tree wins: `PARITY.md` gap 5 still lists this as open; §"the cyd-c5 half" in the same file says DONE, and the driver is in the tree)* | 🛠 `WS2812_GPIO = 42` declared in `board/esp32s3_cyd.rs` with **no consumer** in the GUI tree — and the fleet's LED carries protocol semantics the GUI board is missing (#491) | ❌ no WS2812 fitted on this board | 🛠 `WS2812_GPIO = 27` declared, **no consumer** (#491) *(tree wins: `PARITY.md` implies a C5 status light exists; only the constant does)* |
+| **Status LED** | ✅ onboard LED shows ESP-NOW peer state (off → blink = detected → solid = connected), settable via CFG `L` | ✅ | ✅ **WS2812 ×1 on GPIO42, GRB, driven over RMT directly** — `esp-hal-smartled` 0.17 wants esp-hal ~1.0 and is incompatible with 1.1.x, so `led.rs` encodes the frame itself *(the tree settled a self-contradiction in `PARITY.md`; gap 5 struck in this PR)* | 🛠 `WS2812_GPIO = 42` declared in `board/esp32s3_cyd.rs` with **no consumer** in the GUI tree — and the fleet's LED carries protocol semantics the GUI board is missing (#491) | ❌ no WS2812 fitted on this board | 🛠 `WS2812_GPIO = 27` declared, **no consumer** (#491) *(`PARITY.md`'s implied C5 status light was only ever this constant; corrected in this PR)* |
 | **smol Cast** (mirror the screen to a WLED matrix as UDP pixels) | 🔶 in the fleet tier; nothing to mirror without a panel | ✅ hardware-verified (#26) | 🔶 **known bug: the Cast mirror is blank on the S3** (#483) | 🔶 the GUI flavor's `cast` is opt-in and default-off, so it is absent from shipped builds; pixel-correctness never verified from a GUI board (#493) | 🔶 same (#493) | 🔶 same (#493) |
 | **WLED WiZmote emit** (impersonate a linked remote) | 🔶 `wled` is a build tier, not in the canonical fleet features | 🔶 | 🔶 | 🔶 a `WLED` app tile exists in the GUI registry | 🔶 | 🔶 |
 
@@ -277,13 +280,15 @@ acceptance test.**
 Six cells above exist because the tree contradicted a document. Recorded here so the docs get
 fixed rather than the contradiction being re-discovered.
 
-1. **S3 WS2812 status LED.** `PARITY.md` gap 5 lists it as open ("smol-native parity with C3/C5
-   status light; RMT driver"), while §"the cyd-c5 half" of the *same file* says it is DONE. The tree
-   settles it: `rust/clock/src/led.rs` carries the full WS2812 RMT frame encoder and
-   `board_s3.rs` declares `PIN_WS2812 = 42`. Gap 5 should be struck like gaps 8 and 9.
-2. **C5 status light.** `PARITY.md` decomposes the C5 into "(c) WS2812 status light", implying the
-   board drives one. Only the constant exists — `WS2812_GPIO = 27` in `board/cyd_c5.rs`, with no
-   consumer anywhere in the GUI tree (#491).
+1. **S3 WS2812 status LED — ✅ fixed in this PR.** `PARITY.md` gap 5 listed it as open ("smol-native
+   parity with C3/C5 status light; RMT driver") while §"the cyd-c5 half" of the *same file* said it
+   was DONE. The tree settles it: `rust/clock/src/led.rs` carries the full WS2812 RMT frame encoder
+   and `board_s3.rs` declares `PIN_WS2812 = 42`. **Gap 5 is now struck** like gaps 8 and 9, with the
+   scope of the DONE stated (smol-native only — the GUI flavor's is #491).
+2. **C5 status light — ✅ fixed in this PR.** `PARITY.md` decomposed the C5 into "(c) WS2812 status
+   light", which read as parity *against a C5 capability*. Only the constant exists —
+   `WS2812_GPIO = 27` in `board/cyd_c5.rs`, with no consumer anywhere in the GUI tree. That clause
+   is now corrected in place (#486 scopes the board, #491 covers the missing driver).
 3. **"The S3 and C6 have the DRAM to carry the Bard as an ordinary smol feature"**
    (`rust/clock/Cargo.toml`, at the `bard` feature). Not against today's rows: `dram_headroom()` is
    `free_dram − stack_floor`, so the S3 has 24,672 B and the C6 8,592 B against a 39,072 B cost —
