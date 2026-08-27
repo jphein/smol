@@ -26,10 +26,19 @@ Two flavors, one board: **smol-native** (rust/clock, fleet tier) and **watch-GUI
 | Heap region labels read TRUE (e4c3134 verified on S3) | GUI | 2026-08-27 boot: `main_free=98304 recl_free=65536 psram_free=8342384` — internal pool under its own name, PSRAM under psram_free |
 | `[IMU] absent` honest line (closes #480 on hardware) | GUI | 2026-08-27 boot log: `[IMU] absent (init NACK - no IMU on this board)` — println, not ESP_LOG-gated |
 
-**Outstanding (2026-08-27, agreed with the watch lane):** (1) cell unplug — JP, empty-battery
-honesty read; (2) speaker install — JP, audio-out acoustic first-listen (`beep` is ready the
-moment it's wired); (3) #478 — watch lane, S3 ES8311-ASDOUT capture (audio-in); the
-`[MIC] rms_peak_1s=` instrument flows to the S3 automatically when it lands.
+**Outstanding (updated 2026-08-27 ~13:40):**
+(1) ~~cell unplug~~ **RESOLVED — hardware-does-not-allow.** JP: "there is no cell in the
+s3" — yet the divider read 3.93–3.98 V all day. Mechanism (BOARD.md power section): the
+TP4054's BAT pin drives toward its float voltage on VBUS, so with USB attached the node is
+DRIVEN, not floating; no pulldown probe can collapse it and no VBUS/CHRG status reaches a
+GPIO. Empty-vs-present is undetectable by voltage on USB; off USB with no cell the board
+is simply off. The gauge on a cell-less USB-powered board reads the charger float (~78%) —
+a documented hardware limitation, not a firmware bug. Probe-v2's present-case stays valid
+when a real cell is fitted (a discharging cell reads its true voltage).
+(2) speaker install — **deferred by JP** ("i don't want to install a speaker right now").
+Hardware port verified electrically; `beep` delivers the first tone whenever it's wired.
+(3) #478 — watch lane, S3 ES8311-ASDOUT capture (audio-in); the `[MIC] rms_peak_1s=`
+instrument flows to the S3 automatically when it lands.
 
 **Bench rig of record (2026-08-27):** the `debug-console` cargo feature + `tools/ui_test.py`
 inject synthetic taps/swipes on the real touch path and report per-frame render timings —
