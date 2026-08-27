@@ -3786,14 +3786,26 @@ impl RadioManager {
                 // (`ANNOUNCE_BURST × ANNOUNCE_GAP_MS`) of pure CPU spin. The inline
                 // rationale above says "a tick-driven burst cannot work here: the
                 // reassociation below is synchronous, so the main loop will not run again
-                // until the move is already over." STEP T REMOVES THAT PREMISE: the
-                // reassociation is no longer synchronous, so this can await instead of spin.
+                // until the move is already over."
+                //
+                // STEP T lets this await rather than spin — but NOT because the reassociation
+                // became asynchronous. `block_on(disconnect_async())` / `block_on(connect_async())`
+                // below keep it synchronous from the EXECUTOR's view, which is the only view that
+                // rationale was ever about; removing them is STEP C's. Awaiting is safe for the
+                // OPPOSITE reason to the old rationale: `run()` stays SUSPENDED across this await,
+                // so the mesh loop cannot re-enter.
                 //
                 // ⚠️ This is the ONE deliberate behavioural timing change in STEP T. The
                 // announce CADENCE is unchanged (`due()` still gates each frame at
-                // `ANNOUNCE_GAP_MS`) and so is the total window; what changes is that the
-                // gaps now yield to the executor rather than spin, so `net_task` and the
-                // mesh RX path run DURING the burst instead of being starved by it.
+                // `ANNOUNCE_GAP_MS`) and so is the total window. What changes is that `net_task`
+                // keeps pumping the stack through the gaps and ~600 ms of CPU is no longer burned.
+                //
+                // The mesh RX path is NOT serviced during the gaps either way: `r.service()` lives
+                // in `run()` (main.rs), and `run()` is suspended right here. Pre-T it was a spin,
+                // post-T it is a suspend — unserviced in both. **The deaf window is NARROWED, not
+                // CLOSED**, and that distinction is the whole reason this comment is worded
+                // carefully: a reader who takes "the mesh runs during the burst" as a property
+                // will conclude deaf windows are solved, and build on a guarantee that is not here.
                 while !self.elect_announcer.clear_to_move() {
                     let t = now_ms();
                     if self.elect_announcer.due(t) {
