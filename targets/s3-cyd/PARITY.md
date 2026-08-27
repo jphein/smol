@@ -53,10 +53,16 @@ wrong; the poll loop re-samples every 180 s (600 s screen-off), main.rs ~3168. O
    board HAS a battery ADC: GPIO9, 2:1 divider (BOARD.md). Needs a `has-batt-adc`
    capability arm feeding the same battery UI the PMU feeds on the C6. Kills the 0%
    cosmetic honestly.
-3. **`[IMU] OK` is a VACUOUS LIE on this board** — init is ungated, `let _ =` swallows
-   the NACK, and the ES3C28P has no QMI8658 (absent from BOARD.md pin map). Fix:
-   print by result (OK/absent), gate consumers on `has-imu` (Null-stub pattern already
-   exists for touch). Hardware does NOT allow IMU features here — document, not port.
+3. ~~**`[IMU] OK` is a VACUOUS LIE on this board**~~ **FIXED upstream (`ae80072`, 2026-08-26),
+   delivered here by #470's subtree refresh.** The ES3C28P still has no QMI8658 (absent from
+   BOARD.md pin map), but the log no longer claims otherwise: `src/main.rs` matches on
+   `imu.init()` and prints `absent (init NACK - no IMU on this board)`, and consumers are
+   gated — `has-imu` is NOT on the `board-esp32s3-cyd` arm, so the tilt-driven `Maze` tile is
+   absent and the shell renders "no IMU". Hardware still does NOT allow IMU features here —
+   document, not port — which is why the ❌ stays ❌ (#480).
+   ⚠️ **Unobserved:** nobody has read a boot log off id162 confirming the honest line on the
+   *running* image. The code is in the source the next build ships; that is a weaker claim than
+   "seen on the board", and #480 asks for the stronger one.
 4. **has-light-sleep** — off for S3. esp-hal S3 has rtc_cntl sleep (unlike the C5);
    worth enabling for AOD power. Needs a bench current check, not just a compile.
 5. ~~WS2812 status LED (GPIO42)~~ **DONE — and this row was stale, not open**: the
