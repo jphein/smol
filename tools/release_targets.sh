@@ -105,6 +105,9 @@ for m in "${MANIFESTS[@]}"; do
 **sha256** \`$sha\` · chip **$chip** · flavor **$flavor** · build stamp **0** (downloads are
 not fleet-ratchet builds; identity is this git hash, not the on-screen number).
 
+Verify your download (the release's \`SHA256SUMS\` covers every artifact; you have one):
+\`sha256sum -c --ignore-missing SHA256SUMS\` — or compare against the sha256 above directly.
+
 **Who this is for:** flashing NEW hardware to join a smol mesh. Boards already on the mesh
 update over mesh OTA only — never by re-downloading this file.
 
@@ -328,6 +331,9 @@ for m in "${MANIFESTS[@]}"; do
 # $aname — smol GUI firmware image ($DATE_UTC, git $GITHASH)
 
 **sha256** \`$sha\` · chip **$chip** · flavor **gui** · board feature \`$gui_board\`
+
+Verify your download (the release's \`SHA256SUMS\` covers every artifact; you have one):
+\`sha256sum -c --ignore-missing SHA256SUMS\` — or compare against the sha256 above directly.
 
 This is the **rich-GUI** firmware — the touch/Slint watch shell from \`targets/c6-watch\`, not
 the \`rust/clock\` fleet image. Both speak the same SMOLv1 mesh; they are different programs.

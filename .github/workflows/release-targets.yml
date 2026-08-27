@@ -137,7 +137,9 @@ jobs:
     # each `gh release upload --clobber out/*`, so a per-job file would cover only whichever job
     # uploaded last (#474 found the file missing for exactly this reason). This job runs after all
     # three and checksums what is actually downloadable — the release's current .bin assets —
-    # so `sha256sum -c SHA256SUMS` works from a download directory regardless of which job built what.
+    # so `sha256sum -c --ignore-missing SHA256SUMS` works from a download directory regardless of
+    # which job built what. (--ignore-missing is part of the documented command, docs/RELEASES.md:
+    # the file covers all ten artifacts and a reader downloads one; bare -c exits 1 on a good file.)
     name: combined SHA256SUMS
     needs: [riscv-targets, riscv-gui-targets, s3-target]
     if: ${{ always() && contains(needs.*.result, 'success') }}
