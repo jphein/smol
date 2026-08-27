@@ -27,8 +27,9 @@ Two flavors, one board: **smol-native** (rust/clock, fleet tier) and **watch-GUI
 **Bench rig of record (2026-08-27):** the `debug-console` cargo feature + `tools/ui_test.py`
 inject synthetic taps/swipes on the real touch path and report per-frame render timings —
 the S3 test suite (`targets/s3-cyd/tmp/s3_suite.py`) runs the whole matrix with no hands.
-⚠️ Known gap found by it: the S3 battery probe is BOOT-ONLY (gauge freezes at boot value;
-reported to the watch lane for a poll-loop re-sample before/after the batt merge).
+(Corrected 2026-08-27: an earlier note here claimed the battery probe was boot-only —
+wrong; the poll loop re-samples every 180 s (600 s screen-off), main.rs ~3168. Only the
+`[BATT]` diag PRINT is boot-only. Retracted with the watch lane same hour.)
 
 ## GAPS — hardware allows, firmware doesn't yet
 
