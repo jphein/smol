@@ -169,6 +169,31 @@ else
   printf '%s\n' "$out" | sed 's/^/        /'; bad "sigil vendor"
 fi
 
+# #460 the committed Cargo.lock is actually consulted. Unconditional and early for the same reason as
+# the arm above: if dependency RESOLUTION drifted, every later measurement — the tier checks, the
+# stack floor, #390's symbol-size baseline — is about a graph nobody recorded.
+#
+# `mipidsi` is pinned `=0.10.0` on purpose (s3_oled's ORIENTATION reasoning is tied to 0.10's MADCTL
+# semantics) and on 2026-08-26 the lock did not contain it at all, because no build path passes
+# `--locked` and so every build silently rewrote the file. The strictest pin cargo offers, enforced by
+# nobody. This is #460's option 2 — a gate arm rather than `--locked` spliced into every build
+# invocation, which would change how everyone builds and collide with whichever lane holds those
+# files. If `--locked` is ever adopted on the build paths, DELETE this arm; two statements of one fact
+# is the thing half this file's history is about.
+#
+# THREE outcomes, not two (see the checker's header for the six measured flag/cache combinations):
+# STALE is a hard FAIL; "could not check" (cargo absent, network unreachable) prints loudly and does
+# NOT fail, because that state is the instrument being unavailable rather than a defect in the tree —
+# and if cargo were genuinely missing, every arm below would fail on its own account.
+step "committed Cargo.lock is consulted (#460)"
+out=$("$ROOT/tools/check_lock_fresh.sh" 2>&1); lock_rc=$?
+case "$lock_rc" in
+  0) printf '%s\n' "$out" | sed 's/^/        /'; ok "lock fresh" ;;
+  1) printf '%s\n' "$out" | sed 's/^/        /'; bad "lock fresh" ;;
+  *) printf '%s\n' "$out" | sed 's/^/        /'
+     printf '   \033[33mnote\033[0m %s\n' "lock freshness could not be measured (not a tree defect)" ;;
+esac
+
 # Both firmware halves need `board.rs`/`secrets.rs`, so this runs for either — `excl` on its
 # own in CI would otherwise fail on the missing files rather than on anything it measures.
 if [ "$run_fw" = 1 ] || [ "$run_excl" = 1 ]; then
@@ -697,6 +722,25 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | tail -2; ok "test_config_markers"
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_config_markers"
+  fi
+
+  # #460: prove the lock arm can fail, and — the harder half — that it cannot fail FALSELY.
+  #
+  # Its keeper arms are the two negatives. `--offline` makes `cargo metadata --locked` exit 101 on a
+  # perfectly FRESH lock whenever the registry cache is cold, which on a clean CI runner is the
+  # normal state; and a crate copied without its sibling path deps exits 101 for a third unrelated
+  # reason. Both are asserted to read as "could not check", never STALE. Without them the checker's
+  # central decision — that only cargo's own `because --locked was passed` sentence licenses the
+  # finding — was untested, and sabotaging it was caught by nothing else in the suite.
+  #
+  # It resolves real dependency graphs rather than matching text, but a warm `cargo metadata --locked`
+  # is ~0.13 s and the whole suite measured 0.9 s here — so it is NOT the slow arm its position might
+  # suggest. Placed last in the pure-text run only because it is the newest.
+  step "Cargo.lock freshness gate regression suite (#460)"
+  if out=$("$ROOT/tools/test_lock_fresh.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -2; ok "test_lock_fresh"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_lock_fresh"
   fi
 
   # #426: prove the comment-blind sweep took, in BOTH directions. Three checkers were counting
