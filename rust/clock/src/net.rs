@@ -9,12 +9,11 @@
 #[cfg(feature = "wifi")]
 mod wifi;
 
-// #233: smoltcp `phy::Device` shim over esp-radio 0.18's raw rx/tx tokens (esp-radio
-// dropped esp-wifi's `smoltcp` feature). Transitional — deleted when #198 lands embassy-net.
-#[cfg(feature = "wifi")]
-mod radio_dev;
-#[cfg(feature = "wifi")]
-pub use radio_dev::SmolWifiDevice;
+// #233's smoltcp `phy::Device` shim (`radio_dev.rs`, `SmolWifiDevice`) was DELETED by #335
+// STEP T. Its own header said it: "when smol moves to embassy-net (#198) this whole module is
+// deleted." esp-radio 0.18's STA `Interface` implements `embassy_net_driver::Driver` directly,
+// so with the transport on embassy-net there is nothing left for a hand-rolled phy shim to
+// adapt — `bring_up_stack` hands the interface straight to `embassy_net::new`.
 
 /// #141: clamp the radio's max TX power. Cheap C3-supermini boards distort their own TX at
 /// full power (worse on marginal USB supplies) — the AP receives corrupted auth/ACK frames
@@ -343,6 +342,120 @@ pub(crate) fn radio_controller_config() -> esp_radio::wifi::ControllerConfig {
         .with_dynamic_rx_buf_num(40)
         .with_rx_queue_size(8)
         .with_rx_ba_win(12)
+}
+
+/// #335 STEP T: the always-on embassy-net driver pump. `runner.run().await` drives the internal
+/// smoltcp stack's TX/RX/timers and the DHCP client, REPLACING the ~28 hand-driven `iface.poll()`
+/// / `dhcp.poll()` sites the burst paths used to carry. It parks awaiting interface readiness, so
+/// while it awaits, the executor runs the inline ESP-NOW mesh loop — which is the structural half
+/// of the deaf-window kill: the mesh keeps polling *between* the transport's `.await`s.
+#[cfg(feature = "wifi")]
+#[embassy_executor::task]
+async fn net_task(
+    mut runner: embassy_net::Runner<'static, esp_radio::wifi::Interface<'static>>,
+) -> ! {
+    runner.run().await
+}
+
+/// #335 STEP T: `StackResources<N>`'s N, chosen rather than inherited — see `bring_up_stack`.
+///
+/// **Measured cost (#439): `StackResources<N>` = 448 + 352·N bytes**, exactly linear across five
+/// probe points, all `MaybeUninit` so it is pure `.bss`. N=5 is **2,208 B**.
+///
+/// **Why 4, derived from embassy-net 0.9.1's SOURCE against THIS crate's feature set** —
+/// `StackResources<SOCK>` is the *entire* `SocketSet` storage (`lib.rs:75`), and the stack adds
+/// its own housekeeping sockets into it. Both of those adds are `#[cfg]`-gated, which is the part
+/// that decides the number:
+///
+/// | slot | what | present here? |
+/// |---|---|---|
+/// | — | DNS (`lib.rs:350`) | **NO** — gated `#[cfg(feature = "dns")]`, and our embassy-net features are `tcp, udp, dhcpv4, medium-ethernet, log` |
+/// | 1 | DHCPv4 (`lib.rs:703-710`) | yes — gated `#[cfg(feature = "dhcpv4")]`, which we enable |
+/// | 2 | the TCP socket (MQTT session / OTA fetch — never both) | transient |
+/// | 3 | the UDP socket (SNTP request, or `cast`'s DNRGB listener) | transient |
+/// | 4 | spare — one transient outliving another across a burst boundary | transient |
+///
+/// ⚠️ **The DNS row is why this const carries a derivation instead of a number.** A first pass at
+/// this read `sockets.add(dns::Socket::new(..))` at `lib.rs:350` and counted the slot; the line is
+/// real, and the `#[cfg(feature = "dns")]` directly above it is what makes it irrelevant here.
+/// Reading a call site without its gate is how a static ends up sized for a build nobody makes.
+/// **If a future feature turns `dns` on, this const must go up with it** — that is not automatic
+/// and nothing else will notice.
+///
+/// **The asymmetry that decides the spare, and it is the whole argument:** too HIGH costs 352 B of
+/// `.bss` — 7% of the 4,771 B the image is short (T-SCOPE §7.1). Too LOW is a `SocketSet`-full
+/// panic at runtime, which on this tree means `custom_halt` → `software_reset` → a boot loop on a
+/// fleet that OTAs itself. Those are not comparable costs, and **#404 is the precedent**: a
+/// `SocketSet` that quietly ran out of slots took the fleet down hourly for weeks. Pay the 352 B.
+#[cfg(feature = "wifi")]
+pub(crate) const NET_SOCKETS: usize = 4;
+
+/// #335 STEP T: the ONE embassy-net bring-up, called from BOTH radio tiers.
+///
+/// It exists as a shared helper for a specific reason rather than for tidiness. PHASE3-PLAN §2.2
+/// step 3 names three details as "load-bearing and easy to lose", and a second bring-up site is
+/// exactly where they get lost — silently, because every one of them fails in a way that still
+/// compiles and still boots:
+///
+/// 1. **DR-M3, the seed.** Two `rng.random()` draws, per boot. A shared literal gives the entire
+///    fleet identical TCP ISNs and ephemeral ports — every board indistinguishable to the broker
+///    and to any middlebox, which reads as a network fault, not a firmware one.
+/// 2. **`self_mac` before the move.** `interfaces.station` is CONSUMED here, so the caller must
+///    read its MAC *first* (#68/#76 self-frame drop). Enforced by the signature: this function
+///    takes the interface by value, so a caller that has not already read the MAC cannot get it
+///    back. That is deliberate — the ordering is a type-level fact rather than a comment.
+/// 3. **Spawn failure is `log::error!`, never `.expect()`.** smol's boot path is panic-free by
+///    policy: a panic is MF-2 `software_reset`, i.e. a boot loop.
+///
+/// The DHCP hostname (`kind 12 = "smol"`) is carried across deliberately, and carrying it needed
+/// a **Cargo feature**, not a line of code: `DhcpConfig::hostname` does not exist without
+/// `dhcpv4-hostname`, so the natural bring-up — written against embassy-net's default features —
+/// compiles fine and silently ships an anonymous DHCP lease. See the feature's comment in
+/// `Cargo.toml`. A board identifiable in the lease table is how a wedged transfer gets attributed
+/// to the right peer instead of to the wrong board.
+#[cfg(feature = "wifi")]
+pub(crate) fn bring_up_stack(
+    spawner: embassy_executor::Spawner,
+    station: esp_radio::wifi::Interface<'static>,
+    rng: &mut esp_hal::rng::Rng,
+) -> embassy_net::Stack<'static> {
+    // DR-M3: per-boot entropy, TWO draws — `rng.random()` is u32 and the seed is u64.
+    let seed: u64 = ((rng.random() as u64) << 32) | (rng.random() as u64);
+
+    // DHCP option kind 12, exactly as all three pre-T sites set it. Built through `Default` +
+    // the inherent `push_str` rather than by naming `heapless::String<32>`: this crate has NO
+    // heapless dependency and hand-rolls `mesh_snake::heapless_line` instead, so borrowing
+    // embassy-net's transitive copy would add a direct dep — and a version-pinned one, since the
+    // lock already carries heapless 0.8 and 0.9 — to write a four-character string.
+    let mut dhcp = embassy_net::DhcpConfig::default();
+    dhcp.hostname = Some(Default::default());
+    if let Some(h) = dhcp.hostname.as_mut() {
+        // Infallible at 4 of 32 bytes; a lost hostname would only cost lease-table identity, and
+        // `unwrap` here would trade that for a boot-path panic.
+        let _ = h.push_str("smol");
+    }
+
+    static NET_RESOURCES: static_cell::StaticCell<embassy_net::StackResources<NET_SOCKETS>> =
+        static_cell::StaticCell::new();
+    let (stack, runner) = embassy_net::new(
+        station,
+        embassy_net::Config::dhcpv4(dhcp),
+        NET_RESOURCES.init(embassy_net::StackResources::new()),
+        seed,
+    );
+
+    // Panic-free boot policy. There is exactly ONE fallible step and it is the token:
+    // `embassy_executor::Spawner::spawn` returns `()` in 0.10 (spawner.rs:162), so capacity
+    // failure can only surface as `net_task(..)` yielding `Err`. Checked rather than assumed —
+    // an earlier draft here handled a `Result` from `spawn` and criticised the reference for not
+    // doing so; the reference was right and the draft did not compile.
+    match net_task(runner) {
+        Ok(token) => spawner.spawn(token),
+        Err(_) => log::error!(
+            "smol #335 T: net_task spawn failed (executor pool exhausted) — transport will not pump"
+        ),
+    }
+    stack
 }
 
 /// Phase-1 (default) placeholder used when no radio features are enabled: the

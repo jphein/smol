@@ -633,19 +633,40 @@ fn millis() -> u64 {
 // ⚠️ `#[esp_rtos::main]` does NOT start the scheduler — it only creates the executor. The single
 // `esp_rtos::start` still has to be called by hand, and lives in `run()` at the radio bring-up
 // (see there for why it is placed exactly where the old two calls used to fire).
+// #335 STEP T: the boot `Spawner`, threaded to the radio bring-up so `net_task` lands on
+// the executor that is actually running this future.
+//
+// It is threaded rather than fetched at the use site because both of embassy's
+// `for_current_executor()` accessors are wrong here: the safe one is on `SendSpawner` and
+// can only spawn `Send` tasks (`net_task`'s `Runner` is not), and `Spawner`'s is `unsafe`
+// AND documented to PANIC if the current executor is not an Embassy executor — and a panic
+// on the boot path is MF-2 `software_reset`, i.e. a boot loop.
+//
+// The alias is what keeps `run()` a SINGLE body. `embassy-executor` is `wifi`-gated on this
+// tree, so the `Spawner` type does not exist on the no-radio tier; a cfg-split `run()`
+// signature would fork ~300 lines that have no business differing. `run` only ever reads
+// this inside `#[cfg(feature = "wifi")]` regions.
+#[cfg(feature = "wifi")]
+type BootSpawner = Spawner;
+#[cfg(not(feature = "wifi"))]
+type BootSpawner = ();
+
 #[cfg(feature = "wifi")]
 #[esp_rtos::main]
-async fn main(_spawner: Spawner) -> ! {
-    run().await
+async fn main(spawner: Spawner) -> ! {
+    run(spawner).await
 }
 
 #[cfg(not(feature = "wifi"))]
 #[main]
 fn main() -> ! {
-    embassy_futures::block_on(run())
+    embassy_futures::block_on(run(()))
 }
 
-async fn run() -> ! {
+// `boot_spawner` is read only inside `#[cfg(feature = "wifi")]` regions; on the no-radio
+// tier it is the `()` alias and genuinely unused.
+#[allow(unused_variables)]
+async fn run(boot_spawner: BootSpawner) -> ! {
     // #300 bench builds only: paint the free stack BEFORE anything grows a deep call chain, so
     // the high-water report after a story covers the whole run. First statement in `main` on
     // purpose — even HAL init would otherwise go unmeasured. See src/stack_paint.rs for why
@@ -977,10 +998,12 @@ async fn run() -> ! {
             // #335 P1.2: TIMG0 + SW_INTERRUPT no longer travel in this bundle — the
             // scheduler they fed is started once, above.
             net::WifiPeripherals { wifi: peripherals.WIFI },
+            boot_spawner,
             &mut batt_cache,
             &mut grid_cache,
             &mut boot_render,
         )
+        .await
     };
 
     // Phase 3: blue status LED on GPIO8, created at logical-OFF (GPIO8 is a
@@ -1056,11 +1079,13 @@ async fn run() -> ! {
             // `node_id()` (NVS, seeded from the baked const) so a shared OTA image never
             // steals the default id (#40 identity fix).
             node_id(),
+            boot_spawner,
             &mut boot_tick,
             &mut boot_render,
             &mut batt_cache,
             &mut grid_cache,
         )
+        .await
     };
 
     // --- Clock time base -----------------------------------------------------
@@ -1266,7 +1291,7 @@ async fn run() -> ! {
         // This runs REGARDLESS of the active mode so the LED always reflects the
         // ESP-NOW link and peers stay tracked even while Snake/Clock is on screen.
         #[cfg(feature = "espnow")]
-        if let Some(r) = radio.as_mut() {
+        if let Some(r) = radio.as_deref_mut() {
             if let Some(text) = r.service() {
                 bottom_line = text;
             }
@@ -1326,7 +1351,7 @@ async fn run() -> ! {
                         last_app_ms = t;
                     }
                     reelect_abort
-                });
+                }).await;
                 // Report ONLY if the burst ran. Reporting unconditionally was a real bug, and the
                 // bench caught it: `brst=3009:0:r` on id8 — a 3,009 ms app gap attributed to a
                 // re-election of ZERO duration. Both halves were wrong in different ways. The gap was
@@ -1411,7 +1436,7 @@ async fn run() -> ! {
                                     relay_abort
                                 },
                                 &relay_prog,
-                            );
+                            ).await;
                             redraw = true;
                             crate::ota_mesh::ServeResult::from_leaf_outcome(outcome)
                         }
@@ -1514,7 +1539,7 @@ async fn run() -> ! {
                                 });
                             }
                             ota_abort
-                        }, &ota_prog);
+                        }, &ota_prog).await;
                         // RAN-PREDICATE FOR THIS ARM, STATED RATHER THAN INHERITED. The other three
                         // use `yields > 0` because they are polled every tick and early-return; the
                         // worry here is the opposite failure — association can block, so a predicate
@@ -1906,7 +1931,7 @@ async fn run() -> ! {
                             last_app_ms = t;
                         }
                         flush_abort
-                    });
+                    }).await;
                     // Same `ran()` guard as the re-election arm — a flush that found nothing to do
                     // must not report a burst that did not happen.
                     if probe.ran() {
@@ -1949,7 +1974,7 @@ async fn run() -> ! {
                                     last_app_ms = t;
                                 }
                                 resync_abort
-                            });
+                            }).await;
                             if probe.ran() {
                                 let kind = BurstKind::NtpResync;
                                 let (gap, dur) = probe.finish(kind, millis());
@@ -2072,7 +2097,7 @@ async fn run() -> ! {
                                         &ann,
                                         &mut relay_tick,
                                         &relay_prog,
-                                    )
+                                    ).await
                                 }
                             };
                             // #40: record the phase → published to smol/<leaf>/ota/diag on the
@@ -2423,7 +2448,7 @@ async fn run() -> ! {
         // computed in ALL builds (base_unix/anchor_ms exist everywhere).
         let unix_now = base_unix + (now.saturating_sub(anchor_ms) / 1000) as u32;
         // #21: pull any pending default-screen command BEFORE `ctx` borrows `radio`
-        // (ctx holds `radio.as_mut()`), so the apply below can use `ctx` freely.
+        // (ctx holds `radio.as_deref_mut()`), so the apply below can use `ctx` freely.
         // Two sources feed the ONE apply path (edge-triggered below):
         //   * GATEWAY — its own MQTT `default_screen` config (`take_config_offer`,
         //     already parsed to a `DefaultScreen` in `mqtt_session`);
@@ -2433,7 +2458,7 @@ async fn run() -> ! {
         //     → Clear → board default). A board is gateway XOR leaf, so at most one
         //     yields; the gateway's own config wins if both ever do.
         #[cfg(feature = "espnow")]
-        let config_cmd = radio.as_mut().and_then(|r| {
+        let config_cmd = radio.as_deref_mut().and_then(|r| {
             if let Some(c) = r.take_config_offer() {
                 Some(c)
             } else {
@@ -2472,7 +2497,7 @@ async fn run() -> ! {
                 is_gateway: radio.as_ref().is_some_and(|r| r.is_gateway()),
             },
             #[cfg(feature = "espnow")]
-            radio: radio.as_mut(),
+            radio: radio.as_deref_mut(),
             // #45 the held Custom-screen layout (empty slice = none) — read by the Custom plugin.
             #[cfg(feature = "espnow")]
             custom: &custom_buf[..custom_len],
