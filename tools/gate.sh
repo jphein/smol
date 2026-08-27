@@ -537,6 +537,53 @@ if [ "$run_fw" = 1 ]; then
   # absence — fat LTO can inline a linked module until no symbol survives — so a pass here
   # adds confidence and never stands alone. Skipped, not failed, if the build above did not
   # produce an ELF: a corroboration arm must not invent a verdict.
+  # #438/#335: the stack-paint instrument's own VALIDITY, machine-checked instead of prose.
+  #
+  # #438's warrant was a sentence: "its `.stack` is byte-identical to the fleet tier's (86,200 B),
+  # so the instrument costs zero DRAM and its peak is a peak for the shipped image rather than for
+  # a near-miss of it." On 2026-08-27 that quietly stopped being true — STEP T moved `.bss` by
+  # different amounts on the two tiers and the regions came apart by 1,136 B, with nothing
+  # announcing it because nothing was checking. The peak read off that instrument was about to
+  # decide a ship gate at a ~1 KB margin. #434 is the precedent for what a near-miss instrument
+  # costs; this is the check that would have caught its return.
+  #
+  # Byte-identity is NOT what is asserted — that would be demanding a coincidence back. The
+  # checkable claim is that the measurement errs SAFE: `paint_region <= fleet_region`, so the
+  # instrument always runs with at-most-as-much room as the image we ship.
+  #
+  # ⚠️ Built into its OWN CARGO_TARGET_DIR on purpose. The canonical ELF lives at
+  # `<target>/<triple>/release/clock` and a paint build with the shared target dir would OVERWRITE
+  # it — after which the byte-free arm below would silently measure the paint image instead of the
+  # shipped one. Separate dir, and this step is placed AFTER the stack floor read for the same
+  # reason. (It also cannot reuse the `excl` arm's binaries: those are built with
+  # `line-tables-only` debug, which this file's own header records as CHANGING the image.)
+  step "paint-instrument warrant — paint vs fleet region (#438)"
+  PAINTDIR="${SMOL_GATE_PAINT_DIR:-$GATE_TMP/gate-paint-$(printf %s "$ROOT" | cksum | cut -d' ' -f1)}"
+  FLEET_ELF="${CARGO_TARGET_DIR:-$BUILD_ROOT/$CLOCK/target}/${REPRO_TARGET}/release/clock"
+  if [ ! -f "$FLEET_ELF" ]; then
+    printf '   \033[33mSKIP\033[0m paint warrant — no canonical ELF to compare against\n'
+  # ⚠️ `ESP_LOG=info` is NOT optional and NOT cosmetic. `ESP_LOG` is COMPILE-TIME here: without it
+  # the sentinel is compiled IN and its report line is compiled OUT, so the board runs the
+  # instrument and says nothing. An arm that built the paint tier without it would compare two
+  # images NEITHER of which we flash, see byte-identity, and pass — validating a build nobody
+  # measures with, which is the exact defect class this arm exists to catch. (2026-08-27: two
+  # handoff images shipped in precisely that state and passed md5, region, symbol-count and seed
+  # checks. Every number looked right; the soak would have returned nothing.)
+  elif (cd "$BUILD_ROOT/$CLOCK" && CARGO_TARGET_DIR="$PAINTDIR" ESP_LOG=info \
+          cargo build --release --bin clock "${JOBS[@]}" \
+          --features "stack-paint-lite,$REPRO_FLEET_FEATURES" "${REPRO_CARGO_ARGS[@]}") \
+        >"$GATE_TMP/gate-paint.log" 2>&1; then
+    if out=$("$ROOT/tools/check_paint_warrant.py" --fleet-elf "$FLEET_ELF" \
+               --paint-elf "$PAINTDIR/${REPRO_TARGET}/release/clock" 2>&1); then
+      printf '%s\n' "$out"; ok "paint warrant"
+    else
+      printf '%s\n' "$out"; bad "paint warrant"
+    fi
+  else
+    bad "paint warrant (stack-paint-lite build failed)"
+    tail -15 "$GATE_TMP/gate-paint.log" | sed 's/^/        /'
+  fi
+
   step "byte-free corroboration — symbols in the canonical ELF (#351)"
   ELF="${CARGO_TARGET_DIR:-$BUILD_ROOT/$CLOCK/target}/${REPRO_TARGET}/release/clock"
   if [ -f "$ELF" ]; then
@@ -786,6 +833,20 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | tail -2; ok "test_check_elect_send_path"
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_check_elect_send_path"
+  fi
+
+  # #438/#335: the paint-warrant arm guards an INSTRUMENT rather than the firmware, which makes its
+  # own falsifiability the whole question — a validity check that cannot fail is indistinguishable
+  # from the prose sentence it replaced, and that sentence is precisely what rotted. Two arms drive
+  # the roomier-paint case (including a ONE-BYTE divergence, because a silent tolerance is how a
+  # warrant erodes), three fail closed on a renamed symbol / a nonsense region / an unreadable
+  # input. That last one is not padding: an unreadable input must exit 2 (BLIND) and never 1
+  # (VIOLATED), or a wrong path gets reported as a real and alarming finding that never happened.
+  step "paint-warrant checker regression suite (#438)"
+  if out=$("$ROOT/tools/test_paint_warrant.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -2; ok "test_paint_warrant"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_paint_warrant"
   fi
 
   # #335 STEP G, same reasoning one invariant over: every arm of the station-consumer checker is an
