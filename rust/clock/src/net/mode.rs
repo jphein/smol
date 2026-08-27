@@ -46,14 +46,15 @@ use esp_hal::{
     // #335 P1.2: SoftwareInterruptControl / TimerGroup are gone from this module —
     // `esp_rtos::start` and the peripherals it consumes moved to `main`.
     rng::Rng,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use embassy_futures::block_on;
-// #397 STEP B2: the bounded announce send. `select` races the send future against a deadline;
-// `Timer` is the deadline. Both are available on every radio tier because #391 turned on
-// esp-rtos's `embassy` feature (which supplies embassy-time's driver) and `espnow` implies `wifi`.
+// #397 STEP B2: the bounded announce send. `select` races the send future against a deadline.
+//
+// ⚠️ #503: the deadline is an `esp_hal` INSTANT, deliberately NOT an `embassy_time::Timer`, and
+// this module no longer imports `embassy_time` at all. See `tx_announce_bounded` for the panic
+// that choice avoids — it is not a style preference.
 use embassy_futures::select::{select, Either};
-use embassy_time::{Duration as EmbassyDuration, Timer};
 use esp_radio::{
     esp_now::{EspNow, EspNowWifiInterface, PeerInfo, BROADCAST_ADDRESS},
     wifi::{scan::ScanConfig, sta::StationConfig, Config, WifiController},
@@ -2396,8 +2397,11 @@ fn abandon_tx(waiter: esp_radio::esp_now::SendWaiter<'_>) {
 ///
 /// Not tunable per site on purpose: the two announce sites are the same send of the same frame
 /// under the same radio conditions, and two deadlines would be two behaviours to reason about.
+///
+/// ⚠️ #503: an `esp_hal::time::Duration`, not an `embassy_time::Duration`. The value and meaning
+/// are unchanged; the type is what keeps the deadline off embassy-time's timer queue.
 #[cfg(feature = "espnow")]
-const TX_WAIT: EmbassyDuration = EmbassyDuration::from_millis(30);
+const TX_WAIT: Duration = Duration::from_millis(30);
 
 /// #397 STEP B2: set when a send's completion was still outstanding at `TX_WAIT`, i.e. we walked
 /// away from a callback that may still land.
@@ -2480,7 +2484,38 @@ impl RadioManager {
         let dst = BROADCAST_ADDRESS;
         let outcome = {
             let fut = self.esp_now.send_async(&dst, frame);
-            block_on(select(fut, Timer::after(TX_WAIT)))
+            // 🔴 #503 — WHY THIS IS NOT `Timer::after(TX_WAIT)`, which is what it used to be.
+            //
+            // `block_on` builds its own waker over a null pointer (embassy-futures
+            // `block_on.rs:6`), so the waker it polls with is NOT an Embassy task waker. An
+            // `embassy_time::Timer`, on first poll, hands that waker to embassy-time's timer
+            // queue, which calls `task_from_waker` — and that PANICS on a foreign waker
+            // (embassy-executor `raw/waker.rs:35`), because this tree does not enable
+            // embassy-time's `generic-queue` escape hatch (`Cargo.toml`: features = ["log"]).
+            //
+            // It was LATENT rather than instant death because `select` polls A first and returns
+            // without polling B when A is already `Ready` (embassy-futures `select.rs:64-67`).
+            // A send that completes on its first poll never polls the timer. So the panic fires
+            // only when `send_async` is genuinely PENDING — a contended radio — which is exactly
+            // the post-OTA-relay announce, and exactly where the fleet bench found it: a crown
+            // died at `staged+VERIFIED` + one announce, reproducibly, on both attempts.
+            //
+            // The fix removes the foreign-waker condition instead of tolerating it: a deadline
+            // polled from `esp_hal::time::Instant` needs no waker, no timer queue and no
+            // executor, so there is nothing left to mismatch. `block_on` re-polls unconditionally
+            // (it ignores wakes), so `Pending` here is a bounded spin — which is precisely what
+            // #397 STEP B2 set out to build, and what the pre-#397 unbounded `waiter.wait()` was
+            // not. `TX_WAIT`'s value, the `Unproven`/`Confirmed`/`Failed` arms and the
+            // `TX_ABANDONED` take-and-clear below are all unchanged.
+            let deadline = Instant::now() + TX_WAIT;
+            let expiry = core::future::poll_fn(move |_cx| {
+                if Instant::now() >= deadline {
+                    core::task::Poll::Ready(())
+                } else {
+                    core::task::Poll::Pending
+                }
+            });
+            block_on(select(fut, expiry))
         };
         match outcome {
             Either::First(Ok(())) => {
