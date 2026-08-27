@@ -33,46 +33,58 @@ Two firmware **flavors** share the tree. The **fleet** flavor is `rust/clock/` �
 ## The capability matrix
 
 Which board does what, and where the honest edges are. This is the **short** version — the full
-matrix (45 capabilities × 6 board-flavors, every non-✅ cell carrying its reason) is
+matrix (69 rows × 6 board-flavors — capabilities plus build/release posture, every non-✅ cell
+carrying its reason and its issue) is
 **[docs/CAPABILITIES.md](docs/CAPABILITIES.md)**.
 
 A board can run either firmware flavor or both, and the two are genuinely different machines, so
 **parity is judged per flavor** — the framing [`targets/s3-cyd/PARITY.md`](targets/s3-cyd/PARITY.md)
-established. ✅ integrated · 🔶 partial *(reason given)* · 🛠 hardware supports it, firmware doesn't
-yet · ❌ hardware or HAL cannot · 📋 planned · — n/a to this flavor.
+established. ✅ integrated · 🔶 partial · 🛠 hardware supports it, firmware doesn't yet · ❌ **the
+silicon or the fitted hardware cannot** · 📋 planned · — n/a to this flavor.
+
+**The GUI flavors are a superset of the fleet node** (JP's ruling, [#473](https://github.com/jphein/smol/issues/473)):
+every fleet feature is in scope on a touch board too, plus the GUI layer. So a fleet feature the GUI
+flavor hasn't implemented is a **gap with an issue number**, never "N/A by design" — "the scenes are
+compile-time" explains why a gap is hard, not why it isn't one. ❌ is reserved strictly for hardware
+that cannot. Every 🔶 and 🛠 below carries its issue; **the cell is that issue's acceptance test.**
 
 | | c3 | c3-oled | s3 · fleet | s3 · GUI | c6 · GUI | c5 · GUI |
 |---|---|---|---|---|---|---|
 | SMOLv1 mesh membership | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Crown election / gateway | ✅ | ✅ | ✅ | 🔶 observe-only | 🔶 observe-only | 🔶 observe-only |
-| Gateway: WiFi + NTP + MQTT → HA | ✅ | ✅ | ✅ | ✅ | ✅ | 🔶 HA dark for now |
-| HA discovery + Update entity | ✅ | ✅ | ✅ | 🔶 own topics | 🔶 own topics | 🔶 |
-| Keyed-CFG (every knob, no reflash) | ✅ | ✅ | ✅ | 🔶 own config record | 🔶 | 🔶 |
-| Custom screens | ✅ | ✅ | ✅ | ❌ scenes are compile-time | ❌ | ❌ |
-| Mesh-OTA receive | ✅ | ✅ | ✅ **345→1405, first cross-arch OTA** | 🔶 compiled | 🔶 unproven on the C6 | 🔶 compiled |
-| Mesh-OTA relay / serve | ✅ | ✅ | 🔶 client only | 🔶 | 🔶 | 🔶 |
-| HTTP / push OTA | ✅ | ✅ | ✅ | ✅ | ✅ zero-touch | 🔶 |
-| Ed25519 signed-image verify | ✅ | ✅ | ✅ | 🔶 compiled | ❌ monotonic-build gate instead | ❌ |
-| Display | ❌ headless | ✅ SSD1306 72×40 | ✅ ILI9341V, 4× scaled | ✅ ILI9341V | ✅ CO5300 AMOLED | ✅ ST7789 |
-| Touch | ❌ | ❌ | ❌ no fleet driver | ✅ FT6336U | ✅ FT3168 | 🔶 XPT2046, poll-only |
-| Status LED | ✅ | ✅ | ✅ WS2812/RMT | 🛠 pin only | ❌ none fitted | 🛠 pin only |
-| smol Cast → WLED | 🔶 | ✅ | 🔶 mirror blank (#398) | 🔶 | 🔶 | 🔶 |
-| The Bard (on-device transformer) | 🔶 on glass, **off-fleet** — 6,720 B short | 🔶 same | 🔶 14,400 B short | 🔶 opt-in | 🔶 30,480 B short | 🔶 |
-| Audio out | ❌ | ❌ | 🛠 codec ACKs, no path | 🔶 **acoustic proof pending** | ✅ | ❌ header un-scoped |
-| Audio in / voice | ❌ | ❌ | 🛠 mic fitted | 📋 phase 2 | ✅ ES7210 + STT | ❌ |
-| Battery / PMU | ❌ | ❌ | 🛠 ADC on GPIO9 | 🛠 declared, no reader | ✅ AXP2101 | ❌ |
-| IMU · die temp | ❌ · ✅ | ❌ · ✅ | ❌ · ❌ no xtensa TSENS | ❌ · ❌ | ✅ · ✅ | ❌ · ❌ |
-| 802.15.4 (Zigbee/Thread) | ❌ | ❌ | ❌ | ❌ | 🛠 📋 mutually exclusive with ESP-NOW | 🛠 back-burnered |
-| BLE | ❌ refuted on HW (#22) | ❌ | 🔶 not built | 🔶 | ✅ GATT | 🔶 |
-| CI `builds` a linked image | ✅ | ✅ | ❌ no espup on runners | ❌ | ❌ needs `widen_rom_region` | ❌ no budget row |
-| Published download | ✅ | 🔶 use the c3 image | ✅ | ✅ | ✅ | ✅ |
-| Stack-floor provenance | ✅ `Derived` | ✅ `Derived` | 🔶 `ObservedSufficient` | 🔶 | 🔶 `BootAssert` | ❌ none of its own |
+| Crown election / gateway | ✅ | ✅ | ✅ | 🔶 observe-only #278 | 🔶 observe-only | 🔶 #488 |
+| Gateway: WiFi + NTP + MQTT → HA | ✅ | ✅ | ✅ | ✅ | ✅ | 🔶 HA dark #488 |
+| HA discovery + Update entity | ✅ 🔶 no `_soc` #498 | ✅ | ✅ | 🛠 own topics #492 | 🛠 own topics #492 | 🛠 #492 |
+| Keyed-CFG (every knob, no reflash) | ✅ 11 keys | ✅ | ✅ | 🛠 only `S`/`U`/`R` #490 | 🛠 #490 | 🛠 #490 |
+| Custom screens | ✅ | ✅ | ✅ | 🛠 not rendering #473 | 🛠 #473 | 🛠 #473 |
+| Mesh-OTA receive | ✅ | ✅ | ✅ **345→1405, first cross-arch OTA** | 🔶 compiled #495 | 🔶 unproven on the C6 #495 | 🔶 #495 |
+| Mesh-OTA relay / serve | ✅ | ✅ | 🔶 client only | 🔶 #495 | 🔶 #495 | 🔶 #495 |
+| HTTP / push OTA | ✅ | ✅ | ✅ | ✅ | ✅ zero-touch | 🔶 #488 |
+| Ed25519 signed-image verify | ✅ both paths | ✅ | ✅ | 🔶 mesh yes, HTTP no #489 | 🛠 build-monotonicity only #489 | 🛠 #489 |
+| Display | ❌ no panel fitted | ✅ SSD1306 72×40 | ✅ ILI9341V, 4× scaled | ✅ ILI9341V | ✅ CO5300 AMOLED | ✅ ST7789 |
+| Touch | ❌ none fitted | ❌ | 🛠 no fleet driver *(GUI ⊇ fleet, not the reverse)* | ✅ FT6336U | ✅ FT3168 | 🔶 XPT2046, poll-only |
+| Status LED | ✅ | ✅ | ✅ WS2812/RMT | 🛠 pin only #491 | ❌ none fitted | 🛠 pin only #491 |
+| smol Cast → WLED | 🔶 | ✅ | 🔶 mirror blank #483 | 🔶 default-off #493 | 🔶 #493 | 🔶 #493 |
+| Mesh Snake (head-to-head) | ✅ | ✅ | ✅ | 🛠 #494 | 🛠 #494 | 🛠 #494 |
+| The Bard (on-device transformer) | 🔶 on glass, **off-fleet** — 6,720 B short #497 | 🔶 same | 🔶 14,400 B short #497 | 🔶 opt-in | 🔶 30,480 B short #497 | 🔶 |
+| Audio out | ❌ no codec | ❌ | 🛠 codec ACKs, no path #476 | 🔶 **acoustic proof pending** #477 | ✅ | 🛠 header un-scoped #486 |
+| Audio in / voice | ❌ | ❌ | 🛠 mic fitted #476 | 📋 phase 2 #478 | ✅ ES7210 + STT | 🛠 #486 |
+| Battery % | ❌ | ❌ | 🛠 ADC on GPIO9 #479 | 🛠 declared, no reader #479 | ✅ AXP2101 | 🛠 #486 |
+| PMU · IMU | ❌ · ❌ | ❌ · ❌ | ❌ · ❌ ⚠️ log lies #480 | ❌ · ❌ | ✅ · ✅ | ❌ · ❌ |
+| Die temp (TSENS) | ✅ | ✅ | ❌ `soc_has_tsens` false | ❌ | ✅ | ❌ |
+| 802.15.4 (Zigbee/Thread) | ❌ no radio | ❌ | ❌ no radio | ❌ | 📋 mutually exclusive with ESP-NOW | 📋 back-burnered #399 |
+| BLE | 🔶 silicon has it; refuted in practice #22 | 🔶 | 🔶 not built | 🔶 | ✅ GATT | 🔶 |
+| CI `builds` a linked image | ✅ | ✅ | 🛠 no espup on runners #413 | 🛠 | 🛠 needs `widen_rom_region` | 🛠 no budget row #485 |
+| Published download | ✅ | ✅ *by design* use the c3 image | ✅ | ✅ | ✅ | ✅ |
+| Stack-floor provenance | ✅ `Derived` | ✅ `Derived` | 🔶 `ObservedSufficient` #484 | 🔶 #484 | 🔶 `BootAssert` | 🛠 none of its own #485 |
 
-**Two things that table is careful about.** The Bard runs on glass and is *not in any shipped fleet
-image*: it is budget-predicated, and no chip's declared row currently has the 39,072 B of DRAM it
-needs, so it builds only under the `off-fleet` waiver — which the packaging path then refuses to
-publish. And ❌ almost never means "broken": ❌ on the C3's display means *headless by design*, and ❌
-on the C6's LE Audio means *forensically closed, no earbud model changes it*.
+**Three things that table is careful about.** The Bard runs on glass and is *not in any shipped
+image, on any board*: it is budget-predicated, and no chip's declared row currently has the 39,072 B
+of DRAM it needs, so it builds only under the `off-fleet` waiver — which the packaging path then
+refuses to publish. ❌ never means "not done": on the C3's display it means *no panel is fitted*, and
+on the C6's LE Audio it means *forensically closed — that silicon has no ISO link layer, so no
+earbud model changes it*. And where a whole column is 🔶 for one reason — the C5's is — the reason is
+that nobody has watched it, not that it fails; budgets and behaviours here are **measured, never
+inherited**.
 
 ## What runs on it (the apps)
 
