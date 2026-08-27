@@ -37,7 +37,9 @@ TP4054 ruling documented) and **#492** (HA per-device discovery). Parked with re
 **#479-fleet** (prepped; waits for STEP T per lead), **#495** (needs a crown serve +
 C6-canary coordination), **#278** (blocked on smol speaking ELECT — fleet code, post-T),
 **#490** (needs the heap-safety/N/A scoping pass), **#476/#477** (speaker not installed —
-JP deferral), **#478** (watch-lane phase 2), **#483/#484/#497** (fleet items, T-adjacent).
+JP deferral), **#478** (watch-lane phase 2), **#484/#497** (fleet items, T-adjacent). ~~#483~~ resolved 08-27 — the blank-mirror
+claim is refuted on retained-BMP evidence (see gap 7 below); only the WLED-matrix
+visual remains, hardware-gated.
 
 **Outstanding (updated 2026-08-27 ~13:40):**
 (1) ~~cell unplug~~ **RESOLVED — hardware-does-not-allow.** JP: "there is no cell in the
@@ -109,7 +111,16 @@ wrong; the poll loop re-samples every 180 s (600 s screen-off), main.rs ~3168. O
    GUI flavor has no counterpart for.
 6. **LEDC backlight dimming (GPIO45)** — both flavors run the backlight as a bare
    GPIO today; the GUI's brightness slider is a threshold, not a dim.
-7. **Cast mirror blank on S3** — smol-native known bug (#398 follow-up).
+7. ~~Cast mirror blank on S3~~ **REFUTED 2026-08-27 ~16:20 (#483)**: the retained
+   `smol/162/screen` BMP — which only the node itself publishes, about its own glass —
+   decodes to a legible 635-lit-px mirror (clock digits, status bar; C3 control band
+   583–619). Its publisher was the 1405 fleet image (bca3e62 ⊇ the #411 tee arm,
+   merged d953f62 08-25 14:14); the "blank" observation (08-25 ~13:2x) was the
+   pre-merge branch build, ~50 min BEFORE the arm landed. Cast paths untouched
+   bca3e62..main, so the evidence carries. The issue's flush-tee hypothesis was also
+   wrong — the tee is per-pixel at `draw_iter`, chip-agnostic. Remaining for the
+   literal acceptance ("a WLED matrix shows this board's screen"): a WLED matrix on
+   the bench — none announced on the broker today. Hardware-gated like the speaker.
 8. ~~A/B OTA first roll~~ **DONE 2026-08-26 ~07:07**: id 162 took build 345→1405
    over the air through the sanctioned pipeline — dual-path fetch (crown relay +
    self), slot flip, `ota=confirmed:1405` (self-test passed, no rollback). The
