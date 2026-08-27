@@ -323,6 +323,9 @@ it. A future release that *has* been flashed should say so, and say on what.
 
 ## See also
 
+- [RELEASE-RUNBOOK-v346.md](RELEASE-RUNBOOK-v346.md) — the **executable checklist** for cutting
+  v346, written ahead of the event so task #19 runs from a list instead of a reconstruction. It
+  deliberately does not restate the ceremony above, and it carries its own deletion condition.
 - [BUILDING.md](BUILDING.md) — toolchain, `secrets.rs`, flashing, and the gotchas in full.
 - [ota.md](ota.md) — the signed OTA path fleet boards actually use, including leaf mesh-OTA.
 - [protocol.md](protocol.md) — the wire contract, including the image target descriptor a board
