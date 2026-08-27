@@ -23,6 +23,13 @@ Two flavors, one board: **smol-native** (rust/clock, fleet tier) and **watch-GUI
 | AOD state entry after idle | GUI | suite: `state` screen 3→1 after 20 s idle on watchface (1 = AOD in the ladder) |
 | Audio TX path, electrical (acoustic awaits speaker install) | GUI | `beep`: 1600/1600 B queued through I2S; codec+clock clean. JP has not installed the speaker yet |
 | Battery gauge = measured % by construction | GUI | shell.set_battery and the `[BATT]` println consume the same batt_pct (main.rs:2091/2109); live 3.93 V→73% |
+| Heap region labels read TRUE (e4c3134 verified on S3) | GUI | 2026-08-27 boot: `main_free=98304 recl_free=65536 psram_free=8342384` — internal pool under its own name, PSRAM under psram_free |
+| `[IMU] absent` honest line (closes #480 on hardware) | GUI | 2026-08-27 boot log: `[IMU] absent (init NACK - no IMU on this board)` — println, not ESP_LOG-gated |
+
+**Outstanding (2026-08-27, agreed with the watch lane):** (1) cell unplug — JP, empty-battery
+honesty read; (2) speaker install — JP, audio-out acoustic first-listen (`beep` is ready the
+moment it's wired); (3) #478 — watch lane, S3 ES8311-ASDOUT capture (audio-in); the
+`[MIC] rms_peak_1s=` instrument flows to the S3 automatically when it lands.
 
 **Bench rig of record (2026-08-27):** the `debug-console` cargo feature + `tools/ui_test.py`
 inject synthetic taps/swipes on the real touch path and report per-frame render timings —
