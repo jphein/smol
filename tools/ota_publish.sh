@@ -13,6 +13,7 @@
 # MODES (Model-A #33: stage arms every board's native Update entity; Install is per-device)
 #   ota_publish.sh stage      [<commit>] [--bin <file>] [--build N]  # build+host+publish smol/ota/staged (arms all boards; NO board fetches)
 #   ota_publish.sh install <id>                                      # publish INSTALL → smol/<id>/ota/install (headless per-node canary; the HA Update button is the GUI path). id42 is REFUSED (#314: C6 watch unset-config sentinel, not a node).
+#   ota_publish.sh legacy-line <chip>                              # PREFLIGHT (#464): will an image for <chip> be published on the fleet-wide smol/ota/staged line? exit 0 = yes, 1 = skipped (non-canonical chip)
 # <commit> defaults to HEAD. --bin <file> skips the cargo build and hosts an existing .bin.
 # IDENTITY (#400): stage BUILDS THE WORKING TREE — it cannot build a commit's source. So a
 #   <commit> that is not HEAD is REFUSED (it would stamp that commit's identity onto these bytes),
@@ -88,7 +89,7 @@ die(){ echo "ERROR: $*" >&2; exit 1; }
 # ⚠️ The line range is a DUPLICATED FACT about the header block's extent — edit the header and it
 # rots silently (help output truncates mid-sentence, and nobody reads help on the happy path).
 # test_ota_publish_guards.sh pins both ends so an edit that forgets this fails instead.
-usage(){ sed -n '2,27p' "${BASH_SOURCE[0]}"; exit "${1:-1}"; }
+usage(){ sed -n '2,28p' "${BASH_SOURCE[0]}"; exit "${1:-1}"; }   # 27→28: #464 added a MODES line
 
 MODE="${1:-}"; [ -n "$MODE" ] || usage 1
 
@@ -327,6 +328,66 @@ WARN
   fi
   printf '%s' "$build"
 }
+
+# ---- #464: does the FLEET-WIDE legacy line belong to this image? ---------------------------------
+#
+# THE COST THIS AVOIDS, measured on 2026-08-26 during the S3's first roll: staging an esp32s3 image
+# wrote its build to `smol/ota/staged`, the v922 C3 crown (id50) gated that line (no target field),
+# accepted it (1404 > 922) and **self-fetched the full ~1 MB S3 image**, refusing it only at the
+# finalize descriptor read. Every legacy crown pays ~1 MB of fetch plus flash-write wear per
+# foreign-chip stage, and the refusal is at the very end.
+#
+# WHY SKIPPING IS SAFE, and it rests on one fact rather than on a fleet audit: the legacy line exists
+# for firmware older than #349, which knows only `smol/ota/staged` and only parses `OTA|`. **All such
+# firmware is on esp32c3** — the S3 and C5 targets were created after #349 (#398 and #388 both cite
+# it as prior art), so a pre-#349 non-C3 board has never existed and cannot. A foreign-chip build on
+# the legacy line therefore cannot serve any board: #349-aware boards of that chip read their
+# per-chip line, and non-#349-aware boards of that chip do not exist. The only thing it can do is
+# cost a legacy C3 crown a megabyte.
+#
+# This is DELIBERATELY NARROWER than #464's own fix direction ("retire the fleet-wide line once no
+# pre-per-chip firmware remains"). That retirement needs a rolled fleet and an audit; this needs
+# neither, because it keeps the legacy line for exactly the images a legacy board could install.
+#
+# ⚠️ IT DOES NOT FIX #472 and makes its symptom deterministic rather than accidental. #472 is that a
+# board's `ota/state` composer prefers the fleet line, so an S3 whose per-chip line is newer still
+# advertises the fleet line's (C3) build as `latest`. After this change the fleet line reliably holds
+# a canonical-chip build, which is what makes #472's consumer-side fix well-defined — but the S3's
+# `latest=<c3 build>` stops being the residue of a manual re-stage and becomes the steady state.
+# That trade is deliberate: #472's own body records its symptom as cosmetic (the monotonic ratchet
+# refuses the lower build), while the megabyte is spent on every foreign-chip stage.
+#
+# Pure and exit-code-only so the decision is unit-testable without a broker, a vault or an image —
+# the same reason `should_group_mac` is a pure function rather than an inline condition. Exercised by
+# `ota_publish.sh legacy-line <chip>` and by tools/test_ota_publish_guards.sh.
+legacy_line_wanted() { # <target-chip> <canonical-chip> → 0 = publish the legacy line, 1 = skip
+  local target="$1" canon="$2"
+  [ -n "$canon" ] || return 2                  # caller bug: never guess the canonical chip
+  # No descriptor at all = a pre-#349 image, which by the argument above is a canonical-chip build.
+  # Publishing the legacy line is the ONLY way such an image reaches anything.
+  [ -n "$target" ] || return 0
+  [ "$target" = "$canon" ] && return 0
+  return 1
+}
+
+# ---- legacy-line mode: operator preflight for the decision above --------------
+# "Will this chip's image go on the fleet-wide line?" — answerable before spending a build, a scp and
+# a vault read. Also the seam the unit tests drive, which is why it prints the canonical chip it
+# resolved rather than only a verdict: a wrong answer from a wrong canonical chip is the failure this
+# would otherwise hide.
+if [ "$MODE" = "legacy-line" ]; then
+  _chip="${2-}"
+  _canon="$("$REPO/tools/build_matrix.py" canonical-chip 2>/dev/null || true)"
+  [ -n "$_canon" ] || die "legacy-line: could not resolve meta.canonical_chip from tools/build-matrix.toml"
+  if legacy_line_wanted "$_chip" "$_canon"; then
+    echo "legacy-line: YES — ${_chip:-<no descriptor / pre-#349>} is served by smol/ota/staged (canonical=$_canon)"
+    exit 0
+  else
+    echo "legacy-line: NO — '$_chip' is not the canonical chip ($_canon); smol/ota/staged would be"
+    echo "             skipped (#464: it can only cost a legacy C3 crown a ~1 MB self-fetch)."
+    exit 1
+  fi
+fi
 
 # ---- install mode (Model-A per-node canary; parity with the HA Update button) --
 if [ "$MODE" = "install" ]; then
@@ -571,8 +632,26 @@ LINE="OTA|${BUILD}|${SIZE}|${SHA}|${SIG}|${URL}"
 #
 # Retiring `smol/ota/staged` is therefore the ONE step that needs a ROLLED fleet — not a merged
 # main. Do not remove it here until every board reports a build carrying the OTA2 parser.
-pub_retained "smol/ota/staged" "$LINE"
-echo "staged  smol/ota/staged  <-  build $BUILD ($HASH) ${SIZE}B sha ${SHA:0:12}… sig ${SIG:0:12}… @ $URL"
+#
+# ⚠️ #464: "UNCHANGED" above was chip-BLIND, and that is the defect. The paragraph's reasoning is
+# entirely about pre-#349 *firmware*, all of which is on the canonical chip — so the line is now
+# published only for images a legacy board could actually install. See `legacy_line_wanted`.
+CANON_CHIP="$("$REPO/tools/build_matrix.py" canonical-chip 2>/dev/null || true)"
+[ -n "$CANON_CHIP" ] || die "#464: could not resolve meta.canonical_chip from tools/build-matrix.toml"
+if legacy_line_wanted "$TARGET_CHIP" "$CANON_CHIP"; then
+  pub_retained "smol/ota/staged" "$LINE"
+  echo "staged  smol/ota/staged  <-  build $BUILD ($HASH) ${SIZE}B sha ${SHA:0:12}… sig ${SIG:0:12}… @ $URL"
+else
+  # SKIPPED, and said so — a silent omission here would look exactly like a broker failure, which is
+  # the failure mode the install path's 2026-07-28 note calls the worst this tool can have.
+  echo "skipped smol/ota/staged  —  #464: this is an ${TARGET_CHIP} image and the fleet-wide line"
+  echo "        only serves pre-#349 firmware, all of which is ${CANON_CHIP}. Publishing it here"
+  echo "        would make every legacy ${CANON_CHIP} crown self-fetch ~${SIZE}B and refuse it at"
+  echo "        the finalize descriptor read (observed 2026-08-26, id50). ${TARGET_CHIP} boards are"
+  echo "        armed by smol/ota/staged/${TARGET_CHIP} below."
+  echo "        The retained fleet-wide line keeps its previous (${CANON_CHIP}) value — that is"
+  echo "        #472's cosmetic 'latest' wart on non-${CANON_CHIP} boards, tracked separately."
+fi
 if [ -n "$TARGET_HEX" ]; then
   LINE2="OTA2|${BUILD}|${SIZE}|${SHA}|${TARGET_HEX}|${SIG2}|${URL}"
   pub_retained "smol/ota/staged/${TARGET_CHIP}" "$LINE2"

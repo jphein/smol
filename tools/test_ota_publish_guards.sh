@@ -217,6 +217,45 @@ case "$help" in *"IDENTITY (#400)"*) ok "help documents the identity rule" ;; *)
 case "$help" in *"choose_build()"*) ok "help reaches the end of the header block" ;; *) no "sed range ends early" ;; esac
 case "$help" in *"set -euo"*|*"die()"*) no "sed range overran into code" ;; *) ok "help stops before the code" ;; esac
 
+echo "== 6. #464 the fleet-wide legacy line is chip-SCOPED (pure decision, via the preflight mode) =="
+# The chips come from the MANIFEST, never from a literal here: the script derives the canonical chip
+# from tools/build-matrix.toml, so a hardcoded "esp32c3" in this test would be a second statement of
+# the same fact and would keep passing after the manifest moved.
+CANON="$("$HERE/build_matrix.py" canonical-chip)"
+[ -n "$CANON" ] && ok "canonical chip resolves from the manifest ($CANON)" \
+                || no "canonical chip did not resolve — every arm below would be vacuous"
+FOREIGN="$("$HERE/build_matrix.py" chips | grep -v "^${CANON}\$" | head -1)"
+[ -n "$FOREIGN" ] && ok "a non-canonical chip exists to test against ($FOREIGN)" \
+                  || no "manifest declares only one chip — arm 3 below cannot discriminate"
+
+out="$(bash "$SCRIPT" legacy-line "$CANON" 2>&1)"; rc=$?
+eq "canonical chip -> legacy line PUBLISHED" "0" "$rc"
+case "$out" in *"YES"*) ok "canonical verdict says YES" ;; *) no "canonical verdict unreadable: $out" ;; esac
+
+out="$(bash "$SCRIPT" legacy-line "$FOREIGN" 2>&1)"; rc=$?
+eq "non-canonical chip -> legacy line SKIPPED" "1" "$rc"
+case "$out" in *"#464"*) ok "skip verdict cites #464 (an operator can find the reason)" ;;
+               *) no "skip verdict does not say why: $out" ;; esac
+# ⚠️ The reason must name the chip it resolved, not just refuse. A verdict that cannot be traced to a
+# canonical chip is indistinguishable from a broken manifest lookup.
+case "$out" in *"$CANON"*) ok "skip verdict names the resolved canonical chip" ;;
+               *) no "skip verdict omits the canonical chip: $out" ;; esac
+
+# A pre-#349 image carries NO descriptor, and by the argument in ota_publish.sh it is necessarily a
+# canonical-chip build — so the legacy line is the ONLY way it reaches anything. Skipping it here
+# would silently break staging a rollback image, which is the one case the legacy line exists for.
+out="$(bash "$SCRIPT" legacy-line "" 2>&1)"; rc=$?
+eq "no descriptor (pre-#349 image) -> legacy line PUBLISHED" "0" "$rc"
+
+# The negative that keeps arm 3 honest: this must NOT be a blanket refusal of everything unfamiliar.
+out="$(bash "$SCRIPT" legacy-line "$CANON" 2>&1)"; rc=$?
+eq "control: the canonical chip is still accepted after the refusals" "0" "$rc"
+
+# LIMIT, stated rather than implied: these arms test the DECISION. The CALL SITE (that `stage`
+# consults it before `pub_retained "smol/ota/staged"`) is source-reviewed, not exercised here —
+# reaching that line needs a vault read, an scp and a live broker publish, and a test that publishes
+# to the real fleet topic is not a test. Do not read section 6 as proving the stage path.
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
