@@ -26,6 +26,19 @@ Two flavors, one board: **smol-native** (rust/clock, fleet tier) and **watch-GUI
 | Heap region labels read TRUE (e4c3134 verified on S3) | GUI | 2026-08-27 boot: `main_free=98304 recl_free=65536 psram_free=8342384` — internal pool under its own name, PSRAM under psram_free |
 | `[IMU] absent` honest line (closes #480 on hardware) | GUI | 2026-08-27 boot log: `[IMU] absent (init NACK - no IMU on this board)` — println, not ESP_LOG-gated |
 
+**Matrix run, 2026-08-27 afternoon (JP: "the README matrix is the parity bar"):**
+Closed by this lane, each bench-verified on the S3 — **#491** WS2812 GUI pixel (merged,
+6060bd1), **#482** LEDC backlight PWM + gamma + floor-fix class (merged, ba18847),
+**#489** HTTP-OTA ed25519 (branch 1d2cf38; three live adversarial cases: no-manifest
+refused, forged-sig refused, genuine verified→installed→VALID — the board's running
+build 1788060000 arrived over the signed path as its own proof), **#480** honest IMU
+line (closed on hardware witness). Watch lane closed **#479-GUI** (batt merge ee26edb,
+TP4054 ruling documented) and **#492** (HA per-device discovery). Parked with reasons:
+**#479-fleet** (prepped; waits for STEP T per lead), **#495** (needs a crown serve +
+C6-canary coordination), **#278** (blocked on smol speaking ELECT — fleet code, post-T),
+**#490** (needs the heap-safety/N/A scoping pass), **#476/#477** (speaker not installed —
+JP deferral), **#478** (watch-lane phase 2), **#483/#484/#497** (fleet items, T-adjacent).
+
 **Outstanding (updated 2026-08-27 ~13:40):**
 (1) ~~cell unplug~~ **RESOLVED — hardware-does-not-allow.** JP: "there is no cell in the
 s3" — yet the divider read 3.93–3.98 V all day. Mechanism (BOARD.md power section): the
