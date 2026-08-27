@@ -67,9 +67,9 @@ wrong; the poll loop re-samples every 180 s (600 s screen-off), main.rs ~3168. O
    gated — `has-imu` is NOT on the `board-esp32s3-cyd` arm, so the tilt-driven `Maze` tile is
    absent and the shell renders "no IMU". Hardware still does NOT allow IMU features here —
    document, not port — which is why the ❌ stays ❌ (#480).
-   ⚠️ **Unobserved:** nobody has read a boot log off id162 confirming the honest line on the
-   *running* image. The code is in the source the next build ships; that is a weaker claim than
-   "seen on the board", and #480 asks for the stronger one.
+   ~~⚠️ Unobserved~~ **OBSERVED 2026-08-27 09:33**: boot log off id162 (fresh main-based
+   bench image) printed `[IMU] absent (init NACK - no IMU on this board)` — the stronger
+   claim #480 asked for; the issue closed on that hardware witness (see the DONE table).
 4. **has-light-sleep** — off for S3. esp-hal S3 has rtc_cntl sleep (unlike the C5);
    worth enabling for AOD power. Needs a bench current check, not just a compile.
 5. ~~WS2812 status LED (GPIO42)~~ **DONE — and this row was stale, not open**: the
