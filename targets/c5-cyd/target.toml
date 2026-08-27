@@ -3,17 +3,39 @@ chip = "esp32c5"
 flavor = "fleet"
 source = "rust/clock"
 artifact = false
-# NO FLEET ARTIFACT: the C5 fleet image is CHECK-proven, not LINK-proven ([chip.esp32c5]
-# builds=false; "it links" is itself not proof — see budget.rs). Flip to true when a linked,
-# floor-gated C5 image exists.
+# NO FLEET ARTIFACT — but the reason has NARROWED. A linked C5 fleet image now exists and was
+# run on hardware (id176, 2026-08-27, #485): boots from ota_0, joins WiFi, runs its OWN NTP
+# (`tsrc=ntp`), meshes (`rx` climbing, `net=0:ok`), PSRAM registered (`heap=8,426,036`).
+# So "CHECK-proven, not LINK-proven" is retired — it is LINK-proven and BOOT-proven.
+# It is still not FLOOR-GATED, which is what `artifact = true` requires and why this stays false:
+# [chip.esp32c5] builds=false, and there is still no measured ChipBudget row in budget.rs
+# ("it links" was never proof on its own — that argument stands unchanged).
+# Flip to true when the floor gate exists, not merely when the image links.
+#
+# ⚠️ GEOMETRY CONDITION for whatever floor eventually lands here (team-lead ruling, 2026-08-27).
+# The #485 measurement was taken with the FLEET image running in the WATCH partition table — a
+# 0x600000 (6 MB) app slot — because that is the flash this board physically carries. A fleet row
+# declaring the canonical 0x1F0000 (1.938 MB, 4 MB layout) therefore describes a geometry THIS
+# SILICON DOES NOT HAVE.
+#   * It is the CONSERVATIVE direction: a smaller declared slot is a stricter gate, and the
+#     measured image fits it at 56.15% (1,140,720 B) — comfortably, and within a point of the C3's
+#     56.9% for the same tier.
+#   * So: floor MEASURED in the 6 MB watch table, DECLARED at canonical 4 MB slot geometry =
+#     conservative by construction.
+#   * RE-MEASURE if a true 4 MB-table C5 fleet build ever ships. The two are only interchangeable
+#     while the declaration is the stricter of the pair; a real 4 MB build makes them the same
+#     thing measured twice, and then the inherited number is a guess again.
+# Stated here rather than left as a default inherited from the C3, per budget.rs's own rule that
+# budgets are measured, never inherited.
 
 gui_artifact = true
 gui_board = "board-cyd-c5"
 gui_artifact_name = "smol-c5-cyd-gui"
 # THIS is what the board actually runs today (#413 phase 3.1) — the board-cyd-c5 arm of the
 # targets/c6-watch workspace, riscv32imac, the 320x240 landscape scene set. So the C5 has a
-# download while its FLEET arm is still checks-only: the two axes are independent, which is
-# the whole reason they are separate keys.
+# download while its FLEET arm is still un-gated (it links and boots as of #485; what it lacks
+# is a measured budget row and a floor gate): the two axes are independent, which is the whole
+# reason they are separate keys.
 #
 # ⚠️ Its stack floor is NOT its own: src/main.rs hands every non-C6 board the C6's 71,680 B
 # assert and labels it "PROVISIONAL … a stand-in, not a fact (budgets are measured, never

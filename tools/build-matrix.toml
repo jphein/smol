@@ -190,11 +190,16 @@ target     = "riscv32imac-unknown-none-elf"
 config_markers = ["-Tlinkall.x", "force-frame-pointers", "linker-flavor=ld.lld"]
 builds     = false
 ships      = false
-# NO ChipBudget row, deliberately: nobody has measured this silicon, and `budget.rs` hands an
-# unmeasured chip a poison row rather than the C6's numbers. `builds = false` is therefore also
-# what keeps the roster check quiet — rule 1 of this file only demands a budget for a chip that
-# BUILDS. The board-specific code stop-points are recorded on #388.
-blocked_on = "no measured ChipBudget row yet (budget.rs hands an unmeasured chip the poison row); measure on hardware per #388, then flip `builds`"
+# NO ChipBudget row — but as of #485 (id176, 2026-08-27) the reason is no longer "nobody has
+# measured this silicon." It HAS been measured on hardware: a linked fleet image boots, meshes,
+# and yields `.stack = 76,000 B` (reconciled against `_stack_start - _bss_end`). What is missing
+# is the LITERAL landing, and four named gaps block it — see `blocked_on`. `budget.rs` still hands
+# an unmeasured chip a poison row rather than the C6's numbers, and `builds = false` is therefore
+# still what keeps the roster check quiet — rule 1 of this file only demands a budget for a chip
+# that BUILDS. The board-specific code stop-points are recorded on #388.
+#
+# ⚠️ Do NOT read this as "go measure it" — that sitting has happened. Read the four gaps.
+blocked_on = "measured on hardware (#485: .stack 76,000 B, dram_headroom 4,320 B — the least in the tree) but the ChipBudget literal has not landed: (1) re-measure via repro_build_bin, not a plain link — the C3 row came from the packaging path; (2) no high-water instrument on this chip (hmin=0) so `Derived` is unavailable; (3) `ObservedSufficient` needs the downward soak bracket, since 76,000 B is what it RAN with, not the smallest proven; (4) the ChipBudget console printout needs the board's native-USB cable. Then flip `builds`"
 # CHECKS PASS as of #398's S3 arm — the `has-tsens` fallback it landed was ALSO this row's last
 # stop-point (sensors.rs cfg'd constructors + `Reading.chip_c: Option<f32>`), and the gate itself
 # demanded this flip: it ran the C5, found it COMPILING CLEAN against a `checks = false`
