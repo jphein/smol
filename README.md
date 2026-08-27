@@ -160,9 +160,11 @@ This is where smol stops being a toy. The elected **gateway** briefly bursts ont
 Prebuilt images live on the [releases page](https://github.com/jphein/smol/releases). **Per-target downloads have landed** (#413): the `nightly` release carries **five images** — `smol-c3`, `smol-s3-cyd` (fleet), `smol-s3-cyd-gui`, `smol-watch-c6` and `smol-c5-cyd-gui`. `tools/release_targets.sh` walks the `targets/*/target.toml` manifests and packages every target declaring `artifact = true` (fleet) or `gui_artifact = true` (GUI), through the same reproducible-build calls the OTA publish path uses; the two Xtensa flavors ride a job that provisions the espup `esp` toolchain. Each artifact ships a `NOTES.md` beside it carrying its **sha256**, its chip's **stack-floor provenance** in plain words, and the (chip, profile) sha-lineage rule. Which board gets which flavor is [the capability matrix](docs/CAPABILITIES.md).
 
 ```bash
-# Verify against the sha256 printed in the image's own NOTES.md (per-target
-# artifacts carry it inline; there is no combined SHA256SUMS in this release).
+# Verify against the sha256 printed in the image's own NOTES.md — every artifact
+# carries it inline. If the release also carries a combined SHA256SUMS, use that:
 sha256sum <image>.bin
+sha256sum -c --ignore-missing SHA256SUMS   # --ignore-missing matters: you downloaded
+                                           #   ONE image and the file lists them all
 # ⚠️ If this board has EVER taken an OTA, clear otadata first, or the flash silently
 #    lands in the slot the bootloader will not select. This spares nvs (and your node id).
 espflash erase-region --port /dev/ttyACM0 0xf000 0x2000
