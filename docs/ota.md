@@ -286,6 +286,52 @@ Three layers, in order of how bad the image is:
    re-enters the bootloader, but the real defense is that **only one board was ever at risk** —
    that's the whole point of canary.
 
+## How far back can an OTA go — the retreat floor (#401)
+
+**An OTA can only reach back to `f80cba9` (2026-08-01).** Anything older is **USB-only**.
+
+The reason is #349 working as designed, not a bug: the finalize-time suitability check refuses an
+image whose written slot carries **no target descriptor** (`TargetReject` absent — *"cannot read → do
+not install"*). Every pre-#349 image is descriptor-less, so it downloads in full and is refused at the
+very last step.
+
+`f80cba9` is the first commit whose `build.rs` emits `SMOL_CHIP_ID`, i.e. the first image that
+describes itself. **Recompute it rather than trusting this line** — that is the point of printing the
+command instead of only the hash:
+
+```bash
+git log --reverse --format='%h %ad %s' --date=short -S SMOL_CHIP_ID -- rust/clock/build.rs | head -1
+# f80cba9 2026-08-01 feat(ota): images self-describe their target and devices refuse unsuitable ones (#349)
+```
+
+### The floor is BELOW the Embassy dep wave, which is better than it sounds
+
+#349 landed at **15:18** and the #233 matched-set (`b2537c4`, esp-hal 1.1 / esp-radio 0.18 /
+esp-rtos 0.3) at **15:43** the same afternoon — **25 minutes later**. So the descriptor floor sits
+*under* the dep wave, and an OTA-retreat past #233 is **not** structurally impossible the way retreat
+past #349 is.
+
+```bash
+git log --oneline f80cba9..b2537c4 | wc -l    # 7 — the last of which IS the #233 landing itself
+```
+
+Whether a tree from that era still *builds* today is a separate question and is **untested** — the
+claim here is only about what the device will accept.
+
+### ⚠️ If you are reading #401, its cited hash is wrong
+
+#401 named `60fc1ed` as the floor and identified it with "the #233 landing". Neither holds:
+`60fc1ed` is a **docs** commit from **2026-07-28**, four days *before* #349, and it emits no
+`SMOL_CHIP_ID` anywhere in `rust/clock/`. An image built there is exactly the case #401 correctly says
+is USB-only — so following that hash produces a full download and a refusal. The #233 landing is
+`b2537c4`. #401's *conclusion* (pre-#349 retreat is USB-only) was right; its coordinates were not.
+
+### If a genuine pre-#349 retreat image is ever needed
+
+Old tree + cherry-picked descriptor emission (`build.rs`'s `SMOL_CHIP_ID` plus the embed), built in a
+**detached worktree** so the old tree is never checked out over a live one. That produces a
+descriptor-bearing image of pre-#349 code, which the finalize check will then accept.
+
 ## If a board bricks — USB recovery
 
 A board that won't come back (case 3 above) is recovered over USB, exactly like a first
