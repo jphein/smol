@@ -453,9 +453,41 @@ struct ClimatePending {
     sent_at: Option<Instant>,
 }
 
+/// Index of the registered EXTERNAL PSRAM region in `HEAP.stats().region_stats`.
+///
+/// `region_stats` is ordered by REGISTRATION, not by name, so these constants are
+/// a restatement of the `add_region` order in `main()` and have no other source of
+/// truth. They are named — rather than written as `0`/`1` at the seven sites that
+/// read them — because of what registering PSRAM first did: it shifted both
+/// internal pools one slot along, so every `main=`/`recl=` label in this firmware
+/// began reporting the wrong region. Measured on the s3-cyd: `main_free=8342420`,
+/// which is 7.96 MB, i.e. the External region wearing MAIN's label.
+///
+/// That break has no compile error and no runtime symptom. It only makes the heap
+/// telemetry lie — in the instrument used to diagnose heap problems.
+///
+/// Gated on the same `has-psram` capability that performs the registration, so the
+/// two are impossible to move independently. See that feature's note for why it
+/// describes REGISTRATION rather than the presence of a PSRAM chip.
+#[cfg(feature = "has-psram")]
+const RGN_PSRAM: usize = 0;
+/// Index of the MAIN internal pool. See [`RGN_PSRAM`] for why this is named.
+#[cfg(feature = "has-psram")]
+const RGN_MAIN: usize = 1;
+/// Index of the ROM-reclaimed internal pool (dram2_seg). See [`RGN_PSRAM`].
+#[cfg(feature = "has-psram")]
+const RGN_RECL: usize = 2;
+/// Index of the MAIN internal pool where no external region is registered — the
+/// pools are then the only two regions, in `heap_allocator!` order.
+#[cfg(not(feature = "has-psram"))]
+const RGN_MAIN: usize = 0;
+/// Index of the ROM-reclaimed internal pool (dram2_seg). See [`RGN_MAIN`].
+#[cfg(not(feature = "has-psram"))]
+const RGN_RECL: usize = 1;
+
 /// Log per-region free heap at boot / app-enter. The framebuffer must come from
 /// ONE region, so total-free (HEAP.free()) can read fine while the main region
-/// alone is short. `region_stats[0]` = the MAIN pool, `[1]` = the ROM-reclaimed
+/// alone is short. Addressed via [`RGN_MAIN`] / [`RGN_RECL`] rather than by raw
 /// pool (dram2_seg), in declaration order of the two `heap_allocator!` calls in
 /// `main()` — read the sizes THERE, not from a number copied into this comment.
 ///
@@ -485,11 +517,18 @@ fn log_heap(tag: &str) {
             .map(|r| r.free)
             .unwrap_or(0)
     };
+    // Present as a field on EVERY board, reading 0 where no external region is
+    // registered, so a log consumer never has to branch on board to parse this.
+    #[cfg(feature = "has-psram")]
+    let psram_free = region_free(RGN_PSRAM);
+    #[cfg(not(feature = "has-psram"))]
+    let psram_free = 0usize;
     println!(
-        "[HEAP] {}: main_free={} recl_free={} total_free={} need={}",
+        "[HEAP] {}: main_free={} recl_free={} psram_free={} total_free={} need={}",
         tag,
-        region_free(0),
-        region_free(1),
+        region_free(RGN_MAIN),
+        region_free(RGN_RECL),
+        psram_free,
         esp_alloc::HEAP.free(),
         (410usize / 2) * (502usize / 2),
     );
@@ -605,7 +644,7 @@ fn largest_free_block() -> (usize, usize) {
         // layout before continuing.
         unsafe {
             let layout = core::alloc::Layout::from_size_align_unchecked(sz, 4);
-            let before = region_used(0);
+            let before = region_used(RGN_MAIN);
             let p = alloc::alloc::alloc(layout);
             if !p.is_null() {
                 // WHICH POOL SERVED IT, without hardcoding an address. `alloc_caps`
@@ -613,7 +652,7 @@ fn largest_free_block() -> (usize, usize) {
                 // a rise in region 0's `used` means MAIN served this size. An
                 // address-range test would work too but would rot on any layout
                 // change; a `used` delta cannot.
-                let from_main = region_used(0) > before;
+                let from_main = region_used(RGN_MAIN) > before;
                 alloc::alloc::dealloc(p, layout);
                 // SELF-VALIDATION (#75). A successful probe at `sz` must come out of
                 // ONE region's span, so `sz` can never exceed total free. If it does,
@@ -1012,7 +1051,11 @@ async fn main(_spawner: Spawner) -> ! {
     // (Auto is board landmine L2); size auto-detects. Runs before any
     // heap_allocator! so PSRAM is the head of the walk; the macros only
     // register regions (no allocation) so ordering here is deterministic.
-    #[cfg(feature = "board-esp32s3-cyd")]
+    // Gated on `has-psram` rather than the board name so that registering a
+    // region and shifting the RGN_* indices are the SAME switch. Board-name
+    // gating let them drift: the region moved to index 0 while every reader
+    // still called index 0 "main".
+    #[cfg(feature = "has-psram")]
     {
         use esp_hal::psram::{Psram, PsramConfig, PsramMode, PsramSize};
         let psram = Psram::new(
@@ -1269,7 +1312,42 @@ async fn main(_spawner: Spawner) -> ! {
 
         let dc = Output::new(peripherals.GPIO46, Level::High, OutputConfig::default());
         let lcd_cs = Output::new(peripherals.GPIO10, Level::High, OutputConfig::default());
-        let backlight = Output::new(peripherals.GPIO45, Level::High, OutputConfig::default());
+        // #482: backlight is LEDC PWM now, not a >0-threshold GPIO. 24 kHz
+        // (above audible, far below the 8-bit ceiling), Timer0/Channel0 —
+        // nothing else on this firmware uses LEDC. The Ledc driver and its
+        // timer must outlive the channel, hence the StaticCells.
+        let backlight = {
+            use crate::drivers::ili9341::LedcBacklight;
+            use esp_hal::gpio::DriveMode;
+            use esp_hal::ledc::channel::{self, ChannelIFace as _};
+            use esp_hal::ledc::timer::{self, TimerIFace as _};
+            use esp_hal::ledc::{LSGlobalClkSource, Ledc, LowSpeed};
+
+            static LEDC: StaticCell<Ledc<'static>> = StaticCell::new();
+            static LEDC_TIMER: StaticCell<timer::Timer<'static, LowSpeed>> = StaticCell::new();
+
+            let ledc = LEDC.init({
+                let mut l = Ledc::new(peripherals.LEDC);
+                l.set_global_slow_clock(LSGlobalClkSource::APBClk);
+                l
+            });
+            let lstimer = LEDC_TIMER.init(ledc.timer::<LowSpeed>(timer::Number::Timer0));
+            lstimer
+                .configure(timer::config::Config {
+                    duty: timer::config::Duty::Duty8Bit,
+                    clock_source: timer::LSClockSource::APBClk,
+                    frequency: Rate::from_khz(24),
+                })
+                .expect("LEDC timer");
+            let mut ch = ledc.channel(channel::Number::Channel0, peripherals.GPIO45);
+            ch.configure(channel::config::Config {
+                timer: lstimer,
+                duty_pct: 100,
+                drive_mode: DriveMode::PushPull,
+            })
+            .expect("LEDC channel");
+            LedcBacklight::new(ch)
+        };
 
         let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) =
             esp_hal::dma_buffers!(64, STAGE_BYTES);
@@ -1689,6 +1767,103 @@ async fn main(_spawner: Spawner) -> ! {
         InputConfig::default().with_pull(Pull::Up),
     );
 
+    // Battery ADC (S3-CYD only): no PMU fuel gauge, so read the cell voltage
+    // off the GPIO9 2:1 divider (board::BATT_ADC_GPIO=9 = ADC1_CH8 on the S3,
+    // board::BATT_ADC_DIVIDER=2.0). Curve-calibrated oneshot returns the pin
+    // voltage in mV; ×divider = cell mV → power::lipo_pct. GPIO9 was freed by
+    // moving the boot button to GPIO0 above. The complex AdcPin/AdcCalCurve
+    // types are inferred, so the binding stays untyped.
+    // NOTE(build): esp-hal ADC generics written against the 1.1.2 source but
+    // NOT locally compiled (xtensa is fambuild-only) — if the AdcCalCurve
+    // turbofish or ADC1 lifetime needs a nudge, that's the spot; falling back
+    // to enable_pin() + a raw→mV scale is the escape hatch.
+    #[cfg(feature = "board-esp32s3-cyd")]
+    let (mut bat_adc, mut bat_adc_pin) = {
+        use esp_hal::analog::adc::{Adc, AdcCalCurve, AdcConfig, Attenuation};
+        let mut adc_config = AdcConfig::new();
+        let pin = adc_config
+            .enable_pin_with_cal::<_, AdcCalCurve<esp_hal::peripherals::ADC1<'_>>>(
+                peripherals.GPIO9,
+                Attenuation::_11dB,
+            );
+        (Adc::new(peripherals.ADC1, adc_config), pin)
+    };
+    // ⚠️ SUPERSEDED BY BENCH TRUTH (2026-08-27, JP + targets/s3-cyd/PARITY.md):
+    // the presence-detection below CANNOT WORK ON THIS BOARD, and `present` is
+    // effectively ALWAYS TRUE here. JP confirmed there is NO cell fitted, yet the
+    // divider read 3.93-3.98 V all day. Root cause is the charger topology, not
+    // the probe: BOARD.md's power section is a TP4054 + 200K/200K divider, and on
+    // VBUS the TP4054's BAT pin DRIVES the node toward its float voltage — so the
+    // node is DRIVEN, not floating, and NO pulldown (RTC RDE, IO_MUX FUN_WPD, v1
+    // or v2 below) can collapse a driven rail. No VBUS-sense or CHRG-status pin
+    // reaches a GPIO either. Therefore empty-vs-present is UNDETECTABLE BY VOLTAGE
+    // on USB power, permanently; off USB with no cell the board is simply off
+    // (moot). A cell-less USB-powered board reads the charger float (~78%) — a
+    // documented HARDWARE limitation, not a firmware bug. The gauge is still
+    // correct BY CONSTRUCTION when a real cell is fitted (a discharging cell reads
+    // its true voltage through the divider = the C6-parity behaviour). The
+    // pulldown mechanism below is a sound design DEFEATED by this board's charger,
+    // kept (not deleted) because it is correct on a board whose BAT node floats;
+    // here it is inert. Do not chase the "empty → 0%" arm on the S3-CYD — it can
+    // only fire on a genuinely unpowered node, which this board never is on USB.
+    //
+    // #s3-batt-presence (2026-08-26 bench finding, now superseded): an EMPTY
+    // battery connector floats the divider node square into the plausible-LiPo
+    // band — pin 2048 mV read as "4096 mV / 92%" with NO cell attached, which is
+    // WORSE than the honest 0% it replaced (a dashboard shows a healthy battery on
+    // a board that dies the moment USB drops). Presence is decided by TWO ADC
+    // samples: one
+    // with the pad's internal ~45 kΩ PULLDOWN enabled, one unloaded. A floating
+    // node COLLAPSES toward 0 under the pulldown; a real cell through the 2:1
+    // divider sags but holds far above it. A DIGITAL read cannot do this: with a
+    // cell the node sits ~1.9-2.1 V, below the 3.3 V-logic V_IH (~2.475 V), so a
+    // GPIO read would call a real battery LOW too. The pin object is owned by
+    // the ADC config, so the pulldown is toggled at the register (RTC_IO
+    // TOUCH_PAD9.RDE — GPIO9 is RTC pad 9; the #43 PAC-via-regs() pattern).
+    // Yields (present, unloaded_pin_mv, loaded_pin_mv); the loaded value is
+    // printed at boot so the 250 mV threshold can be iterated against the real
+    // divider impedance on glass (floating measured ≈clamp unloaded, ≈0 loaded).
+    #[cfg(feature = "board-esp32s3-cyd")]
+    macro_rules! s3_batt_sample {
+        () => {{
+            // v2 (bench-refuted v1): the RTC-side RDE alone did NOT load the
+            // pad — an empty connector read loaded 1983 ≈ unloaded 1997 (no
+            // sag at all), i.e. no resistor engaged. Whichever mux owns the
+            // pad during esp-hal's ADC config gets its pulldown: toggle BOTH
+            // the RTC pad's RDE and the IO_MUX pad's FUN_WPD. Harmless to
+            // double-enable; the bench decides if it's enough.
+            let rtcio = esp_hal::peripherals::RTC_IO::regs();
+            let iomux = esp_hal::peripherals::IO_MUX::regs();
+            rtcio.touch_pad(9).modify(|_, w| w.rde().set_bit());
+            iomux.gpio(9).modify(|_, w| w.fun_wpd().set_bit());
+            // First loaded read doubles as RC settle; the second is trusted.
+            let mut loaded: Option<u16> = None;
+            for pass in 0..2u8 {
+                for _ in 0..10_000u16 {
+                    if let Ok(v) = bat_adc.read_oneshot(&mut bat_adc_pin) {
+                        if pass == 1 {
+                            loaded = Some(v);
+                        }
+                        break;
+                    }
+                }
+            }
+            rtcio.touch_pad(9).modify(|_, w| w.rde().clear_bit());
+            iomux.gpio(9).modify(|_, w| w.fun_wpd().clear_bit());
+            let mut unloaded: Option<u16> = None;
+            for _ in 0..10_000u16 {
+                if let Ok(v) = bat_adc.read_oneshot(&mut bat_adc_pin) {
+                    unloaded = Some(v);
+                    break;
+                }
+            }
+            match (loaded, unloaded) {
+                (Some(l), Some(u)) => (l >= 250, u, l),
+                _ => (false, 0u16, 0u16),
+            }
+        }};
+    }
+
     // === OTA foundation: report partition layout + boot slot ===
     let mut flash = esp_storage::FlashStorage::new(peripherals.FLASH);
     let mut config_offset: Option<u32> = None;
@@ -2063,6 +2238,39 @@ async fn main(_spawner: Spawner) -> ! {
         crate::peripherals::ble::BATTERY_PERCENT
             .store(batt_pct, core::sync::atomic::Ordering::Relaxed);
     }
+    // S3-CYD: the AXP block above NACKs (no PMU), leaving 0%; read the real
+    // value off the divider ADC. board::BATT_ADC_DIVIDER scales pin→cell mV.
+    #[cfg(feature = "board-esp32s3-cyd")]
+    {
+        let (present, pin_mv, loaded_mv) = s3_batt_sample!();
+        if present {
+            let cell_mv = (pin_mv as f32 * crate::board::BATT_ADC_DIVIDER) as u16;
+            batt_pct = crate::peripherals::power::lipo_pct(cell_mv);
+            batt_mv = cell_mv;
+            // Boot-time diag (once, not per-poll): the loaded mV is the
+            // presence evidence — print it so the threshold can be iterated
+            // against the real divider impedance on the bench.
+            println!(
+                "[BATT] adc pin_mv={} (loaded {}) cell_mv={} pct={}",
+                pin_mv, loaded_mv, cell_mv, batt_pct
+            );
+            shell.set_battery(batt_pct, batt_mv, charging);
+            crate::peripherals::ble::BATTERY_PERCENT
+                .store(batt_pct, core::sync::atomic::Ordering::Relaxed);
+        } else {
+            // No cell: the floating node collapsed under the probe pulldown.
+            // Report honestly (0%, not a floating-band fiction) and say why.
+            println!(
+                "[BATT] no cell (probe collapsed: loaded {} mV, unloaded {} mV)",
+                loaded_mv, pin_mv
+            );
+            batt_pct = 0;
+            batt_mv = 0;
+            shell.set_battery(0, 0, charging);
+            crate::peripherals::ble::BATTERY_PERCENT
+                .store(0, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
     if let Ok(dt) = rtc.get_time() {
         let _ = shell.set_time(&dt);
         last_dt = Some(dt);
@@ -2237,6 +2445,28 @@ async fn main(_spawner: Spawner) -> ! {
     #[cfg(feature = "mesh-ota")]
     let mut mesh_ota = crate::net::ota_mesh::MeshOta::new();
     let mut mesh = SmolMesh::new(node_id);
+    // WS2812 peer-state pixel (#491): the fleet's status-light semantics on
+    // the GUI flavor. Setup failure degrades to a dark LED — never a panic.
+    #[cfg(feature = "has-ws2812")]
+    let mut ws2812_led = {
+        use esp_hal::rmt::{Rmt, TxChannelConfig, TxChannelCreator as _};
+        use esp_hal::time::Rate;
+        // 80 MHz / divider 1 = 12.5 ns/tick — the encoder's tick base.
+        let ch = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).ok().and_then(|rmt| {
+            #[cfg(feature = "board-esp32s3-cyd")]
+            let pin = peripherals.GPIO42; // board::WS2812_GPIO = 42 (ES3C28P)
+            #[cfg(feature = "board-cyd-c5")]
+            let pin = peripherals.GPIO27; // board::WS2812_GPIO = 27
+            rmt.channel0
+                .configure_tx(&TxChannelConfig::default().with_clk_divider(1))
+                .ok()
+                .map(|c| c.with_pin(pin))
+        });
+        if ch.is_none() {
+            println!("[LED] WS2812 RMT setup failed - status pixel dark");
+        }
+        crate::peripherals::ws2812::Ws2812::new(ch)
+    };
     // Mesh Familiar (fleet #57): always-on holder/arbitration state machine,
     // ticked alongside mesh.tick. The creature renders on the watchface.
     let mut familiar = crate::net::familiar::FamState::new(node_id);
@@ -2857,7 +3087,7 @@ async fn main(_spawner: Spawner) -> ! {
         {
             let mf = esp_alloc::HEAP
                 .stats()
-                .region_stats[0]
+                .region_stats[RGN_MAIN]
                 .as_ref()
                 .map(|r| r.free)
                 .unwrap_or(0);
@@ -2882,14 +3112,21 @@ async fn main(_spawner: Spawner) -> ! {
             let region_free = |i: usize| {
                 hs.region_stats[i].as_ref().map(|r| r.free).unwrap_or(0)
             };
+            // One line shape on every board; `psram=` reads 0 where no external
+            // region is registered.
+            #[cfg(feature = "has-psram")]
+            let psram_free = region_free(RGN_PSRAM);
+            #[cfg(not(feature = "has-psram"))]
+            let psram_free = 0usize;
             println!(
-                "[LOOP] beat={} up={}s heap={} low={} main={} recl={} maxblk={}",
+                "[LOOP] beat={} up={}s heap={} low={} main={} recl={} psram={} maxblk={}",
                 loop_beats,
                 now.as_secs(),
                 heap_now,
                 heap_low,
-                region_free(0),
-                region_free(1),
+                region_free(RGN_MAIN),
+                region_free(RGN_RECL),
+                psram_free,
                 mb_global,
             );
             // Pooled scene-vector capacities (#75). The vector that GROWS is the one
@@ -2993,7 +3230,13 @@ async fn main(_spawner: Spawner) -> ! {
             // largest routine contiguous ask — the texture vector's 256->512 doubling
             // at 14,336 B, which is exactly the allocation that rebooted the watch
             // 10/10 before the CHAR page was bounded.
-            let recl_now = region_free(1);
+            // NAMED, not positional. With a region registered at index 0 this
+            // alarm was watching `region_stats[1]` — the MAIN pool — against the
+            // RECLAIMED threshold, while the message reported index 0 (the 8 MB
+            // external region) as what "main holds". Trigger and text were both
+            // wrong, in different directions, and neither could be seen from the
+            // output.
+            let recl_now = region_free(RGN_RECL);
             if recl_now < RECLAIMED_DANGER_B && !main_pool_warned {
                 main_pool_warned = true;
                 println!(
@@ -3002,7 +3245,7 @@ async fn main(_spawner: Spawner) -> ! {
                      margin; a {} B contiguous ask is now at risk",
                     recl_now,
                     RECLAIMED_DANGER_B,
-                    region_free(0),
+                    region_free(RGN_MAIN),
                     RECLAIMED_DANGER_B,
                 );
             }
@@ -3099,6 +3342,25 @@ async fn main(_spawner: Spawner) -> ! {
                 } else if low_batt_notified && (charging || batt_pct >= 20) {
                     low_batt_notified = false;
                 }
+            }
+            // S3-CYD: divider ADC read (the AXP block above NACKs — no PMU).
+            // v1 drives the battery display + BLE service; the low-battery
+            // notify latch stays on the AXP path for now (S3 follow-up).
+            #[cfg(feature = "board-esp32s3-cyd")]
+            {
+                let (present, pin_mv, _loaded_mv) = s3_batt_sample!();
+                if present {
+                    let cell_mv = (pin_mv as f32 * crate::board::BATT_ADC_DIVIDER) as u16;
+                    batt_pct = crate::peripherals::power::lipo_pct(cell_mv);
+                    batt_mv = cell_mv;
+                } else {
+                    // Empty connector: honest zero, never the floating fiction.
+                    batt_pct = 0;
+                    batt_mv = 0;
+                }
+                shell.set_battery(batt_pct, batt_mv, charging);
+                crate::peripherals::ble::BATTERY_PERCENT
+                    .store(batt_pct, core::sync::atomic::Ordering::Relaxed);
             }
             next_battery = if screen_state == 0 {
                 now + Duration::from_secs(600)
@@ -3728,6 +3990,18 @@ async fn main(_spawner: Spawner) -> ! {
                 if peers != last_mesh_peers {
                     last_mesh_peers = peers;
                 }
+                // #491: peer-state pixel — mesh is unconditional in this loop,
+                // so the ladder is blink (searching) / solid (>=1 peer); frames
+                // only go on the wire when the lit flag changes.
+                #[cfg(feature = "has-ws2812")]
+                ws2812_led.service(
+                    if peers > 0 {
+                        crate::peripherals::ws2812::LedState::Solid
+                    } else {
+                        crate::peripherals::ws2812::LedState::Blink
+                    },
+                    now_ms,
+                );
                 // DIAG record every 60s: full field set in spec order (the HA
                 // dashboard parses positionally), zeros where the watch has
                 // no equivalent counter yet.

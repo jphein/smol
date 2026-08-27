@@ -68,6 +68,8 @@ board-cyd-c5 = [
 # driver seam is proven against this chip — a capability is a tested claim,
 # not an inventory line.
 board-esp32s3-cyd = [
+    # Registers 8 MB octal PSRAM as External at region 0 — see `has-psram`.
+    "has-psram",
     "esp-hal/esp32s3", "esp-rtos/esp32s3", "esp-radio/esp32s3",
     "esp-storage/esp32s3", "esp-bootloader-esp-idf/esp32s3",
     "esp-println/esp32s3", "esp-backtrace/esp32s3",
@@ -83,13 +85,20 @@ board-esp32s3-cyd = [
     # mesh-ota rides ed25519-dalek on xtensa (ota-proto's per-arch dep) —
     # ed25519-compact crashes this backend; see ota-proto/Cargo.toml.
     "mesh-ota",
+    # WS2812 peer-state pixel on GPIO42 (#491) — the same physical pixel the
+    # fleet flavor drives (JP-verified green 2026-08-26), now from the GUI.
+    "has-ws2812",
 ]
 # MESH SERVICES (#36). mesh-ota (#86): peer-sourced firmware over ESP-NOW.
 # A SERVICE feature, not a capability. ON for all three boards: the S3 arm
 # rides ed25519-dalek (ota-proto's per-arch dep) because ed25519-compact
 # crashes the Xtensa backend at every opt level — see ota-proto/Cargo.toml
 # for the whole story.
-mesh-ota = ["dep:ota-proto", "dep:sha2"]
+# ota-proto + sha2 are UNCONDITIONAL deps as of #489: the HTTP OTA path now
+# verifies the same ed25519 manifest the mesh path does, so the crypto/hash
+# stack must exist even in a build without mesh-ota. The feature still gates
+# the mesh session code itself.
+mesh-ota = []
 # cast (#36): mirror the live scene onto a WLED LED matrix over UDP. Opt-in —
 # the flusher tap and UDP path cfg out entirely when off, so default builds
 # are byte-identical. Pixel-correctness needs a matrix on the bench; the math
@@ -115,6 +124,12 @@ has-imu = []
 #                   C6 only for now; enables Voice/STT + the SoundLevel meter.
 has-audio-out = []
 has-audio-in = []
+# WS2812 status pixel over RMT (#491): the fleet's peer-state light (off →
+# blink=searching → solid=peers) on the GUI flavor. Reads board::WS2812_GPIO.
+# S3 = GPIO42 (bench-proven pixel, same part the fleet flavor drives); the
+# C5 declares GPIO27 but stays OFF here until its lane proves the seam on
+# glass — a capability is a tested claim, not an inventory line.
+has-ws2812 = []
 # Capacitive touch (FT3168). The CYD's XPT2046 is resistive: same TouchPoint
 # contract, different driver + calibration; nothing gates on this yet but the
 # distinction is real (pressure vs contact, debounce needs).
@@ -127,6 +142,18 @@ has-die-temp = []
 # replaces the AOD light-sleep poll with a plain timer wait — same cadence,
 # more current, no chip-specific code.
 has-light-sleep = []
+# A PSRAM region is REGISTERED IN THE HEAP by this build.
+#
+# ⚠️ THIS IS A REGISTRATION FACT, NOT A HARDWARE FACT, and the distinction is
+# load-bearing. `board-cyd-c5` has an 8 MB PSRAM chip and does NOT register it on
+# this branch — only the S3 arm calls `HEAP.add_region`. Setting this flag on a
+# board that has the silicon but does not register the region would shift
+# `RGN_MAIN`/`RGN_RECL` off by one in the wrong direction and mislabel that
+# board's heap telemetry, which is the exact bug this feature exists to fix.
+#
+# Set it on precisely the boards whose `main()` arm registers a region, and gate
+# the registration on it too, so the two cannot drift apart.
+has-psram = []
 
 debug-console = ["dep:embedded-io-async"]
 # `tts` (read notifications aloud) is now ON BY DEFAULT — see `default` above.
@@ -312,11 +339,11 @@ hunt = { path = "crates/hunt" }
 # MUST stay byte-identical with smol's copy or the fleet partitions silently.
 mesh-elect = { path = "crates/mesh-elect" }
 mesh-flood = { path = "crates/mesh-flood" }
-ota-proto = { path = "crates/ota-proto", optional = true }
+ota-proto = { path = "crates/ota-proto" }
 cast-core = { path = "crates/cast-core", optional = true }
 bard-core = { path = "crates/bard-core", optional = true }
 # mesh-OTA readback verify (ota_mesh.rs); same pin as ota-proto's.
-sha2 = { version = "0.10", default-features = false, optional = true }
+sha2 = { version = "0.10", default-features = false }
 # #58: pure-logic HA climate parse/encode (oracle-t9 CONFIRMED-CLEAN @5c0d04c) —
 # replaces src/net/climate_model_stub.rs.
 climate-model = { path = "crates/climate-model" }
