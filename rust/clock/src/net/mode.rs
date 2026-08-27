@@ -60,7 +60,7 @@ use esp_radio::{
 };
 
 use crate::led::LedState;
-use crate::net::{SmolWifiDevice, WifiPeripherals};
+use crate::net::WifiPeripherals;
 // #278/#269: the ELECT frame + the announce/follow machinery. Imported as a MODULE rather than
 // glob-imported: its names (`weight`, `Decision`, `Phase`, `Follow`) are generic enough to collide
 // with this file's vocabulary, and `mesh_elect::` at the call site is what tells a reader that the
@@ -2050,7 +2050,12 @@ pub struct RadioManager {
     /// and is available again for periodic relay flushes (`flush_telemetry`). The
     /// smoltcp stack is built/dropped inside each burst, so between bursts this is
     /// just an idle handle that doesn't contend with ESP-NOW on ch6.
-    sta: Option<SmolWifiDevice>,
+    /// #335 STEP T: the ONE embassy-net stack, brought up in `new` and pumped by `net_task`.
+    /// Was `Option<SmolWifiDevice>`; the `Option` is gone because the stack is constructed
+    /// unconditionally in `new` and never torn down — every `None => false` arm it used to
+    /// force was dead weight describing a state this type cannot be in. `Stack` is `Copy`,
+    /// which also retires the disjoint-borrow dance the old `&mut *sta` needed.
+    stack: embassy_net::Stack<'static>,
     /// Kept for the SNTP ephemeral-port seed during the burst.
     rng: Rng,
     mode: Mode,
@@ -2508,23 +2513,34 @@ impl RadioManager {
     /// an NTP burst before switching to ESP-NOW.
     ///
     /// STATION-CONSUMER-SITES: mode.rs::RadioManager::new:1, wifi.rs::try_time_sync:1
-    /// STATION-STACK-SITES: none
+    /// STATION-STACK-SITES: net.rs::bring_up_stack:1
     /// STATION-CONSUMER-GUARD: wifi.rs::try_time_sync | net.rs | pub use wifi::try_time_sync; | all(feature = "wifi", not(feature = "espnow"))
     /// STATION-CONSUMER-GUARD: mode.rs::RadioManager::new | net.rs | pub mod mode; | feature = "espnow"
     ///
-    /// #335 STEP G. Every function that constructs a consumer of the STA transport, with its
-    /// COUNT, checked in both directions by `tools/check_station_consumers.py`. There are two,
-    /// they are in different files, and that is exactly what made this dangerous enough to need
-    /// a gate — so the roster is ONE declaration, file-qualified, rather than a per-file note
-    /// that can be half-updated.
+    /// #335 STEP G, ARRIVED AT BY STEP T. Every function that brings up a consumer of the STA
+    /// transport, with its COUNT, checked in both directions by
+    /// `tools/check_station_consumers.py`. There are two, they are in different files, and that
+    /// is exactly what made this dangerous enough to need a gate — so the roster is ONE
+    /// declaration, file-qualified, rather than a per-file note that can be half-updated.
     ///
     /// WHY A GATE AND NOT A COMMENT: `esp_radio::wifi::Interface` is `Copy`. So
-    /// `embassy_net::new(interfaces.station, ..)` does NOT consume the handle, and a `Stack` can
-    /// be live beside a `SmolWifiDevice` over the same interface. It compiles clean, and then both
-    /// pop `data_queue_rx()` — which is keyed by `InterfaceType` alone — so frames are stolen
-    /// nondeterministically. No error, no panic. `STATION-STACK-SITES` is declared EMPTY on
-    /// purpose: the first `embassy_net::new` to land must update this roster deliberately (STEP T,
-    /// moving every consumer in one commit) instead of inheriting a silent pass.
+    /// `embassy_net::new(interfaces.station, ..)` does NOT consume the handle, and TWO stacks
+    /// over the same interface can be live at once. It compiles clean, and then both pop
+    /// `data_queue_rx()` — which is keyed by `InterfaceType` alone — so frames are stolen
+    /// nondeterministically. No error, no panic.
+    ///
+    /// #335 STEP T CHANGED WHAT THIS ROSTER COUNTS, and the change is the step's proof of
+    /// arrival. Pre-T the danger was a `Stack` co-existing with a `SmolWifiDevice`, so the
+    /// roster counted `SmolWifiDevice::new` and `STATION-STACK-SITES` was declared EMPTY to
+    /// force the first `embassy_net::new` to land deliberately. That device no longer exists —
+    /// `net/radio_dev.rs` is deleted — so the pre-T roster now counts a pattern with zero
+    /// occurrences, which the checker (rightly) refuses to pass on. The live invariant is now:
+    ///
+    ///   * `STATION-STACK-SITES` — `embassy_net::new` appears EXACTLY ONCE, inside the shared
+    ///     `net::bring_up_stack`. Two `Stack`s over one `Copy` interface is the same frame-theft
+    ///     shape, so this is the arm that still has teeth.
+    ///   * `STATION-CONSUMER-SITES` — the two functions that CALL that helper, unchanged in
+    ///     content and still one per radio tier.
     ///
     /// ⚠️ THE GUARDS ARE NOT ON THESE FUNCTIONS. Neither `try_time_sync` nor `RadioManager::new`
     /// carries a `#[cfg]`, and `mod wifi` is compiled on EVERY radio tier — so on an espnow tier
@@ -2534,7 +2550,7 @@ impl RadioManager {
     /// (a cfg predicate contains commas and `=`, never a pipe). The checker compares those cfg
     /// strings LITERALLY and fails closed on any edit; it does not attempt cfg algebra, so it
     /// detects "a guard moved" and makes no claim beyond that.
-    pub fn new(p: WifiPeripherals, id: u8) -> Option<Self> {
+    pub fn new(p: WifiPeripherals, id: u8, spawner: embassy_executor::Spawner) -> Option<Self> {
         // esp-wifi needs a heap; use the single shared region (see net::init_heap).
         super::init_heap();
 
@@ -2542,8 +2558,9 @@ impl RadioManager {
         // BEFORE wifi::new. It is — `main` calls `esp_rtos::start` once, immediately before
         // dispatching here, which is the same instant in boot at which this function used to
         // call it itself.
-        // `Rng` is a `Copy` handle (not entropy itself); kept for the SNTP ephemeral-port seed.
-        let rng = Rng::new();
+        // `Rng` is a `Copy` handle (not entropy itself); kept for the SNTP ephemeral-port seed
+        // and, via `bring_up_stack`, for the DR-M3 per-boot stack seed.
+        let mut rng = Rng::new();
         // 0.18: WIFI is 'static → wifi::new returns an owned 'static controller + interfaces
         // (no EspWifiController Box::leak). STA mode derives from the Config::Station set in
         // associate(); the old explicit set_mode(WifiMode::Sta) is gone in 0.18.
@@ -2572,13 +2589,17 @@ impl RadioManager {
         // age-0, flags-3 self-entry — roster anomaly #1) and wastes an eviction-immune slot.
         let self_mac = interfaces.station.mac_address();
 
+        // #335 STEP T: the ONE embassy-net bring-up for this tier. It CONSUMES
+        // `interfaces.station`, which is exactly why `self_mac` is read on the line above —
+        // the helper takes the interface by value so that ordering is enforced by the type
+        // system rather than by this comment (#68/#76).
+        let stack = super::bring_up_stack(spawner, interfaces.station, &mut rng);
+
         Some(Self {
             controller,
             self_mac,
             esp_now: interfaces.esp_now,
-            // Keep the STA device alive for the NTP burst; dropped afterward.
-            // #233: wrapped in the smoltcp phy::Device shim (net::radio_dev).
-            sta: Some(SmolWifiDevice::new(interfaces.station)),
+            stack,
             rng,
             mode: Mode::WifiSta,
             id,
@@ -2769,7 +2790,7 @@ impl RadioManager {
     ///     taken over — the takeover fires only on a FROZEN `MC` seq (owner truly dead).
     ///
     /// Returns true iff a re-election burst actually ran.
-    pub fn maybe_leaf_reelect(
+    pub async fn maybe_leaf_reelect(
         &mut self,
         batt: &mut crate::batt::BattCache,
         grid: &mut crate::grid::GridCache,
@@ -2879,13 +2900,12 @@ impl RadioManager {
         let mut install_requested = false;
         let mut _leaf_install_seen = false; // #40 #1: a leaf's recovery burst is not a gateway relay
         let mut _leaf_flip_confirmed = false; // #329 B1: no flip sweep off-gateway (stat_cache=None)
-        let reached = match self.sta.as_mut() {
-            None => false,
-            Some(sta) => {
+        let reached = {
+            {
                 let empty: [(u8, &[u8]); 0] = [];
                 crate::net::wifi::run_mqtt_burst(
                     &mut self.controller,
-                    sta,
+                    self.stack,
                     self.rng,
                     id,
                     &empty,
@@ -2916,7 +2936,7 @@ impl RadioManager {
                     &mut None, // #3: recovery burst publishes no relay RX-diag
                     &mut None, // #139-followup: a leaf recovery burst is never a self-OTA fetch
                     tick,
-                )
+                ).await
             }
         };
         if ota_offer.is_some() {
@@ -3016,7 +3036,7 @@ impl RadioManager {
     /// built + dropped INSIDE `run_ntp_burst`, so no live stack contends with
     /// ESP-NOW between bursts.
     #[allow(clippy::too_many_arguments)] // +ota/config/install offer out-params (#6/#21/#33)
-    pub fn burst_ntp(
+    pub async fn burst_ntp(
         &mut self,
         batt: &mut crate::batt::BattCache,
         grid: &mut crate::grid::GridCache,
@@ -3029,17 +3049,16 @@ impl RadioManager {
         // `run_ntp_burst`; not called during the still-blocking MQTT tail).
         render: &mut dyn FnMut(),
     ) -> (bool, Option<u32>) {
-        // Disjoint field borrows: &mut self.controller, &mut *sta, Copy of rng/id.
+        // Disjoint field borrows: &mut self.controller, Copy of stack/rng/id.
         // `batt` is a caller-owned &mut (main's cache), disjoint from every self
         // field — the boot burst's MQTT downlink fills it (see wifi::run_ntp_burst).
+        // #335 STEP T: the `let Some(sta) = .. else { return (false, None) }` bail is gone
+        // with the `Option` — `stack` is always live (see the field).
         let id = self.id;
-        let Some(sta) = self.sta.as_mut() else {
-            return (false, None);
-        };
         let mut reached_dhcp = false;
         let synced = crate::net::wifi::run_ntp_burst(
             &mut self.controller,
-            sta,
+            self.stack,
             self.rng,
             tick,
             render,
@@ -3051,19 +3070,18 @@ impl RadioManager {
             ota_offer,
             config_offer,
             install_requested,
-        );
+        ).await;
         (reached_dhcp, synced)
     }
 
-    /// #192: run a periodic NTP RE-SYNC burst (SNTP-only, NO MQTT tail) on the STA device,
-    /// reusing the boot `NtpMachine` substrate. Called from the main loop on the GATEWAY when
+    /// #192: run a periodic NTP RE-SYNC burst (SNTP-only, NO MQTT tail) on the shared stack,
+    /// reusing the boot prologue. Called from the main loop on the GATEWAY when
     /// `my_synced_at` goes stale (> `NTP_RESYNC_AGE_S`). Returns the fresh Unix time, or `None`
-    /// on failure/abort. Does NOT tear the coexist association (`NtpMachine::step_assoc` skips
-    /// the reconnect when already connected). `rng` is `Copy`; `sta` borrows disjoint from
+    /// on failure/abort. Does NOT tear the coexist association (`ntp_assoc` returns straight
+    /// away when already connected). `rng` and `stack` are `Copy`, disjoint from
     /// `self.controller`. Leaves never call this (mesh time adoption refreshes their freshness).
-    pub fn resync_ntp(&mut self, tick: &mut dyn FnMut() -> bool) -> Option<u32> {
-        let sta = self.sta.as_mut()?;
-        crate::net::wifi::run_ntp_resync(&mut self.controller, sta, self.rng, tick)
+    pub async fn resync_ntp(&mut self, tick: &mut dyn FnMut() -> bool) -> Option<u32> {
+        crate::net::wifi::run_ntp_resync(&mut self.controller, self.stack, self.rng, tick).await
     }
 
     /// Current radio mode. Part of the public API (a caller may inspect which
@@ -3641,7 +3659,7 @@ impl RadioManager {
     /// done here, because that is a behaviour change with its own risk budget and this commit is a
     /// vocabulary change. Whoever takes it: the gate is `may_scan`, and its "DEFER, NEVER ABANDON"
     /// contract is now expressible in the return type.
-    fn reassoc_ch6_prefer(&mut self) -> crate::net::coexist::CrownApDecision {
+    async fn reassoc_ch6_prefer(&mut self) -> crate::net::coexist::CrownApDecision {
         use crate::net::coexist::{select_crown_ap, ApView, CrownApDecision};
         // COEXIST hard gate: never leave the mesh channel mid mesh-OTA transfer (mirrors run_scan).
         // #335: `Deferred`, not `NoAp`. This is a DECLINED LOOK — no scan ran — and it returns
@@ -3763,11 +3781,28 @@ impl RadioManager {
                     new_ch,
                     self.elect_announcer.epoch()
                 );
+                // #335 STEP T / R6: this was a BARE `while` over a wall-clock gate — no
+                // timeout, no yield, no `tick()` — burning ~600 ms
+                // (`ANNOUNCE_BURST × ANNOUNCE_GAP_MS`) of pure CPU spin. The inline
+                // rationale above says "a tick-driven burst cannot work here: the
+                // reassociation below is synchronous, so the main loop will not run again
+                // until the move is already over." STEP T REMOVES THAT PREMISE: the
+                // reassociation is no longer synchronous, so this can await instead of spin.
+                //
+                // ⚠️ This is the ONE deliberate behavioural timing change in STEP T. The
+                // announce CADENCE is unchanged (`due()` still gates each frame at
+                // `ANNOUNCE_GAP_MS`) and so is the total window; what changes is that the
+                // gaps now yield to the executor rather than spin, so `net_task` and the
+                // mesh RX path run DURING the burst instead of being starved by it.
                 while !self.elect_announcer.clear_to_move() {
                     let t = now_ms();
                     if self.elect_announcer.due(t) {
                         self.broadcast_elect();
                     }
+                    embassy_time::Timer::after(embassy_time::Duration::from_millis(
+                        mesh_elect::ANNOUNCE_GAP_MS,
+                    ))
+                    .await;
                 }
             }
         }
@@ -3820,11 +3855,17 @@ impl RadioManager {
         // late is byte-identical to a post-move one, so there is nothing for it to override.
         if matches!(self.elect_announcer.phase(), mesh_elect::Phase::Pre) {
             self.elect_announcer.moved(now_ms());
+            // #335 STEP T / R6: the post-move twin of the spin above — same change, same
+            // reasoning, same unchanged cadence.
             while !self.elect_announcer.settled() {
                 let t = now_ms();
                 if self.elect_announcer.due(t) {
                     self.broadcast_elect();
                 }
+                embassy_time::Timer::after(embassy_time::Duration::from_millis(
+                    mesh_elect::ANNOUNCE_GAP_MS,
+                ))
+                .await;
             }
         }
         decision
@@ -5031,7 +5072,7 @@ impl RadioManager {
     /// image to the inactive slot, verify, activate + reboot. Returns only on a
     /// non-activating outcome (a SUCCESS reboots inside the fetch). Mesh-deaf for the
     /// whole download (spec §6-R4) — driven by the caller's responsive/abortable tick.
-    pub fn run_ota_update(
+    pub async fn run_ota_update(
         &mut self,
         announce: &crate::ota::Announce,
         tick: &mut dyn FnMut() -> bool,
@@ -5067,7 +5108,7 @@ impl RadioManager {
                 off_channel,
                 self.my_rssi_to_ap
             );
-            let decision = self.reassoc_ch6_prefer();
+            let decision = self.reassoc_ch6_prefer().await;
             self.note_crown_ap(decision);
         } else if !ap_known {
             log::info!(
@@ -5088,16 +5129,15 @@ impl RadioManager {
         }
         let rng = self.rng;
         let mut fail: Option<(u32, u32, u32, u32, u32)> = None;
-        let ok = match self.sta.as_mut() {
-            None => false,
-            Some(sta) => {
+        let ok = {
+            {
                 // Self-OTA: activate-on-success (relay_mode = false; the slot out-param is
                 // unused since a successful self-fetch reboots inside `activate`).
                 crate::net::wifi::run_ota_fetch(
-                    &mut self.controller, sta, rng, announce, tick, false, &mut None, &mut fail,
+                    &mut self.controller, self.stack, rng, announce, tick, false, &mut None, &mut fail,
                     progress,
                     Some(self.id), // #188: live progress → smol/<self>/ota/progress (self-OTA)
-                )
+                ).await
             }
         };
         // #139-followup: a SUCCESS reboots INSIDE the fetch (never returns here), so reaching this
@@ -5121,7 +5161,7 @@ impl RadioManager {
                         "smol #217: fetch-leg deaf (ota_fail stage {}) — reassoc before retry",
                         rec.4
                     );
-                    self.reassoc_ch6_prefer();
+                    self.reassoc_ch6_prefer().await;
                 }
             }
         }
@@ -5438,7 +5478,7 @@ impl RadioManager {
     /// degrading for its duration (WiFi fetch then ESP-NOW relay — never concurrent, §D#1);
     /// the UI-alive `tick` runs throughout and latches a long-press ABORT. Returns the
     /// outcome for the HA `smol/<leaf>/ota/state` publish. No-op on a non-gateway.
-    pub fn run_leaf_ota_relay(
+    pub async fn run_leaf_ota_relay(
         &mut self,
         source: crate::ota_mesh::ServeSource,
         leaf_id: u8,
@@ -5562,13 +5602,12 @@ impl RadioManager {
                 let _ = self.switch(Mode::WifiSta);
                 let rng = self.rng;
                 let mut staged: Option<Slot> = None;
-                let fetched = match self.sta.as_mut() {
-                    Some(sta) => crate::net::wifi::run_ota_fetch(
-                        &mut self.controller, sta, rng, announce, tick, true, &mut staged, &mut None,
+                let fetched = {
+                    crate::net::wifi::run_ota_fetch(
+                        &mut self.controller, self.stack, rng, announce, tick, true, &mut staged, &mut None,
                         progress,
                         Some(leaf_id), // #188: live progress → smol/<leaf>/ota/progress (relay-fetch)
-                    ),
-                    None => false,
+                    ).await
                 };
                 if fetched { staged } else { None }
             }
@@ -6006,7 +6045,7 @@ impl RadioManager {
         }
     }
 
-    pub fn flush_telemetry(
+    pub async fn flush_telemetry(
         &mut self,
         own_telemetry: &[u8],
         // #50: the gateway's live `STAT|<screen>:<page>` (main passes it from
@@ -6114,10 +6153,8 @@ impl RadioManager {
         // must never move it.
         let gate_latches =
             (self.leaf_ota_pending as u8) | ((self.leaf_installs_outstanding as u8) << 1);
-        let sta = self.sta.as_mut();
-        let ok = match sta {
-            None => false,
-            Some(sta) => {
+        let ok = {
+            {
                 // (src_id, &payload) list to PUBLISH: the gateway's OWN telemetry
                 // first (spec: "also PUBLISH its own telemetry"), then each queued
                 // leaf message. Disjoint borrows: `own_telemetry` is the caller's;
@@ -6139,7 +6176,7 @@ impl RadioManager {
                 }
                 crate::net::wifi::run_mqtt_burst(
                     &mut self.controller,
-                    sta,
+                    self.stack,
                     self.rng,
                     id,
                     &items[..n],
@@ -6170,7 +6207,7 @@ impl RadioManager {
                     &mut self.leaf_relay_rx, // #3: publish smol/<leaf>/ota/relaydiag (RX evidence)
                     &mut self.ota_self_fail, // #139-followup: publish own smol/<id>/ota/diag on self-fetch fail
                     tick,
-                )
+                ).await
             }
         };
         // #49: record the flush outcome (`ok` = reached CONNACK) into the diag counters — the
@@ -6254,7 +6291,7 @@ impl RadioManager {
                     // Rung 1: ch6-preferred reassociate; keep the crown, re-measure next flush. RE-ARM
                     // the bulk latch + streak so the next shed decision re-proves deafness FRESH after
                     // the realign (155 crux 2 — never shed on pre-reassoc evidence).
-                    self.reassoc_ch6_prefer();
+                    self.reassoc_ch6_prefer().await;
                     self.relay.reassoc_cycles = self.relay.reassoc_cycles.saturating_add(1);
                     self.relay.crown_deaf_streak = 0;
                     self.relay.deaf_bulk_seen = false;
@@ -7749,9 +7786,12 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
 /// burst genuinely runs DHCP + SNTP against the STA device, which esp-wifi hands
 /// out once alongside the ESP-NOW handle — we drive it here, then drop it before
 /// pinning the ESP-NOW channel, so the single radio is never double-driven.
-pub fn start(
+pub async fn start(
     p: WifiPeripherals,
     id: u8,
+    // #335 STEP T: threaded from `#[esp_rtos::main]` so `RadioManager::new` can spawn
+    // `net_task` onto the executor that is actually running this future.
+    spawner: embassy_executor::Spawner,
     // #20: `main` passes the responsive tick (poll button + "Syncing…" redraw +
     // LED fast-blink); returns true to ABORT the boot burst (a long-press → boot
     // ends early and proceeds straight to the Menu). Replaces the old internal
@@ -7764,10 +7804,30 @@ pub fn start(
     render: &mut dyn FnMut(),
     batt: &mut crate::batt::BattCache,
     grid: &mut crate::grid::GridCache,
-) -> (Option<RadioManager>, Option<u32>) {
-    let Some(mut radio) = RadioManager::new(p, id) else {
+) -> (Option<&'static mut RadioManager>, Option<u32>) {
+    // #335 STEP T: the manager is built into a `StaticCell` and handed out by reference,
+    // and this is a MEMORY-LAYOUT decision, not a style one.
+    //
+    // `RadioManager` is 17,216 B. Returned BY VALUE it was materialised in two places that
+    // the compiler cannot overlay: inside `start()`'s own future (held across the boot
+    // `burst_ntp().await`) and again as `run()`'s `radio` local (held across every
+    // main-loop `.await`). Those live in DIFFERENT variants of `run()`'s async state
+    // machine, so the enum takes the max of the two rather than sharing one slot — and the
+    // measured `__embassy_main::POOL` carried BOTH, plus 17,280 B of padding reserving the
+    // slot for the other variant. Measured with `-Zprint-type-sizes`.
+    //
+    // Behind a `StaticCell` the struct lives in `.bss` exactly once and both futures hold a
+    // 4-byte reference. The bytes do not vanish — they move from a doubled-and-padded
+    // future into a single static — but that is the whole point: `.bss` grows by 17,216 and
+    // the futures shrink by roughly twice that, so the DRAM stack region (which is what is
+    // left after `.bss`) grows back. See the PR body's A/B table.
+    static RADIO: static_cell::StaticCell<RadioManager> = static_cell::StaticCell::new();
+    let Some(radio) = RadioManager::new(p, id, spawner) else {
         return (None, None);
     };
+    // Not held across an `.await`, so the by-value construction above never lands in this
+    // function's future; only the reference below does.
+    let radio: &'static mut RadioManager = RADIO.init(radio);
 
     // --- WiFi burst for NTP; `main`'s responsive `tick` runs inside every busy-
     // wait loop (LED fast-blink + "Syncing…" redraw + long-press abort). `batt`/
@@ -7796,7 +7856,7 @@ pub fn start(
         &mut install_requested,
         tick,
         render,
-    );
+    ).await;
     // #6 OTA: stash any gated boot-time announce for `main` to fetch after boot.
     radio.ota_offer = ota_offer;
     // #21: stash the boot-time default-screen config so `main` seeds the boot screen

@@ -66,10 +66,14 @@ arm() {
   case "$out" in *"$want"*) ok "$name (rc=$rc)" ;; *) no "$name: rc right, WRONG REASON — $out" ;; esac
 }
 
-DEV_WIFI='let mut device = SmolWifiDevice::new(interfaces.station);'
-DEV_MODE='sta: Some(SmolWifiDevice::new(interfaces.station)),'
+# #335 STEP T re-pointed every fixture. The roster now counts calls to the SHARED bring-up
+# helper (one per radio tier) instead of `SmolWifiDevice::new`, because STEP T deleted that
+# shim — see the checker's docstring. The two call sites are textually identical, which is
+# fine: `patch1` edits one named file at a time.
+DEV_WIFI='let stack = super::bring_up_stack(spawner, interfaces.station, &mut rng);'
+DEV_MODE='let stack = super::bring_up_stack(spawner, interfaces.station, &mut rng);'
 ROSTER='/// STATION-CONSUMER-SITES: mode.rs::RadioManager::new:1, wifi.rs::try_time_sync:1'
-STACKROSTER='/// STATION-STACK-SITES: none'
+STACKROSTER='/// STATION-STACK-SITES: net.rs::bring_up_stack:1'
 
 echo "== baseline: the real tree must satisfy the invariant =="
 out="$("$CHK" "$ROOT" 2>&1)"; rc=$?
@@ -77,16 +81,18 @@ if [ "$rc" = 0 ]; then ok "unmodified tree: $out"; else no "unmodified tree FAIL
 
 echo "== arm 1 (count): the roster drifts from the tree =="
 # A SECOND device in an ALREADY-LISTED function — the shape a name-only allowlist would miss.
-arm "second device in a listed fn" 1 "arm 1 (count)" net/wifi.rs \
+arm "second bring-up in a listed fn" 1 "arm 1 (count)" net/wifi.rs \
 "$DEV_WIFI	$DEV_WIFI
-    let _steal = SmolWifiDevice::new(interfaces.station);"
-# A device in a function nobody declared.
-arm "device in an undeclared fn" 1 "arm 1 (count)" net/radio_dev.rs \
-"const WIFI_MTU: usize = 1514;	const WIFI_MTU: usize = 1514;
-pub fn sneaky(i: Interface<'static>) -> SmolWifiDevice { SmolWifiDevice::new(i) }"
+    let _steal = super::bring_up_stack(spawner, interfaces.station, &mut rng);"
+# A bring-up in a function nobody declared.
+arm "bring-up in an undeclared fn" 1 "arm 1 (count)" net/wifi.rs \
+"$DEV_WIFI	$DEV_WIFI
+}
+pub fn sneaky(spawner: Spawner, i: Interface<'static>, rng: &mut Rng) {
+    let _ = super::bring_up_stack(spawner, i, rng);"
 # A declared site that no longer exists — a stale roster entry reads as a decision.
 arm "declared site removed" 1 "declared but ABSENT" net/mode.rs \
-"$DEV_MODE	sta: None,"
+"$DEV_MODE	let stack = todo!();"
 
 echo "== arm 2 (coexist): THE packet-theft shape =="
 # The first embassy_net::new must be deliberate, not inherited.
@@ -94,7 +100,7 @@ arm "undeclared embassy_net::new" 1 "arm 2 (coexist)" net/mode.rs \
 "pub fn now_ms() -> u64 {	pub fn now_ms() -> u64 {
     let _ = embassy_net::new(1, 2, 3, 4);"
 # The acute form: one function holding both consumers over one interface.
-arm "one fn holds stack AND device" 1 "holds BOTH" net/wifi.rs \
+arm "one fn holds an inline stack AND a helper call" 1 "holds BOTH" net/wifi.rs \
 "$DEV_WIFI	$DEV_WIFI
     let _stack = embassy_net::new(interfaces.station, cfg, res, seed);"
 
@@ -111,15 +117,20 @@ pub use wifi::try_time_sync;	#[cfg(all(feature = "wifi", not(feature = "espnow")
 pub use wifi::CFG_KEY_LED;
 pub use wifi::try_time_sync;'
 
-echo "== arm 4 (no-new-ctor): a second way to build the device =="
-arm "pub tuple field" 1 "arm 4 (no-new-ctor)" net/radio_dev.rs \
-"pub struct SmolWifiDevice(Interface<'static>);	pub struct SmolWifiDevice(pub Interface<'static>);"
-arm "second constructor returning Self" 1 "arm 4 (no-new-ctor)" net/radio_dev.rs \
-"    /// STA MAC	    pub fn wrap(i: Interface<'static>) -> Self { Self(i) }
-
-    /// STA MAC"
-arm "tuple construction outside its module" 1 "arm 4 (no-new-ctor)" net/wifi.rs \
-"$DEV_WIFI	let mut device = SmolWifiDevice(interfaces.station);"
+echo "== arm 4 (shim-stays-dead): the deleted smoltcp phy shim comes back =="
+# The type reappearing anywhere in CODE is the whole assertion — a second STA transport is
+# being reintroduced, and arms 1-3 only ever look at bring-up sites, so none would see it.
+arm "shim type reintroduced in a source file" 1 "arm 4 (shim-stays-dead)" net/wifi.rs \
+"$DEV_WIFI	$DEV_WIFI
+    let _shim = SmolWifiDevice::new(interfaces.station);"
+# ...and the module file itself returning is called out with its own message.
+seed
+mkdir -p "$work/tree/rust/clock/src/net"
+printf 'pub struct SmolWifiDevice(Interface<%s>);\n' "'static" > "$work/tree/rust/clock/src/net/radio_dev.rs"
+out="$("$CHK" "$work/tree" 2>&1)"; rc=$?
+if [ "$rc" = 1 ] && case "$out" in *"is back in the tree"*) true ;; *) false ;; esac; then
+  ok "radio_dev.rs restored (rc=1)"
+else no "radio_dev.rs restored: rc $rc — $out"; fi
 
 echo "== fail-closed: a blind checker must refuse to pass, never quietly succeed =="
 arm "roster deleted" 2 "no \`STATION-CONSUMER-SITES:\` declaration" net/mode.rs \
@@ -136,14 +147,14 @@ arm "guard declaration malformed" 2 "malformed STATION-CONSUMER-GUARD" net/mode.
 "| net.rs | pub mod mode; | feature	| net.rs | feature"
 # Zero call sites means the pattern moved and every count arm is blind. Two files, so inline.
 seed
-if patch1 "$work/tree/rust/clock/src/net/wifi.rs" "$DEV_WIFI	let mut device = make_dev(interfaces.station);" \
-   && patch1 "$work/tree/rust/clock/src/net/mode.rs" "$DEV_MODE	sta: Some(make_dev(interfaces.station)),"; then
+if patch1 "$work/tree/rust/clock/src/net/wifi.rs" "$DEV_WIFI	let stack = make_stack(interfaces.station);" \
+   && patch1 "$work/tree/rust/clock/src/net/mode.rs" "$DEV_MODE	let stack = make_stack(interfaces.station);"; then
   out="$("$CHK" "$work/tree" 2>&1)"; rc=$?
-  if [ "$rc" != 2 ]; then no "zero device ctor sites: rc $rc, want 2 — $out"
-  else case "$out" in *"found ZERO"*) ok "zero device ctor sites (rc=2)" ;;
-       *) no "zero device ctor sites: rc right, WRONG REASON — $out" ;; esac
+  if [ "$rc" != 2 ]; then no "zero bring-up sites: rc $rc, want 2 — $out"
+  else case "$out" in *"found ZERO"*) ok "zero bring-up sites (rc=2)" ;;
+       *) no "zero bring-up sites: rc right, WRONG REASON — $out" ;; esac
   fi
-else no "zero device ctor sites (fixture setup)"; fi
+else no "zero bring-up sites (fixture setup)"; fi
 # A tree with no sources at all must also refuse.
 mkdir -p "$work/empty/rust/clock/src"
 out="$("$CHK" "$work/empty" 2>&1)"; rc=$?
@@ -153,10 +164,10 @@ echo "== regression: PROSE must not move the verdict, in either direction =="
 # The checker's first run counted its own doc comment as a call site. A comment naming both
 # constructors must leave a clean tree clean.
 seed
-if patch1 "$work/tree/rust/clock/src/net/radio_dev.rs" \
-"const WIFI_MTU: usize = 1514;	const WIFI_MTU: usize = 1514;
+if patch1 "$work/tree/rust/clock/src/net/wifi.rs" \
+"$DEV_WIFI	$DEV_WIFI
 // Prose: embassy_net::new(interfaces.station, ..) beside SmolWifiDevice::new(interfaces.station)
-/* and a block comment: SmolWifiDevice::new(x); embassy_net::new(y); */"; then
+/* and a block comment: SmolWifiDevice::new(x); embassy_net::new(y); bring_up_stack(z); */"; then
   out="$("$CHK" "$work/tree" 2>&1)"; rc=$?
   if [ "$rc" = 0 ]; then ok "comments naming both ctors stay green (rc=0)"
   else no "PROSE FLIPPED THE VERDICT: rc $rc — $out"; fi
