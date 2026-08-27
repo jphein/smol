@@ -7,11 +7,14 @@
 # source diff and no compiler complaint, so review had nothing to look at.
 #
 # Do NOT hand-edit. Re-bless, and explain the delta in the commit message.
-# 29 symbols, 182066 bytes total.
+# 34 symbols, 194978 bytes total.
 #
 # size	section	symbol
 960	.data	TxRxCxt
 2008	.bss	_RNvCs*_7esp_phy9PHY_STATE
+17224	.bss	_RNvNCNvNtNtCs*_5clock3net4mode5start05RADIO
+4096	.bss	_RNvNCNvNtNtCs*_5clock3net4wifi13run_ota_fetch010OTA_TCP_RX
+512	.bss	_RNvNCNvNtNtCs*_5clock3net4wifi13run_ota_fetch010OTA_TCP_TX
 4096	.bss	_RNvNtCs*_5clock3ota12OTA_READBACK
 4096	.data	_RNvNtCs*_5clock3ota9OTA_STAGE
 14784	.bss	_RNvNtCs*_5clock8ota_mesh14OTA_WINDOW_BUF
@@ -22,15 +25,17 @@
 14784	.bss	_RNvNtNtCs*_5clock3net4mode13GW_OTA_WINDOW
 512	.bss	_RNvNtNtCs*_5clock3net4wifi10NTP_TCP_RX
 512	.bss	_RNvNtNtCs*_5clock3net4wifi10NTP_TCP_TX
+512	.bss	_RNvNtNtCs*_5clock3net4wifi11MQTT_TCP_RX
+512	.bss	_RNvNtNtCs*_5clock3net4wifi11MQTT_TCP_TX
 512	.bss	_RNvNtNtCs*_5clock3net4wifi15NTP_UDP_RX_DATA
 512	.bss	_RNvNtNtCs*_5clock3net4wifi15NTP_UDP_TX_DATA
-1408	.data	_RNvNtNtCs*_5clock3net4wifi16NTP_SOCK_STORAGE
+512	.bss	_RNvNtNtCs*_5clock3net4wifi7CAST_TX
 512	.bss	_RNvNtNtCs*_5clock3net4wifi8MQTT_ACC
 516	.bss	_RNvNtNtCs*_5clock3net4wifi9MQTT_JSON
+1920	.bss	_RNvNvNtCs*_5clock3net14bring_up_stack13NET_RESOURCES
 98304	.bss	_RNvNvNtCs*_5clock3net9init_heap4HEAP
 4096	.bss	_RNvNvNtCs*_5clock3ota18verify_active_slot10VERIFY_BUF
-19600	.bss	_RNvNvNtCs*_5clock6___main14___embassy_main4POOL
-4096	.bss	_RNvNvNtNtCs*_5clock3net4wifi13run_ota_fetch10OTA_TCP_RX
+12728	.bss	_RNvNvNtCs*_5clock6___main14___embassy_main4POOL
 592	.bss	gChmCxt
 284	.bss	gScanStruct
 816	.bss	gWpaSm

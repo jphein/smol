@@ -1,6 +1,24 @@
 #!/usr/bin/env python3
 """#335 STEP G: prove there is exactly ONE live consumer of the STA transport per tier.
 
+⚠️ STEP T MOVED WHAT THIS COUNTS. Read this first or the arms below will read as the wrong gate.
+
+Pre-T the tree had TWO transports — a hand-rolled smoltcp `phy::Device` shim (`SmolWifiDevice`)
+and embassy-net — and the danger was one of each being live at once. Arm 1 therefore counted
+`SmolWifiDevice::new`, and `STATION-STACK-SITES` was declared EMPTY so that the first
+`embassy_net::new` had to land deliberately.
+
+STEP T deleted the shim (`net/radio_dev.rs` is gone). A roster that still counted
+`SmolWifiDevice::new` would now count a pattern with ZERO occurrences — and this script fails
+closed on zero, correctly, because an arm that can only match something nonexistent is blind.
+So the arms were re-pointed at the invariant that is actually still live:
+
+  * the STA interface is `Copy`, so TWO `embassy_net::new` calls over it are the SAME
+    frame-theft bug the pre-T version guarded against. That is arm 2, and it now has the teeth.
+  * exactly one bring-up per tier, still mutually exclusive by the same `net.rs` cfg gates.
+    That is arms 1 and 3, counting calls to the shared `bring_up_stack` helper.
+  * the deleted shim must stay deleted. That is arm 4.
+
 Why this exists, and why the type system cannot do it.
 
 `esp_radio::wifi::Interface` is `Copy` (`esp-radio-0.18.0/src/wifi/mod.rs:1306`,
@@ -21,17 +39,22 @@ only in its passing state is not evidence (#350's `test_build_matrix.sh` lesson)
 
 THE FOUR ARMS — each is a way to satisfy the compiler and still ship the packet-theft bug:
 
-  1. count        the per-function count of `SmolWifiDevice::new` drifts from the declared roster.
-                  Counts, not just names, so adding a SECOND device to an already-listed function
-                  fails too — the property that makes the ELECT checker actually work.
-  2. coexist      an `embassy_net::new` appears. THE packet-theft shape. Declared with its own
-                  roster (empty today) so the first one to land must update the roster deliberately
-                  and re-argue the invariant, rather than inheriting a silent pass. Also flags the
-                  acute form directly: one function holding BOTH a stack and a device.
-  3. per-tier     the two consumers stop being mutually exclusive, i.e. someone edits a cfg guard.
-                  THE ARM THAT MATTERS AFTER STEP T, because STEP T is what could make them overlap.
-  4. no-new-ctor  a second way to build the station device appears (`::from`, `::wrap`, a `pub`
-                  tuple field) that arm 1's call-site count would never see.
+  1. count        the per-function count of `bring_up_stack` CALL sites drifts from the declared
+                  roster. Counts, not just names, so a SECOND bring-up inside an already-listed
+                  function fails too — the property that makes the ELECT checker actually work.
+  2. coexist      an `embassy_net::new` appears outside the declared roster. THE packet-theft
+                  shape: `Interface` is `Copy`, so two `Stack`s over it both pop `data_queue_rx()`.
+                  The roster pins it to the ONE shared helper; a second bring-up — inlined in a
+                  caller, or a new tier copying the pattern instead of calling the helper — is
+                  exactly what this catches, and it is why the helper exists at all.
+  3. per-tier     the two bring-up sites stop being mutually exclusive, i.e. someone edits a cfg
+                  guard. Unchanged by STEP T, and still the arm that decides whether two tiers can
+                  ever be live together.
+  4. shim-stays-dead
+                  `SmolWifiDevice` / `radio_dev.rs` reappears. The pre-T shim was deleted because
+                  esp-radio's `Interface` implements `embassy_net_driver::Driver` directly; a
+                  reintroduced phy shim would restore the original two-consumer hazard wholesale,
+                  and no other arm would notice.
 
 ⚠️ ARM 3'S DELIBERATE LIMITATION, stated rather than oversold. Deciding "these two cfg predicates
 are mutually exclusive" is cfg algebra, and this checker does not attempt it. It asserts the
@@ -57,13 +80,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rust_comments import strip_comments  # noqa: E402  (#426 — one implementation, imported)
 
-# The constructor whose call sites ARE the roster.
-DEVICE_CTOR = "SmolWifiDevice::new"
-# The device type, for the no-new-ctor arm.
+# The shared bring-up helper whose CALL sites ARE the roster (one per radio tier).
+DEVICE_CTOR = "bring_up_stack"
+# The retired smoltcp phy shim. Arm 4 asserts it stays retired.
 DEVICE_TYPE = "SmolWifiDevice"
-# The module that is allowed to construct the device by tuple syntax (it owns the type).
+# The module that used to own the shim. Its ABSENCE is now the assertion.
 DEVICE_HOME = "radio_dev.rs"
-# The embassy-net stack constructor — the other consumer of the same queue.
+# The embassy-net stack constructor — two of these over one `Copy` interface is the bug.
 STACK_CTOR = "embassy_net::new"
 
 DECL_SITES = re.compile(r"STATION-CONSUMER-SITES:\s*(.+?)\s*(?:\*/|\n|$)")
@@ -236,17 +259,22 @@ def main() -> int:
     # ── arm 1: declared per-function device-constructor counts, both directions ────────────────
     actual = {}
     for path, text in code.items():
-        for m in re.finditer(re.escape(DEVICE_CTOR) + r"\s*\(", text):
+        for m in re.finditer(r"(?<!fn )\b" + re.escape(DEVICE_CTOR) + r"\s*\(", text):
             key = site_key(path, text, m.start())
             if key is None:
                 fail(f"a `{DEVICE_CTOR}` in {path.relative_to(root)} is not inside any fn")
                 return 2
+            # The helper's own DEFINITION is not a call site. Excluded by name rather than by
+            # the `(?<!fn )` lookbehind alone, because a definition spread across lines would
+            # slip past that.
+            if key.endswith(f"::{DEVICE_CTOR}"):
+                continue
             actual[key] = actual.get(key, 0) + 1
     if not actual:
         fail(
             f"found ZERO `{DEVICE_CTOR}` call sites.",
-            "That cannot be right while the smoltcp shim is still the transport; the pattern must",
-            "have changed, so this arm is blind and refuses to pass.",
+            "Every radio tier brings the stack up through that helper, so zero means the pattern",
+            "moved and this arm is blind. It refuses to pass rather than report a vacuous green.",
         )
         return 2
     if actual != declared:
@@ -294,13 +322,16 @@ def main() -> int:
                 + ". Remove the entry when the site goes, or the roster stops describing the tree."
             )
     # The acute form, called out separately because it is unambiguous wherever the cfgs land:
+    # a tier that BOTH calls the shared helper and stands up its own stack inline has two
+    # `Stack`s over one `Copy` interface — the frame-theft shape, post-T spelling.
     both = sorted(set(stack_actual) & set(actual))
     if both:
         bad.append(
             "arm 2 (coexist): "
             + ", ".join(both)
-            + f" holds BOTH an `{STACK_CTOR}` and a `{DEVICE_CTOR}`. That is the frame-theft shape "
-            "in its most direct form — one function, two consumers, one queue."
+            + f" holds BOTH an inline `{STACK_CTOR}` and a `{DEVICE_CTOR}` call. That is two "
+            "stacks over one `Copy` interface — one function, two consumers, one queue. Call the "
+            "shared helper or bring the stack up inline, never both."
         )
 
     # ── arm 3: the cfg guards are literally unchanged ──────────────────────────────────────────
@@ -349,61 +380,33 @@ def main() -> int:
         )
         return 2
 
-    # ── arm 4: `new` stays the only way to build the device ────────────────────────────────────
+    # ── arm 4: the retired shim stays retired ─────────────────────────────────────────────────
+    # STEP T deleted `net/radio_dev.rs` and with it `SmolWifiDevice`. Pre-T this arm hunted for a
+    # SECOND way to build that device; post-T the stronger and simpler assertion is that it does
+    # not come back at all. A reintroduced phy shim restores the original hazard wholesale — a
+    # `Stack` and a shim over the same `Copy` interface, both popping one rx queue — and none of
+    # arms 1-3 would see it, because they only ever look at bring-up and `embassy_net::new` sites.
     home = [p for p in code if p.name == DEVICE_HOME]
-    if not home:
-        fail(f"the device's home module {DEVICE_HOME!r} was not found.")
-        return 2
-    htext = code[home[0]]
-    struct_m = re.search(r"pub\s+struct\s+" + DEVICE_TYPE + r"\s*(\(|\{|;)", htext)
-    if struct_m is None:
-        fail(
-            f"could not find `pub struct {DEVICE_TYPE}` in {DEVICE_HOME}.",
-            "Arm 4 anchors on that declaration; without it the arm is blind.",
+    if home:
+        bad.append(
+            f"arm 4 (shim-stays-dead): {DEVICE_HOME} is back in the tree. STEP T deleted it "
+            f"because esp-radio's STA `Interface` implements `embassy_net_driver::Driver` "
+            f"directly, so a hand-rolled smoltcp phy shim has nothing left to adapt — and a live "
+            f"shim beside the embassy-net `Stack` is the two-consumers-one-queue bug this whole "
+            f"checker exists for."
         )
-        return 2
-    # A `pub` field turns tuple-construction into a public constructor arm 1 would never see.
-    if struct_m.group(1) == "(":
-        tail = htext[struct_m.end() - 1 :]
-        close = tail.find(")")
-        if close > 0 and re.search(r"\bpub\b", tail[:close]):
-            bad.append(
-                f"arm 4 (no-new-ctor): `{DEVICE_TYPE}`'s tuple field is now `pub`, so "
-                f"`{DEVICE_TYPE}(iface)` is a public constructor anywhere in the crate. Arm 1 "
-                "counts `::new` call sites and would never see it."
-            )
-    # Any other associated fn returning Self is a second constructor.
-    for m in re.finditer(r"impl\s+" + DEVICE_TYPE + r"\s*\{", htext):
-        depth, i = 0, m.end() - 1
-        while i < len(htext):
-            if htext[i] == "{":
-                depth += 1
-            elif htext[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            i += 1
-        body = htext[m.end() : i]
-        for fm in re.finditer(r"fn\s+(\w+)\s*\([^)]*\)\s*->\s*([^{;]+)", body):
-            name, ret = fm.group(1), fm.group(2).strip()
-            if name == "new":
-                continue
-            if re.search(r"\bSelf\b|\b" + DEVICE_TYPE + r"\b", ret):
-                bad.append(
-                    f"arm 4 (no-new-ctor): `{DEVICE_TYPE}::{name}` also returns "
-                    f"`{ret}` — a second constructor. Arm 1's roster counts `::new` sites only, so "
-                    "a device built through this one is invisible to it."
-                )
-    # Tuple construction outside the owning module.
+    shim_hits = []
     for path, text in code.items():
-        if path.name == DEVICE_HOME:
-            continue
-        for m in re.finditer(r"\b" + DEVICE_TYPE + r"\s*\(", text):
-            bad.append(
-                f"arm 4 (no-new-ctor): {path.relative_to(root)}:"
-                f"{text.count(chr(10), 0, m.start()) + 1} builds `{DEVICE_TYPE}` by tuple syntax "
-                f"rather than `::new`, so arm 1 does not count it."
-            )
+        for m in re.finditer(r"\b" + re.escape(DEVICE_TYPE) + r"\b", text):
+            shim_hits.append(str(path.relative_to(root)))
+            break
+    if shim_hits:
+        bad.append(
+            f"arm 4 (shim-stays-dead): `{DEVICE_TYPE}` appears in CODE in "
+            + ", ".join(sorted(shim_hits))
+            + ". The type was deleted by STEP T; its return means a second STA transport is being "
+            "reintroduced. (Prose mentions are fine — this arm reads comment-stripped source.)"
+        )
 
     if bad:
         print("FATAL: the one-station-consumer invariant is violated.", file=sys.stderr)

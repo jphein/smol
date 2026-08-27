@@ -138,10 +138,9 @@ Also **new on main and absent from the reference entirely** — any async re-imp
 | `net/cfgsched.rs` | 171 | #21/#56 keyed-CFG relay scheduling |
 | `net/profile.rs` | 156 | #325/#331/#352 `BoardProfile` runtime variant identity |
 | `net/ledger_link.rs` | 155 | #181 ledger wiring |
-| `net/radio_dev.rs` | 85 | #233 transitional smoltcp `phy::Device` shim over 0.18 raw tokens |
 | `budget.rs` | 478 | #306/#348 DIAG + stack budget arithmetic (holds the stack floor) |
 
-`net/radio_dev.rs` is worth a specific note: it is the **transitional shim** that lets main keep a hand-driven smoltcp stack on esp-radio 0.18. It exists precisely because main chose *not* to take 0c′'s excision. Phase 3/4 completing is what retires it — it is the marker for "the transport port is done".
+`net/radio_dev.rs` **is gone, and its deletion is the marker it was defined to be.** It was the transitional smoltcp `phy::Device` shim (85 lines) that let main keep a hand-driven smoltcp stack on esp-radio 0.18, and this document said of it: "Phase 3/4 completing is what retires it — it is the marker for 'the transport port is done'." #335 STEP T retired it. esp-radio 0.18's STA `Interface` implements `embassy_net_driver::Driver` directly, so once the transport moved to embassy-net there was nothing left for a hand-rolled phy shim to adapt; `net::bring_up_stack` hands the interface straight to `embassy_net::new`. The marker is kept here rather than deleted with the row, because a criterion is only worth anything if someone records the moment it was met.
 
 ---
 
