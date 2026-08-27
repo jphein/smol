@@ -24,11 +24,67 @@ Two firmware **flavors** share the tree. The **fleet** flavor is `rust/clock/` �
 |---|---|---|---|
 | **[`c3`](targets/c3/)** — the headless node, ~$1 | ESP32-C3 · RISC-V | fleet | 🟢 **shipping** — the reference fleet. Every other board's numbers are measured against it. |
 | **[`c3-oled`](targets/c3-oled/)** — the node with a face, ~$2.76 | ESP32-C3 · RISC-V | fleet | 🟢 **shipping** — *the same image* as `c3`; the 72×40 SSD1306 is simply answered at boot. |
-| **[`s3-cyd`](targets/s3-cyd/)** — 2.8" ILI9341V + capacitive touch | ESP32-S3 · Xtensa | fleet **and** GUI | 🟢 **glass-verified (2026-08-26)** — boots, paints, takes touch, meshes, and reaches NTP + MQTT + Home Assistant, in *both* flavors, on real hardware. Not yet building in CI; the first A/B OTA roll is still ahead of it. |
+| **[`s3-cyd`](targets/s3-cyd/)** — 2.8" ILI9341V + capacitive touch | ESP32-S3 · Xtensa | fleet **and** GUI | 🟢 **glass-verified (2026-08-26)** — boots, paints, takes touch, meshes, and reaches NTP + MQTT + Home Assistant, in *both* flavors, on real hardware, and took build **345 → 1405 over the air** the same day: the first cross-architecture OTA in smol's history. Still not building in CI — the only blocker left is the runner toolchain. |
 | **[`c6-watch`](targets/c6-watch/)** — the Waveshare AMOLED smartwatch | ESP32-C6 · RISC-V | GUI | 🟢 **shipping in its own repo**, in-tree here as a full-history subtree. Live on the mesh; `rust/clock` compiles clean for the chip but does not yet link a fleet image for it. |
 | **[`c5-cyd`](targets/c5-cyd/)** — the NM-CYD-C5 2.8" touch board | ESP32-C5 · RISC-V | GUI today | 🟡 **mesh-proven** — the first non-C3 silicon ever heard on smol's mesh (2026-08-24). For `rust/clock` it is **checks-only**: the source compiles for the chip, but there is no measured memory budget row and no linked image yet. Zigbee-bridge role back-burnered. |
 
 **How to read those labels**, because the difference has cost real time here: **checks-only** means `cargo check` is clean for the chip — a real claim, and a much weaker one than *builds*. **Builds** means CI can produce a linked, budget-gated artifact. **Glass-verified** means a human watched it work on the bench. The declarations live in `tools/build-matrix.toml` (`checks` ⇐ `builds` ⇐ `ships`, enforced by a checker in both directions, so a stale pessimistic row fails the gate exactly like a stale optimistic one) and in `rust/clock/src/budget.rs`, and the two must agree or the build fails.
+
+## The capability matrix
+
+Which board does what, and where the honest edges are. This is the **short** version — the full
+matrix (69 rows × 6 board-flavors — capabilities plus build/release posture, every non-✅ cell
+carrying its reason and its issue) is
+**[docs/CAPABILITIES.md](docs/CAPABILITIES.md)**.
+
+A board can run either firmware flavor or both, and the two are genuinely different machines, so
+**parity is judged per flavor** — the framing [`targets/s3-cyd/PARITY.md`](targets/s3-cyd/PARITY.md)
+established. ✅ integrated · 🔶 partial · 🛠 hardware supports it, firmware doesn't yet · ❌ **the
+silicon or the fitted hardware cannot** · 📋 planned · — n/a to this flavor.
+
+**The GUI flavors are a superset of the fleet node** (JP's ruling, [#473](https://github.com/jphein/smol/issues/473)):
+every fleet feature is in scope on a touch board too, plus the GUI layer. So a fleet feature the GUI
+flavor hasn't implemented is a **gap with an issue number**, never "N/A by design" — "the scenes are
+compile-time" explains why a gap is hard, not why it isn't one. ❌ is reserved strictly for hardware
+that cannot. Every 🔶 and 🛠 below carries its issue; **the cell is that issue's acceptance test.**
+
+| | c3 | c3-oled | s3 · fleet | s3 · GUI | c6 · GUI | c5 · GUI |
+|---|---|---|---|---|---|---|
+| SMOLv1 mesh membership | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Crown election / gateway | ✅ | ✅ | ✅ | 🔶 observe-only #278 | 🔶 observe-only | 🔶 #488 |
+| Gateway: WiFi + NTP + MQTT → HA | ✅ | ✅ | ✅ | ✅ | ✅ | 🔶 HA dark #488 |
+| HA discovery + Update entity | ✅ 🔶 no `_soc` #498 | ✅ | ✅ | 🛠 own topics #492 | 🛠 own topics #492 | 🛠 #492 |
+| Keyed-CFG (every knob, no reflash) | ✅ 11 keys | ✅ | ✅ | 🛠 only `S`/`U`/`R` #490 | 🛠 #490 | 🛠 #490 |
+| Custom screens | ✅ | ✅ | ✅ | 🛠 not rendering #473 | 🛠 #473 | 🛠 #473 |
+| Mesh-OTA receive | ✅ | ✅ | ✅ **345→1405, first cross-arch OTA** | 🔶 compiled #495 | 🔶 unproven on the C6 #495 | 🔶 #495 |
+| Mesh-OTA relay / serve | ✅ | ✅ | 🔶 client only | 🔶 #495 | 🔶 #495 | 🔶 #495 |
+| HTTP / push OTA | ✅ | ✅ | ✅ | ✅ | ✅ zero-touch | 🔶 #488 |
+| Ed25519 signed-image verify | ✅ both paths | ✅ | ✅ | 🔶 mesh yes, HTTP no #489 | 🛠 build-monotonicity only #489 | 🛠 #489 |
+| Display | ❌ no panel fitted | ✅ SSD1306 72×40 | ✅ ILI9341V, 4× scaled | ✅ ILI9341V | ✅ CO5300 AMOLED | ✅ ST7789 |
+| Touch | ❌ none fitted | ❌ | 🛠 no fleet driver *(GUI ⊇ fleet, not the reverse)* | ✅ FT6336U | ✅ FT3168 | 🔶 XPT2046, poll-only |
+| Status LED | ✅ | ✅ | ✅ WS2812/RMT | 🛠 pin only #491 | ❌ none fitted | 🛠 pin only #491 |
+| smol Cast → WLED | 🔶 | ✅ | 🔶 mirror blank #483 | 🔶 default-off #493 | 🔶 #493 | 🔶 #493 |
+| Mesh Snake (head-to-head) | ✅ | ✅ | ✅ | 🛠 #494 | 🛠 #494 | 🛠 #494 |
+| The Bard (on-device transformer) | 🔶 on glass, **off-fleet** — 6,720 B short #497 | 🔶 same | 🔶 14,400 B short #497 | 🔶 opt-in | 🔶 30,480 B short #497 | 🔶 |
+| Audio out | ❌ no codec | ❌ | 🛠 codec ACKs, no path #476 | 🔶 **acoustic proof pending** #477 | ✅ | 🛠 header un-scoped #486 |
+| Audio in / voice | ❌ | ❌ | 🛠 mic fitted #476 | 📋 phase 2 #478 | ✅ ES7210 + STT | 🛠 #486 |
+| Battery % | ❌ | ❌ | 🛠 ADC on GPIO9 #479 | 🛠 declared, no reader #479 | ✅ AXP2101 | 🛠 #486 |
+| PMU · IMU | ❌ · ❌ | ❌ · ❌ | ❌ · ❌ ⚠️ log lies #480 | ❌ · ❌ | ✅ · ✅ | ❌ · ❌ |
+| Die temp (TSENS) | ✅ | ✅ | ❌ `soc_has_tsens` false | ❌ | ✅ | ❌ |
+| 802.15.4 (Zigbee/Thread) | ❌ no radio | ❌ | ❌ no radio | ❌ | 📋 mutually exclusive with ESP-NOW | 📋 back-burnered #399 |
+| BLE | 🔶 silicon has it; refuted in practice #22 | 🔶 | 🔶 not built | 🔶 | ✅ GATT | 🔶 |
+| CI `builds` a linked image | ✅ | ✅ | 🛠 no espup on runners #413 | 🛠 | 🛠 needs `widen_rom_region` | 🛠 no budget row #485 |
+| Published download | ✅ | ✅ *by design* use the c3 image | ✅ | ✅ | ✅ | ✅ |
+| Stack-floor provenance | ✅ `Derived` | ✅ `Derived` | 🔶 `ObservedSufficient` #484 | 🔶 #484 | 🔶 `BootAssert` | 🛠 none of its own #485 |
+
+**Three things that table is careful about.** The Bard runs on glass and is *not in any shipped
+image, on any board*: it is budget-predicated, and no chip's declared row currently has the 39,072 B
+of DRAM it needs, so it builds only under the `off-fleet` waiver — which the packaging path then
+refuses to publish. ❌ never means "not done": on the C3's display it means *no panel is fitted*, and
+on the C6's LE Audio it means *forensically closed — that silicon has no ISO link layer, so no
+earbud model changes it*. And where a whole column is 🔶 for one reason — the C5's is — the reason is
+that nobody has watched it, not that it fails; budgets and behaviours here are **measured, never
+inherited**.
 
 ## What runs on it (the apps)
 
@@ -78,6 +134,9 @@ This is where smol stops being a toy. The elected **gateway** briefly bursts ont
 ## Docs
 - **[#148](https://github.com/jphein/smol/issues/148)** — current status + the high-leverage queue
   (living, and machine-checked by `tools/status_check.sh`) · **start here**
+- **[docs/CAPABILITIES.md](docs/CAPABILITIES.md)** — **the capability matrix**: every feature × every
+  board-flavor, three-valued cells (hardware allows / integration done / where partial work stands),
+  and a reason or an issue on every cell that is not green
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — the durable half of steering: the OTA safety envelope,
   research results *including the refutations*, and the decision docket with how each call resolved
 - **[docs/DOC-UPKEEP.md](docs/DOC-UPKEEP.md)** — how these docs and the website are kept true: where truth lives, how to verify a claim, the traps
@@ -98,10 +157,12 @@ This is where smol stops being a toy. The elected **gateway** briefly bursts ont
 
 ### Put smol on a bare board
 
-Prebuilt images live on the [releases page](https://github.com/jphein/smol/releases). Today that is the C3 fleet image from `nightly-2026-08-24`; **per-target downloads are landing now** (#413) — `tools/release_targets.sh` walks the `targets/*/target.toml` manifests and packages every target that declares `artifact = true`, through the same reproducible-build calls the OTA publish path uses. Each artifact ships a `NOTES.md` beside it carrying its chip's **stack-floor provenance** in plain words and the (chip, profile) sha-lineage rule.
+Prebuilt images live on the [releases page](https://github.com/jphein/smol/releases). **Per-target downloads have landed** (#413): the `nightly` release carries **five images** — `smol-c3`, `smol-s3-cyd` (fleet), `smol-s3-cyd-gui`, `smol-watch-c6` and `smol-c5-cyd-gui`. `tools/release_targets.sh` walks the `targets/*/target.toml` manifests and packages every target declaring `artifact = true` (fleet) or `gui_artifact = true` (GUI), through the same reproducible-build calls the OTA publish path uses; the two Xtensa flavors ride a job that provisions the espup `esp` toolchain. Each artifact ships a `NOTES.md` beside it carrying its **sha256**, its chip's **stack-floor provenance** in plain words, and the (chip, profile) sha-lineage rule. Which board gets which flavor is [the capability matrix](docs/CAPABILITIES.md).
 
 ```bash
-sha256sum -c SHA256SUMS
+# Verify against the sha256 printed in the image's own NOTES.md (per-target
+# artifacts carry it inline; there is no combined SHA256SUMS in this release).
+sha256sum <image>.bin
 # ⚠️ If this board has EVER taken an OTA, clear otadata first, or the flash silently
 #    lands in the slot the bootloader will not select. This spares nvs (and your node id).
 espflash erase-region --port /dev/ttyACM0 0xf000 0x2000
