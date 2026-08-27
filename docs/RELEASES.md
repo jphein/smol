@@ -136,7 +136,7 @@ separate keys rather than one flag:
 | `c3-oled` | esp32c3 | ✅ *alias* | — | `alias_of = "c3"` — **one image, two boards**; resolved, not built twice |
 | `s3-cyd` | esp32s3 | ✅ | ✅ | **the only board shipping both flavors** — the case that forced the two axes apart. Xtensa: both need the espup `esp` toolchain |
 | `c6-watch` | esp32c6 | ❌ | ✅ | no fleet image — `rust/clock` `cargo check`s clean for the C6 but cannot LINK one without the watch's `widen_rom_region` hook |
-| `c5-cyd` | esp32c5 | ❌ | ✅ | **has a download while its fleet arm is still checks-only.** The C5 fleet image is CHECK-proven, not LINK-proven, and needs a measured budget row too |
+| `c5-cyd` | esp32c5 | ❌ | ✅ | **has a download while its fleet arm is still un-gated.** The C5 fleet image links and boots on hardware (#485) — it is past CHECK-proven — but still needs a measured budget row before it can be floor-gated |
 
 ### Three properties every per-target artifact carries
 

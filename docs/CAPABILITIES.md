@@ -105,9 +105,17 @@ per (target, flavor)** — the framing `targets/s3-cyd/PARITY.md` established. S
 | **c6 GUI** | [`c6-watch`](../targets/c6-watch/) — Waveshare AMOLED watch | ESP32-C6 · `riscv32imac` | GUI |
 | **c5 GUI** | [`c5-cyd`](../targets/c5-cyd/) — NM-CYD-C5 2.8″ | ESP32-C5 · `riscv32imac` | GUI |
 
-**`c5-cyd` has no fleet column** because it has no fleet image: `rust/clock` `cargo check`s clean
-for the C5 but there is no measured `ChipBudget` row, so `[chip.esp32c5] builds = false` and an
-unmeasured chip is handed `budget.rs`'s poison row (#485). *"It compiles" is a real claim and a much
+**`c5-cyd` has no fleet column** — not because a fleet image cannot exist (one links, boots, joins
+WiFi, runs its own NTP and meshes on id176 as of #485, 2026-08-27) but because it is not **gated**:
+there is still no measured `ChipBudget` row, so `[chip.esp32c5] builds = false` and an unmeasured
+chip is handed `budget.rs`'s poison row.
+⚠️ #485's headline is why the row matters here more than anywhere: measured `free_dram` **76,000 B**
+against the inherited PROVISIONAL 71,680 B floor leaves **4,320 B of `dram_headroom` — the least in
+the tree** (C3 32,352 · C6 watch 8,592). Declared as-is that row would refuse essentially every
+predicated feature, which is information `builds = false` has been withholding rather than an
+argument against declaring it. Four named gaps still block the literal: a `repro_build_bin`-path
+re-measure, no high-water instrument on this chip (`hmin=0` ⇒ `Derived` unavailable), the downward
+soak bracket `ObservedSufficient` requires, and the unreachable `ChipBudget` console printout. *"It compiles" is a real claim and a much
 weaker one than "it builds."*
 
 ---
@@ -119,7 +127,7 @@ weaker one than "it builds."*
 | **`cargo check` clean** (fleet source) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ — all four chips check clean since #398's `has-tsens` fallback |
 | **CI `builds` a linked image** | ✅ canonical chip | ✅ same image | 🛠 runner has no espup `esp` channel — the *only* remaining blocker (#413) | 🛠 same | 🛠 needs the watch's `widen_rom_region` hook before the 6 MB slot budget is honest | 🛠 no measured budget row (#485) |
 | **CI `ships`** | ✅ the only `ships = true` row | ✅ via `alias_of` | 🛠 follows `builds` | 🛠 | 🛠 | 🛠 |
-| **Published download** | ✅ `smol-c3` | ✅ *by design* no second build — `alias_of = "c3"`, flash the c3 image; the release notes name both boards | ✅ `smol-s3-cyd` — built by the espup-provisioning release job, *not* by the `builds` arm | ✅ `smol-s3-cyd-gui` | ✅ `smol-watch-c6` | ✅ `smol-c5-cyd-gui` — **a download while its fleet arm is still checks-only**; the two axes are independent keys for exactly this case |
+| **Published download** | ✅ `smol-c3` | ✅ *by design* no second build — `alias_of = "c3"`, flash the c3 image; the release notes name both boards | ✅ `smol-s3-cyd` — built by the espup-provisioning release job, *not* by the `builds` arm | ✅ `smol-s3-cyd-gui` | ✅ `smol-watch-c6` | ✅ `smol-c5-cyd-gui` — **a download while its fleet arm is still un-gated** (it links and boots as of #485; what it lacks is the measured budget row); the two axes are independent keys for exactly this case |
 | **`ChipBudget` row** | ✅ `ESP32C3` | ✅ shares it | ✅ `ESP32S3_CYD` (#411) | ✅ same row | ✅ `ESP32C6_WATCH` | 🛠 none — the one thing pinning `builds = false` (#485) |
 | **Stack floor** | 74,208 B | 74,208 B | 72,004 B | 72,004 B | 71,680 B | 🔶 inherits the C6's 71,680 B assert, labelled **PROVISIONAL … a stand-in, not a fact** (#485) |
 | **Floor provenance** | ✅ **`Derived`** — from a measured on-hardware peak (55,656 B) with a compile-time 4/3 assertion coupling floor to peak. The strongest grade in the project | ✅ same | 🔶 **`ObservedSufficient`** — the largest region proven to run clean; no high-water number, because `stack-paint`'s sentinel is trampled by boot-era machinery on xtensa (#484) | 🔶 same (#484) | 🔶 **`BootAssert`** — a firmware contract, not a measurement, and it sits ~1,320 B *below* the empirical boot line (permissive in a known, signed direction) | 🛠 none of its own (#485) |
