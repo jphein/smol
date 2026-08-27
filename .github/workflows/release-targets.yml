@@ -132,3 +132,24 @@ jobs:
             --title "nightly per-target images" \
             --notes "Rolling nightly builds - see each artifact's NOTES.md. New-hardware flashing only; fleet boards update over mesh OTA."
           gh release upload nightly out/* --clobber
+  checksums:
+    # The combined SHA256SUMS docs/RELEASES.md promises. It CANNOT be written per-job: three jobs
+    # each `gh release upload --clobber out/*`, so a per-job file would cover only whichever job
+    # uploaded last (#474 found the file missing for exactly this reason). This job runs after all
+    # three and checksums what is actually downloadable — the release's current .bin assets —
+    # so `sha256sum -c SHA256SUMS` works from a download directory regardless of which job built what.
+    name: combined SHA256SUMS
+    needs: [riscv-targets, riscv-gui-targets, s3-target]
+    if: ${{ always() && contains(needs.*.result, 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Regenerate SHA256SUMS over the release's bin assets
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          set -euo pipefail
+          mkdir dl && cd dl
+          gh release download nightly --repo "$GITHUB_REPOSITORY" --pattern '*.bin'
+          sha256sum *.bin > SHA256SUMS
+          echo "covering $(wc -l < SHA256SUMS) artifacts"
+          gh release upload nightly SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
