@@ -93,7 +93,8 @@ A human watched this board do all of it. **Verified on hardware, in the flavor n
   proven to run clean in bench operation. Real protection, weaker provenance than the C3's.
 - **Audio, battery %, light-sleep, LEDC backlight dimming** — the hardware allows them and the
   firmware does not do them yet. See `PARITY.md` for what each one needs.
-- **`[IMU] OK` on this board is a vacuous log line** — the ES3C28P has no IMU. IMU and PMU
-  features are *documented exclusions* here, not gaps.
+- **The IMU log is honest as of `ae80072`** — the ES3C28P has no IMU, and the boot line now says
+  so (`[IMU] absent (init NACK - no IMU on this board)`) instead of an unconditional `OK` (#480).
+  IMU and PMU features remain *documented exclusions* here, not gaps.
 
 The dated running status lives at the bottom of `PORT-SCOPING.md`; `PARITY.md` is the matrix.
