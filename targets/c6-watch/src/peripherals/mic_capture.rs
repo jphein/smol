@@ -390,7 +390,33 @@ pub async fn mic_capture_task(
                     lvl_buf[k] = i16::from_le_bytes([mono_buf[2 * k], mono_buf[2 * k + 1]]);
                 }
                 if samp_n > 0 {
-                    MIC_LEVEL.store(mic_dsp::rms_dbfs(&lvl_buf[..samp_n]) as i32, Ordering::Relaxed);
+                    let rms = mic_dsp::rms_dbfs(&lvl_buf[..samp_n]);
+                    MIC_LEVEL.store(rms as i32, Ordering::Relaxed);
+                    // Machine-verifiable audio-IN (debug-console builds only):
+                    // emit the peak capture level ~1/s so a harness can tell "mic
+                    // task alive" from "mic actually capturing" — the VALUE is the
+                    // discriminator (silence floors ~-60 dBFS, signal reads higher),
+                    // not merely that a line printed.
+                    #[cfg(feature = "debug-console")]
+                    {
+                        // PEAK (loudest) window RMS over each ~1 s interval, not a
+                        // single-window snapshot — so a transient between samples is
+                        // not missed. The field is named rms_peak_1s so it cannot be
+                        // misquoted as instantaneous or second-AVERAGED: each source
+                        // window is 256 samples (16 ms @ 16 kHz) and rms_peak_1s is
+                        // the max of the ~62 windows in the interval. dBFS: silence
+                        // floors ~-60, louder reads higher, so a rising value is
+                        // real audio arriving.
+                        use core::sync::atomic::AtomicI32;
+                        static MIC_PEAK: AtomicI32 = AtomicI32::new(i32::MIN);
+                        static MIC_GATE: core::sync::atomic::AtomicU32 =
+                            core::sync::atomic::AtomicU32::new(0);
+                        MIC_PEAK.fetch_max(rms as i32, Ordering::Relaxed);
+                        if MIC_GATE.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
+                            let peak = MIC_PEAK.swap(i32::MIN, Ordering::Relaxed);
+                            esp_println::println!("[MIC] rms_peak_1s={} dbfs", peak);
+                        }
+                    }
                 }
                 if let Ok(chunk) = MicChunk::from_slice(&mono_buf[..m]) {
                     let _ = sender.try_send(chunk); // drop on full = shed oldest audio (bounded latency)

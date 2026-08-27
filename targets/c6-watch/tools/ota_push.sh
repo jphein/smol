@@ -188,6 +188,26 @@ else
         echo "ota_push:  HASH   $(echo "$SIGIL_STAMP" | cut -d'|' -f2)"
         echo "ota_push:  VER    $(echo "$SIGIL_STAMP" | cut -d'|' -f3)"
         echo "ota_push: ---- compare on SYSTEM page / Settings p4 ----"
+        # EPOCH GUARD (S3 probe-v2 loop, 2026-08-27): the accept-gate is
+        # `announce > baked BUILD_EPOCH` with zero-touch reinstall, so announcing
+        # an epoch GREATER than the image actually bakes = an infinite
+        # self-reinstall loop (install → still-lower baked epoch < announce →
+        # reinstall → …). The WSIGIL marker now carries the baked epoch as
+        # `OTA=<n>` (field 4); refuse if we're about to announce past it.
+        BAKED_EPOCH=$(echo "$SIGIL_STAMP" | sed -n 's/.*|OTA=\([0-9]\{1,\}\).*/\1/p')
+        if [ -n "$BAKED_EPOCH" ]; then
+            echo "ota_push:  OTA    baked epoch $BAKED_EPOCH (announce $EPOCH)"
+            if [ "$EPOCH" -gt "$BAKED_EPOCH" ]; then
+                echo "ota_push: ABORT - announce epoch $EPOCH > image's baked OTA_BUILD $BAKED_EPOCH." >&2
+                echo "ota_push:         Zero-touch + monotonic-accept would self-reinstall-LOOP this." >&2
+                echo "ota_push:         The image was not stamped with this epoch at build time — rebuild" >&2
+                echo "ota_push:         with OTA_BUILD=$EPOCH in .cargo/config.toml [env], or announce <= $BAKED_EPOCH." >&2
+                exit 3
+            fi
+        else
+            echo "ota_push: WARNING image predates the OTA= epoch marker — cannot verify the"
+            echo "ota_push:         announce>baked reinstall-loop guard for this push."
+        fi
     else
         # An image with no marker predates this change (or LTO dropped it) — say
         # so, because silence would read as "sigil matches".
@@ -198,6 +218,33 @@ else
     # 4. Publish the image to the OTA HTTP server.
     scp -q "$TMP/watch.bin" "$OTA_DEST"
     echo "ota_push: image uploaded -> $OTA_DEST ($(stat -c%s "$TMP/watch.bin") bytes)"
+
+    # 4b. #489: SIGNED MANIFEST beside the image. The firmware fetches
+    # `<image-url>.manifest` and ed25519-verifies M = "build|size|sha256hex"
+    # (the fleet's exact manifest shape and key) BEFORE its first flash write;
+    # a push without this file is REFUSED by the watch. Signing mirrors smol's
+    # tools/ota_publish.sh: key from Vaultwarden, /dev/shm temp, shredded.
+    SIGNING_KEY_ITEM="${WATCH_OTA_SIGNING_KEY_ITEM:-smol-ota-signing-ed25519}"
+    SIZE=$(stat -c%s "$TMP/watch.bin")
+    SHA=$(sha256sum "$TMP/watch.bin" | cut -d' ' -f1)
+    M="${EPOCH}|${SIZE}|${SHA}"
+    _msgf="$(mktemp)"; _keyf="$(mktemp -p /dev/shm 2>/dev/null || mktemp)"
+    trap 'shred -u "$_msgf" "$_keyf" 2>/dev/null' EXIT INT TERM
+    bw get notes "$SIGNING_KEY_ITEM" > "$_keyf" 2>/dev/null || {
+        shred -u "$_msgf" "$_keyf" 2>/dev/null
+        echo "ota_push: ABORT - couldn't read signing key '$SIGNING_KEY_ITEM' from bw" >&2
+        echo "ota_push:         (locked vault and 'Not found.' are DIFFERENT failures;" >&2
+        echo "ota_push:         check \`bw status\` + \`bw config server\`)" >&2
+        exit 4
+    }
+    printf '%s' "$M" > "$_msgf"   # printf, NOT echo: M is exact wire bytes
+    SIG="$(openssl pkeyutl -sign -rawin -inkey "$_keyf" -in "$_msgf" | xxd -p -c 64)"
+    shred -u "$_msgf" "$_keyf" 2>/dev/null
+    case "$SIG" in *[!0-9a-f]*|"") echo "ota_push: ABORT - ed25519 signing failed" >&2; exit 4;; esac
+    [ "${#SIG}" -eq 128 ] || { echo "ota_push: ABORT - sig wrong length ${#SIG}" >&2; exit 4; }
+    printf '%s\n%s\n' "$M" "$SIG" > "$TMP/watch.bin.manifest"
+    scp -q "$TMP/watch.bin.manifest" "${OTA_DEST}.manifest"
+    echo "ota_push: signed manifest uploaded -> ${OTA_DEST}.manifest (M=$M)"
 fi
 
 # 5. RETAINED announce: the watch triggers only if <epoch> > its running
