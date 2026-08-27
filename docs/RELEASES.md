@@ -258,7 +258,7 @@ narrow and named: a stock GitHub runner has no espup `esp` toolchain, which
 | `smol-esp32c3-fleet.bin` | **canonical fleet** | `espnow,cast,io` | merged flashable image — bootloader + OTA partition table + app, 4 MiB |
 | `smol-esp32c3-fleet.elf` | canonical fleet | `espnow,cast,io` | same build, for `probe-rs` / `readelf` / symbol work |
 | `smol-esp32c3-default.elf` | `default` | none (no radio) | **ELF only** |
-| `SHA256SUMS` | — | — | verify with `sha256sum -c SHA256SUMS` |
+| `SHA256SUMS` | — | — | verify with `sha256sum -c --ignore-missing SHA256SUMS` |
 
 `espnow,cast,io` is the **canonical tier of record** — `tools/build-matrix.toml`
 `canonical_tier = "fleet"`, matching `REPRO_FLEET_FEATURES` in `tools/repro_build.sh`.
@@ -276,7 +276,9 @@ packageable as a flashable image today.** Filed as a follow-up rather than paper
 Always verify first:
 
 ```bash
-sha256sum -c SHA256SUMS
+# --ignore-missing: SHA256SUMS covers every artifact on the release; you downloaded one.
+# Without it the check reports FAILED for the nine files you don't have and exits 1.
+sha256sum -c --ignore-missing SHA256SUMS
 ```
 
 Then:
