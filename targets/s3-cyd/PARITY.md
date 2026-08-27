@@ -19,6 +19,16 @@ Two flavors, one board: **smol-native** (rust/clock, fleet tier) and **watch-GUI
 | Bard, games, cast-tap plumbing, sensors, budget row | native | #411, four-chip check |
 | mesh-ota feature compiled (ed25519-dalek on xtensa) | GUI | Cargo.toml S3 arm |
 | A/B partition table (6 MiB slots) | both | partitions-ota-s3.csv, flashed |
+| Swipe navigation, machine-verified (no C5-class bog) | GUI | 2026-08-27 debug-console suite: synthetic swipes paged 0→1→2→1→0; page-flip frame 74–79 ms, idle 150 µs (perf cmd) |
+| AOD state entry after idle | GUI | suite: `state` screen 3→1 after 20 s idle on watchface (1 = AOD in the ladder) |
+| Audio TX path, electrical (acoustic awaits speaker install) | GUI | `beep`: 1600/1600 B queued through I2S; codec+clock clean. JP has not installed the speaker yet |
+| Battery gauge = measured % by construction | GUI | shell.set_battery and the `[BATT]` println consume the same batt_pct (main.rs:2091/2109); live 3.93 V→73% |
+
+**Bench rig of record (2026-08-27):** the `debug-console` cargo feature + `tools/ui_test.py`
+inject synthetic taps/swipes on the real touch path and report per-frame render timings —
+the S3 test suite (`targets/s3-cyd/tmp/s3_suite.py`) runs the whole matrix with no hands.
+⚠️ Known gap found by it: the S3 battery probe is BOOT-ONLY (gauge freezes at boot value;
+reported to the watch lane for a poll-loop re-sample before/after the batt merge).
 
 ## GAPS — hardware allows, firmware doesn't yet
 
