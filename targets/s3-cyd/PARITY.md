@@ -50,10 +50,11 @@ Two flavors, one board: **smol-native** (rust/clock, fleet tier) and **watch-GUI
    self), slot flip, `ota=confirmed:1405` (self-test passed, no rollback). The
    fourth silicon family has OTA citizenship. Evidence + en-route findings
    (flash.sh otadata guard, SMOL_NODE_ID build-time trap, v922 crown gaps) on #398.
-9. **#413 release packaging** — per-target downloads from smol GitHub (espup-in-CI vs
-   off-CI builder; smol-d8/JP infra). ⚠️ The GUI flavor's broker/creds are compile-time
-   (`option_env!`) — public images must carry placeholders (the 192.168.1.10 default
-   IS the honest public value); JP's personal builds bake the VLAN-seat leg.
+9. ~~#413 release packaging~~ **DONE 2026-08-27**: phase 3.1 (`a3d7302`) puts the
+   GUI flavors — watch-c6, c5-cyd-gui, **s3-cyd-gui** — in the nightly alongside the
+   fleet tiers. Public images build via `tools/ci_provision_gui.sh` with placeholder
+   creds (the 192.168.1.10 default IS the honest public value); JP's personal builds
+   bake the VLAN-seat leg.
 
 ## The cyd-c5 half of the goal — SATISFIED by construction
 The C5's feature surface decomposes into: (a) the smol-native fleet tier — the S3
