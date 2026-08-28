@@ -1491,8 +1491,19 @@ boards carry it.
 | step | precondition | why |
 |---|---|---|
 | 1. firmware parses **both** generations, subscribes both topics | **merged main** | purely additive; a board that never sees an `OTA2\|` line behaves exactly as before |
-| 2. publisher **dual-stages** (legacy line unchanged + `OTA2\|` per-chip) | **merged main** | old firmware keeps reading the legacy topic it always read; new firmware prefers the per-chip line. Nothing is taken away, so nothing can be stranded |
+| 2. publisher **dual-stages** (legacy line for the CANONICAL chip only + `OTA2\|` per-chip) | **merged main** | old firmware keeps reading the legacy topic it always read; new firmware prefers the per-chip line. Nothing a legacy board could install is taken away, so nothing can be stranded |
 | 3. retire the fleet-wide `smol/ota/staged` line | **a ROLLED fleet** | the moment it stops being published, any board that cannot parse `OTA2\|` stops seeing updates — silently, since its symptom is simply never updating |
+
+> ⚠️ **Step 2 was narrowed by #464, and the wording above used to read "legacy line unchanged".**
+> Publishing *every* stage to the fleet-wide line meant an `esp32s3` staging armed every legacy C3
+> crown, each of which self-fetched ~1 MB before the #349 descriptor check refused it at finalize —
+> a guard working exactly as designed, after the cost had already been paid. `ota_publish.sh` now
+> publishes the legacy line **only when the staged image's chip is the canonical one** (see
+> `legacy_line_wanted`, and the `ota_publish.sh legacy-line <chip>` preflight).
+>
+> This does not weaken step 2's stranding argument, it sharpens it: what a legacy board needs is
+> every image **it could actually install**, and a foreign-chip image was never one of those. A
+> pre-#349 C3 still sees every C3 staging on the topic it has always read.
 
 Step 3 has a second, less obvious dependency: a crown relays the **signed M verbatim** to leaves
 over `OTAM`, so once a crown installs from an `OTA2` line it relays a 119 B M that a pre-#349 leaf
