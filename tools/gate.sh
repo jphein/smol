@@ -927,9 +927,12 @@ if [ "$run_host" = 1 ]; then
   # these guard tools/ota_publish.sh, which is the one script here that can arm the whole fleet.
   #
   # Deliberately NOT wired, with reasons, so the remainder is a declared gap and not an oversight:
-  #   • test_ota_verify.sh      — hermetic but slow (>2 min, replays canned MQTT logs). Not wired
-  #     because I did not watch it run to completion, and wiring a suite on the strength of its own
-  #     header comment is the inference this file exists to refuse. Worth a follow-up.
+  #   • test_ota_verify.sh      — hermetic, and MEASURED: 403 s, 204 assertions, 0 failed (#533).
+  #     It IS wired now, but only under SMOL_GATE_SLOW (see the step below). The previous note here
+  #     said "not wired because I did not watch it run to completion" — that was the right reason
+  #     and it has been discharged: someone watched it. Replaced with the measurement rather than
+  #     left standing, because a stale REASON is worse than none — it stops the next person
+  #     re-examining a decision whose premise has already moved.
   #   • test_ha_deploy_guard.sh — MUST NOT be wired. It commits with `git commit -am` by design and
   #     is built for a scratch clone; running it in a checkout with work in it creates junk commits
   #     (it has already done so here once). Its refusal to run in a working tree IS the guard.
@@ -943,6 +946,30 @@ if [ "$run_host" = 1 ]; then
       printf '%s\n' "$out" | sed 's/^/        /'; bad "$_t"
     fi
   done
+
+  # #533: the OTA-verify suite — 204 assertions over `tools/ota_verify.sh`, which is what answers
+  # "is the artifact we are about to flash the artifact this commit builds?" (the #44/#326
+  # reproducibility contract). It was measured at 403 s: hermetic, no network, no board, leaves the
+  # tree byte-unchanged — and 2-3x the whole rest of this arm.
+  #
+  # SO IT IS OPT-IN, and the reason is about human behaviour rather than correctness. `gate.sh` is
+  # the thing a developer runs verbatim before pushing; a seven-minute gate is one people start
+  # skipping, and A SKIPPED GATE IS WORTH LESS THAN NO GATE, because everyone believes it ran. CI
+  # sets SMOL_GATE_SLOW=1, where the time is already being spent on the fw build, so the assertions
+  # run on every PR without taxing every local push.
+  if [ "${SMOL_GATE_SLOW:-0}" = "1" ]; then
+    step "OTA-verify regression suite (#533 — 204 assertions, ~403 s, SMOL_GATE_SLOW)"
+    if out=$("$ROOT/tools/test_ota_verify.sh" 2>&1); then
+      printf '%s\n' "$out" | tail -1; ok "test_ota_verify"
+    else
+      printf '%s\n' "$out" | sed 's/^/        /'; bad "test_ota_verify"
+    fi
+  else
+    # SAY that it was skipped. A silently-absent check reads identically to a passing one, which is
+    # the failure this file exists to refuse — the same argument as the #400 note above.
+    printf '\n\033[1m── OTA-verify regression suite (#533)\033[0m\n'
+    printf '   \033[33mSKIP\033[0m  204 assertions not run — set SMOL_GATE_SLOW=1 (~403 s). CI runs them.\n'
+  fi
 
   # #390: the offline half of the symbol-size guard. The fw arm runs the checker against a real
   # ELF; this proves the PARSE/NORMALISE/COMPARE logic can fail, using a committed real slice of
