@@ -2275,16 +2275,35 @@ const RELAY_CACHE_CAP: usize = 12;
 /// (diag + scan). #68 F6 freshness (`entry_fresh`) gates the republish so an off-air leaf's
 /// retained record ages out instead of ghosting.
 #[cfg(feature = "wifi")]
-pub struct RelayCache {
+pub struct RelayCache<const VAL: usize = RELAY_VALUE_MAX> {
     ids: [u8; RELAY_CACHE_CAP],
-    vals: [[u8; RELAY_VALUE_MAX]; RELAY_CACHE_CAP],
+    vals: [[u8; VAL]; RELAY_CACHE_CAP],
     lens: [u16; RELAY_CACHE_CAP],
     last_ms: [u64; RELAY_CACHE_CAP],
     count: usize,
 }
 
+/// #382: the DIAG cache's value width, and THE ONE PLACE the reassembly memory decision lives.
+///
+/// `RELAY_VALUE_MAX` (232) is sized to exactly ONE frame, which is correct for `scan_cache` and
+/// impossible for a DIAG record that arrives in parts — a reassembled record is by definition
+/// larger than one frame. That is the feature, not a bug in the sizing.
+///
+/// ⚠️ THIS IS THE EXPENSIVE CONSTANT, and `.bss` is the expensive currency. `esp-hal` takes `.bss`
+/// growth out of `.stack`, one for one — measured on the same build in PR #530, where an 8 B
+/// arena growth moved `.stack` 73,088 -> 73,080. The C3's remaining stack headroom is 8,605 B, so
+/// every 12 bytes added here costs 144 B of it (`RELAY_CACHE_CAP` = 12).
+///
+///   360 (this)  = part A (<= OBS_VALUE_MAX 226) + one ~128 B continuation   -> +1,536 B .bss
+///   448         = enough for the whole 389 B record measured 2026-08-26     -> +2,592 B (~30 %)
+///
+/// 360 is chosen to hold part A plus ONE continuation, matching `DIAG_CONT_PARTS`. Raise the two
+/// TOGETHER or not at all: more parts than the cache can hold is airtime spent on data the
+/// receiver drops, which is strictly worse than not sending it.
+pub const DIAG_CACHE_VALUE_MAX: usize = 360;
+
 #[cfg(feature = "wifi")]
-impl RelayCache {
+impl<const VAL: usize> RelayCache<VAL> {
     // Like `CfgCache`, these are called only by the espnow gateway (`RadioManager`); a
     // wifi-only build (no `RadioManager`) leaves `new`/`set`/`count` unused → allow dead_code
     // so the clippy gate stays clean in every profile.
@@ -2292,18 +2311,74 @@ impl RelayCache {
     pub const fn new() -> Self {
         Self {
             ids: [0; RELAY_CACHE_CAP],
-            vals: [[0; RELAY_VALUE_MAX]; RELAY_CACHE_CAP],
+            vals: [[0; VAL]; RELAY_CACHE_CAP],
             lens: [0; RELAY_CACHE_CAP],
             last_ms: [0; RELAY_CACHE_CAP],
             count: 0,
         }
     }
 
+    /// #382: append a CONTINUATION slice to leaf `id`'s cached record.
+    ///
+    /// Append, not reassemble — every continuation begins on a field boundary (the sender's
+    /// `rposition('|')`), so there is no partial field to stitch and the cache never holds two
+    /// halves at once. That property is what keeps this a memcpy instead of a state machine.
+    ///
+    /// `cut=` STOPS BEING AN EPITAPH AND BECOMES A CHECKSUM. Part A carries `|cut=<dropped>`; this
+    /// strips it, appends the slice, and re-derives the tag from what is STILL missing. A reader
+    /// seeing `|cut=0` knows it has the whole record — which is the fitness criterion this change
+    /// was approved against, and the one an operator can actually see. The instrument that reported
+    /// the bug becomes the one that proves the fix.
+    ///
+    /// Refuses, rather than guesses, in three cases:
+    ///   * no entry for `id` — a slice with no head is a record whose field POSITIONS are unknown,
+    ///     and a positional parse fed a headless tail produces confident nonsense. Self-corrects
+    ///     next cadence.
+    ///   * `part != 1` — only the first continuation is supported while `DIAG_CONT_PARTS == 1`.
+    ///     A part 2 arriving means sender and receiver disagree about the budget, and appending it
+    ///     out of order would corrupt a record that is merely short.
+    ///   * the cached record has no `|cut=` tag — then it was never truncated, so a continuation
+    ///     for it is not ours to apply.
+    #[allow(dead_code)]
+    pub fn append_cont(&mut self, id: u8, part: u8, value: &[u8], now: u64) {
+        if part != 1 {
+            return;
+        }
+        let Some(i) = (0..self.count).find(|&i| self.ids[i] == id) else {
+            return; // continuation with no part A — see the doc comment
+        };
+        let len = self.lens[i] as usize;
+        // Locate the trailing `|cut=<n>` written by `broadcast_diag`. Searching from the END and
+        // requiring it to be the LAST field is deliberate: `cut=` is appended last by construction,
+        // and matching an earlier occurrence would truncate a real record at a coincidence.
+        let cur = &self.vals[i][..len];
+        let Some(tag_at) = crate::net::wire::find_last_cut(cur) else {
+            return; // not a truncated record — nothing to continue
+        };
+        let dropped: usize = crate::net::wire::parse_cut(&cur[tag_at..]).unwrap_or(0);
+        let take = value.len().min(VAL - tag_at);
+        self.vals[i].copy_within(0..tag_at, 0); // no-op; kept explicit for the reader
+        self.vals[i][tag_at..tag_at + take].copy_from_slice(&value[..take]);
+        let mut end = tag_at + take;
+        // Re-derive the tag from what is STILL missing. Saturating: a sender that shipped MORE than
+        // it said it dropped yields 0, which is the honest answer ("nothing is missing"), not a
+        // wrapped huge number.
+        let still = dropped.saturating_sub(take);
+        let mut tag = [0u8; 8];
+        let tlen = crate::net::wire::write_cut(&mut tag, still);
+        if end + tlen <= VAL {
+            self.vals[i][end..end + tlen].copy_from_slice(&tag[..tlen]);
+            end += tlen;
+        }
+        self.lens[i] = end as u16;
+        self.last_ms[i] = now;
+    }
+
     /// Upsert leaf `id`'s record (truncated to `RELAY_VALUE_MAX`), stamping `now` for the F6
     /// freshness gate. A full cache drops the entry and logs it (no silent cap).
     #[allow(dead_code)]
     pub fn set(&mut self, id: u8, value: &[u8], now: u64) {
-        let n = value.len().min(RELAY_VALUE_MAX);
+        let n = value.len().min(VAL);
         for i in 0..self.count {
             if self.ids[i] == id {
                 self.vals[i][..n].copy_from_slice(&value[..n]);
@@ -2662,7 +2737,7 @@ async fn mqtt_session(
     // #70/#49: `Some` on a GATEWAY flush → after publishing THIS node's own diag, republish each
     // CACHED relayed-node DIAG record as retained `smol/<id>/diag` (leaves have no MQTT). F6
     // freshness-gated (an off-air node ages out, no ghost). `None` off-gateway. Read-only.
-    diag_cache: Option<&RelayCache>,
+    diag_cache: Option<&RelayCache<DIAG_CACHE_VALUE_MAX>>,
     // #71: this node's OWN one-shot WiFi-scan record → retained `smol/<node_id>/scan`. Empty ⇒
     // skipped (the common case — a scan is only produced when a `W` command fired). Twin of `diag`.
     scan: &[u8],
@@ -5163,7 +5238,7 @@ pub async fn run_mqtt_burst(
     // #70/#49: this node's own DIAG record → retained `smol/<id>/diag` (empty ⇒ none; see `mqtt_session`).
     diag: &[u8],
     // #70/#49: `Some` on a gateway flush → republish cached relayed diags (see `mqtt_session`); `None` otherwise.
-    diag_cache: Option<&RelayCache>,
+    diag_cache: Option<&RelayCache<DIAG_CACHE_VALUE_MAX>>,
     // #71: this node's own one-shot WiFi-scan record → retained `smol/<id>/scan` (empty ⇒ none).
     scan: &[u8],
     // #71: `Some` on a gateway flush → republish cached relayed scans; `None` otherwise.

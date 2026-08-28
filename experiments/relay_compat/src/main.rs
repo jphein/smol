@@ -55,6 +55,11 @@ fn old_parse_relay(data: &[u8]) -> Option<(u8, u16, u8, u8, &[u8])> {
     Some((src_id, msgid, rest[10] - b'0', rest[12] - b'0', &rest[14..]))
 }
 
+/// Expected `|cut=<n>` width: 5 for the tag + the decimal digits, clamped at 3.
+fn alloc_len(n: usize) -> usize {
+    5 + if n >= 100 { 3 } else if n >= 10 { 2 } else { 1 }
+}
+
 fn main() {
     // (1) NEW frame -> OLD parser (a #13 leaf's H=1 RELAY on an old gateway) -----------------
     let mut fb = [0u8; 128];
@@ -164,5 +169,47 @@ fn main() {
     assert_eq!(dinner, &diag[..cut], "unwrapped inner == the field-boundary-clamped DIAG verbatim");
     assert!(dinner.starts_with(b"SMOLv1 DIAG 007"), "clamped DIAG keeps its classify-able prefix");
 
-    println!("relay_compat: ALL CHECKS PASSED (bidirectional byte-compat + golden bytes + #13/#124 tag round-trips + disambiguation + UP2 clamp + field-boundary DIAG clamp)");
+    // ── #382 `|cut=` tag round-trip ────────────────────────────────────────────────────────────
+    // A leaf DIAG that does not fit one frame is now continued (`DIAGC`), and the crown re-derives
+    // `|cut=` from what is STILL missing so the tag becomes a CHECKSUM: 0 means "you have the whole
+    // record". These three functions are the entire byte-level contract of that, and this change
+    // CANNOT BE TESTED ON HARDWARE from here — so it gets tested here, exhaustively, off-target.
+
+    // write/parse round-trip across every width the tag can take, including the boundaries where
+    // its LENGTH changes (6/7/8 bytes) — the widths are where an off-by-one lives.
+    for n in [0usize, 1, 9, 10, 11, 99, 100, 101, 169, 998, 999] {
+        let mut buf = [0u8; 8];
+        let len = wire::write_cut(&mut buf, n);
+        let expect = alloc_len(n);
+        assert_eq!(len, expect, "write_cut({n}) wrote {len} B, expected {expect}");
+        assert_eq!(wire::parse_cut(&buf[..len]), Some(n), "round-trip failed for {n}");
+    }
+    // The clamp must match `broadcast_diag`'s `dropped.min(999)` — if the two ends disagree about
+    // the field width the record is corrupt, not merely wrong.
+    let mut buf = [0u8; 8];
+    let len = wire::write_cut(&mut buf, 100_000);
+    assert_eq!(&buf[..len], b"|cut=999", "write_cut must clamp at 999 exactly as the sender does");
+
+    // find_last_cut must take the LAST occurrence: `cut=` is appended last by construction, and
+    // matching an earlier one would truncate a real record at a coincidence.
+    // ⚠️ The decoy must be a REAL `|cut=` field, not `=cut=`. My first version of this fixture used
+    // "|note=cut=here", which contains no `|cut=` at all — so the arm passed with `find_last_cut`
+    // sabotaged to take the FIRST occurrence, i.e. it was testing nothing. Caught by sabotaging the
+    // function and watching this stay green, which is the only reason it is right now.
+    let rec = b"DIAG|slot=0|cut=1|up=5|cut=169";
+    let at = wire::find_last_cut(rec).expect("tag found");
+    assert_eq!(&rec[at..], b"|cut=169", "find_last_cut took an earlier occurrence");
+    assert_eq!(wire::parse_cut(&rec[at..]), Some(169));
+
+    // An untruncated record has no tag — the crown must decline to continue it rather than guess.
+    assert!(wire::find_last_cut(b"DIAG|slot=0|up=5").is_none(), "no tag must mean no tag");
+    // Malformed tags parse to None, so a caller can refuse rather than default to 0 and silently
+    // claim a record is complete.
+    assert!(wire::parse_cut(b"|cut=").is_none(), "empty digits must not parse");
+    assert!(wire::parse_cut(b"|cut=12x").is_none(), "non-digits must not parse");
+    // Shorter than the tag itself must not panic on the slice.
+    assert!(wire::find_last_cut(b"|cu").is_none());
+    assert!(wire::find_last_cut(b"").is_none());
+
+    println!("relay_compat: ALL CHECKS PASSED (bidirectional byte-compat + golden bytes + #13/#124 tag round-trips + disambiguation + UP2 clamp + field-boundary DIAG clamp + #382 cut-tag round-trip/clamp/last-occurrence)");
 }
