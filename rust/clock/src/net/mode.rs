@@ -272,6 +272,42 @@ const STAT_PREFIX: &[u8] = b"SMOLv1 STAT "; // + "NNN" + verbatim "<AppKind>:<pa
 /// Value bounded by `RELAY_VALUE_MAX`.
 const DIAG_PREFIX: &[u8] = b"SMOLv1 DIAG "; // + "NNN" + verbatim "up=.. bt=.. rr=.. …"
 
+/// #382: the CONTINUATION of a leaf DIAG that did not fit one frame — `"SMOLv1 DIAGC "` + `"NNN"`
+/// (sender id) + one ASCII part digit + the next slice of the record, starting ON A FIELD BOUNDARY.
+///
+/// Why a second frame at all. Measured across 64 relayed records (2026-07-28 → 08-26): **not one
+/// leaf DIAG has ever arrived complete**. 43 % of the record is dropped, the loss is growing
+/// 2.6 B/day, and what goes first is the entire PROTECTED tail — `mo=`/`mf=`/`mfk=`, the #190
+/// counters that are unsheddable against the MQTT cliff and destroyed every time by this one. Two
+/// ceilings, one name: a field can be protected against the 495 B publish budget and reliably
+/// destroyed by the 218 B relay cut.
+///
+/// Why N-part rather than a two-part split. Two parts is 436 B of capacity against a 389 B record
+/// growing 2.6 B/day — **~18 days of headroom**, i.e. a fix that expires before it is a year old.
+/// Any FIXED part count has an expiry date; the part digit does not.
+///
+/// PART A IS BYTE-IDENTICAL to what a leaf sends today, `|cut=` and all. That is the whole
+/// compatibility story: HA, the crown relay and every existing parser see exactly what they see
+/// now, so there is no flag day and no rolled-fleet dependency — which `docs/protocol.md`'s OTA2
+/// migration table shows is the expensive kind of change. A receiver that does not know `DIAGC`
+/// ignores it exactly as it ignores any unknown frame.
+///
+/// Byte 7 disambiguates from `SCAN`/`STAT`/`DIAG` the same way those disambiguate from each other;
+/// `DIAGC` shares `DIAG`'s first 12 bytes, so ORDER MATTERS at the parse site — `DIAGC` must be
+/// tried FIRST or `strip_prefix(DIAG_PREFIX)` swallows it and yields a record whose first bytes are
+/// `C<part>`. That is asserted below rather than left to whoever edits the parser next.
+const DIAGC_PREFIX: &[u8] = b"SMOLv1 DIAGC "; // + "NNN" + "<part>" + the next field-boundary slice
+
+/// The DIAGC parse arm must precede the DIAG arm. `DIAG_PREFIX` is a strict prefix of
+/// `DIAGC_PREFIX`, so a parser that tries DIAG first matches every continuation as a malformed
+/// DIAG. This proves the hazard EXISTS at compile time; `parse_frame`'s ordering is what avoids it,
+/// and `experiments/relay_compat` exercises it.
+const _: () = assert!(
+    DIAGC_PREFIX.len() > DIAG_PREFIX.len(),
+    "DIAGC_PREFIX must extend DIAG_PREFIX — if that stops being true the parse-order note below is \
+     no longer describing a real hazard and should be re-derived, not deleted"
+);
+
 /// Bytes of DIAG payload an MQTT publish can carry: the 512 B `pkt` buffer in `wifi.rs`, less the
 /// PUBLISH fixed header + 2 B topic-length prefix, less the longest topic (`smol/255/diag`).
 ///
@@ -380,6 +416,73 @@ const _: () = assert!(
 const _: () = assert!(
     DIAG_PREFIX.len() + 3 + crate::net::wifi::RELAY_VALUE_MAX <= 250,
     "leaf DIAG frame exceeds the ESP-NOW payload ceiling — lower RELAY_VALUE_MAX"
+);
+
+/// #382: a continuation frame carries 1 extra byte of header (the part digit) over a DIAG frame, so
+/// its value ceiling is one lower. Derived rather than written down, because the previous constant
+/// of this kind was hand-summed and drifted (#306).
+const CONT_VALUE_MAX: usize = ESP_NOW_MTU - MAC_TRAILER_LEN - DIAGC_PREFIX.len() - 3 - 1;
+
+/// #382: how many continuation frames a leaf will emit per DIAG cadence.
+///
+/// THE ONE KNOB. It bounds airtime, and — together with the crown-side buffer — it is the whole
+/// cost of this feature. Measured at 1: a 250 B frame per leaf per 60 s cadence is 2,192 us of
+/// airtime in the WORST case (1 Mbps DSSS, long preamble), 15,344 us/min across the fleet, a
+/// 0.0256 % duty cycle. For scale, one leaf mesh-OTA moves ~1 MB through the same radio, so a
+/// continuation is 0.024 % of a single transfer.
+///
+/// Why 1 and not "enough for the whole record": the crown cannot store more than it can publish,
+/// and its `RelayCache` entry is sized to ONE frame. Raising this without raising that produces
+/// frames nobody keeps — airtime spent on data that is dropped at the receiver, which is strictly
+/// worse than not sending it. Raise them together, and see the .bss cost recorded on #382 (a full
+/// 448 B/entry reassembly buffer is +2,592 B, ~30 % of the C3's remaining stack headroom, because
+/// esp-hal takes .bss out of .stack — measured, not assumed).
+const DIAG_CONT_PARTS: u8 = 1;
+
+/// Width of the `|cut=<n>` marker at its widest ("|cut=999"). Hoisted to module scope by #382:
+/// it is no longer a detail of `broadcast_diag` but a term in the compile-time pairing between the
+/// sender's continuation budget and the crown's cache, and a constant that two places depend on
+/// should not live inside one of them.
+const CUT_TAG_MAX: usize = 8;
+
+/// #382: what ONE continuation may carry — the DECLARED part-B budget.
+///
+/// **Derived from what the crown can KEEP, not from what the frame can HOLD**, and the difference
+/// is a real bug I shipped in the first draft: the frame allows `CONT_VALUE_MAX` (224 B), the crown
+/// can only append `DIAG_CACHE_VALUE_MAX − OBS_VALUE_MAX` (134 B) after part A, so a full-frame
+/// continuation was silently TRUNCATED at the receiver — positional loss reintroduced at the exact
+/// place this change exists to remove it, and invisible because the frame was well-formed.
+///
+/// Bounding the SENDER by the receiver's budget is the byte-granularity form of the rule that
+/// governs `DIAG_CONT_PARTS`: never emit what the other end cannot keep. Airtime spent on data that
+/// is dropped on arrival is strictly worse than not sending it, because it also looks like it
+/// worked.
+///
+/// 134 B comfortably holds the declared set this carries — the PROTECTED tail (`mo= mf= mfk= apch=
+/// blrev= brst=`, 84 B declared in `DIAG-TAIL`) plus `elect=` and the trailing positional fields
+/// that fall past part A's cut.
+const CONT_DECLARED_MAX: usize = crate::net::wifi::DIAG_CACHE_VALUE_MAX - OBS_VALUE_MAX;
+
+/// #382 THE PAIRING, ENFORCED. `DIAG_CONT_PARTS` and the crown's buffer are two halves of one
+/// decision, and this is what stops them drifting: raise the parts count without raising
+/// `DIAG_CACHE_VALUE_MAX` and the build FAILS rather than the fleet quietly emitting frames whose
+/// tails nobody stores.
+///
+/// The part-A/part-B slot skew that would otherwise worry here is impossible BY CONSTRUCTION: a
+/// continuation is appended into part A's own cache entry, not held in a parallel array, so there
+/// is no second slot to run out of. One `RELAY_CACHE_CAP`, one entry, one record.
+const _: () = assert!(
+    OBS_VALUE_MAX + (DIAG_CONT_PARTS as usize) * CONT_DECLARED_MAX
+        <= crate::net::wifi::DIAG_CACHE_VALUE_MAX + CUT_TAG_MAX,
+    "DIAG_CONT_PARTS exceeds what the crown's diag_cache can hold — raise DIAG_CACHE_VALUE_MAX with \
+     it, or the extra parts are airtime spent on bytes the receiver drops (see #382)"
+);
+
+const _: () = assert!(
+    DIAGC_PREFIX.len() + 3 + 1 + CONT_VALUE_MAX + MAC_TRAILER_LEN <= ESP_NOW_MTU,
+    "leaf DIAG CONTINUATION frame exceeds the ESP-NOW payload ceiling once the #190 group-MAC \
+     trailer is appended — the obvious repair (raise CONT_VALUE_MAX) is the one that overflows the \
+     frame silently, so it is refused here at compile time"
 );
 
 /// #71 observability UPLINK tag: `"SMOLv1 SCAN "` (12 B, trailing space) then `"NNN"` (SENDER id)
@@ -701,6 +804,10 @@ enum Frame<'a> {
     /// the verbatim record bytes (borrow the RX buffer; the GATEWAY caches it in `diag_cache`,
     /// keyed by `src`). Twin of `Stat` but a bigger value → retained `smol/<src>/diag`.
     Diag { src: u8, value: &'a [u8] },
+    /// #382: the next field-boundary slice of a leaf DIAG that did not fit one frame. `part` is
+    /// 1-based (part 0 is the DIAG frame itself), so a receiver can tell "the first continuation"
+    /// from "a continuation I have no part A for" without keeping a sequence number.
+    DiagCont { src: u8, part: u8, value: &'a [u8] },
     /// #71 observability uplink: a node's one-shot WiFi-scan record. Twin of `Diag` (own cache
     /// `scan_cache`) → retained `smol/<src>/scan`.
     Scan { src: u8, value: &'a [u8] },
@@ -2154,7 +2261,7 @@ pub struct RadioManager {
     /// #70/#49 observability (GATEWAY side): per-node relayed DIAG record cache, filled by the
     /// `SMOLv1 DIAG` service arm from node uplinks and republished as retained `smol/<id>/diag`
     /// on each flush (F6 freshness-gated). Twin of `stat_cache` but a bigger value. Unused leaf-side.
-    diag_cache: crate::net::wifi::RelayCache,
+    diag_cache: crate::net::wifi::RelayCache<{ crate::net::wifi::DIAG_CACHE_VALUE_MAX }>,
     /// #71 observability (GATEWAY side): per-node relayed one-shot WiFi-scan cache, twin of
     /// `diag_cache` → retained `smol/<id>/scan`. Unused leaf-side.
     scan_cache: crate::net::wifi::RelayCache,
@@ -3539,7 +3646,6 @@ impl RadioManager {
         // at least be able to tell that it was cut rather than never sent. The crown is unaffected (it
         // self-publishes the full record over MQTT), which is precisely why this hid for so long — the
         // one board anybody looks at is the one that is fine.
-        const CUT_TAG_MAX: usize = 8; // "|cut=999"
         // #190: `OBS_VALUE_MAX`, not `RELAY_VALUE_MAX` — the frame must still fit the MTU *after*
         // `send_to` appends the 9 B group-MAC trailer. Worst case is exact, both branches: cut path
         // 12+3+218+8 = 241, uncut path 12+3+226 = 241, +9 trailer = 250 = `ESP_NOW_MTU`.
@@ -3581,6 +3687,72 @@ impl RadioManager {
         }
         self.send_to(&BROADCAST_ADDRESS, &msg[..end]);
         self.relay_wrap_observability(&msg[..end]);
+
+        // ── #382: CONTINUATIONS ────────────────────────────────────────────────────────────────
+        // Everything above is unchanged, deliberately: part A is byte-identical to what a leaf has
+        // always sent, `|cut=` included. Every existing receiver keeps working with no flag day and
+        // no rolled-fleet dependency — the expensive kind of change, per `protocol.md`'s OTA2
+        // migration table. What follows is PURELY ADDITIVE: a receiver that does not know `DIAGC`
+        // ignores these exactly as it ignores any unknown frame, and is left in today's state.
+        //
+        // Measured justification (64 relayed records, 2026-07-28 → 08-26): NOT ONE leaf DIAG has
+        // ever arrived complete. 43 % dropped, growing 2.6 B/day, and the first thing lost is the
+        // PROTECTED tail — `mo=`/`mf=`/`mfk=`, unsheddable against the MQTT cliff and destroyed
+        // every single time by this one. Two ceilings, one word.
+        if value.len() > n {
+            let mut off = n;
+            let mut part: u8 = 1;
+            while off < value.len() && part <= DIAG_CONT_PARTS {
+                let remain = value.len() - off;
+                // Cut on a FIELD BOUNDARY for the same reason part A does: a positional parse
+                // cannot tell a truncated value from a real one, so a short-but-well-formed slice
+                // is strictly better than a corrupt one. A continuation that begins on a boundary
+                // also needs no partial-field stitching at the receiver — which is the property
+                // that lets the crown APPEND rather than reassemble.
+                // The window is the SMALLER of what the frame holds and what the crown keeps —
+                // see `CONT_DECLARED_MAX`. Using the frame limit alone silently truncates at the
+                // receiver, which is the failure this whole change exists to end.
+                let window = CONT_VALUE_MAX.min(CONT_DECLARED_MAX);
+                let take = if remain > window {
+                    match value[off..off + window].iter().rposition(|&b| b == b'|') {
+                        // `rposition` is relative to the slice; +0 keeps the boundary `|` at the
+                        // START of the NEXT part, so every part begins with a separator exactly
+                        // like part A's own fields do.
+                        Some(i) if i > 0 => i,
+                        // No separator in the whole window (or one at index 0, which would make no
+                        // progress and loop forever). Fall back to the raw cut: a malformed tail
+                        // beats a hang, and this is unreachable for a real DIAG record.
+                        _ => window,
+                    }
+                } else {
+                    remain
+                };
+                let cbase = DIAGC_PREFIX.len();
+                let mut cmsg = [0u8; DIAGC_PREFIX.len() + 3 + 1 + CONT_VALUE_MAX];
+                cmsg[..cbase].copy_from_slice(DIAGC_PREFIX);
+                cmsg[cbase] = b'0' + own / 100;
+                cmsg[cbase + 1] = b'0' + (own / 10) % 10;
+                cmsg[cbase + 2] = b'0' + own % 10;
+                cmsg[cbase + 3] = b'0' + part;
+                let cend = cbase + 4 + take;
+                cmsg[cbase + 4..cend].copy_from_slice(&value[off..off + take]);
+                self.send_to(&BROADCAST_ADDRESS, &cmsg[..cend]);
+                self.relay_wrap_observability(&cmsg[..cend]);
+                off += take;
+                part += 1;
+            }
+            if off < value.len() {
+                // The parts budget ran out before the record did. Say so on the serial line rather
+                // than leaving a silent short record — the ENTIRE point of `|cut=` was that a
+                // reader who cannot see a field must at least know it was cut, and that property
+                // must survive the fix for it.
+                log::warn!(
+                    "smol #382: DIAG still short by {} B after {} continuation(s) — raise DIAG_CONT_PARTS or shed a field",
+                    value.len() - off,
+                    DIAG_CONT_PARTS
+                );
+            }
+        }
     }
 
 
@@ -7383,6 +7555,27 @@ impl RadioManager {
                     self.roster.heard(src, Some(leaf_id), rssi, now);
                     label = Some(alloc::string::String::from("stat"));
                 }
+                Some(Frame::DiagCont { src: node_id, part, value }) => {
+                    // #382: the next field-boundary slice of that leaf's record. APPEND rather than
+                    // reassemble — every part begins on a field boundary, so no partial-field
+                    // stitching is needed and the cache never has to hold two halves at once.
+                    //
+                    // `append_cont` REPLACES part A's trailing `|cut=<n>` and re-derives it from
+                    // what is still missing, so `cut=` stops being an epitaph and becomes a
+                    // CHECKSUM: 0 means the reader has the whole record. That was the fitness
+                    // criterion for this change, and it is the one an operator can see.
+                    //
+                    // GATEWAY-only (a leaf hearing another's continuation has no MQTT), and a
+                    // continuation with no part A cached is DROPPED — a slice with no head is a
+                    // record whose field positions are unknown, and guessing at them is how a
+                    // positional parse produces confident nonsense. It self-corrects next cadence.
+                    if self.relay.is_gateway {
+                        self.diag_cache.append_cont(node_id, part, value, now);
+                    }
+                    self.peers.last_hello_ms = now;
+                    self.roster.heard(src, Some(node_id), rssi, now);
+                    label = Some(alloc::string::String::from("diagc"));
+                }
                 Some(Frame::Diag { src: node_id, value }) => {
                     // #70/#49 observability uplink: a node's DIAG record. GATEWAY-only cache (a
                     // leaf hearing another's DIAG ignores it — no MQTT). Buffer the raw record keyed
@@ -7855,6 +8048,23 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
         // short/non-digit and guarantees `rest.len() >= 3`, so `&rest[3..]` never panics.
         let src = parse_id(rest)?;
         return Some(Frame::Stat { src, value: &rest[3..] });
+    }
+    // #382 CONTINUATION — MUST be tried BEFORE the DIAG arm below. `DIAG_PREFIX` is a strict
+    // prefix of `DIAGC_PREFIX` ("SMOLv1 DIAG " vs "SMOLv1 DIAGC "), so a parser that tries DIAG
+    // first matches EVERY continuation as a DIAG whose record begins "C<part>" — a well-formed
+    // frame silently decoded as a malformed one, which is the worst shape of parse bug because
+    // nothing errors. The compile-time assert beside `DIAGC_PREFIX` proves the two prefixes still
+    // nest; this ordering is what makes that harmless.
+    if let Some(rest) = data.strip_prefix(DIAGC_PREFIX) {
+        // "NNN<part><slice>": 3-ASCII sender id, ONE ASCII digit part, then the slice. `parse_id`
+        // guarantees `rest.len() >= 3`; the part digit needs its own length check because
+        // `parse_id` knows nothing about the extra byte.
+        let src = parse_id(rest)?;
+        let part = *rest.get(3)?;
+        if !part.is_ascii_digit() {
+            return None; // not our frame shape — refuse rather than guess at an index
+        }
+        return Some(Frame::DiagCont { src, part: part - b'0', value: &rest[4..] });
     }
     if let Some(rest) = data.strip_prefix(DIAG_PREFIX) {
         // #70/#49 observability uplink: "NNN<record>" — 3-ASCII SENDER id then the verbatim

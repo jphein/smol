@@ -553,3 +553,57 @@ pub fn should_group_mac(frame: &[u8]) -> bool {
         && !is_ota_family(frame)
         && frame.len() + MAC_TRAILER_LEN <= ESP_NOW_MTU
 }
+
+// ── #382 `|cut=` tag helpers ───────────────────────────────────────────────────────────
+// Pure byte functions, so they live HERE rather than in `net/wifi.rs` where they are used:
+// this module is the dep-free, host-includable codec (`experiments/relay_compat` and
+// `mac_verify` `#[path]`-include it), and a continuation format I cannot test on hardware
+// is one I want a host verifier to exercise byte-for-byte. Putting them next to their
+// caller would have made them untestable off-target — the same coupling #367 guards.
+/// #382: byte offset of the trailing `|cut=` field, or `None`. Scans from the end because the tag
+/// is appended last by construction — matching an earlier `|cut=` would cut a real record at a
+/// coincidence, and a DIAG record is attacker-influenced only in the sense that any peer can
+/// broadcast one, so "coincidence" is not a purely theoretical worry.
+pub fn find_last_cut(rec: &[u8]) -> Option<usize> {
+    const TAG: &[u8] = b"|cut=";
+    if rec.len() < TAG.len() {
+        return None;
+    }
+    (0..=rec.len() - TAG.len()).rev().find(|&i| &rec[i..i + TAG.len()] == TAG)
+}
+
+/// Parse the decimal after `|cut=`. Returns `None` on a malformed tag rather than a default, so the
+/// caller can decline to touch a record it does not understand.
+pub fn parse_cut(tag: &[u8]) -> Option<usize> {
+    let digits = tag.get(5..)?;
+    if digits.is_empty() || !digits.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // `try_fold`, not `fold` over an Option: clippy's `manual_try_fold` refuses the latter under
+    // `-D warnings`, and it is right — the short-circuit is the point, and spelling it with `?`
+    // inside a `fold` hides that the accumulator can abandon early.
+    digits
+        .iter()
+        .try_fold(0usize, |acc, b| acc.checked_mul(10)?.checked_add((b - b'0') as usize))
+}
+
+/// Write `|cut=<n>` into `out` (max 8 bytes: the tag plus 3 digits, matching `CUT_TAG_MAX`),
+/// returning the length. `n` is clamped to 999 exactly as `broadcast_diag` clamps it, so the two
+/// ends of the protocol cannot disagree about the field's width.
+pub fn write_cut(out: &mut [u8; 8], n: usize) -> usize {
+    out[..5].copy_from_slice(b"|cut=");
+    let n = n.min(999);
+    if n >= 100 {
+        out[5] = b'0' + (n / 100) as u8;
+        out[6] = b'0' + ((n / 10) % 10) as u8;
+        out[7] = b'0' + (n % 10) as u8;
+        8
+    } else if n >= 10 {
+        out[5] = b'0' + (n / 10) as u8;
+        out[6] = b'0' + (n % 10) as u8;
+        7
+    } else {
+        out[5] = b'0' + n as u8;
+        6
+    }
+}
