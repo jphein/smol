@@ -45,6 +45,14 @@ from rust_comments import strip_comments  # noqa: E402  (#426)
 FMT = re.compile(r'let mut rec = alloc::format!\(\s*\n\s*"(.*?)",\n', re.S)
 DECL = re.compile(r"DIAG-WIDTHS:\s*(.+)")
 TAIL_DECL = re.compile(r"DIAG-TAIL:\s*(.+)")
+# #382: the DERIVED numbers a human reads. Everything above is a declaration of an INPUT, which is
+# why the inputs stopped drifting and the read-out did not: `fef377d` (#323) widened `ota=11`->`ota=20`
+# and `228`->`237` because this checker refused the build until it did, and left the prose two lines
+# above at "core 464 - margin 31 B" because nothing asked. The drift resumed at exactly this
+# checker's coverage boundary, in the very next commit to touch the constant. A number in prose is a
+# copy of mutable state with no invalidation channel; the fix is to give it one.
+DERIVED_DECL = re.compile(r"DIAG-DERIVED:\s*(.+)")
+DERIVED_ORDER = ("literal", "positional", "tail", "core", "budget", "margin")
 # The unconditional appends live between the PROTECTED-tail banner and the sheddable block. Only
 # `rec.push_str` counts: the #181 ledger strings are BUILT in that region but appended via
 # `room_for`, so they shed and are correctly outside the bound.
@@ -194,6 +202,57 @@ def main() -> int:
     margin = budget - core
     if margin < 0:
         fail.append(f"the core does NOT fit: {core} > budget {budget}")
+
+    # 5. #382: the DERIVED read-out must match what was just derived.
+    #
+    # Checks 1-4 all prove a declared INPUT against the source. None of them looks at the numbers a
+    # reader is actually shown, so those went stale the first time an input legitimately moved — and
+    # a stale margin is not a cosmetic defect here, it is a WRONG AFFORDANCE. The prose advertised
+    # 31 B against a real 22 B, which is enough room to design a 30 B field, pass review against the
+    # doc block, and put the core 8 B past a CLIFF that publishes nothing at all.
+    #
+    # So the read-out is a declaration too, and this proves it. On mismatch we print the corrected
+    # line verbatim: a checker that says "wrong" and makes you re-derive by hand is a checker people
+    # route around, and the whole failure being fixed here is what happens when a human is the only
+    # thing keeping two numbers equal.
+    truth = {
+        "literal": terms[0],
+        "positional": terms[1],
+        "tail": sum(terms[2:]),
+        "core": core,
+        "budget": budget,
+        "margin": margin,
+    }
+    md = DERIVED_DECL.search(src)
+    if not md:
+        print(f"FATAL: no DIAG-DERIVED: declaration found in {path}. Add this line to the "
+              f"DIAG_CORE_MAX doc block:\n    /// DIAG-DERIVED: "
+              + " ".join(f"{k}={truth[k]}" for k in DERIVED_ORDER), file=sys.stderr)
+        return 2
+    got = {}
+    for tok in md.group(1).split():
+        k, _, v = tok.partition("=")
+        if not v.lstrip("-").isdigit() or k not in truth:
+            print(f"FATAL: DIAG-DERIVED: has a malformed or unknown term {tok!r}; expected "
+                  f"{' '.join(DERIVED_ORDER)}.", file=sys.stderr)
+            return 2
+        got[k] = int(v)
+    missing = [k for k in DERIVED_ORDER if k not in got]
+    if missing:
+        print(f"FATAL: DIAG-DERIVED: is missing {', '.join(missing)} — a PARTIAL read-out is how "
+              "the stale half survives. Declare all six.", file=sys.stderr)
+        return 2
+    wrong = [k for k in DERIVED_ORDER if got[k] != truth[k]]
+    if wrong:
+        fail.append("the DIAG-DERIVED read-out no longer matches what it reports on")
+        for k in wrong:
+            fail.append(f"  {k}: doc says {got[k]}, derived {truth[k]} ({truth[k] - got[k]:+d})")
+        fail.append("  replace that line with:\n    /// DIAG-DERIVED: "
+                    + " ".join(f"{k}={truth[k]}" for k in DERIVED_ORDER))
+        if "margin" in wrong and got["margin"] > truth["margin"]:
+            fail.append(f"  ⚠ the doc OVERSTATES the margin by {got['margin'] - truth['margin']} B "
+                        "— anyone sizing a new field against it is being told they can afford more "
+                        "than exists, and the overrun is a silent fleet-wide publish cliff.")
 
     if fail:
         print("FATAL: the DIAG budget arithmetic has drifted from the record it describes.",

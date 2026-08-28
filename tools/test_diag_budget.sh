@@ -75,6 +75,34 @@ arm "core over budget" 1 "does NOT fit" \
 arm "checker blinded (no format string)" 2 "has gone blind" \
     'let mut rec = alloc::format!	let mut rec = notformat!'
 
+echo "== the DERIVED read-out (#382) =="
+# Arms 1-9 above all prove a declared INPUT against the source, and that is precisely why they did
+# not stop the drift they were written to stop: `fef377d` (#323) satisfied every one of them and
+# still left the read-out stale for three weeks. These arms cover the numbers a HUMAN reads.
+#
+# The overstatement direction is the dangerous one and gets its own assertion. An understated margin
+# makes a legitimate field look unaffordable (annoying, and it nearly sank #323). An OVERstated one
+# hands a designer room that does not exist — #471's 30 B three-way split "fits" in the advertised
+# 31 and puts the core 8 B past the cliff, silencing a healthy fleet. So the checker must not merely
+# go red; it must say WHICH WAY it is wrong.
+arm "read-out overstates the margin" 1 "OVERSTATES the margin by 77 B" \
+    'budget=495 margin=22	budget=495 margin=99'
+# The understatement direction must also be caught — it is safe for the cliff, not free for design.
+arm "read-out understates the margin" 1 "margin: doc says 5, derived" \
+    'budget=495 margin=22	budget=495 margin=5'
+# Deleting the line must be FATAL, not a silent pass. A check you can switch off by removing its
+# input is not a check; it is a suggestion. (Tag mangled rather than the line removed, so the arm
+# tests the checker's handling and not sed's.)
+arm "read-out declaration removed" 2 "no DIAG-DERIVED" \
+    'DIAG-DERIVED:	DIAG-DERIVEDX:'
+# A PARTIAL read-out is the realistic sloppy edit: update the terms you touched, leave the rest.
+# That is how half a stale declaration survives an otherwise honest correction.
+arm "read-out missing a term" 2 "is missing margin" \
+    ' margin=22	 '
+# Garbage must not parse as agreement.
+arm "read-out term malformed" 2 "malformed or unknown term" \
+    'margin=22	margin=twenty-two'
+
 echo "== the PROTECTED tail (unconditional push_str) =="
 # The documented hazard, verbatim: "a field appended with a bare push_str and NOT counted here
 # defeats this whole mechanism". Adding one must now be impossible to do quietly.

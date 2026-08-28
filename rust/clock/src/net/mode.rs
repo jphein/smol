@@ -287,13 +287,35 @@ const DIAG_BUDGET: usize = 512 - 4 - "smol/255/diag".len();
 /// a field's TYPE (u8→3, u16→5, u32→10) or the longest member of a fixed string set — so this is a
 /// bound, not an observation, and it cannot be flattered by a board being in a mild state.
 ///
-///   167  format-string literal (keys, `|` separators, `DIAG|` prefix)
-///   228  the 32 positional values at type-max width, after the u32 `up=` narrowing
-///    69  the four PROTECTED appends (`DIAG-TAIL` below) — unconditional, so inside the bound
+/// The three terms of `DIAG_CORE_MAX`, in order:
 ///
-/// **Numbers, re-derived 2026-08-01 (#306/#323).** `DIAG_BUDGET` 495 · core **464** · **margin 31 B**,
-/// and every term is now machine-checked — there is no longer a "proven vs hopeful" split to keep
-/// straight, which was itself a trap worth removing.
+///   `literal`     the format-string literal (keys, `|` separators, `DIAG|` prefix)
+///   `positional`  the positional values at type-max width, after the u32 `up=` narrowing
+///   `tail`        the PROTECTED appends (`DIAG-TAIL` below) — unconditional, so inside the bound
+///
+/// **Every number lives on ONE machine-checked line and nowhere else in this block.** Everything
+/// else here declares an INPUT; this declares the READ-OUT, because the read-out is what drifted.
+/// `check_diag_budget.py` re-derives all six and fails the build on disagreement, printing the
+/// corrected line — so this is a fact a machine keeps true, not a comment somebody remembered:
+///
+/// DIAG-DERIVED: literal=167 positional=237 tail=69 core=473 budget=495 margin=22
+///
+/// ⚠️ **`margin` is the budget for any new field — take it from that line and nowhere else.** For
+/// three weeks this block said **31 B** while the truth was 22, and that gap was not cosmetic: it
+/// was a WRONG AFFORDANCE. #471 needs a 30 B three-way `mac_fail` split. Against 31 it fits with a
+/// byte to spare, passes review *against this very doc block*, and lands the core 8 B past a CLIFF
+/// that publishes NOTHING — a whole fleet of healthy boards going silent, which is the exact
+/// outcome `DIAG_CORE_MAX` exists to make impossible. Against the real 22 it does not fit, and
+/// #471 takes the 15 B two-way split instead. Same feature, opposite design, decided entirely by
+/// which number the designer read.
+///
+/// How it drifted is worth keeping, because it is not carelessness and it will recur wherever a
+/// checker's coverage stops short of what a human reads: `fef377d` (#323) widened `ota=11`→`ota=20`
+/// and the second term 228→237. It updated both **because this checker refused the build until it
+/// did** — and left the prose two lines above alone, because nothing asked. The drift resumed at
+/// precisely the checker's coverage boundary, in the very next commit to touch the constant, one
+/// day after the checker landed to stop exactly this. A number in prose is a copy of mutable state
+/// with no invalidation channel; the repair is not to correct the copy but to give it a channel.
 ///
 /// Two hand-sums were wrong in OPPOSITE directions, which is why nothing had visibly broken:
 ///   * the positional term read **220** against a type-provable **228** — `rst=` counted at

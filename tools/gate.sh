@@ -297,13 +297,34 @@ if [ "$run_fw" = 1 ]; then
   # healthy board looks dead. `DIAG_CORE_MAX` is the compile-time proof it cannot get there, but its
   # operands were a hand-summed comment and had drifted 8 B in the unsafe direction while the file
   # carried three different margins in prose. This proves the declared per-field widths ARE the
-  # record's fields, and PRINTS the margin rather than saying "green". `tools/test_diag_budget.sh`
-  # proves each arm can fail.
+  # record's fields, and PRINTS the margin rather than saying "green". Its arms are proved able to
+  # fail by the step immediately below — which RUNS the harness. This sentence used to say
+  # "`tools/test_diag_budget.sh` proves each arm can fail" while nothing here executed it, and that
+  # is not a harmless wording: an audit asking "which test_*.sh appear in gate.sh" sees the name,
+  # scores the suite covered, and moves on. #400's audit of exactly that shape found four unwired
+  # suites and did not find this one. A comment that ASSERTS a property reads the same as a check
+  # that ENFORCES it — so never name a self-test here except on the line that invokes it.
   step "DIAG budget arithmetic matches the record (#306)"
   if out=$("$ROOT/tools/check_diag_budget.py" "$CLOCK/src/net/mode.rs" 2>&1); then
     printf '%s\n' "$out"; ok "diag budget"
   else
     printf '%s\n' "$out"; bad "diag budget"
+  fi
+
+  # #382: and now the sabotage harness actually RUNS. It has existed since #306 and this gate
+  # only ever MENTIONED it — the comment above said "proves each arm can fail" while nothing
+  # executed it, which is the precise distinction the merge-guard step below calls "the difference
+  # between 'the guard HAS a self-test' and 'the self-test RUNS'". 18 arms, mktemp copies only,
+  # no network, ~2 s.
+  #
+  # It is wired here rather than in a sweep because this gate's own DIAG check was just extended
+  # (the DERIVED read-out), and an unrun harness would have made those new arms decorative — a
+  # self-test nobody runs is indistinguishable from one that cannot fail.
+  step "DIAG budget checker regression suite (#306/#382)"
+  if out=$("$ROOT/tools/test_diag_budget.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "test_diag_budget"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_diag_budget"
   fi
 
   # #367: a host verifier `#[path]`-includes a firmware source, which reads a FILE and does not
