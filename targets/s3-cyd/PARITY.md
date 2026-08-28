@@ -34,12 +34,23 @@ refused, forged-sig refused, genuine verified→installed→VALID — the board'
 build 1788060000 arrived over the signed path as its own proof), **#480** honest IMU
 line (closed on hardware witness). Watch lane closed **#479-GUI** (batt merge ee26edb,
 TP4054 ruling documented) and **#492** (HA per-device discovery). Parked with reasons:
-**#479-fleet** (prepped; waits for STEP T per lead), **#495** (needs a crown serve +
-C6-canary coordination), **#278** (blocked on smol speaking ELECT — fleet code, post-T),
-**#490** (needs the heap-safety/N/A scoping pass), **#476/#477** (speaker not installed —
-JP deferral), **#478** (watch-lane phase 2), **#484/#497** (fleet items, T-adjacent). ~~#483~~ resolved 08-27 — the blank-mirror
+**#479-fleet** (prepped; waits for STEP T per lead), **#278** (blocked on smol speaking
+ELECT — fleet code, post-T), **#490** — mechanical half CLAIMED+BUILT 08-27 (branch
+`feat/gui-cfg-keys-490` @ c87be90, S3 flavor compiles; PR held until the watch lane's
+task-#8 main.rs merge, then rebase — agreed sequencing; scoping half stays watch-lane),
+**#476/#477** (speaker not installed — JP deferral), **#478** (watch-lane phase 2),
+**#484/#497** (fleet items, T-adjacent). ~~#483~~ resolved 08-27 — the blank-mirror
 claim is refuted on retained-BMP evidence (see gap 7 below); only the WLED-matrix
-visual remains, hardware-gated.
+visual remains, hardware-gated. ~~#495~~ **CONCLUDED 08-27 ~17:10 (lead-called window,
+run executed): mesh-OTA receive on the GUI flavors is UNSUPPORTED BY CONSTRUCTION** —
+a fully-armed run (signed per-chip OTA2 line + retained INSTALL, healthy crown id8)
+produced zero OTAM frames in 9 minutes because the crown subscribes only its OWN
+chip's staged topic (wifi.rs:323 → **#518**); per-chip lines are a WiFi self-fetch
+instrument (the 08-26 S3 "mesh roll" was actually that), GUI flavors read no smol
+staged topic, and three more components are named: windowed serve / per-chip size
+ceiling (**#517**), watch SMLT descriptor emission, watch leaf descriptor check
+(necessary — the leaf checks none today). Broker state restored byte-exact; board
+untouched on 1788060000, mesh=5.
 
 **Outstanding (updated 2026-08-27 ~13:40):**
 (1) ~~cell unplug~~ **RESOLVED — hardware-does-not-allow.** JP: "there is no cell in the
