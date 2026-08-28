@@ -1197,6 +1197,7 @@ async def main():
             # The fleet explains the card counts: node boxes are per-node, so "built 33 / live 31"
             # is a node that joined since the last real run, not a mystery.
             report_fleet(nodes, dormant, roster, rejected, fleet)
+            report_unrepresented(cfg, fleet, live, view)
             return report_check(cfg, view, prev, extras, retired, retiring, st, nodes)
         if prev:
             if retiring:
@@ -1856,6 +1857,60 @@ def roster_orphans(roster, fleet):
         missing=[pid for pid in sorted((r or {}).get("peers") or {}) if pid not in (fleet or {})]
         if missing: out[cid]=missing
     return out
+
+
+def report_unrepresented(cfg, fleet, live, pending_view=None):
+    """#356: the INVERSE of #340's dead-row check — a live fleet member with NO CARD ANYWHERE.
+
+    #340 made `--check` catch *a card wired to no node*. Nothing asked the opposite question, and
+    that asymmetry is why `smol-telemetry` drifted to covering **2 of 8** members while the fleet
+    quadrupled: every new target joined a dashboard that structurally could not show it, silently,
+    and it took re-reading a months-old issue to notice.
+
+    Deliberately READ-ONLY and deliberately ACROSS EVERY VIEW. This module generates exactly one
+    view (`VIEW_PATH`) and that single-view invariant exists because two writers to one dashboard
+    already destroyed rows (#340). Reporting on a view is not writing to it, so this can answer the
+    fleet-wide question without acquiring the ownership that caused the incident. It names the view
+    that would have to change; it does not change it.
+
+    A node counts as represented if any view mentions it in either entity shape the fleet uses:
+    `smol_<id>_<metric>` (telemetry mirrors) or `smol<id>_<suffix>` (the per-node Update unique_id).
+    The trailing separator is load-bearing — without it `smol_5` matches `smol_50_ota_death` and the
+    check would report full coverage for a node that has none, which is the exact failure mode of
+    the thing it is checking.
+    """
+    views = cfg.get("views", []) or []
+    pending = json.dumps(pending_view) if pending_view else ""
+    rows = []
+    for nid in sorted(fleet):
+        pat = re.compile(r"smol_%d[_\"]|smol%d[_\"]" % (nid, nid))
+        where = [v.get("path") or v.get("title") or "<untitled>"
+                 for v in views if pat.search(json.dumps(v))]
+        # A node absent from the LIVE dashboard but present in the view this run is about to write
+        # is not a gap — it is a node that joined since the last deploy, and saving fixes it. Without
+        # this distinction the check fires every time the fleet grows, and a checker that cries wolf
+        # on normal events is one people learn to scroll past. The gap worth naming is the node that
+        # NO view carries and that THIS RUN WILL NOT ADD.
+        rows.append((nid, fleet[nid], where, bool(pending and pat.search(pending))))
+    missing = [(i, m) for i, m, w, fix in rows if not w and not fix]
+    print("  view coverage (#356 — a live member with no card is as wrong as a card with no node):")
+    for nid, m, where, fix in rows:
+        state = "live" if nid in live else "dormant"
+        mark = "  " if (where or fix) else "!!"
+        if where:
+            note = " · ".join(where)
+        elif fix:
+            note = f"(absent from the live dashboard; THIS RUN adds it to {VIEW_PATH})"
+        else:
+            note = "NO VIEW REFERENCES THIS NODE"
+        print(f"    {mark} id{nid:<4} {str(m.get('sigil') or ''):<22} {state:<8} {note}")
+    if missing:
+        live_missing = [i for i, _ in missing if i in live]
+        print(f"  !! {len(missing)} fleet member(s) appear on NO view"
+              f"{f' — {len(live_missing)} of them LIVE on the mesh right now' if live_missing else ''}.")
+        print("     A node the fleet can hear and the dashboard cannot show is invisible by")
+        print("     construction, not by accident of state. See #356.")
+    return len(missing)
 
 
 def report_fleet(nodes, dormant, roster, rejected=(), fleet=None):
