@@ -37,15 +37,14 @@ use esp_hal::{
 };
 use esp_radio::wifi::{sta::{ScanMethod, StationConfig}, Config};
 
-use crate::net::SmolWifiDevice;
 // #233: esp-radio 0.18's connect/disconnect are async-only; drive them to completion
 // synchronously (the esp-rtos scheduler preempts the busy loop to run the radio task).
 use embassy_futures::block_on;
-use smoltcp::{
-    iface::{Interface, SocketSet, SocketStorage},
-    socket::{dhcpv4, tcp, udp},
-    wire::{DhcpOption, EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Cidr},
-};
+// #335 STEP T: what is LEFT of the smoltcp import is the measure of the step. The interface,
+// socket set, socket storage, the three socket types and the DHCP option all moved inside
+// embassy-net; `IpAddress` survives because embassy-net re-uses smoltcp's wire types for
+// endpoints, so this is now an address-formatting dependency rather than a stack one.
+use smoltcp::wire::IpAddress;
 
 // -------------------------------------------------------------------------
 // Configuration (compile-time placeholders — set before flashing).
@@ -470,30 +469,16 @@ pub struct WifiPeripherals {
     pub wifi: WIFI<'static>,
 }
 
-/// smoltcp wants a monotonic timestamp; derive it from the HAL's clock.
-fn smoltcp_now() -> smoltcp::time::Instant {
-    smoltcp::time::Instant::from_micros(
-        Instant::now().duration_since_epoch().as_micros() as i64
-    )
-}
-
-/// Build a smoltcp `Interface` bound to the WiFi STA device (verbatim from the
-/// esp-wifi `wifi_dhcp` example's `create_interface`).
-fn create_interface(device: &mut SmolWifiDevice) -> Interface {
-    Interface::new(
-        smoltcp::iface::Config::new(HardwareAddress::Ethernet(EthernetAddress::from_bytes(
-            &device.mac_address(),
-        ))),
-        device,
-        smoltcp_now(),
-    )
-}
-
 /// Phase 2 entry point: bring WiFi up, DHCP, run one SNTP exchange, return the
 /// current Unix time in seconds. Returns `None` on any failure/timeout so the
 /// caller falls back to the free-running clock.
-pub fn try_time_sync(
+pub async fn try_time_sync(
     p: WifiPeripherals,
+    // #335 STEP T: the wifi-only tier brings the stack up here, exactly as the espnow tier
+    // does in `RadioManager::new` — one shared `bring_up_stack`, so the DR-M3 seed, the
+    // read-MAC-before-the-move ordering and the panic-free spawn cannot diverge between the
+    // two radio tiers. That divergence is the whole reason the helper exists.
+    spawner: embassy_executor::Spawner,
     batt: &mut crate::batt::BattCache,
     grid: &mut crate::grid::GridCache,
     // #89 Stage 1: painted on each prologue yield so the (wifi-only bench) boot screen
@@ -507,12 +492,15 @@ pub fn try_time_sync(
     // still needs the scheduler running BEFORE `wifi::new`, and it is — `main` starts it
     // immediately before dispatching to this function, which is the same instant in boot.
     // `Rng` is a `Copy` handle; keep our own copy for the SNTP source-port seed.
-    let rng = Rng::new();
+    let mut rng = Rng::new();
     // In 0.18 the WIFI peripheral is 'static, so wifi::new returns an owned 'static
     // controller + interfaces — no more EspWifiController Box::leak.
     let (mut controller, interfaces) =
         esp_radio::wifi::new(p.wifi, super::radio_controller_config()).ok()?;
-    let mut device = SmolWifiDevice::new(interfaces.station);
+    // #335 STEP T: `SmolWifiDevice::new(interfaces.station)` — the wifi-only tier's half of
+    // the pair STEP T exists to delete — becomes the shared embassy-net bring-up. This
+    // consumes `interfaces.station`, which is why the helper takes it by value.
+    let stack = super::bring_up_stack(spawner, interfaces.station, &mut rng);
 
     // Phase-2 (wifi-only) build has no status LED, so the tick is a no-op.
     // wifi-only build has no relay/gateway role, so the reached-DHCP flag is unused.
@@ -525,7 +513,7 @@ pub fn try_time_sync(
     let mut _install_requested = false;
     let synced = run_ntp_burst(
         &mut controller,
-        &mut device,
+        stack,
         rng,
         &mut || false, // wifi-only bench: no #20 abort button wired
         render,
@@ -537,7 +525,7 @@ pub fn try_time_sync(
         &mut _ota_offer,
         &mut _config_offer,
         &mut _install_requested,
-    );
+    ).await;
     // OTA MF-1 (wifi-only build): confirm/rollback the running image on its first boot.
     // self-test = reached DHCP (a broken-WiFi image can't reach it; the just-run OTA
     // download proved the network is up, so a healthy image won't false-rollback). May
@@ -547,386 +535,255 @@ pub fn try_time_sync(
 }
 
 // ===========================================================================
-// #89 Stage 1 — non-blocking NTP prologue substrate (assoc / DHCP / SNTP).
+// #89 Stage 1 → #335 STEP T — the NTP prologue (assoc / DHCP / SNTP).
 // ===========================================================================
 //
-// The pre-MQTT prologue of `run_ntp_burst` (WiFi association, DHCP, one SNTP
-// exchange) used to be three back-to-back blocking `loop { tick(); iface.poll();
-// … }` spins. Each spin idles waiting on a radio/DHCP/UDP round-trip — wall-clock
-// the UI thread should have spent rendering. `NtpMachine` turns those three waits
-// into ONE resumable state machine polled from the boot path: `poll()` advances
-// the current phase, keeps polling while smoltcp reports forward progress, and
-// returns `Pending` the moment it stalls (or after `BURST_POLL_BUDGET` of
-// continuous progress) so the caller can paint a live clock frame + poll the #20
-// abort button between polls.
+// HISTORY, because this section is now the SECOND rewrite of the same three waits and the
+// reason it shrank matters more than the code that is left.
 //
-// The MQTT tail (`mqtt_session`) is DELIBERATELY still blocking this stage (that
-// is #89 Stage 2) — the machine hands it the live stack and the screen freezes for
-// the ≤ `MQTT_SESSION_BUDGET` tail exactly as before. Reverting Stage 1 alone
-// restores the old blocking prologue with nothing stranded (no later-stage
-// substrate consumer exists yet).
+// Originally the pre-MQTT prologue was three back-to-back blocking
+// `loop { tick(); iface.poll(); … }` spins. #89 Stage 1 replaced them with `NtpMachine`, a
+// hand-rolled resumable state machine (`NtpPhase::{Assoc,Dhcp,Sntp}` + `NtpPoll::Pending`)
+// whose entire job was to RETURN from the middle of a wait so the boot screen could paint a
+// live clock frame and poll the #20 abort button between polls.
 //
-// Buffer hoist (F2 precedent — see `OTA_TCP_RX` in `run_ota_fetch`): the smoltcp
-// socket storage + per-socket buffers live in module `static mut` so the machine
-// can hold `SocketSet<'static>` ACROSS polls. Alias-safe for the same reason the
-// OTA fix is: `run_ntp_burst` is boot-only, single-caller, main-thread, and never
-// re-entered (periodic flushes / re-elections use `run_mqtt_burst`, not this
-// path), so the previous borrow always ends when `run_ntp_burst` returns before
-// any next call. `addr_of_mut!` avoids the reference-to-`static mut` lint.
+// That machine was a hand-written coroutine. `async` is coroutines, so under embassy-net it
+// DISSOLVES: `NtpPhase`, `NtpPoll`, the phase dispatch, the `progressed` bookkeeping, the
+// `BURST_POLL_BUDGET` yield cap and the `assoc_configured`/`sntp_bound`/`sntp_sent` latches
+// are all replaced by the shape of the `.await`s below. The behaviour it existed to provide
+// is NOT dropped — `render()` + `tick()` are still called on every stall, on the same
+// ~ABORT_POLL_SLICE cadence the old `Pending` yield produced. This is the one place in STEP
+// T where a large deletion is the deliverable rather than a risk, so it is spelled out.
+//
+// WHAT IS DELIBERATELY UNCHANGED: the association step. Every `WifiController` call below —
+// `disconnect_async`, `set_config`, `connect_async`, `is_connected` — is carried over
+// VERBATIM, including its `block_on`. STEP T must not touch a single controller call: STEP
+// C moves the controller into its own `wifi_task`, and a controller already half-converted
+// here is a merge conflict with the step that owns it. The seam was already structural
+// (assoc touches only the controller; DHCP/SNTP touched only the device), which is why the
+// device half could move to embassy-net without the controller half moving with it.
+//
+// RETIRED STATICS (the `.bss` these three waits used to hold):
+//   NTP_SOCK_STORAGE  4 × SocketStorage   — embassy-net owns the SocketSet
+//   NTP_DHCP_OPTS     the kind-12 option  — now `DhcpConfig::hostname` in `bring_up_stack`
+//   the dhcpv4 socket                     — embassy-net's DHCP client lives in `net_task`
+// The UDP buffers survive (retyped to embassy-net's) because SNTP still needs a datagram
+// socket, and the TCP buffers survive because the MQTT tail still needs a stream.
 
 /// #142: association attempts on the single baked `WIFI_NETWORK` before giving up
 /// (mesh-only this burst; retry next boot — never a network switch).
 #[cfg(feature = "wifi")]
 const ASSOC_ATTEMPTS: u8 = 3;
 
-/// #89 ⚠️ HARDWARE-WATCH tuning knob (sibling to the retired `SYNC_REDRAW_MS`): the
-/// belt-and-suspenders cap on how long `NtpMachine::poll` may keep polling while
-/// smoltcp reports continuous forward progress before it yields a frame anyway. On
-/// the NTP path progress is never continuous beyond one round-trip, so this cap
-/// effectively never trips here — it earns its keep on the Stage 2/3 transfer paths
-/// that reuse this substrate.
+// --- Hoisted socket buffers (F2 precedent; boot-path, single-caller) ---
+// #335 STEP T: retyped from smoltcp's `udp::PacketMetadata` to embassy-net's. Same sizes,
+// same `.bss`, same alias argument — see `NtpSockets::take`.
 #[cfg(feature = "wifi")]
-const BURST_POLL_BUDGET: Duration = Duration::from_millis(20);
-
-// --- Hoisted smoltcp stack buffers (F2 precedent; boot-only, single-caller) ---
-#[cfg(feature = "wifi")]
-static mut NTP_SOCK_STORAGE: [SocketStorage; 4] = [SocketStorage::EMPTY; 4];
-#[cfg(feature = "wifi")]
-static mut NTP_UDP_RX_META: [udp::PacketMetadata; 4] = [udp::PacketMetadata::EMPTY; 4];
+static mut NTP_UDP_RX_META: [embassy_net::udp::PacketMetadata; 4] =
+    [embassy_net::udp::PacketMetadata::EMPTY; 4];
 #[cfg(feature = "wifi")]
 static mut NTP_UDP_RX_DATA: [u8; 512] = [0; 512];
 #[cfg(feature = "wifi")]
-static mut NTP_UDP_TX_META: [udp::PacketMetadata; 4] = [udp::PacketMetadata::EMPTY; 4];
+static mut NTP_UDP_TX_META: [embassy_net::udp::PacketMetadata; 4] =
+    [embassy_net::udp::PacketMetadata::EMPTY; 4];
 #[cfg(feature = "wifi")]
 static mut NTP_UDP_TX_DATA: [u8; 512] = [0; 512];
 #[cfg(feature = "wifi")]
 static mut NTP_TCP_RX: [u8; 512] = [0; 512];
 #[cfg(feature = "wifi")]
 static mut NTP_TCP_TX: [u8; 512] = [0; 512];
-/// DHCP hostname option — must be `'static` because `dhcpv4::Socket<'a>` borrows it
-/// for the socket's lifetime and this socket lives `'static` in the hoisted `SocketSet`.
-#[cfg(feature = "wifi")]
-static NTP_DHCP_OPTS: [DhcpOption<'static>; 1] = [DhcpOption { kind: 12, data: b"smol" }];
 
-/// The resumable prologue phase. `Assoc → Dhcp → Sntp → Done | Failed`.
+/// What the prologue concluded. Replaces `NtpPoll`, minus the `Pending` variant that only
+/// existed so a hand-rolled coroutine could return from the middle of a wait.
 #[cfg(feature = "wifi")]
-enum NtpPhase {
-    /// WiFi association: run the (blocking, brief) disconnect/configure/start/connect
-    /// FFI once per attempt, then poll `is_connected()` within a per-attempt
-    /// `SYNC_BUDGET`. Up to `ASSOC_ATTEMPTS` (#142). All attempts timing out → `Failed`.
-    Assoc,
-    /// DHCP: poll for a lease within the shared DHCP+SNTP `SYNC_BUDGET`. On a lease,
-    /// qualify the node as gateway (N3c) and advance to `Sntp`; timeout → `Failed`.
-    Dhcp,
-    /// One SNTP exchange within the same shared deadline; a parsed reply → `Done(Some)`,
-    /// deadline → `Done(None)` (DHCP already succeeded, so the MQTT tail still runs).
-    Sntp,
-    /// Prologue complete, DHCP reached: the caller runs the (still-blocking) MQTT tail
-    /// on the live stack, then returns this SNTP result.
-    Done(Option<u32>),
-    /// Assoc or DHCP gave up: the caller returns `None` with NO MQTT tail (mesh-only leaf).
+enum NtpOutcome {
+    /// Assoc or DHCP gave up: caller returns `None` and runs NO MQTT tail (mesh-only leaf).
     Failed,
-}
-
-/// One `NtpMachine::poll` outcome.
-#[cfg(feature = "wifi")]
-enum NtpPoll {
-    /// Prologue stalled on a round-trip — paint a frame + poll abort, then poll again.
-    Pending,
-    /// Assoc/DHCP failed: caller returns `None`, skips the MQTT tail (mesh-only leaf).
-    Failed,
-    /// Reached DHCP; carries the SNTP result. Caller runs the (blocking) MQTT tail on the
-    /// machine's live stack, then returns this value.
+    /// Reached DHCP; carries the SNTP result. N3c: reaching DHCP — not the SNTP result — is
+    /// what qualifies this node as a gateway, so an SNTP outage cannot demote a node whose
+    /// LAN uplink works.
     ReachedDhcp(Option<u32>),
 }
 
-/// #89 Stage 1: the resumable assoc/DHCP/SNTP prologue. Holds the (hoisted) smoltcp
-/// stack + phase + timers ACROSS polls; the caller drives `poll()` and renders between
-/// yields. Built once per boot burst, dropped at burst end (per-burst freshness — a
-/// fresh interface each burst keeps the empty-neighbour-cache behaviour identical to
-/// the pre-#89 path).
+/// Paint a frame + poll the #20 abort, then park for one slice.
+///
+/// This IS `NtpPoll::Pending`. The old machine returned to `run_ntp_burst`, which called
+/// `render()`/`tick()` and polled again; every wait below calls this instead, so the live
+/// boot clock and the abort button keep exactly the responsiveness #89 gave them.
+/// Returns true if the caller should abort.
 #[cfg(feature = "wifi")]
-struct NtpMachine {
-    iface: Interface,
-    sockets: SocketSet<'static>,
-    dhcp_handle: smoltcp::iface::SocketHandle,
-    udp_handle: smoltcp::iface::SocketHandle,
-    tcp_handle: smoltcp::iface::SocketHandle,
-    phase: NtpPhase,
-    /// #142 association attempt counter (0-based).
-    attempt: u8,
-    /// Whether the current attempt's connect FFI bookend has been issued.
-    assoc_configured: bool,
-    /// Per-attempt assoc budget, then the shared DHCP+SNTP budget (set on Assoc→Dhcp).
-    deadline: Instant,
-    /// RNG-seeded ephemeral source port for the SNTP exchange.
-    sntp_src_port: u16,
-    sntp_bound: bool,
-    sntp_sent: bool,
+async fn ntp_yield(tick: &mut dyn FnMut() -> bool, render: &mut dyn FnMut()) -> bool {
+    render();
+    if tick() {
+        return true;
+    }
+    embassy_time::Timer::after(ABORT_POLL_SLICE).await;
+    false
 }
 
+/// Association: the #142 attempt loop, controller calls verbatim from the pre-T `step_assoc`.
+/// Returns false if every attempt timed out (→ mesh-only this burst, retry next boot).
 #[cfg(feature = "wifi")]
-impl NtpMachine {
-    /// Build the hoisted smoltcp stack (DHCP + UDP/SNTP + TCP/MQTT sockets over the
-    /// module `static mut` buffers) and start in `Assoc`. `sntp_src_port` is the
-    /// caller's RNG-seeded ephemeral port for the SNTP request.
-    fn new(device: &mut SmolWifiDevice, sntp_src_port: u16) -> Self {
-        let iface = create_interface(device);
-
-        // SAFETY: single-caller, main-thread, and the previous machine (if any) is dropped
-        // before a new one is built, so these `static mut` borrows never overlap in time.
-        // ⚠️ The original comment here said "boot-only … never re-entered" — that premise
-        // DIED when the hourly resync (`NTP_RESYNC_AGE_S`) started re-entering this
-        // constructor, and it took the fleet down hourly for weeks (#404): `SocketSet::new`
-        // does NOT clear pre-populated `SocketStorage` slots, so every re-entry found the
-        // previous incarnation's sockets still occupying the static array, spilled into the
-        // spare slot, and the NEXT incarnation's `udp` add panicked "full SocketSet" — one
-        // resync after every boot, which is why the crash wore the resync's clock.
-        // Array→slice unsized coercion at the `let` type (NOT `(*ptr)[..]` indexing,
-        // which trips the deny-by-default `dangerous_implicit_autorefs`). The referent
-        // is a `static`, so the borrow is soundly `'static` and the machine holds the
-        // resulting `SocketSet<'static>` across polls.
-        let sock_storage: &'static mut [SocketStorage] =
-            unsafe { &mut *core::ptr::addr_of_mut!(NTP_SOCK_STORAGE) };
-        // #404: clear the slots the last incarnation left behind — re-entry is normal now.
-        for slot in sock_storage.iter_mut() {
-            *slot = SocketStorage::EMPTY;
-        }
-        let udp_rx_meta: &'static mut [udp::PacketMetadata] =
-            unsafe { &mut *core::ptr::addr_of_mut!(NTP_UDP_RX_META) };
-        let udp_rx_data: &'static mut [u8] =
-            unsafe { &mut *core::ptr::addr_of_mut!(NTP_UDP_RX_DATA) };
-        let udp_tx_meta: &'static mut [udp::PacketMetadata] =
-            unsafe { &mut *core::ptr::addr_of_mut!(NTP_UDP_TX_META) };
-        let udp_tx_data: &'static mut [u8] =
-            unsafe { &mut *core::ptr::addr_of_mut!(NTP_UDP_TX_DATA) };
-        let tcp_rx: &'static mut [u8] =
-            unsafe { &mut *core::ptr::addr_of_mut!(NTP_TCP_RX) };
-        let tcp_tx: &'static mut [u8] =
-            unsafe { &mut *core::ptr::addr_of_mut!(NTP_TCP_TX) };
-
-        let mut sockets = SocketSet::new(sock_storage);
-
-        let mut dhcp_socket = dhcpv4::Socket::new();
-        dhcp_socket.set_outgoing_options(&NTP_DHCP_OPTS);
-        let dhcp_handle = sockets.add(dhcp_socket);
-
-        let udp_socket = udp::Socket::new(
-            udp::PacketBuffer::new(udp_rx_meta, udp_rx_data),
-            udp::PacketBuffer::new(udp_tx_meta, udp_tx_data),
-        );
-        let udp_handle = sockets.add(udp_socket);
-
-        let tcp_socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(tcp_rx),
-            tcp::SocketBuffer::new(tcp_tx),
-        );
-        let tcp_handle = sockets.add(tcp_socket);
-
-        Self {
-            iface,
-            sockets,
-            dhcp_handle,
-            udp_handle,
-            tcp_handle,
-            phase: NtpPhase::Assoc,
-            attempt: 0,
-            assoc_configured: false,
-            deadline: Instant::now(), // real deadline set on the first assoc setup
-            sntp_src_port,
-            sntp_bound: false,
-            sntp_sent: false,
-        }
+async fn ntp_assoc(
+    controller: &mut esp_radio::wifi::WifiController<'static>,
+    tick: &mut dyn FnMut() -> bool,
+    render: &mut dyn FnMut(),
+) -> bool {
+    let net = &crate::secrets::WIFI_NETWORK;
+    // #192: an ALREADY-associated caller (the periodic NTP re-sync burst on a coexist
+    // gateway) skips the disconnect/reconfigure/connect FFI — issuing it would TEAR a live
+    // coexist association (mesh-deaf + re-election churn) for no reason. Boot is NOT yet
+    // connected here, so the boot burst still runs the full setup → boot behaviour is
+    // byte-identical.
+    if controller.is_connected() {
+        return true;
     }
-
-    /// Advance the prologue. Keeps polling while smoltcp makes forward progress;
-    /// returns `Pending` the instant it stalls (yield to render + poll abort) or after
-    /// `BURST_POLL_BUDGET` of continuous progress.
-    fn poll(
-        &mut self,
-        controller: &mut esp_radio::wifi::WifiController<'static>,
-        device: &mut SmolWifiDevice,
-    ) -> NtpPoll {
-        let poll_start = Instant::now();
-        loop {
-            let progressed = match self.phase {
-                NtpPhase::Assoc => self.step_assoc(controller),
-                NtpPhase::Dhcp => self.step_dhcp(device),
-                NtpPhase::Sntp => self.step_sntp(device),
-                NtpPhase::Done(_) | NtpPhase::Failed => false,
-            };
-            match self.phase {
-                NtpPhase::Done(t) => return NtpPoll::ReachedDhcp(t),
-                NtpPhase::Failed => return NtpPoll::Failed,
-                _ => {}
-            }
-            if !progressed || Instant::now() >= poll_start + BURST_POLL_BUDGET {
-                return NtpPoll::Pending;
-            }
+    for _attempt in 0..ASSOC_ATTEMPTS {
+        // Drop any prior association before reconfiguring (harmless if not connected).
+        let _ = block_on(controller.disconnect_async());
+        // #233: esp-radio 0.18's StationConfig has private fields — build via BuilderLite.
+        #[allow(unused_mut)]
+        let mut sta_cfg = StationConfig::default()
+            .with_ssid(net.ssid)
+            .with_password(net.pass.into())
+            // #337/#233: carry the 2026-07-20 ALL-CHANNEL SCAN fix forward. It used to be the
+            // build-env knob ESP_WIFI_CONFIG_SCAN_METHOD=1, which esp-radio 0.18 deleted; the
+            // 0.18 equivalent is this runtime StationConfig field, and its default is
+            // `Fast` — i.e. the exact WIFI_FAST_SCAN behaviour that was the #204/#217 root
+            // cause (stop at the FIRST matching-SSID AP → associate to a WEAK ch1 AP over the
+            // STRONG ch6 one → off-channel → OTA-deaf). Scan every channel, then take the
+            // strongest. Prerequisite for the best-gateway election's co_channel/ap_rssi inputs.
+            .with_scan_method(ScanMethod::AllChannels);
+        // COEXIST SOAK (#23 PART 1): pin association to ch1. (0.18 with_channel takes u8,
+        // wrapping it in Some internally.)
+        #[cfg(feature = "coexist-soak")]
+        {
+            sta_cfg = sta_cfg.with_channel(1);
         }
-    }
-
-    /// Association step. The disconnect/configure/start/connect FFI (a brief esp-wifi
-    /// reconfigure, not pumpable — design §2) runs once per attempt; then we poll
-    /// `is_connected()`. Returns whether the phase advanced this step (`false` = still
-    /// waiting → yield).
-    fn step_assoc(&mut self, controller: &mut esp_radio::wifi::WifiController<'static>) -> bool {
-        let net = &crate::secrets::WIFI_NETWORK;
-        // #192: an ALREADY-associated caller (the periodic NTP re-sync burst on a coexist
-        // gateway) skips the disconnect/reconfigure/connect FFI — issuing it would TEAR a live
-        // coexist association (mesh-deaf + re-election churn) for no reason. Go straight to DHCP.
-        // Boot is NOT yet connected here, so the boot burst still runs the full setup below →
-        // boot behaviour is byte-identical.
-        if !self.assoc_configured && controller.is_connected() {
-            self.assoc_configured = true;
-            self.deadline = Instant::now() + SYNC_BUDGET; // shared DHCP+SNTP budget
-            self.phase = NtpPhase::Dhcp;
-            return true;
-        }
-        if !self.assoc_configured {
-            // Drop any prior association before reconfiguring (harmless if not connected).
-            let _ = block_on(controller.disconnect_async());
-            // #233: esp-radio 0.18's StationConfig has private fields — build via BuilderLite.
-            #[allow(unused_mut)]
-            let mut sta_cfg = StationConfig::default()
-                .with_ssid(net.ssid)
-                .with_password(net.pass.into())
-                // #337/#233: carry the 2026-07-20 ALL-CHANNEL SCAN fix forward. It used to be the
-                // build-env knob ESP_WIFI_CONFIG_SCAN_METHOD=1, which esp-radio 0.18 deleted; the
-                // 0.18 equivalent is this runtime StationConfig field, and its default is
-                // `Fast` — i.e. the exact WIFI_FAST_SCAN behaviour that was the #204/#217 root
-                // cause (stop at the FIRST matching-SSID AP → associate to a WEAK ch1 AP over the
-                // STRONG ch6 one → off-channel → OTA-deaf). Scan every channel, then take the
-                // strongest. Prerequisite for the best-gateway election's co_channel/ap_rssi inputs.
-                .with_scan_method(ScanMethod::AllChannels);
-            // COEXIST SOAK (#23 PART 1): pin association to ch1. (0.18 with_channel takes u8,
-            // wrapping it in Some internally.)
-            #[cfg(feature = "coexist-soak")]
-            {
-                sta_cfg = sta_cfg.with_channel(1);
-            }
-            let ok = controller
-                // #233: set_config STARTS the controller in 0.18 (no separate start()).
-                .set_config(&Config::Station(sta_cfg))
-                .is_ok()
-                && block_on(controller.connect_async()).is_ok();
-            if !ok {
-                return self.assoc_attempt_failed();
-            }
-            self.assoc_configured = true;
-            self.deadline = Instant::now() + SYNC_BUDGET; // per-attempt assoc budget
-            return true;
-        }
-        if controller.is_connected() {
-            log::info!("smol #142: associated to '{}'", net.ssid);
-            // Shared DHCP+SNTP budget starts now (mirrors the pre-#89 `deadline` set at
-            // the top of the DHCP loop).
-            self.deadline = Instant::now() + SYNC_BUDGET;
-            self.phase = NtpPhase::Dhcp;
-            return true;
-        }
-        if Instant::now() > self.deadline {
-            log::warn!(
-                "smol #142: assoc timed out on '{}' — retry next burst (mesh-only leaf)",
-                net.ssid
-            );
-            return self.assoc_attempt_failed();
-        }
-        false // still waiting on association → yield
-    }
-
-    /// Count one failed association attempt; give up (→ `Failed`) after `ASSOC_ATTEMPTS`
-    /// (#142: retry the ONE baked network, never switch SSID, no NVS write on failure).
-    fn assoc_attempt_failed(&mut self) -> bool {
-        self.attempt += 1;
-        self.assoc_configured = false; // re-run the connect bookend next attempt
-        if self.attempt >= ASSOC_ATTEMPTS {
-            log::warn!("smol #142: primary assoc unreachable — mesh-only this burst, retry next");
-            self.phase = NtpPhase::Failed;
-        }
-        true
-    }
-
-    /// DHCP step: one `iface.poll()`, apply a lease if it arrived. On a lease, set the
-    /// gateway qualifier (N3c: `run_ntp_burst` returns `ReachedDhcp`) and advance to SNTP.
-    fn step_dhcp(&mut self, device: &mut SmolWifiDevice) -> bool {
-        let changed = matches!(
-            self.iface.poll(smoltcp_now(), device, &mut self.sockets),
-            smoltcp::iface::PollResult::SocketStateChanged
-        );
-        let configured = {
-            let socket = self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp_handle);
-            match socket.poll() {
-                Some(dhcpv4::Event::Configured(cfg)) => Some((cfg.address, cfg.router)),
-                _ => None,
-            }
-        };
-        if let Some((addr, router)) = configured {
-            apply_dhcp(&mut self.iface, addr, router);
-            log::info!("smol: DHCP address {}", addr);
-            self.phase = NtpPhase::Sntp;
-            return true;
-        }
-        if Instant::now() > self.deadline {
-            log::warn!("smol: DHCP timed out");
-            self.phase = NtpPhase::Failed;
-            return true;
-        }
-        changed // progress iff smoltcp readiness changed this poll; else yield
-    }
-
-    /// SNTP step: bind once, send the NTPv4 request once the socket can send, parse a
-    /// reply into Unix seconds. Deadline → `Done(None)` (DHCP already succeeded → MQTT
-    /// tail still runs, just no time this burst).
-    fn step_sntp(&mut self, device: &mut SmolWifiDevice) -> bool {
-        let changed = matches!(
-            self.iface.poll(smoltcp_now(), device, &mut self.sockets),
-            smoltcp::iface::PollResult::SocketStateChanged
-        );
-        let socket = self.sockets.get_mut::<udp::Socket>(self.udp_handle);
-
-        // Bind the ephemeral source port once (retry next poll if the stack isn't ready).
-        if !self.sntp_bound && socket.bind(self.sntp_src_port).is_ok() {
-            self.sntp_bound = true;
-        }
-
-        let mut progressed = changed;
-
-        // Send the NTPv4 request once (LI=0, VN=4, Mode=3 → first byte 0x23), latched.
-        if self.sntp_bound && !self.sntp_sent && socket.can_send() {
-            let mut request = [0u8; 48];
-            request[0] = 0x23;
-            if socket
-                .send_slice(&request, (IpAddress::Ipv4(NTP_SERVER_IP), NTP_PORT))
-                .is_ok()
-            {
-                self.sntp_sent = true;
-                progressed = true;
-            }
-        }
-
-        if socket.can_recv() {
-            let mut buf = [0u8; 48];
-            if let Ok((len, _from)) = socket.recv_slice(&mut buf) {
-                if len >= 48 {
-                    // Transmit Timestamp seconds field = bytes 40..44, big-endian, from
-                    // the NTP epoch (1900).
-                    let ntp_secs = u32::from_be_bytes([buf[40], buf[41], buf[42], buf[43]]);
-                    if ntp_secs > NTP_TO_UNIX_OFFSET {
-                        self.phase = NtpPhase::Done(Some(ntp_secs - NTP_TO_UNIX_OFFSET));
-                        return true;
-                    }
+        let ok = controller
+            // #233: set_config STARTS the controller in 0.18 (no separate start()).
+            .set_config(&Config::Station(sta_cfg))
+            .is_ok()
+            && block_on(controller.connect_async()).is_ok();
+        if ok {
+            // Per-attempt assoc budget, polled exactly as the pre-T machine polled it.
+            let deadline = Instant::now() + SYNC_BUDGET;
+            loop {
+                if controller.is_connected() {
+                    log::info!("smol #142: associated to '{}'", net.ssid);
+                    return true;
+                }
+                if Instant::now() > deadline {
+                    log::warn!(
+                        "smol #142: assoc timed out on '{}' — retry next burst (mesh-only leaf)",
+                        net.ssid
+                    );
+                    break;
+                }
+                if ntp_yield(tick, render).await {
+                    return false; // #20 long-press
                 }
             }
         }
+    }
+    log::warn!("smol #142: primary assoc unreachable — mesh-only this burst, retry next");
+    false
+}
 
-        if Instant::now() > self.deadline {
-            log::warn!("smol: SNTP timed out");
-            self.phase = NtpPhase::Done(None);
-            return true;
+/// The assoc → DHCP → SNTP prologue. Replaces `NtpMachine` + its `poll` dispatch.
+#[cfg(feature = "wifi")]
+async fn ntp_prologue(
+    controller: &mut esp_radio::wifi::WifiController<'static>,
+    stack: embassy_net::Stack<'static>,
+    sntp_src_port: u16,
+    tick: &mut dyn FnMut() -> bool,
+    render: &mut dyn FnMut(),
+) -> NtpOutcome {
+    if !ntp_assoc(controller, tick, render).await {
+        return NtpOutcome::Failed;
+    }
+
+    // Shared DHCP+SNTP budget, starting at association exactly as the pre-T machine set it
+    // on the Assoc→Dhcp transition.
+    let deadline = Instant::now() + SYNC_BUDGET;
+
+    // --- DHCP ---
+    // embassy-net's DHCP client runs in `net_task`; this waits for it rather than driving a
+    // dhcpv4 socket by hand. On the boot burst the lease is genuinely being acquired here;
+    // on a later re-sync it is already up and this falls straight through.
+    loop {
+        if stack.is_config_up() {
+            if let Some(cfg) = stack.config_v4() {
+                log::info!("smol: DHCP address {}", cfg.address);
+            }
+            break;
         }
+        if Instant::now() > deadline {
+            log::warn!("smol: DHCP timed out");
+            return NtpOutcome::Failed;
+        }
+        if ntp_yield(tick, render).await {
+            return NtpOutcome::Failed;
+        }
+    }
 
-        progressed
+    // --- SNTP: one exchange, best-effort ---
+    // A timeout here yields `ReachedDhcp(None)`, NOT `Failed`: DHCP already succeeded, so
+    // the MQTT tail still runs and the node still qualifies as a gateway (N3c). Folding
+    // these two outcomes together would let a throttled time server demote a healthy node.
+    // SAFETY (#335 STEP T): boot/re-sync path, single-caller, main-thread; the socket is
+    // dropped at the end of this function before any next burst can build one, so these
+    // `static mut` borrows never overlap in time.
+    let mut sock = embassy_net::udp::UdpSocket::new(
+        stack,
+        unsafe { &mut *core::ptr::addr_of_mut!(NTP_UDP_RX_META) },
+        unsafe { &mut *core::ptr::addr_of_mut!(NTP_UDP_RX_DATA) },
+        unsafe { &mut *core::ptr::addr_of_mut!(NTP_UDP_TX_META) },
+        unsafe { &mut *core::ptr::addr_of_mut!(NTP_UDP_TX_DATA) },
+    );
+    if sock.bind(sntp_src_port).is_err() {
+        log::warn!("smol: SNTP bind failed");
+        return NtpOutcome::ReachedDhcp(None);
+    }
+    // The NTPv4 request: LI=0, VN=4, Mode=3 ⇒ first byte 0x23.
+    let mut request = [0u8; 48];
+    request[0] = 0x23;
+    if sock
+        .send_to(&request, (IpAddress::Ipv4(NTP_SERVER_IP), NTP_PORT))
+        .await
+        .is_err()
+    {
+        log::warn!("smol: SNTP send failed");
+        return NtpOutcome::ReachedDhcp(None);
+    }
+    loop {
+        let mut buf = [0u8; 48];
+        match embassy_futures::select::select(
+            sock.recv_from(&mut buf),
+            embassy_time::Timer::after(ABORT_POLL_SLICE),
+        )
+        .await
+        {
+            embassy_futures::select::Either::First(Ok((len, _from))) if len >= 48 => {
+                // Transmit Timestamp seconds field = bytes 40..44, big-endian, from the
+                // NTP epoch (1900).
+                let ntp_secs = u32::from_be_bytes([buf[40], buf[41], buf[42], buf[43]]);
+                if ntp_secs > NTP_TO_UNIX_OFFSET {
+                    return NtpOutcome::ReachedDhcp(Some(ntp_secs - NTP_TO_UNIX_OFFSET));
+                }
+            }
+            embassy_futures::select::Either::First(_) => {}
+            embassy_futures::select::Either::Second(_) => {}
+        }
+        if Instant::now() > deadline {
+            log::warn!("smol: SNTP timed out");
+            return NtpOutcome::ReachedDhcp(None);
+        }
+        if ntp_yield(tick, render).await {
+            // #20 long-press during the SNTP wait. DHCP already succeeded, so this is
+            // `ReachedDhcp(None)` and not `Failed` — same reasoning as the timeout.
+            return NtpOutcome::ReachedDhcp(None);
+        }
     }
 }
 
@@ -1014,39 +871,40 @@ pub fn note_broker_connect(connected: bool) {
 #[cfg(feature = "espnow")]
 pub(crate) const NTP_RESYNC_AGE_S: u32 = 3600;
 
-/// #192: periodic NTP re-sync — a lightweight SNTP-only burst that reuses the #89 Stage-1
-/// `NtpMachine` substrate. UNLIKE `run_ntp_burst` it runs NO MQTT tail (no election, no downlink,
-/// no discovery): it exists solely to refresh the clock when `my_synced_at` goes stale
-/// (main-loop trigger, GATEWAY only — leaves refresh via mesh time adoption). On an already-
-/// associated coexist gateway, `NtpMachine::step_assoc` skips the disconnect/reconnect, so this
-/// does NOT tear the coexist association — it rebuilds the smoltcp stack (fresh interface) →
-/// DHCP → one SNTP exchange → returns the Unix time (`None` on timeout/abort/assoc-DHCP fail).
+/// #192: periodic NTP re-sync — a lightweight SNTP-only burst on the shared prologue.
+/// UNLIKE `run_ntp_burst` it runs NO MQTT tail (no election, no downlink, no discovery): it
+/// exists solely to refresh the clock when `my_synced_at` goes stale (main-loop trigger,
+/// GATEWAY only — leaves refresh via mesh time adoption). On an already-associated coexist
+/// gateway, `ntp_assoc` returns immediately on `is_connected()`, so this does NOT tear the
+/// coexist association → DHCP → one SNTP exchange → the Unix time (`None` on
+/// timeout/abort/assoc-DHCP fail).
+///
+/// #335 STEP T: it no longer "rebuilds the smoltcp stack (fresh interface)" — there is ONE
+/// embassy-net stack for the boot, so a re-sync reuses the live interface, the live
+/// neighbour cache and the still-valid DHCP lease. That also retires the #404 hazard at its
+/// root: that bug was `SocketSet::new` finding this function's previous incarnation's
+/// sockets still occupying the shared `static` storage on re-entry, which is impossible
+/// when the socket set is owned by the stack and outlives every burst.
 ///
 /// Reuses the same module `static mut` NTP buffers as the boot burst — alias-safe for the F2
 /// reason: the boot burst completes BEFORE the main loop, and re-syncs are sequential (only one
 /// flush/burst is ever in flight in the single-threaded main loop), so the borrows never overlap.
 #[cfg(feature = "espnow")]
-pub fn run_ntp_resync(
+pub async fn run_ntp_resync(
     controller: &mut esp_radio::wifi::WifiController<'static>,
-    device: &mut SmolWifiDevice,
+    stack: embassy_net::Stack<'static>,
     rng: Rng,
     tick: &mut dyn FnMut() -> bool,
 ) -> Option<u32> {
     let sntp_src_port = 49152 + (rng.random() % 16384) as u16;
-    let mut machine = NtpMachine::new(device, sntp_src_port);
-    loop {
-        match machine.poll(controller, device) {
-            NtpPoll::Pending => {
-                if tick() {
-                    return None; // #20 long-press abort → give up this re-sync, retry when due again
-                }
-            }
-            // Assoc/DHCP gave up (e.g. AP briefly unreachable) → no fresh time this cycle; the
-            // main-loop trigger re-attempts on the next flush once still stale.
-            NtpPoll::Failed => return None,
-            // Reached DHCP; carry the SNTP result. NO MQTT tail (that is run_ntp_burst / the flush).
-            NtpPoll::ReachedDhcp(t) => return t,
-        }
+    // The re-sync has no display to paint (it runs from the main loop, not the boot screen),
+    // so `render` is a no-op — the pre-T machine likewise only rendered from `run_ntp_burst`.
+    match ntp_prologue(controller, stack, sntp_src_port, tick, &mut || {}).await {
+        // Assoc/DHCP gave up (e.g. AP briefly unreachable) → no fresh time this cycle; the
+        // main-loop trigger re-attempts on the next flush once still stale.
+        NtpOutcome::Failed => None,
+        // Reached DHCP; carry the SNTP result. NO MQTT tail (that is run_ntp_burst / the flush).
+        NtpOutcome::ReachedDhcp(t) => t,
     }
 }
 
@@ -1062,9 +920,10 @@ pub fn run_ntp_resync(
 /// Blocking, no async executor — we poll the stack directly, matching the rest
 /// of the firmware's style and keeping the dependency set on crates.io.
 #[allow(clippy::too_many_arguments)] // +grid (issue #16) tips this to 8 params
-pub fn run_ntp_burst(
+pub async fn run_ntp_burst(
     controller: &mut esp_radio::wifi::WifiController<'static>,
-    device: &mut SmolWifiDevice,
+    // #335 STEP T: the ONE embassy-net stack, in place of the per-burst smoltcp device.
+    stack: embassy_net::Stack<'static>,
     rng: Rng,
     tick: &mut dyn FnMut() -> bool,
     // #89 Stage 1: painted on each prologue yield (assoc/DHCP/SNTP stall) so the boot
@@ -1095,34 +954,25 @@ pub fn run_ntp_burst(
     // #33: set true iff a retained OTA `install` command is present for this board.
     install_requested: &mut bool,
 ) -> Option<u32> {
-    // --- #89 Stage 1: resumable assoc → DHCP → SNTP prologue --------------
-    // The three blocking waits (assoc, DHCP, SNTP — up to ASSOC_ATTEMPTS × SYNC_BUDGET
-    // for assoc, then a shared DHCP+SNTP SYNC_BUDGET) are now one `NtpMachine` polled
-    // from here. On each round-trip stall we `render()` a live clock frame + `tick()`
-    // (LED + #20 long-press abort), so the boot screen ticks through the whole sync
-    // window instead of holding a frozen splash. The machine's hoisted `static mut`
-    // stack (F2 precedent) hands off to the still-blocking MQTT tail below.
+    // --- assoc → DHCP → SNTP prologue --------------------------------------
+    // The three waits (assoc, up to ASSOC_ATTEMPTS × SYNC_BUDGET; then a shared DHCP+SNTP
+    // SYNC_BUDGET) are `ntp_prologue`. On each round-trip stall it calls `render()` for a
+    // live clock frame + `tick()` (LED + #20 long-press abort), so the boot screen still
+    // ticks through the whole sync window instead of holding a frozen splash — that is
+    // #89's deliverable, now carried by the `.await` points rather than by a hand-rolled
+    // state machine (see the section header).
     //
     // #142 (unchanged): assoc retries the ONE baked network forever, never switches
     // SSID, writes no NVS on failure; all attempts timing out → mesh-only this burst,
     // retry next boot.
     let sntp_src_port = 49152 + (rng.random() % 16384) as u16;
-    let mut machine = NtpMachine::new(device, sntp_src_port);
-    let synced = loop {
-        match machine.poll(controller, device) {
-            NtpPoll::Pending => {
-                render(); // paint the live clock frame during the round-trip wait
-                if tick() {
-                    return None; // #20 long-press → unwind the burst (no MQTT tail)
-                }
-            }
-            // Assoc or DHCP gave up → mesh-only leaf this burst; NO MQTT tail (matches
-            // the pre-#89 early returns). The next burst/boot retries the primary (#142).
-            NtpPoll::Failed => return None,
-            NtpPoll::ReachedDhcp(t) => break t,
-        }
+    let synced = match ntp_prologue(controller, stack, sntp_src_port, tick, render).await {
+        // Assoc or DHCP gave up → mesh-only leaf this burst; NO MQTT tail (matches
+        // the pre-#89 early returns). The next burst/boot retries the primary (#142).
+        NtpOutcome::Failed => return None,
+        NtpOutcome::ReachedDhcp(t) => t,
     };
-    // N3c: the machine only yields `ReachedDhcp` on an association + DHCP lease — that
+    // N3c: the prologue only yields `ReachedDhcp` on an association + DHCP lease — that
     // alone qualifies the node as a relay GATEWAY (see start()); SNTP is best-effort for
     // TIME, so an SNTP outage can't demote a node with a working LAN uplink.
     *reached_dhcp = true;
@@ -1149,15 +999,21 @@ pub fn run_ntp_burst(
     let mut _ntp_reset_req = ResetReq::new(); // #52: boot/NTP burst subscribes no cmd/reset (cfg_cache=None)
     let mut _ntp_scan_req = ScanReq::new(); // #71: boot/NTP burst subscribes no cmd/scan (cfg_cache=None)
     let mut _ntp_notify_req = NotifyReq::new(); // #197: boot/NTP burst subscribes no notify (cfg_cache=None)
-    // #89 Stage 1: hand the machine's LIVE stack to the UNCHANGED blocking session —
-    // the boot screen freezes for this ≤ MQTT_SESSION_BUDGET tail exactly as before
-    // (making the tail cooperative is #89 Stage 2). `tick` still runs (LED + abort),
-    // but `render` is not called here, so the display holds its last clock frame.
+    // #335 STEP T: the MQTT tail runs on a TCP socket over the same live stack the
+    // prologue just brought up. `tick` still runs (LED + abort); `render` is still not
+    // called here, so the display holds its last clock frame for the ≤ MQTT_SESSION_BUDGET
+    // tail exactly as before.
+    //
+    // SAFETY: boot-path, single-caller, main-thread; this socket is dropped when
+    // `run_ntp_burst` returns, before the main loop's first flush can build its own.
+    // These buffers are the NTP path's OWN (`NTP_TCP_*`), distinct from `run_mqtt_burst`'s
+    // `MQTT_TCP_*` — kept separate deliberately rather than shared, so neither path has to
+    // reason about the other's lifetime.
+    let tcp_rx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(NTP_TCP_RX) };
+    let tcp_tx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(NTP_TCP_TX) };
+    let mut sock = embassy_net::tcp::TcpSocket::new(stack, tcp_rx, tcp_tx);
     let _ = mqtt_session(
-        &mut machine.iface,
-        device,
-        &mut machine.sockets,
-        machine.tcp_handle,
+        &mut sock,
         node_id,
         &[],
         mqtt_port,
@@ -1189,22 +1045,12 @@ pub fn run_ntp_burst(
         &mut None, // #139-followup: boot/NTP burst is never a self-OTA fetch
         mqtt_deadline,
         tick,
-    );
+    ).await;
 
     synced
 }
 
 
-/// Install the DHCP-provided address + default route on the interface.
-fn apply_dhcp(iface: &mut Interface, addr: Ipv4Cidr, router: Option<Ipv4Addr>) {
-    iface.update_ip_addrs(|addrs| {
-        addrs.clear();
-        let _ = addrs.push(IpCidr::Ipv4(addr));
-    });
-    if let Some(router) = router {
-        let _ = iface.routes_mut().add_default_ipv4_route(router);
-    }
-}
 
 use core::fmt::Write as _;
 
@@ -1708,6 +1554,20 @@ const _: () = assert!(
 /// reintroduce F2. Single-caller (one burst) → alias-safe.
 #[cfg(feature = "wifi")]
 static mut MQTT_ACC: [u8; 512] = [0; 512];
+
+/// #335 STEP T: the MQTT session's TCP ring buffers, sized exactly as the per-burst stack
+/// arrays they replace (`let mut tcp_rx/tcp_tx = [0u8; 512]` in `run_mqtt_burst`).
+///
+/// Same size, different memory: `.bss` instead of the burst's stack frame. That is the
+/// point — T-SCOPE §7.1's floor is `ceil(measured_peak × 4/3)`, so moving a byte out of the
+/// measured peak is worth 4/3 of a byte against the region shortfall, while `.bss` grows
+/// only 1:1. See the borrow site in `run_mqtt_burst` for the alias argument.
+/// espnow-gated to match `run_mqtt_burst`, their only consumer — the wifi-only tier reaches
+/// the broker through `run_ntp_burst`'s tail, which has its own `NTP_TCP_*`.
+#[cfg(feature = "espnow")]
+static mut MQTT_TCP_RX: [u8; 512] = [0; 512];
+#[cfg(feature = "espnow")]
+static mut MQTT_TCP_TX: [u8; 512] = [0; 512];
 
 /// #21 leaf-relay: max bytes of a relayed keyed-CFG value. Lives here (not `net::mode`) because
 /// the gateway FILLS the cache from MQTT in `mqtt_session` (compiled under `wifi`), while the
@@ -2487,15 +2347,64 @@ impl RelayCache {
     }
 }
 
-/// Push `data` out a connected TCP socket, polling the stack until it is all queued
-/// or `deadline` passes. Our MQTT packets are tiny (< tx buffer), so this normally
-/// completes in one `send_slice`; returns false on a socket error or timeout.
+/// #335 STEP T: the longest an `.await` inside the transport adapters may park before it
+/// surfaces to re-poll `tick()`.
+///
+/// This constant exists because the blocking→async conversion silently DELETES an abort
+/// path if you let it. The pre-T `tcp_send` re-evaluated `tick()` on every spin of a busy
+/// loop, so a #20 long-press aborted mid-send within microseconds. The natural async
+/// rewrite is `sock.write(..).await`, which parks until the peer moves — and `tick` is a
+/// synchronous `FnMut`, so nothing polls it while that future is pending. On a wedged
+/// broker (the exact case the abort exists for) the button would go dead until the
+/// deadline, i.e. up to `MQTT_SESSION_BUDGET`. Racing every await against this slice keeps
+/// the button's worst-case latency bounded and roughly where it was.
+///
+/// 50 ms is below human perception for a button and costs at most 20 extra wakeups/second
+/// on a path that is idle by definition (it is only reached while blocked on the network).
 #[cfg(feature = "wifi")]
-fn tcp_send(
-    iface: &mut Interface,
-    device: &mut SmolWifiDevice,
-    sockets: &mut SocketSet,
-    handle: smoltcp::iface::SocketHandle,
+const ABORT_POLL_SLICE: embassy_time::Duration = embassy_time::Duration::from_millis(50);
+
+/// #335 STEP T: how long a `close()` may wait for its FIN to reach the wire.
+///
+/// Pre-T, the `iface.poll()` immediately after `socket.close()` is what pushed the FIN out
+/// before the function returned. Under embassy-net the equivalent nudge is `flush()`, and
+/// it is REQUIRED rather than tidy: `TcpSocket`'s `Drop` removes the socket from the
+/// stack's `SocketSet` immediately (embassy-net-0.9.1 tcp.rs:466-470) **without waiting for
+/// the FIN to be sent**. A bare `close(); return;` therefore drops the clean MQTT goodbye
+/// on the floor and leaves the broker holding a half-open session until its own keepalive
+/// reaps it — a silent protocol regression that no compiler error and no gate would catch.
+///
+/// Bounded because the peer may be gone: on a LAN the FIN+ACK is a sub-5 ms round trip, so
+/// 250 ms is ~50× headroom while still refusing to strand a burst behind a dead broker.
+#[cfg(feature = "wifi")]
+const CLOSE_FLUSH_BUDGET: embassy_time::Duration = embassy_time::Duration::from_millis(250);
+
+/// #335 STEP T: `deadline - now` as an embassy-time `Duration`, saturating at zero.
+///
+/// The tree's `Instant`/`Duration` are `esp_hal::time`'s (see the import at the top of this
+/// file), while `Timer::after` wants `embassy_time`'s. Converting HERE — rather than
+/// re-typing the `deadline` parameter that 65 call sites pass — is what keeps this step's
+/// diff to the transport seam instead of spilling into every caller.
+#[cfg(feature = "wifi")]
+fn remaining(deadline: Instant) -> embassy_time::Duration {
+    let now = Instant::now();
+    if now >= deadline {
+        return embassy_time::Duration::from_ticks(0);
+    }
+    embassy_time::Duration::from_micros((deadline - now).as_micros())
+}
+
+/// Push `data` out a connected TCP socket until it is all queued or `deadline` passes.
+/// Our MQTT packets are tiny (< tx buffer), so this normally completes in one `write`;
+/// returns false on a socket error, a #20 abort, or timeout.
+///
+/// #335 STEP T: the stack is pumped by `net_task`, so there is no `iface.poll` here and no
+/// device/socket-set to thread — the four smoltcp parameters collapse to the socket itself.
+/// The `(data, deadline, tick) -> bool` shape is deliberately UNCHANGED so the 65 call
+/// sites gain `.await` and nothing else.
+#[cfg(feature = "wifi")]
+async fn tcp_send(
+    sock: &mut embassy_net::tcp::TcpSocket<'_>,
     data: &[u8],
     deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
@@ -2505,19 +2414,33 @@ fn tcp_send(
         if tick() {
             return false; // #20 abort mid-send (QoS0 — partial send tolerable)
         }
-        iface.poll(smoltcp_now(), device, sockets);
-        let socket = sockets.get_mut::<tcp::Socket>(handle);
-        if socket.can_send() {
-            match socket.send_slice(&data[off..]) {
-                Ok(n) => off += n,
-                Err(_) => return false,
-            }
-        }
-        if Instant::now() > deadline {
+        let left = remaining(deadline);
+        if left.as_ticks() == 0 {
             return false;
         }
+        // Race the write against the shorter of (remaining deadline, abort slice) so that
+        // BOTH bounds stay live while parked. Dropping a pending `write` future is safe:
+        // it enqueues bytes or it does not, and it reports what it enqueued on success —
+        // a cancelled write has consumed nothing, so `off` cannot run ahead of the wire.
+        let slice = if left < ABORT_POLL_SLICE { left } else { ABORT_POLL_SLICE };
+        match embassy_futures::select::select(
+            sock.write(&data[off..]),
+            embassy_time::Timer::after(slice),
+        )
+        .await
+        {
+            // `Ok(0)` means the socket will never accept more (closed for writing) — the
+            // pre-T loop reached the same verdict via `send_slice`'s Err. Distinguished
+            // from the timeout arm on purpose: a zero-length write is a DEAD socket, while
+            // an expired slice is merely "not yet", and folding them together would have
+            // turned every slow broker into a connection error.
+            embassy_futures::select::Either::First(Ok(0)) => return false,
+            embassy_futures::select::Either::First(Ok(n)) => off += n,
+            embassy_futures::select::Either::First(Err(_)) => return false,
+            // Slice expired: fall through to re-poll `tick` and re-check the deadline.
+            embassy_futures::select::Either::Second(_) => {}
+        }
     }
-    iface.poll(smoltcp_now(), device, sockets); // nudge the queued bytes onto the wire
     true
 }
 
@@ -2525,18 +2448,36 @@ fn tcp_send(
 /// `acc[..*acc_len]` (bounded by its capacity). MQTT is a byte stream, so packets
 /// can split/coalesce across reads — [`mqtt_session`] parses whole packets out of
 /// this accumulator with `mqtt::parse_packet`.
+///
+/// #335 STEP T: pre-T this was a NON-BLOCKING drain — it took whatever smoltcp had already
+/// buffered and returned immediately, because the caller's own loop did the waiting. That
+/// property is preserved rather than replaced by an `await` on `read`: the callers are
+/// deadline-driven loops that must keep re-polling `tick` and re-checking their own
+/// budgets, and a bare `read().await` here would park them past both. So this waits only
+/// for readability, bounded, and still returns having taken only what was ready.
 #[cfg(feature = "wifi")]
-fn recv_into(
-    sockets: &mut SocketSet,
-    handle: smoltcp::iface::SocketHandle,
+async fn recv_into(
+    sock: &mut embassy_net::tcp::TcpSocket<'_>,
     acc: &mut [u8],
     acc_len: &mut usize,
 ) {
-    let socket = sockets.get_mut::<tcp::Socket>(handle);
-    if socket.can_recv() && *acc_len < acc.len() {
-        if let Ok(n) = socket.recv_slice(&mut acc[*acc_len..]) {
-            *acc_len += n;
-        }
+    if *acc_len >= acc.len() {
+        return;
+    }
+    // Bounded wait for readability. Without this the enclosing `loop { recv_into; .. }`
+    // becomes a hot spin that starves `net_task` — the very task that has to run for bytes
+    // to arrive — so the loop would burn its whole deadline and receive nothing.
+    if embassy_futures::select::select(
+        sock.wait_read_ready(),
+        embassy_time::Timer::after(ABORT_POLL_SLICE),
+    )
+    .await
+    .is_second()
+    {
+        return; // nothing ready this slice — caller re-polls tick/deadline and comes back
+    }
+    if let Ok(n) = sock.read(&mut acc[*acc_len..]).await {
+        *acc_len += n;
     }
 }
 
@@ -2645,14 +2586,23 @@ pub(crate) fn ota_fail_is_bulk_deaf(w: u32) -> bool {
 /// claim publish and #114 H2's re-assert over a higher id.
 #[cfg(feature = "wifi")]
 #[allow(clippy::too_many_arguments)]
-fn mqtt_session(
-    iface: &mut Interface,
-    device: &mut SmolWifiDevice,
-    sockets: &mut SocketSet,
-    tcp_handle: smoltcp::iface::SocketHandle,
+async fn mqtt_session(
+    // #335 STEP T: `(iface, device, sockets, tcp_handle)` — four objects that only ever
+    // travelled together — collapse to the one socket they existed to address. The
+    // interface and socket-set now live inside embassy-net, pumped by `net_task`.
+    sock: &mut embassy_net::tcp::TcpSocket<'_>,
     node_id: u8,
     telemetry: &[(u8, &[u8])],
-    src_port: u16,
+    // #335 STEP T: RETAINED as `_src_port` rather than deleted, and this is a behavioural
+    // note rather than a tidy-up. Pre-T this RNG-drawn ephemeral port was passed to
+    // smoltcp's `connect(.., src_port)`; embassy-net's `TcpSocket::connect` takes the
+    // remote endpoint ONLY and draws the local port from the stack's own allocator
+    // (embassy-net-0.9.1 tcp.rs:247, `i.get_local_port()`), which is seeded by the DR-M3
+    // per-boot seed handed to `embassy_net::new`. So the property this argument bought —
+    // a per-boot-varying source port, so a rapid reconnect does not collide with the
+    // broker's TIME_WAIT for the previous 4-tuple — is still bought, by the seed instead.
+    // The parameter stays so the 7 call sites keep their shape in this already-large diff.
+    _src_port: u16,
     batt: &mut crate::batt::BattCache,
     grid: &mut crate::grid::GridCache,
     elect: &mut MeshElect,
@@ -2773,24 +2723,39 @@ fn mqtt_session(
     let _ = write!(cast_topic, "smol/{}/cast", node_id);
 
     // --- TCP connect ---
+    // #335 STEP T: pre-T this was a non-blocking `connect()` followed by a hand-rolled
+    // spin that pumped `iface.poll` and watched `state()` for Established/Closed.
+    // embassy-net's `connect` IS that wait, so the spin collapses into it — but it has no
+    // deadline of its own and no notion of the #20 button, so both bounds are re-imposed
+    // here by racing it. Losing either one would strand a boot on an unreachable broker.
     {
-        let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
-        if socket.connect(iface.context(), broker, src_port).is_err() {
-            return false;
-        }
-    }
-    loop {
-        if tick() {
-            return false; // #20 abort during TCP connect wait
-        }
-        iface.poll(smoltcp_now(), device, sockets);
-        let state = sockets.get_mut::<tcp::Socket>(tcp_handle).state();
-        if state == tcp::State::Established {
-            break;
-        }
-        if state == tcp::State::Closed || Instant::now() > deadline {
-            log::warn!("smol: MQTT TCP connect failed/timeout");
-            return false;
+        let connect = sock.connect(broker);
+        let abort = async {
+            loop {
+                if tick() {
+                    return true; // #20 abort during TCP connect wait
+                }
+                embassy_time::Timer::after(ABORT_POLL_SLICE).await;
+                if Instant::now() > deadline {
+                    return false;
+                }
+            }
+        };
+        match embassy_futures::select::select(connect, abort).await {
+            embassy_futures::select::Either::First(Ok(())) => {}
+            embassy_futures::select::Either::First(Err(_)) => {
+                log::warn!("smol: MQTT TCP connect failed/timeout");
+                return false;
+            }
+            // The abort arm won: either the button (true) or the deadline (false). Both
+            // end the session; only the deadline case keeps the pre-T log line, because a
+            // deliberate long-press is not a fault to warn about.
+            embassy_futures::select::Either::Second(aborted) => {
+                if !aborted {
+                    log::warn!("smol: MQTT TCP connect failed/timeout");
+                }
+                return false;
+            }
         }
     }
 
@@ -2819,7 +2784,7 @@ fn mqtt_session(
         ) else {
             return false;
         };
-        if !tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick) {
+        if !tcp_send(sock, &pkt[..n], deadline, tick).await {
             return false;
         }
     }
@@ -2830,8 +2795,7 @@ fn mqtt_session(
         if tick() {
             return false; // #20 abort during CONNACK wait (not yet connected)
         }
-        iface.poll(smoltcp_now(), device, sockets);
-        recv_into(sockets, tcp_handle, &mut acc[..], &mut acc_len);
+        recv_into(sock, &mut acc[..], &mut acc_len).await;
         loop {
             // Extract Copy scalars inside the match so the borrow of `acc` (via the
             // parsed packet) is released before the `copy_within` compaction below.
@@ -2875,7 +2839,7 @@ fn mqtt_session(
     // latest_version source + fetch target. No per-id announce-act topic exists (dropped
     // — the #32 closure): staging only advertises "update available"; it never fetches.
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 4, OTA_STAGED_TOPIC) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
     }
     // #349: ALSO subscribe this board's PER-CHIP staged topic (pid 30 — the first free id; ids
     // 1-29 are taken, and two in-flight SUBSCRIBEs sharing one is an MQTT-3.1.1 violation).
@@ -2883,15 +2847,15 @@ fn mqtt_session(
     // those three retained topics: a subscribe emitted after them can have its retained payload
     // land past the gate and be silently dropped (the #100 drain-order defect, HW-observed).
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 30, staged_chip_topic.as_bytes()) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
     }
     // #21 node-manager: subscribe this board's retained default-screen config (pid 6).
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 6, cfg_topic.as_bytes()) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
     }
     // #33 HA Update entity: subscribe this board's OTA command topic (pid 7).
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 7, cmd_topic.as_bytes()) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
     }
     // #26 cast: subscribe this board's retained cast-enable topic (pid 5). Reset the
     // flag to OFF FIRST so an absent / cleared retained topic reads as disabled — the
@@ -2900,7 +2864,7 @@ fn mqtt_session(
     {
         crate::net::cast::set_enabled(false);
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 5, cast_topic.as_bytes()) {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
     }
     // #21 leaf-relay: a GATEWAY (cfg_cache = Some) also subscribes the WILDCARD leaf
@@ -2912,7 +2876,7 @@ fn mqtt_session(
         if let Some(n) =
             crate::net::mqtt::encode_subscribe(&mut pkt, 8, b"smol/+/config/default_screen")
         {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #40 leaf-mesh-OTA (§B3): a GATEWAY also wildcard-subscribes the leaf OTA install
         // command (pid 9), twin of the config wildcard above → it acts on a leaf's native
@@ -2920,88 +2884,88 @@ fn mqtt_session(
         // staged image over ESP-NOW. The board's OWN install still arrives via `cmd_topic`
         // (pid 7) → self-OTA; the wildcard feeds ONLY other leaf ids.
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 9, b"smol/+/ota/install") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #48 blue-LED mode (pid 10): wildcard-subscribe every leaf's retained led config so the
         // gateway caches + relays it (key `L`) over ESP-NOW, twin of the default_screen wildcard.
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 10, b"smol/+/config/led") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #43 display units (pid 11): the GLOBAL retained units topic `smol/config/units` (NO id
         // — one setting for the whole fleet, so NOT a `smol/+/…` wildcard). The gateway caches it
         // under the broadcast target CFG_TARGET_ALL (255) so ONE relayed `<255>U<val>` frame
         // reaches every leaf, and self-applies its own display units (gw_own.units) below.
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 11, b"smol/config/units") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #gateway-election all-nodes-WiFi debug flag (pid 27): the GLOBAL retained
         // `smol/config/wifi_all` (`0`/`1`, no id). The crown caches it under CFG_TARGET_ALL so ONE
         // relayed `<255>A<val>` frame reaches every leaf (they enable their own WiFi bursts without
         // needing to read the broker themselves), and self-applies its own flag (gw_own.wifi_all).
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 27, b"smol/config/wifi_all") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #55 plugin visibility (pid 12): wildcard-subscribe every leaf's retained plugin mask so
         // the gateway caches + relays it (key `P`) over ESP-NOW, twin of the led wildcard.
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 12, b"smol/+/config/plugins") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #52 remote reboot (pid 13): wildcard-subscribe the TRANSIENT `smol/+/cmd/reset` COMMAND
         // topic (retain:false → seen only while we're connected, never replayed). On receipt the
         // gateway fires a ONE-SHOT `<id>R` relay (never cached — anti-reboot-loop); own id → self.
         if let Some(n) = crate::net::mqtt::encode_subscribe_qos1(&mut pkt, 13, b"smol/+/cmd/reset") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #71 on-demand scan (pid 14): wildcard-subscribe the TRANSIENT `smol/+/cmd/scan` COMMAND
         // topic (retain:false). On receipt the gateway fires a ONE-SHOT `<id>W` relay (never cached
         // — a periodic scan is the coexist hazard); own id → self-scan. Twin of the pid-13 reset arm.
         if let Some(n) = crate::net::mqtt::encode_subscribe_qos1(&mut pkt, 14, b"smol/+/cmd/scan") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #45 Custom screen (pid 15): wildcard-subscribe every leaf's retained custom-screen layout
         // so the gateway caches + relays it (key `Y`) over ESP-NOW, twin of the led/plugins wildcard.
         // (pid 15 — #71's scan took 14 in the merge; distinct pid per concurrent SUBSCRIBE.)
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 15, b"smol/+/config/custom") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #303 Bard story prompt (pid 28): wildcard-subscribe every leaf's retained story opening
         // so the crown can relay it over ESP-NOW. `bard`-gated: a build without the Bard has the
         // CfgTracker slot (see CFG_APPLY_KEYS) but never feeds it, so the slot stays inert.
         #[cfg(feature = "bard")]
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 28, b"smol/+/config/tale") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #302 Bard delivery (pid 29): the reveal pace + inf/page mode, same relay path as `tale`.
         #[cfg(feature = "bard")]
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 29, b"smol/+/config/delivery") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #100 network-switch (pid 16 per-node + pid 17 fleet-wide): the retained active-slot index.
         // CONFIG/CACHED (key `N`, relayed like S/L/U/P/Y). Per-node `smol/<id>/config/net` + the
         // global `smol/config/net` (→ target 255). Applying it writes the NVS net-record + reboots
         // into the slot, edge-triggered on a commanded-slot CHANGE (a re-read is a no-op → no loop).
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 16, b"smol/+/config/net") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 17, b"smol/config/net") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #100 Stage 2 broker override (pid 18 per-node + pid 19 fleet-wide): the retained broker leg.
         // Twin of net (key `B`, relayed + cached + edge-triggered reboot). Applying it writes the NVS
         // net-record + reboots onto the new broker; a wrong value self-heals via the CONNACK fallback.
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 18, b"smol/+/config/broker") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 19, b"smol/config/broker") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #100 Stage 3 OTA-host override (pid 20 per-node + pid 21 fleet-wide): one extra RFC1918 image
         // host (key `O`, relayed + cached). Applied WITHOUT reboot — the allowlist is read at fetch time.
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 20, b"smol/+/config/ota_host") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 21, b"smol/config/ota_host") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #72 IO registry (pid 22): wildcard-subscribe every node's retained pin-map so the
         // gateway caches + relays it (key `G`) over ESP-NOW, twin of the custom/led wildcard.
@@ -3010,18 +2974,18 @@ fn mqtt_session(
         // Kept BEFORE the batt/grid/mc drain-gate below (that ordering is load-bearing — see #110).
         #[cfg(feature = "io")]
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 22, b"smol/+/config/io") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #72 IO output control (pid 23): every node's retained output-states topic (key `g`).
         #[cfg(feature = "io")]
         if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 23, b"smol/+/io/set") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #197 herald: wildcard-subscribe the TRANSIENT `smol/+/notify` toast command (pid 24, QoS 1
         // like cmd/reset|scan — a transient command must not be silently dropped). The gateway relays
         // a captured toast to the target leaf (one-shot `<id>M`) after the burst; 255 = fleet.
         if let Some(n) = crate::net::mqtt::encode_subscribe_qos1(&mut pkt, 24, b"smol/+/notify") {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
     }
 
@@ -3034,14 +2998,14 @@ fn mqtt_session(
     // as before — mc is usually absent at boot, so that path still drains to the deadline.) Pids
     // stay 1/2/3 (identifiers, not order); only the SEND order moved. Still before the PUBLISH loop.
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 1, BATT_TOPIC) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
     }
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 2, GRID_TOPIC) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
     }
     // #23 election: subscribe the retained single-gateway topic (packet-id 3).
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 3, MESH_CHANNEL_TOPIC) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
     }
     // #155 channel-drag operator lever: subscribe the retained channel-hint (packet-id 25). NOTE:
     // this was originally 13, which COLLIDES with the QoS-1 `smol/+/cmd/reset` subscribe (pids
@@ -3052,13 +3016,13 @@ fn mqtt_session(
     // retained value rides the SAME broker burst as `MC` and is captured before the resolver runs
     // (the settle window after the primary downlinks catches it, like the OTA/config retained topics).
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 25, MESH_CHANNEL_HINT_TOPIC) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
     }
     // #gateway-election: subscribe the retained best-gateway metric (packet-id 26 — next free above
     // #155's 25). Rides the SAME broker burst as MC/channel_hint so the resolver reads the operator's
     // metric BEFORE it claims (the settle window after the primary downlinks catches it).
     if let Some(n) = crate::net::mqtt::encode_subscribe(&mut pkt, 26, MESH_ELECT_TOPIC) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
     }
 
     // --- PUBLISH telemetry (transient) + discovery config (retained) per node ---
@@ -3070,7 +3034,7 @@ fn mqtt_session(
         let mut topic = MqttScratch::new();
         let _ = write!(topic, "smol/{}/telemetry", id);
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, topic.as_bytes(), line, false) {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #12: THREE TYPED discovery configs (retained) instead of the old single
         // `telemetry/config`. The old single config (name "smol <id>" + no
@@ -3153,7 +3117,7 @@ fn mqtt_session(
                 id, field, id, field, name, id, tmpl, extra, id, id, adj, noun, dev_extra, env!("BUILD_NUMBER"), crate::net::names::version_name().1
             );
             if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), json.as_bytes(), true) {
-                let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
             }
         }
     }
@@ -3173,7 +3137,7 @@ fn mqtt_session(
         if let Some(n) =
             crate::net::mqtt::encode_publish(&mut pkt, utopic.as_bytes(), uval.as_bytes(), false)
         {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         let mut dtopic = MqttScratch::new();
         let _ = write!(dtopic, "homeassistant/sensor/smol{}/uplink/config", node_id);
@@ -3199,7 +3163,7 @@ fn mqtt_session(
         if let Some(n) =
             crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), json.as_bytes(), true)
         {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
     }
 
@@ -3212,7 +3176,7 @@ fn mqtt_session(
         let mut ptopic = MqttScratch::new();
         let _ = write!(ptopic, "smol/{}/peers", node_id);
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, ptopic.as_bytes(), peers, true) {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // luna #3: the SAME payload on the fixed mesh-wide topic, so the dashboard has one place to
         // read the roster from regardless of which board holds the crown. Only a crown reaches here
@@ -3220,7 +3184,7 @@ fn mqtt_session(
         // exactly one publisher at a time and a crown handover simply overwrites it — retained, so a
         // dashboard restart sees the last roster rather than nothing.
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, MESH_PEERS_TOPIC, peers, true) {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
     }
 
@@ -3232,7 +3196,7 @@ fn mqtt_session(
         let mut stopic = MqttScratch::new();
         let _ = write!(stopic, "smol/{}/status", node_id);
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, stopic.as_bytes(), status, true) {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
     }
 
@@ -3260,7 +3224,7 @@ fn mqtt_session(
                 if let Some(n) =
                     crate::net::mqtt::encode_publish(&mut pkt, ltopic.as_bytes(), &sbuf[..5 + m], true)
                 {
-                    let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                    let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
                 }
             }
         }
@@ -3272,7 +3236,7 @@ fn mqtt_session(
         let mut dtopic = MqttScratch::new();
         let _ = write!(dtopic, "smol/{}/diag", node_id);
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), diag, true) {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
     }
 
@@ -3293,7 +3257,7 @@ fn mqtt_session(
                 let _ = write!(dtopic, "smol/{}/diag", nid);
                 if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), val, true)
                 {
-                    let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                    let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
                 }
             }
         }
@@ -3397,7 +3361,7 @@ fn mqtt_session(
                         json.as_bytes(),
                         true,
                     ) {
-                        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                        let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
                     }
                 }
             }
@@ -3413,7 +3377,7 @@ fn mqtt_session(
         let mut stopic = MqttScratch::new();
         let _ = write!(stopic, "smol/{}/scan", node_id);
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, stopic.as_bytes(), scan, true) {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
     }
 
@@ -3432,7 +3396,7 @@ fn mqtt_session(
                 let _ = write!(stopic, "smol/{}/scan", nid);
                 if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, stopic.as_bytes(), val, true)
                 {
-                    let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                    let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
                 }
             }
         }
@@ -3448,13 +3412,18 @@ fn mqtt_session(
     {
         let mut sctopic = MqttScratch::new();
         let _ = write!(sctopic, "smol/{}/screen", node_id);
-        crate::net::cast::with_screen_b64(|b64| {
-            if let Some(n) =
-                crate::net::mqtt::encode_publish(&mut pkt, sctopic.as_bytes(), b64, true)
-            {
-                let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
-            }
+        // #335 STEP T: `with_screen_b64` takes a SYNCHRONOUS `FnOnce`, so the send cannot
+        // live inside it any more. ENCODE inside the borrow (which is all the closure was
+        // ever needed for — it lends the base64 of the mirrored screen out of a static) and
+        // SEND after it ends. The alternative, holding the borrow across an `.await`, is
+        // exactly what that helper's SAFETY note forbids: "no reference to them outlives
+        // this call."
+        let encoded = crate::net::cast::with_screen_b64(|b64| {
+            crate::net::mqtt::encode_publish(&mut pkt, sctopic.as_bytes(), b64, true)
         });
+        if let Some(n) = encoded {
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
+        }
     }
 
     // --- Receive the retained battery + grid payloads (both SUBSCRIBEs above) ---
@@ -3510,8 +3479,7 @@ fn mqtt_session(
         if tick() {
             break; // #20 abort during downlink wait → fall through to clean DISCONNECT
         }
-        iface.poll(smoltcp_now(), device, sockets);
-        recv_into(sockets, tcp_handle, &mut acc[..], &mut acc_len);
+        recv_into(sock, &mut acc[..], &mut acc_len).await;
         loop {
             let (consumed, puback_id) = match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
                 None => break,
@@ -4040,7 +4008,7 @@ fn mqtt_session(
             // before the post-flush reboot → the redelivery loop physically cannot occur.
             if let Some(pid) = puback_id {
                 if let Some(n) = crate::net::mqtt::encode_puback(&mut pkt, pid) {
-                    let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                    let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
                 }
             }
         }
@@ -4102,14 +4070,14 @@ fn mqtt_session(
         if let Some(n) =
             crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), dpayload.as_bytes(), true)
         {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         log::info!("smol #40: published smol/{}/ota/diag = {} retry={} (clear={})", lid, phase, retry, clear);
         if clear {
             let mut itopic = MqttScratch::new();
             let _ = write!(itopic, "smol/{}/ota/install", lid);
             if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, itopic.as_bytes(), b"", true) {
-                let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
             }
             if pending_leaf == Some(lid) {
                 pending_leaf = None; // don't re-arm a leaf we just consumed
@@ -4138,7 +4106,7 @@ fn mqtt_session(
         if let Some(np) =
             crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), dval.as_bytes(), true)
         {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..np], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..np], deadline, tick).await;
         }
         log::info!(
             "smol #139/#147: published smol/{}/ota/diag = self-fetch-failed chunk={}/{} retry={} stall={} at={}",
@@ -4178,7 +4146,7 @@ fn mqtt_session(
                 let mut itopic = MqttScratch::new();
                 let _ = write!(itopic, "smol/{}/ota/install", lid);
                 if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, itopic.as_bytes(), b"", true) {
-                    let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                    let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
                 }
                 log::info!(
                     "smol #111: leaf id{} version-flipped (>= staged {}) — cleared retained install",
@@ -4248,7 +4216,7 @@ fn mqtt_session(
         if let Some(n) =
             crate::net::mqtt::encode_publish(&mut pkt, rtopic.as_bytes(), rval.as_bytes(), true)
         {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         log::info!(
             "smol #3: relaydiag id{} rx={} otan={} last_wb={}/{} leafV={}",
@@ -4334,7 +4302,7 @@ fn mqtt_session(
             (gate_latches >> 1) & 1
         );
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, adtopic.as_bytes(), adval.as_bytes(), true) {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
     }
 
@@ -4381,7 +4349,13 @@ fn mqtt_session(
                     break;
                 }
             }
-            iface.poll(smoltcp_now(), device, sockets); // give the association a beat to settle
+            // #335 STEP T: pre-T this `iface.poll` was not draining sockets — the comment
+            // says what it was for, and it was the only thing in this loop that let time
+            // pass while the association settled. Deleting it (as the poll-before-recv
+            // sites were deleted) would turn this into an unyielding hot spin that starves
+            // `net_task` and never lets the AP info arrive. So it becomes an explicit
+            // yield, which is what it always actually was.
+            embassy_time::Timer::after(ABORT_POLL_SLICE).await;
         }
         if ap_ch != 0 {
             elect.co_channel = ap_ch == elect.mesh_channel;
@@ -4759,7 +4733,7 @@ fn mqtt_session(
             mcp.as_bytes(),
             true,
         ) {
-            Some(n) => tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick),
+            Some(n) => tcp_send(sock, &pkt[..n], deadline, tick).await,
             None => false,
         };
         if !published {
@@ -4781,8 +4755,7 @@ fn mqtt_session(
                 if tick() {
                     break;
                 }
-                iface.poll(smoltcp_now(), device, sockets);
-                recv_into(sockets, tcp_handle, &mut acc[..], &mut acc_len);
+                recv_into(sock, &mut acc[..], &mut acc_len).await;
                 loop {
                     match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
                         Some((crate::net::mqtt::Incoming::Publish { topic, payload, .. }, consumed)) => {
@@ -4816,7 +4789,7 @@ fn mqtt_session(
                     if let Some(n) =
                         crate::net::mqtt::encode_publish(&mut pkt, MESH_CHANNEL_TOPIC, mcp2.as_bytes(), true)
                     {
-                        if tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick) {
+                        if tcp_send(sock, &pkt[..n], deadline, tick).await {
                             elect.seen_seq = reseq;
                             log::info!("smol: #114 H2 — re-asserted claim over higher-id {} (seq {})", owner2, reseq);
                         }
@@ -4854,7 +4827,7 @@ fn mqtt_session(
         let mut ptopic = MqttScratch::new();
         let _ = write!(ptopic, "smol/{}/peers", node_id);
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, ptopic.as_bytes(), b"", true) {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
     }
 
@@ -4884,7 +4857,7 @@ fn mqtt_session(
             node_id, node_id, node_id, node_id
         );
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), djson.as_bytes(), true) {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // State JSON (retained): installed + latest + in_progress + title. installed/latest
         // stay NUMERIC (HA's version compare). #218: the title is the human DISPLAY — the
@@ -4914,7 +4887,7 @@ fn mqtt_session(
         let mut stopic = MqttScratch::new();
         let _ = write!(stopic, "smol/{}/ota/state", node_id);
         if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, stopic.as_bytes(), sjson.as_bytes(), true) {
-            let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+            let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
         }
         // #111: clear our OWN retained install ONLY once the staged image is KNOWN (parsed this
         // session) — not merely because we caught the INSTALL. The old eager clear-on-catch lost the
@@ -4949,7 +4922,7 @@ fn mqtt_session(
         // makes that benign; this half is what stops it recurring.
         if *install_requested && (ota_offer.is_some() || staged_satisfied) {
             if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, cmd_topic.as_bytes(), &[], true) {
-                let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
             }
         }
     }
@@ -4989,7 +4962,7 @@ fn mqtt_session(
                 lid, lid, lid, lid, lid, adj, noun
             );
             if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, dtopic.as_bytes(), djson.as_bytes(), true) {
-                let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
             }
             // State (retained) ONLY if the leaf reported a build (STAT `|<build>` field) —
             // don't clobber a self-published value with "unknown" for a leaf on old firmware.
@@ -5007,7 +4980,7 @@ fn mqtt_session(
                 let mut stopic = MqttScratch::new();
                 let _ = write!(stopic, "smol/{}/ota/state", lid);
                 if let Some(n) = crate::net::mqtt::encode_publish(&mut pkt, stopic.as_bytes(), sjson.as_bytes(), true) {
-                    let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+                    let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
                 }
             }
         }
@@ -5015,10 +4988,16 @@ fn mqtt_session(
 
     // --- DISCONNECT (clean goodbye) + close the socket ---
     if let Some(n) = crate::net::mqtt::encode_disconnect(&mut pkt) {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
     }
-    sockets.get_mut::<tcp::Socket>(tcp_handle).close();
-    iface.poll(smoltcp_now(), device, sockets);
+    sock.close();
+    // #335 STEP T: this replaces the pre-T `iface.poll()` nudge and is load-bearing — see
+    // `CLOSE_FLUSH_BUDGET` for why dropping it would silently unsend the FIN.
+    let _ = embassy_futures::select::select(
+        sock.flush(),
+        embassy_time::Timer::after(CLOSE_FLUSH_BUDGET),
+    )
+    .await;
     connected
 }
 
@@ -5040,10 +5019,12 @@ fn mqtt_session(
 /// it does not extend the deaf window beyond the flush the mesh already pays for).
 #[cfg(feature = "espnow")]
 #[allow(clippy::too_many_arguments)] // +grid (issue #16) tips this to 8 params
-pub fn run_mqtt_burst(
+pub async fn run_mqtt_burst(
     controller: &mut esp_radio::wifi::WifiController<'static>,
-    device: &mut SmolWifiDevice,
-    rng: Rng,
+    // #335 STEP T: the smoltcp device is replaced by the ONE embassy-net stack, brought up
+    // once at radio init (`net::bring_up_stack`) and pumped by `net_task`.
+    stack: embassy_net::Stack<'static>,
+    #[allow(unused_variables)] rng: Rng,
     node_id: u8,
     messages: &[(u8, &[u8])],
     batt: &mut crate::batt::BattCache,
@@ -5112,64 +5093,21 @@ pub fn run_mqtt_burst(
     ota_self_fail: &mut Option<(u32, u32, u32, u32, u32)>,
     tick: &mut dyn FnMut() -> bool,
 ) -> bool {
-    let mut iface = create_interface(device);
-    // #26 cast adds one UDP socket (the WLED pixel-stream) to the set.
-    #[cfg(not(feature = "cast"))]
-    let mut sockets_storage: [SocketStorage; 3] = Default::default();
-    #[cfg(feature = "cast")]
-    let mut sockets_storage: [SocketStorage; 4] = Default::default();
-    let mut sockets = SocketSet::new(&mut sockets_storage[..]);
-
-    let mut dhcp_socket = dhcpv4::Socket::new();
-    dhcp_socket.set_outgoing_options(&[DhcpOption {
-        kind: 12,
-        data: b"smol",
-    }]);
-    let dhcp_handle = sockets.add(dhcp_socket);
-
-    // TCP socket for the MQTT session (the UDP collector datagram is retired).
-    let mut tcp_rx = [0u8; 512];
-    let mut tcp_tx = [0u8; 512];
-    let tcp_socket = tcp::Socket::new(
-        tcp::SocketBuffer::new(&mut tcp_rx[..]),
-        tcp::SocketBuffer::new(&mut tcp_tx[..]),
-    );
-    let tcp_handle = sockets.add(tcp_socket);
-
-    // #9 item-1: throwaway UDP socket used ONLY to pre-warm the next-hop (router) ARP
-    // right after DHCP (see the warm-up below). Tiny buffers — stack-negligible next to
-    // the 512 B TCP buffers above, so the F1/F2 frame headroom is preserved. mqtt_session
-    // never touches it.
-    let mut warm_rx_meta = [udp::PacketMetadata::EMPTY; 1];
-    let mut warm_tx_meta = [udp::PacketMetadata::EMPTY; 1];
-    let mut warm_rx = [0u8; 1];
-    let mut warm_tx = [0u8; 4];
-    let warm_socket = udp::Socket::new(
-        udp::PacketBuffer::new(&mut warm_rx_meta[..], &mut warm_rx[..]),
-        udp::PacketBuffer::new(&mut warm_tx_meta[..], &mut warm_tx[..]),
-    );
-    let warm_handle = sockets.add(warm_socket);
-
-    // #26 cast: a real UDP socket for the WLED DNRGB pixel-stream (present only in a
-    // cast build). TX sized for one full DNRGB chunk (4 + 3*128 = 388 B ⇒ 512 with
-    // margin); RX tiny (WLED never replies to realtime frames). Streamed AFTER the
-    // MQTT session below, reusing this still-associated interface.
-    #[cfg(feature = "cast")]
-    let mut cast_rx_meta = [udp::PacketMetadata::EMPTY; 1];
-    #[cfg(feature = "cast")]
-    let mut cast_tx_meta = [udp::PacketMetadata::EMPTY; 4];
-    #[cfg(feature = "cast")]
-    let mut cast_rx = [0u8; 4];
-    #[cfg(feature = "cast")]
-    let mut cast_tx = [0u8; 512];
-    #[cfg(feature = "cast")]
-    let cast_handle = {
-        let s = udp::Socket::new(
-            udp::PacketBuffer::new(&mut cast_rx_meta[..], &mut cast_rx[..]),
-            udp::PacketBuffer::new(&mut cast_tx_meta[..], &mut cast_tx[..]),
-        );
-        sockets.add(s)
-    };
+    // #335 STEP T: the per-burst smoltcp stack is GONE. `create_interface`, the
+    // `SocketSet`, the DHCP socket and the TCP buffers all lived here because this
+    // function built a whole IP stack every flush and tore it down again; embassy-net owns
+    // one stack for the life of the boot and `net_task` pumps it. Two consequences worth
+    // stating because they are behavioural, not cosmetic:
+    //
+    //   * the DHCP lease and the ARP/neighbour cache now PERSIST across bursts instead of
+    //     being rebuilt per flush (see the lease wait and the retired warm-up below);
+    //   * the ~2.6 KB of socket buffers this frame used to hold (2 × 512 TCP + the warm
+    //     and cast UDP buffers + the storage array) move OUT of the stack frame into
+    //     embassy-net's static `StackResources` — which is the term T-SCOPE §7.1's
+    //     inequality turns on: bytes leaving the measured stack peak buy 4/3 of a byte
+    //     each against the region floor.
+    //
+    // The TCP socket for the MQTT session is created from static buffers just below.
 
     // FINDING 1b (retained): bound the ENTIRE flush by the short RELAY_FLUSH_BUDGET,
     // not the 30 s NTP budget — a dead AP fails fast so the loop isn't frozen 30 s.
@@ -5217,40 +5155,18 @@ pub fn run_mqtt_burst(
         elect.my_rssi = r.clamp(-127, 0) as i8;
     }
 
-    // Fresh DHCP lease each burst (the interface was just rebuilt).
+    // #335 STEP T: wait for a v4 lease. Pre-T this said "Fresh DHCP lease each burst (the
+    // interface was just rebuilt)" and drove a dhcpv4 socket by hand. embassy-net's DHCP
+    // client lives in `net_task` and holds/renews ONE lease for the life of the boot, so on
+    // every burst after the first this is already up and falls straight through — the
+    // per-flush DORA round trip is simply gone.
     loop {
         if tick() {
             return false; // #20 abort during flush DHCP wait
         }
-        iface.poll(smoltcp_now(), device, &mut sockets);
-        let configured = {
-            let socket = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
-            match socket.poll() {
-                Some(dhcpv4::Event::Configured(cfg)) => Some((cfg.address, cfg.router)),
-                _ => None,
-            }
-        };
-        if let Some((addr, router)) = configured {
-            apply_dhcp(&mut iface, addr, router);
-            log::info!("smol: MQTT flush DHCP {}", addr);
-            // #9 item-1: pre-warm the next-hop (router) ARP in a tight, bounded poll so
-            // the timed MQTT TCP connect below is not delayed by a COLD first-ARP
-            // round-trip — which occasionally overran the 15 s flush window and forced a
-            // 30 s retry (the interface is rebuilt each flush → empty neighbour cache).
-            // A throwaway datagram to the router's discard port (9) triggers neighbour
-            // discovery; poll it out over ≤300 ms (and never past `deadline`). Purely
-            // additive: if it does not resolve, the connect still does its own ARP —
-            // identical to prior behavior, just without the warm cache.
-            if let Some(router) = router {
-                {
-                    let s = sockets.get_mut::<udp::Socket>(warm_handle);
-                    let _ = s.bind(49152 + (rng.random() % 16384) as u16);
-                    let _ = s.send_slice(b"warm", (IpAddress::Ipv4(router), 9u16));
-                }
-                let warm_cap = Instant::now() + Duration::from_millis(300);
-                while Instant::now() < warm_cap && Instant::now() < deadline {
-                    iface.poll(smoltcp_now(), device, &mut sockets);
-                }
+        if stack.is_config_up() {
+            if let Some(cfg) = stack.config_v4() {
+                log::info!("smol: MQTT flush DHCP {}", cfg.address);
             }
             break;
         }
@@ -5258,12 +5174,46 @@ pub fn run_mqtt_burst(
             log::warn!("smol: MQTT flush — DHCP timed out");
             return false;
         }
+        // Yield, or this spin starves the very task that has to run for the lease to land.
+        embassy_time::Timer::after(ABORT_POLL_SLICE).await;
     }
 
+    // #9 item-1 RETIRED BY CONSTRUCTION — recorded rather than silently dropped, because
+    // deleting a latency workaround looks identical to forgetting it.
+    //
+    // That warm-up existed for one stated reason: "the interface is rebuilt each flush →
+    // empty neighbour cache", so the first MQTT connect paid a cold ARP round trip that
+    // occasionally overran the flush window and forced a 30 s retry. It sent a throwaway
+    // datagram to the router's discard port to force neighbour discovery early.
+    //
+    // Under embassy-net the interface is NOT rebuilt each flush — one stack, one neighbour
+    // cache, alive for the whole boot — so the cold-cache condition the workaround was
+    // compensating for cannot arise after the first burst. The premise is gone, so the
+    // workaround goes with it, taking its UDP socket (and therefore one `NET_SOCKETS`
+    // slot — see `net::NET_SOCKETS`) and its four stack buffers with it.
+
     // One MQTT session: publish queued telemetry + discovery, receive the retained
-    // battery downlink into the cache. Local TCP port from the same rng seed the
-    // UDP path used. Bounded within the overall flush `deadline`.
-    let src_port = 49152 + (rng.random() % 16384) as u16;
+    // battery downlink into the cache. Bounded within the overall flush `deadline`.
+    //
+    // #335 STEP T: the local TCP port is no longer drawn here — `TcpSocket::connect` takes
+    // it from the stack's allocator, seeded per boot (see `mqtt_session`'s `_src_port`).
+    let src_port = 0u16;
+
+    // #335 STEP T: the session's TCP buffers, hoisted from this stack frame into `.bss`.
+    //
+    // This is the F2/`OTA_TCP_RX` precedent applied for the same reason and with the same
+    // alias argument: `run_mqtt_burst` is called from the single main-loop flush path, is
+    // never re-entered (the previous `TcpSocket` is dropped when this function returns,
+    // before any next call can build one), and there is no second thread. The `#404`
+    // hazard does not apply — that bug was a `SocketSet` whose *storage slots* were reused
+    // without clearing; here `TcpSocket::new` initialises both buffers' ring state itself.
+    //
+    // It is also a deliberate §7.1 move: 1,024 B leave the measured stack peak for `.bss`,
+    // and because the region floor is `ceil(peak × 4/3)`, a byte moved off the stack is
+    // worth 4/3 of a byte against the shortfall.
+    let tcp_rx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(MQTT_TCP_RX) };
+    let tcp_tx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(MQTT_TCP_TX) };
+    let mut sock = embassy_net::tcp::TcpSocket::new(stack, tcp_rx, tcp_tx);
     // #23: refresh election/liveness each flush — the caller's `elect` carries the
     // persistent (owner,seq,seen_ms) observation IN and the re-decided role OUT.
     // #26 cast: the result is bound (not tail-returned) so the cast stream can run
@@ -5271,10 +5221,7 @@ pub fn run_mqtt_burst(
     // away, leaving a `let … ; return` shape — a cfg-conditional `let_and_return`.
     #[allow(clippy::let_and_return)]
     let session_ok = mqtt_session(
-        &mut iface,
-        device,
-        &mut sockets,
-        tcp_handle,
+        &mut sock,
         node_id,
         messages,
         src_port,
@@ -5306,7 +5253,7 @@ pub fn run_mqtt_burst(
         ota_self_fail, // #139-followup: forward the self-fetch-fail snapshot (or &mut None)
         deadline,
         tick,
-    );
+    ).await;
 
     // #100 Stage 2: feed the broker-override fallback. We only reach here AFTER the WiFi
     // association succeeded (the assoc wait above returns early on failure), so `session_ok`
@@ -5320,15 +5267,7 @@ pub fn run_mqtt_burst(
     #[cfg(feature = "cast")]
     if crate::net::cast::is_enabled() {
         let cast_port = 49152 + (rng.random() % 16384) as u16;
-        cast_stream(
-            &mut iface,
-            device,
-            &mut sockets,
-            cast_handle,
-            cast_port,
-            deadline,
-            tick,
-        );
+        cast_stream(stack, cast_port, deadline, tick).await;
     }
 
     session_ok
@@ -5349,12 +5288,23 @@ const CAST_HOLD: Duration = Duration::from_millis(3000);
 #[cfg(feature = "cast")]
 const CAST_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
+/// #335 STEP T: the cast socket's UDP buffers, hoisted from `run_mqtt_burst`'s frame into
+/// `.bss` (same sizes as the arrays they replace: RX tiny — WLED never replies to realtime
+/// frames — TX one full DNRGB chunk with margin). Same §7.1 trade as `MQTT_TCP_*`.
 #[cfg(feature = "cast")]
-fn cast_stream(
-    iface: &mut Interface,
-    device: &mut SmolWifiDevice,
-    sockets: &mut SocketSet,
-    cast_handle: smoltcp::iface::SocketHandle,
+static mut CAST_RX_META: [embassy_net::udp::PacketMetadata; 1] =
+    [embassy_net::udp::PacketMetadata::EMPTY; 1];
+#[cfg(feature = "cast")]
+static mut CAST_TX_META: [embassy_net::udp::PacketMetadata; 4] =
+    [embassy_net::udp::PacketMetadata::EMPTY; 4];
+#[cfg(feature = "cast")]
+static mut CAST_RX: [u8; 4] = [0; 4];
+#[cfg(feature = "cast")]
+static mut CAST_TX: [u8; 512] = [0; 512];
+
+#[cfg(feature = "cast")]
+async fn cast_stream(
+    stack: embassy_net::Stack<'static>,
     src_port: u16,
     burst_deadline: Instant,
     tick: &mut dyn FnMut() -> bool,
@@ -5377,12 +5327,19 @@ fn cast_stream(
     );
 
     // Bind the cast UDP socket once (ephemeral local port).
-    {
-        let s = sockets.get_mut::<udp::Socket>(cast_handle);
-        if !s.is_open() && s.bind(src_port).is_err() {
-            log::warn!("smol #26: cast socket bind failed");
-            return;
-        }
+    // SAFETY (#335 STEP T): single-caller, main-thread, and this socket is dropped when
+    // `cast_stream` returns — before any next flush can build another — so these `static
+    // mut` borrows never overlap in time. Same argument as `MQTT_TCP_*`.
+    let mut s = embassy_net::udp::UdpSocket::new(
+        stack,
+        unsafe { &mut *core::ptr::addr_of_mut!(CAST_RX_META) },
+        unsafe { &mut *core::ptr::addr_of_mut!(CAST_RX) },
+        unsafe { &mut *core::ptr::addr_of_mut!(CAST_TX_META) },
+        unsafe { &mut *core::ptr::addr_of_mut!(CAST_TX) },
+    );
+    if s.bind(src_port).is_err() {
+        log::warn!("smol #26: cast socket bind failed");
+        return;
     }
 
     let hold_deadline = {
@@ -5400,7 +5357,6 @@ fn cast_stream(
         if tick() {
             break; // long-press → free the radio
         }
-        iface.poll(smoltcp_now(), device, sockets);
         if Instant::now() >= next_frame {
             // One frame = all DNRGB chunks covering LEDs 0..total.
             let mut start = 0usize;
@@ -5411,11 +5367,18 @@ fn cast_stream(
                 else {
                     break;
                 };
+                // #335 STEP T: `send_slice` + an `iface.poll` to "push the datagram out"
+                // becomes one awaited `send_to` — net_task does the pushing. Bounded: a
+                // full TX buffer must not hang the hold past its own deadline.
+                if embassy_futures::select::select(
+                    s.send_to(&pkt[..n], dst),
+                    embassy_time::Timer::after(ABORT_POLL_SLICE),
+                )
+                .await
+                .is_second()
                 {
-                    let s = sockets.get_mut::<udp::Socket>(cast_handle);
-                    let _ = s.send_slice(&pkt[..n], dst);
+                    break; // TX backed up — drop the rest of this frame, try the next one
                 }
-                iface.poll(smoltcp_now(), device, sockets); // push the datagram out
                 start = next;
             }
             frames += 1;
@@ -5424,6 +5387,9 @@ fn cast_stream(
         if Instant::now() >= hold_deadline {
             break;
         }
+        // #335 STEP T: the deleted `iface.poll` was this loop's only yield; without one it
+        // becomes a hot spin between frames that starves `net_task` and never sends.
+        embassy_time::Timer::after(ABORT_POLL_SLICE).await;
     }
     log::info!(
         "smol #26: cast streamed {} frame(s) to WLED {}.{}.{}.{} ({}x{})",
@@ -5475,12 +5441,11 @@ fn parse_ipv4(host: &str) -> Option<smoltcp::wire::Ipv4Address> {
 /// `active_broker()` (#100). espnow-only (the OTA fetch is).
 #[cfg(feature = "espnow")]
 #[allow(clippy::too_many_arguments)]
-fn publish_ota_progress(
-    iface: &mut Interface,
-    device: &mut SmolWifiDevice,
-    sockets: &mut SocketSet,
-    tcp_handle: smoltcp::iface::SocketHandle,
-    src_port: u16,
+async fn publish_ota_progress(
+    // #335 STEP T: still the FETCH's socket, reused in its between-chunks idle window —
+    // the sharing this function is built around is unchanged, only its spelling.
+    sock: &mut embassy_net::tcp::TcpSocket<'_>,
+    #[allow(unused_variables)] src_port: u16,
     node_id: u8,
     done: u32,
     total: u32,
@@ -5493,35 +5458,37 @@ fn publish_ota_progress(
     let deadline = Instant::now() + Duration::from_secs(3);
     // Force the (possibly lingering) socket to CLOSED, then open a fresh broker connection. The
     // fetch loop's per-chunk recycle re-cleans + reconnects to the HTTP host after we return.
-    sockets.get_mut::<tcp::Socket>(tcp_handle).abort();
-    loop {
-        iface.poll(smoltcp_now(), device, sockets);
-        if sockets.get_mut::<tcp::Socket>(tcp_handle).state() == tcp::State::Closed {
-            break;
-        }
-        if Instant::now() > deadline {
-            return;
-        }
-    }
-    if sockets
-        .get_mut::<tcp::Socket>(tcp_handle)
-        .connect(iface.context(), broker, src_port)
-        .is_err()
+    //
+    // #335 STEP T: the pre-T "poll until state()==Closed" spin is `flush()`. embassy-net
+    // documents this exact requirement on `abort()`: "callers should wait for a flush() to
+    // complete before dropping or REUSING the socket" (tcp.rs:427-429) — and reusing it is
+    // precisely what this function does. Bounded, since a dead peer must not eat the
+    // fetch's idle window.
+    sock.abort();
+    let _ = embassy_futures::select::select(
+        sock.flush(),
+        embassy_time::Timer::after(CLOSE_FLUSH_BUDGET),
+    )
+    .await;
     {
-        return;
-    }
-    loop {
-        if tick() {
-            return;
-        }
-        iface.poll(smoltcp_now(), device, sockets);
-        match sockets.get_mut::<tcp::Socket>(tcp_handle).state() {
-            tcp::State::Established => break,
-            tcp::State::Closed => return,
-            _ => {}
-        }
-        if Instant::now() > deadline {
-            return;
+        let connect = sock.connect(broker);
+        let give_up = async {
+            loop {
+                if tick() {
+                    return;
+                }
+                embassy_time::Timer::after(ABORT_POLL_SLICE).await;
+                if Instant::now() > deadline {
+                    return;
+                }
+            }
+        };
+        match embassy_futures::select::select(connect, give_up).await {
+            embassy_futures::select::Either::First(Ok(())) => {}
+            // Progress is best-effort by contract: every failure path here is a silent
+            // return, exactly as the pre-T `Closed`/deadline/abort arms were.
+            embassy_futures::select::Either::First(Err(_)) => return,
+            embassy_futures::select::Either::Second(()) => return,
         }
     }
     let mut pkt = [0u8; 128];
@@ -5529,14 +5496,22 @@ fn publish_ota_progress(
     // take-over that session's connection).
     let mut cid = MqttScratch::new();
     let _ = write!(cid, "smol-{}op", node_id);
-    match crate::net::mqtt::encode_connect(
+    // #335 STEP T: this was ONE match with the send in a GUARD
+    // (`Some(n) if tcp_send(..) => {}` / `_ => return`). A match guard may not contain
+    // `.await`, so the send moves into the arm BODY and the verdict is tested after.
+    // Semantics are preserved exactly: the old `_` arm returned for BOTH a failed encode
+    // and a failed send, which is what `false` from either branch now expresses.
+    let sent = match crate::net::mqtt::encode_connect(
         &mut pkt,
         cid.as_bytes(),
         crate::secrets::MQTT_USER.as_bytes(),
         crate::secrets::MQTT_PASS.as_bytes(),
     ) {
-        Some(n) if tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick) => {}
-        _ => return,
+        Some(n) => tcp_send(sock, &pkt[..n], deadline, tick).await,
+        None => false,
+    };
+    if !sent {
+        return;
     }
     // CONNACK (require rc=0) — small local accumulator. Copy scalars out of the match BEFORE the
     // `copy_within` compaction so the `acc` borrow (via the parsed packet) is released first.
@@ -5547,8 +5522,7 @@ fn publish_ota_progress(
         if tick() {
             return;
         }
-        iface.poll(smoltcp_now(), device, sockets);
-        recv_into(sockets, tcp_handle, &mut acc, &mut acc_len);
+        recv_into(sock, &mut acc, &mut acc_len).await;
         loop {
             let (consumed, ok, bad) = match crate::net::mqtt::parse_packet(&acc[..acc_len]) {
                 None => break,
@@ -5579,11 +5553,17 @@ fn publish_ota_progress(
     if let Some(n) =
         crate::net::mqtt::encode_publish(&mut pkt, topic.as_bytes(), payload.as_bytes(), true)
     {
-        let _ = tcp_send(iface, device, sockets, tcp_handle, &pkt[..n], deadline, tick);
+        let _ = tcp_send(sock, &pkt[..n], deadline, tick).await;
     }
     // Close cleanly; the loop's recycle will re-establish the HTTP connection for the next chunk.
-    sockets.get_mut::<tcp::Socket>(tcp_handle).close();
-    iface.poll(smoltcp_now(), device, sockets);
+    sock.close();
+    // #335 STEP T: this replaces the pre-T `iface.poll()` nudge and is load-bearing — see
+    // `CLOSE_FLUSH_BUDGET` for why dropping it would silently unsend the FIN.
+    let _ = embassy_futures::select::select(
+        sock.flush(),
+        embassy_time::Timer::after(CLOSE_FLUSH_BUDGET),
+    )
+    .await;
 }
 
 /// #6 OTA FETCH burst (`espnow` gateway, triggered by a gated announce): stream the
@@ -5595,10 +5575,11 @@ fn publish_ota_progress(
 /// and never returns.
 #[cfg(feature = "espnow")]
 #[allow(clippy::too_many_arguments)] // +fail diag (#139-followup) tips this to 8 params
-pub fn run_ota_fetch(
+pub async fn run_ota_fetch(
     controller: &mut esp_radio::wifi::WifiController<'static>,
-    device: &mut SmolWifiDevice,
-    rng: Rng,
+    // #335 STEP T: the ONE embassy-net stack, in place of the per-fetch smoltcp device.
+    stack: embassy_net::Stack<'static>,
+    #[allow(unused_variables)] rng: Rng,
     announce: &crate::ota::Announce,
     tick: &mut dyn FnMut() -> bool,
     // #40 relay-mode: when true, stage+verify the image to the inactive slot but do NOT
@@ -5653,15 +5634,6 @@ pub fn run_ota_fetch(
         );
     }
 
-    let mut iface = create_interface(device);
-    let mut sockets_storage: [SocketStorage; 2] = Default::default();
-    let mut sockets = SocketSet::new(&mut sockets_storage[..]);
-    let mut dhcp_socket = dhcpv4::Socket::new();
-    dhcp_socket.set_outgoing_options(&[DhcpOption {
-        kind: 12,
-        data: b"smol",
-    }]);
-    let dhcp_handle = sockets.add(dhcp_socket);
     // OTA throughput fix: 4 KB rx window (was 1536 B). The download was round-trip-bound
     // — the server sent one window's worth then waited a full RTT for the window to
     // reopen on the next poll, capping throughput at ~1536 B / cycle. 4096 nearly triples
@@ -5673,14 +5645,16 @@ pub fn run_ota_fetch(
     // (mesh-deaf, reboots on success, never re-entered concurrently), so a `static mut`
     // buffer is alias-safe — the previous borrow always ends when the fn returns before
     // any next call. `addr_of_mut!` avoids the reference-to-`static mut` lint.
+    //
+    // #335 STEP T: the per-fetch smoltcp `Interface`, `SocketSet` and DHCP socket are gone
+    // (embassy-net owns one of each for the boot). `tcp_tx` joins `OTA_TCP_RX` in `.bss`
+    // for the §7.1 reason — this is the deepest-stack path in the firmware, so 512 B off
+    // THIS frame is the most valuable 512 B in the tree.
     static mut OTA_TCP_RX: [u8; 4096] = [0; 4096];
-    let tcp_rx: &mut [u8; 4096] = unsafe { &mut *core::ptr::addr_of_mut!(OTA_TCP_RX) };
-    let mut tcp_tx = [0u8; 512];
-    let tcp_socket = tcp::Socket::new(
-        tcp::SocketBuffer::new(&mut tcp_rx[..]),
-        tcp::SocketBuffer::new(&mut tcp_tx[..]),
-    );
-    let tcp_handle = sockets.add(tcp_socket);
+    static mut OTA_TCP_TX: [u8; 512] = [0; 512];
+    let tcp_rx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(OTA_TCP_RX) };
+    let tcp_tx: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(OTA_TCP_TX) };
+    let mut sock = embassy_net::tcp::TcpSocket::new(stack, tcp_rx, tcp_tx);
     let deadline = Instant::now() + OTA_FETCH_BUDGET;
 
     // The caller's switch(WifiSta) already issued connect(); wait for association.
@@ -5697,31 +5671,26 @@ pub fn run_ota_fetch(
     let _ = controller.set_power_saving(esp_radio::wifi::PowerSaveMode::None);
     crate::net::assert_max_tx_power(); // #141
 
-    // Fresh DHCP lease (interface just rebuilt).
+    // #335 STEP T: wait for the lease. Pre-T this drove a per-fetch dhcpv4 socket because
+    // the interface had just been rebuilt; embassy-net holds and renews ONE lease in
+    // `net_task`, so by the time an OTA is triggered this is already up.
     loop {
         if tick() {
             return false;
         }
-        iface.poll(smoltcp_now(), device, &mut sockets);
-        let configured = {
-            let s = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
-            match s.poll() {
-                Some(dhcpv4::Event::Configured(cfg)) => Some((cfg.address, cfg.router)),
-                _ => None,
-            }
-        };
-        if let Some((addr, router)) = configured {
-            apply_dhcp(&mut iface, addr, router);
+        if stack.is_config_up() {
             // #gateway-election fetch-leg diag: our DHCP IP + the server we're about to hit — so serial
             // confirms id7 landed on the right subnet to REACH the image host (rules out a routing/
             // firewall/VLAN mismatch as the byte-0 cause vs an on-air RX deafness).
-            log::info!(
-                "smol OTA: DHCP lease {:?} router {:?} — connecting {}:{}",
-                addr,
-                router,
-                host,
-                port
-            );
+            if let Some(cfg) = stack.config_v4() {
+                log::info!(
+                    "smol OTA: DHCP lease {:?} router {:?} — connecting {}:{}",
+                    cfg.address,
+                    cfg.gateway,
+                    host,
+                    port
+                );
+            }
             break;
         }
         if Instant::now() > deadline {
@@ -5729,6 +5698,7 @@ pub fn run_ota_fetch(
             log::warn!("smol OTA: DHCP timed out");
             return false;
         }
+        embassy_time::Timer::after(ABORT_POLL_SLICE).await;
     }
 
     // Open the inactive-slot writer ONCE (image is streamed here across chunks, never buffered
@@ -5816,12 +5786,13 @@ pub fn run_ota_fetch(
         if let Some(pid) = progress_id {
             if Instant::now() >= next_progress_pub {
                 next_progress_pub = Instant::now() + Duration::from_secs(5);
-                let src_port = 49152 + (rng.random() % 16384) as u16;
+                // #335 STEP T: no ephemeral-port draw — the stack's allocator picks the
+                // local port on connect (see `publish_ota_progress`'s `src_port`).
                 let phase = if relay_mode { "relayfetch" } else { "self" };
                 publish_ota_progress(
-                    &mut iface, device, &mut sockets, tcp_handle, src_port, pid,
+                    &mut sock, 0, pid,
                     writer.written(), announce.size, phase, tick,
-                );
+                ).await;
             }
         }
         if tick() {
@@ -5843,82 +5814,98 @@ pub fn run_ota_fetch(
         // reconnected on a half-recycled handle and wedged. Pump the interface until the socket
         // reports CLOSED (RST flushed) with a bounded wait; if it never does, count a stall and
         // retry the whole chunk (fresh abort + new port) rather than reconnect on a dirty handle.
+        // #335 STEP T: the recycle's mechanism survives verbatim in a different spelling.
+        // The pre-T comment describes smoltcp's `abort()` leaving the RST QUEUED until a
+        // later poll, so a chunk that reconnected on a half-recycled handle wedged.
+        // embassy-net has the identical hazard and documents the identical remedy on
+        // `abort()`: "callers should wait for a flush() to complete before dropping or
+        // reusing the socket" (tcp.rs:427-429). `flush()` IS the "pump until the RST is
+        // out" loop, so the bounded wait is preserved rather than dropped — losing it
+        // would reintroduce the #147 wedge on chunk 2+.
         fail_point = ota_fail::RECYCLE;
-        {
-            let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
-            s.abort();
-        }
-        {
-            let recycle_deadline = Instant::now() + OTA_CHUNK_CONNECT;
-            let mut recycled = false;
-            loop {
-                iface.poll(smoltcp_now(), device, &mut sockets);
-                if sockets.get_mut::<tcp::Socket>(tcp_handle).state() == tcp::State::Closed {
-                    recycled = true;
-                    break; // connectable
-                }
-                if tick() {
-                    return false;
-                }
-                if Instant::now() > recycle_deadline || Instant::now() > deadline {
-                    break; // couldn't fully recycle in-window
-                }
+        sock.abort();
+        let recycle_cap = core::cmp::min(Instant::now() + OTA_CHUNK_CONNECT, deadline);
+        let recycled = !embassy_futures::select::select(
+            sock.flush(),
+            embassy_time::Timer::after(remaining(recycle_cap)),
+        )
+        .await
+        .is_second();
+        if !recycled {
+            chunk_retries += 1;
+            stall += 1;
+            if stall >= OTA_MAX_STALL {
+                *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::RECYCLE));
+                log::error!("smol OTA: socket would not recycle to a connectable state — aborting (slot untouched)");
+                return false;
             }
-            if !recycled {
-                chunk_retries += 1;
-                stall += 1;
-                if stall >= OTA_MAX_STALL {
-                    *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::RECYCLE));
-                    log::error!("smol OTA: socket would not recycle to a connectable state — aborting (slot untouched)");
-                    return false;
-                }
-                continue; // fail_point=RECYCLE rides the loop-top snapshot on the retry
-            }
+            continue; // fail_point=RECYCLE rides the loop-top snapshot on the retry
         }
-        // Fresh ephemeral port each chunk (avoids TIME_WAIT / server half-open collisions on reuse).
-        let src_port = 49152 + (rng.random() % 16384) as u16;
+        // #335 STEP T: pre-T drew a fresh ephemeral port per chunk to avoid TIME_WAIT /
+        // server half-open collisions on reuse. embassy-net's `connect` draws the local
+        // port from the stack's allocator, which advances on every connect — so the
+        // per-chunk freshness this line bought is still bought, by the allocator.
+        //
+        // #147: BOUNDED handshake, and CONNECT vs HANDSHAKE stay DISTINCT fail points.
+        // embassy-net folds "issue the connect" and "wait for the handshake" into one
+        // future, which invites collapsing both codes into one — that would corrupt the
+        // #147 diagnostic, whose entire value is telling "never established" apart from
+        // "SYN-ACK never came". `ConnectError` keeps them separable: `TimedOut` is the
+        // handshake wedge, anything else is the connect refusal.
         fail_point = ota_fail::CONNECT;
         {
-            let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
-            if s.connect(iface.context(), (IpAddress::Ipv4(ip), port), src_port)
-                .is_err()
-            {
-                chunk_retries += 1;
-                stall += 1;
-                if stall >= OTA_MAX_STALL {
-                    *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::CONNECT));
-                    log::error!("smol OTA: repeated TCP connect failures — aborting (slot untouched)");
-                    return false;
-                }
-                continue;
-            }
-        }
-        // #147: BOUNDED handshake. A reused socket that wedges HERE (connect ok, may_send never
-        // true) must retry on a fresh port via the stall guard instead of spinning to the 300 s
-        // global budget — that unbounded wait was the #147 whole-fetch death (one wedged chunk 2
-        // ate the entire budget, 11×). Only the GLOBAL deadline or the stall cap is terminal; the
-        // per-chunk window just recycles.
-        fail_point = ota_fail::HANDSHAKE;
-        {
             let chunk_connect_deadline = core::cmp::min(Instant::now() + OTA_CHUNK_CONNECT, deadline);
-            let mut connected = false;
+            enum GiveUp {
+                Abort,
+                Global,
+                Window,
+            }
+            let connect = sock.connect((IpAddress::Ipv4(ip), port));
+            let give_up = async {
+                loop {
+                    if tick() {
+                        return GiveUp::Abort;
+                    }
+                    if Instant::now() > deadline {
+                        return GiveUp::Global;
+                    }
+                    if Instant::now() > chunk_connect_deadline {
+                        return GiveUp::Window;
+                    }
+                    embassy_time::Timer::after(ABORT_POLL_SLICE).await;
+                }
+            };
             let mut window_elapsed = false;
-            while !connected {
-                iface.poll(smoltcp_now(), device, &mut sockets);
-                if sockets.get_mut::<tcp::Socket>(tcp_handle).may_send() {
-                    connected = true;
-                } else if tick() {
-                    return false;
-                } else if Instant::now() > deadline {
-                    *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, ota_fail::HANDSHAKE));
+            match embassy_futures::select::select(connect, give_up).await {
+                embassy_futures::select::Either::First(Ok(())) => {}
+                embassy_futures::select::Either::First(Err(e)) => {
+                    // TimedOut ⇒ the handshake wedged; everything else ⇒ connect refused,
+                    // which is the `CONNECT` marker set above and left standing here.
+                    if matches!(e, embassy_net::tcp::ConnectError::TimedOut) {
+                        fail_point = ota_fail::HANDSHAKE;
+                    }
+                    chunk_retries += 1;
+                    stall += 1;
+                    if stall >= OTA_MAX_STALL {
+                        *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, fail_point));
+                        log::error!("smol OTA: repeated TCP connect/handshake failures — aborting (slot untouched)");
+                        return false;
+                    }
+                    continue;
+                }
+                embassy_futures::select::Either::Second(GiveUp::Abort) => return false,
+                embassy_futures::select::Either::Second(GiveUp::Global) => {
+                    fail_point = ota_fail::HANDSHAKE;
+                    *fail = Some((writer.written() / OTA_CHUNK, chunk_n, chunk_retries, stall, fail_point));
                     log::warn!("smol OTA: TCP connect timed out (slot untouched)");
                     return false;
-                } else if Instant::now() > chunk_connect_deadline {
+                }
+                embassy_futures::select::Either::Second(GiveUp::Window) => {
                     window_elapsed = true;
-                    break; // per-chunk handshake window elapsed → retry on a fresh port
                 }
             }
             if window_elapsed {
+                fail_point = ota_fail::HANDSHAKE;
                 chunk_retries += 1;
                 stall += 1;
                 if stall >= OTA_MAX_STALL {
@@ -5942,14 +5929,17 @@ pub fn run_ota_fetch(
         rl += write_dec(end, &mut rbuf[rl..]);
         {
             fail_point = ota_fail::SEND;
-            let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
-            let ok = s.send_slice(b"GET ").is_ok()
-                && s.send_slice(path.as_bytes()).is_ok()
-                && s.send_slice(b" HTTP/1.0\r\nHost: ").is_ok()
-                && s.send_slice(host.as_bytes()).is_ok()
-                && s.send_slice(b"\r\nRange: ").is_ok()
-                && s.send_slice(&rbuf[..rl]).is_ok()
-                && s.send_slice(b"\r\nConnection: close\r\n\r\n").is_ok();
+            // #335 STEP T: the same seven pieces, in the same order, through the same
+            // short-circuiting `&&` — `tcp_send` (already deadline- and abort-bounded)
+            // stands in for the non-blocking `send_slice`, which could only fail on a
+            // dead socket because the request is far smaller than the tx ring.
+            let ok = tcp_send(&mut sock, b"GET ", deadline, tick).await
+                && tcp_send(&mut sock, path.as_bytes(), deadline, tick).await
+                && tcp_send(&mut sock, b" HTTP/1.0\r\nHost: ", deadline, tick).await
+                && tcp_send(&mut sock, host.as_bytes(), deadline, tick).await
+                && tcp_send(&mut sock, b"\r\nRange: ", deadline, tick).await
+                && tcp_send(&mut sock, &rbuf[..rl], deadline, tick).await
+                && tcp_send(&mut sock, b"\r\nConnection: close\r\n\r\n", deadline, tick).await;
             if !ok {
                 chunk_retries += 1;
                 stall += 1;
@@ -5990,12 +5980,24 @@ pub fn run_ota_fetch(
                 log::warn!("smol OTA: aborted by long-press (slot untouched)");
                 return false;
             }
-            iface.poll(smoltcp_now(), device, &mut sockets);
             let mut closed = false;
             {
-                let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
-                if s.can_recv() {
-                    let outcome = s.recv(|data| {
+                // #335 STEP T: `iface.poll` + `can_recv()` becomes a BOUNDED readability
+                // wait. Bounded, not a bare `read().await`, because this loop still has to
+                // re-poll the #20 button and run the #217 body-stall timer below — the
+                // whole point of that timer is that an RX-deaf peer never closes and never
+                // sends, which is exactly the case where an unbounded await never returns.
+                let ready = !embassy_futures::select::select(
+                    sock.wait_read_ready(),
+                    embassy_time::Timer::after(ABORT_POLL_SLICE),
+                )
+                .await
+                .is_second();
+                if ready {
+                    // smoltcp's `recv(f)` and embassy-net's `read_with(f)` take the same
+                    // `FnOnce(&mut [u8]) -> (consumed, R)` shape, so the drain closure below
+                    // is carried over unchanged.
+                    let outcome = sock.read_with(|data| {
                         rx_total += data.len(); // #gateway-election: count every delivered byte
                         if !headers_done {
                             let take = core::cmp::min(header_buf.len() - header_len, data.len());
@@ -6060,19 +6062,22 @@ pub fn run_ota_fetch(
                             }
                             (data.len(), fed)
                         }
-                    });
+                    }).await;
                     match outcome {
                         Ok(true) => {}
                         Ok(false) => closed = true, // bad header / flash error → end this chunk
                         Err(_) => closed = true,
                     }
-                } else if !s.may_recv() {
+                } else if !sock.may_recv() {
                     closed = true; // peer closed (Connection: close) + rx drained → chunk complete
                 }
             }
-            // Poll AGAIN right after draining so the reopened window (+ its ACK) hits the wire
-            // this iteration — halves the window-closed gap that made the transfer RTT-bound.
-            iface.poll(smoltcp_now(), device, &mut sockets);
+            // #335 STEP T: the pre-T "poll AGAIN right after draining" existed to push the
+            // reopened receive window (+ its ACK) onto the wire in the SAME iteration,
+            // halving the window-closed gap that made the transfer RTT-bound. `net_task`
+            // now owns that egress and is runnable the moment this task next awaits — the
+            // bounded readability wait at the top of the loop is that yield. The property
+            // the line bought is therefore kept; only the mechanism moved.
             // #217: fetch-leg stall detection (see OTA_BODY_STALL init above). Body advanced → reset
             // the timer; else if it has been silent for OTA_BODY_STALL, break the chunk so the outer
             // stall guard counts a zero-progress attempt → STALL fast (not a 300 s DEADLINE spin).
@@ -6183,12 +6188,12 @@ pub fn run_ota_fetch(
         // Keeps the existing `relayfetch`/`self` phase tokens rather than inventing a `done` phase, so
         // no consumer's parser has to learn a new value: `done == total` IS the completion signal.
         if let Some(pid) = progress_id {
-            let src_port = 49152 + (rng.random() % 16384) as u16;
+            // #335 STEP T: see above — the local port comes from the stack's allocator.
             let phase = if relay_mode { "relayfetch" } else { "self" };
             publish_ota_progress(
-                &mut iface, device, &mut sockets, tcp_handle, src_port, pid,
+                &mut sock, 0, pid,
                 announce.size, announce.size, phase, tick,
-            );
+            ).await;
         }
         if relay_mode {
             // #40: the gateway staged+verified a leaf's image into ITS inactive slot; do

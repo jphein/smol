@@ -22,9 +22,9 @@ use clock::budget::{
     ESP32C6_WATCH_HEADROOM_OVERSTATEMENT_BYTES,
 };
 
-/// The published #335 shortfall. If this test starts failing, either a measurement in
-/// `budget.rs` moved (fine — update it *with* its provenance) or someone rounded something.
-const PUBLISHED_SHORTFALL: u32 = 6_720;
+/// The #335 shortfall as published **pre-T**. Kept as a historical anchor rather than a live
+/// expectation — see `bard_dram_verdict_flipped_and_this_is_NOT_a_clearance`.
+const PUBLISHED_SHORTFALL_PRE_T: u32 = 6_720;
 
 /// The floor is 4/3 of the highest measured peak, and the budget uses that same constant — the
 /// one `tools/repro_build.sh` parses. Before #348's follow-up there were two floors for one
@@ -32,29 +32,66 @@ const PUBLISHED_SHORTFALL: u32 = 6_720;
 /// four recorded peaks. There is now one, and this pins it to its input.
 #[test]
 fn the_floor_is_four_thirds_of_the_highest_measured_peak() {
-    assert_eq!(ESP32C3_MEASURED_PEAK_BYTES, 55_656, "#335, id5, 10/10 reports");
-    assert_eq!(ESP32C3_STACK_FLOOR_BYTES, 74_208);
-    assert_eq!(ESP32C3_STACK_FLOOR_BYTES, ESP32C3_MEASURED_PEAK_BYTES * 4 / 3);
+    assert_eq!(
+        ESP32C3_MEASURED_PEAK_BYTES, 48_356,
+        "#335 STEP T, id50, crown + relay OTA fetch + 4,471-chunk serve — pairs 4/5 EXERCISED, \
+         so this is not a lower bound"
+    );
+    assert_eq!(ESP32C3_STACK_FLOOR_BYTES, 64_475);
+    // ⚠️ Was `assert_eq!` while the peak divided evenly by 3. It no longer does:
+    // 48,356 × 4 / 3 = 64,474.67, the floor is the CEILING 64,475, and integer arithmetic
+    // truncates the right-hand side to 64,474. An equality here would now reject the
+    // correctly-rounded floor — the relation is, and always was, `>=` with a ceiling.
+    assert!(ESP32C3_STACK_FLOOR_BYTES >= ESP32C3_MEASURED_PEAK_BYTES * 4 / 3);
+    assert_eq!(
+        ESP32C3_STACK_FLOOR_BYTES,
+        (ESP32C3_MEASURED_PEAK_BYTES * 4).div_ceil(3),
+        "floor must be exactly ceil(peak × 4/3), not merely >= it"
+    );
     // And the chip row must not carry a second, independent copy of it.
     assert_eq!(ESP32C3.stack_floor_bytes, ESP32C3_STACK_FLOOR_BYTES);
 }
 
-/// The old floor was 4/3 of T13's 54,856 B — the lowest peak on record — and stayed put while
-/// two higher ones were measured. This is the regression that guards the direction of the fix.
+/// ⚠️ **Rewritten by #335 STEP T, and the rewrite is the point.** This test used to assert
+/// `floor > 73_728` — i.e. that the floor had risen off T13's stale value. That is an assertion
+/// about *one instance* of staleness, in *one direction*, and it broke the moment a legitimate
+/// measurement moved the peak DOWN (T relocated per-burst socket buffers off the stack, so the
+/// peak fell 67,400 → 48,356 and the floor with it). A test that fails on a correct change is a
+/// test that gets deleted, taking its guard with it.
+///
+/// **The invariant was never "the floor is large". It is "the floor is derived from the CURRENT
+/// peak and is never inherited from an earlier one" — in either direction.** Asserted as such,
+/// with the two real historical staleness values kept as named regression anchors.
 #[test]
-fn the_floor_is_no_longer_the_stale_73728() {
-    assert!(
-        ESP32C3_STACK_FLOOR_BYTES > 73_728,
-        "the floor must not fall back to the T13-derived value once a higher peak is on record"
+fn the_floor_is_derived_from_the_current_peak_never_inherited() {
+    assert_eq!(
+        ESP32C3_STACK_FLOOR_BYTES,
+        (ESP32C3_MEASURED_PEAK_BYTES * 4).div_ceil(3),
+        "the floor must be exactly ceil(peak × 4/3) for the peak recorded beside it"
     );
-    assert_eq!(ESP32C3_STACK_FLOOR_BYTES - 73_728, 480);
+    // Both of these were real, and both were stale in the LOW direction while a higher peak was
+    // already known — which is the failure mode that ships a too-thin image.
+    assert_ne!(
+        ESP32C3_STACK_FLOOR_BYTES, 73_728,
+        "#348: 4/3 × T13's 54,856, kept while two higher peaks were measured"
+    );
+    assert_ne!(
+        ESP32C3_STACK_FLOOR_BYTES, 74_208,
+        "#440: 4/3 × 55,656, kept while the measured peak was 67,400"
+    );
 }
 
 #[test]
 fn c3_dram_headroom_is_the_measured_leftover() {
-    // 106,560 B (the async-stack canonical tier, #233 spike) − 74,208 B (4/3 × the 55,656 B
-    // measured peak, #302). Both numbers are measurements; this is only their subtraction.
-    assert_eq!(ESP32C3.dram_headroom(), 32_352);
+    // 106,560 B (the async-stack canonical tier, #233 spike) − 64,475 B (ceil(4/3 × 48,356),
+    // the #335 STEP T peak). Both numbers are measurements; this is only their subtraction.
+    // Derived rather than restated, so it cannot drift from the constants it is a function of —
+    // the previous literal 32,352 was a third copy of the floor in disguise.
+    assert_eq!(
+        ESP32C3.dram_headroom(),
+        ESP32C3.free_dram_bytes - ESP32C3_STACK_FLOOR_BYTES
+    );
+    assert_eq!(ESP32C3.dram_headroom(), 42_085);
 }
 
 #[test]
@@ -65,22 +102,46 @@ fn c3_flash_headroom_is_the_slot_minus_the_baseline() {
     assert_eq!(ESP32C3.app_slot_bytes, 2_031_616);
 }
 
-/// The whole point of #348: the C3 must refuse the Bard, and refuse it for the *right reason*.
+/// 🔴 **#335 STEP T FLIPPED THIS, AND THE FLIP IS NOT A CLEARANCE TO SHIP THE BARD.**
+///
+/// #348's conclusion was "the C3 must refuse the Bard". Post-T the *model* says otherwise: T moved
+/// the per-burst socket buffers off the stack, the measured peak fell 67,400 → 48,356, the floor
+/// fell 74,208 → 64,475, and the DRAM headroom rose 32,352 → 42,085 — which is **3,013 B more than
+/// the Bard's 39,072 B of statics.** So `fits_dram` is now `true`.
+///
+/// ⚠️ **This test asserts what the MODEL computes. It is not a statement that the Bard can ship.**
+/// The peak feeding that model was measured on a **Bard-FREE** image (`stack-paint-lite,espnow,
+/// cast,io`). Applying it to a composition that *includes* the Bard is exactly the T-SCOPE §3.2
+/// error — a number taken on one composition used to license a different one. #434 is the standing
+/// counter-example: the Bard-inclusive composition needed **≥51,008 B just to reach `main`**, and
+/// its linked `.stack` was 45,992 B, so it panicked at esp-hal's init guard before any of this
+/// arithmetic applied.
+///
+/// **What would actually settle it:** a `stack-paint` (Bard-inclusive) peak on hardware, plus the
+/// packaging gate run on that image. Until then the flip is a model result and the tier exclusions
+/// are what keep the Bard off the fleet — not this number.
 #[test]
-fn bard_does_not_fit_the_c3() {
-    assert!(!ESP32C3.fits(&cost::BARD));
-    assert!(!ESP32C3.fits_dram(&cost::BARD));
+fn bard_dram_verdict_flipped_and_this_is_NOT_a_clearance() {
+    // The model result, asserted as such.
+    assert!(
+        ESP32C3.fits_dram(&cost::BARD),
+        "post-T headroom 42,085 exceeds the Bard's 39,072 B — see the doc comment before acting"
+    );
+    assert_eq!(ESP32C3.dram_shortfall(&cost::BARD), 0);
+    // The margin is THIN, and thin against a peak measured without the thing being budgeted for.
+    assert_eq!(ESP32C3.dram_headroom() - cost::BARD.dram_bytes, 3_013);
 }
 
-/// Reproduces #335's published number from declared data instead of a bench run. 39,072 B of
-/// static DRAM against 32,352 B of headroom.
+/// Reproduces #335's **pre-T** published number from declared data. Kept because the arithmetic is
+/// the audit trail for how the verdict moved: 39,072 B of static DRAM against the *old* 32,352 B of
+/// headroom gave the 6,720 B shortfall. The headroom is now 42,085 B and the shortfall is zero;
+/// this test pins the historical subtraction so the flip is legible rather than silent.
 #[test]
-fn bard_shortfall_matches_the_published_6720() {
-    assert_eq!(ESP32C3.dram_shortfall(&cost::BARD), PUBLISHED_SHORTFALL);
-    assert_eq!(
-        cost::BARD.dram_bytes - ESP32C3.dram_headroom(),
-        PUBLISHED_SHORTFALL
-    );
+fn the_pre_t_bard_shortfall_is_reproducible_from_the_old_floor() {
+    const OLD_FLOOR: u32 = 74_208; // 4/3 × the superseded 55,656 peak
+    let old_headroom = ESP32C3.free_dram_bytes - OLD_FLOOR;
+    assert_eq!(old_headroom, 32_352);
+    assert_eq!(cost::BARD.dram_bytes - old_headroom, PUBLISHED_SHORTFALL_PRE_T);
 }
 
 /// The two axes are independent, and on the C3 they disagree — DRAM refuses, flash is
@@ -188,10 +249,20 @@ fn the_c6_declared_floor_is_optimistic_by_a_known_1320_bytes() {
 /// vs `small_flash`) instead of one.
 #[test]
 fn the_two_chips_are_scarce_on_opposite_axes() {
+    // The INVARIANT — opposite scarcity — and it is unaffected by #335 STEP T.
     assert!(ESP32C6_WATCH.flash_headroom() > ESP32C3.flash_headroom());
     assert!(ESP32C6_WATCH.dram_headroom() < ESP32C3.dram_headroom());
-    // Concretely: the C6 has ~1.85x the flash room and ~0.27x the DRAM room.
-    assert_eq!(ESP32C3.dram_headroom(), 32_352);
+    // Concretely: the C6 has ~1.85x the flash room and ~0.20x the DRAM room (was ~0.27x before
+    // STEP T lowered the C3's floor 74,208 → 64,475, which widened the C3's DRAM headroom).
+    //
+    // ⚠️ The C3 figure is DERIVED, not restated. It used to be the literal 32,352, which is a
+    // third copy of the floor in disguise — and it went stale the moment the floor moved, failing
+    // here rather than where the decision was made. The C6's 8,592 stays a literal because it is
+    // independent measured data for that row, not a function of anything in this file.
+    assert_eq!(
+        ESP32C3.dram_headroom(),
+        ESP32C3.free_dram_bytes - ESP32C3_STACK_FLOOR_BYTES
+    );
     assert_eq!(ESP32C6_WATCH.dram_headroom(), 8_592);
 }
 
@@ -227,7 +298,7 @@ fn a_chip_with_room_accepts_the_bard() {
     let roomy = ChipBudget {
         chip: "fixture-not-a-real-chip",
         free_dram_bytes: 200_000,
-        stack_floor_bytes: 74_208,
+        stack_floor_bytes: 64_475,
         app_slot_bytes: 0x001F_0000,
         baseline_image_bytes: 1_155_600,
     };
@@ -242,7 +313,7 @@ fn the_boundary_is_exact() {
     let chip = ChipBudget {
         chip: "fixture-not-a-real-chip",
         free_dram_bytes: 100_000,
-        stack_floor_bytes: 74_208,
+        stack_floor_bytes: 64_475,
         app_slot_bytes: 0x001F_0000,
         baseline_image_bytes: 1_155_600,
     };
@@ -271,7 +342,7 @@ fn overrun_saturates_instead_of_wrapping() {
     let broken = ChipBudget {
         chip: "fixture-not-a-real-chip",
         free_dram_bytes: 10_000,
-        stack_floor_bytes: 74_208,
+        stack_floor_bytes: 64_475,
         app_slot_bytes: 100_000,
         baseline_image_bytes: 1_155_600,
     };

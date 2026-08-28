@@ -175,6 +175,13 @@ embassy-net = { version = "0.9.1", optional = true, features = [
     "tcp",
     "udp",
     "dhcpv4",
+    # #335 STEP T: DHCP option 12. NOT cosmetic and NOT default — `DhcpConfig::hostname` does not
+    # EXIST without this feature, so a bring-up written against the default feature set silently
+    # drops the hostname and every board becomes an anonymous lease. All three pre-T smoltcp sites
+    # set `kind: 12, data: b"smol"`, and the lease table is how a wedged transfer gets attributed
+    # to the right peer instead of to the wrong board — the failure mode that cost a night on
+    # 2026-08-25. Feature added here rather than the option dropped there.
+    "dhcpv4-hostname",
     "medium-ethernet",
     "log",
 ] }

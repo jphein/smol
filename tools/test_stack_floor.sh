@@ -55,27 +55,49 @@ expect_floor() { # <chip> <bytes> <provenance>
   local got; got="$(repro_stack_floor "$1" 2>&1)"
   if [ "$got" = "$2 $3" ]; then ok "$1 → $2 $3"; else bad "$1 → wanted '$2 $3', got '$got'"; fi
 }
-expect_floor esp32c3 74208 derived
+expect_floor esp32c3 64475 derived
 expect_floor esp32c6 71680 boot-assert
 expect_floor esp32s3 72004 observed-sufficient
 
-# ── ARM 2: THE ACCEPTANCE TEST — the false-REJECT window closes ───────────────────────────────
-# A .stack of 73,000 B sits INSIDE [72,004, 74,208): above the S3's floor, below the C3's. Before
-# this change both verdicts came from the C3's number, so the S3 case was a FATAL on a valid image.
+# ── ARM 2: THE ACCEPTANCE TEST — per-chip discrimination, and the DANGER DIRECTION HAS INVERTED ─
+#
+# ⚠️ THIS IS A FIXTURE WHOSE **MEANING** MOVED WHILE ITS **VALUE** STOOD STILL — the most
+# expensive kind to miss, because nothing goes red. The probe stayed 73,000 B and stayed a
+# perfectly valid number; what changed underneath it was which side of every floor it landed on.
+# A stale VALUE fails loudly. A stale MEANING passes, and the arm reports success while covering
+# nothing at all.
+#
+# This arm was reworked, not renumbered, when #335 STEP T moved the C3 floor 74,208 → 64,475.
+# **The C3 used to be the HIGHEST floor in the tree and is now the LOWEST** (C3 64,475 · C6 71,680
+# · S3 72,004), and the old probe value silently stopped discriminating: 73,000 B is now ABOVE
+# every floor, so both chips accept it and the arm would have passed while testing nothing.
+#
+# The inversion also flips what chip-blindness COSTS, which is the part worth reading:
+#   * BEFORE — everything used the C3's 74,208, the highest. A valid S3 image in [72,004, 74,208)
+#     was FALSELY REJECTED. Annoying, loud, and safe: nothing shipped.
+#   * NOW — the C3's 64,475 is the lowest. Chip-blindness would FALSELY ACCEPT a C6/S3 image in
+#     [64,475, 72,004). **That ships an image too thin for its own chip**, which is the failure
+#     direction that reaches hardware instead of a console.
+# So this arm guards something strictly more dangerous than it did when it was written, and its
+# probe must sit in the new gap rather than the old one.
 echo
-echo "═══ the 2,204 B false-REJECT window — the defect this change exists to close ═══"
-export STACK_BYTES=73000
-out="$(repro_stack_check /nonexistent-elf esp32s3 2>&1)"; rc=$?
-if [ $rc -eq 0 ]; then ok "S3 image with .stack 73,000 PASSES (its floor is 72,004)"
-else bad "S3 image with .stack 73,000 was REJECTED — the window did not close: $out"; fi
-case "$out" in *observed-sufficient*) ok "and the verdict names the provenance" ;;
+echo "═══ per-chip discrimination — and post-T the blind failure would be a false ACCEPT ═══"
+export STACK_BYTES=68000
+out="$(repro_stack_check /nonexistent-elf esp32c3 2>&1)"; rc=$?
+if [ $rc -eq 0 ]; then ok "C3 image with .stack 68,000 PASSES (its floor is 64,475)"
+else bad "C3 image with .stack 68,000 was REJECTED against a 64,475 B floor: $out"; fi
+case "$out" in *derived*) ok "and the verdict names the provenance" ;;
                 *) bad "verdict omits the provenance: $out" ;; esac
 
-out="$(repro_stack_check /nonexistent-elf esp32c3 2>&1)"; rc=$?
-if [ $rc -ne 0 ]; then ok "the SAME .stack 73,000 correctly FATALs for the C3 (floor 74,208)"
-else bad "C3 accepted 73,000 B against a 74,208 B floor"; fi
-case "$out" in *esp32c3*74208*) ok "and the FATAL names the chip and its floor" ;;
+out="$(repro_stack_check /nonexistent-elf esp32s3 2>&1)"; rc=$?
+if [ $rc -ne 0 ]; then ok "the SAME .stack 68,000 correctly FATALs for the S3 (floor 72,004)"
+else bad "S3 ACCEPTED 68,000 B against a 72,004 B floor — a chip-blind FALSE ACCEPT, which ships"; fi
+case "$out" in *esp32s3*72004*) ok "and the FATAL names the chip and its floor" ;;
                 *) bad "FATAL does not name chip+floor: $out" ;; esac
+
+out="$(repro_stack_check /nonexistent-elf esp32c6 2>&1)"; rc=$?
+if [ $rc -ne 0 ]; then ok "and for the C6 too (floor 71,680) — both non-C3 chips reject it"
+else bad "C6 ACCEPTED 68,000 B against a 71,680 B floor — chip-blind false accept"; fi
 
 # ── ARM 3: a genuinely thin stack still fails, for every chip ────────────────────────────────
 echo

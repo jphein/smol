@@ -256,14 +256,27 @@ pub enum FloorProvenance {
 /// and is now the dominant term, not Bard narration. So 55,656 is not merely unreproducible — it is
 /// **superseded and low**.
 ///
-/// ⚠️ **The constants below are deliberately UNCHANGED, and that is a decision, not an oversight.**
-/// Writing `ESP32C3_MEASURED_PEAK_BYTES = 67_400` would break the assert below (`74,208 >= 89,867`
-/// is false, so the crate stops compiling), and raising the floor to satisfy it would break the
-/// packaging gate (`region 85,096 >= floor 89,867` is false, so nothing publishes) — two red gates
-/// on firmware that runs. Updating a ship-gating constant from a LOWER BOUND is also the wrong
-/// direction of error. The crown-duty leg decides it. Full working, with the options and their
-/// numbers, in `docs/embassy/T-SCOPE.md` §6.1.
-pub const ESP32C3_STACK_FLOOR_BYTES: u32 = 74_208;
+/// ⚠️ **RESOLVED 2026-08-27 by #335 STEP T. Both constants move together, and the reason the pre-T
+/// paralysis lifted is that T CHANGED THE PROGRAM, not that anyone re-argued the numbers.**
+///
+/// The pre-T impasse above was real: at a 67,400 B peak the required floor was 89,867 against an
+/// 85,096 B region, so the constant could not be updated without turning two gates red on firmware
+/// that demonstrably ran. What broke the deadlock is the transport move itself. T relocated the
+/// per-burst `SocketSet`, `Interface`, `tcp_rx`/`tcp_tx` and `cast_tx` buffers off the **stack**
+/// into embassy-net's **statics**, which lowers the runtime peak and the region together — and
+/// because the policy is `floor = peak x 4/3`, **a byte moved off the stack closes 4/3 of a byte
+/// of the gap.** That was the predicted mechanism and it is what the measurement shows:
+///
+/// | | pre-T | post-T |
+/// |---|---|---|
+/// | measured peak | 67,400 | **48,356** |
+/// | required floor (`ceil(peak x 4/3)`) | 89,867 | **64,475** |
+/// | shipped region | 85,096 | **73,104** |
+/// | coverage | 1.263x — OUTSIDE policy | **1.512x — inside, with room** |
+///
+/// The image is back inside its own x4/3 policy with **8,629 B of headroom above the floor**, and
+/// the multiplier was never touched.
+pub const ESP32C3_STACK_FLOOR_BYTES: u32 = 64_475;
 
 /// The C3's floor is [`FloorProvenance::Derived`] — the strong form, and the only one on the fleet.
 ///
@@ -307,11 +320,50 @@ pub const ESP32C3_STACK_FLOOR_PROVENANCE: FloorProvenance = FloorProvenance::Der
 /// actually ships. A peak from that tier is the honest successor to this constant. When that run
 /// happens, replace this value and this note together — and record the tier it came from, because
 /// that is the field whose absence caused this.
-pub const ESP32C3_MEASURED_PEAK_BYTES: u32 = 55_656;
+///
+/// ═══ THAT RUN HAPPENED. 2026-08-27, #335 STEP T. §5.1 LABELS, because they are what make the
+/// number usable rather than merely true: ═══
+///
+///   * **48,356 B of a 71,968 B region**, `stack-paint-lite,espnow,cast,io`, `ESP_LOG=info`,
+///     real seeds, built from `git archive c261be5` into a fresh target dir.
+///   * **Duty EXCEEDED the requirement.** Crown tenure · a relay OTA fetch (build 1442, 1 MB) ·
+///     a full 4,471-chunk ESP-NOW serve to id51 · and the announce bursts that follow it. Pairs
+///     4/5 — the OTA fetch/serve chains, the deepest in the tree — were **exercised**, which is
+///     the gap that made every previous number a LOWER BOUND. This one is not a lower bound.
+///   * **Measured high-water, never derived.** The sentinel was falsified on this image first —
+///     proving it CAN report a higher number — before a lower one was trusted.
+///   * Measured on the paint image (region 71,968); the **shipped** image's region is 73,104, so
+///     the instrument ran with *less* room than the fleet image has. The measurement therefore
+///     **over-estimates**, which is the safe direction (`tools/check_paint_warrant.py`).
+///   * **Second tier, duty-labeled and recorded rather than enshrined: `espnow` measured
+///     `P = 47,780` against its own bound of 56,928 (region 75,904).** It gets a line here and
+///     **not a constant of its own** — the C3 row is shared, 48,356 > 47,780, so the fleet number
+///     is the binding one. A second constant that nothing ever compares against is a claim waiting
+///     to rot, which is the failure this whole block exists to document.
+///
+/// ⚠️ **THE DIRECTION ASYMMETRY, stated because this edit LOWERS a ship gate.** Raising a floor
+/// costs margin; lowering one **permits shipping**. So it needs MORE evidence than a raise would,
+/// not less — which is why the labels above are conditions rather than decoration: measured
+/// high-water (never derived), on the T image, crown duty, the OTA chains actually exercised,
+/// instrument falsified first. **If a future peak cannot be taken that way, this constant does not
+/// move.** The x4/3 multiplier is untouched and is not the adjustable part; only the measured
+/// input moves, which is what makes this a repair rather than a fudge.
+///
+/// The `const _: () = assert!` below is what stops the two constants drifting apart silently: a
+/// hand-edit that breaks the relation stops the crate compiling. That coupling is what makes
+/// editing either of them safe at all.
+pub const ESP32C3_MEASURED_PEAK_BYTES: u32 = 48_356;
 
 /// The floor must be at least 4/3 of the highest measured peak. `>=` rather than `==` because a
-/// peak that is not divisible by 3 must round **up** — today it is exact (55,656 × 4 / 3 =
-/// 74,208). This is what stops the two constants drifting apart the way the floor drifted from
+/// peak that is not divisible by 3 must round **up**. As of #335 STEP T that is no longer a
+/// hypothetical: `48,356 × 4 / 3 = 64,474.67`, so the floor is `ceil(...) = 64,475` and the
+/// relation is `>=` by exactly 1 B. ⚠️ Note the assert evaluates in **integer** arithmetic, where
+/// `48_356 * 4 / 3` truncates to `64,474` — so it compares `64,475 >= 64,474` and passes. The
+/// truncation is why this must stay `>=`: an `==` would have rejected the correctly-rounded floor.
+/// (The previous example was exact — `55,656 × 4 / 3 = 74,208` — which is precisely why the
+/// rounding clause had never been exercised and was worth keeping.)
+///
+/// This is what stops the two constants drifting apart the way the floor drifted from
 /// its own derivation before #348: the old 73,728 was 4/3 × 54,856, and stayed put through two
 /// higher measurements.
 const _: () = assert!(
