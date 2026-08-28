@@ -11,7 +11,7 @@ this page exists to prevent.
 | byte-reproducible? | **no** | **yes** — that is the point |
 | credentials | **placeholder** (see below) | placeholder |
 | what it is for | USB-flashing a **new or bench** board | the same, plus being the thing OTA serves |
-| first one | `nightly-2026-08-24` | **v1446 `Molten Gear`** — in canary |
+| first one | `nightly-2026-08-24` | **`1447 Molten Hammer`** — in canary |
 
 > ## The one rule
 >
@@ -77,7 +77,7 @@ was checked there rather than assumed.
 
 ---
 
-## The versioned release ceremony (`v1446 Molten Gear` is the first)
+## The versioned release ceremony (`1447 Molten Hammer` is the first)
 
 The thing that makes a versioned release different is **`tools/repro_build`** and the property it
 buys: **a fixed `(commit, node-id)` builds to the same bytes on any machine, so the sha256 IS the
@@ -323,8 +323,8 @@ it. A future release that *has* been flashed should say so, and say on what.
 
 ## See also
 
-- [RELEASE-RUNBOOK-v1446.md](RELEASE-RUNBOOK-v1446.md) — the **executable checklist** for cutting
-  v1446, written ahead of the event so task #19 runs from a list instead of a reconstruction. It
+- [RELEASE-RUNBOOK.md](RELEASE-RUNBOOK.md) — the **executable checklist** for cutting a versioned
+  release (standing document; per-release run records live at its bottom), written ahead of the event so task #19 runs from a list instead of a reconstruction. It
   deliberately does not restate the ceremony above, and it carries its own deletion condition.
 - [BUILDING.md](BUILDING.md) — toolchain, `secrets.rs`, flashing, and the gotchas in full.
 - [ota.md](ota.md) — the signed OTA path fleet boards actually use, including leaf mesh-OTA.
