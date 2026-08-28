@@ -335,6 +335,11 @@ pub const ESP32C3_STACK_FLOOR_PROVENANCE: FloorProvenance = FloorProvenance::Der
 ///   * Measured on the paint image (region 71,968); the **shipped** image's region is 73,104, so
 ///     the instrument ran with *less* room than the fleet image has. The measurement therefore
 ///     **over-estimates**, which is the safe direction (`tools/check_paint_warrant.py`).
+///   * **Second tier, duty-labeled and recorded rather than enshrined: `espnow` measured
+///     `P = 47,780` against its own bound of 56,928 (region 75,904).** It gets a line here and
+///     **not a constant of its own** — the C3 row is shared, 48,356 > 47,780, so the fleet number
+///     is the binding one. A second constant that nothing ever compares against is a claim waiting
+///     to rot, which is the failure this whole block exists to document.
 ///
 /// ⚠️ **THE DIRECTION ASYMMETRY, stated because this edit LOWERS a ship gate.** Raising a floor
 /// costs margin; lowering one **permits shipping**. So it needs MORE evidence than a raise would,

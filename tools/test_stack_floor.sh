@@ -61,7 +61,13 @@ expect_floor esp32s3 72004 observed-sufficient
 
 # ── ARM 2: THE ACCEPTANCE TEST — per-chip discrimination, and the DANGER DIRECTION HAS INVERTED ─
 #
-# ⚠️ This arm was reworked, not renumbered, when #335 STEP T moved the C3 floor 74,208 → 64,475.
+# ⚠️ THIS IS A FIXTURE WHOSE **MEANING** MOVED WHILE ITS **VALUE** STOOD STILL — the most
+# expensive kind to miss, because nothing goes red. The probe stayed 73,000 B and stayed a
+# perfectly valid number; what changed underneath it was which side of every floor it landed on.
+# A stale VALUE fails loudly. A stale MEANING passes, and the arm reports success while covering
+# nothing at all.
+#
+# This arm was reworked, not renumbered, when #335 STEP T moved the C3 floor 74,208 → 64,475.
 # **The C3 used to be the HIGHEST floor in the tree and is now the LOWEST** (C3 64,475 · C6 71,680
 # · S3 72,004), and the old probe value silently stopped discriminating: 73,000 B is now ABOVE
 # every floor, so both chips accept it and the arm would have passed while testing nothing.
