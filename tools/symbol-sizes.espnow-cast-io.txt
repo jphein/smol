@@ -7,7 +7,7 @@
 # source diff and no compiler complaint, so review had nothing to look at.
 #
 # Do NOT hand-edit. Re-bless, and explain the delta in the commit message.
-# 34 symbols, 194986 bytes total.
+# 34 symbols, 194994 bytes total.
 #
 # size	section	symbol
 960	.data	TxRxCxt
@@ -35,7 +35,7 @@
 1920	.bss	_RNvNvNtCs*_5clock3net14bring_up_stack13NET_RESOURCES
 98304	.bss	_RNvNvNtCs*_5clock3net9init_heap4HEAP
 4096	.bss	_RNvNvNtCs*_5clock3ota18verify_active_slot10VERIFY_BUF
-12728	.bss	_RNvNvNtCs*_5clock6___main14___embassy_main4POOL
+12736	.bss	_RNvNvNtCs*_5clock6___main14___embassy_main4POOL
 592	.bss	gChmCxt
 284	.bss	gScanStruct
 816	.bss	gWpaSm
