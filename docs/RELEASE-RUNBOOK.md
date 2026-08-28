@@ -1,18 +1,31 @@
-# v1446 release runbook — the checklist, not the rationale
+# Release runbook — the checklist, not the rationale
 
-> ## 🟡 PREP ONLY. Nothing in this file fires before JP's go.
-> This exists so that when STEP T merges and the paint bound passes, task #19 **executes from a
-> checklist instead of being reconstructed**. It is written ahead of the event on purpose.
+> ## 📗 STANDING DOCUMENT. Nothing in it fires without JP's go.
+> This is the procedure for cutting a versioned release, so a cut **executes from a checklist instead
+> of being reconstructed**. Per-release specifics live in the **run records** at the bottom.
+>
+> **Prune old run records freely. Never delete the doc.**
 
-> ### ⏳ DELETE OR SUPERSEDE THIS FILE ONCE v1446 IS CUT.
-> Its v1446 specifics become history the moment the release exists, and anything in it that turns out
-> to be *generally* true about versioned releases belongs in `docs/RELEASES.md` instead. A
-> version-stamped runbook with no expiry is how a repo accumulates procedures nobody can date — the
-> same reason `xtensa-spike.yml`'s schedule block carries a deletion condition.
+> ### ⏳ Why the earlier "delete this file once vN is cut" clause is gone
+> It was mine, and it was wrong in two ways that only became visible when someone tried to execute it:
+>
+> 1. **It instructed deleting the checklist at the exact moment it was mid-execution.** A cut is when
+>    this file is *in use*; an expiry keyed to the cut fires during the ceremony it exists to serve.
+> 2. **It would have evaporated the run RECORD along with the doc** — including the corrections the
+>    document paid for in real errors (see §1's guard, which exists because the first draft got the
+>    build number backwards). The next release would have re-derived the same mistakes from scratch.
+>
+> The instinct behind it was right — *an undated procedure rots* — but it was **applied to the wrong
+> artifact**. A runbook is a standing procedure; what is version-specific is the **run record**. So the
+> expiry belongs on the records, not on the doc: prune records, keep the procedure.
+>
+> Same reasoning retires the version from the **filename**. `RELEASE-RUNBOOK-v346.md` → `-v1446.md`
+> deferred a path-level falsehood by exactly one release; it goes false again at the next cut **by
+> construction**. A rename fixes the instance; removing the version fixes the class.
 
 ## What this file deliberately does NOT restate
 
-`docs/RELEASES.md` § *"The versioned release ceremony (`v1446 Molten Gear` is the first)"* already covers the
+`docs/RELEASES.md` § *"The versioned release ceremony"* already covers the
 **why**: the repro-build property (a fixed `(commit, node-id)` builds to the same bytes, so the sha256
 *is* the identity), #44's two causes (rustc's absolute paths, the wall-clock app descriptor), the
 `repro_build.sh`-is-a-sourced-library trap, and sigil names being history that is never re-synced.
@@ -66,8 +79,9 @@ tools/ota_publish.sh legacy-line esp32c3      # (preflight, unrelated — see §
 # 1c. THEN set version.txt to match, so a non-stage build reports the same lineage.
 ```
 
-**This release is `v1446` — `Molten Gear`.** Derived, not chosen — `version_name_for()` in
-`rust/clock/src/net/names.rs:256`:
+**Derive the name from the number the ratchet chose** — `version_name_for()` in
+`rust/clock/src/net/names.rs:256`. (Worked below for the current run; the current release's number and
+word are in the **run records** at the bottom, not here, so this section stays true across cuts.)
 
 ```
 noun = FORGE.nouns[n % 20]          adj = FORGE.adjectives[(n / 20) % 20]
@@ -84,7 +98,8 @@ Verified against every naming control the docs already carry — `341 → Bellow
 > self-consistent and wrong. **A self-checking pair checks the RELATION, not the INPUTS.**
 > Verify the number against `choose_build`'s output *first*, then derive the word from it.
 
-⚠️ **Always write the number and the word together** (`v1446 Molten Gear`) — per `DOC-UPKEEP.md`, that
+⚠️ **Always write the number and the word together** (`vN <Word>` — e.g. the current run record's
+pair) — per `DOC-UPKEEP.md`, that
 pair self-checks, and it is how "build 905 Riveted Furnace" was caught. Never put a bare live build
 number in prose. **But see the guard above: the pair self-checking is not the same as the number being
 right.**
@@ -138,7 +153,7 @@ release-stamped **only because operators exported it by hand.**
 
 ⚠️ **So the stamp does not mean "this is the versioned release."** It means *"an identity-bearing,
 reproducible build of HEAD with clean inputs"* — which a routine canary stage also is. **The thing
-that makes v1446 v1446 is the NUMBER the ratchet chose** — `choose_build`'s output, carried as
+that makes a release THAT release is the NUMBER the ratchet chose** — `choose_build`'s output, carried as
 `SMOL_BUILD_NUMBER`. (⚠️ The first draft of this sentence said "the number in `version.txt`", which is
 the same error §1 corrects: on the release path the env var overrides the file. `version.txt` is what a
 NON-stage build falls back to.) Do not read a release stamp on a staged canary as a release having
@@ -196,8 +211,10 @@ healthy, then the next. The tooling enforces the shape; the discipline is yours.
 
 - Per-target artifacts ride `tools/release_targets.sh` / the release workflow (#413), which walks the
   `targets/*/target.toml` manifests. The combined `SHA256SUMS` job landed in #499.
-- **`docs/RELEASES.md` header table** now reads `first one | nightly-2026-08-24 | **v1446 Molten Gear**
-  — in canary`. Flipping it to *cut* is part of cutting the release, not a follow-up.
+- **`docs/RELEASES.md`'s header table** carries the current release's row. Advancing it (e.g. *in
+  canary* → *cut*) is part of cutting the release, not a follow-up. Read the row rather than trusting
+  a quotation here — quoting it would make this line rot every cut, which is the failure this document
+  just spent a rename fixing.
 - Verify the published assets by **reading the release**, not the workflow's green tick — a green job
   is a claim about a job.
 
@@ -255,3 +272,39 @@ value is entirely in being right:
    the WORD against the NUMBER while the number itself came from `version.txt`, which the release path
    overrides. Corrected in §1, and the general form is worth more than the fix — *thorough verification
    of the wrong proposition is the failure mode that survives being careful*.
+
+---
+
+# Run records
+
+**One entry per cut, newest first.** Prune freely once a release is old enough that nobody would
+re-read it — that pruning is what the retired "delete this file" clause was reaching for, applied to
+the artifact that is actually version-specific.
+
+A record is worth keeping while it still answers *"what did we learn cutting that one?"* — not merely
+because it happened.
+
+## v1446 — `Molten Gear` (in canary)
+
+| | |
+|---|---|
+| number | **1446** — from `choose_build(count, staged, override)`, **not** chosen |
+| word | **Molten** — `(1446/20) % 20 = 12`; noun **Gear** — `1446 % 20 = 6` |
+| controls reproduced | 341 Bellows · 342 Crucible · 345 Riveted Furnace · 905 Flux Furnace |
+| first cut using this runbook | yes — §0–§6 were unexercised before this |
+
+**What this run caught, and why §1 now reads the way it does.** The first draft of §1 said *"bump
+`version.txt` 345 → 346, and v346 is Riveted Gear."* Executing step 1 exposed it: `build.rs:72` reads
+`env_or_file("SMOL_BUILD_NUMBER", "version.txt")` — **env wins** — and the release path supplies that
+env from `choose_build`. So `version.txt` is the fallback for *non-stage* builds, and the ratchet would
+have stamped 1446 while the docs said 346.
+
+The half worth carrying forward is **why four naming controls did not catch it**: they verify the
+**word against the number**, and say nothing about whether the *number* is right. `DOC-UPKEEP`'s
+"name it WITH its sigil word so the pair self-checks" catches a *mismatched* pair; it cannot catch a
+**correctly-derived word on the wrong number**, which is self-consistent and wrong.
+
+> **A self-checking pair checks the RELATION, not the INPUTS.**
+
+That sentence is the most expensive thing in this document, and it is the reason the deletion clause
+had to go: it would have been thrown away with the doc at the exact cut that produced it.

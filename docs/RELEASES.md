@@ -323,8 +323,8 @@ it. A future release that *has* been flashed should say so, and say on what.
 
 ## See also
 
-- [RELEASE-RUNBOOK-v1446.md](RELEASE-RUNBOOK-v1446.md) — the **executable checklist** for cutting
-  v1446, written ahead of the event so task #19 runs from a list instead of a reconstruction. It
+- [RELEASE-RUNBOOK.md](RELEASE-RUNBOOK.md) — the **executable checklist** for cutting a versioned
+  release (standing document; per-release run records live at its bottom), written ahead of the event so task #19 runs from a list instead of a reconstruction. It
   deliberately does not restate the ceremony above, and it carries its own deletion condition.
 - [BUILDING.md](BUILDING.md) — toolchain, `secrets.rs`, flashing, and the gotchas in full.
 - [ota.md](ota.md) — the signed OTA path fleet boards actually use, including leaf mesh-OTA.
