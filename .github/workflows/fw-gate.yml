@@ -74,6 +74,27 @@ jobs:
           key: host
       - run: tools/gate.sh host
 
+  # #533: the OTA-verify suite gets its OWN job rather than riding inside `gate.sh host`.
+  #
+  # Measured: the suite is 403 s; the host job is 161 s and the slowest job today is 214 s. Folding
+  # it into `host` would take that job to ~564 s and make PR feedback 2.6x slower FOR EVERY PR,
+  # including the ones that touch nothing it guards. As its own job it runs in PARALLEL, so the
+  # wall-clock cost is 403 s instead of 564 s, the fast signals still arrive in ~3 minutes, and a
+  # failure names itself instead of being one red line inside a nine-minute log.
+  #
+  # It invokes the suite directly rather than through `gate.sh`, which is the one place this
+  # workflow's "every actual command lives in tools/gate.sh" rule is deliberately not followed: the
+  # gate's arms are what a developer runs before pushing, and this one is explicitly the arm that is
+  # too slow for that. `gate.sh` still runs it under SMOL_GATE_SLOW=1 for anyone touching
+  # `ota_verify.sh`, and prints a loud SKIP line otherwise so nobody mistakes absence for a pass.
+  ota_verify:
+    name: OTA-verify suite (#533)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: tools/test_ota_verify.sh
+
   firmware:
     name: tiers + clippy + stack floor
     runs-on: ubuntu-latest
