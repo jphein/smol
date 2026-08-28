@@ -325,7 +325,9 @@ it. A future release that *has* been flashed should say so, and say on what.
 
 - [RELEASE-RUNBOOK.md](RELEASE-RUNBOOK.md) — the **executable checklist** for cutting a versioned
   release (standing document; per-release run records live at its bottom), written ahead of the event so task #19 runs from a list instead of a reconstruction. It
-  deliberately does not restate the ceremony above, and it carries its own deletion condition.
+  deliberately does not restate the ceremony above. **It no longer carries a deletion condition** —
+  that was the v346-era clause, and the first run showed the expiry belonged on the run records
+  rather than on the procedure: prune records, keep the doc.
 - [BUILDING.md](BUILDING.md) — toolchain, `secrets.rs`, flashing, and the gotchas in full.
 - [ota.md](ota.md) — the signed OTA path fleet boards actually use, including leaf mesh-OTA.
 - [protocol.md](protocol.md) — the wire contract, including the image target descriptor a board
