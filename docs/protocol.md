@@ -177,14 +177,43 @@ add `(epoch+1, NEW_KEY)` to the accepted set, ship, then drop the old.
 
 **⚠️ It is in OBSERVE mode today — and that is a dated trap, not a permanent state.**
 `mode.rs::MAC_ENFORCE` is **`false`**: the firmware appends the MAC on TX, verifies on RX,
-counts `mac_ok`/`mac_fail`, and **soft-accepts** frames that are un-MAC'd or fail the check, so
-a mixed fleet never partitions. When the observe soak shows `mac_fail ≈ 0` on a quiet fleet,
-`MAC_ENFORCE` flips to `true` and a failing frame is **dropped before the parser**.
+counts the outcome, and **soft-accepts** frames that are un-MAC'd or fail the check, so a mixed
+fleet never partitions.
+
+**⚠️ #471: the failure counter is TWO fields, and the flip gate reads the SECOND one.**
+The old single `mac_fail` folded five causes into one `u32`, which made the gate both unreadable
+and *unreachable*: four watch-derived boards vendor `append_group_mac` and never call it, so a
+benign share inflates the number forever and `mac_fail ≈ 0` can never be true whether or not
+anything is wrong. The split is drawn where the **bytes** divide, not where the prose list of
+causes divides — a frame either claimed an epoch we accept, or it did not:
+
+| DIAG key | verdict | meaning | expected |
+|---|---|---|---|
+| `mf=` | `Unkeyed` | nothing claimed an accepted epoch — a legacy un-MAC'd frame (its last 9 bytes are ordinary payload) or a runt | **large and non-zero forever** on a mixed fleet; not an alarm |
+| `mfk=` | `BadTag` | a frame **claimed an accepted epoch** and its tag failed — wrong key, corruption, or a forgery | **zero** on a healthy fleet |
+
+**`mfk= ≈ 0` is the flip gate.** `mf=` is not, and never can be.
+
+⚠️ The pre-#471 quantity is **`mf= + mfk=`**. Anything comparing `mf=` across the flag day is
+comparing two different quantities.
+
+**Why `mfk=` is exact rather than approximate**, which is a property of the epoch VALUE and is now
+enforced: a legacy frame reaches `BadTag` only if the payload byte where an epoch would sit happens
+to equal an accepted epoch. Every SMOLv1 frame reaching the verifier is `SMOLv1 …`-prefixed ASCII,
+so a **non-ASCII epoch makes that structurally impossible** — the false-positive rate is zero, not
+"about 1 in 256". Rotation says to *bump* the epoch, and bumping reaches `0x20` (space) at epoch 32,
+where `SMOLv1 ` frames would flood `mfk=` with benign traffic that looks exactly like an attack. A
+compile-time assert in `wire.rs` now refuses epochs that are `0` or printable ASCII, so that
+rotation is a build failure instead of a fleet-wide false alarm.
+
+When the observe soak shows `mfk= ≈ 0` on a quiet fleet, `MAC_ENFORCE` flips to `true` and a failing
+frame — either class — is **dropped before the parser**.
 
 > **What that means for a non-Rust implementation** (#331's ESPHome component, the C5 spike):
 > a bare, un-MAC'd HELLO **works today and stops working at the flip**, with no warning and no
 > code change on either side. The failure mode then is leaf HELLO-drop → owner churn, *not*
-> crown deafness — `mac_fail` is the counter that tells those apart. **Implement the trailer
+> crown deafness — `mfk=` is the counter that tells those apart (an un-MAC'd HELLO lands in the
+> benign `mf=`, so `mf=` alone cannot). **Implement the trailer
 > up front**, or accept a known expiry date. Either is fine; not knowing is not.
 
 **The group key is a secret.** `GROUP_KEY` / `GROUP_KEY_EPOCH` live in the gateway's

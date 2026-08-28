@@ -298,7 +298,7 @@ const DIAG_BUDGET: usize = 512 - 4 - "smol/255/diag".len();
 /// `check_diag_budget.py` re-derives all six and fails the build on disagreement, printing the
 /// corrected line — so this is a fact a machine keeps true, not a comment somebody remembered:
 ///
-/// DIAG-DERIVED: literal=167 positional=237 tail=69 core=473 budget=495 margin=22
+/// DIAG-DERIVED: literal=167 positional=237 tail=84 core=488 budget=495 margin=7
 ///
 /// ⚠️ **`margin` is the budget for any new field — take it from that line and nowhere else.** For
 /// three weeks this block said **31 B** while the truth was 22, and that gap was not cosmetic: it
@@ -337,12 +337,12 @@ const DIAG_BUDGET: usize = 512 - 4 - "smol/255/diag".len();
 ///
 /// Each `DIAG-TAIL` entry is keyed by the FIRST key of its `rec.push_str`, matching
 /// `check_shed_order.py`'s convention, and is the whole append (literal + values):
-///   `mo`    = `|mo=` + `|mf=` (8) + 2×u32 (20) = 28   ·   `apch` = `|apch=` (6) + u8 (3) = 9
+///   `mo`    = `|mo=` + `|mf=` + `|mfk=` (13) + 3×u32 (30) = 43  ·  `apch` = `|apch=` (6) + u8 (3) = 9
 ///   `blrev` = `|blrev=` (7) + longest token `wifi` (4) = 11
 ///   `brst`  = `|brst=` + 2×`:` (8) + 2×u16 (10) + `brst_kind as char` (2 — a u8 ≥ 128 casts to a
 ///             2-byte UTF-8 scalar, so 1 would be an under-count) + the `+` clamp flag (1) = 21
 ///
-/// DIAG-TAIL: mo=28 apch=9 blrev=11 brst=21
+/// DIAG-TAIL: mo=43 apch=9 blrev=11 brst=21
 ///
 /// The assertion below is the whole point: it proves the record can NEVER be unpublishable, because
 /// the core always fits and everything else is appended only while there is room (see the shed list
@@ -359,7 +359,7 @@ const DIAG_BUDGET: usize = 512 - 4 - "smol/255/diag".len();
 /// 33 B on a leaf and 86 B on the crown — both past the remaining margin, which is exactly why they
 /// must be sheddable and not protected).
 #[cfg(feature = "espnow")]
-const DIAG_CORE_MAX: usize = 167 + 237 + 69;
+const DIAG_CORE_MAX: usize = 167 + 237 + 84;
 
 #[cfg(feature = "espnow")]
 const _: () = assert!(
@@ -396,6 +396,23 @@ const SCAN_PREFIX: &[u8] = b"SMOLv1 SCAN "; // + "NNN" + verbatim "<ssid>,<bssid
 /// is DROPPED before the parser. The failure mode of enforce is "drops some frames," never a
 /// hardware-layer deafness (the MAC is an appended field, not ESP-NOW encryption). HW-held into v345.
 const MAC_ENFORCE: bool = false;
+
+// #471: the compile-time half of the `mfk=` guarantee. `group_epoch_is_unambiguous` explains WHY
+// (a legacy un-MAC'd frame's payload byte must never be able to claim our epoch); this is where the
+// real secret is checked against it. It lives here rather than in `net/wire.rs` because that module
+// is deliberately secrets-free so host verifiers can `#[path]`-include it standalone — putting the
+// assert there broke `relay_compat` with `cannot find 'secrets' in 'crate'`, which is exactly the
+// #367 "a verifier includes a firmware source" coupling this repo already guards.
+//
+// A rotation into printable ASCII is now a BUILD FAILURE rather than a fleet-wide false alarm on
+// the one counter somebody would page on.
+#[cfg(feature = "espnow")]
+const _: () = assert!(
+    crate::net::wire::group_epoch_is_unambiguous(crate::secrets::GROUP_KEY_EPOCH),
+    "GROUP_KEY_EPOCH must not be 0 or printable ASCII (0x20..=0x7E): SMOLv1 payloads ARE ASCII, so \
+     such an epoch lets legacy un-MAC'd frames land in BadTag/`mfk=` and impersonate a forgery. \
+     Pick the next value below 0x20 (design §4.1 / #471)."
+);
 
 /// Const-eval all-zero test for [`crate::secrets::GROUP_KEY`], used by the #336 guard below. A plain
 /// `KEY != [0u8; 32]` will not do: array `PartialEq` is not const-callable, and `[0u8; 32]` is an
@@ -761,6 +778,10 @@ struct DiagCounters {
     /// (design §7.1). Bumped BOTH on a leaf and a gateway (every node verifies what it hears).
     mac_ok: u32,
     mac_fail: u32,
+    /// #471: `mac_fail` restricted to frames that CLAIMED an accepted epoch and failed the tag.
+    /// Surfaced as `mfk=`. Expected ZERO on a healthy fleet — that is the whole point of splitting
+    /// it out of `mac_fail`, which is expected non-zero forever.
+    mac_fail_keyed: u32,
     /// #13 MESH-TEST rig ONLY: count of inbound frames dropped by the deaf-list (surfaced as
     /// `ddrops=` in DIAG). A production build has no deaf-list, so this field doesn't exist.
     #[cfg(feature = "mesh-test")]
@@ -786,6 +807,7 @@ impl DiagCounters {
             brst_clamped: false,
             mac_ok: 0,
             mac_fail: 0,
+            mac_fail_keyed: 0,
             #[cfg(feature = "mesh-test")]
             ddrops: 0,
         }
@@ -4276,7 +4298,10 @@ impl RadioManager {
         // worthless as a gate. Their 28 B is added to `DIAG_CORE_MAX` above, so the assertion PROVES
         // the record still fits one publish (464 ≤ 495, #306 re-derivation) rather than being blind to it.
         // `mo`/`mf` = inbound frames whose group HMAC verified / failed.
-        rec.push_str(&alloc::format!("|mo={}|mf={}", self.diag.mac_ok, self.diag.mac_fail));
+        rec.push_str(&alloc::format!(
+            "|mo={}|mf={}|mfk={}",
+            self.diag.mac_ok, self.diag.mac_fail, self.diag.mac_fail_keyed
+        ));
         rec.push_str(&alloc::format!("|apch={}", self.my_ap_channel));
         if let Some(blrev) = crate::ota::bl_revert_token() {
             rec.push_str("|blrev=");
@@ -6045,7 +6070,11 @@ impl RadioManager {
                     &[(crate::secrets::GROUP_KEY_EPOCH, &crate::secrets::GROUP_KEY)],
                 ) {
                     MacVerdict::Ok { payload_len } => &cdata[..payload_len],
-                    MacVerdict::Fail => cdata,
+                    // #471: both failure verdicts behave identically HERE — this path does not
+                    // count, it only decides whether to strip a trailer. Listed separately rather
+                    // than with a wildcard so a future third verdict fails the BUILD instead of
+                    // silently taking the soft-accept branch.
+                    MacVerdict::Unkeyed | MacVerdict::BadTag => cdata,
                 };
                 if let Some(Frame::Stat { src, value }) = parse_frame(cframe) {
                     if src == leaf_id {
@@ -6812,12 +6841,23 @@ impl RadioManager {
                     self.diag.mac_ok = self.diag.mac_ok.saturating_add(1);
                     &raw[..payload_len]
                 }
-                MacVerdict::Fail => {
+                // #471: two counters, because one could not answer the question the gate asks.
+                // `mf=` is BENIGN-DOMINATED and expected non-zero forever (legacy un-MAC'd members);
+                // `mfk=` is ACTIONABLE and expected ZERO. The enforce behaviour is identical for
+                // both — the split is about what an operator can READ, not about what is accepted.
+                MacVerdict::Unkeyed => {
                     self.diag.mac_fail = self.diag.mac_fail.saturating_add(1);
                     if MAC_ENFORCE {
                         continue; // enforce: an un-MAC'd / bad-MAC frame never reaches the parser
                     }
                     raw // observe: soft-accept — a legacy un-MAC'd frame parses verbatim (no trailer)
+                }
+                MacVerdict::BadTag => {
+                    self.diag.mac_fail_keyed = self.diag.mac_fail_keyed.saturating_add(1);
+                    if MAC_ENFORCE {
+                        continue;
+                    }
+                    raw
                 }
             };
 
