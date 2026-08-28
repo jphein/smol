@@ -579,9 +579,12 @@ pub fn parse_cut(tag: &[u8]) -> Option<usize> {
     if digits.is_empty() || !digits.iter().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    digits.iter().fold(Some(0usize), |acc, b| {
-        acc?.checked_mul(10)?.checked_add((b - b'0') as usize)
-    })
+    // `try_fold`, not `fold` over an Option: clippy's `manual_try_fold` refuses the latter under
+    // `-D warnings`, and it is right — the short-circuit is the point, and spelling it with `?`
+    // inside a `fold` hides that the accumulator can abandon early.
+    digits
+        .iter()
+        .try_fold(0usize, |acc, b| acc.checked_mul(10)?.checked_add((b - b'0') as usize))
 }
 
 /// Write `|cut=<n>` into `out` (max 8 bytes: the tag plus 3 digits, matching `CUT_TAG_MAX`),

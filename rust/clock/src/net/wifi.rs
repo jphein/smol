@@ -2347,6 +2347,13 @@ impl<const VAL: usize> RelayCache<VAL> {
     ///     out of order would corrupt a record that is merely short.
     ///   * the cached record has no `|cut=` tag — then it was never truncated, so a continuation
     ///     for it is not ours to apply.
+    ///
+    /// ⚠️ `espnow`-GATED, and the gate is load-bearing rather than tidy. `RelayCache` is a `wifi`
+    /// item, but `net::wire` — where the `|cut=` helpers live — is `espnow`-gated (`net.rs:97`),
+    /// so a wifi-only build has no `wire` and this method would not compile. That is the correct
+    /// shape and not a workaround: a continuation is a MESH frame, so a build with no mesh has
+    /// nothing to continue. CI caught it as 12 red tiers; see the commit message for why I did not.
+    #[cfg(feature = "espnow")]
     #[allow(dead_code)]
     pub fn append_cont(&mut self, id: u8, part: u8, value: &[u8], now: u64) {
         if part != 1 {
