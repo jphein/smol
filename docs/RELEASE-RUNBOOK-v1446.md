@@ -1,18 +1,18 @@
-# v346 release runbook — the checklist, not the rationale
+# v1446 release runbook — the checklist, not the rationale
 
 > ## 🟡 PREP ONLY. Nothing in this file fires before JP's go.
 > This exists so that when STEP T merges and the paint bound passes, task #19 **executes from a
 > checklist instead of being reconstructed**. It is written ahead of the event on purpose.
 
-> ### ⏳ DELETE OR SUPERSEDE THIS FILE ONCE v346 IS CUT.
-> Its v346 specifics become history the moment the release exists, and anything in it that turns out
+> ### ⏳ DELETE OR SUPERSEDE THIS FILE ONCE v1446 IS CUT.
+> Its v1446 specifics become history the moment the release exists, and anything in it that turns out
 > to be *generally* true about versioned releases belongs in `docs/RELEASES.md` instead. A
 > version-stamped runbook with no expiry is how a repo accumulates procedures nobody can date — the
 > same reason `xtensa-spike.yml`'s schedule block carries a deletion condition.
 
 ## What this file deliberately does NOT restate
 
-`docs/RELEASES.md` § *"The versioned release ceremony (`v346` will be the first)"* already covers the
+`docs/RELEASES.md` § *"The versioned release ceremony (`v1446 Molten Gear` is the first)"* already covers the
 **why**: the repro-build property (a fixed `(commit, node-id)` builds to the same bytes, so the sha256
 *is* the identity), #44's two causes (rustc's absolute paths, the wall-clock app descriptor), the
 `repro_build.sh`-is-a-sourced-library trap, and sigil names being history that is never re-synced.
@@ -41,26 +41,53 @@ main; **verify the merge product.**
 
 ## 1. The version number and its sigil word
 
+> ### 🔴 CORRECTED 2026-08-28 — the first draft of this step was WRONG, and wrong in the direction
+> that ships a mislabelled release. Read the guard before the commands.
+>
+> **The build number is an OUTPUT of the ratchet, not an input you choose.** `ota_publish.sh stage`
+> computes it as `choose_build(count, staged, override)` = `max(git rev-list --count, retained staged
+> build + 1)`, and passes it as `SMOL_BUILD_NUMBER` (`repro_build.sh:406`). `build.rs:72` reads
+> `env_or_file("SMOL_BUILD_NUMBER", "version.txt")` — **env WINS over the file.** So on the release
+> path `version.txt` is the *fallback for non-stage builds*, **not** the number that ships.
+>
+> The first draft said "bump `version.txt` 345 → 346, and v346 is *Riveted Gear*." Both halves were
+> internally consistent and jointly wrong: the ratchet would have stamped a different number while
+> `RELEASES.md` said v346.
+
+**The order is: learn the number → derive the word → make `version.txt` agree.**
+
 ```bash
-# 1a. bump the released build number
-$EDITOR rust/clock/version.txt     # 345 -> 346
+# 1a. LEARN the number the ratchet will use. Do not choose it.
+git rev-list --count HEAD                     # the honest commit count
+tools/ota_publish.sh legacy-line esp32c3      # (preflight, unrelated — see §2)
+#   the retained staged build is the other input; `stage` prints the chosen BUILD before it publishes.
+
+# 1b. DERIVE the word from THAT number (never from version.txt, never by continuing a pattern).
+# 1c. THEN set version.txt to match, so a non-stage build reports the same lineage.
 ```
 
-**v346 is `Riveted Gear`.** Derived, not chosen — `version_name_for()` in
+**This release is `v1446` — `Molten Gear`.** Derived, not chosen — `version_name_for()` in
 `rust/clock/src/net/names.rs:256`:
 
 ```
 noun = FORGE.nouns[n % 20]          adj = FORGE.adjectives[(n / 20) % 20]
-346 -> nouns[6]="Gear",  adjectives[17]="Riveted"
+1446 -> nouns[6]="Gear",  adjectives[(1446/20)%20 = 12]="Molten"
 ```
 
 Verified against every naming control the docs already carry — `341 → Bellows`, `342 → Crucible`,
-`345 → Riveted Furnace`, `905 → Flux Furnace`. All four reproduce, which is what makes the formula
-reading trustworthy rather than assumed.
+`345 → Riveted Furnace`, `905 → Flux Furnace`. All four reproduce.
 
-⚠️ **Always write the number and the word together** (`v346 Riveted Gear`) — per `DOC-UPKEEP.md`, that
+> ⚠️ **And here is the lesson the first draft paid for, because those four controls did not save it.**
+> They verify the **word against the number**. They say nothing about whether the *number* is right.
+> `DOC-UPKEEP`'s rule — *"name it WITH its sigil word so the pair self-checks"* — catches a
+> mismatched pair; it cannot catch a **correctly-derived word on the wrong number**, which is
+> self-consistent and wrong. **A self-checking pair checks the RELATION, not the INPUTS.**
+> Verify the number against `choose_build`'s output *first*, then derive the word from it.
+
+⚠️ **Always write the number and the word together** (`v1446 Molten Gear`) — per `DOC-UPKEEP.md`, that
 pair self-checks, and it is how "build 905 Riveted Furnace" was caught. Never put a bare live build
-number in prose.
+number in prose. **But see the guard above: the pair self-checking is not the same as the number being
+right.**
 
 ---
 
@@ -111,8 +138,11 @@ release-stamped **only because operators exported it by hand.**
 
 ⚠️ **So the stamp does not mean "this is the versioned release."** It means *"an identity-bearing,
 reproducible build of HEAD with clean inputs"* — which a routine canary stage also is. **The thing
-that makes v346 v346 is the NUMBER in `version.txt`.** Do not read a release stamp on a staged canary
-as a release having happened.
+that makes v1446 v1446 is the NUMBER the ratchet chose** — `choose_build`'s output, carried as
+`SMOL_BUILD_NUMBER`. (⚠️ The first draft of this sentence said "the number in `version.txt`", which is
+the same error §1 corrects: on the release path the env var overrides the file. `version.txt` is what a
+NON-stage build falls back to.) Do not read a release stamp on a staged canary as a release having
+happened.
 
 ---
 
@@ -166,8 +196,8 @@ healthy, then the next. The tooling enforces the shape; the discipline is yours.
 
 - Per-target artifacts ride `tools/release_targets.sh` / the release workflow (#413), which walks the
   `targets/*/target.toml` manifests. The combined `SHA256SUMS` job landed in #499.
-- **`docs/RELEASES.md` header table** currently reads `first one | nightly-2026-08-24 | **v346** — not
-  yet cut`. Flipping that row is part of cutting the release, not a follow-up.
+- **`docs/RELEASES.md` header table** now reads `first one | nightly-2026-08-24 | **v1446 Molten Gear**
+  — in canary`. Flipping it to *cut* is part of cutting the release, not a follow-up.
 - Verify the published assets by **reading the release**, not the workflow's green tick — a green job
   is a claim about a job.
 
@@ -221,3 +251,7 @@ value is entirely in being right:
    The arm exists at `ota_publish.sh:504` and has two test arms. §3 is the corrected version.
 2. The sigil word is **computed**, with four documented controls reproduced, rather than continued from
    the v345 pattern by hand.
+3. **And that was still not enough** (found 2026-08-28, during the canary): the four controls verified
+   the WORD against the NUMBER while the number itself came from `version.txt`, which the release path
+   overrides. Corrected in §1, and the general form is worth more than the fix — *thorough verification
+   of the wrong proposition is the failure mode that survives being careful*.
