@@ -17,8 +17,9 @@
 mod wire;
 
 use wire::{
-    append_group_mac, hmac_sha256, verify_group_mac, MacVerdict, ESP_NOW_MTU, MAC_TAG_LEN,
-    MAC_TRAILER_LEN, UP2_INNER_MAX, UP2_OVERHEAD, is_ota_family, should_group_mac,
+    append_group_mac, group_epoch_is_unambiguous, hmac_sha256, verify_group_mac, MacVerdict,
+    ESP_NOW_MTU, MAC_TAG_LEN, MAC_TRAILER_LEN, UP2_INNER_MAX, UP2_OVERHEAD, is_ota_family,
+    should_group_mac,
 };
 
 /// Decode a lowercase hex string into a `[u8; 32]` (panics on wrong length / non-hex).
@@ -62,27 +63,27 @@ fn main() {
             assert_eq!(payload_len, frame.len(), "verify recovers the original payload length");
             assert_eq!(&buf[..payload_len], frame, "verify recovers the original payload bytes");
         }
-        MacVerdict::Fail => panic!("a freshly-MAC'd frame MUST verify"),
+        MacVerdict::Unkeyed | MacVerdict::BadTag => panic!("a freshly-MAC'd frame MUST verify"),
     }
 
     // --- 3. rejection: any tamper or a wrong key fails ------------------------------------------
     // (a) flipped payload byte.
     let mut t = buf;
     t[3] ^= 0x01;
-    assert_eq!(verify_group_mac(&t[..n], &[(epoch, &key)]), MacVerdict::Fail, "flipped payload rejected");
+    assert_eq!(verify_group_mac(&t[..n], &[(epoch, &key)]), MacVerdict::BadTag, "flipped payload rejected AS BadTag — epoch byte intact, so it still claims our epoch (#471)");
     // (b) flipped tag byte (the very last byte).
     let mut t = buf;
     t[n - 1] ^= 0x01;
-    assert_eq!(verify_group_mac(&t[..n], &[(epoch, &key)]), MacVerdict::Fail, "flipped tag rejected");
+    assert_eq!(verify_group_mac(&t[..n], &[(epoch, &key)]), MacVerdict::BadTag, "flipped tag rejected AS BadTag — the tag is what failed, not the claim (#471)");
     // (c) flipped epoch byte (now points at an epoch not in the accepted set / breaks the covered MAC).
     let mut t = buf;
     t[frame.len()] ^= 0x01;
-    assert_eq!(verify_group_mac(&t[..n], &[(epoch, &key)]), MacVerdict::Fail, "flipped epoch rejected");
+    assert_eq!(verify_group_mac(&t[..n], &[(epoch, &key)]), MacVerdict::Unkeyed, "flipped epoch rejected AS Unkeyed — it no longer claims an accepted epoch (#471)");
     // (d) wrong key.
     let other = [0x22u8; 32];
-    assert_eq!(verify_group_mac(&buf[..n], &[(epoch, &other)]), MacVerdict::Fail, "wrong key rejected");
+    assert_eq!(verify_group_mac(&buf[..n], &[(epoch, &other)]), MacVerdict::BadTag, "wrong key rejected AS BadTag — right epoch, wrong key is ACTIONABLE (#471)");
     // (e) right key but an epoch that isn't the frame's epoch → no candidate key → fail.
-    assert_eq!(verify_group_mac(&buf[..n], &[(epoch + 5, &key)]), MacVerdict::Fail, "unknown epoch rejected");
+    assert_eq!(verify_group_mac(&buf[..n], &[(epoch + 5, &key)]), MacVerdict::Unkeyed, "unknown epoch rejected AS Unkeyed (#471)");
 
     // --- 4. epoch rotation: a two-epoch accepted set verifies EITHER epoch ----------------------
     let key_a = [0xa1u8; 32];
@@ -100,11 +101,11 @@ fn main() {
     assert!(matches!(verify_group_mac(&fa[..na], accepted), MacVerdict::Ok { .. }), "overlap accepts epoch N");
     assert!(matches!(verify_group_mac(&fb[..nb], accepted), MacVerdict::Ok { .. }), "overlap accepts epoch N+1");
     // The old key alone must NOT verify the new-epoch frame (proves epoch actually selects the key).
-    assert_eq!(verify_group_mac(&fb[..nb], &[(7, &key_a)]), MacVerdict::Fail, "epoch N key rejects an epoch N+1 frame");
+    assert_eq!(verify_group_mac(&fb[..nb], &[(7, &key_a)]), MacVerdict::Unkeyed, "epoch N key rejects an epoch N+1 frame AS Unkeyed (#471)");
 
     // --- 5. a frame shorter than the trailer is a clean Fail (legacy un-MAC'd tiny frame) -------
-    assert_eq!(verify_group_mac(&[0u8; 4], &[(epoch, &key)]), MacVerdict::Fail, "sub-trailer frame fails");
-    assert_eq!(verify_group_mac(&[], &[(epoch, &key)]), MacVerdict::Fail, "empty frame fails");
+    assert_eq!(verify_group_mac(&[0u8; 4], &[(epoch, &key)]), MacVerdict::Unkeyed, "sub-trailer frame fails AS Unkeyed — too short to claim anything (#471)");
+    assert_eq!(verify_group_mac(&[], &[(epoch, &key)]), MacVerdict::Unkeyed, "empty frame fails AS Unkeyed (#471)");
 
     // --- 6. MTU / trailer budget invariants -----------------------------------------------------
     assert_eq!(MAC_TRAILER_LEN, 1 + MAC_TAG_LEN, "trailer = epoch(1) + tag");
@@ -182,5 +183,36 @@ fn main() {
     over.resize(ESP_NOW_MTU - MAC_TRAILER_LEN + 1, b'x');
     assert!(!should_group_mac(&over), "an over-budget frame is sent verbatim (never > MTU)");
 
-    println!("mac_verify: ALL CHECKS PASSED (RFC 4231 KATs + round-trip + tamper/key/epoch rejection + epoch-rotation dual-accept + MTU budget + OTA-family exemption)");
+    // ── #471: the Unkeyed/BadTag split is only a SECURITY signal if benign traffic cannot reach
+    // BadTag. That property is not a fact about the code — it is a fact about the epoch VALUE, so
+    // it gets proved here rather than asserted in a comment.
+
+    // (a) the rule itself, both directions.
+    for bad in [0u8, 0x20, b'S', b'1', b' ', 0x7E] {
+        assert!(!group_epoch_is_unambiguous(bad),
+            "epoch {bad:#04x} is 0 or printable ASCII — a legacy frame could claim it (#471)");
+    }
+    for good in [1u8, 0x02, 0x1F, 0x7F, 0x80, 0xFF] {
+        assert!(group_epoch_is_unambiguous(good), "epoch {good:#04x} is unambiguous (#471)");
+    }
+
+    // (b) THE LOAD-BEARING CASE. A real legacy un-MAC'd SMOLv1 frame — ASCII, no trailer — must
+    // land in the BENIGN class against a safe epoch. This is the four watch-derived boards, and
+    // it is why `mf=` is expected non-zero forever while `mfk=` is expected zero.
+    let legacy = &b"SMOLv1 DIAG 236|slot=0|up=1234|heap=40000"[..];
+    assert_eq!(verify_group_mac(legacy, &[(1u8, &key)]), MacVerdict::Unkeyed,
+        "a legacy un-MAC'd ASCII frame is BENIGN (mf=), never a forgery report (#471)");
+
+    // (c) and the HAZARD the guard exists to prevent, demonstrated rather than described: with a
+    // printable-ASCII epoch, that same benign frame becomes a BadTag — i.e. `mfk=` would report a
+    // forgery for ordinary traffic. The epoch below is the byte this frame happens to carry at the
+    // trailer offset, so this is the real collision, not a contrived one.
+    let claimed = legacy[legacy.len() - MAC_TRAILER_LEN];
+    assert!(!group_epoch_is_unambiguous(claimed),
+        "sanity: the colliding byte {claimed:#04x} must be one the guard already rejects");
+    assert_eq!(verify_group_mac(legacy, &[(claimed, &key)]), MacVerdict::BadTag,
+        "with an ASCII epoch the SAME benign frame reports as a forgery — this is what the \
+         compile-time guard in net/mode.rs prevents (#471)");
+
+    println!("mac_verify: ALL CHECKS PASSED (RFC 4231 KATs + round-trip + tamper/key/epoch rejection + epoch-rotation dual-accept + MTU budget + OTA-family exemption + #471 Unkeyed/BadTag classification + epoch-ambiguity guard)");
 }

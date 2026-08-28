@@ -85,11 +85,11 @@ echo "== the DERIVED read-out (#382) =="
 # hands a designer room that does not exist — #471's 30 B three-way split "fits" in the advertised
 # 31 and puts the core 8 B past the cliff, silencing a healthy fleet. So the checker must not merely
 # go red; it must say WHICH WAY it is wrong.
-arm "read-out overstates the margin" 1 "OVERSTATES the margin by 77 B" \
-    'budget=495 margin=22	budget=495 margin=99'
+arm "read-out overstates the margin" 1 "OVERSTATES the margin by 92 B" \
+    'budget=495 margin=7	budget=495 margin=99'
 # The understatement direction must also be caught — it is safe for the cliff, not free for design.
-arm "read-out understates the margin" 1 "margin: doc says 5, derived" \
-    'budget=495 margin=22	budget=495 margin=5'
+arm "read-out understates the margin" 1 "margin: doc says 1, derived" \
+    'budget=495 margin=7	budget=495 margin=1'
 # Deleting the line must be FATAL, not a silent pass. A check you can switch off by removing its
 # input is not a check; it is a suggestion. (Tag mangled rather than the line removed, so the arm
 # tests the checker's handling and not sed's.)
@@ -98,10 +98,10 @@ arm "read-out declaration removed" 2 "no DIAG-DERIVED" \
 # A PARTIAL read-out is the realistic sloppy edit: update the terms you touched, leave the rest.
 # That is how half a stale declaration survives an otherwise honest correction.
 arm "read-out missing a term" 2 "is missing margin" \
-    ' margin=22	 '
+    ' margin=7	 '
 # Garbage must not parse as agreement.
 arm "read-out term malformed" 2 "malformed or unknown term" \
-    'margin=22	margin=twenty-two'
+    'margin=7	margin=twenty-two'
 
 echo "== the PROTECTED tail (unconditional push_str) =="
 # The documented hazard, verbatim: "a field appended with a bare push_str and NOT counted here
@@ -112,7 +112,7 @@ arm "undeclared protected append" 1 "UNDECLARED: zzz" \
 # The over-count direction — safe for the cliff, but it is how 16 B went missing and nearly made
 # #323 look unaffordable. An over-count must be as loud as an under-count.
 arm "tail term over-counted" 1 "protected-tail widths sum to" \
-    'DIAG-TAIL: mo=28	DIAG-TAIL: mo=44'
+    'DIAG-TAIL: mo=43	DIAG-TAIL: mo=59'
 # A protected field deleted from the record but left in the declaration.
 arm "declared tail field vanished" 1 "no longer appended: brst" \
     'rec.push_str(&alloc::format!(

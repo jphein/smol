@@ -70,7 +70,19 @@ mqtt:
             'total': (p[1] | int(0)) if p | length >= 2 else 0,
             'phase': (p[2] if p | length >= 3 else '')} | tojson }}
 
-    # --- #190 group-HMAC transport-auth health (mac_ok / mac_fail) — SHIPS v346 ---
+    # --- #190 group-HMAC transport-auth health (mac_ok / mac_fail / mac_fail_keyed) ---
+    #
+    # ⚠ #471 SEMANTIC CHANGE — `mf=` no longer means "everything that failed".
+    # It was ONE counter folding five causes, which made #190's Wave-1 gate (`mac_fail ≈ 0`)
+    # both unreadable and UNREACHABLE: four watch-derived boards vendor `append_group_mac` and
+    # never call it, so a benign share inflates it forever. Since #471 it is two fields:
+    #   mf=  BENIGN-dominated — nothing claimed an accepted epoch (legacy un-MAC'd, or a runt).
+    #        Expected LARGE and non-zero forever. Not an alarm.
+    #   mfk= ACTIONABLE — a frame CLAIMED an accepted epoch and its tag failed: wrong key,
+    #        corruption, or a forgery. Expected ZERO. THIS is the one to alert on.
+    # The pre-#471 quantity is `mf= + mfk=`. Anything comparing `mf=` across the flag day is
+    # comparing two different things — the counters are `total_increasing`, so the split shows
+    # up as `mf=` continuing smoothly while `mfk=` starts fresh at 0, NOT as a visible reset.
     # The #190 observe-release bumps per-node mac_ok / mac_fail counters folded into the
     # already-retained smol/<id>/diag record (issue #190 §7.1). Same DIAG key-picker idiom
     # as the fok/ffl/vok/vfl counters in smol_mesh.yaml.
@@ -93,7 +105,10 @@ mqtt:
         {% set ns = namespace(v=none) %}
         {% for kv in value.split('|') %}{% if kv.startswith('mo=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
         {{ ns.v | int(0) if ns.v is not none else 'unknown' }}
-    - name: "smol 8 mac fail"
+    # BENIGN class. A non-zero, climbing value here is EXPECTED on a mixed fleet and is not a
+    # fault — see the #471 note above. `startswith('mf=')` does NOT match `mfk=` ("mfk" != "mf="),
+    # verified rather than assumed, so this picker is unchanged by the split.
+    - name: "smol 8 mac fail (unkeyed, benign)"
       unique_id: smol_8_mac_fail_mirror
       state_topic: "smol/8/diag"
       entity_category: diagnostic
@@ -102,6 +117,19 @@ mqtt:
       value_template: >-
         {% set ns = namespace(v=none) %}
         {% for kv in value.split('|') %}{% if kv.startswith('mf=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
+        {{ ns.v | int(0) if ns.v is not none else 'unknown' }}
+    # ACTIONABLE class — the security signal. Any sustained climb here means a peer is claiming
+    # OUR epoch and failing the tag. 'unknown' while the key is absent, never 0, so "this build
+    # predates #471" cannot be misread as "zero forgery attempts".
+    - name: "smol 8 mac fail keyed"
+      unique_id: smol_8_mac_fail_keyed_mirror
+      state_topic: "smol/8/diag"
+      entity_category: diagnostic
+      state_class: total_increasing
+      icon: "mdi:shield-alert-outline"
+      value_template: >-
+        {% set ns = namespace(v=none) %}
+        {% for kv in value.split('|') %}{% if kv.startswith('mfk=') %}{% set ns.v = kv.split('=',1)[1] %}{% endif %}{% endfor %}
         {{ ns.v | int(0) if ns.v is not none else 'unknown' }}
 
 template:

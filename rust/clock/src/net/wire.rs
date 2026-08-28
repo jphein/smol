@@ -427,15 +427,41 @@ pub fn append_group_mac(buf: &mut [u8], len: usize, key: &[u8; 32], epoch: u8) -
 }
 
 /// Outcome of [`verify_group_mac`].
+///
+/// **#471: the failure is TWO verdicts, not one.** It used to be a single `Fail` covering five
+/// causes — absent trailer, truncated frame, wrong key, unknown epoch, forgery — and #190's Wave-1
+/// gate is stated in terms of the counter that fold produces. That made the gate **unevaluable**
+/// (an operator reading `mf=145287` learns only that something was not verifiable 145,287 times)
+/// and, on a fleet with legitimately un-MAC'd members, **unreachable**: four watch-derived boards
+/// vendor `append_group_mac` and never call it, so a benign share inflates the number forever and
+/// `mac_fail ≈ 0` can never be true whether or not anything is wrong.
+///
+/// The split is drawn where the *evidence* actually divides, which is not where the prose list of
+/// causes divides — see [`verify_group_mac`]. A frame either **claimed an epoch we accept** or it
+/// did not, and that is the only distinction the bytes support.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MacVerdict {
     /// A valid trailer verified against one of the accepted keys. `payload_len` is the frame length
     /// WITHOUT the trailer — parse `data[..payload_len]`.
     Ok { payload_len: usize },
-    /// No accepted key verified the trailer: absent/truncated (legacy un-MAC'd frame), wrong key,
-    /// wrong/unknown epoch, or a forgery. The caller counts this (`mac_fail`) and — depending on the
-    /// observe-vs-enforce policy — either soft-accepts the raw frame or drops it (design §7.1).
-    Fail,
+    /// **Nothing claimed an accepted epoch.** Either the frame is shorter than a trailer, or the byte
+    /// where an epoch would sit matches no accepted epoch.
+    ///
+    /// This is the **benign-dominated** class and it is *expected to be large and non-zero forever*:
+    /// a legacy un-MAC'd frame has no trailer at all, so its final 9 bytes are ordinary payload and
+    /// the "epoch" read out of them is just whatever byte was there. Counted as `mf=`.
+    ///
+    /// Two causes are deliberately folded here (no-trailer and runt) — both benign, both
+    /// indistinguishable from the bytes, and neither actionable. That is a different thing from the
+    /// fold #471 is about, which mixed benign with actionable.
+    Unkeyed,
+    /// **A frame claimed an epoch we accept, and its tag did not verify.** Wrong key, corruption, or
+    /// a forgery — the security event this feature exists to detect. Counted as `mfk=`.
+    ///
+    /// Unlike [`MacVerdict::Unkeyed`], **this one is expected to be ZERO on a healthy fleet**, which
+    /// is what makes it a usable gate. See [`verify_group_mac`] for why legacy frames do not leak
+    /// into it, and the compile-time guard that keeps that true across an epoch rotation.
+    BadTag,
 }
 
 /// Verify a frame's group-MAC trailer against the accepted `(epoch, key)` set (the current key, plus
@@ -445,22 +471,62 @@ pub enum MacVerdict {
 /// parser under the enforce policy (design §7.3).
 pub fn verify_group_mac(data: &[u8], keys: &[(u8, &[u8; 32])]) -> MacVerdict {
     if data.len() < MAC_TRAILER_LEN {
-        return MacVerdict::Fail;
+        // Too short to carry a trailer, so it cannot have claimed an epoch. Benign class.
+        return MacVerdict::Unkeyed;
     }
     let payload_len = data.len() - MAC_TRAILER_LEN;
     let epoch = data[payload_len];
     let tag = &data[payload_len + 1..]; // exactly MAC_TAG_LEN bytes
+    let mut claimed = false;
     for &(ep, key) in keys {
         if ep != epoch {
             continue;
         }
+        // #471: the frame CLAIMED an epoch we accept. From here a mismatch is actionable, not
+        // legacy — record that before the tag check so the verdict survives a loop that finds no
+        // match. (Set inside the loop, not from `keys.iter().any(...)` above it, so the two can
+        // never disagree about which epochs were actually tried.)
+        claimed = true;
         // Recompute over the frame bytes PLUS the epoch byte — exactly what `append_group_mac` covered.
         let full = hmac_sha256(&key[..], &data[..payload_len + 1]);
         if ct_eq(&full[..MAC_TAG_LEN], tag) {
             return MacVerdict::Ok { payload_len };
         }
     }
-    MacVerdict::Fail
+    if claimed {
+        MacVerdict::BadTag
+    } else {
+        MacVerdict::Unkeyed
+    }
+}
+
+/// #471: is this epoch value one that a LEGACY un-MAC'd frame can never accidentally claim?
+///
+/// `BadTag` (`mfk=`) is only a usable security signal if benign traffic cannot land in it, and
+/// whether it can is decided **entirely by the VALUE of the epoch byte** — a property nothing
+/// recorded until now.
+///
+/// A legacy frame has no trailer, so [`verify_group_mac`] reads its "epoch" out of ordinary payload.
+/// It reaches `BadTag` iff that payload byte happens to equal an accepted epoch (the tag then always
+/// mismatches). Naively that is ~1 in 256 — which would put a permanent noise floor under the gate
+/// and reintroduce, at 1/256 scale, the exact "unreachable pass condition" defect #471 exists to
+/// remove. But every SMOLv1 frame reaching the verifier is `b"SMOLv1 …"`-prefixed **ASCII**, so the
+/// byte at that offset is printable ASCII. Keep the epoch out of that range and the false-positive
+/// rate is not small — it is **structurally zero**.
+///
+/// ⚠️ The hazard is the rotation instruction, which says to **bump** the epoch. Bumping reaches
+/// `0x20` (space) at epoch 32, and `SMOLv1 ` frames are full of spaces — that rotation would flood
+/// `mfk=` with benign traffic indistinguishable from the attack the counter reports. NUL is excluded
+/// too: it is the natural "unset" value, and an epoch of 0 would make every zero-padded buffer a
+/// claimant.
+///
+/// The ASSERTION lives at the call site in `net/mode.rs`, not here, because this module is
+/// deliberately **secrets-free** so the host verifiers can `#[path]`-include it standalone — a
+/// `crate::secrets` reference here breaks `relay_compat` and friends, which is how this function
+/// came to exist rather than an inline `const _: () = assert!(…)`. The rule lives with the code it
+/// describes; the secret stays where the secrets are.
+pub const fn group_epoch_is_unambiguous(epoch: u8) -> bool {
+    epoch != 0 && (epoch < 0x20 || epoch > 0x7E)
 }
 
 /// True iff `frame` is an **OTA-family** frame — one the receiver consumes at the `parse_ota_frame`
