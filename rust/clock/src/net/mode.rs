@@ -439,6 +439,45 @@ const CONT_VALUE_MAX: usize = ESP_NOW_MTU - MAC_TRAILER_LEN - DIAGC_PREFIX.len()
 /// esp-hal takes .bss out of .stack — measured, not assumed).
 const DIAG_CONT_PARTS: u8 = 1;
 
+/// Width of the `|cut=<n>` marker at its widest ("|cut=999"). Hoisted to module scope by #382:
+/// it is no longer a detail of `broadcast_diag` but a term in the compile-time pairing between the
+/// sender's continuation budget and the crown's cache, and a constant that two places depend on
+/// should not live inside one of them.
+const CUT_TAG_MAX: usize = 8;
+
+/// #382: what ONE continuation may carry — the DECLARED part-B budget.
+///
+/// **Derived from what the crown can KEEP, not from what the frame can HOLD**, and the difference
+/// is a real bug I shipped in the first draft: the frame allows `CONT_VALUE_MAX` (224 B), the crown
+/// can only append `DIAG_CACHE_VALUE_MAX − OBS_VALUE_MAX` (134 B) after part A, so a full-frame
+/// continuation was silently TRUNCATED at the receiver — positional loss reintroduced at the exact
+/// place this change exists to remove it, and invisible because the frame was well-formed.
+///
+/// Bounding the SENDER by the receiver's budget is the byte-granularity form of the rule that
+/// governs `DIAG_CONT_PARTS`: never emit what the other end cannot keep. Airtime spent on data that
+/// is dropped on arrival is strictly worse than not sending it, because it also looks like it
+/// worked.
+///
+/// 134 B comfortably holds the declared set this carries — the PROTECTED tail (`mo= mf= mfk= apch=
+/// blrev= brst=`, 84 B declared in `DIAG-TAIL`) plus `elect=` and the trailing positional fields
+/// that fall past part A's cut.
+const CONT_DECLARED_MAX: usize = crate::net::wifi::DIAG_CACHE_VALUE_MAX - OBS_VALUE_MAX;
+
+/// #382 THE PAIRING, ENFORCED. `DIAG_CONT_PARTS` and the crown's buffer are two halves of one
+/// decision, and this is what stops them drifting: raise the parts count without raising
+/// `DIAG_CACHE_VALUE_MAX` and the build FAILS rather than the fleet quietly emitting frames whose
+/// tails nobody stores.
+///
+/// The part-A/part-B slot skew that would otherwise worry here is impossible BY CONSTRUCTION: a
+/// continuation is appended into part A's own cache entry, not held in a parallel array, so there
+/// is no second slot to run out of. One `RELAY_CACHE_CAP`, one entry, one record.
+const _: () = assert!(
+    OBS_VALUE_MAX + (DIAG_CONT_PARTS as usize) * CONT_DECLARED_MAX
+        <= crate::net::wifi::DIAG_CACHE_VALUE_MAX + CUT_TAG_MAX,
+    "DIAG_CONT_PARTS exceeds what the crown's diag_cache can hold — raise DIAG_CACHE_VALUE_MAX with \
+     it, or the extra parts are airtime spent on bytes the receiver drops (see #382)"
+);
+
 const _: () = assert!(
     DIAGC_PREFIX.len() + 3 + 1 + CONT_VALUE_MAX + MAC_TRAILER_LEN <= ESP_NOW_MTU,
     "leaf DIAG CONTINUATION frame exceeds the ESP-NOW payload ceiling once the #190 group-MAC \
@@ -3607,7 +3646,6 @@ impl RadioManager {
         // at least be able to tell that it was cut rather than never sent. The crown is unaffected (it
         // self-publishes the full record over MQTT), which is precisely why this hid for so long — the
         // one board anybody looks at is the one that is fine.
-        const CUT_TAG_MAX: usize = 8; // "|cut=999"
         // #190: `OBS_VALUE_MAX`, not `RELAY_VALUE_MAX` — the frame must still fit the MTU *after*
         // `send_to` appends the 9 B group-MAC trailer. Worst case is exact, both branches: cut path
         // 12+3+218+8 = 241, uncut path 12+3+226 = 241, +9 trailer = 250 = `ESP_NOW_MTU`.
@@ -3671,8 +3709,12 @@ impl RadioManager {
                 // is strictly better than a corrupt one. A continuation that begins on a boundary
                 // also needs no partial-field stitching at the receiver — which is the property
                 // that lets the crown APPEND rather than reassemble.
-                let take = if remain > CONT_VALUE_MAX {
-                    match value[off..off + CONT_VALUE_MAX].iter().rposition(|&b| b == b'|') {
+                // The window is the SMALLER of what the frame holds and what the crown keeps —
+                // see `CONT_DECLARED_MAX`. Using the frame limit alone silently truncates at the
+                // receiver, which is the failure this whole change exists to end.
+                let window = CONT_VALUE_MAX.min(CONT_DECLARED_MAX);
+                let take = if remain > window {
+                    match value[off..off + window].iter().rposition(|&b| b == b'|') {
                         // `rposition` is relative to the slice; +0 keeps the boundary `|` at the
                         // START of the NEXT part, so every part begins with a separator exactly
                         // like part A's own fields do.
@@ -3680,7 +3722,7 @@ impl RadioManager {
                         // No separator in the whole window (or one at index 0, which would make no
                         // progress and loop forever). Fall back to the raw cut: a malformed tail
                         // beats a hang, and this is unreachable for a real DIAG record.
-                        _ => CONT_VALUE_MAX,
+                        _ => window,
                     }
                 } else {
                     remain

@@ -2302,6 +2302,14 @@ pub struct RelayCache<const VAL: usize = RELAY_VALUE_MAX> {
 /// receiver drops, which is strictly worse than not sending it.
 pub const DIAG_CACHE_VALUE_MAX: usize = 360;
 
+/// A widening that does not widen is a feature that silently does nothing: if this is ever set at
+/// or below one frame, `append_cont` has no room and every continuation is dropped while the code
+/// still looks present. Refused at compile time rather than discovered on a bench.
+const _: () = assert!(
+    DIAG_CACHE_VALUE_MAX > RELAY_VALUE_MAX,
+    "DIAG_CACHE_VALUE_MAX must exceed one frame or #382's continuations have nowhere to land"
+);
+
 #[cfg(feature = "wifi")]
 impl<const VAL: usize> RelayCache<VAL> {
     // Like `CfgCache`, these are called only by the espnow gateway (`RadioManager`); a
