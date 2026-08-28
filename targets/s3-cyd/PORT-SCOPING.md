@@ -16,7 +16,11 @@ exactly as the never-allocate rule assumed). Boot narrative verbatim: [DISPLAY] 
 the 4-MiB alternative would have REJECTED it; the C6-measured-image sizing argument
 vindicated. Chip-id 0x0009 byte-confirmed. Port-shuffle law struck again pre-flash
 (ttyACM3 had become the CROWN — the passive re-verify caught it; the guard was immune).
-Remaining: JP's tap verdict → four-corner calibration → the cross-arch mesh-OTA closer.
+Remaining: JP's tap verdict → four-corner calibration.
+⚠️ The "cross-arch mesh-OTA closer" is **retired, not pending** — #495's fully-armed live run produced
+zero OTAM frames and #518 records why it cannot: cross-chip mesh-OTA *serve* does not exist by
+construction. The S3's 345→1405 roll was a **WiFi self-fetch** via the per-chip staged line — real OTA
+citizenship, and not a mesh receive.
 
 **2026-08-25 ~14:15 — BOTH FLAVORS ON MAIN in one hour:** #411 merged (the smol-native
 S3: display arm + measured budget row + the two-check matrix contract, documented for

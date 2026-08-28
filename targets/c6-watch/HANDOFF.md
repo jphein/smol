@@ -39,7 +39,11 @@ smol PRs: #417/#423/#427/#444/#445 ALL MERGED (445 at 02:54Z 2026-08-26 — the 
 **Waiting on (external, will arrive as relays):**
 - S3 SECOND first-light: s3-cyd rebuilds from #445. Watch for `[PSRAM] octal, 8192 KB` boot line.
 - C5 on glass: morpheus image 9 under test; his feat/cyd-c5-gating driver merge is his lane.
-- cast pixels (WLED matrix), cross-arch mesh-OTA + multihop (multi-node windows): bench verifications.
+- cast pixels (WLED matrix), multihop (multi-node windows): bench verifications.
+- ⚠️ **cross-arch mesh-OTA is NOT a pending bench item — it is unsupported by construction** (#518,
+  concluded from #495's fully-armed live run: zero OTAM frames). A crown subscribes only its OWN
+  chip's staged topic, GUI flavors read no `smol/ota/staged/*` at all, and images exceed the
+  fleet-wide 2 MB const (#517). Do not schedule a sitting for it; the components are the work.
 - story E2E: JP's AP fix (#89).
 - bard screen: spec at docs/specs/2026-08-25-bard-screen-spec.md → Luna + glass.
 

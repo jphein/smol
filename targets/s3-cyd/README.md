@@ -86,7 +86,9 @@ A human watched this board do all of it. **Verified on hardware, in the flavor n
 - ~~No A/B OTA roll yet.~~ **✅ OTA citizenship confirmed, 2026-08-26** — id 162 took build
   **345 → 1405 over the air**: slot flip, `ota=confirmed:1405`, self-test passed, no rollback
   (~40 s for 1 MB). **The fourth silicon family is a full fleet citizen**, and this is the first
-  cross-architecture OTA in smol's history. *(#398; three traps burned en route, incl. `flash.sh`
+  cross-architecture OTA in smol's history. ⚠️ **Transport: a WiFi SELF-FETCH via the per-chip
+  staged line** (`smol/ota/staged/esp32s3`) — the mesh half was the announce relay. Not a
+  mesh-OTA *receive*, which #518 records as unsupported by construction across chips. *(#398; three traps burned en route, incl. `flash.sh`
   lacking an otadata erase — after any slot flip a USB flash silently boots the stale slot.)*
 - **Stack-floor provenance is `ObservedSufficient`, not `Derived`** — the stack-measuring
   instrument is known-broken on this chip, so `ESP32S3_STACK_FLOOR_BYTES` is the largest region
