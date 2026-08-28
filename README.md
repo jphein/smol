@@ -24,7 +24,7 @@ Two firmware **flavors** share the tree. The **fleet** flavor is `rust/clock/` �
 |---|---|---|---|
 | **[`c3`](targets/c3/)** — the headless node, ~$1 | ESP32-C3 · RISC-V | fleet | 🟢 **shipping** — the reference fleet. Every other board's numbers are measured against it. |
 | **[`c3-oled`](targets/c3-oled/)** — the node with a face, ~$2.76 | ESP32-C3 · RISC-V | fleet | 🟢 **shipping** — *the same image* as `c3`; the 72×40 SSD1306 is simply answered at boot. |
-| **[`s3-cyd`](targets/s3-cyd/)** — 2.8" ILI9341V + capacitive touch | ESP32-S3 · Xtensa | fleet **and** GUI | 🟢 **glass-verified (2026-08-26)** — boots, paints, takes touch, meshes, and reaches NTP + MQTT + Home Assistant, in *both* flavors, on real hardware, and took build **345 → 1405 over the air** the same day: the first cross-architecture OTA in smol's history. Still not building in CI — the only blocker left is the runner toolchain. |
+| **[`s3-cyd`](targets/s3-cyd/)** — 2.8" ILI9341V + capacitive touch | ESP32-S3 · Xtensa | fleet **and** GUI | 🟢 **glass-verified (2026-08-26)** — boots, paints, takes touch, meshes, and reaches NTP + MQTT + Home Assistant, in *both* flavors, on real hardware, and took build **345 → 1405 over the air** the same day: the first cross-architecture OTA in smol's history — by **WiFi self-fetch** off the per-chip staged line, not a mesh receive (#518). Still not building in CI — the only blocker left is the runner toolchain. |
 | **[`c6-watch`](targets/c6-watch/)** — the Waveshare AMOLED smartwatch | ESP32-C6 · RISC-V | GUI | 🟢 **shipping in its own repo**, in-tree here as a full-history subtree. Live on the mesh; `rust/clock` compiles clean for the chip but does not yet link a fleet image for it. |
 | **[`c5-cyd`](targets/c5-cyd/)** — the NM-CYD-C5 2.8" touch board | ESP32-C5 · RISC-V | GUI today | 🟡 **mesh-proven** — the first non-C3 silicon ever heard on smol's mesh (2026-08-24). For `rust/clock` a linked fleet image now **boots and meshes** on hardware (#485, 2026-08-27) — so it is past *checks-only* — but it is **not `builds`**: there is still no measured memory budget row, so no floor gate. Zigbee-bridge role back-burnered. |
 
@@ -56,7 +56,7 @@ that cannot. Every 🔶 and 🛠 below carries its issue; **the cell is that iss
 | HA discovery + Update entity | ✅ 🔶 no `_soc` #498 | ✅ | ✅ | 🛠 own topics #492 | 🛠 own topics #492 | 🛠 #492 |
 | Keyed-CFG (every knob, no reflash) | ✅ 11 keys | ✅ | ✅ | 🛠 only `S`/`U`/`R` #490 | 🛠 #490 | 🛠 #490 |
 | Custom screens | ✅ | ✅ | ✅ | 🛠 not rendering #473 | 🛠 #473 | 🛠 #473 |
-| Mesh-OTA receive | ✅ | ✅ | ✅ **345→1405, first cross-arch OTA** | 🔶 compiled #495 | 🔶 unproven on the C6 #495 | 🔶 #495 |
+| Mesh-OTA receive | ✅ | ✅ | 🔶 the 345→1405 roll was a **WiFi self-fetch**, not a mesh receive (#518) | 🔶 compiled #495 | 🔶 unproven on the C6 #495 | 🔶 #495 |
 | Mesh-OTA relay / serve | ✅ | ✅ | 🔶 client only | 🔶 #495 | 🔶 #495 | 🔶 #495 |
 | HTTP / push OTA | ✅ | ✅ | ✅ | ✅ | ✅ zero-touch | 🔶 #488 |
 | Ed25519 signed-image verify | ✅ both paths | ✅ | ✅ | 🔶 mesh yes, HTTP no #489 | 🛠 build-monotonicity only #489 | 🛠 #489 |
