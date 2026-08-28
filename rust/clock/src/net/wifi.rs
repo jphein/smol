@@ -4231,6 +4231,55 @@ async fn mqtt_session(
     // install retained → the next flush retries (bounded by LEAF_OTA_MAX_RETRIES). `Announce`
     // is `Copy`, so the pair moves out cleanly.
     match (pending_leaf, *staged_raw) {
+        // #465: REFUSE to relay an announce that states NO TARGET.
+        //
+        // `ota::gate` runs #349's pre-fetch suitability check only `if let Some(t) = a.target`. A
+        // legacy `OTA|` line carries none, and that asymmetry is deliberate — "this staging did not
+        // say" is not "suitable for anyone", so a board judging its OWN self-fetch falls back to the
+        // post-download descriptor read and a new publisher can coexist with an un-rolled fleet.
+        //
+        // That reasoning does NOT survive being inherited by the relay path, and it was inherited
+        // silently. For a self-fetch the board spends ITS OWN airtime and flash-write budget on an
+        // image it will judge at finalize. For a relay the crown spends a DIFFERENT board's, on an
+        // image the leaf is structurally unable to refuse until the whole thing has arrived. The
+        // cost moved to a third party and the justification did not move with it.
+        //
+        // This is the measured incident, not a hypothetical: a v922 crown (pre-#349, so its
+        // `staged_raw` was a target-less `OTA|` announce) relayed a 1,031,008 B C3 image at the S3
+        // leaf id162, which could only refuse at the finalize descriptor read — a full megabyte of
+        // ESP-NOW airtime, ×3 under `LEAF_OTA_MAX_RETRIES`.
+        //
+        // Refusing here RESTORES the leaf's pre-fetch veto by construction: the only announces we
+        // relay are ones the leaf can judge before a single body byte moves.
+        //
+        // The install is deliberately NOT cleared. This is a property of the ANNOUNCE we currently
+        // hold, not a verdict on the leaf — when `staged_raw` refreshes to an `OTA2|` line the next
+        // flush arms normally. Clearing would turn a recoverable staleness into a lost install.
+        (Some(leaf_id), Some(ann)) if ann.target.is_none() => {
+            log::warn!(
+                "smol #465: NOT relaying build {} to leaf id{} — the announce states no target, so the leaf could not refuse it until the whole image had arrived (legacy OTA| line; install left retained for a targeted staging)",
+                ann.build,
+                leaf_id
+            );
+        }
+        // #465 defence in depth: an announce for a chip that is not even OURS has no business
+        // being served onward. Near-tautological today — post-#464 a crown only sees its own
+        // chip's staged line — which is exactly why it is worth asserting rather than assuming:
+        // #464 is a property of the PUBLISHER, and this is the consumer that would pay for the
+        // publisher changing. Unlike the arm above, this one cannot save the observed megabyte
+        // (there the image WAS the crown's chip and the leaf's was different, which the crown
+        // cannot know — see #510 rider 4 for the frame that would tell it).
+        (Some(leaf_id), Some(ann))
+            if ann.target.map(|t| t.chip) != Some(crate::net::target::SELF.chip) =>
+        {
+            log::warn!(
+                "smol #465: NOT relaying build {} to leaf id{} — image targets chip {} but this crown is {}",
+                ann.build,
+                leaf_id,
+                crate::net::target::chip_name(ann.target.map(|t| t.chip).unwrap_or(0)),
+                crate::net::target::chip_name(crate::net::target::SELF.chip)
+            );
+        }
         (Some(leaf_id), Some(ann)) => {
             *leaf_ota = Some((leaf_id, ann));
             log::info!("smol #40: ARMED relay for leaf id{} (staged build {})", leaf_id, ann.build);
@@ -4937,7 +4986,44 @@ async fn mqtt_session(
     // (stat_cache = Some). Idempotent retained publishes, bounded to the heard-leaf set.
     #[cfg(feature = "espnow")]
     if let Some(sc) = stat_cache {
+        // #465 half-1, invariant: A PROXY MUST NEVER OVERWRITE A PRINCIPAL'S OWN CLAIM.
+        //
+        // This block publishes each relayed leaf's `ota/state` ON ITS BEHALF, with
+        // `latest_version` taken from THIS CROWN's staged announce. The premise, stated in the
+        // comment above, is *"a credential-less leaf never opens MQTT, so the gateway is its
+        // proxy"*. That premise is FALSE now — the S3/C5/C6 flavors have their own sessions and
+        // publish the same retained topic. Both writers work as designed and the crown simply
+        // writes last, every flush, forever. Measured on the #398 roll: `smol/162/ota/state`
+        // `latest_version` went 1405 -> 922 AND STUCK. Not staleness — a clobber.
+        //
+        // The clean discriminator is a self-publishes bit in HELLO (filed as #510 rider 4), because
+        // the crown has NO per-leaf chip or capability knowledge: `stat_cache` yields only
+        // `(id, key, relayed-STAT)`, and STAT carries a build and a screen, never a chip. So the
+        // ruled interim "skip leaves whose chip != canonical" is not computable here yet, and a
+        // gate that cannot fire is worse than none — it reads as fixed.
+        //
+        // What IS computable is when this crown has no business making the claim AT ALL. A
+        // target-less (legacy `OTA|`) announce means "this staging did not say" — see
+        // `ota::Announce::target`. Asserting an unjudgeable build as a SPECIFIC leaf's
+        // `latest_version` is claiming knowledge that does not exist, and it is exactly what
+        // produced the 922 clobber. So: no target, no claim; the leaf's own retained value stands.
+        //
+        // Scope is narrow by construction — every post-#349 staging is an `OTA2|` line, so this
+        // fires only for a pre-#349 crown, which is precisely the v922 case that was measured. It
+        // does not change what a modern crown publishes for its credential-less same-chip leaves.
         let latest_staged = staged_raw.as_ref().map(|a| a.build);
+        // TRUE only when this crown holds an announce it may legitimately assert OF A LEAF.
+        let may_claim_for_leaves = match staged_raw.as_ref() {
+            None => false,
+            Some(a) if a.target.is_none() => {
+                log::warn!(
+                    "smol #465: NOT proxy-publishing ota/state for relayed leaves — staged build {} states no target, so it cannot be asserted of any particular leaf (legacy OTA| line)",
+                    a.build
+                );
+                false
+            }
+            Some(_) => true,
+        };
         for i in 0..sc.count() {
             // #56: the status cache is single-channel per leaf; its key column is inert here.
             let (lid, _key, val) = match sc.entry(i) {
@@ -4966,6 +5052,17 @@ async fn mqtt_session(
             }
             // State (retained) ONLY if the leaf reported a build (STAT `|<build>` field) —
             // don't clobber a self-published value with "unknown" for a leaf on old firmware.
+            // #465: `may_claim_for_leaves` gates the WHOLE publish, not just the value. Gating
+            // only the value would leave `latest_staged.unwrap_or(installed)` writing the topic
+            // anyway with "installed == latest" — a different wrong number, still overwriting a
+            // self-publishing leaf's own claim, and one that additionally HIDES an available
+            // update by rendering as up-to-date. Not writing is the only option that honours
+            // "a proxy must never overwrite a principal's own claim"; the leaf's retained value
+            // stands, which for a self-publishing flavor is the correct one and for a
+            // credential-less leaf is the crown's own last good publish.
+            if !may_claim_for_leaves {
+                continue;
+            }
             if let Some(installed) = crate::ota_mesh::stat_build(val) {
                 let latest = latest_staged.unwrap_or(installed);
                 let mut sjson = MqttScratch::new();
