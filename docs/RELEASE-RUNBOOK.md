@@ -80,12 +80,14 @@ tools/ota_publish.sh legacy-line esp32c3      # (preflight, unrelated — see §
 ```
 
 **Derive the name from the number the ratchet chose** — `version_name_for()` in
-`rust/clock/src/net/names.rs:256`. (Worked below for the current run; the current release's number and
-word are in the **run records** at the bottom, not here, so this section stays true across cuts.)
+`rust/clock/src/net/names.rs:256`. The current release's number and word live in the **run records**
+at the bottom, never here — so the worked example below uses a **control**, an already-shipped build
+whose name is a historical fact. An example that used the current run would be a third place for the
+version to go stale, and it would have gone stale twice already this week:
 
 ```
 noun = FORGE.nouns[n % 20]          adj = FORGE.adjectives[(n / 20) % 20]
-1446 -> nouns[6]="Gear",  adjectives[(1446/20)%20 = 12]="Molten"
+345 -> nouns[5]="Furnace",  adjectives[(345/20)%20 = 17]="Riveted"     # v345 Riveted Furnace, shipped
 ```
 
 Verified against every naming control the docs already carry — `341 → Bellows`, `342 → Crucible`,
@@ -98,11 +100,10 @@ Verified against every naming control the docs already carry — `341 → Bellow
 > self-consistent and wrong. **A self-checking pair checks the RELATION, not the INPUTS.**
 > Verify the number against `choose_build`'s output *first*, then derive the word from it.
 
-⚠️ **Always write the number and the word together** (`vN <Word>` — e.g. the current run record's
-pair) — per `DOC-UPKEEP.md`, that
-pair self-checks, and it is how "build 905 Riveted Furnace" was caught. Never put a bare live build
-number in prose. **But see the guard above: the pair self-checking is not the same as the number being
-right.**
+⚠️ **Always write the number and the word together** (`<number> <Word>`; the current pair is in the run
+record). Per `DOC-UPKEEP.md` that pair self-checks, and it is how "build 905 Riveted Furnace" was
+caught. Never put a bare live build number in prose. **But see the guard above: the pair self-checking
+is not the same as the number being right.**
 
 ---
 
@@ -284,16 +285,36 @@ the artifact that is actually version-specific.
 A record is worth keeping while it still answers *"what did we learn cutting that one?"* — not merely
 because it happened.
 
-## v1446 — `Molten Gear` (in canary)
+## 1447 — `Molten Hammer` (in canary)
 
 | | |
 |---|---|
-| number | **1446** — from `choose_build(count, staged, override)`, **not** chosen |
-| word | **Molten** — `(1446/20) % 20 = 12`; noun **Gear** — `1446 % 20 = 6` |
+| number | **1447** — from `choose_build(count, staged, override)`, **not** chosen. Read from the STAGE at cut time, not from any document. |
+| word | **Molten** — `(1447/20) % 20 = 12`; noun **Hammer** — `1447 % 20 = 7` |
 | controls reproduced | 341 Bellows · 342 Crucible · 345 Riveted Furnace · 905 Flux Furnace |
 | first cut using this runbook | yes — §0–§6 were unexercised before this |
+| names this cut wore before staging | `v346 Riveted Gear` → `1446 Molten Gear` → **1447 Molten Hammer** |
 
-**What this run caught, and why §1 now reads the way it does.** The first draft of §1 said *"bump
+**The number moved three times, and the third move is the one that proves the rule.** 346 → 1446 was
+the error below: a number treated as an input when it is an output. But 1446 → **1447** was not an
+error at all, and nothing was done wrong to cause it. The ratchet's floor is
+`git rev-list --count`, so it counts commits — and **merging the document that named the release
+added a commit, which incremented the release it named.** #522 landed at count 1446 and left the
+count at 1447. The version is the output of a function whose inputs include this very file.
+
+The consequence is not "be careful", because care cannot help here — the increment happens *at merge*,
+after the last moment anyone could edit the text. The consequence is structural, and it is why the
+number is quarantined in a run record rather than stated in the document's identity:
+
+> **A release number written in a document that has not merged yet is stale by construction.**
+> The document is an input to the number. Read the number FROM THE STAGE at cut time (§1), record it
+> here AFTER staging, and never let it into a filename, a heading, or a step.
+
+Had the version stayed in the filename, this cut would have needed a *second* rename — and the rename
+commit would have advanced the count again, to 1448. There is no fixed point. That is the whole
+argument for the standing-document form, delivered by the machine rather than by me.
+
+**What this run also caught, and why §1 now reads the way it does.** The first draft of §1 said *"bump
 `version.txt` 345 → 346, and v346 is Riveted Gear."* Executing step 1 exposed it: `build.rs:72` reads
 `env_or_file("SMOL_BUILD_NUMBER", "version.txt")` — **env wins** — and the release path supplies that
 env from `choose_build`. So `version.txt` is the fallback for *non-stage* builds, and the ratchet would

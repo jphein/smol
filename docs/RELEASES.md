@@ -11,7 +11,7 @@ this page exists to prevent.
 | byte-reproducible? | **no** | **yes** — that is the point |
 | credentials | **placeholder** (see below) | placeholder |
 | what it is for | USB-flashing a **new or bench** board | the same, plus being the thing OTA serves |
-| first one | `nightly-2026-08-24` | **v1446 `Molten Gear`** — in canary |
+| first one | `nightly-2026-08-24` | **`1447 Molten Hammer`** — in canary |
 
 > ## The one rule
 >
@@ -77,7 +77,7 @@ was checked there rather than assumed.
 
 ---
 
-## The versioned release ceremony (`v1446 Molten Gear` is the first)
+## The versioned release ceremony (`1447 Molten Hammer` is the first)
 
 The thing that makes a versioned release different is **`tools/repro_build`** and the property it
 buys: **a fixed `(commit, node-id)` builds to the same bytes on any machine, so the sha256 IS the
