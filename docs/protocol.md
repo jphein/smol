@@ -726,7 +726,7 @@ DIAG|slot=<bootslot>|rst=<reset-reason>|boot=<bootcount>|ota=<outcome[:build]>|u
     |fwd=<uplink-fwds>|dedup=<dup-drops>|ttl=<ttl-drops>|hop=<1|2>|dlseq=<last-adopted>|dfwd=<downlink-refloods>
     [|cfg=<applied-config>][|io=<pin>:<count>,…][|deaf=<n>|ddrops=<n>]
     [|ap=<ch>:<rssi>:<bssid>]|cc=<0|1>|degraded=<0|1>|cdeaf=<streak>:<reassocs>:<shed>
-    |etx=<worst-peer-cost>|apch=<ch>[|blrev=<token>][|brst=<gap>:<ms>:<kind>][|sog=<octal>]
+    |etx=<worst-peer-cost>|apch=<ch>[|blrev=<token>][|brst=<gap>:<ms>:<kind>][|bv=<mV>][|sog=<octal>]
     [|shed=<n>][|cut=<bytes>]
 ```
 
@@ -747,6 +747,7 @@ changes, and see the truncation warning.
 | `blrev=<token>` | conditional | the bootloader **auto-revert probe** — present when `ota::bl_revert_token()` has an answer. This is what settles the long-standing *"is revert-on-boot-fail enabled?"* question (see [ROADMAP §3a](ROADMAP.md)) |
 | `etx=<cost>` | **always** (positional) | #164 — worst per-peer link cost. It was **absent from this block entirely** until 2026-07-28 despite being on the wire |
 | `brst=<gap>:<ms>:<kind>` | conditional | 🔴 **THREE parts, not one.** #153's worst app-service gap **in ms**, the **burst duration** that produced it, and a **one-byte kind tag**: `f` flush · `n` ntp · `r` re-election · a SelfOta kind (`6f952d7`). `0` = nothing measured yet. A **`+`** suffix means a `u16` **saturated** at 65.5 s — `brst=65535:65535:o+` honestly reads *"at least 65.5 s"*, not *"exactly"*. It is a **max-since-report**, not a sample (DIAG cadence is 60 s, a burst is seconds, so an instantaneous read would miss the event JP feels), and it resets at publish |
+| `bv=<mV>` | conditional, **sheddable** (offered first = shed last) | #479 — the board's **own cell voltage** in mV off the divider ADC (`sensors.rs`), the first instance of the #511 primary-purpose measurement. Emitted only where the divider is a **board fact** (S3/ES3C28P onboard 200K/200K today); absent on a C3 whose GPIO4 floats, and absent until the first telemetry-cadence sample. ⚠️ On USB a cell-less S3 reads the **TP4054 charger float** (~3.9–4.0 V) — a hardware limitation (`targets/s3-cyd/PARITY.md`), so `bv=` means "cell voltage" only when the board runs on the cell |
 | `sog=<octal>` | conditional, **sheddable** | `a35c5b0` — why a crown did **not** self-install, as an octal bitfield: **bit 0** `leaf_ota_pending` · **bit 1** `leaf_installs_outstanding` · **bit 2** armed-in-RAM. `sog=4` = armed and waiting on nothing (it will fire); `sog=6` = armed but **held** |
 | `shed=<n>` | conditional | fields dropped from the **sheddable** tail to stay inside budget (`7a4823e`) — with a `log::warn!`. Absent = nothing shed |
 | `cut=<bytes>` | conditional | bytes lost to truncation — see below |

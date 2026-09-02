@@ -832,6 +832,14 @@ struct DiagCounters {
     /// Lowest free-heap reading observed since boot (leak/pressure watermark). `u32::MAX` until
     /// the first sample so `min()` latches the true low-water on the first `diag_sample_heap`.
     heap_min: u32,
+    /// #479: the board's OWN cell voltage in mV (sensors.rs divider ADC), pushed by `main` on
+    /// the telemetry cadence via `set_batt_mv`. 0 = no sample yet — the `bv=` append gates on
+    /// it, so a DIAG composed before the first telemetry tick simply omits the field rather
+    /// than publishing a zero. cfg'd to the chips whose divider is a BOARD fact (the S3's
+    /// onboard 200K/200K): a C3's GPIO4 floats without a hand-wired divider, and a floating
+    /// pin must not become an HA voltage entity.
+    #[cfg(feature = "esp32s3")]
+    batt_mv: u16,
     /// #367: scans DEFERRED because free heap was below `budget::SCAN_HEAP_FLOOR_BYTES`
     /// (monotonic, saturating). Non-zero means the unbounded `scan_async` collect is genuinely
     /// pressing on this board's heap — the signal that the latent bug became live here.
@@ -899,6 +907,8 @@ impl DiagCounters {
     const fn new() -> Self {
         Self {
             heap_min: u32::MAX,
+            #[cfg(feature = "esp32s3")]
+            batt_mv: 0,
             scan_skip: 0,
             btn: 0,
             btnl: 0,
@@ -4340,6 +4350,15 @@ impl RadioManager {
         self.diag_io_len = n;
     }
 
+    /// #479: latest cell-voltage sample (mV) from the board's divider ADC — `main` pushes it on
+    /// the telemetry cadence; `diag_record` appends it as `bv=` (sheddable tail, offered first =
+    /// shed last: it is the #511 primary-purpose measurement). See the field's doc for why only
+    /// divider-is-a-board-fact chips emit it.
+    #[cfg(feature = "esp32s3")]
+    pub fn set_batt_mv(&mut self, mv: u16) {
+        self.diag.batt_mv = mv;
+    }
+
     /// #70/#49: build this node's compact DIAG record for retained `smol/<id>/diag`. Format matches
     /// luna's DEPLOYED HA parser (PR #81): literal `DIAG` first field, then `key=value` pairs
     /// PIPE-separated, order-independent, forward-compatible (HA picks by key, unknown keys ignored,
@@ -4582,7 +4601,7 @@ impl RadioManager {
         // unless it equals this list exactly. Change the appends and you must change this line —
         // which is the point: the prose above rotted precisely because nothing could test it.
         //
-        // SHED-ORDER: sog, cfgq, cdeaf, cc, ap, cfg, io, deaf, elect, lg_core, lg
+        // SHED-ORDER: bv, sog, cfgq, cdeaf, cc, ap, cfg, io, deaf, elect, lg_core, lg
         let mut shed = 0u8;
         {
             let mut room_for = |rec: &mut alloc::string::String, field: alloc::string::String| {
@@ -4592,6 +4611,16 @@ impl RadioManager {
                     shed = shed.saturating_add(1);
                 }
             };
+            // #479: the board's own cell voltage (mV). FIRST offered = LAST shed, deliberately:
+            // battery-voltage monitoring is the product's primary job (#511), so on a full record
+            // it outlives everything else in this tail. Sheddable rather than protected because
+            // it must not spend the positional core's machine-checked slack on a field only one
+            // chip emits today (#498's configurable-divider boards join here later). Gated on a
+            // real sample so a pre-telemetry DIAG omits the key instead of publishing 0 mV.
+            #[cfg(feature = "esp32s3")]
+            if self.diag.batt_mv != 0 {
+                room_for(&mut rec, alloc::format!("|bv={}", self.diag.batt_mv));
+            }
             // #33 WHY a crown did not self-install, as one hex digit: bit 0 = `leaf_ota_pending`,
             // bit 1 = `leaf_installs_outstanding`, bit 2 = an install already ARMED in RAM,
             // bit 3 = #381 the armed leaf install has LOST its veto (pre-relay stall). `1` bits in
