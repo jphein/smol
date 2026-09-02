@@ -30,6 +30,140 @@ mipidsi = "=0.10.0"
 embedded-graphics = "0.8.1"
 static_cell = "2"
 
+esp-alloc = { version = "0.10.0", optional = true }
+
+# --- Display (M1) ---------------------------------------------------------
+# PINNED EXACTLY, not caret. The landscape MADCTL byte this board needs (0x28) is
+# derived from mipidsi's `pub(crate)` MemoryMapping::from_orientation. A 0.10.x
+# PATCH that changed that mapping would silently invalidate the derivation in
+# src/main.rs while everything still compiled. Bump deliberately, then re-verify
+# on glass. (burrito-fw #64 pins it for exactly this reason.)
+
+# --- Radio (M3 probe, feature-gated: `--features radio`) ------------------
+# ⚠️ THIS FEATURE EXISTS TO ANSWER A STATED UNKNOWN, NOT TO SHIP A CAPABILITY.
+#
+# THE UNKNOWN: does `wifi` + `esp-now` COMPILE TOGETHER on esp32s3 in esp-radio
+# 0.18? smol proves that pair on esp32c3 (its `espnow` feature = `["wifi",
+# "esp-radio/esp-now"]`) and burrito-fw proves `wifi` alone on esp32s3 — but
+# nothing in either tree proves the INTERSECTION. Until `cargo check --release
+# --features radio` is green, treat S3 ESP-NOW as unproven, not as inherited.
+#
+# NOT AN ISSUE HERE (stated so nobody re-derives it): the `ieee802154` panic
+# hazard does not apply to this target. The S3 has NO 802.15.4 radio at all —
+# that is C5/C6 silicon — so esp-radio's ieee802154 feature is not selectable and
+# cannot be pulled in transitively. The S3's radio hazard is a different one:
+# WiFi and BLE contend, which is what `coex` arbitrates.
+#
+# We deliberately do NOT enable `coex`. esp-radio's build script HARD-ERRORS if
+# `coex` is set without `ble`, and smol's WiFi<->ESP-NOW coexistence is SAME-radio
+# channel management (both live in the WiFi domain), not cross-radio arbitration.
+# So: esp-now only. (smol #233's note, and it transfers verbatim.)
+#
+# `default-features = false` drops esp-radio's default esp-alloc so we re-add it
+# explicitly — matching smol main rather than diverging by accident.
+#
+# NOTE: `esp-now` is NOT in this list. It is switched on by our own `radio`
+# feature via `esp-radio/esp-now`, so the M2 (`wifi`) tier does not drag the
+# ESP-NOW code in. That mirrors smol main, whose `espnow` feature is
+# `["wifi", "esp-radio/esp-now", ...]` — and it is not merely tidiness: esp-radio
+# defines `esp-now = ["wifi", ...]`, so ESP-NOW *cannot* exist without WiFi and
+# the stacking is the honest shape.
+esp-radio = { version = "0.18.0", optional = true, default-features = false, features = [
+    "esp32s3",
+    "wifi",
+    "esp-alloc",
+    "unstable",
+] }
+
+# --- M2 network stack (feature `wifi`) ------------------------------------
+# esp-radio 0.18 DROPPED the `smoltcp` feature esp-wifi 0.15 shipped: the STA
+# `Interface` now implements only `embassy_net_driver::Driver`. This spike is a
+# blocking superloop with no executor, so it drives a RAW smoltcp
+# `Interface`/`SocketSet` over the re-exposed rx/tx tokens — exactly what smol
+# main does, via the same `radio_dev.rs` shim. (burrito-fw takes the other road:
+# embassy-net + an embassy executor. We follow smol, because the phase-2 image is
+# a smol node.)
+smoltcp = { version = "0.13", optional = true, default-features = false, features = [
+    "proto-ipv4",
+    "socket-dhcpv4",
+    "socket-tcp",     # M4's MQTT session
+    "medium-ethernet",
+] }
+
+# #233: esp-radio 0.18 made connect/disconnect/scan ASYNC-ONLY — the blocking
+# variants are gone. This spike has no executor, so association is driven to
+# completion with embassy-futures' busy-loop `block_on` (the esp-rtos scheduler
+# preempts that loop to run the radio task that posts the completion event).
+# See the long note on `associate()` in src/net.rs for why THIS future is driven
+# unbounded while the ESP-NOW send is not — they are not the same hazard.
+embassy-futures = { version = "0.1", optional = true }
+
+# The preemption scheduler backing esp-radio's `esp_radio_preempt_*` os-adapter
+# hooks. In the pre-0.18 stack this lived inside esp-wifi as `builtin-scheduler`;
+# #233 moved it OUT to esp-rtos, which is why esp-radio cannot be used without it.
+#
+# We enable its `esp-radio` + `esp-alloc` drivers but NOT `embassy`: this spike is
+# a BLOCKING SUPERLOOP like smol main, not an embassy application like burrito-fw.
+# `esp_rtos::start()` turns main() into the scheduler's pinned main task, so the
+# straight-line code below runs as-is. (This is the one place the spike follows
+# smol rather than burrito-fw, and it is deliberate — the phase-2 image is a smol
+# node, and matching smol's execution model now avoids porting it twice.)
+esp-rtos = { version = "0.3.0", optional = true, features = [
+    "esp32s3",
+    "esp-radio",
+    "esp-alloc",
+] }
+
+[features]
+# ---------------------------------------------------------------------------
+# THE TIER LADDER. Each milestone is a superset of the one below it.
+#
+#   default  (M1)  bare metal: PSRAM, SPI2, panel, button, heartbeat. No radio,
+#                  no allocator, no network stack in the dependency graph at all.
+#   wifi     (M2)  + esp-radio/esp-rtos/esp-alloc, STA associate, smoltcp DHCP.
+#   radio    (M3)  + esp-radio's `esp-now`, the SMOLv1 hello/ack probe.
+#
+# **`radio` STACKS ON `wifi` rather than being orthogonal**, and that is forced
+# by upstream, not a style choice: esp-radio defines `esp-now = ["wifi", ...]`,
+# so ESP-NOW cannot be enabled without WiFi. Modelling them as orthogonal would
+# be a lie the feature graph would quietly correct — and ESP-NOW *is* WiFi on
+# this silicon (same radio, same channel), which is the fact the whole
+# coexistence story rests on. Stacking says that out loud.
+#
+# Practical consequence: `--features radio` builds M2 as well, so the board
+# associates AND broadcasts. To broadcast without associating you would need an
+# espnow-only mode knob (cyd-c5 has one, `SPIKE_ESPNOW_ONLY`, for when the fleet
+# mesh is not co-channel with the AP). NOT implemented here — this spike's M3
+# runs co-channel or not at all, and pretending otherwise would hide the
+# single-radio channel constraint that phase 2 has to face anyway.
+# ---------------------------------------------------------------------------
+default = []
+
+# The four-corner touch probe. **Stacks on nothing** — pure I2C + GPIO, no radio,
+# no allocator, no network stack. Independent of `wifi`/`radio` on purpose: the
+# transform it settles is a display fact, and making the operator bring up a radio
+# to tap a screen would be a reason not to bother.
+touch = []
+
+# M2 — the radio + network tier.
+wifi = [
+    "dep:esp-radio",
+    "dep:esp-rtos",
+    "dep:esp-alloc",
+    "dep:smoltcp",
+    "dep:embassy-futures",
+]
+
+# M3 — the ESP-NOW probe, on top of M2.
+#
+# ⛔ GUARD-RAIL (smol #388): esp-radio's build.rs PANICS on `wifi` + `ieee802154`
+# together. That hazard cannot fire on this target — the ESP32-S3 has no 802.15.4
+# radio, so the feature is not selectable for `esp32s3` — but the rule is written
+# here anyway because this file is what a C5/C6 reader will copy. Any 802.15.4
+# experiment must be a separate, MUTUALLY EXCLUSIVE feature; never added to this
+# list.
+radio = ["wifi", "esp-radio/esp-now"]
+
 [profile.release]
 opt-level = "s"
 lto = "fat"
