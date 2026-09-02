@@ -1,0 +1,30 @@
+[package]
+name = "spike-scry"
+version = "0.1.0"
+edition = "2021"
+description = "Bring-up spike for the realm scry station (ES3C28P + RC522 on P3) — smol node id 163, smol#540"
+
+# INTENTIONALLY ITS OWN CARGO WORKSPACE ROOT — same reason as ../spike:
+# esp-hal takes exactly one chip feature and cargo unifies features across
+# workspace members. Do not add this crate to smol's root workspace.
+[workspace]
+
+[dependencies]
+# The version set MOVES TOGETHER and matches ../spike (which matches burrito-fw,
+# the only build proven to drive this board). See ../spike/Cargo.toml for the
+# full rationale; the lock resolving 1.1.1 -> 1.1.2 is deliberate there too.
+esp-hal = { version = "1.1.1", features = ["esp32s3", "unstable"] }
+esp-backtrace = { version = "0.19", features = ["esp32s3", "panic-handler", "println"] }
+esp-println = { version = "0.17", default-features = false, features = ["esp32s3", "jtag-serial"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
+
+# RC522 driver: no_std, embedded-hal 1.0. SpiDevice comes from embedded-hal-bus
+# ExclusiveDevice over esp-hal's SpiBus + the CS pin (GPIO3).
+mfrc522 = "0.8"
+embedded-hal = "1.0"
+embedded-hal-bus = "0.3"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1

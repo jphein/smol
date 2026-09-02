@@ -87,7 +87,9 @@ Every SMOLv1 frame stays well under 250 B — *including* its group-MAC trailer,
   `160–175` = the S3 board class (ES3C28P family — ids are per-NODE, never per-product;
   the product lives in the BoardProfile model string): `160` = Ember satellite 1 (#331,
   ember.realm.watch) · `161` = the emberburrito hearth terminal · `162` = the s3-cyd dev
-  board (targets/s3-cyd, the blank ES3C28P JP supplied 2026-08-24) · `163+` free ·
+  board (targets/s3-cyd, the blank ES3C28P JP supplied 2026-08-24) · `163` = the realm
+  scry station (ES3C28P `14:C1:9F:D1:CC:64` + RC522 reader on P3, smol#540, adopted
+  2026-09-01) · `164+` free ·
   `176–191` = C5 CYD (#388, the
   NM-CYD-C5 → `176`; it first spoke on the mesh under that id on 2026-08-24) ·
   `192–223` = reserved for MAC-derived C6-watch ids (today's `122`/`236` stay put

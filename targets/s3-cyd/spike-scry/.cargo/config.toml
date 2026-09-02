@@ -1,0 +1,13 @@
+# Mirrors ../spike/.cargo/config.toml — see that file for the full rationale on
+# the runner-as-flash-guard and the cargo-espflash caveat. Short form: the
+# runner IS the guard (byte-exact serial 14:C1:9F:D1:CC:64, node 163); never
+# simplify it back to bare espflash.
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+[target.xtensa-esp32s3-none-elf]
+runner = "./flash.sh"
+rustflags = ["-C", "link-arg=-Tlinkall.x", "-C", "force-frame-pointers"]
+
+[unstable]
+build-std = ["core", "alloc"]
