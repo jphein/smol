@@ -181,6 +181,7 @@ fn main() -> ! {
     // is up, so the chronicle streams on the glass exactly like on a phone.
     let mut tick: u32 = 0;
     let mut frame_until: u32 = 0;
+    let mut idle_painted = false;
     let mut host_shown = [0u8; 48];
     let mut host_shown_len = 0usize;
     const FRAME_HOLD_TICKS: u32 = 400; // ~60 s at 150 ms
@@ -200,6 +201,18 @@ fn main() -> ! {
         #[cfg(feature = "wifi")]
         if tick % 40 == 0 {
             println!("[scry-{}] link: {}", NODE_ID, net.state().label());
+        }
+
+        // First link-up: put on the station's face. Until then the local
+        // bootstrap text stands, so a station with no AP is still honest.
+        #[cfg(feature = "wifi")]
+        if !idle_painted {
+            if let Some(Some(ms)) = net.with_stack(|iface, dev, socks, h| {
+                scry::paint_idle(iface, dev, socks, h, &delay, &mut display)
+            }) {
+                println!("[scry-{}] idle face painted in {} ms", NODE_ID, ms);
+                idle_painted = true;
+            }
         }
 
         // live refresh of the page being shown
@@ -283,13 +296,18 @@ fn main() -> ! {
                 if frame_until > 0 && tick >= frame_until {
                     frame_until = 0;
                     host_shown_len = 0;
-                    display.clear(BG).ok();
-                    Text::new("SCRY STATION 163", Point::new(60, 40), title)
-                        .draw(&mut display)
-                        .ok();
-                    Text::new("tap a card...", Point::new(20, 130), body)
-                        .draw(&mut display)
-                        .ok();
+                    if net
+                        .with_stack(|iface, dev, socks, h| {
+                            scry::paint_idle(iface, dev, socks, h, &delay, &mut display)
+                        })
+                        .flatten()
+                        .is_none()
+                    {
+                        display.clear(BG).ok();
+                        Text::new("tap a card...", Point::new(20, 130), body)
+                            .draw(&mut display)
+                            .ok();
+                    }
                 }
                 if empty_polls == 20 && last.is_some() {
                     println!("[scry-{}] field clear — re-armed", NODE_ID);

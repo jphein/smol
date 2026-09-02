@@ -218,6 +218,22 @@ pub fn tap<'a>(
     core::str::from_utf8(&out[..len]).ok()
 }
 
+/// The station's resting face — `GET /screen-idle`, server-rendered (orb,
+/// starfield, and the two lines that tell a stranger what this thing does).
+pub fn paint_idle<D>(
+    iface: &mut SmolIface,
+    device: &mut SmolWifiDevice,
+    sockets: &mut SocketSet<'static>,
+    sock_h: SocketHandle,
+    delay: &Delay,
+    display: &mut D,
+) -> Option<u64>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    paint_path(iface, device, sockets, sock_h, delay, display, b"/screen-idle")
+}
+
 /// `GET /screen/<host>` (or the unbound frame) streamed straight to the panel.
 /// Returns the elapsed milliseconds on success — the number the Slint app wants.
 pub fn paint<D>(
@@ -233,14 +249,39 @@ pub fn paint<D>(
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    let mut path = [0u8; 96];
+    let pn = fmt(
+        &mut path,
+        &[
+            b"/",
+            if unbound { b"screen-unbound/" as &[u8] } else { b"screen/" as &[u8] },
+            path_host.as_bytes(),
+        ],
+    );
+    paint_path(iface, device, sockets, sock_h, delay, display, &path[..pn])
+}
+
+/// The streaming blit itself: any `/screen*` path -> the panel, as 8-row
+/// `fill_contiguous` windows. Never buffers the 153,600 B frame.
+fn paint_path<D>(
+    iface: &mut SmolIface,
+    device: &mut SmolWifiDevice,
+    sockets: &mut SocketSet<'static>,
+    sock_h: SocketHandle,
+    delay: &Delay,
+    display: &mut D,
+    path: &[u8],
+) -> Option<u64>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
     let tok = SCRY_TOKEN?;
     let mut req = [0u8; 256];
     let n = fmt(
         &mut req,
         &[
-            b"GET /",
-            if unbound { b"screen-unbound/" as &[u8] } else { b"screen/" as &[u8] },
-            path_host.as_bytes(),
+            b"GET ",
+            path,
             b"?k=",
             tok.as_bytes(),
             b" HTTP/1.1\r\nHost: scry\r\nConnection: close\r\n\r\n",
