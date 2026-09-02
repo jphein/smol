@@ -24,6 +24,12 @@ mfrc522 = "0.8"
 embedded-hal = "1.0"
 embedded-hal-bus = "0.3"
 
+# Display QoL for the bench: same pinned pair as ../spike (=0.10.0 is
+# load-bearing there). Panel is on SPI2, separate from the RC522's SPI3.
+mipidsi = "=0.10.0"
+embedded-graphics = "0.8.1"
+static_cell = "2"
+
 [profile.release]
 opt-level = "s"
 lto = "fat"
