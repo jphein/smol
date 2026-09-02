@@ -203,6 +203,16 @@ fn main() -> ! {
             println!("[scry-{}] link: {}", NODE_ID, net.state().label());
         }
 
+        // While idle, re-fetch the resting face every ~10 s. It carries a live
+        // clock, and it is how the imbue prompt ("present a blank card") and the
+        // "card imbued" confirmation reach the glass without any push channel.
+        #[cfg(feature = "wifi")]
+        if idle_painted && frame_until == 0 && tick % 67 == 0 {
+            let _ = net.with_stack(|iface, dev, socks, h| {
+                scry::paint_idle(iface, dev, socks, h, &delay, &mut display)
+            });
+        }
+
         // First link-up: put on the station's face. Until then the local
         // bootstrap text stands, so a station with no AP is still honest.
         #[cfg(feature = "wifi")]
@@ -311,6 +321,24 @@ fn main() -> ! {
                 }
                 if empty_polls == 20 && last.is_some() {
                     println!("[scry-{}] field clear — re-armed", NODE_ID);
+                    // The card was lifted: the glass returns to its resting
+                    // face. ~3 s of grace (the re-arm threshold) so a quick tap
+                    // still leaves a readable beat; the summoned session and the
+                    // phone page carry the detail from here.
+                    #[cfg(feature = "wifi")]
+                    if frame_until > 0 {
+                        frame_until = 0;
+                        host_shown_len = 0;
+                        if net
+                            .with_stack(|iface, dev, socks, h| {
+                                scry::paint_idle(iface, dev, socks, h, &delay, &mut display)
+                            })
+                            .flatten()
+                            .is_some()
+                        {
+                            println!("[scry-{}] card lifted — back to the orb", NODE_ID);
+                        }
+                    }
                     uid_area
                         .into_styled(PrimitiveStyle::with_fill(BG))
                         .draw(&mut display)
