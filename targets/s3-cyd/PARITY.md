@@ -52,6 +52,44 @@ ceiling (**#517**), watch SMLT descriptor emission, watch leaf descriptor check
 (necessary — the leaf checks none today). Broker state restored byte-exact; board
 untouched on 1788060000, mesh=5.
 
+**Progress since (2026-09-01, T merged #519):**
+- **#479-fleet MERGED** (5c1b468, PR #541): the S3's own cell voltage reaches HA as
+  the `bv=` DIAG field (sheddable-first = shed-last, the #511 primary-purpose
+  measurement) + a discovered `batt_mv` voltage sensor. On-wire witness (fleet flash
+  of id162 → `bv=~39xx` in retained `smol/162/diag`, TP4054 float expected) pending the
+  bench board's replug. GUI half was already closed (ee26edb).
+- **#517 MERGED** (2263bbd, PR #542): `MAX_IMAGE_SIZE` is per-chip — an S3 fleet image
+  can use its full 6 MiB slot instead of being refused at the C3's 2 MiB ceiling. One
+  of #518's four cross-chip-serve components retired.
+- **#518 watch-half in PR #96** (esp32c6-watch): #349 SMLT descriptor emit + a
+  finalize-time suitability gate on both watch OTA paths, incl. the flavor namespace
+  (GUI compat=200). Held for the watch lane's task-#8 merge, then rebase. Remaining
+  #518 work: crown foreign-chip subscribe + windowed serve — fleet-lane architecture.
+- **#490 mechanical CFG keys** built (branch `feat/gui-cfg-keys-490` @ c87be90), same
+  task-#8 hold.
+
+**smol #540 — the scry station (NEW capability, GUI flavor):** an MFRC522 NFC reader on
+the P3 jack turns the S3-CYD (node id163) into a tap-a-card terminal — tap → POST /tap →
+scry.realm.watch summons a Claude session + paints the host's live status page on the
+glass. **Firmware WITNESSED 2026-09-01** (PR esp32c6-watch#97), server-side confirmed
+from ubox0's own logs: RC522 0x82 up, WiFi held on admin/VLAN6, `tap 61:1C:6E:66 → POST
+/tap 200 → summon rolled 'holm' + created the workbench + wrote the chronicle`, steady
+~10 s /screen-idle polling all-200s, 0 paint failures; the /imbue rite witnessed in the
+same tap. **GLASS pixels pending JP's eyes** (idle face / tap→status swap / brightness —
+labels has no camera, PARITY forbids asserting unseen). Four station-only bench defects
+found + fixed: stack-floor boot-loop (inline socket buffers → heap), `Hold::Scry` ∉
+`ASSOC_HOLDS`, kiosk tick trapped behind `mesh_enabled`, card-tap keep-awake. Flavor =
+GUI by radio architecture (a 5 s HTTP kiosk wants a held association, the fleet flavor's
+burst-WiFi/ESP-NOW-first design would churn channels). See [[smol-scry-station]].
+
+**Current true state of the goal:** the S3 is a working target on both flavors with an
+active new capability (scry). What stands between here and "full target, all features":
+the glass-visual witness of #540 (JP's eyes), the task-#8 merge unblocking #490/#96, the
+id162 replug for the #479 on-wire witness, the crown windowed-serve redesign (fleet lane,
+#518 a/b), and the two hardware installs JP deferred (#477 speaker, #483 WLED matrix).
+None are firmware gaps this lane can close alone today — each waits on a human decision,
+another lane's merge, or bench hardware.
+
 **Outstanding (updated 2026-08-27 ~13:40):**
 (1) ~~cell unplug~~ **RESOLVED — hardware-does-not-allow.** JP: "there is no cell in the
 s3" — yet the divider read 3.93–3.98 V all day. Mechanism (BOARD.md power section): the
