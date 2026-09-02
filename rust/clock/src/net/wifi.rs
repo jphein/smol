@@ -1430,6 +1430,10 @@ const DIAG_DISCOVERY: &[(&str, &str, &str, &str, &str)] = &[
     ("up",        "uptime",                "uptime_mirror",               "sensor", ",\"unit_of_measurement\":\"s\",\"device_class\":\"duration\",\"state_class\":\"measurement\""),
     ("heap",      "heap_free",             "heap_free_mirror",            "sensor", ",\"unit_of_measurement\":\"B\",\"device_class\":\"data_size\",\"state_class\":\"measurement\""),
     ("hmin",      "heap_min",              "heap_min_mirror",             "sensor", ",\"unit_of_measurement\":\"B\",\"device_class\":\"data_size\",\"state_class\":\"measurement\""),
+    // #479: the board's OWN cell voltage (divider ADC, mV). Emitted only by boards whose divider
+    // is a board fact (S3 today — see mode.rs batt_mv); elsewhere the key is absent and the
+    // sensor reads unknown, the `blrev`/`cdeaf` precedent for conditionally-emitted fields.
+    ("bv",        "batt_mv",               "batt_mv_mirror",              "sensor", ",\"unit_of_measurement\":\"mV\",\"device_class\":\"voltage\",\"state_class\":\"measurement\""),
     // ── mesh link quality ─────────────────────────────────────────────────────────────────────
     ("loss",      "mesh_loss",             "mesh_loss_mirror",            "sensor", ",\"unit_of_measurement\":\"%\",\"state_class\":\"measurement\""),
     ("rtt",       "mesh_rtt",              "mesh_rtt_mirror",             "sensor", ",\"unit_of_measurement\":\"ms\",\"state_class\":\"measurement\""),

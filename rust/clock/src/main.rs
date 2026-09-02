@@ -1852,6 +1852,11 @@ async fn run(boot_spawner: BootSpawner) -> ! {
             // one path is ever live on a given board.
             if r.relay_emit_due(now) {
                 let reading = sensors.read();
+                // #479: hand the cell voltage to the radio manager for the DIAG `bv=` field —
+                // same cadence as the telemetry line that already carries it as text. mV as u16;
+                // divider-is-a-board-fact chips only (see mode.rs's batt_mv doc).
+                #[cfg(feature = "esp32s3")]
+                r.set_batt_mv((reading.batt_v * 1000.0) as u16);
                 let tele = alloc::format!(
                     "{} {}",
                     // #43: telemetry/uplink keeps the CANONICAL °F wire format regardless of the
@@ -1879,6 +1884,10 @@ async fn run(boot_spawner: BootSpawner) -> ! {
                     // receives the retained batt/grid downlinks into the caches.
                     // Compute our own telemetry here (sensor line + current label).
                     let reading = sensors.read();
+                    // #479: same hand-off as the leaf site above — the gateway's own DIAG
+                    // publishes through the flush, so refresh bv= right before it.
+                    #[cfg(feature = "esp32s3")]
+                    r.set_batt_mv((reading.batt_v * 1000.0) as u16);
                     let own = alloc::format!(
                         "{} {}",
                         // #43: uplink keeps the canonical °F wire format (see the relay_emit
