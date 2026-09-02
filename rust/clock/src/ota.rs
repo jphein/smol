@@ -107,9 +107,26 @@ fn host_allowed(host: &str) -> bool {
     matches!(cfg.and_then(|c| c.ota_host), Some(ovr) if parse_ipv4(host) == Some(ovr))
 }
 
-/// Max image = one app slot (`ota_0`/`ota_1` size from `partitions-ota.csv`). An
-/// announce larger than this is refused before any flash op; also cross-checked vs
-/// the HTTP `Content-Length`.
+/// Max image = one app slot (`ota_0`/`ota_1`), and it is a **per-chip** fact,
+/// not a fleet constant (#517). The C3's `partitions-ota.csv` slot is
+/// `0x1F_0000` (1,984 KiB); the S3's `partitions-ota-s3.csv` slot is
+/// `0x60_0000` (6,144 KiB). One shared `0x1F_0000` capped every S3 fleet image
+/// at the C3's ceiling despite the S3 having 3× the slot — refused at the
+/// announce gate before flash geometry was ever consulted (found staging the
+/// #495 canary; the same chip-scoped-as-scalar shape as the #349 descriptor).
+///
+/// cfg'd on the chip because the gate runs at announce time (no partition read
+/// yet) and the chip implies the board class in the fleet today — the same
+/// grain as `sensors::BattGpio` and the S3 panel arm. When a second board on a
+/// chip has a different table, this becomes a runtime read of the OWN slot at
+/// boot; until then a per-chip const is honest and the announce gate stays
+/// allocation-free.
+///
+/// An announce larger than this is refused before any flash op; also
+/// cross-checked vs the HTTP `Content-Length`.
+#[cfg(feature = "esp32s3")]
+pub const MAX_IMAGE_SIZE: u32 = 0x60_0000;
+#[cfg(not(feature = "esp32s3"))]
 pub const MAX_IMAGE_SIZE: u32 = 0x1F_0000;
 
 /// Streaming chunk cap. The ESP32-C3 has ~400 KB SRAM vs a ~600 KB image, so the
