@@ -176,6 +176,21 @@ direction — the window *count* dominates, not the pixel count — and it match
 > recommendation. It is **not scheduled**: it needs JP's board, and that is his call to give, not
 > this lane's to take.
 
+**Update 2026-09-22 — one input stopped being an assumption.** Luna established that the renderer
+is **band-invariant**, byte-identical against a one-pass render at 2, 4, 7, 8, 9, 12, 16 and 24
+bands (7 and 9 deliberately do not divide 240, so the last strip is short). So band height is a
+**pure memory decision** and the renderer places no constraint on it — which removes one side of
+the tension the bench was designed to resolve, and leaves the memory table above as the whole of
+the question. The figures now derive from arithmetic in tapstone's `band.rs`, with "a full frame
+does not fit" as a compile-time assertion.
+
+⚠️ The invariant that makes this true is narrow: **every entry point positions from panel
+coordinates and never asks the target where it is** — no `bounding_box()`, `size()` or
+`dimensions()` in the drawing code. One of those would make each band draw its own copy of whatever
+was positioned from it, and **each band would still look plausible in isolation**. Whoever builds
+the seam must keep the byte-equality check running rather than relying on review, because a
+firmware author adding a helper has no reason to suspect the constraint exists.
+
 ## 4. The work item neither seam avoids: porting Luna's renderer
 
 `tapstone/rust/shrine-preview` is a **working** `embedded-graphics` renderer at 0027's exact

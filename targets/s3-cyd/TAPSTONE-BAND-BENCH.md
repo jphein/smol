@@ -37,6 +37,34 @@ its buffer fit in internal SRAM?** If the answer is "4 bands or fewer", 38 KB of
 scratch is a real cost and PSRAM deserves another look. If it is "16 bands is fine", bands win
 outright and the PSRAM discussion is closed.
 
+### Update 2026-09-22: the RENDERER half of that tension is gone
+
+Luna established that the renderer is **band-invariant**, and proved it rather than built it —
+byte-identical against a one-pass render at **2, 4, 7, 8, 9, 12, 16 and 24 bands**, across every
+screen, layout, battlefield state and flourish frame. Seven and nine are the load-bearing ones:
+they do not divide 240, so the last strip is short. A renderer that only worked for divisors would
+have silently limited band choice to factors of 240, and nothing would have revealed it until a
+memory budget pointed at seven.
+
+**So band height is now a pure memory decision**, and the table above is the whole of it. The two
+figures also reproduce from arithmetic in `band.rs` rather than being quoted between repositories,
+with "a full frame does not fit" as a compile-time assertion — so revising the free-DRAM figure
+upward past a frame stops the build instead of quietly passing. Same shape as the `Game` ceiling
+in #543.
+
+### ⚠️ And an invariant the firmware seam must not break
+
+The reason band-invariance holds is narrow and one careless edit from being lost: **every entry
+point positions from panel coordinates and never asks the target where it is.** There is no
+`bounding_box()`, `size()` or `dimensions()` anywhere in the drawing code. A single one of those
+would make each band draw its own copy of whatever was positioned from it — and **each band would
+still look plausible in isolation**, so the bug would survive review and look like a rendering
+quirk rather than a coordinate-space error.
+
+That is why byte equality against a one-pass render is the right check and reading the diff is not.
+Whoever implements the seam must keep that check running, because a firmware author adding an
+innocuous helper has no reason to suspect the constraint exists.
+
 ## 2. The reframing that probably makes this easy, and should be checked first
 
 **0010's ~15 fps applies to the animated band, not to a full repaint.** A full battlefield redraw
@@ -59,23 +87,58 @@ and the most likely to end the discussion.
 Five numbers, plus a control that comes before all of them.
 
 ### M0 — the control, and it runs first
-Before any figure is trusted: `Delay::delay_millis(50)` timed with the same
-`esp_hal::time::Instant` path the other measurements use, and an empty-loop timing to get the
-instrument's own overhead.
 
-**Why this is not ceremony:** the timer is the instrument for every number below, and a plausible
-wrong number here is unfalsifiable. This lane has already had two instruments lie inside one day —
-an `nm` that reported zero symbols for *everything* because a shell had not sourced
-`export-esp.sh`, and a probe that measured ~2 KB because the optimiser had const-folded the call it
-was measuring away. Both were caught by a control and neither would have been caught by inspection.
-If M0 does not read ≈50 ms, stop; nothing after it means anything.
+**The first version of this section was a blind control, and it is worth leaving the correction
+visible.** It proposed timing `Delay::delay_millis(50)` with the same `esp_hal::time::Instant` path
+the other measurements use, and expecting ≈50 ms. That cannot fail for the reason the timer could
+actually be wrong: the delay and the clock almost certainly derive from the **same source**, so a
+misconfigured timebase scales both by the same factor and the control reads a perfect 50 ms while
+every number below is wrong by that same ratio. It tests whether the timer agrees with *itself*.
 
-### M1 — the wire floor
+That is exactly the failure Luna hit and disclosed on the renderer side — a negative control
+drawing at a fixed absolute point, which the band translation corrects and clips, so it behaved
+identically banded or not, and six passing invariance tests sat behind a control that could not
+fail. **The generalisation worth carrying: a control must fail for the reason the mechanism admits,
+not the reason that first comes to mind.** The mechanism here is not "the timer is broken" — it is
+"the timer is fine and the timebase is wrong", which on this chip is a live possibility, because
+`CpuClock` is configurable and a firmware/timer frequency mismatch is a real mode rather than a
+hypothetical.
+
+So two controls, both of which CAN fail:
+
+**M0a — the physical floor, which needs no external reference.** A full 320×240 `Rgb565` frame is
+`320 × 240 × 2 = 153,600 B = 1,228,800 bits`. The panel SPI is configured at **40 MHz**
+(`spike-scry/src/main.rs:102`, and `BOARD.md`'s pin table agrees), so the wire alone cannot deliver
+a frame in less than **30.7 ms**, before a single command byte of overhead. That floor is computed
+from first principles and is *independent of the chip's own sense of time*. **A measured full-frame
+blit below 30.7 ms is proof the timebase is wrong** — not that the panel is fast.
+
+> **This control already has something to resolve.** The figure this document has been citing for
+> the full-frame wire is **≈27 ms** (Nebula's, from explore-ember), which is **below the 40 MHz
+> floor** and therefore not achievable as stated. One of these must be wrong: the 27 ms, the 40 MHz,
+> or the assumption that it was a full 320×240 frame (the letterboxed 288×160 image is 92,160 B →
+> 18.4 ms, which is not 27 either). At 80 MHz the floor would be 15.4 ms and 27 ms would be
+> unremarkable. **Resolving this is M0a's first job**, and it is a good sign for the control that it
+> found a discrepancy in the numbers this design was built on before being run once.
+
+**M0b — an off-board reference, for the uniform scaling error M0a can only bound.** Print a marker
+line, wait a long interval *by the board's own reckoning* (10 s), print another. The **host**
+timestamps both lines. katana's clock is genuinely independent of the board's, and at 10 s the
+USB-serial latency (~ms) is noise. If the board's 10 s takes 12.5 s of host time, the timebase is
+off by 25% and every figure below is too.
+
+If either control fails, stop. Nothing after it means anything — and note that this lane has now
+had **four** instruments lie: a blind `nm` (unsourced `export-esp.sh`), a probe whose call the
+optimiser had deleted, a lint arm that skipped its own primary subject, and a test suite grepping
+colourised output. Every one was caught by a control; not one by reading.
+
+### M1 — the wire floor, which doubles as M0a
 One `fill_contiguous` of the full 320×240 from a pre-filled buffer (in PSRAM, since it must be 150
 KB — this measurement is about the SPI wire, not about where the pixels came from).
-**Expect ≈27 ms** (Nebula's cited figure, explore-ember). Anything wildly different means the SPI
-clock or the panel setup differs from that measurement's conditions, and every other number needs
-re-reading.
+
+**Expect ≥ 30.7 ms**, the computed floor, not the ≈27 ms this document previously cited — see
+M0a. Below the floor: the timebase is wrong. Far above it (say > 45 ms): command overhead or the
+SPI setup differs from the configured 40 MHz, and every other number needs re-reading before use.
 
 ### M2 — the rasterise overdraw factor
 Draw 0027's real battlefield (Luna's geometry, via whatever subset of her renderer is portable at
@@ -83,6 +146,10 @@ the time) (a) once into a full-frame PSRAM buffer, and (b) clipped into N strips
 {4, 8, 16}. The ratio is the **overdraw factor** — how much re-running the draw calls per band
 costs. `TAPSTONE-SEAM.md` guessed 8× as an upper bound with no evidence; this replaces the guess.
 Expect it to be well below N, since most draw calls are rejected cheaply by the clip rectangle.
+
+Note this is now purely a **cost** measurement. Whether banding is *correct* at a given N is
+settled — Luna's byte-equality proof covers 2 through 24 including non-divisors — so M2 cannot
+change the design, only price it.
 
 ### M3 — window-count sensitivity
 The same full frame of pixels pushed as 1, 4, 8, 16 and 240 windows.
