@@ -158,10 +158,23 @@ blit it, repeat. Nebula's cited figures bound it — 320×240 rasterise ≈ **1.
 at a time" maps onto dirty-rect strip updates almost too neatly — the same trick `s3_oled.rs`
 already uses with its 360-byte buffer and dirty rect.
 
-**Caveat, stated plainly: those are other people's measurements, not mine** (see §7). The band
-count and overdraw factor are arithmetic on cited numbers, not a benchmark. What they establish is
-that the PSRAM dependency is a *choice*, not a consequence — enough to not design around it, not
-enough to promise 25 fps.
+A third line of evidence arrived independently while this was being written: **Luna's costing of
+0027's geometry puts a lane column at ~35% of the frame budget as one contiguous window, against
+~97% if the same pixels are pushed split per row.** That is the same conclusion from a third
+direction — the window *count* dominates, not the pixel count — and it matches `BOARD.md`'s measured
+"per-cell SPI windows are 2× slower than a full-screen repaint".
+
+> **⚠️ PROVISIONAL. Three independent lines of reasoning agree, and not one of them is a bench
+> measurement.** `spike-scry`'s no-buffer design, `BOARD.md`'s house rule and Luna's window costing
+> all point at bands, but the band count and the rasterise overdraw factor are arithmetic on cited
+> numbers. What the three establish is that **the PSRAM dependency is a choice rather than a
+> consequence** — enough to stop designing around it, not enough to promise a frame rate. Build on
+> it, and do not quote 25 fps as a property of the board.
+>
+> The measurement that would settle it is designed in
+> [`TAPSTONE-BAND-BENCH.md`](TAPSTONE-BAND-BENCH.md), including which results would change this
+> recommendation. It is **not scheduled**: it needs JP's board, and that is his call to give, not
+> this lane's to take.
 
 ## 4. The work item neither seam avoids: porting Luna's renderer
 
@@ -194,17 +207,26 @@ So my suggested order, whichever seam wins:
    generalises to a second crate, and the manifest/tag/file-list machinery exists.
 3. Then build the surface.
 
-## 5. What I need decided
+## 5. What needed deciding, and what was decided
 
-1. **Nebula's §5 Q3, finally: does the S3 colour screen belong to smol or to the watch?** My
-   recommendation is smol/`clock`, and §2 is the argument — but it is a JP-level call about two
-   codebases, not mine.
-2. **Capability feature, or chip feature?** I want `has-color-panel` selected by `esp32s3`, per the
-   documented model. It would be smol's first *app* gated on a capability, so it is a small
-   precedent.
-3. **Band rendering, or a PSRAM frame?** I recommend bands and no PSRAM dependency. The honest
-   version is that this deserves one measurement on the bench before it is committed to, and that
-   measurement needs JP's board.
+1. **Nebula's §5 Q3: does the S3 colour screen belong to smol or to the watch?** — **OPEN, with
+   JP.** My recommendation is smol/`clock` and §2 is the argument, but it is a call about two
+   codebases and it is not this lane's. Note that the *rendering* axis may already be settled even
+   though the ownership axis is not: 0010 rejected Slint on measurement, and the watch is the Slint
+   renderer.
+2. **Capability feature or chip feature?** — **DECIDED: capability.** `has-color-panel`, selected by
+   `esp32s3` exactly as `has-psram` already is. This applies smol's own stated rule
+   (*"predicate on a declared capability, never on a chip name"*, `budget.rs`) rather than
+   inventing one; being the first *app* gated that way is an extension of an existing convention,
+   not a new one.
+3. **Band rendering or a PSRAM frame?** — **DECIDED: bands, PROVISIONALLY**, on the three
+   converging lines in §3 and with the caveat there. The settling measurement is designed in
+   [`TAPSTONE-BAND-BENCH.md`](TAPSTONE-BAND-BENCH.md) and is not scheduled.
+
+A correction belonging to §1 rather than here, recorded because the doc it affects is upstream:
+0010's amendment routed the shrine to "the GUI flavor", which §1 shows is not a way to name a
+rendering decision. The requirement it meant is *a locally-rasterising colour surface on this
+panel*; the lead is correcting the amendment to say that.
 
 ## 6. What this survey does not claim
 
