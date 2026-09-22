@@ -517,6 +517,38 @@ if [ "$run_fw" = 1 ]; then
         | sort -u | sed 's/^/        /' | head -12
     fi
   done < <("$ROOT/tools/build_matrix.py" emit --for clippy)
+
+  # #544 — the NON-CANONICAL chips lint too.
+  #
+  # The loop above crosses `clippy -D warnings` with every tier on the CANONICAL chip. Nothing
+  # linted the others, so a warning in code only a non-canonical chip compiles — `s3_oled.rs`,
+  # `board_s3.rs`, an S3 arm of `main.rs` — was in nobody's field of view. Not a hypothetical:
+  # the S3 carried 4 such diagnostics, found by building it by hand for #543 while this arm did
+  # not exist. Measured on a pristine provision, because the first attempt found 3 more that were
+  # purely a local `board.rs` artifact.
+  #
+  # ⚠️ It is also a different CLIPPY, not only a different chip — espup's fork is pinned at
+  # 1.95.0.0 against stable's 1.97.1 — so it can fire lints stable has since relaxed. That is a
+  # real divergence on the toolchain that reported it, not a false positive; `check_chips.sh
+  # --lint`'s header says what to do with one, and there is a worked `#[allow]` at
+  # `familiar/mod.rs`'s `FAM_CALL` arm.
+  #
+  # THREE outcomes, like the #460 lock arm and for the same reason. Exit 3 means nothing was
+  # linted at all (no espup, no riscv targets) and is printed as a LOUD SKIP rather than a pass:
+  # an arm that silently measures nothing would reproduce, one level up, the gap it was added to
+  # close. On CI that is the expected S3 outcome today and the C5/C6 still lint.
+  #
+  # `SMOL_CHIPS_CRATE` points it at whatever the tiers above were built from — the #363 mirror when
+  # that engaged, this tree otherwise. Linting a different input than the tiers did would make the
+  # two arms' verdicts incomparable.
+  step "clippy -D warnings — non-canonical chips (#544)"
+  out=$(SMOL_CHIPS_CRATE="$BUILD_ROOT/$CLOCK" "$ROOT/tools/check_chips.sh" --lint 2>&1); chips_rc=$?
+  case "$chips_rc" in
+    0) printf '%s\n' "$out" | tail -5; ok "chip lints" ;;
+    3) printf '%s\n' "$out" | sed 's/^/        /'
+       printf '   \033[33mnote\033[0m %s\n' "no non-canonical chip could be linted here (toolchains absent) — NOT a pass" ;;
+    *) printf '%s\n' "$out" | sed 's/^/        /'; bad "chip lints" ;;
+  esac
 fi
 
 if [ "$run_excl" = 1 ]; then
@@ -856,6 +888,18 @@ if [ "$run_host" = 1 ]; then
   # than a non-C3 chip's own. Nothing in a passing run could have revealed that. The suite uses a
   # `readelf` stub, so it can put a .stack inside the 2,204 B false-REJECT window no real image
   # occupies. Pure text, no cargo, no ELF.
+  # #544: prove the non-canonical-chip lint arm can FAIL, and can tell its three outcomes apart.
+  # Pure text — cargo and rustup are stubbed — so it costs nothing and needs no toolchain. The
+  # end-to-end proof (a real planted lint, real clippy, the arm going red) is recorded in the
+  # commit; what this suite guards is the decision logic, which is where the defect was: the first
+  # draft reported a missing rustup TARGET as a lint failure instead of an absent instrument.
+  step "non-canonical chip lint arm regression suite (#544)"
+  if out=$("$ROOT/tools/test_lint_chips.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -2; ok "test_lint_chips"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_lint_chips"
+  fi
+
   step "per-chip stack-floor regression suite (#413)"
   if out=$("$ROOT/tools/test_stack_floor.sh" 2>&1); then
     printf '%s\n' "$out" | tail -2; ok "test_stack_floor"

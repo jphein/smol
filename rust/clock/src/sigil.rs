@@ -52,7 +52,10 @@ impl Plugin for SigilState {
 
     fn update(&mut self, ctx: &mut Ctx) {
         // Static content: repaint only on the first entry or a forced redraw (menu switch).
-        if !(ctx.redraw || !self.drawn) {
+        // Written as the positive bail condition rather than the sibling screens'
+        // `!(redraw || cadence)` shape: those have a real cadence term, this one's is just
+        // "already drawn", and the double negative reads worse than it parallels.
+        if !ctx.redraw && self.drawn {
             return;
         }
         self.drawn = true;

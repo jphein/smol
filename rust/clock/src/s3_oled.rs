@@ -237,12 +237,6 @@ impl S3Oled {
     }
 
     #[inline]
-    fn bit(&self, x: u32, y: u32) -> bool {
-        let idx = (y * LOGICAL_W + x) as usize;
-        (self.fb[idx / 8] >> (idx % 8)) & 1 != 0
-    }
-
-    #[inline]
     fn set_bit(&mut self, x: u32, y: u32, on: bool) {
         let idx = (y * LOGICAL_W + x) as usize;
         let (byte, mask) = (idx / 8, 1u8 << (idx % 8));
