@@ -66,6 +66,29 @@ use tapstone_rules::{Applied, Chain, Game, HouseRules, Phase, Record, Refusal, W
 use crate::app::{AppKind, Ctx, Plugin, Transition};
 use crate::input::Press;
 
+/// Issue 10's `Game` <= 350 B budget, asserted **for the target this actually ships to**.
+///
+/// There is already a host test for this (`tapstone-rules`'s `game_fits_its_ram_budget`), and on
+/// its own it is not quite evidence: it measures x86_64's layout, and the claim is about
+/// `xtensa-esp32s3-none-elf`. `Game` contains no pointers and nothing wider than a `u16`, so the
+/// two SHOULD agree — but "should agree" is an inference about the thing being measured, and this
+/// file is compiled by the Xtensa build, so the inference can simply be replaced with a check.
+///
+/// `const _: () = assert!(...)` and not a runtime check or a test: it is evaluated by the compiler
+/// that is targeting the chip, so a layout difference fails the FIRMWARE build with this message
+/// rather than passing a host suite and shipping. Same construction as `budget.rs`'s chip asserts,
+/// and for the same reason.
+///
+/// Measured exactly 350 B on both x86_64 and xtensa-esp32s3 (2026-09-21) — AT the bound, with zero
+/// headroom. One more `u8` field in `Game` or `Seat` breaks this, which is the point of having it.
+const _: () = assert!(
+    core::mem::size_of::<Game>() <= 350,
+    "size_of::<Game>() exceeds issue 10's 350 B budget ON THIS TARGET. Game is what every shrine \
+     holds and what app.rs's `App` union is sized against, so this is a firmware-wide RAM cost. \
+     Fix it in tapstone and re-vendor (tools/tapstone_vendor.sh --sync); do not raise the bound \
+     without saying what the extra bytes buy and re-checking App's largest variant."
+);
+
 /// The shrine's game state. Owned by the [`crate::app::App`] union, so it lives on the stack with
 /// every other screen's state and allocates nothing.
 ///
