@@ -266,15 +266,57 @@ if [ "$run_fw" = 1 ] || [ "$run_excl" = 1 ]; then
       esac
       # rsync does not create nested destination parents (only the final component), so make them
       # first — without this the very first run of a fresh mirror fails on `mkdir "…/rust/clock"`.
-      if mkdir -p "$MIRROR/$CLOCK" "$MIRROR/rust/sigil-names" \
-         && rsync -a --delete \
-            --exclude='target/' --exclude='src/board.rs' --exclude='src/secrets.rs' \
-            "$ROOT/$CLOCK/" "$MIRROR/$CLOCK/" \
-         && rsync -a --delete --exclude='target/' \
-            "$ROOT/rust/sigil-names/" "$MIRROR/rust/sigil-names/" \
-         && "$ROOT/tools/ci_provision.sh" "$MIRROR/$CLOCK" >/dev/null; then
+      # The sibling crates are DERIVED from clock's own manifest, not listed here — and that is a
+      # bug fix, not a tidy-up. This block named `rust/sigil-names` and nothing else, while
+      # `rust/clock/Cargo.toml` has path-depended on `rust/esp-wifi-sys-chip` since #347 (the
+      # esp-radio 0.18 chip-feature split). A path dependency's directory must EXIST for cargo to
+      # parse the manifest at all, optional or not — so the mirror was unusable, and every tier
+      # built from it failed identically with "failed to get `esp-wifi-sys-chip` as a dependency of
+      # package `clock`". Not tier-specific, not feature-specific: `default` failed too.
+      #
+      # It stayed hidden because this arm only ENGAGES when local provisioning declares a symbol
+      # the examples do not (#363), which is a minority of runs and none of CI's. So the failure
+      # was reachable only by the developer least likely to read it as infrastructure: someone
+      # mid-way through wiring up a new board constant, holding a tree they already suspect.
+      #
+      # Found 2026-09-21 while adding a THIRD sibling (rust/tapstone-rules, issue 10), which would
+      # have been the second crate this list silently omitted. Hence derived: the list is exactly
+      # the manifest's `path = "../*"` entries, so the next sibling needs no edit here. Same
+      # reasoning as the `tests/*.rs` glob two arms down — "a list would stop covering what is
+      # added after it" — applied to the thing that list broke.
+      SIBLINGS=$(grep -v '^[[:space:]]*#' "$ROOT/$CLOCK/Cargo.toml" \
+                 | sed -n 's/.*path = "\.\.\/\([A-Za-z0-9_.-]*\)".*/\1/p' | sort -u)
+      mirror_ok=1
+      # An EMPTY list is a failure, not a fast path. If the derivation silently matched nothing,
+      # the mirror would be missing every sibling and we would be back to the bug above with no
+      # message — so refuse rather than provision a mirror that cannot build.
+      if [ -z "$SIBLINGS" ]; then
+        printf '   mirror: no `path = "../*"` siblings found in %s/Cargo.toml — refusing to
+' "$CLOCK"
+        printf '           provision a mirror that cannot resolve clock'"'"'s path deps.
+'
+        mirror_ok=0
+      fi
+      mkdir -p "$MIRROR/$CLOCK" || mirror_ok=0
+      rsync -a --delete \
+        --exclude='target/' --exclude='src/board.rs' --exclude='src/secrets.rs' \
+        "$ROOT/$CLOCK/" "$MIRROR/$CLOCK/" || mirror_ok=0
+      for sib in $SIBLINGS; do
+        if [ ! -d "$ROOT/rust/$sib" ]; then
+          printf '   mirror: clock path-depends on rust/%s, which is not in this tree.\n' "$sib"
+          mirror_ok=0
+          continue
+        fi
+        mkdir -p "$MIRROR/rust/$sib" \
+          && rsync -a --delete --exclude='target/' "$ROOT/rust/$sib/" "$MIRROR/rust/$sib/" \
+          || mirror_ok=0
+      done
+      "$ROOT/tools/ci_provision.sh" "$MIRROR/$CLOCK" >/dev/null || mirror_ok=0
+      if [ "$mirror_ok" = 1 ]; then
         BUILD_ROOT="$MIRROR"
-        ok "mirror provisioned (tiers below build from it, not from your tree)"
+        # Name the count, so a mirror that copied FEWER siblings than the manifest declares is
+        # visible in the log rather than only in the compile error it causes later.
+        ok "mirror provisioned + $(printf '%s\n' "$SIBLINGS" | wc -w) sibling crate(s) (tiers below build from it, not from your tree)"
       else
         bad "mirror provisioning (#363) — falling back to linting your tree"
       fi
