@@ -236,6 +236,40 @@ features = "espnow"
 features = "espnow,cast,io"
 ships    = true
 
+[tier.tapstone]
+# Tapstone (issue 10) — the vendored rules engine + the shrine app slot.
+#
+# `${canonical}` is NOT decoration here, it is the whole point of the row. `AppKind::Tapstone`'s
+# `as_wire` and `live_screen` arms live inside functions that are themselves `#[cfg(espnow)]`, so
+# they compile ONLY where espnow and tapstone are both on. A `tapstone`-alone tier would lint the
+# module and silently never compile those two arms — a typo in either would then ship, in the one
+# flavor nothing builds. Crossing with the canonical (fleet) tier is what closes that.
+#
+# No `off-fleet`, unlike [tier.bard], and that is a MEASUREMENT not an omission. Measured
+# 2026-09-21 on familiar, release + fat-LTO, engine made reachable by a `black_box` probe (see
+# below for why that matters), as `.text` + `.rodata` deltas against the same tier without the
+# feature:
+#   esp32c3  espnow,cast,io   .text +8,770  .rodata   +960   (opt-level "s", the global profile)
+#   esp32s3  espnow,cast,io   .text +9,536  .rodata   +912   (opt_level 2, the #398/#409 override)
+# So ~9.7 KB of flash-resident code and data, against 875,968 B of C3 flash headroom
+# (app_slot 2,031,616 - baseline_image 1,155,648, budget.rs) and 5,262,800 B on the S3. It is
+# 1.1% of the tighter chip's headroom; #348's budget predicate has nothing to waive.
+#
+# ⚠️ TWO THINGS THE NUMBERS ABOVE CORRECT, both worth keeping written down:
+#   * Issue 10's criterion says the crate adds <= 8 KB. It does not — it adds ~9.7 KB on either
+#     chip. The 8 KB came from the crate's own `.text` measured as a standalone rlib (~3.7 KB);
+#     inlined and monomorphised into a fat-LTO firmware it costs about 2.6x that, and `.rodata`
+#     (the SET1 card table) was not counted at all. The criterion is optimistic, not the design:
+#     nothing is actually tight. Correct the issue, do not shrink the engine.
+#   * The AS-COMMITTED cost is only +1,888 B of `.text`, because nothing calls
+#     `TapstoneApp::commit` until issue 1 lands and LTO therefore strips almost the whole engine
+#     (verified with `nm`: ONE tapstone symbol survives in the shipped S3 ELF). Measuring the
+#     tree as it stands would have reported ~2 KB and been wrong by 5x the moment the mesh was
+#     wired. Hence the probe. Re-measure without it and you will get the smaller, useless number
+#     — and note the first probe attempt read ~2 KB too, because an all-zeros literal let the
+#     optimiser const-fold `Record::decode` to `None` and delete the call again.
+features = "tapstone,${canonical}"
+
 [tier.bard]
 # #347: off the C3 fleet image, still a supported build for chips with room. `off-fleet` is
 # #348's declaration that this is not the fleet image; without it the budget predicate
@@ -427,6 +461,7 @@ provisioned per tree, so its contents are not a property of the commit at all.""
 # Regenerate with: tools/check_exclusions.py claims --toml
 [tier_exclusive]
 "src/textclip.rs" = "wifi"
+"src/tapstone.rs" = "tapstone"
 # #398: chip-exclusive (esp32s3). The gate's contract is BOTH sections: this DECLARATION
 # (so removing the cfg-gate later cannot go unnoticed) plus the [unobservable] excuse
 # below (CI cannot build xtensa to observe them). Learned across three CI rounds.

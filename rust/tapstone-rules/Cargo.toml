@@ -1,0 +1,76 @@
+[package]
+name = "tapstone-rules"
+version = "0.1.0"
+# CONCRETE, not `edition.workspace = true`. Upstream's manifest inherits edition / rust-version /
+# license from tapstone's `rust/Cargo.toml` workspace table, and that table does not exist here —
+# so this file is the one part of the crate that CANNOT be a byte copy. The values are transcribed
+# from tapstone's `[workspace.package]` at tag `rules-v0.1.0`: edition 2024, rust-version 1.95,
+# license MIT. `tools/tapstone_vendor.sh` checks `src/` and `tests/`; it deliberately does NOT
+# check this file, because a byte-identical copy of it would not build.
+edition = "2024"
+# Same floor as `clock`, and for the same reason: espup's Xtensa fork is pinned at 1.95.0.0 and is
+# the only rustc that can target `xtensa-esp32s3-none-elf`. Raising this line drops the S3.
+rust-version = "1.95"
+license = "MIT"
+description = "VENDORED copy of tapstone's rules engine. src/ and tests/ are byte-identical upstream; do not edit."
+
+# #347, same line and same reason as `rust/sigil-names` and `rust/esp-wifi-sys-chip`: DECLARED as
+# its own workspace root, not merely positioned as one.
+#
+# esp-hal accepts exactly one chip feature and cargo unifies features across workspace members, so
+# a riscv crate and an xtensa crate cannot share a workspace graph. `rust/clock` is its own root and
+# absorbs path dependencies only from INSIDE its directory — this crate sits beside `clock`, not
+# under it, so it was never a member. But that makes a load-bearing invariant depend on where a
+# directory sits, and the symptom of breaking it is an esp-hal build-script error about two chips
+# that names neither this crate nor the move that caused it. `[workspace]` pins the boundary
+# regardless of position.
+#
+# It has a second job here that it does not have for sigil-names: this crate has a REAL dependency
+# (sha2), and its own workspace means its own lockfile. `rust/clock/Cargo.lock` therefore records
+# sha2 once, from clock's own declaration, and a `cargo test` in this directory cannot perturb it.
+# That is what makes the issue-10 `--locked` criterion meaningful rather than lucky.
+[workspace]
+
+# ⚠️ VENDORED, NOT AUTHORED HERE.
+#
+# `src/*.rs` and `tests/*.rs` are byte-identical copies of tapstone's `rust/tapstone-rules/` at tag
+# **rules-v0.1.0** (annotated tag 2352351, commit 1bb1608). Edit them THERE, tag there, then
+# re-vendor with `tools/tapstone_vendor.sh --sync --tag <new-tag>`. A fix applied in this directory
+# is a fix the arena service and the sim never get — and the entire hash-chain design rests on the
+# firmware engine and the host engine being the SAME engine, byte for byte. Divergence here does not
+# produce a compile error; it produces two shrines that disagree about who won.
+#
+# WHY vendored rather than a dependency: identical to sigil-names' reasoning. smol is a PUBLIC repo,
+# so a `path` dependency on ~/Projects/tapstone builds on JP's workstation and nowhere else, and a
+# `git` dependency needs tapstone pushed public — which is JP's call, and tapstone is pre-trademark-
+# search. Vendoring is the only shape that builds for everyone today. The vendor is a bridge, not a
+# destination: when tapstone is public, swap this for
+#   tapstone-rules = { git = "https://github.com/jphein/tapstone", tag = "rules-v0.1.0" }
+# and delete this directory.
+#
+# `tools/tapstone_vendor.sh --check` is what keeps the copy from becoming the drift it replaces, and
+# `tools/gate.sh` runs it unconditionally. Both halves matter: sigil-names had a careful checker
+# that nothing invoked for three months (#384), and it reported real drift to an audience of zero.
+
+[lib]
+name = "tapstone_rules"
+path = "src/lib.rs"
+
+[dependencies]
+# BYTE-IDENTICAL to `rust/clock`'s own sha2 line, deliberately. clock already links
+# `sha2 0.11` with `default-features = false` for the OTA image identity, so cargo unifies the two
+# into ONE copy and the rules engine's chain hash costs no additional `compress256`. Any divergence
+# here — a version bump, a feature, dropping `default-features = false` — silently doubles the
+# largest single contribution to this crate's flash cost, so change the two lines together or not
+# at all.
+sha2 = { version = "0.11", default-features = false }
+
+[features]
+default = []
+# Upstream declares this; it gates Debug/Display helpers in tests only and the crate stays no_std
+# without it. smol never enables it — the firmware has no std to enable. Declared rather than
+# omitted for the reason sigil-names spells out at `divergent-themed-realms`: an UNDECLARED feature
+# makes `cfg(feature = "std")` an unknown cfg, which compiles out while emitting
+# `unexpected cfg condition value`, and an unknown cfg is silently-always-false rather than
+# deliberately-false — the class of gate that cannot fail.
+std = []

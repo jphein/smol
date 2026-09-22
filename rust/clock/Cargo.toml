@@ -85,6 +85,21 @@ required-features = ["hostsim"]
 # transitive deps and no_std, so it adds nothing to the pinned esp-hal lockfile but itself.
 # `default-features = false` is explicit: smol must never get the divergent themed realms.
 sigil-names = { path = "../sigil-names", default-features = false }
+# VENDORED tapstone rules engine (rust/tapstone-rules), pinned to tapstone tag `rules-v0.1.0`.
+# A path dep INSIDE this repo for exactly sigil-names' reason: tapstone is a private repo, so a
+# path dep to ~/Projects/tapstone builds on one machine and a git dep needs it pushed public.
+# `tools/tapstone_vendor.sh` (run by tools/gate.sh) is what keeps the copy from drifting.
+#
+# OPTIONAL, unlike sigil-names, and the asymmetry is deliberate: node identity is in every build
+# because every board has a name, but the rules engine is only in a build that can host a match.
+# It carries real bytes — ~3.7 KB of its own `.text`, plus `sha2::compress256` which a `wifi` image
+# already links for the OTA image identity — and the C3 fleet image lives inside a 2 MiB OTA slot
+# (#517). So it rides the `tapstone` feature below rather than the base graph, matching how `bard`,
+# `wled` and `cast` each gate their own capability.
+#
+# `default-features = false` is explicit and matters: upstream's `std` feature only lights up test
+# helpers, and there is no std on any target here to light them with.
+tapstone-rules = { path = "../tapstone-rules", default-features = false, optional = true }
 # --- Core HAL (Phase 1, always on) ---------------------------------------
 # `unstable` is required for I2C/SPI/RNG and is also a hard requirement of
 # esp-wifi. `esp32c3` selects the chip. `rt` + `exception-handler` come from
@@ -610,6 +625,25 @@ cast = ["espnow"]
 # have the DRAM to carry it as an ordinary smol feature (OpenWrt's `DEFAULT := n` — the
 # definition stays, the default flips), and `bard` still gets a CI tier.
 bard = ["hw", "dep:libm"]
+
+# ── Tapstone (smol issue 10 · tapstone decision 0010) ────────────────────────
+# The shrine app: a Game, a Chain and the arbiter's one commit path (src/tapstone.rs), over the
+# vendored rules engine.
+#
+# `hw` and NOT `espnow`, for the same reason `bard` is `hw`: the engine is entirely local. A shrine
+# recomputes state from tap events it already has, so this compiles and runs on a radio-less board
+# — which is what makes it testable on a bench before the MATCH frame family (issue 1) exists. The
+# mesh is how records ARRIVE, not what makes them mean anything.
+#
+# It is its OWN feature rather than riding `espnow` because the fleet build must not be made to
+# carry a game it cannot display: the C3's 0.42" OLED has no battlefield, and its fleet image is
+# inside a 2 MiB OTA slot. When issue 3's c3-oled lane counter lands, that build opts in here.
+#
+# ⚠️ NOT YET A FLEET COMPOSITION. Nothing in a `tapstone` build reaches the radio today (issue 1
+# is unbuilt), and issue 2's group-MAC enforcement — which is what makes an inbound commit
+# trustworthy at all — is unbuilt too. Do not add this to the canonical fleet feature list in
+# tools/repro_build.sh until both exist; a forged commit is a forged match result.
+tapstone = ["hw", "dep:tapstone-rules"]
 
 # ── #348 budget waiver ───────────────────────────────────────────────────────
 # Declares "this build is NOT the C3 fleet image, so the fleet baseline the budget was
