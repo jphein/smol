@@ -1,0 +1,18 @@
+# Per-file SHA-256 of the VENDORED tapstone rules engine. Paths are relative to
+# rust/tapstone-rules/. Generated and verified by tools/tapstone_vendor.sh; do not
+# hand-edit, and do not edit the files it names — see that script's header.
+# tag: rules-v0.1.0
+# commit: 1bb1608d6be21644431dcc54f9d1ede03d8ebd72
+e6c2bac6c024aeca43589e0430a42c79a09da8dcab2fd4c5266c694cd0a7fd06  src/lib.rs
+36959c0527ed4eb9ea228ae5cad9d24cd9b78c22ab1dda3760a38fc3c3e53dce  src/cards.rs
+470741668d81d7467b41e077cb74ee7d43d815ea355ed4fa9b1d38b9d81785e2  src/event.rs
+834ea6cf04f5b3588243f2baf5962fe7c2bb722f9fd9e361b2e118c3ff9bae9f  src/hash.rs
+34b87f3e690af66702dcfd7d6be875794852920c2bdd8242e2991a8b5a1ba257  src/rules.rs
+e559f94fba785acd37fe7fc3fbcf8ec833f107e441fc5e43cab58a9fa2cb76a7  src/state.rs
+070a6db46d4bcc0531aef095a7aa25a4e172f82dd1548d4cbea35fd219d452f2  tests/cards.rs
+deac3cf58c1bd8f826899b292215480b7eab57d9a403c09cc22b81c416ee09ca  tests/determinism.rs
+795d6a608697a4f0b57d50ddf5320836d670d72f811f66ef944dbf57d38ffa4f  tests/event.rs
+952e0ad4432025011dd69700d25386d1ebe2bc541f51ca5c8d29b43df238725f  tests/lobby.rs
+ccee7ed7d7448893e4db4b95f201a4fff24c2f94353838c9ba7399c1bdda1e98  tests/rules.rs
+c2f399bb5938a7aef57fa2b1588af650b5ae870f6819382e23cd3b00be9068d5  tests/state.rs
+90175b10041ef80f7d66dbe435df35f5475d27fdfddc7d4a47b243cf271ee4ca  testdata/seed-1.json

@@ -123,6 +123,13 @@ mod s3_oled;
 // every tier; the 277 KB model is `.rodata` (XIP flash) and its scratch is `.bss`.
 #[cfg(feature = "bard")]
 mod bard;
+// Tapstone (smol issue 10) — the shrine's Game + Chain + arbiter commit path over the vendored
+// rules engine. Radio-free (rides `hw`), like `bard`: the engine is local, the mesh only delivers
+// records to it. At crate root, not under a `tapstone/` directory, for the reason the note below
+// spells out — `tools/check_exclusions.py` reads tier ownership off the PATH, and one file needs
+// no directory to own.
+#[cfg(feature = "tapstone")]
+mod tapstone;
 // #434 the stack instrument, at crate root because that is where it BELONGS: it depends on
 // nothing but two linker symbols, and living under `bard/` is what welded `stack-paint` to a
 // composition that (post-#391) no longer boots. The move is not cosmetic — this repo encodes tier

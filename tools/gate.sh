@@ -169,6 +169,22 @@ else
   printf '%s\n' "$out" | sed 's/^/        /'; bad "sigil vendor"
 fi
 
+# Issue 10 — the VENDORED tapstone rules engine still matches the tag it pins. Beside the arm
+# above, unconditional, and for a sharper version of the same reason: sigil drift renames boards,
+# but rules drift makes two shrines compute different chain heads from identical taps and disagree
+# about who won, with no error anywhere. The `src/` bytes ARE the protocol (tapstone decision 0004).
+#
+# Cheap by construction: a sha256 manifest plus, when ~/Projects/tapstone is present, a `git show`
+# diff against the pinned tag. The BEHAVIOURAL half — replaying a recorded match through the
+# vendored engine — is the `tapstone-rules` suite in the cargo-test arm below, because it costs a
+# compile and this arm must stay runnable in a second on a CI box with no sibling checkout.
+step "vendored tapstone-rules matches its pinned tag (issue 10)"
+if out=$("$ROOT/tools/tapstone_vendor.sh" --check 2>&1); then
+  printf '%s\n' "$out" | tail -3; ok "tapstone vendor"
+else
+  printf '%s\n' "$out" | sed 's/^/        /'; bad "tapstone vendor"
+fi
+
 # #460 the committed Cargo.lock is actually consulted. Unconditional and early for the same reason as
 # the arm above: if dependency RESOLUTION drifted, every later measurement — the tier checks, the
 # stack floor, #390's symbol-size baseline — is about a graph nobody recorded.
@@ -794,6 +810,35 @@ if [ "$run_host" = 1 ]; then
       bad "test $n"; tail -12 "$GATE_TMP/gate-test-$n.log" | sed 's/^/        /'
     fi
   done
+
+  # Issue 10 — the VENDORED rules engine's own suites, and the one that matters:
+  # `tests/vendor_golden_replay.rs` replays a real recorded match (decks, house rules, every
+  # record) through this copy and demands the chain head the transcript carries, per record and at
+  # the end. That is the agreement proof the whole two-shrine design rests on, and byte-equality
+  # alone does not establish it — identical sources can still diverge through a toolchain or a
+  # feature unification. The vendor arm near the top of this file checks the bytes; this checks the
+  # behaviour. Both, or neither is evidence.
+  #
+  # Its own workspace (`[workspace]` in that Cargo.toml), so it runs from its own directory with
+  # its own lockfile and cannot perturb `rust/clock/Cargo.lock` — which is what keeps issue 10's
+  # `--locked` criterion meaningful. No `--no-default-features` needed, unlike the arm above: this
+  # crate pulls no bare-metal stack, so there is no `portable-atomic` to leak into the host build.
+  step "vendored tapstone-rules host suites (cargo test)"
+  if (cd "$ROOT/rust/tapstone-rules" && cargo test "${JOBS[@]}") \
+       >"$GATE_TMP/gate-test-tapstone-rules.log" 2>&1; then
+    # Sum the per-suite counts, and print it: "0 passed" from a suite that silently stopped
+    # collecting tests still exits 0, which is the failure this file has already been bitten by.
+    passed=$(grep -Eo '[0-9]+ passed' "$GATE_TMP/gate-test-tapstone-rules.log" \
+             | awk '{n+=$1} END {print n+0}')
+    if [ "$passed" -gt 0 ]; then
+      ok "test tapstone-rules — $passed passed"
+    else
+      bad "test tapstone-rules — exited 0 but ran NO tests"
+    fi
+  else
+    bad "test tapstone-rules"
+    tail -15 "$GATE_TMP/gate-test-tapstone-rules.log" | sed 's/^/        /'
+  fi
 
   # #350: prove the matrix checker's arms can fail. Pure text, no cargo — see the file header
   # for why a green-only demonstration is not evidence.
