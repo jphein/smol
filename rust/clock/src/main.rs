@@ -1030,7 +1030,7 @@ async fn run(boot_spawner: BootSpawner) -> ! {
     #[cfg(all(feature = "espnow", feature = "esp32s3"))]
     let mut led = {
         use esp_hal::rmt::{Rmt, TxChannelConfig, TxChannelCreator};
-        let channel = Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(80))
+        let channel = Rmt::new(peripherals.RMT, Rate::from_mhz(80))
             .ok()
             .and_then(|rmt| {
                 rmt.channel0

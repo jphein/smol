@@ -560,6 +560,18 @@ impl FamState {
         }
 
         match f.kind {
+            // `clippy::collapsible_match` fires here on espup's 1.95 fork ONLY — stable 1.97 does
+            // not (see tools/check_chips.sh --lint on that divergence, which is the arm that found
+            // this). It wants the inner `if` hoisted into a match GUARD:
+            // `FAM_CALL if self.is_holder && f.holder == self.node_id =>`.
+            //
+            // Verified equivalent TODAY and deliberately not taken. With a guard, a FAM_CALL that
+            // fails the condition falls through to the `_ => {}` arm below — so "we saw a call
+            // addressed to someone else and ignored it" stops being stated here and starts
+            // depending on an unrelated arm continuing to exist. The nested form is robust to that
+            // arm changing; the guard form silently is not. A two-line saving is not worth
+            // coupling this arm's correctness to another one.
+            #[allow(clippy::collapsible_match)]
             FAM_CALL => {
                 // "Come here!" addressed to us as holder → bias next wander to the
                 // caller, and expedite it so the pet actually walks over soon.
