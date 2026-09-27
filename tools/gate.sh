@@ -38,6 +38,10 @@
 #          block below for why this is not the proof.
 #   8. tools/test_check_exclusions.sh — proof that (7)'s arms can actually fail, including the
 #      vacuous-green one (an ELF with no DWARF has an empty file set and every absence "holds")
+#   9. `tools/gate.sh hand` ONLY (not `all`): smol#548, every [hand_build] row compiled by
+#      tools/build_hand.sh from the manifest's recipe. Needs espup + `. ~/export-esp.sh`; CI's
+#      `hand builds` job supplies both. `all` prints a SKIP line for it. The host arm runs
+#      tools/test_build_hand.sh, which proves the builder can fail without a toolchain.
 #
 # WHAT IT DOES NOT COVER — read this before trusting a green run:
 #   * `mesh-test`: cannot RUN — it needs a per-board `DEAF_MACS` that only a real board.rs has.
@@ -119,13 +123,18 @@ export TMPDIR="$GATE_TMP"
 BUILD_ROOT="$ROOT"
 WHAT="${1:-all}"
 FAILED=()
-run_fw=1; run_host=1; run_excl=1
+run_fw=1; run_host=1; run_excl=1; run_hand=0
+# `hand` (smol#548) compiles every [hand_build] row, which needs the espup Xtensa toolchain. It is
+# NOT part of `all`: a dev box without espup would go red on a missing toolchain, not on a defect.
+# `all` says so loudly at the end instead, so absence is never read as a pass; CI runs it as its own
+# job (`hand builds`, fw-gate.yml).
 case "$WHAT" in
   host) run_fw=0; run_excl=0 ;;
   fw)   run_host=0; run_excl=0 ;;
   excl) run_host=0; run_fw=0 ;;
+  hand) run_host=0; run_fw=0; run_excl=0; run_hand=1 ;;
   all)  ;;
-  *) echo "usage: tools/gate.sh [all|host|fw|excl]" >&2; exit 2 ;;
+  *) echo "usage: tools/gate.sh [all|host|fw|excl|hand]" >&2; exit 2 ;;
 esac
 
 # shellcheck source=/dev/null
@@ -196,7 +205,7 @@ esac
 
 # Both firmware halves need `board.rs`/`secrets.rs`, so this runs for either — `excl` on its
 # own in CI would otherwise fail on the missing files rather than on anything it measures.
-if [ "$run_fw" = 1 ] || [ "$run_excl" = 1 ]; then
+if [ "$run_fw" = 1 ] || [ "$run_excl" = 1 ] || [ "$run_hand" = 1 ]; then
   step "provisioning (git-ignored; existing files untouched)"
   "$ROOT/tools/ci_provision.sh" "$CLOCK" || { echo "provisioning failed" >&2; exit 1; }
 
@@ -832,6 +841,16 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_build_matrix"
   fi
 
+  # smol#548: the hand-build COMPILER (tools/build_hand.sh) can fail each way it could go blind —
+  # typed row list, dropped env word, empty manifest, missing toolchain, stale ELF. Pure text,
+  # fake cargos; the real compile is `tools/gate.sh hand`.
+  step "hand-build compiler regression suite (smol#548)"
+  if out=$("$ROOT/tools/test_build_hand.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "test_build_hand"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_build_hand"
+  fi
+
   # #351: the same discipline for the exclusion checker, and it matters more here. An ABSENCE
   # check's passing state and its broken state print the same green — "no violations found"
   # and "nothing found at all" are indistinguishable from the outside. Pure text, no cargo,
@@ -1006,6 +1025,21 @@ if [ "$run_host" = 1 ]; then
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_board_consts"
   fi
+fi
+
+if [ "$run_hand" = 1 ]; then
+  # smol#548: every [hand_build] row, compiled from the manifest's recipe (s3-tapstone-gw today).
+  # From YOUR tree, not the #363 mirror: a hand build is the image that gets flashed, and the mirror
+  # carries only rust/clock and sigil-names (not esp-wifi-sys-chip). On CI the two are the same.
+  step "hand builds — every [hand_build] row compiles (smol#548)"
+  if out=$("$ROOT/tools/build_hand.sh" 2>&1); then
+    printf '%s\n' "$out" | grep -E '^   [^ ]+: [0-9]+ B  |hand build\(s\) built'; ok "hand builds"
+  else
+    printf '%s\n' "$out" | tail -30 | sed 's/^/        /'; bad "hand builds"
+  fi
+elif [ "$WHAT" = all ]; then
+  step "hand builds"
+  printf '   \033[33mSKIP\033[0m hand builds need espup: run tools/gate.sh hand (CI job: hand builds)\n'
 fi
 
 step "summary"

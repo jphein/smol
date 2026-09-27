@@ -162,6 +162,53 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # smol#548 — the HAND BUILDS (tools/build-matrix.toml `[hand_build.*]`), compiled on every push.
+  #
+  # s3-tapstone-gw is the Tapstone gateway on an S3: the image on the arena box's USB port. The S3
+  # is `builds = false`, so the `firmware` job never compiles it, and until this job the only
+  # compile was a human on familiar. The recipe is still the manifest's (tools/build_hand.sh reads
+  # `build_matrix.py hand-builds` + `hand-build`); this job only supplies the Xtensa toolchain.
+  #
+  # Provisioned exactly as xtensa-spike.yml measured (fresh, uncached: its header has the numbers,
+  # ~61 s install + ~80-120 s build), and pinned in LOCKSTEP with it and with katana/familiar. The
+  # two pins below are a second copy of that file's; tools/test_build_hand.sh does not see YAML, so
+  # if you move one, move both (the spike's pin-assert step is copied here verbatim for that reason:
+  # a drifted pin fails loudly instead of building with the wrong fork).
+  #
+  # Built with ci_provision.sh's THROWAWAY GROUP_KEY: this proves the image compiles and links, and
+  # can never produce a flashable fleet gateway. It does not replace the bench (bench.py).
+  hand_builds:
+    name: hand builds (xtensa, smol#548)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      XTENSA_VERSION: 1.95.0.0
+      ESPUP_VERSION: 0.17.1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install espup + the esp toolchain (fresh, uncached — xtensa-spike.yml's proven recipe)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/espup \
+            "https://github.com/esp-rs/espup/releases/download/v${ESPUP_VERSION}/espup-x86_64-unknown-linux-gnu"
+          chmod +x /tmp/espup
+          /tmp/espup install --toolchain-version "$XTENSA_VERSION" --targets esp32s3 --export-file "$HOME/export-esp.sh"
+      - name: Assert the toolchain is EXACTLY the pinned fork
+        run: |
+          set -euo pipefail
+          . "$HOME/export-esp.sh"
+          got="$(rustc +esp -vV | sed -n 's/.*(\(1\.[0-9.]*\))$/\1/p' | tail -1)"
+          echo "xtensa rustc reports: $got (want $XTENSA_VERSION)"
+          [ "$got" = "$XTENSA_VERSION" ] || { echo "::error::xtensa toolchain is $got, expected $XTENSA_VERSION"; exit 1; }
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/clock
+          key: hand
+      - name: tools/gate.sh hand
+        run: |
+          . "$HOME/export-esp.sh"
+          tools/gate.sh hand
+
   # #351 — the BYTE-FREE claims, checked instead of asserted.
   #
   # A SEPARATE JOB, not another step in `firmware`, because it builds with a different cargo
