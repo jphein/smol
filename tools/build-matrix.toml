@@ -290,6 +290,13 @@ features = "stack-paint,${canonical}"
 # machine. Keeping the budget on is what makes this tier's number transferable to the fleet image.
 features = "stack-paint-lite,${canonical}"
 
+[tier.tapstone-gw]
+# #548 the Tapstone USB-serial gateway (targets/c3-tapstone-gw): the fleet node plus the `@TS1`
+# USB bridge, WiFi off. Not shipped — it is one board on the arena laptop, flashed by hand, and a
+# board running it can never be a crown, so it must never become a fleet release by accident.
+# The canonical features ride along because the gateway is an ordinary mesh member otherwise.
+features = "tapstone-gw,${canonical}"
+
 # ── features with NO tier, declared so the omission is a decision ─────────────
 # The coverage arm requires every feature in Cargo.toml to be either covered by a tier above or
 # listed here with a reason. An undeclared gap is a gate failure — the aspiration that used to
@@ -470,6 +477,8 @@ provisioned per tree, so its contents are not a property of the commit at all.""
 "src/net/target.rs" = "wifi"
 "src/net/treehead.rs" = "espnow"
 "src/net/wifi.rs" = "wifi"
+"src/net/ts_lines.rs" = "tapstone-gw"
+"src/ts_gw.rs" = "tapstone-gw"
 "src/net/wire.rs" = "espnow"
 "src/net/wled.rs" = "wled"
 "src/ota.rs" = "wifi"

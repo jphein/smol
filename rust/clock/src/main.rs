@@ -238,6 +238,11 @@ mod ota_mesh;
 #[cfg(feature = "espnow")]
 mod ota_screen;
 
+// #548 the Tapstone USB-serial gateway: `@TS1 ` lines on the USB-Serial-JTAG <-> MATCH frames on
+// the mesh, WiFi off, never the crown. Only in a `tapstone-gw` build (targets/c3-tapstone-gw).
+#[cfg(feature = "tapstone-gw")]
+mod ts_gw;
+
 // LOCAL git-ignored WiFi credentials, used by the `wifi`/`espnow` radio bring-up.
 #[cfg(feature = "wifi")]
 mod secrets;
@@ -1088,6 +1093,15 @@ async fn run(boot_spawner: BootSpawner) -> ! {
         .await
     };
 
+    // #548: the gateway takes the USB-Serial-JTAG's RX half now that the radio is up, and says
+    // HELLO once; the arena's discovery PINGs for another if it missed this one.
+    #[cfg(feature = "tapstone-gw")]
+    let mut gw = {
+        let gw = ts_gw::Gateway::new(peripherals.USB_DEVICE);
+        gw.hello(radio.as_deref());
+        gw
+    };
+
     // --- Clock time base -----------------------------------------------------
     // Anchor the clock to the monotonic ms clock instead of accumulating ticks
     // in the loop (which would drift while another mode is on screen): the time
@@ -1290,6 +1304,11 @@ async fn run(boot_spawner: BootSpawner) -> ! {
         // === Background (all modes, espnow build): service ESP-NOW + drive LED.
         // This runs REGARDLESS of the active mode so the LED always reflects the
         // ESP-NOW link and peers stay tracked even while Snake/Clock is on screen.
+        // #548: answer the arena's lines (TX / PING) and emit ROSTER. MATCH frames go up from
+        // inside `service` below, and again from `ts_gw::subtick`'s slices at the bottom.
+        #[cfg(feature = "tapstone-gw")]
+        gw.pump(radio.as_deref_mut(), now);
+
         #[cfg(feature = "espnow")]
         if let Some(r) = radio.as_deref_mut() {
             if let Some(text) = r.service() {
@@ -2686,7 +2705,11 @@ async fn run(boot_spawner: BootSpawner) -> ! {
         }
         was_toast = toast_now;
 
+        #[cfg(not(feature = "tapstone-gw"))]
         subtick(&delay).await;
+        // #548: the same 20 ms, sliced, with the radio drained between slices (see ts_gw).
+        #[cfg(feature = "tapstone-gw")]
+        ts_gw::subtick(&mut radio, &mut gw).await;
     }
 }
 

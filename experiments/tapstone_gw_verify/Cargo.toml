@@ -1,0 +1,21 @@
+# Host guard for the #548 Tapstone gateway's `@TS1 ` line codec (rust/clock/src/net/ts_lines.rs).
+# `#[path]`-includes the REAL codec (no drift) plus the real net/wire.rs, so the trailer-strip
+# decision is exercised against the actual #190 MAC functions rather than a model of them.
+# Panic-on-failure `main`, the house convention, so tools/gate.sh's `*_verify` glob runs it.
+# The cross-repo half (tapstone's own parser reading these bytes) is experiments/tapstone_lines_xcheck,
+# which needs a tapstone checkout and so is deliberately NOT named `*_verify`.
+[package]
+name = "tapstone_gw_verify"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "tapstone_gw_verify"
+path = "src/main.rs"
+
+[dependencies]
+sha2 = "0.10"
+
+[profile.dev]
+opt-level = 0

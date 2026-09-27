@@ -84,6 +84,38 @@ const ESP_NOW_FIXED_CHANNEL: u8 = 6;
 #[cfg(feature = "coexist-soak")]
 const ESP_NOW_FIXED_CHANNEL: u8 = 1;
 
+/// #548: the Tapstone gateway's optional fixed channel, from `SMOL_TS_CHANNEL` at build time
+/// (`None` = find the mesh by its HELLOs, see the HELLO arm of `service`). A bad value is a build
+/// failure, not a gateway that silently scans.
+#[cfg(feature = "tapstone-gw")]
+const TS_PINNED_CHANNEL: Option<u8> = match option_env!("SMOL_TS_CHANNEL") {
+    Some(s) => Some(ts_parse_channel(s)),
+    None => None,
+};
+
+#[cfg(feature = "tapstone-gw")]
+const fn ts_parse_channel(s: &str) -> u8 {
+    let b = s.as_bytes();
+    assert!(!b.is_empty() && b.len() <= 2, "SMOL_TS_CHANNEL must be a channel number 1..=13");
+    let mut n = 0u8;
+    let mut i = 0;
+    while i < b.len() {
+        assert!(b[i].is_ascii_digit(), "SMOL_TS_CHANNEL must be decimal");
+        n = n * 10 + (b[i] - b'0');
+        i += 1;
+    }
+    assert!(n >= 1 && n <= 13, "SMOL_TS_CHANNEL must be 1..=13");
+    n
+}
+
+// #548: the gateway codec's size constants are typed in a host-includable file that cannot name
+// `wire`, so they are tied to wire's here, where the target compiler evaluates them.
+#[cfg(feature = "tapstone-gw")]
+const _: () = {
+    assert!(crate::net::ts_lines::TX_FRAME_MAX == ESP_NOW_MTU - MAC_TRAILER_LEN);
+    assert!(crate::net::ts_lines::TRAILER_LEN == MAC_TRAILER_LEN);
+};
+
 // =========================================================================
 // Peer handshake protocol (drives the blue status LED).
 // =========================================================================
@@ -2899,6 +2931,17 @@ impl RadioManager {
         if self.relay.is_gateway {
             return; // gateway owns its channel via association; never scans
         }
+        // #548: a Tapstone gateway built with `SMOL_TS_CHANNEL=<n>` sits on that channel and never
+        // hops, for a table with no crown to find (or a bench that wants one fixed channel).
+        #[cfg(feature = "tapstone-gw")]
+        if let Some(ch) = TS_PINNED_CHANNEL {
+            if !self.scan_locked {
+                let _ = self.esp_now.set_channel(ch);
+                self.scan_locked = true;
+                log::info!("smol #548: tapstone gateway pinned to ch{} (SMOL_TS_CHANNEL)", ch);
+            }
+            return;
+        }
         // #3b (regression fix): while ACTIVELY receiving a mesh-OTA, HOLD the channel — do NOT
         // unlock/hop. The transfer runs on ESP_NOW_FIXED_CHANNEL and hopping mid-transfer drops
         // chunks. NARROW + bounded: true only during a live session (`is_active`); with no OTA in
@@ -3014,6 +3057,11 @@ impl RadioManager {
         const REELECT_RETRY_MS: u64 = 10_000; // min gap between recovery bursts
         if self.relay.is_gateway {
             return false; // a gateway re-decides on its own flush; only leaves recover here
+        }
+        // #548: the Tapstone gateway never re-elects — a recovery burst is a WiFi association
+        // (~14 s mesh-deaf, the measured `brst=14088`), and it must never become the crown.
+        if cfg!(feature = "tapstone-gw") {
+            return false;
         }
         // #3b: a leaf with a LIVE mesh-OTA session must NOT re-elect — re-election re-associates
         // to WiFi (off-ch6) and took id8 OFFLINE mid-relay. While armed, the gateway is merely
@@ -3232,6 +3280,7 @@ impl RadioManager {
     /// built + dropped INSIDE `run_ntp_burst`, so no live stack contends with
     /// ESP-NOW between bursts.
     #[allow(clippy::too_many_arguments)] // +ota/config/install offer out-params (#6/#21/#33)
+    #[cfg_attr(feature = "tapstone-gw", allow(dead_code))] // #548: the gateway never bursts
     pub async fn burst_ntp(
         &mut self,
         batt: &mut crate::batt::BattCache,
@@ -3296,6 +3345,15 @@ impl RadioManager {
     pub fn switch(&mut self, mode: Mode) -> Result<(), ()> {
         if self.mode == mode {
             return Ok(());
+        }
+        // #548: the Tapstone gateway never associates. This is the backstop under the entry-point
+        // guards (`start`, `maybe_leaf_reelect`, `set_debug_wifi_all`): any path that still asks
+        // for STA is refused here, so the radio never leaves the mesh channel for an AP. A crown
+        // is chosen over the broker, so a board that never associates can never be the crown.
+        #[cfg(feature = "tapstone-gw")]
+        if mode == Mode::WifiSta {
+            log::warn!("smol #548: tapstone gateway refuses WiFi STA (WiFi is off by design)");
+            return Err(());
         }
         match mode {
             Mode::EspNow => {
@@ -5054,6 +5112,14 @@ impl RadioManager {
     /// periodic WiFi bursts even as a leaf (`relay_ready_to_flush` / `flush_telemetry` ungate) and may
     /// self-fetch OTA; the debug flush claim-SUPPRESSES so it never perturbs the crown election.
     pub fn set_debug_wifi_all(&mut self, on: bool) {
+        // #548: a relayed CFG `A=1` must not turn the Tapstone gateway's WiFi on.
+        #[cfg(feature = "tapstone-gw")]
+        let on = {
+            if on {
+                log::info!("smol #548: all-nodes-WiFi debug ignored on the tapstone gateway");
+            }
+            false
+        };
         if self.debug_wifi_all != on {
             log::info!("smol #gateway-election: all-nodes-WiFi debug -> {}", on);
         }
@@ -6924,7 +6990,11 @@ impl RadioManager {
     /// fit check never fails for a real frame; if it ever did, we send raw rather than exceed the
     /// MTU. The OTA-mesh sends (OTAM/OTAD/OTAN) bypass `send_to` entirely and carry their own
     /// ed25519 signature, so they are (intentionally) untouched by the group MAC.
-    fn send_to(&mut self, dst: &[u8; 6], data: &[u8]) {
+    ///
+    /// #548: returns whether the driver ACCEPTED the frame (queued it) — not whether it was
+    /// delivered, which `abandon_tx` deliberately never waits to learn. Every fleet caller ignores
+    /// it, as before; the Tapstone gateway reports it to the arena as `TXOK` / `TXERR send-failed`.
+    fn send_to(&mut self, dst: &[u8; 6], data: &[u8]) -> bool {
         let mut buf = [0u8; ESP_NOW_MTU];
         // #190: append the group-MAC trailer only when `should_group_mac` says so — a pure decision
         // (host-tested) that EXCLUDES the OTA family (OTAM/OTAD/OTAN/LDBG). Those frames are
@@ -6945,8 +7015,14 @@ impl RadioManager {
             data
         };
         match self.esp_now.send(dst, out) {
-            Ok(waiter) => abandon_tx(waiter), // #397: see `abandon_tx`
-            Err(e) => log::warn!("smol: esp-now send failed: {:?}", e),
+            Ok(waiter) => {
+                abandon_tx(waiter); // #397: see `abandon_tx`
+                true
+            }
+            Err(e) => {
+                log::warn!("smol: esp-now send failed: {:?}", e);
+                false
+            }
         }
     }
 
@@ -7032,12 +7108,13 @@ impl RadioManager {
             // NOT a crown-deaf-shed (design §7.3) — `mac_fail` is the telemetry that tells the two
             // apart, so it must be counted SEPARATELY from RF-deafness signals.
             let raw = recv.data();
-            let payload: &[u8] = match verify_group_mac(
+            let verdict = verify_group_mac(
                 raw,
                 // Accepted (epoch, key) set. Rotation: add `(GROUP_KEY_EPOCH + 1, &GROUP_KEY_NEXT)`
                 // as a second pair for the one-release overlap window (design §4.1), then drop the old.
                 &[(crate::secrets::GROUP_KEY_EPOCH, &crate::secrets::GROUP_KEY)],
-            ) {
+            );
+            let payload: &[u8] = match verdict {
                 MacVerdict::Ok { payload_len } => {
                     self.diag.mac_ok = self.diag.mac_ok.saturating_add(1);
                     &raw[..payload_len]
@@ -7061,6 +7138,16 @@ impl RadioManager {
                     raw
                 }
             };
+
+            // #548: the Tapstone gateway forwards every MATCH frame to USB and nothing else sees
+            // it. After the verify (so the counters above stay whole, and ENFORCE, once on, drops a
+            // bad frame here exactly as it does for the fleet) and before `parse_frame`, which has
+            // no MATCH arm — registering the family in `classify()` is tapstone smol-issues #1.
+            #[cfg(feature = "tapstone-gw")]
+            if crate::net::ts_lines::is_match(raw) {
+                self.ts_forward(src, rssi, verdict, raw, now);
+                continue;
+            }
 
             match parse_frame(payload) {
                 Some(Frame::Snk(f)) => {
@@ -7131,6 +7218,26 @@ impl RadioManager {
                             peer_id,
                             self.elected_owner_channel
                         );
+                    }
+
+                    // #548: the Tapstone gateway has no owner to follow — it never reads the broker's
+                    // `MC`, so `elected_owner` is its own id and the arm above can never match. Every
+                    // mesh member rides the crown's channel, so ANY peer's HELLO says the mesh is here:
+                    // hold this channel while HELLOs keep arriving, and let `leaf_scan_tick`'s
+                    // owner-silence unlock re-scan if they stop. A scanning leaf passing through a
+                    // wrong channel can lock it briefly; it dwells 1.5 s and moves on, so the lock
+                    // lapses after SCAN_SILENCE_MS and converges on the channel HELLOs stay on.
+                    #[cfg(feature = "tapstone-gw")]
+                    if !self.relay.is_gateway {
+                        if !self.scan_locked {
+                            log::info!(
+                                "smol #548: tapstone gateway locked to ch{} (heard id{}'s HELLO)",
+                                self.learned_channel,
+                                peer_id
+                            );
+                        }
+                        self.scan_locked = true;
+                        self.last_owner_heard_ms = now;
                     }
 
                     // Register the broadcaster so the ACK below can be unicast (#28: bounded LRU).
@@ -7979,6 +8086,87 @@ fn encode_time(id: u8, unix: u32, synced_at: u32, out: &mut [u8]) -> usize {
 /// test, and looks like a simplification. `tools/check_elect_send_path.py` reads this impl and fails
 /// if it names any sender but `send_to`, or if a second implementation appears. Do not delete that
 /// check because this comment exists — the comment is what failed last time.
+/// #548 the Tapstone USB-serial gateway's view of the radio. The line codec is
+/// `net::ts_lines`; the USB side and the main-loop driver are `crate::ts_gw`.
+#[cfg(feature = "tapstone-gw")]
+impl RadioManager {
+    /// Forward one received MATCH frame to USB as `@TS1 RX …`, straight from the RX drain: no
+    /// queue, so a frame is on the wire the same pass `service` pulls it off the radio.
+    fn ts_forward(&mut self, src: [u8; 6], rssi: i32, verdict: MacVerdict, raw: &[u8], now: u64) {
+        use crate::net::ts_lines::{self, Show, Trailer};
+        // Liveness and roster, like any other peer frame. The id is NOT learned from the frame's
+        // header byte: that is a claim inside an unverified payload, and the roster's ids are the
+        // ones `send_to_id`-style unicast resolves against, learned from HELLO.
+        self.peers.last_hello_ms = now;
+        self.roster.heard(src, None, rssi, now);
+        let trailer = match verdict {
+            MacVerdict::Ok { .. } => Trailer::Verified,
+            MacVerdict::BadTag => Trailer::BadTag,
+            MacVerdict::Unkeyed => Trailer::Absent,
+        };
+        let (frame, mac_ok) = ts_lines::forward(raw, trailer);
+        // `<src>` is the LINK-layer sender (the arena keeps it apart from the header's `src`):
+        // the roster's id for this MAC, else the header's claim, else 0 for a runt with neither.
+        let src_id = self
+            .roster
+            .id_for_mac(src)
+            .or_else(|| frame.get(ts_lines::MATCH_SRC_OFFSET).copied())
+            .unwrap_or(0);
+        let rssi = rssi.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+        esp_println::println!("{}", Show(|f| ts_lines::write_rx(f, src_id, rssi, mac_ok, frame)));
+    }
+
+    /// Send one MATCH frame to node `dst` (255 = broadcast) through the `send_to` choke, so it
+    /// carries the #190 trailer exactly like every other SMOLv1 frame. `Ok` means the driver
+    /// accepted it, not that `dst` received it (ESP-NOW's delivery callback is not awaited).
+    pub fn ts_send(&mut self, dst: u8, frame: &[u8]) -> Result<(), crate::net::ts_lines::Reason> {
+        use crate::net::ts_lines::Reason;
+        let mac = if dst == 255 {
+            BROADCAST_ADDRESS
+        } else if dst == self.id {
+            return Err(Reason::SelfDst);
+        } else {
+            let mac = self.roster.mac_for_id(dst).ok_or(Reason::UnknownDst)?;
+            self.ensure_peer(mac, now_ms());
+            mac
+        };
+        if self.send_to(&mac, frame) {
+            Ok(())
+        } else {
+            Err(Reason::SendFailed)
+        }
+    }
+
+    /// Fresh, id-known roster entries as `(id, mac, rssi)` into `out`; returns how many.
+    pub fn ts_roster(&self, now: u64, out: &mut [(u8, [u8; 6], i8); ROSTER_CAP]) -> usize {
+        let mut n = 0;
+        for node in self.roster.nodes.iter() {
+            if !node.used || !node.id_known || now.saturating_sub(node.last_heard_ms) > ROSTER_STALE_MS {
+                continue;
+            }
+            out[n] = (node.id, node.mac, node.rssi.clamp(i8::MIN as i32, i8::MAX as i32) as i8);
+            n += 1;
+        }
+        n
+    }
+
+    /// This node's station MAC, as the arena's port discovery matches it (spec D8).
+    pub fn ts_self_mac(&self) -> [u8; 6] {
+        self.self_mac
+    }
+
+    /// This node's mesh id.
+    pub fn ts_node_id(&self) -> u8 {
+        self.id
+    }
+
+    /// Never true on the gateway (see the `#548` guards); the driver checks it anyway and says so
+    /// loudly, because "never the crown" is the property the arena's timing rests on.
+    pub fn ts_is_crown(&self) -> bool {
+        self.relay.is_gateway
+    }
+}
+
 impl mesh_elect::GroupMacSink for RadioManager {
     fn send_group_mac(&mut self, dst: &[u8; 6], frame: &[u8]) {
         self.send_to(dst, frame);
@@ -8192,9 +8380,13 @@ pub async fn start(
     // from the LIVE AP (mqtt_session reads current_ap_info) — WITHOUT this the boot resolver's
     // co_channel stayed false and the co-channel seize could never fire at boot (the regression).
     elect.mesh_channel = ESP_NOW_FIXED_CHANNEL;
+    #[cfg_attr(feature = "tapstone-gw", allow(unused_mut))]
     let mut ota_offer: Option<crate::ota::Announce> = None;
+    #[cfg_attr(feature = "tapstone-gw", allow(unused_mut))]
     let mut config_offer: Option<crate::app::DefaultScreen> = None;
+    #[cfg_attr(feature = "tapstone-gw", allow(unused_mut))]
     let mut install_requested = false;
+    #[cfg(not(feature = "tapstone-gw"))]
     let (reached_dhcp, synced) = radio.burst_ntp(
         batt,
         grid,
@@ -8205,6 +8397,16 @@ pub async fn start(
         tick,
         render,
     ).await;
+    // #548: the Tapstone gateway skips the boot burst entirely — no association, no DHCP, no
+    // SNTP, no broker election. So it boots as a leaf with no elected owner (`elect.owner_id` is
+    // its own id), never publishes an `MC`, and so can never be the crown. Time comes from the
+    // mesh (TIME adoption), as on any credential-less leaf.
+    #[cfg(feature = "tapstone-gw")]
+    let (reached_dhcp, synced): (bool, Option<u32>) = {
+        let _ = (batt, grid, tick, render);
+        log::info!("smol #548: tapstone gateway — WiFi off, skipping the boot burst");
+        (false, None)
+    };
     // #6 OTA: stash any gated boot-time announce for `main` to fetch after boot.
     radio.ota_offer = ota_offer;
     // #21: stash the boot-time default-screen config so `main` seeds the boot screen
