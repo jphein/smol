@@ -43,6 +43,8 @@ use esp_println::println;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
+mod sdraw;
+
 struct NoClock;
 impl TimeSource for NoClock {
     fn get_timestamp(&self) -> Timestamp {
@@ -115,7 +117,34 @@ fn main() -> ! {
         };
         println!("[spike-sd] rc522 verdict: {}", verdict);
 
-        // ---- 2. MicroSD, SPI mode ------------------------------------------
+        // ---- 2a. MicroSD, card level (raw, read-only) ---------------------
+        {
+            let mut spi = Spi::new(
+                p.SPI3.reborrow(),
+                SpiConfig::default()
+                    .with_frequency(Rate::from_khz(400))
+                    .with_mode(Mode::_0),
+            )
+            .expect("spi3 sdraw config")
+            .with_sck(p.GPIO38.reborrow())
+            .with_mosi(p.GPIO40.reborrow())
+            .with_miso(p.GPIO39.reborrow());
+            let mut cs = Output::new(p.GPIO47.reborrow(), Level::High, OutputConfig::default());
+            match sdraw::identify(&mut spi, &mut cs, &delay) {
+                None => println!("[spike-sd] card level: NO CARD answered CMD0 (see [sdraw] lines)"),
+                Some(card) => {
+                    sdraw::report(&card);
+                    let _ = spi.apply_config(
+                        &SpiConfig::default()
+                            .with_frequency(Rate::from_mhz(4))
+                            .with_mode(Mode::_0),
+                    );
+                    sdraw::describe_layout(&mut spi, &mut cs, card.sdhc);
+                }
+            }
+        }
+
+        // ---- 2b. MicroSD, filesystem (embedded-sdmmc, read-only) -------------
         {
             let mut spi = Spi::new(
                 p.SPI3.reborrow(),
@@ -202,6 +231,19 @@ where
         }
     });
     println!("[spike-sd] fat: root has {} entries ({:?})", count, r.map(|_| "ok"));
+    // The positive-control file JP writes: its exact text, if present.
+    match root.open_file_in_dir("TAPSTONE.TXT", FileMode::ReadOnly) {
+        Ok(f) => {
+            let mut t = [0u8; 64];
+            let n = f.read(&mut t).unwrap_or(0);
+            println!(
+                "[spike-sd] fat: TAPSTONE.TXT ({} B) says {:?}",
+                n,
+                core::str::from_utf8(&t[..n]).unwrap_or("<not utf-8>")
+            );
+        }
+        Err(e) => println!("[spike-sd] fat: no TAPSTONE.TXT ({:?})", e),
+    }
     let Some((name, size)) = first else {
         println!("[spike-sd] fat: no regular file in root to read back");
         return;
