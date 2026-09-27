@@ -185,9 +185,12 @@ tree_files() {
 }
 
 fetch_upstream() {
-  local tmp
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  # GLOBAL, not `local`: the EXIT trap runs after this function has returned, and under `set -u` a
+  # trap naming a local that is gone fails the whole script AFTER every layer passed (CI, 2026-09-27:
+  # "tmp: unbound variable", exit 1, on a green check).
+  FETCH_TMP="$(mktemp -d)"
+  trap 'rm -rf "$FETCH_TMP"' EXIT
+  local tmp="$FETCH_TMP"
   # Bare + blobless: refs and tags only, blobs on demand for the handful of files diffed.
   if git clone --quiet --bare --filter=blob:none "$UPSTREAM_URL" "$tmp/tapstone-game.git" 2>/dev/null; then
     git -C "$tmp/tapstone-game.git" remote set-url origin "$UPSTREAM_URL"
