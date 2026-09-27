@@ -324,6 +324,15 @@ features = "stack-paint-lite,${canonical}"
 # The canonical features ride along because the gateway is an ordinary mesh member otherwise.
 features = "tapstone-gw,${canonical}"
 
+[tier.tapstone-station]
+# tapstone#132 (c) the Tapstone shrine station (src/tapstone_station.rs): a seat running
+# tapstone_proto::shrine over the gateway's radio posture and USB bridge. On the C3 CI job it is a
+# headless seat (no panel); the S3 build, with 0032's colour screens, is the
+# [hand_build.s3-tapstone-station] row below. Deliberately NOT `${canonical}`: the canonical
+# features carry `cast`, which the S3 station refuses (it draws the colour panel itself), and `io`,
+# whose S3 pool is the P3 jack a card reader owns.
+features = "tapstone-station,espnow"
+
 # ── HAND BUILDS: declared, never a CI job (smol#549 follow-up) ────────────────
 # A `[hand_build.<target>]` row is a (chip, tier) pair on NEITHER axis — a chip that cannot build
 # in CI crossed with a tier that is not the canonical one. Rule 2 forbids emitting that as a job,
@@ -344,6 +353,14 @@ features = "tapstone-gw,${canonical}"
 # builds every row here (smol#548).
 chip = "esp32s3"
 tier = "tapstone-gw"
+
+[hand_build.s3-tapstone-station]
+# tapstone#132 (c): the shrine station on the ES3C28P, one image for the arena's board (seat A
+# plus the USB bridge, TAPSTONE_STATION_NODE) and a remote one (seat B). Verified on katana's
+# table (tapstone docs/runbooks/radio-match.md, "Real shrines"). Compiled by fw-gate's
+# `hand builds` job like the gateway.
+chip = "esp32s3"
+tier = "tapstone-station"
 
 # ── features with NO tier, declared so the omission is a decision ─────────────
 # The coverage arm requires every feature in Cargo.toml to be either covered by a tier above or

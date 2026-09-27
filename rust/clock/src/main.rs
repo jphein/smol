@@ -252,11 +252,11 @@ mod ts_gw;
 // tapstone#132 (c): the shrine station (its seat is tapstone_proto::shrine).
 #[cfg(feature = "tapstone-station")]
 pub(crate) mod tapstone_station;
-#[cfg(feature = "tapstone-station")]
+#[cfg(all(feature = "tapstone-station", feature = "esp32s3"))]
 pub(crate) mod tapstone_screen;
-// The station draws on the raw colour panel; `cast`'s tee would wrap it and mirror only the 1-bit
-// image, so the two are not combined.
-#[cfg(all(feature = "tapstone-station", feature = "cast"))]
+// The S3 station draws on the raw colour panel; `cast`'s tee would wrap it and mirror only the
+// 1-bit image, so the two are not combined there. (A C3 station is headless and draws nothing.)
+#[cfg(all(feature = "tapstone-station", feature = "esp32s3", feature = "cast"))]
 compile_error!("tapstone-station draws the colour panel itself; build it without `cast`");
 
 // LOCAL git-ignored WiFi credentials, used by the `wifi`/`espnow` radio bring-up.
@@ -2736,7 +2736,9 @@ async fn run(boot_spawner: BootSpawner) -> ! {
         ts_gw::subtick(&mut radio, &mut gw).await;
         #[cfg(feature = "tapstone-station")]
         if let Some(r) = radio.as_deref_mut() {
-            station.service(r, display.station_panel(), millis());
+            station.service(r, millis());
+            #[cfg(feature = "esp32s3")]
+            station.draw(display.station_panel(), millis());
         }
     }
 }

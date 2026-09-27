@@ -176,6 +176,8 @@ enum Route {
 
 pub struct Station {
     shrine: Shrine<Autoplay>,
+    /// 0032's screens: the S3's colour panel only. A C3 station is a headless seat.
+    #[cfg(feature = "esp32s3")]
     screens: crate::tapstone_screen::Screens,
     route: Route,
     last_beacon: Option<u64>,
@@ -212,6 +214,7 @@ impl Station {
         if matches!(option_env!("TAPSTONE_NO_PROPOSE"), Some("1")) {
             println!("[station] NO-PROPOSE build: the stall control, this seat plays nothing");
         }
+        #[cfg(feature = "esp32s3")]
         let faction = if d.name.starts_with("tide") {
             tapstone_rules::Faction::Tide
         } else {
@@ -219,6 +222,7 @@ impl Station {
         };
         Self {
             shrine,
+            #[cfg(feature = "esp32s3")]
             screens: crate::tapstone_screen::Screens::new(node, faction),
             route: Route::Unknown,
             last_beacon: None,
@@ -233,7 +237,7 @@ impl Station {
     }
 
     /// Drain the inbox into the seat, then tick it; send whatever it says.
-    pub fn service(&mut self, radio: &mut RadioManager, panel: &mut crate::s3_oled::Panel, now: u64) {
+    pub fn service(&mut self, radio: &mut RadioManager, now: u64) {
         while let Some(q) = radio.ts_inbox.pop() {
             let Some((h, f)) = Frame::decode(&q.buf[..q.len]) else {
                 continue;
@@ -277,6 +281,11 @@ impl Station {
             self.send(radio, now, *dst, bytes);
         }
         self.status(now);
+    }
+
+    /// Repaint 0032's screen if what it shows changed (the S3's colour panel).
+    #[cfg(feature = "esp32s3")]
+    pub fn draw(&mut self, panel: &mut crate::s3_oled::Panel, now: u64) {
         let s = &self.shrine;
         self.screens.update(
             panel,
