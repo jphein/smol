@@ -22,6 +22,20 @@ sees a full round.
 The two probes take turns on SPI3 through `reborrow()`. The S3 has only SPI2, which the panel
 uses, and SPI3, so a station with both a reader and a card must share SPI3 the same way.
 
+## Read-only, enforced
+
+`check_readonly.sh` fails the build gate (`tools/gate.sh`, host arm) if `src/` sends any SD
+command outside {0, 8, 9, 10, 17, 41, 55, 58}. That set rules out write (24/25), program (27),
+write protect (28–30), erase (32/33/38), lock (42), general command (56) and ACMD23. The script
+also fails on:
+- a command index that isn't a literal;
+- a command framed outside `cmd()`;
+- any file mode other than `FileMode::ReadOnly`;
+- an embedded-sdmmc write API (`.write(`, `delete_file_in_dir`, `make_dir_in_dir`, …).
+
+A floor makes it exit 2 if it can't find the eight read commands and a read-only open, so a
+parser that sees nothing can't pass. Each class was planted once and went red (smol#554).
+
 ## Build and flash
 
 Build on familiar, then flash from the host the board is plugged into, holding the board lock:
