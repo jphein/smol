@@ -63,7 +63,7 @@ Free/unclaimed (**inferred, not schematic-verified**): 2, 3, 14, 19, 20, 21, 43,
 and 48, and they are the MicroSD slot: the other two sources never used it, so all three agreed
 by omission (smol#547). **SD card:** the slot exists; esp-hal 1.1 has no SDMMC host driver, so
 smol drives it in SPI mode, and the S3's two SPI hosts force it to time-share SPI3 with a P3
-reader. Glass status and the mount probe: `spike-sd/README.md`.
+reader. On glass 2026-09-27: a SanDisk 32 GB SDHC mounts in SPI mode (FAT32, root listed); probe and results in `spike-sd/README.md`.
 
 ## Display
 

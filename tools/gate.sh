@@ -851,6 +851,16 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_build_hand"
   fi
 
+  # smol#554: spike-sd runs against cards that are not ours (JP's, with SSH keys on it). Its
+  # "read-only by construction" is held by an allow-list of SD commands and file modes, with a
+  # floor so a parser that sees nothing cannot pass. Pure grep, so it lives in the host half.
+  step "spike-sd read-only guard (smol#554)"
+  if out=$("$ROOT/targets/s3-cyd/spike-sd/check_readonly.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "spike-sd read-only"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "spike-sd read-only"
+  fi
+
   # #351: the same discipline for the exclusion checker, and it matters more here. An ABSENCE
   # check's passing state and its broken state print the same green — "no violations found"
   # and "nothing found at all" are indistinguishable from the outside. Pure text, no cargo,
