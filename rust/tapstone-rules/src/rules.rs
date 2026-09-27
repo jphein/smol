@@ -1,13 +1,18 @@
 //! Applying tap events to the game state: the rules. Every failure is a `Refusal`, never a panic.
 use crate::cards::{CardKind, Effect, Keyword, design};
 use crate::event::{Kind, Record};
-use crate::state::{CELLS, Game, LANES, Phase, SEATS, Seat, Unit, Winner};
+use crate::state::{
+    CELLS, COMMANDER_DESIGN, Commander, Game, LANES, Phase, SEATS, Seat, Unit, Winner,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
     NotYourTurn,
     NotInHand,
-    NoMana { need: u8, have: u8 },
+    NoMana {
+        need: u8,
+        have: u8,
+    },
     CellOccupied,
     AlreadyChargedThisRound,
     AlreadyAdvancedLane,
@@ -19,6 +24,12 @@ pub enum Refusal {
     SeatTaken,
     MulliganClosed,
     LobbyClosed,
+    /// 0036: the seat owes draws, so a `Draw` is the only tap it may make.
+    DrawOwed,
+    /// A `Draw` from a seat that owes none.
+    NoDrawOwed,
+    /// A `Draw` of a design with no undrawn copy left in the seat's list.
+    NotInDeck,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,8 +53,13 @@ pub enum Applied {
     },
     /// The second seat was claimed: hands dealt, round 1, seat 0 active.
     Started,
+    /// The hand went back to the list; `returned` draws are now owed (0036).
     Mulliganed {
-        drawn: u8,
+        returned: u8,
+    },
+    /// One owed draw paid; `owed` is what the seat still owes.
+    Drew {
+        owed: u8,
     },
 }
 
@@ -60,8 +76,21 @@ impl Game {
                 _ => Err(Refusal::NotPlaying),
             },
             Phase::Playing => {
-                if r.seat as usize >= SEATS || r.seat != self.active {
+                if r.seat as usize >= SEATS {
                     return Err(Refusal::NotYourTurn);
+                }
+                // 0036: a draw is paid by whichever seat owes it. Only opening draws can be owed
+                // off-turn, so both seats draw their opening hands at once.
+                if r.kind == Kind::Draw {
+                    let out = self.draw(r)?;
+                    self.seq = self.seq.wrapping_add(1);
+                    return Ok(out);
+                }
+                if r.seat != self.active {
+                    return Err(Refusal::NotYourTurn);
+                }
+                if self.seats[(r.seat & 1) as usize].owed > 0 {
+                    return Err(Refusal::DrawOwed);
                 }
                 let out = match r.kind {
                     Kind::Mulligan => self.mulligan(),
@@ -70,11 +99,11 @@ impl Game {
                     Kind::CastSpell => self.cast_spell(r),
                     Kind::Advance => self.advance(r),
                     Kind::Pass => Ok(self.end_turn()),
-                    // Leave is out of scope for v0; ClaimSeat belongs to the Lobby.
-                    Kind::ClaimSeat | Kind::Leave => Err(Refusal::NotPlaying),
+                    // Leave is out of scope for v0; ClaimSeat belongs to the Lobby; Draw returned above.
+                    Kind::ClaimSeat | Kind::Leave | Kind::Draw => Err(Refusal::NotPlaying),
                 }?;
                 if r.kind != Kind::Mulligan {
-                    self.seats[(r.seat & 1) as usize].acted = true;
+                    self.seats[(r.seat & 1) as usize].set_acted(true);
                 }
                 Ok(out)
             }
@@ -83,7 +112,9 @@ impl Game {
         Ok(out)
     }
 
-    /// Lobby: `r.seat` claims a seat with castle design `r.card`. The second claim starts the game.
+    /// Lobby: `r.seat` claims a seat with castle design `r.card` and its commander's final stats
+    /// (0029): `target` = attack, `aux` = toughness, `lane` = keyword code, -1 for none. A claim
+    /// with toughness 0 or an unknown keyword code is `BadTarget`. The second claim starts the game.
     fn claim_seat(&mut self, r: &Record) -> Result<Applied, Refusal> {
         if r.seat as usize >= SEATS {
             return Err(Refusal::NotYourTurn);
@@ -92,36 +123,51 @@ impl Game {
         if d.kind != CardKind::Castle {
             return Err(Refusal::BadTarget);
         }
-        let seat = &mut self.seats[(r.seat & 1) as usize];
-        if seat.present {
+        if self.seats[(r.seat & 1) as usize].present() {
             return Err(Refusal::SeatTaken);
         }
+        let keyword = match r.lane {
+            -1 => None,
+            code => Some(Keyword::from_code(code as u8).ok_or(Refusal::BadTarget)?),
+        };
+        self.set_commander(r.seat, Commander::stats(r.target, r.aux, keyword))?;
+        let seat = &mut self.seats[(r.seat & 1) as usize];
         seat.castle_design = r.card;
-        seat.present = true;
-        if self.seats.iter().all(|s| s.present) {
+        seat.set_present(true);
+        if self.seats.iter().all(|s| s.present()) {
             self.begin_play();
             return Ok(Applied::Started);
         }
         Ok(Applied::SeatClaimed { seat: r.seat })
     }
 
-    /// Once, on the active seat's first turn before any other action: discard the hand and draw
-    /// as many from the remaining deck order.
+    /// A draw tap (0036): one copy of `r.card` from the seat's list into its hand, paying one
+    /// owed draw. Draws never count as acting, so they never close the mulligan.
+    fn draw(&mut self, r: &Record) -> Result<Applied, Refusal> {
+        let s = &mut self.seats[(r.seat & 1) as usize];
+        if s.owed == 0 {
+            return Err(Refusal::NoDrawOwed);
+        }
+        if !s.draw_design(r.card) {
+            return Err(Refusal::NotInDeck);
+        }
+        s.owed -= 1;
+        s.clamp_owed();
+        Ok(Applied::Drew { owed: s.owed })
+    }
+
+    /// Once, on the active seat's first turn before any other action: the hand goes back into the
+    /// list (the player shuffles it into the physical deck) and a fresh hand of the same size is
+    /// owed as draw taps (0036).
     fn mulligan(&mut self) -> Result<Applied, Refusal> {
         let s = self.me();
-        if s.acted || s.mulliganed {
+        if s.acted() || s.mulliganed() {
             return Err(Refusal::MulliganClosed);
         }
-        let n = s.hand_len;
-        s.hand_len = 0;
-        let mut drawn = 0;
-        for _ in 0..n {
-            if s.draw() {
-                drawn += 1;
-            }
-        }
-        s.mulliganed = true;
-        Ok(Applied::Mulliganed { drawn })
+        let returned = s.return_hand();
+        s.owe(returned);
+        s.set_mulliganed(true);
+        Ok(Applied::Mulliganed { returned })
     }
 
     fn me(&mut self) -> &mut Seat {
@@ -130,14 +176,14 @@ impl Game {
 
     fn charge(&mut self, r: &Record) -> Result<Applied, Refusal> {
         let s = self.me();
-        if s.charged_this_round {
+        if s.charged_this_round() {
             return Err(Refusal::AlreadyChargedThisRound);
         }
         if !s.remove_from_hand(r.card) {
             return Err(Refusal::NotInHand);
         }
         s.charged = s.charged.saturating_add(1);
-        s.charged_this_round = true;
+        s.set_charged_this_round(true);
         Ok(Applied::Charged)
     }
 
@@ -201,6 +247,7 @@ impl Game {
             }
         }
         let opp = 1 - (self.active & 1) as usize;
+        let mut owe = 0;
         match effect {
             Effect::Damage { amount, castle_ok } => {
                 if r.target == CASTLE_TARGET {
@@ -230,7 +277,7 @@ impl Game {
                 if u.toughness > max_toughness {
                     return Err(Refusal::BadTarget);
                 }
-                self.seats[s].cells[l][c] = None;
+                self.remove_unit(s, l, c);
             }
             Effect::Shift => {
                 let (s, l, c) = unpack(r.target)?;
@@ -246,15 +293,13 @@ impl Game {
                 let u = self.seats[s].cells[l][c].take();
                 self.seats[s].cells[nl][c] = u;
             }
-            Effect::Draw { count } => {
-                for _ in 0..count {
-                    self.me().draw();
-                }
-            }
+            Effect::Draw { count } => owe = count,
         }
         let s = self.me();
         s.spent = s.spent.saturating_add(need);
         s.remove_from_hand(r.card);
+        // Owed after the spell leaves the hand, so the slot it frees counts (0036).
+        s.owe(owe);
         self.sweep_dead();
         // A castle at 0 during a live turn is never a displayable state: finish now.
         if self.any_castle_fallen() {
@@ -267,7 +312,7 @@ impl Game {
         let lane = lane_index(r.lane)?;
         let round = self.round;
         let s = self.me();
-        if s.lanes_advanced[lane] {
+        if s.lane_advanced(lane) {
             return Err(Refusal::AlreadyAdvancedLane);
         }
         let mut moved = 0;
@@ -282,7 +327,7 @@ impl Game {
                 }
             }
         }
-        s.lanes_advanced[lane] = true;
+        s.set_lane_advanced(lane, true);
         Ok(Applied::Advanced {
             lane: lane as u8,
             moved,
@@ -308,12 +353,20 @@ impl Game {
         let rules = self.rules;
         let s = &mut self.seats[next];
         s.spent = 0;
-        s.charged_this_round = false;
-        s.lanes_advanced = [false; LANES];
+        s.set_charged_this_round(false);
+        s.clear_lanes_advanced();
+        // A fallen commander comes back at its owner's turn start once its round has come, if
+        // its back cell is free; otherwise it waits for a later turn start (0029).
+        let c = s.commander;
+        let back = &mut s.cells[c.lane as usize % LANES][0];
+        if c.returns != 0 && round >= c.returns && back.is_none() {
+            *back = Some(c.unit(round));
+            s.commander.returns = 0;
+        }
         if round >= rules.pressure_from {
             s.castle.life = s.castle.life.saturating_sub(rules.pressure);
         }
-        s.draw();
+        s.owe(1); // the turn-start draw is a tap (0036)
         if self.any_castle_fallen() {
             return self.finish();
         }
@@ -380,14 +433,34 @@ impl Game {
     }
 
     fn sweep_dead(&mut self) {
-        for slot in self
-            .seats
-            .iter_mut()
-            .flat_map(|s| s.cells.iter_mut().flatten())
-        {
-            if matches!(*slot, Some(u) if u.damage >= u.toughness) {
-                *slot = None;
+        for s in 0..SEATS {
+            for l in 0..LANES {
+                for c in 0..CELLS {
+                    if matches!(self.seats[s].cells[l][c], Some(u) if u.damage >= u.toughness) {
+                        self.remove_unit(s, l, c);
+                    }
+                }
             }
+        }
+    }
+
+    /// Every way a unit leaves the board goes through here, so a commander's death is never
+    /// missed: its castle loses `commander_fall` and it is scheduled to return (0029).
+    fn remove_unit(&mut self, s: usize, l: usize, c: usize) {
+        let Some(u) = self.seats[s].cells[l][c].take() else {
+            return;
+        };
+        if u.design == COMMANDER_DESIGN {
+            let (fall, wait, round) = (
+                self.rules.commander_fall,
+                self.rules.commander_return,
+                self.round,
+            );
+            let seat = &mut self.seats[s];
+            seat.castle.life = seat.castle.life.saturating_sub(fall);
+            // `returns` 0 means "on the board", so a return round must be at least 1.
+            seat.commander.returns = round.saturating_add(wait).max(1);
+            seat.commander.lane = l as u8;
         }
     }
 }

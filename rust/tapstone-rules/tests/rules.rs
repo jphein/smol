@@ -22,9 +22,22 @@ fn tap(seat: u8, kind: Kind, card: u16, lane: i8, target: u8) -> Record {
         auth: 0,
     }
 }
+/// Pay every draw the active seat owes from the top of its list (0036: a draw is a tap).
+fn pay(g: &mut Game) {
+    let a = g.active;
+    while g.seats[a as usize].owed_draws() > 0 {
+        let c = g.top_of_list(a).unwrap();
+        g.apply(&tap(a, Kind::Draw, c, -1, 0)).unwrap();
+    }
+}
+/// Pass, then let the seat whose turn starts pay its draw.
+fn pass(g: &mut Game) {
+    g.apply(&tap(g.active, Kind::Pass, 0, -1, 0)).unwrap();
+    pay(g);
+}
 fn pass_round(g: &mut Game) {
-    g.apply(&tap(g.active, Kind::Pass, 0, -1, 0)).unwrap();
-    g.apply(&tap(g.active, Kind::Pass, 0, -1, 0)).unwrap();
+    pass(g);
+    pass(g);
 }
 /// Charge the last card in hand (never the Vanguard at hand[1]).
 fn charge_last(g: &mut Game) {
@@ -94,12 +107,12 @@ fn rush_enters_mid_and_occupied_cell_refuses() {
     } // round 5, 4 mana, hand [2,3,4,5,10]
     assert_eq!(g.seats[0].charged, 4);
     assert!(g.seats[0].hand[..g.seats[0].hand_len()].contains(&3));
-    g.apply(&tap(0, Kind::CastUnit, 3, 1, 0)).unwrap(); // Ashen Vanguard, Rush
-    assert!(g.seats[0].cells[1][1].is_some(), "Rush enters the mid cell");
-    assert!(g.seats[0].cells[1][0].is_none());
-    g.apply(&tap(0, Kind::CastUnit, 2, 1, 0)).unwrap(); // Whelp into lane 1 back
+    g.apply(&tap(0, Kind::CastUnit, 3, 2, 0)).unwrap(); // Ashen Vanguard, Rush (lane 2: lane 1 back is the commander's)
+    assert!(g.seats[0].cells[2][1].is_some(), "Rush enters the mid cell");
+    assert!(g.seats[0].cells[2][0].is_none());
+    g.apply(&tap(0, Kind::CastUnit, 2, 2, 0)).unwrap(); // Whelp into lane 2 back
     assert_eq!(
-        g.apply(&tap(0, Kind::CastUnit, 4, 1, 0)),
+        g.apply(&tap(0, Kind::CastUnit, 4, 2, 0)),
         Err(Refusal::CellOccupied)
     );
 }
@@ -115,14 +128,14 @@ fn not_your_turn_and_pass_advances_turn_and_round() {
         g.apply(&tap(2, Kind::Pass, 0, -1, 0)),
         Err(Refusal::NotYourTurn)
     );
-    g.apply(&tap(0, Kind::Pass, 0, -1, 0)).unwrap();
+    pass(&mut g);
     assert_eq!((g.active, g.round), (1, 1));
     assert_eq!(
         g.seats[1].hand_len(),
         7,
-        "seat 1 draws at the start of its turn"
+        "seat 1 draws at the start of its turn (5 + the 0035 bonus + the draw)"
     );
-    g.apply(&tap(1, Kind::Pass, 0, -1, 0)).unwrap();
+    pass(&mut g);
     assert_eq!((g.active, g.round), (0, 2));
     assert_eq!(g.seats[0].hand_len(), 6, "draw at the start of your turn");
 }
@@ -138,11 +151,11 @@ fn front_units_hit_the_castle_when_unopposed() {
         g.apply(&tap(0, Kind::Advance, 0, 0, 0)),
         Err(Refusal::AlreadyAdvancedLane)
     );
-    g.apply(&tap(0, Kind::Pass, 0, -1, 0)).unwrap(); // mid unit does not attack
+    pass(&mut g); // mid unit does not attack
     assert_eq!(g.seats[1].castle.life, 20);
-    g.apply(&tap(1, Kind::Pass, 0, -1, 0)).unwrap();
+    pass(&mut g);
     g.apply(&tap(0, Kind::Advance, 0, 0, 0)).unwrap(); // → front
-    g.apply(&tap(0, Kind::Pass, 0, -1, 0)).unwrap(); // combat: front Whelp hits castle for 2
+    pass(&mut g); // combat: front Whelp hits castle for 2
     assert_eq!(g.seats[1].castle.life, 18);
 }
 
@@ -170,26 +183,26 @@ fn combat_is_simultaneous_and_shield_absorbs_one() {
     // seat 0 casts Whelp, advances to mid (Haste)
     g.apply(&tap(0, Kind::CastUnit, 2, 0, 0)).unwrap();
     g.apply(&tap(0, Kind::Advance, 0, 0, 0)).unwrap();
-    g.apply(&tap(0, Kind::Pass, 0, -1, 0)).unwrap();
+    pass(&mut g);
     // seat 1: charge twice over two turns is not possible in one turn; give seat 1 mana via its own charges
     // seat 1 hand at this point: opening [2,3,4,5,6,7] + draws 8,9,10 → charge_last takes 10, then 9 …
     charge_last(&mut g); // seat 1 charged 1
-    g.apply(&tap(1, Kind::Pass, 0, -1, 0)).unwrap();
+    pass(&mut g);
     g.apply(&tap(0, Kind::Advance, 0, 0, 0)).unwrap(); // Whelp → front (round 4)
-    g.apply(&tap(0, Kind::Pass, 0, -1, 0)).unwrap(); // Whelp hits castle: 18
+    pass(&mut g); // Whelp hits castle: 18
     assert_eq!(g.seats[1].castle.life, 18);
     charge_last(&mut g); // seat 1 charged 2
     g.apply(&tap(1, Kind::CastUnit, 8, 0, 0)).unwrap(); // Shieldbearer, lane 0 back (seat 1 side)
-    g.apply(&tap(1, Kind::Pass, 0, -1, 0)).unwrap(); // Whelp hits castle again: 16
+    pass(&mut g); // Whelp hits castle again: 16
     assert_eq!(g.seats[1].castle.life, 16);
     // seat 0 passes twice while seat 1 advances the Shieldbearer to the front
-    g.apply(&tap(0, Kind::Pass, 0, -1, 0)).unwrap(); // Whelp: 14
+    pass(&mut g); // Whelp: 14
     g.apply(&tap(1, Kind::Advance, 0, 0, 0)).unwrap(); // Shieldbearer → mid
-    g.apply(&tap(1, Kind::Pass, 0, -1, 0)).unwrap(); // Whelp: 12 (Shieldbearer in mid, melee ignores it)
+    pass(&mut g); // Whelp: 12 (Shieldbearer in mid, melee ignores it)
     assert_eq!(g.seats[1].castle.life, 12);
-    g.apply(&tap(0, Kind::Pass, 0, -1, 0)).unwrap(); // Whelp: 10
+    pass(&mut g); // Whelp: 10
     g.apply(&tap(1, Kind::Advance, 0, 0, 0)).unwrap(); // Shieldbearer → front
-    g.apply(&tap(1, Kind::Pass, 0, -1, 0)).unwrap(); // Whelp 2 vs Shield1 → 1 damage; Shieldbearer 1 vs Whelp 1 toughness → Whelp dies
+    pass(&mut g); // Whelp 2 vs Shield1 → 1 damage; Shieldbearer 1 vs Whelp 1 toughness → Whelp dies
     assert_eq!(g.seats[1].castle.life, 10, "front unit absorbs the hit");
     assert!(
         g.seats[0].cells[0][2].is_none(),
@@ -434,14 +447,20 @@ fn draw_spell_draws_count() {
     let mut g = game();
     arm(&mut g, 1, 11); // Deep Breath: cost 1, Draw 2
     let hand = g.seats[0].hand_len();
-    let pos = g.seats[0].deck_pos;
+    let list = g.seats[0].deck_len;
     g.apply(&tap(0, Kind::CastSpell, 11, -1, 0)).unwrap();
+    assert_eq!(
+        g.seats[0].owed_draws(),
+        2,
+        "the spell owes its count (0036)"
+    );
+    pay(&mut g);
     assert_eq!(
         g.seats[0].hand_len(),
         hand + 1,
         "two drawn, one card left the hand"
     );
-    assert_eq!(g.seats[0].deck_pos, pos + 2);
+    assert_eq!(g.seats[0].deck_len, list - 2);
 }
 
 #[test]

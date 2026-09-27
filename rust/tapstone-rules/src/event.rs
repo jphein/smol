@@ -12,6 +12,9 @@ pub enum Kind {
     Pass = 7,
     /// Reserved in v0: accepted by the decoder, always refused with `NotPlaying`.
     Leave = 8,
+    /// 0036: the design tapped as it is drawn. Legal only while the seat owes a draw and an
+    /// undrawn copy is in its list.
+    Draw = 9,
 }
 
 impl Kind {
@@ -25,6 +28,7 @@ impl Kind {
             6 => Kind::Advance,
             7 => Kind::Pass,
             8 => Kind::Leave,
+            9 => Kind::Draw,
             _ => return None,
         })
     }

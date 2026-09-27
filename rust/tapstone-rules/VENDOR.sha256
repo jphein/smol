@@ -1,18 +1,23 @@
-# Per-file SHA-256 of the VENDORED tapstone rules engine. Paths are relative to
-# rust/tapstone-rules/. Generated and verified by tools/tapstone_vendor.sh; do not
-# hand-edit, and do not edit the files it names — see that script's header.
-# tag: rules-v0.1.0
-# commit: 1bb1608d6be21644431dcc54f9d1ede03d8ebd72
-e6c2bac6c024aeca43589e0430a42c79a09da8dcab2fd4c5266c694cd0a7fd06  src/lib.rs
-36959c0527ed4eb9ea228ae5cad9d24cd9b78c22ab1dda3760a38fc3c3e53dce  src/cards.rs
-470741668d81d7467b41e077cb74ee7d43d815ea355ed4fa9b1d38b9d81785e2  src/event.rs
-834ea6cf04f5b3588243f2baf5962fe7c2bb722f9fd9e361b2e118c3ff9bae9f  src/hash.rs
-34b87f3e690af66702dcfd7d6be875794852920c2bdd8242e2991a8b5a1ba257  src/rules.rs
-e559f94fba785acd37fe7fc3fbcf8ec833f107e441fc5e43cab58a9fa2cb76a7  src/state.rs
-070a6db46d4bcc0531aef095a7aa25a4e172f82dd1548d4cbea35fd219d452f2  tests/cards.rs
-deac3cf58c1bd8f826899b292215480b7eab57d9a403c09cc22b81c416ee09ca  tests/determinism.rs
+# Per-file SHA-256 of the VENDORED tapstone-rules. Paths are relative to rust/tapstone-rules/.
+# Generated and verified by tools/tapstone_vendor.sh; do not hand-edit, and do not edit
+# the files it names — see that script's header. This list IS the vendored file set.
+# source: https://github.com/jphein/tapstone-game
+# tag: rules-v0.2.0
+# commit: a3e37a8290d8df88344fc9071558f7d695f24c8b
+d925be8c43d9590a38589bb2d3a56852ca57de10d7baa9526a9d0f1915611ef8  src/cards.rs
+d9fb68de637aa38c3a68dd1cbed3620e32f4ba69ab15bb81933723b5f623e9cd  src/event.rs
+09ac0a0d0e05e8105d6349452bc26d73dcc5ccefe769d593d4b8ab0be523f1f9  src/hash.rs
+576f16ce3580df4bdca4d7e8a9bad17cd08a5b72e4324914ffd3fdff9fa5de8d  src/lib.rs
+19224c71c6b98ea916b7ba104986410d98a9bdaa97819c56b598a4d208466b6f  src/rules.rs
+2d662566c0eb2d65dd48317b5d3737db4ea5497b948ce65eabac5dff71d00893  src/state.rs
+82f8cdd96a72adc77541629334d9f3b2176994baa4dae6689cf42a0898ee02a2  tests/cards.rs
+d15e697b33275f8d6a6a18f37f9659fa8b381f7a7ea08dfd99af17b26f09a5f9  tests/commander.rs
+a4664a74b9d0f820808f4eae3021adfcdcceb31db3975c8a7304903f40d26cf4  tests/determinism.rs
+7bd2485ef6a2a4f8d381e478f58535635541f312f3cbbd2225c085ad7a27fbdc  tests/draws.rs
 795d6a608697a4f0b57d50ddf5320836d670d72f811f66ef944dbf57d38ffa4f  tests/event.rs
-952e0ad4432025011dd69700d25386d1ebe2bc541f51ca5c8d29b43df238725f  tests/lobby.rs
-ccee7ed7d7448893e4db4b95f201a4fff24c2f94353838c9ba7399c1bdda1e98  tests/rules.rs
-c2f399bb5938a7aef57fa2b1588af650b5ae870f6819382e23cd3b00be9068d5  tests/state.rs
-90175b10041ef80f7d66dbe435df35f5475d27fdfddc7d4a47b243cf271ee4ca  testdata/seed-1.json
+a99df45839505ea6871ecb149160c7750ecff2104fbcbe74932c76d5a6cd070d  tests/lobby.rs
+ad88ea13688e588abfa16f58330bf8b5f5b671993f55134449aa420a3b2d8460  tests/rules.rs
+6f499a02d0c75b4b801b706963698b350043fcbdc2859f493c8af5b4b144ac9d  tests/state.rs
+537cd1714ac7ab0e83652e638b7f777886aebbd946db4b2fab37fd3dbe7f2527  testdata/seed-1.json
+b773e87e1a9fcf7c098334feccd352aed422036e5bb16d259eb4f9c2a90c338c  tests/vendor_golden_replay.rs
+80b9c93f72eb66e825f509fd3114ca672a3b7c199ae231634594059dd6c6c84a  tests/vendor_budget.rs

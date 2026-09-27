@@ -85,10 +85,12 @@ required-features = ["hostsim"]
 # transitive deps and no_std, so it adds nothing to the pinned esp-hal lockfile but itself.
 # `default-features = false` is explicit: smol must never get the divergent themed realms.
 sigil-names = { path = "../sigil-names", default-features = false }
-# VENDORED tapstone rules engine (rust/tapstone-rules), pinned to tapstone tag `rules-v0.1.0`.
-# A path dep INSIDE this repo for exactly sigil-names' reason: tapstone is a private repo, so a
-# path dep to ~/Projects/tapstone builds on one machine and a git dep needs it pushed public.
-# `tools/tapstone_vendor.sh` (run by tools/gate.sh) is what keeps the copy from drifting.
+# VENDORED tapstone crates (rust/tapstone-rules, -proto, -progression), all three pinned to ONE tag
+# of the public github.com/jphein/tapstone-game (the pin is the `# tag:` line of each crate's
+# VENDOR.sha256). A path dep INSIDE this repo, not a git dep: the firmware must build offline and
+# `--locked` from this tree alone. Vendored only from tapstone-game, never from the private
+# development repo; `tools/tapstone_vendor.sh` (run by tools/gate.sh) refuses any other source and
+# keeps the copies from drifting.
 #
 # OPTIONAL, unlike sigil-names, and the asymmetry is deliberate: node identity is in every build
 # because every board has a name, but the rules engine is only in a build that can host a match.
@@ -100,6 +102,14 @@ sigil-names = { path = "../sigil-names", default-features = false }
 # `default-features = false` is explicit and matters: upstream's `std` feature only lights up test
 # helpers, and there is no std on any target here to light them with.
 tapstone-rules = { path = "../tapstone-rules", default-features = false, optional = true }
+# The MATCH frame codec, follower and shrine seat (the arena's protocol), and commander progression.
+# Same pin, same feature. Their only registry dep beyond sha2 is heapless 0.8, already in this lock.
+tapstone-proto = { path = "../tapstone-proto", optional = true }
+tapstone-progression = { path = "../tapstone-progression", optional = true }
+# The shrine's 320x240 screens (vendored like the rest). Rides the same feature so the gate compiles
+# it for the chip; embedded-graphics unifies with this crate's `=0.8.2` pin. Not in the 64 KB
+# engine budget below: the renderer's cost is the station's, measured when the station draws.
+shrine-render = { path = "../shrine-render", optional = true }
 # --- Core HAL (Phase 1, always on) ---------------------------------------
 # `unstable` is required for I2C/SPI/RNG and is also a hard requirement of
 # esp-wifi. `esp32c3` selects the chip. `rt` + `exception-handler` come from
@@ -643,7 +653,7 @@ bard = ["hw", "dep:libm"]
 # is unbuilt), and issue 2's group-MAC enforcement — which is what makes an inbound commit
 # trustworthy at all — is unbuilt too. Do not add this to the canonical fleet feature list in
 # tools/repro_build.sh until both exist; a forged commit is a forged match result.
-tapstone = ["hw", "dep:tapstone-rules"]
+tapstone = ["hw", "dep:tapstone-rules", "dep:tapstone-proto", "dep:tapstone-progression", "dep:shrine-render"]
 
 # ── #348 budget waiver ───────────────────────────────────────────────────────
 # Declares "this build is NOT the C3 fleet image, so the fleet baseline the budget was

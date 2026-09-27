@@ -150,7 +150,7 @@ impl TapstoneApp {
             Ok(applied) => {
                 if applied == Applied::Started {
                     // Genesis, taken once, AFTER the rules are final and BEFORE any state step.
-                    self.chain = Some(Chain::genesis(&self.game.rules));
+                    self.chain = Some(Chain::genesis(&self.game));
                 } else if let Some(c) = self.chain.as_mut() {
                     c.step(r, &self.game);
                 }

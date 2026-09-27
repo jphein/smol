@@ -12,4 +12,4 @@ pub use cards::{CardDesign, CardKind, Effect, Faction, Keyword, SET1};
 pub use event::{Kind, Record};
 pub use hash::Chain;
 pub use rules::{Applied, Refusal};
-pub use state::{Game, HouseRules, Phase, Winner};
+pub use state::{COMMANDER_DESIGN, Commander, Game, HouseRules, Phase, Winner};

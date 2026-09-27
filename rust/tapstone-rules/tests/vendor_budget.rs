@@ -51,18 +51,25 @@ fn a_record_is_twenty_four_bytes_on_the_wire() {
     assert_eq!(r.encode().len(), 24);
 }
 
-/// The canonical state image is 134 B, and it is 134 B *for a derivable reason*.
+/// The canonical state image is 144 B, and it is 144 B *for a derivable reason*.
 ///
 /// This one is not a size check, it is a **coupling** check. The chain hashes this image, so its
 /// length and layout are the protocol: two shrines that disagree about it compute different heads
 /// from identical taps. `hash.rs` derives `CANON` from `SEATS`, `LANES`, `CELLS` and `HAND_MAX`,
 /// so re-asserting the arithmetic here means a future change to any of those constants cannot
 /// quietly move the image — it fails with the two numbers side by side. A bare
-/// `assert_eq!(canonical_len(), 134)` would catch the same drift while explaining none of it.
+/// `assert_eq!(canonical_len(), 144)` would catch the same drift while explaining none of it.
 #[test]
-fn the_canonical_state_image_is_134_bytes_by_construction() {
+fn the_canonical_state_image_is_144_bytes_by_construction() {
     const CELLS: usize = 3;
-    let derived = 6 + SEATS * (2 + 5 + LANES * CELLS * 4 + 1 + HAND_MAX * 2);
+    // 0029 (the commander, rules-v0.2.0) added 5 B per seat: attack, toughness, keyword code,
+    // return round, lane. 134 B at rules-v0.1.0; 144 B since.
+    // The genesis domain tag did NOT move with it: domain stays v0 until the first shipped release,
+    // lead ruling 2026-09-27. The change is pre-release (no shipped shrine holds a v0.1.0 chain),
+    // and a bump would move every chain hash, golden and piece of radio evidence for no safety gain.
+    // After the first shipped release, the message below is the rule.
+    const COMMANDER_BYTES: usize = 5;
+    let derived = 6 + SEATS * (2 + 5 + COMMANDER_BYTES + LANES * CELLS * 4 + 1 + HAND_MAX * 2);
     assert_eq!(
         canonical_len(),
         derived,
@@ -70,7 +77,7 @@ fn the_canonical_state_image_is_134_bytes_by_construction() {
     );
     assert_eq!(
         canonical_len(),
-        134,
+        144,
         "the canonical state image changed size. This is a PROTOCOL BREAK, not a refactor: every \
          recorded match hashes differently, and a shrine on the old image and one on the new \
          compute different chain heads from the same taps without either noticing. It needs a \

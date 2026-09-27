@@ -46,7 +46,7 @@ fn same_records_same_chain_and_a_changed_record_changes_it() {
     ];
     let run = |recs: &[Record]| {
         let mut g = Game::new(HouseRules::default(), [0, 1], [&deck, &deck]).started();
-        let mut chain = Chain::genesis(&g.rules);
+        let mut chain = Chain::genesis(&g);
         for r in recs {
             g.apply(r).unwrap();
             chain.step(r, &g);
@@ -55,7 +55,7 @@ fn same_records_same_chain_and_a_changed_record_changes_it() {
     };
     assert_eq!(run(&recs), run(&recs));
     let mut other = recs;
-    other[1].lane = 1;
+    other[1].lane = 2; // lane 1 back is the commander's (0029)
     assert_ne!(run(&recs), run(&other));
     assert!(
         canonical_len() <= 512,
@@ -65,12 +65,14 @@ fn same_records_same_chain_and_a_changed_record_changes_it() {
 
 #[test]
 fn genesis_depends_on_house_rules_and_head_changes_per_step() {
-    let a = Chain::genesis(&HouseRules::default());
+    let deck = [2u16; 25];
+    let at = |rules| Chain::genesis(&Game::new(rules, [0, 1], [&deck, &deck]).started());
+    let a = at(HouseRules::default());
     let hr = HouseRules {
         castle_life: 25,
         ..HouseRules::default()
     };
-    assert_ne!(a.head(), Chain::genesis(&hr).head());
+    assert_ne!(a.head(), at(hr).head());
     assert_eq!(a.len, 0);
 }
 
@@ -95,13 +97,13 @@ fn genesis_changes_when_rules_change_in_lobby() {
         2u16, 3, 4, 5, 6, 7, 8, 9, 10, 11, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 2, 3, 4, 5, 6,
     ];
     let mut g = Game::new(HouseRules::default(), [0, 1], [&deck, &deck]);
-    let before = Chain::genesis(&g.rules);
+    let before = Chain::genesis(&g);
     g.with_rules(HouseRules {
         castle_life: 25,
         ..HouseRules::default()
     })
     .unwrap();
-    assert_ne!(before.head(), Chain::genesis(&g.rules).head());
+    assert_ne!(before.head(), Chain::genesis(&g).head());
 }
 
 #[test]
@@ -111,14 +113,23 @@ fn mulligan_changes_the_chain() {
     ];
     let run = |recs: &[Record]| {
         let mut g = Game::new(HouseRules::default(), [0, 1], [&deck, &deck]).started();
-        let mut chain = Chain::genesis(&g.rules);
+        let mut chain = Chain::genesis(&g);
         for r in recs {
             g.apply(r).unwrap();
             chain.step(r, &g);
         }
         chain.head()
     };
-    let with = [record(0, Kind::Mulligan, 0), record(0, Kind::Pass, 0)];
+    // 0036: the mulligan returns the hand and owes five draws, tapped from the top of the list.
+    let with = [
+        record(0, Kind::Mulligan, 0),
+        record(0, Kind::Draw, 7),
+        record(0, Kind::Draw, 8),
+        record(0, Kind::Draw, 9),
+        record(0, Kind::Draw, 10),
+        record(0, Kind::Draw, 11),
+        record(0, Kind::Pass, 0),
+    ];
     let without = [record(0, Kind::Pass, 0)];
     assert_ne!(run(&with), run(&without));
 }

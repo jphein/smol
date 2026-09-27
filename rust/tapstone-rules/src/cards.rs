@@ -16,6 +16,30 @@ pub enum Keyword {
     Taunt,
 }
 
+impl Keyword {
+    /// The closed list in wire order. A commander's keyword travels as this code in `ClaimSeat`'s
+    /// `lane` byte and in the canonical image (0029); `Option::None` is 0xFF / -1.
+    const ALL: [Keyword; 5] = [
+        Keyword::Ranged,
+        Keyword::Shield1,
+        Keyword::Haste,
+        Keyword::Rush,
+        Keyword::Taunt,
+    ];
+
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_code(code: u8) -> Option<Keyword> {
+        if (code as usize) < Self::ALL.len() {
+            Some(Self::ALL[code as usize])
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effect {
     Damage { amount: u8, castle_ok: bool },
@@ -112,6 +136,12 @@ pub static SET1: &[CardDesign] = &[
     spell(11, "Deep Breath", Faction::Neutral, 1, Effect::Draw { count: 2 }),
     spell(12, "Mend", Faction::Neutral, 1, Effect::Heal { amount: 2 }),
     spell(13, "Riptide", Faction::Tide, 3, Effect::Destroy { max_toughness: 2 }),
+    unit(14, "Forge Runner", Faction::Ember, 2, 2, 2, Some(Keyword::Haste)),
+    unit(15, "Bellows Raider", Faction::Ember, 2, 2, 1, Some(Keyword::Rush)),
+    unit(16, "Slag Brute", Faction::Ember, 4, 4, 3, None),
+    spell(17, "Magma Burst", Faction::Ember, 3, Effect::Damage { amount: 3, castle_ok: true }),
+    unit(18, "Brine Skimmer", Faction::Tide, 1, 1, 1, Some(Keyword::Ranged)),
+    unit(19, "Trench Leviathan", Faction::Tide, 4, 3, 4, Some(Keyword::Shield1)),
 ];
 // END GENERATED SET1
 

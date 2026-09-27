@@ -2,8 +2,9 @@ use tapstone_rules::cards::design;
 use tapstone_rules::{CardKind, Effect, Faction, Keyword, SET1};
 
 #[test]
-fn set1_has_fourteen_designs_with_unique_ids() {
-    assert_eq!(SET1.len(), 14);
+fn set1_has_twenty_designs_with_unique_ids() {
+    // 14 designs, then #147's six (2026-09-27): two 30-card decks at three copies need ten each.
+    assert_eq!(SET1.len(), 20);
     for (i, c) in SET1.iter().enumerate() {
         assert_eq!(c.id as usize, i, "design index must equal its id");
         assert!(!c.name.is_empty());
@@ -40,7 +41,8 @@ fn tide_bolt_is_a_damage_spell() {
 #[test]
 fn design_lookup_is_bounds_checked() {
     assert_eq!(design(13).map(|d| d.name), Some("Riptide"));
-    assert!(design(14).is_none());
+    assert_eq!(design(19).map(|d| d.name), Some("Trench Leviathan"));
+    assert!(design(20).is_none());
 }
 
 #[test]
@@ -56,4 +58,64 @@ fn mend_heals_and_riptide_destroys() {
         riptide.kind,
         CardKind::Spell(Effect::Destroy { max_toughness: 2 })
     );
+}
+
+/// #147's six designs, exactly as its table states them: only existing vocabulary, one keyword at
+/// most, no engine work.
+#[test]
+fn the_expansion_cards_match_the_approved_table() {
+    let unit = |attack, toughness, keyword| CardKind::Unit {
+        attack,
+        toughness,
+        keyword,
+    };
+    let want = [
+        (
+            14,
+            "Forge Runner",
+            Faction::Ember,
+            2,
+            unit(2, 2, Some(Keyword::Haste)),
+        ),
+        (
+            15,
+            "Bellows Raider",
+            Faction::Ember,
+            2,
+            unit(2, 1, Some(Keyword::Rush)),
+        ),
+        (16, "Slag Brute", Faction::Ember, 4, unit(4, 3, None)),
+        (
+            17,
+            "Magma Burst",
+            Faction::Ember,
+            3,
+            CardKind::Spell(Effect::Damage {
+                amount: 3,
+                castle_ok: true,
+            }),
+        ),
+        (
+            18,
+            "Brine Skimmer",
+            Faction::Tide,
+            1,
+            unit(1, 1, Some(Keyword::Ranged)),
+        ),
+        (
+            19,
+            "Trench Leviathan",
+            Faction::Tide,
+            4,
+            unit(3, 4, Some(Keyword::Shield1)),
+        ),
+    ];
+    for (id, name, faction, cost, kind) in want {
+        let c = design(id).unwrap_or_else(|| panic!("design {id} missing"));
+        assert_eq!(
+            (c.name, c.faction, c.cost, c.kind),
+            (name, faction, cost, kind),
+            "st1-{id:03}"
+        );
+    }
 }

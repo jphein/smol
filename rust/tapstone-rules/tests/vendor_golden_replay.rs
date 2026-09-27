@@ -8,7 +8,7 @@
 //! Tapstone's two shrines never exchange game state. They exchange TAP EVENTS and an 8-byte chain
 //! head, and each shrine recomputes the state itself (decision 0004). That only works if the
 //! engine on the shrine and the engine on the host are the same engine to the bit: one differing
-//! byte in the canonical state image (134 B, `hash.rs`) makes two shrines compute different heads
+//! byte in the canonical state image (144 B, `hash.rs`) makes two shrines compute different heads
 //! from the same taps, and the table's answer to "who won" becomes "they disagree".
 //!
 //! So this replays a transcript the HOST engine produced — decks, house rules, every record, and
@@ -27,23 +27,16 @@
 //! Vendoring the transcript instead of the number keeps that property: if the transcript is ever
 //! re-vendored, the expectations travel with it in the same commit.
 //!
-//! ── WHY THE TRANSCRIPT IS A FROZEN VECTOR AND `src/` IS A PINNED MIRROR ───────────────────────
-//! These two have DIFFERENT drift rules, and the difference is load-bearing:
-//!
-//!   `src/`                  must equal tapstone at tag `rules-v0.1.0`, forever, byte for byte.
-//!                           Divergence means two engines. `--check` fails closed on it.
-//!   `testdata/seed-1.json`  is a frozen TEST VECTOR: a fixed input with its fixed expected
-//!                           output. It is not required to track tapstone's current golden,
-//!                           because tapstone's goldens legitimately move whenever its sim's
-//!                           scripted seats change — a sim-side event that says nothing about the
-//!                           engine. Chasing it would manufacture exactly the staleness churn the
-//!                           paragraph above is about.
-//!
-//! The vector was taken from tapstone `main` (not from the tag) so that the hash a reviewer reads
-//! here is the hash `jq .final_hash` prints in tapstone today. It replays green through the tag's
-//! engine because `src/` is byte-identical between the tag and that commit — verified, not assumed.
-//! Engine divergence is still caught behaviourally, by `--check`'s third layer replaying tapstone's
-//! CURRENT golden through this copy whenever the sibling repo is present.
+//! ── WHY THE TRANSCRIPT IS VENDORED AT THE SAME TAG AS `src/` ──────────────────────────────────
+//! `testdata/seed-1.json` is upstream's `rust/tapstone-sim/golden/seed-1.json` at the SAME tag as
+//! `src/`, and `tools/tapstone_vendor.sh` tag-diffs it like any vendored file. At rules-v0.1.0 it
+//! was a frozen vector taken from tapstone `main`, on the argument that goldens move whenever the
+//! sim's scripted seats change without the engine moving. That argument was about `main` versus
+//! the tag: a golden taken AT the tag was produced by exactly the engine `src/` holds, so it can
+//! never disagree with it for a sim-only reason. And the 0.2.0 re-vendor showed why "frozen" could
+//! not last: the commander (0029) changed the state image (134 B -> 144 B) and genesis, so the old
+//! vector's hashes were an old engine's and no longer replay. A vector must travel with the engine
+//! it was recorded by, in the same re-vendor commit.
 //!
 //! ── WHY THERE IS A JSON PARSER IN HERE AND NOT A `serde` DEV-DEPENDENCY ───────────────────────
 //! `--locked` on the S3 build is one of issue 10's four criteria, and it is the one that proves no
@@ -262,6 +255,8 @@ fn house_rules(j: &J) -> HouseRules {
         pressure_from: g("pressure_from"),
         pressure: g("pressure"),
         stop_round: g("stop_round"),
+        commander_fall: g("commander_fall"),
+        commander_return: g("commander_return"),
     }
 }
 
@@ -275,6 +270,7 @@ fn kind(s: &str) -> Kind {
         "Advance" => Kind::Advance,
         "Pass" => Kind::Pass,
         "Leave" => Kind::Leave,
+        "Draw" => Kind::Draw,
         other => panic!("unknown record kind {other:?}"),
     }
 }
@@ -373,7 +369,7 @@ fn vendored_engine_reproduces_the_hosts_transcript() {
             panic!(
                 "record {} ({:?}) was accepted by the host engine but REFUSED here: {refusal:?}\n\
                  That is engine divergence, not a bad transcript. Check src/ against tapstone at \
-                 tag rules-v0.1.0 with tools/tapstone_vendor.sh --check.",
+                 the pinned tag with tools/tapstone_vendor.sh --check.",
                 r.seq, r.kind,
             )
         });
@@ -381,7 +377,7 @@ fn vendored_engine_reproduces_the_hosts_transcript() {
         // Genesis is taken when the game leaves the Lobby (hash.rs's stated contract): lobby
         // records are transcript-only and carry `hash: null`.
         let got: Option<String> = if applied == Applied::Started {
-            chain = Some(Chain::genesis(&g.rules));
+            chain = Some(Chain::genesis(&g));
             None
         } else if let Some(c) = chain.as_mut() {
             c.step(&r, &g);

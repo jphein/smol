@@ -11,14 +11,20 @@ fn new_game_deals_hands_from_seeded_decks() {
     assert_eq!(g.phase, Phase::Lobby);
     let g = g.started();
     assert_eq!(g.seats[0].hand_len(), 5);
-    assert_eq!(g.seats[1].hand_len(), 6, "second player bonus");
+    // 6: decision 0035 restored second_player_bonus to 1, because the commander (0029) moved the
+    // seat edge to seat 0. Seat 1 also draws before its first turn, so it opens two cards ahead.
+    assert_eq!(
+        g.seats[1].hand_len(),
+        6,
+        "one second-player bonus card since 0035"
+    );
     assert_eq!(g.seats[0].castle.life, 20);
     assert_eq!(g.round, 1);
     assert_eq!(g.active, 0);
 }
 
 #[test]
-fn house_rules_default_matches_decision_0011() {
+fn house_rules_default_matches_decision_0035_and_147() {
     let hr = HouseRules::default();
     assert_eq!(
         (
@@ -30,20 +36,20 @@ fn house_rules_default_matches_decision_0011() {
             hr.pressure,
             hr.stop_round
         ),
-        (25, 5, 1, 20, 8, 2, 12)
+        // deck_size 30 since #147 (2026-09-27): ten designs at three copies; the rest is 0035's.
+        (30, 5, 1, 20, 8, 2, 12)
     );
 }
 
 #[test]
-fn draw_on_exhausted_deck_returns_false_and_leaves_hand_unchanged() {
+fn an_exhausted_list_owes_nothing_beyond_its_copies() {
+    // 0036: owed draws never exceed the undrawn copies, the old "a drawn-out deck draws nothing".
     let mut s = Seat::empty();
     s.deck[0] = 5;
     s.deck_len = 1;
-    assert!(s.draw());
-    assert_eq!(s.hand_len(), 1);
-    let before = s;
-    assert!(!s.draw());
-    assert_eq!(s, before);
+    s.owe(3);
+    assert_eq!(s.owed_draws(), 1);
+    assert!(s.undrawn(5) && !s.undrawn(6));
 }
 
 #[test]
@@ -61,17 +67,34 @@ fn remove_from_hand_removes_first_match_and_keeps_order() {
 fn deck_len_is_clamped_by_deck_size_and_deck_max() {
     let thirty: [u16; 30] = core::array::from_fn(|i| (i % 12 + 2) as u16);
     let thirty_one: [u16; 31] = core::array::from_fn(|i| (i % 12 + 2) as u16);
-    let g = Game::new(HouseRules::default(), [0, 1], [&thirty, &thirty]);
-    assert_eq!(
-        g.seats[0].deck_len, 25,
-        "default deck_size clamps a 30-card deck"
-    );
-    let big = HouseRules {
-        deck_size: 30,
+    let small = HouseRules {
+        deck_size: 25,
         ..HouseRules::default()
     };
-    let g = Game::new(big, [0, 1], [&thirty, &thirty]);
-    assert_eq!(g.seats[0].deck_len, 30);
-    let g = Game::new(big, [0, 1], [&thirty_one, &thirty_one]);
+    let g = Game::new(small, [0, 1], [&thirty, &thirty]);
+    assert_eq!(
+        g.seats[0].deck_len, 25,
+        "deck_size 25 clamps a 30-card deck"
+    );
+    let g = Game::new(HouseRules::default(), [0, 1], [&thirty, &thirty]);
+    assert_eq!(g.seats[0].deck_len, 30, "the default holds all 30 (#147)");
+    let g = Game::new(HouseRules::default(), [0, 1], [&thirty_one, &thirty_one]);
     assert_eq!(g.seats[1].deck_len, 30, "DECK_MAX clamps a 31-card deck");
+}
+
+#[test]
+fn house_rules_round_trip_through_their_hashed_bytes() {
+    let r = tapstone_rules::HouseRules {
+        castle_life: 17,
+        commander_return: 4,
+        ..Default::default()
+    };
+    assert_eq!(tapstone_rules::HouseRules::from_bytes(r.bytes()), r);
+    let mut b = r.bytes();
+    b[3] = 99;
+    assert_eq!(
+        tapstone_rules::HouseRules::from_bytes(b).castle_life,
+        99,
+        "byte 3 is castle_life"
+    );
 }
