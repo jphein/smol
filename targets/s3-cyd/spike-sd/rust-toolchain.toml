@@ -1,0 +1,37 @@
+[toolchain]
+# The espup-installed Xtensa fork. Mainline rustup has NO `xtensa-esp32s3-none-elf`
+# target — Xtensa is Tier 3 and still needs the esp-rs compiler fork. This is the
+# single biggest difference from every other smol target (C3/C5/C6 are RISC-V and
+# build on mainline).
+#
+#   cargo binstall espup espflash -y     # or: cargo install --locked espup espflash
+#   espup install                        # writes ~/export-esp.sh
+#
+# ---------------------------------------------------------------------------
+# ⚠️ THE TWO-DISGUISE TRAP — read this before "fixing" a broken build
+# ---------------------------------------------------------------------------
+# Every shell that builds this crate needs BOTH of these, in this order:
+#
+#   export PATH="$HOME/.cargo/bin:$PATH" && source ~/export-esp.sh
+#
+# Neither is on PATH by default. `~/export-esp.sh` sets exactly two things:
+#   LIBCLANG_PATH -> the esp-clang lib dir
+#   prepends the xtensa-esp-elf GCC bin dir to PATH
+#
+# The trap is that a MISSING ENVIRONMENT DISGUISES ITSELF AS A BROKEN TOOLCHAIN,
+# in two different costumes:
+#
+#   1. `linker `xtensa-esp32s3-elf-gcc` not found`
+#      -> This does NOT mean the toolchain is broken or missing. It means you did
+#         not source ~/export-esp.sh in THIS shell. Source it and re-run.
+#         Do not reinstall espup. Do not go looking for the linker.
+#
+#   2. An error deep inside `xtensa_lx` / an unresolvable `#![no_std]` core
+#      -> This usually means cargo silently fell back to the STABLE toolchain,
+#         because `rust-toolchain.toml` is resolved BY DIRECTORY. Running
+#         `cargo <cmd> --manifest-path <here>` from somewhere else does NOT pick
+#         this file up. `cd` into the crate first; confirm the output actually
+#         says `Checking s3-cyd-spike`.
+#
+# Both cost an afternoon apiece if you read them at face value.
+channel = "esp"
