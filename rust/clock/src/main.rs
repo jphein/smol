@@ -686,6 +686,11 @@ async fn run(boot_spawner: BootSpawner) -> ! {
     #[cfg(feature = "paint")]
     stack_paint::paint();
 
+    // Flash-budget instrument (tools/check_tapstone_flash.py): keeps the vendored tapstone crates
+    // reachable so LTO cannot strip what the budget measures. Never in a flashed build.
+    #[cfg(feature = "tapstone-probe")]
+    core::hint::black_box(tapstone::flash_probe(core::hint::black_box(0)));
+
     // --- Clocks & peripherals ------------------------------------------------
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
 

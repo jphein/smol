@@ -245,29 +245,21 @@ ships    = true
 # module and silently never compile those two arms — a typo in either would then ship, in the one
 # flavor nothing builds. Crossing with the canonical (fleet) tier is what closes that.
 #
-# No `off-fleet`, unlike [tier.bard], and that is a MEASUREMENT not an omission. Measured
-# 2026-09-21 on familiar, release + fat-LTO, engine made reachable by a `black_box` probe (see
-# below for why that matters), as `.text` + `.rodata` deltas against the same tier without the
-# feature:
-#   esp32c3  espnow,cast,io   .text +8,770  .rodata   +960   (opt-level "s", the global profile)
-#   esp32s3  espnow,cast,io   .text +9,536  .rodata   +912   (opt_level 2, the #398/#409 override)
-# So ~9.7 KB of flash-resident code and data, against 875,968 B of C3 flash headroom
-# (app_slot 2,031,616 - baseline_image 1,155,648, budget.rs) and 5,262,800 B on the S3. It is
-# 1.1% of the tighter chip's headroom; #348's budget predicate has nothing to waive.
+# No `off-fleet`, unlike [tier.bard], and that is a MEASUREMENT not an omission. The flash cost is
+# GATED, not written down: `tools/gate.sh fw` builds this composition plus `tapstone-probe` and
+# `tools/check_tapstone_flash.py` fails it over 64 KB (JP's ruling 2026-09-27, which replaced issue
+# 10's 8 KB criterion; the engine had never fit 8 KB once inlined into a fat-LTO image, and the
+# shrine seat in tapstone-proto more than triples it). Readings at rules-v0.2.0, 2026-09-27:
+#   esp32c3 canonical (the gated one)  +35,216 B (1.98.1: +35,364; .text +33,036, .rodata +2,240)
+#   esp32s3 by hand (opt_level 2)      +48,176 B (.text +45,864, .rodata +2,240) -- 17 KB headroom
+# The S3 is NOT gated (no Xtensa toolchain in CI) and runs ~37% heavier: re-measure it by hand
+# (tools/check_tapstone_flash.py on two `cargo +esp` ELFs) before the station adds engine code.
 #
-# ⚠️ TWO THINGS THE NUMBERS ABOVE CORRECT, both worth keeping written down:
-#   * Issue 10's criterion says the crate adds <= 8 KB. It does not — it adds ~9.7 KB on either
-#     chip. The 8 KB came from the crate's own `.text` measured as a standalone rlib (~3.7 KB);
-#     inlined and monomorphised into a fat-LTO firmware it costs about 2.6x that, and `.rodata`
-#     (the SET1 card table) was not counted at all. The criterion is optimistic, not the design:
-#     nothing is actually tight. Correct the issue, do not shrink the engine.
-#   * The AS-COMMITTED cost is only +1,888 B of `.text`, because nothing calls
-#     `TapstoneApp::commit` until issue 1 lands and LTO therefore strips almost the whole engine
-#     (verified with `nm`: ONE tapstone symbol survives in the shipped S3 ELF). Measuring the
-#     tree as it stands would have reported ~2 KB and been wrong by 5x the moment the mesh was
-#     wired. Hence the probe. Re-measure without it and you will get the smaller, useless number
-#     — and note the first probe attempt read ~2 KB too, because an all-zeros literal let the
-#     optimiser const-fold `Record::decode` to `None` and delete the call again.
+# ⚠️ WHY A PROBE: nothing calls `TapstoneApp::commit` or the shrine seat until issue 1 lands, so fat
+# LTO strips almost the whole engine from the shipping tree (verified with `nm` on 2026-09-21: ONE
+# tapstone symbol survived). Measuring the tree as it stands reads ~2 KB and is wrong the moment
+# the mesh is wired. The checker FAILS under a 4 KB floor rather than passing a probe LTO has
+# defeated (control, 2026-09-27: probe call removed -> delta -1,172 B -> BLIND, red).
 features = "tapstone,${canonical}"
 
 [tier.bard]
@@ -364,6 +356,9 @@ hostsim  = "host-only, and covered by the `cargo test` arm in tools/gate.sh"
 # check exists to guarantee. A `[tier.paint]` would build the instrument attached to nothing, which
 # is precisely the composition that has no measurement to give.
 paint    = "the instrument, not a composition — built by BOTH `stack-paint` and `stack-paint-lite`"
+# The tapstone flash-budget probe: an instrument like `paint`. tools/gate.sh fw builds it (release,
+# fat LTO, own target dir) on top of the canonical tier and measures it against the canonical ELF.
+tapstone-probe = "the flash-budget instrument — built by tools/gate.sh fw's tapstone flash arm, never flashed"
 
 # ── #347 Part 2: the chip axis is not a tier ──────────────────────────────────
 # A CHIP is the other axis of this very matrix — `[chip.*]` above — so a `[tier.esp32c5]` would

@@ -663,6 +663,31 @@ if [ "$run_fw" = 1 ]; then
     tail -15 "$GATE_TMP/gate-paint.log" | sed 's/^/        /'
   fi
 
+  # JP's ruling 2026-09-27: the vendored tapstone crates (rules, proto, progression) may cost at most
+  # 64 KB of flash. Measured as the flash-image delta between the canonical ELF (the stack step's)
+  # and the same composition plus `tapstone,tapstone-probe`; the probe keeps the crates reachable,
+  # because nothing calls them until issue 1 and fat LTO would otherwise strip them to ~2 KB. The
+  # checker also FAILS under a 4 KB floor, because a probe LTO has defeated cannot see the budget.
+  # Its OWN target dir, for the paint arm's reason: sharing one would overwrite the canonical ELF.
+  step "tapstone flash budget — vendored crates vs 64 KB (JP 2026-09-27)"
+  TSDIR="${SMOL_GATE_TAPSTONE_DIR:-$GATE_TMP/gate-tsflash-$(printf %s "$ROOT" | cksum | cut -d' ' -f1)}"
+  if [ ! -f "$FLEET_ELF" ]; then
+    printf '   \033[33mSKIP\033[0m tapstone flash — no canonical ELF to compare against\n'
+  elif (cd "$BUILD_ROOT/$CLOCK" && CARGO_TARGET_DIR="$TSDIR" \
+          cargo build --release --bin clock "${JOBS[@]}" \
+          --features "tapstone,tapstone-probe,$REPRO_FLEET_FEATURES" "${REPRO_CARGO_ARGS[@]}") \
+        >"$GATE_TMP/gate-tsflash.log" 2>&1; then
+    if out=$("$ROOT/tools/check_tapstone_flash.py" --fleet-elf "$FLEET_ELF" \
+               --tapstone-elf "$TSDIR/${REPRO_TARGET}/release/clock" 2>&1); then
+      printf '%s\n' "$out"; ok "tapstone flash"
+    else
+      printf '%s\n' "$out"; bad "tapstone flash"
+    fi
+  else
+    bad "tapstone flash (tapstone-probe build failed)"
+    tail -15 "$GATE_TMP/gate-tsflash.log" | sed 's/^/        /'
+  fi
+
   step "byte-free corroboration — symbols in the canonical ELF (#351)"
   ELF="${CARGO_TARGET_DIR:-$BUILD_ROOT/$CLOCK/target}/${REPRO_TARGET}/release/clock"
   if [ -f "$ELF" ]; then
@@ -1077,6 +1102,15 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | tail -1; ok "test_symbol_sizes"
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_symbol_sizes"
+  fi
+
+  # The tapstone flash checker's offline half: its budget and blind-floor arms can fail, on
+  # synthetic ELFs, with no toolchain. The fw arm runs it on real ones.
+  step "tapstone flash checker self-test"
+  if out=$("$ROOT/tools/check_tapstone_flash.py" --self-test 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "check_tapstone_flash self-test"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "check_tapstone_flash self-test"
   fi
 
   # #419: the board-fact seam. A constant in targets/*/src/board/*.rs is a STATEMENT ABOUT THE

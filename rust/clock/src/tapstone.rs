@@ -331,3 +331,51 @@ impl core::fmt::Write for Line {
         Ok(())
     }
 }
+
+/// **The flash-budget probe** (JP's ruling 2026-09-27: the vendored tapstone crates may cost at most
+/// 64 KB of flash; `tools/check_tapstone_flash.py`, run by `tools/gate.sh fw`).
+///
+/// Nothing in a `tapstone` build calls the engine yet (issue 1 wires the mesh), so fat LTO strips
+/// almost all of it and a measurement of the shipping tree reads ~2 KB — wrong by 5x the day the
+/// mesh lands. This makes the whole shrine path REACHABLE: a MATCH frame decoded and fed to the
+/// shrine seat (`tapstone-proto`: codec, follower, rules engine, chain), one scheduler tick, the
+/// app's own commit path, and commander progression. Every input goes through `black_box` — an
+/// all-zeros literal let the optimiser const-fold `Record::decode` to `None` and delete the call
+/// (#543's first probe read ~2 KB for exactly that reason).
+///
+/// An INSTRUMENT, never a composition: only the gate builds `tapstone-probe`, and it is never
+/// flashed (build-matrix.toml `[exempt]`).
+#[cfg(feature = "tapstone-probe")]
+#[inline(never)]
+pub fn flash_probe(seed: u64) -> usize {
+    use core::hint::black_box;
+    use tapstone_proto::frame::{FRAME_MAX, Frame};
+    use tapstone_proto::shrine::{Autoplay, Shrine};
+
+    let deck = black_box([seed as u16; tapstone_rules::state::DECK_MAX]);
+    let mut shrine = Shrine::new(
+        black_box(seed),
+        black_box(0),
+        black_box(1),
+        black_box(1),
+        &deck,
+        Autoplay::new(black_box(seed)),
+    );
+    let mut n = 0;
+    let buf = black_box([seed as u8; FRAME_MAX]);
+    if let Some((h, f)) = Frame::decode(&buf) {
+        n += shrine.rx(&h, &f).len();
+    }
+    n += shrine.act(black_box(seed), black_box(true), black_box(false)).len();
+
+    let mut app = TapstoneApp::new();
+    let rec = black_box([seed as u8; Record::LEN]);
+    if let Some(r) = Record::decode(&rec) {
+        n += usize::from(app.commit(&r).is_ok());
+    }
+    n += app.head().map_or(0, |h| usize::from(h[0]));
+
+    let c = tapstone_progression::commander_at(black_box(seed as u8), black_box(&[]));
+    n += usize::from(c.attack) + usize::from(c.toughness);
+    black_box(n)
+}

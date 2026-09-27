@@ -654,6 +654,10 @@ bard = ["hw", "dep:libm"]
 # trustworthy at all — is unbuilt too. Do not add this to the canonical fleet feature list in
 # tools/repro_build.sh until both exist; a forged commit is a forged match result.
 tapstone = ["hw", "dep:tapstone-rules", "dep:tapstone-proto", "dep:tapstone-progression", "dep:shrine-render"]
+# The flash-budget INSTRUMENT (src/tapstone.rs `flash_probe`, tools/check_tapstone_flash.py): makes
+# the vendored crates reachable so LTO keeps what the 64 KB budget measures. Built only by
+# tools/gate.sh fw into its own target dir; never a composition, never flashed.
+tapstone-probe = ["tapstone"]
 
 # ── #348 budget waiver ───────────────────────────────────────────────────────
 # Declares "this build is NOT the C3 fleet image, so the fleet baseline the budget was
