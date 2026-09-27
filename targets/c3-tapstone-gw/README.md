@@ -5,10 +5,14 @@ bridges the laptop's `tapstone-arena` to the mesh: every received `SMOLv1 MATCH 
 USB as an `@TS1 RX` line, and every `@TS1 TX` line from the laptop goes out as a frame. smol#548,
 part of tapstone#132. The host side is tapstone's `rust/tapstone-arena/src/link/{lines,serial}.rs`.
 
-**Status: 🟡 compile- and host-verified, not hardware-verified.** The `tapstone-gw` tier builds and
-passes `clippy -D warnings` in `tools/gate.sh`; the line codec is checked on the host against pinned
-goldens and against tapstone's own parser. No board has run it yet: the bench below is the
-acceptance test, and it needs hands.
+**Status: 🟡 compile- and host-verified on the C3; ✅ hardware-verified on the S3.** The `tapstone-gw`
+tier builds and passes `clippy -D warnings` in `tools/gate.sh` for the C3, and the line codec is
+checked on the host against pinned goldens and against tapstone's own parser. No C3 has run it yet.
+
+> **The S3 build exists and is the one that was bench-verified.** The fleet has spare S3s and no
+> spare C3s, so on 2026-09-26 the bench below ran on two of JP's ESP32-S3 shrine boards: PASS,
+> 100/100 frames, p95 ≤ 17.2 ms, `mac_ok` 100/100. Same code, same USB-Serial-JTAG peripheral; only
+> the build differs. Recipe, build script and numbers: [`targets/s3-tapstone-gw`](../s3-tapstone-gw/README.md).
 
 - **Chip**: ESP32-C3 · **firmware**: `rust/clock`, tier `tapstone-gw` = `tapstone-gw` + the fleet
   features (`tools/build-matrix.toml`) · **download**: none (`target.toml` says why)
@@ -44,8 +48,9 @@ and is logged instead.
 
 **Why the C3.** It is `canonical_chip` in `tools/build-matrix.toml` and the only chip with
 `builds = true`, so this tier is compiled and linted on every gate run, on CI as well as locally. The
-S3 would work the same way (same USB-Serial-JTAG peripheral), but CI cannot build Xtensa yet, and the
-S3 is the shrine board, which already has a job at the table. A bare `c3` supermini costs about a
+S3 works the same way (same USB-Serial-JTAG peripheral) and is the build that was bench-verified,
+but CI cannot build Xtensa yet, so the S3 is a declared hand build (`targets/s3-tapstone-gw`) rather
+than a gated one. A bare `c3` supermini costs about a
 dollar and needs nothing but its USB-C port.
 
 **A build flavor, not an `AppKind`.** In smol an "app" is a screen behind the BOOT menu. The gateway
