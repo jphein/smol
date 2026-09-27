@@ -34,6 +34,8 @@ DEFAULT_CARGO = HERE.parent / "rust" / "clock" / "Cargo.toml"
 # carries a python copy so it can name the chip it is about to stage.
 DEFAULT_TARGET_RS = HERE.parent / "rust" / "clock" / "src" / "net" / "target.rs"
 DEFAULT_OTA_PUBLISH = HERE / "ota_publish.sh"
+# smol#549 follow-up: the target folders, read for the hand-build arm (and its reverse direction).
+DEFAULT_TARGETS = HERE.parent / "targets"
 
 
 # ── loading ───────────────────────────────────────────────────────────────────
@@ -90,8 +92,23 @@ def load(path: Path) -> dict:
             if field not in chip:
                 raise Bad(f"chip {name!r} declares no `{field}`")
 
+    # `[hand_build.<target>]` (smol#549 follow-up): a (chip, tier) pair that is built BY HAND, off
+    # both axes. Unknown references are MALFORMED rather than failed checks, the same call the
+    # canonical_chip/canonical_tier references above make: a row naming a chip that does not exist
+    # is a broken file, not a true statement about a tree.
+    hand = doc.get("hand_build") or {}
+    for name, row in hand.items():
+        for field in ("chip", "tier"):
+            if field not in row:
+                raise Bad(f"hand_build {name!r} declares no `{field}`")
+        if row["chip"] not in chips:
+            raise Bad(f"hand_build {name!r}: chip {row['chip']!r} is not a declared chip")
+        if row["tier"] not in tiers:
+            raise Bad(f"hand_build {name!r}: tier {row['tier']!r} is not a declared tier")
+
     return {"meta": meta, "chips": chips, "tiers": tiers,
             "exempt": doc.get("exempt") or {},
+            "hand_build": hand,
             "canonical_chip": canon_chip, "canonical_tier": canon_tier}
 
 
@@ -223,6 +240,37 @@ def budget_chips(path: Path) -> set[str]:
     return {c for c in found if c not in NOT_A_FLEET_TARGET}
 
 
+def cargo_default(path: Path) -> list[str]:
+    """Cargo.toml's `default` feature list, in order. The hand-build recipe needs it because it
+    builds with `--no-default-features` (the default names the canonical chip) and has to put the
+    rest of `default` back — derived here, so `hw` is not a second hand-typed copy."""
+    try:
+        with open(path, "rb") as fh:
+            return list(((tomllib.load(fh).get("features") or {}).get("default")) or [])
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise Bad(f"{path}: cannot read [features].default — {exc}")
+
+
+def target_manifests(root: Path) -> dict[str, dict]:
+    """`targets/<name>/target.toml`, keyed by folder name. They are flat TOML by convention
+    (tools/release_targets.sh reads them with sed), so tomllib reads them without surprises."""
+    out: dict[str, dict] = {}
+    for m in sorted(root.glob("*/target.toml")):
+        try:
+            with open(m, "rb") as fh:
+                out[m.parent.name] = tomllib.load(fh)
+        except tomllib.TOMLDecodeError as exc:
+            raise Bad(f"{m}: {exc}")
+    return out
+
+
+def on_axis(doc: dict, chip: str, tier: str) -> bool:
+    """Is (chip, tier) a job `matrix()` already emits? Kept next to matrix() in meaning: the
+    canonical chip crosses every tier, and every BUILDABLE chip crosses the canonical tier."""
+    return (chip == doc["canonical_chip"]
+            or (tier == doc["canonical_tier"] and doc["chips"][chip]["builds"]))
+
+
 def cargo_features(path: Path) -> set[str]:
     """Feature names from `[features]`. Parsed as TOML, not scraped — Cargo.toml IS TOML, so
     there is no excuse for a regex here (unlike budget.rs, which is Rust and has one)."""
@@ -330,6 +378,53 @@ def check(doc: dict, repro: Path, budget: Path) -> list[str]:
         for ghost in sorted(exempt - feats):
             fails.append(f"[exempt] names {ghost!r}, which is not a feature in Cargo.toml")
 
+    # 4b. smol#549 follow-up — HAND BUILDS. The S3 gateway was bench-verified on a recipe typed by
+    #     hand, because the S3 is `builds = false` (no CI toolchain) and tapstone-gw is not the
+    #     canonical tier: (esp32s3, tapstone-gw) is on NEITHER axis, and crossing them is exactly
+    #     what rule 2 refuses. A `[hand_build]` row declares such a pair WITHOUT emitting a job, so
+    #     the one-axis matrix is untouched and the recipe is still derived from this file.
+    #     Checked in BOTH directions against targets/, like every other roster here:
+    #       row -> folder: the row's folder exists and agrees on chip and flavor, with no artifact;
+    #       folder -> row: a rust/clock folder whose off-canonical flavor is a tier must be a
+    #                      matrix job or a hand build — otherwise it is an undeclared build.
+    hand = doc.get("hand_build") or {}
+    troot = doc.get("_targets") or DEFAULT_TARGETS
+    try:
+        folders = target_manifests(troot)
+    except Bad as exc:
+        fails.append(str(exc))
+        folders = {}
+    for name, row in hand.items():
+        chip, tier = row["chip"], row["tier"]
+        if not chips[chip]["checks"]:
+            fails.append(f"hand_build {name}: chip {chip} is `checks = false` — a recipe for a chip "
+                         f"whose source is declared not to compile")
+        if on_axis(doc, chip, tier):
+            fails.append(f"hand_build {name}: ({chip}, {tier}) is already on the CI matrix — a hand "
+                         f"build of it is an unchecked second copy of a CI job; drop the row")
+        tm = folders.get(name)
+        if tm is None:
+            fails.append(f"hand_build {name}: no targets/{name}/target.toml — a hand build is "
+                         f"declared by its target folder, which carries the recipe's README")
+            continue
+        if tm.get("chip") != chip:
+            fails.append(f"hand_build {name}: targets/{name} says chip {tm.get('chip')!r}, "
+                         f"the row says {chip!r}")
+        if tm.get("flavor") != tier:
+            fails.append(f"hand_build {name}: targets/{name} says flavor {tm.get('flavor')!r}, "
+                         f"the row says tier {tier!r}")
+        if tm.get("artifact") is not False:
+            fails.append(f"hand_build {name}: targets/{name} has artifact = true (or none) — a hand "
+                         f"build has no release path; release_targets.sh builds the fleet flavor only")
+    for name, tm in folders.items():
+        chip, flavor = tm.get("chip"), tm.get("flavor")
+        if (tm.get("source") != "rust/clock" or chip not in chips or flavor not in tiers
+                or flavor == doc["canonical_tier"] or name in hand):
+            continue
+        if not on_axis(doc, chip, flavor):
+            fails.append(f"targets/{name}: ({chip}, {flavor}) is not a declared build — no matrix "
+                         f"job builds it and no [hand_build.{name}] row declares it")
+
     # 5. the emitted matrix is not a cross product.
     n = len(matrix(doc))
     buildable = sum(1 for c in chips.values() if c["builds"])
@@ -346,7 +441,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("command",
                     choices=("emit", "chips", "chip-checks", "canonical-chip", "config-markers",
-                             "ci-matrix", "check"))
+                             "ci-matrix", "hand-build", "check"))
+    ap.add_argument("name", nargs="?", default=None, help="hand-build: the target folder name")
     ap.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     ap.add_argument("--repro", type=Path, default=DEFAULT_REPRO)
     ap.add_argument("--budget", type=Path, default=DEFAULT_BUDGET)
@@ -355,6 +451,7 @@ def main() -> int:
     # regression suite can craft a SHORT roster instead of sabotaging the real files.
     ap.add_argument("--target-rs", type=Path, default=DEFAULT_TARGET_RS)
     ap.add_argument("--ota-publish", type=Path, default=DEFAULT_OTA_PUBLISH)
+    ap.add_argument("--targets", type=Path, default=DEFAULT_TARGETS)
     ap.add_argument("--for", dest="phase", choices=("check", "clippy"), default="check",
                     help="emit: which gate phase's tier list to produce")
     ap.add_argument("--builds", action="store_true", help="chips: only buildable ones")
@@ -454,6 +551,34 @@ def main() -> int:
         print(doc["canonical_chip"])
         return 0
 
+    if args.command == "hand-build":
+        # smol#549 follow-up: the recipe for ONE `[hand_build]` row, for targets/<name>/build.sh.
+        #   chip · target · toolchain · build_std · opt_level · features
+        # Same sentinel rule as chip-checks. `features` = Cargo.toml's `default` with the canonical
+        # chip swapped for this one (the build is --no-default-features), then the tier's list.
+        # An unknown name is an ERROR: a build script handed a typo must not get an empty recipe.
+        row = (doc.get("hand_build") or {}).get(args.name or "")
+        if row is None:
+            print(f"hand-build: no [hand_build.{args.name}] — known: "
+                  f"{', '.join(sorted(doc.get('hand_build') or {})) or '(none)'}", file=sys.stderr)
+            return 2
+        spec = doc["chips"][row["chip"]]
+        try:
+            default = cargo_default(args.cargo)
+        except Bad as exc:
+            print(f"hand-build: {exc}", file=sys.stderr)
+            return 2
+        if doc["canonical_chip"] not in default:
+            print(f"hand-build: Cargo.toml's default {default} does not name the canonical chip "
+                  f"{doc['canonical_chip']!r}, so there is nothing to swap", file=sys.stderr)
+            return 2
+        base = [row["chip"] if f == doc["canonical_chip"] else f for f in default]
+        feats = ",".join(f for f in base + doc["tiers"][row["tier"]]["features"].split(",") if f)
+        opt = lambda v: str(v or "").strip() or "-"  # noqa: E731
+        print("\t".join((row["chip"], spec["target"], opt(spec.get("toolchain")),
+                         opt(spec.get("build_std")), opt(spec.get("opt_level")), feats)))
+        return 0
+
     if args.command == "ci-matrix":
         print(json.dumps({"include": matrix(doc)}, separators=(",", ":")))
         return 0
@@ -461,12 +586,14 @@ def main() -> int:
     doc["_cargo_toml"] = args.cargo
     doc["_target_rs"] = args.target_rs
     doc["_ota_publish"] = args.ota_publish
+    doc["_targets"] = args.targets
     fails = check(doc, args.repro, args.budget)
     jobs = matrix(doc)
     builds = [c for c, s in doc["chips"].items() if s["builds"]]
     ships = [c for c, s in doc["chips"].items() if s["ships"]]
     print(f"  build matrix: {len(jobs)} jobs · chips builds={','.join(builds) or '-'} "
-          f"ships={','.join(ships) or '-'} · {len(doc['tiers'])} tiers")
+          f"ships={','.join(ships) or '-'} · {len(doc['tiers'])} tiers · "
+          f"{len(doc['hand_build'])} hand build(s), no job")
     if fails:
         for f in fails:
             print(f"  FAIL {f}", file=sys.stderr)

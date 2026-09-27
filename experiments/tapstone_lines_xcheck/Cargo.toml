@@ -1,0 +1,20 @@
+# #548 cross-repo check: tapstone's REAL arena-side parser (rust/tapstone-arena/src/link/lines.rs)
+# reads what smol's gateway codec (rust/clock/src/net/ts_lines.rs) writes, and smol's decoder
+# reads what tapstone's `tx_line` / `ping_line` write. Needs a tapstone checkout, so it is NOT named
+# `*_verify` and tools/gate.sh does not run it (CI has no tapstone). Run by hand:
+#   TAPSTONE_DIR=/path/to/tapstone cargo run --release
+# TAPSTONE_DIR defaults to ../../../tapstone (a sibling checkout of smol). build.rs refuses to
+# build without the file rather than skipping, so a green run always means tapstone's code ran.
+[package]
+name = "tapstone_lines_xcheck"
+version = "0.0.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "tapstone_lines_xcheck"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 0

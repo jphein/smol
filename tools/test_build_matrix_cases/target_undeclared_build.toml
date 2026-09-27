@@ -1,0 +1,21 @@
+# EXPECT: not a declared build
+# TARGETS: _targets_gw
+# The folder exists but nothing declares (esp32s3, gw): no matrix job, no hand_build row. This is
+# the direction that makes a hand recipe a declared build: adding the folder alone goes red.
+[meta]
+canonical_chip = "esp32c3"
+canonical_tier = "fleet"
+[chip.esp32c3]
+target = "riscv32imc-unknown-none-elf"
+builds = true
+checks = true
+ships = true
+[chip.esp32s3]
+target = "xtensa-esp32s3-none-elf"
+builds = false
+checks = true
+ships = false
+[tier.fleet]
+features = "espnow,cast,io"
+[tier.gw]
+features = "gw,${canonical}"

@@ -683,6 +683,14 @@ coexist-soak = ["espnow"]
 # build is BYTE-FREE of it AND structurally CANNOT be made deaf (no field, no hook) — the
 # strongest guard against a "won't-rejoin" leftover-deaf ghost. DIAG surfaces deaf=/ddrops=.
 mesh-test = ["espnow"]
+# #548 TAPSTONE USB-SERIAL GATEWAY. One node on the Tapstone arena laptop's USB bridges `@TS1 `
+# lines to MATCH frames (tapstone arena spec §4): src/ts_gw.rs + the codec in src/net/ts_lines.rs,
+# design + bench procedure in targets/c3-tapstone-gw/README.md. Builds on `espnow` (it IS a mesh
+# node). It changes the node's role: WiFi never comes up (no boot burst, no re-election, STA
+# refused in `switch`), so it can never be the crown, whose WiFi bursts deafen it for up to ~15 s.
+# NOT a fleet image — a board flashed with it stops being a WiFi-capable crown candidate. The
+# fleet tiers are byte-free of it (every hook is cfg-gated; #351 checks the claim).
+tapstone-gw = ["espnow"]
 
 [profile.release]
 # esp-wifi strongly recommends opt-level "s"/2/3 and LTO; the radio blobs are

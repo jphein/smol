@@ -1,0 +1,10 @@
+# Machine-readable target manifest — read by tools/release_targets.sh (#413).
+name = "c3-tapstone-gw"
+chip = "esp32c3"
+flavor = "tapstone-gw"           # rust/clock `tapstone-gw` tier (tools/build-matrix.toml)
+source = "rust/clock"
+artifact = false
+# NO DOWNLOAD, deliberately. This is one board on the Tapstone arena laptop's USB, flashed by hand
+# with the fleet's GROUP_KEY (a placeholder-key image would forward every frame as mac_ok=0), and
+# a board running it can never be a crown. A release artifact would invite flashing it onto fleet
+# boards, which is the one thing it must not be. #548; bench procedure in README.md.

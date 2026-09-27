@@ -1,0 +1,14 @@
+# Machine-readable target manifest — read by tools/release_targets.sh (#413).
+name = "s3-tapstone-gw"
+chip = "esp32s3"
+flavor = "tapstone-gw"           # rust/clock `tapstone-gw` tier, as c3-tapstone-gw's
+source = "rust/clock"
+artifact = false
+# NO DOWNLOAD, for c3-tapstone-gw's reason: a gateway is flashed by hand with the fleet's
+# GROUP_KEY and can never be a crown, so a release artifact would only invite flashing it onto
+# fleet boards. There is a second reason on this chip: the S3 is `builds = false` (no CI
+# toolchain), so nothing but a hand build could produce one anyway.
+#
+# DECLARED as `[hand_build.s3-tapstone-gw]` in tools/build-matrix.toml, which is where
+# build.sh reads its recipe from. `build_matrix.py check` fails if this folder exists without
+# that row, or if the two disagree on chip or flavor.
