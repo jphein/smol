@@ -15,6 +15,10 @@ mod ts_lines;
 #[allow(dead_code)]
 mod wire;
 
+#[path = "../../../rust/clock/src/net/flood.rs"]
+#[allow(dead_code)]
+mod flood;
+
 use std::cell::Cell;
 use ts_lines::*;
 
@@ -255,8 +259,34 @@ fn trailer() {
     check!(v == MacVerdict::Unkeyed && forward(&air[..n2], map(v)).0.len() == n2, "other epoch: whole");
 }
 
+/// The roster id learned from an `UP2` envelope. On two tapstone gateways (nodes 61 and 62, 2026-09-26)
+/// board 62's ROSTER alternated `62:<61's MAC>`: 61 relayed 62's OWN envelope back, and the UP2 arm
+/// credited the envelope's `origin` to the relay's MAC. The arena keys seats by that link id.
+fn roster_ids() {
+    use flood::{up2_sender_id, MAX_HOP};
+    // The measured case: our own envelope, echoed by a relay (hop already decremented).
+    check!(up2_sender_id(62, MAX_HOP - 1, 62).is_none(), "our own UP2 echoed by a relay teaches nothing");
+    // A third node's envelope via a relay: the MAC is the relay's, the origin is not the sender.
+    check!(up2_sender_id(9, MAX_HOP - 1, 62).is_none(), "a relayed UP2 names its origin, not its sender");
+    check!(up2_sender_id(9, 0, 62).is_none(), "hop 0 is relayed too");
+    // Straight from the originator (it emits at MAX_HOP): the sender IS the origin.
+    check!(up2_sender_id(9, MAX_HOP, 62) == Some(9), "an un-relayed UP2 names its sender");
+    // No frame may seat our own id on a peer's MAC, whatever its hop says.
+    check!(up2_sender_id(62, MAX_HOP, 62).is_none(), "our own id is never learned for a peer");
+
+    // The live arm must route through that rule rather than learning `origin` inline.
+    let mode = include_str!("../../../rust/clock/src/net/mode.rs");
+    check!(!mode.contains("roster.heard(src, Some(origin)"), "mode.rs learns an UP2 origin as the link sender");
+    let arm = mode.split("Some(Frame::Up2 {").nth(1).and_then(|a| a.split("Some(Frame::").next());
+    check!(
+        arm.is_some_and(|a| a.contains("up2_sender_id(origin, hop, self.id)")),
+        "the UP2 arm does not call flood::up2_sender_id"
+    );
+}
+
 fn main() {
     encoders();
+    roster_ids();
     decoder();
     line_reader();
     trailer();

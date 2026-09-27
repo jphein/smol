@@ -7435,9 +7435,12 @@ impl RadioManager {
                 }
                 Some(Frame::Up2 { origin, env_msgid, hop, inner }) => {
                     // #124 multi-hop uplink ENVELOPE. Proves the SENDER (last relay, or the origin)
-                    // is audible (LED detected + roster, attributed to `origin`).
+                    // is audible (LED detected + roster). Its id is `origin` ONLY for an un-relayed
+                    // envelope: `src` is the last relay's MAC, and learning `origin` for it seated a
+                    // gateway's own id on its relaying peer (#548, see `flood::up2_sender_id`).
                     self.peers.last_hello_ms = now;
-                    self.roster.heard(src, Some(origin), rssi, now);
+                    let sender_id = crate::net::flood::up2_sender_id(origin, hop, self.id);
+                    self.roster.heard(src, sender_id, rssi, now);
                     if origin == self.id {
                         // Our OWN envelope echoed back by a relay — never re-forward/reassemble it
                         // (bogus fwd + could loop). But the echo PROVES a relay heard + forwarded us
