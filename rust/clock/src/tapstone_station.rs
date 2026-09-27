@@ -38,6 +38,11 @@
 //! - **The voice from SD clips** (0033). The slot mounts on glass (spike-sd), but no data pack
 //!   exists yet, so the band is text only.
 use esp_println::println;
+
+/// 0032's screens: the S3's colour panel only (nested so the tier-exclusion checker, #351, reads
+/// the gate as `esp32s3` + `tapstone-station`).
+#[cfg(feature = "esp32s3")]
+pub mod screen;
 use tapstone_proto::frame::{BROADCAST, FRAME_MAX, Frame, Lobby, Tap};
 use tapstone_proto::shrine::{ARENA_NODE, Autoplay, Shrine};
 use tapstone_rules::Phase;
@@ -178,7 +183,7 @@ pub struct Station {
     shrine: Shrine<Autoplay>,
     /// 0032's screens: the S3's colour panel only. A C3 station is a headless seat.
     #[cfg(feature = "esp32s3")]
-    screens: crate::tapstone_screen::Screens,
+    screens: screen::Screens,
     route: Route,
     last_beacon: Option<u64>,
     next_status: u64,
@@ -223,7 +228,7 @@ impl Station {
         Self {
             shrine,
             #[cfg(feature = "esp32s3")]
-            screens: crate::tapstone_screen::Screens::new(node, faction),
+            screens: screen::Screens::new(node, faction),
             route: Route::Unknown,
             last_beacon: None,
             next_status: 0,

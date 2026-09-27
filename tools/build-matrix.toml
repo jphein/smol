@@ -474,6 +474,10 @@ hal-cpu-reset-unindexed  = "esp-hal API-fact marker (hal-* namespace) selected b
 # gate will FAIL on these entries — the designed stale-claim sequence; delete them then.
 "src/board_s3.rs" = "esp32s3 tiers cannot build on CI (no espup); observed locally via check_chips.sh + on hardware — graduates when #413 lands xtensa in CI"
 "src/s3_oled.rs" = "esp32s3 tiers cannot build on CI (no espup); observed locally via check_chips.sh + on hardware — graduates when #413 lands xtensa in CI"
+# tapstone#132 (c): the station's screens, esp32s3 + tapstone-station. Compiled in CI by the
+# `hand builds` job (s3-tapstone-station), but no CI TIER is an S3 build, so no tier ELF can observe
+# it; observed on hardware (ids 61/62, tapstone runbook "Real shrines").
+"src/tapstone_station/screen.rs" = "esp32s3 tiers cannot build on CI (no espup); compiled by fw-gate `hand builds` (s3-tapstone-station) and observed on hardware — graduates with board_s3.rs"
 
 "src/secrets.rs" = """\
 consts only (WIFI_NETWORK / MQTT_* / WLED_CAST_*) — 0 fn / 0 impl in both secrets.rs and \
@@ -548,6 +552,8 @@ provisioned per tree, so its contents are not a property of the commit at all.""
 "src/net/wifi.rs" = "wifi"
 "src/net/ts_lines.rs" = "tapstone-gw"
 "src/ts_gw.rs" = "tapstone-gw"
+"src/tapstone_station.rs" = "tapstone-station"
+"src/tapstone_station/screen.rs" = "esp32s3+tapstone-station"
 "src/net/wire.rs" = "espnow"
 "src/net/wled.rs" = "wled"
 "src/ota.rs" = "wifi"

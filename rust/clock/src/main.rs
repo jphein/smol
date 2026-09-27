@@ -252,10 +252,6 @@ mod ts_gw;
 // tapstone#132 (c): the shrine station (its seat is tapstone_proto::shrine).
 #[cfg(feature = "tapstone-station")]
 pub(crate) mod tapstone_station;
-// The screens are the S3's colour panel only: the module is empty elsewhere (its own inner cfg),
-// so this gate stays a single feature the tier-exclusion checker (#351) can read.
-#[cfg(feature = "tapstone-station")]
-pub(crate) mod tapstone_screen;
 // The S3 station draws on the raw colour panel; `cast`'s tee would wrap it and mirror only the
 // 1-bit image, so the two are not combined there. (A C3 station is headless and draws nothing.)
 #[cfg(all(feature = "tapstone-station", feature = "esp32s3", feature = "cast"))]

@@ -15,10 +15,6 @@
 //! 4. **Result** once the game is over (screen 4, the game-level result).
 //!
 //! Redraws happen only when what a screen shows changes ([`Key`]); there is no animation yet.
-// The S3's colour panel only; on any other chip this module is empty (main.rs gates it on the
-// feature alone, which the tier-exclusion checker can model).
-#![cfg(feature = "esp32s3")]
-
 use core::fmt::Write as _;
 
 use embedded_graphics::{pixelcolor::Rgb565, prelude::*, primitives::Rectangle};
