@@ -1,0 +1,28 @@
+[package]
+name = "spike-sd"
+version = "0.1.0"
+edition = "2021"
+description = "ES3C28P MicroSD slot + P3 RC522 presence probe (smol#547) — console only"
+
+# Its own workspace root, like ../spike and ../spike-scry: esp-hal takes exactly
+# one chip feature and cargo unifies features across workspace members.
+[workspace]
+
+[dependencies]
+# Version set copied from ../spike-scry (the proven ES3C28P stack).
+esp-hal = { version = "1.1.1", features = ["esp32s3", "unstable"] }
+esp-backtrace = { version = "0.19", features = ["esp32s3", "panic-handler", "println"] }
+esp-println = { version = "0.17", default-features = false, features = ["esp32s3", "jtag-serial"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
+embedded-hal = "1.0"
+embedded-hal-bus = "0.3"
+mfrc522 = "0.8"
+# SPI-mode SD + FAT. esp-hal 1.1 has no SDMMC host driver, so the 4-bit slot is
+# driven in SPI mode (CLK/CMD/D0/D3 only).
+embedded-sdmmc = { version = "0.9", default-features = false }
+
+[profile.release]
+opt-level = "s"
+debug = 2
+lto = "fat"
+codegen-units = 1

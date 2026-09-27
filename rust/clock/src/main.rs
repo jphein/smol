@@ -907,15 +907,14 @@ async fn run(boot_spawner: BootSpawner) -> ! {
         ]);
         // #398 S3: the C3's pool pins are all CLAIMED on the ES3C28P (0=BOOT, 1=amp
         // enable ACTIVE-LOW, 7=I2S WS, 10=LCD chip-select — binding that one fights the
-        // display for its own bus). Pool from board_s3::FREE_GPIOS instead — which is
-        // INFERRED-not-schematic-verified (its own caveat): meter before wiring hardware.
+        // display for its own bus). smol#547: the pool is the P3 jack (io::FREE_PINS order);
+        // it held GPIO38–41 until the schematic showed them to be the MicroSD slot.
         #[cfg(feature = "esp32s3")]
         let mut m = io::PinMap::new([
+            Flex::new(peripherals.GPIO2),
+            Flex::new(peripherals.GPIO3),
+            Flex::new(peripherals.GPIO14),
             Flex::new(peripherals.GPIO21),
-            Flex::new(peripherals.GPIO38),
-            Flex::new(peripherals.GPIO39),
-            Flex::new(peripherals.GPIO40),
-            Flex::new(peripherals.GPIO41),
         ]);
         io::boot_selftest(&mut m);
         m

@@ -43,10 +43,14 @@ use esp_hal::gpio::{Flex, InputConfig, Level, OutputConfig, Pull};
 #[cfg(not(feature = "esp32s3"))]
 pub const FREE_PINS: [u8; 5] = [0, 1, 3, 7, 10];
 /// #398 S3 (ES3C28P): the C3's pool pins are all claimed there (0=BOOT, 1=amp enable,
-/// 7=I2S WS, 10=LCD chip-select). These five come from board_s3::FREE_GPIOS, which is
-/// ⚠️ INFERRED-not-schematic-verified — meter a pin before committing hardware to it.
+/// 7=I2S WS, 10=LCD chip-select). smol#547: the pool is the **P3 "Expanded IO" jack**
+/// (`board_s3::P3_JACK_PINS`: IO2, IO3, IO14, IO21), the board's only header-exposed free
+/// pins. It was `[21, 38, 39, 40, 41]` until 2026-09-27, and 38–41 are the MicroSD slot's
+/// CLK/D0/CMD/D1 (schematic), which the boot self-test below toggled on every boot.
+/// ⚠️ A build that wires an RC522 to P3 (the scry/Tapstone station) owns these pins: it must
+/// not also enable `io`.
 #[cfg(feature = "esp32s3")]
-pub const FREE_PINS: [u8; 5] = [21, 38, 39, 40, 41];
+pub const FREE_PINS: [u8; 4] = [2, 3, 14, 21];
 
 /// GPIOs that MUST NEVER be bound: a `G`-key descriptor naming one is rejected and
 /// surfaced in DIAG, never applied. Cited against their real claim sites (NOT
@@ -63,13 +67,43 @@ pub const RESERVED_PINS: [u8; 8] = [2, 4, 5, 6, 8, 9, 20, 21];
 /// #398 S3: everything the ES3C28P's peripherals claim (board_s3 has the per-pin story):
 /// 0 BOOT · 1 amp(ACTIVE-LOW) · 4–8 I2S/audio · 9 BAT_ADC · 10–13 LCD SPI ·
 /// 15–17 touch I2C/INT · **18 = the touch-reset NEVER-CONFIGURE pin** · 19/20 USB ·
-/// 33–37 octal PSRAM · 42 WS2812 · 45 backlight/strap · 46 LCD DC.
+/// 33–37 octal PSRAM · 38–41, 47, 48 MicroSD (smol#547) · 42 WS2812 · 45 backlight/strap ·
+/// 46 LCD DC.
 #[cfg(feature = "esp32s3")]
-pub const RESERVED_PINS: [u8; 26] = [
+pub const RESERVED_PINS: [u8; 32] = [
     0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20,
     33, 34, 35, 36, 37, // octal PSRAM — ALL FIVE (a first draft dropped 36/37; count, don't trust)
+    38, 39, 40, 41, 47, 48, // MicroSD slot, board_s3::SD_PINS (smol#547)
     42, 45, 46,
 ];
+
+/// smol#547: the pool, the reserved list and the board's SD slot, checked against each other at
+/// COMPILE time — the S3 pool once held four SD pins because `board_s3::FREE_GPIOS` was an
+/// inference, and nothing compared the lists. Fails the build, so an esp32s3 compile is the test.
+#[cfg(feature = "esp32s3")]
+const _: () = {
+    const fn has(list: &[u8], x: u8) -> bool {
+        let mut i = 0;
+        while i < list.len() {
+            if list[i] == x {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+    let mut i = 0;
+    while i < FREE_PINS.len() {
+        assert!(!has(&RESERVED_PINS, FREE_PINS[i]), "io: a FREE_PINS entry is reserved");
+        assert!(!has(&crate::board_s3::SD_PINS, FREE_PINS[i]), "io: a FREE_PINS entry is an SD pin");
+        i += 1;
+    }
+    let mut j = 0;
+    while j < crate::board_s3::SD_PINS.len() {
+        assert!(has(&RESERVED_PINS, crate::board_s3::SD_PINS[j]), "io: an SD pin is not reserved");
+        j += 1;
+    }
+};
 
 /// Number of runtime-bindable slots (= free pins). Fixed capacity → no alloc.
 pub const NPIN: usize = FREE_PINS.len();

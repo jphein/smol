@@ -115,9 +115,9 @@ pub const PIN_LCD_MOSI: u8 = 11;
 /// SPI2 MISO — **unused**: the panel is write-only and nothing else sits on this bus.
 ///
 /// Recorded rather than omitted so a future port does not reuse the pin believing it free.
-/// Unlike the C5 CYD, this board has **no shared SPI bus**: no XPT2046, no SD slot (see
-/// [`HAS_SD_CARD`]). The whole `SharedSpiBus` / chip-select-interleave hazard class from
-/// `cyd-c5/watch-port/src/drivers/spi_bus.rs` **does not exist here**.
+/// Unlike the C5 CYD, **nothing shares the panel's bus**: no XPT2046, and the MicroSD slot
+/// (see [`HAS_SD_CARD`]) has its own pins. The S3 has only SPI2 and SPI3, though, so the SD
+/// slot and a P3-jack RC522 must **time-share SPI3** (re-pinned per use, see [`PIN_SD_CLK`]).
 pub const PIN_LCD_MISO: u8 = 13;
 
 /// Display chip select. `BOARD.md` GPIO 10 (`LCD_CS`).
@@ -449,10 +449,58 @@ pub const PSRAM_MODE_IS_RUNTIME_CONFIG: bool = true;
 /// of internal RAM knowingly rather than discovering this as intermittent corruption.
 pub const RADIO_HEAP_MAY_USE_PSRAM: bool = false;
 
-/// **No SD card slot exists on this board.** Use a FAT partition on internal flash if
-/// storage is ever needed. (The classic CYD has one; this board does not — another place
-/// dimensional similarity misleads.)
-pub const HAS_SD_CARD: bool = false;
+/// **A MicroSD slot exists** (smol#547). This constant said `false` until 2026-09-27: the
+/// retro-go and ESPHome sources never used the slot, so all three sources agreed by omission,
+/// while the vendor schematic (source 1) has had `SD_CARD1` all along.
+///
+/// SCHEMATIC-VERIFIED, `ES3C28P_Schematic.pdf` page 1, "MicroSD card slot interface circuit":
+/// `SD_CARD1` pins 1 D2 · 2 D3 · 3 CMD · 5 CLK · 7 D0 · 8 D1, each on a 10K pull-up
+/// (R17 D2, R34 D3, R35 CMD, R36 CLK, R37 D0, R18 D1). The GPIO of each net is read off the
+/// ESP32-S3 symbol on the same page (see the `PIN_SD_*` constants). No card-detect net.
+///
+/// All four data lines reach the chip, so the slot is SDMMC 4-bit capable; **esp-hal 1.1 has
+/// no SDMMC host driver**, so smol drives it in **SPI mode**: CLK = SCK, CMD = MOSI,
+/// D0 = MISO, D3 = CS, with D1/D2 idle on their pull-ups. Glass status: see
+/// `targets/s3-cyd/spike-sd/README.md` (the mount probe and its recorded result).
+pub const HAS_SD_CARD: bool = true;
+
+// Schematic citation for every `PIN_SD_*`: `pdftotext -bbox` of the vendor PDF places each
+// net label on the same row (≈1.2 pt below) as the chip pin it hangs off — SD_D1 y438.4 vs
+// MTDI y439.6, SD_CMD 446.2/MTDO 447.4, SD_D0 450.1/MTCK 451.2, SD_CLK 454.0/GPIO38 455.1,
+// SD_D3 477.4/SPICLK_P 478.6, SD_D2 481.3/SPICLK_N 482.5. The layout-mode text puts the pin
+// NUMBERS one row off; trust the coordinates, not `pdftotext -layout`. Each row is one pin
+// (number ≈2 pt above the name, net ≈1 pt above, row pitch 3.9 pt), and the chip pin numbers
+// agree with the ESP32-S3 QFN56 pinout. Positive control for the method: the row above SD_D1
+// reads `48 · RGB_LED · MTMS` = GPIO42, the WS2812 already known on glass ([`PIN_WS2812`]).
+
+/// SD CLK → **GPIO38** (chip pin 43). SPI-mode SCK. Pull-up R36.
+pub const PIN_SD_CLK: u8 = 38;
+/// SD CMD → **GPIO40** (MTDO, chip pin 45). SPI-mode MOSI. Pull-up R35.
+///
+/// GPIO39–42 are the S3's JTAG pins (MTCK/MTDO/MTDI/MTMS); harmless here because smol debugs
+/// over the USB-JTAG bridge (19/20), which is independent of these pads unless the JTAG
+/// source eFuse is changed.
+pub const PIN_SD_CMD: u8 = 40;
+/// SD D0 → **GPIO39** (MTCK, chip pin 44). SPI-mode MISO. Pull-up R37.
+pub const PIN_SD_D0: u8 = 39;
+/// SD D1 → **GPIO41** (MTDI, chip pin 47). Unused in SPI mode; leave it Hi-Z (pull-up R18).
+pub const PIN_SD_D1: u8 = 41;
+/// SD D2 → **GPIO48** (SPICLK_N, chip pin 36). Unused in SPI mode; leave it Hi-Z (pull-up R17).
+pub const PIN_SD_D2: u8 = 48;
+/// SD D3 → **GPIO47** (SPICLK_P, chip pin 37). SPI-mode **chip select**, active low. Pull-up
+/// R34 keeps the card deselected while the pin is unconfigured.
+///
+/// 47/48 sit in the VDD_SPI domain; on this N16R8 (quad flash, 3.3 V VDD_SPI) they are ordinary
+/// 3.3 V pads.
+pub const PIN_SD_D3_CS: u8 = 47;
+/// All six SD pins, for reservation lists (`io::RESERVED_PINS` must contain every one).
+pub const SD_PINS: [u8; 6] = [PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0, PIN_SD_D1, PIN_SD_D2, PIN_SD_D3_CS];
+/// SPI-mode init clock: the SD spec caps identification at 400 kHz.
+pub const SD_INIT_HZ: u32 = 400_000;
+/// P3 "Expanded IO" jack: IO2 = MISO, IO3 = CS, IO14 = SCK, IO21 = MOSI when the RC522 is
+/// wired (silk-verified 2026-09-01, `labels/scry/rc522-s3cyd-wiring.md`, `../spike-scry`).
+/// These are the board's only header-exposed free GPIOs; a build that reads cards owns them.
+pub const P3_JACK_PINS: [u8; 4] = [2, 3, 14, 21];
 
 /// **No LDR** (ambient light sensor). Another classic-CYD feature this board lacks.
 pub const HAS_LDR: bool = false;
@@ -466,7 +514,10 @@ pub const HAS_IEEE802154: bool = false;
 /// package, which cannot see a net that exists but went unrecorded. Treat as a hypothesis:
 /// meter a pin before committing hardware to it. Note **19/20 are the native USB D-/D+**
 /// and are only "free" if USB is not used.
-pub const FREE_GPIOS: [u8; 13] = [2, 3, 14, 19, 20, 21, 38, 39, 40, 41, 43, 44, 47];
+///
+/// That caveat came true on 2026-09-27 (smol#547): 38, 39, 40, 41 and 47 were on this list and
+/// are the SD slot ([`SD_PINS`]). 43/44 are UART0 TX/RX (the ROM boot log prints on 43).
+pub const FREE_GPIOS: [u8; 8] = [2, 3, 14, 19, 20, 21, 43, 44];
 
 // ===========================================================================
 // Fleet identity
