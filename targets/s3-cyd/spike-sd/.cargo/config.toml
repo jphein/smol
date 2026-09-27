@@ -1,0 +1,10 @@
+# Same build shape as ../spike-scry. No runner: flash with espflash against the
+# byte-exact /dev/serial/by-id path of the board under test (README).
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+[target.xtensa-esp32s3-none-elf]
+rustflags = ["-C", "link-arg=-Tlinkall.x", "-C", "force-frame-pointers"]
+
+[unstable]
+build-std = ["core", "alloc"]

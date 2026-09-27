@@ -191,3 +191,9 @@ The original: [ESP32-C3 SuperMini + 0.42" OLED (AliExpress)](https://www.aliexpr
 
 ---
 *Built collaboratively with Claude Code — a fleet of agents did the research, flashing, CAD, and firmware while the build stayed in motion.*
+
+## License
+
+AGPL-3.0-or-later © 2026 Jeffrey Pine Hein. See [LICENSE](LICENSE).
+
+Third-party subtrees keep their own licenses and notices: `targets/c6-watch` (MIT OR Apache-2.0, from waveshare-watch-rs), its vendored `i-slint-renderer-software` (GPL-3.0-only OR Slint licenses), `experiments/nes-c3/Anemoia-ESP32` (GPL-3.0) and `experiments/atomic14-games` (Unlicense).

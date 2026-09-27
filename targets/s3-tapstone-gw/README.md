@@ -16,10 +16,13 @@ are in the verifying comment on smol#549. The C3 arm has not run on hardware yet
 - **Nothing in the gateway names a chip.** Both chips drive their USB-C port with the same
   USB-Serial-JTAG peripheral, and `ts_gw.rs` only uses that peripheral's RX half. `rust/clock/src`
   needed no S3 cfg for this; only the build invocation differs.
-- **The C3 stays the CI arm.** The S3 is `builds = false` in `tools/build-matrix.toml` (CI has no
-  Xtensa toolchain), so `tools/gate.sh` compiles and lints the gateway only as `c3-tapstone-gw`. This
-  folder is declared as `[hand_build.s3-tapstone-gw]`: no CI job, but the recipe comes from the
-  manifest and `build_matrix.py check` holds this folder to it.
+- **The C3 stays the lint arm; the S3 is compiled by its own job.** The S3 is `builds = false` in
+  `tools/build-matrix.toml`, so the `firmware` job checks and lints the gateway only as
+  `c3-tapstone-gw`. This folder is declared as `[hand_build.s3-tapstone-gw]`: the recipe comes from
+  the manifest, `build_matrix.py check` holds this folder to it, and the fw-gate job **`hand builds`**
+  (smol#548) installs the pinned espup toolchain and compiles it on every push with
+  `tools/gate.sh hand` → `tools/build_hand.sh`. That build uses CI's throwaway `GROUP_KEY`, so it
+  proves the image compiles and links, never that it works: the bench below is still the test.
 
 ## The recipe
 
@@ -45,7 +48,10 @@ Each part has a reason:
 
 You do not type it. `build.sh` gets it from `tools/build_matrix.py hand-build s3-tapstone-gw`, which
 derives it from the manifest, and `tools/test_build_matrix.sh` (in the gate) fails if that
-derivation stops producing exactly the line above.
+derivation stops producing exactly the line above. `tools/build_hand.sh --print s3-tapstone-gw`
+shows what CI compiles (the line above without the per-board id and channel), and
+`tools/test_build_hand.sh` fails if that stops being the same build. On familiar, with
+`. ~/export-esp.sh`, `tools/gate.sh hand` runs the same compile locally (about 2 min cold).
 
 ## Build and flash
 

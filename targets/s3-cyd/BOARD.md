@@ -49,11 +49,21 @@ octets are the only difference from this unit. Byte-exact serial matching only.
 | **45** | LCD_BL | backlight, **active-HIGH** | BSS138 gate. Also the VDD_SPI strapping pin — safe: schematic `R32` (10K to GND) hard-wires the strap LOW and latches at reset before GPIO drivers exist |
 | **46** | LCD_DC | display data/command | strapping pin; fine as a runtime output |
 | — | LCD_RST | **bonded to CHIP_PU/EN** | **there is no LCD reset GPIO** — software `SWRESET` only |
-| — | SD card | **does not exist on this board** | use a FAT partition on internal flash if storage is ever needed |
+| **38** | SD_CLK | MicroSD CLK (SPI-mode SCK) | smol#547, schematic `SD_CARD1` pin 5, pull-up R36 |
+| **39** | SD_D0 | MicroSD D0 (SPI-mode MISO) | MTCK; pull-up R37 |
+| **40** | SD_CMD | MicroSD CMD (SPI-mode MOSI) | MTDO; pull-up R35 |
+| **41** | SD_D1 | MicroSD D1 | MTDI; unused in SPI mode, pull-up R18 |
+| **47** | SD_D3 | MicroSD D3 (SPI-mode **CS**) | SPICLK_P; pull-up R34 keeps the card deselected |
+| **48** | SD_D2 | MicroSD D2 | SPICLK_N; unused in SPI mode, pull-up R17 |
 | — | LDR | **does not exist** | (a classic-CYD feature this board lacks) |
 
-Free/unclaimed (**inferred, not schematic-verified**): 2, 3, 14, 19, 20, 21, 38–41, 43,
-44, 47, 48 — note 19/20 are the native USB D-/D+.
+Free/unclaimed (**inferred, not schematic-verified**): 2, 3, 14, 19, 20, 21, 43, 44 — note
+19/20 are the native USB D-/D+, 43/44 are UART0, and 2/3/14/21 are the P3 "Expanded IO" jack
+(the RC522 harness on a card-reading build). Until 2026-09-27 this line also listed 38–41, 47
+and 48, and they are the MicroSD slot: the other two sources never used it, so all three agreed
+by omission (smol#547). **SD card:** the slot exists; esp-hal 1.1 has no SDMMC host driver, so
+smol drives it in SPI mode, and the S3's two SPI hosts force it to time-share SPI3 with a P3
+reader. On glass 2026-09-27: a SanDisk 32 GB SDHC mounts in SPI mode (FAT32, root listed); probe and results in `spike-sd/README.md`.
 
 ## Display
 
