@@ -441,7 +441,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("command",
                     choices=("emit", "chips", "chip-checks", "canonical-chip", "config-markers",
-                             "ci-matrix", "hand-build", "check"))
+                             "ci-matrix", "hand-build", "hand-builds", "check"))
     ap.add_argument("name", nargs="?", default=None, help="hand-build: the target folder name")
     ap.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     ap.add_argument("--repro", type=Path, default=DEFAULT_REPRO)
@@ -551,6 +551,15 @@ def main() -> int:
         print(doc["canonical_chip"])
         return 0
 
+    if args.command == "hand-builds":
+        # Every `[hand_build]` row's name, one per line, for tools/build_hand.sh (the CI job that
+        # compiles them). Read from here so the job cannot carry its own list and miss a row. An
+        # empty manifest prints nothing and exits 0; the FLOOR is the builder's, which refuses to
+        # pass having built nothing (tools/test_build_hand.sh holds both halves).
+        for name in (doc.get("hand_build") or {}):
+            print(name)
+        return 0
+
     if args.command == "hand-build":
         # smol#549 follow-up: the recipe for ONE `[hand_build]` row, for targets/<name>/build.sh.
         #   chip · target · toolchain · build_std · opt_level · features
@@ -593,7 +602,7 @@ def main() -> int:
     ships = [c for c, s in doc["chips"].items() if s["ships"]]
     print(f"  build matrix: {len(jobs)} jobs · chips builds={','.join(builds) or '-'} "
           f"ships={','.join(ships) or '-'} · {len(doc['tiers'])} tiers · "
-          f"{len(doc['hand_build'])} hand build(s), no job")
+          f"{len(doc['hand_build'])} hand build(s), off-matrix (fw-gate `hand builds`)")
     if fails:
         for f in fails:
             print(f"  FAIL {f}", file=sys.stderr)

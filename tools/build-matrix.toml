@@ -313,6 +313,8 @@ features = "tapstone-gw,${canonical}"
 # bench.py PASS, 100/100 frames, p95 <= 17.2 ms). Same USB-Serial-JTAG peripheral, and the
 # gateway code names no chip: only the invocation differs. tools/test_build_matrix.sh pins what
 # this row derives to that bench's hand recipe, so a drift here is a red line, not a bench surprise.
+# Off the one-axis matrix, but COMPILED: fw-gate's `hand builds` job runs tools/build_hand.sh, which
+# builds every row here (smol#548).
 chip = "esp32s3"
 tier = "tapstone-gw"
 
