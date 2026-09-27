@@ -214,7 +214,7 @@ pub fn parse_inbound(line: &[u8], truncated: bool, frame: &mut [u8; TX_FRAME_MAX
             if len > TX_FRAME_MAX {
                 return refuse(Reason::TooLong);
             }
-            for (i, pair) in hex.chunks_exact(2).enumerate() {
+            for (i, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
                 match (nibble(pair[0]), nibble(pair[1])) {
                     (Some(hi), Some(lo)) => frame[i] = hi << 4 | lo,
                     _ => return refuse(Reason::BadHex),
