@@ -96,6 +96,10 @@ pub mod cfgsched;
 // byte-compat guard. `mode` re-exports it via `use crate::net::wire::*`.
 #[cfg(feature = "espnow")]
 pub mod wire;
+// #548: the Tapstone gateway's `@TS1 ` USB line codec. Pure + host-includable like `wire`
+// (experiments/tapstone_gw_verify, experiments/tapstone_lines_xcheck).
+#[cfg(feature = "tapstone-gw")]
+pub mod ts_lines;
 
 // #217 rung-3: co-channel-preferred crown AP selection + the never-crownless strand-guard state
 // machine. PURE (no esp-hal/esp-wifi, no alloc) so it's host-tested verbatim by

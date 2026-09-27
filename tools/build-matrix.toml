@@ -324,6 +324,32 @@ features = "stack-paint,${canonical}"
 # machine. Keeping the budget on is what makes this tier's number transferable to the fleet image.
 features = "stack-paint-lite,${canonical}"
 
+[tier.tapstone-gw]
+# #548 the Tapstone USB-serial gateway (targets/c3-tapstone-gw): the fleet node plus the `@TS1`
+# USB bridge, WiFi off. Not shipped — it is one board on the arena laptop, flashed by hand, and a
+# board running it can never be a crown, so it must never become a fleet release by accident.
+# The canonical features ride along because the gateway is an ordinary mesh member otherwise.
+features = "tapstone-gw,${canonical}"
+
+# ── HAND BUILDS: declared, never a CI job (smol#549 follow-up) ────────────────
+# A `[hand_build.<target>]` row is a (chip, tier) pair on NEITHER axis — a chip that cannot build
+# in CI crossed with a tier that is not the canonical one. Rule 2 forbids emitting that as a job,
+# and it stays forbidden: `ci-matrix` never sees these rows. What the row buys is that the recipe
+# is DERIVED from this file (`build_matrix.py hand-build <target>`: the chip row's target,
+# toolchain, build_std and opt_level, Cargo.toml's `default` with the chip swapped, then the tier)
+# instead of living in someone's shell history, and that `check` holds it to targets/<target>/ in
+# both directions. `check` refuses a row for a `checks = false` chip, a row whose pair is already
+# on an axis, and a folder whose pair is neither a job nor a row.
+
+[hand_build.s3-tapstone-gw]
+# The Tapstone gateway on JP's shrine boards. The C3 arm is the one CI compiles, but the fleet has
+# spare S3s and no spare C3s, and the S3 is the one that was bench-verified (2026-09-26: two S3s,
+# bench.py PASS, 100/100 frames, p95 <= 17.2 ms). Same USB-Serial-JTAG peripheral, and the
+# gateway code names no chip: only the invocation differs. tools/test_build_matrix.sh pins what
+# this row derives to that bench's hand recipe, so a drift here is a red line, not a bench surprise.
+chip = "esp32s3"
+tier = "tapstone-gw"
+
 # ── features with NO tier, declared so the omission is a decision ─────────────
 # The coverage arm requires every feature in Cargo.toml to be either covered by a tier above or
 # listed here with a reason. An undeclared gap is a gate failure — the aspiration that used to
@@ -505,6 +531,8 @@ provisioned per tree, so its contents are not a property of the commit at all.""
 "src/net/target.rs" = "wifi"
 "src/net/treehead.rs" = "espnow"
 "src/net/wifi.rs" = "wifi"
+"src/net/ts_lines.rs" = "tapstone-gw"
+"src/ts_gw.rs" = "tapstone-gw"
 "src/net/wire.rs" = "espnow"
 "src/net/wled.rs" = "wled"
 "src/ota.rs" = "wifi"

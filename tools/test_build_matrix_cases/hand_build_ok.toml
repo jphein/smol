@@ -1,0 +1,26 @@
+# EXPECT-OK
+# EXPECT-JOBS: 2
+# TARGETS: _targets_gw
+# A hand build (#549 follow-up) is DECLARED, not emitted: the matrix stays one C3 x two tiers = 2
+# jobs. If hand builds ever leak into ci-matrix, the S3 (builds = false) gets a CI job that
+# cannot pass, and this count goes red.
+[meta]
+canonical_chip = "esp32c3"
+canonical_tier = "fleet"
+[chip.esp32c3]
+target = "riscv32imc-unknown-none-elf"
+builds = true
+checks = true
+ships = true
+[chip.esp32s3]
+target = "xtensa-esp32s3-none-elf"
+builds = false
+checks = true
+ships = false
+[tier.fleet]
+features = "espnow,cast,io"
+[tier.gw]
+features = "gw,${canonical}"
+[hand_build.s3-gw]
+chip = "esp32s3"
+tier = "gw"

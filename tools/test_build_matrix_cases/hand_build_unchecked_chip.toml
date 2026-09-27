@@ -1,0 +1,22 @@
+# EXPECT: declared not to compile
+# TARGETS: _targets_gw
+[meta]
+canonical_chip = "esp32c3"
+canonical_tier = "fleet"
+[chip.esp32c3]
+target = "riscv32imc-unknown-none-elf"
+builds = true
+checks = true
+ships = true
+[chip.esp32s3]
+target = "xtensa-esp32s3-none-elf"
+builds = false
+checks = false
+ships = false
+[tier.fleet]
+features = "espnow,cast,io"
+[tier.gw]
+features = "gw,${canonical}"
+[hand_build.s3-gw]
+chip = "esp32s3"
+tier = "gw"
