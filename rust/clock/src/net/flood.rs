@@ -126,6 +126,16 @@ pub fn forward_decision(is_gateway: bool, hop: u8, already_seen: bool) -> Forwar
     }
 }
 
+/// The id an inbound `UP2` envelope lets the roster learn for its LINK-layer sender (the MAC it
+/// arrived from). `origin` names the node that BUILT the envelope, which is the sender only when no
+/// relay has touched it: an originator emits at [`MAX_HOP`] and every relay re-wraps at `hop - 1`.
+/// A relayed envelope teaches nothing about the relay's id (its own HELLOs do that), and no frame
+/// may seat `self_id` on a peer's MAC: a relay echoing our own envelope back did exactly that on
+/// two tapstone gateways (smol#548), and a gateway's roster is what the arena seats players by.
+pub fn up2_sender_id(origin: u8, hop: u8, self_id: u8) -> Option<u8> {
+    (hop >= MAX_HOP && origin != self_id).then_some(origin)
+}
+
 /// Number of consecutive successful direct-uplink probes required to drop the
 /// multi-hop latch — the hysteresis that stops a marginal/asymmetric link from
 /// flapping a leaf between single- and multi-hop.
