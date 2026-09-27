@@ -739,6 +739,10 @@ mesh-test = ["espnow"]
 # NOT a fleet image — a board flashed with it stops being a WiFi-capable crown candidate. The
 # fleet tiers are byte-free of it (every hook is cfg-gated; #351 checks the claim).
 tapstone-gw = ["espnow"]
+# tapstone#132 (c): the shrine station, riding the gateway's radio posture and USB bridge so one
+# image serves the arena's own board (seat A) and a remote one (seat B). src/tapstone_station.rs.
+# The vendored crates come in through `tapstone`.
+tapstone-station = ["tapstone-gw", "tapstone"]
 
 [profile.release]
 # esp-wifi strongly recommends opt-level "s"/2/3 and LTO; the radio blobs are

@@ -205,6 +205,10 @@ pub struct S3Oled {
     fb: [u8; FB_BYTES],
     /// Dirty logical rect, inclusive: (x0, y0, x1, y1). `None` = clean.
     dirty: Option<(u32, u32, u32, u32)>,
+    /// tapstone#132 (c): the shrine station has taken the panel for its colour screens, so the
+    /// 1-bit image is no longer flushed over them.
+    #[cfg(feature = "tapstone-station")]
+    station_owned: bool,
 }
 
 impl S3Oled {
@@ -216,7 +220,17 @@ impl S3Oled {
             panel,
             fb: [0; FB_BYTES],
             dirty: Some((0, 0, LOGICAL_W - 1, LOGICAL_H - 1)),
+            #[cfg(feature = "tapstone-station")]
+            station_owned: false,
         }
+    }
+
+    /// tapstone#132 (c): hand the whole colour panel to the shrine station. From here on
+    /// [`flush`](Self::flush) pushes nothing, so the clock's 1-bit image never covers a screen.
+    #[cfg(feature = "tapstone-station")]
+    pub fn station_panel(&mut self) -> &mut Panel {
+        self.station_owned = true;
+        &mut self.panel
     }
 
     /// Present for `main`'s uniform boot flow; the panel was initialised in
@@ -273,6 +287,10 @@ impl S3Oled {
         let Some((x0, y0, x1, y1)) = self.dirty.take() else {
             return Ok(());
         };
+        #[cfg(feature = "tapstone-station")]
+        if self.station_owned {
+            return Ok(());
+        }
 
         let (px0, py0) = (x0 * SCALE, y0 * SCALE);
         let (pw, ph) = ((x1 - x0 + 1) * SCALE, (y1 - y0 + 1) * SCALE);

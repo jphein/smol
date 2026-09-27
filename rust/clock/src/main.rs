@@ -249,6 +249,15 @@ mod ota_screen;
 // the mesh, WiFi off, never the crown. Only in a `tapstone-gw` build (targets/c3-tapstone-gw).
 #[cfg(feature = "tapstone-gw")]
 mod ts_gw;
+// tapstone#132 (c): the shrine station (its seat is tapstone_proto::shrine).
+#[cfg(feature = "tapstone-station")]
+pub(crate) mod tapstone_station;
+#[cfg(feature = "tapstone-station")]
+pub(crate) mod tapstone_screen;
+// The station draws on the raw colour panel; `cast`'s tee would wrap it and mirror only the 1-bit
+// image, so the two are not combined.
+#[cfg(all(feature = "tapstone-station", feature = "cast"))]
+compile_error!("tapstone-station draws the colour panel itself; build it without `cast`");
 
 // LOCAL git-ignored WiFi credentials, used by the `wifi`/`espnow` radio bring-up.
 #[cfg(feature = "wifi")]
@@ -1112,6 +1121,10 @@ async fn run(boot_spawner: BootSpawner) -> ! {
         gw.hello(radio.as_deref());
         gw
     };
+    #[cfg(feature = "tapstone-station")]
+    let mut station = tapstone_station::Station::new(tapstone_station::station_node(
+        radio.as_deref().map_or(0, |r| r.ts_node_id()),
+    ));
 
     // --- Clock time base -----------------------------------------------------
     // Anchor the clock to the monotonic ms clock instead of accumulating ticks
@@ -2721,6 +2734,10 @@ async fn run(boot_spawner: BootSpawner) -> ! {
         // #548: the same 20 ms, sliced, with the radio drained between slices (see ts_gw).
         #[cfg(feature = "tapstone-gw")]
         ts_gw::subtick(&mut radio, &mut gw).await;
+        #[cfg(feature = "tapstone-station")]
+        if let Some(r) = radio.as_deref_mut() {
+            station.service(r, display.station_panel(), millis());
+        }
     }
 }
 
