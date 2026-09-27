@@ -1,0 +1,5 @@
+name = "s3-gw"
+chip = "esp32s3"
+flavor = "fleet"
+source = "rust/clock"
+artifact = false

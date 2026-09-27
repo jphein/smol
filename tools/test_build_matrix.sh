@@ -23,6 +23,8 @@
 #   # CARGO: <file>                use this Cargo.toml fixture instead of _cargo_empty.toml
 #   # TARGET-RS: <file>            use this net/target.rs fixture (#413 id<->name roster arm)
 #   # OTA-PUBLISH: <file>          use this ota_publish.sh fixture (#413 id<->name roster arm)
+#   # TARGETS: <dir>               use this targets/ fixture tree instead of _targets_empty
+#                                  (the hand-build arm, smol#549 follow-up)
 #
 # Exit 0 all cases behaved; 1 otherwise.
 set -uo pipefail
@@ -51,6 +53,10 @@ for case_file in "$CASES"/*.toml; do
   otapub="$CASES/$(sed -n 's/^# OTA-PUBLISH: *//p' "$case_file" | head -1)"
   [ -f "$otapub" ] || otapub="$HERE/ota_publish.sh"
   [ -f "$cargo" ] || cargo="$CASES/_cargo_empty.toml"
+  # Default is an EMPTY tree, not the repo's targets/: a fixture manifest names fixture chips and
+  # tiers, and pointing it at the real folders would make every old case depend on them.
+  targets="$CASES/$(sed -n 's/^# TARGETS: *//p' "$case_file" | head -1)"
+  [ -d "$targets" ] && [ "$targets" != "$CASES/" ] || targets="$CASES/_targets_empty"
 
   want_fail="$(sed -n 's/^# EXPECT: *//p' "$case_file" | head -1)"
   want_bad="$(sed -n 's/^# EXPECT-MALFORMED: *//p' "$case_file" | head -1)"
@@ -65,7 +71,7 @@ for case_file in "$CASES"/*.toml; do
   fi
 
   out="$("$BM" check --manifest "$case_file" --repro "$REPRO" --budget "$budget" --cargo "$cargo" \
-         --target-rs "$targetrs" --ota-publish "$otapub" 2>&1)"
+         --target-rs "$targetrs" --ota-publish "$otapub" --targets "$targets" 2>&1)"
   rc=$?
 
   if [ -n "$want_bad" ]; then
@@ -105,6 +111,26 @@ for case_file in "$CASES"/*.toml; do
     fi
   fi
 done
+
+# ── the S3 gateway's recipe, pinned to what was HARDWARE-verified (smol#549, 2026-09-26) ──────
+# `hand-build` DERIVES the invocation (chip row + tier + Cargo.toml's `default`). The bench PASS on
+# two S3s was taken with the hand recipe below, typed out before the row existed. If a manifest or
+# Cargo.toml edit changes what the derivation produces, the verified image and the declared one are
+# no longer the same build, and that has to be a red line here, not a surprise at the bench.
+want_hb="$(printf '%s\t' esp32s3 xtensa-esp32s3-none-elf esp core,alloc 2 esp32s3,hw,tapstone-gw,espnow,cast,io)"
+want_hb="${want_hb%$'\t'}"
+got_hb="$("$BM" hand-build s3-tapstone-gw 2>&1)"
+if [ "$got_hb" = "$want_hb" ]; then
+  note "hand-build s3-tapstone-gw — derives the bench-verified recipe"
+else
+  oops "hand-build s3-tapstone-gw: derived $(printf '%q' "$got_hb"), bench-verified $(printf '%q' "$want_hb")"
+fi
+# ...and an unknown name is an error, never an empty (vacuously fine) recipe.
+if "$BM" hand-build no-such-target >/dev/null 2>&1; then
+  oops "hand-build no-such-target: exit 0 — a typo'd name must not yield a recipe"
+else
+  note "hand-build no-such-target — refused"
+fi
 
 printf '\n   %d ok, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
