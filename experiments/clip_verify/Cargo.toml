@@ -6,6 +6,7 @@
 # a screen cannot reboot a board. Permanent guard.
 [package]
 name = "clip_verify"
+license = "AGPL-3.0-or-later"
 version = "0.0.0"
 edition = "2021"
 publish = false

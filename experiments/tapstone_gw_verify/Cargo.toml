@@ -6,6 +6,7 @@
 # which needs a tapstone checkout and so is deliberately NOT named `*_verify`.
 [package]
 name = "tapstone_gw_verify"
+license = "AGPL-3.0-or-later"
 version = "0.0.0"
 edition = "2021"
 publish = false

@@ -10,6 +10,7 @@
 # `no_std`, zero further deps — safe for every consumer including firmware.
 [package]
 name = "smol-core"
+license = "AGPL-3.0-or-later"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"

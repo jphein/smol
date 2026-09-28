@@ -1,5 +1,6 @@
 [package]
 name = "s3-cyd-spike"
+license = "AGPL-3.0-or-later"
 version = "0.1.0"
 edition = "2021"
 description = "Phase-1 bring-up spike for the ES3C28P (ESP32-S3 N16R8) as a smol fleet target — node id 162"

@@ -1,5 +1,6 @@
 [package]
 name = "spike-sd"
+license = "AGPL-3.0-or-later"
 version = "0.1.0"
 edition = "2021"
 description = "ES3C28P MicroSD slot + P3 RC522 presence probe (smol#547) — console only"
