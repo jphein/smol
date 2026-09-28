@@ -1,0 +1,28 @@
+# VENDORED from github.com/jphein/tapstone-game (tools/tapstone_vendor.sh). This manifest is smol's
+# own, NOT a copy: upstream inherits edition/rust-version/license from tapstone's workspace, which
+# does not exist here. src/ and the vendored tests/ are byte-identical to the pinned tag.
+[package]
+name = "tapstone-proto"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "AGPL-3.0-or-later"
+description = "VENDORED copy of tapstone's MATCH frames, TSX1 transcript and follower. src/ is byte-identical upstream; do not edit."
+
+# Its own workspace, like tapstone-rules: a standalone crate for `cargo test` here, and a path dep
+# of rust/clock under the `tapstone` feature.
+[workspace]
+
+[lib]
+name = "tapstone_proto"
+path = "src/lib.rs"
+
+# Upstream's [dependencies], verbatim in meaning. `heapless 0.8.0` is already in rust/clock's
+# lock (a transitive dep of the esp stack), so this adds no registry crate.
+[dependencies]
+tapstone-rules = { path = "../tapstone-rules", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+heapless = "0.8"
+
+# Upstream's dev-deps (proptest, tapstone-sim) are absent on purpose: the two tests that need them
+# (tests/follower.rs, tests/frame.rs) are declared excluded in tools/tapstone_vendor.sh.

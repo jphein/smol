@@ -264,6 +264,13 @@ pub enum AppKind {
     // radio tier: the model is entirely local, so the screen works on a headless power-only board.
     #[cfg(feature = "bard")]
     Bard,
+    // Tapstone (issue 10) — the shrine. LIVE whenever compiled (REGISTRY row + `enter` +
+    // `from_wire` construct it), like Batt/Grid/Bard → NO dead_code allow, and adding one would
+    // be as wrong as omitting a needed one: the allows above exist only for `Snake`, which
+    // genuinely has no constructor under espnow because SNAKE_KIND aliases to MeshSnake there.
+    // cfg(tapstone) rather than a radio tier: the rules engine is local (see Cargo.toml).
+    #[cfg(feature = "tapstone")]
+    Tapstone,
 }
 
 /// #21 node-manager CONSUME — the parsed retained `smol/<id>/config/default_screen`
@@ -325,6 +332,12 @@ impl AppKind {
             "Custom" => AppKind::Custom,
             #[cfg(feature = "bard")]
             "Bard" => AppKind::Bard,
+            // Issue 3 wants `S=Tapstone:0` over keyed CFG to switch a shrine to this screen; the
+            // keyed-CFG half of that is issue 3's, but the token has to resolve here or the
+            // config would be silently IGNORED (the wrong-tier path), which reads as a broken
+            // CFG rather than a missing feature.
+            #[cfg(feature = "tapstone")]
+            "Tapstone" => AppKind::Tapstone,
             _ => return None,
         })
     }
@@ -363,6 +376,8 @@ impl AppKind {
             AppKind::Custom => "Custom",
             #[cfg(feature = "bard")]
             AppKind::Bard => "Bard",
+            #[cfg(feature = "tapstone")]
+            AppKind::Tapstone => "Tapstone",
         }
     }
 }
@@ -440,6 +455,14 @@ pub enum App {
     // variant, so the model scratch lives in `bard`'s module statics, not here.
     #[cfg(feature = "bard")]
     Bard(crate::bard::BardApp),
+    // `Game` is 350 B (MEASURED — `tapstone-rules`'s `game_fits_its_ram_budget` test prints it),
+    // plus an `Option<Chain>` and five bytes of bookkeeping. That is below the ~0.5 KB this
+    // enum's own doc comment above already attributes to `MeshSnake`, so on the espnow tiers this
+    // variant should not grow the union at all — NOT measured end-to-end, which would take a
+    // const-assert against `size_of::<App>()` that no tier has today. If a card-set cache ever
+    // pushes past MeshSnake, EVERY screen pays: the union is sized to its largest member.
+    #[cfg(feature = "tapstone")]
+    Tapstone(crate::tapstone::TapstoneApp),
 }
 
 #[cfg(not(feature = "hostsim"))] // #152: dispatch union impl — firmware-only (see the enum)
@@ -482,6 +505,10 @@ impl App {
             // protagonist, `now_ms` seeds the sampler).
             #[cfg(feature = "bard")]
             AppKind::Bard => App::Bard(crate::bard::BardApp::new(ctx)),
+            // No `ctx`: the shrine's identity comes from the seat a player CLAIMS with a card,
+            // not from the node id, and its clock base is the mesh's (issue 6), not `now_ms`.
+            #[cfg(feature = "tapstone")]
+            AppKind::Tapstone => App::Tapstone(crate::tapstone::TapstoneApp::new()),
         }
     }
 
@@ -522,6 +549,8 @@ impl App {
             App::Custom(s) => Plugin::on_button(s, press, ctx),
             #[cfg(feature = "bard")]
             App::Bard(s) => Plugin::on_button(s, press, ctx),
+            #[cfg(feature = "tapstone")]
+            App::Tapstone(s) => Plugin::on_button(s, press, ctx),
         }
     }
 
@@ -562,6 +591,8 @@ impl App {
             App::Custom(s) => Plugin::paint_burst(s, display, now_ms),
             #[cfg(feature = "bard")]
             App::Bard(s) => Plugin::paint_burst(s, display, now_ms),
+            #[cfg(feature = "tapstone")]
+            App::Tapstone(s) => Plugin::paint_burst(s, display, now_ms),
         }
     }
 
@@ -594,6 +625,8 @@ impl App {
             App::Custom(s) => Plugin::update(s, ctx),
             #[cfg(feature = "bard")]
             App::Bard(s) => Plugin::update(s, ctx),
+            #[cfg(feature = "tapstone")]
+            App::Tapstone(s) => Plugin::update(s, ctx),
         }
     }
 
@@ -646,6 +679,8 @@ impl App {
             App::Custom(_) => (AppKind::Custom, 0),
             #[cfg(feature = "bard")]
             App::Bard(_) => (AppKind::Bard, 0),
+            #[cfg(feature = "tapstone")]
+            App::Tapstone(_) => (AppKind::Tapstone, 0),
         }
     }
 }
@@ -708,6 +743,10 @@ pub const REGISTRY: &[AppDesc] = &[
     // tier that compiles the feature.
     #[cfg(feature = "bard")]
     AppDesc { title: "Bard", kind: AppKind::Bard },
+    // Tapstone — the shrine. Appears in any tier that compiles the feature (no radio needed).
+    // Last row, like Bard: a capability app rather than one of the original seven.
+    #[cfg(feature = "tapstone")]
+    AppDesc { title: "Tapstone", kind: AppKind::Tapstone },
 ];
 
 /// #55 plugin visibility: the STABLE mask bit for an app kind, INDEPENDENT of the (cfg-gated)
@@ -762,6 +801,12 @@ pub const fn plugin_bit(kind: AppKind) -> Option<u8> {
         // legacy mask hide it permanently. `None` ⇒ always shown.
         #[cfg(feature = "bard")]
         AppKind::Bard => None,
+        // Tapstone — NOT #55-maskable, for the reason Sigil/Custom/Bard are not: luna's live mask
+        // is the ORIGINAL seven plugins (bits 0..6, all-on 007F) and predates every app since, so
+        // handing this one a bit would let a legacy all-on mask hide it permanently. `None` ⇒
+        // always shown, and the live #55 contract needs no rework.
+        #[cfg(feature = "tapstone")]
+        AppKind::Tapstone => None,
         AppKind::Menu => None,
     }
 }

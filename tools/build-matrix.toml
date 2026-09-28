@@ -236,6 +236,33 @@ features = "espnow"
 features = "espnow,cast,io"
 ships    = true
 
+[tier.tapstone]
+# Tapstone (issue 10) — the vendored rules engine + the shrine app slot.
+#
+# `${canonical}` is NOT decoration here, it is the whole point of the row. `AppKind::Tapstone`'s
+# `as_wire` and `live_screen` arms live inside functions that are themselves `#[cfg(espnow)]`, so
+# they compile ONLY where espnow and tapstone are both on. A `tapstone`-alone tier would lint the
+# module and silently never compile those two arms — a typo in either would then ship, in the one
+# flavor nothing builds. Crossing with the canonical (fleet) tier is what closes that.
+#
+# No `off-fleet`, unlike [tier.bard], and that is a MEASUREMENT not an omission. The flash cost is
+# GATED, not written down: `tools/gate.sh fw` builds this composition plus `tapstone-probe` and
+# `tools/check_tapstone_flash.py` fails it over 64 KB (JP's ruling 2026-09-27, which replaced issue
+# 10's 8 KB criterion; the engine had never fit 8 KB once inlined into a fat-LTO image, and the
+# shrine seat in tapstone-proto more than triples it). Readings, 2026-09-27:
+#                                      rules-v0.2.0   rules-v0.2.2 (+ the interim arbiter)
+#   esp32c3 canonical (the gated one)  +35,216 B      +39,130 B (1.98.1: +39,278)
+#   esp32s3 by hand (opt_level 2)      +48,176 B      +51,832 B (.text +49,272) -- 13.7 KB headroom
+# The S3 is NOT gated (no Xtensa toolchain in CI) and runs ~32% heavier: re-measure it by hand
+# (tools/check_tapstone_flash.py on two `cargo +esp` ELFs) before the station adds engine code.
+#
+# ⚠️ WHY A PROBE: nothing calls `TapstoneApp::commit` or the shrine seat until issue 1 lands, so fat
+# LTO strips almost the whole engine from the shipping tree (verified with `nm` on 2026-09-21: ONE
+# tapstone symbol survived). Measuring the tree as it stands reads ~2 KB and is wrong the moment
+# the mesh is wired. The checker FAILS under a 4 KB floor rather than passing a probe LTO has
+# defeated (control, 2026-09-27: probe call removed -> delta -1,172 B -> BLIND, red).
+features = "tapstone,${canonical}"
+
 [tier.bard]
 # #347: off the C3 fleet image, still a supported build for chips with room. `off-fleet` is
 # #348's declaration that this is not the fleet image; without it the budget predicate
@@ -332,6 +359,9 @@ hostsim  = "host-only, and covered by the `cargo test` arm in tools/gate.sh"
 # check exists to guarantee. A `[tier.paint]` would build the instrument attached to nothing, which
 # is precisely the composition that has no measurement to give.
 paint    = "the instrument, not a composition — built by BOTH `stack-paint` and `stack-paint-lite`"
+# The tapstone flash-budget probe: an instrument like `paint`. tools/gate.sh fw builds it (release,
+# fat LTO, own target dir) on top of the canonical tier and measures it against the canonical ELF.
+tapstone-probe = "the flash-budget instrument — built by tools/gate.sh fw's tapstone flash arm, never flashed"
 
 # ── #347 Part 2: the chip axis is not a tier ──────────────────────────────────
 # A CHIP is the other axis of this very matrix — `[chip.*]` above — so a `[tier.esp32c5]` would
@@ -455,6 +485,7 @@ provisioned per tree, so its contents are not a property of the commit at all.""
 # Regenerate with: tools/check_exclusions.py claims --toml
 [tier_exclusive]
 "src/textclip.rs" = "wifi"
+"src/tapstone.rs" = "tapstone"
 # #398: chip-exclusive (esp32s3). The gate's contract is BOTH sections: this DECLARATION
 # (so removing the cfg-gate later cannot go unnoticed) plus the [unobservable] excuse
 # below (CI cannot build xtensa to observe them). Learned across three CI rounds.

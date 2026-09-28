@@ -1,0 +1,28 @@
+# VENDORED from github.com/jphein/tapstone-game (tools/tapstone_vendor.sh). This manifest is smol's
+# own, NOT a copy: upstream inherits edition/rust-version/license from tapstone's workspace, which
+# does not exist here. src/ and tests/ are byte-identical to the pinned tag.
+[package]
+name = "shrine-render"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "AGPL-3.0-or-later"
+description = "VENDORED copy of tapstone's shrine renderer: 320x240 RGB565 screens with embedded-graphics. src/ is byte-identical upstream; do not edit."
+
+[workspace]
+
+[lib]
+name = "shrine_render"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+# Upstream's [dependencies]. embedded-graphics resolves to rust/clock's `=0.8.2` pin and heapless
+# to 0.8.0 there, both already in its lock, so this adds no registry crate to the firmware graph.
+[dependencies]
+tapstone-rules = { path = "../tapstone-rules", default-features = false }
+tapstone-progression = { path = "../tapstone-progression" }
+embedded-graphics = "0.8"
+heapless = "0.8"
+
+[features]
+default = []

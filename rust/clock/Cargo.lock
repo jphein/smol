@@ -141,10 +141,14 @@ dependencies = [
  "nb 1.1.0",
  "portable-atomic",
  "sha2",
+ "shrine-render",
  "sigil-names",
  "smoltcp",
  "ssd1306",
  "static_cell",
+ "tapstone-progression",
+ "tapstone-proto",
+ "tapstone-rules",
 ]
 
 [[package]]
@@ -1952,6 +1956,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "shrine-render"
+version = "0.1.0"
+dependencies = [
+ "embedded-graphics",
+ "heapless 0.8.0",
+ "tapstone-progression",
+ "tapstone-rules",
+]
+
+[[package]]
 name = "sigil-names"
 version = "0.1.0"
 
@@ -2076,6 +2090,29 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tapstone-progression"
+version = "0.1.0"
+dependencies = [
+ "tapstone-rules",
+]
+
+[[package]]
+name = "tapstone-proto"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.8.0",
+ "sha2",
+ "tapstone-rules",
+]
+
+[[package]]
+name = "tapstone-rules"
+version = "0.1.0"
+dependencies = [
+ "sha2",
 ]
 
 [[package]]

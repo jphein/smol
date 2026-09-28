@@ -1,0 +1,19 @@
+# VENDORED from github.com/jphein/tapstone-game (tools/tapstone_vendor.sh). This manifest is smol's
+# own, NOT a copy: upstream inherits edition/rust-version/license from tapstone's workspace, which
+# does not exist here. src/ and tests/ are byte-identical to the pinned tag.
+[package]
+name = "tapstone-progression"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "AGPL-3.0-or-later"
+description = "VENDORED copy of tapstone's commander progression (XP, levels, slots, items). src/ is byte-identical upstream; do not edit."
+
+[workspace]
+
+[lib]
+name = "tapstone_progression"
+path = "src/lib.rs"
+
+[dependencies]
+tapstone-rules = { path = "../tapstone-rules", default-features = false }

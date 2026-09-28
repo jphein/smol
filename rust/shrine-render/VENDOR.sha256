@@ -1,0 +1,26 @@
+# Per-file SHA-256 of the VENDORED shrine-render. Paths are relative to rust/shrine-render/.
+# Generated and verified by tools/tapstone_vendor.sh; do not hand-edit, and do not edit
+# the files it names — see that script's header. This list IS the vendored file set.
+# source: https://github.com/jphein/tapstone-game
+# tag: rules-v0.2.2
+# commit: 6886a82d9190ea9f00d2e1e5965bbb01f8f37217
+6165d451fe5e2e978d9e477822f5211b0f80629dc9865fddbd9745ac9c1cc295  src/band.rs
+659b2b91707b1548e0900ed6eabed34ae14ab08a1ebb5f63ace4369373295416  src/battlefield.rs
+4681bfd9b7f0fa7c75e6d321949070f518a261878ad51ae799a22af008c22085  src/commander.rs
+9d95b939760cf2abb574151185a8a3efb4a750fb1724f913915df86e83ba8f8f  src/cost.rs
+8de94ea69860dec6890392d2a9f7d4a124b959fe43d638e286efdf22fea1ca08  src/draws.rs
+d5e5192141b456ad428985b5f5b6338f5c0d82dcc275d2d3c8e886b2eec47c8b  src/flourish.rs
+fbb5196cada07f377aacccb7140e4e355c68828ef41d8a4bd5db02b1a7786a7f  src/fmt.rs
+8d0a8f29dc2aee04f0acff99399dec9c1fc2aa1cd9962345bf981d15619af840  src/geom.rs
+464f01c2197c9d84a51fb9fbd205be53ec52742b0dec3deb860f98f8f2feabb0  src/ink.rs
+8a0f2fc253a1abf18e969c6e1b235c29efeed0b668487482ee965c571e2b3e75  src/lib.rs
+1aa926c0cc89421e7ac990de446a0670c771cb1f967d2b3e8c0484fd07fee37e  src/motion.rs
+f62bdc3575426ced5b903cba03b1ef4fe3f3403b278fe04a664e1bd640848c53  src/palette.rs
+7701254873ffca575d3a163922f80092e007c666e4ff1f97cdd656ad6f22dc1f  src/screens.rs
+073425cfd59fbb6ca6c7050454079d1c897370679abecda24331d292cbaf9b2d  src/sprite.rs
+51841770645d8e6ecdca8e67875f9b864b0b7dab5bbe074689e497226a524de7  src/station.rs
+bcc8faa70c1b35bb7d44716119bbea1d063582f613fcc52cb5d44eeafe750585  src/voice.rs
+f47a6f923b0188a2ba9028a7d1e8a7ea9196f55589131208ef096b32ed94f96d  tests/band.rs
+2891c0c3171d0745063fc7caf11cc9bf8ab99c01fd83d230de1623dedfb0ca28  tests/cost.rs
+0424e081d4a87d676b4bb508579dbfc80aae179ab532af7bd5a948529217d638  tests/geom.rs
+69343c78a66cbc1183bd916327d2c48dd4e1e46edb16e6c237b2418606c045e7  tests/palette.rs

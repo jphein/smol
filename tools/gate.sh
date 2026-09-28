@@ -178,6 +178,22 @@ else
   printf '%s\n' "$out" | sed 's/^/        /'; bad "sigil vendor"
 fi
 
+# Issue 10 — the VENDORED tapstone sources (rules, proto, progression, shrine-render, decks) still match the one tapstone-game tag they pin. Beside the arm
+# above, unconditional, and for a sharper version of the same reason: sigil drift renames boards,
+# but rules drift makes two shrines compute different chain heads from identical taps and disagree
+# about who won, with no error anywhere. The `src/` bytes ARE the protocol (tapstone decision 0004).
+#
+# Cheap by construction: sha256 manifests plus a `git show` diff against the pinned tag of the
+# public jphein/tapstone-game (a local checkout at ~/Projects/tapstone-game, or fetched in CI). The BEHAVIOURAL half — replaying a recorded match through the
+# vendored engine — is the `tapstone-rules` suite in the cargo-test arm below, because it costs a
+# compile and this arm must stay cheap.
+step "vendored tapstone crates match their pinned tag (issue 10)"
+if out=$("$ROOT/tools/tapstone_vendor.sh" --check 2>&1); then
+  printf '%s\n' "$out" | tail -3; ok "tapstone vendor"
+else
+  printf '%s\n' "$out" | sed 's/^/        /'; bad "tapstone vendor"
+fi
+
 # #555 made smol AGPL-3.0-or-later in LICENSE and the README but in no manifest, so every package
 # kept claiming "MIT OR Apache-2.0" or nothing. Unconditional and cheap (cargo metadata --no-deps,
 # ~1 s): the licence a package declares is what tooling and SBOMs read, so it is checked like a fact.
@@ -285,15 +301,57 @@ if [ "$run_fw" = 1 ] || [ "$run_excl" = 1 ] || [ "$run_hand" = 1 ]; then
       esac
       # rsync does not create nested destination parents (only the final component), so make them
       # first — without this the very first run of a fresh mirror fails on `mkdir "…/rust/clock"`.
-      if mkdir -p "$MIRROR/$CLOCK" "$MIRROR/rust/sigil-names" \
-         && rsync -a --delete \
-            --exclude='target/' --exclude='src/board.rs' --exclude='src/secrets.rs' \
-            "$ROOT/$CLOCK/" "$MIRROR/$CLOCK/" \
-         && rsync -a --delete --exclude='target/' \
-            "$ROOT/rust/sigil-names/" "$MIRROR/rust/sigil-names/" \
-         && "$ROOT/tools/ci_provision.sh" "$MIRROR/$CLOCK" >/dev/null; then
+      # The sibling crates are DERIVED from clock's own manifest, not listed here — and that is a
+      # bug fix, not a tidy-up. This block named `rust/sigil-names` and nothing else, while
+      # `rust/clock/Cargo.toml` has path-depended on `rust/esp-wifi-sys-chip` since #347 (the
+      # esp-radio 0.18 chip-feature split). A path dependency's directory must EXIST for cargo to
+      # parse the manifest at all, optional or not — so the mirror was unusable, and every tier
+      # built from it failed identically with "failed to get `esp-wifi-sys-chip` as a dependency of
+      # package `clock`". Not tier-specific, not feature-specific: `default` failed too.
+      #
+      # It stayed hidden because this arm only ENGAGES when local provisioning declares a symbol
+      # the examples do not (#363), which is a minority of runs and none of CI's. So the failure
+      # was reachable only by the developer least likely to read it as infrastructure: someone
+      # mid-way through wiring up a new board constant, holding a tree they already suspect.
+      #
+      # Found 2026-09-21 while adding a THIRD sibling (rust/tapstone-rules, issue 10), which would
+      # have been the second crate this list silently omitted. Hence derived: the list is exactly
+      # the manifest's `path = "../*"` entries, so the next sibling needs no edit here. Same
+      # reasoning as the `tests/*.rs` glob two arms down — "a list would stop covering what is
+      # added after it" — applied to the thing that list broke.
+      SIBLINGS=$(grep -v '^[[:space:]]*#' "$ROOT/$CLOCK/Cargo.toml" \
+                 | sed -n 's/.*path = "\.\.\/\([A-Za-z0-9_.-]*\)".*/\1/p' | sort -u)
+      mirror_ok=1
+      # An EMPTY list is a failure, not a fast path. If the derivation silently matched nothing,
+      # the mirror would be missing every sibling and we would be back to the bug above with no
+      # message — so refuse rather than provision a mirror that cannot build.
+      if [ -z "$SIBLINGS" ]; then
+        printf '   mirror: no `path = "../*"` siblings found in %s/Cargo.toml — refusing to
+' "$CLOCK"
+        printf '           provision a mirror that cannot resolve clock'"'"'s path deps.
+'
+        mirror_ok=0
+      fi
+      mkdir -p "$MIRROR/$CLOCK" || mirror_ok=0
+      rsync -a --delete \
+        --exclude='target/' --exclude='src/board.rs' --exclude='src/secrets.rs' \
+        "$ROOT/$CLOCK/" "$MIRROR/$CLOCK/" || mirror_ok=0
+      for sib in $SIBLINGS; do
+        if [ ! -d "$ROOT/rust/$sib" ]; then
+          printf '   mirror: clock path-depends on rust/%s, which is not in this tree.\n' "$sib"
+          mirror_ok=0
+          continue
+        fi
+        mkdir -p "$MIRROR/rust/$sib" \
+          && rsync -a --delete --exclude='target/' "$ROOT/rust/$sib/" "$MIRROR/rust/$sib/" \
+          || mirror_ok=0
+      done
+      "$ROOT/tools/ci_provision.sh" "$MIRROR/$CLOCK" >/dev/null || mirror_ok=0
+      if [ "$mirror_ok" = 1 ]; then
         BUILD_ROOT="$MIRROR"
-        ok "mirror provisioned (tiers below build from it, not from your tree)"
+        # Name the count, so a mirror that copied FEWER siblings than the manifest declares is
+        # visible in the log rather than only in the compile error it causes later.
+        ok "mirror provisioned + $(printf '%s\n' "$SIBLINGS" | wc -w) sibling crate(s) (tiers below build from it, not from your tree)"
       else
         bad "mirror provisioning (#363) — falling back to linting your tree"
       fi
@@ -624,6 +682,31 @@ if [ "$run_fw" = 1 ]; then
     tail -15 "$GATE_TMP/gate-paint.log" | sed 's/^/        /'
   fi
 
+  # JP's ruling 2026-09-27: the vendored tapstone crates (rules, proto, progression) may cost at most
+  # 64 KB of flash. Measured as the flash-image delta between the canonical ELF (the stack step's)
+  # and the same composition plus `tapstone,tapstone-probe`; the probe keeps the crates reachable,
+  # because nothing calls them until issue 1 and fat LTO would otherwise strip them to ~2 KB. The
+  # checker also FAILS under a 4 KB floor, because a probe LTO has defeated cannot see the budget.
+  # Its OWN target dir, for the paint arm's reason: sharing one would overwrite the canonical ELF.
+  step "tapstone flash budget — vendored crates vs 64 KB (JP 2026-09-27)"
+  TSDIR="${SMOL_GATE_TAPSTONE_DIR:-$GATE_TMP/gate-tsflash-$(printf %s "$ROOT" | cksum | cut -d' ' -f1)}"
+  if [ ! -f "$FLEET_ELF" ]; then
+    printf '   \033[33mSKIP\033[0m tapstone flash — no canonical ELF to compare against\n'
+  elif (cd "$BUILD_ROOT/$CLOCK" && CARGO_TARGET_DIR="$TSDIR" \
+          cargo build --release --bin clock "${JOBS[@]}" \
+          --features "tapstone,tapstone-probe,$REPRO_FLEET_FEATURES" "${REPRO_CARGO_ARGS[@]}") \
+        >"$GATE_TMP/gate-tsflash.log" 2>&1; then
+    if out=$("$ROOT/tools/check_tapstone_flash.py" --fleet-elf "$FLEET_ELF" \
+               --tapstone-elf "$TSDIR/${REPRO_TARGET}/release/clock" 2>&1); then
+      printf '%s\n' "$out"; ok "tapstone flash"
+    else
+      printf '%s\n' "$out"; bad "tapstone flash"
+    fi
+  else
+    bad "tapstone flash (tapstone-probe build failed)"
+    tail -15 "$GATE_TMP/gate-tsflash.log" | sed 's/^/        /'
+  fi
+
   step "byte-free corroboration — symbols in the canonical ELF (#351)"
   ELF="${CARGO_TARGET_DIR:-$BUILD_ROOT/$CLOCK/target}/${REPRO_TARGET}/release/clock"
   if [ -f "$ELF" ]; then
@@ -769,6 +852,42 @@ if [ "$run_host" = 1 ]; then
       ok "test $n — $(grep -Eo '[0-9]+ passed' "$GATE_TMP/gate-test-$n.log" | tail -1)"
     else
       bad "test $n"; tail -12 "$GATE_TMP/gate-test-$n.log" | sed 's/^/        /'
+    fi
+  done
+
+  # Issue 10 — the VENDORED rules engine's own suites, and the one that matters:
+  # `tests/vendor_golden_replay.rs` replays a real recorded match (decks, house rules, every
+  # record) through this copy and demands the chain head the transcript carries, per record and at
+  # the end. That is the agreement proof the whole two-shrine design rests on, and byte-equality
+  # alone does not establish it — identical sources can still diverge through a toolchain or a
+  # feature unification. The vendor arm near the top of this file checks the bytes; this checks the
+  # behaviour. Both, or neither is evidence.
+  #
+  # Its own workspace (`[workspace]` in that Cargo.toml), so it runs from its own directory with
+  # its own lockfile and cannot perturb `rust/clock/Cargo.lock` — which is what keeps issue 10's
+  # `--locked` criterion meaningful. No `--no-default-features` needed, unlike the arm above: this
+  # crate pulls no bare-metal stack, so there is no `portable-atomic` to leak into the host build.
+  # The four vendored tapstone crates, one pin (tools/tapstone_vendor.sh; the fifth source,
+  # rust/tapstone-decks, is data with no tests of its own). Each is its own
+  # workspace with its own lockfile, so none can perturb rust/clock/Cargo.lock.
+  for crate in tapstone-rules tapstone-proto tapstone-progression shrine-render; do
+    step "vendored $crate host suites (cargo test)"
+    log="$GATE_TMP/gate-test-$crate.log"
+    # Declared skips (tests that read tapstone's docs, which smol does not vendor), exact names.
+    mapfile -t skips < <("$ROOT/tools/tapstone_vendor.sh" --skips "$crate")
+    extra=(); [ ${#skips[@]} -gt 0 ] && extra=(-- --exact "${skips[@]}")
+    if (cd "$ROOT/rust/$crate" && cargo test --no-fail-fast "${JOBS[@]}" "${extra[@]}") >"$log" 2>&1; then
+      # Sum the per-suite counts, and print it: "0 passed" from a suite that silently stopped
+      # collecting tests still exits 0, which is the failure this file has already been bitten by.
+      passed=$(grep -Eo '[0-9]+ passed' "$log" | awk '{n+=$1} END {print n+0}')
+      if [ "$passed" -gt 0 ]; then
+        ok "test $crate — $passed passed"
+      else
+        bad "test $crate — exited 0 but ran NO tests"
+      fi
+    else
+      bad "test $crate"
+      tail -15 "$log" | sed 's/^/        /'
     fi
   done
 
@@ -1022,6 +1141,15 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | tail -1; ok "test_symbol_sizes"
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_symbol_sizes"
+  fi
+
+  # The tapstone flash checker's offline half: its budget and blind-floor arms can fail, on
+  # synthetic ELFs, with no toolchain. The fw arm runs it on real ones.
+  step "tapstone flash checker self-test"
+  if out=$("$ROOT/tools/check_tapstone_flash.py" --self-test 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "check_tapstone_flash self-test"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "check_tapstone_flash self-test"
   fi
 
   # #419: the board-fact seam. A constant in targets/*/src/board/*.rs is a STATEMENT ABOUT THE
