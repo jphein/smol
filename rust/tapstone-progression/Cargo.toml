@@ -6,7 +6,7 @@ name = "tapstone-progression"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 description = "VENDORED copy of tapstone's commander progression (XP, levels, slots, items). src/ is byte-identical upstream; do not edit."
 
 [workspace]

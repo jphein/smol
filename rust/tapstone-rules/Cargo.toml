@@ -11,7 +11,7 @@ edition = "2024"
 # Same floor as `clock`, and for the same reason: espup's Xtensa fork is pinned at 1.95.0.0 and is
 # the only rustc that can target `xtensa-esp32s3-none-elf`. Raising this line drops the S3.
 rust-version = "1.95"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 description = "VENDORED copy of tapstone's rules engine. src/ and tests/ are byte-identical upstream; do not edit."
 
 # #347, same line and same reason as `rust/sigil-names` and `rust/esp-wifi-sys-chip`: DECLARED as

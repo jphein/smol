@@ -6,7 +6,7 @@ name = "tapstone-proto"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 description = "VENDORED copy of tapstone's MATCH frames, TSX1 transcript and follower. src/ is byte-identical upstream; do not edit."
 
 # Its own workspace, like tapstone-rules: a standalone crate for `cargo test` here, and a path dep
