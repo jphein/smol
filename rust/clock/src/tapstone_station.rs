@@ -179,13 +179,53 @@ enum Route {
     Air(u8),
 }
 
+/// The station's send side: where the arena is, and how to reach a node.
+struct Tx {
+    node: u8,
+    route: Route,
+    last_beacon: Option<u64>,
+    sent: u32,
+    send_errors: u32,
+}
+
+impl Tx {
+    fn send(&mut self, radio: &mut RadioManager, now: u64, dst: u8, bytes: &[u8]) {
+        if matches!(Frame::decode(bytes), Some((_, Frame::Lobby(Lobby { .. })))) {
+            if self.last_beacon.is_some_and(|t| now.saturating_sub(t) < BEACON_MS) {
+                return;
+            }
+            self.last_beacon = Some(now);
+        }
+        let to_arena = dst == ARENA_NODE || dst == BROADCAST;
+        // Up the USB when the arena is this board's own host.
+        if to_arena && self.route == Route::Local {
+            println!("{}", Show(|f| ts_lines::write_rx(f, self.node, 0, true, bytes)));
+            self.sent += 1;
+            if dst == ARENA_NODE {
+                return;
+            }
+        }
+        let air_dst = match (dst, self.route) {
+            (BROADCAST, _) => BROADCAST,
+            (ARENA_NODE, Route::Air(n)) => n,
+            // The arena's whereabouts are unknown until it beacons (every 2 s): a claim sent
+            // before then is re-sent every 100 ms by the seat, so dropping one costs nothing.
+            (ARENA_NODE, _) => return,
+            (d, _) => d,
+        };
+        match radio.ts_send(air_dst, bytes) {
+            Ok(()) => self.sent += 1,
+            Err(_) => self.send_errors = self.send_errors.saturating_add(1),
+        }
+    }
+}
+
 pub struct Station {
     shrine: Shrine<Autoplay>,
     /// 0032's screens: the S3's colour panel only. A C3 station is a headless seat.
     #[cfg(feature = "esp32s3")]
     screens: screen::Screens,
-    route: Route,
-    last_beacon: Option<u64>,
+    tx: Tx,
     next_status: u64,
     reported_over: Option<u32>,
     /// The last match whose `R` this station heard (the seat's own flag resets with the lobby).
@@ -194,8 +234,6 @@ pub struct Station {
     over_at: Option<u64>,
     /// `TAPSTONE_NO_PROPOSE=1` at build time: the stall control, a seat that proposes nothing.
     no_propose: bool,
-    sent: u32,
-    send_errors: u32,
 }
 
 impl Station {
@@ -208,6 +246,9 @@ impl Station {
         shrine.stamp_uids = true;
         // A real shrine stays at the table: back to the lobby after each match.
         shrine.rematch = true;
+        // rules-v0.2.2 carries the interim arbiter (arena spec §7); this station does not take the
+        // role yet, so it never detects dark on its own.
+        shrine.dark.detect = false;
         println!(
             "[station] node {} index {} deck {} castle {} ({} cards)",
             node,
@@ -229,15 +270,18 @@ impl Station {
             shrine,
             #[cfg(feature = "esp32s3")]
             screens: screen::Screens::new(node, faction),
-            route: Route::Unknown,
-            last_beacon: None,
+            tx: Tx {
+                node,
+                route: Route::Unknown,
+                last_beacon: None,
+                sent: 0,
+                send_errors: 0,
+            },
             next_status: 0,
             reported_over: None,
             heard_result: None,
             over_at: None,
             no_propose: matches!(option_env!("TAPSTONE_NO_PROPOSE"), Some("1")),
-            sent: 0,
-            send_errors: 0,
         }
     }
 
@@ -248,18 +292,22 @@ impl Station {
                 continue;
             };
             // The arena is recognised by what it sends, not by its header `src`: behind a gateway
-            // it speaks as the gateway's node (61 at this table), and 200 only on a desk mesh.
-            let from_arena = match &f {
-                Frame::Lobby(l) => l.seat_pref == ARENA_SEAT_PREF,
-                Frame::Begin(_) | Frame::Commit(_) | Frame::Result(_) | Frame::Handback(_) => true,
-                Frame::Tap(Tap::Reject { .. }) => true,
-                _ => false,
-            };
+            // it speaks as the gateway's node (61 at this table), and 200 only on a desk mesh. A
+            // seat's node is never the arena's (the interim's commits come from seat 0's).
+            let seat_node = self.shrine.follower.begun().is_some()
+                && self.shrine.follower.nodes().contains(&h.src);
+            let from_arena = !seat_node
+                && match &f {
+                    Frame::Lobby(l) => l.seat_pref == ARENA_SEAT_PREF,
+                    Frame::Begin(_) | Frame::Commit(_) | Frame::Result(_) => true,
+                    Frame::Tap(Tap::Reject { .. }) => true,
+                    _ => false,
+                };
             if from_arena {
                 let route = if q.local { Route::Local } else { Route::Air(q.src) };
-                if route != self.route {
+                if route != self.tx.route {
                     println!("[station] arena heard: {:?}", route);
-                    self.route = route;
+                    self.tx.route = route;
                 }
             }
             if let Frame::Result(_) = f
@@ -268,10 +316,9 @@ impl Station {
                 self.heard_result = Some(h.match_id);
                 println!("[station] RESULT match {:08x}", h.match_id);
             }
-            let out = self.shrine.rx(&h, &f);
-            for (dst, bytes) in out.iter() {
-                self.send(radio, now, *dst, bytes);
-            }
+            let tx = &mut self.tx;
+            self.shrine
+                .rx_to(&h, &f, &mut |dst, bytes| tx.send(radio, now, dst, bytes));
         }
         // The result hold: no claim for RESULT_HOLD_MS after the match is seen over. The lobby
         // beacon still goes out, so the arena keeps the shrine on its table.
@@ -280,11 +327,13 @@ impl Station {
         } else if self.shrine.follower.game.phase == Phase::Playing {
             self.over_at = None;
         }
-        let may_claim = self.over_at.is_none_or(|t| now.saturating_sub(t) >= RESULT_HOLD_MS);
-        let out = self.shrine.act(now, may_claim, self.no_propose);
-        for (dst, bytes) in out.iter() {
-            self.send(radio, now, *dst, bytes);
-        }
+        let may_claim = self
+            .over_at
+            .is_none_or(|t| now.saturating_sub(t) >= RESULT_HOLD_MS);
+        let tx = &mut self.tx;
+        self.shrine.act_to(now, may_claim, self.no_propose, &mut |dst, bytes| {
+            tx.send(radio, now, dst, bytes)
+        });
         self.status(now);
     }
 
@@ -297,41 +346,10 @@ impl Station {
             now,
             &s.follower.game,
             s.seat(),
-            self.route != Route::Unknown,
+            self.tx.route != Route::Unknown,
             s.follower.next_mseq(),
             s.follower.begun().unwrap_or(0),
         );
-    }
-
-    fn send(&mut self, radio: &mut RadioManager, now: u64, dst: u8, bytes: &[u8]) {
-        if matches!(Frame::decode(bytes), Some((_, Frame::Lobby(Lobby { .. })))) {
-            if self.last_beacon.is_some_and(|t| now.saturating_sub(t) < BEACON_MS) {
-                return;
-            }
-            self.last_beacon = Some(now);
-        }
-        let me = self.shrine.node;
-        let to_arena = dst == ARENA_NODE || dst == BROADCAST;
-        // Up the USB when the arena is this board's own host.
-        if to_arena && self.route == Route::Local {
-            println!("{}", Show(|f| ts_lines::write_rx(f, me, 0, true, bytes)));
-            self.sent += 1;
-            if dst == ARENA_NODE {
-                return;
-            }
-        }
-        let air_dst = match (dst, self.route) {
-            (BROADCAST, _) => BROADCAST,
-            (ARENA_NODE, Route::Air(n)) => n,
-            // The arena's whereabouts are unknown until it beacons (every 2 s): a claim sent
-            // before then is re-sent every 100 ms by the seat, so dropping one costs nothing.
-            (ARENA_NODE, _) => return,
-            (d, _) => d,
-        };
-        match radio.ts_send(air_dst, bytes) {
-            Ok(()) => self.sent += 1,
-            Err(_) => self.send_errors = self.send_errors.saturating_add(1),
-        }
     }
 
     fn status(&mut self, now: u64) {
@@ -345,7 +363,7 @@ impl Station {
         self.next_status = now + STATUS_MS;
         let head = s.follower.head_hash();
         println!(
-            "[station] {} match {:08x} seat {:?} phase {:?} round {} mseq {} head {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} route {:?} sent {} err {} drop {}",
+            "[station] {} match {:08x} seat {:?} phase {:?} round {} mseq {} head {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} route {:?} sent {} err {} dark {}",
             if final_now { "FINAL" } else { "status" },
             s.follower.begun().unwrap_or(0),
             s.seat(),
@@ -353,10 +371,10 @@ impl Station {
             g.round,
             s.follower.next_mseq(),
             head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7],
-            self.route,
-            self.sent,
-            self.send_errors,
-            0u32,
+            self.tx.route,
+            self.tx.sent,
+            self.tx.send_errors,
+            u32::from(self.shrine.dark.on),
         );
         if final_now {
             self.reported_over = s.follower.begun();
