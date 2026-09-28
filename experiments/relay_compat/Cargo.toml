@@ -4,6 +4,7 @@
 # both directions + the exact golden wire layout. The permanent guard for the #124 UP2 migration.
 [package]
 name = "relay_compat"
+license = "AGPL-3.0-or-later"
 version = "0.0.0"
 edition = "2021"
 publish = false

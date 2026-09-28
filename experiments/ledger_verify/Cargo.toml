@@ -5,6 +5,7 @@
 # sha2 supplies the injected hasher (the ledger core is hasher-agnostic / dependency-free).
 [package]
 name = "ledger_verify"
+license = "AGPL-3.0-or-later"
 version = "0.0.0"
 edition = "2021"
 publish = false

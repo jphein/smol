@@ -1,5 +1,6 @@
 [package]
 name = "oled-scale"
+license = "AGPL-3.0-or-later"
 version = "0.1.0"
 edition = "2021"
 description = "BinaryColor 72x40 -> RGB565 integer-scaling DrawTarget with dirty-rect tracking (smol#398 Path A)"

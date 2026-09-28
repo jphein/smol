@@ -1,5 +1,6 @@
 [package]
 name = "s3-backend-staging"
+license = "AGPL-3.0-or-later"
 version = "0.1.0"
 edition = "2021"
 description = "Staging crate: the S3 (ES3C28P) 4th app::Oled backend, proven to compile for xtensa before rust/clock intake"
