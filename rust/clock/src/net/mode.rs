@@ -2256,6 +2256,10 @@ pub struct RadioManager {
     /// Our short device id, embedded in HELLO beacons and matched against the
     /// id carried by inbound ACKs to detect a bidirectional link.
     id: u8,
+    /// tapstone#132 (c): MATCH frames for the shrine station, from the RX drain and from
+    /// `ts_send`'s local delivery (the arena on this board's USB addressing this node).
+    #[cfg(feature = "tapstone-station")]
+    pub ts_inbox: crate::tapstone_station::Inbox,
     /// Handshake state driving the blue LED (see the protocol comment above).
     peers: PeerTracker,
     /// BENCH link statistics (only exercised while in BENCH mode).
@@ -2826,6 +2830,8 @@ impl RadioManager {
         Some(Self {
             controller,
             self_mac,
+            #[cfg(feature = "tapstone-station")]
+            ts_inbox: crate::tapstone_station::Inbox::new(),
             esp_now: interfaces.esp_now,
             stack,
             rng,
@@ -8117,6 +8123,13 @@ impl RadioManager {
             .unwrap_or(0);
         let rssi = rssi.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
         esp_println::println!("{}", Show(|f| ts_lines::write_rx(f, src_id, rssi, mac_ok, frame)));
+        // tapstone#132 (c): the station hears the air too. A frame whose trailer FAILED is not
+        // handed to the seat (a forged commit is a forged result); an unkeyed one is, as the
+        // fleet's observe-mode accepts it.
+        #[cfg(feature = "tapstone-station")]
+        if !matches!(trailer, Trailer::BadTag) {
+            self.ts_inbox.push(src_id, false, frame);
+        }
     }
 
     /// Send one MATCH frame to node `dst` (255 = broadcast) through the `send_to` choke, so it
@@ -8124,6 +8137,18 @@ impl RadioManager {
     /// accepted it, not that `dst` received it (ESP-NOW's delivery callback is not awaited).
     pub fn ts_send(&mut self, dst: u8, frame: &[u8]) -> Result<(), crate::net::ts_lines::Reason> {
         use crate::net::ts_lines::Reason;
+        // tapstone#132 (c): the arena on this board's USB reaches this board's own seat here, and
+        // hears nothing back over the air (the station answers up the USB).
+        #[cfg(feature = "tapstone-station")]
+        {
+            let seat = crate::tapstone_station::station_node(self.id);
+            if dst == 255 || dst == seat {
+                self.ts_inbox.push(seat, true, frame);
+                if dst == seat {
+                    return Ok(());
+                }
+            }
+        }
         let mac = if dst == 255 {
             BROADCAST_ADDRESS
         } else if dst == self.id {
