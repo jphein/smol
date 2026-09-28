@@ -1185,6 +1185,18 @@ if [ "$run_hand" = 1 ]; then
   else
     printf '%s\n' "$out" | tail -30 | sed 's/^/        /'; bad "hand builds"
   fi
+
+  # The vendored tapstone crates' 64 KB flash budget on the S3, the shrine's chip and the tighter one
+  # (opt_level 2: +51,832 B at rules-v0.2.2, against the C3's +39,130). tools/gate.sh fw gates the C3;
+  # this job is the one with the Xtensa toolchain, so the S3 is gated here. Two builds from
+  # `build_matrix.py chip-recipe esp32s3`, then the same checker, with the same 4 KB blind floor.
+  step "tapstone flash budget on the S3 — vendored crates vs 64 KB (JP 2026-09-27)"
+  if out=$("$ROOT/tools/tapstone_flash_chip.sh" esp32s3 2>"$GATE_TMP/gate-tsflash-s3.log"); then
+    printf '%s\n' "$out"; ok "tapstone flash (esp32s3)"
+  else
+    printf '%s\n' "$out"; tail -15 "$GATE_TMP/gate-tsflash-s3.log" | sed 's/^/        /'
+    bad "tapstone flash (esp32s3)"
+  fi
 elif [ "$WHAT" = all ]; then
   step "hand builds"
   printf '   \033[33mSKIP\033[0m hand builds need espup: run tools/gate.sh hand (CI job: hand builds)\n'
