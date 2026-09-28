@@ -338,8 +338,9 @@ impl core::fmt::Write for Line {
 /// Nothing in a `tapstone` build calls the engine yet (issue 1 wires the mesh), so fat LTO strips
 /// almost all of it and a measurement of the shipping tree reads ~2 KB — wrong by 5x the day the
 /// mesh lands. This makes the whole shrine path REACHABLE: a MATCH frame decoded and fed to the
-/// shrine seat (`tapstone-proto`: codec, follower, rules engine, chain), one scheduler tick, the
-/// app's own commit path, and commander progression. Every input goes through `black_box` — an
+/// shrine seat's routed entry points (`tapstone-proto`: codec, follower, rules engine, chain, and the
+/// interim arbiter for an arena-dark window), one scheduler tick, one proposed tap, the app's own
+/// commit path, and commander progression. Every input goes through `black_box` — an
 /// all-zeros literal let the optimiser const-fold `Record::decode` to `None` and delete the call
 /// (#543's first probe read ~2 KB for exactly that reason).
 ///
@@ -361,12 +362,20 @@ pub fn flash_probe(seed: u64) -> usize {
         &deck,
         Autoplay::new(black_box(seed)),
     );
-    let mut n = 0;
+    // The ROUTED entry points (rules-v0.2.2 made them the only public ones): they carry the
+    // arena-dark detection and the interim arbiter, so the budget counts what the shrine will run.
+    let mut sent = 0usize;
+    let mut sink = |dst: u8, bytes: &[u8]| sent += usize::from(dst) + bytes.len();
     let buf = black_box([seed as u8; FRAME_MAX]);
     if let Some((h, f)) = Frame::decode(&buf) {
-        n += shrine.rx(&h, &f).len();
+        shrine.rx_to(&h, &f, &mut sink);
     }
-    n += shrine.act(black_box(seed), black_box(true), black_box(false)).len();
+    shrine.act_to(black_box(seed), black_box(true), black_box(false), &mut sink);
+    let tap = black_box([seed as u8; Record::LEN]);
+    if let Some(r) = Record::decode(&tap) {
+        shrine.propose_to(black_box(seed), r, &mut sink);
+    }
+    let mut n = black_box(sent);
 
     let mut app = TapstoneApp::new();
     let rec = black_box([seed as u8; Record::LEN]);

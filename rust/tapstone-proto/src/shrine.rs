@@ -12,8 +12,8 @@ use tapstone_rules::{Game, HouseRules, Kind, Phase, Record};
 
 use crate::follower::{Follower, OnBegin, OnCommit, OnHandback};
 use crate::frame::{
-    BROADCAST, Begin, FRAME_MAX, Frame, HANDBACK_RECORDS, Header, Join, Lobby, Tap, arena_refusal,
-    join_role, lobby_flags,
+    BROADCAST, Begin, FRAME_MAX, Frame, HANDBACK_RECORDS, Handback, Header, Join, Lobby, Nak, Tap,
+    arena_refusal, join_role, lobby_flags, refusal_code,
 };
 use crate::ids::{deck_sigil, rules_id};
 
@@ -23,8 +23,18 @@ pub const ARENA_NODE: u8 = 200;
 /// The arena re-sends its head this often (`tapstone-arena` `core::play::HEAD_MS`; a test there
 /// holds the two equal). A rejoining shrine waits one period caught up before it proposes.
 pub const HEAD_MS: u64 = 1000;
-/// Frames one call can emit: a `J`, or a lobby beacon and a claim, or a tap, or a reply.
+/// Frames one base call can emit: a `J`, or a lobby beacon and a claim, or a tap, or a reply. The
+/// routed entry points (`act_to`, `rx_to`, `propose_to`) emit through a sink instead, because an
+/// interim's hand-back is as many chunks as the log needs.
 pub const OUT_MAX: usize = 3;
+/// Arena-dark detection (lead ruling 2026-09-27, arena spec §7 step 1): no frame from the arena for
+/// this long. The arena re-broadcasts its head every [`HEAD_MS`] in play, so this is three missed
+/// heads, the idiom of protocol §4.5's 3 s `PEER_STALE`.
+pub const DARK_MS: u64 = 3_000;
+/// How long the interim waits for seat 1 to catch it up before arbitrating anyway (#98).
+pub const SYNC_BOUND_MS: u64 = 1_000;
+/// The interim re-sends its catch-up `N` this often while it waits (#98).
+pub const SYNC_RETRY_MS: u64 = 100;
 
 pub type Bytes = Vec<u8, FRAME_MAX>;
 /// Frames to send, as `(dst, bytes)`.
@@ -150,7 +160,90 @@ pub struct Shrine<C> {
     pub stamp_uids: bool,
     /// The UIDs of this seat's copies in hand, in draw order: `hand`, by copy.
     pub hand_uids: Vec<[u8; 7], DECK_MAX>,
+    /// The time of the last `act_to` call: the clock `rx_to` runs on (commit `time_ms`, the
+    /// catch-up's retry and bound, the arena's last-heard time).
+    pub now: u64,
+    /// The arena-dark state and the interim arbiter's (arena spec §7, #76, #91, #98).
+    pub dark: Dark,
 }
+
+/// The arena-dark window, from this shrine's side (arena spec §7). When the arena goes dark, seat 0's
+/// shrine (the first claimed, 0006/0029) is the **interim arbiter**: it arbitrates its own taps in
+/// place and seat 1's, answers a seat's `J`/`N` from its own log (#76), catches up from seat 1 before
+/// its first commit (#98), hands its log back to the revived arena (`H`, `K`), and returns to
+/// follower on the arena's first commit (step 5). Seat 1 re-addresses what it sent the arena to seat
+/// 0's node. This was `tapstone-arena/tests/harness.rs`'s `Net` until 2026-09-27; it lives here so
+/// the shrine firmware runs the interim the tests run (spec D3).
+pub struct Dark {
+    /// The arena is dark, as this shrine sees it.
+    pub on: bool,
+    /// Detect dark from the arena's silence ([`DARK_MS`]). Off: only [`Shrine::go_dark`] starts a
+    /// dark window (the test harness's god's-eye death of the arena).
+    pub detect: bool,
+    /// When this shrine last heard the arena.
+    pub last_arena: Option<u64>,
+    /// While dark, the interim answers a seat's `J` and `N` (#76). Off: the deferral this replaced.
+    pub answers: bool,
+    /// #98: before its first commit in a dark window the interim asks seat 1 (`N`) for any record
+    /// past its own head and adopts the `H` answer. Off: the interim arbitrates at once.
+    pub syncs: bool,
+    /// The interim has caught up with seat 1 this dark window (or gave up waiting).
+    pub synced: bool,
+    /// When the interim first and last asked seat 1 to catch it up, this dark window.
+    pub sync_asked: Option<(u64, u64)>,
+    /// Taps that reached the interim while it waited, one per seat in arrival order.
+    pub sync_held: Vec<(u16, Record), 2>,
+    /// The highest lseq the interim committed per seat, this match.
+    pub lseq: [u16; 2],
+    /// Test controls: flip one card of the rebuilt `B` (#76), zero `H.last_lseq` to a seat (#76),
+    /// flip one byte of one carried hash in the hand-back to the arena.
+    pub corrupt_begin: bool,
+    pub zero_lseq: bool,
+    pub corrupt_handback: bool,
+    /// Instruments: `J`/`N` answers sent; rejects sent to seat 1; taps, and seats' `J`/`N`, that
+    /// reached an interim with no game (#91); records adopted from seat 1's catch-up; frames the
+    /// interim addressed to the (dark) arena anyway.
+    pub replies: u32,
+    pub rejects: u32,
+    pub gameless_taps: u32,
+    pub gameless_asks: u32,
+    pub sync_adopted: u32,
+    pub to_arena: u32,
+}
+
+impl Dark {
+    pub const fn new() -> Dark {
+        Dark {
+            on: false,
+            detect: true,
+            last_arena: None,
+            answers: true,
+            syncs: true,
+            synced: false,
+            sync_asked: None,
+            sync_held: Vec::new(),
+            lseq: [0; 2],
+            corrupt_begin: false,
+            zero_lseq: false,
+            corrupt_handback: false,
+            replies: 0,
+            rejects: 0,
+            gameless_taps: 0,
+            gameless_asks: 0,
+            sync_adopted: 0,
+            to_arena: 0,
+        }
+    }
+}
+
+impl Default for Dark {
+    fn default() -> Dark {
+        Dark::new()
+    }
+}
+
+/// A frame sink: `(dst, bytes)`.
+pub type Emit<'a> = dyn FnMut(u8, &[u8]) + 'a;
 
 impl<C: Chooser> Shrine<C> {
     /// A shrine on `node` with figurine/copy index `index`, claiming with `castle`, holding `deck`.
@@ -188,6 +281,8 @@ impl<C: Chooser> Shrine<C> {
             lobby_after: None,
             stamp_uids: false,
             hand_uids: Vec::new(),
+            now: 0,
+            dark: Dark::new(),
         }
     }
 
@@ -321,7 +416,7 @@ impl<C: Chooser> Shrine<C> {
     /// a lost claim cannot strand the lobby. In a match: the owed draws first (0036), then this
     /// seat's turn, one tap at a time with a 100 ms retransmit (protocol §4.3). `manual` makes no
     /// play taps. Returns the frames to send, as `(dst, bytes)`.
-    pub fn act(&mut self, now: u64, may_claim: bool, manual: bool) -> Out {
+    fn act_base(&mut self, now: u64, may_claim: bool, manual: bool) -> Out {
         let i = self.index;
         let seat = self.seat();
         let node = self.node;
@@ -483,7 +578,7 @@ impl<C: Chooser> Shrine<C> {
     /// gets the UID of the first copy of that design not yet drawn (0036), as in `act`. Sends
     /// nothing with no seat, with a tap still pending, or for a draw of a design this shrine holds
     /// no undrawn copy of.
-    pub fn propose(&mut self, now: u64, mut tap: Record) -> Out {
+    fn propose_base(&mut self, now: u64, mut tap: Record) -> Out {
         let mut out = Out::new();
         if self.seat().is_none() || self.pending.is_some() {
             return out;
@@ -501,7 +596,7 @@ impl<C: Chooser> Shrine<C> {
 
     /// A commit or a tap reject heard from the mesh (anything else is ignored). Returns the
     /// replies to send: an ACK, a NAK for a gap, or an X for a hash split.
-    pub fn rx(&mut self, h: &Header, f: &Frame) -> Out {
+    fn follow(&mut self, h: &Header, f: &Frame) -> Out {
         let mut out = Out::new();
         let i = self.seat();
         match f {
@@ -608,6 +703,367 @@ impl<C: Chooser> Shrine<C> {
             _ => {}
         }
         out
+    }
+}
+
+/// The routed entry points and the interim arbiter (arena spec §7).
+impl<C: Chooser> Shrine<C> {
+    /// One scheduler tick, routed: [`Shrine::act`]'s frames, with the dark window applied (the
+    /// interim arbitrates its own tap in place; seat 1 re-addresses to the interim).
+    pub fn act_to(&mut self, now: u64, may_claim: bool, manual: bool, emit: &mut Emit<'_>) {
+        self.now = now;
+        self.detect_dark(now);
+        let out = self.act_base(now, may_claim, manual);
+        for (dst, bytes) in out.iter() {
+            self.route(*dst, bytes, true, emit);
+        }
+    }
+
+    /// A tap its person chose, routed as [`Shrine::act_to`] routes the scripted ones.
+    pub fn propose_to(&mut self, now: u64, tap: Record, emit: &mut Emit<'_>) -> bool {
+        self.now = now;
+        let out = self.propose_base(now, tap);
+        let sent = !out.is_empty();
+        for (dst, bytes) in out.iter() {
+            self.route(*dst, bytes, true, emit);
+        }
+        sent
+    }
+
+    /// A frame heard from the mesh, routed: the follower's replies, and the interim's side of a
+    /// dark window. The branch order is the harness's, which the dark tests pinned.
+    pub fn rx_to(&mut self, h: &Header, f: &Frame, emit: &mut Emit<'_>) {
+        if self.arena_sent(h, f) {
+            self.dark.last_arena = Some(self.now);
+        }
+        let seat = self.seat();
+        let interim = self.interim_role();
+        let dark = self.dark.on;
+        let peer = self.peer_node();
+        match f {
+            Frame::Commit(_) => {
+                // The first commit from the revived arena is the handover (step 5). Only a shrine
+                // holding `B` can tell it from the interim's own commits (the seat map names the
+                // interim's node); a seatless one stays dark until it can.
+                if dark && self.interim_node().is_some_and(|n| h.src != n) {
+                    self.dark.on = false;
+                }
+                self.follow_to(h, f, emit);
+            }
+            // Seat 1's tap reaches the interim arbiter while the arena is dark.
+            Frame::Tap(Tap::Propose { lseq, record }) if interim && dark => {
+                self.interim_commit(*lseq, *record, emit);
+            }
+            // ...or a would-be interim with no game, which arbitrates nothing (#91).
+            Frame::Tap(Tap::Propose { .. }) if seat.is_none() && dark => {
+                self.dark.gameless_taps += 1;
+            }
+            // The revived arena asks for the gap: every hand-back chunk.
+            Frame::Join(j) if interim && j.role == join_role::ARENA => {
+                self.send_handback(j.have_mseq, u64::MAX, ARENA_NODE, true, emit);
+            }
+            // It NAKs the chunks it is missing.
+            Frame::HandbackNak(k) if interim => {
+                self.send_handback(k.from_mseq, k.bitmap, ARENA_NODE, true, emit);
+            }
+            // #76: a seat's J (a reboot) is answered with B rebuilt from this state, then H chunks.
+            Frame::Join(j)
+                if interim
+                    && dark
+                    && self.dark.answers
+                    && j.role == join_role::SEAT
+                    && self.begin.is_some() =>
+            {
+                self.dark.replies += 1;
+                let Some(mut b) = self.follower.begin_frame() else {
+                    return;
+                };
+                if self.dark.corrupt_begin {
+                    b.decks[1][0] ^= 0x0001;
+                }
+                let id = self.begin.map_or(0, |(id, _)| id);
+                emit(h.src, &encode(self.node, id, &Frame::Begin(b)));
+                self.send_handback(j.have_mseq, u64::MAX, h.src, true, emit);
+            }
+            // #76: a seat's N (a gap) gets the same chunks from `from`.
+            Frame::Nak(n)
+                if interim
+                    && dark
+                    && self.dark.answers
+                    && Some(h.src) == peer
+                    && self.begin.is_some() =>
+            {
+                self.dark.replies += 1;
+                self.send_handback(n.from, u64::MAX, h.src, true, emit);
+            }
+            // #98: the interim's catch-up N: seat 1 answers with what it holds from `from`.
+            Frame::Nak(n) if seat == Some(1) && dark && Some(h.src) == self.interim_node() => {
+                if self.follower.handback(n.from, 0).is_some() {
+                    self.send_handback(n.from, u64::MAX, h.src, false, emit);
+                } else if self.follower.begun().is_some() {
+                    // Seat 1 is behind the interim: nothing past `from`, said as one empty chunk.
+                    let hb = Handback {
+                        from_mseq: n.from,
+                        idx: 0,
+                        count: 1,
+                        n: 0,
+                        last_lseq: self.follower.last_lseq(),
+                        records: [[0; 32]; HANDBACK_RECORDS],
+                    };
+                    let id = self.begin.map_or(0, |(id, _)| id);
+                    emit(h.src, &encode(self.node, id, &Frame::Handback(hb)));
+                }
+            }
+            // ...and the interim adopts the answer, then arbitrates from the common head.
+            Frame::Handback(hb) if interim && dark && Some(h.src) == peer && !self.dark.synced => {
+                let before = self.follower.next_mseq();
+                self.follow_to(h, f, emit);
+                let after = self.follower.next_mseq();
+                self.dark.sync_adopted += u32::from(after - before);
+                let end =
+                    hb.from_mseq as usize + hb.idx as usize * HANDBACK_RECORDS + hb.n as usize;
+                if hb.idx + 1 == hb.count && after as usize >= end {
+                    self.dark.synced = true;
+                    let held = core::mem::take(&mut self.dark.sync_held);
+                    for (lseq, r) in held {
+                        self.interim_commit(lseq, r, emit);
+                    }
+                }
+            }
+            // #91: a gameless would-be interim has nothing to answer a seat's J or N from.
+            Frame::Join(_) | Frame::Nak(_)
+                if seat.is_none() && dark && !self.arena_sent(h, f) && self.begin.is_none() =>
+            {
+                self.dark.gameless_asks += 1;
+            }
+            Frame::Tap(Tap::Reject { .. })
+            | Frame::Result(_)
+            | Frame::Begin(_)
+            | Frame::Handback(_) => {
+                self.follow_to(h, f, emit);
+            }
+            _ => {}
+        }
+    }
+
+    /// The arena process died (the harness's god's-eye view, or [`DARK_MS`] of silence): a fresh
+    /// dark window. Nothing is pending, so every seat's next tap goes out on the new route at once.
+    pub fn go_dark(&mut self) {
+        self.dark.on = true;
+        self.dark.synced = false;
+        self.dark.sync_asked = None;
+        self.dark.sync_held.clear();
+        self.pending = None;
+    }
+
+    /// The arena is back (its first commit, step 5).
+    pub fn end_dark(&mut self) {
+        self.dark.on = false;
+    }
+
+    /// Enter the dark window on [`DARK_MS`] of the arena's silence, in a match this shrine plays.
+    fn detect_dark(&mut self, now: u64) {
+        let playing = self.follower.begun().is_some() && self.follower.game.phase == Phase::Playing;
+        if self.dark.detect
+            && !self.dark.on
+            && playing
+            && self
+                .dark
+                .last_arena
+                .is_some_and(|t| now.saturating_sub(t) >= DARK_MS)
+        {
+            self.go_dark();
+        }
+    }
+
+    /// Seat 0's shrine is the interim. A shrine with no seat (it never heard `B`, #91, or rebooted
+    /// and kept nothing, #76) knows neither its own seat nor the interim's node: it arbitrates
+    /// nothing, broadcasts what it meant for the arena (the interim, or a revived arena, hears it),
+    /// and counts what reached it as a would-be interim.
+    fn interim_role(&self) -> bool {
+        self.seat() == Some(0)
+    }
+
+    /// Seat 0's node, from `B`'s seat map: where seat 1 sends what it meant for the arena.
+    fn interim_node(&self) -> Option<u8> {
+        self.follower.begun().map(|_| self.follower.nodes()[0])
+    }
+
+    /// The other seat's node.
+    fn peer_node(&self) -> Option<u8> {
+        let seat = self.seat()?;
+        Some(self.follower.nodes()[1 - seat])
+    }
+
+    /// Did the arena send this? The arena heads its frames with its own node (200 on a desk
+    /// mesh, its gateway's node over the radio), never a seat's, and only it sends these kinds.
+    fn arena_sent(&self, h: &Header, f: &Frame) -> bool {
+        let seat_node = self.follower.begun().is_some() && self.follower.nodes().contains(&h.src);
+        if seat_node {
+            return false;
+        }
+        match f {
+            Frame::Lobby(l) => l.seat_pref == 0xFF,
+            Frame::Join(j) => j.role == join_role::ARENA,
+            Frame::Begin(_)
+            | Frame::Commit(_)
+            | Frame::Result(_)
+            | Frame::HandbackNak(_)
+            | Frame::Doll(_)
+            | Frame::Tap(Tap::Reject { .. }) => true,
+            _ => false,
+        }
+    }
+
+    /// Where a frame this shrine addressed to the arena goes while the arena is dark.
+    fn route(&mut self, dst: u8, bytes: &[u8], from_act: bool, emit: &mut Emit<'_>) {
+        if !(self.dark.on && dst == ARENA_NODE) {
+            return emit(dst, bytes);
+        }
+        if self.seat().is_none() {
+            // Seatless: the interim's node is unknown (see `interim_role`).
+            if from_act {
+                self.dark.to_arena += 1;
+            }
+            return emit(BROADCAST, bytes);
+        }
+        if self.interim_role() {
+            if !from_act {
+                return emit(dst, bytes);
+            }
+            // Only a tap is the interim's to arbitrate. Anything else it addresses to the arena
+            // (its `J` for a `B` it never received, #91) goes on the air to the arena as ever:
+            // nobody hears it while the arena is dead, and the revived arena does.
+            match Frame::decode(bytes) {
+                Some((_, Frame::Tap(Tap::Propose { lseq, record }))) => {
+                    self.interim_commit(lseq, record, emit)
+                }
+                _ => {
+                    self.dark.to_arena += 1;
+                    emit(dst, bytes);
+                }
+            }
+        } else if let Some(n) = self.interim_node() {
+            emit(n, bytes);
+        }
+    }
+
+    /// The follower's own handling, its replies routed.
+    fn follow_to(&mut self, h: &Header, f: &Frame, emit: &mut Emit<'_>) {
+        let out = self.follow(h, f);
+        for (dst, bytes) in out.iter() {
+            self.route(*dst, bytes, false, emit);
+        }
+    }
+
+    /// Arbitrate a tap as the interim: its own, or seat 1's (arena spec §7, #76, #98).
+    fn interim_commit(&mut self, lseq: u16, r: Record, emit: &mut Emit<'_>) {
+        if self.begin.is_none() {
+            self.dark.gameless_taps += 1;
+            return;
+        }
+        if !self.interim_caught_up(emit) {
+            // Held, and arbitrated the moment seat 1's answer lands (the proposer's retransmit
+            // would otherwise cost 100 ms); a retransmit meanwhile replaces its seat's.
+            self.dark.sync_held.retain(|(_, h)| h.seat != r.seat);
+            let _ = self.dark.sync_held.push((lseq, r));
+            return;
+        }
+        let now = self.now as u32;
+        let seat = r.seat;
+        // Dedupe retransmits by (seat, lseq), exactly as the arena does, from every lseq seen
+        // committed: the interim's own AND the ones it followed before the arena went dark
+        // (a rebooted seat's restarted counter got through otherwise, #76).
+        let seen = self.follower.last_lseq()[(seat & 1) as usize];
+        if self.dark.lseq[(seat & 1) as usize].max(seen) >= lseq {
+            return;
+        }
+        let id = self.begin.map_or(0, |(id, _)| id);
+        match self.follower.arbitrate(r, lseq, now) {
+            Ok(c) => {
+                self.dark.lseq[(seat & 1) as usize] = lseq;
+                emit(BROADCAST, &encode(self.node, id, &Frame::Commit(c)));
+                if Some(seat as usize) == self.seat() {
+                    // The interim never hears its own commits back, so it notes its own taps here:
+                    // without it a copy drawn while dark was drawn again after the revival, and the
+                    // arena refused it forever (COPY_DRAWN, #76).
+                    self.pending = None;
+                    self.note_own(&c.record);
+                }
+            }
+            Err(e) => {
+                let reject = Frame::Tap(Tap::Reject {
+                    lseq,
+                    reason: refusal_code(&e),
+                });
+                if Some(seat as usize) == self.seat() {
+                    self.pending = None;
+                    self.refused = self.refused.saturating_add(1);
+                } else if let Some(p) = self.peer_node() {
+                    self.dark.rejects += 1;
+                    emit(p, &encode(self.node, 0, &reject));
+                }
+            }
+        }
+    }
+
+    /// #98: whether the interim may arbitrate yet. Before its first commit in a dark window it sends
+    /// seat 1 an `N` from its own next mseq, every [`SYNC_RETRY_MS`], and seat 1 answers with `H`
+    /// chunks of whatever it holds past that (none: one empty chunk). A seat 1 that never answers
+    /// is waited for [`SYNC_BOUND_MS`], then the interim arbitrates as before.
+    fn interim_caught_up(&mut self, emit: &mut Emit<'_>) -> bool {
+        if !self.dark.syncs || self.dark.synced {
+            return true;
+        }
+        let now = self.now;
+        let (first, last) = *self.dark.sync_asked.get_or_insert((now, 0));
+        if now.saturating_sub(first) >= SYNC_BOUND_MS {
+            self.dark.synced = true;
+            return true;
+        }
+        if last == 0 || now.saturating_sub(last) >= SYNC_RETRY_MS {
+            self.dark.sync_asked = Some((first, now.max(1)));
+            let from = self.follower.next_mseq();
+            let id = self.begin.map_or(0, |(id, _)| id);
+            if let Some(p) = self.peer_node() {
+                emit(
+                    p,
+                    &encode(self.node, id, &Frame::Nak(Nak { from, to: from })),
+                );
+            }
+        }
+        false
+    }
+
+    /// `H` chunks of this shrine's log from `from`, the chunks `bitmap` names, to `dst`. `as_interim`:
+    /// the interim's hand-back (the test controls apply), or seat 1 answering a catch-up.
+    fn send_handback(
+        &mut self,
+        from: u16,
+        bitmap: u64,
+        dst: u8,
+        as_interim: bool,
+        emit: &mut Emit<'_>,
+    ) {
+        let Some(first) = self.follower.handback(from, 0) else {
+            return;
+        };
+        let id = self.begin.map_or(0, |(id, _)| id);
+        for idx in 0..first.count {
+            if idx < 64 && bitmap & (1 << idx) == 0 {
+                continue;
+            }
+            let Some(mut hb) = self.follower.handback(from, idx) else {
+                continue;
+            };
+            if as_interim && self.dark.corrupt_handback && idx == first.count - 1 {
+                hb.records[0][30] ^= 0x01; // one byte of one carried hash
+            }
+            if as_interim && self.dark.zero_lseq && dst != ARENA_NODE {
+                hb.last_lseq = [0; 2];
+            }
+            emit(dst, &encode(self.node, id, &Frame::Handback(hb)));
+        }
     }
 }
 

@@ -182,6 +182,11 @@ impl Follower {
         self.begun
     }
 
+    /// The seat map from `B`, seat order: the node each seat's shrine answers on (#67).
+    pub fn nodes(&self) -> [u8; 2] {
+        self.nodes
+    }
+
     /// The seat `node` holds, from `B`'s seat map.
     pub fn seat_of(&self, node: u8) -> Option<u8> {
         self.begun?;
