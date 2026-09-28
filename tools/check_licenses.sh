@@ -6,6 +6,11 @@
 # what `cargo metadata`, crates tooling and SBOM scanners read, so a stale field is a false licence
 # claim that outlives the prose it contradicts. This makes the metadata a checked fact.
 #
+# Manifests come from the TREE (find), not from git's index: the gate also runs on rsync mirrors and
+# `git archive` exports with no `.git`, and on a stale index. There, `git ls-files` silently skipped
+# every manifest added since, and a planted MIT stayed green (2026-09-27, on smol#543's four new
+# crates). Build output (target/), node_modules, .git and the gate's tmp/ are pruned.
+#
 # It asks CARGO, not grep: `cargo metadata --no-deps` per tracked Cargo.toml, so `license.workspace
 # = true` resolves to what the workspace really says. A package with no field reads as null and
 # fails like a wrong one. A manifest cargo cannot read fails closed: an unreadable manifest is an
@@ -47,7 +52,8 @@ for p in d["packages"]:
   if [[ "$lic" != "$EXPECTED" ]]; then
     echo "FAIL: $m ($name) declares license '$lic', not '$EXPECTED'"; rc=1
   fi
-done < <(git ls-files '*Cargo.toml')
+done < <(find . \( -name target -o -name node_modules -o -name .git -o -path ./tmp \) -prune -o \
+             -name Cargo.toml -type f -print | sed 's|^\./||' | sort)
 if [[ $n -eq 0 ]]; then echo "FAIL: no packages checked — the instrument saw nothing"; exit 1; fi
 [[ $rc -eq 0 ]] && echo "ok: $n packages declare $EXPECTED (exempt: targets/c6-watch/**, rust/sigil-names)"
 exit "$rc"
