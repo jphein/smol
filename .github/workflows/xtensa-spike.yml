@@ -62,7 +62,7 @@ jobs:
     # which is the wrong answer to write down.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Runner facts (recorded — a spike's context is part of its result)
         run: |
