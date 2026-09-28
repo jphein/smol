@@ -249,10 +249,11 @@ ships    = true
 # GATED, not written down: `tools/gate.sh fw` builds this composition plus `tapstone-probe` and
 # `tools/check_tapstone_flash.py` fails it over 64 KB (JP's ruling 2026-09-27, which replaced issue
 # 10's 8 KB criterion; the engine had never fit 8 KB once inlined into a fat-LTO image, and the
-# shrine seat in tapstone-proto more than triples it). Readings at rules-v0.2.0, 2026-09-27:
-#   esp32c3 canonical (the gated one)  +35,216 B (1.98.1: +35,364; .text +33,036, .rodata +2,240)
-#   esp32s3 by hand (opt_level 2)      +48,176 B (.text +45,864, .rodata +2,240) -- 17 KB headroom
-# The S3 is NOT gated (no Xtensa toolchain in CI) and runs ~37% heavier: re-measure it by hand
+# shrine seat in tapstone-proto more than triples it). Readings, 2026-09-27:
+#                                      rules-v0.2.0   rules-v0.2.2 (+ the interim arbiter)
+#   esp32c3 canonical (the gated one)  +35,216 B      +39,130 B (1.98.1: +39,278)
+#   esp32s3 by hand (opt_level 2)      +48,176 B      +51,832 B (.text +49,272) -- 13.7 KB headroom
+# The S3 is NOT gated (no Xtensa toolchain in CI) and runs ~32% heavier: re-measure it by hand
 # (tools/check_tapstone_flash.py on two `cargo +esp` ELFs) before the station adds engine code.
 #
 # ⚠️ WHY A PROBE: nothing calls `TapstoneApp::commit` or the shrine seat until issue 1 lands, so fat
