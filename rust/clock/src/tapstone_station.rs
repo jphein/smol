@@ -26,15 +26,22 @@
 //! and chain head every 2 s, and the final head once the match is over, which is what
 //! tapstone's `radio_verify.py` compares against the arena's ledger.
 //!
+//! ## The interim arbiter (arena spec §7)
+//!
+//! The seat's `Dark` state (tapstone_proto, rules-v0.2.2) does it all; this file carries frames.
+//! After 3 s with no arena frame the station goes dark; seat 0 (seat A, the arena's own board)
+//! arbitrates as the interim, and seat 1 re-addresses to seat 0's node. That node is virtual on
+//! the table (`TAPSTONE_STATION_NODE`, 161, behind gateway 61), so [`Tx`] learns header src →
+//! link node from air frames and sends through the link. The revived arena's first commit ends it.
+//! `TAPSTONE_NO_INTERIM=1` builds the control: no dark detection, so a dead arena stalls the match.
+//!
 //! ## Owed (tapstone#132)
 //!
-//! - **The interim arbiter role.** This station is a seat only; it never arbitrates in a dark
-//!   window. When it does, it must match tapstone #162: before its first commit the interim sends
-//!   seat 1 an `N` from its own next mseq and holds taps until the `H` chunks arrive (one empty
-//!   chunk if seat 1 has nothing newer), bounded at 1 s (`tests/harness.rs` `SYNC_BOUND_MS`,
-//!   arena spec §7).
+//! - **A seatless station in a dark window.** One that rebooted and kept nothing has no `B`, so no
+//!   seat map: it broadcasts what it meant for the arena (proto's rule), but it only knows the
+//!   arena is dark if something tells it; the silence detector runs in a match it plays.
 //! - **Card taps.** Neither Tapstone board has an RC522 on P3 (spike-sd, 2026-09-27), so the seat
-//!   plays by `Autoplay`. With a reader, a tap becomes a `Shrine::propose` of the copy's UID.
+//!   plays by `Autoplay`. With a reader, a tap becomes a `Shrine::propose_to` of the copy's UID.
 //! - **The voice from SD clips** (0033). The slot mounts on glass (spike-sd), but no data pack
 //!   exists yet, so the band is text only.
 use esp_println::println;
@@ -179,16 +186,38 @@ enum Route {
     Air(u8),
 }
 
+/// Header src → link-layer node, learned from air frames: the table's seat A is a virtual node
+/// (`TAPSTONE_STATION_NODE`, 161) behind the arena's gateway (61), and seat 1 addresses it by
+/// its seat node in a dark window.
+const LINKS: usize = 4;
+
 /// The station's send side: where the arena is, and how to reach a node.
 struct Tx {
     node: u8,
     route: Route,
     last_beacon: Option<u64>,
+    links: [(u8, u8); LINKS],
     sent: u32,
     send_errors: u32,
 }
 
 impl Tx {
+    fn learn(&mut self, hdr: u8, link: u8) {
+        if hdr == link {
+            return;
+        }
+        if let Some(e) = self.links.iter_mut().find(|e| e.0 == hdr || e.0 == 0) {
+            *e = (hdr, link);
+        }
+    }
+
+    fn link_for(&self, node: u8) -> u8 {
+        self.links
+            .iter()
+            .find(|e| e.0 == node && node != 0)
+            .map_or(node, |e| e.1)
+    }
+
     fn send(&mut self, radio: &mut RadioManager, now: u64, dst: u8, bytes: &[u8]) {
         if matches!(Frame::decode(bytes), Some((_, Frame::Lobby(Lobby { .. })))) {
             if self.last_beacon.is_some_and(|t| now.saturating_sub(t) < BEACON_MS) {
@@ -211,7 +240,7 @@ impl Tx {
             // The arena's whereabouts are unknown until it beacons (every 2 s): a claim sent
             // before then is re-sent every 100 ms by the seat, so dropping one costs nothing.
             (ARENA_NODE, _) => return,
-            (d, _) => d,
+            (d, _) => self.link_for(d),
         };
         match radio.ts_send(air_dst, bytes) {
             Ok(()) => self.sent += 1,
@@ -246,9 +275,9 @@ impl Station {
         shrine.stamp_uids = true;
         // A real shrine stays at the table: back to the lobby after each match.
         shrine.rematch = true;
-        // rules-v0.2.2 carries the interim arbiter (arena spec §7); this station does not take the
-        // role yet, so it never detects dark on its own.
-        shrine.dark.detect = false;
+        // The interim role (arena spec §7): on unless built `TAPSTONE_NO_INTERIM=1`, the control
+        // for the arena kill/restart run (a dark window nobody arbitrates).
+        shrine.dark.detect = !matches!(option_env!("TAPSTONE_NO_INTERIM"), Some("1"));
         println!(
             "[station] node {} index {} deck {} castle {} ({} cards)",
             node,
@@ -259,6 +288,9 @@ impl Station {
         );
         if matches!(option_env!("TAPSTONE_NO_PROPOSE"), Some("1")) {
             println!("[station] NO-PROPOSE build: the stall control, this seat plays nothing");
+        }
+        if matches!(option_env!("TAPSTONE_NO_INTERIM"), Some("1")) {
+            println!("[station] NO-INTERIM build: the arena-dark control, no dark detection");
         }
         #[cfg(feature = "esp32s3")]
         let faction = if d.name.starts_with("tide") {
@@ -274,6 +306,7 @@ impl Station {
                 node,
                 route: Route::Unknown,
                 last_beacon: None,
+                links: [(0, 0); LINKS],
                 sent: 0,
                 send_errors: 0,
             },
@@ -291,6 +324,9 @@ impl Station {
             let Some((h, f)) = Frame::decode(&q.buf[..q.len]) else {
                 continue;
             };
+            if !q.local {
+                self.tx.learn(h.src, q.src);
+            }
             // The arena is recognised by what it sends, not by its header `src`: behind a gateway
             // it speaks as the gateway's node (61 at this table), and 200 only on a desk mesh. A
             // seat's node is never the arena's (the interim's commits come from seat 0's).
@@ -316,9 +352,13 @@ impl Station {
                 self.heard_result = Some(h.match_id);
                 println!("[station] RESULT match {:08x}", h.match_id);
             }
+            let dark_before = self.shrine.dark.on;
             let tx = &mut self.tx;
             self.shrine
                 .rx_to(&h, &f, &mut |dst, bytes| tx.send(radio, now, dst, bytes));
+            if dark_before && !self.shrine.dark.on {
+                println!("[station] dark ENDS: the arena's commit (handover)");
+            }
         }
         // The result hold: no claim for RESULT_HOLD_MS after the match is seen over. The lobby
         // beacon still goes out, so the arena keeps the shrine on its table.
@@ -330,10 +370,18 @@ impl Station {
         let may_claim = self
             .over_at
             .is_none_or(|t| now.saturating_sub(t) >= RESULT_HOLD_MS);
+        let dark_before = self.shrine.dark.on;
         let tx = &mut self.tx;
         self.shrine.act_to(now, may_claim, self.no_propose, &mut |dst, bytes| {
             tx.send(radio, now, dst, bytes)
         });
+        if !dark_before && self.shrine.dark.on {
+            println!(
+                "[station] dark BEGINS: no arena frame for {} ms; interim={}",
+                tapstone_proto::shrine::DARK_MS,
+                self.shrine.seat() == Some(0)
+            );
+        }
         self.status(now);
     }
 
