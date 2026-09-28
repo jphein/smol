@@ -2,8 +2,8 @@
 # Generated and verified by tools/tapstone_vendor.sh; do not hand-edit, and do not edit
 # the files it names — see that script's header. This list IS the vendored file set.
 # source: https://github.com/jphein/tapstone-game
-# tag: rules-v0.2.0
-# commit: a3e37a8290d8df88344fc9071558f7d695f24c8b
+# tag: rules-v0.2.1
+# commit: 63d73c6da8adbb5d9a7b5c56303b44fb59a1558e
 6165d451fe5e2e978d9e477822f5211b0f80629dc9865fddbd9745ac9c1cc295  src/band.rs
 659b2b91707b1548e0900ed6eabed34ae14ab08a1ebb5f63ace4369373295416  src/battlefield.rs
 4681bfd9b7f0fa7c75e6d321949070f518a261878ad51ae799a22af008c22085  src/commander.rs
