@@ -178,6 +178,16 @@ else
   printf '%s\n' "$out" | sed 's/^/        /'; bad "sigil vendor"
 fi
 
+# #555 made smol AGPL-3.0-or-later in LICENSE and the README but in no manifest, so every package
+# kept claiming "MIT OR Apache-2.0" or nothing. Unconditional and cheap (cargo metadata --no-deps,
+# ~1 s): the licence a package declares is what tooling and SBOMs read, so it is checked like a fact.
+step "package licenses match LICENSE (#555)"
+if out=$("$ROOT/tools/check_licenses.sh" 2>&1); then
+  printf '%s\n' "$out" | tail -1; ok "licenses"
+else
+  printf '%s\n' "$out" | sed 's/^/        /'; bad "licenses"
+fi
+
 # #460 the committed Cargo.lock is actually consulted. Unconditional and early for the same reason as
 # the arm above: if dependency RESOLUTION drifted, every later measurement — the tier checks, the
 # stack floor, #390's symbol-size baseline — is about a graph nobody recorded.

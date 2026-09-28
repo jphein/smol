@@ -4,6 +4,7 @@
 # Mirrors experiments/flood_verify + etx_verify + ledger_verify.
 [package]
 name = "treehead_verify"
+license = "AGPL-3.0-or-later"
 version = "0.0.0"
 edition = "2021"
 publish = false

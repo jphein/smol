@@ -7,6 +7,7 @@
 # build without the file rather than skipping, so a green run always means tapstone's code ran.
 [package]
 name = "tapstone_lines_xcheck"
+license = "AGPL-3.0-or-later"
 version = "0.0.0"
 edition = "2021"
 publish = false

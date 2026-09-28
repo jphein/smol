@@ -1,5 +1,6 @@
 [package]
 name = "spike-scry"
+license = "AGPL-3.0-or-later"
 version = "0.1.0"
 edition = "2021"
 description = "Bring-up spike for the realm scry station (ES3C28P + RC522 on P3) — smol node id 163, smol#540"

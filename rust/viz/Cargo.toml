@@ -17,7 +17,7 @@ members = ["mesh-model", "meshscope", "observatory"]
 
 [workspace.package]
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-or-later"
 publish = false
 
 [workspace.dependencies]

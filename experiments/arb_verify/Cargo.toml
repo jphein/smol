@@ -8,6 +8,7 @@
 # Mirrors experiments/relay_compat. Run: `cargo run` — panics on any mismatch.
 [package]
 name = "arb_verify"
+license = "AGPL-3.0-or-later"
 version = "0.0.0"
 edition = "2021"
 publish = false

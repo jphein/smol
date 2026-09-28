@@ -5,6 +5,7 @@
 # legacy / re-weight / malformed), and the byte-faithful `Legacy` recovery backoff. Permanent guard.
 [package]
 name = "election_verify"
+license = "AGPL-3.0-or-later"
 version = "0.0.0"
 edition = "2021"
 publish = false
