@@ -441,8 +441,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("command",
                     choices=("emit", "chips", "chip-checks", "canonical-chip", "config-markers",
-                             "ci-matrix", "hand-build", "hand-builds", "check"))
-    ap.add_argument("name", nargs="?", default=None, help="hand-build: the target folder name")
+                             "ci-matrix", "hand-build", "hand-builds", "chip-recipe", "check"))
+    ap.add_argument("name", nargs="?", default=None,
+                    help="hand-build: the target folder name; chip-recipe: the chip")
     ap.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     ap.add_argument("--repro", type=Path, default=DEFAULT_REPRO)
     ap.add_argument("--budget", type=Path, default=DEFAULT_BUDGET)
@@ -585,6 +586,35 @@ def main() -> int:
         feats = ",".join(f for f in base + doc["tiers"][row["tier"]]["features"].split(",") if f)
         opt = lambda v: str(v or "").strip() or "-"  # noqa: E731
         print("\t".join((row["chip"], spec["target"], opt(spec.get("toolchain")),
+                         opt(spec.get("build_std")), opt(spec.get("opt_level")), feats)))
+        return 0
+
+    if args.command == "chip-recipe":
+        # The recipe for ONE chip's CANONICAL-tier image, in hand-build's shape:
+        #   chip · target · toolchain · build_std · opt_level · features
+        # For tools/gate.sh hand's S3 tapstone flash arm, which must build the S3 fleet image (and
+        # that image plus the probe) without a second copy of the S3's knobs. `features` is Cargo's
+        # `default` with the canonical chip swapped for this one, then the canonical tier's list:
+        # the same derivation as hand-build, on the one tier the chip axis is defined against.
+        spec = doc["chips"].get(args.name or "")
+        if spec is None:
+            print(f"chip-recipe: no [chip.{args.name}] — known: {', '.join(doc['chips'])}",
+                  file=sys.stderr)
+            return 2
+        try:
+            default = cargo_default(args.cargo)
+        except Bad as exc:
+            print(f"chip-recipe: {exc}", file=sys.stderr)
+            return 2
+        if doc["canonical_chip"] not in default:
+            print(f"chip-recipe: Cargo.toml's default {default} does not name the canonical chip "
+                  f"{doc['canonical_chip']!r}, so there is nothing to swap", file=sys.stderr)
+            return 2
+        base = [args.name if f == doc["canonical_chip"] else f for f in default]
+        tier = doc["tiers"][doc["canonical_tier"]]["features"].split(",")
+        feats = ",".join(f for f in base + tier if f)
+        opt = lambda v: str(v or "").strip() or "-"  # noqa: E731
+        print("\t".join((args.name, spec["target"], opt(spec.get("toolchain")),
                          opt(spec.get("build_std")), opt(spec.get("opt_level")), feats)))
         return 0
 
