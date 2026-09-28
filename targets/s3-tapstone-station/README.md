@@ -57,9 +57,25 @@ out as one windowed write. Measured paints: station 75 ms mean and 84 ms max, id
 | run-v3-r1 | station id62 vs a `/remote/*` seat | 57b98ffa | 101 | VERIFIED |
 | run-v3-r2 | control | — | — | CONTROL OK |
 
+## The arena dies mid-match (arena spec §7)
+
+The station takes the interim role from `tapstone_proto::shrine` (rules-v0.2.2): 3 s with no arena
+frame is dark, seat 0 (the arena's own board) arbitrates, seat 1 proposes to it, and the revived
+arena takes the hand-back. `TAPSTONE_NO_INTERIM=1` builds the control. Run with tapstone's
+`tools/radio_dark.py` (the arena SIGKILLed at 16 journaled records, dead for 15 s, restarted on
+the same ledger):
+
+| run | build | during the dark window | result |
+|---|---|---|---|
+| run-dark4 | interim, this PR's vendored build | 17 → 110 records: the interim finished the match | VERIFIED 57b9dc22, 110 records |
+| run-dark5-control | `TAPSTONE_NO_INTERIM=1`, same build | no dark, stuck at 16 | CONTROL OK; VERIFIED after restart (57b9dc71, 106) |
+| run-dark3 | interim | both boards dark, A `interim=true`, 16 → 41 records | VERIFIED 57b9dab5, 98 records |
+| run-dark1 | interim | 14 → 71 records | VERIFIED 57b9d9ec, 98 records |
+| run-dark2-control | `TAPSTONE_NO_INTERIM=1` | no dark, stuck at 16 | CONTROL OK; VERIFIED after restart (57b9da59) |
+
 ## Owed
 
-- **The interim arbiter role.** When it lands, it must match tapstone #162's catch-up: before its
-  first commit, send seat 1 an `N`, and hold taps until the `H` chunks arrive, bounded at 1 s.
+- **A seatless station in a dark window** (rebooted, kept nothing): it cannot detect dark or
+  find the interim until it holds `B`.
 - **RC522 card taps.** Neither board has a reader on P3 (`targets/s3-cyd/spike-sd`).
 - **0033's voice from SD clips.** The slot mounts (spike-sd), but no data pack exists yet.
