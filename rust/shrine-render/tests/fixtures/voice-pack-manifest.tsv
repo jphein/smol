@@ -1,0 +1,8 @@
+# tapstone voice pack v1
+# voice	fake-voice
+# format	ima-adpcm	22050	256
+# clips	3	28340
+id	file	bytes	sha256	text_sha256	text
+invite	5014F9AF.WAV	17468	ad871b5be3bc447a2174c732955cbb8baf6f39e63cf0a6373f6d326d417f35d9	76b67a7e403e2ac35528957d42105abdc2a1c552e2cab13995f74f302b4d2c32	set your castle on the stone
+level_up.2	21E78684.WAV	5692	85bfa24455de5335d1a6436b6a1ef3f24936b18d3e3ee467da368488bda8cfa6	32e72cce7401e77630f77f083bb9dcbd3c1a3206e1f7997763f29691c4eeceea	level two
+pass	D74FF0EE.WAV	5180	e51337bc8d273ee2f993348888a4cdcd8e49099f8ea7c64f82acfe73bd4e32d3	db95c2da5d9c6207770c15361cfefd360b2a636b342831aa97ba7d5524033467	you pass

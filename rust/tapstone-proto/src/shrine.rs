@@ -182,6 +182,16 @@ pub struct Dark {
     pub detect: bool,
     /// When this shrine last heard the arena.
     pub last_arena: Option<u64>,
+    /// smol#558: a shrine with no seat (it rebooted and kept nothing, or never heard `B`) cannot
+    /// detect dark from silence, having no match in play to be silent about. Its `J` for a `B` is
+    /// the probe instead: one nobody answers for [`DARK_MS`] means the arena is dark. Off: the
+    /// `J` goes to the dead arena and the seat stalls until it revives.
+    pub discovers: bool,
+    /// When this shrine, holding no `B` at all, first asked for one. Written and read only while
+    /// `begin` is `None`, and a `B` once taken is never dropped (a reboot builds a fresh shrine),
+    /// so the stamp a seatless rejoin leaves behind is never read again: a rematch's `J` for a
+    /// lost `B` (#67) cannot find it stale and declare dark (`tests/dark_seatless.rs`).
+    pub asked_begin: Option<u64>,
     /// While dark, the interim answers a seat's `J` and `N` (#76). Off: the deferral this replaced.
     pub answers: bool,
     /// #98: before its first commit in a dark window the interim asks seat 1 (`N`) for any record
@@ -217,6 +227,8 @@ impl Dark {
             on: false,
             detect: true,
             last_arena: None,
+            discovers: true,
+            asked_begin: None,
             answers: true,
             syncs: true,
             synced: false,
@@ -455,6 +467,9 @@ impl<C: Chooser> Shrine<C> {
         if ask && self.join_sent.is_none_or(|t| now - t >= 1_000) {
             self.join_sent = Some(now);
             self.begin_asks += 1;
+            if self.begin.is_none() {
+                self.dark.asked_begin.get_or_insert(now);
+            }
             let j = Frame::Join(Join {
                 role: join_role::SEAT,
                 have_mseq: 0,
@@ -466,6 +481,9 @@ impl<C: Chooser> Shrine<C> {
             // the arena for a full replay, repeating every second until one arrives.
             if self.join && self.join_sent.is_none_or(|t| now - t >= 1_000) {
                 self.join_sent = Some(now);
+                if self.begin.is_none() {
+                    self.dark.asked_begin.get_or_insert(now);
+                }
                 // From what it already holds, so a repeated J resumes where the last one left off.
                 let j = Frame::Join(Join {
                     role: join_role::SEAT,
@@ -862,16 +880,29 @@ impl<C: Chooser> Shrine<C> {
     }
 
     /// Enter the dark window on [`DARK_MS`] of the arena's silence, in a match this shrine plays.
+    /// A shrine with no `B` has no match in play to hear silence in, and it cannot tell the
+    /// arena's commits from the interim's (it has no seat map), so its probe is its own `J`: one
+    /// nobody has answered with a `B` for [`DARK_MS`] means the arena is dark (smol#558). Dark,
+    /// its `J` goes out broadcast (`route`), the interim answers it with a rebuilt `B` (#76), and
+    /// that `B` names its seat and the interim's node. If the arena was only slow, its answer
+    /// arrives the same way, and its first commit ends the window (step 5).
     fn detect_dark(&mut self, now: u64) {
+        if !self.dark.detect || self.dark.on {
+            return;
+        }
         let playing = self.follower.begun().is_some() && self.follower.game.phase == Phase::Playing;
-        if self.dark.detect
-            && !self.dark.on
-            && playing
+        let silent = playing
             && self
                 .dark
                 .last_arena
-                .is_some_and(|t| now.saturating_sub(t) >= DARK_MS)
-        {
+                .is_some_and(|t| now.saturating_sub(t) >= DARK_MS);
+        let unanswered = self.dark.discovers
+            && self.begin.is_none()
+            && self
+                .dark
+                .asked_begin
+                .is_some_and(|t| now.saturating_sub(t) >= DARK_MS);
+        if silent || unanswered {
             self.go_dark();
         }
     }

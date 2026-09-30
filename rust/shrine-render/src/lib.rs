@@ -42,6 +42,7 @@ pub mod fmt;
 pub mod geom;
 pub mod ink;
 pub mod motion;
+pub mod pack;
 pub mod palette;
 pub mod screens;
 pub mod sprite;
