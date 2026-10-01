@@ -1010,6 +1010,14 @@ if [ "$run_host" = 1 ]; then
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "station voice read-only"
   fi
+  # tapstone#132: the S3 station's stack-headroom checker can read both Xtensa prologue forms (its
+  # ELF arm runs in `hand`, which has the toolchain). Text only.
+  step "station stack-headroom checker self-test (tapstone#132)"
+  if out=$("$ROOT/tools/check_station_stack.py" --self-test 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "station stack self-test"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "station stack self-test"
+  fi
 
   # #351: the same discipline for the exclusion checker, and it matters more here. An ABSENCE
   # check's passing state and its broken state print the same green — "no violations found"
@@ -1205,6 +1213,24 @@ if [ "$run_hand" = 1 ]; then
     printf '%s\n' "$out" | grep -E '^   [^ ]+: [0-9]+ B  |hand build\(s\) built'; ok "hand builds"
   else
     printf '%s\n' "$out" | tail -30 | sed 's/^/        /'; bad "hand builds"
+  fi
+
+  # tapstone#132: the S3 station's stack headroom. On 2026-09-30 its image panicked at boot on glass
+  # (a stack-guard write): run()'s poll frame was ~38 KB, and the voice's .bss shrank .stack until
+  # the boot paint's callees had 684 B. The build is rebuilt by name here (the gateway row shares
+  # the target dir), then .stack - run's frame must be >= 12,288 B (tools/check_station_stack.py).
+  step "S3 station stack headroom — .stack minus run()'s frame >= 12 KB (tapstone#132)"
+  if out=$("$ROOT/tools/build_hand.sh" s3-tapstone-station 2>&1); then
+    elf=$(printf '%s\n' "$out" | sed -n 's/^   s3-tapstone-station: [0-9]* B  //p' | tail -1)
+    if ! "$ROOT/tools/check_station_stack.py" --self-test >/dev/null 2>&1; then
+      bad "station stack — the checker's self-test failed (it would be blind)"
+    elif sout=$("$ROOT/tools/check_station_stack.py" "$elf" 2>&1); then
+      printf '        %s\n' "$sout"; ok "station stack headroom"
+    else
+      printf '        %s\n' "$sout"; bad "station stack headroom"
+    fi
+  else
+    printf '%s\n' "$out" | tail -15 | sed 's/^/        /'; bad "station stack — the station did not build"
   fi
 
   # The vendored tapstone crates' 64 KB flash budget on the S3, the shrine's chip and the tighter one
