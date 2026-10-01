@@ -156,6 +156,9 @@ struct Playing {
     started: u64,
     blocks: u32,
     late: bool,
+    /// The last feed, and the longest gap between feeds (the ring holds 52 ms).
+    last: u64,
+    max_gap: u64,
 }
 
 pub struct Voice {
@@ -367,7 +370,7 @@ impl Voice {
         out.amp.set_low();
         self.clip.start(wav.samples);
         println!("[voice] says {} ({} samples): {:?}", name, wav.samples, text);
-        self.playing = Some(Playing { file, tail: RING_LEN, started: now, blocks: 0, late: false });
+        self.playing = Some(Playing { file, tail: RING_LEN, started: now, blocks: 0, late: false, last: now, max_gap: 0 });
     }
 
     /// Is a clip playing (the station holds repaints while it is)?
@@ -391,14 +394,18 @@ impl Voice {
         let Some(xfer) = out.xfer.as_mut() else {
             return;
         };
+        p.max_gap = p.max_gap.max(now.saturating_sub(p.last));
+        p.last = now;
         let mut stage = [0u8; 512];
         loop {
             let avail = match xfer.available() {
                 Ok(a) => a,
                 Err(_) => {
-                    // An executor stall longer than the ring: the clip ends here.
+                    // A gap longer than the ring: esp-hal's circular transfer stays Late from
+                    // here (c6-watch silent_clock_task), so the clip ends now.
                     p.late = true;
                     p.tail = 0;
+                    self.clip.start(0);
                     break;
                 }
             };
@@ -432,14 +439,16 @@ impl Voice {
             if xfer.push(&stage[..n]).is_err() {
                 p.late = true;
                 p.tail = 0;
+                self.clip.start(0);
                 break;
             }
         }
         if self.clip.done() && p.tail == 0 {
             println!(
-                "[voice] played {} blocks in {} ms{}",
+                "[voice] played {} blocks in {} ms, longest feed gap {} ms{}",
                 p.blocks,
                 now.saturating_sub(p.started),
+                p.max_gap,
                 if p.late { " (ring ran dry: cut short)" } else { "" }
             );
             self.played += 1;
