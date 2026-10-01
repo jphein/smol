@@ -84,3 +84,16 @@ fn a_full_read_answer_fits_one_frame() {
     assert!(encode(OK, 1, &[0u8; MAX_BLOCKS * 512], &mut out).is_some());
     assert_eq!(READ, b'R');
 }
+
+#[test]
+fn arm_needs_the_size_and_the_cid_read_now() {
+    let cid = [0x03, b'S', b'D', b'S', b'U', b'3', b'2', b'G', 0x80, 1, 2, 3, 4, 0x01, 0x6A, 0x01];
+    let ok = info_answer(31_914_983_424, &cid);
+    assert!(arm_matches(31_914_983_424, &cid, &ok));
+    // A card of the same model and size swapped in: another serial number.
+    let mut other = cid;
+    other[12] ^= 1;
+    assert!(!arm_matches(31_914_983_424, &other, &ok));
+    assert!(!arm_matches(31_914_983_425, &cid, &ok), "another size");
+    assert!(!arm_matches(31_914_983_424, &cid, &ok[..8]), "the old size-only ARM is refused");
+}

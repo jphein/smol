@@ -8,9 +8,9 @@
 //! The board writes what the host tells it to, in 512 B blocks: the host builds the FAT32 image
 //! with `mkfs.vfat` and mtools (tapstone's `sd_prepare.py` code), so the format is a trusted
 //! tool's. The wire format is `rust/sdprov-proto`:
-//! - **INFO**: the card's size.
-//! - **ARM**: must echo that size before any write. A card swapped mid-session, or a host talking
-//!   to the wrong board, is refused.
+//! - **INFO**: the card's size and its CID (CMD10, read fresh each time).
+//! - **ARM**: must echo that size and CID; the board reads the CID again and refuses a mismatch, so
+//!   a card swapped after the host's checks (even the same model and size) is never armed.
 //! - **READ**: blocks, read-only (the host's blank check, before anything is written).
 //! - **WRITE** / **ZERO**: blocks.
 //! - **FILE**: a file's size and sha256, read back through the FAT with a read-only mount (the
@@ -21,8 +21,7 @@
 #![no_std]
 #![no_main]
 
-use embedded_hal::spi::SpiBus;
-use embedded_hal_bus::spi::ExclusiveDevice;
+use embedded_hal::spi::{ErrorType, Operation, SpiBus, SpiDevice};
 use embedded_sdmmc::{
     Block, BlockDevice, BlockIdx, Mode as FileMode, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager,
 };
@@ -45,6 +44,64 @@ use sha2::{Digest, Sha256};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
+// spike-sd's card-level probe, read-only by construction (its check_readonly.sh allow-list:
+// CMD0/8/9/10/17/41/55/58): identify() re-initialises the card and returns its CID.
+// Shared whole with spike-sd; this image calls identify() only.
+#[allow(dead_code)]
+#[path = "../../spike-sd/src/sdraw.rs"]
+mod sdraw;
+
+/// The slot as an embedded-hal SpiDevice whose bus and chip select stay reachable, so the CID can
+/// be read raw (sdraw) between embedded-sdmmc's transactions.
+struct Slot {
+    bus: Spi<'static, Blocking>,
+    cs: Output<'static>,
+}
+
+impl ErrorType for Slot {
+    type Error = esp_hal::spi::Error;
+}
+
+impl SpiDevice for Slot {
+    fn transaction(&mut self, ops: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
+        self.cs.set_low();
+        let mut r = Ok(());
+        for op in ops.iter_mut() {
+            r = match op {
+                Operation::Read(b) => SpiBus::read(&mut self.bus, b),
+                Operation::Write(b) => SpiBus::write(&mut self.bus, b),
+                Operation::Transfer(rd, wr) => SpiBus::transfer(&mut self.bus, rd, wr),
+                Operation::TransferInPlace(b) => SpiBus::transfer_in_place(&mut self.bus, b),
+                Operation::DelayNs(ns) => {
+                    Delay::new().delay_nanos(*ns);
+                    Ok(())
+                }
+            };
+            if r.is_err() {
+                break;
+            }
+        }
+        let f = SpiBus::flush(&mut self.bus);
+        self.cs.set_high();
+        r.and(f)
+    }
+}
+
+/// The card's CID, read now (sdraw re-initialises the card at 400 kHz), then embedded-sdmmc is
+/// told to initialise it again before its next access.
+fn cid_now(sd: &Card) -> Option<[u8; 16]> {
+    let cid = sd.spi(|s| {
+        let slow = SpiConfig::default().with_frequency(Rate::from_khz(400)).with_mode(Mode::_0);
+        let fast = SpiConfig::default().with_frequency(Rate::from_mhz(10)).with_mode(Mode::_0);
+        let _ = s.bus.apply_config(&slow);
+        let c = sdraw::identify(&mut s.bus, &mut s.cs, &Delay::new()).map(|c| c.cid);
+        let _ = s.bus.apply_config(&fast);
+        c
+    });
+    sd.mark_card_uninit();
+    cid
+}
+
 struct NoClock;
 impl TimeSource for NoClock {
     fn get_timestamp(&self) -> Timestamp {
@@ -52,7 +109,7 @@ impl TimeSource for NoClock {
     }
 }
 
-type Card = SdCard<ExclusiveDevice<Spi<'static, Blocking>, Output<'static>, Delay>, Delay>;
+type Card = SdCard<Slot, Delay>;
 
 fn reply(tx: &mut UsbSerialJtagTx<'static, Blocking>, kind: u8, seq: u16, payload: &[u8]) {
     let mut out = [0u8; proto::FRAME_MAX];
@@ -123,17 +180,13 @@ fn main() -> ! {
     let cs = Output::new(p.GPIO47, Level::High, OutputConfig::default());
     let _ = SpiBus::write(&mut spi, &[0xFF; 10]);
     let _ = SpiBus::flush(&mut spi);
-    let dev = ExclusiveDevice::new(spi, cs, delay).expect("sd device");
-    let sd = SdCard::new(dev, delay);
+    let sd = SdCard::new(Slot { bus: spi, cs }, delay);
     let bytes = sd.num_bytes().ok();
-    match bytes {
-        Some(n) => {
-            sd.spi(|d| {
-                let _ = d.bus_mut().apply_config(&SpiConfig::default().with_frequency(Rate::from_mhz(10)).with_mode(Mode::_0));
-            });
-            println!("[sdprov] card: {} bytes ({} MiB)", n, n >> 20);
-        }
-        None => println!("[sdprov] no card"),
+    let boot_cid = bytes.and_then(|_| cid_now(&sd));
+    match (bytes, boot_cid) {
+        (Some(n), Some(c)) => println!("[sdprov] card: {} bytes ({} MiB), CID {:02X?}", n, n >> 20, c),
+        (Some(n), None) => println!("[sdprov] card: {} bytes ({} MiB), CID unreadable", n, n >> 20),
+        _ => println!("[sdprov] no card"),
     }
 
     let (mut rx, mut tx) = UsbSerialJtag::new(p.USB_DEVICE).split();
@@ -157,17 +210,20 @@ fn main() -> ! {
                 };
                 let u32_at = |i: usize| u32::from_le_bytes([pl[i], pl[i + 1], pl[i + 2], pl[i + 3]]);
                 match kind {
-                    proto::INFO => match bytes {
-                        Some(b) => reply(&mut tx, proto::OK, seq, &b.to_le_bytes()),
-                        None => reply(&mut tx, proto::ERR, seq, &[proto::E_CARD]),
+                    // INFO and ARM read the CID from the card each time: what the host checked and what
+                    // gets armed are the same card, or nothing is written.
+                    proto::INFO => match (bytes, card.as_ref().and_then(cid_now)) {
+                        (Some(b), Some(cid)) => reply(&mut tx, proto::OK, seq, &proto::info_answer(b, &cid)),
+                        _ => reply(&mut tx, proto::ERR, seq, &[proto::E_CARD]),
                     },
                     proto::ARM => {
-                        let want = (pl.len() == 8).then(|| u64::from_le_bytes(pl.try_into().unwrap_or([0; 8])));
-                        if bytes.is_some() && want == bytes {
-                            armed = true;
-                            reply(&mut tx, proto::OK, seq, &[]);
-                        } else {
-                            reply(&mut tx, proto::ERR, seq, &[proto::E_ARM_MISMATCH]);
+                        armed = false;
+                        match (bytes, card.as_ref().and_then(cid_now)) {
+                            (Some(b), Some(cid)) if proto::arm_matches(b, &cid, pl) => {
+                                armed = true;
+                                reply(&mut tx, proto::OK, seq, &[]);
+                            }
+                            _ => reply(&mut tx, proto::ERR, seq, &[proto::E_ARM_MISMATCH]),
                         }
                     }
                     proto::WRITE | proto::ZERO if !armed => reply(&mut tx, proto::ERR, seq, &[proto::E_NOT_ARMED]),

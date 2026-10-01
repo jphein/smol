@@ -26,11 +26,15 @@ pub const MAX_PAYLOAD: usize = 4 + MAX_BLOCKS * 512;
 pub const FRAME_MAX: usize = HEADER + MAX_PAYLOAD + 4;
 
 // Requests (host -> board).
-/// Card facts: answered with OK + card bytes (u64 LE).
+/// Card facts: answered with OK + card bytes (u64 LE) + the card's CID (16 B), read fresh from
+/// the card for this request (CMD10), so two INFOs bracket a check on one card.
 pub const INFO: u8 = b'I';
-/// Allow writes to THIS card: payload is the card size INFO gave (u64 LE). Writes are refused
-/// until the board is armed with the size of the card it holds.
+/// Allow writes to THIS card: payload is the size and CID an INFO gave ([`ARM_LEN`] B). The board
+/// reads the CID again and refuses unless both match ([`arm_matches`]): a card swapped after the
+/// host's checks, even one of the same model and size, is never armed.
 pub const ARM: u8 = b'A';
+/// INFO's answer, and ARM's payload: size (u64 LE) then CID (16 B).
+pub const ARM_LEN: usize = 8 + 16;
 /// Write blocks: LBA (u32 LE), then 1..=8 blocks of 512 B.
 pub const WRITE: u8 = b'W';
 /// Zero blocks: LBA (u32 LE), count (u32 LE).
@@ -55,6 +59,20 @@ pub const E_ARGS: u8 = 3;
 pub const E_NOT_FOUND: u8 = 4;
 pub const E_ARM_MISMATCH: u8 = 5;
 pub const E_UNKNOWN: u8 = 6;
+
+/// The board's ARM decision: the payload must carry exactly the card size it knows and the CID it
+/// has just read from the card.
+pub fn arm_matches(size: u64, cid_now: &[u8; 16], payload: &[u8]) -> bool {
+    payload.len() == ARM_LEN && payload[..8] == size.to_le_bytes() && payload[8..] == cid_now[..]
+}
+
+/// INFO's answer: size then CID.
+pub fn info_answer(size: u64, cid: &[u8; 16]) -> [u8; ARM_LEN] {
+    let mut a = [0u8; ARM_LEN];
+    a[..8].copy_from_slice(&size.to_le_bytes());
+    a[8..].copy_from_slice(cid);
+    a
+}
 
 /// CRC-32/IEEE (reflected, poly 0xEDB88320), bit by bit: no table, 300 bytes of code.
 pub fn crc32(data: &[u8]) -> u32 {

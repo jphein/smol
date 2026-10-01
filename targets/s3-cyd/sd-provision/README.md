@@ -16,21 +16,24 @@ the ANSWERS.jsonl record of his tapstone pane). A one-time grant for those two c
 - the scry station (`…CC:64`), by name;
 - any port that isn't `/dev/serial/by-id`.
 
-The board refuses every write until the host ARMs it with the card size the board itself reported.
-That catches a card swapped for one of another size, not one of the same model; the board names
-itself to nobody, so the host's by-id check is the guard on WHICH board. The host also refuses a
-card that isn't blank (sd_prepare's test, on blocks read through READ) unless it is given
-`--format-authorised "<who said so, when>"`, which it logs.
+The board refuses every write until the host ARMs it with the card size AND the card's CID (its
+manufacturer, product name and serial number, read with CMD10). INFO and ARM both read the CID from
+the card at that moment, so the host's checks and the write are bound to one card: a card swapped
+after the check, even the same model and size, is refused at ARM. The board names itself to nobody,
+so the host's exact by-id check is the guard on WHICH board. The host also refuses a card that isn't
+blank (sd_prepare's test, failing closed, on blocks read through READ, between two INFOs whose CIDs
+must match) unless it is given `--format-authorised "<who said so, when>"`, which it records,
+fsynced, in a regular audit file before anything is written.
 
 ## How it works
-1. **INFO**: the board reports the card's size. **READ**: the host checks the card is blank (an
+1. **INFO**: the board reports the card's size and CID. **READ**: the host checks the card is blank (an
    all-zero first MiB, or one FAT partition whose root holds only a label).
 2. The host builds the card's whole image on disk as a sparse file of that size: an MBR, then FAT32
    by `mkfs.vfat` (label `SHRINE`) and the pack by mtools, using `sd_prepare.py`'s code.
    - The label must not be `TAPSTONE`. A label is a root entry, and embedded-sdmmc opens the first
      root entry with a matching name, so a `TAPSTONE` label hides the `TAPSTONE` directory.
      Board 61 showed this on 2026-09-30.
-3. **ARM**, then **ZERO** the metadata zone (MBR through the root directory's cluster). Then
+3. **ARM** (size + CID, re-read and compared by the board), then **ZERO** the metadata zone (MBR through the root directory's cluster). Then
    **WRITE** every block of the image's data extents, 8 blocks (4 KB) per frame.
 4. **FILE** for every file in the pack: the board mounts the card read-only through embedded-sdmmc,
    the station's own path, and returns the file's size and sha256. The host compares them with the
