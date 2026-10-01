@@ -253,7 +253,8 @@ mod ts_gw;
 #[cfg(feature = "tapstone-station")]
 pub(crate) mod tapstone_station;
 // tapstone 0033: the voice clips' header and IMA-ADPCM decoder (pure; the host lib shares it).
-#[cfg(feature = "tapstone-station")]
+// Its one user is the S3 station's voice; a C3 station has no codec.
+#[cfg(all(feature = "tapstone-station", feature = "esp32s3"))]
 mod shrine_voice;
 // The S3 station draws on the raw colour panel; `cast`'s tee would wrap it and mirror only the
 // 1-bit image, so the two are not combined there. (A C3 station is headless and draws nothing.)
