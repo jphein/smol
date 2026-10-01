@@ -904,6 +904,18 @@ if [ "$run_host" = 1 ]; then
     bad "test es8311"; tail -15 "$log" | sed 's/^/        /'
   fi
 
+  # rust/sdprov-proto: the in-board SD provisioner's wire format (targets/s3-cyd/sd-provision, the
+  # one smol image that writes a card). Its suite holds the framing, the CRC32 and the corrupt-frame
+  # report, and two byte vectors tapstone's tools/test_sd_provision.py asserts too.
+  step "sdprov-proto host suite (cargo test)"
+  log="$GATE_TMP/gate-test-sdprov-proto.log"
+  if (cd "$ROOT/rust/sdprov-proto" && cargo test --no-fail-fast "${JOBS[@]}") >"$log" 2>&1; then
+    passed=$(grep -Eo '[0-9]+ passed' "$log" | awk '{n+=$1} END {print n+0}')
+    if [ "$passed" -gt 0 ]; then ok "test sdprov-proto — $passed passed"; else bad "test sdprov-proto — exited 0 but ran NO tests"; fi
+  else
+    bad "test sdprov-proto"; tail -15 "$log" | sed 's/^/        /'
+  fi
+
   # #350: prove the matrix checker's arms can fail. Pure text, no cargo — see the file header
   # for why a green-only demonstration is not evidence.
   # #351: prove the byte-free source arm can fail. Pure text, no cargo.

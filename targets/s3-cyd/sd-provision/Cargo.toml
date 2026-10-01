@@ -1,0 +1,28 @@
+[package]
+name = "sd-provision"
+license = "AGPL-3.0-or-later"
+version = "0.1.0"
+edition = "2021"
+description = "ES3C28P: write the shrine's voice pack to the card in its own SD slot, over USB (tapstone 0033)"
+
+# Its own workspace root, like ../spike-sd: esp-hal takes exactly one chip feature and cargo
+# unifies features across workspace members.
+[workspace]
+
+[dependencies]
+# The version set of ../spike-sd (the proven ES3C28P SD stack).
+esp-hal = { version = "1.1.1", features = ["esp32s3", "unstable"] }
+esp-backtrace = { version = "0.19", features = ["esp32s3", "panic-handler", "println"] }
+esp-println = { version = "0.17", default-features = false, features = ["esp32s3", "jtag-serial"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3"] }
+embedded-hal = "1.0"
+embedded-hal-bus = "0.3"
+embedded-sdmmc = { version = "0.9", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+sdprov-proto = { path = "../../../rust/sdprov-proto" }
+
+[profile.release]
+opt-level = "s"
+debug = 2
+lto = "fat"
+codegen-units = 1
