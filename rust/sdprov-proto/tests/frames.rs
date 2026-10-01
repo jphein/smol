@@ -76,3 +76,11 @@ fn an_oversized_payload_is_refused_at_encode() {
     let mut out = [0u8; FRAME_MAX + 1];
     assert!(encode(WRITE, 0, &[0u8; MAX_PAYLOAD + 1], &mut out).is_none());
 }
+
+#[test]
+fn a_full_read_answer_fits_one_frame() {
+    // OK + 8 blocks is the largest answer the board sends.
+    let mut out = [0u8; FRAME_MAX];
+    assert!(encode(OK, 1, &[0u8; MAX_BLOCKS * 512], &mut out).is_some());
+    assert_eq!(READ, b'R');
+}

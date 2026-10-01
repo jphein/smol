@@ -35,6 +35,9 @@ pub const ARM: u8 = b'A';
 pub const WRITE: u8 = b'W';
 /// Zero blocks: LBA (u32 LE), count (u32 LE).
 pub const ZERO: u8 = b'Z';
+/// Read blocks (no ARM needed: it writes nothing): LBA (u32 LE), count (u8, 1..=8). Answered with
+/// OK + count x 512 B. The host's blank check reads the card this way before anything is written.
+pub const READ: u8 = b'R';
 /// Hash one file through the FAT (read-only mount): payload is its path, e.g.
 /// `TAPSTONE/VOICE/SET1/MANIFEST.TSV`. Answered with OK + size (u32 LE) + sha256.
 pub const FILE: u8 = b'F';

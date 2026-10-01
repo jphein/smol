@@ -9,17 +9,22 @@ The host side is tapstone's `tools/sd_provision.py`. The wire format is `rust/sd
 test vectors are shared with the Python tests.
 
 ## Who may be written
-JP authorised exactly the cards in the two shrines, board 61 (`14:C1:9F:D1:C6:38`) and board 62
-(`14:C1:9F:D1:C0:88`), on 2026-09-30. The host tool refuses:
+JP authorised exactly the cards then in the two shrines, board 61 (`14:C1:9F:D1:C6:38`) and board 62
+(`14:C1:9F:D1:C0:88`): "ok both sd cards in the slots can be formatted by you" (2026-09-30 16:4x,
+the ANSWERS.jsonl record of his tapstone pane). A one-time grant for those two cards. The host tool refuses:
 - any other board, by MAC;
 - the scry station (`…CC:64`), by name;
 - any port that isn't `/dev/serial/by-id`.
 
-The board refuses every write until the host ARMs it with the card size the board itself reported,
-so a swapped card or the wrong board writes nothing.
+The board refuses every write until the host ARMs it with the card size the board itself reported.
+That catches a card swapped for one of another size, not one of the same model; the board names
+itself to nobody, so the host's by-id check is the guard on WHICH board. The host also refuses a
+card that isn't blank (sd_prepare's test, on blocks read through READ) unless it is given
+`--format-authorised "<who said so, when>"`, which it logs.
 
 ## How it works
-1. **INFO**: the board reports the card's size.
+1. **INFO**: the board reports the card's size. **READ**: the host checks the card is blank (an
+   all-zero first MiB, or one FAT partition whose root holds only a label).
 2. The host builds the card's whole image on disk as a sparse file of that size: an MBR, then FAT32
    by `mkfs.vfat` (label `SHRINE`) and the pack by mtools, using `sd_prepare.py`'s code.
    - The label must not be `TAPSTONE`. A label is a root entry, and embedded-sdmmc opens the first

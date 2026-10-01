@@ -11,6 +11,7 @@
 //! - **INFO**: the card's size.
 //! - **ARM**: must echo that size before any write. A card swapped mid-session, or a host talking
 //!   to the wrong board, is refused.
+//! - **READ**: blocks, read-only (the host's blank check, before anything is written).
 //! - **WRITE** / **ZERO**: blocks.
 //! - **FILE**: a file's size and sha256, read back through the FAT with a read-only mount (the
 //!   path the station reads), so each file is checked on the card itself.
@@ -54,7 +55,7 @@ impl TimeSource for NoClock {
 type Card = SdCard<ExclusiveDevice<Spi<'static, Blocking>, Output<'static>, Delay>, Delay>;
 
 fn reply(tx: &mut UsbSerialJtagTx<'static, Blocking>, kind: u8, seq: u16, payload: &[u8]) {
-    let mut out = [0u8; 64];
+    let mut out = [0u8; proto::FRAME_MAX];
     if let Some(n) = proto::encode(kind, seq, payload, &mut out) {
         let _ = tx.write(&out[..n]);
         let _ = tx.flush_tx();
@@ -202,6 +203,24 @@ fn main() -> ! {
                             left -= k as u32;
                         }
                         reply(&mut tx, if ok { proto::OK } else { proto::ERR }, seq, if ok { &[] } else { &[proto::E_CARD] });
+                    }
+                    proto::READ => {
+                        let Some(c) = card.as_ref() else { continue };
+                        let k = if pl.len() == 5 { pl[4] as usize } else { 0 };
+                        if k == 0 || k > proto::MAX_BLOCKS {
+                            reply(&mut tx, proto::ERR, seq, &[proto::E_ARGS]);
+                            continue;
+                        }
+                        match c.read(&mut blocks[..k], BlockIdx(u32_at(0))) {
+                            Ok(()) => {
+                                let mut data = [0u8; proto::MAX_BLOCKS * 512];
+                                for (i, b) in blocks[..k].iter().enumerate() {
+                                    data[512 * i..512 * (i + 1)].copy_from_slice(&b.contents);
+                                }
+                                reply(&mut tx, proto::OK, seq, &data[..512 * k]);
+                            }
+                            Err(_) => reply(&mut tx, proto::ERR, seq, &[proto::E_CARD]),
+                        }
                     }
                     proto::FILE => {
                         let Ok(path) = core::str::from_utf8(pl) else {
