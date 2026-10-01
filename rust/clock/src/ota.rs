@@ -2318,10 +2318,36 @@ fn encode_net_cfg(c: NetCfg) -> [u8; NET_REC_LEN] {
     r
 }
 
+/// The last net record `read_net_cfg` saw (outer `None` = never read). DIAG reads this instead of the
+/// flash (tapstone#132, 2026-10-01): `diag_record → read_net_cfg` was the chain under the stack-
+/// overflow panics — a 7,248 B frame (a 3 KB partition-table buffer plus `FlashStorage::read`'s
+/// 4 KB) on top of `run`'s poll frame, every 30 s. Every write re-reads, so the mirror tracks flash.
+#[cfg(feature = "wifi")]
+static NET_CFG_SEEN: embassy_sync::blocking_mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    core::cell::Cell<Option<Option<NetCfg>>>,
+> = embassy_sync::blocking_mutex::Mutex::new(core::cell::Cell::new(None));
+
+/// The net record as last read from flash, without touching flash. `None` until the first
+/// `read_net_cfg` (`net::mode::start` primes it at boot, before the radio exists); then the
+/// record, or its absence.
+#[cfg(feature = "espnow")]
+pub fn net_cfg_seen() -> Option<Option<NetCfg>> {
+    NET_CFG_SEEN.lock(|c| c.get())
+}
+
 /// Read the persisted net selection. `None` on any flash/partition error, erased, or corrupt →
 /// the caller defaults to slot 0 (boot-default network — SAFE). Brick-safe (never panics).
+/// Records what it read in `NET_CFG_SEEN`.
 #[cfg(feature = "wifi")]
 pub fn read_net_cfg() -> Option<NetCfg> {
+    let cfg = read_net_cfg_flash();
+    NET_CFG_SEEN.lock(|c| c.set(Some(cfg)));
+    cfg
+}
+
+#[cfg(feature = "wifi")]
+fn read_net_cfg_flash() -> Option<NetCfg> {
     use embedded_storage::nor_flash::ReadNorFlash;
     let mut flash = flash();
     let mut buf = [0u8; PT_SCRATCH];
@@ -2366,6 +2392,9 @@ pub fn write_net_cfg(c: NetCfg) {
         return;
     }
     let _ = flash.write(base + NET_REC_OFF, &encode_net_cfg(c));
+    // Refresh the DIAG mirror from what actually persisted (wifi.rs's fallback writer doesn't
+    // read back, and a swallowed error must not leave DIAG showing the intended value).
+    let _ = read_net_cfg();
 }
 
 /// Parse a dotted-quad IPv4 (`"10.0.8.111"`) into four octets. Panic-free, `no_std`: rejects any

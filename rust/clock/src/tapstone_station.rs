@@ -66,6 +66,8 @@ pub mod voice;
 /// Card taps: the RC522 on P3 drives the seat (S3 only; without one, `Autoplay`).
 #[cfg(feature = "esp32s3")]
 pub mod taps;
+/// `stackfree N` on the status line: the main stack's untouched bytes (tapstone#132, all chips).
+mod stackfree;
 /// SPI3, shared by the SD slot and the reader (main builds it).
 #[cfg(feature = "esp32s3")]
 pub use spi3::{ReaderPins, Spi3};
@@ -319,6 +321,9 @@ impl Station {
         #[cfg(feature = "esp32s3")] reader: Option<&'static mut taps::Reader>,
     ) -> &'static mut Self {
         static STATION: static_cell::StaticCell<Station> = static_cell::StaticCell::new();
+        // After the radio's boot peak (build_radio) and before the station's service loop: what
+        // the status line reports is the headroom of the running station.
+        stackfree::paint();
         let d = deck_def();
         let seed = u64::from(node) << 8 | index() as u64;
         let mut shrine = Shrine::new(seed, index(), node, d.castle, d.cards, Autoplay::new(seed));
@@ -521,7 +526,7 @@ impl Station {
         self.next_status = now + STATUS_MS;
         let head = s.follower.head_hash();
         println!(
-            "[station] {} match {:08x} seat {:?} phase {:?} round {} mseq {} head {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} route {:?} sent {} err {} dark {}",
+            "[station] {} match {:08x} seat {:?} phase {:?} round {} mseq {} head {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} route {:?} sent {} err {} dark {} stackfree {}",
             if final_now { "FINAL" } else { "status" },
             s.follower.begun().unwrap_or(0),
             s.seat(),
@@ -533,6 +538,8 @@ impl Station {
             self.tx.sent,
             self.tx.send_errors,
             u32::from(self.shrine.dark.on),
+            // -1 = never painted (cannot happen: `new` paints). Bytes, not words.
+            stackfree::free().map_or(-1, i64::from),
         );
         if final_now {
             self.reported_over = s.follower.begun();
