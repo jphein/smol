@@ -61,6 +61,9 @@ pub mod clock;
 // tapstone 0033: the shrine station's voice clips (header + IMA-ADPCM), pure; tests/shrine_voice.rs.
 #[cfg(feature = "hostsim")]
 pub mod shrine_voice;
+// The station's card-tap grammar (tapstone 0009/0032/0036), pure; tests/shrine_taps.rs.
+#[cfg(feature = "hostsim")]
+pub mod shrine_taps;
 #[cfg(feature = "hostsim")]
 pub mod input;
 // #300 The Bard's tiny-LLM core. Lives in `src/bard/` (its own dir, room for the

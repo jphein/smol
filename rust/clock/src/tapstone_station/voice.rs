@@ -25,10 +25,7 @@ use esp_hal::dma::{DmaDescriptor, DmaTransferTxCircular};
 use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::i2c::master::{BusTimeout, Config as I2cConfig, I2c, SoftwareTimeout};
 use esp_hal::i2s::master::{Config as I2sConfig, DataFormat, I2s, I2sTx};
-use esp_hal::peripherals::{
-    DMA_CH0, GPIO1, GPIO5, GPIO7, GPIO8, GPIO15, GPIO16, GPIO38, GPIO39, GPIO40, GPIO47, I2C0, I2S0,
-    SPI3,
-};
+use esp_hal::peripherals::{DMA_CH0, GPIO1, GPIO5, GPIO7, GPIO8, GPIO15, GPIO16, I2C0, I2S0};
 use esp_hal::time::Rate;
 use esp_println::println;
 use sha2::{Digest, Sha256};
@@ -54,14 +51,10 @@ const RING_DESC: usize = 4_092;
 const RING_LEN: usize = 3 * RING_DESC;
 const RING_DESCS: usize = esp_hal::dma::descriptor_count(RING_LEN, RING_DESC, true);
 
-/// The peripherals the voice owns (all `board_s3`): SPI3 and the SD pins, I²C0 on 16/15 for the
-/// codec, I²S0 + a DMA channel on BCLK 5 / WS 7 / DOUT 8, and the amp's shutdown pin.
+/// The peripherals the voice owns (all `board_s3`): the shared SPI3 (for the SD slot), I²C0 on
+/// 16/15 for the codec, I²S0 + a DMA channel on BCLK 5 / WS 7 / DOUT 8, and the amp's shutdown pin.
 pub struct VoiceHw {
-    pub spi3: SPI3<'static>,
-    pub sd_sck: GPIO38<'static>,
-    pub sd_mosi: GPIO40<'static>,
-    pub sd_miso: GPIO39<'static>,
-    pub sd_cs: GPIO47<'static>,
+    pub spi3: &'static RefCell<Spi3>,
     pub i2c0: I2C0<'static>,
     pub sda: GPIO16<'static>,
     pub scl: GPIO15<'static>,
@@ -197,10 +190,7 @@ impl Voice {
         // The amp first: its pin's power-on state (undriven) is amp ON, so drive it off now.
         let amp = Output::new(hw.amp, Level::High, OutputConfig::default());
         let out = Self::bring_up_out(hw.i2c0, hw.sda, hw.scl, hw.i2s0, hw.dma, hw.bclk, hw.ws, hw.dout, amp);
-        static SPI3_CELL: StaticCell<RefCell<Spi3>> = StaticCell::new();
-        let cell: &'static RefCell<Spi3> =
-            SPI3_CELL.init(RefCell::new(Spi3::new(hw.spi3, hw.sd_sck, hw.sd_mosi, hw.sd_miso, hw.sd_cs)));
-        let pack = Self::mount(cell);
+        let pack = Self::mount(hw.spi3);
         static VOICE: StaticCell<Voice> = StaticCell::new();
         VOICE.init(Voice { pack, out, clip: Clip::new(), playing: None, last: None, played: 0 })
     }

@@ -259,6 +259,10 @@ pub(crate) mod tapstone_station;
 #[cfg(feature = "tapstone-station")]
 #[cfg(feature = "esp32s3")]
 mod shrine_voice;
+// The station's card-tap grammar (tapstone 0009/0032/0036), pure; the host lib shares it. Its
+// one user is the S3 station's reader.
+#[cfg(all(feature = "tapstone-station", feature = "esp32s3"))]
+mod shrine_taps;
 // The S3 station draws on the raw colour panel; `cast`'s tee would wrap it and mirror only the
 // 1-bit image, so the two are not combined there. (A C3 station is headless and draws nothing.)
 #[cfg(all(feature = "tapstone-station", feature = "esp32s3", feature = "cast"))]
@@ -1126,6 +1130,23 @@ async fn run(boot_spawner: BootSpawner) -> ! {
         gw.hello(radio.as_deref());
         gw
     };
+    // SPI3, shared: the SD slot (`board_s3::SD_PINS`) and the P3 jack's reader (`P3_JACK_PINS`),
+    // re-pinned per transaction (tapstone_station::spi3).
+    #[cfg(all(feature = "tapstone-station", feature = "esp32s3"))]
+    let s3_spi3 = tapstone_station::Spi3::new(
+        peripherals.SPI3,
+        peripherals.GPIO38,
+        peripherals.GPIO40,
+        peripherals.GPIO39,
+        peripherals.GPIO47,
+        tapstone_station::ReaderPins {
+            sck: peripherals.GPIO14,
+            mosi: peripherals.GPIO21,
+            miso: peripherals.GPIO2,
+            cs: peripherals.GPIO3,
+        },
+    )
+    .share();
     // A `&'static mut`: the station is built in its own static (Station::new says why).
     #[cfg(feature = "tapstone-station")]
     let station = tapstone_station::Station::new(
@@ -1135,11 +1156,7 @@ async fn run(boot_spawner: BootSpawner) -> ! {
         // None of them is claimed elsewhere in a station build (no `io`, no touch).
         #[cfg(feature = "esp32s3")]
         tapstone_station::voice::Voice::new(tapstone_station::voice::VoiceHw {
-            spi3: peripherals.SPI3,
-            sd_sck: peripherals.GPIO38,
-            sd_mosi: peripherals.GPIO40,
-            sd_miso: peripherals.GPIO39,
-            sd_cs: peripherals.GPIO47,
+            spi3: s3_spi3,
             i2c0: peripherals.I2C0,
             sda: peripherals.GPIO16,
             scl: peripherals.GPIO15,
@@ -1150,6 +1167,9 @@ async fn run(boot_spawner: BootSpawner) -> ! {
             dout: peripherals.GPIO8,
             amp: peripherals.GPIO1,
         }),
+        // Card taps: an RC522 on the P3 jack, if one answers (else the seat keeps Autoplay).
+        #[cfg(feature = "esp32s3")]
+        tapstone_station::taps::Reader::detect(s3_spi3, tapstone_station::deck_len()),
     );
 
     // --- Clock time base -----------------------------------------------------
