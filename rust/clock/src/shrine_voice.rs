@@ -131,7 +131,7 @@ impl Clip {
         } else {
             let k = self.pos - 1;
             let b = self.block[4 + k / 2];
-            let nib = if k % 2 == 0 { b & 0x0F } else { b >> 4 };
+            let nib = if k.is_multiple_of(2) { b & 0x0F } else { b >> 4 };
             (self.pred, self.idx) = next(nib, self.pred, self.idx);
         }
         self.pos += 1;
