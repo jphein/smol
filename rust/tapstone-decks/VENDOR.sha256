@@ -2,7 +2,7 @@
 # Generated and verified by tools/tapstone_vendor.sh; do not hand-edit, and do not edit
 # the files it names — see that script's header. This list IS the vendored file set.
 # source: https://github.com/jphein/tapstone-game
-# tag: rules-v0.2.2
-# commit: 6886a82d9190ea9f00d2e1e5965bbb01f8f37217
+# tag: rules-v0.2.3
+# commit: 74c8e87589cc8e143ce6874b171f4519a9d0ef9b
 06ee2e5d7522adc64893c0cf9ee03465fdb24aa402f5c9d1bc387d3feab7b389  decks/ember-neutral.toml
 75be52d43c260d94c07df9c857639540a71e4ccaec6e1f6cef8ed27aa26b8ee5  decks/tide-neutral.toml

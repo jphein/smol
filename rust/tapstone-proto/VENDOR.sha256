@@ -2,13 +2,13 @@
 # Generated and verified by tools/tapstone_vendor.sh; do not hand-edit, and do not edit
 # the files it names — see that script's header. This list IS the vendored file set.
 # source: https://github.com/jphein/tapstone-game
-# tag: rules-v0.2.2
-# commit: 6886a82d9190ea9f00d2e1e5965bbb01f8f37217
+# tag: rules-v0.2.3
+# commit: 74c8e87589cc8e143ce6874b171f4519a9d0ef9b
 a83b6fa5fa1a6052d8401a15d48bd82a7c1c759e010fe3c5f91bc0602e74de01  src/follower.rs
 0e31eb89714bc833fc52b60f6816dbe0b23ca0f45fa098b22b20909bd2bfdedc  src/frame.rs
 c26cd8c8294056269bf36275276d09d98b1ebd55ecf91824efee5625c68c88eb  src/ids.rs
 3c059e8158ef8de27a6b59e97895eb949622bea7039150476764856d306e46ca  src/lib.rs
-55ba8497dfde2c6bef804f57af6f830a05e03613a69d77234f3525ef7a64897e  src/shrine.rs
+30061986ae91bed57d5835bfbda4e652286cd386bf76ecd5664a1d913d231e4b  src/shrine.rs
 4139f7559f4a7ea8356d36ffa65f0607dcff52186926869cec812cf3f0fba48f  src/transcript.rs
 048c0851dab94ca40170ae33c1974246100e567a67a611b81601f48c4251077d  src/wire.rs
 f99c53e9a2f5d710085139de2d3f2fc5cd3a21ca436969159ce4ef423446727f  tests/ids.rs
