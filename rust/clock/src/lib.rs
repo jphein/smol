@@ -58,6 +58,9 @@ pub(crate) use host::node_id;
 pub mod app;
 #[cfg(feature = "hostsim")]
 pub mod clock;
+// tapstone 0033: the shrine station's voice clips (header + IMA-ADPCM), pure; tests/shrine_voice.rs.
+#[cfg(feature = "hostsim")]
+pub mod shrine_voice;
 #[cfg(feature = "hostsim")]
 pub mod input;
 // #300 The Bard's tiny-LLM core. Lives in `src/bard/` (its own dir, room for the

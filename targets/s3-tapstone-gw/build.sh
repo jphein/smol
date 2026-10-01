@@ -85,9 +85,15 @@ else
   dst="$REMOTE:$RDIR"
 fi
 
-# The crate plus its two path dependencies (../sigil-names, ../esp-wifi-sys-chip), same layout.
+# The crate plus its path dependencies, same layout.
+# rust/clock/Cargo.toml's `path = "../*"` siblings, DERIVED (tools/gate.sh's mirror arm, same
+# reason): cargo must find every path dependency's directory, optional or not, so a hand list
+# breaks the build on the next sibling added. rust/es8311 was the one that would have.
+siblings=$(grep -v '^[[:space:]]*#' "$ROOT/rust/clock/Cargo.toml" \
+           | sed -n 's/.*path = "\.\.\/\([A-Za-z0-9_.-]*\)".*/\1/p' | sort -u)
+[ -n "$siblings" ] || { echo "build: no path siblings found in rust/clock/Cargo.toml" >&2; exit 2; }
 run "mkdir -p $RDIR/rust"
-for d in clock sigil-names esp-wifi-sys-chip; do
+for d in clock $siblings; do
   rsync -a --delete --exclude target/ "$ROOT/rust/$d/" "$dst/rust/$d/"
 done
 

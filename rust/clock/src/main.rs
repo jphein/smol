@@ -252,6 +252,9 @@ mod ts_gw;
 // tapstone#132 (c): the shrine station (its seat is tapstone_proto::shrine).
 #[cfg(feature = "tapstone-station")]
 pub(crate) mod tapstone_station;
+// tapstone 0033: the voice clips' header and IMA-ADPCM decoder (pure; the host lib shares it).
+#[cfg(feature = "tapstone-station")]
+mod shrine_voice;
 // The S3 station draws on the raw colour panel; `cast`'s tee would wrap it and mirror only the
 // 1-bit image, so the two are not combined there. (A C3 station is headless and draws nothing.)
 #[cfg(all(feature = "tapstone-station", feature = "esp32s3", feature = "cast"))]
@@ -1120,9 +1123,29 @@ async fn run(boot_spawner: BootSpawner) -> ! {
         gw
     };
     #[cfg(feature = "tapstone-station")]
-    let mut station = tapstone_station::Station::new(tapstone_station::station_node(
-        radio.as_deref().map_or(0, |r| r.ts_node_id()),
-    ));
+    let mut station = tapstone_station::Station::new(
+        tapstone_station::station_node(radio.as_deref().map_or(0, |r| r.ts_node_id())),
+        // tapstone 0033: the band's voice. Every pin is `board_s3`'s: SPI3 on the SD slot
+        // (SD_PINS), the codec on I2C0 16/15, I2S0 on BCLK 5 / WS 7 / DOUT 8, the amp on GPIO1.
+        // None of them is claimed elsewhere in a station build (no `io`, no touch).
+        #[cfg(feature = "esp32s3")]
+        tapstone_station::voice::Voice::new(tapstone_station::voice::VoiceHw {
+            spi3: peripherals.SPI3,
+            sd_sck: peripherals.GPIO38,
+            sd_mosi: peripherals.GPIO40,
+            sd_miso: peripherals.GPIO39,
+            sd_cs: peripherals.GPIO47,
+            i2c0: peripherals.I2C0,
+            sda: peripherals.GPIO16,
+            scl: peripherals.GPIO15,
+            i2s0: peripherals.I2S0,
+            dma: peripherals.DMA_CH0,
+            bclk: peripherals.GPIO5,
+            ws: peripherals.GPIO7,
+            dout: peripherals.GPIO8,
+            amp: peripherals.GPIO1,
+        }),
+    );
 
     // --- Clock time base -----------------------------------------------------
     // Anchor the clock to the monotonic ms clock instead of accumulating ticks

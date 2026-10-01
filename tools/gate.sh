@@ -1002,6 +1002,14 @@ if [ "$run_host" = 1 ]; then
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "spike-sd read-only"
   fi
+  # tapstone 0033: the shrine station reads JP's cards too (the voice pack), through embedded-sdmmc.
+  # The same guard's filesystem form: ReadOnly opens only, no SD command framing, no write API.
+  step "station voice read-only guard (tapstone 0033)"
+  if out=$("$ROOT/targets/s3-cyd/spike-sd/check_readonly.sh" --fs "$ROOT/rust/clock/src/tapstone_station/voice.rs" 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "station voice read-only"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "station voice read-only"
+  fi
 
   # #351: the same discipline for the exclusion checker, and it matters more here. An ABSENCE
   # check's passing state and its broken state print the same green — "no violations found"

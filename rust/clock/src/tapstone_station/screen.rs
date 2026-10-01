@@ -198,6 +198,20 @@ fn paint(band: &mut Band, panel: &mut Panel, draw: impl Fn(&mut Strip<'_>)) {
     }
 }
 
+/// The sentence the band says now, for the voice (tapstone 0033): what screen 3's band shows in a
+/// match, the arena-gone line in a dark window, and nothing otherwise.
+pub fn band_text(g: &Game, seat: Option<usize>, dark: bool) -> shrine_render::fmt::Text {
+    if dark {
+        return Voice::Dark(Dark::ArenaGone).text();
+    }
+    match (seat, g.phase) {
+        (Some(s), Phase::Playing) => Station::from_game(g, s as u8)
+            .map(|st| band_for(&st).text())
+            .unwrap_or_default(),
+        _ => shrine_render::fmt::Text::new(),
+    }
+}
+
 /// The band for an engine state (tapstone `shrine-preview`'s `band_for`): an owed draw first, since
 /// the engine refuses everything else, then a fallen commander's return, then nothing.
 fn band_for(st: &Station) -> Voice<'static> {
