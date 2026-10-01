@@ -1030,6 +1030,15 @@ if [ "$run_host" = 1 ]; then
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "station stack self-test"
   fi
+  # tapstone#132 (2026-10-01): the worst-case call-chain checker, on the 52e8a00b fixture both shrines
+  # panicked on. It must go red there (the diag_record→read_net_cfg chain), fit with that frame cut,
+  # and refuse an unreadable prologue, a missing one and an undeclared cycle. Text only.
+  step "station stack-depth checker self-test (tapstone#132)"
+  if out=$("$ROOT/tools/check_stack_depth.py" --self-test 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "station stack-depth self-test"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "station stack-depth self-test"
+  fi
 
   # #351: the same discipline for the exclusion checker, and it matters more here. An ABSENCE
   # check's passing state and its broken state print the same green — "no violations found"
@@ -1231,7 +1240,7 @@ if [ "$run_hand" = 1 ]; then
   # (a stack-guard write): run()'s poll frame was ~38 KB, and the voice's .bss shrank .stack until
   # the boot paint's callees had 684 B. The build is rebuilt by name here (the gateway row shares
   # the target dir), then .stack - run's frame must be >= 12,288 B (tools/check_station_stack.py).
-  step "S3 station stack headroom — .stack minus run()'s frame >= 12 KB (tapstone#132)"
+  step "S3 station stack — run()'s frame floor, and the worst call chain + IRQ reserve vs .stack (tapstone#132)"
   if out=$("$ROOT/tools/build_hand.sh" s3-tapstone-station 2>&1); then
     elf=$(printf '%s\n' "$out" | sed -n 's/^   s3-tapstone-station: [0-9]* B  //p' | tail -1)
     if ! "$ROOT/tools/check_station_stack.py" --self-test >/dev/null 2>&1; then
@@ -1240,6 +1249,16 @@ if [ "$run_hand" = 1 ]; then
       printf '        %s\n' "$sout"; ok "station stack headroom"
     else
       printf '        %s\n' "$sout"; bad "station stack headroom"
+    fi
+    # tapstone#132 (2026-10-01): the frame floor above passed the image both shrines then panicked
+    # on. This sums the deepest call chain from `main`, plus a 2,560 B interrupt reserve and a 1 KB
+    # margin, against .stack (tools/check_stack_depth.py; exit 2 = could not read = red).
+    if ! "$ROOT/tools/check_stack_depth.py" --self-test >/dev/null 2>&1; then
+      bad "station stack depth — the checker's self-test failed (it would be blind)"
+    elif dout=$("$ROOT/tools/check_stack_depth.py" "$elf" 2>&1); then
+      printf '%s\n' "$dout" | sed 's/^/        /'; ok "station stack depth"
+    else
+      printf '%s\n' "$dout" | sed 's/^/        /'; bad "station stack depth"
     fi
   else
     printf '%s\n' "$out" | tail -15 | sed 's/^/        /'; bad "station stack — the station did not build"

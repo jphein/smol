@@ -2782,7 +2782,15 @@ impl RadioManager {
     /// (a cfg predicate contains commas and `=`, never a pipe). The checker compares those cfg
     /// strings LITERALLY and fails closed on any edit; it does not attempt cfg algebra, so it
     /// detects "a guard moved" and makes no claim beyond that.
-    pub fn new(p: WifiPeripherals, id: u8, spawner: embassy_executor::Spawner) -> Option<Self> {
+    /// Written into `slot` (the `StaticCell` in `build_radio`), not returned by value: by value,
+    /// the 20 KB struct was copied through the caller's frame too (measured: `build_radio` at
+    /// 35,680 B, against 24,128 B this way, where only the literal's own temporary remains).
+    pub fn new(
+        slot: &'static mut core::mem::MaybeUninit<Self>,
+        p: WifiPeripherals,
+        id: u8,
+        spawner: embassy_executor::Spawner,
+    ) -> Option<&'static mut Self> {
         // esp-wifi needs a heap; use the single shared region (see net::init_heap).
         super::init_heap();
 
@@ -2827,7 +2835,7 @@ impl RadioManager {
         // system rather than by this comment (#68/#76).
         let stack = super::bring_up_stack(spawner, interfaces.station, &mut rng);
 
-        Some(Self {
+        Some(slot.write(Self {
             controller,
             self_mac,
             #[cfg(feature = "tapstone-station")]
@@ -2916,7 +2924,7 @@ impl RadioManager {
             // No creature exists until one is heard or first-birthed on a cold mesh.
             fam: FamState::new(id),
             fam_inbox: FamInbox::new(),
-        })
+        }))
     }
 
     /// #23 stage 2 leaf channel-discovery. Call every subtick from `main`. A LEAF (not
@@ -4463,7 +4471,9 @@ impl RadioManager {
         // POSITIONAL DIAG parse; a dashboard follow-up repurposes or drops it. Stage 2/3 override
         // state is still LIVE from the NVS net-record: brk=<baked|ovr|fb> (broker override — `fb` =
         // auto-disabled after repeated CONNACK failures, running the baked broker) + otah=<slot|ovr>.
-        let net = crate::ota::read_net_cfg().unwrap_or_default();
+        // tapstone#132: the mirror, not the flash — the flash read was the overflowing chain.
+        // Primed by `start` at boot, so `None` here cannot happen on a running radio.
+        let net = crate::ota::net_cfg_seen().flatten().unwrap_or_default();
         let net_fb = "ok"; // #142: frozen (no slot fallback in single-network mode)
         let brk = match (net.broker.is_some(), net.broker_fallback) {
             (true, false) => "ovr",
@@ -8338,6 +8348,25 @@ fn parse_frame(data: &[u8]) -> Option<Frame<'_>> {
 // Public flow used by `main` under `--features espnow`.
 // -------------------------------------------------------------------------
 
+/// The manager, built into its `StaticCell` in a frame of its own (tapstone#132, 2026-10-01).
+///
+/// Built by value inside `start()`, the 20 KB struct sat in `start()`'s poll frame, and that poll
+/// is inlined into `run()`'s: so it held 20 KB of `run()`'s 30 KB frame for the whole life of the
+/// program, not just at boot. On the S3 tapstone station the periodic `diag_record` →
+/// `read_net_cfg` chain then summed to 44,864 B against a 43,828 B `.stack`, and both shrines
+/// rebooted with stack-overflow panics. Not inlined, the temporary exists only while this function
+/// runs, once, at boot: `run()`'s frame went from 30,304 B to 9,200 B (`tools/check_stack_depth.py`
+/// gates the whole chain now, this boot peak included).
+#[inline(never)]
+fn build_radio(
+    p: WifiPeripherals,
+    id: u8,
+    spawner: embassy_executor::Spawner,
+) -> Option<&'static mut RadioManager> {
+    static RADIO: static_cell::StaticCell<RadioManager> = static_cell::StaticCell::new();
+    RadioManager::new(RADIO.uninit(), p, id, spawner)
+}
+
 /// Bring the radio up, run a REAL WiFi -> DHCP -> SNTP burst (fast-blinking the
 /// blue LED throughout), then TIME-SHARE-switch the single radio to ESP-NOW.
 ///
@@ -8385,13 +8414,12 @@ pub async fn start(
     // future into a single static — but that is the whole point: `.bss` grows by 17,216 and
     // the futures shrink by roughly twice that, so the DRAM stack region (which is what is
     // left after `.bss`) grows back. See the PR body's A/B table.
-    static RADIO: static_cell::StaticCell<RadioManager> = static_cell::StaticCell::new();
-    let Some(radio) = RadioManager::new(p, id, spawner) else {
+    // Prime the net-record mirror DIAG reads (tapstone#132): here at boot, not under DIAG, and not
+    // inside `build_radio` either, whose 24 KB frame it would sit on (measured: 44,752 B, over .stack).
+    let _ = crate::ota::read_net_cfg();
+    let Some(radio) = build_radio(p, id, spawner) else {
         return (None, None);
     };
-    // Not held across an `.await`, so the by-value construction above never lands in this
-    // function's future; only the reference below does.
-    let radio: &'static mut RadioManager = RADIO.init(radio);
 
     // --- WiFi burst for NTP; `main`'s responsive `tick` runs inside every busy-
     // wait loop (LED fast-blink + "Syncing…" redraw + long-press abort). `batt`/
