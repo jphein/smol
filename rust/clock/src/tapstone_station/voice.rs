@@ -46,10 +46,11 @@ const MANIFEST: &str = "MANIFEST.TSV";
 const MAX_CLIPS: usize = 300;
 /// The longest manifest row the reader takes (set 1's longest is under 260 B).
 const ROW_MAX: usize = 384;
-/// The DMA ring: 3 descriptors x 1,536 B = 4,608 B, 52 ms of 22,050 Hz stereo 16-bit: more than
-/// two 20 ms superloop ticks. Borrowed from the screen's band buffer for each clip
-/// (`screen::lend_band`), because a `.bss` ring came out of the S3's stack.
-const RING_DESC: usize = 1_536;
+/// The DMA ring: 3 descriptors x 4,092 B (esp-hal's largest) = 12,276 B, 139 ms of 22,050 Hz
+/// stereo 16-bit. Borrowed from the screen's 15,360 B band buffer for each clip
+/// (`screen::lend_band`), so its size costs no RAM. 52 ms (4,608 B) ran dry on the table: feed
+/// gaps measured 46-145 ms (run-v2, 2026-09-30); the station also feeds between subtick slices.
+const RING_DESC: usize = 4_092;
 const RING_LEN: usize = 3 * RING_DESC;
 const RING_DESCS: usize = esp_hal::dma::descriptor_count(RING_LEN, RING_DESC, true);
 
@@ -156,7 +157,7 @@ struct Playing {
     started: u64,
     blocks: u32,
     late: bool,
-    /// The last feed, and the longest gap between feeds (the ring holds 52 ms).
+    /// The last feed, and the longest gap between feeds (the ring holds 139 ms).
     last: u64,
     max_gap: u64,
 }
@@ -366,7 +367,7 @@ impl Voice {
             out.stop();
             return;
         }
-        // The ring opens on silence (52 ms): the amp rises into a driven, silent line.
+        // The ring opens on silence (139 ms): the amp rises into a driven, silent line.
         out.amp.set_low();
         self.clip.start(wav.samples);
         println!("[voice] says {} ({} samples): {:?}", name, wav.samples, text);

@@ -2755,8 +2755,11 @@ async fn run(boot_spawner: BootSpawner) -> ! {
         #[cfg(not(feature = "tapstone-gw"))]
         subtick(&delay).await;
         // #548: the same 20 ms, sliced, with the radio drained between slices (see ts_gw).
-        #[cfg(feature = "tapstone-gw")]
+        #[cfg(all(feature = "tapstone-gw", not(all(feature = "tapstone-station", feature = "esp32s3"))))]
         ts_gw::subtick(&mut radio, &mut gw).await;
+        // The S3 station feeds its voice between the slices too (ts_gw::subtick_with says why).
+        #[cfg(all(feature = "tapstone-station", feature = "esp32s3"))]
+        ts_gw::subtick_with(&mut radio, &mut gw, &mut || station.feed_voice(millis())).await;
         #[cfg(feature = "tapstone-station")]
         if let Some(r) = radio.as_deref_mut() {
             station.service(r, millis());

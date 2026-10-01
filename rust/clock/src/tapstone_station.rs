@@ -81,7 +81,7 @@ const RESULT_HOLD_MS: u64 = 10_000;
 /// The arena's own lobby beacon names no seat (tapstone `core::lobby`); a shrine's names its index.
 const ARENA_SEAT_PREF: u8 = 0xFF;
 /// A repaint waits for a clip at most this long (set 1's longest clip is under 5 s). A repaint
-/// takes 75–84 ms, longer than the 52 ms I²S ring, so it would cut a clip short.
+/// needs the band buffer the I²S ring is playing from (screen::lend_band).
 #[cfg(feature = "esp32s3")]
 const VOICE_HOLD_MS: u64 = 8_000;
 
@@ -424,6 +424,13 @@ impl Station {
         #[cfg(feature = "esp32s3")]
         self.voice.service(now);
         self.status(now);
+    }
+
+    /// Top the voice's I2S ring up (between the superloop's subtick slices, as well as in
+    /// `service`).
+    #[cfg(feature = "esp32s3")]
+    pub fn feed_voice(&mut self, now: u64) {
+        self.voice.service(now);
     }
 
     /// Repaint 0032's screen if what it shows changed (the S3's colour panel), then say the band.
