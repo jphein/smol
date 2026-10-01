@@ -95,6 +95,29 @@ type Band = [Rgb565; (W * BAND_ROWS) as usize];
 /// single superloop task.
 static mut BAND: Band = [Rgb565::BLACK; (W * BAND_ROWS) as usize];
 
+/// The voice borrows `BAND` as its I²S ring while a clip plays (tapstone 0033). A paint and a
+/// clip never overlap: the station holds repaints while a clip plays, and cuts the clip before a
+/// repaint that has waited too long. Without the loan, the voice's own 4.6 KB ring came straight
+/// out of the S3's stack (2026-09-30: a stack-guard panic at boot on board 61).
+static BAND_LENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Lend `BAND`'s first `N` bytes (the voice's DMA ring). `None` if it is already lent. Any bytes
+/// are a valid `Rgb565`, and a paint draws every pixel of a band before sending it.
+pub fn lend_band<const N: usize>() -> Option<&'static mut [u8; N]> {
+    const { assert!(N <= core::mem::size_of::<Band>()) };
+    if BAND_LENT.swap(true, core::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    // SAFETY: the flag gives one borrower at a time, and `Screens::update` never touches BAND
+    // while it is set. BAND is 2-aligned, which the S3's GDMA needs nothing beyond for internal RAM.
+    Some(unsafe { &mut *(core::ptr::addr_of_mut!(BAND) as *mut [u8; N]) })
+}
+
+/// Give `BAND` back. The borrower must hold no reference into it after this.
+pub fn return_band() {
+    BAND_LENT.store(false, core::sync::atomic::Ordering::Release);
+}
+
 pub struct Screens {
     shown: Option<Key>,
     last_paint: u64,
@@ -137,6 +160,11 @@ impl Screens {
             _ => Key::Idle,
         };
         if self.shown == Some(key) || now.saturating_sub(self.last_paint) < MIN_REPAINT_MS {
+            return;
+        }
+        // The voice holds BAND as its ring: paint next time (the station cuts a clip that holds a
+        // repaint too long, so this is a belt to that brace).
+        if BAND_LENT.load(core::sync::atomic::Ordering::Acquire) {
             return;
         }
         self.shown = Some(key);
@@ -195,6 +223,20 @@ fn paint(band: &mut Band, panel: &mut Panel, draw: impl Fn(&mut Strip<'_>)) {
         }
         let area = Rectangle::new(Point::new(0, y0), Size::new(W, BAND_ROWS));
         let _ = panel.fill_contiguous(&area, band.iter().copied());
+    }
+}
+
+/// The sentence the band says now, for the voice (tapstone 0033): what screen 3's band shows in a
+/// match, the arena-gone line in a dark window, and nothing otherwise.
+pub fn band_text(g: &Game, seat: Option<usize>, dark: bool) -> shrine_render::fmt::Text {
+    if dark {
+        return Voice::Dark(Dark::ArenaGone).text();
+    }
+    match (seat, g.phase) {
+        (Some(s), Phase::Playing) => Station::from_game(g, s as u8)
+            .map(|st| band_for(&st).text())
+            .unwrap_or_default(),
+        _ => shrine_render::fmt::Text::new(),
     }
 }
 

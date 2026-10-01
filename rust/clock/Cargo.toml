@@ -110,6 +110,12 @@ tapstone-progression = { path = "../tapstone-progression", optional = true }
 # it for the chip; embedded-graphics unifies with this crate's `=0.8.2` pin. Not in the 64 KB
 # engine budget below: the renderer's cost is the station's, measured when the station draws.
 shrine-render = { path = "../shrine-render", optional = true }
+# tapstone 0033, the S3 station's voice: smol's one ES8311 driver (rust/es8311, shared with c6-watch,
+# its own workspace) and a read-only FAT reader for the SD pack. Both ride `tapstone-station`; only
+# the S3's `tapstone_station::voice` uses them, so a C3 station links neither.
+es8311 = { path = "../es8311", optional = true }
+embedded-sdmmc = { version = "0.9", default-features = false, optional = true }
+embedded-hal = { version = "1.0", optional = true }
 # --- Core HAL (Phase 1, always on) ---------------------------------------
 # `unstable` is required for I2C/SPI/RNG and is also a hard requirement of
 # esp-wifi. `esp32c3` selects the chip. `rt` + `exception-handler` come from
@@ -742,7 +748,7 @@ tapstone-gw = ["espnow"]
 # tapstone#132 (c): the shrine station, riding the gateway's radio posture and USB bridge so one
 # image serves the arena's own board (seat A) and a remote one (seat B). src/tapstone_station.rs.
 # The vendored crates come in through `tapstone`.
-tapstone-station = ["tapstone-gw", "tapstone"]
+tapstone-station = ["tapstone-gw", "tapstone", "dep:es8311", "dep:embedded-sdmmc", "dep:embedded-hal"]
 
 [profile.release]
 # esp-wifi strongly recommends opt-level "s"/2/3 and LTO; the radio blobs are

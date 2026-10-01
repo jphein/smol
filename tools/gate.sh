@@ -891,6 +891,19 @@ if [ "$run_host" = 1 ]; then
     fi
   done
 
+  # rust/es8311: smol's one ES8311 driver, shared by c6-watch and the S3 tapstone station. Its suite
+  # pins every I2C transaction of both clock modes (c6-watch's, moved byte for byte, and the
+  # BCLK-derived one heard on emberboy), so a change to either sequence is a red here, not a
+  # silent speaker on a board. Its own workspace and lockfile, like the vendored crates above.
+  step "es8311 host suite (cargo test)"
+  log="$GATE_TMP/gate-test-es8311.log"
+  if (cd "$ROOT/rust/es8311" && cargo test --no-fail-fast "${JOBS[@]}") >"$log" 2>&1; then
+    passed=$(grep -Eo '[0-9]+ passed' "$log" | awk '{n+=$1} END {print n+0}')
+    if [ "$passed" -gt 0 ]; then ok "test es8311 — $passed passed"; else bad "test es8311 — exited 0 but ran NO tests"; fi
+  else
+    bad "test es8311"; tail -15 "$log" | sed 's/^/        /'
+  fi
+
   # #350: prove the matrix checker's arms can fail. Pure text, no cargo — see the file header
   # for why a green-only demonstration is not evidence.
   # #351: prove the byte-free source arm can fail. Pure text, no cargo.
@@ -988,6 +1001,14 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | tail -1; ok "spike-sd read-only"
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "spike-sd read-only"
+  fi
+  # tapstone 0033: the shrine station reads JP's cards too (the voice pack), through embedded-sdmmc.
+  # The same guard's filesystem form: ReadOnly opens only, no SD command framing, no write API.
+  step "station voice read-only guard (tapstone 0033)"
+  if out=$("$ROOT/targets/s3-cyd/spike-sd/check_readonly.sh" --fs "$ROOT/rust/clock/src/tapstone_station/voice.rs" 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "station voice read-only"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "station voice read-only"
   fi
 
   # #351: the same discipline for the exclusion checker, and it matters more here. An ABSENCE

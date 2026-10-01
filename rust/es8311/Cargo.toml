@@ -1,0 +1,19 @@
+[package]
+name = "es8311"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "smol's ONE ES8311 codec driver: c6-watch's sequence and the S3 station's, over embedded-hal I2C."
+
+# Beside `rust/clock`, not under it, and its own workspace: the same #347 boundary as
+# rust/sigil-names and rust/esp-wifi-sys-chip. It is path-depended by `rust/clock` (the tapstone
+# station, xtensa) and by `targets/c6-watch` (riscv and xtensa), so it must never join either graph.
+# Its only dependency is embedded-hal, which both lockfiles already carry.
+[workspace]
+
+[lib]
+name = "es8311"
+path = "src/lib.rs"
+
+[dependencies]
+embedded-hal = "1.0"

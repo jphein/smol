@@ -17,7 +17,32 @@
 #      `delete_file_in_dir`, `make_dir_in_dir`, `truncate`, `set_len`, `close_file` after write …).
 # FAILS (exit 2) when the floor is not met: an absence check that finds nothing prints the same
 # green as one that works, so it must find the eight read commands and a ReadOnly open.
+#
+#   targets/s3-cyd/spike-sd/check_readonly.sh --fs <file.rs>...
+#
+# The FILESYSTEM-ONLY form, for code that reaches the card through embedded-sdmmc alone (the shrine
+# station's `tapstone_station/voice.rs`, tapstone 0033). Rules 3 and 4 as above, plus: it frames NO SD
+# command at all (no `cmd(` call, no `0x40 |` byte), since embedded-sdmmc does that and only its
+# write APIs send a write command. FLOOR (exit 2): a `FileMode::ReadOnly` open in every file named.
 set -euo pipefail
+if [ "${1:-}" = "--fs" ]; then
+  shift
+  [ $# -gt 0 ] || { echo "check_readonly --fs: no files" >&2; exit 2; }
+  fail=0
+  for f in "$@"; do
+    [ -f "$f" ] || { echo "check_readonly --fs: no $f" >&2; exit 2; }
+    grep -qE '\bcmd\(|0x40 *\|' "$f" && { echo "check_readonly: FAIL $f frames an SD command: $(grep -nE '\bcmd\(|0x40 *\|' "$f")"; fail=1; }
+    for m in $(grep -hoE '(FileMode|Mode)::[A-Za-z]+' "$f" | grep -vE '^Mode::_[0-3]$' | sort -u); do
+      [ "$m" = FileMode::ReadOnly ] || { echo "check_readonly: FAIL $f file mode $m (only FileMode::ReadOnly is allowed)"; fail=1; }
+    done
+    grep -qnE 'ReadWrite' "$f" && { echo "check_readonly: FAIL $f names a ReadWrite* mode: $(grep -nE 'ReadWrite' "$f")"; fail=1; }
+    w=$(grep -nE '\.(write|write_all|truncate|set_len|flush_file)\(|delete_file_in_dir|make_dir_in_dir|delete_dir|\bflush\(\)' "$f" || true)
+    [ -z "$w" ] || { echo "check_readonly: FAIL $f calls an embedded-sdmmc write API: $w"; fail=1; }
+    grep -q 'FileMode::ReadOnly' "$f" || { echo "check_readonly: FLOOR $f has no FileMode::ReadOnly open — is it still the card's reader?"; exit 2; }
+  done
+  [ "$fail" = 0 ] && echo "check_readonly --fs: OK — $# file(s), only FileMode::ReadOnly opens, no SD command framing, no write APIs"
+  exit "$fail"
+fi
 dir="${1:-$(cd "$(dirname "$0")" && pwd)}"
 src="$dir/src"
 [ -d "$src" ] || { echo "check_readonly: no $src" >&2; exit 2; }

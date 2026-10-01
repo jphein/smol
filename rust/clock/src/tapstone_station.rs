@@ -35,6 +35,14 @@
 //! link node from air frames and sends through the link. The revived arena's first commit ends it.
 //! `TAPSTONE_NO_INTERIM=1` builds the control: no dark detection, so a dead arena stalls the match.
 //!
+//! ## The voice (tapstone 0033, S3 only)
+//!
+//! [`voice`] mounts the SD card read-only at boot and speaks the band from the pack
+//! (`/TAPSTONE/VOICE/SET1`). Each line is found by the sha256 of its text. After a repaint,
+//! `draw` asks for the band's line; while a clip plays, repaints wait (up to `VOICE_HOLD_MS`),
+//! because a repaint outlasts the I²S ring. With no card, no pack or no codec, the band stays
+//! text, and the boot log says which.
+//!
 //! ## Owed (tapstone#132)
 //!
 //! - **A seatless station in a dark window.** One that rebooted and kept nothing has no `B`, so no
@@ -42,14 +50,19 @@
 //!   arena is dark if something tells it; the silence detector runs in a match it plays.
 //! - **Card taps.** Neither Tapstone board has an RC522 on P3 (spike-sd, 2026-09-27), so the seat
 //!   plays by `Autoplay`. With a reader, a tap becomes a `Shrine::propose_to` of the copy's UID.
-//! - **The voice from SD clips** (0033). The slot mounts on glass (spike-sd), but no data pack
-//!   exists yet, so the band is text only.
+//! - **Voice from a card that is inserted after boot.** The card is mounted once, at boot.
 use esp_println::println;
 
 /// 0032's screens: the S3's colour panel only (nested so the tier-exclusion checker, #351, reads
 /// the gate as `esp32s3` + `tapstone-station`).
 #[cfg(feature = "esp32s3")]
 pub mod screen;
+/// SPI3's one owner: the SD slot now, the P3 card reader to come (S3 only).
+#[cfg(feature = "esp32s3")]
+mod spi3;
+/// 0033's voice from SD: the card, the pack, the codec and the I²S ring (S3 only).
+#[cfg(feature = "esp32s3")]
+pub mod voice;
 use tapstone_proto::frame::{BROADCAST, FRAME_MAX, Frame, Lobby, Tap};
 use tapstone_proto::shrine::{ARENA_NODE, Autoplay, Shrine};
 use tapstone_rules::Phase;
@@ -67,6 +80,10 @@ const STATUS_MS: u64 = 2_000;
 const RESULT_HOLD_MS: u64 = 10_000;
 /// The arena's own lobby beacon names no seat (tapstone `core::lobby`); a shrine's names its index.
 const ARENA_SEAT_PREF: u8 = 0xFF;
+/// A repaint waits for a clip at most this long (set 1's longest clip is under 5 s). A repaint
+/// needs the band buffer the I²S ring is playing from (screen::lend_band).
+#[cfg(feature = "esp32s3")]
+const VOICE_HOLD_MS: u64 = 8_000;
 
 mod decks {
     include!(concat!(env!("OUT_DIR"), "/tapstone_decks.rs"));
@@ -254,6 +271,12 @@ pub struct Station {
     /// 0032's screens: the S3's colour panel only. A C3 station is a headless seat.
     #[cfg(feature = "esp32s3")]
     screens: screen::Screens,
+    /// 0033: the band, spoken from the SD pack (text only without a card, pack or codec).
+    #[cfg(feature = "esp32s3")]
+    voice: &'static mut voice::Voice,
+    /// When the current clip began holding repaints back.
+    #[cfg(feature = "esp32s3")]
+    held_since: Option<u64>,
     tx: Tx,
     next_status: u64,
     reported_over: Option<u32>,
@@ -266,8 +289,20 @@ pub struct Station {
 }
 
 impl Station {
-    /// The station for this board's node id `node`.
-    pub fn new(node: u8) -> Self {
+    /// The station for this board's node id `node`. On the S3, `voice` is the hardware the band
+    /// speaks through.
+    ///
+    /// The station lives in a static and `run` holds a reference. Built by value, the whole seat
+    /// (the follower's game, chain and logs) sat in the main task's poll frame on the S3, which
+    /// measured 37,952 B before the voice. That left the boot paint's callees ~13 KB of a 51 KB
+    /// stack region, and the voice's `.bss` (~12 KB) took the rest: a stack-guard panic at boot
+    /// on board 61, 2026-09-30. Not inlined, so its temporaries stay out of `run`'s frame too.
+    #[inline(never)]
+    pub fn new(
+        node: u8,
+        #[cfg(feature = "esp32s3")] voice: &'static mut voice::Voice,
+    ) -> &'static mut Self {
+        static STATION: static_cell::StaticCell<Station> = static_cell::StaticCell::new();
         let d = deck_def();
         let seed = u64::from(node) << 8 | index() as u64;
         let mut shrine = Shrine::new(seed, index(), node, d.castle, d.cards, Autoplay::new(seed));
@@ -298,10 +333,14 @@ impl Station {
         } else {
             tapstone_rules::Faction::Ember
         };
-        Self {
+        STATION.init(Self {
             shrine,
             #[cfg(feature = "esp32s3")]
             screens: screen::Screens::new(node, faction),
+            #[cfg(feature = "esp32s3")]
+            voice,
+            #[cfg(feature = "esp32s3")]
+            held_since: None,
             tx: Tx {
                 node,
                 route: Route::Unknown,
@@ -315,7 +354,7 @@ impl Station {
             heard_result: None,
             over_at: None,
             no_propose: matches!(option_env!("TAPSTONE_NO_PROPOSE"), Some("1")),
-        }
+        })
     }
 
     /// Drain the inbox into the seat, then tick it; send whatever it says.
@@ -360,6 +399,10 @@ impl Station {
                 println!("[station] dark ENDS: the arena's commit (handover)");
             }
         }
+        // Feed the voice between the long steps too: one service() call measured up to 129 ms
+        // on the table, near the 139 ms ring.
+        #[cfg(feature = "esp32s3")]
+        self.voice.service(crate::millis());
         // The result hold: no claim for RESULT_HOLD_MS after the match is seen over. The lobby
         // beacon still goes out, so the arena keeps the shrine on its table.
         if self.shrine.follower.game.phase == Phase::Over {
@@ -375,6 +418,8 @@ impl Station {
         self.shrine.act_to(now, may_claim, self.no_propose, &mut |dst, bytes| {
             tx.send(radio, now, dst, bytes)
         });
+        #[cfg(feature = "esp32s3")]
+        self.voice.service(crate::millis());
         if !dark_before && self.shrine.dark.on {
             println!(
                 "[station] dark BEGINS: no arena frame for {} ms; interim={}",
@@ -382,12 +427,32 @@ impl Station {
                 self.shrine.seat() == Some(0)
             );
         }
+        #[cfg(feature = "esp32s3")]
+        self.voice.service(crate::millis());
         self.status(now);
     }
 
-    /// Repaint 0032's screen if what it shows changed (the S3's colour panel).
+    /// Top the voice's I2S ring up (between the superloop's subtick slices, as well as in
+    /// `service`).
+    #[cfg(feature = "esp32s3")]
+    pub fn feed_voice(&mut self, now: u64) {
+        self.voice.service(now);
+    }
+
+    /// Repaint 0032's screen if what it shows changed (the S3's colour panel), then say the band.
+    /// The text shows first and the voice follows it; while a clip plays, repaints wait (up to
+    /// [`VOICE_HOLD_MS`]) so the ring never runs dry under a paint.
     #[cfg(feature = "esp32s3")]
     pub fn draw(&mut self, panel: &mut crate::s3_oled::Panel, now: u64) {
+        if self.voice.playing() {
+            let since = *self.held_since.get_or_insert(now);
+            if now.saturating_sub(since) < VOICE_HOLD_MS {
+                return;
+            }
+            // Waited long enough: the paint needs the band buffer the clip is playing from.
+            self.voice.cut();
+        }
+        self.held_since = None;
         let s = &self.shrine;
         self.screens.update(
             panel,
@@ -398,6 +463,8 @@ impl Station {
             s.follower.next_mseq(),
             s.follower.begun().unwrap_or(0),
         );
+        let text = screen::band_text(&s.follower.game, s.seat(), s.dark.on);
+        self.voice.say(text.as_str(), now);
     }
 
     fn status(&mut self, now: u64) {

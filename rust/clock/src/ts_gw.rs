@@ -164,7 +164,15 @@ fn handle(parsed: Inbound, line: &[u8], frame: &[u8; TX_FRAME_MAX], radio: Optio
 
 /// The gateway's version of main.rs's `subtick`: the same 20 ms, in [`SLICES`] slices, draining
 /// the radio (which forwards MATCH frames as it goes) and pumping USB between them.
+#[cfg(not(all(feature = "tapstone-station", feature = "esp32s3")))]
 pub async fn subtick(radio: &mut Option<&'static mut RadioManager>, gw: &mut Gateway) {
+    subtick_with(radio, gw, &mut || {}).await;
+}
+
+/// [`subtick`], calling `each` after every slice: the S3 station feeds its voice's I2S ring there
+/// (tapstone 0033), because the superloop's whole iteration (measured 46-145 ms on the table)
+/// outlasts the ring, and the slices come every 5 ms.
+pub async fn subtick_with(radio: &mut Option<&'static mut RadioManager>, gw: &mut Gateway, each: &mut dyn FnMut()) {
     let slice = embassy_time::Duration::from_millis((crate::SUBTICK_MS / SLICES) as u64);
     for _ in 0..SLICES {
         embassy_time::Timer::after(slice).await;
@@ -172,5 +180,6 @@ pub async fn subtick(radio: &mut Option<&'static mut RadioManager>, gw: &mut Gat
             let _ = r.service();
         }
         gw.pump(radio.as_deref_mut(), crate::millis());
+        each();
     }
 }
