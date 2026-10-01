@@ -45,14 +45,21 @@ def frame_from_disasm(text):
     if not m:
         raise Unreadable(f"the first instruction is not `entry a1, N`: {ins[0]!r}")
     n = int(m.group(1), 0)
-    if n > 32 or len(ins) < 4:
+    if n > 32:
         return n
-    lit = re.match(r"l32r\s+(a\d+),\s*[0-9a-f]+\s*<[^>]*>\s*\((0x)?([0-9a-f]+)", ins[1])
-    sub = re.match(r"sub\s+(a\d+),\s*a1,\s*(a\d+)$", ins[2])
-    movsp = re.match(r"movsp\s+a1,\s*(a\d+)$", ins[3])
-    if lit and sub and movsp and sub.group(2) == lit.group(1) and movsp.group(1) == sub.group(1):
-        return 32 + int(lit.group(3), 16)
-    return n
+    # entry 32 is either a small frame, or the head of the large form. Any `movsp a1` in the
+    # prologue means the large form, which must then parse in full: a literal whose value objdump
+    # did not annotate, or any other shape, is UNREADABLE (exit 2), never a 32-byte frame. That
+    # 32-byte reading is exactly what the image that panicked on glass would have passed with.
+    if not any(re.match(r"movsp\s+a1,", i) for i in ins[1:6]):
+        return n
+    if len(ins) >= 4:
+        lit = re.match(r"l32r\s+(a\d+),\s*[0-9a-f]+\s*<[^>]*>\s*\((0x)?([0-9a-f]+)", ins[1])
+        sub = re.match(r"sub\s+(a\d+),\s*a1,\s*(a\d+)$", ins[2])
+        movsp = re.match(r"movsp\s+a1,\s*(a\d+)$", ins[3])
+        if lit and sub and movsp and sub.group(2) == lit.group(1) and movsp.group(1) == sub.group(1):
+            return 32 + int(lit.group(3), 16)
+    raise Unreadable(f"a large-frame prologue this checker cannot read: {ins[1:4]!r}")
 
 
 def run_tool(*args):
@@ -97,9 +104,22 @@ LARGE = """
 """
 
 
+LARGE_UNANNOTATED = """
+42040a64:\t004136        \tentry\ta1, 32
+42040a67:\tc6ed81        \tl32r\ta8, 4203261c <idle_hook_fn+0x25d4>
+42040a6a:\tc08180        \tsub\ta8, a1, a8
+42040a6d:\t001810        \tmovsp\ta1, a8
+"""
+
+
 def self_test():
     assert frame_from_disasm(SMALL) == 0x7630, "entry a1, N"
     assert frame_from_disasm(LARGE) == 32 + 0x9690, "entry 32 + l32r/sub/movsp"
+    try:
+        frame_from_disasm(LARGE_UNANNOTATED)
+        raise AssertionError("a large frame whose literal objdump did not annotate must be unreadable, not 32 B")
+    except Unreadable:
+        pass
     try:
         frame_from_disasm("42000000:\t0000\tnop\n")
         raise AssertionError("a function without `entry` must be unreadable, not a frame of 0")
@@ -107,7 +127,7 @@ def self_test():
         pass
     assert check(43828, 0x7660, 12288)[0], "the fixed image passes"
     assert not check(39260, 32 + 0x9690, 12288)[0], "the image that panicked on glass fails"
-    print("check_station_stack self-test: 5 ok")
+    print("check_station_stack self-test: 6 ok")
 
 
 def check(stack, frame, floor):
