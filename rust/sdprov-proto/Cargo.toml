@@ -1,0 +1,16 @@
+[package]
+name = "sdprov-proto"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "smol: the in-board SD provisioner's wire format (framing + CRC32), shared by the S3 firmware and its tests."
+
+# Its own workspace (the #347 boundary, as rust/es8311): no_std and dependency-free, path-depended
+# by targets/s3-cyd/sd-provision (xtensa); its host tests run in tools/gate.sh host.
+[workspace]
+
+[lib]
+name = "sdprov_proto"
+path = "src/lib.rs"
+
+[dependencies]
