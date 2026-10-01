@@ -321,6 +321,8 @@ embedded-graphics = "0.8.2"
 embedded-graphics-core = "0.4"
 embedded-hal = "1.0"
 embedded-hal-bus = "0.3.0"
+# smol's one ES8311 driver, shared with the S3 tapstone station (rust/es8311, its own workspace).
+es8311 = { path = "../../rust/es8311" }
 heapless = "0.9"
 u8g2-fonts = "0.8.0"
 

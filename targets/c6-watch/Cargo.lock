@@ -1756,6 +1756,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
+name = "es8311"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+]
+
+[[package]]
 name = "esp-alloc"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2205,6 +2212,7 @@ dependencies = [
 name = "esp32c6-watch"
 version = "0.12.1"
 dependencies = [
+ "bard-core",
  "cast-core",
  "climate-model",
  "critical-section",
@@ -2220,6 +2228,7 @@ dependencies = [
  "embedded-io 0.7.1",
  "embedded-io-async 0.7.0",
  "embedded-storage",
+ "es8311",
  "esp-alloc",
  "esp-backtrace",
  "esp-bootloader-esp-idf",
