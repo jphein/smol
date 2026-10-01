@@ -48,8 +48,8 @@
 //! - **A seatless station in a dark window.** One that rebooted and kept nothing has no `B`, so no
 //!   seat map: it broadcasts what it meant for the arena (proto's rule), but it only knows the
 //!   arena is dark if something tells it; the silence detector runs in a match it plays.
-//! - **Card taps.** Neither Tapstone board has an RC522 on P3 (spike-sd, 2026-09-27), so the seat
-//!   plays by `Autoplay`. With a reader, a tap becomes a `Shrine::propose_to` of the copy's UID.
+//! - **Tag bindings that outlive a power-up.** [`taps`] binds fresh tags inline (the scry bridge's
+//!   rule) and keeps them in RAM; nothing is written.
 //! - **Voice from a card that is inserted after boot.** The card is mounted once, at boot.
 use esp_println::println;
 
@@ -57,12 +57,18 @@ use esp_println::println;
 /// the gate as `esp32s3` + `tapstone-station`).
 #[cfg(feature = "esp32s3")]
 pub mod screen;
-/// SPI3's one owner: the SD slot now, the P3 card reader to come (S3 only).
+/// SPI3's one owner: the SD slot and the P3 card reader (S3 only).
 #[cfg(feature = "esp32s3")]
 mod spi3;
 /// 0033's voice from SD: the card, the pack, the codec and the I²S ring (S3 only).
 #[cfg(feature = "esp32s3")]
 pub mod voice;
+/// Card taps: the RC522 on P3 drives the seat (S3 only; without one, `Autoplay`).
+#[cfg(feature = "esp32s3")]
+pub mod taps;
+/// SPI3, shared by the SD slot and the reader (main builds it).
+#[cfg(feature = "esp32s3")]
+pub use spi3::{ReaderPins, Spi3};
 use tapstone_proto::frame::{BROADCAST, FRAME_MAX, Frame, Lobby, Tap};
 use tapstone_proto::shrine::{ARENA_NODE, Autoplay, Shrine};
 use tapstone_rules::Phase;
@@ -107,6 +113,12 @@ fn deck_def() -> DeckDef {
         .find(|d| d.0 == want)
         .unwrap_or(&decks::DECKS[0]);
     DeckDef { name, castle, cards }
+}
+
+/// How many copies the seat's deck list holds (the S3 reader's tag registry size).
+#[cfg(feature = "esp32s3")]
+pub fn deck_len() -> usize {
+    deck_def().cards.len()
 }
 
 /// The seat's node id. On a board whose USB holds the arena it MUST differ from the mesh id: the
@@ -277,6 +289,9 @@ pub struct Station {
     /// When the current clip began holding repaints back.
     #[cfg(feature = "esp32s3")]
     held_since: Option<u64>,
+    /// The RC522 on P3, if one answered at boot: then taps drive the seat, not `Autoplay`.
+    #[cfg(feature = "esp32s3")]
+    reader: Option<&'static mut taps::Reader>,
     tx: Tx,
     next_status: u64,
     reported_over: Option<u32>,
@@ -301,6 +316,7 @@ impl Station {
     pub fn new(
         node: u8,
         #[cfg(feature = "esp32s3")] voice: &'static mut voice::Voice,
+        #[cfg(feature = "esp32s3")] reader: Option<&'static mut taps::Reader>,
     ) -> &'static mut Self {
         static STATION: static_cell::StaticCell<Station> = static_cell::StaticCell::new();
         let d = deck_def();
@@ -341,6 +357,8 @@ impl Station {
             voice,
             #[cfg(feature = "esp32s3")]
             held_since: None,
+            #[cfg(feature = "esp32s3")]
+            reader,
             tx: Tx {
                 node,
                 route: Route::Unknown,
@@ -414,12 +432,19 @@ impl Station {
             .over_at
             .is_none_or(|t| now.saturating_sub(t) >= RESULT_HOLD_MS);
         let dark_before = self.shrine.dark.on;
+        // A reader makes the seat manual: its taps are the moves, so `act_to` proposes nothing.
+        #[cfg(feature = "esp32s3")]
+        let manual = self.no_propose || self.reader.is_some();
+        #[cfg(not(feature = "esp32s3"))]
+        let manual = self.no_propose;
         let tx = &mut self.tx;
-        self.shrine.act_to(now, may_claim, self.no_propose, &mut |dst, bytes| {
+        self.shrine.act_to(now, may_claim, manual, &mut |dst, bytes| {
             tx.send(radio, now, dst, bytes)
         });
         #[cfg(feature = "esp32s3")]
         self.voice.service(crate::millis());
+        #[cfg(feature = "esp32s3")]
+        self.service_taps(radio, now);
         if !dark_before && self.shrine.dark.on {
             println!(
                 "[station] dark BEGINS: no arena frame for {} ms; interim={}",
@@ -437,6 +462,24 @@ impl Station {
     #[cfg(feature = "esp32s3")]
     pub fn feed_voice(&mut self, now: u64) {
         self.voice.service(now);
+    }
+
+    /// The reader's tap, if one came, proposed; and a manual seat's stale proposal, again.
+    #[cfg(feature = "esp32s3")]
+    fn service_taps(&mut self, radio: &mut RadioManager, now: u64) {
+        let Some(reader) = self.reader.as_mut() else {
+            return;
+        };
+        let (send, line) = reader.service(now, &self.shrine);
+        let send = send.or_else(|| taps::stale(&self.shrine, now).inspect(|_| self.shrine.pending = None));
+        if let Some(line) = line {
+            self.voice.say(line.text().as_str(), now);
+        }
+        if let Some(r) = send {
+            let tx = &mut self.tx;
+            let sent = self.shrine.propose_to(now, r, &mut |dst, bytes| tx.send(radio, now, dst, bytes));
+            println!("[taps] propose {:?} card {} lane {} target {} -> {}", r.kind, r.card, r.lane, r.target, if sent { "sent" } else { "not sent" });
+        }
     }
 
     /// Repaint 0032's screen if what it shows changed (the S3's colour panel), then say the band.

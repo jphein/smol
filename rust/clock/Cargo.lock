@@ -140,6 +140,7 @@ dependencies = [
  "esp-wifi-sys-chip",
  "libm",
  "log",
+ "mfrc522",
  "mipidsi",
  "nb 1.1.0",
  "portable-atomic",
@@ -1585,6 +1586,16 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "mfrc522"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "543f2c392f438e427aa9009338710434884b0dc95d0c39110f456846be0aa352"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "heapless 0.8.0",
+]
 
 [[package]]
 name = "micromath"

@@ -77,5 +77,14 @@ the same ledger):
 
 - **A seatless station in a dark window** (rebooted, kept nothing): it cannot detect dark or
   find the interim until it holds `B`.
-- **RC522 card taps.** Neither board has a reader on P3 (`targets/s3-cyd/spike-sd`).
-- **0033's voice from SD clips.** The slot mounts (spike-sd), but no data pack exists yet.
+- **Tag bindings that survive a power-off.** Taps bind fresh tags inline and keep them in RAM.
+
+## The voice (tapstone 0033) and card taps
+
+- **Voice.** At boot the station mounts the SD card read-only and indexes
+  `/TAPSTONE/VOICE/SET1/MANIFEST.TSV` (tapstone's `tools/sd_prepare.py` writes it, only ever to a
+  blank card). It then speaks the voice band through the ES8311 and the SPK socket.
+  - The boot log says `[voice] sd: no card`, `card, no pack` or `pack mounted, N clips`.
+  - The band stays as text when there's no card or pack.
+- **Taps.** Wire an RC522 to P3 per [WIRING.md](WIRING.md). With one, the seat plays from card taps;
+  without one, the boot log says `[taps] no reader on P3`, and the seat keeps Autoplay.

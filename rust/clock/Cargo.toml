@@ -116,6 +116,8 @@ shrine-render = { path = "../shrine-render", optional = true }
 es8311 = { path = "../es8311", optional = true }
 embedded-sdmmc = { version = "0.9", default-features = false, optional = true }
 embedded-hal = { version = "1.0", optional = true }
+# Card taps on the S3 station: the RC522 on the P3 jack (spike-scry's and spike-sd's driver).
+mfrc522 = { version = "0.8", optional = true }
 # --- Core HAL (Phase 1, always on) ---------------------------------------
 # `unstable` is required for I2C/SPI/RNG and is also a hard requirement of
 # esp-wifi. `esp32c3` selects the chip. `rt` + `exception-handler` come from
@@ -748,7 +750,7 @@ tapstone-gw = ["espnow"]
 # tapstone#132 (c): the shrine station, riding the gateway's radio posture and USB bridge so one
 # image serves the arena's own board (seat A) and a remote one (seat B). src/tapstone_station.rs.
 # The vendored crates come in through `tapstone`.
-tapstone-station = ["tapstone-gw", "tapstone", "dep:es8311", "dep:embedded-sdmmc", "dep:embedded-hal"]
+tapstone-station = ["tapstone-gw", "tapstone", "dep:es8311", "dep:embedded-sdmmc", "dep:embedded-hal", "dep:mfrc522"]
 
 [profile.release]
 # esp-wifi strongly recommends opt-level "s"/2/3 and LTO; the radio blobs are
