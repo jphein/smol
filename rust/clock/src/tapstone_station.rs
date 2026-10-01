@@ -399,6 +399,10 @@ impl Station {
                 println!("[station] dark ENDS: the arena's commit (handover)");
             }
         }
+        // Feed the voice between the long steps too: one service() call measured up to 129 ms
+        // on the table, near the 139 ms ring.
+        #[cfg(feature = "esp32s3")]
+        self.voice.service(crate::millis());
         // The result hold: no claim for RESULT_HOLD_MS after the match is seen over. The lobby
         // beacon still goes out, so the arena keeps the shrine on its table.
         if self.shrine.follower.game.phase == Phase::Over {
@@ -414,6 +418,8 @@ impl Station {
         self.shrine.act_to(now, may_claim, self.no_propose, &mut |dst, bytes| {
             tx.send(radio, now, dst, bytes)
         });
+        #[cfg(feature = "esp32s3")]
+        self.voice.service(crate::millis());
         if !dark_before && self.shrine.dark.on {
             println!(
                 "[station] dark BEGINS: no arena frame for {} ms; interim={}",
@@ -422,7 +428,7 @@ impl Station {
             );
         }
         #[cfg(feature = "esp32s3")]
-        self.voice.service(now);
+        self.voice.service(crate::millis());
         self.status(now);
     }
 
