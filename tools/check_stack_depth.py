@@ -30,7 +30,7 @@ What the graph cannot see, and the rule for each. Every rule is either a bound o
   - Recursion: a cycle in the direct graph has no static depth. Each cycle must match
     RECURSION_OK (a reason per entry). Any other cycle is UNREADABLE (exit 2), never a pass.
   - Interrupts: on esp-rtos an interrupt runs on the interrupted task's stack. IRQ_RESERVE is
-    2,048 B. Measured on this image: the level-1 vector's own chain (`__level_1_interrupt` →
+    2,560 B. Measured on this image: the level-1 vector's own chain (`__level_1_interrupt` →
     `trigger_task_switch`, the panic's frame) is printed by the check, and the reserve must cover
     it plus one nested higher-level interrupt plus the 0x100 B exception save area per level.
     On glass, the 2026-10-01 panic put sp 1,564 B under `_stack_end` where the static chain
@@ -57,6 +57,8 @@ ROM_FRAME = 256
 EXC_FRAME = 0x100
 ROM = range(0x40000000, 0x40060000)  # the S3's mask ROM
 DISPATCH = re.compile(r"^<esp_rtos::embassy::Executor>::run_inner::")
+# The station's own task body: it must be reachable from ROOT, or the graph is missing the chain.
+STATION_TASK = re.compile(r"^clock::run::\{closure#0\}$")
 TASK_POLL = re.compile(r"^<embassy_executor::raw::TaskStorage<.*>>::poll$")
 # The panic machinery is terminal: a panic halts the board, so how deep its message formatting goes
 # is not a state a running station is ever in. Its frames are counted, its callees are not.
@@ -202,7 +204,12 @@ class Graph:
         self.funcs, self.e = funcs, edges(funcs)
         polls = {a for a, f in funcs.items() if TASK_POLL.match(f["name"])}
         self.dispatch = {a for a, f in funcs.items() if DISPATCH.match(f["name"])}
-        if self.dispatch and not polls:
+        if not self.dispatch:
+            # The task bodies are reached ONLY through the executor's dispatch. Without it (an
+            # esp-rtos rename of run_inner) the station's own chain drops out of the graph and the
+            # worst case collapses to main's prologue: that must never read as "fits".
+            raise Unreadable("no executor dispatch matched DISPATCH (renamed?): the tasks are not in the graph")
+        if not polls:
             raise Unreadable("an executor dispatch but no `TaskStorage::poll` to dispatch to")
         for a in self.dispatch:
             c, rom, ind = self.e[a]
@@ -332,6 +339,15 @@ def analyse(text, stack, elf=None, out=print):
     taken = data_taken(elf, funcs) if elf else set()
     g = Graph(funcs, taken)
     root = find(funcs, ROOT)
+    reach, todo = set(), [root]
+    while todo:
+        a = todo.pop()
+        if a not in reach:
+            reach.add(a)
+            todo.extend(g.e[a][0])
+    if not any(STATION_TASK.match(funcs[a]["name"]) for a in reach):
+        raise Unreadable(f"the station task (`{STATION_TASK.pattern}`) is not reachable from `{ROOT}`: "
+                         f"the graph does not contain the chain this check exists for")
     worst = g.depth(root)[0]
     ch = g.chain(root)
     isr, isr_via = isr_bound(g, funcs, elf)
@@ -415,19 +431,38 @@ def self_test():
         raise AssertionError("a function without `entry` must be UNREADABLE")
     except Unreadable:
         pass
-    looped = text.replace("<clock::ota::read_net_cfg>:\n", "<clock::ota::read_net_cfg>:\n"
-                          "4200fff0:\tcall8\t420d0000 <<clock::net::mode::RadioManager>::diag_record>\n", 1)
-    looped = looped.replace("4200fff0:", "{:x}:".format(int(re.search(
-        r"^([0-9a-f]+) <clock::ota::read_net_cfg>:", text, re.M).group(1), 16) + 1), 1)
-    looped = looped.replace("420d0000", re.search(
-        r"^([0-9a-f]+) <<clock::net::mode::RadioManager>::diag_record>:", text, re.M).group(1), 1)
+    # The cycle is a call to diag_record placed AFTER read_net_cfg's `entry`, so the function
+    # still parses and only the recursion rule can refuse it (oracle R7-2).
+    diag = re.search(r"^([0-9a-f]+) <<clock::net::mode::RadioManager>::diag_record>:", text, re.M).group(1)
+    m = re.search(r"^([0-9a-f]+) <clock::ota::read_net_cfg>:\n([0-9a-f]+):\tentry\ta1, 0x1c50\n", text, re.M)
+    assert m, "the fixture's read_net_cfg prologue moved"
+    call = "{:x}:\tcall8\t{} <<clock::net::mode::RadioManager>::diag_record>\n".format(int(m.group(2), 16) + 3, diag)
+    looped = text[:m.end()] + call + text[m.end():]
     try:
         analyse(looped, FIXTURE_STACK, out=quiet)
         raise AssertionError("a recursion cycle not in RECURSION_OK must be UNREADABLE")
-    except Unreadable:
-        pass
-    print("check_stack_depth self-test: 5 ok (52e8a00b red on the diag_record→read_net_cfg chain, "
-          f"{worst:,} B vs {FIXTURE_STACK:,}; fits at {worst2:,} B with that frame at 64 B; 3 fail-closed)")
+    except Unreadable as e:
+        assert "recursion" in str(e), f"the cycle must be refused AS recursion, not for another reason: {e}"
+    # No executor dispatch (an esp-rtos rename of run_inner): the tasks fall out of the graph and
+    # the worst case collapses. It must be UNREADABLE, never "fits" (oracle R7-1).
+    renamed = text.replace("<esp_rtos::embassy::Executor>::run_inner::", "<esp_rtos::embassy::Executor>::run_core::")
+    assert renamed != text, "the rename perturbation must apply"
+    try:
+        analyse(renamed, FIXTURE_STACK, out=quiet)
+        raise AssertionError("an image with no matched executor dispatch must be UNREADABLE")
+    except Unreadable as e:
+        assert "dispatch" in str(e), e
+    # The dispatch is there but the station task is not (renamed, or no longer polled): its chain
+    # is missing, so the depth is not the station's. UNREADABLE.
+    gone = text.replace("<clock::run::{closure#0}>", "<clock::walk::{closure#0}>")
+    assert gone != text, "the task-rename perturbation must apply"
+    try:
+        analyse(gone, FIXTURE_STACK, out=quiet)
+        raise AssertionError("an image whose station task is unreachable must be UNREADABLE")
+    except Unreadable as e:
+        assert "not reachable" in str(e), e
+    print("check_stack_depth self-test: 7 ok (52e8a00b red on the diag_record→read_net_cfg chain, "
+          f"{worst:,} B vs {FIXTURE_STACK:,}; fits at {worst2:,} B with that frame at 64 B; 5 fail-closed)")
 
 
 def main(argv=None):
