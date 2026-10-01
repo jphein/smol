@@ -261,7 +261,8 @@ pub(crate) mod tapstone_station;
 mod shrine_voice;
 // The station's card-tap grammar (tapstone 0009/0032/0036), pure; the host lib shares it. Its
 // one user is the S3 station's reader.
-#[cfg(all(feature = "tapstone-station", feature = "esp32s3"))]
+#[cfg(feature = "tapstone-station")]
+#[cfg(feature = "esp32s3")]
 mod shrine_taps;
 // The S3 station draws on the raw colour panel; `cast`'s tee would wrap it and mirror only the
 // 1-bit image, so the two are not combined there. (A C3 station is headless and draws nothing.)
