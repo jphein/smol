@@ -478,6 +478,12 @@ hal-cpu-reset-unindexed  = "esp-hal API-fact marker (hal-* namespace) selected b
 # `hand builds` job (s3-tapstone-station), but no CI TIER is an S3 build, so no tier ELF can observe
 # it; observed on hardware (ids 61/62, tapstone runbook "Real shrines").
 "src/tapstone_station/screen.rs" = "esp32s3 tiers cannot build on CI (no espup); compiled by fw-gate `hand builds` (s3-tapstone-station) and observed on hardware — graduates with board_s3.rs"
+# tapstone 0033: the station's voice (SD read-only, the codec, the I2S ring) and its pure decoder,
+# esp32s3 + tapstone-station like screen.rs, for the same reason: compiled by `hand builds`, no S3
+# tier ELF, observed on hardware (ids 61/62 on 2026-09-30: "pack mounted, 280 clips", clips played).
+"src/shrine_voice.rs" = "esp32s3 tiers cannot build on CI (no espup); compiled by fw-gate `hand builds` (s3-tapstone-station) and observed on hardware — graduates with board_s3.rs"
+"src/tapstone_station/voice.rs" = "esp32s3 tiers cannot build on CI (no espup); compiled by fw-gate `hand builds` (s3-tapstone-station) and observed on hardware — graduates with board_s3.rs"
+"src/tapstone_station/spi3.rs" = "esp32s3 tiers cannot build on CI (no espup); compiled by fw-gate `hand builds` (s3-tapstone-station) and observed on hardware — graduates with board_s3.rs"
 
 "src/secrets.rs" = """\
 consts only (WIFI_NETWORK / MQTT_* / WLED_CAST_*) — 0 fn / 0 impl in both secrets.rs and \
