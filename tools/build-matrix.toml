@@ -484,6 +484,10 @@ hal-cpu-reset-unindexed  = "esp-hal API-fact marker (hal-* namespace) selected b
 "src/shrine_voice.rs" = "esp32s3 tiers cannot build on CI (no espup); compiled by fw-gate `hand builds` (s3-tapstone-station) and observed on hardware — graduates with board_s3.rs"
 "src/tapstone_station/voice.rs" = "esp32s3 tiers cannot build on CI (no espup); compiled by fw-gate `hand builds` (s3-tapstone-station) and observed on hardware — graduates with board_s3.rs"
 "src/tapstone_station/spi3.rs" = "esp32s3 tiers cannot build on CI (no espup); compiled by fw-gate `hand builds` (s3-tapstone-station) and observed on hardware — graduates with board_s3.rs"
+# Card taps (the RC522 on P3) and their pure grammar: the same S3-only shape. Compiled by `hand builds`;
+# observed on hardware only as far as "no reader on P3" (no RC522 wired yet).
+"src/shrine_taps.rs" = "esp32s3 tiers cannot build on CI (no espup); compiled by fw-gate `hand builds` (s3-tapstone-station); on hardware only its no-reader path has run — graduates with board_s3.rs"
+"src/tapstone_station/taps.rs" = "esp32s3 tiers cannot build on CI (no espup); compiled by fw-gate `hand builds` (s3-tapstone-station); on hardware only its no-reader path has run — graduates with board_s3.rs"
 
 "src/secrets.rs" = """\
 consts only (WIFI_NETWORK / MQTT_* / WLED_CAST_*) — 0 fn / 0 impl in both secrets.rs and \
