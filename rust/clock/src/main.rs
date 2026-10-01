@@ -1123,8 +1123,9 @@ async fn run(boot_spawner: BootSpawner) -> ! {
         gw.hello(radio.as_deref());
         gw
     };
+    // A `&'static mut`: the station is built in its own static (Station::new says why).
     #[cfg(feature = "tapstone-station")]
-    let mut station = tapstone_station::Station::new(
+    let station = tapstone_station::Station::new(
         tapstone_station::station_node(radio.as_deref().map_or(0, |r| r.ts_node_id())),
         // tapstone 0033: the band's voice. Every pin is `board_s3`'s: SPI3 on the SD slot
         // (SD_PINS), the codec on I2C0 16/15, I2S0 on BCLK 5 / WS 7 / DOUT 8, the amp on GPIO1.

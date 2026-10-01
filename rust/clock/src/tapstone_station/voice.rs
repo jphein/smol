@@ -47,7 +47,8 @@ const MAX_CLIPS: usize = 300;
 /// The longest manifest row the reader takes (set 1's longest is under 260 B).
 const ROW_MAX: usize = 384;
 /// The DMA ring: 3 descriptors x 1,536 B = 4,608 B, 52 ms of 22,050 Hz stereo 16-bit: more than
-/// two 20 ms superloop ticks. `.bss`, and every byte of it comes out of the S3's stack.
+/// two 20 ms superloop ticks. Borrowed from the screen's band buffer for each clip
+/// (`screen::lend_band`), because a `.bss` ring came out of the S3's stack.
 const RING_DESC: usize = 1_536;
 const RING_LEN: usize = 3 * RING_DESC;
 const RING_DESCS: usize = esp_hal::dma::descriptor_count(RING_LEN, RING_DESC, true);
@@ -106,8 +107,6 @@ struct Out {
     /// SAFETY: from a `StaticCell`, used only through [`Out::start`], and only while `xfer` is
     /// `None`: at most one transfer ever borrows it, as `write_dma_circular` requires.
     tx: *mut I2sTx<'static, Blocking>,
-    /// SAFETY: the same, for the ring. Written (zeroed) only while no transfer runs.
-    ring: *mut [u8; RING_LEN],
     xfer: Option<DmaTransferTxCircular<'static, I2sTx<'static, Blocking>>>,
 }
 
@@ -118,8 +117,10 @@ impl Out {
         if self.xfer.is_some() {
             return true;
         }
-        // SAFETY: no transfer exists (checked above), so nothing else reaches either.
-        let ring: &'static mut [u8; RING_LEN] = unsafe { &mut *self.ring };
+        let Some(ring) = super::screen::lend_band::<RING_LEN>() else {
+            println!("[voice] i2s: the band buffer is busy - clip skipped");
+            return false;
+        };
         ring.fill(0);
         let ring: &'static [u8; RING_LEN] = ring;
         let tx: &'static mut I2sTx<'static, Blocking> = unsafe { &mut *self.tx };
@@ -130,6 +131,7 @@ impl Out {
             }
             Err(e) => {
                 println!("[voice] i2s: transfer refused: {:?}", e);
+                super::screen::return_band();
                 false
             }
         }
@@ -138,7 +140,10 @@ impl Out {
     fn stop(&mut self) {
         self.amp.set_high();
         let _ = self.codec.shutdown();
-        self.xfer = None;
+        if self.xfer.take().is_some() {
+            // The transfer (and its borrow of the ring) is dropped: the DMA has stopped.
+            super::screen::return_band();
+        }
     }
 }
 
@@ -179,7 +184,12 @@ fn hex_name(name: u32, out: &mut [u8; 12]) -> &str {
 
 impl Voice {
     /// Bring up the codec and I²S, then mount the card. Every failure degrades and says why once.
-    pub fn new(hw: VoiceHw) -> Self {
+    ///
+    /// The voice lives in a static and the station holds a reference: built by value, its
+    /// ~3.5 KB would sit in the main task's frame, and that frame on the S3 has already
+    /// overflowed its guard once (screen.rs, `BAND`). Not inlined, for the same reason.
+    #[inline(never)]
+    pub fn new(hw: VoiceHw) -> &'static mut Voice {
         // The amp first: its pin's power-on state (undriven) is amp ON, so drive it off now.
         let amp = Output::new(hw.amp, Level::High, OutputConfig::default());
         let out = Self::bring_up_out(hw.i2c0, hw.sda, hw.scl, hw.i2s0, hw.dma, hw.bclk, hw.ws, hw.dout, amp);
@@ -187,10 +197,12 @@ impl Voice {
         let cell: &'static RefCell<Spi3> =
             SPI3_CELL.init(RefCell::new(Spi3::new(hw.spi3, hw.sd_sck, hw.sd_mosi, hw.sd_miso, hw.sd_cs)));
         let pack = Self::mount(cell);
-        Self { pack, out, clip: Clip::new(), playing: None, last: None, played: 0 }
+        static VOICE: StaticCell<Voice> = StaticCell::new();
+        VOICE.init(Voice { pack, out, clip: Clip::new(), playing: None, last: None, played: 0 })
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     fn bring_up_out(
         i2c0: I2C0<'static>,
         sda: GPIO16<'static>,
@@ -233,7 +245,6 @@ impl Voice {
         };
         static DESC: StaticCell<[DmaDescriptor; RING_DESCS]> = StaticCell::new();
         static TX: StaticCell<I2sTx<'static, Blocking>> = StaticCell::new();
-        static RING: StaticCell<[u8; RING_LEN]> = StaticCell::new();
         let tx = i2s
             .i2s_tx
             .with_bclk(bclk)
@@ -241,14 +252,14 @@ impl Voice {
             .with_dout(dout)
             .build(DESC.init([DmaDescriptor::EMPTY; RING_DESCS]));
         let tx: *mut I2sTx<'static, Blocking> = TX.init(tx);
-        let ring: *mut [u8; RING_LEN] = RING.init([0u8; RING_LEN]);
         println!(
             "[voice] codec: ES8311 up at 0x18, BCLK-derived, {} Hz; i2s ring {} B; amp off",
             RATE, RING_LEN
         );
-        Some(Out { codec, amp, tx, ring, xfer: None })
+        Some(Out { codec, amp, tx, xfer: None })
     }
 
+    #[inline(never)]
     fn mount(cell: &'static RefCell<Spi3>) -> Option<Pack> {
         if cell.borrow_mut().sd_wake().is_err() {
             println!("[voice] sd: spi3 refused - text only");
@@ -362,6 +373,14 @@ impl Voice {
     /// Is a clip playing (the station holds repaints while it is)?
     pub fn playing(&self) -> bool {
         self.playing.is_some()
+    }
+
+    /// Cut the clip short: a repaint has waited as long as it may, and needs the band buffer back.
+    pub fn cut(&mut self) {
+        if self.playing.is_some() {
+            println!("[voice] clip cut for a repaint");
+            self.end();
+        }
     }
 
     /// Top the ring up. Call every superloop tick.

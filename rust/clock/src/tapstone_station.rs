@@ -273,7 +273,7 @@ pub struct Station {
     screens: screen::Screens,
     /// 0033: the band, spoken from the SD pack (text only without a card, pack or codec).
     #[cfg(feature = "esp32s3")]
-    voice: voice::Voice,
+    voice: &'static mut voice::Voice,
     /// When the current clip began holding repaints back.
     #[cfg(feature = "esp32s3")]
     held_since: Option<u64>,
@@ -291,7 +291,18 @@ pub struct Station {
 impl Station {
     /// The station for this board's node id `node`. On the S3, `voice` is the hardware the band
     /// speaks through.
-    pub fn new(node: u8, #[cfg(feature = "esp32s3")] voice: voice::Voice) -> Self {
+    ///
+    /// The station lives in a static and `run` holds a reference. Built by value, the whole seat
+    /// (the follower's game, chain and logs) sat in the main task's poll frame on the S3, which
+    /// measured 37,952 B before the voice. That left the boot paint's callees ~13 KB of a 51 KB
+    /// stack region, and the voice's `.bss` (~12 KB) took the rest: a stack-guard panic at boot
+    /// on board 61, 2026-09-30. Not inlined, so its temporaries stay out of `run`'s frame too.
+    #[inline(never)]
+    pub fn new(
+        node: u8,
+        #[cfg(feature = "esp32s3")] voice: &'static mut voice::Voice,
+    ) -> &'static mut Self {
+        static STATION: static_cell::StaticCell<Station> = static_cell::StaticCell::new();
         let d = deck_def();
         let seed = u64::from(node) << 8 | index() as u64;
         let mut shrine = Shrine::new(seed, index(), node, d.castle, d.cards, Autoplay::new(seed));
@@ -322,7 +333,7 @@ impl Station {
         } else {
             tapstone_rules::Faction::Ember
         };
-        Self {
+        STATION.init(Self {
             shrine,
             #[cfg(feature = "esp32s3")]
             screens: screen::Screens::new(node, faction),
@@ -343,7 +354,7 @@ impl Station {
             heard_result: None,
             over_at: None,
             no_propose: matches!(option_env!("TAPSTONE_NO_PROPOSE"), Some("1")),
-        }
+        })
     }
 
     /// Drain the inbox into the seat, then tick it; send whatever it says.
@@ -425,6 +436,8 @@ impl Station {
             if now.saturating_sub(since) < VOICE_HOLD_MS {
                 return;
             }
+            // Waited long enough: the paint needs the band buffer the clip is playing from.
+            self.voice.cut();
         }
         self.held_since = None;
         let s = &self.shrine;
