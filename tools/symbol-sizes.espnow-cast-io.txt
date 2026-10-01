@@ -12,7 +12,6 @@
 # size	section	symbol
 960	.data	TxRxCxt
 2008	.bss	_RNvCs*_7esp_phy9PHY_STATE
-18768	.bss	_RNvNCNvNtNtCs*_5clock3net4mode5start05RADIO
 4096	.bss	_RNvNCNvNtNtCs*_5clock3net4wifi13run_ota_fetch010OTA_TCP_RX
 512	.bss	_RNvNCNvNtNtCs*_5clock3net4wifi13run_ota_fetch010OTA_TCP_TX
 4096	.bss	_RNvNtCs*_5clock3ota12OTA_READBACK
@@ -36,6 +35,7 @@
 98304	.bss	_RNvNvNtCs*_5clock3net9init_heap4HEAP
 4096	.bss	_RNvNvNtCs*_5clock3ota18verify_active_slot10VERIFY_BUF
 12736	.bss	_RNvNvNtCs*_5clock6___main14___embassy_main4POOL
+18768	.bss	_RNvNvNtNtCs*_5clock3net4mode11build_radio5RADIO
 592	.bss	gChmCxt
 284	.bss	gScanStruct
 816	.bss	gWpaSm
