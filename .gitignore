@@ -82,3 +82,7 @@ site/version.json
 # Scratch for tooling that needs a temp dir (JP directive 2026-08-25: katana's /tmp is a 16 GB
 # tmpfs, i.e. RAM — build/test scratch must be disk-backed). `tools/test_*.sh` default TMPDIR here.
 /tmp/
+
+# Agent/session scratch (findings, task state, rescued data): per-project scratch/ syncs between
+# hosts via Syncthing and is never committed; durable results get committed in their real home.
+/scratch/
