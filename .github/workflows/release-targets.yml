@@ -19,7 +19,9 @@ on:
   schedule:
     - cron: '47 7 * * *'   # nightly, offset from the 06:17 spike cron
 concurrency:
-  group: release-targets
+  # Scoped by ref (#571, xreview): concurrency is resolved BEFORE ref-guard runs, so with one shared
+  # group a rejected branch/tag dispatch could still cancel a legitimate main publication mid-upload.
+  group: release-targets-${{ github.ref }}
   cancel-in-progress: true
 env:
   XTENSA_VERSION: 1.95.0.0
@@ -27,8 +29,32 @@ env:
 permissions:
   contents: write            # gh release upload
 jobs:
+  # #571: every job below ends in `gh release upload nightly … --clobber`, i.e. it PUBLISHES to the
+  # public nightly. A workflow_dispatch from a feature branch therefore overwrote the public images
+  # with branch-built ones (one did, 2026-11-13 11:14Z; only the concurrency group cancelled it
+  # first). Two layers: this job refuses a non-main ref EARLY and LOUDLY, and every publishing job
+  # also carries its own `if:` on the ref, so the guard holds even if `needs:` is ever edited away.
+  # Test build changes with tools/release_targets.sh locally, never by dispatching this.
+  # LIMIT (xreview): workflow_dispatch runs the workflow file AT THE SELECTED REF, so a branch or tag
+  # cut before this guard still carries the unguarded version and can still publish if dispatched,
+  # and re-running a pre-guard run keeps its old definition. Never dispatch release-targets on any
+  # ref but main.
+  ref-guard:
+    name: publish only from main (#571)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Refuse to publish from a non-main ref
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::release-targets publishes to the PUBLIC nightly and runs only from refs/heads/main; refusing $GITHUB_REF (#571). Test build changes with tools/release_targets.sh locally."
+            exit 1
+          fi
+          echo "ref ok: $GITHUB_REF publishes the nightly"
   riscv-targets:
     name: riscv artifacts (c3 family)
+    needs: ref-guard
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -54,6 +80,8 @@ jobs:
           gh release upload nightly out/* --clobber
   riscv-gui-targets:
     name: riscv GUI artifacts (c6-watch, c5-cyd)
+    needs: ref-guard
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 45          # Slint compiles the scene set from source; slower than a fleet image
     steps:
@@ -89,6 +117,8 @@ jobs:
           gh release upload nightly out/* --clobber
   s3-target:
     name: "xtensa artifacts (s3-cyd: fleet + gui)"
+    needs: ref-guard
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -142,7 +172,8 @@ jobs:
     # the file covers all ten artifacts and a reader downloads one; bare -c exits 1 on a good file.)
     name: combined SHA256SUMS
     needs: [riscv-targets, riscv-gui-targets, s3-target]
-    if: ${{ always() && contains(needs.*.result, 'success') }}
+    # `always()` alone would run this (and its upload) off main too: the ref is part of the condition.
+    if: ${{ always() && github.ref == 'refs/heads/main' && contains(needs.*.result, 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
