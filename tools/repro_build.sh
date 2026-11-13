@@ -420,7 +420,11 @@ repro_build_bin() {
     rm -rf "$_t"/release/build/esp-bootloader-esp-idf-* \
            "$_t"/release/.fingerprint/esp-bootloader-esp-idf-* \
            "$_t/${REPRO_TARGET}"/release/build/esp-bootloader-esp-idf-* \
-           "$_t/${REPRO_TARGET}"/release/.fingerprint/esp-bootloader-esp-idf-*
+           "$_t/${REPRO_TARGET}"/release/.fingerprint/esp-bootloader-esp-idf-* \
+           "$_t"/release/build/esp-bootloader-esp-idf \
+           "$_t/${REPRO_TARGET}"/release/build/esp-bootloader-esp-idf
+    # ^ cargo >= 1.100's build-dir layout: build/<crate>/<hash>/{fingerprint,out,run}, so the whole
+    #   per-crate dir is the old build-script artifacts + fingerprint pair (2026-11-13, stable 1.100.0).
     # #119: the canonical fleet image is espnow + cast (#26 WLED-cast + the #74 crown
     # display-mirror) + io (#72 registry — inert until a G config binds pins, and the
     # dollhouse's dashboard-only pin-binding depends on it being resident). Changing this

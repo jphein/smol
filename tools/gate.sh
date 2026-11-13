@@ -792,12 +792,15 @@ if [ "$run_fw" = 1 ]; then
                 cargo check --release "${JOBS[@]}" --features "$REPRO_FLEET_FEATURES" \
                 "${REPRO_CARGO_ARGS[@]}" 2>&1 ); then
       _bs="${CARGO_TARGET_DIR:-$BUILD_ROOT/$CLOCK/target}/${REPRO_TARGET}/release/build"
-      if grep -qhs 'BUILD_HASH=nogit' "$_bs"/clock-*/output; then
+      # cargo >= 1.100 moved build-script output from build/clock-<h>/output to
+      # build/clock/<h>/run/stdout; read BOTH layouts, or the instrument goes blind on a toolchain
+      # bump and reports a working guard as broken (2026-11-13, stable 1.100.0).
+      if grep -qhs 'BUILD_HASH=nogit' "$_bs"/clock-*/output "$_bs"/clock/*/run/stdout; then
         printf '        stamps BUILD_HASH=nogit when the commit is unresolvable\n'
       else
         echo "        an unidentifiable build did NOT stamp 'nogit' — the fallback is back to"
         echo "        something that reads like a value:"
-        grep -hs 'BUILD_HASH=' "$_bs"/clock-*/output | sort -u | sed 's/^/          /'
+        grep -hs 'BUILD_HASH=' "$_bs"/clock-*/output "$_bs"/clock/*/run/stdout | sort -u | sed 's/^/          /'
         _id_ok=0
       fi
     else

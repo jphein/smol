@@ -578,8 +578,8 @@ fn matmul(out: &mut [f32], x: &QAct, w: &QTensor, w_off: usize, n_in: usize, gs:
                 n_in,
             );
             let mut ival: i32 = 0;
-            for k in j..seg_end {
-                ival += i8at(w.q, row + k) * x.q[k] as i32;
+            for (k, &xq) in (j..seg_end).zip(&x.q[j..seg_end]) {
+                ival += i8at(w.q, row + k) * xq as i32;
             }
             acc += ival as f32 * f32at(w.s, wg) * x.s[ag];
             j = seg_end;
