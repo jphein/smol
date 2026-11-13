@@ -1870,10 +1870,8 @@ impl ResetReq {
     }
     /// Queue a leaf id for a one-shot reboot relay (deduped; dropped if full — re-pressable).
     pub fn push_leaf(&mut self, id: u8) {
-        for i in 0..self.n {
-            if self.targets[i] == id {
-                return;
-            }
+        if self.targets[..self.n].contains(&id) {
+            return;
         }
         if self.n < RESET_REQ_MAX {
             self.targets[self.n] = id;
@@ -1916,10 +1914,8 @@ impl ScanReq {
     }
     /// Queue a leaf id for a one-shot scan relay (deduped; dropped if full — re-triggerable).
     pub fn push_leaf(&mut self, id: u8) {
-        for i in 0..self.n {
-            if self.targets[i] == id {
-                return;
-            }
+        if self.targets[..self.n].contains(&id) {
+            return;
         }
         if self.n < RESET_REQ_MAX {
             self.targets[self.n] = id;

@@ -1408,24 +1408,23 @@ impl Roster {
     /// Find the slot for `mac`: existing match, else a free slot, else evict the
     /// oldest-heard (bounded — a new MAC past capacity drops the stalest).
     fn slot(&mut self, mac: [u8; 6]) -> usize {
-        for i in 0..ROSTER_CAP {
-            if self.nodes[i].used && self.nodes[i].mac == mac {
-                return i;
-            }
+        if let Some(i) = self.nodes[..ROSTER_CAP]
+            .iter()
+            .position(|n| n.used && n.mac == mac)
+        {
+            return i;
         }
-        for i in 0..ROSTER_CAP {
-            if !self.nodes[i].used {
-                self.nodes[i] = Node::EMPTY;
-                self.nodes[i].used = true;
-                self.nodes[i].mac = mac;
-                return i;
-            }
+        if let Some(i) = self.nodes[..ROSTER_CAP].iter().position(|n| !n.used) {
+            self.nodes[i] = Node::EMPTY;
+            self.nodes[i].used = true;
+            self.nodes[i].mac = mac;
+            return i;
         }
         let mut victim = 0;
         let mut oldest = u64::MAX;
-        for i in 0..ROSTER_CAP {
-            if self.nodes[i].last_heard_ms < oldest {
-                oldest = self.nodes[i].last_heard_ms;
+        for (i, n) in self.nodes[..ROSTER_CAP].iter().enumerate() {
+            if n.last_heard_ms < oldest {
+                oldest = n.last_heard_ms;
                 victim = i;
             }
         }

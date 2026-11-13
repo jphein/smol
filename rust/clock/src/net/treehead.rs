@@ -244,14 +244,9 @@ impl<const N: usize> HeadSet<N> {
         node_id: u8,
         sha256: F,
     ) -> Option<Proof> {
-        let mut index = None;
-        for i in 0..self.count {
-            if self.heads[i].node_id == node_id {
-                index = Some(i);
-                break;
-            }
-        }
-        let index = index?;
+        let index = self.heads[..self.count]
+            .iter()
+            .position(|h| h.node_id == node_id)?;
         let mut leaves = [EMPTY_ROOT; N];
         for (leaf, h) in leaves[..self.count]
             .iter_mut()

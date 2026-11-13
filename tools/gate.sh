@@ -788,16 +788,23 @@ if [ "$run_fw" = 1 ]; then
     fi
     # (b) the same tree, NOT claiming a release, must build and stamp the absence by name. This is
     # the direction that matters for forensics: `dev` was identical for every such build ever made.
+    # Freshness (xreview on #570): the grep below must read THIS invocation's build-script output,
+    # never a cached one from an earlier build, so clear clock's build-script dirs in both cargo
+    # layouts first. A stale `nogit` could otherwise PASS a build that stamps something else.
+    _bs="${CARGO_TARGET_DIR:-$BUILD_ROOT/$CLOCK/target}/${REPRO_TARGET}/release/build"
+    rm -rf "$_bs"/clock-* "$_bs"/clock
     if out=$( cd "$BUILD_ROOT/$CLOCK" && GIT_DIR=/nonexistent \
                 cargo check --release "${JOBS[@]}" --features "$REPRO_FLEET_FEATURES" \
                 "${REPRO_CARGO_ARGS[@]}" 2>&1 ); then
-      _bs="${CARGO_TARGET_DIR:-$BUILD_ROOT/$CLOCK/target}/${REPRO_TARGET}/release/build"
-      if grep -qhs 'BUILD_HASH=nogit' "$_bs"/clock-*/output; then
+      # cargo >= 1.100 moved build-script output from build/clock-<h>/output to
+      # build/clock/<h>/run/stdout; read BOTH layouts, or the instrument goes blind on a toolchain
+      # bump and reports a working guard as broken (2026-11-13, stable 1.100.0).
+      if grep -qhs 'BUILD_HASH=nogit' "$_bs"/clock-*/output "$_bs"/clock/*/run/stdout; then
         printf '        stamps BUILD_HASH=nogit when the commit is unresolvable\n'
       else
         echo "        an unidentifiable build did NOT stamp 'nogit' — the fallback is back to"
         echo "        something that reads like a value:"
-        grep -hs 'BUILD_HASH=' "$_bs"/clock-*/output | sort -u | sed 's/^/          /'
+        grep -hs 'BUILD_HASH=' "$_bs"/clock-*/output "$_bs"/clock/*/run/stdout | sort -u | sed 's/^/          /'
         _id_ok=0
       fi
     else
