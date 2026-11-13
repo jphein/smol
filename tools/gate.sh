@@ -194,6 +194,24 @@ else
   printf '%s\n' "$out" | sed 's/^/        /'; bad "tapstone vendor"
 fi
 
+# #529: the SMOLv1 wire codec lives at TWO paths that must hold the same bytes: the canonical
+# rust/clock copy (the one the host verifiers #[path]-include) and the watch subtree's vendored
+# mesh-flood copy. They drifted silently once already (#528's MacVerdict split reached only the
+# canonical copy; nothing compared them). Unconditional and free: a byte compare. On a difference it
+# names both paths and prints the first differing lines; the fix is to carry the canonical bytes to
+# the watch repo and refresh the subtree, never to edit one copy alone.
+step "vendored wire.rs is byte-identical to the canonical copy (#529)"
+WIRE_CANON="$ROOT/rust/clock/src/net/wire.rs"
+WIRE_VENDOR="$ROOT/targets/c6-watch/crates/mesh-flood/src/wire.rs"
+if [ ! -f "$WIRE_CANON" ] || [ ! -f "$WIRE_VENDOR" ]; then
+  bad "wire.rs identity: a path is missing ($WIRE_CANON / $WIRE_VENDOR)"
+elif cmp -s "$WIRE_CANON" "$WIRE_VENDOR"; then
+  ok "wire.rs identity ($(sha256sum "$WIRE_CANON" | cut -c1-12))"
+else
+  diff "$WIRE_CANON" "$WIRE_VENDOR" | head -12 | sed 's/^/        /'
+  bad "wire.rs identity: ${WIRE_VENDOR#"$ROOT"/} differs from ${WIRE_CANON#"$ROOT"/}"
+fi
+
 # #555 made smol AGPL-3.0-or-later in LICENSE and the README but in no manifest, so every package
 # kept claiming "MIT OR Apache-2.0" or nothing. Unconditional and cheap (cargo metadata --no-deps,
 # ~1 s): the licence a package declares is what tooling and SBOMs read, so it is checked like a fact.
