@@ -19,7 +19,9 @@ on:
   schedule:
     - cron: '47 7 * * *'   # nightly, offset from the 06:17 spike cron
 concurrency:
-  group: release-targets
+  # Scoped by ref (#571, xreview): concurrency is resolved BEFORE ref-guard runs, so with one shared
+  # group a rejected branch/tag dispatch could still cancel a legitimate main publication mid-upload.
+  group: release-targets-${{ github.ref }}
   cancel-in-progress: true
 env:
   XTENSA_VERSION: 1.95.0.0
@@ -33,6 +35,10 @@ jobs:
   # first). Two layers: this job refuses a non-main ref EARLY and LOUDLY, and every publishing job
   # also carries its own `if:` on the ref, so the guard holds even if `needs:` is ever edited away.
   # Test build changes with tools/release_targets.sh locally, never by dispatching this.
+  # LIMIT (xreview): workflow_dispatch runs the workflow file AT THE SELECTED REF, so a branch or tag
+  # cut before this guard still carries the unguarded version and can still publish if dispatched,
+  # and re-running a pre-guard run keeps its old definition. Never dispatch release-targets on any
+  # ref but main.
   ref-guard:
     name: publish only from main (#571)
     runs-on: ubuntu-latest
