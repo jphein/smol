@@ -214,6 +214,12 @@ cmd_packages() {
   if [ -z "$pkgs" ]; then
     echo "  no packages found under $LOCAL_DIR — not checked" >&2; return 2
   fi
+  # Names are one per line from here on; a newline inside a path or basename would split into two
+  # decoys and could read as in sync. Packages are committed files, so this is a refusal, not a case.
+  if [ "$(printf '%s' "$pkgs" | grep -c '')" -ne "$(find "$LOCAL_DIR" -maxdepth 1 -name '*.yaml' | wc -l)" ] \
+     || [ "$(printf '%s' "$REMOTE_DIR" | wc -l)" -ne 0 ]; then
+    echo "  a package name or $REMOTE_DIR contains a newline — not checked" >&2; return 2
+  fi
   tmp="$(mktemp -d -p "${TMPDIR:-$HOME/.cache}" ha-pkg.XXXXXX)" && [ -d "$tmp" ] || {
     echo "  could not create a scratch dir under ${TMPDIR:-$HOME/.cache} — not checked" >&2; return 2; }
   trap 'rm -rf "$tmp"' RETURN
@@ -227,7 +233,7 @@ cmd_packages() {
     echo "  could not list $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
   fi
   while IFS= read -r f; do
-    if ! printf '%s\n' "$listing" | grep -qxF -- "$f"; then
+    if ! grep -qxF -- "$f" <<< "$listing"; then   # here-string, not a pipe: no SIGPIPE under pipefail
       printf '  %-24s MISSING on live\n' "$f"; drift=1; continue
     fi
     if ! rsh "cat $(q "$REMOTE_DIR/$f")" > "$tmp/$f" 2>/dev/null; then

@@ -48,6 +48,13 @@ reset;                                     expect "a nonexistent repo package di
 sp="$(mktemp -d -p "$base" "ha pkg sp.XXXXXX")"; cp ha/packages/*.yaml "$sp/"
                                            expect "a live dir path with a space is in sync" 0 "$(run "$sp")"
 rm -rf "$sp"
+ap="$(mktemp -d -p "$base" "ha-pkg-it's.XXXXXX")"; cp ha/packages/*.yaml "$ap/"
+                                           expect "a live dir path with an apostrophe is in sync" 0 "$(run "$ap")"
+rm -rf "$ap"
+nl="$(mktemp -d -p "$base" ha-pkg-nl.XXXXXX)"; cp ha/packages/*.yaml "$nl/"; cp "$nl/smol_bard.yaml" "$nl/a.yaml
+smol_bard.yaml"
+reset;                                     expect "a package name with a newline is refused (2)" 2 "$(HA_LOCAL_DIR=$nl run "$live")"
+rm -rf "$nl"
 reset;                                     expect "a failed scratch mktemp is 2"         2 "$(TMPDIR=$live/no-such-tmp run "$live")"
 if [ "$(id -u)" != 0 ]; then
   reset; chmod 000 "$live/smol_mesh.yaml";  expect "an unreadable live file is 2, not drift"  2 "$(run "$live")"
