@@ -216,8 +216,8 @@ cmd_packages() {
   fi
   # Names are one per line from here on; a newline inside a path or basename would split into two
   # decoys and could read as in sync. Packages are committed files, so this is a refusal, not a case.
-  if [ "$(printf '%s' "$pkgs" | grep -c '')" -ne "$(find "$LOCAL_DIR" -maxdepth 1 -name '*.yaml' | wc -l)" ] \
-     || [ "$(printf '%s' "$REMOTE_DIR" | wc -l)" -ne 0 ]; then
+  if [ "$(printf '%s\n' "$pkgs" | wc -l)" -ne "$(find "$LOCAL_DIR" -maxdepth 1 -name '*.yaml' -printf '.' | wc -c)" ] \
+     || [ "$(printf '%s' "$REMOTE_DIR" | wc -l)" -ne 0 ]; then   # lines vs entries: a newline in a name makes them differ
     echo "  a package name or $REMOTE_DIR contains a newline — not checked" >&2; return 2
   fi
   tmp="$(mktemp -d -p "${TMPDIR:-$HOME/.cache}" ha-pkg.XXXXXX)" && [ -d "$tmp" ] || {
