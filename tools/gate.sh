@@ -992,6 +992,16 @@ if [ "$run_host" = 1 ]; then
   # It resolves real dependency graphs rather than matching text, but a warm `cargo metadata --locked`
   # is ~0.13 s and the whole suite measured 0.9 s here — so it is NOT the slow arm its position might
   # suggest. Placed last in the pure-text run only because it is the newest.
+  # #575: `ha_deploy.sh packages` is the exit-coded package-drift check (status always exits 0, which is how
+  # two packages sat committed-but-undeployed for weeks). This proves each arm can fail; it runs against a
+  # scratch copy via HA_SSH=local, so it needs no HA VM and sends nothing. Pure text, ~0.1 s.
+  step "HA package drift check regression suite (#575)"
+  if out=$("$ROOT/tools/test_ha_pkg_drift.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "test_ha_pkg_drift"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_ha_pkg_drift"
+  fi
+
   step "Cargo.lock freshness gate regression suite (#460)"
   if out=$("$ROOT/tools/test_lock_fresh.sh" 2>&1); then
     printf '%s\n' "$out" | tail -2; ok "test_lock_fresh"
