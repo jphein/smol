@@ -98,6 +98,9 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 CLOCK="rust/clock"
+# #526: every cargo invocation this gate runs in $CLOCK passes --locked, directly (below) or through
+# repro_cargo_args (tools/repro_build.sh REPRO_LOCKED_TREES). A stale lock is refused, never rewritten.
+LOCKED=(--locked)
 
 # ── Temp artifacts live in the REPO, not in /tmp (JP directive 2026-08-25) ─────────────────────
 # katana's `/tmp` is a 16 GB **tmpfs** — RAM+swap, not disk. This gate alone writes a log per tier
@@ -522,7 +525,7 @@ if [ "$run_fw" = 1 ]; then
       printf '   \033[33mSKIP\033[0m %-16s (feature not in Cargo.toml on this branch)\n' "$name"; continue
     fi
     args=(--release "${JOBS[@]}"); [ -n "$feats" ] && args+=(--features "$feats")
-    if (cd "$BUILD_ROOT/$CLOCK" && cargo check "${args[@]}") >"$GATE_TMP/gate-$name.log" 2>&1; then
+    if (cd "$BUILD_ROOT/$CLOCK" && cargo check "${args[@]}" "${LOCKED[@]}") >"$GATE_TMP/gate-$name.log" 2>&1; then
       ok "check $name"
     else
       bad "check $name"; tail -15 "$GATE_TMP/gate-$name.log" | sed 's/^/        /'
@@ -546,7 +549,7 @@ if [ "$run_fw" = 1 ]; then
       printf '   \033[33mSKIP\033[0m %-16s (feature not in Cargo.toml on this branch)\n' "$name"; continue
     fi
     args=(--release "${JOBS[@]}"); [ -n "$feats" ] && args+=(--features "$feats")
-    if (cd "$BUILD_ROOT/$CLOCK" && cargo clippy "${args[@]}" -- -D warnings) >"$GATE_TMP/gate-clippy-$name.log" 2>&1; then
+    if (cd "$BUILD_ROOT/$CLOCK" && cargo clippy "${args[@]}" "${LOCKED[@]}" -- -D warnings) >"$GATE_TMP/gate-clippy-$name.log" 2>&1; then
       ok "clippy $name"
     else
       bad "clippy $name"
@@ -604,7 +607,7 @@ if [ "$run_excl" = 1 ]; then
     fi
     args=(--release --bin clock "${JOBS[@]}"); [ -n "$feats" ] && args+=(--features "$feats")
     if (cd "$BUILD_ROOT/$CLOCK" && CARGO_TARGET_DIR="$EXCL/target" \
-          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build "${args[@]}") \
+          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build "${args[@]}" "${LOCKED[@]}") \
           >"$GATE_TMP/gate-excl-$name.log" 2>&1; then
       cp "$EXCL/target/$REPRO_TARGET/release/clock" "$EXCL/elf/$name"
       EXCL_ARGS+=(--elf "$name=$feats=$EXCL/elf/$name")
@@ -871,7 +874,7 @@ if [ "$run_host" = 1 ]; then
     [ -f "$t" ] || continue
     n=$(basename "$t" .rs)
     if (cd "$ROOT/$CLOCK" && cargo test --no-default-features --features hostsim \
-          --target "$HOST_TRIPLE" --test "$n" "${JOBS[@]}") >"$GATE_TMP/gate-test-$n.log" 2>&1; then
+          --target "$HOST_TRIPLE" --test "$n" "${JOBS[@]}" "${LOCKED[@]}") >"$GATE_TMP/gate-test-$n.log" 2>&1; then
       # Print the count rather than a bare PASS: "8 passed" is checkable, "ok" is not, and a
       # suite that silently starts running ZERO tests still says ok.
       ok "test $n — $(grep -Eo '[0-9]+ passed' "$GATE_TMP/gate-test-$n.log" | tail -1)"
@@ -1000,6 +1003,17 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | tail -1; ok "test_ha_pkg_drift"
   else
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_ha_pkg_drift"
+  fi
+
+  # #526: DETECTION (above, #460) is not ENFORCEMENT. This proves the rust/clock build paths pass --locked
+  # (per tree, via repro_cargo_args, and every direct cargo call here in $CLOCK), that a stale lock is
+  # REFUSED rather than rewritten, and — as the control — that without --locked cargo silently rewrites
+  # it. Resolution-time refusal: ~2 s, no compilation.
+  step "cargo --locked enforcement regression suite (#526)"
+  if out=$("$ROOT/tools/test_cargo_locked.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "test_cargo_locked"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_cargo_locked"
   fi
 
   step "Cargo.lock freshness gate regression suite (#460)"

@@ -130,6 +130,24 @@ repro_cargo_args() {
   REPRO_CARGO_ARGS=(
     --config "target.${REPRO_TARGET}.rustflags=[\"--remap-path-prefix=${reg}=/registry\",\"--remap-path-prefix=${sysroot}=/rust\"]"
   )
+  if repro_tree_locked "${1:-.}"; then REPRO_CARGO_ARGS+=(--locked); fi
+}
+
+# #526 — `--locked`, PER TREE. tools/check_lock_fresh.sh (#460) DETECTS a stale lock in the gate; this
+# ENFORCES it on every build that goes through repro_cargo_args (repro_build_bin → ota_publish,
+# release_targets, repro_at_canonical; and gate.sh's paint/tapstone/identity arms): a lock that needs
+# updating is refused, never silently rewritten, so two hosts cannot build different dependency
+# graphs from one commit (#44/#326). Adopted tree by tree, never globally (#526's trap): a tree joins
+# this list only after check_lock_fresh.sh has been run against it and any regeneration landed as its
+# own reviewed change. The trees NOT adopted, with the reason for each, are listed in #526.
+REPRO_LOCKED_TREES=(rust/clock)
+
+repro_tree_locked() { # $1 crate dir -> 0 when it is (a mirror of) an adopted tree
+  local d t; d="$(cd "${1:-.}" 2>/dev/null && pwd)" || return 1
+  for t in "${REPRO_LOCKED_TREES[@]}"; do
+    case "$d" in */"$t") return 0 ;; esac
+  done
+  return 1
 }
 
 # #300 STACK FLOOR — the gate that was missing. `.stack` is placed in the DRAM left after `.bss`,
