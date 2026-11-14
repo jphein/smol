@@ -112,14 +112,18 @@ fi
 # the newest name, which differs when a run committed its manifest but not the copy). A legacy plain
 # SHA256SUMS that matches no per-run manifest (written before #574, covering every .bin) protects
 # nothing in particular; this run replaces it.
+plain_present=0; awk -F'\t' '$1=="SHA256SUMS"' <<<"$listing" | grep -q . && plain_present=1
 plain="$(awk -F'\t' '$1=="SHA256SUMS" {print $2}' <<<"$listing")"
-committed=""
+committed=""; retention=1
 if [ -n "$plain" ]; then
   committed="$(awk -F'\t' -v d="$plain" '$1 ~ /^SHA256SUMS-/ && $2==d {sub(/^SHA256SUMS-/, "", $1); print $1}' <<<"$listing" | head -1)"
+elif [ "$plain_present" = 1 ]; then
+  # xreview r4: present but its digest unreadable -> the protected set is unknown -> no deletion at all
+  echo "publish_nightly: SHA256SUMS has no readable digest; skipping retention this run" >&2; retention=0
 fi
 cutoff="$(date -u -d "$TODAY - $KEEP days" +%F)"
 pruned=0
-while read -r set_stamp; do
+while [ "$retention" = 1 ] && read -r set_stamp; do
   [ -n "$set_stamp" ] || continue
   set_date="${set_stamp%%-g*}"
   date -u -d "$set_date" +%F >/dev/null 2>&1 || continue       # not a real date: not ours to judge
@@ -145,7 +149,9 @@ relist
 need=$(( $(ls "$DIST" | wc -l) ))                                # images + notes + this run's manifest
 have=$(grep -c . <<<"$listing" || true)
 already=$(for f in "$DIST"/*; do awk -F'\t' -v n="$(basename "$f")" '$1==n' <<<"$listing"; done | grep -c . || true)
-[ $((have - already + need + 1)) -le "$CAP" ] || abort "the release holds $have assets; this set needs $((need - already + 1)) more and the cap is $CAP"
+plain_new=0; awk -F'\t' '$1=="SHA256SUMS"' <<<"$listing" | grep -q . || plain_new=1   # xreview r4: not twice
+[ $((have - already + need + plain_new)) -le "$CAP" ] \
+  || abort "the release holds $have assets; this set needs $((need - already + plain_new)) more and the cap is $CAP"
 
 # ── 3. upload this run's images and notes — unless this exact set is already committed ─────────────
 # A committed set is immutable (xreview r2): if its manifest exists, nothing of it is re-uploaded. Same

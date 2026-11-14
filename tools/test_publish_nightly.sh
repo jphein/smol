@@ -143,6 +143,19 @@ cp "$FAKE_REL/SHA256SUMS-2026-10-02-g2222222bbbb" "$FAKE_REL/SHA256SUMS"   # pla
 [ -e "$FAKE_REL/smol-c3-2026-10-02-g2222222bbbb.bin" ] && ok "the set SHA256SUMS named at prune time is never pruned" \
   || bad "the previously committed set was pruned"
 
+# 10. a plain SHA256SUMS with no readable digest: the protected set is unknown, so nothing is pruned
+stage "$W/s"; fresh_release
+FAKE_NODIGEST="SHA256SUMS" "$PUB" "$W/s" >"$W/out" 2>&1
+! grep -q -- "-X DELETE" "$FAKE_REL.log" && grep -q "skipping retention" "$W/out" \
+  && ok "SHA256SUMS without a readable digest: retention skipped, nothing deleted" || bad "digestless plain: deletions happened"
+
+# 11. capacity boundary: a set that fits exactly is accepted; one asset fewer room is refused
+#     (after pruning: the 11-10 set (3) + SHA256SUMS (1) = 4; this set needs 4+4+1 = 9 -> exactly 13)
+stage "$W/s"; fresh_release
+NIGHTLY_CAP=13 "$PUB" "$W/s" >"$W/out" 2>&1 && ok "capacity: a set that fits exactly (cap 13) is accepted" || bad "exact fit refused: $(tail -1 "$W/out")"
+stage "$W/s"; fresh_release
+NIGHTLY_CAP=12 "$PUB" "$W/s" >"$W/out" 2>&1; [ $? = 1 ] && ok "capacity: one slot short (cap 12) is refused" || bad "cap 12 accepted"
+
 # 8. a committed set is immutable: a rerun with the same bytes verifies and uploads no image; a rerun
 #    with other bytes under the same date+hash is refused before any upload
 stage "$W/s"; fresh_release; "$PUB" "$W/s" >/dev/null 2>&1; : > "$FAKE_REL.log"
