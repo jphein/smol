@@ -236,14 +236,14 @@ cmd_packages() {
   # The listing is captured with a sentinel byte after it, so $(…) cannot strip a trailing newline
   # that belongs to a file name; every entry then ends in exactly one newline.
   local raw
-  if ! raw="$(rsh "cd $(q "$REMOTE_DIR") && ls -1A && printf x" 2>/dev/null)" || [ "${raw%x}" = "$raw" ]; then
+  if ! raw="$(rsh "cd $(q "$REMOTE_DIR") && QUOTING_STYLE=literal ls -1A && printf x" 2>/dev/null)" || [ "${raw%x}" = "$raw" ]; then
     echo "  could not list $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
   fi
   raw="${raw%x}"
   # Refusal for the live side: the newline count must equal the entry count (NUL-separated,
   # busybox-safe); a live name containing a newline, leading or trailing, breaks that equality.
   local lents
-  if ! lents="$(rsh "set -o pipefail 2>/dev/null; cd $(q "$REMOTE_DIR") && find . -mindepth 1 -maxdepth 1 -print0 | tr -dc '\\0' | wc -c" 2>/dev/null)"; then
+  if ! lents="$(rsh "(set -o pipefail) 2>/dev/null && set -o pipefail; cd $(q "$REMOTE_DIR") && find . -mindepth 1 -maxdepth 1 -print0 | tr -dc '\\0' | wc -c" 2>/dev/null)"; then
     echo "  could not count $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
   fi
   if [ "$(printf '%s' "$raw" | tr -dc '\n' | wc -c)" -ne "$((lents))" ]; then
