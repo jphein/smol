@@ -27,9 +27,9 @@ env:
   XTENSA_VERSION: 1.95.0.0
   ESPUP_VERSION: 0.17.1
 permissions:
-  contents: write            # gh release upload
+  contents: read             # #574: only the publish job writes (its own permissions block)
 jobs:
-  # #571: every job below ends in `gh release upload nightly … --clobber`, i.e. it PUBLISHES to the
+  # #571: the publish job (#574: the ONLY job that writes to the release) PUBLISHES to the
   # public nightly. A workflow_dispatch from a feature branch therefore overwrote the public images
   # with branch-built ones (one did, 2026-11-13 11:14Z; only the concurrency group cancelled it
   # first). Two layers: this job refuses a non-main ref EARLY and LOUDLY, and every publishing job
@@ -68,16 +68,9 @@ jobs:
           cd /tmp && unzip -o ef.zip && install -m755 espflash "$HOME/.cargo/bin/espflash"
       - name: Build the riscv artifacts
         run: bash tools/release_targets.sh out c3
+      # #574: STAGE only. Publishing is the publish job's, after every build job has succeeded.
       - uses: actions/upload-artifact@v4
-        with: { name: riscv-artifacts, path: out/ }
-      - name: Attach to the rolling nightly prerelease
-        env: { GH_TOKEN: '${{ github.token }}' }
-        run: |
-          set -euo pipefail
-          gh release view nightly >/dev/null 2>&1 || gh release create nightly --prerelease \
-            --title "nightly per-target images" \
-            --notes "Rolling nightly builds - see each artifact's NOTES.md. New-hardware flashing only; fleet boards update over mesh OTA."
-          gh release upload nightly out/* --clobber
+        with: { name: riscv-artifacts, path: out/, if-no-files-found: error, retention-days: 3 }
   riscv-gui-targets:
     name: riscv GUI artifacts (c6-watch, c5-cyd)
     needs: ref-guard
@@ -105,16 +98,9 @@ jobs:
         run: CI_PROVISION_GUI_SELFTEST=1 bash tools/ci_provision_gui.sh targets/c6-watch riscv32imac-unknown-none-elf
       - name: Build the riscv GUI artifacts
         run: bash tools/release_targets.sh out c6-watch c5-cyd
+      # #574: STAGE only. Publishing is the publish job's, after every build job has succeeded.
       - uses: actions/upload-artifact@v4
-        with: { name: riscv-gui-artifacts, path: out/ }
-      - name: Attach to the rolling nightly prerelease
-        env: { GH_TOKEN: '${{ github.token }}' }
-        run: |
-          set -euo pipefail
-          gh release view nightly >/dev/null 2>&1 || gh release create nightly --prerelease \
-            --title "nightly per-target images" \
-            --notes "Rolling nightly builds - see each artifact's NOTES.md. New-hardware flashing only; fleet boards update over mesh OTA."
-          gh release upload nightly out/* --clobber
+        with: { name: riscv-gui-artifacts, path: out/, if-no-files-found: error, retention-days: 3 }
   s3-target:
     name: "xtensa artifacts (s3-cyd: fleet + gui)"
     needs: ref-guard
@@ -152,37 +138,32 @@ jobs:
           set -euo pipefail
           . "$HOME/export-esp.sh"
           bash tools/release_targets.sh out s3-cyd
+      # #574: STAGE only. Publishing is the publish job's, after every build job has succeeded.
       - uses: actions/upload-artifact@v4
-        with: { name: s3-artifact, path: out/ }
-      - name: Attach to the rolling nightly prerelease
-        env: { GH_TOKEN: '${{ github.token }}' }
-        run: |
-          set -euo pipefail
-          gh release view nightly >/dev/null 2>&1 || gh release create nightly --prerelease \
-            --title "nightly per-target images" \
-            --notes "Rolling nightly builds - see each artifact's NOTES.md. New-hardware flashing only; fleet boards update over mesh OTA."
-          gh release upload nightly out/* --clobber
-  checksums:
-    # The combined SHA256SUMS docs/RELEASES.md promises. It CANNOT be written per-job: three jobs
-    # each `gh release upload --clobber out/*`, so a per-job file would cover only whichever job
-    # uploaded last (#474 found the file missing for exactly this reason). This job runs after all
-    # three and checksums what is actually downloadable — the release's current .bin assets —
-    # so `sha256sum -c --ignore-missing SHA256SUMS` works from a download directory regardless of
-    # which job built what. (--ignore-missing is part of the documented command, docs/RELEASES.md:
-    # the file covers all ten artifacts and a reader downloads one; bare -c exits 1 on a good file.)
-    name: combined SHA256SUMS
-    needs: [riscv-targets, riscv-gui-targets, s3-target]
-    # `always()` alone would run this (and its upload) off main too: the ref is part of the condition.
-    if: ${{ always() && github.ref == 'refs/heads/main' && contains(needs.*.result, 'success') }}
+        with: { name: s3-artifact, path: out/, if-no-files-found: error, retention-days: 3 }
+  publish:
+    # #574: ONE publisher. The three build jobs used to each `gh release upload nightly out/* --clobber`
+    # and a checksums job hashed whatever the release held, so a cancelled or failed job left a public
+    # MIXTURE of old and new assets (2026-11-13, run 43415382132: c3 + xtensa published, c6-watch
+    # failed) under a SHA256SUMS that covered all of it. Now the build jobs only stage, and this job:
+    #   * runs only when EVERY build job succeeded (the implicit success() below: all or nothing);
+    #   * refuses an incomplete staged set before touching the release (tools/publish_nightly.sh);
+    #   * uploads, VERIFIES every file is on the release, and only then uploads SHA256SUMS (this run's
+    #     images only), so SHA256SUMS is the commit point and never describes a mixture;
+    #   * prunes dated assets past 14 days (the release had grown to 817, against GitHub's 1000 cap).
+    # tools/test_publish_nightly.sh proves each of those arms against a fake gh (gate.sh host).
+    # Same main-only rule as every publisher (#571): needs ref-guard AND its own `if:` on the ref.
+    name: publish the nightly (all or nothing, #574)
+    needs: [ref-guard, riscv-targets, riscv-gui-targets, s3-target]
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
+    permissions:
+      contents: write        # gh release upload / asset delete: this job only
     steps:
-      - name: Regenerate SHA256SUMS over the release's bin assets
-        env: { GH_TOKEN: '${{ github.token }}' }
-        run: |
-          set -euo pipefail
-          mkdir dl && cd dl
-          gh release download nightly --repo "$GITHUB_REPOSITORY" --pattern '*.bin'
-          sha256sum *.bin > SHA256SUMS
-          echo "covering $(wc -l < SHA256SUMS) artifacts"
-          gh release upload nightly SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: staged }       # one subdirectory per staged set
+      - name: Publish one complete set, SHA256SUMS last
+        env: { GH_TOKEN: '${{ github.token }}', GH_REPO: '${{ github.repository }}' }
+        run: bash tools/publish_nightly.sh staged
