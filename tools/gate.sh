@@ -1016,8 +1016,9 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_cargo_locked"
   fi
 
-  # #574: the nightly publisher publishes one complete set or nothing, SHA256SUMS last (the commit
-  # point), and prunes past retention under a per-run cap. Proven against a fake gh: no network.
+  # #574: the nightly publisher commits one complete set or nothing (its per-run manifest
+  # SHA256SUMS-<date>-g<hash> is the commit record), checks digests, and prunes whole sets past retention
+  # under a per-run cap. Proven against a fake gh (25 arms): no network.
   step "nightly publisher regression suite (#574)"
   if out=$("$ROOT/tools/test_publish_nightly.sh" 2>&1); then
     printf '%s\n' "$out" | tail -1; ok "test_publish_nightly"
