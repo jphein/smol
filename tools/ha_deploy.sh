@@ -233,18 +233,23 @@ cmd_packages() {
   # Enumerate first, so a transport or permission failure is 2 before any file is judged. The
   # assignment sits inside the if: under this script's set -e a failing $(…) in a bare assignment
   # would abort the script instead (the first cut of this fix did exactly that).
-  if ! listing="$(rsh "cd $(q "$REMOTE_DIR") && ls -1A" 2>/dev/null)"; then
+  # The listing is captured with a sentinel byte after it, so $(…) cannot strip a trailing newline
+  # that belongs to a file name; every entry then ends in exactly one newline.
+  local raw
+  if ! raw="$(rsh "cd $(q "$REMOTE_DIR") && ls -1A && printf x" 2>/dev/null)" || [ "${raw%x}" = "$raw" ]; then
     echo "  could not list $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
   fi
-  # Same refusal for the live side: the listing is one name per line, so its line count must equal
-  # the entry count (NUL-separated, busybox-safe); a live name with a newline would split into decoys.
+  raw="${raw%x}"
+  # Refusal for the live side: the newline count must equal the entry count (NUL-separated,
+  # busybox-safe); a live name containing a newline, leading or trailing, breaks that equality.
   local lents
-  if ! lents="$(rsh "cd $(q "$REMOTE_DIR") && find . -mindepth 1 -maxdepth 1 -print0 | tr -dc '\\0' | wc -c" 2>/dev/null)"; then
+  if ! lents="$(rsh "set -o pipefail 2>/dev/null; cd $(q "$REMOTE_DIR") && find . -mindepth 1 -maxdepth 1 -print0 | tr -dc '\\0' | wc -c" 2>/dev/null)"; then
     echo "  could not count $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
   fi
-  if [ -n "$listing" ] && [ "$(printf '%s\n' "$listing" | wc -l)" -ne "$((lents))" ]; then
+  if [ "$(printf '%s' "$raw" | tr -dc '\n' | wc -c)" -ne "$((lents))" ]; then
     echo "  a live file name in $REMOTE_DIR contains a newline — not checked" >&2; return 2
   fi
+  listing="${raw%$'\n'}"
   while IFS= read -r f; do
     local grc=0; grep -qxF -- "$f" <<< "$listing" || grc=$?   # here-string, not a pipe: no SIGPIPE under pipefail
     case "$grc" in
