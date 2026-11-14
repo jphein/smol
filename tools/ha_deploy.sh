@@ -207,8 +207,8 @@ fetch_remote() { # $1 basename -> stdout; exit status is the remote cat's (used 
 # an empty repo list, an unchecked scratch dir, a swallowed enumeration failure, and a fetch failure
 # read as "missing". Every "could not check" is now 2, and nothing is interpolated unquoted.
 cmd_packages() {
-  local drift=0 tmp pkgs listing f rc
-  pkgs="$(packages)"
+  local drift=0 tmp pkgs listing f
+  pkgs="$(packages 2>/dev/null || true)"
   if [ -z "$pkgs" ]; then
     echo "  no packages found under $LOCAL_DIR — not checked" >&2; return 2
   fi
@@ -218,10 +218,11 @@ cmd_packages() {
   if ! rsh "test -d $(q "$REMOTE_DIR")" 2>/dev/null; then
     echo "  could not reach $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
   fi
-  # Enumerate first, so a transport or permission failure is 2 before any file is judged.
-  listing="$(rsh "cd $(q "$REMOTE_DIR") && ls -1")"; rc=$?
-  if [ "$rc" -ne 0 ]; then
-    echo "  could not list $HA_SSH:$REMOTE_DIR (exit $rc) — not checked" >&2; return 2
+  # Enumerate first, so a transport or permission failure is 2 before any file is judged. The
+  # assignment sits inside the if: under this script's set -e a failing $(…) in a bare assignment
+  # would abort the script instead (the first cut of this fix did exactly that).
+  if ! listing="$(rsh "cd $(q "$REMOTE_DIR") && ls -1" 2>/dev/null)"; then
+    echo "  could not list $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
   fi
   while IFS= read -r f; do
     if ! printf '%s\n' "$listing" | grep -qxF -- "$f"; then
