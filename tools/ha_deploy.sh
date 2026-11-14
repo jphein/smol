@@ -187,13 +187,13 @@ packages() { # repo package basenames, sorted
   find "$LOCAL_DIR" -maxdepth 1 -name '*.yaml' -printf '%f\n' | sort
 }
 
-q() { printf '%q' "$1"; }   # one shell-safe word, local or remote (review of #576, finding 4)
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }   # POSIX single-quote escaping: safe for sh here and over ssh (review of #576 / #580)
 
 rsh() { # $1 command -> run it where the live packages are. HA_SSH=local runs it here (test harness only).
   if [ "$HA_SSH" = local ]; then sh -c "$1"; else ssh "${SSH_OPTS[@]}" "$HA_SSH" "$1"; fi
 }
 
-fetch_remote() { # $1 basename -> stdout; exit status is the remote cat's (used by status/diff only)
+fetch_remote() { # $1 basename -> stdout, empty on any failure (status/diff only; `packages` fetches itself)
   rsh "cat $(q "$REMOTE_DIR/$1") 2>/dev/null" || true
 }
 
@@ -208,7 +208,9 @@ fetch_remote() { # $1 basename -> stdout; exit status is the remote cat's (used 
 # read as "missing". Every "could not check" is now 2, and nothing is interpolated unquoted.
 cmd_packages() {
   local drift=0 tmp pkgs listing f
-  pkgs="$(packages 2>/dev/null || true)"
+  if ! pkgs="$(packages 2>/dev/null)"; then
+    echo "  could not list the repo packages under $LOCAL_DIR — not checked" >&2; return 2
+  fi
   if [ -z "$pkgs" ]; then
     echo "  no packages found under $LOCAL_DIR — not checked" >&2; return 2
   fi
@@ -221,7 +223,7 @@ cmd_packages() {
   # Enumerate first, so a transport or permission failure is 2 before any file is judged. The
   # assignment sits inside the if: under this script's set -e a failing $(…) in a bare assignment
   # would abort the script instead (the first cut of this fix did exactly that).
-  if ! listing="$(rsh "cd $(q "$REMOTE_DIR") && ls -1" 2>/dev/null)"; then
+  if ! listing="$(rsh "cd $(q "$REMOTE_DIR") && ls -1A" 2>/dev/null)"; then
     echo "  could not list $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
   fi
   while IFS= read -r f; do
@@ -231,13 +233,14 @@ cmd_packages() {
     if ! rsh "cat $(q "$REMOTE_DIR/$f")" > "$tmp/$f" 2>/dev/null; then
       echo "  could not read $HA_SSH:$REMOTE_DIR/$f — not checked" >&2; return 2
     fi
-    if cmp -s "$LOCAL_DIR/$f" "$tmp/$f"; then
-      printf '  %-24s in sync\n' "$f"
-    else
-      local a b; a=$(diff "$LOCAL_DIR/$f" "$tmp/$f" | grep -c '^<' || true)
-      b=$(diff "$LOCAL_DIR/$f" "$tmp/$f" | grep -c '^>' || true)
-      printf '  %-24s DIFFERS  (repo-only lines: %s, live-only lines: %s)\n' "$f" "$a" "$b"; drift=1
-    fi
+    local crc=0; cmp -s "$LOCAL_DIR/$f" "$tmp/$f" || crc=$?   # 0 same · 1 differ · 2+ could not compare
+    case "$crc" in
+      0) printf '  %-24s in sync\n' "$f" ;;
+      1) local a b; a=$(diff "$LOCAL_DIR/$f" "$tmp/$f" | grep -c '^<' || true)
+         b=$(diff "$LOCAL_DIR/$f" "$tmp/$f" | grep -c '^>' || true)
+         printf '  %-24s DIFFERS  (repo-only lines: %s, live-only lines: %s)\n' "$f" "$a" "$b"; drift=1 ;;
+      *) echo "  could not compare $f (cmp exit $crc) — not checked" >&2; return 2 ;;
+    esac
   done <<< "$pkgs"
   local extra
   extra=$(printf '%s\n' "$listing" | grep '\.yaml$' | grep -vxF -- "$pkgs" || true)
