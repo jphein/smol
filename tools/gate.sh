@@ -1016,6 +1016,16 @@ if [ "$run_host" = 1 ]; then
     printf '%s\n' "$out" | sed 's/^/        /'; bad "test_cargo_locked"
   fi
 
+  # #574: the nightly publisher commits one complete set or nothing (its per-run manifest
+  # SHA256SUMS-<date>-g<hash> is the commit record), checks digests, and prunes whole sets past retention
+  # under a per-run cap. Proven against a fake gh (25 arms): no network.
+  step "nightly publisher regression suite (#574)"
+  if out=$("$ROOT/tools/test_publish_nightly.sh" 2>&1); then
+    printf '%s\n' "$out" | tail -1; ok "test_publish_nightly"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'; bad "test_publish_nightly"
+  fi
+
   step "Cargo.lock freshness gate regression suite (#460)"
   if out=$("$ROOT/tools/test_lock_fresh.sh" 2>&1); then
     printf '%s\n' "$out" | tail -2; ok "test_lock_fresh"

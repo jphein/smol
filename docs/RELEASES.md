@@ -23,6 +23,16 @@ this page exists to prevent.
 
 ---
 
+## Which nightly images are a complete set (#574)
+
+The `nightly` prerelease is written by one publish job, all or nothing (`tools/publish_nightly.sh`).
+GitHub cannot swap a release's assets atomically, so the commit record is a manifest, not the asset
+list: **a nightly set is published when its `SHA256SUMS-<date>-g<hash>` exists.** That file is written
+only after every image of the set is on the release with a matching digest, and is never overwritten.
+`SHA256SUMS` is a copy of the latest one. Verify a download against the manifest of its own date and
+hash: `sha256sum -c --ignore-missing SHA256SUMS-<date>-g<hash>`. Images with no manifest of their own
+are an unfinished run; do not flash them. Sets older than 14 days are pruned whole.
+
 ## 🔴 Published binaries carry PLACEHOLDER credentials
 
 This surprises people, so it goes first and in full.
