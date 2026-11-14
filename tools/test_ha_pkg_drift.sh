@@ -33,6 +33,24 @@ reset; rm "$live/smol_bard.yaml";          expect "a package missing on live"   
 reset; echo "x: 1" > "$live/smol_extra.yaml"
                                            expect "a live-only package"               1 "$(run "$live")" "LIVE-ONLY smol_extra.yaml"
                                            expect "an unreachable live dir is 2, never 'in sync'" 2 "$(run "$live/nope")"
+# Arms added after the post-merge review of #576: each was a way to return 0 without having checked.
+reset; echo "x: 1" > "$live/other.yaml"
+                                           expect "a live-only package not named smol_*"  1 "$(run "$live")" "LIVE-ONLY other.yaml"
+reset; : > "$live/smol_bard.yaml"; empty="$(mktemp -d -p "$base" ha-pkg-empty.XXXXXX)"; cp "$live"/*.yaml "$empty/"
+       : > "$empty/smol_bard.yaml"
+                                           expect "two identical empty files are in sync (not MISSING)" 0 "$(HA_LOCAL_DIR=$empty run "$live")"
+rm -rf "$empty"
+nopk="$(mktemp -d -p "$base" ha-pkg-none.XXXXXX)"
+reset;                                     expect "an empty repo package list is 2, never 'in sync'" 2 "$(HA_LOCAL_DIR=$nopk run "$live")"
+rm -rf "$nopk"
+if [ "$(id -u)" != 0 ]; then
+  reset; chmod 000 "$live/smol_mesh.yaml";  expect "an unreadable live file is 2, not drift"  2 "$(run "$live")"
+  chmod 644 "$live/smol_mesh.yaml"
+  reset; chmod 111 "$live";                 expect "a live dir that exists but cannot be listed is 2" 2 "$(run "$live")"
+  chmod 755 "$live"
+else
+  echo "  skip unreadable-file and unlistable-dir arms (running as root)"
+fi
 rm -f "$live.out"
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

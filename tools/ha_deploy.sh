@@ -57,7 +57,7 @@ set -euo pipefail
 HA_SSH="${HA_SSH:-jp@10.0.6.108}"
 HA_URL="${HA_URL:-https://ha.jphe.in}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOCAL_DIR="$REPO_DIR/ha/packages"
+LOCAL_DIR="${HA_LOCAL_DIR:-$REPO_DIR/ha/packages}"   # override only for tools/test_ha_pkg_drift.sh
 REMOTE_DIR="${HA_REMOTE_DIR:-/homeassistant/packages}"   # override only for tools/test_ha_pkg_drift.sh
 SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes)
 
@@ -187,12 +187,14 @@ packages() { # repo package basenames, sorted
   find "$LOCAL_DIR" -maxdepth 1 -name '*.yaml' -printf '%f\n' | sort
 }
 
+q() { printf '%q' "$1"; }   # one shell-safe word, local or remote (review of #576, finding 4)
+
 rsh() { # $1 command -> run it where the live packages are. HA_SSH=local runs it here (test harness only).
   if [ "$HA_SSH" = local ]; then sh -c "$1"; else ssh "${SSH_OPTS[@]}" "$HA_SSH" "$1"; fi
 }
 
-fetch_remote() { # $1 basename -> stdout (empty if the file does not exist there)
-  rsh "cat $REMOTE_DIR/$1 2>/dev/null" || true
+fetch_remote() { # $1 basename -> stdout; exit status is the remote cat's (used by status/diff only)
+  rsh "cat $(q "$REMOTE_DIR/$1") 2>/dev/null" || true
 }
 
 # --- packages (#575) ---------------------------------------------------------------------
@@ -201,25 +203,43 @@ fetch_remote() { # $1 basename -> stdout (empty if the file does not exist there
 # committed and never deployed, and the issue that found it guessed the wrong direction. This is the
 # exit-coded, package-only answer: 0 in sync · 1 drift (either direction, or a live-only package) ·
 # 2 could not check. Run it after a merge that touches ha/packages, and from any periodic check.
+# Post-merge review of #576 (xreview, DO-NOT-MERGE) found four ways this returned 0 without checking:
+# an empty repo list, an unchecked scratch dir, a swallowed enumeration failure, and a fetch failure
+# read as "missing". Every "could not check" is now 2, and nothing is interpolated unquoted.
 cmd_packages() {
-  local drift=0 tmp; tmp="$(mktemp -d -p "${TMPDIR:-$HOME/.cache}")"; trap 'rm -rf "$tmp"' RETURN
-  if ! rsh "test -d $REMOTE_DIR" 2>/dev/null; then
+  local drift=0 tmp pkgs listing f rc
+  pkgs="$(packages)"
+  if [ -z "$pkgs" ]; then
+    echo "  no packages found under $LOCAL_DIR — not checked" >&2; return 2
+  fi
+  tmp="$(mktemp -d -p "${TMPDIR:-$HOME/.cache}" ha-pkg.XXXXXX)" && [ -d "$tmp" ] || {
+    echo "  could not create a scratch dir under ${TMPDIR:-$HOME/.cache} — not checked" >&2; return 2; }
+  trap 'rm -rf "$tmp"' RETURN
+  if ! rsh "test -d $(q "$REMOTE_DIR")" 2>/dev/null; then
     echo "  could not reach $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
   fi
-  for f in $(packages); do
-    fetch_remote "$f" > "$tmp/$f"
-    if [ ! -s "$tmp/$f" ]; then
-      printf '  %-24s MISSING on live\n' "$f"; drift=1
-    elif cmp -s "$LOCAL_DIR/$f" "$tmp/$f"; then
+  # Enumerate first, so a transport or permission failure is 2 before any file is judged.
+  listing="$(rsh "cd $(q "$REMOTE_DIR") && ls -1")"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "  could not list $HA_SSH:$REMOTE_DIR (exit $rc) — not checked" >&2; return 2
+  fi
+  while IFS= read -r f; do
+    if ! printf '%s\n' "$listing" | grep -qxF -- "$f"; then
+      printf '  %-24s MISSING on live\n' "$f"; drift=1; continue
+    fi
+    if ! rsh "cat $(q "$REMOTE_DIR/$f")" > "$tmp/$f" 2>/dev/null; then
+      echo "  could not read $HA_SSH:$REMOTE_DIR/$f — not checked" >&2; return 2
+    fi
+    if cmp -s "$LOCAL_DIR/$f" "$tmp/$f"; then
       printf '  %-24s in sync\n' "$f"
     else
       local a b; a=$(diff "$LOCAL_DIR/$f" "$tmp/$f" | grep -c '^<' || true)
       b=$(diff "$LOCAL_DIR/$f" "$tmp/$f" | grep -c '^>' || true)
       printf '  %-24s DIFFERS  (repo-only lines: %s, live-only lines: %s)\n' "$f" "$a" "$b"; drift=1
     fi
-  done
+  done <<< "$pkgs"
   local extra
-  extra=$(rsh "ls $REMOTE_DIR/smol*.yaml 2>/dev/null" | xargs -r -n1 basename | grep -vxF "$(packages)" || true)
+  extra=$(printf '%s\n' "$listing" | grep '\.yaml$' | grep -vxF -- "$pkgs" || true)
   if [ -n "$extra" ]; then
     printf '  LIVE-ONLY %s\n' $extra; drift=1
   fi
