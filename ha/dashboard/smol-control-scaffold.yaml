@@ -250,10 +250,12 @@ cards:
   # the real topology 2026-07-28 on JP's instruction ("grid draw watts, solar battery soc
   # epever, and bmw i3 battery"):
   #   solar bank SOC  -> sensor.epever_battery_soc      (EPEver charge controller, Modbus)
-  #   EV pack SOC     -> sensor.battery_emulator_0fcc_soc  (the BMW i3 pack, read over CAN
-  #                      by Battery-Emulator; SoH 80% confirms it is the repurposed pack.
-  #                      NOT sensor.battery_average_soc — that is the inverter's average
-  #                      across banks, not the i3.)
+  #   EV pack SOC     -> sensor.be_soc  (the BMW i3 pack, read over CAN by Battery-Emulator:
+  #                      "SOC (Scaled)". Repointed 2026-11-13 from battery_emulator_0fcc_soc,
+  #                      a discovery twin from the 08-21 settings reset that was user-disabled
+  #                      08-27 and showed as the view's one DEAD ROW. NOT sensor.be_soc_real
+  #                      (unscaled) and NOT sensor.battery_average_soc — that is the inverter's
+  #                      average across banks, not the i3.)
   #   grid draw       -> sensor.yurt_consumption + the two PJ2101A clamps. This is the SAME
   #                      source `smol_publish_grid_display` renders onto the glass, so the
   #                      card and the OLED can never disagree. Total is kW; the legs are the
@@ -275,7 +277,7 @@ cards:
             max: 100
             severity: {green: 60, yellow: 35, red: 0}
           - type: gauge
-            entity: sensor.battery_emulator_0fcc_soc
+            entity: sensor.be_soc
             name: i3 pack
             unit: "%"
             min: 0

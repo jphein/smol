@@ -1335,7 +1335,8 @@ GEN_OWNED = re.compile(r"^vertical-stack\|node\d+$")
 #     {battery_bank_soc,ev_battery_soc,house_load,solar_charge_current} all return DOES NOT
 #     EXIST, so this card renders four blank rows on glass right now. The scaffold already holds
 #     its corrected replacement (POWER & SOLAR, mapped 2026-07-28 on JP's instruction to
-#     sensor.epever_battery_soc 77 / battery_emulator_0fcc_soc 100 / yurt_consumption 1.355 +
+#     sensor.epever_battery_soc 77 / battery_emulator_0fcc_soc 100 [since 2026-11-13: sensor.be_soc;
+#     0fcc was a discovery twin, disabled 08-27] / yurt_consumption 1.355 +
 #     the two clamps / epever_charging_current 2.0 — all live). BACK-PORTING THIS CARD WOULD
 #     HAVE REVERTED THAT MAPPING, which is why "the repo cannot reproduce it" was the wrong
 #     conclusion to act on unread.
