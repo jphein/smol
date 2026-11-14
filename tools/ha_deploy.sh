@@ -246,7 +246,9 @@ cmd_packages() {
   if ! lents="$(rsh "(set -o pipefail) 2>/dev/null && set -o pipefail; cd $(q "$REMOTE_DIR") && find . -mindepth 1 -maxdepth 1 -print0 | tr -dc '\\0' | wc -c" 2>/dev/null)"; then
     echo "  could not count $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
   fi
-  if [ "$(printf '%s' "$raw" | tr -dc '\n' | wc -c)" -ne "$((lents))" ]; then
+  lents="${lents//[[:space:]]/}"
+  case "$lents" in ''|*[!0-9]*) echo "  live entry count from $HA_SSH is not a number — not checked" >&2; return 2 ;; esac
+  if [ "$(printf '%s' "$raw" | tr -dc '\n' | wc -c)" -ne "$lents" ]; then
     echo "  a live file name in $REMOTE_DIR contains a newline — not checked" >&2; return 2
   fi
   listing="${raw%$'\n'}"
