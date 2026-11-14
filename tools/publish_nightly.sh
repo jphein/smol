@@ -90,9 +90,24 @@ if ! RID="$("$GH" api "repos/$REPO/releases/tags/$TAG" --jq .id 2>/dev/null)"; t
 fi
 assets() { "$GH" api --paginate "repos/$REPO/releases/$RID/assets?per_page=100" \
              --jq '.[] | [.name, (.digest // ""), .state, .url] | @tsv'; }
+# Every listing goes through relist: an API failure STOPS the run (xreview r3: a failed listing inside a
+# command substitution read as "absent", which is how a manifest check could pass on no data).
+relist() { listing="$(assets)" || abort "could not list the release's assets"; }
+relist
+
+# ── this run's manifest, BEFORE any mutation (xreview r3) ──────────────────────────────────────────
+# A committed set is immutable. Presence is judged by NAME, separately from the digest: a manifest that
+# exists but whose digest cannot be read is refused, never mistaken for absent.
+want_m="sha256:$(sha256sum < "$DIST/$MANIFEST" | cut -d' ' -f1)"
+committed_here=0
+if awk -F'\t' -v n="$MANIFEST" '$1==n' <<<"$listing" | grep -q .; then
+  existing="$(awk -F'\t' -v n="$MANIFEST" '$1==n {print $2}' <<<"$listing")"
+  [ -n "$existing" ] || abort "$MANIFEST exists but its digest cannot be read; refusing to touch it"
+  [ "$existing" = "$want_m" ] || abort "$MANIFEST already exists with different content (a committed set is never overwritten)"
+  committed_here=1
+fi
 
 # ── 2. retention (whole sets, before uploading) and capacity ──────────────────────────────────────
-listing="$(assets)"
 # The set plain SHA256SUMS currently copies: the per-run manifest with the SAME digest (xreview r2: not
 # the newest name, which differs when a run committed its manifest but not the copy). A legacy plain
 # SHA256SUMS that matches no per-run manifest (written before #574, covering every .bin) protects
@@ -117,7 +132,8 @@ while read -r set_stamp; do
   # interruption then leaves an unpublished leftover, never a manifest naming deleted images.
   if [ -n "$murl" ]; then
     "$GH" api -X DELETE "$murl" >/dev/null
-    awk -F'\t' -v n="SHA256SUMS-$set_stamp" '$1==n' <<<"$(assets)" | grep -q . \
+    relist
+    awk -F'\t' -v n="SHA256SUMS-$set_stamp" '$1==n' <<<"$listing" | grep -q . \
       && abort "SHA256SUMS-$set_stamp is still on the release after its delete; its images are kept"
     pruned=$((pruned + 1))
   fi
@@ -125,7 +141,7 @@ while read -r set_stamp; do
   pruned=$((pruned + ${#urls[@]}))
 done < <(awk -F'\t' '{print $1}' <<<"$listing" | sed -nE "s/.*$SUFFIX_RE/\\1-g\\2/p" | sort -u)
 echo "publish_nightly: pruned $pruned asset(s) of sets dated before $cutoff (keep $KEEP days, cap $PMAX/run)"
-listing="$(assets)"
+relist
 need=$(( $(ls "$DIST" | wc -l) ))                                # images + notes + this run's manifest
 have=$(grep -c . <<<"$listing" || true)
 already=$(for f in "$DIST"/*; do awk -F'\t' -v n="$(basename "$f")" '$1==n' <<<"$listing"; done | grep -c . || true)
@@ -135,12 +151,7 @@ already=$(for f in "$DIST"/*; do awk -F'\t' -v n="$(basename "$f")" '$1==n' <<<"
 # A committed set is immutable (xreview r2): if its manifest exists, nothing of it is re-uploaded. Same
 # manifest content -> verify the committed assets are still ours and finish; different -> refuse
 # before any mutation. Only a set with NO manifest (an unfinished run) is ever clobbered.
-want_m="sha256:$(sha256sum < "$DIST/$MANIFEST" | cut -d' ' -f1)"
-existing="$(awk -F'\t' -v n="$MANIFEST" '$1==n {print $2}' <<<"$(assets)")"
-if [ -n "$existing" ] && [ "$existing" != "$want_m" ]; then
-  abort "$MANIFEST already exists with different content (a committed set is never overwritten)"
-fi
-if [ -z "$existing" ]; then
+if [ "$committed_here" = 0 ]; then
   ( cd "$DIST" && "$GH" release upload "$TAG" --repo "$REPO" *.bin *.bin.NOTES.md --clobber )
 else
   echo "publish_nightly: $MANIFEST is already committed with this content; verifying, not re-uploading"
@@ -148,7 +159,7 @@ fi
 
 # ── 4. verify: state "uploaded" and OUR digest, for every image and note ───────────────────────────
 verify() { # $@ local files -> 0 when each is on the release, uploaded, with our sha256
-  local listing f n want got bad=0; listing="$(assets)"
+  local f n want got bad=0; relist
   for f in "$@"; do
     n="$(basename "$f")"; want="sha256:$(sha256sum < "$f" | cut -d' ' -f1)"
     got="$(awk -F'\t' -v n="$n" '$1==n && $3=="uploaded" {print $2}' <<<"$listing")"
@@ -159,7 +170,7 @@ verify() { # $@ local files -> 0 when each is on the release, uploaded, with our
 verify "$DIST"/*.bin "$DIST"/*.bin.NOTES.md || abort "an image or note is not on the release with our digest"
 
 # ── 5. commit: the immutable per-run manifest, then the convenience copy ──────────────────────────
-if [ -z "$existing" ]; then
+if [ "$committed_here" = 0 ]; then
   ( cd "$DIST" && "$GH" release upload "$TAG" --repo "$REPO" "$MANIFEST" )
 fi
 verify "$DIST/$MANIFEST" || abort "$MANIFEST is not on the release with our digest"

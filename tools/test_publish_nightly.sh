@@ -26,8 +26,10 @@ cat > "$W/gh" <<'GH'
 REL="${FAKE_REL:?}"; echo "$*" >> "$REL.log"
 if [ "$1" = api ] && [ "$2" = -X ]; then rm -f "$REL/${4#fake://}"; exit 0; fi
 if [ "$1" = api ] && [ "$2" = --paginate ]; then
+  [ -n "${FAKE_LIST_FAIL:-}" ] && exit 1
   for f in "$REL"/*; do [ -e "$f" ] || continue
-    printf '%s\tsha256:%s\tuploaded\tfake://%s\n' "$(basename "$f")" "$(sha256sum < "$f" | cut -d' ' -f1)" "$(basename "$f")"
+    n="$(basename "$f")"; d="sha256:$(sha256sum < "$f" | cut -d' ' -f1)"; [ "$n" = "${FAKE_NODIGEST:-}" ] && d=""
+    printf '%s\t%s\tuploaded\tfake://%s\n' "$n" "$d" "$n"
   done; exit 0; fi
 if [ "$1" = api ]; then [ -d "$REL" ] && { echo 1; exit 0; }; exit 1; fi
 case "$1 $2" in
@@ -111,7 +113,16 @@ else bad "corrupt upload: exit $rc; manifest $( [ -e "$FAKE_REL/SHA256SUMS-$S" ]
 stage "$W/s"; fresh_release; echo "someone else's" > "$FAKE_REL/SHA256SUMS-$S"
 "$PUB" "$W/s" >"$W/out" 2>&1; rc=$?
 [ "$rc" = 1 ] && [ "$(cat "$FAKE_REL/SHA256SUMS-$S")" = "someone else's" ] && [ "$(cat "$FAKE_REL/SHA256SUMS")" = "previous sums" ] \
-  && ok "an existing manifest is never overwritten (exit 1)" || bad "existing manifest: exit $rc"
+  && [ -e "$FAKE_REL/smol-c3-2026-10-01-g1111111aaaa.bin" ] && ! grep -q -- "-X DELETE\|release upload" "$FAKE_REL.log" \
+  && ok "an existing manifest with other content: exit 1 before ANY mutation (not even retention)" || bad "existing manifest: exit $rc"
+stage "$W/s"; fresh_release; cp "$FAKE_REL/SHA256SUMS-2026-11-10-g3333333cccc" "$FAKE_REL/SHA256SUMS-$S"; before="$(snapshot)"
+FAKE_NODIGEST="SHA256SUMS-$S" "$PUB" "$W/s" >"$W/out" 2>&1; rc=$?
+[ "$rc" = 1 ] && [ "$before" = "$(snapshot)" ] && grep -q "digest cannot be read" "$W/out" \
+  && ok "a manifest present without a readable digest is refused, not taken for absent" || bad "no-digest manifest: exit $rc"
+stage "$W/s"; fresh_release; before="$(snapshot)"
+FAKE_LIST_FAIL=1 "$PUB" "$W/s" >"$W/out" 2>&1; rc=$?
+[ "$rc" = 1 ] && [ "$before" = "$(snapshot)" ] && ! grep -q -- "-X DELETE\|release upload" "$FAKE_REL.log" \
+  && ok "a failing asset listing stops the run before any mutation (exit 1)" || bad "listing failure: exit $rc"
 
 # 5. capacity: too full even after pruning -> exit 1 before any upload
 stage "$W/s"; fresh_release
