@@ -57,7 +57,7 @@ set -euo pipefail
 HA_SSH="${HA_SSH:-jp@10.0.6.108}"
 HA_URL="${HA_URL:-https://ha.jphe.in}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOCAL_DIR="$REPO_DIR/ha/packages"
+LOCAL_DIR="${HA_LOCAL_DIR:-$REPO_DIR/ha/packages}"   # override only for tools/test_ha_pkg_drift.sh
 REMOTE_DIR="${HA_REMOTE_DIR:-/homeassistant/packages}"   # override only for tools/test_ha_pkg_drift.sh
 SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes)
 
@@ -187,12 +187,14 @@ packages() { # repo package basenames, sorted
   find "$LOCAL_DIR" -maxdepth 1 -name '*.yaml' -printf '%f\n' | sort
 }
 
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }   # POSIX single-quote escaping: safe for sh here and over ssh (review of #576 / #580)
+
 rsh() { # $1 command -> run it where the live packages are. HA_SSH=local runs it here (test harness only).
   if [ "$HA_SSH" = local ]; then sh -c "$1"; else ssh "${SSH_OPTS[@]}" "$HA_SSH" "$1"; fi
 }
 
-fetch_remote() { # $1 basename -> stdout (empty if the file does not exist there)
-  rsh "cat $REMOTE_DIR/$1 2>/dev/null" || true
+fetch_remote() { # $1 basename -> stdout, empty on any failure (status/diff only; `packages` fetches itself)
+  rsh "cat $(q "$REMOTE_DIR/$1") 2>/dev/null" || true
 }
 
 # --- packages (#575) ---------------------------------------------------------------------
@@ -201,28 +203,84 @@ fetch_remote() { # $1 basename -> stdout (empty if the file does not exist there
 # committed and never deployed, and the issue that found it guessed the wrong direction. This is the
 # exit-coded, package-only answer: 0 in sync · 1 drift (either direction, or a live-only package) ·
 # 2 could not check. Run it after a merge that touches ha/packages, and from any periodic check.
+# Post-merge review of #576 (xreview, DO-NOT-MERGE) found four ways this returned 0 without checking:
+# an empty repo list, an unchecked scratch dir, a swallowed enumeration failure, and a fetch failure
+# read as "missing". Every "could not check" is now 2, and nothing is interpolated unquoted.
 cmd_packages() {
-  local drift=0 tmp; tmp="$(mktemp -d -p "${TMPDIR:-$HOME/.cache}")"; trap 'rm -rf "$tmp"' RETURN
-  if ! rsh "test -d $REMOTE_DIR" 2>/dev/null; then
+  local drift=0 tmp pkgs listing f
+  if ! pkgs="$(packages 2>/dev/null)"; then
+    echo "  could not list the repo packages under $LOCAL_DIR — not checked" >&2; return 2
+  fi
+  if [ -z "$pkgs" ]; then
+    echo "  no packages found under $LOCAL_DIR — not checked" >&2; return 2
+  fi
+  # Names are one per line from here on; a newline inside a path or basename would split into two
+  # decoys and could read as in sync. Packages are committed files, so this is a refusal, not a case.
+  local ents
+  if ! ents="$(find "$LOCAL_DIR" -maxdepth 1 -name '*.yaml' -printf '.' | wc -c)"; then
+    echo "  could not count the repo packages under $LOCAL_DIR — not checked" >&2; return 2
+  fi
+  if [ "$(printf '%s\n' "$pkgs" | wc -l)" -ne "$ents" ] \
+     || [ "$(printf '%s' "$REMOTE_DIR" | wc -l)" -ne 0 ]; then   # lines vs entries: a newline in a name makes them differ
+    echo "  a package name or $REMOTE_DIR contains a newline — not checked" >&2; return 2
+  fi
+  tmp="$(mktemp -d -p "${TMPDIR:-$HOME/.cache}" ha-pkg.XXXXXX)" && [ -d "$tmp" ] || {
+    echo "  could not create a scratch dir under ${TMPDIR:-$HOME/.cache} — not checked" >&2; return 2; }
+  trap 'rm -rf "$tmp"' RETURN
+  if ! rsh "test -d $(q "$REMOTE_DIR")" 2>/dev/null; then
     echo "  could not reach $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
   fi
-  for f in $(packages); do
-    fetch_remote "$f" > "$tmp/$f"
-    if [ ! -s "$tmp/$f" ]; then
-      printf '  %-24s MISSING on live\n' "$f"; drift=1
-    elif cmp -s "$LOCAL_DIR/$f" "$tmp/$f"; then
-      printf '  %-24s in sync\n' "$f"
-    else
-      local a b; a=$(diff "$LOCAL_DIR/$f" "$tmp/$f" | grep -c '^<' || true)
-      b=$(diff "$LOCAL_DIR/$f" "$tmp/$f" | grep -c '^>' || true)
-      printf '  %-24s DIFFERS  (repo-only lines: %s, live-only lines: %s)\n' "$f" "$a" "$b"; drift=1
-    fi
-  done
-  local extra
-  extra=$(rsh "ls $REMOTE_DIR/smol*.yaml 2>/dev/null" | xargs -r -n1 basename | grep -vxF "$(packages)" || true)
-  if [ -n "$extra" ]; then
-    printf '  LIVE-ONLY %s\n' $extra; drift=1
+  # Enumerate first, so a transport or permission failure is 2 before any file is judged. The
+  # assignment sits inside the if: under this script's set -e a failing $(…) in a bare assignment
+  # would abort the script instead (the first cut of this fix did exactly that).
+  # The listing is captured with a sentinel byte after it, so $(…) cannot strip a trailing newline
+  # that belongs to a file name; every entry then ends in exactly one newline.
+  local raw
+  if ! raw="$(rsh "cd $(q "$REMOTE_DIR") && QUOTING_STYLE=literal ls -1A && printf x" 2>/dev/null)" || [ "${raw%x}" = "$raw" ]; then
+    echo "  could not list $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
   fi
+  raw="${raw%x}"
+  # Refusal for the live side: the newline count must equal the entry count (NUL-separated,
+  # busybox-safe); a live name containing a newline, leading or trailing, breaks that equality.
+  local lents
+  if ! lents="$(rsh "(set -o pipefail) 2>/dev/null && set -o pipefail; cd $(q "$REMOTE_DIR") && find . -mindepth 1 -maxdepth 1 -print0 | tr -dc '\\0' | wc -c" 2>/dev/null)"; then
+    echo "  could not count $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
+  fi
+  lents="${lents//[[:space:]]/}"
+  case "$lents" in ''|*[!0-9]*) echo "  live entry count from $HA_SSH is not a number — not checked" >&2; return 2 ;; esac
+  if [ "$(printf '%s' "$raw" | tr -dc '\n' | wc -c)" -ne "$lents" ]; then
+    echo "  a live file name in $REMOTE_DIR contains a newline — not checked" >&2; return 2
+  fi
+  listing="${raw%$'\n'}"
+  while IFS= read -r f; do
+    local grc=0; grep -qxF -- "$f" <<< "$listing" || grc=$?   # here-string, not a pipe: no SIGPIPE under pipefail
+    case "$grc" in
+      0) ;;
+      1) printf '  %-24s MISSING on live\n' "$f"; drift=1; continue ;;
+      *) echo "  could not test the live listing for $f (grep exit $grc) — not checked" >&2; return 2 ;;
+    esac
+    if ! rsh "cat $(q "$REMOTE_DIR/$f")" > "$tmp/$f" 2>/dev/null; then
+      echo "  could not read $HA_SSH:$REMOTE_DIR/$f — not checked" >&2; return 2
+    fi
+    local crc=0; cmp -s "$LOCAL_DIR/$f" "$tmp/$f" || crc=$?   # 0 same · 1 differ · 2+ could not compare
+    case "$crc" in
+      0) printf '  %-24s in sync\n' "$f" ;;
+      1) local a b; a=$(diff "$LOCAL_DIR/$f" "$tmp/$f" | grep -c '^<' || true)
+         b=$(diff "$LOCAL_DIR/$f" "$tmp/$f" | grep -c '^>' || true)
+         printf '  %-24s DIFFERS  (repo-only lines: %s, live-only lines: %s)\n' "$f" "$a" "$b"; drift=1 ;;
+      *) echo "  could not compare $f (cmp exit $crc) — not checked" >&2; return 2 ;;
+    esac
+  done <<< "$pkgs"
+  local x xrc
+  while IFS= read -r x; do
+    case "$x" in *.yaml) ;; *) continue ;; esac
+    xrc=0; grep -qxF -- "$x" <<< "$pkgs" || xrc=$?
+    case "$xrc" in
+      0) ;;
+      1) printf '  LIVE-ONLY %s\n' "$x"; drift=1 ;;
+      *) echo "  could not test the repo list for $x (grep exit $xrc) — not checked" >&2; return 2 ;;
+    esac
+  done <<< "$listing"
   return "$drift"
 }
 
