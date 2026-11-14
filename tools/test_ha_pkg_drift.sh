@@ -55,6 +55,8 @@ nl="$(mktemp -d -p "$base" ha-pkg-nl.XXXXXX)"; cp ha/packages/*.yaml "$nl/"; cp 
 smol_bard.yaml"
 reset;                                     expect "a package name with a newline is refused (2)" 2 "$(HA_LOCAL_DIR=$nl run "$live")"
 rm -rf "$nl"
+reset; cp "$live/smol_bard.yaml" "$live/junk
+smol_bard.yaml";                           expect "a live file name with a newline is refused (2)" 2 "$(run "$live")"
 reset;                                     expect "a failed scratch mktemp is 2"         2 "$(TMPDIR=$live/no-such-tmp run "$live")"
 if [ "$(id -u)" != 0 ]; then
   reset; chmod 000 "$live/smol_mesh.yaml";  expect "an unreadable live file is 2, not drift"  2 "$(run "$live")"

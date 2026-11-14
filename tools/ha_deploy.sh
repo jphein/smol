@@ -216,7 +216,11 @@ cmd_packages() {
   fi
   # Names are one per line from here on; a newline inside a path or basename would split into two
   # decoys and could read as in sync. Packages are committed files, so this is a refusal, not a case.
-  if [ "$(printf '%s\n' "$pkgs" | wc -l)" -ne "$(find "$LOCAL_DIR" -maxdepth 1 -name '*.yaml' -printf '.' | wc -c)" ] \
+  local ents
+  if ! ents="$(find "$LOCAL_DIR" -maxdepth 1 -name '*.yaml' -printf '.' | wc -c)"; then
+    echo "  could not count the repo packages under $LOCAL_DIR — not checked" >&2; return 2
+  fi
+  if [ "$(printf '%s\n' "$pkgs" | wc -l)" -ne "$ents" ] \
      || [ "$(printf '%s' "$REMOTE_DIR" | wc -l)" -ne 0 ]; then   # lines vs entries: a newline in a name makes them differ
     echo "  a package name or $REMOTE_DIR contains a newline — not checked" >&2; return 2
   fi
@@ -232,10 +236,22 @@ cmd_packages() {
   if ! listing="$(rsh "cd $(q "$REMOTE_DIR") && ls -1A" 2>/dev/null)"; then
     echo "  could not list $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
   fi
+  # Same refusal for the live side: the listing is one name per line, so its line count must equal
+  # the entry count (NUL-separated, busybox-safe); a live name with a newline would split into decoys.
+  local lents
+  if ! lents="$(rsh "cd $(q "$REMOTE_DIR") && find . -mindepth 1 -maxdepth 1 -print0 | tr -dc '\\0' | wc -c" 2>/dev/null)"; then
+    echo "  could not count $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
+  fi
+  if [ -n "$listing" ] && [ "$(printf '%s\n' "$listing" | wc -l)" -ne "$((lents))" ]; then
+    echo "  a live file name in $REMOTE_DIR contains a newline — not checked" >&2; return 2
+  fi
   while IFS= read -r f; do
-    if ! grep -qxF -- "$f" <<< "$listing"; then   # here-string, not a pipe: no SIGPIPE under pipefail
-      printf '  %-24s MISSING on live\n' "$f"; drift=1; continue
-    fi
+    local grc=0; grep -qxF -- "$f" <<< "$listing" || grc=$?   # here-string, not a pipe: no SIGPIPE under pipefail
+    case "$grc" in
+      0) ;;
+      1) printf '  %-24s MISSING on live\n' "$f"; drift=1; continue ;;
+      *) echo "  could not test the live listing for $f (grep exit $grc) — not checked" >&2; return 2 ;;
+    esac
     if ! rsh "cat $(q "$REMOTE_DIR/$f")" > "$tmp/$f" 2>/dev/null; then
       echo "  could not read $HA_SSH:$REMOTE_DIR/$f — not checked" >&2; return 2
     fi
@@ -248,11 +264,16 @@ cmd_packages() {
       *) echo "  could not compare $f (cmp exit $crc) — not checked" >&2; return 2 ;;
     esac
   done <<< "$pkgs"
-  local extra
-  extra=$(printf '%s\n' "$listing" | grep '\.yaml$' | grep -vxF -- "$pkgs" || true)
-  if [ -n "$extra" ]; then
-    printf '  LIVE-ONLY %s\n' $extra; drift=1
-  fi
+  local x xrc
+  while IFS= read -r x; do
+    case "$x" in *.yaml) ;; *) continue ;; esac
+    xrc=0; grep -qxF -- "$x" <<< "$pkgs" || xrc=$?
+    case "$xrc" in
+      0) ;;
+      1) printf '  LIVE-ONLY %s\n' "$x"; drift=1 ;;
+      *) echo "  could not test the repo list for $x (grep exit $xrc) — not checked" >&2; return 2 ;;
+    esac
+  done <<< "$listing"
   return "$drift"
 }
 
