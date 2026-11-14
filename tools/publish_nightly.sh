@@ -22,10 +22,11 @@
 #      NOTES, all of one run (one date, one hash), no name in two staged sets;
 #   2. capacity and retention: delete whole sets (every asset of a -<date>-g<hash>) dated more than
 #      NIGHTLY_KEEP_DAYS (14) before today, oldest first, never this run's set nor the set plain
-#      SHA256SUMS currently names, at most NIGHTLY_PRUNE_MAX (200) assets per run; then refuse if this
-#      set still would not fit under the cap. Pruning runs BEFORE uploading, so a full release can
-#      always recover;
-#   3. upload this run's images and notes;
+#      SHA256SUMS copies (matched by digest), its manifest FIRST and confirmed gone before its images,
+#      at most NIGHTLY_PRUNE_MAX (200) assets per run; then refuse if this set still would not fit
+#      under the cap. Pruning runs BEFORE uploading, so a full release can always recover;
+#   3. upload this run's images and notes, unless this exact set is already committed (then verify only;
+#      a committed set with other content is refused before any mutation);
 #   4. verify every one is on the release in state "uploaded" with OUR sha256 digest, else exit 1;
 #   5. commit: upload SHA256SUMS-<date>-g<hash> (never clobbered: an existing one must match), verify
 #      its digest, then replace plain SHA256SUMS.
@@ -92,9 +93,14 @@ assets() { "$GH" api --paginate "repos/$REPO/releases/$RID/assets?per_page=100" 
 
 # ── 2. retention (whole sets, before uploading) and capacity ──────────────────────────────────────
 listing="$(assets)"
-committed=""                                                     # the set plain SHA256SUMS names
-if awk -F'\t' '$1=="SHA256SUMS"' <<<"$listing" | grep -q .; then
-  committed="$(awk -F'\t' '{print $1}' <<<"$listing" | grep -E '^SHA256SUMS-' | sort | tail -1 | sed 's/^SHA256SUMS-//')"
+# The set plain SHA256SUMS currently copies: the per-run manifest with the SAME digest (xreview r2: not
+# the newest name, which differs when a run committed its manifest but not the copy). A legacy plain
+# SHA256SUMS that matches no per-run manifest (written before #574, covering every .bin) protects
+# nothing in particular; this run replaces it.
+plain="$(awk -F'\t' '$1=="SHA256SUMS" {print $2}' <<<"$listing")"
+committed=""
+if [ -n "$plain" ]; then
+  committed="$(awk -F'\t' -v d="$plain" '$1 ~ /^SHA256SUMS-/ && $2==d {sub(/^SHA256SUMS-/, "", $1); print $1}' <<<"$listing" | head -1)"
 fi
 cutoff="$(date -u -d "$TODAY - $KEEP days" +%F)"
 pruned=0
@@ -104,8 +110,17 @@ while read -r set_stamp; do
   date -u -d "$set_date" +%F >/dev/null 2>&1 || continue       # not a real date: not ours to judge
   [[ "$set_date" < "$cutoff" ]] || continue
   [ "$set_stamp" = "$STAMP" ] || [ "$set_stamp" = "$committed" ] && continue
-  mapfile -t urls < <(awk -F'\t' -v s="$set_stamp" '$1 ~ ("-" s "\\.bin(\\.NOTES\\.md)?$") || $1 == ("SHA256SUMS-" s) {print $4}' <<<"$listing")
-  [ $((pruned + ${#urls[@]})) -le "$PMAX" ] || break             # whole sets only, under the cap
+  mapfile -t urls < <(awk -F'\t' -v s="$set_stamp" '$1 ~ ("-" s "\\.bin(\\.NOTES\\.md)?$") {print $4}' <<<"$listing")
+  murl="$(awk -F'\t' -v n="SHA256SUMS-$set_stamp" '$1==n {print $4}' <<<"$listing")"
+  [ $((pruned + ${#urls[@]} + (${#murl} > 0))) -le "$PMAX" ] || break   # whole sets only, under the cap
+  # The manifest goes FIRST and its absence is confirmed before any image goes (xreview r2): an
+  # interruption then leaves an unpublished leftover, never a manifest naming deleted images.
+  if [ -n "$murl" ]; then
+    "$GH" api -X DELETE "$murl" >/dev/null
+    awk -F'\t' -v n="SHA256SUMS-$set_stamp" '$1==n' <<<"$(assets)" | grep -q . \
+      && abort "SHA256SUMS-$set_stamp is still on the release after its delete; its images are kept"
+    pruned=$((pruned + 1))
+  fi
   for u in "${urls[@]}"; do "$GH" api -X DELETE "$u" >/dev/null; done
   pruned=$((pruned + ${#urls[@]}))
 done < <(awk -F'\t' '{print $1}' <<<"$listing" | sed -nE "s/.*$SUFFIX_RE/\\1-g\\2/p" | sort -u)
@@ -116,8 +131,20 @@ have=$(grep -c . <<<"$listing" || true)
 already=$(for f in "$DIST"/*; do awk -F'\t' -v n="$(basename "$f")" '$1==n' <<<"$listing"; done | grep -c . || true)
 [ $((have - already + need + 1)) -le "$CAP" ] || abort "the release holds $have assets; this set needs $((need - already + 1)) more and the cap is $CAP"
 
-# ── 3. upload this run's images and notes ─────────────────────────────────────────────────────────
-( cd "$DIST" && "$GH" release upload "$TAG" --repo "$REPO" *.bin *.bin.NOTES.md --clobber )
+# ── 3. upload this run's images and notes — unless this exact set is already committed ─────────────
+# A committed set is immutable (xreview r2): if its manifest exists, nothing of it is re-uploaded. Same
+# manifest content -> verify the committed assets are still ours and finish; different -> refuse
+# before any mutation. Only a set with NO manifest (an unfinished run) is ever clobbered.
+want_m="sha256:$(sha256sum < "$DIST/$MANIFEST" | cut -d' ' -f1)"
+existing="$(awk -F'\t' -v n="$MANIFEST" '$1==n {print $2}' <<<"$(assets)")"
+if [ -n "$existing" ] && [ "$existing" != "$want_m" ]; then
+  abort "$MANIFEST already exists with different content (a committed set is never overwritten)"
+fi
+if [ -z "$existing" ]; then
+  ( cd "$DIST" && "$GH" release upload "$TAG" --repo "$REPO" *.bin *.bin.NOTES.md --clobber )
+else
+  echo "publish_nightly: $MANIFEST is already committed with this content; verifying, not re-uploading"
+fi
 
 # ── 4. verify: state "uploaded" and OUR digest, for every image and note ───────────────────────────
 verify() { # $@ local files -> 0 when each is on the release, uploaded, with our sha256
@@ -132,11 +159,8 @@ verify() { # $@ local files -> 0 when each is on the release, uploaded, with our
 verify "$DIST"/*.bin "$DIST"/*.bin.NOTES.md || abort "an image or note is not on the release with our digest"
 
 # ── 5. commit: the immutable per-run manifest, then the convenience copy ──────────────────────────
-existing="$(awk -F'\t' -v n="$MANIFEST" '$1==n {print $2}' <<<"$(assets)")"
 if [ -z "$existing" ]; then
   ( cd "$DIST" && "$GH" release upload "$TAG" --repo "$REPO" "$MANIFEST" )
-elif [ "$existing" != "sha256:$(sha256sum < "$DIST/$MANIFEST" | cut -d' ' -f1)" ]; then
-  abort "$MANIFEST already exists with different content (a manifest is never overwritten)"
 fi
 verify "$DIST/$MANIFEST" || abort "$MANIFEST is not on the release with our digest"
 cp "$DIST/$MANIFEST" "$DIST/SHA256SUMS"

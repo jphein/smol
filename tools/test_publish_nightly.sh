@@ -124,12 +124,29 @@ stage "$W/s"; fresh_release
 NIGHTLY_PRUNE_MAX=4 "$PUB" "$W/s" >"$W/out" 2>&1
 a=$(ls "$FAKE_REL" | grep -c 2026-10-01); b=$(ls "$FAKE_REL" | grep -c 2026-10-02)
 { [ "$a" = 0 ] && [ "$b" = 3 ]; } && ok "prune cap 4: one whole 3-asset set deleted, the next kept whole" || bad "prune cap: 10-01 left $a, 10-02 left $b"
-stage "$W/s"; fresh_release; rm -f "$FAKE_REL"/*2026-11-10*; echo sums > "$FAKE_REL/SHA256SUMS-2026-10-02-g2222222bbbb"
+stage "$W/s"; fresh_release; rm -f "$FAKE_REL"/*2026-11-10*
+cp "$FAKE_REL/SHA256SUMS-2026-10-02-g2222222bbbb" "$FAKE_REL/SHA256SUMS"   # plain SHA256SUMS copies 10-02
 "$PUB" "$W/s" >/dev/null 2>&1 || true
 # after the run the committed set is this run's; the PREVIOUS committed (latest manifest before the
 # run: 10-02) must have survived the prune that ran before the commit
 [ -e "$FAKE_REL/smol-c3-2026-10-02-g2222222bbbb.bin" ] && ok "the set SHA256SUMS named at prune time is never pruned" \
   || bad "the previously committed set was pruned"
+
+# 8. a committed set is immutable: a rerun with the same bytes verifies and uploads no image; a rerun
+#    with other bytes under the same date+hash is refused before any upload
+stage "$W/s"; fresh_release; "$PUB" "$W/s" >/dev/null 2>&1; : > "$FAKE_REL.log"
+"$PUB" "$W/s" >"$W/out" 2>&1; rc=$?
+[ "$rc" = 0 ] && ! grep -q "release upload.*\.bin" "$FAKE_REL.log" && grep -q "already committed" "$W/out" \
+  && ok "a rerun of a committed set verifies and re-uploads no image" || bad "idempotent rerun: exit $rc"
+printf 'different bytes\n' > "$W/s/s3/smol-s3-cyd-$S.bin"; before="$(snapshot)"; : > "$FAKE_REL.log"
+"$PUB" "$W/s" >"$W/out" 2>&1; rc=$?
+[ "$rc" = 1 ] && [ "$before" = "$(snapshot)" ] && ! grep -q "release upload" "$FAKE_REL.log" \
+  && ok "other bytes under a committed date+hash: refused before any upload (exit 1)" || bad "conflicting rerun: exit $rc"
+
+# 9. pruning deletes a set's manifest BEFORE its images
+stage "$W/s"; fresh_release; "$PUB" "$W/s" >/dev/null 2>&1
+m=$(grep -n "DELETE fake://SHA256SUMS-2026-10-01" "$FAKE_REL.log" | cut -d: -f1); i=$(grep -n "DELETE fake://smol-c3-2026-10-01" "$FAKE_REL.log" | head -1 | cut -d: -f1)
+[ -n "$m" ] && [ -n "$i" ] && [ "$m" -lt "$i" ] && ok "prune: the manifest is deleted before the set's images" || bad "prune order: manifest@$m image@$i"
 
 # 7. the real manifests
 real="$(bash "$ROOT/tools/release_targets.sh" --expected)"
