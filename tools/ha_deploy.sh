@@ -13,6 +13,7 @@
 #   ./tools/ha_deploy.sh diff [file]   # full unified diff for one package (or all)
 #   ./tools/ha_deploy.sh dash          # dashboard-only drift check (READ-ONLY; exits 1 on drift)
 #   ./tools/ha_deploy.sh assets        # theme/www file pairs (#321) (READ-ONLY; exits 1 on drift)
+#   ./tools/ha_deploy.sh packages      # packages only (#575) (READ-ONLY; 0 sync · 1 drift · 2 unreachable)
 #   ./tools/ha_deploy.sh pull          # live -> repo, so out-of-band edits become commits
 #   ./tools/ha_deploy.sh push [file...] # repo -> live from HEAD, validated, with rollback
 #   ./tools/ha_deploy.sh push --all      # every differing package (required if >1)
@@ -57,7 +58,7 @@ HA_SSH="${HA_SSH:-jp@10.0.6.108}"
 HA_URL="${HA_URL:-https://ha.jphe.in}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCAL_DIR="$REPO_DIR/ha/packages"
-REMOTE_DIR="/homeassistant/packages"
+REMOTE_DIR="${HA_REMOTE_DIR:-/homeassistant/packages}"   # override only for tools/test_ha_pkg_drift.sh
 SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes)
 
 # --- #321: the SECOND class of managed path — explicit file PAIRS, not a directory sync ------
@@ -186,8 +187,43 @@ packages() { # repo package basenames, sorted
   find "$LOCAL_DIR" -maxdepth 1 -name '*.yaml' -printf '%f\n' | sort
 }
 
+rsh() { # $1 command -> run it where the live packages are. HA_SSH=local runs it here (test harness only).
+  if [ "$HA_SSH" = local ]; then sh -c "$1"; else ssh "${SSH_OPTS[@]}" "$HA_SSH" "$1"; fi
+}
+
 fetch_remote() { # $1 basename -> stdout (empty if the file does not exist there)
-  ssh "${SSH_OPTS[@]}" "$HA_SSH" "cat $REMOTE_DIR/$1 2>/dev/null" || true
+  rsh "cat $REMOTE_DIR/$1 2>/dev/null" || true
+}
+
+# --- packages (#575) ---------------------------------------------------------------------
+# `status` is a human report and always exits 0, so nothing could gate on package drift: on
+# 2026-11-13 smol_mesh.yaml (since 3b69ca7, 08-25) and smol_telemetry.yaml (#471/#537) had sat
+# committed and never deployed, and the issue that found it guessed the wrong direction. This is the
+# exit-coded, package-only answer: 0 in sync · 1 drift (either direction, or a live-only package) ·
+# 2 could not check. Run it after a merge that touches ha/packages, and from any periodic check.
+cmd_packages() {
+  local drift=0 tmp; tmp="$(mktemp -d -p "${TMPDIR:-$HOME/.cache}")"; trap 'rm -rf "$tmp"' RETURN
+  if ! rsh "test -d $REMOTE_DIR" 2>/dev/null; then
+    echo "  could not reach $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
+  fi
+  for f in $(packages); do
+    fetch_remote "$f" > "$tmp/$f"
+    if [ ! -s "$tmp/$f" ]; then
+      printf '  %-24s MISSING on live\n' "$f"; drift=1
+    elif cmp -s "$LOCAL_DIR/$f" "$tmp/$f"; then
+      printf '  %-24s in sync\n' "$f"
+    else
+      local a b; a=$(diff "$LOCAL_DIR/$f" "$tmp/$f" | grep -c '^<' || true)
+      b=$(diff "$LOCAL_DIR/$f" "$tmp/$f" | grep -c '^>' || true)
+      printf '  %-24s DIFFERS  (repo-only lines: %s, live-only lines: %s)\n' "$f" "$a" "$b"; drift=1
+    fi
+  done
+  local extra
+  extra=$(rsh "ls $REMOTE_DIR/smol*.yaml 2>/dev/null" | xargs -r -n1 basename | grep -vxF "$(packages)" || true)
+  if [ -n "$extra" ]; then
+    printf '  LIVE-ONLY %s\n' $extra; drift=1
+  fi
+  return "$drift"
 }
 
 # --- assets (#321) --------------------------------------------------------------------------
@@ -255,7 +291,7 @@ cmd_status() {
   done
   # A package that exists ONLY on the VM is the drift that bit us before — surface it loudly.
   local extra
-  extra=$(ssh "${SSH_OPTS[@]}" "$HA_SSH" "ls $REMOTE_DIR/smol*.yaml 2>/dev/null" | xargs -r -n1 basename \
+  extra=$(rsh "ls $REMOTE_DIR/smol*.yaml 2>/dev/null" | xargs -r -n1 basename \
           | grep -vxF "$(packages)" || true)
   if [ -n "$extra" ]; then
     echo; echo "  LIVE-ONLY packages (untracked — run 'pull' to bring them into git):"
@@ -815,8 +851,9 @@ case "${1:-status}" in
   diff)   cmd_diff "${2:-}" ;;
   dash)   cmd_dash ;;   # exit code propagates: 0 in sync · 1 live-only drift · 2 could not check
   assets) cmd_assets ;; # #321; same contract as dash: 0 in sync · 1 drift · 2 could not check
+  packages) cmd_packages ;; # #575; same contract: 0 in sync · 1 drift · 2 could not check
   pull)   cmd_pull ;;
   push)   shift; cmd_push "$@" ;;
-  -h|--help|help) sed -n '2,34p' "${BASH_SOURCE[0]}" ;;
-  *) die "unknown mode '${1}' (status | diff | dash | assets | pull | push)" ;;
+  -h|--help|help) sed -n '2,35p' "${BASH_SOURCE[0]}" ;;
+  *) die "unknown mode '${1}' (status | diff | dash | assets | packages | pull | push)" ;;
 esac
