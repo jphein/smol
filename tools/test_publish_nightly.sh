@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# test_publish_nightly.sh — #574. Prove tools/publish_nightly.sh publishes one complete set or nothing,
-# against a FAKE `gh` that keeps the "release" in a directory (no network, no real release touched).
-# Arms (each observed):
-#   1. a complete set: every image + notes published, SHA256SUMS uploaded LAST and covering exactly
-#      this run's images, old assets beyond retention pruned, recent ones and SHA256SUMS kept;
-#   2. incomplete sets REFUSE (exit 2) with the release untouched: an empty set, a .bin without its
-#      NOTES, a name in two sets, no sets at all;
-#   3. an upload that silently drops a file -> exit 1 and SHA256SUMS is NOT replaced (the commit point).
+# test_publish_nightly.sh — #574. Prove tools/publish_nightly.sh commits one complete set or nothing,
+# against a FAKE `gh` that keeps the "release" in a directory (no network; no real release touched).
+# Each arm is observed:
+#   1. a complete set commits: images + notes on the release, the per-run manifest written after them
+#      and verifying, plain SHA256SUMS a copy of it, old SETS pruned whole, recent ones kept;
+#   2. incomplete or wrong sets REFUSE (exit 2) with the release untouched: an image missing from the
+#      expected set, an extra one, an image without NOTES, a name in two staged sets, images from two
+#      runs, no staged sets;
+#   3. an upload whose bytes do not match (digest) -> exit 1 and NO manifest is written;
+#   4. a per-run manifest that already exists with other content is never overwritten (exit 1);
+#   5. capacity: a release too full for this set refuses before uploading (exit 1), after pruning;
+#   6. the prune cap deletes whole sets only; the set plain SHA256SUMS names is never pruned;
+#   7. release_targets.sh --expected, run on the REAL manifests, lists the images the publisher demands.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PUB="$ROOT/tools/publish_nightly.sh"
@@ -15,84 +20,121 @@ pass=0; fail=0
 ok()  { printf '   PASS %s\n' "$1"; pass=$((pass+1)); }
 bad() { printf '   FAIL %s\n' "$1"; fail=$((fail+1)); }
 
-# the fake gh: release = $REL/ ; log of calls = $REL.log ; FAKE_DROP=<name> silently skips one upload
+# the fake gh: release = $FAKE_REL/ ; calls logged to $FAKE_REL.log ; FAKE_CORRUPT=<name> uploads other bytes
 cat > "$W/gh" <<'GH'
 #!/usr/bin/env bash
 REL="${FAKE_REL:?}"; echo "$*" >> "$REL.log"
+if [ "$1" = api ] && [ "$2" = -X ]; then rm -f "$REL/${4#fake://}"; exit 0; fi
+if [ "$1" = api ] && [ "$2" = --paginate ]; then
+  for f in "$REL"/*; do [ -e "$f" ] || continue
+    printf '%s\tsha256:%s\tuploaded\tfake://%s\n' "$(basename "$f")" "$(sha256sum < "$f" | cut -d' ' -f1)" "$(basename "$f")"
+  done; exit 0; fi
+if [ "$1" = api ]; then [ -d "$REL" ] && { echo 1; exit 0; }; exit 1; fi
 case "$1 $2" in
-  "release view")
-    [ -d "$REL" ] || exit 1
-    if [ "${4:-}" = "--json" ]; then
-      for f in "$REL"/*; do [ -e "$f" ] || continue; n="$(basename "$f")"
-        printf '%s\t%s\tfake://%s\n' "$n" "$(stat -c %s "$f")" "$n"; done
-    fi ;;
   "release create") mkdir -p "$REL" ;;
   "release upload")
     shift 3
-    for f in "$@"; do [ "$f" = --clobber ] && continue
-      [ "$(basename "$f")" = "${FAKE_DROP:-}" ] && continue
-      cp "$f" "$REL/"; done ;;
-  "api -X") rm -f "$REL/${4#fake://}" ;;
+    while [ $# -gt 0 ]; do
+      case "$1" in --repo) shift 2; continue ;; --clobber) shift; continue ;; esac
+      n="$(basename "$1")"
+      if [ "$n" = "${FAKE_CORRUPT:-}" ]; then echo corrupted > "$REL/$n"; else cp "$1" "$REL/"; fi
+      shift
+    done ;;
   *) echo "fake gh: unexpected $*" >&2; exit 9 ;;
 esac
 GH
 chmod +x "$W/gh"
-export GH="$W/gh" TODAY=2026-11-13 NIGHTLY_KEEP_DAYS=14
+export GH="$W/gh" GH_REPO=fake/repo TODAY=2026-11-13 NIGHTLY_KEEP_DAYS=14 FAKE_REL="$W/rel"
+printf 'smol-c3\nsmol-c3-oled\nsmol-s3-cyd\nsmol-watch-c6\n' > "$W/expected"
+export EXPECTED_CMD="cat $W/expected"
+S=2026-11-13-gabc1234def0
 
-stage() { # $1 dir; writes three sets: c3 (2 images), gui (1), s3 (1)
+stage() { # $1 dir: three staged sets holding exactly the expected four images
   rm -rf "$1"; mkdir -p "$1/riscv" "$1/gui" "$1/s3"
-  for p in "riscv/smol-c3" "riscv/smol-c3-oled" "gui/smol-c6-watch-gui" "s3/smol-s3-cyd"; do
-    printf 'image %s\n' "$p" > "$1/$p-2026-11-13-gabc1234def0.bin"
-    printf 'notes %s\n' "$p" > "$1/$p-2026-11-13-gabc1234def0.bin.NOTES.md"
+  for p in riscv/smol-c3 riscv/smol-c3-oled gui/smol-watch-c6 s3/smol-s3-cyd; do
+    printf 'image %s\n' "$p" > "$1/$p-$S.bin"; printf 'notes %s\n' "$p" > "$1/$p-$S.bin.NOTES.md"
   done
 }
-fresh_release() { # an existing release with an old night, a recent night and an old SHA256SUMS
-  rm -rf "$FAKE_REL" "$FAKE_REL.log"; mkdir -p "$FAKE_REL"
-  for d in 2026-10-01 2026-11-10; do
-    echo old > "$FAKE_REL/smol-c3-$d-g1111111aaaa.bin"; echo n > "$FAKE_REL/smol-c3-$d-g1111111aaaa.bin.NOTES.md"; done
-  echo "old sums" > "$FAKE_REL/SHA256SUMS"
+put_set() { # $1 stamp: an old committed-looking set on the fake release
+  echo "old $1" > "$FAKE_REL/smol-c3-$1.bin"; echo n > "$FAKE_REL/smol-c3-$1.bin.NOTES.md"
+  echo "sums $1" > "$FAKE_REL/SHA256SUMS-$1"
 }
-export FAKE_REL="$W/rel"
+fresh_release() {
+  rm -rf "$FAKE_REL" "$FAKE_REL.log"; mkdir -p "$FAKE_REL"
+  put_set 2026-10-01-g1111111aaaa; put_set 2026-10-02-g2222222bbbb; put_set 2026-11-10-g3333333cccc
+  echo "previous sums" > "$FAKE_REL/SHA256SUMS"
+}
+snapshot() { (cd "$FAKE_REL" && for f in *; do printf '%s %s\n' "$f" "$(md5sum < "$f")"; done); }
 
-# 1. complete set
+# 1. a complete set commits
 stage "$W/s"; fresh_release
 if "$PUB" "$W/s" >"$W/out" 2>&1; then
-  n=$(ls "$FAKE_REL"/*2026-11-13*.bin 2>/dev/null | wc -l)
-  last="$(grep 'release upload' "$FAKE_REL.log" | tail -1)"
-  sums_ok="$(cd "$FAKE_REL" && sha256sum -c SHA256SUMS >/dev/null 2>&1 && wc -l < SHA256SUMS)"
-  [ "$n" = 4 ] && ok "complete set: all 4 images published" || bad "complete set: $n of 4 images published"
-  [[ "$last" == *" SHA256SUMS --clobber" ]] && ok "SHA256SUMS is the LAST upload (the commit point)" || bad "last upload was: $last"
-  [ "$sums_ok" = 4 ] && ok "SHA256SUMS verifies and covers exactly this run's 4 images" || bad "SHA256SUMS: '$sums_ok'"
-  [ ! -e "$FAKE_REL/smol-c3-2026-10-01-g1111111aaaa.bin" ] && [ ! -e "$FAKE_REL/smol-c3-2026-10-01-g1111111aaaa.bin.NOTES.md" ] \
-    && ok "an asset past retention (2026-10-01) is pruned, notes too" || bad "old assets were not pruned"
-  [ -e "$FAKE_REL/smol-c3-2026-11-10-g1111111aaaa.bin" ] && ok "a recent night (2026-11-10) is kept" || bad "a recent night was pruned"
+  n=$(ls "$FAKE_REL"/*"$S".bin 2>/dev/null | wc -l)
+  [ "$n" = 4 ] && ok "complete set: all 4 images published" || bad "complete set: $n of 4 images"
+  m_line=$(grep -n "SHA256SUMS-$S" "$FAKE_REL.log" | head -1 | cut -d: -f1)
+  i_line=$(grep -n "release upload.*\.bin" "$FAKE_REL.log" | head -1 | cut -d: -f1)
+  [ -n "$m_line" ] && [ -n "$i_line" ] && [ "$m_line" -gt "$i_line" ] && [[ "$(grep 'release upload' "$FAKE_REL.log" | tail -1)" == *" SHA256SUMS --clobber" ]] \
+    && ok "order: images, then SHA256SUMS-$S, then plain SHA256SUMS last" || bad "upload order wrong: $(grep 'release upload' "$FAKE_REL.log" | tr '\n' '|')"
+  (cd "$FAKE_REL" && sha256sum -c "SHA256SUMS-$S" >/dev/null 2>&1) && [ "$(wc -l < "$FAKE_REL/SHA256SUMS-$S")" = 4 ] \
+    && cmp -s "$FAKE_REL/SHA256SUMS" "$FAKE_REL/SHA256SUMS-$S" \
+    && ok "the manifest verifies, covers exactly this run's 4 images, and SHA256SUMS copies it" || bad "manifest wrong"
+  [ -z "$(ls "$FAKE_REL" | grep -E '2026-10-0[12]')" ] && ok "sets past retention pruned WHOLE (image, notes, manifest)" \
+    || bad "old sets left: $(ls "$FAKE_REL" | grep -E '2026-10-0[12]' | tr '\n' ' ')"
+  [ -e "$FAKE_REL/smol-c3-2026-11-10-g3333333cccc.bin" ] && [ -e "$FAKE_REL/SHA256SUMS-2026-11-10-g3333333cccc" ] \
+    && ok "a set inside retention (2026-11-10) is kept" || bad "a recent set was pruned"
 else bad "complete set: exit $? — $(tail -2 "$W/out")"; fi
 
-# 2. incomplete sets refuse with the release untouched
-refuse_case() { # $1 name, $2 setup command
-  stage "$W/s"; eval "$2"; fresh_release; before="$(cd "$FAKE_REL" && ls | md5sum)"
+# 2. refusals leave the release untouched
+refuse_case() { # $1 name, $2 setup
+  stage "$W/s"; eval "$2"; fresh_release; before="$(snapshot)"
   "$PUB" "$W/s" >"$W/out" 2>&1; rc=$?
-  if [ "$rc" = 2 ] && [ "$before" = "$(cd "$FAKE_REL" && ls | md5sum)" ] && ! grep -q "release upload" "$FAKE_REL.log" 2>/dev/null; then
+  if [ "$rc" = 2 ] && [ "$before" = "$(snapshot)" ] && ! grep -q "release upload\|-X DELETE" "$FAKE_REL.log" 2>/dev/null; then
     ok "refuses (exit 2, release untouched): $1"
   else bad "$1: exit $rc; $(tail -1 "$W/out")"; fi
 }
-refuse_case "an empty staged set"            'rm -f "$W/s/gui/"*'
-refuse_case "a .bin without its NOTES"       'rm -f "$W/s/s3/"*.NOTES.md'
-refuse_case "one name in two staged sets"    'cp "$W/s/s3/"*.bin "$W/s/gui/"'
-refuse_case "no staged sets at all"          'rm -rf "$W/s/"*'
+refuse_case "an expected image is missing"     'rm -f "$W/s/s3/"*'"; rmdir \"\$W/s/s3\""
+refuse_case "an image the manifests do not expect" 'printf x > "$W/s/s3/smol-extra-$S.bin"; printf n > "$W/s/s3/smol-extra-$S.bin.NOTES.md"'
+refuse_case "an image without its NOTES"       'rm -f "$W/s/s3/"*.NOTES.md'
+refuse_case "one name in two staged sets"      'cp "$W/s/s3/"*.bin "$W/s/gui/"; cp "$W/s/s3/"*.NOTES.md "$W/s/gui/"'
+refuse_case "images from two runs"             'for f in "$W/s/s3/"*; do mv "$f" "${f/abc1234def0/fff9999eee8}"; done'
+refuse_case "no staged sets"                   'rm -rf "$W/s/"*'
 
-# 3. a silently dropped upload: exit 1, SHA256SUMS stays on the previous complete set
+# 3. a corrupted upload: exit 1, no manifest, plain SHA256SUMS untouched
 stage "$W/s"; fresh_release
-FAKE_DROP="smol-s3-cyd-2026-11-13-gabc1234def0.bin" "$PUB" "$W/s" >"$W/out" 2>&1; rc=$?
-if [ "$rc" = 1 ] && [ "$(cat "$FAKE_REL/SHA256SUMS")" = "old sums" ] && grep -q "NOT PUBLISHED: smol-s3-cyd" "$W/out"; then
-  ok "a dropped upload fails (exit 1) and SHA256SUMS is NOT replaced"
-else bad "dropped upload: exit $rc, SHA256SUMS='$(head -c 40 "$FAKE_REL/SHA256SUMS")'"; fi
+FAKE_CORRUPT="smol-s3-cyd-$S.bin" "$PUB" "$W/s" >"$W/out" 2>&1; rc=$?
+if [ "$rc" = 1 ] && [ ! -e "$FAKE_REL/SHA256SUMS-$S" ] && [ "$(cat "$FAKE_REL/SHA256SUMS")" = "previous sums" ] \
+   && grep -q "NOT PUBLISHED: smol-s3-cyd" "$W/out"; then
+  ok "a digest mismatch fails (exit 1): no manifest, SHA256SUMS unchanged"
+else bad "corrupt upload: exit $rc; manifest $( [ -e "$FAKE_REL/SHA256SUMS-$S" ] && echo written || echo absent)"; fi
 
-# 4. the prune cap: with NIGHTLY_PRUNE_MAX=1 only one old asset goes per run
+# 4. an existing per-run manifest with other content is never overwritten
+stage "$W/s"; fresh_release; echo "someone else's" > "$FAKE_REL/SHA256SUMS-$S"
+"$PUB" "$W/s" >"$W/out" 2>&1; rc=$?
+[ "$rc" = 1 ] && [ "$(cat "$FAKE_REL/SHA256SUMS-$S")" = "someone else's" ] && [ "$(cat "$FAKE_REL/SHA256SUMS")" = "previous sums" ] \
+  && ok "an existing manifest is never overwritten (exit 1)" || bad "existing manifest: exit $rc"
+
+# 5. capacity: too full even after pruning -> exit 1 before any upload
 stage "$W/s"; fresh_release
-NIGHTLY_PRUNE_MAX=1 "$PUB" "$W/s" >"$W/out" 2>&1
-left=$(ls "$FAKE_REL"/*2026-10-01* 2>/dev/null | wc -l)
-[ "$left" = 1 ] && ok "the prune cap holds: 1 of 2 old assets deleted this run" || bad "prune cap: $left old assets left (want 1)"
+NIGHTLY_CAP=8 "$PUB" "$W/s" >"$W/out" 2>&1; rc=$?
+[ "$rc" = 1 ] && ! grep -q "release upload" "$FAKE_REL.log" && grep -q "cap is 8" "$W/out" \
+  && ok "a release too full for the set refuses before uploading (exit 1)" || bad "capacity: exit $rc; $(tail -1 "$W/out")"
+
+# 6. the prune cap deletes whole sets only, and never the committed one
+stage "$W/s"; fresh_release
+NIGHTLY_PRUNE_MAX=4 "$PUB" "$W/s" >"$W/out" 2>&1
+a=$(ls "$FAKE_REL" | grep -c 2026-10-01); b=$(ls "$FAKE_REL" | grep -c 2026-10-02)
+{ [ "$a" = 0 ] && [ "$b" = 3 ]; } && ok "prune cap 4: one whole 3-asset set deleted, the next kept whole" || bad "prune cap: 10-01 left $a, 10-02 left $b"
+stage "$W/s"; fresh_release; rm -f "$FAKE_REL"/*2026-11-10*; echo sums > "$FAKE_REL/SHA256SUMS-2026-10-02-g2222222bbbb"
+"$PUB" "$W/s" >/dev/null 2>&1 || true
+# after the run the committed set is this run's; the PREVIOUS committed (latest manifest before the
+# run: 10-02) must have survived the prune that ran before the commit
+[ -e "$FAKE_REL/smol-c3-2026-10-02-g2222222bbbb.bin" ] && ok "the set SHA256SUMS named at prune time is never pruned" \
+  || bad "the previously committed set was pruned"
+
+# 7. the real manifests
+real="$(bash "$ROOT/tools/release_targets.sh" --expected)"
+if [ -n "$real" ] && ! grep -qv '^smol-[a-z0-9-]*$' <<<"$real"; then ok "release_targets.sh --expected on the real manifests: $(tr '\n' ' ' <<<"$real")"
+else bad "release_targets.sh --expected: '$real'"; fi
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

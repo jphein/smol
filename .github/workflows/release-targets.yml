@@ -22,7 +22,9 @@ concurrency:
   # Scoped by ref (#571, xreview): concurrency is resolved BEFORE ref-guard runs, so with one shared
   # group a rejected branch/tag dispatch could still cancel a legitimate main publication mid-upload.
   group: release-targets-${{ github.ref }}
-  cancel-in-progress: true
+  # #574 (xreview): never cancel a run in progress. A cancel landing in the publish job could stop it
+  # between images and manifest; a newer run now waits instead (at most one pending per ref).
+  cancel-in-progress: false
 env:
   XTENSA_VERSION: 1.95.0.0
   ESPUP_VERSION: 0.17.1
@@ -147,10 +149,13 @@ jobs:
     # MIXTURE of old and new assets (2026-11-13, run 43415382132: c3 + xtensa published, c6-watch
     # failed) under a SHA256SUMS that covered all of it. Now the build jobs only stage, and this job:
     #   * runs only when EVERY build job succeeded (the implicit success() below: all or nothing);
-    #   * refuses an incomplete staged set before touching the release (tools/publish_nightly.sh);
-    #   * uploads, VERIFIES every file is on the release, and only then uploads SHA256SUMS (this run's
-    #     images only), so SHA256SUMS is the commit point and never describes a mixture;
-    #   * prunes dated assets past 14 days (the release had grown to 817, against GitHub's 1000 cap).
+    #   * refuses a staged set that is not EXACTLY `release_targets.sh --expected` (from the manifests)
+    #     before touching the release (tools/publish_nightly.sh);
+    #   * prunes whole sets past 14 days first (the release had grown to 817 assets, cap 1000), uploads,
+    #     VERIFIES each file's state and sha256 digest on the release, and only then writes the run's
+    #     immutable SHA256SUMS-<date>-g<hash>: a set is published when that manifest exists. GitHub has
+    #     no atomic multi-asset swap, so that manifest, not the asset list, is the commit record;
+    #     plain SHA256SUMS is a copy of the latest, replaced last (docs/RELEASES.md).
     # tools/test_publish_nightly.sh proves each of those arms against a fake gh (gate.sh host).
     # Same main-only rule as every publisher (#571): needs ref-guard AND its own `if:` on the ref.
     name: publish the nightly (all or nothing, #574)

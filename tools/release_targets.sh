@@ -26,13 +26,33 @@
 #   Exit: 0 all built · 1 a build/gate failed · 2 manifest/environment problem.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT="${1:?usage: release_targets.sh <output-dir> [target ...]}"; shift || true
-mkdir -p "$OUT"
 
 # Minimal TOML reader for the flat manifests (key = "value" / key = true|false). Deliberately not
 # a TOML parser: the manifests are ours, flat by convention, and a parser dependency on the
 # publish path is new failure surface (same argument as repro_build.sh's no-TOML rule).
 tget() { sed -n "s/^${2} *= *\"\?\([^\"#]*\)\"\?.*/\1/p" "$1" | head -1 | sed 's/ *$//'; }
+
+# #574: `release_targets.sh --expected` prints the image base names a complete run produces (one per
+# line, before -<date>-g<hash>.bin), from the SAME manifest rules the two build loops below apply:
+# fleet = artifact true, no alias_of, flavor fleet, one per chip/flavor; gui = gui_artifact true.
+# tools/publish_nightly.sh refuses a staged set that is not exactly this, so a build that silently
+# skipped a target cannot publish a short set. Keep it in step with the loops (the publisher's test
+# runs it against the real manifests).
+if [ "${1:-}" = "--expected" ]; then
+  declare -A seen=()
+  for m in "$ROOT"/targets/*/target.toml; do
+    n="$(tget "$m" name)"; c="$(tget "$m" chip)"; f="$(tget "$m" flavor)"
+    if [ "$(tget "$m" artifact)" = true ] && [ -z "$(tget "$m" alias_of)" ] && [ "$f" = fleet ] \
+       && [ -z "${seen[$c/$f]:-}" ]; then seen[$c/$f]=1; echo "smol-$n"; fi
+    if [ "$(tget "$m" gui_artifact)" = true ]; then
+      a="$(tget "$m" gui_artifact_name)"; echo "${a:-smol-$n-gui}"
+    fi
+  done | sort
+  exit 0
+fi
+
+OUT="${1:?usage: release_targets.sh <output-dir> [target ...] | --expected}"; shift || true
+mkdir -p "$OUT"
 
 # Enumerate the requested manifests.
 declare -a MANIFESTS=()
