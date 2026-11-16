@@ -13,6 +13,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 SH=./tools/ha_deploy.sh
 base="${RUNNER_TEMP:-${TMPDIR:-$HOME/.cache}}"; mkdir -p "$base"
 live="$(mktemp -d -p "$base" ha-pkg-drift.XXXXXX)"; trap 'rm -rf "$live"' EXIT
+# no `set -e` here, so a failed mktemp would leave $live empty and reset() would aim rm/cp at "/" (xreview #576 r1 #3)
+[ -n "$live" ] && [ -d "$live" ] || { echo "could not make a scratch dir under $base" >&2; exit 2; }
 pass=0; fail=0
 run() { HA_SSH=local HA_REMOTE_DIR="$1" "$SH" packages >"$live.out" 2>&1; echo $?; }
 expect() { # $1 name, $2 want rc, $3 got rc, $4 optional grep the output must contain
