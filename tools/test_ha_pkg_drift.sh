@@ -12,11 +12,13 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 SH=./tools/ha_deploy.sh
 base="${RUNNER_TEMP:-${TMPDIR:-$HOME/.cache}}"; mkdir -p "$base"
-live="$(mktemp -d -p "$base" ha-pkg-drift.XXXXXX)"; trap 'rm -rf "$live"' EXIT
+live="$(mktemp -d -p "$base" ha-pkg-drift.XXXXXX)"; live2=""; stub=""
 # no `set -e` here, so a failed mktemp would leave $live empty and reset() would aim rm/cp at "/" (xreview #576 r1 #3)
 [ -n "$live" ] && [ -d "$live" ] || { echo "could not make a scratch dir under $base" >&2; exit 2; }
+trap 'rm -rf "$live" "$live.out"; [ -n "$live2" ] && rm -rf "$live2"; [ -n "$stub" ] && rm -rf "$stub"' EXIT
 pass=0; fail=0
 run() { HA_SSH=local HA_REMOTE_DIR="$1" "$SH" packages >"$live.out" 2>&1; echo $?; }
+runp() { PATH="$2:$PATH" HA_SSH=local HA_REMOTE_DIR="$1" "$SH" packages >"$live.out" 2>&1; echo $?; }   # with a stub dir first on PATH
 expect() { # $1 name, $2 want rc, $3 got rc, $4 optional grep the output must contain
   if [ "$3" = "$2" ] && { [ -z "${4:-}" ] || grep -q -- "$4" "$live.out"; }; then
     pass=$((pass+1)); printf '  ok   %s\n' "$1"
@@ -76,3 +78,31 @@ fi
 rm -f "$live.out"
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
+# Fault injection (xreview backfill of #580, 2026-11-16): the live-side stages must fail closed one by one. A fresh
+# live copy (earlier arms leave permission/newline fixtures behind) and stubs first on PATH that fail ONLY on the live
+# side: `find` when run from the live dir (the remote enumeration cd's there; the repo listing does not), `cat` on a
+# live path, `cmp` always (the only cmp is the live comparison). `sh` here is /bin/sh (dash on Ubuntu: no pipefail).
+live2="$(mktemp -d -p "$base" ha-pkg-fault.XXXXXX)"; cp ha/packages/*.yaml "$live2/"
+stub="$(mktemp -d -p "$base" ha-pkg-stub.XXXXXX)"
+# the live find prints the complete listing and THEN fails (a stat error on an entry): the count matches the listing,
+# only find's status says the enumeration failed; a pipeline would have hidden it behind wc's 0
+printf '#!/bin/sh\nif [ "$PWD" = "%s" ]; then /usr/bin/find "$@"; exit 1; fi\nexec /usr/bin/find "$@"\n' "$live2" > "$stub/find"; chmod 700 "$stub/find"
+                                           expect "a live find that lists everything and then fails is 2, never 'in sync'"  2 "$(runp "$live2" "$stub")" "could not count"
+rm -f "$stub/find"; printf '#!/bin/sh\ncase "$1" in "%s"/*) exit 1;; esac\nexec /bin/cat "$@"\n' "$live2" > "$stub/cat"; chmod 700 "$stub/cat"
+                                           expect "a failing fetch (cat) of a live file is 2"             2 "$(runp "$live2" "$stub")" "could not read"
+rm -f "$stub/cat"; printf '#!/bin/sh\nexit 3\n' > "$stub/cmp"; chmod 700 "$stub/cmp"
+                                           expect "a comparison error (cmp exit 3) is 2, never drift or in sync" 2 "$(runp "$live2" "$stub")" "could not compare"
+# a tr that fails after find succeeded (a read error on the scratch file): still 2, the stage is not hidden behind wc
+rm -f "$stub/cmp"; printf '#!/bin/sh\nexit 1\n' > "$stub/tr"; chmod 700 "$stub/tr"
+                                           expect "a failing tr in the live count is 2 (no pipeline hides it)"  2 "$(runp "$live2" "$stub")" "could not count"
+# mktemp failing on the live side: 2, and an unrelated file named .c beside the packages survives (nothing is removed
+# that was not made)
+rm -f "$stub/tr"; printf '#!/bin/sh\n[ "$PWD" = "%s" ] && exit 1\nexec /usr/bin/mktemp "$@"\n' "$live2" > "$stub/mktemp"; chmod 700 "$stub/mktemp"; printf 'keep\n' > "$live2/.c"
+                                           expect "a failing mktemp on the live side is 2"  2 "$(runp "$live2" "$stub")" "could not count"
+[ "$(cat "$live2/.c" 2>/dev/null)" = keep ] && { pass=$((pass+1)); printf '  ok   %s\n' "a stray .c beside the packages survives a failed count"; } || { fail=$((fail+1)); printf '  FAIL %s\n' "the stray .c was removed or changed"; }
+rm -f "$stub/mktemp" "$live2/.c"
+# the last stage: a wc that prints a plausible count and then fails (live side only) is 2, never a count
+printf '#!/bin/sh\nif [ "$PWD" = "%s" ]; then echo 4; exit 1; fi\nexec /usr/bin/wc "$@"\n' "$live2" > "$stub/wc"; chmod 700 "$stub/wc"
+                                           expect "a wc that prints a count and then fails is 2"  2 "$(runp "$live2" "$stub")" "could not count"
+rm -f "$stub/wc"
+printf '\n%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" = 0 ]

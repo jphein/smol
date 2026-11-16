@@ -243,7 +243,10 @@ cmd_packages() {
   # Refusal for the live side: the newline count must equal the entry count (NUL-separated,
   # busybox-safe); a live name containing a newline, leading or trailing, breaks that equality.
   local lents
-  if ! lents="$(rsh "(set -o pipefail) 2>/dev/null && set -o pipefail; cd $(q "$REMOTE_DIR") && find . -mindepth 1 -maxdepth 1 -print0 | tr -dc '\\0' | wc -c" 2>/dev/null)"; then
+  # No pipeline carries a stage's status (a remote sh without pipefail, dash, would otherwise report only the last
+  # command's; xreview backfill of #580): find, then tr, each write into a private mktemp -d (both names reserved, no
+  # symlink clobber), wc reads the second; the dir is removed only when it was made, nothing else is ever removed.
+  if ! lents="$(rsh "cd $(q "$REMOTE_DIR") || exit 1; d=\$(mktemp -d) || exit 1; find . -mindepth 1 -maxdepth 1 -print0 > \"\$d/l\" && tr -dc '\\0' < \"\$d/l\" > \"\$d/c\" && c=\$(wc -c < \"\$d/c\"); rc=\$?; rm -rf -- \"\$d\"; [ \"\$rc\" = 0 ] && printf %s \"\$c\"" 2>/dev/null)"; then
     echo "  could not count $HA_SSH:$REMOTE_DIR — not checked" >&2; return 2
   fi
   lents="${lents//[[:space:]]/}"
