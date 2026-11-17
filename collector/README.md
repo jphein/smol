@@ -106,10 +106,11 @@ Pick a host that's reachable from the AP the gateway associates to (e.g.
 
 ```
 # on katana
-scp collector/collector.py collector/smol-collector.service familiar:/tmp/
+git rev-parse --short HEAD > /tmp/collector.hash   # the build stamp: the host copy has no .git
+scp collector/collector.py collector/smol-collector.service /tmp/collector.hash familiar:/tmp/
 
 # on the host (familiar / disks)
-mkdir -p ~/smol-collector && mv /tmp/collector.py ~/smol-collector/
+mkdir -p ~/smol-collector && mv /tmp/collector.py /tmp/collector.hash ~/smol-collector/
 sudo mv /tmp/smol-collector.service /etc/systemd/system/
 #   edit WorkingDirectory / ExecStart paths in the unit if not ~/smol-collector
 sudo systemctl daemon-reload
@@ -124,8 +125,9 @@ only pass `--status-host 0.0.0.0` if you truly want it LAN-visible.
 
 **Live deploy:** running on **disks** as a *user* service (`~/.config/systemd/user/
 smol-collector.service`, linger enabled → survives reboot, no sudo) at
-`10.0.11.117:9999`. Redeploy = `scp collector/collector.py disks:~/smol-collector/`
-then `ssh disks 'systemctl --user restart smol-collector'`.
+`10.0.11.117:9999`. Redeploy = `git rev-parse --short HEAD > /tmp/collector.hash && scp collector/collector.py
+/tmp/collector.hash disks:~/smol-collector/` then `ssh disks 'systemctl --user restart smol-collector'` (the hash file
+is what /api/version reports; without it the bare copy says "dev").
 
 ## Honesty / security
 
