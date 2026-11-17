@@ -270,3 +270,40 @@ class TestStatusEndpoint(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class StampedHashTest(unittest.TestCase):
+    """The deployed copy is a bare scp (no .git): /api/version read '· dev' on disks (2026-11-17, CHECK sigil-coverage)."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.src = os.path.join(self.dir, "collector.py")
+        with open(collector.__file__, encoding="utf-8") as f, open(self.src, "w", encoding="utf-8") as g:
+            g.write(f.read())
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("collector_copy", self.src)
+        self.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+        self._env = os.environ.pop("SMOL_COLLECTOR_HASH", None)
+
+    def tearDown(self):
+        if self._env is not None:
+            os.environ["SMOL_COLLECTOR_HASH"] = self._env
+        else:
+            os.environ.pop("SMOL_COLLECTOR_HASH", None)
+
+    def test_a_bare_copy_without_a_stamp_says_dev(self):
+        self.assertEqual(self.mod._compute_git_short_hash(), "dev")
+
+    def test_the_stamp_file_beside_the_copy_is_the_hash(self):
+        with open(os.path.join(self.dir, "collector.hash"), "w") as f:
+            f.write("A0C13ED\n")
+        self.assertEqual(self.mod._compute_git_short_hash(), "a0c13ed")
+
+    def test_the_env_wins_and_junk_is_ignored(self):
+        with open(os.path.join(self.dir, "collector.hash"), "w") as f:
+            f.write("a0c13ed\n")
+        os.environ["SMOL_COLLECTOR_HASH"] = "not-a-hash; rm -rf"
+        self.assertEqual(self.mod._compute_git_short_hash(), "a0c13ed")
+        os.environ["SMOL_COLLECTOR_HASH"] = "1234567"
+        self.assertEqual(self.mod._compute_git_short_hash(), "1234567")

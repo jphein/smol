@@ -27,6 +27,7 @@ itself is unauthenticated). Run it only on a trusted LAN. See README.md.
 import argparse
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -152,8 +153,18 @@ def git_short_hash():
     return _GIT_HASH
 
 
+HASH_FILE = "collector.hash"   # written next to collector.py by the redeploy (README): the host copy has no .git
+_HEX = re.compile(r"[0-9a-f]{7,40}")
+
+
 def _compute_git_short_hash():
-    """Best-effort short git hash of this repo; 'dev' if unavailable."""
+    """The deployed build's short hash: SMOL_COLLECTOR_HASH, else collector.hash beside this file (the redeploy writes
+    it, because the deployed copy is a bare scp with no .git: /api/version read "· dev" on disks, 2026-11-17), else
+    `git rev-parse` when run from a checkout, else 'dev'. A value that is not 7-40 hex chars is ignored."""
+    for cand in (os.environ.get("SMOL_COLLECTOR_HASH", ""), _read_hash_file()):
+        cand = (cand or "").strip().lower()
+        if _HEX.fullmatch(cand):
+            return cand[:12]
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -165,6 +176,14 @@ def _compute_git_short_hash():
     except (OSError, subprocess.SubprocessError):
         pass
     return "dev"
+
+
+def _read_hash_file():
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), HASH_FILE), encoding="ascii") as f:
+            return f.read(64)
+    except (OSError, UnicodeDecodeError):
+        return ""
 
 
 # ---------------------------------------------------------------------------
